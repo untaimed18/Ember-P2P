@@ -90,6 +90,7 @@ pub(in crate::network) async fn apply_deferred_disk_loads(
                     }
                     known_files.absorb_missing_from(loads.known_files);
                     sync_shared_friends_only_hashes(shared_friends_only_hashes, known_files);
+                    upload_server::publish_known_records(&state.known_records_shared, known_files);
                     or_index_friends_only_from_known(local_index, known_files).await;
                     *known_met_ready = true;
                     if !known_files.is_authoritative() {
@@ -185,6 +186,10 @@ pub(in crate::network) async fn apply_deferred_disk_loads(
                             }
                             sync_shared_friends_only_hashes(
                                 shared_friends_only_hashes,
+                                known_files,
+                            );
+                            upload_server::publish_known_records(
+                                &state.known_records_shared,
                                 known_files,
                             );
                             or_index_friends_only_from_known(local_index, known_files).await;

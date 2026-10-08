@@ -86,6 +86,8 @@ pub struct EmberMaintenanceResult {
     /// Friend sessions asked for their Ember DHT contacts. Like the bridge,
     /// non-zero only while the table is short of a working set.
     pub friend_contact_asks: usize,
+    /// Friends asked to meet over UDP this cycle.
+    pub friend_meets: usize,
 }
 
 /// Persisted peak of verified Ember DHT contacts, so a restart does not
@@ -122,6 +124,11 @@ pub(super) struct EmberSourceAddress {
 pub struct EmberValueLookupPending {
     pub search_id: u32,
     pub records_rx: oneshot::Receiver<Vec<Vec<u8>>>,
+    /// Nodes that answered the walk, set before `records_rx` resolves. A walk
+    /// nobody answered — offline, or a routing table of contacts that have
+    /// gone — finishes empty-handed whether or not the record exists, so a
+    /// caller reading "nothing found" as "nothing there" checks this first.
+    pub responded: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 pub(super) struct PendingDownload {
@@ -707,8 +714,11 @@ pub(super) struct NetworkState {
     /// or after auto-connect gives up on the preferred server.
     pub(super) server_auto_reconnect: bool,
     /// Consecutive preferred-server connection failures for exponential backoff
-    /// (reset on success). After [`AUTO_CONNECT_MAX_FAILURES`], auto-reconnect stops.
+    /// (reset by a session that lasts). After [`AUTO_CONNECT_MAX_FAILURES`],
+    /// auto-reconnect stops or, with auto-connect on, slows down.
     pub(super) server_reconnect_failures: u32,
+    /// The last connect attempt failed because our own network was down.
+    pub(super) server_reconnect_network_down: bool,
     /// Only server auto-reconnect / auto-connect may dial. Set on connect and
     /// persisted as last successful server on login.
     pub(super) preferred_ed2k_server: Option<(String, u16)>,
@@ -748,6 +758,9 @@ pub(super) struct NetworkState {
     /// The download folders, live: download workers and the upload listener
     /// hold this rather than the folder they were started with.
     pub(super) download_folders: crate::storage::part_folders::SharedDownloadFolders,
+    /// known.met's records for the upload listener's hashset answers.
+    /// Published when the catalog is absorbed and on every save of it.
+    pub(super) known_records_shared: ed2k::upload::SharedKnownRecords,
     /// Shared "filter incoming connections via IP filter" flag for the
     /// TCP accept loop.
     pub(super) filter_incoming_shared: Arc<std::sync::atomic::AtomicBool>,
@@ -1009,6 +1022,13 @@ pub(super) struct NetworkState {
     /// nothing about when we should next ask them.
     pub(super) ember_friend_contacts_asked: HashMap<[u8; 16], std::time::Instant>,
     pub(super) ember_friend_contacts_served: HashMap<[u8; 16], std::time::Instant>,
+
+    /// The same pair for `EMBER_EXT_DHT_MEET`: when we last asked each friend
+    /// to meet over UDP, and when we last `PING`ed one for a meet (its ask or
+    /// its answer). An ask stays here until the friend turns up as a verified
+    /// contact (counted as a meet that worked) or its interval lapses.
+    pub(super) ember_friend_meets_asked: HashMap<[u8; 16], std::time::Instant>,
+    pub(super) ember_friend_meets_pinged: HashMap<[u8; 16], std::time::Instant>,
 
     /// Session store-ack/fail totals as of the previous Ember publish
     /// heartbeat, so that line can report a per-cycle delta next to the total
@@ -1301,6 +1321,9 @@ pub(super) struct NetworkState {
     /// `ember_dht_pending_lookups` because a value lookup yields records,
     /// not contacts.
     pub(super) ember_dht_pending_value_lookups: HashMap<u32, oneshot::Sender<Vec<Vec<u8>>>>,
+    /// Where each of those waiters reads how many nodes answered its walk.
+    pub(super) ember_dht_value_lookup_responded:
+        HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     /// Active keyword/source publishes (slice 5). `PublishManager` tracks
     /// the targeted nodes and their acks; the network task drives it by
     /// sending `STORE_RECORD` frames and feeding `STORE_ACK`s back in.
@@ -1452,6 +1475,10 @@ pub(super) struct NetworkState {
     /// Rooms whose committed handoff has already been reported as not landing,
     /// so the report goes out once per window rather than every pass.
     pub(super) channel_handoff_failure_noted: HashSet<[u8; 16]>,
+    /// When the latest handoff fetch of each owned room that found no record
+    /// of ours was started. What tells a commitment that was never stored from
+    /// one whose acknowledgement went missing.
+    pub(super) channel_handoff_absent_at: HashMap<[u8; 16], i64>,
     /// Consecutive history-sync attempts that found no path to the neighbor,
     /// per (channel_id, neighbor pubkey). Cleared on a send; drives
     /// [`ember::channel::history_sync_retry_secs`].
@@ -1622,12 +1649,24 @@ pub(super) struct NetworkState {
     /// with what accepting one needs. In memory only: see
     /// [`chat_attach::sweep_interrupted`] for what a restart does to them.
     pub(super) attach_inbound: HashMap<[u8; 16], chat_attach::InboundAttach>,
-    /// Receives in flight, so a cancel from either side can stop one.
-    pub(super) attach_fetches: HashMap<[u8; 16], tokio::task::JoinHandle<()>>,
+    /// Receives in flight with the friend each is from, so a cancel from
+    /// either side, or removing the friend, can stop one.
+    pub(super) attach_fetches: HashMap<[u8; 16], ([u8; 16], tokio::task::JoinHandle<()>)>,
     /// Recent auto-accepts per friend, as `(when, bytes)`, for the budget that
     /// stops a friend filling the disk one small file at a time. See
     /// [`chat_attach::auto_accept_allowed`].
     pub(super) attach_auto_log: HashMap<[u8; 16], VecDeque<(i64, u64)>>,
+    /// Received attachments whose card the user pressed "Try again" on, and
+    /// when. That press is their acceptance of the re-offer it asks for.
+    pub(super) attach_retry_asked: HashMap<[u8; 16], i64>,
+    /// Files we sent and offered again because the friend pressed "Try again",
+    /// and when. The friend's next accept answers that offer rather than
+    /// asking for another, which is what keeps the two from looping.
+    pub(super) attach_reoffered: HashMap<[u8; 16], i64>,
+    /// The owned-rooms list last published, and when. See
+    /// `channel_membership::maybe_publish_owned_rooms_list`.
+    pub(super) owned_rooms_published: Option<Vec<[u8; 16]>>,
+    pub(super) owned_rooms_published_at: i64,
     /// In-flight FIND_VALUE of a content-key epoch record (`search_id` →
     /// channel + epoch).
     pub(super) ember_channel_epoch_searches: HashMap<u32, ([u8; 16], i64)>,

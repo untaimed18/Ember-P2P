@@ -723,6 +723,22 @@ pub(super) const EMBER_KAD_BRIDGE_UNTIL_CONTACTS: usize = ember::dht::K_BUCKET_S
 pub(super) const EMBER_FRIEND_CONTACT_ASK_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(60);
 
+/// Minimum spacing between asking one friend to meet over UDP
+/// (`EMBER_EXT_DHT_MEET`). A simultaneous open that failed is likely to fail
+/// again until something about either network changes, so this is slower than
+/// the contact ask; it is also asked at any table size, so it has to be cheap.
+pub(super) const EMBER_FRIEND_MEET_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
+
+/// Friends asked to meet per maintenance tick, least recently asked first.
+pub(super) const EMBER_FRIEND_MEETS_PER_TICK: usize = 2;
+
+/// Minimum spacing between `PING`s to one friend for a meet, and how long after
+/// asking we act on its answer. One round trip is what an answer needs; the
+/// spacing is what keeps a friend from having us `PING` it on demand.
+pub(super) const EMBER_FRIEND_MEET_ANSWER_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
 /// How long after asking a friend we will act on its answer.
 ///
 /// Held apart from the interval above because the two want different lengths:
@@ -1396,6 +1412,11 @@ pub(super) async fn run_ember_maintenance(
     //      stops entirely once the table holds a working set.
     result.friend_contact_asks = ask_friends_for_ember_contacts(state).await;
 
+    // 0a2) Ask friends that are not contacts to meet over UDP, so a friend can
+    //      become a contact itself rather than only hand over its own. See
+    //      `ask_friends_to_meet`.
+    result.friend_meets = ask_friends_to_meet(state).await;
+
     // 0b) Staleness purge. Liveness pings alone need three consecutive
     //     misses to evict, and the ping budget is small, so a contact that
     //     quietly disappeared could hold its slot for hours — blocking the
@@ -2037,6 +2058,14 @@ pub(super) async fn run_ember_maintenance(
     state.ember_friend_contacts_served.retain(|_, at| {
         prune_now.saturating_duration_since(*at) < EMBER_FRIEND_CONTACT_SERVE_INTERVAL
     });
+    // A meet ask that has not turned the friend into a contact by its interval
+    // did not work; dropping it is what lets the next one go out.
+    state
+        .ember_friend_meets_asked
+        .retain(|_, at| prune_now.saturating_duration_since(*at) < EMBER_FRIEND_MEET_INTERVAL);
+    state.ember_friend_meets_pinged.retain(|_, at| {
+        prune_now.saturating_duration_since(*at) < EMBER_FRIEND_MEET_ANSWER_WINDOW
+    });
 
     // Everything the overlay's health depends on, in one line. A node that is
     // not growing is the hard case to diagnose from the outside: "1 contact"
@@ -2047,7 +2076,7 @@ pub(super) async fn run_ember_maintenance(
     info!(
         "Ember DHT cycle: contacts={} ({verified_now_len} verified, {} leads, {} session), \
          announced={}, peer_lists={}, gossip={} (new {}, refused {}, rationed {} from {} \
-         introducer(s)), pings={}, bridge={}, friend_asks={}, \
+         introducer(s)), pings={}, bridge={}, friend_asks={}, friend_meets={}, \
          noise_keys={}, keyless={}, records due={} selected={} queued={} re-armed={} \
          backlog={}",
         state.ember_dht.contact_count(),
@@ -2066,6 +2095,7 @@ pub(super) async fn run_ember_maintenance(
         result.liveness_pings_sent,
         result.kad_bridge_pings_sent,
         result.friend_contact_asks,
+        result.friend_meets,
         state.ember_noise_keys.len(),
         state.ember_keyless_peers.len(),
         result.republish_due,

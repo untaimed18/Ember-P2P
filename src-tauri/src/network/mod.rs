@@ -2,7 +2,7 @@ mod api;
 mod bans;
 mod browse;
 mod channel_gossip;
-mod channel_membership;
+pub(crate) mod channel_membership;
 mod channel_relay;
 mod channel_xfer;
 mod chat;
@@ -77,7 +77,7 @@ use self::ed2k::server::{Ed2kServerConnection, ServerLink};
 use self::ed2k::server_list::{ServerEntry, ServerList};
 use self::ed2k::server_udp::{ServerUdpResponse, ServerUdpSocket};
 use self::ed2k::sources::SourceManager;
-use self::ed2k::transfer::{classify_error, DownloadEvent, Ed2kDownload, SourceFailureKind};
+use self::ed2k::transfer::{classify_error, DownloadEvent, SourceFailureKind};
 use self::ed2k::upload::{self as upload_server, UploadEvent, UploadEventKind};
 use self::kad::bootstrap;
 use self::kad::buddy::{BuddyEvent, BuddyManager, BuddyState, PendingBuddySet};
@@ -172,6 +172,15 @@ pub use self::state::{
 #[cfg(debug_assertions)]
 pub use self::state::{EmberDhtFindPending, EmberDhtLookupPending, EmberPingPending};
 
+/// Whole seconds on a clock that a change of the system time does not move,
+/// for gaps the event loop measures in `i64` seconds. Starts well above zero,
+/// which those fields use for "never".
+pub(crate) fn monotonic_secs() -> i64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let elapsed = START.get_or_init(std::time::Instant::now).elapsed().as_secs();
+    1_000_000_i64.saturating_add(i64::try_from(elapsed).unwrap_or(i64::MAX))
+}
+
 fn relay_ticket_next_round_delay(
     round_started_at: tokio::time::Instant,
     completed_at: tokio::time::Instant,
@@ -261,6 +270,8 @@ pub struct NetworkDeps {
     pub fresh_part_hashes: Arc<RwLock<HashMap<[u8; 16], Vec<[u8; 16]>>>>,
     /// Application database (transfers, friends, chat, known files).
     pub db: Arc<Database>,
+    /// What the startup sweep does with part files `db` does not list.
+    pub orphan_disposal: crate::commands::transfers::OrphanDisposal,
 
     // --- Transfers and bandwidth ---
     /// Download/upload bookkeeping shared with the sharing manager.
@@ -309,6 +320,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         local_index,
         fresh_part_hashes,
         db,
+        orphan_disposal,
         transfer_manager,
         bandwidth_limiter,
         shared_peers,
@@ -580,9 +592,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
     let _ = app_handle.emit("network-status", NetworkStatus::Connecting);
 
-    // Mutable: a failed startup mapping auto-disables UPnP for the rest of
-    // this session (see the emission below), which gates off the maintenance
-    // retries, the QUIC port mapping, and the shutdown teardown.
+    // Read once: gates the maintenance retries, the QUIC port mapping and the
+    // shutdown teardown for the whole session, so a change applies at restart.
     let upnp_enabled = settings.upnp_enabled;
 
     // Defer UPnP gateway discovery/mapping and heavy disk loads until after
@@ -874,7 +885,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         external_ip_shared: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         self_lookup_done: false,
         last_self_lookup: 0,
-        kad_started_at: chrono::Utc::now().timestamp(),
+        kad_started_at: monotonic_secs(),
         last_kad_contact: None,
         udp_firewalled: true,
         udp_fw_verified: false,
@@ -940,6 +951,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         // `initiate_server_connect`, which flips this on for drop recovery.
         server_auto_reconnect: false,
         server_reconnect_failures: 0,
+        server_reconnect_network_down: false,
         preferred_ed2k_server: None,
         server_last_connect_attempt: None,
         pending_uss_pings: HashMap::new(),
@@ -960,6 +972,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             settings.skip_compress_video,
         )),
         download_folders: settings.download_folders().shared(),
+        known_records_shared: Default::default(),
         filter_incoming_shared: Arc::new(std::sync::atomic::AtomicBool::new(
             settings.filter_incoming_connections,
         )),
@@ -1012,6 +1025,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_gossip_reputation: ember::dht::gossip::GossipReputation::new(),
         ember_friend_contacts_asked: HashMap::new(),
         ember_friend_contacts_served: HashMap::new(),
+        ember_friend_meets_asked: HashMap::new(),
+        ember_friend_meets_pinged: HashMap::new(),
             ember_bridge_fast_at: None,
             ember_gossip_probe_window: (std::time::Instant::now(), 0),
             ember_publish_beat_acked: 0,
@@ -1097,6 +1112,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_dht_search_requests: HashMap::new(),
         ember_dht_pending_lookups: HashMap::new(),
         ember_dht_pending_value_lookups: HashMap::new(),
+        ember_dht_value_lookup_responded: HashMap::new(),
         ember_publish: ember::dht::publish::PublishManager::new(),
         ember_dht_publish_requests: HashMap::new(),
         ember_dht_pending_publishes: HashMap::new(),
@@ -1135,6 +1151,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_handoff_publishes: HashMap::new(),
         channel_handoff_completing: Arc::new(std::sync::Mutex::new(HashSet::new())),
         channel_handoff_failure_noted: HashSet::new(),
+        channel_handoff_absent_at: HashMap::new(),
         channel_history_sync_mark: HashMap::new(),
         channel_history_sync_ingested: HashMap::new(),
         ember_channel_presence_searches: HashMap::new(),
@@ -1187,6 +1204,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         attach_inbound: HashMap::new(),
         attach_fetches: HashMap::new(),
         attach_auto_log: HashMap::new(),
+        attach_retry_asked: HashMap::new(),
+        attach_reoffered: HashMap::new(),
+        owned_rooms_published: None,
+        owned_rooms_published_at: 0,
         ember_channel_epoch_searches: HashMap::new(),
         ember_pending_channel_epoch: Vec::new(),
         channel_epoch_fetch_at: HashMap::new(),
@@ -1630,6 +1651,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 cm.all_records().len()
             );
         }
+        match db.load_credit_ember_links() {
+            Ok(links) => {
+                for (user_hash, ember_hash) in links {
+                    cm.restore_proven_ember_hash(user_hash, ember_hash);
+                }
+            }
+            Err(e) => warn!("Could not load Known Ember Peers links: {e}"),
+        }
         // Ember credit records live in a separate v15 table, loaded the
         // same way as the eMule table above.
         if let Ok(records) = db.load_ember_credits() {
@@ -1790,6 +1819,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let ul_banned = shared_banned_ips.clone();
         let ul_banned_hashes = shared_banned_hashes.clone();
         let ul_friends_only = shared_friends_only_hashes.clone();
+        let ul_known_records = state.known_records_shared.clone();
         let ul_antileech = shared_antileech.clone();
         let ul_skip_compress = state.skip_compress_video_shared.clone();
         let ul_filter_incoming = state.filter_incoming_shared.clone();
@@ -1855,6 +1885,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 ul_banned,
                 ul_banned_hashes,
                 ul_friends_only,
+                ul_known_records,
                 ul_antileech,
                 ul_skip_compress,
                 ul_filter_incoming,
@@ -2038,12 +2069,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // a `OP_GLOBGETSOURCES` could sit in the kernel buffer for up
     // to 5 seconds before we noticed — bad latency for source
     // discovery. Pings remain rate-limited *per server* by
-    // `MIN_PING_INTERVAL_SECS` (= 5s) inside `send_status_ping`,
-    // so the higher tick rate doesn't increase ping traffic — it
-    // just makes the recv drain feel like a real event-driven arm.
-    // CPU cost per idle tick is one `try_recv_from` syscall (which
-    // returns `WouldBlock` instantly when nothing's queued) plus a
-    // hashmap lookup for the cooldown — negligible.
+    // `status_ping_due` (eMule's 4.5 h), so the higher tick rate
+    // doesn't increase ping traffic — it just makes the recv drain
+    // feel like a real event-driven arm. CPU cost per idle tick is
+    // one `try_recv_from` syscall (which returns `WouldBlock`
+    // instantly when nothing's queued) — negligible.
     let initial_ping_interval_ms = 200u64;
     let mut server_udp_ping_timer =
         tokio::time::interval(std::time::Duration::from_millis(initial_ping_interval_ms));
@@ -2221,8 +2251,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let mut nat_probe_started_at: Option<tokio::time::Instant> = None;
     let mut nat_probe_backoff_until: Option<tokio::time::Instant> = None;
     let mut credit_flush_handle: Option<tokio::task::JoinHandle<()>> = None;
-    let mut last_server_activity_at = chrono::Utc::now().timestamp();
-    let mut last_kad_activity_at = chrono::Utc::now().timestamp();
+    let mut last_server_activity_at = monotonic_secs();
+    let mut last_kad_activity_at = monotonic_secs();
     let mut last_cache_refresh_started_at = 0i64;
     // `(known.met dirty generation, publish-badge fingerprint)` the cached
     // shared-file list was last built from. `None` until the first refresh, so
@@ -2414,8 +2444,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let mut pending_offer_signature: Option<(usize, u64)> = None;
     let mut next_offer_packet_at: Option<tokio::time::Instant> = None;
 
+    // Drained only by the 120 s known.met tick, and its senders `try_send`, so
+    // a burst of completions between drains is dropped past this capacity.
     let (aich_set_tx, mut aich_set_rx) =
-        tokio::sync::mpsc::channel::<ed2k::aich::AICHRecoveryHashSet>(128);
+        tokio::sync::mpsc::channel::<ed2k::aich::AICHRecoveryHashSet>(MAX_AICH_HASH_SETS);
 
     info!("Network event loop starting");
     let mut shutdown_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
@@ -2595,12 +2627,31 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 let cutoff = std::time::SystemTime::now()
                     .checked_sub(std::time::Duration::from_secs(5))
                     .unwrap_or(std::time::UNIX_EPOCH);
-                let (roots, db) = (settings.download_roots(), db.clone());
+                let (roots, db, data_dir) =
+                    (settings.download_roots(), db.clone(), data_dir.clone());
                 tokio::spawn(async move {
-                    crate::commands::transfers::sweep_orphan_part_files(
-                        &roots, &known_ids, &db, cutoff,
+                    use crate::commands::transfers::OrphanDisposal;
+                    let complete = crate::commands::transfers::sweep_orphan_part_files(
+                        &roots,
+                        &known_ids,
+                        &db,
+                        cutoff,
+                        orphan_disposal,
                     )
                     .await;
+                    if let OrphanDisposal::SetAside { .. } = orphan_disposal {
+                        if complete {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                OrphanDisposal::set_aside_finished(&data_dir)
+                            })
+                            .await;
+                        } else {
+                            tracing::warn!(
+                                "Orphan sweep did not reach every part file the replaced \
+                                 database does not list; the next launch sets them aside again"
+                            );
+                        }
+                    }
                 });
             }
 
@@ -2959,7 +3010,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         // well as KAD, and it gates the KAD half on connection
                         // state itself. Only the KAD accounting is conditional.
                         if state.stats.status != NetworkStatus::Disconnected {
-                            last_kad_activity_at = chrono::Utc::now().timestamp();
+                            last_kad_activity_at = monotonic_secs();
                             stats_manager.add_overhead(
                                 crate::storage::statistics::OverheadCategory::Kad,
                                 crate::storage::statistics::OverheadDirection::Download,
@@ -4111,11 +4162,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 if upnp_enabled && !upnp_maintain_in_flight {
                     let revision = upnp_mappings.revision();
                     let mut mappings = upnp_mappings.clone();
+                    let seen_ip = state.external_ip;
                     let tx = upnp_maintain_result_tx.clone();
                     upnp_maintain_in_flight = true;
                     upnp_maintain_started_at = Some(tokio::time::Instant::now());
                     upnp_maintain_handle = Some(tokio::spawn(async move {
-                        let mapped = mappings.maintain().await;
+                        let mapped = mappings.maintain(seen_ip).await;
                         let _ = tx.send(UpnpMaintainResult {
                             revision,
                             mappings,

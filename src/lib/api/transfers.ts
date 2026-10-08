@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { withTimeout } from '$lib/utils';
+import { takeBackPendingCancels } from '$lib/stores/pendingCancels';
 import * as m from '$lib/paraglide/messages';
 import type {
   Transfer,
@@ -60,6 +61,7 @@ export async function startDownload(
   if (!fileHash?.trim()) {
     throw new Error(m.error_transfers_invalid_file_hash());
   }
+  await takeBackPendingCancels([fileHash]);
   return invoke('start_download', {
     fileHash,
     fileName,
@@ -96,10 +98,6 @@ export async function stopTransfer(transferId: string): Promise<void> {
 
 export async function resumeTransfer(transferId: string): Promise<void> {
   return withTimeout(invoke<void>('resume_transfer', { transferId }), 'resume_transfer');
-}
-
-export async function cancelTransfer(transferId: string): Promise<void> {
-  return invoke('cancel_transfer', { transferId });
 }
 
 export async function removeTransfer(transferId: string): Promise<void> {
@@ -178,8 +176,37 @@ export async function getKnownClientCounts(): Promise<KnownClientCounts> {
   );
 }
 
-export async function clearCompleted(): Promise<number> {
-  return invoke('clear_completed');
+/** Clear finished downloads from the list: all of them, or only `transferIds`.
+ *  Returns how many went. */
+export async function clearCompleted(transferIds?: string[]): Promise<number> {
+  if (!transferIds) return invoke('clear_completed');
+  let cleared = 0;
+  for (let i = 0; i < transferIds.length; i += MAX_BATCH_TRANSFER_IDS) {
+    cleared += await invoke<number>('clear_completed', {
+      transferIds: transferIds.slice(i, i + MAX_BATCH_TRANSFER_IDS),
+    });
+  }
+  return cleared;
+}
+
+/** Ids of the downloads waiting in the download queue, front first. */
+export async function getDownloadQueueIds(): Promise<string[]> {
+  return invoke('get_download_queue_ids');
+}
+
+/** Move queued downloads to the front or back of the download queue.
+ *  Returns how many were waiting there; a running one is not. */
+export async function moveTransfersInQueue(transferIds: string[], toFront: boolean): Promise<number> {
+  let moved = 0;
+  // To the front last chunk first, so earlier chunks end up ahead of later ones.
+  const chunks: string[][] = [];
+  for (let i = 0; i < transferIds.length; i += MAX_BATCH_TRANSFER_IDS) {
+    chunks.push(transferIds.slice(i, i + MAX_BATCH_TRANSFER_IDS));
+  }
+  for (const chunk of toFront ? chunks.reverse() : chunks) {
+    moved += await invoke<number>('move_transfers_in_queue', { transferIds: chunk, toFront });
+  }
+  return moved;
 }
 
 export async function setTransferPriority(transferId: string, priority: 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto'): Promise<void> {
@@ -199,24 +226,22 @@ export async function setPreviewPriority(transferId: string, enabled: boolean): 
   return invoke('set_preview_priority', { transferId, enabled });
 }
 
-export async function pauseAllTransfers(): Promise<void> {
-  return invoke('pause_all_transfers');
-}
-
 /** `MAX_BATCH_TRANSFER_IDS` in `commands/transfers.rs`: a larger request is
  *  refused outright with `transfers_batch_too_large`. */
 const MAX_BATCH_TRANSFER_IDS = 500;
 
 /** Send `transferIds` through a batch command in backend-sized chunks, in
  *  order, stopping at the first chunk that fails. */
-async function invokeChunked(command: string, transferIds: string[]): Promise<void> {
+async function invokeChunked(command: string, transferIds: string[], extra: Record<string, unknown> = {}): Promise<void> {
   for (let i = 0; i < transferIds.length; i += MAX_BATCH_TRANSFER_IDS) {
-    await invoke<void>(command, { transferIds: transferIds.slice(i, i + MAX_BATCH_TRANSFER_IDS) });
+    await invoke<void>(command, { ...extra, transferIds: transferIds.slice(i, i + MAX_BATCH_TRANSFER_IDS) });
   }
 }
 
-export async function pauseTransfersBatch(transferIds: string[]): Promise<void> {
-  return invokeChunked('pause_transfers_batch', transferIds);
+/** `hold` keeps the freed download slots empty instead of starting queued
+ *  rows in them: the pause before a cancel the user can still undo. */
+export async function pauseTransfersBatch(transferIds: string[], options: { hold?: boolean } = {}): Promise<void> {
+  return invokeChunked('pause_transfers_batch', transferIds, options.hold ? { hold: true } : {});
 }
 
 export async function resumeTransfersBatch(transferIds: string[]): Promise<void> {
@@ -229,10 +254,6 @@ export async function stopTransfersBatch(transferIds: string[]): Promise<void> {
 
 export async function cancelTransfersBatch(transferIds: string[]): Promise<void> {
   return invokeChunked('cancel_transfers_batch', transferIds);
-}
-
-export async function resumeAllTransfers(): Promise<void> {
-  return invoke('resume_all_transfers');
 }
 
 export async function getTransferSources(transferId: string): Promise<SourceInfo[]> {

@@ -27,6 +27,7 @@ const alias = {
 
 export default defineConfig({
   test: {
+    fsModuleCache: true,
     projects: [
       {
         resolve: { alias },

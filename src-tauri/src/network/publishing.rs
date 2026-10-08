@@ -84,10 +84,8 @@ pub(super) fn collect_friends_only_hashes(
         .filter(|f| f.friends_only && !f.hash.is_empty())
         .map(|f| f.hash.to_ascii_lowercase())
         .collect();
-    for rec in known_files.iter_records() {
-        if rec.friends_only {
-            out.insert(hex::encode(rec.file_hash));
-        }
+    for hash in collect_known_friends_only_hashes(known_files) {
+        out.insert(hex::encode(hash));
     }
     out
 }
@@ -324,12 +322,17 @@ pub(super) async fn or_index_friends_only_from_known(
         .or_friends_only_from_hashes(&hashes);
 }
 
+/// known.met's friends-only records, plus the share intent's copy, which
+/// survives a lost or partly read known.met.
 pub(super) fn collect_known_friends_only_hashes(known_files: &KnownFileList) -> HashSet<[u8; 16]> {
-    known_files
-        .iter_records()
-        .filter(|r| r.friends_only)
-        .map(|r| r.file_hash)
-        .collect()
+    let mut out = crate::storage::share_intent::friends_only_hashes_if_ready();
+    out.extend(
+        known_files
+            .iter_records()
+            .filter(|r| r.friends_only)
+            .map(|r| r.file_hash),
+    );
+    out
 }
 
 pub(super) fn sync_shared_friends_only_hashes(

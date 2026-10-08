@@ -12,14 +12,20 @@
   import UpdateNotice from '$lib/components/UpdateNotice.svelte';
   import SilentUpdateCountdown from '$lib/components/SilentUpdateCountdown.svelte';
   import { initSilentUpdate, reportUpdateOutcome } from '$lib/stores/silentUpdate';
+  import FinishActionCountdown from '$lib/components/FinishActionCountdown.svelte';
+  import { initFinishAction } from '$lib/stores/finishAction';
   import { startUserActivityReporting } from '$lib/userActivity';
+  import { startClipboardWatch } from '$lib/clipboardWatch';
+  import { notify } from '$lib/notifications';
+  import { formatBytes } from '$lib/utils';
 
   import { initNetworkStore, cleanupNetworkStore, startStatsPoll } from '$lib/stores/network';
   import { initTransferStore, cleanupTransferStore, startTransferPoll } from '$lib/stores/transfers';
   import { initSearchStore, cleanupSearchStore } from '$lib/stores/search';
   import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
   import { chatDockOpen, closeDock, retainChatTabs } from '$lib/stores/chatTabs';
-  import { initChannelsStore, cleanupChannelsStore } from '$lib/stores/channels';
+  import { initChannelsStore, cleanupChannelsStore, refreshChannels } from '$lib/stores/channels';
+  import { CHANNELS_RECOVERED_EVENT } from '$lib/api/channels';
   import { loadAppSettings, clearAppSettings, setAppSettings } from '$lib/stores/settings';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
   import { applyDocumentLang, translateError } from '$lib/i18n';
@@ -34,7 +40,11 @@
     takePendingEmberDefaultOnNotice,
     takePendingRestoreFailedNotice,
     takePendingRestoreExpiredNotice,
+    takePendingRestoreDownloadFolderNotice,
     takePendingKnownMetNotice,
+    SETTINGS_CHANGED_EVENT,
+    QUIT_REQUESTED_EVENT,
+    setPendingUndo,
   } from '$lib/api/settings';
   import {
     applyBackgroundCheckResult,
@@ -47,7 +57,9 @@
     acknowledgeSecurityPolicyReset,
     getSecurityPolicyState,
   } from '$lib/api/security';
-  import { addToast, clearAllToasts, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
+  import {
+    addToast, clearAllToasts, onPendingUndoChange, toastError, toastSuccess, toastWarning,
+  } from '$lib/stores/toast';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { confirmDroppedFolders, dismissDroppedFolders } from '$lib/api/sharing';
   import { takePendingDownloadOverflowNotice } from '$lib/api/transfers';
@@ -296,11 +308,15 @@
     let handoffCheckTimer: number | undefined;
     let unlistenUpdateCheck: UnlistenFn | null = null;
     let unlistenUpdateResume: UnlistenFn | null = null;
+    let unlistenSettingsChanged: UnlistenFn | null = null;
+    let unlistenQuitRequested: UnlistenFn | null = null;
     let unlistenSilentUpdate: UnlistenFn | null = null;
+    let unlistenFinishAction: UnlistenFn | null = null;
     const stopActivityReporting = startUserActivityReporting();
     let unlistenClose: UnlistenFn | null = null;
     let unlistenConfigCorrupt: UnlistenFn | null = null;
     let unlistenDbCorrupt: UnlistenFn | null = null;
+    let unlistenRecovered: UnlistenFn | null = null;
     let unlistenKnownMet: UnlistenFn | null = null;
     let unlistenPolicyReset: UnlistenFn | null = null;
     let unlistenFoldersAdded: UnlistenFn | null = null;
@@ -309,6 +325,8 @@
     let unlistenDropPending: UnlistenFn | null = null;
     let unlistenDropRejected: UnlistenFn | null = null;
     let unlistenDownloadFolder: UnlistenFn | null = null;
+    let unlistenDiskSpace: UnlistenFn | null = null;
+    const stopClipboardWatch = startClipboardWatch();
     let stopChatPopout: (() => void) | null = null;
 
     void initChatPopoutMain().then((stop) => {
@@ -370,6 +388,22 @@
       .then((fn) => { if (mounted) unlistenDbCorrupt = fn; else fn(); })
       .catch((e) => console.error('Failed to register db-corrupt listener:', e));
 
+    // Rooms this identity owns, found on the network again after a restore
+    // or from Settings, and put back on this device.
+    listen<{ count: number }>(CHANNELS_RECOVERED_EVENT, (event) => {
+      const count = event.payload?.count ?? 0;
+      if (count <= 0) return;
+      toastSuccess(
+        plural(count, {
+          one: m.layout_channels_recovered_one,
+          other: () => m.layout_channels_recovered_other({ count }),
+        }),
+      );
+      refreshChannels().catch(() => {});
+    })
+      .then((fn) => { if (mounted) unlistenRecovered = fn; else fn(); })
+      .catch((e) => console.error('Failed to register channels-recovered listener:', e));
+
     // known.met could not be read: nothing is published and only friends are
     // uploaded to this session, which used to show nowhere but the log.
     // Pulled from a backend latch, with the event only a wake-up: it is emitted
@@ -428,6 +462,13 @@
         if (mounted && expired) addToast('warning', m.layout_restore_expired(), 0);
       })
       .catch((e) => console.error('Failed to consume the restore-expired latch:', e));
+
+    // Sticky: downloads now land somewhere the user did not choose.
+    takePendingRestoreDownloadFolderNotice()
+      .then((path) => {
+        if (mounted && path) addToast('warning', m.layout_restore_download_folder_replaced({ path }), 0);
+      })
+      .catch((e) => console.error('Failed to consume the restore download-folder latch:', e));
 
     listen<{ loaded: boolean; resetRequired: boolean; reason?: string }>(
       'security-policy-reset-required',
@@ -507,7 +548,31 @@
       show: m.tray_show(),
       quit: m.tray_quit(),
       cancelUpdate: m.tray_cancel_update({ time: '{time}' }),
+      pauseAll: m.tray_pause_all(),
+      resumeAll: m.tray_resume_all(),
+      altSpeed: m.tray_alt_speed(),
+      cancelExit: m.tray_cancel_exit(),
+      cancelSleep: m.tray_cancel_sleep(),
     }).catch((e) => console.error('Failed to set the tray labels:', e));
+
+    // The tray and the status bar save speed limits without the Settings page.
+    listen<AppSettings>(SETTINGS_CHANGED_EVENT, (event) => {
+      if (mounted) setAppSettings(event.payload);
+    })
+      .then((fn) => { if (mounted) unlistenSettingsChanged = fn; else fn(); })
+      .catch((e) => console.error('Failed to register settings-changed listener:', e));
+
+    // A cancel or removal behind an Undo toast reaches the backend only when
+    // the toast goes, so an exit started from the tray asks for it first.
+    onPendingUndoChange((pending) => {
+      void setPendingUndo(pending).catch((e) => console.warn('Failed to report pending Undo actions:', e));
+    });
+    listen(QUIT_REQUESTED_EVENT, () => {
+      if (!mounted) return;
+      void quitApp().catch((e) => console.error('Failed to quit Ember:', e));
+    })
+      .then((fn) => { if (mounted) unlistenQuitRequested = fn; else fn(); })
+      .catch((e) => console.error('Failed to register quit-requested listener:', e));
 
     // An update restart asks for the page and search tabs just before it shuts
     // Ember down, so the launch after it can put them back.
@@ -521,6 +586,10 @@
       .then((fn) => { if (mounted) unlistenSilentUpdate = fn; else fn(); })
       .catch((e) => console.error('Failed to register silent-update listener:', e));
 
+    initFinishAction()
+      .then((fn) => { if (mounted) unlistenFinishAction = fn; else fn(); })
+      .catch((e) => console.error('Failed to register finish-action listener:', e));
+
     // Downloads re-queue on their own once the folder is fixed, so without this
     // the only sign of a folder Ember cannot write is rows that never start.
     listen('download-folder-unavailable', () => {
@@ -529,6 +598,16 @@
     })
       .then((fn) => { if (mounted) unlistenDownloadFolder = fn; else fn(); })
       .catch((e) => console.error('Failed to register download-folder-unavailable listener:', e));
+
+    listen<{ path?: string; freeBytes?: number }>('disk-space-low', (event) => {
+      if (!mounted) return;
+      const free = formatBytes(event.payload?.freeBytes ?? 0);
+      const message = m.layout_disk_space_low({ free, path: event.payload?.path ?? '' });
+      toastWarning(message);
+      void notify('disk_space', m.layout_disk_space_low_title(), message);
+    })
+      .then((fn) => { if (mounted) unlistenDiskSpace = fn; else fn(); })
+      .catch((e) => console.error('Failed to register disk-space-low listener:', e));
 
     listen<{ token?: number; folders?: string[]; reason?: string }>(
       'shared-folder-drop-pending',
@@ -721,7 +800,12 @@
       if (handoffCheckTimer !== undefined) window.clearTimeout(handoffCheckTimer);
       if (unlistenUpdateCheck) unlistenUpdateCheck();
       if (unlistenUpdateResume) unlistenUpdateResume();
+      if (unlistenSettingsChanged) unlistenSettingsChanged();
+      if (unlistenQuitRequested) unlistenQuitRequested();
+      // The pending-Undo listener stays: `clearAllToasts` below starts the
+      // commits it has to report the end of. The next mount replaces it.
       if (unlistenSilentUpdate) unlistenSilentUpdate();
+      if (unlistenFinishAction) unlistenFinishAction();
       stopActivityReporting();
       if (stopPoll) stopPoll();
       if (stopTransferPoll) stopTransferPoll();
@@ -736,6 +820,7 @@
       if (unlistenClose) unlistenClose();
       if (unlistenConfigCorrupt) unlistenConfigCorrupt();
       if (unlistenDbCorrupt) unlistenDbCorrupt();
+      if (unlistenRecovered) unlistenRecovered();
       if (unlistenKnownMet) unlistenKnownMet();
       if (unlistenPolicyReset) unlistenPolicyReset();
       if (unlistenFoldersAdded) unlistenFoldersAdded();
@@ -744,6 +829,8 @@
       if (unlistenDropPending) unlistenDropPending();
       if (unlistenDropRejected) unlistenDropRejected();
       if (unlistenDownloadFolder) unlistenDownloadFolder();
+      if (unlistenDiskSpace) unlistenDiskSpace();
+      stopClipboardWatch();
       stopChatPopout?.();
     };
   });
@@ -811,6 +898,7 @@
     <!-- Non-blocking auto-update banner, driven by the shared updater store. -->
     <UpdateNotice />
     <SilentUpdateCountdown />
+    <FinishActionCountdown />
     <!-- Headless: routes OS-delivered ed2k:// links and .emulecollection
     files into the app once the shell is ready (settings loaded, no wizard). -->
     <DeepLinkHandler />

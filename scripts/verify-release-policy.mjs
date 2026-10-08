@@ -196,6 +196,35 @@ function releaseTags(root) {
     .map((line) => line.slice(1));
 }
 
+/**
+ * Fail unless this checkout carries the history and tags that the checks
+ * against the previous release read.
+ *
+ * Off a release, a checkout without them is treated as "cannot check", so a
+ * source tarball build is not blocked. Cutting a release is different: the
+ * default `actions/checkout` fetches one commit, where `git tag` finds nothing
+ * older than the tag being cut, and the Ember DHT check below silently passed
+ * every release build that way.
+ */
+function requireReleaseHistory(root) {
+  let shallow;
+  try {
+    shallow = execFileSync("git", ["rev-parse", "--is-shallow-repository"], {
+      cwd: root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    shallow = null;
+  }
+  if (shallow !== "false") {
+    throw new Error(
+      "Release history policy failed:\n- this checkout has no full git history, so the previous " +
+        "release cannot be compared against; check out with fetch-depth: 0",
+    );
+  }
+}
+
 /** The highest `vX.Y.Z` tag in the repository, or `null` if there are none. */
 function latestReleaseTag(root) {
   const versions = releaseTags(root);
@@ -372,6 +401,17 @@ export function verifyWorkflow({ root = scriptRoot } = {}) {
     const topLevel = jobsIndex >= 0 ? source.slice(0, jobsIndex) : source;
     if (!/permissions:\s*\r?\n\s{2}contents:\s*read\b/.test(topLevel)) {
       errors.push(`${path}: top-level permissions must be contents: read`);
+    }
+
+    for (const [name, body] of releaseJobs(source)) {
+      if (
+        body.includes("scripts/verify-release-policy.mjs") &&
+        !/^\s*fetch-depth:\s*0\s*$/m.test(body)
+      ) {
+        errors.push(
+          `${path}: ${name} runs the release policy, which reads earlier tags, so its checkout must set fetch-depth: 0`,
+        );
+      }
     }
   }
 
@@ -571,9 +611,15 @@ function emberDhtVersionAtTag(root, tag) {
  * notes for a freshly bumped version are legitimately unwritten for a while,
  * and failing on that would leave main red between a bump and its changelog.
  * And a repository with no older tag to read simply cannot be checked, which
- * is treated the same way `verifyVersionAdvanced` treats a tagless checkout.
+ * is treated the same way `verifyVersionAdvanced` treats a tagless checkout —
+ * except while a release is being cut, when a checkout that lacks the history
+ * is an error rather than a skip.
  */
-export function verifyEmberDhtVersion({ root = scriptRoot } = {}) {
+export function verifyEmberDhtVersion({
+  root = scriptRoot,
+  tag = null,
+  requireTag = false,
+} = {}) {
   const version = JSON.parse(read(root, "package.json")).version;
   const source = read(root, EMBER_DHT_SOURCE);
   const match = source.match(EMBER_DHT_VERSION_RE);
@@ -584,6 +630,11 @@ export function verifyEmberDhtVersion({ root = scriptRoot } = {}) {
   }
   const wireVersion = Number(match[1]);
   const skipped = { wireVersion, previousWireVersion: null, checked: false };
+
+  const effectiveTag = tag ?? envReleaseTag();
+  if (requireTag || (effectiveTag != null && effectiveTag === `v${version}`)) {
+    requireReleaseHistory(root);
+  }
 
   const previousTag = previousReleaseTag(root, version);
   if (!previousTag) return skipped;

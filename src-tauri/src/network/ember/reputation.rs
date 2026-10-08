@@ -330,22 +330,6 @@ impl ReputationManager {
         !was_banned && now_banned
     }
 
-    /// Get a peer's current score, applying decay first.
-    ///
-    /// Unused outside tests today: the periodic `reputation_timer` in
-    /// network/mod.rs already calls `maybe_decay()` directly every 60s, so
-    /// nothing on the hot path needs the decay-then-read behavior this
-    /// wraps (see that timer's own comment). Kept as the mutable
-    /// counterpart to `score()` for a future caller that wants a
-    /// guaranteed-fresh value without waiting on the periodic tick.
-    #[allow(dead_code)]
-    pub fn get_score(&mut self, node_id: &[u8; 16]) -> i32 {
-        self.maybe_decay();
-        self.peers
-            .get(node_id)
-            .map_or(DEFAULT_REPUTATION, |p| p.score)
-    }
-
     /// Record the same event against both the freely-rotatable node identity
     /// and the observed IPv4 address. The stricter IP threshold means normal
     /// NAT-sharing peers are not banned for a handful of failures, while a
@@ -735,7 +719,7 @@ impl ReputationManager {
                 non_banned.push((*id, p.score.min(p.penalty), p.last_interaction));
             }
         }
-        // Evicting a peer forgets it completely: `get_score` on an unknown id
+        // Evicting a peer forgets it completely: `score` on an unknown id
         // returns `DEFAULT_REPUTATION` and `is_banned` returns false. So a
         // record's worth is how far it sits from that default, and the cost of
         // dropping it is asymmetric — forgetting goodwill only costs the peer
@@ -779,9 +763,9 @@ mod tests {
 
     #[test]
     fn default_reputation() {
-        let mut mgr = ReputationManager::new();
+        let mgr = ReputationManager::new();
         let id = [1u8; 16];
-        assert_eq!(mgr.get_score(&id), DEFAULT_REPUTATION);
+        assert_eq!(mgr.score(&id), DEFAULT_REPUTATION);
     }
 
     #[test]
@@ -791,7 +775,7 @@ mod tests {
         mgr.record_event(&id, ReputationEvent::SuccessfulChunk);
         mgr.record_event(&id, ReputationEvent::SuccessfulChunk);
         mgr.record_event(&id, ReputationEvent::SuccessfulChunk);
-        assert!(mgr.get_score(&id) > 0);
+        assert!(mgr.score(&id) > 0);
     }
 
     #[test]
@@ -799,7 +783,7 @@ mod tests {
         let mut mgr = ReputationManager::new();
         let id = [3u8; 16];
         mgr.record_event(&id, ReputationEvent::CorruptData);
-        assert!(mgr.get_score(&id) < 0);
+        assert!(mgr.score(&id) < 0);
     }
 
     #[test]
@@ -819,13 +803,13 @@ mod tests {
         for _ in 0..2000 {
             mgr.record_event(&id, ReputationEvent::SuccessfulChunk);
         }
-        assert_eq!(mgr.get_score(&id), MAX_REPUTATION);
+        assert_eq!(mgr.score(&id), MAX_REPUTATION);
 
         let id2 = [6u8; 16];
         for _ in 0..200 {
             mgr.record_event(&id2, ReputationEvent::CorruptData);
         }
-        assert_eq!(mgr.get_score(&id2), MIN_REPUTATION);
+        assert_eq!(mgr.score(&id2), MIN_REPUTATION);
     }
 
     /// A ban has to be able to expire. Re-arming it on every subsequent event
@@ -1222,6 +1206,21 @@ mod tests {
         assert!(manager.currently_banned_ips().contains(&ip));
         assert!(manager.clear_ip_ban(ip));
         assert!(!manager.currently_banned_ips().contains(&ip));
+    }
+
+    /// A manual unban has to stick: the score is lifted clear of the ban
+    /// threshold, or the peer's next bad event re-bans them on the spot.
+    #[test]
+    fn clearing_a_manual_ban_lifts_it_and_the_score() {
+        let mut manager = ReputationManager::new();
+        let id = [7u8; 16];
+        manager.apply_manual_ban(&id);
+        assert!(manager.is_banned(&id));
+
+        assert!(manager.clear_ban(&id));
+        assert!(!manager.is_banned(&id));
+        assert!(manager.score(&id) > BAN_THRESHOLD);
+        assert!(!manager.clear_ban(&[8u8; 16]), "an unknown peer has nothing to clear");
     }
 
     #[test]

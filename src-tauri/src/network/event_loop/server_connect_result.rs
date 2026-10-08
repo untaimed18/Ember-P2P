@@ -49,6 +49,7 @@ pub(in crate::network) async fn on_server_connect_result(
                         *shared_server_addr.write().await = None;
                         state.server_reconnect_failures =
                             state.server_reconnect_failures.saturating_add(1);
+                        state.server_reconnect_network_down = false;
                         state.stats.server_status = "disconnected".to_string();
                         let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "disconnected" }));
                         if state.server_auto_reconnect
@@ -89,6 +90,7 @@ pub(in crate::network) async fn on_server_connect_result(
             ed2k::server::set_server_flags_mirror(session.server_flags);
             // `server_reconnect_failures` is deliberately left alone: only a
             // session that lasts clears it (`handle_server_disconnect`).
+            state.server_reconnect_network_down = false;
             state.preferred_ed2k_server = Some((ip.clone(), port));
             {
                 let last = ed2k::server_list::LastEd2kServer {
@@ -101,7 +103,7 @@ pub(in crate::network) async fn on_server_connect_result(
                     warn!("Failed to persist last eD2K server: {e}");
                 }
             }
-            *last_server_activity_at = chrono::Utc::now().timestamp();
+            *last_server_activity_at = crate::network::monotonic_secs();
             state.server_logged_in_at = Some(std::time::Instant::now());
             state.server_addr = Some(addr);
             *shared_server_addr.write().await = Some(addr);
@@ -417,39 +419,18 @@ pub(in crate::network) async fn on_server_connect_result(
         }
         Ok(ServerConnectResult { ip, port, result: Err(e), .. }) => {
             info!("Failed to connect to server {ip}:{port}: {e}");
-            let attempt = state.server_reconnect_failures.saturating_add(1);
-            let will_retry = state.server_auto_reconnect
-                && state.preferred_ed2k_server.as_ref().is_some_and(|(pip, pport)| {
-                    pip == &ip && *pport == port
-                })
-                && attempt < AUTO_CONNECT_MAX_FAILURES;
-            if will_retry {
-                emit_server_log(
-                    app_handle,
-                    &format!(
-                        "Connection failed ({e}); retrying preferred server ({attempt}/{AUTO_CONNECT_MAX_FAILURES})..."
-                    ),
-                );
-            } else {
-                emit_server_log(
-                    app_handle,
-                    &format!("Connection failed ({e})."),
-                );
-            }
-            state.server_reconnect_failures = attempt;
+            let network_down =
+                record_server_connect_failure(state, settings, app_handle, &ip, port, &e);
             *shared_server_addr.write().await = None;
-            state.server_list.record_failure(&ip, port);
-            let met_path = state.data_dir.join("server.met");
-            spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
+            // A server we never reached has not failed; counting it would
+            // prune the preferred server from the list during an outage.
+            if !network_down {
+                state.server_list.record_failure(&ip, port);
+                let met_path = state.data_dir.join("server.met");
+                spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
+            }
             state.stats.server_status = "disconnected".to_string();
             let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "disconnected" }));
-            if state.server_auto_reconnect && attempt >= AUTO_CONNECT_MAX_FAILURES {
-                abandon_server_auto_reconnect(
-                    state,
-                    app_handle,
-                    &format!("could not reach preferred server {ip}:{port}"),
-                );
-            }
             // Keep `server_last_connect_attempt` so reconnect backoff
             // still applies when retrying the same preferred host.
         }
@@ -458,11 +439,12 @@ pub(in crate::network) async fn on_server_connect_result(
             emit_server_log(app_handle, &format!("Connection error: {e}"));
             state.server_reconnect_failures =
                 state.server_reconnect_failures.saturating_add(1);
+            state.server_reconnect_network_down = false;
             *shared_server_addr.write().await = None;
             state.stats.server_status = "disconnected".to_string();
             let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "disconnected" }));
             if state.server_auto_reconnect
-                && state.server_reconnect_failures >= AUTO_CONNECT_MAX_FAILURES
+                && server_auto_reconnect_gives_up(state.server_reconnect_failures, settings)
             {
                 let detail = state
                     .preferred_ed2k_server

@@ -17,8 +17,6 @@ const KAD_DISCONNECT_DELAY_SECS: i64 = 20 * 60;
 const BIG_TIMER_DISCONNECT_BYPASS_SECS: i64 = KAD_DISCONNECT_DELAY_SECS - 5 * 60;
 /// eMule MIN2S(1): per-zone small timer fires every minute for liveness probing.
 const SMALL_TIMER_INTERVAL_SECS: i64 = 60;
-/// Default contact time-to-live (eMule: 2 hours).
-const CONTACT_DEFAULT_TTL_SECS: i64 = 7200;
 
 pub fn kad_version_name(version: u8) -> &'static str {
     match version {
@@ -726,7 +724,7 @@ impl RoutingZone {
                 return false;
             }
             if c.expires_at == 0 {
-                c.expires_at = now + CONTACT_DEFAULT_TTL_SECS;
+                c.expires_at = now;
             }
             true
         });
@@ -818,20 +816,6 @@ impl RoutingZone {
         }
     }
 
-    // K3: retained for future explicit-trust callers (tests, migration
-    // tools) now that the ambient load paths no longer mass-verify.
-    #[allow(dead_code)]
-    fn set_all_contacts_verified(&mut self) {
-        if let Some(bin) = &mut self.bin {
-            for c in &mut bin.contacts {
-                c.verified = true;
-            }
-        } else if let Some(children) = &mut self.children {
-            children.0.set_all_contacts_verified();
-            children.1.set_all_contacts_verified();
-        }
-    }
-
     /// Find the deepest leaf zone containing our own ID (always child[0] since
     /// our XOR distance to ourselves is zero). Returns its level.
     fn deepest_leaf_level(&self) -> u32 {
@@ -858,28 +842,6 @@ impl RoutingZone {
         }
     }
 
-    /// Find contact by IP+port across all bins. Returns mutable ref for SetAlive.
-    fn touch_contact_by_addr(&mut self, ip: Ipv4Addr, udp_port: u16) -> bool {
-        if let Some(bin) = &mut self.bin {
-            if let Some(pos) = bin
-                .contacts
-                .iter()
-                .position(|c| c.ip == ip && c.udp_port == udp_port)
-            {
-                let contact = &mut bin.contacts[pos];
-                contact.update_type();
-                let id = contact.id;
-                bin.push_to_bottom(&id);
-                return true;
-            }
-            false
-        } else if let Some(children) = &mut self.children {
-            children.0.touch_contact_by_addr(ip, udp_port)
-                || children.1.touch_contact_by_addr(ip, udp_port)
-        } else {
-            false
-        }
-    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -1190,6 +1152,11 @@ impl RoutingTable {
                 return false;
             }
         }
+        // eMule `IsGoodIPPort` in `CRoutingZone::Add`.
+        if contact.udp_port == 0 {
+            tracing::debug!("RT reject {}: UDP port 0", contact.id);
+            return false;
+        }
         if contact.udp_port == 53 && contact.version <= KADEMLIA_VERSION5_48A {
             tracing::debug!(
                 "Rejecting DNS port contact ({}) version {}",
@@ -1276,8 +1243,11 @@ impl RoutingTable {
         if contact.created_at == 0 {
             contact.created_at = now;
         }
+        // eMule gives a new contact no expiry and the small timer then stamps
+        // it `tNow`, so the next pass over its zone probes it; a dead contact
+        // must not wait out a full TTL before its first HELLO.
         if contact.expires_at == 0 {
-            contact.expires_at = now + CONTACT_DEFAULT_TTL_SECS;
+            contact.expires_at = now;
         }
 
         let contact_ip = contact.ip;
@@ -1474,8 +1444,16 @@ impl RoutingTable {
         }
     }
 
-    pub fn touch_contact_by_addr(&mut self, ip: Ipv4Addr, udp_port: u16) -> bool {
-        self.root.touch_contact_by_addr(ip, udp_port)
+    /// Add a contact another node told us about (a KadRes or BootstrapRes
+    /// list), leaving one we already have untouched, as eMule does with
+    /// `bUpdate = false`. A list is hearsay: letting it update an existing
+    /// entry let any node revive dead contacts, clear their options, or move
+    /// them to a port of its choosing.
+    pub fn insert_if_new(&mut self, contact: KadContact) -> bool {
+        if self.get_contact(&contact.id).is_some() {
+            return false;
+        }
+        self.insert(contact)
     }
 
     pub fn all_contacts(&self) -> impl Iterator<Item = &KadContact> {
@@ -1500,16 +1478,6 @@ impl RoutingTable {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    pub fn clear(&mut self) {
-        let now = chrono::Utc::now().timestamp();
-        self.root = RoutingZone::new_leaf(0, KadId::from_u32(0), 0);
-        self.big_timer_global_deadline = now;
-        self.next_zone_event_order = 1;
-        self.global_ip_count.clear();
-        self.global_subnet_count.clear();
-        self.in_use_contacts.clear();
     }
 
     pub fn get_contact(&self, id: &KadId) -> Option<&KadContact> {
@@ -1551,12 +1519,6 @@ impl RoutingTable {
             }
         }
         None
-    }
-
-    // K3: kept for future explicit-trust callers; see RoutingZone counterpart.
-    #[allow(dead_code)]
-    pub fn set_all_contacts_verified(&mut self) {
-        self.root.set_all_contacts_verified();
     }
 
     /// eMule GetBootstrapContacts -- TopDepth(LOG_BASE_EXPONENT).
@@ -1889,6 +1851,62 @@ mod find_closest_tests {
             last_type_set: 0,
             received_hello: false,
         }
+    }
+
+    #[test]
+    fn a_contact_list_from_another_node_never_rewrites_a_known_contact() {
+        let mut rt = RoutingTable::new(KadId([0xFF; 16]), false);
+        let mut known = contact(0x01, 1);
+        known.kad_options = 0x02;
+        known.contact_type = CONTACT_TYPE_DEAD;
+        assert!(rt.insert(known.clone()));
+
+        let mut hearsay = contact(0x01, 1);
+        hearsay.udp_port = 9999;
+        hearsay.kad_options = 0;
+        assert!(!rt.insert_if_new(hearsay), "already known: left alone");
+        let kept = rt.get_contact(&known.id).expect("still there");
+        assert_eq!(kept.udp_port, 4672, "not moved to the port the list named");
+        assert_eq!(kept.kad_options, 0x02, "options not cleared");
+        assert_eq!(kept.contact_type, CONTACT_TYPE_DEAD, "not revived");
+
+        assert!(rt.insert_if_new(contact(0x02, 2)), "a new one is still added");
+    }
+
+    /// eMule `CRoutingZone::Add` refuses these through `IsGoodIPPort`: a
+    /// contact we can never send to only takes a bin slot and an IP slot.
+    #[test]
+    fn a_contact_on_udp_port_zero_is_never_admitted() {
+        let mut rt = RoutingTable::new(KadId([0xFF; 16]), false);
+        let mut portless = contact(0x01, 1);
+        portless.udp_port = 0;
+        assert!(!rt.insert(portless.clone()));
+        assert!(!rt.insert_if_new(portless));
+        assert!(rt.is_empty());
+        assert!(!rt.has_contact_ip(Ipv4Addr::new(1, 2, 3, 1)));
+    }
+
+    /// eMule stamps a new contact's expiry with the time of the first small
+    /// timer pass that sees it, so the pass after that sends it a HELLO
+    /// rather than leaving a dead contact unprobed for a whole TTL.
+    #[test]
+    fn a_new_contact_is_probed_on_the_next_small_timer_pass() {
+        let mut rt = RoutingTable::new(KadId([0xFF; 16]), false);
+        let mut fresh = contact(0x01, 1);
+        fresh.verified = false;
+        fresh.contact_type = CONTACT_TYPE_NEW;
+        assert!(rt.insert(fresh.clone()));
+
+        let next_pass = chrono::Utc::now().timestamp() + SMALL_TIMER_INTERVAL_SECS;
+        let mut to_probe = Vec::new();
+        let mut removed = Vec::new();
+        rt.root
+            .on_small_timer(next_pass, &mut to_probe, &mut removed, &HashMap::new());
+        assert_eq!(
+            to_probe.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![fresh.id]
+        );
+        assert!(removed.is_empty());
     }
 
     /// Regression guard: `find_closest` seeds fresh FindNode/self-lookup

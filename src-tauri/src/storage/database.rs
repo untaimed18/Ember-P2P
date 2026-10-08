@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use parking_lot::Mutex;
 
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
@@ -19,6 +20,10 @@ const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
 /// Rooms kept in the Discover cache. Far more than a browse can usefully show,
 /// and small enough that the table stays a rounding error on disk.
 const MAX_CHANNEL_CACHE_ROWS: i64 = 500;
+/// Seeds of earlier offers a nominee keeps beside the newest, per room. An
+/// owner re-offers only after an offer lapses or is withdrawn, so a record it
+/// can still adopt is one of the last few.
+const HANDOFF_SUPERSEDED_SEEDS_KEPT: i64 = 3;
 /// A cached listing this old has been absent from the DHT for many times the
 /// index record's own lifetime, so offering it would only send the user at a
 /// room that no longer answers.
@@ -83,6 +88,8 @@ pub struct ChatAttachmentRow {
     pub status: String,
     pub transferred: u64,
     pub created_at: i64,
+    /// How many times the transfer was tried again; 0 on its first attempt.
+    pub attempt: u32,
 }
 
 /// One row of a room's history as the UI needs it.
@@ -115,6 +122,68 @@ pub struct ChannelMessageRow {
     /// The parent is missing because the user removed it from this device, as
     /// opposed to never having received it.
     pub reply_parent_deleted: bool,
+}
+
+/// Newest lines per room kept as needing a newer Ember; see
+/// [`Database::note_channel_newer_line`].
+pub const CHANNEL_NEWER_LINES_PER_ROOM: i64 = 200;
+
+/// Salts kept for rooms not (yet) on this device; see
+/// [`Database::record_channel_owned_salt`].
+const CHANNEL_ORPHAN_SALTS_KEPT: i64 = 64;
+
+/// How long a salt read from the network's list is carried for a room this
+/// device has not put back: twice the life of the records it would be put
+/// back from, after which there is nothing left to find.
+const CHANNEL_CARRIED_SALT_SECS: i64 = 60 * 86_400;
+
+/// What [`Database::adopt_recovered_owned_channel`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveredChannel {
+    /// The room was not here; it is now, as ours.
+    Inserted,
+    /// We held it as a member; we own it again.
+    Adopted,
+    /// We already held it with its seed.
+    AlreadyOwned,
+    /// We deleted it here, and it stays that way.
+    Deleted,
+    /// We handed it on from here.
+    Moved,
+}
+
+/// The rows of `channel_newer_frames` that still say something: of a room this
+/// device holds, and for a key, an epoch past the one the room reads under. A
+/// row for a room deleted by a build that never knew the table, or for an
+/// epoch a later key overtook, says nothing.
+const CHANNEL_NEWER_LIVE_ROWS: &str = "FROM channel_newer_frames f
+     JOIN channels c ON c.channel_id = f.channel_id
+     WHERE (f.source <> 'key' OR f.epoch > c.key_epoch)";
+
+/// What in one room this build was sent and cannot read, counted against what
+/// it reads now — a row written before an update taught it the kind no longer
+/// counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChannelNewerStatus {
+    /// Displayable lines of a kind this build does not know.
+    pub lines: i64,
+    /// The room's key came sealed in a version this build cannot open.
+    pub key: bool,
+}
+
+impl ChannelNewerStatus {
+    fn note(&mut self, source: &str, kind: i64) {
+        let Ok(kind) = u8::try_from(kind) else {
+            return;
+        };
+        match source {
+            "line" if !crate::network::ember::channel::ext_kind_understood(kind) => self.lines += 1,
+            "key" if !crate::network::ember::channel::epoch_envelope_version_supported(kind) => {
+                self.key = true;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// What a reply's quote needs of the line it answers.
@@ -495,14 +564,41 @@ enum ChannelHandoffTransition {
     Refused,
     AlreadyApplied,
     Applied,
+    /// Applied to a successor this device had already joined on its own,
+    /// whose history is its own and is not copied over.
+    Linked,
+}
+
+/// Who named the successor a handoff leads to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelHandoffAuthority {
+    /// The old room's key: a handoff record, or a commitment of our own.
+    Owner,
+    /// A nominee's succession claim, which only the claimant signs.
+    Claim,
+}
+
+/// Where a handoff's successor stands on this device. See
+/// [`Database::handoff_successor_fit_locked`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoffSuccessorFit {
+    /// Not held yet; the handoff creates it.
+    Fresh,
+    /// Created by an earlier handoff of this same room.
+    Resumed,
+    /// Held already, joined on its own rather than through this room.
+    Joined,
+    /// This room itself, or a room that came from a different one.
+    Unfit,
 }
 
 /// A room we own that is spoken for by a handoff record we have begun
 /// publishing. See [`Database::commit_channel_handoff`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelHandoffCommit {
-    /// The member whose ready this answers, lowercase hex. Empty when the
-    /// commitment was adopted from a record found in the DHT.
+    /// The member whose ready this answers, or whose claim this follows,
+    /// lowercase hex. Empty when the commitment was adopted from a record
+    /// found in the DHT.
     pub nominee: String,
     pub version: u64,
     /// The successor room's pubkey, lowercase hex.
@@ -511,6 +607,9 @@ pub struct ChannelHandoffCommit {
     pub committed_at: i64,
     /// Some node is known to hold the record.
     pub confirmed: bool,
+    /// Following `nominee`'s succession claim rather than answering an offer
+    /// of ours. See [`Database::commit_claimed_channel_handoff`].
+    pub claimed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -523,6 +622,40 @@ pub enum ChannelHandoffCommitOutcome {
     Conflict,
     /// Not our room, already moved, or not the offer that is pending.
     NotPending,
+    /// A successor this device will not offer the room to: the room itself,
+    /// or a room it already holds that did not come from it.
+    Unfit,
+}
+
+/// A move whose record this device signed, kept so it can be republished for
+/// the members who were away for it. See [`Database::retired_channel_handoffs`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredChannelHandoff {
+    /// The room that moved.
+    pub channel_id: String,
+    pub channel_pubkey: String,
+    /// The handoff's version, or for a claim the owner timestamp it cites.
+    pub version: u64,
+    pub successor_pubkey: String,
+    pub private: bool,
+    /// The old room's seed, for a handoff its owner signed. `None` for a
+    /// succession claim, which our user key signs.
+    pub owner_seed: Option<[u8; 32]>,
+    pub retired_at: i64,
+    pub published_at: i64,
+}
+
+/// A stretch an owned room went without a snapshot from us long enough for its
+/// nominee to have claimed it. See [`Database::channel_owner_silence`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelOwnerSilence {
+    /// The nominee our last snapshot before the silence named, lowercase hex.
+    pub nominee: String,
+    pub claim_after_days: i64,
+    /// Our last stamp before going quiet.
+    pub silent_from: i64,
+    /// Our first stamp after.
+    pub silent_until: i64,
 }
 const CHAT_KEY_FILE: &str = "chat-history.key";
 const CHAT_CIPHERTEXT_PREFIX: &str = "EMBRCHAT1:";
@@ -563,6 +696,11 @@ const CHAT_AAD_DOMAIN: &[u8] = b"ember-chat-db-row-v1\0";
 const CHANNEL_MSG_AAD_DOMAIN: &[u8] = b"ember-channel-db-row-v1\0";
 const CHANNEL_SECRET_AAD_DOMAIN: &[u8] = b"ember-channel-secret-v1\0";
 const CHANNEL_SECRET_PREFIX: &str = "EMBRCSEC1:";
+const CHANNEL_DRAFT_AAD_DOMAIN: &[u8] = b"ember-channel-draft-v1\0";
+const CHANNEL_DRAFT_PREFIX: &str = "EMBRCDRF1:";
+/// The composer's 4096-character limit at four bytes a character. A draft is
+/// never sent from here, so this only bounds what one row can hold.
+const MAX_CHANNEL_DRAFT_BYTES: usize = 16 * 1024;
 const CHAT_ATTACH_AAD_DOMAIN: &[u8] = b"ember-chat-attachment-db-v1\0";
 /// Marks a sealed `chat_attachments` name or path. A value without it is one
 /// written before v60 that has not been sealed yet, and is read as it stands.
@@ -600,10 +738,86 @@ impl std::fmt::Display for CorruptDatabase {
 
 impl std::error::Error for CorruptDatabase {}
 
+/// `ember.db` was last written by a newer Ember, whose schema this build must
+/// not touch.
+#[derive(Debug)]
+struct SchemaTooNew(i64);
+
+impl std::fmt::Display for SchemaTooNew {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Database schema version {} is newer than this Ember build supports \
+             (max {MAX_SUPPORTED_SCHEMA_VERSION}). The database was likely written by a \
+             more recent version of Ember. Install that version to access this data; \
+             refusing to start to avoid corruption.",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for SchemaTooNew {}
+
+/// Why [`Database::new`] failed, as far as the person starting Ember can do
+/// something about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenFailure {
+    NewerVersion,
+    DiskFull,
+    Other,
+}
+
+impl OpenFailure {
+    pub fn of(error: &anyhow::Error) -> Self {
+        if error
+            .chain()
+            .any(|cause| cause.downcast_ref::<SchemaTooNew>().is_some())
+        {
+            return Self::NewerVersion;
+        }
+        let disk_full = error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::SqliteFailure(sqlite, _)) if sqlite.code == ErrorCode::DiskFull
+            ) || cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::StorageFull)
+        });
+        if disk_full {
+            Self::DiskFull
+        } else {
+            Self::Other
+        }
+    }
+
+    /// What the dialog shown before Ember exits says.
+    pub fn message(self, data_dir: &std::path::Path, error: &anyhow::Error) -> String {
+        let data_dir = data_dir.display();
+        match self {
+            Self::NewerVersion => format!(
+                "Ember's database was last used by a newer version of Ember, and this \
+                 version cannot open it without risking your data.\n\n\
+                 Install the latest version of Ember to continue. Nothing has been changed.\n\n\
+                 Data folder: {data_dir}"
+            ),
+            Self::DiskFull => format!(
+                "The drive that holds Ember's data is full, so Ember cannot open its \
+                 database.\n\n\
+                 Free up some space on that drive, then start Ember again.\n\n\
+                 Data folder: {data_dir}"
+            ),
+            Self::Other => format!(
+                "Ember could not open its database.\n\n{error:#}\n\n\
+                 The log files in the logs folder of {data_dir} have the details."
+            ),
+        }
+    }
+}
+
 impl Database {
     pub fn new(app_handle: &tauri::AppHandle) -> anyhow::Result<Self> {
-        let app_dir = paths::ensure_data_dir_with_app(app_handle)
-            .map_err(|e| anyhow::anyhow!("Failed to prepare data dir: {e}"))?;
+        let app_dir =
+            paths::ensure_data_dir_with_app(app_handle).context("Failed to prepare data dir")?;
 
         Self::open_for_session(&app_dir.join("ember.db"))
     }
@@ -626,14 +840,25 @@ impl Database {
         let opened = match Self::open_with(&db_path, unclean) {
             Ok(db) => Ok(db),
             Err(e) if db_path.exists() && Self::is_corruption_error(&e) => {
+                if let Some(data_dir) = db_path.parent() {
+                    if let Err(error) =
+                        crate::commands::transfers::OrphanDisposal::record_database_replacement(
+                            data_dir,
+                        )
+                    {
+                        tracing::warn!(
+                            "Could not record that orphaned downloads are to be set aside: {error}"
+                        );
+                    }
+                }
                 let backup = Self::backup_corrupt_database(&db_path)?;
                 tracing::warn!(
                     "ember.db was corrupt and has been preserved at {}; creating a fresh database",
                     backup.display()
                 );
-                let mut db = Self::open_at(&db_path).map_err(|retry| {
-                    anyhow::anyhow!(
-                        "Failed to initialize a fresh database after preserving the corrupt one at {}: {retry}",
+                let mut db = Self::open_at(&db_path).with_context(|| {
+                    format!(
+                        "Failed to initialize a fresh database after preserving the corrupt one at {}",
                         backup.display()
                     )
                 })?;
@@ -750,6 +975,22 @@ impl Database {
             corrupt_backup: None,
         };
         db.run_migrations()?;
+        // Every attachment read joins it, so it is made now rather than left
+        // to the first read to fail on.
+        {
+            let conn = db.conn.lock();
+            Self::ensure_chat_attachment_attempts_locked(&conn)?;
+            let has_granted: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('chat_attachment_attempts') WHERE name = 'granted'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_granted == 0 {
+                conn.execute_batch(
+                    "ALTER TABLE chat_attachment_attempts ADD COLUMN granted INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+        }
 
         info!("Database initialized");
         Ok(db)
@@ -884,7 +1125,7 @@ impl Database {
     /// `starts_with` elsewhere: under LIKE a plaintext body beginning
     /// `embrchat1:` would count as ciphertext and seal chat permanently instead
     /// of minting a fresh key.
-    const CHAT_KEYED_COLUMNS: [(&'static str, &'static str); 6] = [
+    const CHAT_KEYED_COLUMNS: [(&'static str, &'static str); 8] = [
         ("chat_messages", "message GLOB 'EMBRCHAT1:*'"),
         ("channel_messages", "message GLOB 'EMBRCHAT1:*'"),
         (
@@ -893,6 +1134,8 @@ impl Database {
         ),
         ("channel_key_epochs", "secret_enc GLOB 'EMBRCSEC1:*'"),
         ("channel_handoff_pending", "owner_seed GLOB 'EMBRCSEC1:*'"),
+        ("channel_handoff_superseded", "owner_seed GLOB 'EMBRCSEC1:*'"),
+        ("channel_handoff_retired", "owner_seed GLOB 'EMBRCSEC1:*'"),
         (
             "chat_attachments",
             "file_name GLOB 'EMBRCATT1:*' OR source_path GLOB 'EMBRCATT1:*' \
@@ -1458,23 +1701,18 @@ impl Database {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL DEFAULT 0);",
         )?;
-        let version: i64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+        // Not defaulted on failure: read as 0, a database of any version would
+        // have every migration run over it again.
+        let version: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            [],
+            |r| r.get(0),
+        )?;
 
         // Refuse to run against a database that was last opened by a newer
         // Ember build.
         if version > MAX_SUPPORTED_SCHEMA_VERSION {
-            anyhow::bail!(
-                "Database schema version {version} is newer than this Ember build supports \
-                 (max {MAX_SUPPORTED_SCHEMA_VERSION}). The database was likely written by a \
-                 more recent version of Ember. Install that version to access this data; \
-                 refusing to start to avoid corruption."
-            );
+            return Err(SchemaTooNew(version).into());
         }
 
         let set_version = |tx: &Connection, v: i64| -> anyhow::Result<()> {
@@ -1904,8 +2142,24 @@ impl Database {
                 .unwrap_or(0);
             if auto_vacuum == 0 {
                 // Must set the pragma, then VACUUM, for the file header to change.
-                conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
-                info!("Enabled incremental auto_vacuum on existing database (v21)");
+                // VACUUM rewrites the whole file, so it fails on a disk without
+                // that much room — every launch, were it fatal, for what only
+                // reclaims space.
+                // A corrupt page it reads is still fatal, so that recovery
+                // preserves the file and starts afresh.
+                match conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;") {
+                    Ok(()) => info!("Enabled incremental auto_vacuum on existing database (v21)"),
+                    Err(e) => {
+                        let e = anyhow::Error::from(e);
+                        if Self::is_corruption_error(&e) {
+                            return Err(e.context("VACUUM found ember.db corrupt (v21)"));
+                        }
+                        warn!(
+                            "Could not enable incremental auto_vacuum on the existing database \
+                             (v21); continuing without it: {e}"
+                        );
+                    }
+                }
             }
             // Only drop a legacy snapshot this database already carried when
             // it was opened.
@@ -2688,7 +2942,7 @@ impl Database {
             //
             // Columns on `credits` rather than a side table: they are keyed by
             // the same `user_hash`, they are written and pruned on exactly the
-            // same schedule, and `save_all_credits` replaces the table
+            // same schedule, and `save_all_credits_with_ember` replaces the table
             // wholesale, so a separate table would only add a second thing to
             // keep in step with that replacement.
             let tx = conn.unchecked_transaction()?;
@@ -3180,6 +3434,90 @@ impl Database {
         Ok(())
     }
 
+    /// What a file we sent was offered as — `(source_path, file_size,
+    /// root_hash)` — whatever has become of the transfer since. For offering it
+    /// again; [`Self::chat_attachment_grant`] is what decides whether it can be
+    /// read.
+    pub fn chat_attachment_source(&self, xfer_id: &str) -> Option<(String, u64, String)> {
+        let conn = self.conn.lock();
+        let (stored, size, root) = conn
+            .query_row(
+                "SELECT source_path, file_size, root_hash FROM chat_attachments
+                 WHERE xfer_id = ?1 AND direction = 'sent' AND source_path IS NOT NULL",
+                rusqlite::params![xfer_id],
+                |row| {
+                    let path: String = row.get(0)?;
+                    let size: i64 = row.get(1)?;
+                    let root: String = row.get(2)?;
+                    Ok((path, size.max(0) as u64, root))
+                },
+            )
+            .ok()?;
+        drop(conn);
+        let path =
+            Self::open_attachment_field(self.chat_key.as_deref(), xfer_id, "source_path", &stored)?;
+        Some((path, size, root))
+    }
+
+    /// The root an attachment row was offered under, either direction.
+    pub fn chat_attachment_root(&self, xfer_id: &str) -> Option<String> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT root_hash FROM chat_attachments WHERE xfer_id = ?1",
+            rusqlite::params![xfer_id],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    /// Put an ended attachment back to `status` for another try, with nothing
+    /// transferred, and `expires_at` when given. Only from one of `from`, in the
+    /// same statement as the check, so a retry cannot revive a row that moved
+    /// on meanwhile. Returns whether it did.
+    pub fn reopen_chat_attachment(
+        &self,
+        xfer_id: &str,
+        from: &[&str],
+        status: &str,
+        expires_at: Option<i64>,
+    ) -> anyhow::Result<bool> {
+        if from.is_empty() {
+            return Ok(false);
+        }
+        let placeholders = (0..from.len())
+            .map(|i| format!("?{}", i + 4))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE chat_attachments SET
+                status = ?2,
+                transferred = 0,
+                expires_at = COALESCE(?3, expires_at)
+             WHERE xfer_id = ?1 AND status IN ({placeholders})"
+        );
+        let mut params: Vec<rusqlite::types::Value> = vec![
+            xfer_id.to_string().into(),
+            status.to_string().into(),
+            expires_at.map_or(rusqlite::types::Value::Null, rusqlite::types::Value::Integer),
+        ];
+        params.extend(from.iter().map(|s| rusqlite::types::Value::Text(s.to_string())));
+        let conn = self.conn.lock();
+        Self::ensure_chat_attachment_attempts_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let moved = tx.execute(&sql, rusqlite::params_from_iter(params))? > 0;
+        if moved {
+            // What tells the UI an update belongs to this attempt and not to
+            // the one that ended, which it otherwise keeps over anything later.
+            tx.execute(
+                "INSERT INTO chat_attachment_attempts (xfer_id, attempt) VALUES (?1, 1)
+                 ON CONFLICT(xfer_id) DO UPDATE SET attempt = attempt + 1",
+                rusqlite::params![xfer_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(moved)
+    }
+
     /// The live grant for `xfer_id`, if `friend_hash` is who it was granted to.
     ///
     /// The friend is part of the lookup rather than something the caller checks
@@ -3333,11 +3671,14 @@ impl Database {
         limit: i64,
     ) -> anyhow::Result<Vec<ChatAttachmentRow>> {
         let conn = self.conn.lock();
+        Self::ensure_chat_attachment_attempts_locked(&conn)?;
         let mut stmt = conn.prepare(
-            "SELECT xfer_id, friend_hash, direction, file_name, file_size,
-                    dest_path, status, transferred, created_at
-             FROM chat_attachments WHERE friend_hash = ?1
-             ORDER BY created_at DESC, rowid DESC LIMIT ?2",
+            "SELECT a.xfer_id, a.friend_hash, a.direction, a.file_name, a.file_size,
+                    a.dest_path, a.status, a.transferred, a.created_at, n.attempt
+             FROM chat_attachments a
+             LEFT JOIN chat_attachment_attempts n ON n.xfer_id = a.xfer_id
+             WHERE a.friend_hash = ?1
+             ORDER BY a.created_at DESC, a.rowid DESC LIMIT ?2",
         )?;
         let rows = stmt
             .query_map(
@@ -3352,7 +3693,7 @@ impl Database {
 
     /// Column order shared by every attachment read: xfer_id, friend_hash,
     /// direction, file_name, file_size, dest_path, status, transferred,
-    /// created_at. Name and path come back as stored; see
+    /// created_at, attempt. Name and path come back as stored; see
     /// [`Self::open_chat_attachment_row`].
     fn chat_attachment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatAttachmentRow> {
         Ok(ChatAttachmentRow {
@@ -3365,7 +3706,53 @@ impl Database {
             status: row.get(6)?,
             transferred: row.get::<_, i64>(7)?.max(0) as u64,
             created_at: row.get(8)?,
+            attempt: row.get::<_, Option<i64>>(9)?.unwrap_or(0).clamp(0, i64::from(u32::MAX)) as u32,
         })
+    }
+
+    /// How many times each attachment was tried again, created on first use so
+    /// the schema stays at the version 1.7.0 can still open after a downgrade.
+    /// A row without an entry is on its first attempt.
+    ///
+    /// `granted` is set once the friend has had the full grant for a file we
+    /// sent, which decides what their "Try again" may reopen; see
+    /// [`Self::chat_attachment_was_granted`].
+    fn ensure_chat_attachment_attempts_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS chat_attachment_attempts (
+                xfer_id TEXT PRIMARY KEY,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                granted INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Record that a file we sent moved from its offer's short lifetime to
+    /// the grant's.
+    pub fn mark_chat_attachment_granted(&self, xfer_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_attachment_attempts_locked(&conn)?;
+        conn.execute(
+            "INSERT INTO chat_attachment_attempts (xfer_id, attempt, granted) VALUES (?1, 0, 1)
+             ON CONFLICT(xfer_id) DO UPDATE SET granted = 1",
+            rusqlite::params![xfer_id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether the friend ever had the full grant for a file we sent.
+    pub fn chat_attachment_was_granted(&self, xfer_id: &str) -> bool {
+        let conn = self.conn.lock();
+        if Self::ensure_chat_attachment_attempts_locked(&conn).is_err() {
+            return true;
+        }
+        conn.query_row(
+            "SELECT granted FROM chat_attachment_attempts WHERE xfer_id = ?1",
+            rusqlite::params![xfer_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .is_ok_and(|granted| granted != 0)
     }
 
     /// Open the sealed name and path of a row read by
@@ -3385,11 +3772,14 @@ impl Database {
     /// One attachment by id, whichever side of it this node is on.
     pub fn chat_attachment(&self, xfer_id: &str) -> Option<ChatAttachmentRow> {
         let conn = self.conn.lock();
+        Self::ensure_chat_attachment_attempts_locked(&conn).ok()?;
         let row = conn
             .query_row(
-                "SELECT xfer_id, friend_hash, direction, file_name, file_size,
-                        dest_path, status, transferred, created_at
-                 FROM chat_attachments WHERE xfer_id = ?1",
+                "SELECT a.xfer_id, a.friend_hash, a.direction, a.file_name, a.file_size,
+                        a.dest_path, a.status, a.transferred, a.created_at, n.attempt
+                 FROM chat_attachments a
+                 LEFT JOIN chat_attachment_attempts n ON n.xfer_id = a.xfer_id
+                 WHERE a.xfer_id = ?1",
                 rusqlite::params![xfer_id],
                 Self::chat_attachment_from_row,
             )
@@ -3433,12 +3823,21 @@ impl Database {
     /// is never a candidate, whatever its age.
     fn prune_settled_chat_attachments_locked(conn: &Connection, now: i64) -> anyhow::Result<usize> {
         let cutoff = now.saturating_sub(CHAT_ATTACHMENT_RETENTION_SECS);
-        Ok(conn.execute(
+        let deleted = conn.execute(
             "DELETE FROM chat_attachments
              WHERE status NOT IN ('offered', 'awaiting', 'accepted', 'active')
                AND expires_at < ?1 AND created_at < ?1",
             rusqlite::params![cutoff],
-        )?)
+        )?;
+        // Rows also go with a removed friend, so counts are cleared by what is
+        // left rather than by what this pass deleted.
+        Self::ensure_chat_attachment_attempts_locked(conn)?;
+        conn.execute(
+            "DELETE FROM chat_attachment_attempts
+             WHERE xfer_id NOT IN (SELECT xfer_id FROM chat_attachments)",
+            [],
+        )?;
+        Ok(deleted)
     }
 
     /// Write a consistent, self-contained copy of the live database to `dest`.
@@ -3646,6 +4045,34 @@ impl Database {
             params![peer_id],
         )?;
         Ok(())
+    }
+
+    /// Every manually banned peer, with the name and client software its
+    /// credit record last saw. A ban is placed by user hash from a transfer
+    /// row, so the `peers` row itself usually carries no name. Rows are
+    /// `(peer_id, addresses, peer_name, client_software)`.
+    pub fn get_banned_peers(&self) -> anyhow::Result<Vec<(String, Vec<String>, String, String)>> {
+        let conn = self.conn.lock();
+        let banned: Vec<(String, String)> = conn
+            .prepare("SELECT id, addresses FROM peers WHERE banned = 1 ORDER BY id")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut credit = conn.prepare(
+            "SELECT peer_name, client_software FROM credits WHERE user_hash = ?1",
+        )?;
+        let mut out = Vec::with_capacity(banned.len());
+        for (id, addresses) in banned {
+            let addresses: Vec<String> = serde_json::from_str(&addresses).unwrap_or_default();
+            let (name, client) = match hex::decode(&id) {
+                Ok(hash) if hash.len() == 16 => credit
+                    .query_row(params![hash], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .optional()?
+                    .unwrap_or_default(),
+                _ => (String::new(), String::new()),
+            };
+            out.push((id, addresses, name, client));
+        }
+        Ok(out)
     }
 
     /// Record `ip` as one of the addresses belonging to a (banned) peer.
@@ -4242,10 +4669,9 @@ impl Database {
 
     /// Record many cancelled/finished downloads in one transaction.
     ///
-    /// Same reasoning as [`Database::remove_transfers`]: the per-row
-    /// [`Database::record_download_history`] opens its own transaction, so a
-    /// batch cancel paid one fsync per row before it even reached the deletes.
-    /// Rows are `(file_hash, file_name, file_size, status)`.
+    /// Same reasoning as [`Database::remove_transfers`]: a transaction per row
+    /// made a batch cancel pay one fsync per row before it even reached the
+    /// deletes. Rows are `(file_hash, file_name, file_size, status)`.
     pub fn record_download_history_batch(
         &self,
         rows: &[(String, String, u64, &str)],
@@ -4655,6 +5081,69 @@ impl Database {
         Ok(records)
     }
 
+    /// The Ember node id each non-friend peer proved alongside SecIdent
+    /// (`CreditRecord::proven_ember_hash`), kept beside `credits` rather than
+    /// as a column of it for the same reason as
+    /// [`Self::ensure_transfer_part_folders_locked`]: a numbered migration
+    /// would stop 1.7.0 from opening the database after a downgrade.
+    fn ensure_credit_ember_links_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS credit_ember_links (
+                user_hash BLOB PRIMARY KEY,
+                ember_hash BLOB NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
+    pub fn load_credit_ember_links(&self) -> anyhow::Result<Vec<([u8; 16], [u8; 16])>> {
+        let conn = self.conn.lock();
+        Self::ensure_credit_ember_links_locked(&conn)?;
+        let mut stmt = conn.prepare("SELECT user_hash, ember_hash FROM credit_ember_links")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)))?
+            .filter_map(|row| {
+                let (user_hash, ember_hash) = row.ok()?;
+                Some((user_hash.try_into().ok()?, ember_hash.try_into().ok()?))
+            })
+            .collect();
+        Ok(rows)
+    }
+
+    /// Write the links of the credit rows a flush touched: `Some` stores one,
+    /// `None` and `removed` clear one, and `full_sync` first clears the table
+    /// so it mirrors the ledger exactly.
+    pub fn save_credit_ember_links(
+        &self,
+        links: &[([u8; 16], Option<[u8; 16]>)],
+        removed: &[[u8; 16]],
+        full_sync: bool,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_credit_ember_links_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        if full_sync {
+            tx.execute("DELETE FROM credit_ember_links", [])?;
+        }
+        {
+            let mut upsert = tx.prepare(
+                "INSERT OR REPLACE INTO credit_ember_links (user_hash, ember_hash) VALUES (?1, ?2)",
+            )?;
+            let mut delete = tx.prepare("DELETE FROM credit_ember_links WHERE user_hash = ?1")?;
+            for (user_hash, ember_hash) in links {
+                match ember_hash {
+                    Some(eh) => upsert.execute(params![&user_hash[..], &eh[..]])?,
+                    None => delete.execute(params![&user_hash[..]])?,
+                };
+            }
+            for user_hash in removed {
+                delete.execute(params![&user_hash[..]])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn load_statistics(&self) -> anyhow::Result<Vec<(String, i64)>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT key, value FROM statistics")?;
@@ -4819,74 +5308,13 @@ impl Database {
         Ok(())
     }
 
-    /// Persist the full credit ledger as a single atomic replacement.
-    /// The previous implementation only ran `INSERT OR REPLACE` per row,
-    /// which meant rows pruned in memory by `CreditManager::cleanup_stale`
-    /// were left behind in the database. On the next launch the loader
-    /// would resurrect those stale rows and the in-memory eviction
-    /// would have to run again — visible as a Known Clients tab that
-    /// kept showing months-old "Unknown" peers across restarts even
-    /// after the periodic pruner had supposedly cleaned them up.
-    ///
-    /// `DELETE FROM credits` followed by the INSERTs inside one
-    /// transaction guarantees the table mirrors the in-memory snapshot
-    /// exactly. SQLite's transaction guarantees that either the whole
-    /// replacement lands or nothing changes, so a crash mid-flush won't
-    /// leave the table empty.
-    // Retained as a focused, unit-tested building block (full-replacement
-    // semantics); production flushes go through `save_credit_changes` and
-    // `sync_all_credits_with_ember`.
-    #[allow(dead_code)]
-    pub fn save_all_credits(&self, credits: &[CreditRowRef<'_>]) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        let tx = conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM credits", [])?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state, ember_hash, crypto_verified_once, peer_name, client_software, seen_ip) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
-            )?;
-            for (
-                hash,
-                uploaded,
-                downloaded,
-                last_seen,
-                public_key,
-                ident_ip,
-                ident_state,
-                ember_hash,
-                crypto_verified_once,
-                peer_name,
-                client_software,
-                seen_ip,
-            ) in credits
-            {
-                stmt.execute(params![
-                    &hash[..],
-                    i64::try_from(*uploaded).unwrap_or(i64::MAX),
-                    i64::try_from(*downloaded).unwrap_or(i64::MAX),
-                    *last_seen,
-                    *public_key,
-                    i64::from(*ident_ip),
-                    i64::from(*ident_state),
-                    ember_hash.map(|eh| eh.as_slice()),
-                    i64::from(*crypto_verified_once),
-                    *peer_name,
-                    *client_software,
-                    i64::from(*seen_ip),
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     /// Load persisted Ember credit records. Returns raw field tuples so
     /// the caller can rehydrate `EmberCreditRecord` without this layer
     /// depending on the credit types — same pattern as
     /// `load_credits`.
     ///
     /// Field order matches the v15 schema and the
-    /// `save_all_ember_credits` INSERT statement: pubkey, uploaded,
+    /// `save_all_credits_with_ember` INSERT statement: pubkey, uploaded,
     /// downloaded, last_upload_time, last_download_time,
     /// completed_sessions, total_sessions, avg_upload_speed, last_seen,
     /// ident_verified.
@@ -4944,66 +5372,14 @@ impl Database {
         Ok(records)
     }
 
-    /// Full-replacement save for the Ember credit table — same
-    /// contract as `save_all_credits`: DELETE followed by INSERT
-    /// inside one transaction so on-disk state matches the
-    /// in-memory `CreditManager.ember_credits` snapshot exactly. A
-    /// crash mid-flush leaves the pre-save rows intact thanks to
-    /// SQLite's all-or-nothing transaction guarantee.
-    #[allow(clippy::type_complexity, dead_code)]
-    pub fn save_all_ember_credits(
-        &self,
-        credits: &[(&[u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)],
-    ) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        let tx = conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM ember_credits", [])?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO ember_credits (\
-                    pub_key, uploaded, downloaded, last_upload_time, last_download_time, \
-                    completed_sessions, total_sessions, avg_upload_speed, last_seen, ident_verified\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            )?;
-            for (
-                pk,
-                up,
-                down,
-                last_up,
-                last_down,
-                completed,
-                total,
-                avg_speed,
-                last_seen,
-                verified,
-            ) in credits
-            {
-                stmt.execute(params![
-                    &pk[..],
-                    i64::try_from(*up).unwrap_or(i64::MAX),
-                    i64::try_from(*down).unwrap_or(i64::MAX),
-                    *last_up,
-                    *last_down,
-                    i64::from(*completed),
-                    i64::from(*total),
-                    i64::try_from(*avg_speed).unwrap_or(i64::MAX),
-                    *last_seen,
-                    i64::from(*verified),
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     /// Full-replacement save of BOTH credit tables inside a SINGLE
     /// transaction, so the `credits` and `ember_credits` tables can never
-    /// diverge across a crash or a partial failure. The previous code ran
-    /// `save_all_credits` and `save_all_ember_credits` as two independent
-    /// committed transactions back-to-back; if the second failed (or the
-    /// process died between them) the two tables ended up inconsistent
-    /// despite a comment claiming "either both land or neither". Both
-    /// DELETE+INSERT pairs now share one `tx`, restoring that guarantee.
+    /// diverge across a crash or a partial failure: both DELETE+INSERT pairs
+    /// share one `tx`.
+    ///
+    /// A replacement rather than per-row `INSERT OR REPLACE`, so rows pruned
+    /// in memory by `CreditManager::cleanup_stale` do not survive on disk and
+    /// get resurrected by the loader on the next launch.
     #[allow(clippy::type_complexity)]
     pub fn save_all_credits_with_ember(
         &self,
@@ -6775,6 +7151,18 @@ impl Database {
         Ok(out)
     }
 
+    /// Drop an outbound message the outbox gave up on, once its text has gone
+    /// out again as a new row. Only a failed one of ours: anything else may
+    /// still be delivered, or is the friend's own words.
+    pub fn delete_failed_chat_message(&self, friend_hash: &str, id: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Ok(conn.execute(
+            "DELETE FROM chat_messages
+             WHERE id = ?1 AND friend_hash = ?2 AND direction = 'sent' AND delivery = ?3",
+            params![id, friend_hash, CHAT_FAILED],
+        )? > 0)
+    }
+
     /// Move a stored outbound message between delivery states.
     pub fn set_chat_delivery(&self, id: i64, delivery: i64) -> anyhow::Result<usize> {
         let conn = self.conn.lock();
@@ -6803,8 +7191,8 @@ impl Database {
         Ok(matched)
     }
 
-    /// Count of outbound messages still queued, per friend. Drives the
-    /// "unsent" affordance in the chat dock.
+    /// Count of outbound messages still queued, per friend.
+    #[cfg(test)]
     pub fn pending_chat_counts(&self) -> anyhow::Result<Vec<(String, i64)>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
@@ -7352,6 +7740,13 @@ impl Database {
                 now
             ],
         )?;
+        // Anything left under this id belonged to a copy of the room deleted by
+        // a build that did not know to clear it.
+        Self::ensure_channel_newer_frames_locked(conn)?;
+        conn.execute(
+            "DELETE FROM channel_newer_frames WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
         Ok(())
     }
 
@@ -7384,11 +7779,33 @@ impl Database {
     pub fn tombstone_channel(&self, channel_id: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
+        // The pending offer and any committed handoff go in the same write. Left
+        // standing, the handoff loop kept publishing and then completed it,
+        // which created the successor room — in the room list, walked into —
+        // on a device whose user had just destroyed the room it came from.
+        // The room's keys go too. `deleted` and `is_owner` are all the refusal
+        // reads; the owner seed and join secret left behind could still sign
+        // for the room and mint invites to it, with nothing able to remove
+        // them later, since `forget_channel` refuses a row we own.
         let n = tx.execute(
-            "UPDATE channels SET in_room = 0, deleted = 1 WHERE channel_id = ?1",
+            "UPDATE channels SET in_room = 0, deleted = 1,
+                 pending_successor = '', pending_handoff_version = 0,
+                 owner_seed = NULL, join_secret = NULL, topic = '', welcome = ''
+             WHERE channel_id = ?1",
             params![channel_id],
         )?;
         if n > 0 {
+            Self::delete_channel_handoff_commit_locked(&tx, channel_id)?;
+            Self::ensure_channel_claims_declined_locked(&tx)?;
+            tx.execute(
+                "DELETE FROM channel_claims_declined WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+            Self::ensure_channel_owner_silences_locked(&tx)?;
+            tx.execute(
+                "DELETE FROM channel_owner_silences WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
             tx.execute(
                 "DELETE FROM channel_messages WHERE channel_id = ?1",
                 params![channel_id],
@@ -7405,6 +7822,26 @@ impl Database {
                 "DELETE FROM channel_key_epochs WHERE channel_id = ?1",
                 params![channel_id],
             )?;
+            Self::ensure_channel_drafts_locked(&tx)?;
+            tx.execute(
+                "DELETE FROM channel_drafts WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+            Self::ensure_channel_newer_frames_locked(&tx)?;
+            tx.execute(
+                "DELETE FROM channel_newer_frames WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+            Self::ensure_channel_owner_key_pending_locked(&tx)?;
+            tx.execute(
+                "DELETE FROM channel_owner_key_pending WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+            Self::ensure_channel_name_unconfirmed_locked(&tx)?;
+            tx.execute(
+                "DELETE FROM channel_name_unconfirmed WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
             // The forget-list goes too. It exists to stop a deleted line being
             // re-inserted by the next gossip replay, and with the room itself
             // destroyed there is no ingest path left to refuse — so every row
@@ -7414,10 +7851,7 @@ impl Database {
                 "DELETE FROM channel_message_tombstones WHERE channel_id = ?1",
                 params![channel_id],
             )?;
-            tx.execute(
-                "DELETE FROM channel_handoff_pending WHERE old_channel_id = ?1",
-                params![channel_id],
-            )?;
+            Self::clear_handoff_seeds_locked(&tx, channel_id)?;
         }
         tx.commit()?;
         if n > 0 {
@@ -7481,10 +7915,29 @@ impl Database {
             "DELETE FROM channel_message_reactions WHERE channel_id = ?1",
             params![channel_id],
         )?;
-        // Any half-finished handoff goes with the room. Left behind it is an
-        // unreachable row keyed to a channel that no longer exists.
+        Self::ensure_channel_newer_frames_locked(&tx)?;
         tx.execute(
-            "DELETE FROM channel_handoff_pending WHERE old_channel_id = ?1",
+            "DELETE FROM channel_newer_frames WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        Self::ensure_channel_owner_key_pending_locked(&tx)?;
+        tx.execute(
+            "DELETE FROM channel_owner_key_pending WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        Self::ensure_channel_name_unconfirmed_locked(&tx)?;
+        tx.execute(
+            "DELETE FROM channel_name_unconfirmed WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        // A nominee's seeds stay. The owner may already have published a
+        // handoff naming one, and it is then the only key to a successor every
+        // other member is following; rejoining this room finds the record and
+        // installs it. `prune_forgotten_handoff_seeds` drops them
+        // once nothing can still be following that record.
+        Self::ensure_channel_claims_declined_locked(&tx)?;
+        tx.execute(
+            "DELETE FROM channel_claims_declined WHERE channel_id = ?1",
             params![channel_id],
         )?;
         tx.execute(
@@ -7509,6 +7962,15 @@ impl Database {
                 params![channel_id],
             )?,
         };
+        Self::ensure_channel_drafts_locked(&tx)?;
+        tx.execute(
+            "DELETE FROM channel_drafts WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        // A claim followed in this room is about this room alone. The handoff
+        // loop would drop it on its next pass for want of a row; going with the
+        // row keeps who claimed it off the disk in between.
+        Self::delete_channel_handoff_commit_locked(&tx, channel_id)?;
         let n = tx.execute(
             "DELETE FROM channels WHERE channel_id = ?1",
             params![channel_id],
@@ -7516,6 +7978,593 @@ impl Database {
         tx.commit()?;
         bump_channel_roster_generation(channel_id);
         Ok(n > 0)
+    }
+
+    /// Half-typed room lines, kept across a restart. Sealed with the chat key
+    /// like the room's messages, because a draft is message text that has not
+    /// been sent yet and deserves no less. In a table of its own, created on
+    /// first use, for the same reason as
+    /// [`Self::ensure_transfer_part_folders_locked`]: a numbered migration
+    /// would stop 1.7.0 from opening the database after a downgrade.
+    fn ensure_channel_drafts_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_drafts (
+                channel_id TEXT PRIMARY KEY,
+                body TEXT NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// What this device was sent in a room and could not read because it
+    /// needs a newer Ember: extension frames of a kind this build does not
+    /// know, and a sealed room key in an envelope version it cannot open.
+    /// Kept so the room can say so instead of leaving gaps nobody can see;
+    /// never the frames themselves.
+    ///
+    /// `source` is `line` or `key`. For a line, `ref` is its wire id and
+    /// `kind` the extension kind; for a key, `ref` is the epoch and `kind` the
+    /// envelope version. Created on first use, like
+    /// [`Self::ensure_channel_drafts_locked`].
+    fn ensure_channel_newer_frames_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_newer_frames (
+                channel_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                ref TEXT NOT NULL,
+                kind INTEGER NOT NULL,
+                epoch INTEGER NOT NULL DEFAULT 0,
+                sender_pubkey TEXT NOT NULL DEFAULT '',
+                seen_at INTEGER NOT NULL,
+                PRIMARY KEY (channel_id, source, ref)
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Note a displayable frame this build cannot read, `seen_at` being when
+    /// it arrived here. Returns whether the room's count went up: at the cap
+    /// a new row displaces the oldest, which the count does not show. Only the
+    /// newest [`CHANNEL_NEWER_LINES_PER_ROOM`] are kept per room.
+    pub fn note_channel_newer_line(
+        &self,
+        channel_id: &str,
+        msg_id: &str,
+        sender_pubkey: &str,
+        kind: u8,
+        seen_at: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_newer_frames_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let added = tx.execute(
+            "INSERT OR IGNORE INTO channel_newer_frames
+                (channel_id, source, ref, kind, sender_pubkey, seen_at)
+             VALUES (?1, 'line', ?2, ?3, ?4, ?5)",
+            params![channel_id, msg_id, i64::from(kind), sender_pubkey, seen_at],
+        )? > 0;
+        let pruned = if added {
+            tx.execute(
+                "DELETE FROM channel_newer_frames
+                 WHERE channel_id = ?1 AND source = 'line' AND ref NOT IN (
+                     SELECT ref FROM channel_newer_frames
+                     WHERE channel_id = ?1 AND source = 'line'
+                     ORDER BY seen_at DESC, ref DESC LIMIT ?2
+                 )",
+                params![channel_id, CHANNEL_NEWER_LINES_PER_ROOM],
+            )?
+        } else {
+            0
+        };
+        tx.commit()?;
+        Ok(added && pruned == 0)
+    }
+
+    /// Note that this room's key for `epoch` came sealed in an envelope
+    /// version this build cannot open. Returns whether that was news. An epoch
+    /// at or below the one the room already reads under is moot and not noted.
+    pub fn note_channel_newer_key(
+        &self,
+        channel_id: &str,
+        epoch: i64,
+        version: u8,
+        seen_at: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_newer_frames_locked(&conn)?;
+        let added = conn.execute(
+            "INSERT OR IGNORE INTO channel_newer_frames
+                (channel_id, source, ref, kind, epoch, seen_at)
+             SELECT ?1, 'key', ?2, ?3, ?2, ?4
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM channels WHERE channel_id = ?1 AND key_epoch >= ?2
+             )",
+            params![channel_id, epoch, i64::from(version), seen_at],
+        )? > 0;
+        Ok(added)
+    }
+
+    /// The user has seen that some of a room's lines need a newer Ember.
+    pub fn dismiss_channel_newer_lines(&self, channel_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_newer_frames_locked(&conn)?;
+        Ok(conn.execute(
+            "DELETE FROM channel_newer_frames WHERE channel_id = ?1 AND source = 'line'",
+            params![channel_id],
+        )? > 0)
+    }
+
+    /// What needs a newer Ember in one room.
+    pub fn channel_newer_status(&self, channel_id: &str) -> anyhow::Result<ChannelNewerStatus> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_newer_frames_locked(&conn)?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT f.source, f.kind {CHANNEL_NEWER_LIVE_ROWS} AND f.channel_id = ?1"
+        ))?;
+        let mut status = ChannelNewerStatus::default();
+        for row in stmt.query_map(params![channel_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            let (source, kind) = row?;
+            status.note(&source, kind);
+        }
+        Ok(status)
+    }
+
+    /// [`Self::channel_newer_status`] for every room that has any.
+    pub fn channel_newer_status_all(
+        &self,
+    ) -> anyhow::Result<std::collections::HashMap<String, ChannelNewerStatus>> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_newer_frames_locked(&conn)?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT f.channel_id, f.source, f.kind {CHANNEL_NEWER_LIVE_ROWS}"
+        ))?;
+        let mut out: std::collections::HashMap<String, ChannelNewerStatus> =
+            std::collections::HashMap::new();
+        for row in stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })? {
+            let (channel_id, source, kind) = row?;
+            out.entry(channel_id).or_default().note(&source, kind);
+        }
+        Ok(out)
+    }
+
+    /// The salt each room this identity owns was derived from; see
+    /// [`crate::network::ember::channel::derive_owned_room_seed`]. A room with
+    /// no row here has a random seed, as every room did before. Created on
+    /// first use.
+    ///
+    /// `carried` marks a salt read from the network's list for a room this
+    /// device could not put back yet: it stays listed, so the room is not
+    /// dropped from the list for good by the first device to publish one.
+    fn ensure_channel_owned_salts_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_owned_salts (
+                channel_id TEXT PRIMARY KEY,
+                salt TEXT NOT NULL,
+                carried INTEGER NOT NULL DEFAULT 0,
+                carried_at INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Keep listing a salt from the network's list whose room is not back yet.
+    pub fn carry_owned_salt(
+        &self,
+        channel_id: &str,
+        salt: &crate::network::ember::channel::OwnedRoomSalt,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_owned_salts_locked(&conn)?;
+        // Dated from the first time it was carried, not the latest: a room that
+        // never comes back is dropped once the list stops being worth keeping
+        // it in, rather than carried for ever.
+        conn.execute(
+            "INSERT INTO channel_owned_salts (channel_id, salt, carried, carried_at)
+             VALUES (?1, ?2, 1, ?3)
+             ON CONFLICT(channel_id) DO UPDATE SET
+                carried = 1,
+                carried_at = CASE WHEN carried = 1 THEN carried_at ELSE excluded.carried_at END",
+            params![channel_id, hex::encode(salt), chrono::Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// Stop listing a salt whose room is gone: deleted, or handed on.
+    pub fn drop_owned_salt(&self, channel_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_owned_salts_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM channel_owned_salts WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        Ok(())
+    }
+
+    /// Remember the salt a room's seed came from. Written before the room is
+    /// published, so a room the network knows always has one here.
+    pub fn record_channel_owned_salt(
+        &self,
+        channel_id: &str,
+        salt: &crate::network::ember::channel::OwnedRoomSalt,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_owned_salts_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO channel_owned_salts (channel_id, salt) VALUES (?1, ?2)
+             ON CONFLICT(channel_id) DO NOTHING",
+            params![channel_id, hex::encode(salt)],
+        )?;
+        // Salts minted for rooms that never came to exist — a creation that
+        // failed, a handoff nobody completed — are kept only the newest few:
+        // each handoff offer version mints one, and an owner could send many.
+        tx.execute(
+            "DELETE FROM channel_owned_salts
+             WHERE carried = 0
+               AND channel_id NOT IN (SELECT channel_id FROM channels)
+               AND rowid NOT IN (
+                   SELECT rowid FROM channel_owned_salts
+                   WHERE carried = 0
+                     AND channel_id NOT IN (SELECT channel_id FROM channels)
+                   ORDER BY rowid DESC LIMIT ?1
+               )",
+            params![CHANNEL_ORPHAN_SALTS_KEPT],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The salts of the rooms this device runs as owner — held with their
+    /// seed, not deleted, not handed on — and of those carried for a room not
+    /// back yet, in a stable order: what the identity's owned-rooms list says.
+    /// A carried room may be held here as a member, rejoined from an invite
+    /// since the device was lost; it is still ours to recover.
+    pub fn owned_room_salts(&self) -> anyhow::Result<Vec<crate::network::ember::channel::OwnedRoomSalt>> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_owned_salts_locked(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT s.salt FROM channel_owned_salts s
+             LEFT JOIN channels c ON c.channel_id = s.channel_id
+             WHERE (c.is_owner = 1 AND c.deleted = 0 AND c.successor_id = ''
+                    AND c.owner_seed IS NOT NULL)
+                OR (s.carried = 1 AND s.carried_at > ?2
+                    AND (c.channel_id IS NULL OR (c.deleted = 0 AND c.successor_id = '')))
+             ORDER BY s.carried, s.salt
+             LIMIT ?1",
+        )?;
+        let carried_since = chrono::Utc::now().timestamp() - CHANNEL_CARRIED_SALT_SECS;
+        let salts = stmt
+            .query_map(
+                params![
+                    crate::network::ember::dht::publish::OWNED_ROOMS_MAX as i64,
+                    carried_since
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .filter_map(|row| row.ok())
+            .filter_map(|hex_salt| hex::decode(hex_salt).ok())
+            .filter_map(|bytes| <[u8; 16]>::try_from(bytes).ok())
+            .collect();
+        Ok(salts)
+    }
+
+    /// Whether the identity's owned-rooms list on the network has been read
+    /// into this database since it was restored from a backup or rebuilt.
+    ///
+    /// Every launch reads the list once before publishing its own (see
+    /// [`crate::network::channel_membership::owned_rooms_list_read`]); this
+    /// records only that a restore owes that read even on a profile that has
+    /// not taken up Channels on this device yet. Created on first use, which
+    /// owes nothing.
+    fn ensure_owned_rooms_list_synced_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_owned_rooms_synced (
+                id INTEGER PRIMARY KEY CHECK (id = 0),
+                synced INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
+        Ok(())
+    }
+
+    pub fn set_owned_rooms_list_synced(&self, synced: bool) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_owned_rooms_list_synced_locked(&conn)?;
+        conn.execute(
+            "INSERT INTO channel_owned_rooms_synced (id, synced) VALUES (0, ?1)
+             ON CONFLICT(id) DO UPDATE SET synced = excluded.synced",
+            params![i64::from(synced)],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a read of the network's list is owed because this database was
+    /// explicitly marked as restored or rebuilt — not merely never read by a
+    /// profile that has never owned a room.
+    pub fn owned_rooms_list_read_owed(&self) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Self::ensure_owned_rooms_list_synced_locked(&conn)?;
+        Ok(conn
+            .query_row(
+                "SELECT synced FROM channel_owned_rooms_synced WHERE id = 0",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|synced| synced == 0))
+    }
+
+    /// Rooms this device owns again after a recovery but cannot run yet: the
+    /// key they currently seal with is `epoch`, which it has still to fetch
+    /// back from its own sealed copy. Until it has, it must not republish the
+    /// room or rotate it, or it would announce an older key and mint one under
+    /// a number the room already uses. Created on first use.
+    fn ensure_channel_owner_key_pending_locked(conn: &Connection) -> anyhow::Result<()> {
+        static SHAPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_owner_key_pending (
+                channel_id TEXT PRIMARY KEY,
+                epoch INTEGER NOT NULL,
+                since INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
+        // A development build made the table without `since`.
+        if !SHAPED.load(std::sync::atomic::Ordering::Acquire) {
+            let has_since = conn
+                .prepare("SELECT 1 FROM pragma_table_info('channel_owner_key_pending') WHERE name = 'since'")?
+                .exists([])?;
+            if !has_since {
+                conn.execute_batch(
+                    "ALTER TABLE channel_owner_key_pending ADD COLUMN since INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            SHAPED.store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    }
+
+    pub fn mark_channel_owner_key_pending(&self, channel_id: &str, epoch: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_owner_key_pending_locked(&conn)?;
+        // Dated from when the wait began, not from the latest epoch it moved to.
+        conn.execute(
+            "INSERT INTO channel_owner_key_pending (channel_id, epoch, since) VALUES (?1, ?2, ?3)
+             ON CONFLICT(channel_id) DO UPDATE SET epoch = MAX(epoch, excluded.epoch)",
+            params![channel_id, epoch, chrono::Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// When a recovered room began waiting on its current key.
+    pub fn channel_owner_key_pending_since(&self, channel_id: &str) -> anyhow::Result<Option<(i64, i64)>> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_owner_key_pending_locked(&conn)?;
+        Ok(conn
+            .query_row(
+                "SELECT epoch, since FROM channel_owner_key_pending WHERE channel_id = ?1",
+                params![channel_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// The epoch a recovered room is waiting on, if it is waiting.
+    pub fn channel_owner_key_pending(&self, channel_id: &str) -> anyhow::Result<Option<i64>> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_owner_key_pending_locked(&conn)?;
+        Ok(conn
+            .query_row(
+                "SELECT epoch FROM channel_owner_key_pending WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Rooms whose name here is a stand-in a recovery put in, because nothing
+    /// it could ask said what the room is called. Kept out of every snapshot
+    /// and listing the owner signs, so it never renames the room for its
+    /// members; the owner renaming the room ends it. Created on first use.
+    fn ensure_channel_name_unconfirmed_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_name_unconfirmed (
+                channel_id TEXT PRIMARY KEY
+            );",
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_channel_name_unconfirmed(&self, channel_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_name_unconfirmed_locked(&conn)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_name_unconfirmed (channel_id) VALUES (?1)",
+            params![channel_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn channel_name_unconfirmed(&self, channel_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_name_unconfirmed_locked(&conn)?;
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM channel_name_unconfirmed WHERE channel_id = ?1",
+                params![channel_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Put a room this identity owns back on this device, from what the
+    /// network still holds of it. Nothing is overwritten: a room already held
+    /// with its seed is left alone, one deleted here stays deleted, and one
+    /// held as a member — rejoined from an invite since the device was lost —
+    /// is made ours again with its keys and history as they are.
+    #[allow(clippy::too_many_arguments)]
+    pub fn adopt_recovered_owned_channel(
+        &self,
+        channel_id: &str,
+        pubkey: &str,
+        name: &str,
+        visibility: &str,
+        owner_seed: &[u8; 32],
+        join_secret: Option<&[u8; 32]>,
+        salt: &crate::network::ember::channel::OwnedRoomSalt,
+    ) -> anyhow::Result<RecoveredChannel> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_owned_salts_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let outcome = match Self::get_channel_locked(&tx, channel_id)? {
+            Some(row) if row.deleted => RecoveredChannel::Deleted,
+            // Handed on from here: the room it moved to is the one to run, and
+            // this one gave up its seed when it went.
+            Some(row) if !row.successor_id.is_empty() => RecoveredChannel::Moved,
+            Some(_)
+                if self
+                    .load_channel_secret_locked(&tx, channel_id, "owner_seed", "owner")?
+                    .is_some() =>
+            {
+                RecoveredChannel::AlreadyOwned
+            }
+            Some(_) => {
+                let owner_enc = Self::encrypt_channel_secret(
+                    self.require_chat_key()?,
+                    channel_id,
+                    "owner",
+                    owner_seed,
+                )?;
+                tx.execute(
+                    "UPDATE channels SET is_owner = 1, owner_seed = ?2, in_room = 1
+                     WHERE channel_id = ?1",
+                    params![channel_id, owner_enc],
+                )?;
+                RecoveredChannel::Adopted
+            }
+            None => {
+                self.insert_channel_locked(
+                    &tx,
+                    channel_id,
+                    pubkey,
+                    name,
+                    visibility,
+                    true,
+                    Some(owner_seed),
+                    join_secret,
+                )?;
+                RecoveredChannel::Inserted
+            }
+        };
+        match outcome {
+            RecoveredChannel::Adopted | RecoveredChannel::Inserted | RecoveredChannel::AlreadyOwned => {
+                tx.execute(
+                    "INSERT INTO channel_owned_salts (channel_id, salt, carried) VALUES (?1, ?2, 0)
+                     ON CONFLICT(channel_id) DO UPDATE SET carried = 0",
+                    params![channel_id, hex::encode(salt)],
+                )?;
+            }
+            // Gone from here for good: no longer listed.
+            RecoveredChannel::Deleted | RecoveredChannel::Moved => {
+                tx.execute(
+                    "DELETE FROM channel_owned_salts WHERE channel_id = ?1",
+                    params![channel_id],
+                )?;
+            }
+        }
+        tx.commit()?;
+        drop(conn);
+        if matches!(outcome, RecoveredChannel::Adopted | RecoveredChannel::Inserted) {
+            bump_channel_roster_generation(channel_id);
+        }
+        Ok(outcome)
+    }
+
+    fn channel_draft_aad(channel_id: &str) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(CHANNEL_DRAFT_AAD_DOMAIN.len() + 4 + channel_id.len());
+        aad.extend_from_slice(CHANNEL_DRAFT_AAD_DOMAIN);
+        aad.extend_from_slice(&(channel_id.len() as u32).to_le_bytes());
+        aad.extend_from_slice(channel_id.as_bytes());
+        aad
+    }
+
+    /// Store a room's draft, or drop it when `text` is empty. Refuses while
+    /// chat is locked, since the draft could only be kept in the clear.
+    pub fn save_channel_draft(&self, channel_id: &str, text: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_drafts_locked(&conn)?;
+        if text.is_empty() {
+            conn.execute(
+                "DELETE FROM channel_drafts WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+            return Ok(());
+        }
+        if text.len() > MAX_CHANNEL_DRAFT_BYTES {
+            anyhow::bail!("Draft is too long to keep");
+        }
+        let key = self.require_chat_key()?;
+        let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+        let mut nonce = [0u8; CHAT_NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        let aad = Self::channel_draft_aad(channel_id);
+        let encrypted = cipher
+            .encrypt(XNonce::from_slice(&nonce), Payload { msg: text.as_bytes(), aad: &aad })
+            .map_err(|_| anyhow::anyhow!("Failed to encrypt draft"))?;
+        let mut envelope = Vec::with_capacity(CHAT_NONCE_LEN + encrypted.len());
+        envelope.extend_from_slice(&nonce);
+        envelope.extend_from_slice(&encrypted);
+        let sealed = format!("{CHANNEL_DRAFT_PREFIX}{}", STANDARD_NO_PAD.encode(envelope));
+        conn.execute(
+            "INSERT OR REPLACE INTO channel_drafts (channel_id, body, updated_at)
+             VALUES (?1, ?2, ?3)",
+            params![channel_id, sealed, chrono::Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// A room's stored draft, or empty when there is none, chat is locked, or
+    /// the row no longer opens under the key this device holds.
+    pub fn load_channel_draft(&self, channel_id: &str) -> anyhow::Result<String> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_drafts_locked(&conn)?;
+        let Some(key) = self.chat_key.as_deref() else {
+            return Ok(String::new());
+        };
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT body FROM channel_drafts WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(stored) = stored else {
+            return Ok(String::new());
+        };
+        let opened = stored
+            .strip_prefix(CHANNEL_DRAFT_PREFIX)
+            .and_then(|encoded| STANDARD_NO_PAD.decode(encoded).ok())
+            .filter(|envelope| envelope.len() >= CHAT_NONCE_LEN + 16)
+            .and_then(|envelope| {
+                let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(key));
+                let aad = Self::channel_draft_aad(channel_id);
+                cipher
+                    .decrypt(
+                        XNonce::from_slice(&envelope[..CHAT_NONCE_LEN]),
+                        Payload { msg: &envelope[CHAT_NONCE_LEN..], aad: &aad },
+                    )
+                    .ok()
+            })
+            .and_then(|plain| String::from_utf8(plain).ok());
+        Ok(opened.unwrap_or_default())
     }
 
     pub fn load_channel_owner_seed(&self, channel_id: &str) -> anyhow::Result<Option<[u8; 32]>> {
@@ -7600,30 +8649,64 @@ impl Database {
 
     /// Record a rotated content key and make it current, dropping epochs past
     /// the retention window.
+    ///
+    /// Refused for an epoch this room already holds under a different secret.
+    /// Once minted, an epoch's key may already be sealed out to the members,
+    /// and two rotations racing for the same number replaced it with one
+    /// nobody else was given. The same secret again is a re-fetch, and fine.
     pub fn insert_channel_key_epoch(
         &self,
         channel_id: &str,
         epoch: i64,
         secret: &[u8; 32],
     ) -> anyhow::Result<()> {
-        let enc = Self::encrypt_channel_secret(
-            self.require_chat_key()?,
-            channel_id,
-            &format!("epoch{epoch}"),
-            secret,
-        )?;
+        let chat_key = self.require_chat_key()?;
+        let label = format!("epoch{epoch}");
+        let enc = Self::encrypt_channel_secret(chat_key, channel_id, &label, secret)?;
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO channel_key_epochs (channel_id, epoch, secret_enc, created_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(channel_id, epoch) DO UPDATE SET secret_enc = excluded.secret_enc",
-            params![channel_id, epoch, enc, chrono::Utc::now().timestamp()],
-        )?;
+        let held: Option<String> = tx
+            .query_row(
+                "SELECT secret_enc FROM channel_key_epochs WHERE channel_id = ?1 AND epoch = ?2",
+                params![channel_id, epoch],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match held {
+            Some(held) => {
+                let same = Self::decrypt_channel_secret(chat_key, channel_id, &label, &held)
+                    .is_ok_and(|held| held == *secret);
+                if !same {
+                    anyhow::bail!("epoch {epoch} of this room already holds a different key");
+                }
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO channel_key_epochs (channel_id, epoch, secret_enc, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![channel_id, epoch, enc, chrono::Utc::now().timestamp()],
+                )?;
+            }
+        }
         // Never walk the epoch backwards: an out-of-order record must not
         // demote the room to an older key for everything it sends next.
         tx.execute(
             "UPDATE channels SET key_epoch = ?2 WHERE channel_id = ?1 AND key_epoch < ?2",
+            params![channel_id, epoch],
+        )?;
+        // A key this build could open has arrived, so no earlier one is still
+        // waiting on a newer Ember.
+        Self::ensure_channel_newer_frames_locked(&tx)?;
+        tx.execute(
+            "DELETE FROM channel_newer_frames
+             WHERE channel_id = ?1 AND source = 'key' AND epoch <= ?2",
+            params![channel_id, epoch],
+        )?;
+        // A recovered room this device owns can run again once it holds the
+        // key it was waiting on.
+        Self::ensure_channel_owner_key_pending_locked(&tx)?;
+        tx.execute(
+            "DELETE FROM channel_owner_key_pending WHERE channel_id = ?1 AND epoch <= ?2",
             params![channel_id, epoch],
         )?;
         tx.execute(
@@ -7771,7 +8854,12 @@ impl Database {
     /// [`Self::commit_channel_handoff`]): a new offer would lead to a second
     /// record beside one that may already be stored. Withdrawing drops an
     /// unconfirmed commitment with it, and is refused for a confirmed one —
-    /// that record is out, and the members are following it.
+    /// that record is out, and the members are following it — and for a claim
+    /// we are following, whose members have already left.
+    ///
+    /// A withdrawn record that turns out to be stored after all is still
+    /// adopted when our handoff fetch finds it; see
+    /// [`Self::confirm_channel_handoff`].
     pub fn set_channel_pending_handoff(
         &self,
         channel_id: &str,
@@ -7781,7 +8869,7 @@ impl Database {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         if let Some(held) = Self::load_channel_handoff_commit_locked(&tx, channel_id)? {
-            if !successor_member.is_empty() || held.confirmed {
+            if !successor_member.is_empty() || held.confirmed || held.claimed {
                 anyhow::bail!("an ownership transfer of this room is already being published");
             }
             Self::delete_channel_handoff_commit_locked(&tx, channel_id)?;
@@ -7823,6 +8911,11 @@ impl Database {
     /// already have published a handoff naming its pubkey, so a replayed or
     /// reordered older offer — or a repeat of the same one — overwriting it
     /// would leave this device unable to sign for the room it was handed.
+    ///
+    /// The seed a newer offer replaces is kept aside in
+    /// `channel_handoff_superseded` (the newest [`HANDOFF_SUPERSEDED_SEEDS_KEPT`]
+    /// of them) until the room finishes its handoff: the record the owner ends
+    /// up adopting can be one it stored for the earlier offer.
     pub fn store_handoff_pending_seed(
         &self,
         old_channel_id: &str,
@@ -7838,7 +8931,16 @@ impl Database {
         )?;
         let now = chrono::Utc::now().timestamp();
         let conn = self.conn.lock();
-        let n = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        Self::ensure_channel_handoff_superseded_locked(&tx)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO channel_handoff_superseded
+                (old_channel_id, version, successor_pubkey, owner_seed, created_at)
+             SELECT old_channel_id, version, successor_pubkey, owner_seed, created_at
+             FROM channel_handoff_pending WHERE old_channel_id = ?1 AND version < ?2",
+            params![old_channel_id, version as i64],
+        )?;
+        let n = tx.execute(
             "INSERT INTO channel_handoff_pending (old_channel_id, version, successor_pubkey, owner_seed, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(old_channel_id) DO UPDATE SET
@@ -7849,7 +8951,34 @@ impl Database {
              WHERE excluded.version > channel_handoff_pending.version",
             params![old_channel_id, version as i64, successor_pubkey, enc, now],
         )?;
+        tx.execute(
+            "DELETE FROM channel_handoff_superseded
+             WHERE old_channel_id = ?1 AND version NOT IN (
+                 SELECT version FROM channel_handoff_superseded
+                 WHERE old_channel_id = ?1 ORDER BY version DESC LIMIT ?2
+             )",
+            params![old_channel_id, HANDOFF_SUPERSEDED_SEEDS_KEPT],
+        )?;
+        tx.commit()?;
         Ok(n > 0)
+    }
+
+    /// Seeds a newer offer replaced, created on first use like
+    /// `channel_handoff_commits`. `channel_handoff_pending` keeps the newest
+    /// alone, which is what builds predating this table read. `owner_seed` is
+    /// sealed like the newest one's and is listed in `CHAT_KEYED_COLUMNS`.
+    fn ensure_channel_handoff_superseded_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_handoff_superseded (
+                old_channel_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                successor_pubkey TEXT NOT NULL,
+                owner_seed TEXT,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (old_channel_id, version)
+            );",
+        )?;
+        Ok(())
     }
 
     pub fn load_handoff_pending_row(
@@ -7878,25 +9007,93 @@ impl Database {
         Ok(Some((pk, ver as u64, seed)))
     }
 
+    /// The seed minted for the offer at `version`, the newest or one it
+    /// superseded, if it is the one behind `successor_pubkey`.
     pub fn load_handoff_pending_seed(
         &self,
         old_channel_id: &str,
         successor_pubkey: &str,
         version: u64,
     ) -> anyhow::Result<Option<[u8; 32]>> {
-        let Some((pk, ver, seed)) = self.load_handoff_pending_row(old_channel_id)? else {
+        let stored: Option<(String, String)> = {
+            let conn = self.conn.lock();
+            Self::ensure_channel_handoff_superseded_locked(&conn)?;
+            conn.query_row(
+                "SELECT successor_pubkey, owner_seed FROM channel_handoff_pending
+                 WHERE old_channel_id = ?1 AND version = ?2
+                 UNION ALL
+                 SELECT successor_pubkey, owner_seed FROM channel_handoff_superseded
+                 WHERE old_channel_id = ?1 AND version = ?2
+                 LIMIT 1",
+                params![old_channel_id, version as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+        };
+        let Some((pk, enc)) = stored else {
             return Ok(None);
         };
-        if pk != successor_pubkey || ver != version {
+        if pk != successor_pubkey {
             return Ok(None);
         }
-        Ok(Some(seed))
+        Ok(Some(Self::decrypt_channel_secret(
+            self.require_chat_key()?,
+            old_channel_id,
+            "handoff",
+            &enc,
+        )?))
+    }
+
+    /// Rooms holding a seed, the newest or a superseded one, minted at or
+    /// after `minted_since`.
+    pub fn handoff_seed_rooms(&self, minted_since: i64) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_handoff_superseded_locked(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT old_channel_id FROM channel_handoff_pending WHERE created_at >= ?1
+             UNION
+             SELECT old_channel_id FROM channel_handoff_superseded WHERE created_at >= ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![minted_since], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
+    }
+
+    /// Drop seeds minted before `minted_before` for rooms this device no
+    /// longer lists. Forgetting a room keeps its seeds (see
+    /// [`Self::delete_channel`]), and with the row gone no handoff will ever
+    /// finish and clear them.
+    pub fn prune_forgotten_handoff_seeds(&self, minted_before: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        Self::ensure_channel_handoff_superseded_locked(&tx)?;
+        for table in ["channel_handoff_pending", "channel_handoff_superseded"] {
+            tx.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE created_at < ?1
+                       AND old_channel_id NOT IN (SELECT channel_id FROM channels)"
+                ),
+                params![minted_before],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn clear_handoff_pending(&self, old_channel_id: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
+        Self::clear_handoff_seeds_locked(&conn, old_channel_id)
+    }
+
+    fn clear_handoff_seeds_locked(conn: &Connection, old_channel_id: &str) -> anyhow::Result<()> {
+        Self::ensure_channel_handoff_superseded_locked(conn)?;
         conn.execute(
             "DELETE FROM channel_handoff_pending WHERE old_channel_id = ?1",
+            params![old_channel_id],
+        )?;
+        conn.execute(
+            "DELETE FROM channel_handoff_superseded WHERE old_channel_id = ?1",
             params![old_channel_id],
         )?;
         Ok(())
@@ -7905,12 +9102,61 @@ impl Database {
     /// Follow an owner-signed handoff: create the successor room, copy local
     /// history, and mark the old id as superseded. Never copies `owner_seed`
     /// from the old row.
+    ///
+    /// A successor this device already joined on its own is linked rather than
+    /// refused: the record naming it is the room's word, and every member who
+    /// did not hold it is following it there.
     pub fn apply_channel_handoff(
         &self,
         old_channel_id: &str,
         successor_pubkey: &str,
         successor_channel_id: &str,
         _version: u64,
+        keep_join_secret: bool,
+        successor_owner_seed: Option<&[u8; 32]>,
+    ) -> anyhow::Result<bool> {
+        self.apply_channel_handoff_as(
+            ChannelHandoffAuthority::Owner,
+            old_channel_id,
+            successor_pubkey,
+            successor_channel_id,
+            keep_join_secret,
+            successor_owner_seed,
+        )
+    }
+
+    /// Follow a nominee's succession claim, as a member honouring it or as the
+    /// claimant taking the room.
+    ///
+    /// Unlike [`Self::apply_channel_handoff`], a successor already held is
+    /// refused unless a handoff of this room created it: the claimant alone
+    /// names it, and could as well name another room the member is in. Nor is
+    /// a rotation left owing on the claimant's successor, which
+    /// `claim_channel_ownership` rotates itself; two would race for one epoch.
+    pub fn apply_claimed_channel_handoff(
+        &self,
+        old_channel_id: &str,
+        successor_pubkey: &str,
+        successor_channel_id: &str,
+        keep_join_secret: bool,
+        successor_owner_seed: Option<&[u8; 32]>,
+    ) -> anyhow::Result<bool> {
+        self.apply_channel_handoff_as(
+            ChannelHandoffAuthority::Claim,
+            old_channel_id,
+            successor_pubkey,
+            successor_channel_id,
+            keep_join_secret,
+            successor_owner_seed,
+        )
+    }
+
+    fn apply_channel_handoff_as(
+        &self,
+        authority: ChannelHandoffAuthority,
+        old_channel_id: &str,
+        successor_pubkey: &str,
+        successor_channel_id: &str,
         keep_join_secret: bool,
         successor_owner_seed: Option<&[u8; 32]>,
     ) -> anyhow::Result<bool> {
@@ -7922,30 +9168,37 @@ impl Database {
         // What happens next is decided inside the transaction but acted on after
         // the lock is released — `clear_handoff_pending` and the replay both
         // take the lock themselves, and this mutex is not reentrant.
-        {
+        let transition = {
             let conn = self.conn.lock();
             let tx = conn.unchecked_transaction()?;
-            if self.channel_handoff_transition_locked(
+            let transition = self.channel_handoff_transition_locked(
                 &tx,
                 old_channel_id,
                 successor_pubkey,
                 successor_channel_id,
                 keep_join_secret,
                 successor_owner_seed,
-            )? == ChannelHandoffTransition::Refused
-            {
+                authority,
+            )?;
+            if transition == ChannelHandoffTransition::Refused {
                 return Ok(false);
             }
             tx.commit()?;
             bump_channel_roster_generation(old_channel_id);
             bump_channel_roster_generation(successor_channel_id);
+            transition
+        };
+        if transition == ChannelHandoffTransition::Linked {
+            self.clear_handoff_pending(old_channel_id)?;
+        } else {
+            self.finish_channel_handoff(old_channel_id, successor_channel_id)?;
         }
-        self.finish_channel_handoff(old_channel_id, successor_channel_id)?;
         Ok(true)
     }
 
     /// The transactional half of a handoff, on a connection the caller holds
     /// inside a transaction it commits.
+    #[allow(clippy::too_many_arguments)]
     fn channel_handoff_transition_locked(
         &self,
         tx: &Connection,
@@ -7954,11 +9207,16 @@ impl Database {
         successor_channel_id: &str,
         keep_join_secret: bool,
         successor_owner_seed: Option<&[u8; 32]>,
+        authority: ChannelHandoffAuthority,
     ) -> anyhow::Result<ChannelHandoffTransition> {
+        let owes_rotation = authority == ChannelHandoffAuthority::Owner;
         let old = match Self::get_channel_locked(tx, old_channel_id)? {
             Some(ch) => ch,
             None => return Ok(ChannelHandoffTransition::Refused),
         };
+        if old.deleted {
+            return Ok(ChannelHandoffTransition::Refused);
+        }
         if !old.successor_id.is_empty() {
             if old.successor_id != successor_channel_id {
                 return Ok(ChannelHandoffTransition::Refused);
@@ -7971,37 +9229,41 @@ impl Database {
                     .load_channel_secret_locked(tx, successor_channel_id, "owner_seed", "owner")?
                     .is_none()
                 {
-                    let enc = Self::encrypt_channel_secret(
-                        self.require_chat_key()?,
+                    self.install_successor_owner_seed_locked(
+                        tx,
                         successor_channel_id,
-                        "owner",
                         seed,
-                    )?;
-                    tx.execute(
-                        "UPDATE channels SET is_owner = 1, owner_seed = ?2
-                         WHERE channel_id = ?1",
-                        params![successor_channel_id, enc],
+                        owes_rotation,
                     )?;
                 }
             }
             return Ok(ChannelHandoffTransition::AlreadyApplied);
         }
-        let successor_exists = Self::get_channel_locked(tx, successor_channel_id)?.is_some();
-        if successor_exists {
+        let fit = Self::handoff_successor_fit_locked(tx, old_channel_id, successor_channel_id)?;
+        let linked = match fit {
+            HandoffSuccessorFit::Fresh | HandoffSuccessorFit::Resumed => false,
+            HandoffSuccessorFit::Joined if authority == ChannelHandoffAuthority::Owner => true,
+            HandoffSuccessorFit::Joined | HandoffSuccessorFit::Unfit => {
+                return Ok(ChannelHandoffTransition::Refused);
+            }
+        };
+        if fit != HandoffSuccessorFit::Fresh {
             // The owner may have created the successor row first,
             // without the new seed. The named successor installs it
             // here — never by copying the old `owner_seed`.
             if let Some(seed) = successor_owner_seed {
-                let enc = Self::encrypt_channel_secret(
-                    self.require_chat_key()?,
+                self.install_successor_owner_seed_locked(
+                    tx,
                     successor_channel_id,
-                    "owner",
                     seed,
+                    owes_rotation,
                 )?;
+            }
+            if linked {
                 tx.execute(
-                    "UPDATE channels SET is_owner = 1, owner_seed = ?2
-                     WHERE channel_id = ?1",
-                    params![successor_channel_id, enc],
+                    "UPDATE channels SET predecessor_id = ?2
+                     WHERE channel_id = ?1 AND predecessor_id = ''",
+                    params![successor_channel_id, old_channel_id],
                 )?;
             }
         } else {
@@ -8023,6 +9285,24 @@ impl Database {
                 successor_owner_seed,
                 join_secret.as_ref(),
             )?;
+            // The successor's owner owes it a rotation from the start. Every
+            // member built its key from whichever epoch of the old room they
+            // had reached, so one who missed a rotation is on a different key
+            // from the rest — and the owner's may predate a ban, which the
+            // banned member still holds. The new key reaches each member sealed
+            // pairwise against the owner's identity, so it needs no shared
+            // secret to have survived. Written here so a crash cannot take the
+            // handoff without the rotation; the owned-room pass clears it once
+            // the snapshot announcing the new epoch is out.
+            if owes_rotation
+                && successor_owner_seed.is_some()
+                && old.visibility == crate::network::ember::channel::CHANNEL_KIND_PRIVATE
+            {
+                tx.execute(
+                    "UPDATE channels SET rotate_pending = 1 WHERE channel_id = ?1",
+                    params![successor_channel_id],
+                )?;
+            }
             // Announce-only travels: it is how the room is run, and a successor
             // that quietly reopened the floor to everyone is not the room its
             // members followed. Pins deliberately do not. They name messages
@@ -8063,20 +9343,58 @@ impl Database {
             params![old_channel_id, successor_channel_id],
         )?;
         Self::delete_channel_handoff_commit_locked(tx, old_channel_id)?;
-        Ok(ChannelHandoffTransition::Applied)
+        Ok(if linked {
+            ChannelHandoffTransition::Linked
+        } else {
+            ChannelHandoffTransition::Applied
+        })
     }
 
-    /// Copy history into the successor and drop the nominee-side seed row.
+    /// Make this device the successor's owner with the seed the nominee minted.
+    ///
+    /// `owes_rotation` leaves a private successor marked for the owned-room
+    /// pass to rotate, which a handoff needs (see the insert branch of
+    /// [`Self::channel_handoff_transition_locked`]) and a claim does not, since
+    /// the claimant rotates on the spot.
+    fn install_successor_owner_seed_locked(
+        &self,
+        tx: &Connection,
+        successor_channel_id: &str,
+        seed: &[u8; 32],
+        owes_rotation: bool,
+    ) -> anyhow::Result<()> {
+        let enc = Self::encrypt_channel_secret(
+            self.require_chat_key()?,
+            successor_channel_id,
+            "owner",
+            seed,
+        )?;
+        tx.execute(
+            "UPDATE channels SET is_owner = 1, owner_seed = ?2,
+                 rotate_pending = CASE WHEN ?3 THEN (visibility = 'private') ELSE rotate_pending END
+             WHERE channel_id = ?1",
+            params![successor_channel_id, enc, owes_rotation],
+        )?;
+        Ok(())
+    }
+
+    /// Copy history into the successor and drop the nominee-side seed rows.
     ///
     /// Outside the handoff transaction: 5,000 inserts is too long to hold the
     /// write lock for, and it is safe to resume because `predecessor_id` is
     /// already recorded and the message IDs are deterministic.
+    ///
+    /// Copies keep their read flag, and the old room's copied lines are then
+    /// marked read, so an unread line is counted once, in the successor.
+    /// Marked only after every copy: a resumed copy takes its flag from the
+    /// old line.
     fn finish_channel_handoff(
         &self,
         old_channel_id: &str,
         successor_channel_id: &str,
     ) -> anyhow::Result<()> {
         let history = self.get_channel_messages(old_channel_id, 5_000, None)?;
+        let mut copied_unread = Vec::new();
         for row in history.into_iter().rev() {
             let msg_id = format!("handoff-{old_channel_id}-{}", row.id);
             // No signature travels with a handoff copy. The author signed the
@@ -8098,12 +9416,31 @@ impl Database {
             // not verify here anyway, so the quote is carried by pointing the
             // copy at its parent's copy. Oldest first, so that copy is already
             // written; local-only like the rest of a handoff copy.
+            if copied.is_ok() && !row.read {
+                copied_unread.push(row.id);
+            }
             if let (Ok(copy_id), Some(parent)) = (copied, row.reply_parent.as_ref()) {
                 let _ = self.conn.lock().execute(
                     "UPDATE channel_messages SET reply_to = ?1 WHERE id = ?2",
                     params![format!("handoff-{old_channel_id}-{}", parent.id), copy_id],
                 );
             }
+        }
+        // Only lines whose copy landed, so each unread line is counted once:
+        // in the successor if it was copied, here if it was not (past the copy
+        // window, or a copy that failed).
+        if !copied_unread.is_empty() {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction()?;
+            {
+                let mut mark = tx.prepare(
+                    "UPDATE channel_messages SET read = 1 WHERE channel_id = ?1 AND id = ?2",
+                )?;
+                for id in copied_unread {
+                    mark.execute(params![old_channel_id, id])?;
+                }
+            }
+            tx.commit()?;
         }
         let _ = self.clear_handoff_pending(old_channel_id);
         Ok(())
@@ -8121,19 +9458,46 @@ impl Database {
                 successor_pubkey TEXT NOT NULL,
                 committed_at INTEGER NOT NULL,
                 confirmed INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS channel_handoff_claimants (
+                channel_id TEXT PRIMARY KEY,
+                claimant TEXT NOT NULL,
+                successor_pubkey TEXT NOT NULL
             );",
         )?;
         Ok(())
     }
 
-    fn channel_handoff_commit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChannelHandoffCommit> {
-        Ok(ChannelHandoffCommit {
-            nominee: row.get(0)?,
-            version: row.get::<_, i64>(1)?.max(0) as u64,
-            successor_pubkey: row.get(2)?,
-            committed_at: row.get(3)?,
-            confirmed: row.get::<_, i64>(4)? != 0,
-        })
+    /// Every column of a commitment. A followed claim keeps its claimant in
+    /// `channel_handoff_claimants` and leaves `nominee` empty, which a build
+    /// predating that table reads as a record adopted from the DHT: one it
+    /// completes without looking for an offer, as this build does.
+    const CHANNEL_HANDOFF_COMMIT_SELECT: &'static str =
+        "SELECT c.channel_id, c.nominee, c.version, c.successor_pubkey, c.committed_at,
+                c.confirmed, k.claimant
+         FROM channel_handoff_commits c
+         LEFT JOIN channel_handoff_claimants k
+           ON k.channel_id = c.channel_id AND c.nominee = ''
+              AND k.successor_pubkey = c.successor_pubkey";
+
+    fn channel_handoff_commit_from_row(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<(String, ChannelHandoffCommit)> {
+        let claimant: Option<String> = row.get(6)?;
+        Ok((
+            row.get(0)?,
+            ChannelHandoffCommit {
+                claimed: claimant.is_some(),
+                nominee: match claimant {
+                    Some(claimant) => claimant,
+                    None => row.get(1)?,
+                },
+                version: row.get::<_, i64>(2)?.max(0) as u64,
+                successor_pubkey: row.get(3)?,
+                committed_at: row.get(4)?,
+                confirmed: row.get::<_, i64>(5)? != 0,
+            },
+        ))
     }
 
     fn load_channel_handoff_commit_locked(
@@ -8143,12 +9507,12 @@ impl Database {
         Self::ensure_channel_handoff_commits_locked(conn)?;
         Ok(conn
             .query_row(
-                "SELECT nominee, version, successor_pubkey, committed_at, confirmed
-                 FROM channel_handoff_commits WHERE channel_id = ?1",
+                &format!("{} WHERE c.channel_id = ?1", Self::CHANNEL_HANDOFF_COMMIT_SELECT),
                 params![channel_id],
                 Self::channel_handoff_commit_from_row,
             )
-            .optional()?)
+            .optional()?
+            .map(|(_, commit)| commit))
     }
 
     fn store_channel_handoff_commit_locked(
@@ -8169,13 +9533,28 @@ impl Database {
                 confirmed = excluded.confirmed",
             params![
                 channel_id,
-                commit.nominee,
+                if commit.claimed { "" } else { commit.nominee.as_str() },
                 commit.version as i64,
                 commit.successor_pubkey,
                 commit.committed_at,
                 i64::from(commit.confirmed)
             ],
         )?;
+        if commit.claimed {
+            conn.execute(
+                "INSERT INTO channel_handoff_claimants (channel_id, claimant, successor_pubkey)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(channel_id) DO UPDATE SET
+                    claimant = excluded.claimant,
+                    successor_pubkey = excluded.successor_pubkey",
+                params![channel_id, commit.nominee, commit.successor_pubkey],
+            )?;
+        } else {
+            conn.execute(
+                "DELETE FROM channel_handoff_claimants WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+        }
         Ok(())
     }
 
@@ -8183,6 +9562,10 @@ impl Database {
         Self::ensure_channel_handoff_commits_locked(conn)?;
         conn.execute(
             "DELETE FROM channel_handoff_commits WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        conn.execute(
+            "DELETE FROM channel_handoff_claimants WHERE channel_id = ?1",
             params![channel_id],
         )?;
         Ok(())
@@ -8201,6 +9584,380 @@ impl Database {
             )
             .optional()?;
         Ok(row.and_then(|(pk, ver)| (!pk.is_empty() && ver > 0).then_some((pk, ver as u64))))
+    }
+
+    /// Where `successor_id` stands as the successor of `old_channel_id`.
+    ///
+    /// Never the room itself, nor a room that a handoff of some other room
+    /// created: following either loops the room or merges it into another.
+    /// A room joined on its own, by invite or from the directory, is
+    /// [`HandoffSuccessorFit::Joined`], which the callers weigh by who named it.
+    fn handoff_successor_fit_locked(
+        conn: &Connection,
+        old_channel_id: &str,
+        successor_id: &str,
+    ) -> anyhow::Result<HandoffSuccessorFit> {
+        if successor_id.eq_ignore_ascii_case(old_channel_id) {
+            return Ok(HandoffSuccessorFit::Unfit);
+        }
+        Ok(match Self::get_channel_locked(conn, successor_id)? {
+            None => HandoffSuccessorFit::Fresh,
+            Some(existing) if existing.predecessor_id.eq_ignore_ascii_case(old_channel_id) => {
+                HandoffSuccessorFit::Resumed
+            }
+            Some(existing) if existing.predecessor_id.is_empty() => HandoffSuccessorFit::Joined,
+            Some(_) => HandoffSuccessorFit::Unfit,
+        })
+    }
+
+    /// [`Self::handoff_successor_fit_locked`] for a successor named by its
+    /// pubkey (hex), `Unfit` for one that is not 32 bytes of hex.
+    fn handoff_successor_pubkey_fit_locked(
+        conn: &Connection,
+        old_channel_id: &str,
+        successor_pubkey: &str,
+    ) -> anyhow::Result<HandoffSuccessorFit> {
+        match Self::handoff_successor_id(successor_pubkey) {
+            Some(successor_id) => Self::handoff_successor_fit_locked(conn, old_channel_id, &successor_id),
+            None => Ok(HandoffSuccessorFit::Unfit),
+        }
+    }
+
+    /// The successor room id a handoff naming `successor_pubkey` (hex) leads
+    /// to, or `None` for a key that is not 32 bytes of hex.
+    fn handoff_successor_id(successor_pubkey: &str) -> Option<String> {
+        hex::decode(successor_pubkey)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            .map(|pk| hex::encode(crate::network::ember::channel::channel_id_from_pubkey(&pk)))
+    }
+
+    /// Claims on our rooms we stopped following, by the successor they name,
+    /// created on first use like `channel_handoff_commits`. By successor rather
+    /// than version: the version of a followed claim is when we found it, so
+    /// each fetch that finds the same claim again would arrive at a new one.
+    fn ensure_channel_claims_declined_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_claims_declined (
+                channel_id TEXT NOT NULL,
+                successor_pubkey TEXT NOT NULL,
+                declined_at INTEGER NOT NULL,
+                PRIMARY KEY (channel_id, successor_pubkey)
+            );",
+        )?;
+        Ok(())
+    }
+
+    fn channel_claim_declined_locked(
+        conn: &Connection,
+        channel_id: &str,
+        successor_pubkey: &str,
+    ) -> anyhow::Result<bool> {
+        Self::ensure_channel_claims_declined_locked(conn)?;
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM channel_claims_declined
+                 WHERE channel_id = ?1 AND successor_pubkey = ?2",
+                params![channel_id, successor_pubkey.to_ascii_lowercase()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Moves this device signed, created on first use like
+    /// `channel_handoff_commits`. `owner_seed` is sealed under the chat key like
+    /// every other channel secret, and is listed in `CHAT_KEYED_COLUMNS`.
+    fn ensure_channel_handoff_retired_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_handoff_retired (
+                channel_id TEXT PRIMARY KEY,
+                channel_pubkey TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                successor_pubkey TEXT NOT NULL,
+                private INTEGER NOT NULL DEFAULT 0,
+                owner_seed TEXT,
+                retired_at INTEGER NOT NULL,
+                published_at INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Owner silences, created on first use like `channel_handoff_commits`.
+    fn ensure_channel_owner_silences_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_owner_silences (
+                channel_id TEXT PRIMARY KEY,
+                nominee TEXT NOT NULL,
+                claim_after_days INTEGER NOT NULL,
+                silent_from INTEGER NOT NULL,
+                silent_until INTEGER NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn store_retired_channel_handoff_locked(
+        &self,
+        conn: &Connection,
+        channel_id: &str,
+        channel_pubkey: &str,
+        version: u64,
+        successor_pubkey: &str,
+        private: bool,
+        owner_seed: Option<&[u8; 32]>,
+        now: i64,
+    ) -> anyhow::Result<()> {
+        let sealed = match owner_seed {
+            Some(seed) => Some(Self::encrypt_channel_secret(
+                self.require_chat_key()?,
+                channel_id,
+                "retired",
+                seed,
+            )?),
+            None => None,
+        };
+        Self::ensure_channel_handoff_retired_locked(conn)?;
+        conn.execute(
+            "INSERT INTO channel_handoff_retired
+                (channel_id, channel_pubkey, version, successor_pubkey, private, owner_seed,
+                 retired_at, published_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
+             ON CONFLICT(channel_id) DO UPDATE SET
+                channel_pubkey = excluded.channel_pubkey,
+                version = excluded.version,
+                successor_pubkey = excluded.successor_pubkey,
+                private = excluded.private,
+                owner_seed = excluded.owner_seed,
+                retired_at = excluded.retired_at,
+                published_at = 0",
+            params![
+                channel_id,
+                channel_pubkey.to_ascii_lowercase(),
+                version as i64,
+                successor_pubkey.to_ascii_lowercase(),
+                i64::from(private),
+                sealed,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Keep a succession claim we published, so it can be republished like a
+    /// handoff: members who were away when it went out have no other way to
+    /// learn the room moved, and nor does an owner who comes back.
+    pub fn retire_channel_claim(
+        &self,
+        old_channel_id: &str,
+        old_channel_pubkey: &str,
+        witnessed_ts: i64,
+        successor_pubkey: &str,
+        private: bool,
+        now: i64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        self.store_retired_channel_handoff_locked(
+            &conn,
+            old_channel_id,
+            old_channel_pubkey,
+            witnessed_ts.max(1) as u64,
+            successor_pubkey,
+            private,
+            None,
+            now,
+        )
+    }
+
+    /// Every move this device still republishes. Rows past
+    /// [`crate::network::ember::channel::HANDOFF_RETIRED_KEEP_SECS`] are
+    /// dropped on the way, and a row whose seed no longer opens is skipped
+    /// rather than failing the rest.
+    pub fn retired_channel_handoffs(&self, now: i64) -> anyhow::Result<Vec<RetiredChannelHandoff>> {
+        let key = self.require_chat_key()?;
+        let conn = self.conn.lock();
+        Self::ensure_channel_handoff_retired_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM channel_handoff_retired WHERE retired_at < ?1 OR retired_at > ?2",
+            params![
+                now.saturating_sub(crate::network::ember::channel::HANDOFF_RETIRED_KEEP_SECS),
+                now.saturating_add(crate::network::ember::channel::HANDOFF_RETIRED_KEEP_SECS)
+            ],
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT channel_id, channel_pubkey, version, successor_pubkey, private, owner_seed,
+                    retired_at, published_at
+             FROM channel_handoff_retired",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(
+                |(channel_id, channel_pubkey, version, successor_pubkey, private, sealed, retired_at, published_at)| {
+                    let owner_seed = match sealed {
+                        Some(sealed) => Some(
+                            Self::decrypt_channel_secret(key, &channel_id, "retired", &sealed).ok()?,
+                        ),
+                        None => None,
+                    };
+                    Some(RetiredChannelHandoff {
+                        channel_id,
+                        channel_pubkey,
+                        version: version.max(0) as u64,
+                        successor_pubkey,
+                        private,
+                        owner_seed,
+                        retired_at,
+                        published_at,
+                    })
+                },
+            )
+            .collect())
+    }
+
+    pub fn note_retired_channel_handoff_published(&self, channel_id: &str, at: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_handoff_retired_locked(&conn)?;
+        conn.execute(
+            "UPDATE channel_handoff_retired SET published_at = ?2 WHERE channel_id = ?1",
+            params![channel_id, at],
+        )?;
+        Ok(())
+    }
+
+    /// The silence recorded for a room we own, if its nominee could have
+    /// claimed it while we were gone.
+    pub fn channel_owner_silence(&self, channel_id: &str) -> anyhow::Result<Option<ChannelOwnerSilence>> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_owner_silences_locked(&conn)?;
+        Ok(conn
+            .query_row(
+                "SELECT nominee, claim_after_days, silent_from, silent_until
+                 FROM channel_owner_silences WHERE channel_id = ?1",
+                params![channel_id],
+                |row| {
+                    Ok(ChannelOwnerSilence {
+                        nominee: row.get(0)?,
+                        claim_after_days: row.get(1)?,
+                        silent_from: row.get(2)?,
+                        silent_until: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// [`Self::channel_owner_silence`] while a claim found now could still be
+    /// one the silence allowed, forgetting it once that is over; see
+    /// [`Self::settle_channel_owner_silence_locked`].
+    pub fn live_channel_owner_silence(
+        &self,
+        channel_id: &str,
+        now: i64,
+    ) -> anyhow::Result<Option<ChannelOwnerSilence>> {
+        {
+            let conn = self.conn.lock();
+            Self::settle_channel_owner_silence_locked(&conn, channel_id, now)?;
+        }
+        self.channel_owner_silence(channel_id)
+    }
+
+    /// Forget the silence recorded for a room once a claim found from here on
+    /// says nothing about it: the window after our return
+    /// ([`crate::network::ember::channel::OWNER_RETURN_CLAIM_WINDOW_SECS`])
+    /// has passed, or the room is no longer ours, or no longer names the
+    /// nominee the silence did.
+    fn settle_channel_owner_silence_locked(
+        conn: &Connection,
+        channel_id: &str,
+        now: i64,
+    ) -> anyhow::Result<()> {
+        Self::ensure_channel_owner_silences_locked(conn)?;
+        conn.execute(
+            "DELETE FROM channel_owner_silences WHERE channel_id = ?1 AND (
+                ?2 >= silent_until + ?3 OR ?2 < silent_until - ?3
+                OR NOT EXISTS (
+                    SELECT 1 FROM channels c
+                     WHERE c.channel_id = ?1 AND c.is_owner = 1 AND c.claim_after_days > 0
+                       AND lower(c.successor_nominee) = channel_owner_silences.nominee
+                ))",
+            params![
+                channel_id,
+                now,
+                crate::network::ember::channel::OWNER_RETURN_CLAIM_WINDOW_SECS
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Commit a room we own to the successor `claimant`, its nominee, claimed
+    /// while we were silent. Returns whether this call committed it; a room
+    /// already spoken for, by this claim or anything else, is left as it is,
+    /// and so is a claim we have declined or one whose claimant is banned.
+    ///
+    /// No offer of ours stands behind it, so applying it asks for none: the
+    /// claim is what the members followed. Withdraws any pending offer with
+    /// it, since the room is no longer ours to offer.
+    pub fn commit_claimed_channel_handoff(
+        &self,
+        channel_id: &str,
+        claimant: &str,
+        successor_pubkey: &str,
+        now: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let Some(row) = Self::get_channel_locked(&tx, channel_id)? else {
+            return Ok(false);
+        };
+        if !row.is_owner || row.deleted || !row.successor_id.is_empty() {
+            return Ok(false);
+        }
+        if Self::handoff_successor_pubkey_fit_locked(&tx, channel_id, successor_pubkey)?
+            == HandoffSuccessorFit::Unfit
+        {
+            return Ok(false);
+        }
+        if Self::load_channel_handoff_commit_locked(&tx, channel_id)?.is_some()
+            || Self::channel_claim_declined_locked(&tx, channel_id, successor_pubkey)?
+            || Self::channel_member_banned_locked(&tx, channel_id, claimant)?
+        {
+            return Ok(false);
+        }
+        Self::store_channel_handoff_commit_locked(
+            &tx,
+            channel_id,
+            &ChannelHandoffCommit {
+                nominee: claimant.to_ascii_lowercase(),
+                version: now.max(1) as u64,
+                successor_pubkey: successor_pubkey.to_ascii_lowercase(),
+                committed_at: now,
+                confirmed: false,
+                claimed: true,
+            },
+        )?;
+        tx.execute(
+            "UPDATE channels SET pending_successor = '', pending_handoff_version = 0
+             WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Commit a room we own to the successor its nominee answered with.
@@ -8224,12 +9981,22 @@ impl Database {
         let Some(row) = Self::get_channel_locked(&tx, channel_id)? else {
             return Ok(ChannelHandoffCommitOutcome::NotPending);
         };
-        if !row.is_owner || !row.successor_id.is_empty() {
+        if !row.is_owner || row.deleted || !row.successor_id.is_empty() {
             return Ok(ChannelHandoffCommitOutcome::NotPending);
         }
         match Self::channel_pending_handoff_locked(&tx, channel_id)? {
             Some((pending, ver)) if pending.eq_ignore_ascii_case(nominee) && ver == version => {}
             _ => return Ok(ChannelHandoffCommitOutcome::NotPending),
+        }
+        // Stricter than the members, who link a room they joined on their own:
+        // nothing is published yet, and a successor the nominee names that
+        // this device already holds is far likelier someone else's room than
+        // one they minted for this.
+        if !matches!(
+            Self::handoff_successor_pubkey_fit_locked(&tx, channel_id, successor_pubkey)?,
+            HandoffSuccessorFit::Fresh | HandoffSuccessorFit::Resumed
+        ) {
+            return Ok(ChannelHandoffCommitOutcome::Unfit);
         }
         if let Some(held) = Self::load_channel_handoff_commit_locked(&tx, channel_id)? {
             return Ok(
@@ -8248,6 +10015,7 @@ impl Database {
             successor_pubkey: successor_pubkey.to_ascii_lowercase(),
             committed_at: now,
             confirmed: false,
+            claimed: false,
         };
         Self::store_channel_handoff_commit_locked(&tx, channel_id, &commit)?;
         tx.commit()?;
@@ -8268,22 +10036,9 @@ impl Database {
     ) -> anyhow::Result<Vec<(String, ChannelHandoffCommit)>> {
         let conn = self.conn.lock();
         Self::ensure_channel_handoff_commits_locked(&conn)?;
-        let mut stmt = conn.prepare(
-            "SELECT channel_id, nominee, version, successor_pubkey, committed_at, confirmed
-             FROM channel_handoff_commits",
-        )?;
+        let mut stmt = conn.prepare(Self::CHANNEL_HANDOFF_COMMIT_SELECT)?;
         let rows = stmt
-            .query_map([], |row| {
-                let channel_id: String = row.get(0)?;
-                let commit = ChannelHandoffCommit {
-                    nominee: row.get(1)?,
-                    version: row.get::<_, i64>(2)?.max(0) as u64,
-                    successor_pubkey: row.get(3)?,
-                    committed_at: row.get(4)?,
-                    confirmed: row.get::<_, i64>(5)? != 0,
-                };
-                Ok((channel_id, commit))
-            })?
+            .query_map([], Self::channel_handoff_commit_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -8296,6 +10051,14 @@ impl Database {
     /// under our room's key is what the members follow, so the commitment
     /// moves to it rather than competing with it. A found record carries no
     /// nominee; see [`Self::apply_owned_channel_handoff`].
+    ///
+    /// That holds for a record we withdrew and for one whose nominee has been
+    /// banned since, too. Refusing those left us alone in the old room while
+    /// the members followed the record, and free to offer the room again,
+    /// which put a second successor beside the first. Two things do stand
+    /// against a found record: a commitment of ours to a newer one that may
+    /// still land, because members take the newest record they find; and a
+    /// successor no handoff of this room can lead to, which they refuse too.
     pub fn confirm_channel_handoff(
         &self,
         channel_id: &str,
@@ -8309,7 +10072,7 @@ impl Database {
         let Some(row) = Self::get_channel_locked(&tx, channel_id)? else {
             return Ok(false);
         };
-        if !row.is_owner || !row.successor_id.is_empty() {
+        if !row.is_owner || row.deleted || !row.successor_id.is_empty() {
             return Ok(false);
         }
         let commit = match Self::load_channel_handoff_commit_locked(&tx, channel_id)? {
@@ -8323,17 +10086,112 @@ impl Database {
                 }
             }
             _ if !adopt => return Ok(false),
-            _ => ChannelHandoffCommit {
-                nominee: String::new(),
-                version,
-                successor_pubkey: successor_pubkey.to_ascii_lowercase(),
-                committed_at: now,
-                confirmed: true,
-            },
+            // An unconfirmed commitment with no nominee is a claim followed by
+            // a build that kept no claimant; like any followed claim it has no
+            // offer to lapse.
+            Some(held)
+                if held.version > version
+                    && (held.confirmed
+                        || held.claimed
+                        || held.nominee.is_empty()
+                        || crate::network::ember::channel::handoff_offer_live(held.version, now)) =>
+            {
+                return Ok(false);
+            }
+            _ => {
+                if Self::handoff_successor_pubkey_fit_locked(&tx, channel_id, successor_pubkey)?
+                    == HandoffSuccessorFit::Unfit
+                {
+                    return Ok(false);
+                }
+                ChannelHandoffCommit {
+                    nominee: String::new(),
+                    version,
+                    successor_pubkey: successor_pubkey.to_ascii_lowercase(),
+                    committed_at: now,
+                    confirmed: true,
+                    claimed: false,
+                }
+            }
         };
         Self::store_channel_handoff_commit_locked(&tx, channel_id, &commit)?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Give up an unconfirmed commitment whose nominee has been banned since,
+    /// if it is still `commit`. The caller has stopped publishing it and has
+    /// looked: no acknowledgement confirmed it, and a handoff fetch begun after
+    /// its last publish found nothing of ours stored. Should it turn up after
+    /// all, [`Self::confirm_channel_handoff`] adopts it like any found record.
+    ///
+    /// A followed claim is declined with it, by successor, so the next claim
+    /// fetch does not take it straight back up. A pending offer to the same
+    /// member goes too.
+    pub fn drop_banned_channel_handoff_commit(
+        &self,
+        channel_id: &str,
+        commit: &ChannelHandoffCommit,
+        now: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        match Self::load_channel_handoff_commit_locked(&tx, channel_id)? {
+            Some(held) if held == *commit && !held.confirmed && !held.nominee.is_empty() => {}
+            _ => return Ok(false),
+        }
+        if !Self::channel_member_banned_locked(&tx, channel_id, &commit.nominee)? {
+            return Ok(false);
+        }
+        Self::delete_channel_handoff_commit_locked(&tx, channel_id)?;
+        if commit.claimed {
+            Self::ensure_channel_claims_declined_locked(&tx)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO channel_claims_declined
+                    (channel_id, successor_pubkey, declined_at)
+                 VALUES (?1, ?2, ?3)",
+                params![channel_id, commit.successor_pubkey.to_ascii_lowercase(), now],
+            )?;
+        }
+        tx.execute(
+            "UPDATE channels SET pending_successor = '', pending_handoff_version = 0
+             WHERE channel_id = ?1 AND lower(pending_successor) = ?2",
+            params![channel_id, commit.nominee.to_ascii_lowercase()],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The confirmed commitment a room we own is ready to complete.
+    ///
+    /// One naming a successor the transition would refuse — the room itself,
+    /// or a room that came from another — is dropped instead of returned. Kept,
+    /// it was retried on every pass, and each pass signs the registry name over
+    /// before finding that out.
+    pub fn completable_channel_handoff_commit(
+        &self,
+        channel_id: &str,
+    ) -> anyhow::Result<Option<ChannelHandoffCommit>> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let Some(commit) = Self::load_channel_handoff_commit_locked(&tx, channel_id)? else {
+            return Ok(None);
+        };
+        if !commit.confirmed {
+            return Ok(None);
+        }
+        if Self::handoff_successor_pubkey_fit_locked(&tx, channel_id, &commit.successor_pubkey)?
+            == HandoffSuccessorFit::Unfit
+        {
+            Self::delete_channel_handoff_commit_locked(&tx, channel_id)?;
+            tx.commit()?;
+            tracing::warn!(
+                channel_id = %channel_id,
+                "dropped a confirmed handoff whose successor this room cannot move to"
+            );
+            return Ok(None);
+        }
+        Ok(Some(commit))
     }
 
     /// Start a committed-but-unconfirmed handoff's publish window over.
@@ -8495,16 +10353,22 @@ impl Database {
     /// write share one transaction, so of two callers racing to finish the same
     /// handoff exactly one sees `true` and does the side effects that follow.
     /// A commitment made from a nominee's ready also requires that offer to
-    /// still be the pending one; one adopted from the DHT has no nominee and
-    /// is authoritative on its own.
+    /// still be the pending one; one adopted from the DHT, or following a
+    /// claim, has no offer behind it and is authoritative on its own. One the
+    /// transition refuses is dropped, so it is not retried on every pass.
+    ///
+    /// The seed the transition drops is kept aside, in the same transaction,
+    /// for republishing the handoff record: nobody else can sign it, and a
+    /// member who was away for longer than the record lives has no other way
+    /// to find the successor. See [`Self::retired_channel_handoffs`].
     pub fn apply_owned_channel_handoff(&self, channel_id: &str) -> anyhow::Result<bool> {
-        let successor_id = {
+        let (successor_id, transition) = {
             let conn = self.conn.lock();
             let tx = conn.unchecked_transaction()?;
             let Some(row) = Self::get_channel_locked(&tx, channel_id)? else {
                 return Ok(false);
             };
-            if !row.is_owner || !row.successor_id.is_empty() {
+            if !row.is_owner || row.deleted || !row.successor_id.is_empty() {
                 return Ok(false);
             }
             let Some(commit) = Self::load_channel_handoff_commit_locked(&tx, channel_id)? else {
@@ -8513,7 +10377,7 @@ impl Database {
             if !commit.confirmed {
                 return Ok(false);
             }
-            if !commit.nominee.is_empty() {
+            if !commit.claimed && !commit.nominee.is_empty() {
                 match Self::channel_pending_handoff_locked(&tx, channel_id)? {
                     Some((pending, ver))
                         if pending.eq_ignore_ascii_case(&commit.nominee)
@@ -8530,23 +10394,47 @@ impl Database {
             let successor_id =
                 hex::encode(crate::network::ember::channel::channel_id_from_pubkey(&successor_pk));
             let keep = row.visibility == crate::network::ember::channel::CHANNEL_KIND_PRIVATE;
-            if self.channel_handoff_transition_locked(
+            let seed = self.load_channel_secret_locked(&tx, channel_id, "owner_seed", "owner")?;
+            let transition = self.channel_handoff_transition_locked(
                 &tx,
                 channel_id,
                 &commit.successor_pubkey,
                 &successor_id,
                 keep,
                 None,
-            )? != ChannelHandoffTransition::Applied
-            {
-                return Ok(false);
+                ChannelHandoffAuthority::Owner,
+            )?;
+            match transition {
+                ChannelHandoffTransition::Applied | ChannelHandoffTransition::Linked => {}
+                ChannelHandoffTransition::Refused => {
+                    Self::delete_channel_handoff_commit_locked(&tx, channel_id)?;
+                    tx.commit()?;
+                    return Ok(false);
+                }
+                ChannelHandoffTransition::AlreadyApplied => return Ok(false),
+            }
+            if let Some(seed) = seed {
+                self.store_retired_channel_handoff_locked(
+                    &tx,
+                    channel_id,
+                    &row.pubkey,
+                    commit.version,
+                    &commit.successor_pubkey,
+                    keep,
+                    Some(&seed),
+                    chrono::Utc::now().timestamp(),
+                )?;
             }
             tx.commit()?;
             bump_channel_roster_generation(channel_id);
             bump_channel_roster_generation(&successor_id);
-            successor_id
+            (successor_id, transition)
         };
-        self.finish_channel_handoff(channel_id, &successor_id)?;
+        if transition == ChannelHandoffTransition::Linked {
+            self.clear_handoff_pending(channel_id)?;
+        } else {
+            self.finish_channel_handoff(channel_id, &successor_id)?;
+        }
         Ok(true)
     }
 
@@ -8835,6 +10723,14 @@ impl Database {
         member_pubkey: &str,
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
+        Self::channel_member_banned_locked(&conn, channel_id, member_pubkey)
+    }
+
+    fn channel_member_banned_locked(
+        conn: &Connection,
+        channel_id: &str,
+        member_pubkey: &str,
+    ) -> anyhow::Result<bool> {
         let banned: Option<i64> = conn
             .query_row(
                 "SELECT banned FROM channel_members WHERE channel_id = ?1 AND member_pubkey = ?2",
@@ -9167,6 +11063,9 @@ impl Database {
             return Ok(None);
         }
         Self::apply_owner_room_policy_locked(&tx, channel_id, policy)?;
+        // An edit that changes or withdraws the nomination ends what the
+        // silence could stand for: a claim by that nominee is ours to refuse.
+        Self::settle_channel_owner_silence_locked(&tx, channel_id, now)?;
         tx.commit()?;
         bump_channel_roster_generation(channel_id);
         Ok(Some(stamp))
@@ -9188,12 +11087,34 @@ impl Database {
         Self::stamp_owner_snapshot_locked(&conn, channel_id, now)
     }
 
+    /// Also where a silence long enough for the room's nominee to have claimed
+    /// it is noticed, since a stamp is the first thing an owner coming back
+    /// signs. The stamp before it is the one a claim made in our absence cites,
+    /// and nothing else keeps it once this one replaces it; see
+    /// [`Self::channel_owner_silence`].
     fn stamp_owner_snapshot_locked(
         conn: &Connection,
         channel_id: &str,
         now: i64,
     ) -> anyhow::Result<Option<i64>> {
-        Ok(conn
+        let prior: Option<(i64, i64, String, i64, bool)> = conn
+            .query_row(
+                "SELECT owner_snapshot_at, moderation_updated_at, successor_nominee,
+                        claim_after_days, is_owner
+                 FROM channels WHERE channel_id = ?1",
+                params![channel_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get::<_, i64>(4)? != 0,
+                    ))
+                },
+            )
+            .optional()?;
+        let stamp: Option<i64> = conn
             .query_row(
                 "UPDATE channels SET owner_snapshot_at = MAX(?2, 1 + MAX(
                     CASE WHEN owner_snapshot_at <= ?2 + ?3 THEN owner_snapshot_at ELSE 0 END,
@@ -9203,7 +11124,34 @@ impl Database {
                 params![channel_id, now, OWNER_STAMP_MAX_LEAD_SECS],
                 |row| row.get(0),
             )
-            .optional()?)
+            .optional()?;
+        if let (Some((snapshot_at, moderated_at, nominee, claim_after_days, true)), Some(stamp)) =
+            (prior, stamp)
+        {
+            let last = snapshot_at.max(moderated_at);
+            if last > 0
+                && !nominee.is_empty()
+                && claim_after_days > 0
+                && stamp.saturating_sub(last) >= claim_after_days.saturating_mul(86_400)
+            {
+                Self::ensure_channel_owner_silences_locked(conn)?;
+                conn.execute(
+                    "INSERT INTO channel_owner_silences
+                        (channel_id, nominee, claim_after_days, silent_from, silent_until)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(channel_id) DO UPDATE SET
+                        nominee = excluded.nominee,
+                        claim_after_days = excluded.claim_after_days,
+                        silent_from = excluded.silent_from,
+                        silent_until = excluded.silent_until",
+                    params![channel_id, nominee.to_ascii_lowercase(), claim_after_days, last, stamp],
+                )?;
+            }
+        }
+        if stamp.is_some() {
+            Self::settle_channel_owner_silence_locked(conn, channel_id, now)?;
+        }
+        Ok(stamp)
     }
 
     /// Everything [`Self::apply_channel_moderation`] writes, inside the
@@ -9524,6 +11472,12 @@ impl Database {
         conn.execute(
             "UPDATE channels SET name = ?2, renamed_at = ?3 WHERE channel_id = ?1",
             params![channel_id, name, renamed_at],
+        )?;
+        // The owner has named the room: whatever stood in for its name is gone.
+        Self::ensure_channel_name_unconfirmed_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM channel_name_unconfirmed WHERE channel_id = ?1",
+            params![channel_id],
         )?;
         drop(conn);
         bump_channel_roster_generation(channel_id);
@@ -10757,6 +12711,26 @@ impl Database {
         })
     }
 
+    /// When one member's current reaction to a line was made, if they have one
+    /// stored (a withdrawn one counts: it carries the time that keeps a stale
+    /// frame from reasserting it).
+    pub fn channel_reaction_stamp(
+        &self,
+        channel_id: &str,
+        msg_id: &str,
+        member_pubkey: &str,
+    ) -> anyhow::Result<Option<i64>> {
+        let conn = self.conn.lock();
+        Ok(conn
+            .query_row(
+                "SELECT reacted_at FROM channel_message_reactions
+                 WHERE channel_id = ?1 AND msg_id = ?2 AND member_pubkey = ?3",
+                params![channel_id, msg_id, member_pubkey.to_ascii_lowercase()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// Record one member's reaction to one line, newest claim winning.
     ///
     /// Returns whether anything changed, so a caller can skip telling the UI
@@ -10963,24 +12937,8 @@ impl Database {
         }
     }
 
-    /// Record a completed or cancelled download in history.
-    pub fn record_download_history(
-        &self,
-        file_hash: &str,
-        file_name: &str,
-        file_size: u64,
-        status: &str,
-    ) -> anyhow::Result<()> {
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
-        Self::record_download_history_in(&tx, file_hash, file_name, file_size, status)?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// The history insert itself, so a caller that is already inside a
-    /// transaction (see [`Database::complete_transfer`]) can include it rather
-    /// than opening a second one.
+    /// Record a completed or cancelled download in history, inside a
+    /// transaction the caller already holds (see [`Database::complete_transfer`]).
     fn record_download_history_in(
         conn: &rusqlite::Connection,
         file_hash: &str,
@@ -12256,27 +14214,30 @@ mod tests {
         assert_eq!(blocked[0].1, "Mallory");
     }
 
-    /// Regression: `save_all_credits` MUST act as a full replacement so
-    /// records pruned in memory by `CreditManager::cleanup_stale` are
-    /// also dropped from the persisted table. Before this was a bare
-    /// `INSERT OR REPLACE`, the database accumulated stale rows
-    /// indefinitely — visible as a Known Clients tab that kept showing
-    /// months-old peers across restarts even though the in-memory
-    /// pruner was running on the periodic timer.
+    /// Regression: `save_all_credits_with_ember` MUST act as a full
+    /// replacement so records pruned in memory by
+    /// `CreditManager::cleanup_stale` are also dropped from the persisted
+    /// table. Before this was a bare `INSERT OR REPLACE`, the database
+    /// accumulated stale rows indefinitely — visible as a Known Clients tab
+    /// that kept showing months-old peers across restarts even though the
+    /// in-memory pruner was running on the periodic timer.
     #[test]
     fn save_all_credits_is_a_full_replacement() {
-        let db = credits_only_db();
+        let (db, path) = migrated_credits_db("replace");
         let h1 = [0x01u8; 16];
         let h2 = [0x02u8; 16];
         let h3 = [0x03u8; 16];
         let pk: &[u8] = &[0xAA; 4];
 
         // Seed three records.
-        db.save_all_credits(&[
-            (&h1, 100, 200, 1_700_000_000, pk, 0, 0, None, false, "", "", 0),
-            (&h2, 300, 400, 1_700_000_001, pk, 0x0102_0304, 1, None, true, "", "", 0),
-            (&h3, 500, 600, 1_700_000_002, pk, 0, 0, None, false, "", "", 0),
-        ])
+        db.save_all_credits_with_ember(
+            &[
+                (&h1, 100, 200, 1_700_000_000, pk, 0, 0, None, false, "", "", 0),
+                (&h2, 300, 400, 1_700_000_001, pk, 0x0102_0304, 1, None, true, "", "", 0),
+                (&h3, 500, 600, 1_700_000_002, pk, 0, 0, None, false, "", "", 0),
+            ],
+            &[],
+        )
         .expect("seed");
         let loaded = db.load_credits().expect("reload after seed");
         assert_eq!(loaded.len(), 3, "seed must persist three records");
@@ -12284,8 +14245,11 @@ mod tests {
         // Re-save with only one of the three. The other two represent
         // stale records the in-memory pruner has just dropped — they
         // must NOT survive in the database.
-        db.save_all_credits(&[(&h2, 999, 888, 1_700_000_999, pk, 0x0102_0304, 1, None, true, "Nia", "eMule 0.60a", 0x0506_0708)])
-            .expect("replace");
+        db.save_all_credits_with_ember(
+            &[(&h2, 999, 888, 1_700_000_999, pk, 0x0102_0304, 1, None, true, "Nia", "eMule 0.60a", 0x0506_0708)],
+            &[],
+        )
+        .expect("replace");
         let after = db.load_credits().expect("reload after replace");
         assert_eq!(after.len(), 1, "stale records must not persist");
         assert_eq!(after[0].0, h2);
@@ -12307,6 +14271,7 @@ mod tests {
             "client_software must persist"
         );
         assert_eq!(after[0].11, 0x0506_0708, "seen_ip must persist");
+        remove_db_files(db, &path);
     }
 
     /// Saving an empty slice must clear every existing row — the only
@@ -12314,14 +14279,15 @@ mod tests {
     /// that has to actually empty the table.
     #[test]
     fn save_all_credits_with_empty_input_clears_table() {
-        let db = credits_only_db();
+        let (db, path) = migrated_credits_db("empty");
         let h1 = [0x01u8; 16];
-        db.save_all_credits(&[(&h1, 1, 1, 0, &[], 0, 0, None, false, "", "", 0)])
+        db.save_all_credits_with_ember(&[(&h1, 1, 1, 0, &[], 0, 0, None, false, "", "", 0)], &[])
             .expect("seed");
         assert_eq!(db.load_credits().expect("reload").len(), 1);
 
-        db.save_all_credits(&[]).expect("empty save");
+        db.save_all_credits_with_ember(&[], &[]).expect("empty save");
         assert!(db.load_credits().expect("reload empty").is_empty());
+        remove_db_files(db, &path);
     }
 
     /// Opened through the real migrations, so the `ON CONFLICT` targets are
@@ -12513,17 +14479,20 @@ mod tests {
     /// after any restart.
     #[test]
     fn crypto_verified_anchor_round_trips() {
-        let db = credits_only_db();
+        let (db, path) = migrated_credits_db("anchor");
         let anchored = [0x11u8; 16];
         let fresh = [0x22u8; 16];
         let pk: &[u8] = &[0xAA; 4];
 
-        db.save_all_credits(&[
-            (&anchored, 10, 20, 1_700_000_000, pk, 0, 1, None, true, "", "", 0),
-            // Persisted `Failed` (2) with no anchor: exactly the state a
-            // stranger can force by failing one challenge under this hash.
-            (&fresh, 30, 40, 1_700_000_001, pk, 0, 2, None, false, "", "", 0),
-        ])
+        db.save_all_credits_with_ember(
+            &[
+                (&anchored, 10, 20, 1_700_000_000, pk, 0, 1, None, true, "", "", 0),
+                // Persisted `Failed` (2) with no anchor: exactly the state a
+                // stranger can force by failing one challenge under this hash.
+                (&fresh, 30, 40, 1_700_000_001, pk, 0, 2, None, false, "", "", 0),
+            ],
+            &[],
+        )
         .expect("seed");
 
         let loaded = db.load_credits().expect("reload");
@@ -12539,6 +14508,7 @@ mod tests {
             !anchor_of(fresh),
             "an unanchored record must not gain an anchor from its ident_state"
         );
+        remove_db_files(db, &path);
     }
 
     /// In-memory `Database` with just the `banned_ips` table for
@@ -12570,6 +14540,37 @@ mod tests {
         assert_eq!(db.get_banned_ips().expect("load"), vec![ip]);
         db.unban_ip(ip).expect("unban");
         assert!(db.get_banned_ips().expect("load after unban").is_empty());
+    }
+
+    /// The banned list names a peer from its credit record, since the ban
+    /// itself is placed by hash alone, and an unban takes it off the list.
+    #[test]
+    fn banned_peers_list_names_from_credits_and_drops_unbanned_rows() {
+        let (db, path) = migrated_credits_db("banned-list");
+        let named = [0x0Au8; 16];
+        let unnamed = [0x0Bu8; 16];
+        db.save_all_credits_with_ember(
+            &[(&named, 1, 1, 0, &[], 0, 0, None, false, "Nia", "eMule 0.60a", 0)],
+            &[],
+        )
+        .expect("seed credits");
+        db.ban_peer(&hex::encode(named)).expect("ban named");
+        db.ban_peer(&hex::encode(unnamed)).expect("ban unnamed");
+
+        let listed = db.get_banned_peers().expect("list");
+        assert_eq!(
+            listed,
+            vec![
+                (hex::encode(named), Vec::new(), "Nia".to_string(), "eMule 0.60a".to_string()),
+                (hex::encode(unnamed), Vec::new(), String::new(), String::new()),
+            ]
+        );
+
+        db.unban_peer(&hex::encode(named)).expect("unban");
+        let listed = db.get_banned_peers().expect("list after unban");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, hex::encode(unnamed));
+        remove_db_files(db, &path);
     }
 
     #[test]
@@ -12741,6 +14742,27 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// The Known Ember Peers links are written per flushed row, cleared with
+    /// `None` or a removed row, and mirrored exactly on a full sync — in a
+    /// table of their own, so the schema version 1.7.0 checks stays put.
+    #[test]
+    fn credit_ember_links_follow_the_flushed_rows() {
+        let db = credits_only_db();
+        let (a, b, c) = ([1u8; 16], [2u8; 16], [3u8; 16]);
+        db.save_credit_ember_links(&[(a, Some([0xA1; 16])), (b, Some([0xB1; 16]))], &[], false)
+            .unwrap();
+        let mut links = db.load_credit_ember_links().unwrap();
+        links.sort();
+        assert_eq!(links, vec![(a, [0xA1; 16]), (b, [0xB1; 16])]);
+
+        db.save_credit_ember_links(&[(a, None), (c, Some([0xC1; 16]))], &[b], false)
+            .unwrap();
+        assert_eq!(db.load_credit_ember_links().unwrap(), vec![(c, [0xC1; 16])]);
+
+        db.save_credit_ember_links(&[(a, Some([0xA2; 16]))], &[], true).unwrap();
+        assert_eq!(db.load_credit_ember_links().unwrap(), vec![(a, [0xA2; 16])]);
     }
 
     /// A download's part folder lives in a table of its own, not a column of
@@ -13489,6 +15511,70 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
+    /// "Try again" reuses the row: it moves back only from a status it was
+    /// asked to, counts the attempt, keeps its place in the conversation, and
+    /// leaves the schema where a downgrade can still open it.
+    #[test]
+    fn a_retried_attachment_reopens_its_own_row_and_counts_the_attempt() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-attach-retry-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let xfer = "ab".repeat(8);
+        let friend = "cd".repeat(8);
+        let now = 1_000_000i64;
+        db.upsert_chat_attachment(
+            &xfer, &friend, "sent", "holiday.zip", 4096, &"11".repeat(32),
+            Some("C:\\private\\holiday.zip"), "offered", now, now + 600,
+        )
+        .expect("insert");
+        assert_eq!(db.chat_attachment(&xfer).expect("row").attempt, 0);
+        db.set_chat_attachment_status(&xfer, "active", Some(2048), None).expect("active");
+
+        assert!(
+            !db.reopen_chat_attachment(&xfer, &["failed"], "offered", Some(now + 900)).expect("reopen"),
+            "a live transfer is not reopened"
+        );
+        db.set_chat_attachment_status(&xfer, "failed", None, None).expect("failed");
+        assert!(db.reopen_chat_attachment(&xfer, &["failed"], "offered", Some(now + 900)).expect("reopen"));
+        let row = db.chat_attachment(&xfer).expect("row");
+        assert_eq!((row.status.as_str(), row.transferred, row.attempt, row.created_at), ("offered", 0, 1, now));
+        assert_eq!(db.chat_attachment_expiry(&xfer), Some(now + 900));
+        assert!(db.chat_attachment_grant(&xfer, &friend, now).is_some(), "readable again");
+        assert_eq!(
+            db.chat_attachment_source(&xfer).map(|(p, s, r)| (p, s, r.len())),
+            Some(("C:\\private\\holiday.zip".to_string(), 4096, 64))
+        );
+
+        db.set_chat_attachment_status(&xfer, "failed", None, None).expect("failed");
+        assert!(db.reopen_chat_attachment(&xfer, &["failed"], "accepted", None).expect("reopen"));
+        assert_eq!(db.chat_attachment(&xfer).expect("row").attempt, 2);
+        assert_eq!(db.chat_attachment_expiry(&xfer), Some(now + 900), "no expiry given, none moved");
+        assert_eq!(
+            db.chat_attachments_for_friend(&friend, 10).expect("list")[0].attempt,
+            2,
+            "the list carries the attempt too"
+        );
+
+        assert!(!db.chat_attachment_was_granted(&xfer));
+        db.mark_chat_attachment_granted(&xfer).expect("granted");
+        assert!(db.chat_attachment_was_granted(&xfer));
+        assert_eq!(db.chat_attachment(&xfer).expect("row").attempt, 2, "the attempt is kept");
+        let fresh = "ef".repeat(8);
+        db.mark_chat_attachment_granted(&fresh).expect("granted before any retry");
+        assert!(db.chat_attachment_was_granted(&fresh));
+        assert_eq!(db.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 62, "1.7.0 has to open this database");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
     fn raw_attachment_fields(
         db: &Database,
         xfer: &str,
@@ -13564,6 +15650,60 @@ mod tests {
         assert!(wrong_key.chat_attachment_grant(&sent, &friend, now).is_none());
 
         drop(wrong_key);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A room draft survives on disk sealed, reads back as typed, is bound to
+    /// its room, and goes when it is cleared or the room is forgotten.
+    #[test]
+    fn channel_drafts_are_sealed_and_bound_to_their_room() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-channel-draft-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let (room, other) = ("a1".repeat(16), "b2".repeat(16));
+        assert_eq!(db.load_channel_draft(&room).unwrap(), "");
+
+        db.save_channel_draft(&room, "see you at the meetup").expect("save");
+        assert_eq!(db.load_channel_draft(&room).unwrap(), "see you at the meetup");
+        let stored: String = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT body FROM channel_drafts WHERE channel_id = ?1",
+                params![room],
+                |row| row.get(0),
+            )
+            .expect("raw row");
+        assert!(stored.starts_with(CHANNEL_DRAFT_PREFIX));
+        assert!(!stored.contains("meetup"));
+
+        // Moved under another room's id, the row no longer opens.
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO channel_drafts (channel_id, body) VALUES (?1, ?2)",
+                params![other, stored],
+            )
+            .expect("copy row");
+        assert_eq!(db.load_channel_draft(&other).unwrap(), "");
+
+        assert!(db.save_channel_draft(&room, &"x".repeat(MAX_CHANNEL_DRAFT_BYTES + 1)).is_err());
+        assert_eq!(db.load_channel_draft(&room).unwrap(), "see you at the meetup");
+
+        db.save_channel_draft(&room, "").expect("clear");
+        assert_eq!(db.load_channel_draft(&room).unwrap(), "");
+
+        db.save_channel_draft(&other, "still here").expect("save other");
+        db.delete_channel(&other, None).expect("forget");
+        assert_eq!(db.load_channel_draft(&other).unwrap(), "");
+
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
@@ -13875,6 +16015,7 @@ mod tests {
             file.write_all(&[0xFF; 16]).unwrap();
         }
 
+        let set_aside_marker = dir.join("set-aside-orphans");
         let after_clean = Database::open_for_session(&path).expect("open after a clean exit");
         assert!(
             after_clean.corrupt_backup.is_none(),
@@ -13882,14 +16023,146 @@ mod tests {
         );
         drop(after_clean);
         assert!(marker.exists(), "that session never reached its shutdown");
+        assert!(!set_aside_marker.exists());
 
         let after_crash = Database::open_for_session(&path).expect("open after a crash");
         assert!(
             after_crash.corrupt_backup.is_some(),
             "after an unclean shutdown the check runs and preserves the damaged file"
         );
+        assert!(
+            set_aside_marker.exists(),
+            "orphaned downloads are set aside from the moment the database is replaced"
+        );
         drop(after_crash);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The v21 VACUUM reads every page, so it can be what finds a database
+    /// corrupt. That still ends in recovery rather than a warning.
+    #[test]
+    fn corruption_found_by_the_v21_vacuum_still_recovers_the_database() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = std::env::temp_dir().join(format!(
+            "ember-vacuum-corrupt-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ember.db");
+        let db = Database::open_at(&path).expect("first open");
+        let (last_page, page_size) = {
+            let conn = db.conn.lock();
+            conn.execute_batch("PRAGMA auto_vacuum=NONE; VACUUM; CREATE TABLE filler(x BLOB);")
+                .unwrap();
+            for _ in 0..40 {
+                conn.execute("INSERT INTO filler VALUES (randomblob(2000))", [])
+                    .unwrap();
+            }
+            conn.execute("UPDATE schema_version SET version = 20", [])
+                .unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)).unwrap();
+            assert_eq!(auto_vacuum, 0, "v21 vacuums only a database without auto_vacuum");
+            let last_page: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
+            let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap();
+            (last_page, page_size)
+        };
+        drop(db);
+
+        // A leaf the filler's inserts appended, which nothing before the
+        // VACUUM reads.
+        {
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(((last_page - 2) * page_size) as u64)).unwrap();
+            file.write_all(&[0xFF; 16]).unwrap();
+        }
+        // With the chat history locked, v23 leaves it as it is and runs no
+        // VACUUM of its own.
+        std::fs::write(dir.join(CHAT_KEY_FILE), b"locked").unwrap();
+
+        let recovered = Database::open_for_session(&path).expect("recovered");
+        assert!(
+            recovered.corrupt_backup.is_some(),
+            "the damaged file is preserved and replaced"
+        );
+        drop(recovered);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn remove_scratch_db(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn a_database_from_a_newer_ember_is_refused_and_reported_as_such() {
+        let (db, path) = scratch_db("newer-schema");
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "UPDATE schema_version SET version = ?1",
+                params![MAX_SUPPORTED_SCHEMA_VERSION + 1],
+            )
+            .unwrap();
+        }
+        drop(db);
+
+        let error = Database::open_at(&path).err().expect("a newer schema is refused");
+        assert_eq!(OpenFailure::of(&error), OpenFailure::NewerVersion);
+        assert!(OpenFailure::NewerVersion
+            .message(std::path::Path::new("data"), &error)
+            .contains("newer version of Ember"));
+        remove_scratch_db(&path);
+    }
+
+    /// Read as version 0, it had every migration run over a database of any
+    /// version, a newer one included.
+    #[test]
+    fn a_schema_version_that_cannot_be_read_fails_the_open() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-unreadable-schema-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        remove_scratch_db(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE schema_version (v INTEGER NOT NULL);")
+                .unwrap();
+        }
+
+        let error = Database::open_at(&path).err().expect("the version is unreadable");
+        assert_eq!(OpenFailure::of(&error), OpenFailure::Other);
+        let conn = Connection::open(&path).unwrap();
+        let shared_files: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'shared_files'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(shared_files, 0, "no migration ran");
+        drop(conn);
+        remove_scratch_db(&path);
+    }
+
+    #[test]
+    fn a_full_disk_is_told_apart_from_other_open_failures() {
+        let sqlite_full = anyhow::Error::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            None,
+        ));
+        assert_eq!(OpenFailure::of(&sqlite_full), OpenFailure::DiskFull);
+        let storage_full = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            .context("Failed to prepare data dir");
+        assert_eq!(OpenFailure::of(&storage_full), OpenFailure::DiskFull);
+        let denied = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(OpenFailure::of(&denied), OpenFailure::Other);
+        assert!(OpenFailure::Other
+            .message(std::path::Path::new("data"), &denied)
+            .contains("permission denied"));
     }
 
     fn scratch_db(tag: &str) -> (Database, std::path::PathBuf) {
@@ -13995,6 +16268,30 @@ mod tests {
         assert_eq!(matched, vec![true, true, false]);
         assert!(db.pending_chat_messages(&friend, 10).unwrap().is_empty());
         assert!(db.set_chat_delivery_many(&[], CHAT_DELIVERED).unwrap().is_empty());
+        drop_scratch_db(db, path);
+    }
+
+    /// Resend's cleanup removes only the copy the outbox gave up on: never a
+    /// message still on its way, and never one in another friend's chat.
+    #[test]
+    fn only_a_failed_sent_message_can_be_discarded() {
+        let (db, path) = scratch_db("chat-discard-failed");
+        let friend = "e6".repeat(8);
+        let failed = db.insert_pending_chat_message(&friend, "lost").expect("queue");
+        let queued = db.insert_pending_chat_message(&friend, "waiting").expect("queue");
+        db.set_chat_delivery(failed, CHAT_FAILED).expect("mark");
+
+        assert!(!db.delete_failed_chat_message(&"e7".repeat(8), failed).unwrap());
+        assert!(!db.delete_failed_chat_message(&friend, queued).unwrap());
+        assert!(db.delete_failed_chat_message(&friend, failed).unwrap());
+        assert!(!db.delete_failed_chat_message(&friend, failed).unwrap());
+        let left: Vec<i64> = db
+            .pending_chat_messages(&friend, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert_eq!(left, vec![queued]);
         drop_scratch_db(db, path);
     }
 
@@ -16356,6 +18653,12 @@ mod tests {
         let gone = db.get_channel(&channel_id).unwrap().unwrap();
         assert!(!gone.in_room);
         assert!(gone.deleted);
+        assert!(gone.is_owner, "the refusal still knows it was ours");
+        assert!(
+            db.load_channel_owner_seed(&channel_id).unwrap().is_none(),
+            "a destroyed room keeps no key that could still sign for it"
+        );
+        assert!(db.load_channel_join_secret(&channel_id).unwrap().is_none());
         assert!(
             !db.set_channel_in_room(&channel_id, true).unwrap(),
             "a tombstoned room cannot be re-entered on this device"
@@ -16585,6 +18888,278 @@ mod tests {
         db.insert_channel_message(&channel_id, &me, "sent", "newer", "s2", 7_000, "", true)
             .unwrap();
         assert_eq!(db.last_sent_channel_message_at(&channel_id).unwrap(), 7_000);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// What a room was sent that needs a newer Ember is counted, bounded,
+    /// dismissed, superseded by a key this build can open, and forgotten with
+    /// the room.
+    #[test]
+    fn a_room_keeps_count_of_what_needs_a_newer_ember() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-newer-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "7d".repeat(16);
+        let other = "8e".repeat(16);
+        for id in [&channel_id, &other] {
+            db.insert_channel(id, &"5b".repeat(32), "Room", "private", false, None, None)
+                .expect("insert channel");
+        }
+        assert_eq!(db.channel_newer_status(&channel_id).unwrap(), ChannelNewerStatus::default());
+
+        let sender = "ab".repeat(32);
+        assert!(db.note_channel_newer_line(&channel_id, &"01".repeat(16), &sender, 90, 100).unwrap());
+        assert!(
+            !db.note_channel_newer_line(&channel_id, &"01".repeat(16), &sender, 90, 100).unwrap(),
+            "the same line twice is one line"
+        );
+        assert!(db.note_channel_newer_line(&other, &"02".repeat(16), &sender, 91, 100).unwrap());
+        assert_eq!(db.channel_newer_status(&channel_id).unwrap().lines, 1);
+        let all = db.channel_newer_status_all().unwrap();
+        assert_eq!((all[&channel_id].lines, all[&other].lines), (1, 1));
+
+        // Bounded per room, newest kept, and a line past the cap is not news:
+        // the count it would announce did not move.
+        for i in 0..CHANNEL_NEWER_LINES_PER_ROOM + 10 {
+            let counted = db
+                .note_channel_newer_line(&channel_id, &format!("{i:032x}"), &sender, 90, 1_000 + i)
+                .unwrap();
+            assert_eq!(counted, i + 1 < CHANNEL_NEWER_LINES_PER_ROOM, "line {i}");
+        }
+        assert_eq!(
+            db.channel_newer_status(&channel_id).unwrap().lines,
+            CHANNEL_NEWER_LINES_PER_ROOM
+        );
+
+        assert!(db.dismiss_channel_newer_lines(&channel_id).unwrap());
+        assert_eq!(db.channel_newer_status(&channel_id).unwrap().lines, 0);
+        assert_eq!(db.channel_newer_status(&other).unwrap().lines, 1, "only that room's");
+
+        // A key in a version this build cannot open, until one it can arrives.
+        assert!(db.note_channel_newer_key(&channel_id, 5, 2, 200).unwrap());
+        assert!(!db.note_channel_newer_key(&channel_id, 5, 2, 201).unwrap());
+        assert!(db.channel_newer_status(&channel_id).unwrap().key);
+        db.insert_channel_key_epoch(&channel_id, 4, &[4u8; 32]).unwrap();
+        assert!(db.channel_newer_status(&channel_id).unwrap().key, "an older key settles nothing");
+        db.insert_channel_key_epoch(&channel_id, 5, &[5u8; 32]).unwrap();
+        assert!(!db.channel_newer_status(&channel_id).unwrap().key);
+
+        // An epoch the room already reads past is moot, and not noted.
+        assert!(!db.note_channel_newer_key(&channel_id, 5, 2, 202).unwrap());
+        assert!(!db.note_channel_newer_key(&channel_id, 3, 2, 202).unwrap());
+
+        // Rows naming what this build reads do not count.
+        db.note_channel_newer_key(&channel_id, 9, crate::network::ember::channel::EPOCH_ENVELOPE_VERSION, 300)
+            .unwrap();
+        assert!(!db.channel_newer_status(&channel_id).unwrap().key);
+
+        assert!(db.delete_channel(&other, None).unwrap());
+        assert!(!db.channel_newer_status_all().unwrap().contains_key(&other));
+
+        // A row left under an id whose room went without clearing it — a
+        // delete by a build that never knew the table — counts for nothing,
+        // and a room created again under that id starts clean.
+        db.note_channel_newer_line(&other, &"03".repeat(16), &sender, 92, 400).unwrap();
+        assert!(!db.channel_newer_status_all().unwrap().contains_key(&other));
+        db.insert_channel(&other, &"5b".repeat(32), "Room", "private", false, None, None)
+            .expect("insert channel again");
+        assert_eq!(db.channel_newer_status(&other).unwrap(), ChannelNewerStatus::default());
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// The owned-rooms list names the rooms run here as owner and the ones
+    /// carried for later, never a room that never came to exist or is gone,
+    /// and a restored database publishes none until it has read the network's.
+    #[test]
+    fn the_owned_rooms_list_names_live_and_carried_rooms_only() {
+        use crate::network::ember::channel::{derive_owned_room_seed, ChannelIdentity};
+        let path = std::env::temp_dir().join(format!(
+            "ember-owned-salts-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+
+        assert!(!db.owned_rooms_list_read_owed().unwrap(), "a new profile owes no read");
+        db.set_owned_rooms_list_synced(false).unwrap();
+        assert!(db.owned_rooms_list_read_owed().unwrap(), "restored: a read is owed");
+        db.set_owned_rooms_list_synced(true).unwrap();
+        assert!(!db.owned_rooms_list_read_owed().unwrap(), "and paid once read");
+
+        // Minted from the identity and a salt the list can be rebuilt from,
+        // and not listed until the room it was minted for exists.
+        let identity = [0x5Au8; 32];
+        let (ident, derived) = crate::network::channel_membership::mint_owned_room_identity(&db, &identity);
+        assert!(derived);
+        assert!(db.owned_room_salts().unwrap().is_empty(), "no room yet");
+        let id = hex::encode(ident.channel_id);
+        db.insert_channel(&id, &hex::encode(ident.pubkey), "Mine", "public", true, Some(&ident.seed()), None)
+            .unwrap();
+        let salts = db.owned_room_salts().unwrap();
+        assert_eq!(salts.len(), 1);
+        assert_eq!(
+            ChannelIdentity::from_seed(&derive_owned_room_seed(&identity, &salts[0])).channel_id,
+            ident.channel_id,
+            "the listed salt rebuilds the room"
+        );
+
+        // Carried for a room not back yet, whether or not it is held here as
+        // a member; dropped once it is known to be gone.
+        let absent = "ab".repeat(16);
+        db.carry_owned_salt(&absent, &[7u8; 16]).unwrap();
+        let member = "cd".repeat(16);
+        db.insert_channel(&member, &"ef".repeat(32), "As member", "public", false, None, None)
+            .unwrap();
+        db.carry_owned_salt(&member, &[8u8; 16]).unwrap();
+        let salts = db.owned_room_salts().unwrap();
+        assert_eq!(salts.len(), 3);
+        assert_eq!(salts, db.owned_room_salts().unwrap(), "in a stable order");
+        assert_ne!(salts[0], [7u8; 16], "the room run here before those carried");
+        db.drop_owned_salt(&absent).unwrap();
+        db.tombstone_channel(&member).unwrap();
+        assert_eq!(db.owned_room_salts().unwrap().len(), 1, "gone rooms are not listed");
+
+        // A room deleted here leaves the list.
+        db.tombstone_channel(&id).unwrap();
+        assert!(db.owned_room_salts().unwrap().is_empty());
+
+        // Salts minted for rooms that never came to exist are kept only the
+        // newest few.
+        for _ in 0..(CHANNEL_ORPHAN_SALTS_KEPT + 10) {
+            crate::network::channel_membership::mint_owned_room_identity(&db, &identity);
+        }
+        let orphans: i64 = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM channel_owned_salts
+                 WHERE channel_id NOT IN (SELECT channel_id FROM channels)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, CHANNEL_ORPHAN_SALTS_KEPT);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A recovered room goes back in without overwriting anything, and one
+    /// still waiting on its current key stops waiting when the key arrives.
+    #[test]
+    fn a_recovered_room_is_adopted_without_overwriting_and_waits_for_its_key() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-recover-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let seed = [0x0Du8; 32];
+        let join = [0x0Eu8; 32];
+
+        let salt = [0x0Fu8; 16];
+        let fresh = "1a".repeat(16);
+        db.carry_owned_salt(&fresh, &salt).unwrap();
+        assert_eq!(
+            db.adopt_recovered_owned_channel(&fresh, &"2b".repeat(32), "Lost room", "private", &seed, Some(&join), &salt)
+                .unwrap(),
+            RecoveredChannel::Inserted
+        );
+        assert_eq!(db.owned_room_salts().unwrap(), vec![salt], "listed as ours, not carried");
+        let carried: i64 = db
+            .conn
+            .lock()
+            .query_row("SELECT carried FROM channel_owned_salts WHERE channel_id = ?1", params![fresh], |r| r.get(0))
+            .unwrap();
+        assert_eq!(carried, 0);
+        let row = db.get_channel(&fresh).unwrap().expect("row");
+        assert!(row.is_owner && row.in_room_now());
+        assert_eq!(db.load_channel_owner_seed(&fresh).unwrap(), Some(seed));
+        assert_eq!(db.load_channel_join_secret(&fresh).unwrap(), Some(join));
+        assert_eq!(
+            db.adopt_recovered_owned_channel(&fresh, &"2b".repeat(32), "Again", "private", &[0x99; 32], None, &salt)
+                .unwrap(),
+            RecoveredChannel::AlreadyOwned
+        );
+        assert_eq!(db.load_channel_owner_seed(&fresh).unwrap(), Some(seed), "not overwritten");
+
+        // Rejoined from an invite as a member since the device was lost.
+        let member = "3c".repeat(16);
+        db.insert_channel(&member, &"4d".repeat(32), "As member", "private", false, None, Some(&join))
+            .unwrap();
+        db.set_channel_in_room(&member, false).unwrap();
+        assert_eq!(
+            db.adopt_recovered_owned_channel(&member, &"4d".repeat(32), "Ignored", "private", &seed, None, &[0x10; 16])
+                .unwrap(),
+            RecoveredChannel::Adopted
+        );
+        let row = db.get_channel(&member).unwrap().expect("row");
+        assert!(row.is_owner && row.in_room_now());
+        assert_eq!(row.name, "As member", "its name is kept");
+        assert_eq!(db.load_channel_join_secret(&member).unwrap(), Some(join), "and its key");
+
+        // Deleted here stays deleted.
+        let gone = "5e".repeat(16);
+        db.insert_channel(&gone, &"6f".repeat(32), "Gone", "public", true, Some(&seed), None)
+            .unwrap();
+        db.tombstone_channel(&gone).unwrap();
+        db.carry_owned_salt(&gone, &[0x11; 16]).unwrap();
+        assert_eq!(
+            db.adopt_recovered_owned_channel(&gone, &"6f".repeat(32), "Gone", "public", &seed, None, &[0x11; 16])
+                .unwrap(),
+            RecoveredChannel::Deleted
+        );
+        assert_eq!(db.owned_room_salts().unwrap().len(), 2, "the deleted room is no longer listed");
+
+        // Handed on from here: the room to run is the successor.
+        let moved = "7a".repeat(16);
+        db.insert_channel(&moved, &"8b".repeat(32), "Moved", "public", true, Some(&seed), None)
+            .unwrap();
+        db.conn
+            .lock()
+            .execute("UPDATE channels SET successor_id = ?2 WHERE channel_id = ?1", params![moved, "9c".repeat(16)])
+            .unwrap();
+        assert_eq!(
+            db.adopt_recovered_owned_channel(&moved, &"8b".repeat(32), "Moved", "public", &seed, None, &[0x12; 16])
+                .unwrap(),
+            RecoveredChannel::Moved
+        );
+
+        // Waiting on epoch 3 until it, or a later one, is stored.
+        db.mark_channel_owner_key_pending(&fresh, 3).unwrap();
+        assert_eq!(db.channel_owner_key_pending(&fresh).unwrap(), Some(3));
+        db.insert_channel_key_epoch(&fresh, 2, &[2u8; 32]).unwrap();
+        assert_eq!(db.channel_owner_key_pending(&fresh).unwrap(), Some(3), "an older key is not it");
+        db.insert_channel_key_epoch(&fresh, 3, &[3u8; 32]).unwrap();
+        assert_eq!(db.channel_owner_key_pending(&fresh).unwrap(), None);
+        // A stand-in name stays out of what the owner signs until a rename.
+        assert!(!db.channel_name_unconfirmed(&fresh).unwrap());
+        db.mark_channel_name_unconfirmed(&fresh).unwrap();
+        assert!(db.channel_name_unconfirmed(&fresh).unwrap());
+        db.rename_owned_channel(&fresh, "Named again", 1_000).unwrap();
+        assert!(!db.channel_name_unconfirmed(&fresh).unwrap());
+
+        db.mark_channel_owner_key_pending(&fresh, 5).unwrap();
+        db.mark_channel_name_unconfirmed(&fresh).unwrap();
+        assert!(db.delete_channel(&fresh, None).unwrap());
+        assert_eq!(db.channel_owner_key_pending(&fresh).unwrap(), None, "goes with the room");
+        assert!(!db.channel_name_unconfirmed(&fresh).unwrap(), "and so does the stand-in");
 
         drop(db);
         let _ = std::fs::remove_file(&path);
@@ -17111,6 +19686,924 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
+    /// A re-offer mints a new seed, but the record the owner ends up adopting
+    /// can be the one it stored for an earlier offer. That seed has to stay
+    /// installable until the room has moved.
+    #[test]
+    fn a_superseded_handoff_seed_stays_installable_until_the_room_moves() {
+        let (db, path) = handoff_test_db("superseded-seeds");
+        let room = "5f".repeat(16);
+        let key = |n: u8| format!("{n:02x}").repeat(32);
+        for n in 1..=6u8 {
+            assert!(db
+                .store_handoff_pending_seed(&room, 99 + u64::from(n), &key(n), &[n; 32])
+                .unwrap());
+        }
+        assert_eq!(
+            db.load_handoff_pending_row(&room).unwrap(),
+            Some((key(6), 105, [6; 32])),
+            "the newest offer's seed is still the one an offer is answered with"
+        );
+        assert_eq!(db.load_handoff_pending_seed(&room, &key(5), 104).unwrap(), Some([5; 32]));
+        assert_eq!(db.load_handoff_pending_seed(&room, &key(3), 102).unwrap(), Some([3; 32]));
+        assert!(
+            db.load_handoff_pending_seed(&room, &key(2), 101).unwrap().is_none(),
+            "only the last few offers' seeds are kept"
+        );
+        assert!(
+            db.load_handoff_pending_seed(&room, &key(4), 102).unwrap().is_none(),
+            "a seed answers only for the key it was minted as"
+        );
+
+        assert!(
+            !db.store_handoff_pending_seed(&room, 103, &key(9), &[9; 32]).unwrap(),
+            "an earlier offer replayed late still mints nothing"
+        );
+        assert_eq!(db.load_handoff_pending_seed(&room, &key(4), 103).unwrap(), Some([4; 32]));
+
+        db.clear_handoff_pending(&room).unwrap();
+        assert!(db.load_handoff_pending_seed(&room, &key(5), 104).unwrap().is_none());
+        assert!(db.load_handoff_pending_row(&room).unwrap().is_none());
+
+        drop_handoff_test_db(db, path);
+    }
+
+    /// Forgetting a room the owner may already have handed to us must not
+    /// throw away the only key to the successor its members are following.
+    #[test]
+    fn forgetting_a_room_keeps_its_handoff_seeds_until_they_age_out() {
+        let (db, path) = handoff_test_db("forgotten-seeds");
+        let room = "6a".repeat(16);
+        let listed = "6b".repeat(16);
+        for id in [&room, &listed] {
+            db.insert_channel(id, &"d4".repeat(32), "Room", "public", false, None, None)
+                .unwrap();
+        }
+        assert!(db
+            .store_handoff_pending_seed(&room, 100, &"a1".repeat(32), &[0x11; 32])
+            .unwrap());
+        assert!(db
+            .store_handoff_pending_seed(&room, 101, &"b2".repeat(32), &[0x22; 32])
+            .unwrap());
+        assert!(db
+            .store_handoff_pending_seed(&listed, 100, &"c3".repeat(32), &[0x33; 32])
+            .unwrap());
+        let now = chrono::Utc::now().timestamp();
+        let mut seeded = db.handoff_seed_rooms(now - 60).unwrap();
+        seeded.sort();
+        assert_eq!(seeded, vec![room.clone(), listed.clone()]);
+        assert!(
+            db.handoff_seed_rooms(now + 60).unwrap().is_empty(),
+            "a seed minted before the horizon no longer counts"
+        );
+
+        assert!(db.set_channel_in_room(&room, false).unwrap());
+        assert!(db.delete_channel(&room, None).unwrap());
+        assert_eq!(
+            db.load_handoff_pending_seed(&room, &"a1".repeat(32), 100).unwrap(),
+            Some([0x11; 32])
+        );
+        db.prune_forgotten_handoff_seeds(now - 60).unwrap();
+        assert_eq!(
+            db.load_handoff_pending_seed(&room, &"b2".repeat(32), 101).unwrap(),
+            Some([0x22; 32]),
+            "a recent seed outlives forgetting its room"
+        );
+
+        db.prune_forgotten_handoff_seeds(now + 60).unwrap();
+        assert!(db.load_handoff_pending_seed(&room, &"a1".repeat(32), 100).unwrap().is_none());
+        assert!(db.load_handoff_pending_seed(&room, &"b2".repeat(32), 101).unwrap().is_none());
+        assert_eq!(
+            db.load_handoff_pending_seed(&listed, &"c3".repeat(32), 100).unwrap(),
+            Some([0x33; 32]),
+            "a room still listed keeps its seed whatever its age"
+        );
+
+        assert!(db.tombstone_channel(&listed).unwrap());
+        assert!(db.load_handoff_pending_seed(&listed, &"c3".repeat(32), 100).unwrap().is_none());
+
+        drop_handoff_test_db(db, path);
+    }
+
+    /// Copies keep each line's read flag, so the old room's copied lines have
+    /// to stop counting or every unread line is counted twice.
+    #[test]
+    fn a_followed_handoff_counts_each_unread_line_once_in_the_successor() {
+        let (db, path) = handoff_test_db("unread-once");
+        let old_id = "7c".repeat(16);
+        let successor_id = "8e".repeat(16);
+        let them = "b2".repeat(32);
+        db.insert_channel(&old_id, &"a1".repeat(32), "Room", "public", false, None, None)
+            .unwrap();
+        db.insert_channel_message(&old_id, &them, "received", "seen", "m1", 100, "", true)
+            .unwrap();
+        db.insert_channel_message(&old_id, &them, "received", "unseen", "m2", 101, "", false)
+            .unwrap();
+        db.insert_channel_message(&old_id, &them, "received", "unseen too", "m3", 102, "", false)
+            .unwrap();
+        assert_eq!(db.get_channel(&old_id).unwrap().unwrap().unread, 2);
+
+        assert!(db
+            .apply_channel_handoff(&old_id, &"9d".repeat(32), &successor_id, 1, false, None)
+            .unwrap());
+        assert_eq!(db.get_channel(&successor_id).unwrap().unwrap().unread, 2);
+        assert_eq!(db.get_channel(&old_id).unwrap().unwrap().unread, 0);
+
+        db.insert_channel_message(&old_id, &them, "received", "not followed yet", "m4", 103, "", false)
+            .unwrap();
+        assert_eq!(
+            db.get_channel(&old_id).unwrap().unwrap().unread,
+            1,
+            "a line arriving after the copy is the old room's own"
+        );
+
+        drop_handoff_test_db(db, path);
+    }
+
+    fn handoff_test_db(tag: &str) -> (Database, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "ember-handoff-{tag}-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        (Database::open_at(&path).expect("open db"), path)
+    }
+
+    fn drop_handoff_test_db(db: Database, path: std::path::PathBuf) {
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// Each member builds the successor's key from whichever epoch of the old
+    /// room it had reached, so the new owner has to rotate before the room is
+    /// one room again — and the obligation has to land with the handoff, not
+    /// after it, or a crash between the two loses it.
+    #[test]
+    fn a_nominee_taking_over_a_private_room_owes_it_a_key_rotation() {
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let (db, path) = handoff_test_db("rotate");
+        let private = ChannelIdentity::generate();
+        let public = ChannelIdentity::generate();
+        for (room, visibility) in [(&private, "private"), (&public, "public")] {
+            db.insert_channel(
+                &hex::encode(room.channel_id),
+                &hex::encode(room.pubkey),
+                "Room",
+                visibility,
+                false,
+                None,
+                Some(&[0x31; 32]),
+            )
+            .unwrap();
+        }
+        let successor = ChannelIdentity::generate();
+        let successor_id = hex::encode(successor.channel_id);
+        assert!(db
+            .apply_channel_handoff(
+                &hex::encode(private.channel_id),
+                &hex::encode(successor.pubkey),
+                &successor_id,
+                5,
+                true,
+                Some(&successor.seed()),
+            )
+            .unwrap());
+        assert!(
+            db.channel_rotate_is_pending(&successor_id).unwrap(),
+            "the new owner's first snapshot has to carry a fresh epoch"
+        );
+
+        let public_successor = ChannelIdentity::generate();
+        let public_successor_id = hex::encode(public_successor.channel_id);
+        assert!(db
+            .apply_channel_handoff(
+                &hex::encode(public.channel_id),
+                &hex::encode(public_successor.pubkey),
+                &public_successor_id,
+                5,
+                false,
+                Some(&public_successor.seed()),
+            )
+            .unwrap());
+        assert!(
+            !db.channel_rotate_is_pending(&public_successor_id).unwrap(),
+            "a public room's key is its pubkey, so there is nothing to rotate"
+        );
+
+        let (member_db, member_path) = handoff_test_db("rotate-member");
+        member_db
+            .insert_channel(
+                &hex::encode(private.channel_id),
+                &hex::encode(private.pubkey),
+                "Room",
+                "private",
+                false,
+                None,
+                Some(&[0x31; 32]),
+            )
+            .unwrap();
+        assert!(member_db
+            .apply_channel_handoff(
+                &hex::encode(private.channel_id),
+                &hex::encode(successor.pubkey),
+                &successor_id,
+                5,
+                true,
+                None,
+            )
+            .unwrap());
+        assert!(
+            !member_db.channel_rotate_is_pending(&successor_id).unwrap(),
+            "only the successor's owner can mint its epochs"
+        );
+
+        drop_handoff_test_db(member_db, member_path);
+        drop_handoff_test_db(db, path);
+    }
+
+    /// The nominee names the successor key, and a modified one can name this
+    /// room's own key or a room the follower already holds.
+    #[test]
+    fn a_handoff_cannot_loop_a_room_into_itself_or_into_a_room_from_elsewhere() {
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let (db, path) = handoff_test_db("unfit");
+        let room = ChannelIdentity::generate();
+        let room_id = hex::encode(room.channel_id);
+        let other = ChannelIdentity::generate();
+        let other_id = hex::encode(other.channel_id);
+        let elsewhere = "5e".repeat(16);
+        db.insert_channel(&room_id, &hex::encode(room.pubkey), "Room", "public", false, None, None)
+            .unwrap();
+        db.insert_channel(&other_id, &hex::encode(other.pubkey), "Other", "public", false, None, None)
+            .unwrap();
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE channels SET predecessor_id = ?2 WHERE channel_id = ?1",
+                params![other_id, elsewhere],
+            )
+            .unwrap();
+
+        assert!(!db
+            .apply_channel_handoff(&room_id, &hex::encode(room.pubkey), &room_id, 1, false, None)
+            .unwrap());
+        assert!(
+            !db.apply_channel_handoff(&room_id, &hex::encode(other.pubkey), &other_id, 1, false, None)
+                .unwrap(),
+            "a room another room was handed off to is not this one's successor"
+        );
+        let row = db.get_channel(&room_id).unwrap().unwrap();
+        assert!(row.successor_id.is_empty(), "the room is left where it was");
+        assert_eq!(db.get_channel(&other_id).unwrap().unwrap().predecessor_id, elsewhere);
+
+        // The owner refuses to commit to one in the first place.
+        let (owner_db, owner_path) = handoff_test_db("unfit-owner");
+        owner_db
+            .insert_channel(&room_id, &hex::encode(room.pubkey), "Room", "public", true, None, None)
+            .unwrap();
+        owner_db
+            .insert_channel(&other_id, &hex::encode(other.pubkey), "Other", "public", false, None, None)
+            .unwrap();
+        let nominee = "a1".repeat(32);
+        owner_db.set_channel_pending_handoff(&room_id, &nominee, 100).unwrap();
+        for successor in [room.pubkey, other.pubkey] {
+            assert_eq!(
+                owner_db
+                    .commit_channel_handoff(&room_id, &nominee, 100, &hex::encode(successor), 10)
+                    .unwrap(),
+                ChannelHandoffCommitOutcome::Unfit
+            );
+        }
+        assert!(owner_db.channel_handoff_commit(&room_id).unwrap().is_none());
+
+        drop_handoff_test_db(owner_db, owner_path);
+        drop_handoff_test_db(db, path);
+    }
+
+    /// A member who joined the successor on its own, by invite, before the
+    /// handoff record reached them: the room's record names it, so the old
+    /// room is pointed at it rather than left ownerless, and the history the
+    /// joined room already has is its own.
+    #[test]
+    fn a_handoff_links_a_successor_the_member_already_joined_without_copying_history() {
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let (db, path) = handoff_test_db("joined");
+        let room = ChannelIdentity::generate();
+        let room_id = hex::encode(room.channel_id);
+        let successor = ChannelIdentity::generate();
+        let successor_id = hex::encode(successor.channel_id);
+        db.insert_channel(&room_id, &hex::encode(room.pubkey), "Room", "public", false, None, None)
+            .unwrap();
+        db.insert_channel_message(&room_id, &"a1".repeat(32), "in", "hello", "m1", 100, "", true)
+            .unwrap();
+        db.insert_channel(
+            &successor_id,
+            &hex::encode(successor.pubkey),
+            "Room",
+            "public",
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !db.apply_claimed_channel_handoff(
+                &room_id,
+                &hex::encode(successor.pubkey),
+                &successor_id,
+                false,
+                None
+            )
+            .unwrap(),
+            "a claimant alone names the successor, so a room already held is refused"
+        );
+        assert!(db
+            .apply_channel_handoff(&room_id, &hex::encode(successor.pubkey), &successor_id, 1, false, None)
+            .unwrap());
+        assert_eq!(db.get_channel(&room_id).unwrap().unwrap().successor_id, successor_id);
+        assert_eq!(db.get_channel(&successor_id).unwrap().unwrap().predecessor_id, room_id);
+        assert!(
+            db.get_channel_messages(&successor_id, 100, None).unwrap().is_empty(),
+            "the old room's history is not copied into a room joined on its own"
+        );
+
+        // The owner adopts a found record naming one too; it only refuses to
+        // offer the room to one in the first place.
+        let (owner_db, owner_path) = handoff_test_db("joined-owner");
+        let owned = "4d".repeat(16);
+        owner_db
+            .insert_channel(&owned, &"d4".repeat(32), "Room", "public", true, None, None)
+            .unwrap();
+        let joined = ChannelIdentity::generate();
+        owner_db
+            .insert_channel(
+                &hex::encode(joined.channel_id),
+                &hex::encode(joined.pubkey),
+                "Joined",
+                "public",
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let nominee = "a1".repeat(32);
+        owner_db.set_channel_pending_handoff(&owned, &nominee, 100).unwrap();
+        assert_eq!(
+            owner_db
+                .commit_channel_handoff(&owned, &nominee, 100, &hex::encode(joined.pubkey), 10)
+                .unwrap(),
+            ChannelHandoffCommitOutcome::Unfit
+        );
+        assert!(owner_db
+            .confirm_channel_handoff(&owned, 100, &hex::encode(joined.pubkey), 10, true)
+            .unwrap());
+        assert!(owner_db.apply_owned_channel_handoff(&owned).unwrap());
+        assert_eq!(
+            owner_db.get_channel(&owned).unwrap().unwrap().successor_id,
+            hex::encode(joined.channel_id)
+        );
+
+        drop_handoff_test_db(owner_db, owner_path);
+        drop_handoff_test_db(db, path);
+    }
+
+    /// A confirmed commitment the transition refuses used to be retried on
+    /// every pass, each one signing the registry name over first, and blocked
+    /// banning or withdrawing for good. It is dropped instead, and a found
+    /// record naming such a successor is never adopted.
+    #[test]
+    fn a_confirmed_handoff_the_room_cannot_move_to_is_dropped() {
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let (db, path) = handoff_test_db("unfit-confirmed");
+        let room = ChannelIdentity::generate();
+        let room_id = hex::encode(room.channel_id);
+        db.insert_channel(&room_id, &hex::encode(room.pubkey), "Room", "public", true, None, None)
+            .unwrap();
+        assert!(
+            !db.confirm_channel_handoff(&room_id, 100, &hex::encode(room.pubkey), 10, true).unwrap(),
+            "a found record handing the room to itself"
+        );
+
+        let successor = ChannelIdentity::generate();
+        let successor_id = hex::encode(successor.channel_id);
+        let nominee = "a1".repeat(32);
+        db.set_channel_pending_handoff(&room_id, &nominee, 100).unwrap();
+        assert!(matches!(
+            db.commit_channel_handoff(&room_id, &nominee, 100, &hex::encode(successor.pubkey), 10)
+                .unwrap(),
+            ChannelHandoffCommitOutcome::Committed(_)
+        ));
+        assert!(db
+            .confirm_channel_handoff(&room_id, 100, &hex::encode(successor.pubkey), 12, false)
+            .unwrap());
+        // The successor turns up since, as a room some other handoff created.
+        db.insert_channel(
+            &successor_id,
+            &hex::encode(successor.pubkey),
+            "Other",
+            "public",
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE channels SET predecessor_id = ?2 WHERE channel_id = ?1",
+                params![successor_id, "5e".repeat(16)],
+            )
+            .unwrap();
+        assert!(db.completable_channel_handoff_commit(&room_id).unwrap().is_none());
+        assert!(db.channel_handoff_commit(&room_id).unwrap().is_none(), "dropped, not kept for retry");
+
+        assert!(db
+            .confirm_channel_handoff(&room_id, 200, &hex::encode(successor.pubkey), 20, true)
+            .is_ok_and(|adopted| !adopted));
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO channel_handoff_commits
+                    (channel_id, nominee, version, successor_pubkey, committed_at, confirmed)
+                 VALUES (?1, '', 300, ?2, 30, 1)",
+                params![room_id, hex::encode(successor.pubkey)],
+            )
+            .unwrap();
+        assert!(!db.apply_owned_channel_handoff(&room_id).unwrap());
+        assert!(
+            db.channel_handoff_commit(&room_id).unwrap().is_none(),
+            "the apply drops what the transition refuses"
+        );
+        assert!(db.get_channel(&room_id).unwrap().unwrap().is_owner, "and the room stays ours");
+
+        drop_handoff_test_db(db, path);
+    }
+
+    /// A record of ours that is stored is what the members follow, whether or
+    /// not we still mean it. Refusing one we withdrew, or whose nominee has
+    /// been banned since, left us behind in the old room, free to offer it
+    /// again and put a second successor beside the first.
+    #[test]
+    fn a_stored_handoff_is_adopted_even_once_withdrawn_or_its_nominee_banned() {
+        let (db, path) = handoff_test_db("withdrawn");
+        let room = "4c".repeat(16);
+        let nominee = "a1".repeat(32);
+        db.insert_channel(&room, &"d4".repeat(32), "Room", "public", true, None, None)
+            .unwrap();
+        db.upsert_channel_member(&room, &nominee, "Nominee", 1, None).unwrap();
+
+        db.set_channel_pending_handoff(&room, &nominee, 200).unwrap();
+        assert!(matches!(
+            db.commit_channel_handoff(&room, &nominee, 200, &"9c".repeat(32), 10).unwrap(),
+            ChannelHandoffCommitOutcome::Committed(_)
+        ));
+        db.set_channel_pending_handoff(&room, "", 0).unwrap();
+        assert!(db.channel_handoff_commit(&room).unwrap().is_none());
+        assert!(
+            db.confirm_channel_handoff(&room, 200, &"9C".repeat(32), 20, true).unwrap(),
+            "the record we withdrew is adopted when our fetch finds it stored"
+        );
+        let adopted = db.channel_handoff_commit(&room).unwrap().unwrap();
+        assert!(adopted.confirmed && adopted.nominee.is_empty());
+        assert!(db.apply_owned_channel_handoff(&room).unwrap(), "with no offer asked for");
+
+        let (banned_db, banned_path) = handoff_test_db("withdrawn-banned");
+        banned_db
+            .insert_channel(&room, &"d4".repeat(32), "Room", "public", true, None, None)
+            .unwrap();
+        banned_db.upsert_channel_member(&room, &nominee, "Nominee", 1, None).unwrap();
+        banned_db.set_channel_pending_handoff(&room, &nominee, 300).unwrap();
+        assert!(matches!(
+            banned_db.commit_channel_handoff(&room, &nominee, 300, &"8d".repeat(32), 30).unwrap(),
+            ChannelHandoffCommitOutcome::Committed(_)
+        ));
+        banned_db.apply_channel_ban_action(&room, &nominee, true, 35).unwrap();
+        assert!(
+            banned_db
+                .confirm_channel_handoff(&room, 300, &"8d".repeat(32), 40, false)
+                .unwrap(),
+            "an acknowledgement says it is stored, banned nominee or not"
+        );
+        assert!(banned_db.apply_owned_channel_handoff(&room).unwrap());
+
+        drop_handoff_test_db(banned_db, banned_path);
+        drop_handoff_test_db(db, path);
+    }
+
+    /// Members take the newest record they find, so an older one turning up
+    /// does not displace a commitment of ours that may still land after it —
+    /// until that one has lapsed without ever being seen stored.
+    #[test]
+    fn an_older_found_handoff_does_not_displace_a_newer_live_commitment() {
+        let (db, path) = handoff_test_db("older-found");
+        let room = "4e".repeat(16);
+        let nominee = "a1".repeat(32);
+        db.insert_channel(&room, &"d4".repeat(32), "Room", "public", true, None, None)
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let live = now as u64;
+        db.set_channel_pending_handoff(&room, &nominee, live).unwrap();
+        assert!(matches!(
+            db.commit_channel_handoff(&room, &nominee, live, &"9c".repeat(32), now).unwrap(),
+            ChannelHandoffCommitOutcome::Committed(_)
+        ));
+        assert!(!db
+            .confirm_channel_handoff(&room, live - 600, &"8d".repeat(32), now, true)
+            .unwrap());
+        assert_eq!(db.channel_handoff_commit(&room).unwrap().unwrap().version, live);
+        assert!(
+            db.confirm_channel_handoff(&room, live + 1, &"7e".repeat(32), now, true).unwrap(),
+            "a newer one is what the members take, so we take it too"
+        );
+
+        let (lapsed_db, lapsed_path) = handoff_test_db("older-found-lapsed");
+        lapsed_db
+            .insert_channel(&room, &"d4".repeat(32), "Room", "public", true, None, None)
+            .unwrap();
+        lapsed_db.set_channel_pending_handoff(&room, &nominee, 200).unwrap();
+        assert!(matches!(
+            lapsed_db.commit_channel_handoff(&room, &nominee, 200, &"9c".repeat(32), 10).unwrap(),
+            ChannelHandoffCommitOutcome::Committed(_)
+        ));
+        assert!(lapsed_db
+            .confirm_channel_handoff(&room, 150, &"8d".repeat(32), now, true)
+            .unwrap());
+        assert_eq!(lapsed_db.channel_handoff_commit(&room).unwrap().unwrap().version, 150);
+
+        drop_handoff_test_db(lapsed_db, lapsed_path);
+        drop_handoff_test_db(db, path);
+    }
+
+    /// A moderator's ban of the nominee leaves our commitment standing. The
+    /// handoff loop stops publishing it and, once it has looked and found
+    /// nothing stored, gives it up with the offer behind it. A followed claim
+    /// given up this way is declined by successor.
+    #[test]
+    fn a_banned_nominees_unstored_handoff_is_given_up() {
+        let (db, path) = handoff_test_db("banned-unstored");
+        let room = "4f".repeat(16);
+        let nominee = "a1".repeat(32);
+        db.insert_channel(&room, &"d4".repeat(32), "Room", "public", true, None, None)
+            .unwrap();
+        db.upsert_channel_member(&room, &nominee, "Nominee", 1, None).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        db.set_channel_pending_handoff(&room, &nominee, now as u64).unwrap();
+        let ChannelHandoffCommitOutcome::Committed(commit) = db
+            .commit_channel_handoff(&room, &nominee, now as u64, &"9c".repeat(32), now)
+            .unwrap()
+        else {
+            panic!("committed");
+        };
+        assert!(!db.drop_banned_channel_handoff_commit(&room, &commit, now).unwrap());
+        db.apply_channel_ban_action(&room, &nominee, true, now).unwrap();
+        let stale = ChannelHandoffCommit {
+            version: commit.version + 1,
+            ..commit.clone()
+        };
+        assert!(
+            !db.drop_banned_channel_handoff_commit(&room, &stale, now).unwrap(),
+            "only the commitment the caller looked at"
+        );
+        assert!(db.drop_banned_channel_handoff_commit(&room, &commit, now).unwrap());
+        assert!(db.channel_handoff_commit(&room).unwrap().is_none());
+        assert!(db.channel_pending_handoff(&room).unwrap().is_none());
+        assert!(
+            !Database::channel_claim_declined_locked(&db.conn.lock(), &room, &"9c".repeat(32)).unwrap(),
+            "an offer of ours is not a claim to decline"
+        );
+
+        // Confirmed means stored: that one is completed, not given up.
+        db.set_channel_pending_handoff(&room, &nominee, now as u64 + 1).unwrap();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO channel_handoff_commits
+                    (channel_id, nominee, version, successor_pubkey, committed_at, confirmed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                params![room, nominee, now + 1, "8d".repeat(32), now],
+            )
+            .unwrap();
+        let confirmed = db.channel_handoff_commit(&room).unwrap().unwrap();
+        assert!(!db.drop_banned_channel_handoff_commit(&room, &confirmed, now).unwrap());
+
+        drop_handoff_test_db(db, path);
+    }
+
+    /// Deleting a room mid-handoff used to leave its commitment for the handoff
+    /// loop to finish, which created the successor room on the device of the
+    /// user who had just destroyed its predecessor.
+    #[test]
+    fn deleting_a_room_mid_handoff_drops_the_handoff_with_it() {
+        let (db, path) = handoff_test_db("tombstone");
+        let room = "3b".repeat(16);
+        let nominee = "a1".repeat(32);
+        let successor_pk = "9c".repeat(32);
+        let successor_id = hex::encode(crate::network::ember::channel::channel_id_from_pubkey(
+            &[0x9c; 32],
+        ));
+        db.insert_channel(&room, &"d4".repeat(32), "Room", "public", true, None, None)
+            .unwrap();
+        db.set_channel_pending_handoff(&room, &nominee, 100).unwrap();
+        assert!(matches!(
+            db.commit_channel_handoff(&room, &nominee, 100, &successor_pk, 10).unwrap(),
+            ChannelHandoffCommitOutcome::Committed(_)
+        ));
+        assert!(db.confirm_channel_handoff(&room, 100, &successor_pk, 12, false).unwrap());
+
+        assert!(db.tombstone_channel(&room).unwrap());
+        assert!(db.channel_handoff_commit(&room).unwrap().is_none());
+        assert!(db.channel_pending_handoff(&room).unwrap().is_none());
+        assert!(!db.apply_owned_channel_handoff(&room).unwrap());
+        assert!(!db.confirm_channel_handoff(&room, 100, &successor_pk, 20, true).unwrap());
+        assert!(!db
+            .apply_channel_handoff(&room, &successor_pk, &successor_id, 100, false, None)
+            .unwrap());
+        assert!(
+            db.get_channel(&successor_id).unwrap().is_none(),
+            "no successor room appears for a room the user deleted"
+        );
+
+        drop_handoff_test_db(db, path);
+    }
+
+    /// Once the owner gives the room up its seed goes, and with it the only key
+    /// that can sign the record a member who was away needs. A copy is kept
+    /// for that alone, for a bounded time.
+    #[test]
+    fn an_owner_handoff_keeps_the_old_seed_only_to_republish_its_record() {
+        use crate::network::ember::channel::{ChannelIdentity, HANDOFF_RETIRED_KEEP_SECS};
+
+        let (db, path) = handoff_test_db("retired");
+        let room = ChannelIdentity::generate();
+        let room_id = hex::encode(room.channel_id);
+        let successor = ChannelIdentity::generate();
+        let successor_pk = hex::encode(successor.pubkey);
+        let nominee = "a1".repeat(32);
+        db.insert_channel(
+            &room_id,
+            &hex::encode(room.pubkey),
+            "Room",
+            "private",
+            true,
+            Some(&room.seed()),
+            Some(&[0x31; 32]),
+        )
+        .unwrap();
+        db.set_channel_pending_handoff(&room_id, &nominee, 100).unwrap();
+        assert!(matches!(
+            db.commit_channel_handoff(&room_id, &nominee, 100, &successor_pk, 10).unwrap(),
+            ChannelHandoffCommitOutcome::Committed(_)
+        ));
+        assert!(db.confirm_channel_handoff(&room_id, 100, &successor_pk, 12, false).unwrap());
+        assert!(db.apply_owned_channel_handoff(&room_id).unwrap());
+        assert!(db.load_channel_owner_seed(&room_id).unwrap().is_none());
+
+        let now = chrono::Utc::now().timestamp();
+        let retired = db.retired_channel_handoffs(now).unwrap();
+        assert_eq!(
+            retired,
+            vec![RetiredChannelHandoff {
+                channel_id: room_id.clone(),
+                channel_pubkey: hex::encode(room.pubkey),
+                version: 100,
+                successor_pubkey: successor_pk.clone(),
+                private: true,
+                owner_seed: Some(room.seed()),
+                retired_at: retired[0].retired_at,
+                published_at: 0,
+            }]
+        );
+        db.note_retired_channel_handoff_published(&room_id, now).unwrap();
+        assert_eq!(db.retired_channel_handoffs(now).unwrap()[0].published_at, now);
+
+        assert!(
+            db.retired_channel_handoffs(now + HANDOFF_RETIRED_KEEP_SECS + 60)
+                .unwrap()
+                .is_empty(),
+            "the seed is not kept past the republish period"
+        );
+
+        drop_handoff_test_db(db, path);
+    }
+
+    /// The stamp before an owner's silence is what a claim made during it
+    /// cites, and the next stamp replaces it; it is kept aside the moment the
+    /// owner comes back so a claim can still be checked against it.
+    #[test]
+    fn an_owner_back_from_a_claimable_silence_remembers_it() {
+        let (db, path) = handoff_test_db("silence");
+        let room = "2a".repeat(16);
+        let nominee = "A1".repeat(32);
+        db.insert_channel(&room, &"d4".repeat(32), "Room", "public", true, None, None)
+            .unwrap();
+        let day = 86_400i64;
+        let now = chrono::Utc::now().timestamp();
+        let last = now - 20 * day;
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE channels SET successor_nominee = ?2, claim_after_days = 14,
+                     owner_snapshot_at = ?3
+                 WHERE channel_id = ?1",
+                params![room, nominee, last],
+            )
+            .unwrap();
+
+        assert_eq!(db.stamp_owner_snapshot(&room, now).unwrap(), Some(now));
+        assert_eq!(
+            db.channel_owner_silence(&room).unwrap(),
+            Some(ChannelOwnerSilence {
+                nominee: nominee.to_ascii_lowercase(),
+                claim_after_days: 14,
+                silent_from: last,
+                silent_until: now,
+            })
+        );
+        db.stamp_owner_snapshot(&room, now + 60).unwrap();
+        assert_eq!(
+            db.channel_owner_silence(&room).unwrap().unwrap().silent_from,
+            last,
+            "an ordinary republish does not overwrite the silence"
+        );
+
+        let (quiet_db, quiet_path) = handoff_test_db("silence-short");
+        quiet_db
+            .insert_channel(&room, &"d4".repeat(32), "Room", "public", true, None, None)
+            .unwrap();
+        quiet_db
+            .conn
+            .lock()
+            .execute(
+                "UPDATE channels SET successor_nominee = ?2, claim_after_days = 14,
+                     owner_snapshot_at = ?3
+                 WHERE channel_id = ?1",
+                params![room, nominee, now - 13 * day],
+            )
+            .unwrap();
+        quiet_db.stamp_owner_snapshot(&room, now).unwrap();
+        assert!(
+            quiet_db.channel_owner_silence(&room).unwrap().is_none(),
+            "a silence shorter than the window is just a holiday"
+        );
+
+        // Following the claim commits the room to its claimant and withdraws
+        // anything pending; a second find leaves it alone.
+        db.set_channel_pending_handoff(&room, &"b2".repeat(32), now as u64).unwrap();
+        assert!(db.commit_claimed_channel_handoff(&room, &nominee, &"9c".repeat(32), now).unwrap());
+        assert!(!db.commit_claimed_channel_handoff(&room, &nominee, &"9c".repeat(32), now + 1).unwrap());
+        let commit = db.channel_handoff_commit(&room).unwrap().expect("committed");
+        assert!(commit.claimed && !commit.confirmed);
+        assert_eq!(commit.nominee, nominee.to_ascii_lowercase());
+        assert!(db.channel_pending_handoff(&room).unwrap().is_none());
+        assert!(
+            db.list_channel_handoff_commits().unwrap() == vec![(room.clone(), commit.clone())],
+            "listed the same way it is loaded"
+        );
+        let stored_nominee: String = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT nominee FROM channel_handoff_commits WHERE channel_id = ?1",
+                params![room],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            stored_nominee.is_empty(),
+            "a build that predates the claimant table reads it as one asking for no offer"
+        );
+        assert!(
+            db.set_channel_pending_handoff(&room, "", 0).is_err(),
+            "the members who honoured the claim have left; there is nothing to withdraw to"
+        );
+
+        drop_handoff_test_db(quiet_db, quiet_path);
+        drop_handoff_test_db(db, path);
+    }
+
+    /// A silence stands for claims found in the hour after we came back, and
+    /// only while the room still names the nominee it recorded. Kept longer,
+    /// it let a nominee publish a claim after we were back and have us follow.
+    #[test]
+    fn an_owner_forgets_its_silence_after_the_return_window_or_a_new_nomination() {
+        use crate::network::ember::channel::OWNER_RETURN_CLAIM_WINDOW_SECS;
+
+        let (db, path) = handoff_test_db("silence-settle");
+        let room = "2b".repeat(16);
+        let other_room = "2c".repeat(16);
+        let nominee = "a1".repeat(32);
+        let day = 86_400i64;
+        let now = chrono::Utc::now().timestamp();
+        for id in [&room, &other_room] {
+            db.insert_channel(id, &"d4".repeat(32), "Room", "public", true, None, None)
+                .unwrap();
+            db.conn
+                .lock()
+                .execute(
+                    "UPDATE channels SET successor_nominee = ?2, claim_after_days = 14,
+                         owner_snapshot_at = ?3
+                     WHERE channel_id = ?1",
+                    params![id, nominee, now - 20 * day],
+                )
+                .unwrap();
+            db.stamp_owner_snapshot(id, now).unwrap();
+            assert!(db.live_channel_owner_silence(id, now).unwrap().is_some());
+        }
+
+        assert!(db
+            .live_channel_owner_silence(&room, now + OWNER_RETURN_CLAIM_WINDOW_SECS - 1)
+            .unwrap()
+            .is_some());
+        db.stamp_owner_snapshot(&room, now + OWNER_RETURN_CLAIM_WINDOW_SECS).unwrap();
+        assert!(
+            db.channel_owner_silence(&room).unwrap().is_none(),
+            "a normal republish after the window clears it"
+        );
+
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE channels SET successor_nominee = ?2 WHERE channel_id = ?1",
+                params![other_room, "b2".repeat(32)],
+            )
+            .unwrap();
+        assert!(
+            db.live_channel_owner_silence(&other_room, now + 60).unwrap().is_none(),
+            "a claim by a nominee we have replaced is ours to refuse"
+        );
+        assert!(db.channel_owner_silence(&other_room).unwrap().is_none());
+
+        drop_handoff_test_db(db, path);
+    }
+
+    /// Two rotations racing for the same epoch number used to leave whichever
+    /// wrote last, though the first one's key may already have been sealed out
+    /// to every member.
+    #[test]
+    fn an_epoch_secret_once_held_is_never_replaced() {
+        let (db, path) = handoff_test_db("epoch-cas");
+        let channel_id = "3d".repeat(16);
+        db.insert_channel(&channel_id, &"4d".repeat(32), "Private", "private", true, None, None)
+            .unwrap();
+        db.insert_channel_key_epoch(&channel_id, 1, &[0x01u8; 32]).unwrap();
+        assert!(db.insert_channel_key_epoch(&channel_id, 1, &[0x02u8; 32]).is_err());
+        assert_eq!(
+            db.load_channel_key_epochs(&channel_id).unwrap(),
+            vec![(1, [0x01u8; 32])],
+            "the key sealed out first is the one kept"
+        );
+        db.insert_channel_key_epoch(&channel_id, 1, &[0x01u8; 32])
+            .expect("the same key again is a re-fetch");
+
+        drop_handoff_test_db(db, path);
+    }
+
+    /// The claimant rotates its successor on the spot. Leaving the owed mark
+    /// as well let the owned-room pass rotate it a second time, the two racing
+    /// for one epoch number; the mark is left only for a rotation that failed.
+    #[test]
+    fn a_claimed_successor_is_not_left_owing_a_second_rotation() {
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let (db, path) = handoff_test_db("claim-rotate");
+        let room = ChannelIdentity::generate();
+        let room_id = hex::encode(room.channel_id);
+        db.insert_channel(
+            &room_id,
+            &hex::encode(room.pubkey),
+            "Room",
+            "private",
+            false,
+            None,
+            Some(&[0x31; 32]),
+        )
+        .unwrap();
+        let successor = ChannelIdentity::generate();
+        let successor_id = hex::encode(successor.channel_id);
+        assert!(db
+            .apply_claimed_channel_handoff(
+                &room_id,
+                &hex::encode(successor.pubkey),
+                &successor_id,
+                true,
+                Some(&successor.seed()),
+            )
+            .unwrap());
+        let row = db.get_channel(&successor_id).unwrap().unwrap();
+        assert!(row.is_owner);
+        assert!(!db.channel_rotate_is_pending(&successor_id).unwrap());
+
+        drop_handoff_test_db(db, path);
+    }
+
     /// Rotation is only useful if the keys survive in a readable window and the
     /// window is actually bounded: too few and a member offline across a ban
     /// cannot read the gap, unbounded and every key a room ever used stays on
@@ -17168,7 +20661,7 @@ mod tests {
 
         // An out-of-order record must not demote the room: everything we send
         // next would be sealed under a key half the members have dropped.
-        db.insert_channel_key_epoch(&channel_id, total - 2, &[0xEEu8; 32])
+        db.insert_channel_key_epoch(&channel_id, total - kept, &[0xEEu8; 32])
             .expect("insert stale epoch");
         let row = db.get_channel(&channel_id).unwrap().unwrap();
         assert_eq!(row.key_epoch, total, "a late arrival cannot walk it back");

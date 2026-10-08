@@ -1,5 +1,7 @@
 <script lang="ts">
   import type { FileInfo } from '$lib/types';
+  import FileTypeIcon from '$lib/components/FileTypeIcon.svelte';
+  import { extensionFromPath, fileTypeKey } from '$lib/fileTypes';
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { ctxMenuPosition } from '$lib/actions/ctxMenu';
   import { formatSize, formatNumber, formatDateTime, formatDateWithYear as formatDate } from '$lib/utils';
@@ -74,6 +76,7 @@
     onToggleCheck,
     onToggleCheckAll,
     missingPaths = new Set<string>(),
+    highlight = '',
   }: {
     sortedFiles: FileInfo[];
     selectedPath: string | null;
@@ -95,7 +98,25 @@
     onToggleCheck?: (path: string, shiftKey: boolean) => void;
     onToggleCheckAll?: () => void;
     missingPaths?: Set<string>;
+    /** The search text the rows were filtered by, marked in each name. */
+    highlight?: string;
   } = $props();
+
+  let highlightLower = $derived(highlight.trim().toLowerCase());
+
+  /** `name` split around its first case-insensitive match of the search, the
+   *  same test the filter uses; `null` when there is nothing to mark. */
+  function splitOnMatch(name: string): [string, string, string] | null {
+    const q = highlightLower;
+    if (!q) return null;
+    const lower = name.toLowerCase();
+    // Lower-casing that changes the length (a few non-Latin letters) would
+    // put the index on the wrong characters of the original.
+    if (lower.length !== name.length) return null;
+    const at = lower.indexOf(q);
+    if (at < 0) return null;
+    return [name.slice(0, at), name.slice(at, at + q.length), name.slice(at + q.length)];
+  }
 
   // --- Virtualization ---
   const ROW_HEIGHT = 28;
@@ -646,13 +667,15 @@
             {/if}
             {#each visibleColumns as col (col.key)}
               {#if col.key === 'name'}
+                {@const nameParts = splitOnMatch(file.name)}
                 <td class="cell-name" title={missingPaths.has(file.path) ? m.library_row_missing_title({ path: file.path }) : file.path}>
+                  <FileTypeIcon kind={fileTypeKey(file.extension || extensionFromPath(file.path))} size={18} />
                   {#if missingPaths.has(file.path)}
                     <svg class="missing-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true">
                       <path d="M8 1.5 1 14h14z"/><line x1="8" y1="6.5" x2="8" y2="9.5"/><line x1="8" y1="11.5" x2="8" y2="11.5"/>
                     </svg>
                   {/if}
-                  {file.name}
+                  {#if nameParts}{nameParts[0]}<mark class="name-match">{nameParts[1]}</mark>{nameParts[2]}{:else}{file.name}{/if}
                 </td>
               {:else if col.key === 'size'}
                 <td class="cell-num">{formatSize(file.size)}</td>
@@ -893,16 +916,20 @@
     border-bottom-color: color-mix(in srgb, var(--accent) 22%, var(--border));
   }
 
-  .col-check {
+  /* `.lib-table` for specificity: `.lib-table th` would otherwise left-align
+     the header box while the rows' sat centred. */
+  .lib-table .col-check {
     width: 32px;
     min-width: 32px;
     max-width: 32px;
     text-align: center;
+    vertical-align: middle;
     padding: 0 4px !important;
   }
   .col-check input[type="checkbox"] {
+    display: block;
     cursor: pointer;
-    margin: 0;
+    margin: 0 auto;
   }
   .cell-num {
     text-align: right;
@@ -980,6 +1007,20 @@
      name so broken shares stand out passively (not just under the filter). */
   .row-missing .cell-name {
     color: var(--danger);
+  }
+  /* Inline so the name keeps the cell's ellipsis; centred on the 28 px row. */
+  .cell-name :global(.file-type-icon) {
+    vertical-align: middle;
+    margin: -2px 7px 0 0;
+  }
+  .row-missing .cell-name :global(.file-type-icon) {
+    opacity: 0.55;
+  }
+  .name-match {
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    color: inherit;
+    border-radius: 2px;
+    padding: 0 1px;
   }
   .row-missing :global(td:not(.cell-name)) {
     opacity: 0.55;

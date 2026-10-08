@@ -271,6 +271,16 @@ impl EmberObservedIpVotes {
         None
     }
 
+    /// Age votes out on the clock rather than only when the next one arrives.
+    ///
+    /// Without it a node no one is ponging kept reporting a confirmation whose
+    /// votes had all lapsed, and when a vote finally came the lapse was dated
+    /// then, so a rival was held to the old peak for a vote lifetime counted
+    /// from that late moment instead of from when the quorum actually went.
+    pub fn expire(&mut self) {
+        self.prune(Instant::now());
+    }
+
     /// Drop votes and addresses that have aged out.
     fn prune(&mut self, now: Instant) {
         self.votes.retain(|_, v| {
@@ -877,6 +887,35 @@ mod tests {
             votes.votes.len() <= MAX_TRACKED_ADDRS,
             "tracked {} addresses, above the cap",
             votes.votes.len()
+        );
+    }
+
+    /// A confirmation whose votes lapse while nobody votes is dropped when the
+    /// clock says so, and the rival hold runs from that moment, not from the
+    /// next vote.
+    #[test]
+    fn a_quiet_confirmation_lapses_on_the_clock() {
+        let mut votes = EmberObservedIpVotes::new();
+        let current = addr(50, 4672);
+        let rival = addr(51, 4672);
+        let t0 = Instant::now();
+        votes.record_vote_at(current, reporter(1, 0, 1), t0);
+        votes.record_vote_at(current, reporter(1, 1, 1), t0);
+        votes.record_vote_at(current, reporter(1, 2, 1), t0);
+        assert_eq!(votes.confirmed(), Some(current));
+
+        let lapse = t0 + VOTE_TTL + Duration::from_secs(1);
+        votes.prune(lapse);
+        assert_eq!(votes.confirmed(), None, "no live vote backs it any more");
+
+        let later = lapse + VOTE_TTL + Duration::from_secs(1);
+        votes.prune(later);
+        votes.record_vote_at(rival, reporter(9, 0, 1), later);
+        votes.record_vote_at(rival, reporter(9, 1, 1), later);
+        assert_eq!(
+            votes.record_vote_at(rival, reporter(9, 2, 1), later),
+            Some(rival),
+            "the lapse aged out a vote lifetime after it happened"
         );
     }
 }

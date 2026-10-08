@@ -1,7 +1,7 @@
 //! Once-a-second housekeeping that lives outside the network event loop.
 //!
-//! Three jobs, all of which have to happen on a clock rather than in response
-//! to a command:
+//! Jobs that all have to happen on a clock rather than in response to a
+//! command:
 //!
 //! - **Bandwidth schedule.** A window opens at 23:00 with nobody at the
 //!   keyboard, so the caps have to be re-resolved on a tick.
@@ -9,6 +9,10 @@
 //!   stop — again with nobody watching.
 //! - **Tray tooltip.** The one status surface available while the window is
 //!   hidden.
+//! - **Taskbar progress.** The download list as one bar on the taskbar button,
+//!   red while something needs the user.
+//! - **Low disk space.** A download drive running out of space is reported
+//!   before downloads stop on it.
 //!
 //! Deliberately *not* folded into `network/mod.rs`'s `stats_timer`: nothing
 //! here touches network state, and that loop's arms already run long enough
@@ -16,15 +20,38 @@
 //! starts slipping. This task only reads shared state — the config lock, the
 //! transfer manager, the bandwidth limiter — and never sends a network command.
 
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::FutureExt;
+use tauri::window::{ProgressBarState, ProgressBarStatus};
 use tauri::{Emitter, Manager};
 
 use crate::app_state::AppState;
 use crate::bandwidth::schedule;
 use crate::power::WakeLock;
+use crate::sharing::manager::TransferManager;
 use crate::types::{RuntimeStatus, TransferDirection, TransferHealth, TransferStatus};
+
+/// How often the download drive's free space is read while downloads run.
+const DISK_CHECK_EVERY: u32 = 30;
+const MIB: u64 = 1024 * 1024;
+
+/// Set when the main window gains focus. Whatever had failed has had a chance
+/// to be seen, so the taskbar stops asking for attention over it.
+static MAIN_WINDOW_FOCUSED: AtomicBool = AtomicBool::new(false);
+/// Whether the main window has focus now. A download that fails while the
+/// user is looking at Ember has been seen as it happened.
+static MAIN_WINDOW_HAS_FOCUS: AtomicBool = AtomicBool::new(false);
+
+pub fn note_main_window_focus(focused: bool) {
+    MAIN_WINDOW_HAS_FOCUS.store(focused, Ordering::Release);
+    if focused {
+        MAIN_WINDOW_FOCUSED.store(true, Ordering::Release);
+    }
+}
 
 /// Housekeeping cadence. One second matches the limiter's own speed tick, and
 /// is the coarsest interval at which a schedule boundary still lands within a
@@ -75,6 +102,12 @@ async fn run(app: tauri::AppHandle) {
     let mut applied_limits: Option<(u64, u64)> = None;
     let mut applied_tooltip: Option<String> = None;
     let mut holding_wake_lock = false;
+    let mut applied_taskbar: Option<Taskbar> = None;
+    // Failed downloads the user has had a chance to see; `None` until the
+    // last session's rows are back, so those do not count as news.
+    let mut failures_seen: Option<usize> = None;
+    let mut disk = DiskWatch::default();
+    let mut ticks: u32 = 0;
 
     let mut ticker = tokio::time::interval(TICK);
     // Skip, not Burst: after a runtime stall (or a machine resuming from the
@@ -94,12 +127,16 @@ async fn run(app: tauri::AppHandle) {
             continue;
         };
 
+        ticks = ticks.wrapping_add(1);
         let (weekday, minute) = schedule::local_now();
-        let (resolved, prevent_sleep) = {
+        let (resolved, prevent_sleep, alt_speed, low_disk_mb, download_folder) = {
             let config = state.config.read().await;
             (
                 schedule::resolve_settings(&config.settings, weekday, minute),
                 config.settings.prevent_sleep_while_active,
+                config.settings.alt_speed_enabled,
+                config.settings.low_disk_warning_mb,
+                config.settings.download_folder.clone(),
             )
         };
 
@@ -122,22 +159,80 @@ async fn run(app: tauri::AppHandle) {
                     previous.0,
                     target.1,
                     previous.1,
-                    resolved
-                        .active
-                        .as_ref()
-                        .map(|rule| format!("schedule rule {}", rule.id))
-                        .unwrap_or_else(|| "manual limits".to_string()),
+                    if alt_speed {
+                        "alternative limits".to_string()
+                    } else {
+                        resolved
+                            .active
+                            .as_ref()
+                            .map(|rule| format!("schedule rule {}", rule.id))
+                            .unwrap_or_else(|| "manual limits".to_string())
+                    },
                 );
             }
             applied_limits = Some(target);
         }
 
         let working = count_working_transfers(&state).await;
+        let disk_check_due = ticks.is_multiple_of(DISK_CHECK_EVERY);
+        let (pending, outstanding, progress, failed, insufficient, restored, part_folders) = {
+            let manager = state.transfer_manager.read().await;
+            let (failed, insufficient) = needs_attention(&manager);
+            let part_folders: Vec<PathBuf> = if disk_check_due {
+                crate::finish_action::pending_download_rows(&manager)
+                    .filter_map(|t| crate::storage::part_folders::located_folder(&t.id))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (
+                crate::finish_action::pending_downloads(&manager),
+                crate::finish_action::outstanding_downloads(&manager),
+                download_progress(&manager),
+                failed,
+                insufficient,
+                manager.restored,
+                part_folders,
+            )
+        };
+        crate::finish_action::tick(&app, outstanding);
+
+        let focused = MAIN_WINDOW_FOCUSED.swap(false, Ordering::AcqRel);
+        if focused || MAIN_WINDOW_HAS_FOCUS.load(Ordering::Acquire) || !restored {
+            failures_seen = restored.then_some(failed);
+        }
+        if focused {
+            // Showing the window again can give it a fresh taskbar button
+            // with no progress on it.
+            applied_taskbar = None;
+        }
+        // A failed row cleared from the list is not a failure seen.
+        let seen = failures_seen.get_or_insert(failed);
+        *seen = (*seen).min(failed);
+        let taskbar = Taskbar::of(pending, progress, insufficient > 0 || failed > *seen);
+        if applied_taskbar != Some(taskbar) {
+            set_taskbar(&app, taskbar);
+            applied_taskbar = Some(taskbar);
+        }
+
+        let disk_due = (disk_check_due && pending > 0).then(|| {
+            let mut folders = vec![PathBuf::from(&download_folder)];
+            folders.extend(part_folders);
+            folders
+        });
+        for warning in disk.tick(disk_due, pending > 0, low_disk_mb).await {
+            if let Err(error) = app.emit("disk-space-low", &warning) {
+                tracing::debug!("Could not emit the low disk space warning: {error}");
+            }
+        }
         // `sleep_inhibit_supported` is part of the condition rather than only a
         // display flag: on a platform with no implementation `set` is a no-op,
         // so without it `holding_wake_lock` would report an inhibitor that was
         // never taken.
-        let want_awake = sleep_inhibit_supported && prevent_sleep && working > 0;
+        let want_awake = sleep_inhibit_supported
+            && prevent_sleep
+            && working > 0
+            && !crate::finish_action::wake_lock_held_off();
         if want_awake != holding_wake_lock {
             wake_lock.set(want_awake);
             holding_wake_lock = want_awake;
@@ -153,6 +248,7 @@ async fn run(app: tauri::AppHandle) {
             effective_upload_speed: state.bandwidth_limiter.effective_upload_rate(),
             effective_download_speed: target.1,
             schedule: resolved.active,
+            alt_speed,
             sleep_inhibit_supported,
             // What the OS accepted, not what was asked for: a refused
             // `SetThreadExecutionState` is backed off rather than retried every
@@ -220,6 +316,236 @@ async fn count_working_transfers(state: &AppState) -> usize {
         .count()
 }
 
+/// Failed downloads on the list, and downloads held for want of disk space.
+fn needs_attention(manager: &TransferManager) -> (usize, usize) {
+    let failed = manager
+        .completed
+        .iter()
+        .filter(|t| t.direction == TransferDirection::Download && t.status == TransferStatus::Failed)
+        .count();
+    let insufficient = manager
+        .active
+        .values()
+        .chain(manager.queue.iter())
+        .filter(|t| t.direction == TransferDirection::Download && t.status == TransferStatus::Insufficient)
+        .count();
+    (failed, insufficient)
+}
+
+/// Bytes done and bytes in all, over the downloads that will still finish on
+/// their own.
+fn download_progress(manager: &TransferManager) -> (u64, u64) {
+    crate::finish_action::pending_download_rows(manager).fold((0, 0), |(done, total), t| {
+        (
+            done.saturating_add(t.completed_size.min(t.total_size)),
+            total.saturating_add(t.total_size),
+        )
+    })
+}
+
+/// What the taskbar button shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Taskbar {
+    Off,
+    Progress { percent: u64, attention: bool },
+}
+
+impl Taskbar {
+    /// With nothing left to download but something needing the user, a full
+    /// red bar.
+    fn of(pending: usize, (done, total): (u64, u64), attention: bool) -> Self {
+        if pending == 0 && !attention {
+            return Taskbar::Off;
+        }
+        let percent = if pending == 0 {
+            100
+        } else if total == 0 {
+            0
+        } else {
+            u64::try_from(u128::from(done) * 100 / u128::from(total)).unwrap_or(100)
+        };
+        Taskbar::Progress {
+            percent: percent.min(100),
+            attention,
+        }
+    }
+}
+
+fn set_taskbar(app: &tauri::AppHandle, taskbar: Taskbar) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let state = match taskbar {
+        Taskbar::Off => ProgressBarState {
+            status: Some(ProgressBarStatus::None),
+            progress: None,
+        },
+        Taskbar::Progress { percent, attention } => ProgressBarState {
+            status: Some(if attention {
+                ProgressBarStatus::Error
+            } else {
+                ProgressBarStatus::Normal
+            }),
+            progress: Some(percent),
+        },
+    };
+    if let Err(error) = window.set_progress_bar(state) {
+        tracing::debug!("Could not set the taskbar progress: {error}");
+    }
+}
+
+/// The `disk-space-low` event.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiskSpaceLow {
+    path: String,
+    free_bytes: u64,
+}
+
+/// One drive's free space, as read through the first folder found on it.
+struct VolumeReading {
+    volume: String,
+    path: String,
+    free: u64,
+}
+
+/// Free space on the drives downloads are written to, read off the monitor's
+/// own task: a network drive can take a long time to answer.
+#[derive(Default)]
+struct DiskWatch {
+    probe: Option<tokio::task::JoinHandle<Vec<VolumeReading>>>,
+    /// Drives already warned about, by [`volume_key`].
+    warned: HashSet<String>,
+}
+
+impl DiskWatch {
+    /// `due` carries the folders to read when a reading is due: the download
+    /// folder and every earlier one still holding a download's part files.
+    async fn tick(
+        &mut self,
+        due: Option<Vec<PathBuf>>,
+        downloading: bool,
+        threshold_mb: u32,
+    ) -> Vec<DiskSpaceLow> {
+        let threshold = u64::from(threshold_mb).saturating_mul(MIB);
+        let mut warnings = Vec::new();
+        if let Some(probe) = self.probe.take_if(|probe| probe.is_finished()) {
+            if let Ok(readings) = probe.await {
+                // A drive no longer downloaded to is forgotten, so going back
+                // to it while it is still low warns again.
+                self.warned
+                    .retain(|volume| readings.iter().any(|r| &r.volume == volume));
+                for reading in readings {
+                    let mut warned = self.warned.contains(&reading.volume);
+                    if crossed_below(&mut warned, reading.free, threshold) {
+                        warnings.push(DiskSpaceLow {
+                            path: reading.path,
+                            free_bytes: reading.free,
+                        });
+                    }
+                    if warned {
+                        self.warned.insert(reading.volume);
+                    } else {
+                        self.warned.remove(&reading.volume);
+                    }
+                }
+            }
+        }
+        // With nothing downloading there are no readings to clear a warning,
+        // so a drive that recovered meanwhile would never warn again.
+        if threshold == 0 || !downloading {
+            self.warned.clear();
+        } else if let Some(folders) = due.filter(|_| self.probe.is_none()) {
+            self.probe = Some(tokio::task::spawn_blocking(move || read_volumes(folders)));
+        }
+        warnings
+    }
+}
+
+/// Free space per drive, each drive read once however many folders are on it.
+fn read_volumes(folders: Vec<PathBuf>) -> Vec<VolumeReading> {
+    let mut readings: Vec<VolumeReading> = Vec::new();
+    for folder in folders {
+        let Some(existing) = existing_ancestor(&folder) else {
+            continue;
+        };
+        let Some(volume) = volume_key(existing) else {
+            continue;
+        };
+        if readings.iter().any(|r| r.volume == volume) {
+            continue;
+        }
+        if let Ok(free) = fs2::available_space(existing) {
+            readings.push(VolumeReading {
+                volume,
+                path: folder.to_string_lossy().into_owned(),
+                free,
+            });
+        }
+    }
+    readings
+}
+
+/// What tells two folders' drives apart: the device on Unix, the drive or
+/// share on Windows.
+#[cfg(unix)]
+fn volume_key(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.dev().to_string())
+}
+
+#[cfg(windows)]
+fn volume_key(path: &Path) -> Option<String> {
+    use std::path::Prefix;
+    let std::path::Component::Prefix(prefix) = path.components().next()? else {
+        return None;
+    };
+    // `\\?\C:` and `C:` are one drive, as are `\\?\UNC\server\share` and
+    // `\\server\share`.
+    Some(match prefix.kind() {
+        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+            format!("{}:", char::from(letter).to_ascii_uppercase())
+        }
+        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => format!(
+            r"\\{}\{}",
+            server.to_string_lossy().to_uppercase(),
+            share.to_string_lossy().to_uppercase()
+        ),
+        _ => prefix.as_os_str().to_string_lossy().to_uppercase(),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn volume_key(path: &Path) -> Option<String> {
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// Whether `free` has just gone under `threshold`. Once warned, it has to
+/// climb a quarter above the threshold before it can warn again, so a drive
+/// hovering at the line does not warn every half minute.
+fn crossed_below(warned: &mut bool, free: u64, threshold: u64) -> bool {
+    if threshold == 0 {
+        return false;
+    }
+    if free < threshold {
+        let first = !*warned;
+        *warned = true;
+        first
+    } else {
+        if free >= threshold.saturating_add(threshold / 4) {
+            *warned = false;
+        }
+        false
+    }
+}
+
+/// The nearest part of `path` that exists: the folder may not have been
+/// created yet.
+fn existing_ancestor(path: &Path) -> Option<&Path> {
+    path.ancestors()
+        .find(|p| !p.as_os_str().is_empty() && p.exists())
+}
+
 /// Tooltip for the tray icon: the current rates, or just the app name when
 /// nothing is moving.
 ///
@@ -233,6 +559,16 @@ fn tray_tooltip(state: &AppState, working: usize) -> String {
     if let Some(secs) = crate::auto_update::silent::countdown_remaining_secs() {
         return format!(
             "Ember\n\u{27F3} {}",
+            crate::auto_update::silent::format_countdown(secs)
+        );
+    }
+    if let Some((action, secs)) = crate::finish_action::countdown_remaining_secs() {
+        let symbol = match action {
+            crate::finish_action::FinishAction::Sleep => '\u{263E}',
+            _ => '\u{2715}',
+        };
+        return format!(
+            "Ember\n{symbol} {}",
             crate::auto_update::silent::format_countdown(secs)
         );
     }
@@ -331,10 +667,14 @@ pub fn apply_effective_limits(
         published.effective_upload_speed = upload_in_force;
         published.effective_download_speed = resolved.max_download_speed;
         published.schedule = resolved.active;
+        published.alt_speed = settings.alt_speed_enabled;
         published.clone()
     };
     if let Err(error) = app.emit("ember:runtime-status", &status) {
         tracing::debug!("Could not emit runtime status after a settings save: {error}");
+    }
+    if crate::tray::note_alt_speed(settings.alt_speed_enabled) {
+        crate::auto_update::silent::rebuild_tray_menu(app);
     }
 }
 
@@ -370,6 +710,7 @@ fn resolved_status(settings: &crate::types::AppSettings) -> RuntimeStatus {
         effective_upload_speed: resolved.max_upload_speed,
         effective_download_speed: resolved.max_download_speed,
         schedule: resolved.active,
+        alt_speed: settings.alt_speed_enabled,
         sleep_inhibit_supported: crate::power::supported(),
         sleep_inhibit_held: false,
     }
@@ -390,5 +731,62 @@ mod tests {
         assert_eq!(format_rate(1_000_000), "1.0 MB/s");
         assert_eq!(format_rate(12_300_000), "12.3 MB/s");
         assert_eq!(format_rate(2_500_000_000), "2.50 GB/s");
+    }
+
+    #[test]
+    fn the_disk_warning_comes_once_per_dip() {
+        let mut warned = false;
+        let threshold = 1000;
+        assert!(!crossed_below(&mut warned, 5000, threshold));
+        assert!(crossed_below(&mut warned, 999, threshold));
+        assert!(!crossed_below(&mut warned, 500, threshold), "already said");
+        assert!(!crossed_below(&mut warned, 1100, threshold));
+        assert!(!crossed_below(&mut warned, 900, threshold), "hovering at the line");
+        assert!(!crossed_below(&mut warned, 1250, threshold));
+        assert!(crossed_below(&mut warned, 900, threshold), "climbed clear, then fell again");
+        assert!(!crossed_below(&mut warned, 0, 0), "off");
+    }
+
+    #[test]
+    fn folders_on_one_drive_are_read_and_warned_about_once() {
+        let base = std::env::temp_dir();
+        let readings = read_volumes(vec![
+            base.join("ember-not-created-yet").join("Downloads"),
+            base.clone(),
+        ]);
+        assert_eq!(readings.len(), 1, "one drive, one reading");
+        assert!(readings[0].path.ends_with("Downloads"), "named by the first folder on it");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_path_is_the_same_drive_as_the_plain_one() {
+        assert_eq!(volume_key(Path::new(r"\\?\c:\Downloads")), volume_key(Path::new(r"C:\Other")));
+        assert_eq!(
+            volume_key(Path::new(r"\\?\UNC\nas\media\a")),
+            volume_key(Path::new(r"\\NAS\Media\b"))
+        );
+        assert_ne!(volume_key(Path::new(r"C:\")), volume_key(Path::new(r"D:\")));
+    }
+
+    #[test]
+    fn the_taskbar_shows_downloads_and_what_needs_the_user() {
+        assert_eq!(Taskbar::of(0, (0, 0), false), Taskbar::Off);
+        assert_eq!(
+            Taskbar::of(2, (250, 1000), false),
+            Taskbar::Progress { percent: 25, attention: false }
+        );
+        assert_eq!(
+            Taskbar::of(0, (0, 0), true),
+            Taskbar::Progress { percent: 100, attention: true }
+        );
+        assert_eq!(
+            Taskbar::of(1, (0, 0), false),
+            Taskbar::Progress { percent: 0, attention: false }
+        );
+        assert_eq!(
+            Taskbar::of(1, (u64::MAX, u64::MAX), false),
+            Taskbar::Progress { percent: 100, attention: false }
+        );
     }
 }

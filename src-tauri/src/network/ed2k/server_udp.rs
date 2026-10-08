@@ -34,8 +34,10 @@ pub const SRV_UDPFLG_TCPOBFUSCATION: u32 = 0x0400;
 const MIN_PING_INTERVAL_SECS: i64 = 5;
 /// Normal server status ping interval (4.5 hours)
 pub const STAT_REASK_INTERVAL_SECS: i64 = 16200;
-
-const MAX_TRACKED_SERVERS: usize = 500;
+/// How long a status ping's challenge waits for its reply. eMule gives a
+/// crypt ping 20 s (`ServerList.cpp`); pings go out at most every 200 ms,
+/// so this also bounds the map to a few hundred entries.
+const CHALLENGE_REPLY_WINDOW_SECS: i64 = 60;
 
 /// Wrap a plain server UDP packet in eMule's UDP-obfuscation envelope
 /// when the destination server has both advertised the capability AND
@@ -69,18 +71,40 @@ fn maybe_obfuscate_packet(
     (encrypted, wire_addr)
 }
 
+/// One step of draining the server UDP socket.
+pub enum ServerUdpRecv {
+    Packet(usize, ServerUdpResponse),
+    /// A datagram we cannot use, or a receive error that says nothing about
+    /// the datagrams behind it. Keep draining.
+    Skipped,
+    /// Nothing left to read.
+    Drained,
+}
+
 pub struct ServerUdpSocket {
     socket: Arc<UdpSocket>,
-    last_ping_times: std::collections::HashMap<SocketAddr, i64>,
-    /// Pending UDP challenge values per server (eMule: anti-spoof)
-    pending_challenges: std::collections::HashMap<SocketAddr, u32>,
+    /// Challenge and send time of each status ping awaiting its reply,
+    /// keyed by canonical server addr (eMule: anti-spoof).
+    pending_challenges: std::collections::HashMap<SocketAddr, (u32, i64)>,
+}
+
+/// Whether `server` is due a status ping at `now`, judged by the
+/// per-server time `send_status_ping`'s caller records on the entry.
+///
+/// eMule's UDPSERVSTATREASKTIME. The caller ticks every 200 ms so a queued
+/// `OP_GLOBGETSOURCES` is never left sitting in the socket buffer, and relies
+/// on this gate for the actual cadence. Public servers rate-limit and
+/// blacklist clients that ping more often, which silently kills UDP source
+/// discovery — the thing the pings exist to support.
+pub fn status_ping_due(server: &ServerEntry, now: i64) -> bool {
+    server.last_udp_ping_at == 0
+        || now - server.last_udp_ping_at >= STAT_REASK_INTERVAL_SECS.max(MIN_PING_INTERVAL_SECS)
 }
 
 impl ServerUdpSocket {
     pub fn from_socket(socket: UdpSocket) -> Self {
         Self {
             socket: Arc::new(socket),
-            last_ping_times: std::collections::HashMap::new(),
             pending_challenges: std::collections::HashMap::new(),
         }
     }
@@ -92,7 +116,15 @@ impl ServerUdpSocket {
 
     /// Remove and return a pending challenge for the given address (for verification).
     pub fn take_challenge(&mut self, addr: &SocketAddr) -> Option<u32> {
-        self.pending_challenges.remove(addr)
+        self.pending_challenges
+            .remove(addr)
+            .map(|(challenge, _)| challenge)
+    }
+
+    fn remember_challenge(&mut self, addr: SocketAddr, challenge: u32, now: i64) {
+        self.pending_challenges
+            .retain(|_, (_, sent)| now - *sent < CHALLENGE_REPLY_WINDOW_SECS);
+        self.pending_challenges.insert(addr, (challenge, now));
     }
 
     /// Build a single-file get-sources packet. Returns (packet, addr).
@@ -278,12 +310,21 @@ impl ServerUdpSocket {
         Some((wire_packet, wire_addr))
     }
 
-    pub async fn send_status_ping(&mut self, server: &ServerEntry) -> anyhow::Result<usize> {
+    /// Ping `server` if [`status_ping_due`], returning the bytes sent (0 when
+    /// not due). The caller records `now` on the entry after a send.
+    pub async fn send_status_ping(
+        &mut self,
+        server: &ServerEntry,
+        now: i64,
+    ) -> anyhow::Result<usize> {
+        if !status_ping_due(server, now) {
+            return Ok(0);
+        }
         let udp_port = server.port.checked_add(4).ok_or_else(|| {
             anyhow::anyhow!("Server port {} too high for UDP offset", server.port)
         })?;
         // `plain_addr` is the **canonical** server addr (TCP port + 4).
-        // We use it as the cooldown / challenge tracking key so the
+        // We use it as the challenge tracking key so the
         // recv path — which canonicalises obfuscated source addrs to
         // this same value — finds the matching challenge regardless
         // of whether the reply came from `obfuscation_port_udp` or
@@ -309,25 +350,6 @@ impl ServerUdpSocket {
             wire_addr.set_port(server.obfuscation_port_udp);
         }
 
-        let now = chrono::Utc::now().timestamp();
-        // Dedup keyed by the canonical (plain) addr — so toggling
-        // obfuscation on/off for a server doesn't bypass the
-        // cooldown by switching to a "different" key.
-        // eMule's UDPSERVSTATREASKTIME. The caller ticks every 200 ms so a
-        // queued `OP_GLOBGETSOURCES` is never left sitting in the socket
-        // buffer, and relies on this per-server gate for the actual cadence —
-        // so the gate has to be the real one. Using `MIN_PING_INTERVAL_SECS`
-        // (a 5-second floor meant for on-demand pings) made that fast tick
-        // the cadence instead, hammering every server in the list every few
-        // seconds forever. Public servers rate-limit and blacklist for that,
-        // which silently kills UDP source discovery — the thing the pings
-        // exist to support.
-        if let Some(&last) = self.last_ping_times.get(&plain_addr) {
-            if now - last < STAT_REASK_INTERVAL_SECS.max(MIN_PING_INTERVAL_SECS) {
-                return Ok(0);
-            }
-        }
-
         // eMule: send 4-byte random challenge with status ping (anti-spoof).
         // CSPRNG (OsRng) so the anti-spoof value is unpredictable.
         let challenge = rand::RngCore::next_u32(&mut rand::rngs::OsRng).wrapping_add(1);
@@ -343,34 +365,7 @@ impl ServerUdpSocket {
         };
 
         let sent = self.socket.send_to(&wire_packet, wire_addr).await?;
-        // Tracking keyed by canonical addr — see comment above.
-        self.last_ping_times.insert(plain_addr, now);
-        self.pending_challenges.insert(plain_addr, challenge);
-
-        if self.last_ping_times.len() > MAX_TRACKED_SERVERS {
-            // Evict oldest-first rather than by age. The ping gate above only
-            // sends when the previous ping is older than `STAT_REASK_INTERVAL`
-            // and stamps `now` on success, so every surviving entry is younger
-            // than that cutoff by construction — an age-based `retain` could
-            // never remove anything and `MAX_TRACKED_SERVERS` bounded nothing
-            // for a server list over 500 entries.
-            let excess = self.last_ping_times.len() - MAX_TRACKED_SERVERS;
-            let mut by_age: Vec<(SocketAddr, i64)> = self
-                .last_ping_times
-                .iter()
-                .map(|(addr, ts)| (*addr, *ts))
-                .collect();
-            by_age.sort_unstable_by_key(|(_, ts)| *ts);
-            for (addr, _) in by_age.into_iter().take(excess) {
-                // Never drop the entry we just made; it is the newest, so this
-                // only matters if the cap is somehow at zero.
-                if addr == plain_addr {
-                    continue;
-                }
-                self.last_ping_times.remove(&addr);
-                self.pending_challenges.remove(&addr);
-            }
-        }
+        self.remember_challenge(plain_addr, challenge, now);
         debug!(
             "Sent status ping to {}:{} (challenge=0x{challenge:08X})",
             server.ip, server.port
@@ -388,63 +383,14 @@ impl ServerUdpSocket {
     /// per category) and under-counting (the previous SourceExchange
     /// estimate was `sources.len() * 10`, missing the packet header
     /// and per-source overhead).
-    /// Backwards-compatible plain-only receive. Used by tests; live
-    /// recv goes through `try_recv_with` so we can attempt UDP
-    /// obfuscation decryption when the first byte ≠ `0xE3`.
-    #[allow(dead_code)]
+    /// Plain-only receive for tests; live recv goes through `try_recv_with`
+    /// so we can attempt UDP obfuscation decryption when the first byte ≠
+    /// `0xE3`.
+    #[cfg(test)]
     pub async fn try_recv(&self) -> Option<(usize, ServerUdpResponse)> {
-        self.try_recv_with(|_ip, _port| None).await
-    }
-
-    // `recv_packet` / `process_received` were drafted as building
-    // blocks for an event-driven recv arm but the actual integration
-    // shortened the existing ping timer's interval instead (cleaner
-    // diff against the giant inline dispatch block). Kept as
-    // `#[cfg(test)]`-only helpers below so the API surface is still
-    // tested even though prod uses `try_recv_with` from the timer.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub async fn recv_packet(&self) -> std::io::Result<(Vec<u8>, SocketAddr)> {
-        let mut buf = [0u8; 65536];
-        let (len, addr) = self.socket.recv_from(&mut buf).await?;
-        Ok((buf[..len].to_vec(), addr))
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub fn process_received<F>(
-        data: &[u8],
-        addr: SocketAddr,
-        key_lookup: F,
-    ) -> Option<(usize, ServerUdpResponse)>
-    where
-        F: Fn(Ipv4Addr, u16) -> Option<(u32, u16)>,
-    {
-        let len = data.len();
-        if len < 2 {
-            return None;
-        }
-        if data[0] == OP_EDONKEYPROT {
-            return parse_server_udp_response(&data[1..], addr).map(|resp| (len, resp));
-        }
-        let src_ip = match addr.ip() {
-            std::net::IpAddr::V4(v4) => v4,
-            _ => return None,
-        };
-        let (base_key, tcp_port) = key_lookup(src_ip, addr.port())?;
-        if base_key == 0 {
-            return None;
-        }
-        use super::server_obfuscation::{decrypt_received_server, DecryptOutcome};
-        match decrypt_received_server(data, base_key) {
-            DecryptOutcome::Decrypted(plain) => {
-                if plain.len() < 2 || plain[0] != OP_EDONKEYPROT {
-                    return None;
-                }
-                let canonical_addr = SocketAddr::new(addr.ip(), tcp_port.saturating_add(4));
-                parse_server_udp_response(&plain[1..], canonical_addr).map(|resp| (len, resp))
-            }
-            _ => None,
+        match self.try_recv_with(|_ip, _port| None).await {
+            ServerUdpRecv::Packet(len, resp) => Some((len, resp)),
+            ServerUdpRecv::Skipped | ServerUdpRecv::Drained => None,
         }
     }
 
@@ -469,63 +415,82 @@ impl ServerUdpSocket {
     /// packet so random noise from non-server sources doesn't corrupt
     /// anything.
     ///
+    /// Only `WouldBlock` ends a drain. Windows reports each ICMP
+    /// port-unreachable from an earlier send as a `ConnectionReset` on a
+    /// later receive, and neither that nor one unusable datagram says
+    /// anything about the replies queued behind it.
+    ///
     /// Wire reference: `CEncryptedDatagramSocket::DecryptReceivedServer`
     /// in eMule's `EncryptedDatagramSocket.cpp`.
-    pub async fn try_recv_with<F>(&self, key_lookup: F) -> Option<(usize, ServerUdpResponse)>
+    pub async fn try_recv_with<F>(&self, key_lookup: F) -> ServerUdpRecv
     where
         F: Fn(Ipv4Addr, u16) -> Option<(u32, u16)>,
     {
         let mut buf = [0u8; 65536];
         match self.socket.try_recv_from(&mut buf) {
-            Ok((len, addr)) => {
-                if len < 2 {
-                    return None;
-                }
-                if buf[0] == OP_EDONKEYPROT {
-                    // Plain packet — historical fast path. addr is
-                    // already canonical: a plain reply only comes
-                    // from the standard UDP port = TCP+4.
-                    return parse_server_udp_response(&buf[1..len], addr).map(|resp| (len, resp));
-                }
-                // Obfuscation candidate: only servers we know the
-                // BaseKey for can have sent us an encrypted packet.
-                let src_ip = match addr.ip() {
-                    std::net::IpAddr::V4(v4) => v4,
-                    _ => return None,
-                };
-                let (base_key, tcp_port) = key_lookup(src_ip, addr.port())?;
-                if base_key == 0 {
-                    // We know the server but haven't learned its key
-                    // yet — can't decrypt. The original status
-                    // exchange must have been plain (which it is,
-                    // for the first ping).
-                    return None;
-                }
-                use super::server_obfuscation::{decrypt_received_server, DecryptOutcome};
-                match decrypt_received_server(&buf[..len], base_key) {
-                    DecryptOutcome::Decrypted(plain) => {
-                        if plain.len() < 2 || plain[0] != OP_EDONKEYPROT {
-                            return None;
-                        }
-                        // Canonicalise: emit the response with the
-                        // standard UDP port so handlers' `addr.port()
-                        // - 4` math gives the right TCP port. We
-                        // report the *wire* length (`len`) for stats
-                        // — that's the actual on-the-wire cost.
-                        let canonical_port = tcp_port.saturating_add(4);
-                        let canonical_addr = SocketAddr::new(addr.ip(), canonical_port);
-                        parse_server_udp_response(&plain[1..], canonical_addr)
-                            .map(|resp| (len, resp))
-                    }
-                    // Plain (shouldn't happen — first byte ≠ 0xE3
-                    // here), or magic mismatch / too short / no key /
-                    // invalid padding: drop quietly. Random noise on
-                    // a UDP socket is normal; logging would be spam.
-                    _ => None,
-                }
+            Ok((len, addr)) => match decode_server_datagram(&buf[..len], addr, key_lookup) {
+                Some(resp) => ServerUdpRecv::Packet(len, resp),
+                None => ServerUdpRecv::Skipped,
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => ServerUdpRecv::Drained,
+            Err(e) => {
+                debug!("Server UDP recv error: {e}");
+                ServerUdpRecv::Skipped
             }
-            Err(_) => None,
         }
+    }
+}
+
+fn decode_server_datagram<F>(
+    data: &[u8],
+    addr: SocketAddr,
+    key_lookup: F,
+) -> Option<ServerUdpResponse>
+where
+    F: Fn(Ipv4Addr, u16) -> Option<(u32, u16)>,
+{
+    if data.len() < 2 {
+        return None;
+    }
+    if data[0] == OP_EDONKEYPROT {
+        // Plain packet — historical fast path. addr is
+        // already canonical: a plain reply only comes
+        // from the standard UDP port = TCP+4.
+        return parse_server_udp_response(&data[1..], addr);
+    }
+    // Obfuscation candidate: only servers we know the
+    // BaseKey for can have sent us an encrypted packet.
+    let src_ip = match addr.ip() {
+        std::net::IpAddr::V4(v4) => v4,
+        _ => return None,
+    };
+    let (base_key, tcp_port) = key_lookup(src_ip, addr.port())?;
+    if base_key == 0 {
+        // We know the server but haven't learned its key
+        // yet — can't decrypt. The original status
+        // exchange must have been plain (which it is,
+        // for the first ping).
+        return None;
+    }
+    use super::server_obfuscation::{decrypt_received_server, DecryptOutcome};
+    match decrypt_received_server(data, base_key) {
+        DecryptOutcome::Decrypted(plain) => {
+            if plain.len() < 2 || plain[0] != OP_EDONKEYPROT {
+                return None;
+            }
+            // Canonicalise: emit the response with the
+            // standard UDP port so handlers' `addr.port()
+            // - 4` math gives the right TCP port. The caller
+            // reports the *wire* length for stats — that's
+            // the actual on-the-wire cost.
+            let canonical_addr = SocketAddr::new(addr.ip(), tcp_port.saturating_add(4));
+            parse_server_udp_response(&plain[1..], canonical_addr)
+        }
+        // Plain (shouldn't happen — first byte ≠ 0xE3
+        // here), or magic mismatch / too short / no key /
+        // invalid padding: drop quietly. Random noise on
+        // a UDP socket is normal; logging would be spam.
+        _ => None,
     }
 }
 
@@ -1618,6 +1583,77 @@ mod tests {
                 "empty expression queued for flags 0x{flags:04X}"
             );
         }
+    }
+
+    #[test]
+    fn status_ping_waits_the_reask_interval_recorded_on_the_server() {
+        let mut server = ServerEntry::new("1.2.3.4".into(), 4661);
+        let now = 1_000_000;
+        assert!(status_ping_due(&server, now), "never pinged");
+        server.last_udp_ping_at = now;
+        assert!(!status_ping_due(&server, now + 1));
+        assert!(!status_ping_due(&server, now + STAT_REASK_INTERVAL_SECS - 1));
+        assert!(status_ping_due(&server, now + STAT_REASK_INTERVAL_SECS));
+    }
+
+    /// The challenge map used to share a 500-entry cap with the ping gate, so
+    /// with a longer server list a ping's challenge was evicted before its
+    /// reply arrived and the reply was discarded.
+    #[tokio::test]
+    async fn challenges_for_pings_in_flight_survive_a_large_server_list() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut server_udp = ServerUdpSocket::from_socket(socket);
+        let now = 1_000_000;
+        let addr_of = |i: u32| SocketAddr::new(Ipv4Addr::from(0x0A00_0000 + i).into(), 4665);
+        for i in 0..2_000 {
+            server_udp.remember_challenge(addr_of(i), i + 1, now);
+        }
+        assert_eq!(server_udp.take_challenge(&addr_of(0)), Some(1));
+        assert_eq!(server_udp.take_challenge(&addr_of(1_999)), Some(2_000));
+
+        server_udp.remember_challenge(addr_of(5_000), 7, now + CHALLENGE_REPLY_WINDOW_SECS);
+        assert_eq!(server_udp.take_challenge(&addr_of(1)), None, "stale challenge kept");
+        assert_eq!(server_udp.pending_challenges.len(), 1);
+    }
+
+    /// One unusable datagram, or a Windows `ConnectionReset` left by an ICMP
+    /// port-unreachable, used to end the drain and strand every reply queued
+    /// behind it until the next tick.
+    #[tokio::test]
+    async fn drain_continues_past_resets_and_unusable_datagrams() {
+        let recv_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = recv_socket.local_addr().unwrap();
+        let server_udp = ServerUdpSocket::from_socket(recv_socket);
+        let send_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let closed_addr = UdpSocket::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let _ = server_udp.socket_handle().send_to(&[0], closed_addr).await;
+        send_socket.send_to(&[0x42], recv_addr).await.unwrap();
+        send_socket
+            .send_to(&[OP_EDONKEYPROT, 0x01, 0x02], recv_addr)
+            .await
+            .unwrap();
+        let mut status = vec![OP_EDONKEYPROT, OP_GLOBSERVSTATRES];
+        status.extend_from_slice(&[0u8; 12]);
+        send_socket.send_to(&status, recv_addr).await.unwrap();
+
+        let outcomes = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut outcomes = Vec::new();
+            loop {
+                match server_udp.try_recv_with(|_, _| None).await {
+                    ServerUdpRecv::Packet(..) => {
+                        outcomes.push("packet");
+                        break outcomes;
+                    }
+                    ServerUdpRecv::Skipped => outcomes.push("skipped"),
+                    ServerUdpRecv::Drained => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .expect("the status reply behind the junk was never read");
+        assert!(outcomes.len() >= 3, "{outcomes:?}");
+        assert!(outcomes[..outcomes.len() - 1].iter().all(|o| *o == "skipped"));
     }
 
     #[tokio::test]

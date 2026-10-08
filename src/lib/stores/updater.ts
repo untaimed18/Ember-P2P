@@ -1,6 +1,7 @@
 import { get, writable } from 'svelte/store';
 import { Channel, invoke } from '@tauri-apps/api/core';
 import { relaunch } from '@tauri-apps/plugin-process';
+import { flushToastActionsBeforeExit } from '$lib/stores/toast';
 import * as m from '$lib/paraglide/messages';
 import { codedErrorOf, translateError } from '$lib/i18n';
 
@@ -626,6 +627,7 @@ export async function runStagedInstaller(): Promise<void> {
 /** Restart the app to apply an installed update. */
 export async function restartToUpdate(): Promise<void> {
   try {
+    await flushToastActionsBeforeExit();
     await relaunch();
   } catch (e) {
     retryAction = 'relaunch';

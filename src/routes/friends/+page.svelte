@@ -41,9 +41,23 @@
   import { networkStats } from '$lib/stores/network';
   import { menuKeydown } from '$lib/a11y';
   import IconX from '$lib/components/IconX.svelte';
+  import FriendSettingsDialog from '$lib/components/FriendSettingsDialog.svelte';
+  import { chatAllowedWith, friendOverrides } from '$lib/friendSettings';
 
   let friends: FriendInfo[] = $derived($friendsListStore);
-  let chatDisabled = $derived($appSettings?.friend_chat_disabled === true);
+  function chatDisabledFor(hash: string): boolean {
+    return !chatAllowedWith($appSettings, hash);
+  }
+  /** The friend whose settings dialog is open. */
+  let settingsFor: FriendInfo | null = $state(null);
+  $effect(() => {
+    const open = settingsFor;
+    if (open && !$friendsListStore.some((f) => f.user_hash === open.user_hash)) settingsFor = null;
+  });
+  /** Whether a friend has any setting of their own, for the dot on the gear. */
+  function hasOverrides(hash: string): boolean {
+    return Object.keys(friendOverrides($appSettings, hash)).length > 0;
+  }
   let loading = $state(true);
   let error: string | null = $state(null);
   /** Has `getFriends()` ever come back? An empty list only means "no friends
@@ -225,7 +239,7 @@
   let onlineFriendCount = $derived(friends.filter(f => isFriendOnline(f.user_hash)).length);
 
   function openChat(f: FriendInfo) {
-    if (chatDisabled) return;
+    if (chatDisabledFor(f.user_hash)) return;
     // Delegate to the global multi-conversation dock. It opens the
     // dock if not already visible, adds (or focuses) a tab for this
     // friend, and lets the user keep chatting while navigating to
@@ -767,26 +781,7 @@
     const hash = editingHash;
     const nick = editNickname.trim();
     try {
-      await updateFriendNickname(hash, nick);
-      friendsListStore.update((list) =>
-        list.map((f) => (f.user_hash === hash ? { ...f, nickname: nick } : f)),
-      );
-      // Push the rename through to any open chat tab so the strip
-      // and the conversation header don't keep the old nickname.
-      renameChatTab(hash, nick || hash.slice(0, 8) + '\u2026');
-      if (nick) {
-        rememberFriendName(hash, nick);
-      } else {
-        // `rememberFriendName` ignores an empty name, so a cleared nickname
-        // would keep labelling the dock and toasts from the cache.
-        const key = hash.toLowerCase();
-        friendNamesStore.update((names) => {
-          if (!names.has(key)) return names;
-          const next = new Map(names);
-          next.delete(key);
-          return next;
-        });
-      }
+      await renameFriend(hash, nick);
       // Blur-to-save means the user may already be renaming a different friend
       // by the time this resolves; only close the editor if it is still ours.
       if (editingHash === hash) editingHash = null;
@@ -794,6 +789,32 @@
       error = toErr(e);
     } finally {
       saveEditPending = false;
+    }
+  }
+
+  /** Save a friend's name, from the card or from their settings, and carry it
+   *  to every place that shows it. */
+  async function renameFriend(hash: string, nick: string): Promise<void> {
+    await updateFriendNickname(hash, nick);
+    friendsListStore.update((list) =>
+      list.map((f) => (f.user_hash === hash ? { ...f, nickname: nick } : f)),
+    );
+    if (settingsFor?.user_hash === hash) settingsFor = { ...settingsFor, nickname: nick };
+    // Push the rename through to any open chat tab so the strip
+    // and the conversation header don't keep the old nickname.
+    renameChatTab(hash, nick || hash.slice(0, 8) + '\u2026');
+    if (nick) {
+      rememberFriendName(hash, nick);
+    } else {
+      // `rememberFriendName` ignores an empty name, so a cleared nickname
+      // would keep labelling the dock and toasts from the cache.
+      const key = hash.toLowerCase();
+      friendNamesStore.update((names) => {
+        if (!names.has(key)) return names;
+        const next = new Map(names);
+        next.delete(key);
+        return next;
+      });
     }
   }
 
@@ -940,8 +961,19 @@
   onclose={closeBrowse}
 />
 
+{#if settingsFor}
+  <FriendSettingsDialog
+    friend={settingsFor}
+    onrename={renameFriend}
+    onclose={() => (settingsFor = null)}
+  />
+{/if}
+
 <div class="page-header">
-  <h2>{m.nav_friends()}</h2>
+  <h2 class="friends-title">
+    {m.nav_friends()}
+    <span class="beta-badge">{m.common_beta()}</span>
+  </h2>
   <div class="header-actions">
     <button class="ghost" onclick={() => loadFriends()} disabled={loading}>{m.common_refresh()}</button>
   </div>
@@ -1434,8 +1466,8 @@
             class="chat-btn"
             class:has-unread={unread > 0}
             onclick={() => openChat(f)}
-            disabled={chatDisabled}
-            title={chatDisabled
+            disabled={chatDisabledFor(f.user_hash)}
+            title={chatDisabledFor(f.user_hash)
               ? m.chat_dock_chat_disabled()
               : isOnline ? m.friends_encrypted_chat_title() : m.friends_action_chat()}
           >
@@ -1453,6 +1485,25 @@
                 })}
               </span>
             {/if}
+          </button>
+
+          <button
+            type="button"
+            class="card-settings-btn"
+            class:has-overrides={hasOverrides(f.user_hash)}
+            disabled={!$appSettings}
+            onclick={() => (settingsFor = f)}
+            title={hasOverrides(f.user_hash)
+              ? m.friend_settings_open_custom({ name: shortName })
+              : m.friend_settings_open({ name: shortName })}
+            aria-label={hasOverrides(f.user_hash)
+              ? m.friend_settings_open_custom({ name: shortName })
+              : m.friend_settings_open({ name: shortName })}
+          >
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="8" cy="8" r="2.1"/>
+              <path d="M8 1.6v1.6M8 12.8v1.6M1.6 8h1.6M12.8 8h1.6M3.5 3.5l1.1 1.1M11.4 11.4l1.1 1.1M3.5 12.5l1.1-1.1M11.4 4.6l1.1-1.1"/>
+            </svg>
           </button>
 
           <details class="card-more">
@@ -1598,6 +1649,13 @@
 </div>
 
 <style>
+  .friends-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0;
+  }
+
   .friends-content {
     padding: 20px;
   }
@@ -2197,6 +2255,41 @@
   .card-more > summary svg {
     width: 14px;
     height: 14px;
+  }
+
+  .card-settings-btn {
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-muted);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background var(--transition-fast), color var(--transition-fast);
+  }
+
+  .card-settings-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .card-settings-btn svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  /* This friend has settings of their own: the gear reads as switched on. */
+  .card-settings-btn.has-overrides {
+    background: var(--accent-fill);
+    color: var(--accent);
+  }
+
+  .card-settings-btn.has-overrides:hover {
+    background: color-mix(in srgb, var(--accent) 24%, transparent);
+    color: var(--accent-hover);
   }
 
   .card-more-menu {

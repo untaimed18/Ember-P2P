@@ -300,6 +300,9 @@ export interface NetworkStats {
   firewalled: boolean;
   buddy_status: 'none' | 'searching' | 'connecting' | 'connecting_lowid' | 'connected' | 'connected_lowid' | 'serving' | 'serving_lowid';
   upnp_mapped: boolean;
+  /** UPnP removed its forwards because the router's address is not the one
+   *  peers see (a VPN, typically). Not a failure. */
+  upnp_stood_down?: boolean;
   stores_acknowledged: number;
   kad_users_estimate: number;
   tcp_status?: string;
@@ -454,6 +457,11 @@ export interface EmberDiagnostics {
   /** Contacts a friend answered with that the routing table accepted. Asks
    *  climbing with this flat means friends have nothing verified to share. */
   ember_dht_friend_contacts_learned?: number;
+  /** Times we asked a friend that is not a DHT contact to meet over UDP. */
+  ember_dht_friend_meets?: number;
+  /** Friends that became verified contacts within a meet's interval. Meets
+   *  climbing with this flat is the both-ends-symmetric case. */
+  ember_dht_friend_meets_converted?: number;
   ember_dht_records_republished: number;
   /** KAD-bridge bootstrap pings sent this session (slice 13): while the DHT
    *  is still sparse, KAD-learned Ember peers are DHT-pinged so their signed
@@ -623,16 +631,6 @@ export interface EmberDiagnostics {
   ember_dht_verified_highwater?: number;
 }
 
-/** Result of an `ember_ping_peer` harness round-trip. `rtt_ms` is set
- *  iff `success` is true. The `peerPubkeyHex` argument is optional —
- *  when omitted, the backend resolves the peer's Noise pubkey from
- *  the KAD-fed cache. */
-export interface EmberPingResult {
-  success: boolean;
-  rtt_ms?: number;
-  error?: string;
-}
-
 /** One Ember DHT routing-table contact, as returned by
  *  `get_ember_dht_contacts`. All key/id fields are hex-encoded.
  *  The UI snapshot omits `addr` so peer IPs never reach the webview. */
@@ -671,57 +669,6 @@ export interface EmberDhtStoreEntry {
   record_count: number;
   keyword_records: number;
   source_records: number;
-}
-
-/** Result of a single-hop `ember_dht_find_node`: the contacts a peer
- *  answered with for a target ID, or the reason the lookup failed. */
-export interface EmberDhtFindResult {
-  success: boolean;
-  contacts: EmberDhtContact[];
-  rtt_ms?: number;
-  error?: string;
-}
-
-/** Result of `ember_dht_publish_keyword`: the DHT key the signed record
- *  landed under and how many nodes acknowledged storing it. */
-export interface EmberDhtPublishResult {
-  success: boolean;
-  key: string;
-  stored_on: number;
-  targets: number;
-  error?: string;
-}
-
-/** One signed record returned by `ember_dht_find_value`. Only records
- *  whose publisher signature verified are surfaced. */
-export interface EmberDhtRecordInfo {
-  record_type: number;
-  file_name: string;
-  file_size: number;
-  file_hash: string;
-  publisher: string;
-  timestamp: number;
-}
-
-/** Result of an iterative `ember_dht_find_value`: the verified records
- *  discovered for a keyword, or the reason the lookup failed. */
-export interface EmberDhtFindValueResult {
-  success: boolean;
-  records: EmberDhtRecordInfo[];
-  rtt_ms?: number;
-  error?: string;
-}
-
-/** Result of `ember_dht_run_maintenance` (slice 6): how much work the
- *  forced maintenance cycle kicked off. */
-export interface EmberDhtMaintenanceResult {
-  success: boolean;
-  buckets_refreshed: number;
-  liveness_pings_sent: number;
-  records_republished: number;
-  announces_sent: number;
-  kad_bridge_pings_sent: number;
-  error?: string;
 }
 
 export interface ServerInfo {
@@ -867,6 +814,27 @@ export interface AntiLeechReplaceResult {
   compile_errors: Array<[string, string]>;
 }
 
+/** One friend's exceptions to the friend settings. A field left out follows
+ *  the global setting. Mirrors `FriendOverrides` in `src-tauri/src/types.rs`.
+ *  The friend's name is not here: it is their nickname in the friends list. */
+export interface FriendOverrides {
+  /** Chat both ways. Off also refuses their files. */
+  chat?: boolean;
+  /** Files from this friend (chat attachments and file offers). Unset follows
+   *  chat. */
+  files?: boolean;
+  /** Their files at or under this many MB download without asking; 0 always
+   *  asks. */
+  auto_accept_mb?: number;
+  /** Let this friend browse our shared files. */
+  browse?: boolean;
+  /** Read receipts both ways. */
+  read_receipts?: boolean;
+  notify_online?: boolean;
+  /** Messages and files from this friend. */
+  notify_messages?: boolean;
+}
+
 export interface AppSettings {
   nickname: string;
   /** Unique Channels handle claimed on Rendezvous. Empty until chosen. */
@@ -939,8 +907,6 @@ export interface AppSettings {
   download_queue_wait_secs: number;
   /** Extra multi-source retry rounds after initial tasks (1–20) */
   multisource_retry_rounds: number;
-  /** Per-source part hash failure retries during transfer (1–20) */
-  download_part_retry_rounds: number;
   /** Max download size in GiB (1–593; default 593, the ed2k part-count ceiling) */
   max_download_file_size_gib: number;
   /** Global search / find-sources / find-notes timeout in seconds (30–600) */
@@ -970,6 +936,9 @@ export interface AppSettings {
   /** Files a friend sends in chat at or under this many MB download without
    *  asking; larger ones wait for an accept. 0 always asks. At most 2048. */
   chat_attachment_auto_accept_mb: number;
+  /** Per-friend exceptions to the friend settings above, keyed by the friend's
+   *  lowercase hex hash. Written only through `setFriendOverrides`. */
+  friend_overrides?: Record<string, FriendOverrides>;
   /** Maximum number of friends allowed (1–500) */
   max_friends: number;
   /**
@@ -1058,6 +1027,23 @@ export interface AppSettings {
   /** Ordered timetable of clock-driven caps. The first rule whose window is
    *  open wins; when none is, the manual limits apply. */
   bandwidth_schedule: BandwidthScheduleRule[];
+
+  /** Use the alternative limits in place of the manual ones and the schedule.
+   *  Also switched from the tray and the status bar. */
+  alt_speed_enabled: boolean;
+  /** Bytes per second; 0 is unlimited. */
+  alt_max_upload_speed: number;
+  alt_max_download_speed: number;
+  /** Start Ember when the user signs in. */
+  launch_at_login: boolean;
+  /** A launch at sign-in comes up in the tray rather than on the desktop. */
+  start_hidden_at_login: boolean;
+  /** Reopen the main window where it was when Ember last quit. */
+  remember_window_position: boolean;
+  /** Offer to add eD2K links found on the clipboard when the window gains focus. */
+  watch_clipboard_links: boolean;
+  /** Free space, in MB, under which the download drive is reported low; 0 off. */
+  low_disk_warning_mb: number;
 }
 
 /** One window of the bandwidth timetable.
@@ -1102,6 +1088,8 @@ export interface RuntimeStatus {
   effective_download_speed: number;
   /** Absent when the manual limits are in force. */
   schedule?: ActiveScheduleRule;
+  /** The alternative limits are in force, overriding manual and schedule. */
+  alt_speed: boolean;
   /** Whether this platform can hold a sleep inhibitor at all. False means the
    *  `prevent_sleep_while_active` toggle would do nothing, so the UI disables
    *  it rather than offering a dead switch. */

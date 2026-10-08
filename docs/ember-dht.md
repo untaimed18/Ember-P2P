@@ -185,7 +185,19 @@ standing gap is now narrower and different: not "nothing advertises a range" but
 "a shape change still partitions every peer running a build older than this
 one", which the advertiser count is what measures.
 
-### 3. Meeting a friend we cannot dial — designed, not started
+### 3. Meeting a friend we cannot dial — built in 1.7.2, unvalidated live
+
+Built as designed below, as `EMBER_EXT_DHT_MEET` (`0x0D`; `0x07` was taken by
+then). Body is the sender's Ember UDP port and an answer flag. A node asks each
+direct-session friend it holds no verified contact for, at most every ten
+minutes and two per tick, least recently asked first; the friend `PING`s the
+asker's session address at the claimed port and answers with its own port; the
+asker `PING`s back on the answer. An answer is only acted on within a minute of
+the ask, and an ask is answered at most once a minute per friend. Skipped for a
+relayed session (no address of the friend's own) and while our own NAT is
+symmetric. Diagnostics: `ember_dht_friend_meets` against
+`ember_dht_friend_meets_converted`. What follows is the design it was built
+from.
 
 Still open on this path: nothing uses the friend session to carry a *live*
 introduction, so a friend we cannot dial never becomes an overlay contact however

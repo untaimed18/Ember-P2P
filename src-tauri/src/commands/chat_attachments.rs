@@ -82,11 +82,11 @@ pub async fn pick_and_send_chat_attachment(
     if !state.friend_hashes.read().await.contains(&friend) {
         return Err(coded("peers_not_friend", "Can only send files to friends"));
     }
-    if state.config.read().await.settings.friend_chat_disabled {
-        return Err(coded(
-            "peers_attach_disabled",
-            "Chatting with friends is turned off in Settings",
-        ));
+    {
+        let config = state.config.read().await;
+        if !config.settings.chat_allowed_with(&friend) {
+            return Err(crate::network::chat_attach::chat_off_error(&config.settings));
+        }
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
     bounded_send(
@@ -222,6 +222,22 @@ pub async fn cancel_chat_attachment(
     await_reply(rx, "peers_no_response", "No response").await?
 }
 
+/// Try a transfer that ended without the file again, keeping its card.
+#[tauri::command]
+pub async fn retry_chat_attachment(
+    state: tauri::State<'_, AppState>,
+    xfer_id: String,
+) -> Result<(), String> {
+    let xfer_id = parse_xfer_id(&xfer_id)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    bounded_send(
+        &state.network_tx,
+        NetworkCommand::RetryChatAttachment { xfer_id, tx },
+    )
+    .await?;
+    await_reply(rx, "peers_no_response", "No response").await?
+}
+
 /// Every attachment in one conversation, newest first.
 ///
 /// Read straight from the database rather than through the network task: this
@@ -282,22 +298,24 @@ pub async fn open_chat_attachment(
             "Download has not finished yet",
         ));
     };
-    let dl_folder = state.config.read().await.settings.download_folder.clone();
+    let dl_folders = state.config.read().await.settings.download_folders();
     let name = row.file_name;
     tokio::task::spawn_blocking(move || {
-        // Confined to the download folder, and re-resolved now rather than
-        // trusted from the row: the file may have been moved or replaced since.
-        let canonical = crate::security::filesystem::verify_existing_path(
+        // Confined to a download folder, or to the Chat Files it was received
+        // into when that folder has since been replaced, and re-resolved now
+        // rather than trusted from the row: the file may have been moved or
+        // replaced since.
+        let canonical = crate::security::filesystem::verify_recorded_file(
             std::path::Path::new(&dest),
-            std::slice::from_ref(&dl_folder),
+            &dl_folders.roots(),
+            CHAT_FILES_DIR,
         )
         .map_err(|e| coded_ctx("transfers_invalid_path", "Invalid or changed download path", e))?;
         // And within that, to Chat Files, where every received attachment
         // lands: a row is never a way to open anything else in Downloads.
-        let in_chat_files = std::path::Path::new(&dl_folder)
-            .join(CHAT_FILES_DIR)
-            .canonicalize()
-            .is_ok_and(|chat_files| canonical.starts_with(chat_files));
+        let in_chat_files = canonical
+            .parent()
+            .is_some_and(|dir| crate::security::filesystem::is_landing_dir(dir, CHAT_FILES_DIR));
         if !in_chat_files {
             return Err(coded(
                 "transfers_invalid_path",

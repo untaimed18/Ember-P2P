@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
 import {
@@ -340,6 +340,60 @@ test("an unbumped wire version and unwritten notes are both left alone", () => {
     });
   } finally {
     rmSync(unwritten, { recursive: true, force: true });
+  }
+});
+
+test("a release cut from a shallow checkout fails instead of skipping the wire check", () => {
+  // The release workflow's default depth-1 checkout has no tag older than the
+  // one being cut, so the comparison found nothing and every release passed.
+  const fixture = emberDhtFixture({ previous: 2, current: 3, bullets: null });
+  const shallow = mkdtempSync(join(tmpdir(), "ember-release-shallow-"));
+  const original = process.env.GITHUB_REF_NAME;
+  try {
+    delete process.env.GITHUB_REF_NAME;
+    execFileSync(
+      "git",
+      ["clone", "--quiet", "--depth", "1", pathToFileURL(fixture).href, shallow],
+      { stdio: "ignore" },
+    );
+    assert.throws(
+      () => verifyEmberDhtVersion({ root: shallow, requireTag: true }),
+      /no full git history.*fetch-depth: 0/s,
+    );
+    assert.throws(
+      () => verifyEmberDhtVersion({ root: shallow, tag: `v${packageVersion}` }),
+      /no full git history/,
+    );
+    assert.equal(
+      verifyEmberDhtVersion({ root: shallow }).checked,
+      false,
+      "off a release, missing history is still a skip",
+    );
+    assert.equal(
+      verifyEmberDhtVersion({ root: fixture, requireTag: true }).previousWireVersion,
+      2,
+      "a full checkout reads the previous release",
+    );
+  } finally {
+    if (original === undefined) delete process.env.GITHUB_REF_NAME;
+    else process.env.GITHUB_REF_NAME = original;
+    rmSync(fixture, { recursive: true, force: true });
+    rmSync(shallow, { recursive: true, force: true });
+  }
+});
+
+test("every job that runs the release policy checks out the full history", () => {
+  const fixture = tamperedWorkflow(
+    "          # As in `verify`: the policy gate below reads the previous release tag.\n          fetch-depth: 0\n",
+    "",
+  );
+  try {
+    assert.throws(
+      () => verifyWorkflow({ root: fixture }),
+      /sign-publish runs the release policy, .* must set fetch-depth: 0/,
+    );
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
   }
 });
 

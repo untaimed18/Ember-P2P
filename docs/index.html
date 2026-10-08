@@ -1093,7 +1093,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="" width="80" height="80">
-      <h3>Get Ember 1.7.1</h3>
+      <h3>Get Ember 1.7.2</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11, and for x86-64 Linux as a <code>.deb</code> or an AppImage.</p>
       <span class="download-meta">Windows installer &middot; Linux <code>.deb</code> / AppImage &middot; no extra runtimes</span>
       <div class="btn-group">
@@ -1699,7 +1699,7 @@ peer_count    (u16 LE)
     <h3>Prerequisites</h3>
     <ul>
       <li><a href="https://rustup.rs/" target="_blank" rel="noopener">Rust</a> (1.94+)</li>
-      <li><a href="https://nodejs.org/" target="_blank" rel="noopener">Node.js</a> (20.19+, 22.12+, or 24+)</li>
+      <li><a href="https://nodejs.org/" target="_blank" rel="noopener">Node.js</a> (22.12+ or 24+)</li>
       <li><strong>Windows:</strong> Visual Studio Build Tools with C++ workload</li>
     </ul>
 
@@ -1865,6 +1865,84 @@ npm run tauri build -- --config '{"bundle":{"createUpdaterArtifacts":false}}'</c
   <section id="releases">
     <h2>Release History</h2>
     <p>Every Ember release, newest first. These are the same notes we publish on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
+
+    <article class="release" id="release-1-7-2">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.7.2" target="_blank" rel="noopener">Ember v1.7.2</a></h3>
+        <time class="release-date" datetime="2026-10-08">October 8, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.7.2" target="_blank" rel="noopener"><code>v1.7.2</code></a></p>
+      <div class="release-notes">
+        <p>Ember gets easier to live with: Settings apply as you change them, the tray and status bar can pause everything or switch to alternative speed limits, Ember can start when you sign in and exit or sleep when your downloads are done, and Transfers, Search and the Library gain the shortcuts and bulk actions they were missing. Rooms you own can now be found again from your identity alone, rooms reopen where you left them, and each friend gets settings of their own. Friends is now marked Beta beside Channels.</p>
+
+        <h4>Before you upgrade</h4>
+
+        <ul>
+          <li><strong>The Ember DHT wire version is unchanged at version 4,</strong> so 1.7.2, 1.7.1, 1.7.0 and every 1.6 release see each other on the overlay normally</li>
+          <li><strong>Settings save as you change them.</strong> Switches and lists apply at once; typed fields have an Apply button (<kbd>Enter</kbd> applies, <kbd>Esc</kbd> reverts). Save, Discard and <kbd>Ctrl</kbd>+<kbd>S</kbd> are gone</li>
+          <li><strong>Max uploads now defaults to Auto,</strong> which opens slots by how much your upload rate can feed, as eMule does. A number you saved is kept. If you may go back to 1.7.1, set a number first: 1.7.1 reads Auto as one slot</li>
+          <li><strong>UPnP is on for new profiles.</strong> Existing settings keep their value. If your VPN forwards its own port, Ember notices and stands its forwards down</li>
+          <li><strong>Friends is marked Beta.</strong> It is stable enough to use; features are still being added and some behavior may change</li>
+        </ul>
+
+        <h4>What&rsquo;s New</h4>
+
+        <h5>Everyday controls</h5>
+        <ul>
+          <li><strong>Pause all, Resume all and alternative speed limits</strong> from the tray, a new speed-limits popover on the status bar, or Settings. Alternative limits override your normal limits and the schedule while they are on</li>
+          <li><strong>Launch at sign-in,</strong> optionally straight to the tray, and the window reopens where you left it</li>
+          <li><strong>When downloads finish,</strong> Ember can exit or put the computer to sleep after a one-minute countdown you can cancel, including from the tray</li>
+          <li><strong>Download progress on the taskbar button,</strong> red when a download fails or is waiting for disk space, and a warning when the download drive runs low (1&nbsp;GB by default)</li>
+          <li><strong>Copied eD2K links are offered</strong> when you switch to Ember, if you turn it on in Settings</li>
+          <li><strong>Test my ports</strong> asks a few peers to connect back and reports each port as open, closed or untested, and the Ember Network page gains <strong>Restart Ember</strong> and <strong>Copy diagnostics</strong></li>
+        </ul>
+
+        <h5>Transfers, Search and Library</h5>
+        <ul>
+          <li><strong>The row menu acts on the whole selection,</strong> downloads can move to the front or back of the queue, and <kbd>Ctrl</kbd>+<kbd>A</kbd>, <kbd>Space</kbd>, <kbd>Shift</kbd>+arrows and <kbd>Home</kbd>/<kbd>End</kbd> work on Transfers</li>
+          <li><strong>Cancel, Remove and Clear completed can be undone</strong> from the toast they leave</li>
+          <li><strong>Search can hide files you already have,</strong> highlights the words you searched for, moves with the arrow keys, shows the size of what you ticked, and can run a finished tab again</li>
+          <li><strong>The Library shows file-type icons,</strong> filters by sharing state, highlights matches, and Open hands a file to its default app</li>
+          <li><strong>Every banned peer is listed</strong> under Security, with an Unban button, and a banned peer can be unbanned from Transfers</li>
+          <li><strong>Upload slots are chosen the way eMule chooses them,</strong> and a session is no longer cut off mid-chunk</li>
+        </ul>
+
+        <h5>Friends</h5>
+        <ul>
+          <li><strong>Each friend has their own settings</strong> behind a gear on their card: chat, files, auto-accept limit, read receipts, browsing and notifications, each able to follow your defaults</li>
+          <li><strong>A failed friend file can be tried again</strong> on the same card, and a receive that loses its QUIC stream carries on over TCP</li>
+          <li><strong>Ember peers who are not friends</strong> stay on the Known Ember Peers tab</li>
+        </ul>
+
+        <h5>Rooms</h5>
+        <ul>
+          <li><strong>Find rooms you own</strong> again from your identity alone, after restoring any backup: their bans, moderators, topic and current key come back. It runs at launch and from Settings</li>
+          <li><strong>Each conversation reopens at the message you were reading,</strong> a half-typed room message survives a restart, and the composer has an emoji picker</li>
+          <li><strong>Snooze a room</strong> for an hour, eight hours or until tomorrow morning</li>
+          <li><strong>Lists draw as lists, long posts fold,</strong> members are ordered online, away, then offline, and a welcome message can be folded away</li>
+          <li><strong>Discover folds away listings that look like spam,</strong> and owners are asked to name a successor once a room has three other members</li>
+          <li><strong>Messages from a newer Ember are carried,</strong> and a room says when it needs a newer Ember instead of going quiet</li>
+        </ul>
+
+        <h4>What&rsquo;s Fixed</h4>
+
+        <ul>
+          <li><strong>A finished download could start over.</strong> Pausing during the move into Downloads, or during a restored download&rsquo;s re-check, could lose the finished file and download it again</li>
+          <li><strong>Restoring a backup could delete part-finished downloads</strong> the backup did not list. They are now set aside in <code>Temp</code>, and restored shared folders wait for you to approve them again</li>
+          <li><strong>LowID callback downloads shut out every other source</strong> for the file until they ended. They now join the normal multi-source download</li>
+          <li><strong>Downloads are more robust:</strong> queued sources no longer hold parts, finished but unchecked parts are verified, and blocks a peer was never asked for are refused</li>
+          <li><strong>eMule and aMule buddy links dropped after three minutes,</strong> and server auto-reconnect gave up after a short outage; both now hold</li>
+          <li><strong>A free upload slot could stay empty</strong> while a peer with two connections waited for one</li>
+          <li><strong>Files you unshared could come back</strong> when a partly shared folder was widened, and friends-only files could be offered openly before the file list had loaded</li>
+          <li><strong>The Downloads list could loop and freeze</strong> while scrolling</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.7.1...v1.7.2" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.7.1...v1.7.2</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-7-1">
       <div class="release-header">

@@ -421,6 +421,7 @@
   confirmLabel={confirmLabel || m.deeplink_confirm_open()}
   cancelLabel={m.deeplink_confirm_ignore()}
   isolateMessage={true}
+  focusCancel
   onconfirm={() => resolveConfirmation('accept')}
   oncancel={() => resolveConfirmation('reject')}
   ondismiss={() => resolveConfirmation('defer')}

@@ -357,9 +357,20 @@ fn apply_known2(data_dir: &Path, pending: &Path) -> anyhow::Result<u64> {
 fn apply_server_met(data_dir: &Path, pending: &Path) -> anyhow::Result<u64> {
     use crate::network::ed2k::server_list::ServerList;
     let path = data_dir.join("server.met");
-    let mut list = ServerList::load_server_met(&path).unwrap_or_else(|_| ServerList::new());
+    // Merging into an empty list in place of one that would not load would
+    // replace every server Ember holds with eMule's.
+    let mut list = match ServerList::load_server_met(&path) {
+        Ok(list) => list,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ServerList::new(),
+        Err(e) => anyhow::bail!("Ember's server.met could not be read, so it was left as it is: {e}"),
+    };
     let stats = list.merge_from_bytes_filtered(&std::fs::read(pending.join("server.met"))?, false, None)?;
-    ServerList::write_server_met_bytes(&path, &list.to_server_met_bytes()?)?;
+    if stats.added + stats.updated + stats.filtered + stats.at_capacity == 0 {
+        anyhow::bail!("eMule's server.met has no servers Ember can read");
+    }
+    if stats.added + stats.updated > 0 {
+        ServerList::write_server_met_bytes(&path, &list.to_server_met_bytes()?)?;
+    }
     Ok(stats.added as u64)
 }
 
@@ -372,7 +383,7 @@ fn apply_nodes_dat(data_dir: &Path, pending: &Path) -> anyhow::Result<u64> {
     let theirs = load_nodes_dat(&staged)?.len();
     let ours = load_nodes_dat(&path).map_or(0, |c| c.len());
     if theirs > ours {
-        std::fs::copy(&staged, &path)?;
+        crate::security::atomic_write(&path, &std::fs::read(&staged)?, false)?;
         Ok(theirs as u64)
     } else {
         Ok(0)
@@ -388,7 +399,7 @@ fn apply_ipfilter(data_dir: &Path, pending: &Path, backup: &Path) -> anyhow::Res
         .filter(|&n| n > 0)
         .ok_or_else(|| anyhow::anyhow!("eMule's ipfilter.dat has no ranges Ember can read"))?;
     back_up(&path, backup)?;
-    std::fs::copy(&staged, &path)?;
+    crate::security::atomic_write(&path, &std::fs::read(&staged)?, false)?;
     Ok(ranges as u64)
 }
 
@@ -893,6 +904,51 @@ mod tests {
         assert!([1, 2, 3].iter().all(|&n| merged.contains(&[n; 20])));
         assert_eq!(merged.len(), 3);
         drop(db);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn server_met_with(servers: &[([u8; 4], u16)]) -> Vec<u8> {
+        let mut buf = vec![0x0E];
+        buf.extend_from_slice(&(servers.len() as u32).to_le_bytes());
+        for (ip, port) in servers {
+            buf.extend_from_slice(ip);
+            buf.extend_from_slice(&port.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Either side failing leaves Ember's own list exactly as it was and says
+    /// so in the report, rather than putting eMule's servers, or nothing, in
+    /// its place.
+    #[test]
+    fn a_server_met_import_that_cannot_merge_leaves_embers_list_alone() {
+        use crate::network::ed2k::server_list::ServerList;
+        let root = scratch("servers");
+        let (data, pending) = (root.join("data"), root.join("pending"));
+        for dir in [&data, &pending] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let ours = data.join("server.met");
+        let theirs = pending.join("server.met");
+
+        let unreadable = [0x7Fu8, 1, 0, 0, 0, 0, 0, 0, 0];
+        std::fs::write(&ours, unreadable).unwrap();
+        std::fs::write(&theirs, server_met_with(&[([1, 2, 3, 4], 4661)])).unwrap();
+        assert!(apply_server_met(&data, &pending).is_err(), "Ember's list would not load");
+        assert_eq!(std::fs::read(&ours).unwrap(), unreadable);
+
+        let held = server_met_with(&[([5, 6, 7, 8], 4242)]);
+        std::fs::write(&ours, &held).unwrap();
+        for garbage in [&b""[..], b"\x0E\x01", b"\x7F\x01\x00\x00\x00junk"] {
+            std::fs::write(&theirs, garbage).unwrap();
+            assert!(apply_server_met(&data, &pending).is_err(), "{garbage:?} has no servers");
+            assert_eq!(std::fs::read(&ours).unwrap(), held, "{garbage:?}");
+        }
+
+        std::fs::write(&theirs, server_met_with(&[([1, 2, 3, 4], 4661)])).unwrap();
+        assert_eq!(apply_server_met(&data, &pending).unwrap(), 1);
+        assert_eq!(ServerList::load_server_met(&ours).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 

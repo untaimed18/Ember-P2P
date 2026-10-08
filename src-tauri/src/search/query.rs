@@ -281,7 +281,11 @@ pub fn parse(query: &str) -> Option<QueryExpr> {
     }
 
     let toks = lex(query);
-    let mut parser = Parser { toks, pos: 0 };
+    let mut parser = Parser {
+        toks,
+        pos: 0,
+        dropped_exclusion: false,
+    };
     // A `)` with no `(` to close ends `parse_or`; skip it and carry on, or
     // everything after it was dropped (`movie (2019)) 1080p` lost `1080p`).
     let mut parts = Vec::new();
@@ -296,6 +300,11 @@ pub fn parse(query: &str) -> Option<QueryExpr> {
     }
     if let Some(expr) = fold_and(parts) {
         return Some(expr);
+    }
+    // The plain tokenizer below cannot tell a negated word from any other, so
+    // it would search for exactly the term the user asked to exclude.
+    if parser.dropped_exclusion {
+        return None;
     }
 
     // The boolean parse produced nothing usable (e.g. every term was too
@@ -563,6 +572,9 @@ fn lex(query: &str) -> Vec<Tok> {
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    /// Set when a group's negated terms were discarded because every positive
+    /// operand they excluded from tokenized to nothing.
+    dropped_exclusion: bool,
 }
 
 impl Parser {
@@ -594,6 +606,7 @@ impl Parser {
     fn parse_and(&mut self, depth: usize) -> Option<QueryExpr> {
         let mut positives: Vec<QueryExpr> = Vec::new();
         let mut negatives: Vec<QueryExpr> = Vec::new();
+        let mut wrote_positive = false;
         loop {
             match self.peek() {
                 None | Some(Tok::Or) | Some(Tok::RParen) => break,
@@ -605,6 +618,7 @@ impl Parser {
                     }
                 }
                 Some(Tok::LParen) | Some(Tok::Word(_)) | Some(Tok::Phrase(_)) => {
+                    wrote_positive = true;
                     if let Some(p) = self.parse_primary(depth) {
                         positives.push(p);
                     }
@@ -614,13 +628,19 @@ impl Parser {
 
         let mut acc = if !positives.is_empty() {
             fold_and(positives)?
-        } else if !negatives.is_empty() {
+        } else if negatives.is_empty() {
+            return None;
+        } else if wrote_positive {
+            // `tv -sport`: the user did name something to subtract from, it is
+            // just too short to search for. Promoting the exclusion would
+            // search for the very term they asked to leave out.
+            self.dropped_exclusion = true;
+            return None;
+        } else {
             // Degenerate all-negative group (e.g. just "-foo"): there is nothing
             // to subtract from, so treat the negated terms as positives rather
             // than emitting a "match everything except" search.
             return fold_and(negatives);
-        } else {
-            return None;
         };
 
         for neg in negatives {
@@ -1070,6 +1090,27 @@ mod tests {
         // search rather than "everything except cam".
         let expr = parse("-cam").unwrap();
         assert_eq!(expr, term("cam"));
+    }
+
+    /// `tv` is below the 3-byte keyword minimum, so nothing is left to
+    /// subtract `sport` from — and searching for `sport` would return exactly
+    /// the files the user asked to leave out.
+    #[test]
+    fn an_exclusion_after_a_too_short_word_is_never_searched_for() {
+        assert_eq!(parse("tv -sport"), None);
+        assert_eq!(parse("tv NOT sport"), None);
+        assert_eq!(parse("(tv) -sport"), None);
+        // Another alternative still searches; the exclusion stays out of it.
+        let expr = parse("tv -sport OR movie").unwrap();
+        assert_eq!(expr.positive_terms(), vec!["movie".to_string()]);
+        // With a searchable word in front the dash is a NOT, as in eMule.
+        assert_eq!(
+            parse("news -sport"),
+            Some(QueryExpr::Not(
+                Box::new(term("news")),
+                Box::new(term("sport"))
+            ))
+        );
     }
 
     #[test]

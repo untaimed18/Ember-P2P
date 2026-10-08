@@ -53,10 +53,28 @@ struct CountryField {
 pub fn lookup_country(reader: &GeoIpReader, ip: IpAddr) -> Option<String> {
     let guard = reader.read().ok()?;
     let r = guard.as_ref()?;
-    // maxminddb 0.29: `lookup` returns a `LookupResult`; `decode` then yields
+    // maxminddb 0.29+: `lookup` returns a `LookupResult`; `decode` then yields
     // `Result<Option<T>, _>` (None when the IP isn't present). Treat any
     // lookup/decode error or a missing record as "no country".
     let result = r.lookup(ip).ok()?;
     let record: CountryRecord = result.decode().ok().flatten()?;
     record.country?.iso_code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_database_resolves_countries() {
+        let reader = empty();
+        fill(&reader, Path::new(env!("CARGO_MANIFEST_DIR")));
+        assert!(reader.read().unwrap().is_some(), "bundled MMDB failed to load");
+
+        let public: IpAddr = "8.8.8.8".parse().unwrap();
+        assert_eq!(lookup_country(&reader, public).as_deref(), Some("US"));
+
+        let private: IpAddr = "192.168.1.1".parse().unwrap();
+        assert_eq!(lookup_country(&reader, private), None);
+    }
 }

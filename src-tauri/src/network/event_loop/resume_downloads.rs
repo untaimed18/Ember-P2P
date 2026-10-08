@@ -278,6 +278,86 @@ fn verify_restored_file(
     Ok(Ok(()))
 }
 
+/// The first of `candidates`, in the download folder `root`, that is this
+/// download's `size`-byte file. `Err` is why none was: a mismatch that only
+/// this download's bytes can give (its ed2k hash matched) wins, then a file
+/// that could not be read, as worth retrying. Blocking.
+fn find_published_file(
+    candidates: &[PathBuf],
+    root: &str,
+    size: u64,
+    expected: &str,
+    expected_aich: Option<&str>,
+    expected_ember: Option<&str>,
+) -> Result<PathBuf, String> {
+    const MISMATCH: &str = "Restored final file hash mismatch";
+    let mut unreadable = false;
+    let mut pin_mismatch = None;
+    for candidate in candidates {
+        // `None`: the file could not be read at all.
+        let verdict = (|| {
+            let verified =
+                crate::security::filesystem::verify_existing_path(candidate, &[root.to_string()])
+                    .ok()?;
+            let mut file = std::fs::File::open(&verified).ok()?;
+            if file.metadata().ok()?.len() != size {
+                return Some(Err(MISMATCH.to_string()));
+            }
+            // All three digests from one read. Checked one at a time, this
+            // walked a restored multi-GB file up to three times over — and a
+            // restore re-verification is the moment a user is waiting to
+            // learn whether their file survived.
+            verify_restored_file(&mut file, expected, expected_aich, expected_ember).ok()
+        })();
+        match verdict {
+            Some(Ok(())) => return Ok(candidate.clone()),
+            Some(Err(error)) if error != MISMATCH => {
+                pin_mismatch.get_or_insert(error);
+            }
+            Some(Err(_)) => {}
+            None => unreadable = true,
+        }
+    }
+    Err(pin_mismatch.unwrap_or_else(|| {
+        if unreadable {
+            "Restored final file could not be read".to_string()
+        } else {
+            MISMATCH.to_string()
+        }
+    }))
+}
+
+/// Run a restored download's blocking re-verification `check` and send the
+/// event it returns from the blocking task itself. Pause, Stop and Cancel
+/// abort the returned task but cannot stop the check, which may still publish
+/// the file and remove its `.part`: were the event sent from the task, the
+/// row would be left unfinished beside a finished file, and Resume refused
+/// until restart. A panicking check reports `Failed` with `panic_context`.
+fn spawn_restore_check(
+    tx: mpsc::Sender<DownloadEvent>,
+    transfer_id: String,
+    generation: Option<u64>,
+    panic_context: &'static str,
+    check: impl FnOnce() -> DownloadEvent + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    let checking = tokio::task::spawn_blocking(move || {
+        let event = std::panic::catch_unwind(std::panic::AssertUnwindSafe(check))
+            .unwrap_or_else(|panic| {
+                let error = format!("{panic_context}: {}", describe_panic(&*panic));
+                DownloadEvent::Failed {
+                    transfer_id,
+                    failure_kind: ed2k::transfer::classify_error(&error),
+                    error,
+                    generation,
+                }
+            });
+        let _ = tx.blocking_send(event);
+    });
+    tokio::spawn(async move {
+        let _ = checking.await;
+    })
+}
+
 /// Remove a recovered download's `.part` and `.part.met` from `folder`, or
 /// have them removed once they can be. Blocking.
 fn remove_recovered_part_files(folder: &Path, transfer_id: &str) {
@@ -504,6 +584,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 let tx = dl_event_tx.clone();
                 let download_root = dl_folder.clone();
                 let part_files_in = found_parts.get(&tid).map(PathBuf::from);
+                let generation = Some(control.generation());
                 note_copy_check(&tid, transfer.status.clone());
                 transfer.status = TransferStatus::Verifying;
                 transfer.speed = 0;
@@ -511,18 +592,16 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 {
                     let mut mgr = transfer_manager.write().await;
                     mgr.active.insert(tid.clone(), transfer);
+                    mgr.begin_restore_verification(&tid, &control);
                     mgr.register_control(&tid, control);
                 }
                 let handle_id = tid.clone();
-                // The event is sent from the blocking task itself. Pause, Stop
-                // and Cancel abort the async task but cannot stop the check,
-                // which may still publish the file and remove its `.part`:
-                // were the event sent from the task, the row would be left
-                // unfinished beside a finished file, and the check's entry
-                // would misroute the download's next failure.
-                let handle = tokio::spawn(async move {
-                    let (panic_tx, panic_tid) = (tx.clone(), tid.clone());
-                    let checked = tokio::task::spawn_blocking(move || {
+                let handle = spawn_restore_check(
+                    tx,
+                    tid.clone(),
+                    generation,
+                    "Restored final file could not be read",
+                    move || {
                         let recovered = recover_restored_copies(
                             &copies,
                             &download_root,
@@ -537,7 +616,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                                 remove_recovered_part_files(&folder, &tid);
                             }
                         }
-                        let event = match recovered {
+                        match recovered {
                             Ok(final_path) => {
                                 take_copy_check(&tid);
                                 DownloadEvent::Completed {
@@ -545,6 +624,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                                     final_path: Some(final_path.to_string_lossy().into_owned()),
                                     part_hashes: Vec::new(),
                                     ember_verified: ember_pinned,
+                                    generation,
                                 }
                             }
                             Err(error) => {
@@ -553,24 +633,12 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                                     transfer_id: tid,
                                     error,
                                     failure_kind,
+                                    generation,
                                 }
                             }
-                        };
-                        let _ = tx.blocking_send(event);
-                    })
-                    .await;
-                    if let Err(e) = checked {
-                        let error = format!("Restored final file could not be read: {e}");
-                        let failure_kind = ed2k::transfer::classify_error(&error);
-                        let _ = panic_tx
-                            .send(DownloadEvent::Failed {
-                                transfer_id: panic_tid,
-                                error,
-                                failure_kind,
-                            })
-                            .await;
-                    }
-                });
+                        }
+                    },
+                );
                 state.download_handles.insert(handle_id, handle);
                 continue;
             }
@@ -582,10 +650,32 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 TransferStatus::Verifying | TransferStatus::Completing
             ) {
                 let safe_name = crate::security::sanitize_filename(&transfer.file_name);
-                let final_path = PathBuf::from(&dl_folder).join("Downloads").join(&safe_name);
+                let published: Vec<PathBuf> = if part_path.exists() {
+                    Vec::new()
+                } else {
+                    // Listing Downloads is blocking I/O, and on a share that is
+                    // not answering it is a long one: off the network task, and
+                    // given up on rather than waited out.
+                    let downloads = PathBuf::from(&dl_folder).join("Downloads");
+                    let name = safe_name.clone();
+                    let listing = tokio::task::spawn_blocking(move || {
+                        ed2k::transfer::published_names(&downloads, &name)
+                            .into_iter()
+                            .filter(|path| path.exists())
+                            .collect::<Vec<_>>()
+                    });
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), listing).await {
+                        Ok(Ok(found)) => found,
+                        _ => {
+                            warn!("Could not list {dl_folder}/Downloads in time to recover {}", transfer.id);
+                            Vec::new()
+                        }
+                    }
+                };
 
-                if !part_path.exists() && final_path.exists() {
-                    // The .part is gone and a file with the target name
+                if !published.is_empty() {
+                    // The .part is gone and a file with the target name, or
+                    // the `name (N)` completion gives it when that is taken,
                     // exists. That usually means completion already moved
                     // the verified file and the app crashed before writing
                     // the terminal status. But a *pre-existing, unrelated*
@@ -606,79 +696,57 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                     // this file's official Ember hash.
                     let expected_ember = transfer.ember_file_hash.clone();
                     let ember_pinned = expected_ember.is_some();
-                    let verify_path = final_path.clone();
+                    let file_size = transfer.total_size;
                     let allowed_root = dl_folder.clone();
                     let tid = transfer.id.clone();
                     let tid_handle = tid.clone();
                     let tx = dl_event_tx.clone();
+                    let generation = Some(control.generation());
                     transfer.status = TransferStatus::Verifying;
                     transfer.speed = 0;
                     restore_db_writes.push(transfer.clone());
                     {
                         let mut mgr = transfer_manager.write().await;
                         mgr.active.insert(tid.clone(), transfer);
+                        mgr.begin_restore_verification(&tid, &control);
                         mgr.register_control(&tid, control);
                     }
-                    let handle = tokio::spawn(async move {
-                        // `Ok(())` verified, `Err(msg)` mismatched, and the
-                        // outer `None` means the file could not be read at
-                        // all. Which check failed decides whether this is
-                        // worth retrying, so the reason travels with it.
-                        let verdict = tokio::task::spawn_blocking(move || {
-                            let verified_path =
-                                crate::security::filesystem::verify_existing_path(
-                                    &verify_path,
-                                    &[allowed_root],
-                                )
-                                .ok()?;
-                            // All three digests from one read. Checked one
-                            // at a time, this walked a restored multi-GB
-                            // file up to three times over — and a restore
-                            // re-verification is the moment a user is
-                            // waiting to learn whether their file survived.
-                            let mut file = std::fs::File::open(&verified_path).ok()?;
-                            verify_restored_file(
-                                &mut file,
+                    let handle = spawn_restore_check(
+                        tx,
+                        tid.clone(),
+                        generation,
+                        "Restored final file could not be read",
+                        move || {
+                            match find_published_file(
+                                &published,
+                                &allowed_root,
+                                file_size,
                                 &expected,
                                 expected_aich.as_deref(),
                                 expected_ember.as_deref(),
-                            )
-                            .ok()
-                        })
-                        .await
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| {
-                            Err("Restored final file could not be read".to_string())
-                        });
-                        match verdict {
-                            Ok(()) => {
-                                let _ = tx
-                                    .send(DownloadEvent::Completed {
-                                        transfer_id: tid,
-                                        final_path: Some(
-                                            final_path.to_string_lossy().into_owned(),
-                                        ),
-                                        part_hashes: Vec::new(),
-                                        ember_verified: ember_pinned,
-                                    })
-                                    .await;
-                            }
-                            Err(error) => {
-                                warn!(
-                                    "Restored download {tid} failed re-verification: {error}"
-                                );
-                                let failure_kind = ed2k::transfer::classify_error(&error);
-                                let _ = tx
-                                    .send(DownloadEvent::Failed {
+                            ) {
+                                Ok(final_path) => DownloadEvent::Completed {
+                                    transfer_id: tid,
+                                    final_path: Some(final_path.to_string_lossy().into_owned()),
+                                    part_hashes: Vec::new(),
+                                    ember_verified: ember_pinned,
+                                    generation,
+                                },
+                                Err(error) => {
+                                    warn!(
+                                        "Restored download {tid} failed re-verification: {error}"
+                                    );
+                                    let failure_kind = ed2k::transfer::classify_error(&error);
+                                    DownloadEvent::Failed {
                                         transfer_id: tid,
                                         error,
                                         failure_kind,
-                                    })
-                                    .await;
+                                        generation,
+                                    }
+                                }
                             }
-                        }
-                    });
+                        },
+                    );
                     state.download_handles.insert(tid_handle, handle);
                     continue;
                 }
@@ -707,56 +775,66 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                         transfer.status = TransferStatus::Verifying;
                         transfer.speed = 0;
                         restore_db_writes.push(transfer.clone());
+                        let verify_control = control.clone();
+                        let generation = Some(control.generation());
                         {
                             let mut mgr = transfer_manager.write().await;
                             mgr.active.insert(tid.clone(), transfer);
+                            mgr.begin_restore_verification(&tid, &control);
                             mgr.register_control(&tid, control);
                         }
 
                         if let Some(old_handle) = state.download_handles.remove(&dl_tid2) {
                             old_handle.abort();
                         }
-                        let handle = tokio::spawn(async move {
-                            let result = reverify_complete_part_file(
-                                &dl_tid,
-                                &file_hash,
-                                &file_name,
-                                file_size,
-                                expected_aich.as_deref(),
-                                expected_ember.as_deref(),
-                                &part_dir,
-                                &dl_dir,
-                            )
-                            .await;
-                            match result {
-                                Ok(final_path) => {
-                                    let _ = tx
-                                        .send(DownloadEvent::Completed {
+                        // Verify, move and report on one blocking task: a move
+                        // left unreported would leave the row unfinished with
+                        // its `.part` gone, so Resume would download it all
+                        // again as "name (1)".
+                        let handle = spawn_restore_check(
+                            tx,
+                            dl_tid.clone(),
+                            generation,
+                            "Re-verification of restored download failed",
+                            move || {
+                                let result = reverify_complete_part_file(
+                                    &dl_tid,
+                                    &file_hash,
+                                    &file_name,
+                                    file_size,
+                                    expected_aich.as_deref(),
+                                    expected_ember.as_deref(),
+                                    &part_dir,
+                                    &dl_dir,
+                                    &verify_control,
+                                );
+                                match result {
+                                    Ok(final_path) => DownloadEvent::Completed {
+                                        transfer_id: dl_tid,
+                                        final_path: Some(
+                                            final_path.to_string_lossy().into_owned(),
+                                        ),
+                                        // `reverify_complete_part_file` only
+                                        // re-checks the whole-file ed2k hash,
+                                        // not a per-part hashset.
+                                        part_hashes: Vec::new(),
+                                        ember_verified: ember_pinned,
+                                        generation,
+                                    },
+                                    Err(e) => {
+                                        warn!("Re-verification of restored download failed: {e}");
+                                        let error = e.to_string();
+                                        let failure_kind = ed2k::transfer::classify_error(&error);
+                                        DownloadEvent::Failed {
                                             transfer_id: dl_tid,
-                                            final_path: Some(
-                                                final_path.to_string_lossy().into_owned(),
-                                            ),
-                                            // `reverify_complete_part_file` only
-                                            // re-checks the whole-file ed2k hash,
-                                            // not a per-part hashset.
-                                            part_hashes: Vec::new(),
-                                            ember_verified: ember_pinned,
-                                        })
-                                        .await;
+                                            error,
+                                            failure_kind,
+                                            generation,
+                                        }
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!("Re-verification of restored download failed: {e}");
-                                    let kind = ed2k::transfer::classify_error(&e.to_string());
-                                    let _ = tx
-                                        .send(DownloadEvent::Failed {
-                                            transfer_id: dl_tid,
-                                            error: e.to_string(),
-                                            failure_kind: kind,
-                                        })
-                                        .await;
-                                }
-                            }
-                        });
+                            },
+                        );
                         state.download_handles.insert(dl_tid2, handle);
                         continue;
                     }
@@ -1310,5 +1388,78 @@ mod tests {
         assert_eq!(published, downloads.join("movie (1).bin"), "the same file by its hash");
         assert!(!same_bytes.exists());
         assert!(!downloads.join("movie (2).bin").exists());
+    }
+
+    /// Completion published the file as `name (1)` because `name` was taken,
+    /// then the app stopped before recording it: the restore finds it there.
+    #[test]
+    fn a_crash_after_a_numbered_publish_completes_from_the_numbered_name() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let scratch = Scratch::new("numbered-publish");
+        let (current, data) = (scratch.folder("current"), scratch.0.join("data"));
+        std::fs::create_dir_all(&data).unwrap();
+        let root = current.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(&data, std::slice::from_ref(&root))
+            .unwrap();
+        let finished = vec![5u8; 100];
+        let downloads = current.join("Downloads");
+        std::fs::write(downloads.join("movie.bin"), vec![6u8; 100]).unwrap();
+        std::fs::write(downloads.join("movie (1).bin"), &finished).unwrap();
+        let hash = ed2k::hash::ed2k_hash_open_file(
+            &mut std::fs::File::open(downloads.join("movie (1).bin")).unwrap(),
+        )
+        .unwrap();
+
+        let candidates = ed2k::transfer::published_names(&downloads, "movie.bin");
+        assert_eq!(
+            find_published_file(&candidates, &root, 100, &hash, None, None),
+            Ok(downloads.join("movie (1).bin"))
+        );
+
+        std::fs::remove_file(downloads.join("movie (1).bin")).unwrap();
+        let candidates = ed2k::transfer::published_names(&downloads, "movie.bin");
+        assert_eq!(
+            find_published_file(&candidates, &root, 100, &hash, None, None),
+            Err("Restored final file hash mismatch".to_string()),
+            "an unrelated file of the same name is not this download"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_check_reports_even_when_its_task_is_aborted() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let handle = spawn_restore_check(tx, "dl".to_string(), Some(7), "check failed", || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            DownloadEvent::Completed {
+                transfer_id: "dl".to_string(),
+                final_path: None,
+                part_hashes: Vec::new(),
+                ember_verified: false,
+                generation: Some(7),
+            }
+        });
+        handle.abort();
+
+        let event = rx.recv().await.expect("the check's result is sent");
+        assert!(matches!(event, DownloadEvent::Completed { generation: Some(7), .. }));
+    }
+
+    #[tokio::test]
+    async fn panicking_restore_check_reports_a_failure_for_its_generation() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let handle = spawn_restore_check(tx, "dl".to_string(), Some(7), "check failed", || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            panic!("disk vanished")
+        });
+        handle.abort();
+
+        match rx.recv().await.expect("a panicking check still reports") {
+            DownloadEvent::Failed { transfer_id, error, generation, .. } => {
+                assert_eq!(transfer_id, "dl");
+                assert_eq!(generation, Some(7));
+                assert_eq!(error, "check failed: disk vanished");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 }

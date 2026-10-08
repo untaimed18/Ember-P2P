@@ -1,192 +1,273 @@
 <script lang="ts">
   import { toasts, removeToast, pauseToastDismiss, resumeToastDismiss } from '$lib/stores/toast';
   import * as m from '$lib/paraglide/messages';
-  import { fly } from 'svelte/transition';
+  import { cubicIn, cubicInOut, cubicOut } from 'svelte/easing';
   import { prefersReducedMotion } from 'svelte/motion';
   import { chatDockOpen } from '$lib/stores/chatTabs';
   import IconX from './IconX.svelte';
   import { isChatWindow } from '$lib/windowRole';
+  import { shortcutModAria } from '$lib/platform';
 
   /** The chat window is all dock, so there is no dock beside it to clear. */
   const besideDock = !isChatWindow();
 
-  const flyParams = () => ({ x: prefersReducedMotion.current ? 0 : 24, duration: prefersReducedMotion.current ? 0 : 200 });
+  /** Slides in from the window edge, settling as it lands. */
+  function toastIn(_node: Element) {
+    if (prefersReducedMotion.current) {
+      return { duration: 140, css: (t: number) => `opacity: ${t}` };
+    }
+    return {
+      duration: 340,
+      css: (t: number) => {
+        const e = cubicOut(t);
+        return `opacity: ${Math.min(1, t * 1.6)}; transform: translateX(${(1 - e) * 36}px) scale(${0.96 + 0.04 * e})`;
+      },
+    };
+  }
+
+  /** Slides back out, then gives up its height so the toasts after it glide
+   *  into place instead of jumping once it is gone. */
+  function toastOut(node: Element) {
+    const style = getComputedStyle(node);
+    const height = (node as HTMLElement).offsetHeight;
+    const margin = parseFloat(style.marginBottom) || 0;
+    const padTop = parseFloat(style.paddingTop) || 0;
+    const padBottom = parseFloat(style.paddingBottom) || 0;
+    if (prefersReducedMotion.current) {
+      return { duration: 140, css: (t: number) => `opacity: ${t}` };
+    }
+    const SLIDE = 0.55;
+    return {
+      duration: 380,
+      css: (t: number) => {
+        const p = 1 - t;
+        const slide = cubicIn(Math.min(1, p / SLIDE));
+        const keep = 1 - cubicInOut(Math.max(0, (p - SLIDE) / (1 - SLIDE)));
+        return `opacity: ${1 - slide}; transform: translateX(${slide * 32}px); height: ${height * keep}px; padding-top: ${padTop * keep}px; padding-bottom: ${padBottom * keep}px; border-block-width: ${keep}px; margin-bottom: ${margin * keep}px; overflow: hidden`;
+      },
+    };
+  }
+
+  let container = $state<HTMLDivElement>();
+  /** The Undo Ctrl+Z takes: the newest. */
+  const latestUndoId = $derived($toasts.findLast((t) => t.action?.undo)?.id);
+
+  /** Chromium fires no `focusout` for a focused button removed with its
+   *  toast, so the countdowns of the toasts left would stay held. */
+  function afterRemoving(fn: () => void) {
+    fn();
+    queueMicrotask(() => {
+      if (!container) return;
+      if (!container.contains(document.activeElement) && !container.matches(':hover')) resumeToastDismiss();
+    });
+  }
 </script>
 
-{#if $toasts.length > 0}
-  <!-- No live region on the container: each toast is its own `role="alert"`,
-       and nesting an assertive region inside a polite one makes the
-       announcement behavior ambiguous across screen readers. -->
-  <!-- Hovering or tabbing in holds every countdown; `focusin`/`focusout` cover
-       the keyboard path to the close buttons, which a pointer-only pause would
-       leave racing the timer. -->
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <!-- The pointer handlers are a timing hint, not an affordance: there is
-       nothing here to activate, so a role would advertise an interaction that
-       does not exist. The container is deliberately role-less (see above), and
-       the keyboard equivalent is `focusin`/`focusout` rather than a click. -->
-  <div
-    class="toast-container"
-    class:dock-open={besideDock && $chatDockOpen}
-    data-a11y-no-inert
-    onmouseenter={pauseToastDismiss}
-    onmouseleave={resumeToastDismiss}
-    onfocusin={pauseToastDismiss}
-    onfocusout={resumeToastDismiss}
-  >
-    {#each $toasts as toast (toast.id)}
-      <!--
-        Severity picks the role. `role="alert"` is assertive: it interrupts
-        whatever the screen reader is saying mid-sentence, which is right for
-        a failed download and wrong for "Copied to clipboard" — and every
-        toast used to be assertive, so a burst of successes talked over the
-        page the user was actually reading. Warnings and errors keep it;
-        success and info become polite `status`.
-      -->
-      <div
-        class="toast toast-{toast.type}"
-        role={toast.type === 'error' || toast.type === 'warning' ? 'alert' : 'status'}
-        transition:fly={flyParams()}
-      >
-        <span class="toast-icon" aria-hidden="true">
-          {#if toast.type === 'success'}
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" width="16" height="16">
-              <polyline points="5 12.5 10 17.5 19 7" />
-            </svg>
-          {:else if toast.type === 'error'}
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" width="16" height="16">
-              <line x1="6" y1="6" x2="18" y2="18" />
-              <line x1="18" y1="6" x2="6" y2="18" />
-            </svg>
-          {:else if toast.type === 'warning'}
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16">
-              <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
-              <line x1="12" y1="9" x2="12" y2="13" />
-              <line x1="12" y1="17" x2="12" y2="17" />
-            </svg>
-          {:else}
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16">
-              <circle cx="12" cy="12" r="9" />
-              <line x1="12" y1="11" x2="12" y2="16" />
-              <line x1="12" y1="8" x2="12" y2="8" />
-            </svg>
-          {/if}
-        </span>
-        <span class="toast-msg">{toast.message}</span>
-        <button type="button" class="toast-close" onclick={() => removeToast(toast.id)} title={m.common_dismiss()} aria-label={m.common_dismiss()}>
-          <IconX size={13} />
-        </button>
-      </div>
-    {/each}
-  </div>
-{/if}
+<!-- Always mounted, empty or not: a transition plays only when its own block
+     comes or goes, so a container created with the first toast and removed
+     with the last showed a lone toast, the most common kind, popping in and
+     vanishing with no animation at all. -->
+<!-- No live region on the container: each toast is its own `role="alert"`,
+     and nesting an assertive region inside a polite one makes the
+     announcement behavior ambiguous across screen readers. -->
+<!-- Hovering or tabbing in holds every countdown; `focusin`/`focusout` cover
+     the keyboard path to the close buttons, which a pointer-only pause would
+     leave racing the timer. -->
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<!-- The pointer handlers are a timing hint, not an affordance: there is
+     nothing here to activate, so a role would advertise an interaction that
+     does not exist. The container is deliberately role-less (see above), and
+     the keyboard equivalent is `focusin`/`focusout` rather than a click. -->
+<div
+  bind:this={container}
+  class="toast-container"
+  class:dock-open={besideDock && $chatDockOpen}
+  data-a11y-no-inert
+  onmouseenter={pauseToastDismiss}
+  onmouseleave={resumeToastDismiss}
+  onfocusin={pauseToastDismiss}
+  onfocusout={resumeToastDismiss}
+>
+  {#each $toasts as toast (toast.id)}
+    <!--
+      Severity picks the role. `role="alert"` is assertive: it interrupts
+      whatever the screen reader is saying mid-sentence, which is right for
+      a failed download and wrong for "Copied to clipboard" — and every
+      toast used to be assertive, so a burst of successes talked over the
+      page the user was actually reading. Warnings and errors keep it;
+      success and info become polite `status`.
+    -->
+    <div
+      class="toast toast-{toast.type}"
+      role={toast.type === 'error' || toast.type === 'warning' ? 'alert' : 'status'}
+      in:toastIn
+      out:toastOut
+    >
+      <span class="toast-icon" aria-hidden="true">
+        {#if toast.type === 'success'}
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
+            <polyline points="5 12.5 10 17.5 19 7" />
+          </svg>
+        {:else if toast.type === 'error'}
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" width="12" height="12">
+            <line x1="6" y1="6" x2="18" y2="18" />
+            <line x1="18" y1="6" x2="6" y2="18" />
+          </svg>
+        {:else if toast.type === 'warning'}
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" width="13" height="13">
+            <line x1="12" y1="5" x2="12" y2="13.5" />
+            <line x1="12" y1="19" x2="12" y2="19" />
+          </svg>
+        {:else}
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" width="13" height="13">
+            <line x1="12" y1="5" x2="12" y2="5" />
+            <line x1="12" y1="10.5" x2="12" y2="19" />
+          </svg>
+        {/if}
+      </span>
+      <span class="toast-msg" id="toast-msg-{toast.id}">{toast.message}</span>
+      {#if toast.action}
+        {@const action = toast.action}
+        <button
+          type="button"
+          class="toast-action"
+          aria-describedby="toast-msg-{toast.id}"
+          aria-keyshortcuts={toast.id === latestUndoId ? `${shortcutModAria()}+Z` : undefined}
+          onclick={() => afterRemoving(() => action.run())}
+        >{action.label}</button>
+      {/if}
+      <button type="button" class="toast-close" onclick={() => afterRemoving(() => removeToast(toast.id))} title={m.common_dismiss()} aria-label={m.common_dismiss()}>
+        <IconX size={13} />
+      </button>
+    </div>
+  {/each}
+</div>
 
 <style>
   .toast-container {
     position: fixed;
-    top: 12px;
-    right: 12px;
+    /* The padding is room for the toasts' shadows, which the scroll box
+       below would otherwise cut off; the edges are where the toasts sit. */
+    top: 4px;
+    right: 0;
+    padding: 8px 12px 20px 24px;
     /* Above the modal overlay tier (10000). A toast raised while a dialog is
        open is usually reporting that dialog's action failing, so it must not
        render behind the scrim. */
     z-index: 10001;
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    max-width: 400px;
+    width: min(392px, 100vw);
     /* Hard stop against a burst (or a few very long backend error strings)
        growing the stack past the bottom of the window, where the oldest
        toasts would be unreachable. The container is `pointer-events: none`
        so it never blocks the app behind it; the toasts opt back in, which is
        also what lets a wheel over one scroll this list. */
-    max-height: calc(100dvh - 24px);
+    max-height: calc(100dvh - 4px);
     overflow-y: auto;
     /* Not `visible`: alongside `overflow-y: auto` that computes to `auto` too,
-       and the enter/exit `fly` translates 24px on x — enough to flash a
-       horizontal scrollbar on every toast. */
+       and the slide in and out on x is enough to flash a horizontal
+       scrollbar on every toast. */
     overflow-x: clip;
     overscroll-behavior: contain;
     pointer-events: none;
   }
   .toast-container.dock-open {
-    right: calc(min(420px, 40vw) + 12px);
+    right: min(420px, 40vw);
   }
+
+  /* One card for every kind, so a toast reads as a toast whatever it says:
+     the kind is carried by `--tone` alone, on the edge, the icon and the
+     action. A tinted fill made each kind a different card, and the faint
+     info tint was easy to miss over a busy table. */
   .toast {
+    --tone: var(--accent);
+    --tone-text: var(--badge-accent-text);
+    --on-tone: var(--on-accent);
+    position: relative;
     pointer-events: auto;
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 10px 12px 10px 14px;
+    margin-bottom: 10px;
+    padding: 11px 8px 11px 16px;
     border-radius: var(--radius-md);
     font-size: var(--font-size-md);
     color: var(--text-primary);
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    box-shadow: var(--shadow-md);
+    background: var(--ctx-surface);
+    border: 1px solid var(--ctx-border);
+    box-shadow: var(--ctx-shadow);
+    overflow: hidden;
   }
   .toast-success {
-    background: color-mix(in srgb, var(--success) 14%, var(--bg-secondary));
-    border-color: color-mix(in srgb, var(--success) 32%, transparent);
+    --tone: var(--success);
+    --tone-text: var(--badge-success-text);
+    --on-tone: var(--on-success);
   }
   .toast-error {
-    background: color-mix(in srgb, var(--danger) 14%, var(--bg-secondary));
-    border-color: color-mix(in srgb, var(--danger) 32%, transparent);
+    --tone: var(--danger);
+    --tone-text: var(--badge-danger-text);
+    --on-tone: var(--on-danger);
   }
   .toast-warning {
-    background: color-mix(in srgb, var(--warning) 14%, var(--bg-secondary));
-    border-color: color-mix(in srgb, var(--warning) 32%, transparent);
+    --tone: var(--warning);
+    --tone-text: var(--badge-warning-text);
+    --on-tone: var(--on-warning);
   }
-  .toast-info {
-    background: color-mix(in srgb, var(--accent) 12%, var(--bg-secondary));
-    border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  .toast::before {
+    content: '';
+    position: absolute;
+    inset-block: 0;
+    inset-inline-start: 0;
+    width: 4px;
+    background: var(--tone);
   }
   .toast-icon {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
-  }
-  .toast-success .toast-icon { color: var(--badge-success-text); }
-  .toast-error .toast-icon { color: var(--badge-danger-text); }
-  .toast-warning .toast-icon { color: var(--badge-warning-text); }
-  .toast-info .toast-icon { color: var(--badge-accent-text); }
-  :global([data-theme="dark"]) .toast-success {
-    background: color-mix(in srgb, var(--success) 18%, var(--bg-secondary));
-    border-color: color-mix(in srgb, var(--success) 36%, transparent);
-  }
-  :global([data-theme="dark"]) .toast-error {
-    background: color-mix(in srgb, var(--danger) 18%, var(--bg-secondary));
-    border-color: color-mix(in srgb, var(--danger) 36%, transparent);
-  }
-  :global([data-theme="dark"]) .toast-warning {
-    background: color-mix(in srgb, var(--warning) 18%, var(--bg-secondary));
-    border-color: color-mix(in srgb, var(--warning) 36%, transparent);
-  }
-  :global([data-theme="dark"]) .toast-info {
-    background: color-mix(in srgb, var(--accent) 16%, var(--bg-secondary));
-    border-color: color-mix(in srgb, var(--accent) 34%, transparent);
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: var(--tone);
+    color: var(--on-tone);
   }
   /* Backend error strings carry hashes and full Windows paths; without
      min-width:0 a flex item won't shrink below its min-content width. */
-  .toast-msg { flex: 1; min-width: 0; line-height: 1.35; overflow-wrap: anywhere; }
+  .toast-msg { flex: 1; min-width: 0; line-height: 1.4; overflow-wrap: anywhere; }
+  .toast-action {
+    flex-shrink: 0;
+    padding: 4px 11px;
+    border: 1px solid color-mix(in srgb, var(--tone) 45%, transparent);
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--tone) 12%, transparent);
+    color: var(--tone-text);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    cursor: pointer;
+    transition: background var(--transition-fast), border-color var(--transition-fast);
+  }
+  .toast-action:hover {
+    background: color-mix(in srgb, var(--tone) 22%, transparent);
+    border-color: color-mix(in srgb, var(--tone) 65%, transparent);
+  }
   .toast-close {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 22px;
-    height: 22px;
+    width: 24px;
+    height: 24px;
     background: none;
     border: none;
     border-radius: var(--radius-sm);
-    color: var(--text-secondary);
+    color: var(--text-muted);
     cursor: pointer;
     padding: 0;
-    opacity: 0.85;
     flex-shrink: 0;
-    transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast);
+    transition: background var(--transition-fast), color var(--transition-fast);
   }
   .toast-close:hover {
-    opacity: 1;
     color: var(--text-primary);
     background: color-mix(in srgb, var(--text-primary) 10%, transparent);
   }

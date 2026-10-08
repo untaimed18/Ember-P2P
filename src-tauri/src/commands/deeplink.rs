@@ -271,34 +271,7 @@ pub fn load_pending_queue(app: &AppHandle) -> Vec<PendingDeepLink> {
         })
 }
 
-/// True for a UNC share (`\\server\share`, `//server/share`, `\\?\UNC\…`) or
-/// any other `\\` namespace path that does not name a local drive letter.
-///
-/// Merely resolving such a path makes Windows connect to the server over SMB
-/// and offer the user's NTLM credentials, so a link must never get Ember to
-/// touch one.
-fn is_network_path(path: &str) -> bool {
-    let normalized = path.trim().replace('/', "\\");
-    let Some(rest) = normalized.strip_prefix(r"\\") else {
-        return false;
-    };
-    // Windows collapses `..` in a `\\.\` path before resolving it, so
-    // `\\.\C:\..\UNC\server\share` climbs off the drive onto a share.
-    if rest.split('\\').any(|component| component.trim() == "..") {
-        return true;
-    }
-    let names_local_drive = |device: &str| {
-        let bytes = device.as_bytes();
-        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
-    };
-    match rest
-        .strip_prefix(r"?\")
-        .or_else(|| rest.strip_prefix(r".\"))
-    {
-        Some(device) => !names_local_drive(device),
-        None => true,
-    }
-}
+use crate::security::is_network_path;
 
 /// True if `arg` looks like a deep link we should act on: an `ed2k:` URI
 /// (including browser-encoded `ed2k://%7Cfile%7C…` forms), an absolute local
@@ -318,6 +291,31 @@ pub fn is_deep_link_payload(arg: &str) -> bool {
         || lower.starts_with("ember3:")
         || lower.starts_with("ember2:")
         || lower.starts_with("ember-channel:")
+}
+
+/// Split an OS drop into the collection files to open and the paths to share.
+///
+/// A dropped `.emulecollection` means what double-clicking it means, so it
+/// takes the same confirmed path a double-click's argv does rather than being
+/// shared as an ordinary file. One the deep-link checks refuse (a network
+/// path, an overlong one) stays with the drop and is shared as before.
+pub fn take_dropped_collections(
+    paths: Vec<std::path::PathBuf>,
+) -> (Vec<String>, Vec<std::path::PathBuf>) {
+    let mut collections = Vec::new();
+    let mut rest = Vec::new();
+    for path in paths {
+        let is_collection = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("emulecollection"));
+        match path.to_str() {
+            Some(s) if is_collection && s.len() <= MAX_PAYLOAD_LEN && is_deep_link_payload(s) => {
+                collections.push(s.to_string());
+            }
+            _ => rest.push(path),
+        }
+    }
+    (collections, rest)
 }
 
 /// Pull the deep-link payloads out of a process/instance argv.
@@ -541,12 +539,10 @@ pub async fn ack_pending_deep_link(
 /// Load a collection from a path already authorized by an OS file association
 /// or the native file picker.
 ///
-/// Unlike `collections::load_collection` (which constrains the path to the
-/// user's shared/download folders because it's driven by an in-app file
-/// dialog), a `.emulecollection` opened from the shell can live anywhere
-/// (Downloads, Desktop, an email attachment). The user double-clicking the
-/// file *is* the authorization, so we drop the folder-containment check and
-/// instead lean on extension, regular-file, and size validation.
+/// A `.emulecollection` opened from the shell can live anywhere (Downloads,
+/// Desktop, an email attachment). The user double-clicking the file *is* the
+/// authorization, so there is no folder-containment check; we lean on
+/// extension, regular-file, and size validation instead.
 ///
 /// This is deliberately not a Tauri command. Exposing a raw unrestricted path
 /// to the webview would let injected renderer code use the OS-authorized
@@ -649,6 +645,40 @@ pub async fn open_pending_collection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_collections_open_and_everything_else_is_shared() {
+        let root = if cfg!(windows) { "C:\\drop\\" } else { "/drop/" };
+        let collection = format!("{root}set.eMuleCollection");
+        let folder = format!("{root}Movies");
+        let lookalike = format!("{root}notes.emulecollection.txt");
+        let relative = "set.emulecollection".to_string();
+        let (open, share) = take_dropped_collections(vec![
+            collection.clone().into(),
+            folder.clone().into(),
+            lookalike.clone().into(),
+            relative.clone().into(),
+        ]);
+        assert_eq!(open, vec![collection]);
+        assert_eq!(
+            share,
+            vec![
+                std::path::PathBuf::from(folder),
+                lookalike.into(),
+                relative.into(),
+            ],
+            "only an absolute collection path is opened; the rest is shared as before"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_dropped_collection_on_a_network_share_is_not_opened() {
+        let (open, share) =
+            take_dropped_collections(vec![r"\\server\share\set.emulecollection".into()]);
+        assert!(open.is_empty());
+        assert_eq!(share.len(), 1);
+    }
 
     #[test]
     fn linux_claims_ed2k_only_when_unowned_or_already_ours() {
@@ -832,6 +862,9 @@ mod tests {
             r"\\?\GLOBALROOT\Device\Mup\attacker.example\s\list.emulecollection",
             r"\\.\C:\..\UNC\attacker.example\s\list.emulecollection",
             r"\\.\C:\Users\..\..\UNC\attacker.example\s\list.emulecollection",
+            r"\??\UNC\attacker.example\s\list.emulecollection",
+            r"\??\GLOBALROOT\Device\Mup\attacker.example\s\list.emulecollection",
+            r"\??\C:\..\UNC\attacker.example\s\list.emulecollection",
         ];
         for path in remote {
             assert!(is_network_path(path), "{path}");
@@ -854,6 +887,7 @@ mod tests {
             assert!(!is_network_path(local), "{local}");
             assert_eq!(preview_deep_link_payload(local).unwrap().kind, "collection");
         }
+        assert!(!is_network_path(r"\??\C:\Users\Ember\set.emulecollection"));
     }
 
     #[test]

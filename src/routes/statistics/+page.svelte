@@ -45,6 +45,9 @@
   // no snapshot — drives the unavailable hint under Peer Reputation.
   let repUnavailable = $state(false);
 
+  /** Retry / Refresh clicks still in flight, which show as a busy button. */
+  let manualLoads = $state(0);
+
   async function loadStats(opts: { force?: boolean } = {}) {
     if (unmounted) return;
     // A user-initiated retry (the error screen button) bypasses the poll's
@@ -54,6 +57,7 @@
     if (busySeq !== 0 && !opts.force) return;
     const seq = ++requestSeq;
     busySeq = seq;
+    if (opts.force) manualLoads++;
     try {
       // Fire both fetches concurrently — they hit different backend
       // paths (stats reads a cached snapshot; reputation reads the
@@ -101,6 +105,7 @@
     } finally {
       if (!unmounted) loading = false;
       if (busySeq === seq) busySeq = 0;
+      if (opts.force) manualLoads--;
     }
   }
 
@@ -218,7 +223,10 @@
     <p class="page-subtitle">{m.stats_page_subtitle()}</p>
   </div>
   <div class="header-actions">
-    <button class="ghost" onclick={() => loadStats({ force: true })} disabled={loading}>{m.common_refresh()}</button>
+    <button class="ghost" onclick={() => loadStats({ force: true })} disabled={loading || manualLoads > 0} aria-busy={manualLoads > 0}>
+      {#if manualLoads > 0}<span class="spinner xs" aria-hidden="true"></span>{/if}
+      {m.common_refresh()}
+    </button>
   </div>
 </div>
 
@@ -234,7 +242,10 @@
          which meant it alone ignored the theme's error treatment. -->
     <div class="empty-state">
       <p class="empty-title">{error}</p>
-      <button class="empty-action" onclick={() => loadStats({ force: true })}>{m.common_retry()}</button>
+      <button class="empty-action" onclick={() => loadStats({ force: true })} disabled={manualLoads > 0} aria-busy={manualLoads > 0}>
+        {#if manualLoads > 0}<span class="spinner xs" aria-hidden="true"></span>{/if}
+        {m.common_retry()}
+      </button>
     </div>
   {:else if stats}
 

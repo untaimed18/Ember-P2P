@@ -560,7 +560,7 @@ impl AsyncWrite for StreamWriter {
 /// `OP_CALLBACKREQUESTED` → `TryToConnect` → unified-client-serve behaviour.
 /// Both variants share the entire post-handshake serve loop in `run_session`;
 /// only the handshake preamble differs (who sends `OP_HELLO` first, and
-/// `negotiate_incoming` vs `negotiate_outgoing`).
+/// `negotiate_incoming_with_first_byte` vs `negotiate_outgoing`).
 enum ConnInit {
     Inbound(TcpStream),
     OutboundServe(Box<OutboundServeState>),
@@ -963,6 +963,64 @@ pub(crate) fn friends_only_snapshot_ready(set: &SharedFriendsOnlyHashes) -> bool
     }
 }
 
+/// known.met's records, snapshotted for the upload listener, which cannot read
+/// `KnownFileList` for the same reason as [`SharedFriendsOnlyHashes`]. eMule
+/// answers `OP_HASHSETREQ` from the `CKnownFile` in memory; without this a
+/// complete file's hashset was a read of the whole file.
+pub type SharedKnownRecords = Arc<std::sync::RwLock<crate::storage::known_files::KnownRecords>>;
+
+pub fn publish_known_records(
+    dest: &SharedKnownRecords,
+    known_files: &crate::storage::known_files::KnownFileList,
+) {
+    let next = known_files.records();
+    match dest.write() {
+        Ok(mut records) => *records = next,
+        Err(poisoned) => *poisoned.into_inner() = next,
+    }
+}
+
+/// A complete file's MD4 part hashes, when they can be had without reading it.
+///
+/// A file under one part is its own single part hash. Otherwise the known.met
+/// record is used only when its size matches and its hashes recombine to
+/// `file_hash`: the record is keyed by hash alone, and a hashset that does not
+/// describe exactly that content would fail every part the downloader checks.
+///
+/// And only while the file still has the time it was hashed at: one edited in
+/// place since then, before a rescan, keeps its size, and its old hashset would
+/// pass the downloader's check and then fail every part it fetched.
+fn stored_md4_hashset(
+    records: &SharedKnownRecords,
+    file_hash: &[u8; 16],
+    file_size: u64,
+    on_disk_mtime: Option<i64>,
+) -> Option<Vec<[u8; 16]>> {
+    if file_size > 0 && file_size < PARTSIZE {
+        return Some(vec![*file_hash]);
+    }
+    let on_disk_mtime = on_disk_mtime?;
+    let part_hashes = {
+        let records = records.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let record = records.find_by_hash(file_hash).filter(|record| {
+            record.file_size == file_size
+                && crate::storage::known_files::recorded_mtime_matches(
+                    record.modified_at,
+                    on_disk_mtime,
+                )
+        })?;
+        record.part_hashes.clone()
+    };
+    super::transfer::verify_hashset(file_hash, &part_hashes, file_size).then_some(part_hashes)
+}
+
+/// The file's modification time in whole seconds, as known.met records it.
+async fn file_mtime_secs(path: &std::path::Path) -> Option<i64> {
+    let modified = tokio::fs::metadata(path).await.ok()?.modified().ok()?;
+    let secs = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    i64::try_from(secs).ok()
+}
+
 /// Snapshot hit is always restricted. Until known.met has been absorbed,
 /// fail closed even when the live index says public — hashing starts rows
 /// with `friends_only: false`, and restoring that flag from known.met can
@@ -1046,6 +1104,15 @@ mod skip_video_compression_tests {
         assert!(is_video_file_name("clip.webm"));
         assert!(!is_video_file_name("album.flac"));
         assert!(!is_video_file_name("no-extension"));
+    }
+
+    #[test]
+    fn archives_are_recognised_whatever_the_case() {
+        assert!(is_precompressed_file_name("Backup.ZIP"));
+        assert!(is_precompressed_file_name("source.tar"));
+        assert!(is_precompressed_file_name("comic.cbr"));
+        assert!(!is_precompressed_file_name("notes.txt"));
+        assert!(!is_precompressed_file_name("no-extension"));
     }
 }
 
@@ -1143,6 +1210,12 @@ pub struct KadCallbackParts {
     /// the connection is adopted, so without this the live row had nothing to
     /// inherit a label from and showed a dash.
     pub origin: Option<crate::types::SourceOrigin>,
+    /// Set only when this connection was taken for a LowID source's answer to
+    /// our `OP_CALLBACKREQUEST`. Only such a connection may stamp its user
+    /// hash onto that source's row: any other route's peer that shares the
+    /// row's listening port would claim the row, and the real peer's
+    /// callbacks would no longer match it.
+    pub answers_server_callback: bool,
 }
 
 /// Path B (eMule queued-source model) inbound reconnect index.
@@ -1540,9 +1613,6 @@ const HARD_UPLOAD_QUEUE_SIZE: usize = MAX_UPLOAD_QUEUE_SIZE
     } else {
         800
     }) / 4;
-/// m6: Score multiplier for peers we are simultaneously downloading from.
-const DOWNLOAD_BONUS_MULTIPLIER: f64 = 1.5;
-
 /// eMule-style per-file request frequency tracker for detecting aggressive leechers.
 /// `MIN_REQUESTTIME` (`opcodes.h:116`) is 600 seconds. After `BADCLIENTBAN`
 /// infractions inside that window, ban the client.
@@ -1574,7 +1644,12 @@ struct FileRequestTracker {
     /// requests from different people looked like one client re-asking inside
     /// `MIN_REQUESTTIME` and `BADCLIENTBAN` banned the whole address for
     /// seven days. Only a peer that sent no user hash falls back to its IP.
-    entries: HashMap<(QueueIdentity, [u8; 16]), (std::time::Instant, u32)>,
+    ///
+    /// The value also carries the address the strikes were earned from: the
+    /// user hash travels in the clear and the ban lands on an IP, so strikes
+    /// primed under a hash from one address must not count toward banning
+    /// another.
+    entries: HashMap<(QueueIdentity, [u8; 16]), (std::time::Instant, u32, IpAddr)>,
     /// When the 1h expiry sweep last ran. The sweep is driven from the
     /// `OP_STARTUPLOADREQ` path, which every uploading peer shares through one
     /// mutex, so running it per request made a full `retain` part of the cost
@@ -1629,13 +1704,21 @@ impl FileRequestTracker {
     fn record_request(
         &mut self,
         identity: QueueIdentity,
+        peer_ip: IpAddr,
         file_hash: [u8; 16],
         is_friend_slot: bool,
         downloading_from_peer: bool,
     ) -> bool {
         let now = std::time::Instant::now();
+        let peer_ip = peer_ip.to_canonical();
         let key = (identity, file_hash);
-        if let Some((last_time, bad_count)) = self.entries.get_mut(&key) {
+        if let Some((last_time, bad_count, strike_ip)) = self.entries.get_mut(&key) {
+            if *strike_ip != peer_ip {
+                *strike_ip = peer_ip;
+                *bad_count = 0;
+                *last_time = now;
+                return false;
+            }
             if last_time.elapsed().as_secs() < MIN_REQUESTTIME_SECS && !is_friend_slot {
                 // eMule adds `(GetDownloadState() != DS_DOWNLOADING)`, i.e. zero
                 // while the peer is uploading to us, which still refreshes the
@@ -1652,7 +1735,7 @@ impl FileRequestTracker {
             *last_time = now;
             false
         } else {
-            self.entries.insert(key, (now, 0));
+            self.entries.insert(key, (now, 0, peer_ip));
             false
         }
     }
@@ -1663,7 +1746,7 @@ impl FileRequestTracker {
     /// `OP_OUTOFPARTREQS` — so a rotation we initiated cannot be counted
     /// against the peer that complied with it.
     fn forgive_requeue(&mut self, identity: QueueIdentity, file_hash: [u8; 16]) {
-        if let Some((_, bad_count)) = self.entries.get_mut(&(identity, file_hash)) {
+        if let Some((_, bad_count, _)) = self.entries.get_mut(&(identity, file_hash)) {
             *bad_count = 0;
         }
     }
@@ -1678,7 +1761,7 @@ impl FileRequestTracker {
         {
             self.last_sweep = Some(now);
             self.entries
-                .retain(|_, (t, _)| t.elapsed().as_secs() < 3600);
+                .retain(|_, (t, _, _)| t.elapsed().as_secs() < 3600);
         }
         // Hard cap: a peer rotating through millions of distinct file
         // hashes within the 1h window could otherwise grow this map
@@ -1691,13 +1774,13 @@ impl FileRequestTracker {
             // map and building a `HashSet` of survivors: O(n) instead of
             // O(n log n), and no second allocation the size of the map.
             let mut times: Vec<std::time::Instant> =
-                self.entries.values().map(|(t, _)| *t).collect();
+                self.entries.values().map(|(t, _, _)| *t).collect();
             if FILE_REQUEST_TRIM_TARGET < times.len() {
                 // Descending, so index `FILE_REQUEST_TRIM_TARGET` is the oldest
                 // entry we still intend to keep.
                 times.select_nth_unstable_by(FILE_REQUEST_TRIM_TARGET, |a, b| b.cmp(a));
                 let cutoff = times[FILE_REQUEST_TRIM_TARGET];
-                self.entries.retain(|_, (t, _)| *t > cutoff);
+                self.entries.retain(|_, (t, _, _)| *t > cutoff);
             }
         }
     }
@@ -1853,6 +1936,45 @@ fn push_grant_dialable(
         && !in_flight.contains(&e.identity)
         && !backoff.contains_key(&e.identity)
         && !is_banned(&e.user_hash, &SocketAddr::new(ip, e.tcp_port))
+}
+
+/// The best-scoring queue row `competes` admits, the earlier join breaking a
+/// tie to agree with [`compute_queue_rank`].
+///
+/// Rows whose identity already holds a slot are passed over. eMule's waiting
+/// list never holds a client that is uploading, but here a second connection
+/// under the same identity can wait while the first is served. `try_activate`
+/// refuses that row, and every other waiter takes a slot only when it is the
+/// pick, so choosing it would leave the free slot empty.
+fn best_waiter<'q>(
+    cm: &CreditManager,
+    idx: &LocalIndex,
+    queued: &QueuedPerFile<'_>,
+    queue: &'q [QueueEntry],
+    slot_holders: &HashSet<QueueIdentity>,
+    competes: impl Fn(&QueueEntry) -> bool,
+) -> Option<(&'q QueueEntry, f64)> {
+    let mut best: Option<(&QueueEntry, f64)> = None;
+    for e in queue {
+        if slot_holders.contains(&e.identity) || !competes(e) {
+            continue;
+        }
+        let score = score_queue_entry(
+            cm,
+            idx,
+            queued,
+            &e.user_hash,
+            e.file_hash,
+            e.join_time.elapsed().as_secs(),
+            e.current_addr,
+            e.emule_version,
+            e.is_friend_slot,
+        );
+        if best.is_none_or(|(b, bs)| score > bs || (score == bs && e.join_time < b.join_time)) {
+            best = Some((e, score));
+        }
+    }
+    best
 }
 
 /// Shared handle to the upload queue so non-upload subsystems (e.g. the UDP
@@ -2233,6 +2355,25 @@ fn is_video_file_name(name: &str) -> bool {
         })
 }
 
+/// Whether a file of this name is an archive, which a block of will not
+/// compress. eMule sends these with `OP_SENDINGPART` without trying
+/// (`CUpDownClient::CreateNextBlockPackage`: zip, cbz, rar, cbr, ace, ogm,
+/// tar, tgz, gz, bz2); the newer formats here are as incompressible. The
+/// zlib pass would only be thrown away when it comes out no smaller, so
+/// skipping it changes nothing on the wire, only what the CPU spends.
+fn is_precompressed_file_name(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "zip" | "cbz" | "rar" | "cbr" | "ace" | "ogm" | "tar" | "tgz" | "gz" | "bz2"
+                    | "7z" | "xz" | "zst"
+            )
+        })
+}
+
 #[derive(Debug)]
 struct ResolvedUploadFile {
     /// The name the file is shared under: the download's target name for a
@@ -2600,6 +2741,19 @@ pub enum UploadEventKind {
         ember_hash: [u8; 16],
         contacts: Vec<u8>,
     },
+    /// A friend is `PING`ing our Ember UDP socket and asks us to `PING` its
+    /// own (`EMBER_EXT_DHT_MEET`). Only raised for a direct session: the
+    /// `PING` goes to `peer_ip`, the address that session is connected from,
+    /// with the port the friend claimed, never to an address it named.
+    EmberDhtMeet {
+        ember_hash: [u8; 16],
+        peer_ip: std::net::Ipv4Addr,
+        udp_port: u16,
+        /// This is the answer to a meet we asked for, so it is not answered.
+        answer: bool,
+        /// The friend session this arrived on, for our own answer.
+        reply_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    },
     /// A friend is offering to send us a file. Surfaced to the UI for an
     /// explicit accept — we never start a download because a peer asked us to.
     EmberFileOffer {
@@ -2696,6 +2850,14 @@ pub enum UploadEventKind {
     EmberFriendSearchFailed {
         ember_hash: [u8; 16],
     },
+    /// The punch registration for a friend transfer they accepted could not
+    /// be published, so the punch can never happen. Sent from the spawned
+    /// registration back into the network task, which releases the source as
+    /// a decline does. State-mutation only; never reaches the UI.
+    FriendTransferPunchFailed {
+        friend: [u8; 16],
+        nonce: [u8; 16],
+    },
     /// The upload listener auto-banned an IP (eMule-style
     /// AddRequestCount: a peer re-requesting the same file far too
     /// frequently). Routed back to the network task so the ban lands in
@@ -2774,6 +2936,8 @@ struct UploadHandler {
     banned_hashes: SharedBannedHashes,
     /// known.met friends-only hashes (see [`SharedFriendsOnlyHashes`]).
     friends_only_hashes: SharedFriendsOnlyHashes,
+    /// known.met records, for answering hashsets (see [`SharedKnownRecords`]).
+    known_records: SharedKnownRecords,
     /// Anti-leech client-software pattern filter. Checked once per session
     /// after Hello/EmuleInfo, before any slot is granted or queue position
     /// is held. Hot-reloadable from disk via the Settings UI.
@@ -2820,6 +2984,9 @@ struct UploadHandler {
     /// In-memory MD4 part-hash cache for `OP_HASHSETREQ`: file_hash_hex ->
     /// (part hashes, last_access). See [`PartHashCache`].
     part_hash_cache: Arc<tokio::sync::Mutex<PartHashCache>>,
+    /// Whole-file hash computations running now, across every peer. See
+    /// [`MAX_CONCURRENT_UNCACHED_HASH_JOBS`].
+    uncached_hash_jobs: Arc<tokio::sync::Semaphore>,
     /// Our Ember identity hash, sent in EmuleInfo for friend identification
     ember_hash: [u8; 16],
     /// Our Ed25519 public key, advertised in `OP_EMBER_HELLO` so peers can
@@ -3011,49 +3178,31 @@ impl DirBrowseListing {
     }
 }
 
-/// Uncached whole-file hash computations one connection may trigger per window.
-const MAX_UNCACHED_HASH_JOBS: u32 = 4;
-/// Window over which [`MAX_UNCACHED_HASH_JOBS`] is measured.
-const UNCACHED_HASH_WINDOW_SECS: u64 = 300;
-
-/// Per-connection budget for cache-missing hash requests.
+/// Uncached whole-file hash computations one address may trigger per window.
 ///
 /// `OP_HASHSETREQ`, `OP_HASHSETREQUEST2` and `OP_AICHREQUEST` each answer a
 /// ~22-byte packet by reading an entire shared file, and they need no upload
-/// slot, no queue position and no identity. The two memos in front of them hold
-/// 50 entries each and are process-wide, so a peer that cycles requests across
-/// 51 or more shared hashes misses every time — turning a trickle of small
-/// packets into continuous full-disk reads and MD4/SHA1 over every shared byte,
-/// none of it visible to `AbuseTracker`, which counts connections rather than
-/// packets.
+/// slot, no queue position and no identity. The memos in front of them hold 50
+/// entries each, so a peer that cycles requests across 51 or more shared hashes
+/// misses every time — turning a trickle of small packets into continuous
+/// full-disk reads and MD4/SHA1 over every shared byte.
 ///
-/// Cache *hits* are free and unmetered; only the expensive path spends.
-struct UncachedHashBudget {
-    spent: u32,
-    window_start: std::time::Instant,
-}
-
-impl UncachedHashBudget {
-    fn new() -> Self {
-        Self {
-            spent: 0,
-            window_start: std::time::Instant::now(),
-        }
-    }
-
-    /// Consume one unit, returning false when the connection is over budget.
-    fn try_spend(&mut self) -> bool {
-        if self.window_start.elapsed().as_secs() >= UNCACHED_HASH_WINDOW_SECS {
-            self.spent = 0;
-            self.window_start = std::time::Instant::now();
-        }
-        if self.spent >= MAX_UNCACHED_HASH_JOBS {
-            return false;
-        }
-        self.spent += 1;
-        true
-    }
-}
+/// Counted per address in [`AbuseTracker`], not per connection, since a budget
+/// a reconnect refills bounds nothing. Scaled by [`MAX_CONNECTIONS_PER_IP`] for
+/// the clients that may share an address, as [`MAX_REQUESTS_PER_WINDOW`] is.
+/// Answers that read no file — memo hits, known.met hashsets, stored AICH sets
+/// — are free and unmetered.
+const MAX_UNCACHED_HASH_JOBS: u32 = 4 * MAX_CONNECTIONS_PER_IP as u32;
+/// Window over which [`MAX_UNCACHED_HASH_JOBS`] is measured.
+const UNCACHED_HASH_WINDOW_SECS: u64 = 300;
+/// Uncached whole-file hash computations running at once across every peer.
+///
+/// The per-address budget does not bound a request flood spread over many
+/// addresses; this does, at the disk. A request that finds every job busy for
+/// [`UNCACHED_HASH_JOB_WAIT`] goes unanswered without spending its address's
+/// budget, as a refusal the peer did nothing to earn.
+const MAX_CONCURRENT_UNCACHED_HASH_JOBS: usize = 2;
+const UNCACHED_HASH_JOB_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// MD4 part hashes for complete shared files, keyed by ed2k hash hex.
 ///
@@ -3303,6 +3452,8 @@ struct SlotBandwidth {
     /// the wire, advanced by `bytes / share` on every grant.
     send_by: std::time::Instant,
     last_send: std::time::Instant,
+    /// The share `send_by` was last booked against.
+    share: Option<u64>,
 }
 
 impl SlotBandwidth {
@@ -3311,7 +3462,41 @@ impl SlotBandwidth {
         Self {
             send_by: now,
             last_send: now,
+            share: None,
         }
+    }
+
+    /// How long `bytes` takes at `share`; a slot with no share is held to the
+    /// trickle's own rate, one packet per [`TRICKLE_BLOCK_DEADLINE`], which is
+    /// all `GetNeededBytes` ever grants it.
+    fn owed(bytes: u64, share: Option<u64>) -> std::time::Duration {
+        match share {
+            Some(share) => std::time::Duration::from_nanos(
+                (u128::from(bytes) * 1_000_000_000 / u128::from(share.max(1)))
+                    .min(u128::from(u64::MAX)) as u64,
+            ),
+            None => TRICKLE_BLOCK_DEADLINE,
+        }
+    }
+
+    /// Debt booked at an old share — before promotion past `maxSlot`, a slot
+    /// opening or closing, a new limit — is not owed at the new one: the slot
+    /// waits at most one `bytes`-sized packet at the share it now has.
+    ///
+    /// Only a change of standing counts: gaining or losing a share, or one that
+    /// moved by more than a tenth. USS retunes the rate about every second, and
+    /// rebasing on each of those would forgive every slot its spare-token debt.
+    fn rebase(&mut self, bytes: u64, share: Option<u64>) {
+        let changed = match (self.share, share) {
+            (Some(old), Some(new)) => old.abs_diff(new).saturating_mul(10) > old.max(1),
+            (old, new) => old != new,
+        };
+        if !changed {
+            return;
+        }
+        self.share = share;
+        let cap = std::time::Instant::now() + Self::owed(bytes, share);
+        self.send_by = self.send_by.min(cap);
     }
 
     /// Whether the trickle pass owes this slot the `bytes`-sized packet it is
@@ -3341,19 +3526,17 @@ impl SlotBandwidth {
     ///
     /// `send_by` is floored at `now` so an idle slot banks no credit — eMule's
     /// budget is global and likewise carries nothing forward per slot. A slot
-    /// with no share is held to the trickle's own rate, one packet per
-    /// [`TRICKLE_BLOCK_DEADLINE`], which is all `GetNeededBytes` ever grants it.
+    /// with no share does not accumulate either: every packet it sends went
+    /// out on the trickle or on spare tokens, never against a share it owes.
     fn charge(&mut self, bytes: u64, share: Option<u64>) {
         let now = std::time::Instant::now();
         self.last_send = now;
-        let owed = match share {
-            Some(share) => std::time::Duration::from_nanos(
-                (u128::from(bytes) * 1_000_000_000 / u128::from(share.max(1)))
-                    .min(u128::from(u64::MAX)) as u64,
-            ),
-            None => TRICKLE_BLOCK_DEADLINE,
+        self.share = share;
+        let owed = Self::owed(bytes, share);
+        self.send_by = match share {
+            Some(_) => self.send_by.max(now) + owed,
+            None => now + owed,
         };
-        self.send_by = self.send_by.max(now) + owed;
     }
 }
 
@@ -3418,7 +3601,25 @@ struct AbuseEntry {
     /// occasional missing-file asks over hours do not accumulate forever
     /// while `record_request` keeps `window_start` fresh.
     fnf_window_start: std::time::Instant,
+    /// Whole-file hash computations in the current window; see
+    /// [`MAX_UNCACHED_HASH_JOBS`].
+    hash_jobs: u32,
+    hash_window_start: std::time::Instant,
     banned_until: Option<std::time::Instant>,
+}
+
+impl AbuseEntry {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            request_count: 0,
+            window_start: now,
+            fnf_hashes: Vec::new(),
+            fnf_window_start: now,
+            hash_jobs: 0,
+            hash_window_start: now,
+            banned_until: None,
+        }
+    }
 }
 
 /// eMule: BAN_TIMEOUT = 2 hours. Shared with the persisted mirror
@@ -3498,7 +3699,10 @@ impl AbuseTracker {
             self.entries.retain(|_, e| match e.banned_until {
                 Some(u) if now >= u => false,
                 Some(_) => true,
-                None => now.duration_since(e.window_start).as_secs() < ABUSE_WINDOW_SECS * 2,
+                None => {
+                    now.duration_since(e.window_start.max(e.hash_window_start)).as_secs()
+                        < ABUSE_WINDOW_SECS * 2
+                }
             });
             self.last_cleanup = now;
         }
@@ -3510,13 +3714,7 @@ impl AbuseTracker {
         let now = std::time::Instant::now();
         self.maybe_cleanup(now);
 
-        let entry = self.entries.entry(ip).or_insert_with(|| AbuseEntry {
-            request_count: 0,
-            window_start: now,
-            fnf_hashes: Vec::new(),
-            fnf_window_start: now,
-            banned_until: None,
-        });
+        let entry = self.entries.entry(ip).or_insert_with(|| AbuseEntry::new(now));
 
         if let Some(until) = entry.banned_until {
             return now < until;
@@ -3549,13 +3747,7 @@ impl AbuseTracker {
         let ip = Self::normalize_ip(&ip);
         let now = std::time::Instant::now();
         self.maybe_cleanup(now);
-        let entry = self.entries.entry(ip).or_insert_with(|| AbuseEntry {
-            request_count: 0,
-            window_start: now,
-            fnf_hashes: Vec::new(),
-            fnf_window_start: now,
-            banned_until: None,
-        });
+        let entry = self.entries.entry(ip).or_insert_with(|| AbuseEntry::new(now));
 
         if let Some(until) = entry.banned_until {
             return now < until;
@@ -3583,6 +3775,24 @@ impl AbuseTracker {
         }
 
         false
+    }
+
+    /// Spend one of `ip`'s whole-file hash computations for the window,
+    /// returning false when it has none left.
+    fn try_spend_uncached_hash_job(&mut self, ip: std::net::IpAddr) -> bool {
+        let ip = Self::normalize_ip(&ip);
+        let now = std::time::Instant::now();
+        self.maybe_cleanup(now);
+        let entry = self.entries.entry(ip).or_insert_with(|| AbuseEntry::new(now));
+        if now.duration_since(entry.hash_window_start).as_secs() >= UNCACHED_HASH_WINDOW_SECS {
+            entry.hash_jobs = 0;
+            entry.hash_window_start = now;
+        }
+        if entry.hash_jobs >= MAX_UNCACHED_HASH_JOBS {
+            return false;
+        }
+        entry.hash_jobs += 1;
+        true
     }
 }
 
@@ -3693,7 +3903,6 @@ fn peer_ip_u32(current_addr: Option<SocketAddr>) -> u32 {
 /// eMule `GetCombinedFilePrioAndCredit` — wait-independent soft-zone ranking:
 /// `10 * credit_ratio * GetFilePrioAsNumber()`. Friends with a verified friend
 /// slot bypass soft-zone checks entirely (caller responsibility).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn combined_file_prio_and_credit(
     cm: &CreditManager,
     idx: &LocalIndex,
@@ -3701,8 +3910,6 @@ pub(crate) fn combined_file_prio_and_credit(
     user_hash: &[u8; 16],
     file_hash: [u8; 16],
     peer_ip: u32,
-    ember_pubkey: Option<&[u8; 32]>,
-    ember_verified: bool,
 ) -> f64 {
     let prio_num = idx
         .get_by_hash(&hex::encode(file_hash))
@@ -3715,11 +3922,7 @@ pub(crate) fn combined_file_prio_and_credit(
     ) {
         return 0.0;
     }
-    let ratio = match ember_pubkey.filter(|_| ember_verified) {
-        Some(pubkey) => cm.get_ember_score_ratio(pubkey),
-        None => cm.get_score_ratio(user_hash, peer_ip),
-    };
-    10.0 * ratio * prio_num
+    10.0 * cm.get_score_ratio(user_hash, peer_ip) * prio_num
 }
 
 /// Soft-zone admit decision matching eMule `AddClientToQueue` soft→hard gate.
@@ -3733,20 +3936,14 @@ pub(crate) fn soft_zone_should_admit(
 
 /// Consistent eMule-style queue score for a single entry.
 /// All code paths that compare or rank queue entries MUST use this function
-/// to avoid scoring asymmetry (eMule version penalty, friend slot, download
-/// bonus).  `cm` provides credit ratio; `idx` provides file priority, and
-/// `queued` the demand an Auto priority resolves by.
+/// to avoid scoring asymmetry (eMule version penalty, friend slot).  `cm`
+/// provides credit ratio; `idx` provides file priority, and `queued` the
+/// demand an Auto priority resolves by.
 ///
-/// Phase 3 routing: when the peer has advertised an Ed25519 pubkey AND
-/// completed full proof-of-possession on the session (`ember_verified`),
-/// the base score is drawn from the Ember ledger
-/// (`CreditManager::get_ember_queue_score`) which layers decayed credit
-/// ratio, session-reliability, and upload-speed fairness on top of the
-/// baseline eMule formula. Peers without PoP — vanilla eMule clients,
-/// hash-only Ember peers, and Ember peers that haven't yet completed
-/// the challenge-response — continue using the legacy
-/// `CreditManager::get_queue_score`, keeping the network-wide credit
-/// compatibility story intact.
+/// Every peer is scored by eMule's formula, Ember peers included, so an eMule
+/// user waiting beside an Ember one is ranked on the same terms. eMule's
+/// `GetScore` (`UploadClient.cpp:180-235`) has no multiplier for a peer we are
+/// downloading from: the credit ratio is what rewards it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn score_queue_entry(
     cm: &CreditManager,
@@ -3758,8 +3955,6 @@ pub(crate) fn score_queue_entry(
     current_addr: Option<SocketAddr>,
     emule_version: u8,
     is_friend_slot: bool,
-    ember_pubkey: Option<&[u8; 32]>,
-    ember_verified: bool,
 ) -> f64 {
     score_queue_entry_with_prio(
         cm,
@@ -3769,8 +3964,6 @@ pub(crate) fn score_queue_entry(
         current_addr,
         emule_version,
         is_friend_slot,
-        ember_pubkey,
-        ember_verified,
     )
 }
 
@@ -3799,8 +3992,6 @@ pub(crate) fn score_queue_entry_with_prio(
     current_addr: Option<SocketAddr>,
     emule_version: u8,
     is_friend_slot: bool,
-    ember_pubkey: Option<&[u8; 32]>,
-    ember_verified: bool,
 ) -> f64 {
     // Normalize IPv4-mapped IPv6 (::ffff:x.x.x.x) so queue scoring and
     // BadGuy IP checks work for peers connecting over dual-stack sockets.
@@ -3808,43 +3999,7 @@ pub(crate) fn score_queue_entry_with_prio(
     // IP-pinning used by `get_current_ident_state` to detect identity
     // spoofing via IP switches.
     let peer_ip = peer_ip_u32(current_addr);
-
-    // Verified Ember peers get the enhanced-scoring path. Two guards
-    // on the same branch (pubkey present AND PoP verified) so
-    // binding-only peers fall through to eMule scoring — the Ember
-    // ledger only starts accruing bytes after PoP per
-    // `add_ember_uploaded`, so routing an unverified peer through
-    // `get_ember_queue_score` would always score at MIN until they
-    // verified. The eMule fallback is strictly kinder to
-    // already-known binding-only peers.
-    //
-    // BadGuy IP check still runs via the eMule ratio for safety:
-    // `get_current_ident_state` is the only place we detect identity
-    // IP swaps, and it's keyed on the user_hash ledger. If the eMule
-    // side returns 0.0 (BadGuy), we propagate that — a verified
-    // Ember pubkey cannot override the BadGuy decision since BadGuy
-    // means "this peer's user_hash was seen on a different IP",
-    // which is still suspicious regardless of Ember identity.
-    let emule_score = cm.get_queue_score(user_hash, wait_secs, file_prio, peer_ip);
-    let use_ember = ember_verified && ember_pubkey.is_some();
-    let mut score = if use_ember {
-        let pk = ember_pubkey.expect("guarded by use_ember");
-        // Short-circuit the BadGuy zero so a spoofer who compromised
-        // one peer's user_hash but verified their own Ember pubkey
-        // can't reach the queue via the Ember scoring path.
-        if emule_score == 0.0 {
-            0.0
-        } else {
-            cm.get_ember_queue_score(pk, wait_secs, file_prio)
-        }
-    } else {
-        emule_score
-    };
-    let has_download_bonus = cm.has_download_bonus(user_hash, peer_ip)
-        || (use_ember && cm.has_ember_download_bonus(ember_pubkey.expect("guarded by use_ember")));
-    if has_download_bonus {
-        score *= DOWNLOAD_BONUS_MULTIPLIER;
-    }
+    let mut score = cm.get_queue_score(user_hash, wait_secs, file_prio, peer_ip);
     if emule_version > 0 && emule_version <= 0x19 {
         score *= 0.5;
     }
@@ -3886,8 +4041,6 @@ pub(crate) fn compute_queue_rank(
             entry.current_addr,
             entry.emule_version,
             entry.is_friend_slot,
-            entry.ember_pubkey.as_ref(),
-            entry.ember_verified,
         );
         if es > my_score || (es == my_score && entry.join_time < my_join_time) {
             rank = rank.saturating_add(1);
@@ -3923,8 +4076,6 @@ pub(crate) fn compute_queue_ranks(
                 entry.current_addr,
                 entry.emule_version,
                 entry.is_friend_slot,
-                entry.ember_pubkey.as_ref(),
-                entry.ember_verified,
             )
         })
         .collect();
@@ -3948,44 +4099,6 @@ pub(crate) fn compute_queue_ranks(
 
 /// eMule MAX_PURGEQUEUETIME: 1 hour in seconds
 pub(crate) const MAX_PURGEQUEUETIME_SECS: u64 = 3600;
-
-/// Wait time to score an *uploading* peer with, when deciding whether a waiter
-/// should preempt it.
-///
-/// eMule scores a client that already holds a slot with `GetScore(true, true)`,
-/// whose base is its accrued wait plus a flat bonus: 30 minutes while it is
-/// inside the first 15 minutes of the upload, 15 minutes after that
-/// (`UploadClient.cpp:212-220`). The comment there gives the reason in one line —
-/// *"the first 15 min download time counts as 15 min waiting time and you get a
-/// 15 min bonus while you are in the first 15 min :) (to avoid 20 sec
-/// downloads)"*.
-///
-/// Without it, Ember compared a *frozen* wait-at-grant against live waiters, and
-/// that value is zero on the two commonest grants: a HighID push-grant sets it to
-/// zero outright, and an empty-queue direct add has nothing accrued. Zero times
-/// the preempt factor is still zero, so the first peer to arrive on an idle node
-/// was thrown off roughly ten seconds after a second peer queued, having
-/// transferred almost nothing — then the same thing happened to its replacement.
-///
-/// Note also that eMule only score-preempts at all when `TransferFullChunks` is
-/// off, and it defaults to on (`Preferences.cpp:2147`), in which case sessions end
-/// on `SESSIONMAXTRANS` instead. So this bonus is the *lenient* reading of
-/// eMule's behaviour, not the strict one.
-fn uploading_score_wait_secs(
-    wait_at_grant_secs: u64,
-    session_elapsed: Option<std::time::Duration>,
-) -> u64 {
-    const FIRST_PHASE: u64 = 15 * 60;
-    const EARLY_BONUS: u64 = 30 * 60;
-    const LATER_BONUS: u64 = 15 * 60;
-    let elapsed = session_elapsed.map(|d| d.as_secs()).unwrap_or(0);
-    let bonus = if elapsed < FIRST_PHASE {
-        EARLY_BONUS
-    } else {
-        LATER_BONUS
-    };
-    wait_at_grant_secs.saturating_add(elapsed).saturating_add(bonus)
-}
 
 /// Pure decision core of `UploadHandler::purge_unshared_queue_entries`, split
 /// out so the eviction rule can be unit-tested without constructing a full
@@ -4205,8 +4318,6 @@ pub(crate) async fn udp_queue_rank_for_peer(
         target.current_addr,
         target.emule_version,
         target.is_friend_slot,
-        target.ember_pubkey.as_ref(),
-        target.ember_verified,
     );
     Some(compute_queue_rank(
         &cm,
@@ -4248,6 +4359,7 @@ pub async fn start_upload_server(
     banned_ips: SharedBannedIps,
     banned_hashes: SharedBannedHashes,
     friends_only_hashes: SharedFriendsOnlyHashes,
+    known_records: SharedKnownRecords,
     antileech: crate::security::antileech::SharedAntiLeechFilter,
     skip_compress_video: Arc<std::sync::atomic::AtomicBool>,
     filter_incoming_connections: Arc<std::sync::atomic::AtomicBool>,
@@ -4324,7 +4436,10 @@ pub async fn start_upload_server(
             }
         }
     };
-    let current_max = max_concurrent_uploads.load(std::sync::atomic::Ordering::Relaxed);
+    let current_max = match max_concurrent_uploads.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => "auto".to_string(),
+        n => n.to_string(),
+    };
     info!(
         "Peer-to-peer upload listener started on TCP port {tcp_port} (max {current_max} uploads)"
     );
@@ -4366,6 +4481,7 @@ pub async fn start_upload_server(
         banned_ips,
         banned_hashes,
         friends_only_hashes,
+        known_records,
         antileech,
         skip_compress_video,
         filter_incoming_connections,
@@ -4380,6 +4496,9 @@ pub async fn start_upload_server(
         abuse_tracker: Arc::new(tokio::sync::Mutex::new(AbuseTracker::new())),
         aich_cache: Arc::new(tokio::sync::Mutex::new(AichCache::new())),
         part_hash_cache: Arc::new(tokio::sync::Mutex::new(PartHashCache::new())),
+        uncached_hash_jobs: Arc::new(tokio::sync::Semaphore::new(
+            MAX_CONCURRENT_UNCACHED_HASH_JOBS,
+        )),
         ember_hash,
         ed25519_public_key,
         ed25519_secret_key,
@@ -5716,6 +5835,12 @@ impl UploadHandler {
         (tid, control)
     }
 
+    /// The identities holding a slot right now, for the selection sites that
+    /// must pass them over (see [`best_waiter`]).
+    fn slot_holder_snapshot(&self) -> HashSet<QueueIdentity> {
+        self.slot_holders.lock().clone()
+    }
+
     /// eMule ForceNewClient/AcceptNewClient dynamic slot computation.
     /// Uses observed (smoothed) upload bandwidth to decide how many concurrent
     /// upload slots the server should maintain, scaling per-slot target rate
@@ -5727,9 +5852,14 @@ impl UploadHandler {
     /// if the formula would allow it.
     fn compute_dynamic_slot_count(&self) -> usize {
         let active = self.active_count.load(std::sync::atomic::Ordering::Relaxed);
-        let max_configured = self
+        // 0 is Auto: the bandwidth terms below decide alone, as in eMule.
+        let max_configured = match self
             .max_concurrent_uploads
-            .load(std::sync::atomic::Ordering::Relaxed);
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => MAX_UP_CLIENTS_ALLOWED,
+            n => n,
+        };
 
         let observed_rate = self.bandwidth_limiter.smoothed_upload_speed();
         let effective_rate = if observed_rate > 0 || active > 0 {
@@ -5890,6 +6020,41 @@ impl UploadHandler {
         }
     }
 
+    /// Admit one whole-file hash computation for `peer_addr`, or `None` when
+    /// it must go unanswered. The permit has to be held until the blocking
+    /// read finishes, which can outlive the session that asked.
+    ///
+    /// See [`MAX_CONCURRENT_UNCACHED_HASH_JOBS`] and [`MAX_UNCACHED_HASH_JOBS`].
+    async fn admit_uncached_hash_job(
+        &self,
+        peer_addr: SocketAddr,
+        opcode: &str,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        // Waited for rather than refused outright: eMule asks for a slot only
+        // once the hashset has arrived, so a dropped answer costs that peer
+        // its place until its next reask. Only this session waits.
+        let Ok(Ok(permit)) = tokio::time::timeout(
+            UNCACHED_HASH_JOB_WAIT,
+            self.uncached_hash_jobs.clone().acquire_owned(),
+        )
+        .await
+        else {
+            debug!("Every uncached hash job stayed busy; not answering {opcode} from {peer_addr}");
+            return None;
+        };
+        let within_budget = self
+            .abuse_tracker
+            .lock()
+            .await
+            .try_spend_uncached_hash_job(peer_addr.ip());
+        if !within_budget {
+            warn!("Peer {peer_addr} exceeded its uncached hashset budget; refusing {opcode}");
+            self.note_abusive_request(peer_addr.ip()).await;
+            return None;
+        }
+        Some(permit)
+    }
+
     async fn emit_auto_ban(&self, ip: std::net::IpAddr, reason: &str) {
         let v4 = match ip {
             std::net::IpAddr::V4(v4) => Some(v4),
@@ -6022,71 +6187,35 @@ impl UploadHandler {
             let in_flight = self.push_grant_in_flight.lock().await;
             let backoff = self.push_grant_backoff.lock().await;
             let queue = self.upload_queue.lock().await;
+            let slot_holders = self.slot_holder_snapshot();
 
-            let mut best_connected_score = f64::MIN;
-            let mut best_dial: Option<(QueueEntry, f64)> = None;
             let queued = QueuedPerFile::new(&queue);
-
-            for e in queue.iter() {
-                if e.last_request.elapsed().as_secs() >= MAX_PURGEQUEUETIME_SECS {
-                    continue;
-                }
-                let score = score_queue_entry(
-                    &cm,
-                    &idx,
-                    &queued,
-                    &e.user_hash,
-                    e.file_hash,
-                    e.join_time.elapsed().as_secs(),
-                    e.current_addr,
-                    e.emule_version,
-                    e.is_friend_slot,
-                    e.ember_pubkey.as_ref(),
-                    e.ember_verified,
-                );
-                if let Some(bound) = e.current_addr {
-                    if !self.peer_is_banned(&e.user_hash, &bound) && score > best_connected_score
-                    {
-                        best_connected_score = score;
-                    }
-                    continue;
-                }
-                if !push_grant_dialable(e, &in_flight, &backoff, |hash, addr| {
-                    self.peer_is_banned(hash, addr)
-                }) {
-                    continue;
-                }
-                let better = match &best_dial {
-                    None => true,
-                    Some((_, bs)) => {
-                        score > *bs
-                            || (score == *bs
-                                && best_dial
-                                    .as_ref()
-                                    .map(|(be, _)| e.join_time < be.join_time)
-                                    .unwrap_or(true))
-                    }
-                };
-                if better {
-                    best_dial = Some((e.clone(), score));
-                }
-            }
-            drop(queue);
-            drop(backoff);
-            drop(in_flight);
-            drop(idx);
-            drop(cm);
+            let fresh =
+                |e: &QueueEntry| e.last_request.elapsed().as_secs() < MAX_PURGEQUEUETIME_SECS;
+            let best_connected = best_waiter(&cm, &idx, &queued, &queue, &slot_holders, |e| {
+                fresh(e)
+                    && e
+                        .current_addr
+                        .is_some_and(|bound| !self.peer_is_banned(&e.user_hash, &bound))
+            });
+            let best_dial = best_waiter(&cm, &idx, &queued, &queue, &slot_holders, |e| {
+                fresh(e)
+                    && push_grant_dialable(e, &in_flight, &backoff, |hash, addr| {
+                        self.peer_is_banned(hash, addr)
+                    })
+            });
 
             // Only dial when this HighID outscores every connected waiter
             // (or there are no connected waiters) — same priority as
             // FindBestClientInQueue returning a disconnected HighID.
-            best_dial.and_then(|(entry, score)| {
-                if score > best_connected_score || best_connected_score == f64::MIN {
-                    Some(entry)
-                } else {
-                    None
+            match (best_dial, best_connected) {
+                (Some((entry, score)), connected)
+                    if connected.is_none_or(|(_, connected_score)| score > connected_score) =>
+                {
+                    Some(entry.clone())
                 }
-            })
+                _ => None,
+            }
         };
 
         let Some(entry) = candidate else {
@@ -6600,6 +6729,9 @@ impl UploadHandler {
         let skip_diversions = outbound || inbound_stream;
         let relayed = matches!(init, ConnInit::InboundStream { relayed: true, .. });
         let attach_addr = (!relayed).then_some(peer_addr);
+        // A relayed session's address is the relay's, never the IP a verified
+        // identity was pinned to, so credit is judged as for an unknown address.
+        let credit_peer_ip = if relayed { 0 } else { peer_ip_u32(Some(peer_addr)) };
 
         // Check if already banned (fast path), but don't count yet --
         // buddy/KAD callback connections are legitimate and shouldn't
@@ -7426,6 +7558,7 @@ impl UploadHandler {
                             peer_caps: hello_caps.clone(),
                             friend_ember_hash: Some(peer.ember_hash),
                             origin: Some(crate::types::SourceOrigin::Ember),
+                            answers_server_callback: false,
                         })
                         .await;
                     return Ok(());
@@ -7585,6 +7718,7 @@ impl UploadHandler {
                     peer_caps: hello_caps.clone(),
                     friend_ember_hash: None,
                     origin: callback_origin,
+                    answers_server_callback: false,
                 };
                 let _ = self.kad_callback_tx.send(parts).await;
                 return Ok(());
@@ -7594,7 +7728,8 @@ impl UploadHandler {
         // Check if this is a server callback connection (LowID source connecting
         // back after we sent OP_CALLBACKREQUEST). We match by the TCP port the
         // peer reports in its Hello packet against registered LowID sources for
-        // our currently-connected server.
+        // our currently-connected server that we recently asked to call back,
+        // or whose user hash an earlier callback confirmed.
         if let Some(peer_v4) = diversion_ip {
             let peer_hello_port = if hello_data.len() >= 23 {
                 u16::from_le_bytes([hello_data[21], hello_data[22]])
@@ -7607,7 +7742,7 @@ impl UploadHandler {
                     if let Some(addr) = *server_addr {
                         if let std::net::IpAddr::V4(v4) = addr.ip() {
                             let sm = self.source_manager.read().await;
-                            let matches = sm.find_lowid_files_by_port(
+                            let matches = sm.find_answered_callback_files(
                                 u32::from_le_bytes(v4.octets()),
                                 addr.port(),
                                 peer_hello_port,
@@ -7654,6 +7789,7 @@ impl UploadHandler {
                         peer_caps: hello_caps.clone(),
                         friend_ember_hash: None,
                         origin: None,
+                        answers_server_callback: true,
                     };
                     let _ = self.kad_callback_tx.send(parts).await;
                     return Ok(());
@@ -7726,6 +7862,7 @@ impl UploadHandler {
                     peer_caps: hello_caps.clone(),
                     friend_ember_hash: None,
                     origin: None,
+                    answers_server_callback: false,
                 };
                 let _ = self.kad_callback_tx.send(parts).await;
                 return Ok(());
@@ -8191,11 +8328,8 @@ impl UploadHandler {
         // slot grant, file switch, and session end along with the
         // served-parts tally.
         let mut sent_blocks: HashSet<(u64, u64)> = HashSet::new();
-        // Budget for hash requests that miss the memos and therefore re-read a
-        // whole shared file. See `UncachedHashBudget`.
-        let mut uncached_hash_budget = UncachedHashBudget::new();
         // Per-session allowance for *answered* hash requests (hashset / AICH).
-        // `uncached_hash_budget` meters whole-file reads; this meters the
+        // `admit_uncached_hash_job` meters whole-file reads; this meters the
         // answers themselves, which are orders of magnitude larger than the
         // requests that trigger them and can be served from a memo for free.
         //
@@ -8278,7 +8412,6 @@ impl UploadHandler {
         let mut last_rank_resend = std::time::Instant::now();
         // Deduplicate ShareInterest "request" per file hash on this TCP session.
         let mut recorded_share_request: Option<[u8; 16]> = None;
-        let mut last_preempt_check: std::time::Instant = std::time::Instant::now();
         let mut epx_packets_received: u8 = 0;
         let mut last_part_request: std::time::Instant = std::time::Instant::now();
         // Last time this session actually credited bytes, so padding can be
@@ -8435,8 +8568,8 @@ impl UploadHandler {
         //   Rebuilt every `PART_TRACKER_REFRESH` so that newly-completed
         //   parts of a partial file (when we are both uploading and
         //   downloading it) become advertisable within a bounded delay.
-        // - `cached_is_video_ext`: cheap bool, hoisted out of the per-block
-        //   loop in OP_REQUESTPARTS.
+        // - `cached_name_kind`: whether the file is a video and whether it is
+        //   an archive, hoisted out of the per-block loop in OP_REQUESTPARTS.
         //
         // All three are keyed on `PathBuf` rather than `file_hash` so they
         // survive the `current_file_hash = Some(same_hash)` reassigns that
@@ -8456,7 +8589,7 @@ impl UploadHandler {
             // not re-parsed on the timed refresh.
             Option<(std::time::SystemTime, u64)>,
         )> = None;
-        let mut cached_is_video_ext: Option<(PathBuf, bool)> = None;
+        let mut cached_name_kind: Option<(PathBuf, bool, bool)> = None;
         // Keep the disk-backed cache short-lived so a just-verified part can
         // be seeded promptly. The unchanged is_range_safe_to_serve gate below
         // still requires both completeness and MD4 verification.
@@ -8679,7 +8812,7 @@ impl UploadHandler {
             //   * `uploaded > 0` — we already moved bytes for this
             //     peer this session, so they exist in the UI's
             //     "Transferring" pane. If the slot deactivated for
-            //     any reason (session preemption, score rotation)
+            //     any reason (session limit, rotation)
             //     but the connection is still up because the peer
             //     keeps sending chatter, the row would otherwise
             //     stay pinned at its last `transferred` value
@@ -8746,14 +8879,15 @@ impl UploadHandler {
                             "Re-sending EPX to {peer_addr} (gen {}->{}, {} bytes)",
                             last_epx_generation, current_gen, epx_data.len()
                         );
+                        self.bandwidth_limiter.charge_upload((6 + epx_data.len()) as u64);
                         if write_packet_async(
-                            &mut writer,
-                            OP_EMULEPROT,
-                            OP_EMBER_SOURCEEXCHANGE,
-                            &epx_data,
-                        )
-                        .await
-                        .is_ok()
+                                &mut writer,
+                                OP_EMULEPROT,
+                                OP_EMBER_SOURCEEXCHANGE,
+                                &epx_data,
+                            )
+                            .await
+                            .is_ok()
                         {
                             last_epx_generation = current_gen;
                             self.epx_overhead.record_upload((6 + epx_data.len()) as u64);
@@ -8806,7 +8940,14 @@ impl UploadHandler {
                         })
                         .await;
                         match wrote {
-                            Ok(Ok(())) => continue,
+                            Ok(Ok(())) => {
+                                // Charged after the fact and never waited on:
+                                // these frames are chat, browse and acks, which
+                                // must not queue behind the slots' data.
+                                self.bandwidth_limiter
+                                    .charge_upload(outbound_data.len() as u64);
+                                continue;
+                            }
                             Ok(Err(e)) => {
                                 info!("Ending session with {peer_addr}: outbound write failed: {e}");
                             }
@@ -8872,48 +9013,28 @@ impl UploadHandler {
                             let dynamic_slots = self.compute_dynamic_slot_count();
 
                             if current_active < dynamic_slots {
-                                // Snapshot queue entries and release lock before acquiring RwLocks.
                                 // Purge stale entries (eMule MAX_PURGEQUEUETIME) first so
                                 // this periodic rank/grant path respects the same TTL as
                                 // STARTUPLOADREQ; otherwise a peer that only holds the TCP
                                 // session open can live in the queue past the 1-hour cap.
-                                let queue_snapshot: Vec<_> = {
+                                let best_identity = {
+                                    let cm = self.credit_manager.read().await;
+                                    let idx_snap = self.local_index.read().await;
                                     let mut queue = self.upload_queue.lock().await;
+                                    let slot_holders = self.slot_holder_snapshot();
                                     queue.retain(|e| {
                                         e.last_request.elapsed().as_secs() < MAX_PURGEQUEUETIME_SECS
                                     });
-                                    queue.iter().enumerate().map(|(i, e)| {
-                                        (i, e.identity.clone(), e.current_addr, e.join_time, e.file_hash, e.user_hash, e.emule_version, e.is_friend_slot, e.ember_pubkey, e.ember_verified)
-                                    }).collect()
+                                    best_waiter(
+                                        &cm,
+                                        &idx_snap,
+                                        &QueuedPerFile::new(&queue),
+                                        &queue,
+                                        &slot_holders,
+                                        |e| e.current_addr.is_some(),
+                                    )
+                                    .map(|(e, _)| e.identity.clone())
                                 };
-                                let cm = self.credit_manager.read().await;
-                                let idx_snap = self.local_index.read().await;
-                                let mut best_identity = None;
-                                let mut best_join: Option<std::time::Instant> = None;
-                                let mut best_score = f64::MIN;
-                                let queued = QueuedPerFile::of_files(queue_snapshot.iter().map(|row| row.4));
-                                for &(_i, ref identity, current_addr, join_time, file_hash, ref user_hash, emule_version, is_friend_slot, ref ember_pubkey, ember_verified) in &queue_snapshot {
-                                    if current_addr.is_none() {
-                                        continue;
-                                    }
-                                    let score = score_queue_entry(
-                                        &cm, &idx_snap, &queued, user_hash, file_hash,
-                                        join_time.elapsed().as_secs(), current_addr,
-                                        emule_version, is_friend_slot,
-                                        ember_pubkey.as_ref(), ember_verified,
-                                    );
-                                    // Tie-break by earlier join_time to agree with
-                                    // compute_queue_rank's FIFO tie ordering.
-                                    if score > best_score
-                                        || (score == best_score && best_join.is_none_or(|bj| join_time < bj))
-                                    {
-                                        best_score = score;
-                                        best_identity = Some(identity.clone());
-                                        best_join = Some(join_time);
-                                    }
-                                }
-                                drop(idx_snap);
-                                drop(cm);
 
                                 if best_identity.is_some() {
                                     // Reserve the slot atomically BEFORE removing the
@@ -9061,23 +9182,12 @@ impl UploadHandler {
                                 let cm = self.credit_manager.read().await;
                                 let idx_snap = self.local_index.read().await;
                                 let queue = self.upload_queue.lock().await;
-                                // Gate friend-slot priority on verified PoP:
-                                // `is_friend` alone only means the peer claims
-                                // a hash we know; `is_verified` means they
-                                // signed a nonce on THIS session with the
-                                // matching Ed25519 key. Re-evaluate here
-                                // rather than capturing once because
-                                // `ember_auth_state` can advance from
-                                // `NotStarted` → `Verified` mid-session as
-                                // the peer's CHALLENGE/RESPONSE arrives.
-                                let ember_verified = secure_v2_authenticated;
                                 let my_score = score_queue_entry(
                                     &cm, &idx_snap, &QueuedPerFile::new(&queue), &peer_user_hash,
                                     current_file_hash.unwrap_or([0u8; 16]),
                                     queue_join_time.elapsed().as_secs(),
                                     Some(peer_addr), hello_caps.emule_version_byte,
                                     friend_slot_priority,
-                                    hello_caps.ember_pubkey.as_ref(), ember_verified,
                                 );
                                 let rank = compute_queue_rank(
                                     &cm, &idx_snap, &queue,
@@ -9495,6 +9605,7 @@ impl UploadHandler {
                                     }
                                 }
                             }
+                            self.bandwidth_limiter.charge_upload((6 + status_payload.len()) as u64);
                             write_packet_async(
                                 &mut writer,
                                 OP_EDONKEYHEADER,
@@ -9577,6 +9688,7 @@ impl UploadHandler {
                             resp.extend_from_slice(&hash);
                             resp.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
                             resp.extend_from_slice(name_bytes);
+                            self.bandwidth_limiter.charge_upload((6 + resp.len()) as u64);
                             write_packet_async(
                                 &mut writer,
                                 OP_EDONKEYHEADER,
@@ -9712,6 +9824,7 @@ impl UploadHandler {
                                 tracker.cleanup_stale();
                                 tracker.record_request(
                                     QueueIdentity::from_peer(peer_user_hash, peer_addr),
+                                    peer_addr.ip(),
                                     h,
                                     is_friend_slot,
                                     downloading_from_peer,
@@ -9753,163 +9866,80 @@ impl UploadHandler {
                     let should_accept = if current_active >= dynamic_slots {
                         false
                     } else {
-                        // Snapshot queue, purging stale entries first, then release lock
-                        let (queue_empty, queue_snapshot) = {
-                            let mut queue = self.upload_queue.lock().await;
-                            queue.retain(|e| e.last_request.elapsed().as_secs() < MAX_PURGEQUEUETIME_SECS);
-                            let empty = queue.is_empty();
-                            let snap: Vec<_> = queue
-                                .iter()
-                                .enumerate()
-                                .map(|(i, e)| {
-                                    (
-                                        i,
-                                        e.identity.clone(),
-                                        e.current_addr,
-                                        e.join_time,
-                                        e.file_hash,
-                                        e.user_hash,
-                                        e.emule_version,
-                                        e.is_friend_slot,
-                                        e.add_next_connect,
-                                        e.ember_pubkey,
-                                        e.ember_verified,
-                                        e.is_high_id,
-                                        e.tcp_port,
-                                        e.last_ip,
-                                    )
-                                })
-                                .collect();
-                            (empty, snap)
-                        };
-                        if queue_empty {
-                            true
-                        } else if queue_snapshot.iter().any(|t| t.1 == queue_identity && t.8) {
-                            // eMule m_bAddNextConnect: this reconnecting peer was flagged
-                            // (it would have won while disconnected), so grant it the next
-                            // slot ahead of normal scoring and drop its queue entry. The
-                            // shared `slot_guard.try_activate` below still gates on a free
-                            // slot, so this cannot over-grant. A live waiter bound to a
-                            // different socket still owns the row — don't let a hash
-                            // replay collect the flag and delete them.
-                            let mut queue = self.upload_queue.lock().await;
-                            if let Some(pos) = queue.iter().position(|e| e.identity == queue_identity)
-                            {
+                        // Global scoring lock order: credit manager → local index
+                        // → upload queue.
+                        let cm = self.credit_manager.read().await;
+                        let idx_snap = self.local_index.read().await;
+                        let mut queue = self.upload_queue.lock().await;
+                        let slot_holders = self.slot_holder_snapshot();
+                        queue.retain(|e| e.last_request.elapsed().as_secs() < MAX_PURGEQUEUETIME_SECS);
+                        let own_row = queue.iter().position(|e| e.identity == queue_identity);
+                        // A live waiter bound to a different socket still owns the
+                        // row — don't let a hash replay take its grant and delete it.
+                        let mut take_own_row = |queue: &mut Vec<QueueEntry>| match own_row {
+                            Some(pos) => {
                                 if queue_row_owned_by_session(
                                     queue[pos].current_addr,
                                     queue[pos].tcp_port,
                                     peer_addr,
                                     hello_caps.tcp_port,
                                 ) {
-                                    let removed = queue.remove(pos);
-                                    removed_queue_entry = Some(removed);
+                                    removed_queue_entry = Some(queue.remove(pos));
                                     true
                                 } else {
                                     false
                                 }
-                            } else {
-                                true
                             }
+                            None => true,
+                        };
+                        if queue.is_empty() {
+                            true
+                        } else if own_row.is_some_and(|pos| queue[pos].add_next_connect) {
+                            // eMule m_bAddNextConnect: this reconnecting peer was flagged
+                            // (it would have won while disconnected), so grant it the next
+                            // slot ahead of normal scoring and drop its queue entry. The
+                            // shared `slot_guard.try_activate` below still gates on a free
+                            // slot, so this cannot over-grant.
+                            take_own_row(&mut queue)
                         } else {
-                            let cm = self.credit_manager.read().await;
-                            let idx_snap = self.local_index.read().await;
                             // eMule FindBestClientInQueue: connected peers OR dialable
                             // HighIDs compete for the slot; disconnected LowIDs only
                             // get m_bAddNextConnect.
-                            let mut best_ready_identity: Option<QueueIdentity> = None;
-                            let mut best_ready_join: Option<std::time::Instant> = None;
-                            let mut best_ready_score = f64::MIN;
-                            let mut best_ready_needs_dial = false;
-                            let mut best_low_identity: Option<QueueIdentity> = None;
-                            let mut best_low_score = f64::MIN;
-                            let queued = QueuedPerFile::of_files(queue_snapshot.iter().map(|row| row.4));
-                            for &(
-                                _i,
-                                ref identity,
-                                current_addr,
-                                join_time,
-                                file_hash,
-                                ref user_hash,
-                                emule_version,
-                                is_friend_slot,
-                                add_next_connect,
-                                ref ember_pubkey,
-                                ember_verified,
-                                is_high_id,
-                                tcp_port,
-                                last_ip,
-                            ) in &queue_snapshot
-                            {
-                                let score = score_queue_entry(
-                                    &cm,
-                                    &idx_snap,
-                                    &queued,
-                                    user_hash,
-                                    file_hash,
-                                    join_time.elapsed().as_secs(),
-                                    current_addr,
-                                    emule_version,
-                                    is_friend_slot,
-                                    ember_pubkey.as_ref(),
-                                    ember_verified,
-                                );
-                                let connected = current_addr.is_some();
-                                let dialable = !connected
-                                    && is_high_id
-                                    && tcp_port > 0
-                                    && last_ip.is_some();
-                                if connected || dialable {
-                                    if score > best_ready_score
-                                        || (score == best_ready_score
-                                            && best_ready_join.is_none_or(|bj| join_time < bj))
-                                    {
-                                        best_ready_score = score;
-                                        best_ready_identity = Some(identity.clone());
-                                        best_ready_join = Some(join_time);
-                                        best_ready_needs_dial = dialable;
-                                    }
-                                } else if !add_next_connect && score > best_low_score {
-                                    best_low_score = score;
-                                    best_low_identity = Some(identity.clone());
-                                }
-                            }
-                            if let Some(low_id) = best_low_identity {
-                                if best_low_score > best_ready_score {
-                                    let mut queue = self.upload_queue.lock().await;
+                            let ready = |e: &QueueEntry| {
+                                e.current_addr.is_some()
+                                    || (e.is_high_id && e.tcp_port > 0 && e.last_ip.is_some())
+                            };
+                            let queued = QueuedPerFile::new(&queue);
+                            let best_ready =
+                                best_waiter(&cm, &idx_snap, &queued, &queue, &slot_holders, ready)
+                                    .map(|(e, score)| {
+                                        (e.identity.clone(), score, e.current_addr.is_none())
+                                    });
+                            let best_low =
+                                best_waiter(&cm, &idx_snap, &queued, &queue, &slot_holders, |e| {
+                                    !ready(e) && !e.add_next_connect
+                                })
+                                .map(|(e, score)| (e.identity.clone(), score));
+                            drop(queued);
+                            if let Some((low_id, low_score)) = best_low {
+                                let outscores_ready = best_ready
+                                    .as_ref()
+                                    .is_none_or(|(_, score, _)| low_score > *score);
+                                if outscores_ready {
                                     if let Some(e) = queue.iter_mut().find(|e| e.identity == low_id)
                                     {
                                         e.add_next_connect = true;
                                     }
                                 }
                             }
-                            drop(idx_snap);
-                            drop(cm);
                             // Grant iff THIS peer is the best ready *connected* peer.
                             // A disconnected HighID that outscores everyone is left for
                             // the proactive AddUpNextClient dial (slot opener), matching
                             // eMule FindBestClient → TryToConnect rather than granting
                             // a lower-scoring connected peer.
-                            match best_ready_identity {
-                                Some(bi) if bi == queue_identity && !best_ready_needs_dial => {
-                                    let mut queue = self.upload_queue.lock().await;
-                                    if let Some(pos) =
-                                        queue.iter().position(|e| e.identity == queue_identity)
-                                    {
-                                        if queue_row_owned_by_session(
-                                            queue[pos].current_addr,
-                                            queue[pos].tcp_port,
-                                            peer_addr,
-                                            hello_caps.tcp_port,
-                                        ) {
-                                            let removed = queue.remove(pos);
-                                            removed_queue_entry = Some(removed);
-                                            true
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        true
-                                    }
+                            match best_ready {
+                                Some((bi, _, needs_dial)) if bi == queue_identity && !needs_dial => {
+                                    take_own_row(&mut queue)
                                 }
                                 Some(_) => false,
                                 None => true,
@@ -10067,7 +10097,6 @@ impl UploadHandler {
                                 queue[pos].join_time.elapsed().as_secs(),
                                 Some(peer_addr), hello_caps.emule_version_byte,
                                 friend_slot_priority,
-                                hello_caps.ember_pubkey.as_ref(), ember_verified,
                             );
                             
                             compute_queue_rank(
@@ -10113,7 +10142,7 @@ impl UploadHandler {
                             // wait=0 got almost everyone refused.
                             let new_fh = current_file_hash.unwrap_or([0u8; 16]);
                             let ember_verified = secure_v2_authenticated;
-                            let peer_ip = peer_ip_u32(Some(peer_addr));
+                            let peer_ip = credit_peer_ip;
                             let queued = QueuedPerFile::new(&queue);
                             let new_combined = combined_file_prio_and_credit(
                                 &cm,
@@ -10122,8 +10151,6 @@ impl UploadHandler {
                                 &peer_user_hash,
                                 new_fh,
                                 peer_ip,
-                                hello_caps.ember_pubkey.as_ref(),
-                                ember_verified,
                             );
                             let avg_combined = if queue.is_empty() {
                                 0.0
@@ -10140,8 +10167,6 @@ impl UploadHandler {
                                             peer_ip_u32(e.current_addr.or_else(|| {
                                                 e.last_ip.map(|ip| SocketAddr::new(ip, 0))
                                             })),
-                                            e.ember_pubkey.as_ref(),
-                                            e.ember_verified,
                                         )
                                     })
                                     .sum();
@@ -10166,8 +10191,6 @@ impl UploadHandler {
                                     Some(peer_addr),
                                     hello_caps.emule_version_byte,
                                     friend_slot_priority,
-                                    hello_caps.ember_pubkey.as_ref(),
-                                    ember_verified,
                                 );
                                 let mut rank_val: u16 = 1;
                                 for e in queue.iter() {
@@ -10184,8 +10207,6 @@ impl UploadHandler {
                                         e.current_addr,
                                         e.emule_version,
                                         e.is_friend_slot,
-                                        e.ember_pubkey.as_ref(),
-                                        e.ember_verified,
                                     );
                                     if es > new_score
                                         || (es == new_score && e.join_time < join_time)
@@ -10231,7 +10252,6 @@ impl UploadHandler {
                                 &cm, &idx_snap, &QueuedPerFile::new(&queue), &peer_user_hash, new_fh,
                                 0, Some(peer_addr), hello_caps.emule_version_byte,
                                 friend_slot_priority,
-                                hello_caps.ember_pubkey.as_ref(), ember_verified,
                             );
                             
                             compute_queue_rank(
@@ -10530,8 +10550,8 @@ impl UploadHandler {
 
                     // Cap what one request can commit us to serving, *before*
                     // the per-block split below. Every rotation control —
-                    // SESSIONMAXTRANS, SESSIONMAXTIME, the score-based
-                    // preemption check and the outer idle gate — lives after
+                    // SESSIONMAXTRANS, SESSIONMAXTIME and the outer idle
+                    // gate — lives after
                     // the block loop, so a single range covering the whole
                     // file (nothing rejected it: it is within EOF and
                     // correctly ordered) held one of the user's upload slots
@@ -10742,14 +10762,19 @@ impl UploadHandler {
                     }
                     let part_tracker_ref = cached_part_tracker.as_ref().map(|(_, t, _, _, _)| t);
 
-                    // Hoist video-ext computation out of the per-block loop:
-                    // it's a property of the file, not the block, and
-                    // `to_lowercase()` allocates a fresh String per call.
-                    if cached_is_video_ext.as_ref().map(|(p, _)| p != &file_path).unwrap_or(true) {
-                        cached_is_video_ext =
-                            Some((file_path.clone(), is_video_file_name(&resolved.name)));
+                    // Hoisted out of the per-block loop: these are
+                    // properties of the file, not the block.
+                    if cached_name_kind.as_ref().map(|(p, _, _)| p != &file_path).unwrap_or(true) {
+                        cached_name_kind = Some((
+                            file_path.clone(),
+                            is_video_file_name(&resolved.name),
+                            is_precompressed_file_name(&resolved.name),
+                        ));
                     }
-                    let is_video_ext = cached_is_video_ext.as_ref().map(|(_, v)| *v).unwrap_or(false);
+                    let (is_video_ext, is_archive) = cached_name_kind
+                        .as_ref()
+                        .map(|(_, video, archive)| (*video, *archive))
+                        .unwrap_or((false, false));
 
                     // Drop a stale cached File handle if the peer switched to
                     // a different file within this TCP session. We also
@@ -10979,6 +11004,7 @@ impl UploadHandler {
                         // Skip compression for video files when configured (eMule: dontcompressavi)
                         let use_compression = peer_compression_ver > 0
                             && data.len() > 1024
+                            && !is_archive
                             && !(is_video_ext
                                 && self
                                     .skip_compress_video
@@ -11313,7 +11339,11 @@ impl UploadHandler {
                         unflushed_credit_bytes = 0;
                         {
                             let mut cm = self.credit_manager.write().await;
-                            cm.add_uploaded(peer_user_hash, batch_credited_bytes);
+                            cm.add_uploaded(
+                                peer_user_hash,
+                                credit_peer_ip,
+                                batch_credited_bytes,
+                            );
                             // Ember credit ledger: mirrors the eMule
                             // credit write for peers that have
                             // advertised an Ed25519 pubkey AND
@@ -11427,7 +11457,7 @@ impl UploadHandler {
                         break;
                     }
 
-                    // Enforce eMule session limits + score-based preemption.
+                    // Enforce eMule session limits.
                     // eMule CheckForTimeOver: don't rotate if nobody is waiting.
                     // eMule's condition is `!ForceNewClient()`
                     // (`UploadQueue.cpp:789`, `:798`), not "somebody is
@@ -11448,7 +11478,8 @@ impl UploadHandler {
                     // tripping our own leecher detector.
                     let queue_has_waiters = {
                         let q = self.upload_queue.lock().await;
-                        !q.is_empty()
+                        let slot_holders = self.slot_holder_snapshot();
+                        q.iter().any(|e| !slot_holders.contains(&e.identity))
                     };
                     let can_open_another_slot = self
                         .active_count
@@ -11472,7 +11503,7 @@ impl UploadHandler {
                     // max session time (SESSIONMAXTIME). Friend priority requires
                     // proof-of-possession on THIS session (merely claiming a
                     // friend's hash is not enough), matching the queue-insertion
-                    // and preemption sites. Without this exemption a friend's
+                    // site. Without this exemption a friend's
                     // transfer was interrupted with OP_OUTOFPARTREQS every ~9.5 MB
                     // (re-queued, then immediately re-granted via their score, but
                     // with a needless stall) — eMule keeps the friend uploading
@@ -11490,81 +11521,17 @@ impl UploadHandler {
                                 .map(|t| t.elapsed().as_secs() >= SESSIONMAXTIME_SECS)
                                 .unwrap_or(false));
 
-                    // eMule-style score-based preemption: every ~10 seconds, check
-                    // if a queued peer has a significantly higher score than us.
-                    //
-                    // Exempt for the same reason the byte and time caps above
-                    // are: eMule returns false from `CheckForTimeOver` for a
-                    // friend slot before it ever reaches the score comparison
-                    // (`UploadQueue.cpp:773`), with no LowID condition. A friend
-                    // used to be covered here only as a side effect of the
-                    // `268_435_455` score override, and `friend_slot_takes_priority`
-                    // now withholds that from LowID peers — so without this a LowID
-                    // friend was exempt from the caps but still evictable by score,
-                    // which is the interrupted-transfer stall that exemption exists
-                    // to prevent. Withholding the override is about who gets the
-                    // *next* slot, since a LowID peer cannot be dialled to hand it
-                    // one; it says nothing about a friend already connected and
-                    // actively uploading.
-                    let preempted = if !session_expired
-                        && !is_verified_friend
-                        && slot_guard.is_active()
-                        && last_preempt_check.elapsed().as_secs() >= 10
-                    {
-                        last_preempt_check = std::time::Instant::now();
-                        let cm = self.credit_manager.read().await;
-                        let idx_snap = self.local_index.read().await;
-                        let queue = self.upload_queue.lock().await;
-                        if queue.is_empty() {
-                            false
-                        } else {
-                            let my_fh = current_file_hash.unwrap_or([0u8; 16]);
-                            // See queue-insertion site above: friend
-                            // priority only counts when PoP has landed
-                            // on this session.
-                            let ember_verified = secure_v2_authenticated;
-                            let queued = QueuedPerFile::new(&queue);
-                            let my_score = score_queue_entry(
-                                &cm, &idx_snap, &queued, &peer_user_hash, my_fh,
-                                uploading_score_wait_secs(
-                                    queue_wait_at_grant,
-                                    session_start.map(|t| t.elapsed()),
-                                ),
-                                Some(peer_addr),
-                                hello_caps.emule_version_byte,
-                                friend_slot_takes_priority(
-                                    is_verified_friend,
-                                    &hello_caps,
-                                    peer_addr,
-                                ),
-                                hello_caps.ember_pubkey.as_ref(), ember_verified,
-                            );
-
-                            let mut best_queued_score = f64::MIN;
-                            for entry in queue.iter() {
-                                if entry.current_addr.is_none() {
-                                    continue;
-                                }
-                                let score = score_queue_entry(
-                                    &cm, &idx_snap, &queued, &entry.user_hash, entry.file_hash,
-                                    entry.join_time.elapsed().as_secs(), entry.current_addr,
-                                    entry.emule_version, entry.is_friend_slot,
-                                    entry.ember_pubkey.as_ref(), entry.ember_verified,
-                                );
-                                if score > best_queued_score {
-                                    best_queued_score = score;
-                                }
-                            }
-                            best_queued_score > my_score * 2.0
-                        }
-                    } else {
-                        false
-                    };
-
-                    let session_expired = session_expired || preempted;
-
+                    // No score preemption. eMule ends a session by score only
+                    // with `TransferFullChunks` off, and it defaults to on
+                    // (`Preferences.cpp:2147`), so a holder keeps its slot until
+                    // `SESSIONMAXTRANS` (`UploadQueue.cpp:773-805`): a part the
+                    // peer can finish, hash and share, rather than a fragment.
+                    // Ember also checked every 10 s whether a connected waiter
+                    // outscored the holder twice over, and did so whether or not
+                    // a slot was free — so a peer mid-chunk was cut off for a
+                    // waiter that could simply have taken the empty slot.
                     if session_expired && slot_guard.is_active() {
-                        let reason = if preempted { "score preempted" } else { "session limit" };
+                        let reason = "session limit";
                         // We are about to ask this peer to request again, so
                         // its re-request is ours, not evidence against it. The
                         // leecher detector counts any `OP_STARTUPLOADREQ` inside
@@ -11594,24 +11561,13 @@ impl UploadHandler {
                              sending OP_OUTOFPARTREQS",
                             rate_tracker.smoothed_rate(),
                         );
-                        // Record the Ember session-reliability +
-                        // speed outcome. `session_limit` is treated
-                        // as a clean completion (we served them the
-                        // max allowed per session) while `score
-                        // preempted` is not — we kicked them out
-                        // because a higher-scoring peer showed up,
-                        // which from the reliability perspective is
-                        // still "they didn't voluntarily bail". We
-                        // follow the plan spec and count only the
-                        // natural session-limit case as completed so
-                        // the reliability multiplier can actually
-                        // differentiate peers that walk away
-                        // mid-transfer from peers we rotate out.
+                        // Record the Ember session history. Reaching the
+                        // session limit is a clean completion: we served
+                        // them the most allowed per session.
                         if let Some(pk) = hello_caps.ember_pubkey {
                             let verified = secure_v2_authenticated;
-                            let completed = !preempted;
                             let mut cm = self.credit_manager.write().await;
-                            cm.record_ember_session(pk, uploaded, session_secs, completed, verified);
+                            cm.record_ember_session(pk, uploaded, session_secs, true, verified);
                         }
                         // Cleared before the write: if it fails, the teardown
                         // must not record this session a second time.
@@ -11627,9 +11583,9 @@ impl UploadHandler {
                         if let Some(tid) = &transfer_id {
                             // Terminal event for the rotated-out session. Use
                             // Completed only if we actually moved bytes; a slot
-                            // that was granted then immediately rotated (e.g. score
-                            // preemption) without sending any data emits Failed so
-                            // the UI row is distinguishable from a real transfer.
+                            // that reached the time limit without sending any
+                            // data emits Failed so the UI row is
+                            // distinguishable from a real transfer.
                             // Statistics only count full-file serves as completed.
                             let kind = if uploaded > 0 {
                                 upload_session_completed(
@@ -11783,7 +11739,7 @@ impl UploadHandler {
                                 // eMule soft→hard: CombinedFilePrioAndCredit (no wait)
                                 let new_fh = current_file_hash.unwrap_or([0u8; 16]);
                                 let ember_verified = secure_v2_authenticated;
-                                let peer_ip = peer_ip_u32(Some(peer_addr));
+                                let peer_ip = credit_peer_ip;
                                 let queued = QueuedPerFile::new(&queue);
                                 let new_combined = combined_file_prio_and_credit(
                                     &cm,
@@ -11792,8 +11748,6 @@ impl UploadHandler {
                                     &peer_user_hash,
                                     new_fh,
                                     peer_ip,
-                                    hello_caps.ember_pubkey.as_ref(),
-                                    ember_verified,
                                 );
                                 let avg_combined = if queue.is_empty() {
                                     0.0
@@ -11810,8 +11764,6 @@ impl UploadHandler {
                                                 peer_ip_u32(e.current_addr.or_else(|| {
                                                     e.last_ip.map(|ip| SocketAddr::new(ip, 0))
                                                 })),
-                                                e.ember_pubkey.as_ref(),
-                                                e.ember_verified,
                                             )
                                         })
                                         .sum();
@@ -12139,20 +12091,27 @@ impl UploadHandler {
                         let file_size = file.size;
                         let is_partial = file.is_partial;
                         let mut opened = file.opened;
-                        // Complete files answer from the memo when we have it:
-                        // this handler is otherwise a whole-file read for the
-                        // price of a 22-byte packet, and every downloader of a
-                        // share sends one.
+                        // Complete files answer from known.met or the memo when
+                        // we have it: this handler is otherwise a whole-file
+                        // read for the price of a 22-byte packet, and every
+                        // downloader of a share sends one.
                         let cache_key = hex::encode(req_hash);
                         let memoized = if is_partial {
                             None
+                        } else if let Some(hashes) = stored_md4_hashset(
+                            &self.known_records,
+                            &req_hash,
+                            file_size,
+                            file_mtime_secs(&path).await,
+                        ) {
+                            Some(hashes)
                         } else {
                             self.part_hash_cache.lock().await.get(&cache_key)
                         };
                         let hashset_result = match memoized {
                             Some(hashes) => {
                                 // A memo hit costs us no file read, so it spends
-                                // no `uncached_hash_budget` — but the *answer*
+                                // no uncached-job budget — but the *answer*
                                 // is still `16 + 2 + parts*16` bytes (~86 KB for
                                 // a 50 GB share) for a 22-byte request, and
                                 // nothing else bounded how often a peer could
@@ -12163,20 +12122,23 @@ impl UploadHandler {
                                 }
                                 Ok(Some(hashes))
                             }
-                            // Partial files answer from `.part.met` without
-                            // reading the file, so they are not what the budget
-                            // meters — and charging them would spend it on work
-                            // that can never populate the memo, then start
-                            // counting an honest downloader's retries as abuse.
-                            None if !is_partial && !uncached_hash_budget.try_spend() => {
-                                warn!(
-                                    "Peer {peer_addr} exceeded its uncached hashset budget; refusing OP_HASHSETREQ"
-                                );
-                                self.note_abusive_request(peer_addr.ip()).await;
-                                Ok(None)
-                            }
                             None => {
+                                // Partial files answer from `.part.met` without
+                                // reading the file, so they are not what the
+                                // budget meters — and charging them would spend
+                                // it on work that can never populate the memo,
+                                // then start counting an honest downloader's
+                                // retries as abuse.
+                                let job = if is_partial {
+                                    None
+                                } else {
+                                    match self.admit_uncached_hash_job(peer_addr, "OP_HASHSETREQ").await {
+                                        Some(job) => Some(job),
+                                        None => continue,
+                                    }
+                                };
                                 let computed = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<[u8; 16]>>> {
+                                    let _job = job;
                                     if is_partial && file_size > 0 {
                                         let tracker = super::part_tracker::PartTracker::new(file_size, &path);
                                         let cached = tracker.part_hashes();
@@ -12272,6 +12234,13 @@ impl UploadHandler {
                                 let cache_key = hex::encode(file_ident.md4_hash);
                                 let memoized_md4 = if is_partial || !request_md4 {
                                     None
+                                } else if let Some(hashes) = stored_md4_hashset(
+                                    &self.known_records,
+                                    &file_ident.md4_hash,
+                                    file_size,
+                                    file_mtime_secs(&path).await,
+                                ) {
+                                    Some(hashes)
                                 } else {
                                     self.part_hash_cache.lock().await.get(&cache_key)
                                 };
@@ -12316,22 +12285,24 @@ impl UploadHandler {
                                         self.note_abusive_request(peer_addr.ip()).await;
                                     }
                                 }
-                                // Both branches below read the whole file, so
-                                // charge the connection's budget whenever either
-                                // missed its memo.
-                                if (compute_md4 || compute_aich) && !uncached_hash_budget.try_spend()
-                                {
-                                    warn!(
-                                        "Peer {peer_addr} exceeded its uncached hashset budget; refusing OP_HASHSETREQUEST2"
-                                    );
-                                    self.note_abusive_request(peer_addr.ip()).await;
-                                    continue;
-                                }
+                                // Either branch below reads the whole file of a
+                                // complete one that missed its memo; a partial
+                                // file answers from `.part.met`, as in the legacy
+                                // handler.
+                                let job = if !is_partial && (compute_md4 || compute_aich) {
+                                    match self.admit_uncached_hash_job(peer_addr, "OP_HASHSETREQUEST2").await {
+                                        Some(job) => Some(job),
+                                        None => continue,
+                                    }
+                                } else {
+                                    None
+                                };
                                 // A read failure (a range lock, a pulled drive, a
                                 // truncated file) skips the answer, as the legacy
                                 // and AICH handlers do, rather than ending the
                                 // session and any slot it holds.
                                 let hashed = tokio::task::spawn_blocking(move || {
+                                    let _job = job;
                                     let md4 = if compute_md4 {
                                         if is_partial {
                                             let tracker = super::part_tracker::PartTracker::new(file_size, &path);
@@ -12573,6 +12544,7 @@ impl UploadHandler {
                                 } else {
                                     OP_MULTIPACKETANSWER
                                 };
+                                self.bandwidth_limiter.charge_upload((6 + answer.len()) as u64);
                                 write_packet_async(
                                     &mut writer,
                                     OP_EMULEPROT,
@@ -12603,6 +12575,7 @@ impl UploadHandler {
                                                     peer_source_exchange_ver,
                                                 )
                                             };
+                                            self.bandwidth_limiter.charge_upload((6 + resp.len()) as u64);
                                             write_packet_async(
                                                 &mut writer,
                                                 OP_EMULEPROT,
@@ -12621,6 +12594,7 @@ impl UploadHandler {
                                                 let sm = self.source_manager.read().await;
                                                 sm.build_answer_sources2_versioned(&mpreq.file_hash, exclude_ip, *version)
                                             };
+                                            self.bandwidth_limiter.charge_upload((6 + resp.len()) as u64);
                                             write_packet_async(
                                                 &mut writer,
                                                 OP_EMULEPROT,
@@ -12659,8 +12633,10 @@ impl UploadHandler {
                     // adds a few bytes when enabled; the unobfuscated
                     // size is a reasonable lower bound.
                     self.sx_overhead.record_download((6 + payload.len()) as u64);
-                    // SX v1: respond with OP_ANSWERSOURCES (legacy v1 format)
-                    if let Some(hash) = current_file_hash {
+                    // SX v1: Hash(16), answered with OP_ANSWERSOURCES (legacy v1 format)
+                    if payload.len() >= 16 {
+                        let mut hash = [0u8; 16];
+                        hash.copy_from_slice(&payload[..16]);
                         let peer = PeerFileAccess {
                             ember_hash: peer_ember_hash,
                             secure_v2_authenticated,
@@ -12680,6 +12656,7 @@ impl UploadHandler {
                                 peer_source_exchange_ver,
                             )
                         };
+                        self.bandwidth_limiter.charge_upload((6 + resp.len()) as u64);
                         write_packet_async(
                             &mut writer,
                             OP_EMULEPROT,
@@ -12713,6 +12690,7 @@ impl UploadHandler {
                             let sm = self.source_manager.read().await;
                             sm.build_answer_sources2_versioned(&hash, exclude_ip, requested_version)
                         };
+                        self.bandwidth_limiter.charge_upload((6 + resp.len()) as u64);
                         write_packet_async(
                             &mut writer,
                             OP_EMULEPROT,
@@ -12772,18 +12750,18 @@ impl UploadHandler {
                                 // the file, so it spends none of the budget.
                                 self.aich_cache.lock().await.insert(hash_hex.clone(), hs.clone());
                                 Ok(hs)
-                            } else if !uncached_hash_budget.try_spend() {
-                                warn!(
-                                    "Peer {peer_addr} exceeded its uncached hashset budget; refusing OP_AICHREQUEST"
-                                );
-                                self.note_abusive_request(peer_addr.ip()).await;
-                                continue;
                             } else {
+                                let Some(job) =
+                                    self.admit_uncached_hash_job(peer_addr, "OP_AICHREQUEST").await
+                                else {
+                                    continue;
+                                };
                                 // Hash the already-pinned upload handle. Reopening
                                 // by path would allow a post-resolve symlink swap
                                 // to poison the AICH cache under this MD4 key.
                                 let mut opened = file.opened;
                                 let res = tokio::task::spawn_blocking(move || {
+                                    let _job = job;
                                     crate::network::ed2k::aich::AICHRecoveryHashSet::build_from_open_file(
                                         &mut opened,
                                     )
@@ -12827,7 +12805,7 @@ impl UploadHandler {
                                     // `aich_cache` with one request could then loop
                                     // 20-byte `OP_AICHREQUEST` packets, and because
                                     // the memo-hit branch above spends no
-                                    // `uncached_hash_budget`, each one pinned a
+                                    // uncached-job budget, each one pinned a
                                     // Tokio worker for the rebuild — starving
                                     // downloads, KAD and the accept loop, three
                                     // connections at a time per IP. The packet-level
@@ -13087,7 +13065,11 @@ impl UploadHandler {
                                     info!("Ember binding: peer {peer_addr} pubkey matches advertised hash");
                                     if peer_user_hash != [0u8; 16] {
                                         let mut cm = self.credit_manager.write().await;
-                                        cm.note_bound_ember_hash(peer_user_hash, *peer_eh);
+                                        cm.note_bound_ember_hash(
+                                            peer_user_hash,
+                                            *peer_eh,
+                                            CreditManager::ident_ip_of(peer_addr),
+                                        );
                                     }
                                     // Unlock mesh + first EPX once HELLO
                                     // binding succeeds (friend privileges
@@ -13122,14 +13104,15 @@ impl UploadHandler {
                                                 "Sending EPX to bound Ember peer {peer_addr} ({} bytes, gen {gen})",
                                                 epx_data.len()
                                             );
+                                            self.bandwidth_limiter.charge_upload((6 + epx_data.len()) as u64);
                                             if write_packet_async(
-                                                &mut writer,
-                                                OP_EMULEPROT,
-                                                OP_EMBER_SOURCEEXCHANGE,
-                                                &epx_data,
-                                            )
-                                            .await
-                                            .is_ok()
+                                                    &mut writer,
+                                                    OP_EMULEPROT,
+                                                    OP_EMBER_SOURCEEXCHANGE,
+                                                    &epx_data,
+                                                )
+                                                .await
+                                                .is_ok()
                                             {
                                                 last_epx_generation = gen;
                                                 last_epx_resend = std::time::Instant::now();
@@ -13433,14 +13416,15 @@ impl UploadHandler {
                                         "Sending EPX to verified Ember peer {peer_addr} ({} bytes, gen {gen})",
                                         epx_data.len()
                                     );
+                                    self.bandwidth_limiter.charge_upload((6 + epx_data.len()) as u64);
                                     if write_packet_async(
-                                        &mut writer,
-                                        OP_EMULEPROT,
-                                        OP_EMBER_SOURCEEXCHANGE,
-                                        &epx_data,
-                                    )
-                                    .await
-                                    .is_ok()
+                                            &mut writer,
+                                            OP_EMULEPROT,
+                                            OP_EMBER_SOURCEEXCHANGE,
+                                            &epx_data,
+                                        )
+                                        .await
+                                        .is_ok()
                                     {
                                         last_epx_generation = gen;
                                         last_epx_resend = std::time::Instant::now();
@@ -13814,6 +13798,33 @@ impl UploadHandler {
                                         .await;
                                 }
                             }
+                            Some((super::messages::EMBER_EXT_DHT_MEET, body)) => {
+                                // A relayed session has no address of the
+                                // friend's own to ping.
+                                if let (
+                                    Some(std::net::IpAddr::V4(peer_ip)),
+                                    Some((udp_port, answer)),
+                                    Some(reply_tx),
+                                ) = (
+                                    attach_addr.map(|a| a.ip()),
+                                    super::messages::decode_dht_meet(body),
+                                    ember_session_handle.as_ref().map(|h| h.tx.clone()),
+                                ) {
+                                    let _ = self
+                                        .upload_event_tx
+                                        .send(UploadEvent {
+                                            transfer_id: String::new(),
+                                            kind: UploadEventKind::EmberDhtMeet {
+                                                ember_hash: eh,
+                                                peer_ip,
+                                                udp_port,
+                                                answer,
+                                                reply_tx,
+                                            },
+                                        })
+                                        .await;
+                                }
+                            }
                             Some((super::messages::EMBER_EXT_ATTACH_OFFER
                                 | super::messages::EMBER_EXT_ATTACH_REPLY
                                 | super::messages::EMBER_EXT_ATTACH_CANCEL, _)) => {
@@ -13987,7 +13998,11 @@ impl UploadHandler {
 
         if unflushed_credit_bytes > 0 {
             let mut cm = self.credit_manager.write().await;
-            cm.add_uploaded(peer_user_hash, unflushed_credit_bytes);
+            cm.add_uploaded(
+                peer_user_hash,
+                credit_peer_ip,
+                unflushed_credit_bytes,
+            );
             if let Some(pk) = hello_caps.ember_pubkey {
                 cm.add_ember_uploaded(pk, unflushed_credit_bytes, secure_v2_authenticated);
             }
@@ -14142,6 +14157,7 @@ impl UploadHandler {
         };
 
         let share = slot_share_per_sec(allowed, open_slots, index);
+        slot.rebase(bytes, share);
         // eMule's leftover pass will spend down to its last fragment rather than
         // let the uplink idle (`max(bytesToSpend - spentBytes, doubleSendSize)`,
         // `UploadBandwidthThrottler.cpp:593`), so surplus counts from one
@@ -14889,18 +14905,11 @@ mod friends_only_snapshot_tests {
 
 #[cfg(test)]
 mod scoring_tests {
-    //! Phase 3: verify `score_queue_entry` routes verified Ember peers
-    //! through `get_ember_queue_score` while everyone else stays on the
-    //! legacy eMule credit-ratio path. The underlying scoring formulas
-    //! are covered by the unit tests in `credits.rs`; this module is
-    //! specifically about the routing gate — `ember_verified && pubkey.is_some()`
-    //! — and its interaction with the friend-slot override, version
-    //! penalty, and BadGuy short-circuit.
+    //! `score_queue_entry` against eMule's `GetScore`: the same formula for
+    //! every peer, the friend-slot override and the BadGuy short-circuit.
+    //! The credit-ratio formula itself is covered in `credits.rs`.
     use super::*;
-    use crate::network::ed2k::credits::{
-        CreditManager, IdentState, EMBER_RELIABILITY_MAX, EMBER_RELIABILITY_MIN,
-        EMBER_SPEED_BASELINE_BPS,
-    };
+    use crate::network::ed2k::credits::{CreditManager, IdentState};
     use crate::search::index::LocalIndex;
     use chrono::Utc;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -15026,10 +15035,7 @@ mod scoring_tests {
         assert!(!index_offers_hash(&index, &[0x33; 16]));
     }
 
-    /// Seed an eMule credit record so `get_queue_score` returns a
-    /// meaningful non-MIN ratio for the test user_hash. Without this
-    /// the eMule path scores at MIN (1.0) and our comparisons get
-    /// noisy.
+    /// A peer that has uploaded to us, so its credit ratio rises above 1.
     fn seed_emule_credits(cm: &mut CreditManager, user_hash: [u8; 16]) {
         let record = cm.get_or_create(user_hash);
         record.uploaded = 1_000_000;
@@ -15038,31 +15044,33 @@ mod scoring_tests {
         record.ident_ip = 0;
     }
 
-    /// Seed an Ember credit record matching the fixture above so the
-    /// enhanced path has real numbers to multiply against.
+    /// The best history the Ember ledger can carry: fully reliable and fast.
     fn seed_ember_credits(cm: &mut CreditManager, pubkey: [u8; 32]) {
         let now = Utc::now().timestamp();
         let record = cm.get_or_create_ember(pubkey);
         record.uploaded = 1_000_000;
-        record.downloaded = 5_000_000;
+        record.downloaded = 50_000_000;
         record.last_download_time = now;
         record.last_upload_time = now;
         record.total_sessions = 10;
-        record.completed_sessions = 10; // 100% reliability → 1.5×
-        record.avg_upload_speed = (2.0 * EMBER_SPEED_BASELINE_BPS) as u64; // → 1.2×
+        record.completed_sessions = 10;
+        record.avg_upload_speed = 10 * 1024 * 1024;
         record.ident_verified = true;
     }
 
+    /// eMule's `GetScore` is wait × credit ratio × file priority, with no
+    /// multiplier for a peer we download from and nothing read from any
+    /// other ledger — so an Ember peer with a glowing Ember record scores
+    /// exactly what an eMule peer with the same `user_hash` history does.
     #[test]
-    fn verified_ember_peer_routes_through_enhanced_scoring() {
+    fn every_peer_is_scored_by_emules_formula_alone() {
         let mut cm = CreditManager::new();
         let idx = LocalIndex::new();
         let user_hash = [0xEEu8; 16];
-        let pubkey = [0xEBu8; 32];
         seed_emule_credits(&mut cm, user_hash);
-        seed_ember_credits(&mut cm, pubkey);
+        seed_ember_credits(&mut cm, [0xEBu8; 32]);
 
-        let emule_score = score_queue_entry(
+        let score = score_queue_entry(
             &cm,
             &idx,
             &QueuedPerFile::new(&[]),
@@ -15072,138 +15080,25 @@ mod scoring_tests {
             addr(),
             /* emule_version */ 0x42,
             /* is_friend_slot */ false,
-            /* ember_pubkey */ None,
-            /* ember_verified */ false,
         );
-        let ember_score = score_queue_entry(
-            &cm,
-            &idx,
-            &QueuedPerFile::new(&[]),
-            &user_hash,
-            [0u8; 16],
-            300,
-            addr(),
-            0x42,
-            false,
-            Some(&pubkey),
-            true,
-        );
-
-        // With 100% reliability (×1.5) and 2× baseline speed (×1.2),
-        // the multiplicative headroom over the eMule path is 1.8× at
-        // minimum (ignoring decay, which is ~1.0 for a just-now
-        // download). Assert at least 1.5× so the test doesn't flake
-        // on small ratio-formula differences between the two paths.
+        let ratio = cm.get_score_ratio(&user_hash, 0x0A00_0001);
+        assert!(ratio > 1.0, "the fixture must earn credit, got {ratio}");
+        // No file in the index scores as Normal priority (7 / 10).
+        let expected = 300.0 * ratio * 0.7;
         assert!(
-            ember_score >= emule_score * 1.5,
-            "verified Ember routing must score meaningfully higher (got ember={ember_score} emule={emule_score})",
+            (score - expected).abs() < 1e-9,
+            "score {score} must be wait × ratio × priority ({expected})",
         );
     }
 
     #[test]
-    fn unverified_ember_peer_falls_back_to_emule_scoring() {
-        let mut cm = CreditManager::new();
-        let idx = LocalIndex::new();
-        let user_hash = [0xEEu8; 16];
-        let pubkey = [0xEBu8; 32];
-        seed_emule_credits(&mut cm, user_hash);
-        seed_ember_credits(&mut cm, pubkey);
-
-        // Same pubkey advertised but `ember_verified = false`:
-        // hash-spoofer who hasn't proven possession. Must NOT pick
-        // up the Ember ledger's multipliers.
-        let scored_without_verification = score_queue_entry(
-            &cm,
-            &idx,
-            &QueuedPerFile::new(&[]),
-            &user_hash,
-            [0u8; 16],
-            300,
-            addr(),
-            0x42,
-            false,
-            Some(&pubkey),
-            false,
-        );
-        let emule_only = score_queue_entry(
-            &cm,
-            &idx,
-            &QueuedPerFile::new(&[]),
-            &user_hash,
-            [0u8; 16],
-            300,
-            addr(),
-            0x42,
-            false,
-            None,
-            false,
-        );
-        assert_eq!(
-            scored_without_verification, emule_only,
-            "unverified Ember peer must score identically to a vanilla eMule peer",
-        );
-    }
-
-    #[test]
-    fn missing_pubkey_falls_back_to_emule_scoring() {
-        // Peer is "verified" in some abstract sense (PoP flag = true)
-        // but has no advertised pubkey: defensive path, shouldn't
-        // crash, should silently fall back. Covers the impossible-in-
-        // practice but still-compilable-API shape where the caller
-        // passes verified=true with pubkey=None.
+    fn friend_slot_override_dwarfs_any_credit_history() {
         let mut cm = CreditManager::new();
         let idx = LocalIndex::new();
         let user_hash = [0xEEu8; 16];
         seed_emule_credits(&mut cm, user_hash);
 
-        let with_none = score_queue_entry(
-            &cm,
-            &idx,
-            &QueuedPerFile::new(&[]),
-            &user_hash,
-            [0u8; 16],
-            300,
-            addr(),
-            0x42,
-            false,
-            None,
-            true,
-        );
-        let baseline = score_queue_entry(
-            &cm,
-            &idx,
-            &QueuedPerFile::new(&[]),
-            &user_hash,
-            [0u8; 16],
-            300,
-            addr(),
-            0x42,
-            false,
-            None,
-            false,
-        );
-        assert_eq!(
-            with_none, baseline,
-            "None pubkey must take eMule path regardless of verified flag"
-        );
-    }
-
-    #[test]
-    fn friend_slot_override_still_wins_for_verified_ember_peer() {
-        // The friend-slot constant is meant to dwarf any credit-ratio
-        // differential so friends never lose their slot. Verify the
-        // Ember routing path doesn't accidentally bypass the override
-        // — i.e. `is_friend_slot = true` forces the high constant
-        // regardless of whether the base score came from eMule or
-        // Ember scoring.
-        let mut cm = CreditManager::new();
-        let idx = LocalIndex::new();
-        let user_hash = [0xEEu8; 16];
-        let pubkey = [0xEBu8; 32];
-        seed_emule_credits(&mut cm, user_hash);
-        seed_ember_credits(&mut cm, pubkey);
-
-        let ember_friend_score = score_queue_entry(
+        let score = score_queue_entry(
             &cm,
             &idx,
             &QueuedPerFile::new(&[]),
@@ -15213,53 +15108,24 @@ mod scoring_tests {
             addr(),
             0x42,
             /* is_friend_slot */ true,
-            Some(&pubkey),
-            true,
         );
-        let emule_friend_score = score_queue_entry(
-            &cm,
-            &idx,
-            &QueuedPerFile::new(&[]),
-            &user_hash,
-            [0u8; 16],
-            300,
-            addr(),
-            0x42,
-            true,
-            None,
-            false,
-        );
-        assert_eq!(
-            ember_friend_score, emule_friend_score,
-            "friend-slot override constant must dominate both routing paths",
-        );
-        assert!(
-            ember_friend_score > 1_000_000.0,
-            "friend slot should map to the multi-million priority constant",
-        );
+        assert_eq!(score, 268_435_455.0, "eMule's friend-slot score, 0x0FFFFFFF");
     }
 
     #[test]
-    fn badguy_ip_short_circuit_blocks_both_paths() {
-        // A peer whose user_hash is verified to a different IP must
-        // score 0.0 via the eMule path; the Ember routing path must
-        // inherit that zero so a verified Ember pubkey can't be used
-        // to smuggle a BadGuy around the IP-pinning check.
+    fn a_badguy_ip_scores_zero() {
+        // A user_hash verified on one IP and presented from another is
+        // eMule's IS_IDBADGUY, which `GetScore` returns 0 for.
         let mut cm = CreditManager::new();
         let idx = LocalIndex::new();
         let user_hash = [0xEEu8; 16];
-        let pubkey = [0xEBu8; 32];
         seed_emule_credits(&mut cm, user_hash);
-        seed_ember_credits(&mut cm, pubkey);
+        cm.check_identity_ip(user_hash, 0x0A000001); // 10.0.0.1 pinned
 
-        // Pin the peer's verified ident to a fixed IP, then call
-        // scoring from a different IP → BadGuy → eMule score 0.0.
         let bad_addr = Some(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
             4662,
         ));
-        cm.check_identity_ip(user_hash, 0x0A000001); // 10.0.0.1 pinned
-
         let score = score_queue_entry(
             &cm,
             &idx,
@@ -15270,85 +15136,8 @@ mod scoring_tests {
             bad_addr,
             /* emule_version */ 0,
             false,
-            Some(&pubkey),
-            true,
         );
-        assert_eq!(
-            score, 0.0,
-            "BadGuy short-circuit must zero both routing paths"
-        );
-    }
-
-    #[test]
-    fn reliability_penalty_actually_shows_up_in_score() {
-        // Two otherwise-identical verified Ember peers — one with
-        // 100% reliability, one with 0%. The 100% peer's score
-        // should be `MAX / MIN ≈ 1.875×` the 0% peer's, give or
-        // take the speed multiplier (which we hold constant).
-        let mut cm = CreditManager::new();
-        let idx = LocalIndex::new();
-        let good_user = [0x01u8; 16];
-        let bad_user = [0x02u8; 16];
-        let good_pk = [0x11u8; 32];
-        let bad_pk = [0x22u8; 32];
-        let good_addr = Some(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            4662,
-        ));
-        let bad_addr = Some(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
-            4662,
-        ));
-
-        seed_emule_credits(&mut cm, good_user);
-        seed_emule_credits(&mut cm, bad_user);
-        let now = Utc::now().timestamp();
-        for (pk, completed) in [(good_pk, 10u32), (bad_pk, 0u32)] {
-            let r = cm.get_or_create_ember(pk);
-            r.uploaded = 1_000_000;
-            r.downloaded = 5_000_000;
-            r.last_download_time = now;
-            r.total_sessions = 10;
-            r.completed_sessions = completed;
-            r.avg_upload_speed = EMBER_SPEED_BASELINE_BPS as u64; // neutral speed
-            r.ident_verified = true;
-        }
-
-        let good = score_queue_entry(
-            &cm,
-            &idx,
-            &QueuedPerFile::new(&[]),
-            &good_user,
-            [0u8; 16],
-            300,
-            good_addr,
-            0,
-            false,
-            Some(&good_pk),
-            true,
-        );
-        let bad = score_queue_entry(
-            &cm,
-            &idx,
-            &QueuedPerFile::new(&[]),
-            &bad_user,
-            [0u8; 16],
-            300,
-            bad_addr,
-            0,
-            false,
-            Some(&bad_pk),
-            true,
-        );
-        // Reliability multiplier differential only. Expected:
-        // MAX / MIN = 1.5 / 0.8 ≈ 1.875. Assert at least 1.6× to
-        // leave a little slack for ratio clamping.
-        let observed_ratio = good / bad;
-        let expected_ratio = EMBER_RELIABILITY_MAX / EMBER_RELIABILITY_MIN;
-        assert!(
-            observed_ratio > expected_ratio * 0.85,
-            "reliability differential should produce ≳{expected_ratio:.2}× score gap, got {observed_ratio:.3}×",
-        );
+        assert_eq!(score, 0.0);
     }
 
     #[test]
@@ -15381,8 +15170,6 @@ mod scoring_tests {
             &user,
             [0u8; 16],
             peer_ip,
-            None,
-            false,
         );
         // Unknown file → prio 7 → combined = 10 * ratio * 7
         assert!(
@@ -15483,8 +15270,6 @@ mod scoring_tests {
                 Some(addr),
                 0,
                 friend_slot,
-                None,
-                false,
             )
         };
         assert_eq!(scored(true), 268_435_455.0);
@@ -15608,8 +15393,6 @@ mod scoring_tests {
                 entry.current_addr,
                 entry.emule_version,
                 entry.is_friend_slot,
-                entry.ember_pubkey.as_ref(),
-                entry.ember_verified,
             );
             let one = compute_queue_rank(&cm, &idx, &queue, &entry.identity, score, entry.join_time);
             assert_eq!(rank, one, "row {:?}", entry.identity);
@@ -16300,39 +16083,6 @@ mod abuse_and_seniority_tests {
         assert!(faithful.join_time.elapsed().as_secs() >= MAX_PURGEQUEUETIME_SECS);
     }
 
-    /// eMule hands an uploading client a flat bonus so a waiter cannot displace
-    /// it seconds after it started — "to avoid 20 sec downloads"
-    /// (`UploadClient.cpp:212-220`). Ember scored the holder on a frozen
-    /// wait-at-grant that is zero for a push-grant and for the common
-    /// empty-queue add, so any waiter with a positive score won immediately.
-    #[test]
-    fn a_freshly_granted_slot_is_not_immediately_outscored() {
-        use std::time::Duration;
-
-        // The case that thrashed: nothing accrued before the grant, ten seconds in.
-        let fresh = uploading_score_wait_secs(0, Some(Duration::from_secs(10)));
-        assert!(
-            fresh >= 30 * 60,
-            "a brand-new upload must not score as a zero-wait peer, got {fresh}s"
-        );
-
-        // The bonus steps down once past the first 15 minutes, and the score
-        // still only ever grows with time held.
-        let early = uploading_score_wait_secs(0, Some(Duration::from_secs(14 * 60)));
-        let later = uploading_score_wait_secs(0, Some(Duration::from_secs(16 * 60)));
-        assert_eq!(early, 14 * 60 + 30 * 60);
-        assert_eq!(later, 16 * 60 + 15 * 60);
-        assert!(later > 15 * 60);
-
-        // Wait accrued before the grant still counts, and a missing session
-        // start cannot panic or read as an enormous wait.
-        assert_eq!(
-            uploading_score_wait_secs(120, Some(Duration::from_secs(60))),
-            120 + 60 + 30 * 60
-        );
-        assert_eq!(uploading_score_wait_secs(0, None), 30 * 60);
-    }
-
     /// `GetTargetClientDataRate` (`UploadQueue.cpp:397-409`) is the divisor the
     /// whole apportionment rests on, and both the slot-count formula and the
     /// per-slot share read it — so its table has to be exact.
@@ -16615,6 +16365,32 @@ mod abuse_and_seniority_tests {
         );
     }
 
+    #[test]
+    fn a_shareless_slot_builds_no_debt_and_promotion_caps_what_it_owes() {
+        use std::time::Duration;
+        let mut slot = SlotBandwidth::new();
+        for _ in 0..100 {
+            slot.charge(10_240, None);
+        }
+        let owed = slot.send_by.duration_since(std::time::Instant::now());
+        assert!(
+            owed <= TRICKLE_BLOCK_DEADLINE,
+            "packets sent on spare tokens must not stack debt, got {owed:?}"
+        );
+
+        // Promoted into `maxSlot`: one packet at the new share is all it waits.
+        slot.rebase(10_240, Some(10_240));
+        let owed = slot.send_by.duration_since(std::time::Instant::now());
+        assert!(owed <= Duration::from_secs(1), "promotion left {owed:?} of debt");
+
+        // Debt booked at the share it still has is kept.
+        slot.charge(10_240, Some(10_240));
+        slot.charge(10_240, Some(10_240));
+        let before = slot.send_by;
+        slot.rebase(10_240, Some(10_240));
+        assert_eq!(slot.send_by, before);
+    }
+
     /// The hard limit is derived from the soft one, so the pair has to stay in
     /// eMule's relationship: `soft + max(soft, 800) / 4` (`UploadQueue.cpp:621`).
     #[test]
@@ -16814,6 +16590,8 @@ mod abuse_and_seniority_tests {
         QueueIdentity::Ip(ip.parse().unwrap())
     }
 
+    const STRIKE_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 1));
+
     /// Two eMules behind one NAT are two clients, and eMule's own
     /// `AddRequestCount` counts per client. Sharing one counter meant their
     /// ordinary interleaved requests looked like a single peer re-asking
@@ -16828,13 +16606,13 @@ mod abuse_and_seniority_tests {
 
         // Both clients ask, then each re-asks immediately. Per-identity that
         // is one strike each, nowhere near BADCLIENTBAN.
-        assert!(!tracker.record_request(a.clone(), hash, false, false));
-        assert!(!tracker.record_request(b.clone(), hash, false, false));
+        assert!(!tracker.record_request(a.clone(), STRIKE_IP, hash, false, false));
+        assert!(!tracker.record_request(b.clone(), STRIKE_IP, hash, false, false));
         backdate(&mut tracker, &a, hash, 1);
         backdate(&mut tracker, &b, hash, 1);
-        assert!(!tracker.record_request(a.clone(), hash, false, false));
+        assert!(!tracker.record_request(a.clone(), STRIKE_IP, hash, false, false));
         assert!(
-            !tracker.record_request(b.clone(), hash, false, false),
+            !tracker.record_request(b.clone(), STRIKE_IP, hash, false, false),
             "one client's re-ask must not push another client toward a ban"
         );
         assert_eq!(tracker.entries[&(a, hash)].1, 1);
@@ -16900,19 +16678,74 @@ mod abuse_and_seniority_tests {
         assert_eq!(active.load(Ordering::Relaxed), 2);
     }
 
+    /// A second connection under a slot holder's identity can wait for another
+    /// file while the first is served. Picking it for the next slot granted
+    /// nothing — `try_activate` refuses it and every other waiter defers to the
+    /// pick — so one peer could keep every free slot empty.
+    #[test]
+    fn a_top_waiter_that_already_holds_a_slot_yields_the_free_slot_to_the_next_waiter() {
+        let cm = CreditManager::new();
+        let idx = LocalIndex::new();
+
+        let holder_hash = [0xA1; 16];
+        let mut holder_row = waiter("203.0.113.7", 4672);
+        holder_row.identity = QueueIdentity::UserHash(holder_hash);
+        holder_row.user_hash = holder_hash;
+        holder_row.file_hash = [2u8; 16];
+        holder_row.current_addr = Some(addr("203.0.113.7"));
+        holder_row.join_time = std::time::Instant::now() - std::time::Duration::from_secs(600);
+
+        let mut next = waiter("198.51.100.9", 4672);
+        next.identity = QueueIdentity::UserHash([0xB2; 16]);
+        next.user_hash = [0xB2; 16];
+        next.current_addr = Some(addr("198.51.100.9"));
+        next.join_time = std::time::Instant::now() - std::time::Duration::from_secs(60);
+
+        let queue = vec![next.clone(), holder_row.clone()];
+        let queued = QueuedPerFile::new(&queue);
+        let pick = |slot_holders: &HashSet<QueueIdentity>| {
+            best_waiter(&cm, &idx, &queued, &queue, slot_holders, |e| e.current_addr.is_some())
+                .map(|(e, _)| e.identity.clone())
+        };
+        assert_eq!(
+            pick(&HashSet::new()),
+            Some(holder_row.identity.clone()),
+            "the longer wait is the top scorer"
+        );
+
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let holders = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let order = Arc::new(SlotOrder::default());
+        let guard = || {
+            UploadSlotGuard::new(active.clone(), notify.clone(), holders.clone(), order.clone())
+        };
+        let mut serving = guard();
+        assert!(serving.try_activate(4, &holder_row.identity));
+
+        let picked = pick(&holders.lock().clone());
+        assert_eq!(picked, Some(next.identity.clone()));
+        let mut granted = guard();
+        assert!(
+            granted.try_activate(4, &picked.unwrap()),
+            "the free slot must go to the next waiter"
+        );
+        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
     #[test]
     fn a_well_spaced_request_pays_down_an_earlier_strike() {
         let mut tracker = FileRequestTracker::new();
         let id = ident("203.0.113.9");
         let hash = [3u8; 16];
 
-        tracker.record_request(id.clone(), hash, false, false);
+        tracker.record_request(id.clone(), STRIKE_IP, hash, false, false);
         backdate(&mut tracker, &id, hash, 1);
-        assert!(!tracker.record_request(id.clone(), hash, false, false));
+        assert!(!tracker.record_request(id.clone(), STRIKE_IP, hash, false, false));
         assert_eq!(tracker.entries[&(id.clone(), hash)].1, 1);
 
         backdate(&mut tracker, &id, hash, MIN_REQUESTTIME_SECS + 1);
-        assert!(!tracker.record_request(id.clone(), hash, false, false));
+        assert!(!tracker.record_request(id.clone(), STRIKE_IP, hash, false, false));
         assert_eq!(
             tracker.entries[&(id, hash)].1,
             0,
@@ -16929,14 +16762,14 @@ mod abuse_and_seniority_tests {
         let id = ident("203.0.113.10");
         let hash = [4u8; 16];
 
-        tracker.record_request(id.clone(), hash, false, false);
+        tracker.record_request(id.clone(), STRIKE_IP, hash, false, false);
         backdate(&mut tracker, &id, hash, 1);
-        assert!(!tracker.record_request(id.clone(), hash, false, false));
+        assert!(!tracker.record_request(id.clone(), STRIKE_IP, hash, false, false));
 
         tracker.forgive_requeue(id.clone(), hash);
         backdate(&mut tracker, &id, hash, 1);
         assert!(
-            !tracker.record_request(id, hash, false, false),
+            !tracker.record_request(id, STRIKE_IP, hash, false, false),
             "a forgiven rotation must not leave the peer one request from a ban"
         );
     }
@@ -16947,13 +16780,43 @@ mod abuse_and_seniority_tests {
         let id = ident("203.0.113.11");
         let hash = [5u8; 16];
 
-        tracker.record_request(id.clone(), hash, false, false);
+        tracker.record_request(id.clone(), STRIKE_IP, hash, false, false);
         let mut banned = false;
         for _ in 0..BADCLIENTBAN {
             backdate(&mut tracker, &id, hash, 1);
-            banned |= tracker.record_request(id.clone(), hash, false, false);
+            banned |= tracker.record_request(id.clone(), STRIKE_IP, hash, false, false);
         }
         assert!(banned, "the ban must stay reachable for a genuinely abusive peer");
+    }
+
+    #[test]
+    fn strikes_primed_under_a_user_hash_do_not_ban_another_address() {
+        let mut tracker = FileRequestTracker::new();
+        let id = QueueIdentity::UserHash([0xCC; 16]);
+        let hash = [8u8; 16];
+        let primer: IpAddr = "198.51.100.30".parse().unwrap();
+        let victim: IpAddr = "198.51.100.31".parse().unwrap();
+
+        tracker.record_request(id.clone(), primer, hash, false, false);
+        for _ in 0..BADCLIENTBAN - 1 {
+            backdate(&mut tracker, &id, hash, 1);
+            assert!(!tracker.record_request(id.clone(), primer, hash, false, false));
+        }
+        backdate(&mut tracker, &id, hash, 1);
+        assert!(
+            !tracker.record_request(id.clone(), victim, hash, false, false),
+            "the request that would cross BADCLIENTBAN came from a different address"
+        );
+        assert_eq!(tracker.entries[&(id.clone(), hash)].1, 0);
+
+        let mapped: IpAddr = "::ffff:198.51.100.31".parse().unwrap();
+        backdate(&mut tracker, &id, hash, 1);
+        tracker.record_request(id.clone(), mapped, hash, false, false);
+        assert_eq!(
+            tracker.entries[&(id, hash)].1,
+            1,
+            "the IPv4-mapped form is the same address"
+        );
     }
 
     /// eMule never strikes a friend holding a friend slot, and adds nothing while
@@ -16970,11 +16833,11 @@ mod abuse_and_seniority_tests {
         ] {
             let mut tracker = FileRequestTracker::new();
             let id = ident("203.0.113.12");
-            tracker.record_request(id.clone(), hash, is_friend, downloading);
+            tracker.record_request(id.clone(), STRIKE_IP, hash, is_friend, downloading);
             for _ in 0..(BADCLIENTBAN * 3) {
                 backdate(&mut tracker, &id, hash, 1);
                 assert!(
-                    !tracker.record_request(id.clone(), hash, is_friend, downloading),
+                    !tracker.record_request(id.clone(), STRIKE_IP, hash, is_friend, downloading),
                     "{label} must never be banned by the request-frequency counter"
                 );
             }
@@ -17032,17 +16895,125 @@ mod abuse_and_seniority_tests {
 
     #[test]
     fn the_uncached_hash_budget_refuses_a_loop_and_refills_after_the_window() {
-        let mut budget = UncachedHashBudget::new();
+        let mut tracker = AbuseTracker::new();
+        let ip: IpAddr = "198.51.100.20".parse().unwrap();
         for _ in 0..MAX_UNCACHED_HASH_JOBS {
-            assert!(budget.try_spend());
+            assert!(tracker.try_spend_uncached_hash_job(ip));
         }
-        assert!(!budget.try_spend(), "a looping peer must be cut off");
+        assert!(!tracker.try_spend_uncached_hash_job(ip), "a looping peer must be cut off");
 
-        budget.window_start =
+        tracker.entries.get_mut(&ip).unwrap().hash_window_start =
             std::time::Instant::now() - std::time::Duration::from_secs(UNCACHED_HASH_WINDOW_SECS);
         assert!(
-            budget.try_spend(),
+            tracker.try_spend_uncached_hash_job(ip),
             "the budget must refill so an honest peer is not cut off for the whole session"
+        );
+    }
+
+    /// The budget lived in the session, so every reconnect refilled it and a
+    /// peer could read the whole share by reconnecting every fourth request.
+    #[test]
+    fn the_uncached_hash_budget_is_per_address_and_survives_a_reconnect() {
+        let mut tracker = AbuseTracker::new();
+        let ip: IpAddr = "198.51.100.21".parse().unwrap();
+        for _ in 0..MAX_UNCACHED_HASH_JOBS {
+            assert!(tracker.try_spend_uncached_hash_job(ip));
+        }
+        assert!(
+            !tracker.record_request(ip),
+            "a reconnect is well inside the connection limit"
+        );
+        let mapped: IpAddr = "::ffff:198.51.100.21".parse().unwrap();
+        assert!(
+            !tracker.try_spend_uncached_hash_job(mapped),
+            "a new connection from the same address must not get a fresh budget"
+        );
+        assert!(
+            tracker.try_spend_uncached_hash_job("198.51.100.22".parse().unwrap()),
+            "another address has its own"
+        );
+    }
+
+    fn known_record(
+        file_hash: [u8; 16],
+        file_size: u64,
+        part_hashes: Vec<[u8; 16]>,
+    ) -> crate::storage::known_files::KnownFileRecord {
+        crate::storage::known_files::KnownFileRecord {
+            file_hash,
+            part_hashes,
+            file_name: format!("{}.bin", hex::encode(file_hash)),
+            file_size,
+            file_path: format!("/library/{}.bin", hex::encode(file_hash)),
+            aich_hash: String::new(),
+            ember_file_hash: String::new(),
+            modified_at: 0,
+            all_time_transferred: 0,
+            all_time_requested: 0,
+            all_time_accepted: 0,
+            upload_priority: 0,
+            last_publish_src: 0,
+            last_shared: 0,
+            is_shared: true,
+            friends_only: false,
+            complete_sources: 0,
+            last_ember_source_publish: 0,
+            last_ember_keyword_publish: 0,
+            media: None,
+            media_scanned: false,
+        }
+    }
+
+    /// eMule answers a hashset from the `CKnownFile` in memory, so a complete
+    /// file's must come from known.met rather than a read of the file — but
+    /// only one that is provably the hashset of the content asked for.
+    #[test]
+    fn a_complete_files_hashset_is_answered_from_known_met_only_when_it_matches() {
+        use digest::Digest;
+        let parts = vec![[0x11u8; 16], [0x22u8; 16]];
+        let file_size = PARTSIZE + 1000;
+        let file_hash: [u8; 16] = md4::Md4::digest(parts.concat()).into();
+        let other_hash = [0x77u8; 16];
+
+        let mut known = crate::storage::known_files::KnownFileList::new();
+        known.add_or_update(known_record(file_hash, file_size, parts.clone()));
+        known.add_or_update(known_record(other_hash, file_size, parts.clone()));
+        let records: SharedKnownRecords = Default::default();
+        assert_eq!(
+            stored_md4_hashset(&records, &file_hash, file_size, Some(0)),
+            None,
+            "nothing published yet"
+        );
+
+        publish_known_records(&records, &known);
+        assert_eq!(
+            stored_md4_hashset(&records, &file_hash, file_size, Some(0)),
+            Some(parts.clone())
+        );
+        assert_eq!(
+            stored_md4_hashset(&records, &file_hash, file_size, Some(60)),
+            None,
+            "edited in place since it was hashed: same size, other bytes"
+        );
+        assert_eq!(
+            stored_md4_hashset(&records, &file_hash, file_size, None),
+            None,
+            "a file whose time cannot be read is not vouched for"
+        );
+        assert_eq!(
+            stored_md4_hashset(&records, &file_hash, file_size + 1, Some(0)),
+            None,
+            "a record of another size is other content"
+        );
+        assert_eq!(
+            stored_md4_hashset(&records, &other_hash, file_size, Some(0)),
+            None,
+            "hashes that do not recombine to the file hash are not its hashset"
+        );
+        assert_eq!(
+            stored_md4_hashset(&records, &[0x55; 16], 4096, Some(0)),
+            Some(vec![[0x55; 16]]),
+            "a file under one part is its own part hash"
         );
     }
 

@@ -1907,11 +1907,12 @@ pub(in crate::network) async fn on_search_poll_tick(
                         if let Some(old_handle) = state.download_handles.remove(&tid2) {
                             old_handle.abort();
                         }
+                        let generation = Some(ms_download.control.generation());
                         let handle = tokio::spawn(async move {
                             if let Err(e) = ms_download.run(tx).await {
                                 error!("Multi-source download failed: {e}");
                                 let kind = classify_error(&e.to_string());
-                                let _ = tx2.send(DownloadEvent::Failed { transfer_id: tid, error: e.to_string(), failure_kind: kind }).await;
+                                let _ = tx2.send(DownloadEvent::Failed { transfer_id: tid, error: e.to_string(), failure_kind: kind, generation }).await;
                             }
                         });
                         state.download_handles.insert(tid2, handle);

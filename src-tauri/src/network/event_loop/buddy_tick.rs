@@ -47,7 +47,7 @@ pub(in crate::network) async fn on_buddy_tick(
     if buddy_state != BuddyState::Connected {
         debug!("Buddy tick: state={:?}, tcp_fw={:?}, udp_fw={:?}, routing_table={}", buddy_state, tcp_fw, udp_fw, state.routing_table.len());
     }
-    if buddy_state == BuddyState::Connected {
+    if state.buddy_manager.buddy_ping_due(std::time::Instant::now()) {
         state.buddy_manager.send_buddy_ping().await;
     }
     if state.buddy_manager.finding_timed_out() {

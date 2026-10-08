@@ -74,7 +74,8 @@
     flattenLibraryFolderTree,
   } from '$lib/libraryFolderTree';
   import * as m from '$lib/paraglide/messages';
-  import { translateError } from '$lib/i18n';
+  import { codedErrorOf, translateError } from '$lib/i18n';
+  import { highlightMatches } from '$lib/stores/highlight';
   import { plural } from '$lib/plural';
   import { openChatFilesFolder } from '$lib/api/friends';
   import { openChannelFilesFolder } from '$lib/api/channels';
@@ -332,10 +333,23 @@
   const LOADED_COLLECTION_DISPLAY_LIMIT = 1000;
 
   let collectionSearch = $state('');
+  // Debounced like the Library search: on a large library the filter below
+  // walks every hashed file, which on each keystroke made typing lag.
+  let collectionQuery = $state('');
+  $effect(() => {
+    const q = collectionSearch;
+    if (collectionQuery === '' || q === '') {
+      collectionQuery = q;
+      return;
+    }
+    const timer = setTimeout(() => (collectionQuery = q), 150);
+    return () => clearTimeout(timer);
+  });
+  let collectionNamesLower = $derived(hashedLibraryFiles.map((f) => f.name.toLowerCase()));
   let collectionFilteredFiles = $derived.by(() => {
-    const q = collectionSearch.trim().toLowerCase();
+    const q = collectionQuery.trim().toLowerCase();
     if (!q) return hashedLibraryFiles;
-    return hashedLibraryFiles.filter(f => f.name.toLowerCase().includes(q));
+    return hashedLibraryFiles.filter((_, i) => collectionNamesLower[i].includes(q));
   });
   let displayedCollectionFiles = $derived.by(() =>
     collectionFilteredFiles.slice(0, COLLECTION_PICKER_DISPLAY_LIMIT)
@@ -488,6 +502,25 @@
   let typeFilter: TypeFilter = $state('All');
   let showDuplicatesOnly = $state(false);
   let showMissingOnly = $state(false);
+  type ShareScopeFilter = 'all' | 'friends_only' | 'unpublished' | 'hashing';
+  const VALID_SHARE_SCOPES = new Set<ShareScopeFilter>(['all', 'friends_only', 'unpublished', 'hashing']);
+  let shareScopeFilter = $state<ShareScopeFilter>('all');
+  /** A saved sharing-state filter waiting for the library to load. */
+  let pendingShareScope = $state<Exclude<ShareScopeFilter, 'all'> | null>(null);
+
+  /**
+   * The one sharing state a row is in, if any of the filterable ones.
+   *
+   * A friends-only file is never published by design, so it counts as
+   * friends-only rather than as waiting to be published.
+   */
+  function shareScopeOf(f: FileInfo): Exclude<ShareScopeFilter, 'all'> | null {
+    if (!f.hash) return 'hashing';
+    if (!f.shared) return null;
+    if (f.friends_only) return 'friends_only';
+    if (!f.shared_kad && !f.shared_ed2k && !f.shared_ember) return 'unpublished';
+    return null;
+  }
   let missingPathSet: Set<string> = $state(new Set());
   let missingScanTruncated = $state(false);
   let missingTotalCount = $state(0);
@@ -759,7 +792,7 @@
 
   /** Coalescing window for `shared-files-changed` while a scan is running.
    *
-   *  A refresh re-fetches the *entire* library over IPC — `get_shared_files`
+   *  A refresh re-fetches the *entire* library over IPC — a changed library
    *  returns every indexed row, and discovery allows up to 100,000 per folder —
    *  then recomputes every derived view over it. Hashing emits
    *  `shared-files-changed` continuously, so the 300 ms window meant a large
@@ -1004,8 +1037,11 @@
   }
 
   async function openSharedFileExternally(path: string) {
-    // Stop in-app playback before handing the file to the OS player.
-    playerStopToken += 1;
+    // Stop in-app playback before handing media to the OS player, so the two
+    // do not play over each other. Any other file leaves it playing.
+    if (playableKind(fileByPath.get(path)?.extension || extensionFromPath(path))) {
+      playerStopToken += 1;
+    }
     try {
       await openSharedFileCommand(path);
     } catch (e: unknown) {
@@ -1367,7 +1403,9 @@
     const hasType = typeFilter !== 'All';
     const dupOnly = showDuplicatesOnly;
     const missOnly = showMissingOnly;
-    if (!hasFolder && !hasQuery && !hasType && !dupOnly && !missOnly) return files;
+    const scope = shareScopeFilter;
+    const hasScope = scope !== 'all';
+    if (!hasFolder && !hasQuery && !hasType && !dupOnly && !missOnly && !hasScope) return files;
     // Normalized once per pass rather than once per row: `isPathInFolder`
     // re-derived it from `folder` on every call.
     const normalizedFolder = hasFolder ? normalizePathForMatch(folder!) : '';
@@ -1377,11 +1415,32 @@
       if (hasType && f.matchType !== typeFilter) return false;
       if (dupOnly && (!f.hash || !duplicateHashes.has(f.hash))) return false;
       if (missOnly && !missingPathSet.has(f.path)) return false;
+      if (hasScope && shareScopeOf(f) !== scope) return false;
       return true;
     });
   });
 
-  let hasActiveLibraryFilters = $derived(!!filterFolder || !!searchQuery.trim() || typeFilter !== 'All' || showDuplicatesOnly || showMissingOnly);
+  /** Counts per sharing state, for the labels in the sharing-state filter. */
+  let shareScopeCounts = $derived.by(() => {
+    const counts: Record<Exclude<ShareScopeFilter, 'all'>, number> = { friends_only: 0, unpublished: 0, hashing: 0 };
+    for (const f of files) {
+      const scope = shareScopeOf(f);
+      if (scope) counts[scope]++;
+    }
+    return counts;
+  });
+
+  $effect(() => {
+    const pending = pendingShareScope;
+    if (!pending || !initialLoadDone) return;
+    const matches = shareScopeCounts[pending] > 0;
+    untrack(() => {
+      pendingShareScope = null;
+      if (matches) shareScopeFilter = pending;
+    });
+  });
+
+  let hasActiveLibraryFilters = $derived(!!filterFolder || !!searchQuery.trim() || typeFilter !== 'All' || showDuplicatesOnly || showMissingOnly || shareScopeFilter !== 'all');
   let libraryHashedCount = $derived.by(() => {
     let hashed = 0;
     for (const f of files) if (f.hash) hashed++;
@@ -1399,6 +1458,8 @@
     typeFilter = 'All';
     showDuplicatesOnly = false;
     showMissingOnly = false;
+    shareScopeFilter = 'all';
+    pendingShareScope = null;
   }
 
   // --- Multi-select ---
@@ -1416,6 +1477,13 @@
     let n = 0;
     for (const f of files) if (checkedPaths.has(f.path) && f.hash) n++;
     return n;
+  });
+  /** What the selection weighs, for the bulk bar: worth knowing before a
+   *  Delete or a collection. */
+  let checkedTotalSize = $derived.by(() => {
+    let bytes = 0;
+    for (const p of checkedPaths) bytes += fileByPath.get(p)?.size ?? 0;
+    return bytes;
   });
   let checkedRestrictCount = $derived.by(() => {
     let n = 0;
@@ -1639,6 +1707,10 @@
           deleted++;
         } catch (e: unknown) {
           failures.push(`${f.name}: ${toErr(e)}`);
+          // "Keep file" in the backend's delete-permanently question (a file
+          // the Recycle Bin will not take): the rest are very likely in the
+          // same place, so stop rather than ask again for every one of them.
+          if (codedErrorOf(e)?.code === 'sharing_delete_declined') break;
         }
         bulkProgress = { done: index + 1, total: targets.length };
       }
@@ -2054,6 +2126,51 @@
   let ctxCopySub = $state(false);
   let ctxSendSub = $state(false);
   let ctxWebSub = $state(false);
+
+  // Hover intent for the submenus that open on hover. The path from a parent
+  // item to its submenu crosses the gap beside the item and often clips a
+  // neighbouring item, or the file list when the menu sits near an edge.
+  // Closing on the first `mouseleave` snapped the submenu shut on the way to
+  // it, so leaving waits a moment, reaching the submenu (a child of the item,
+  // so it re-enters the item) cancels that, and brushing past another parent
+  // item only switches to it if the pointer stays there.
+  type HoverSub = 'priority' | 'copy' | 'send' | 'web';
+  const CTX_SUB_INTENT_MS = 300;
+  let ctxSubTimer: ReturnType<typeof setTimeout> | undefined;
+  function openHoverSub(which: HoverSub | null) {
+    clearTimeout(ctxSubTimer);
+    ctxPrioritySub = which === 'priority';
+    ctxCopySub = which === 'copy';
+    if (which === 'send' && !ctxSendSub) void loadSendableFriends();
+    ctxSendSub = which === 'send';
+    ctxWebSub = which === 'web';
+  }
+  function enterHoverSub(which: HoverSub) {
+    clearTimeout(ctxSubTimer);
+    const open: HoverSub | null = ctxPrioritySub
+      ? 'priority'
+      : ctxCopySub
+        ? 'copy'
+        : ctxSendSub
+          ? 'send'
+          : ctxWebSub
+            ? 'web'
+            : null;
+    if (open === null || open === which) openHoverSub(which);
+    else ctxSubTimer = setTimeout(() => openHoverSub(which), CTX_SUB_INTENT_MS);
+  }
+  function leaveHoverSub() {
+    clearTimeout(ctxSubTimer);
+    ctxSubTimer = setTimeout(() => openHoverSub(null), CTX_SUB_INTENT_MS);
+  }
+  /** A click on a parent item opens its submenu. Without stopping it here the
+   *  click reached the document handler and dismissed the whole menu. Clicks
+   *  on the submenu's own items are left alone: they run their action. */
+  function clickHoverSub(e: MouseEvent, which: HoverSub) {
+    if (e.target instanceof Element && e.target.closest('.ctx-submenu')) return;
+    e.stopPropagation();
+    openHoverSub(which);
+  }
   // Empty until settings load, so the submenu shows its "configure in Settings"
   // hint rather than a stale list.
   let webServices = $derived($appSettings?.web_services ?? []);
@@ -2092,6 +2209,7 @@
 
   function onCtx(e: MouseEvent, f: FileInfo) {
     e.preventDefault();
+    clearTimeout(ctxSubTimer);
     ctxPrioritySub = false;
     ctxCopySub = false;
     ctxSendSub = false;
@@ -2110,6 +2228,7 @@
     void tick().then(() => ctxMenuItems(ctxMenuEl)[0]?.focus());
   }
   function closeCtx() {
+    clearTimeout(ctxSubTimer);
     ctxMenu = null;
     ctxPrioritySub = false;
     ctxCopySub = false;
@@ -2155,6 +2274,7 @@
       if (!parentItem) return false;
       e.preventDefault();
       parentItem.focus();
+      clearTimeout(ctxSubTimer);
       ctxPrioritySub = false;
       ctxCopySub = false;
       ctxSendSub = false;
@@ -2279,8 +2399,11 @@
 
     const typing = isTypingTarget(e.target);
 
-    // "/" focuses the search input when not already typing.
-    if (!typing && e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    // "/" focuses the search input when not already typing; Ctrl/Cmd+F does
+    // from anywhere, as on Channels.
+    const findKey =
+      (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && isShortcutLetter(e, 'f');
+    if (findKey || (!typing && e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey)) {
       e.preventDefault();
       searchInputEl?.focus();
       searchInputEl?.select();
@@ -2443,7 +2566,7 @@
         case 'properties':
           requestSelectPath(f.path);
           break;
-        case 'open_file': await openSharedFile(f.path); break;
+        case 'open_file': await openSharedFileExternally(f.path); break;
         case 'open_folder': await openSharedFolder(f.path); break;
         // The backend reads the template from settings by index and does the
         // substituting, and collects the native confirmation — so there is
@@ -2721,6 +2844,16 @@
         if (typeof parsed.showDuplicatesOnly === 'boolean') {
           showDuplicatesOnly = parsed.showDuplicatesOnly;
         }
+        // Deferred like "missing only" below: put back once the library is
+        // loaded, and only if it still matches something. "Still hashing"
+        // restored after the hashing finished would open on an empty list.
+        if (
+          typeof parsed.shareScopeFilter === 'string'
+          && parsed.shareScopeFilter !== 'all'
+          && VALID_SHARE_SCOPES.has(parsed.shareScopeFilter as ShareScopeFilter)
+        ) {
+          pendingShareScope = parsed.shareScopeFilter as Exclude<ShareScopeFilter, 'all'>;
+        }
         // Restore "missing only" only if the user actually has missing
         // files; otherwise the toggle would re-enable a filter that
         // immediately matches zero rows. The clearing in the onMount
@@ -2767,6 +2900,7 @@
         sortAsc,
         showDuplicatesOnly,
         showMissingOnly,
+        shareScopeFilter: pendingShareScope ?? shareScopeFilter,
         topPanelOpen,
         topPanelMetric,
         topPanelScope,
@@ -2778,7 +2912,7 @@
   $effect(() => {
     if (!filtersRestored) return;
     // Track dependencies explicitly so this effect re-runs when any filter/sort changes.
-    void typeFilter; void filterFolder; void searchQuery; void sortField; void sortAsc; void showDuplicatesOnly; void showMissingOnly;
+    void typeFilter; void filterFolder; void searchQuery; void sortField; void sortAsc; void showDuplicatesOnly; void showMissingOnly; void shareScopeFilter; void pendingShareScope;
     void topPanelOpen; void topPanelMetric; void topPanelScope; void expandedFolders;
     persistFilters();
   });
@@ -3231,6 +3365,12 @@
         <option value={opt}>{fileTypeFilterLabel(opt)}</option>
       {/each}
     </select>
+    <select class="filter-type" bind:value={shareScopeFilter} onchange={() => (pendingShareScope = null)} aria-label={m.library_scope_filter_aria()}>
+      <option value="all">{m.library_scope_all()}</option>
+      <option value="friends_only">{m.library_scope_friends_only()} ({formatNumber(shareScopeCounts.friends_only)})</option>
+      <option value="unpublished">{m.library_scope_unpublished()} ({formatNumber(shareScopeCounts.unpublished)})</option>
+      <option value="hashing">{m.library_scope_hashing()} ({formatNumber(shareScopeCounts.hashing)})</option>
+    </select>
     <button
       class="dupes-toggle"
       class:active={showDuplicatesOnly}
@@ -3498,7 +3638,7 @@
             </div>
           {/if}
           {#if collectionFilteredFiles.length === 0 && hashedLibraryFiles.length > 0}
-            <div class="coll-pick-empty">{m.library_coll_no_matches({ query: collectionSearch })}</div>
+            <div class="coll-pick-empty">{m.library_coll_no_matches({ query: collectionQuery })}</div>
           {:else if hashedLibraryFiles.length === 0}
             <div class="coll-pick-empty">{m.library_coll_no_hashed_files()}</div>
           {/if}
@@ -3950,12 +4090,13 @@
         onToggleCheck={toggleCheck}
         onToggleCheckAll={toggleCheckAll}
         missingPaths={missingPathSet}
+        highlight={$highlightMatches ? debouncedQuery : ''}
       />
     {/if}
 
     {#if checkedCount > 0}
       <div class="bulk-action-bar">
-        <span class="bulk-count">{plural(checkedCount, { one: m.library_bulk_count_one, other: () => m.library_bulk_count_other({ count: checkedCount }) })}</span>
+        <span class="bulk-count">{plural(checkedCount, { one: m.library_bulk_count_one, other: () => m.library_bulk_count_other({ count: formatNumber(checkedCount) }) })}<span class="bulk-size"> · {formatSize(checkedTotalSize)}</span></span>
         {#if checkedHiddenCount > 0}
           <button
             type="button"
@@ -4403,9 +4544,10 @@
         tabindex="0"
         aria-haspopup="menu"
         aria-expanded={ctxPrioritySub}
-        onmouseenter={() => ctxPrioritySub = true}
-        onmouseleave={() => ctxPrioritySub = false}
-        onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') ctxPrioritySub = true; }}
+        onmouseenter={() => enterHoverSub('priority')}
+        onmouseleave={leaveHoverSub}
+        onclick={(e) => clickHoverSub(e, 'priority')}
+        onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') openHoverSub('priority'); }}
       >
         {m.library_col_priority()}
         <span class="ctx-hint">{priorityLabel(ctxMenu.file.priority)}</span>
@@ -4436,9 +4578,10 @@
         tabindex="0"
         aria-haspopup="menu"
         aria-expanded={ctxCopySub}
-        onmouseenter={() => ctxCopySub = true}
-        onmouseleave={() => ctxCopySub = false}
-        onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') ctxCopySub = true; }}
+        onmouseenter={() => enterHoverSub('copy')}
+        onmouseleave={leaveHoverSub}
+        onclick={(e) => clickHoverSub(e, 'copy')}
+        onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') openHoverSub('copy'); }}
       >
         {m.servers_copy_ed2k_link()}
         {#if ctxCopySub}
@@ -4469,12 +4612,14 @@
         tabindex="0"
         aria-haspopup="menu"
         aria-expanded={ctxWebSub}
-        onclick={(e) => { e.stopPropagation(); ctxWebSub = !ctxWebSub; }}
+        onmouseenter={() => enterHoverSub('web')}
+        onmouseleave={leaveHoverSub}
+        onclick={(e) => clickHoverSub(e, 'web')}
         onkeydown={(e) => {
           if (e.target !== e.currentTarget) return;
           if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowRight') {
             e.preventDefault();
-            ctxWebSub = true;
+            openHoverSub('web');
           }
         }}
       >
@@ -4520,9 +4665,10 @@
           tabindex="0"
           aria-haspopup="menu"
           aria-expanded={ctxSendSub}
-          onmouseenter={() => { ctxSendSub = true; void loadSendableFriends(); }}
-          onmouseleave={() => ctxSendSub = false}
-          onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') { ctxSendSub = true; void loadSendableFriends(); } }}
+          onmouseenter={() => enterHoverSub('send')}
+          onmouseleave={leaveHoverSub}
+          onclick={(e) => clickHoverSub(e, 'send')}
+          onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') openHoverSub('send'); }}
         >
           {m.library_send_to_friend()}
           {#if ctxSendSub}
@@ -5520,6 +5666,11 @@
     border-radius: var(--radius-pill);
     background: color-mix(in srgb, var(--accent) 16%, transparent);
     white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .bulk-size {
+    font-weight: 500;
+    opacity: 0.8;
   }
   .bulk-sep {
     width: 1px;

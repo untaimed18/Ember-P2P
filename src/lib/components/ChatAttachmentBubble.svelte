@@ -5,9 +5,10 @@
     cancelChatAttachment,
     openChatAttachment,
     respondChatAttachment,
+    retryChatAttachment,
     type ChatAttachment,
   } from '$lib/api/friends';
-  import { formatBytes, formatDurationSecs, formatSpeed } from '$lib/utils';
+  import { formatBytes, formatDurationSecs, formatLiveSpeed } from '$lib/utils';
   import { extensionFromPath, fileTypeKey } from '$lib/fileTypes';
   import FileTypeIcon from '$lib/components/FileTypeIcon.svelte';
   import { noteXferBytes, xferRate, xferSecondsLeft, type RateSamples } from '$lib/xferRate';
@@ -37,9 +38,32 @@
   );
   let moving = $derived(attachment.status === 'active' || attachment.status === 'accepted');
 
+  /** A receive retried from this card waits on the sender to offer the file
+   *  again; until it does, or for this long, the card says so. */
+  const RETRY_ASK_SHOWN_MS = 30_000;
+  let askedAt = $state<{ attempt: number; status: string } | null>(null);
+  $effect(() => {
+    if (!askedAt) return;
+    if (attachment.attempt !== askedAt.attempt || attachment.status !== askedAt.status) {
+      askedAt = null;
+      return;
+    }
+    const timer = setTimeout(() => (askedAt = null), RETRY_ASK_SHOWN_MS);
+    return () => clearTimeout(timer);
+  });
+  let asking = $derived(askedAt !== null);
+
+  function retry() {
+    return run(async () => {
+      await retryChatAttachment(attachment.xfer_id);
+      if (!sent) askedAt = { attempt: attachment.attempt, status: attachment.status };
+    });
+  }
+
   /** The line under the file name, in the terms of whoever is looking at it. */
   let statusLine = $derived.by(() => {
     const name = friendName;
+    if (asking) return m.chat_attach_retry_asking({ name });
     switch (attachment.status) {
       case 'offered':
         return m.chat_attach_waiting({ name });
@@ -205,7 +229,7 @@
     {/if}
     <span class="attach-status-text">{statusLine}</span>
     {#if rate > 0}
-      <span class="attach-speed">{formatSpeed(rate)}</span>
+      <span class="attach-speed">{formatLiveSpeed(rate)}</span>
     {/if}
     {#if secondsLeft !== null}
       <span class="attach-left">{m.chat_attach_time_left({ time: formatDurationSecs(secondsLeft) })}</span>
@@ -239,6 +263,20 @@
         disabled={busy}
         onclick={() => run(() => cancelChatAttachment(attachment.xfer_id))}
       >{m.chat_attach_cancel()}</button>
+    </div>
+  {:else if attachment.retryable}
+    <div class="attach-actions">
+      <button
+        type="button"
+        class="attach-primary"
+        disabled={busy || asking}
+        onclick={retry}
+      >
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.8v3.4H9.6"/>
+        </svg>
+        {m.chat_attach_retry()}
+      </button>
     </div>
   {:else if attachment.has_file}
     <div class="attach-actions">

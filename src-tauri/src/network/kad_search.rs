@@ -340,7 +340,7 @@ pub(super) fn convert_search_results(
             existing.file.complete_sources = *cs;
 
             if name_spam_penalty(&p.name) < name_spam_penalty(&existing.file.name) {
-                existing.file.name = p.name;
+                crate::search::merge::rename_result(existing, p.name);
             }
             if existing.file_type.is_empty() && !p.file_type.is_empty() {
                 existing.file_type = p.file_type;
@@ -1304,6 +1304,15 @@ pub(super) fn matches_search_expr_impl(
             let value = kad::publish::kad_keyword_lowercase(value);
             if tag_matches_filename(tag) {
                 lower_name.contains(&value)
+            } else if tag_matches_fileformat(tag) {
+                // Nobody publishes the extension as a tag: it is part of the
+                // name, and eMule matches it there (`Entry.cpp`, "special
+                // handling for TAG_FILEFORMAT"). Looked up as a stored tag, an
+                // extension filter matched nothing on an Ember storage node.
+                let wanted = value.trim_start_matches('.');
+                lower_name
+                    .rsplit_once('.')
+                    .is_some_and(|(_, ext)| !wanted.is_empty() && ext == wanted)
             } else if let Some(tags) = tags {
                 tags.iter()
                     .find(|entry_tag| tag_name_matches(tag, &entry_tag.name))
@@ -1362,6 +1371,16 @@ pub(super) fn tag_matches_filename(tag: &SearchTagRef) -> bool {
     }
 }
 
+/// eMule `TAG_FILEFORMAT` (`FT_FILEFORMAT`): the file extension, no dot.
+const TAG_FILEFORMAT: u8 = 0x04;
+
+pub(super) fn tag_matches_fileformat(tag: &SearchTagRef) -> bool {
+    match tag {
+        SearchTagRef::Id(id) => *id == TAG_FILEFORMAT,
+        SearchTagRef::Str(_) => false,
+    }
+}
+
 pub(super) fn tag_matches_filesize(tag: &SearchTagRef) -> bool {
     match tag {
         SearchTagRef::Id(id) => *id == TAG_FILESIZE,
@@ -1382,4 +1401,68 @@ pub(super) fn matches_requested_file_size_tags(tags: &[KadTag], requested_size: 
         .find_map(search_entry_tag_u64)
         .map(|size| size == requested_size)
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod fileformat_tests {
+    use super::*;
+
+    fn named(name: &str) -> Vec<KadTag> {
+        vec![KadTag {
+            name: TagName::Id(TAG_FILENAME),
+            value: TagValue::String(name.to_string()),
+        }]
+    }
+
+    fn ext(value: &str) -> KadSearchExpr {
+        KadSearchExpr::MetaString {
+            tag: SearchTagRef::Id(TAG_FILEFORMAT),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_extension_term_matches_the_file_name_like_emule() {
+        let tags = named("Some.Movie.2024.MKV");
+        assert!(matches_search_expr_for_tags(&ext("mkv"), &tags));
+        assert!(matches_search_expr_for_tags(&ext(".mkv"), &tags));
+        assert!(!matches_search_expr_for_tags(&ext("mk"), &tags), "equality, not a substring");
+        assert!(!matches_search_expr_for_tags(&ext("avi"), &tags));
+        assert!(!matches_search_expr_for_tags(&ext("mkv"), &named("no_extension")));
+        assert!(!matches_search_expr_for_tags(&ext(""), &tags));
+    }
+}
+
+#[cfg(test)]
+mod convert_tests {
+    use super::*;
+
+    fn entry(name: &str) -> kad::messages::SearchResultEntry {
+        kad::messages::SearchResultEntry {
+            id: KadId([0x42; 16]),
+            tags: vec![
+                KadTag {
+                    name: TagName::Id(TAG_FILENAME),
+                    value: TagValue::String(name.to_string()),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_FILESIZE),
+                    value: TagValue::Uint32(4096),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn a_better_name_from_a_later_node_brings_its_extension_and_type() {
+        let padded = "[promo] [promo] Holiday Clip.avi";
+        let clean = "Holiday Clip.zip";
+        assert!(name_spam_penalty(clean) < name_spam_penalty(padded));
+
+        let results = convert_search_results(&[entry(padded), entry(clean)], |_| true);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file.name, clean);
+        assert_eq!(results[0].file.extension, "zip");
+        assert_eq!(results[0].file_type, "Arc");
+    }
 }

@@ -25,8 +25,9 @@
     disambiguatedMemberName,
     formatBytes,
     formatDurationSecs,
+    formatDateTime,
     formatRelativeTime,
-    formatSpeed,
+    formatLiveSpeed,
     shortPubkey,
   } from '$lib/utils';
   import {
@@ -39,6 +40,13 @@
   import { toast, toastError, toastSuccess } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
+  import {
+    checkForUpdates,
+    installUpdate,
+    restartToUpdate,
+    runStagedInstaller,
+    updater,
+  } from '$lib/stores/updater';
   import * as m from '$lib/paraglide/messages';
   import {
     addChannelModerator,
@@ -50,6 +58,7 @@
     createChannel,
     isValidChannelUsername,
     deleteOwnedChannel,
+    dismissChannelNewerLines,
     enterChannel,
     forgetChannel,
     gatherChannels,
@@ -116,6 +125,12 @@
     setChannelInRoom,
     setChannelMemberCount,
     setChannelNotifyLevel,
+    channelSnoozes,
+    effectiveNotifyLevels,
+    endChannelSnooze,
+    snoozeChannel,
+    snoozedUntil,
+    type SnoozeChoice,
     upsertChannel,
     restoreActiveChannelOnEnter,
     stashActiveChannelOnLeave,
@@ -136,6 +151,7 @@
     searchEnterTarget,
     sectionRooms,
   } from '$lib/channelSections';
+  import { LIKELY_SPAM_SCORE, listingSpamScores } from '$lib/channelListingSpam';
   import { isApplePlatform, shortcutModAria } from '$lib/platform';
   import { isShortcutLetter } from '$lib/shortcutKey';
 
@@ -177,6 +193,9 @@
   let leaveTargetId = $state<string | null>(null);
   let forgetOpen = $state(false);
   let forgetTargetId = $state<string | null>(null);
+  /** Whether the room being removed has saved messages here, or is only a
+   *  Discover listing, which removing just hides. */
+  let forgetTargetStored = $state(true);
   let forgettingIds = $state<string[]>([]);
   let usernameDraft = $state('');
   let claimingUsername = $state(false);
@@ -292,6 +311,7 @@
   let deepLinkJoin = $state(false);
   /** In-room history search. Local only, so it finds what this device kept. */
   let searchOpen = $state(false);
+  let roomSearchEl: HTMLInputElement | undefined = $state();
   let searchQuery = $state('');
   let searchHits: ChannelMessageInfo[] = $state([]);
   let searching = $state(false);
@@ -440,6 +460,119 @@
   function notifyLevelLabel(level: ChannelNotifyLevel): string {
     return (NOTIFY_CHOICES.find((choice) => choice.level === level) ?? NOTIFY_CHOICES[0]).label();
   }
+  let selectedSnoozedUntil = $derived(
+    selected ? snoozedUntil($channelSnoozes, selected.channel_id) : null,
+  );
+  const SNOOZE_CHOICES: { choice: SnoozeChoice; label: () => string }[] = [
+    { choice: '1h', label: () => m.channels_snooze_1h() },
+    { choice: '8h', label: () => m.channels_snooze_8h() },
+    { choice: 'tomorrow', label: () => m.channels_snooze_tomorrow() },
+  ];
+  let bellTitle = $derived(
+    selectedSnoozedUntil !== null
+      ? m.channels_snoozed_until({ time: snoozeEndLabel(selectedSnoozedUntil) })
+      : m.channels_notify_title({ level: notifyLevelLabel(selectedNotifyLevel) }),
+  );
+  /**
+   * Welcome messages the reader hid, by room, against the text they hid. A
+   * fingerprint rather than the text, so the page does not keep a second copy
+   * of every room's welcome; when the owner rewrites it the fingerprint stops
+   * matching and the new one is shown again.
+   */
+  const FOLDED_WELCOMES_KEY = 'ember.channels.welcome-folded.v1';
+  const FOLDED_WELCOMES_MAX = 200;
+
+  function welcomeFingerprint(text: string): string {
+    let hash = 5381;
+    for (let i = 0; i < text.length; i++) hash = ((hash * 33) ^ text.charCodeAt(i)) >>> 0;
+    return `${text.length}:${hash.toString(36)}`;
+  }
+
+  function loadFoldedWelcomes(): Record<string, string> {
+    try {
+      const parsed: unknown = JSON.parse(localStorage.getItem(FOLDED_WELCOMES_KEY) ?? '{}');
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+      return Object.fromEntries(
+        Object.entries(parsed).filter(
+          (entry): entry is [string, string] => /^[0-9a-f]{32}$/.test(entry[0]) && typeof entry[1] === 'string',
+        ),
+      );
+    } catch {
+      return {};
+    }
+  }
+
+  let foldedWelcomes = $state<Record<string, string>>(loadFoldedWelcomes());
+  let selectedWelcomeHidden = $derived(
+    !!selected?.welcome.trim()
+      && foldedWelcomes[selected.channel_id] === welcomeFingerprint(selected.welcome),
+  );
+
+  /**
+   * Owners asked to name a successor once their room has people in it.
+   *
+   * Without one, an owner who vanishes leaves a room nobody can ever moderate
+   * again, and the setting that prevents it sits in Room settings where nobody
+   * goes looking until it is too late. Asked once per room: Not now is kept
+   * on this device, and naming anyone ends it.
+   */
+  const SUCCESSOR_PROMPT_MEMBERS = 3;
+  const SUCCESSOR_PROMPT_KEY = 'ember.channels.successor-prompt-dismissed.v1';
+  const SUCCESSOR_PROMPT_MAX = 200;
+
+  function loadSuccessorPromptDismissed(): string[] {
+    try {
+      const parsed: unknown = JSON.parse(localStorage.getItem(SUCCESSOR_PROMPT_KEY) ?? '[]');
+      return Array.isArray(parsed)
+        ? parsed.filter((id): id is string => typeof id === 'string' && /^[0-9a-f]{32}$/.test(id))
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  let successorPromptDismissed = $state<string[]>(loadSuccessorPromptDismissed());
+  let successorPromptShown = $derived(
+    !!selected
+      && selected.is_owner
+      && !selected.successor_id
+      && !selected.successor_nominee
+      && !successorPromptDismissed.includes(selected.channel_id)
+      && members.filter((mem) => !mem.is_self && !mem.banned).length >= SUCCESSOR_PROMPT_MEMBERS,
+  );
+
+  function dismissSuccessorPrompt(channelId: string) {
+    successorPromptDismissed = [...successorPromptDismissed.filter((id) => id !== channelId), channelId].slice(
+      -SUCCESSOR_PROMPT_MAX,
+    );
+    try {
+      localStorage.setItem(SUCCESSOR_PROMPT_KEY, JSON.stringify(successorPromptDismissed));
+    } catch {
+      // Quota exceeded / private mode. Holds for this session.
+    }
+  }
+
+  function toggleWelcomeFold(channelId: string, welcome: string) {
+    const print = welcomeFingerprint(welcome);
+    const { [channelId]: current, ...rest } = foldedWelcomes;
+    // Oldest first, and a fold re-inserts, so the cap drops the stalest.
+    const kept = Object.entries(rest).slice(-(FOLDED_WELCOMES_MAX - 1));
+    foldedWelcomes = Object.fromEntries(current === print ? kept : [...kept, [channelId, print]]);
+    try {
+      localStorage.setItem(FOLDED_WELCOMES_KEY, JSON.stringify(foldedWelcomes));
+    } catch {
+      // Quota exceeded / private mode. The fold still holds for this session.
+    }
+  }
+
+  /** The time alone when the snooze ends today, with the day when it does not. */
+  function snoozeEndLabel(until: number): string {
+    const sameDay = new Date(until).toDateString() === new Date().toDateString();
+    return formatDateTime(
+      Math.floor(until / 1000),
+      sameDay ? { hour: 'numeric', minute: '2-digit' } : { weekday: 'short', hour: 'numeric', minute: '2-digit' },
+    );
+  }
   /** A public room's key is in its public listing, so "encrypted" alone
    *  would promise more than the padlock can keep. */
   let selectedEncTitle = $derived(
@@ -453,6 +586,10 @@
   let selectedKeyBehind = $derived(selected?.key_behind ?? false);
   /** Zero for anyone the room exempts, so the composer has one number to read
    *  rather than a rule to re-derive. */
+  /** Members only come in partway: catch-up brings the most recent lines from
+   *  before they joined and nothing earlier. The owner has been here since
+   *  the start. */
+  let selectedHistoryNote = $derived(selected && !selected.is_owner ? m.channels_history_start() : '');
   let selectedSlowMode = $derived(
     selected && !selected.is_owner && !selected.you_are_moderator
       ? selected.slow_mode_secs
@@ -571,6 +708,8 @@
       pinned_msg_ids: [],
       // From the room's signed listing, so it shows before joining.
       language: item.language ?? '',
+      newer_lines: 0,
+      newer_key: false,
     };
   }
   let leaveTargetName = $derived(
@@ -615,13 +754,25 @@
   });
   let favouriteSet = $derived(new Set($favouriteChannels));
   let roomSections = $derived(sectionRooms(visibleChannels, $favouriteChannels));
+  /** Scored across every listing, not just those the search leaves, so a
+   *  flood of copies is still a flood while the user types its name. */
+  let listingScores = $derived(listingSpamScores([...discoveredById.values()]));
+  let showLikelySpam = $state(false);
+  let likelySpam = $derived(
+    roomSections.discover.filter((ch) => (listingScores.get(ch.channel_id) ?? 0) >= LIKELY_SPAM_SCORE),
+  );
+  let likelySpamIds = $derived(new Set(likelySpam.map((ch) => ch.channel_id)));
+  /** Discover as drawn: likely spam folded away unless the user asked for it. */
+  let discoverShown = $derived(
+    showLikelySpam ? roomSections.discover : roomSections.discover.filter((ch) => !likelySpamIds.has(ch.channel_id)),
+  );
   /** Every joined room in display order, whatever the search box holds:
    *  Alt+↑/↓ steps through the rooms you are in, not the ones a half-typed
    *  query happens to leave on screen. */
   let joinedInOrder = $derived(sectionRooms(sortedChannels, $favouriteChannels).yours);
   /** Every row in the order it is drawn, which is the order the search box's
    *  arrow keys walk. */
-  let orderedRows = $derived([...roomSections.yours, ...roomSections.discover]);
+  let orderedRows = $derived([...roomSections.yours, ...discoverShown]);
   let unreadJoinedIds = $derived(
     channelList.filter((c) => c.in_room && c.unread > 0).map((c) => c.channel_id),
   );
@@ -649,10 +800,18 @@
           (hit) => !hit.sender_pubkey || !roomIgnoredKeys.includes(hit.sender_pubkey.toLowerCase()),
         ),
   );
+  /** Who is here first: the list is for finding someone to talk to, and
+   *  ordering by name alone buried the members who could answer among the
+   *  ones last seen days ago. */
+  const PRESENCE_RANK = { online: 0, away: 1, offline: 2 } as const;
+
   let sortedMembers = $derived(
     members.slice().sort((a, b) => {
       if (a.is_self !== b.is_self) return a.is_self ? -1 : 1;
       if (a.banned !== b.banned) return a.banned ? 1 : -1;
+      const presence =
+        PRESENCE_RANK[presenceOf(a, presenceNow)] - PRESENCE_RANK[presenceOf(b, presenceNow)];
+      if (presence !== 0) return presence;
       if (a.moderator !== b.moderator) return a.moderator ? -1 : 1;
       const an = (a.nickname || a.member_pubkey).toLowerCase();
       const bn = (b.nickname || b.member_pubkey).toLowerCase();
@@ -711,7 +870,8 @@
   }
 
   /**
-   * Alt+↑/↓ steps through joined rooms; Ctrl/⌘+K searches the room list.
+   * Alt+↑/↓ steps through joined rooms; Ctrl/⌘+K searches the room list and
+   * Ctrl/⌘+F the open room's messages.
    *
    * On `document`, which runs ahead of the dock's `window` listener, and the
    * dock stands down on `defaultPrevented` — so claiming Ctrl+K here is what
@@ -729,8 +889,10 @@
       && (e.key === 'ArrowUp' || e.key === 'ArrowDown');
     const searchKey =
       (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && isShortcutLetter(e, 'k');
+    const findKey =
+      (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && isShortcutLetter(e, 'f');
     // Everything below costs a DOM query, and this runs on every keypress.
-    if (!menuKey && !roomStep && !searchKey) return;
+    if (!menuKey && !roomStep && !searchKey && !findKey) return;
     if (document.querySelector('[aria-modal="true"]')) return;
     const target = e.target instanceof HTMLElement ? e.target : null;
     if (target?.closest('.chat-dock')) return;
@@ -761,9 +923,23 @@
       if (next && next.channel_id !== selectedId) void selectChannel(next.channel_id);
       return;
     }
+    if (findKey) {
+      if (!selected) return;
+      e.preventDefault();
+      void openRoomSearch();
+      return;
+    }
     if (!listSearchEl) return;
     e.preventDefault();
     void focusListSearch();
+  }
+
+  /** Ctrl/⌘+F: opens the room's message search, or returns to it if open. */
+  async function openRoomSearch() {
+    searchOpen = true;
+    await tick();
+    roomSearchEl?.focus();
+    roomSearchEl?.select();
   }
 
   async function focusListSearch() {
@@ -1110,6 +1286,23 @@
         else unlistenModeration = fn;
       })
       .catch((e) => console.error('Failed to register channel-moderation listener:', e));
+    // Something in a room needs a newer Ember: its banner comes with the room.
+    // Coalesced, because anyone who can post in a public room can send these
+    // as fast as they can chat, and each one is a full re-read of the list.
+    let unlistenNewer: UnlistenFn | undefined;
+    let newerRefresh: ReturnType<typeof setTimeout> | undefined;
+    listen<{ channel_id: string }>('ember:channel-newer', () => {
+      if (newerRefresh !== undefined) return;
+      newerRefresh = setTimeout(() => {
+        newerRefresh = undefined;
+        if (!cancelled) refreshChannels().catch(() => {});
+      }, NEWER_REFRESH_MS);
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlistenNewer = fn;
+      })
+      .catch((e) => console.error('Failed to register channel-newer listener:', e));
     let unlistenHandoff: UnlistenFn | undefined;
     listen<{ channel_id: string; successor_id?: string; phase?: string }>('ember:channel-handoff', (event) => {
       if (event.payload?.phase === 'failed') toastError(m.error_channels_handoff_stuck());
@@ -1176,6 +1369,8 @@
       unlistenPresence?.();
       unlistenChat?.();
       unlistenModeration?.();
+      unlistenNewer?.();
+      clearTimeout(newerRefresh);
       unlistenHandoff?.();
       unlistenFound?.();
       document.removeEventListener('pointerdown', onCardMenuPointerDown);
@@ -1344,7 +1539,17 @@
 
   async function selectChannel(id: string) {
     const ch = $channelsStore.find((c) => c.channel_id === id);
-    if (!ch?.in_room) return;
+    if (!ch?.in_room) {
+      // A joined row the directory cache drew while the room list itself has
+      // never loaded: there is nothing here to open it from, and the click
+      // used to do nothing at all. Try the list again, and open the room if
+      // it arrives.
+      if (!ch && !channelsLoaded && !loading) {
+        await loadChannels();
+        if ($channelsStore.some((c) => c.channel_id === id && c.in_room)) await selectChannel(id);
+      }
+      return;
+    }
     activeChannelId.set(id);
     members = [];
     membersLoading = true;
@@ -1435,9 +1640,11 @@
       // them. `refreshChannels` rather than `loadChannels`: we select the new
       // room explicitly below, so the latter's roster fetch for whatever was
       // previously open would be thrown away.
+      // The room exists from here on. A refresh that fails must not read as a
+      // failed create, which sent people to make it a second time.
       const [copied] = await Promise.all([
         copyToClipboard(invite.uri),
-        refreshChannels(),
+        refreshChannels().catch((e) => console.warn('refreshChannels after create failed:', e)),
       ]);
       await selectChannel(invite.channel_id);
       if (copied) {
@@ -1480,7 +1687,7 @@
         item.channel_id === joined.channel_id ? { ...item, joined: joined.in_room } : item,
       );
       upsertChannel(joined);
-      void refreshChannels();
+      void refreshChannels().catch(() => {});
       await selectChannel(joined.channel_id);
     } catch (e) {
       error = translateError(e, m.error_operation_failed());
@@ -1516,7 +1723,7 @@
       clearDraft(`ch:${id}`);
       setPendingReply(id, null);
       forgetChannelFavourite(id);
-      void refreshChannels();
+      void refreshChannels().catch(() => {});
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
       // The optimistic walk-out has to come back too, not just the row.
@@ -1625,7 +1832,7 @@
         item.channel_id === joined.channel_id ? { ...item, joined: joined.in_room } : item,
       );
       upsertChannel(joined);
-      void refreshChannels();
+      void refreshChannels().catch(() => {});
       await selectChannel(joined.channel_id);
     } catch (e) {
       error = translateError(e, m.error_operation_failed());
@@ -1641,6 +1848,9 @@
 
   function requestForget(channelId: string) {
     forgetTargetId = channelId;
+    // Read now, not while the dialog closes: removing a stored room drops its
+    // row, which would flip the wording under the closing animation.
+    forgetTargetStored = storedChannelIds.has(channelId);
     forgetOpen = true;
   }
 
@@ -1654,16 +1864,20 @@
     // successful delete even if the following refresh throws — otherwise
     // Discover would resurrect the room.
     hideChannel(id);
-    forgetChannelNotifyLevel(id);
-    forgetChannelFavourite(id);
-    forgetChannelIgnores(id);
     let deleted = false;
     try {
       if (storedChannelIds.has(id)) await forgetChannel(id);
       deleted = true;
+      // Only once it is really gone: a forget that failed brings the room
+      // back, and it has to come back muted and ignoring whom it did.
+      forgetChannelNotifyLevel(id);
+      forgetChannelFavourite(id);
+      forgetChannelIgnores(id);
       clearDraft(`ch:${id}`);
       setPendingReply(id, null);
-      await refreshChannels();
+      // The room is gone either way; a list that failed to reload is not a
+      // failed forget, and saying so invited a second attempt.
+      await refreshChannels().catch((e) => console.warn('refreshChannels after forget failed:', e));
     } catch (e) {
       if (!deleted) unhideChannel(id);
       toastError(translateError(e, m.error_operation_failed()));
@@ -1694,7 +1908,7 @@
       await tick();
       clearDraft(`ch:${id}`);
       setPendingReply(id, null);
-      await refreshChannels();
+      await refreshChannels().catch((e) => console.warn('refreshChannels after delete failed:', e));
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
@@ -1725,7 +1939,9 @@
     try {
       const updated = await updateChannelModeration(id, editTopic, editWelcome);
       replaceChannel(updated);
-      editingModeration = false;
+      // The form is the selected room's; if that has changed, the room now on
+      // screen still has its own edit open.
+      if (selectedId === id) editingModeration = false;
       toastSuccess(m.channels_moderation_saved());
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
@@ -1742,7 +1958,7 @@
     try {
       const updated = await renameChannel(id, name);
       replaceChannel(updated);
-      renameDraft = updated.name;
+      if (selectedId === id) renameDraft = updated.name;
       toastSuccess(m.channels_rename_saved());
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
@@ -1873,19 +2089,28 @@
     return m.channels_slow_mode_seconds({ count: secs });
   }
 
-  async function handleSlowMode(secs: number) {
+  /** Whether it was saved. A refused choice has to be put back on the select
+   *  by its caller: the value it is drawn from never changed, so Svelte has
+   *  nothing to write and the refused option stayed showing. */
+  async function handleSlowMode(secs: number): Promise<boolean> {
     const id = selectedId;
-    if (!id || savingSlowMode) return;
+    if (!id || savingSlowMode) return false;
     savingSlowMode = true;
     try {
       replaceChannel(await setChannelSlowMode(id, secs));
+      return true;
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
-      // The select reads off the row, so a refresh is what puts it back.
       await refreshChannels().catch(() => {});
+      return false;
     } finally {
       savingSlowMode = false;
     }
+  }
+
+  /** Put a select back on the value it is drawn from after a refused change. */
+  function restoreSelect(el: HTMLSelectElement, value: string) {
+    el.value = value;
   }
 
   async function handleInvitePolicy(ownerOnly: boolean) {
@@ -1931,7 +2156,7 @@
       await transferChannelOwnership(id, target.member_pubkey);
       transferSent = { ...transferSent, [id]: target.member_pubkey };
       toastSuccess(m.channels_transfer_started());
-      await refreshChannels();
+      await refreshChannels().catch((e) => console.warn('refreshChannels after transfer failed:', e));
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
@@ -1940,23 +2165,26 @@
     }
   }
 
-  async function handleNominee(memberPubkey: string, days = DEFAULT_CLAIM_DAYS) {
+  /** Whether it was saved; see `handleSlowMode`. */
+  async function handleNominee(memberPubkey: string, days = DEFAULT_CLAIM_DAYS): Promise<boolean> {
     const id = selectedId;
     // Takes the gate it was already setting. Writing `savingModeration` without
     // checking it meant two of these could overlap, and whichever finished first
     // cleared the flag the other was still relying on — re-enabling every
     // moderation control while a write was in flight.
-    if (!id || moderationBusy) return;
+    if (!id || moderationBusy) return false;
     savingModeration = true;
     try {
       await setChannelSuccessorNominee(id, memberPubkey || null, memberPubkey ? days : null);
-      toastSuccess(m.channels_succession_saved());
-      await refreshChannels();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
+      return false;
     } finally {
       savingModeration = false;
     }
+    toastSuccess(m.channels_succession_saved());
+    await refreshChannels().catch((e) => console.warn('refreshChannels after nominee failed:', e));
+    return true;
   }
 
   async function handleClaim() {
@@ -1966,7 +2194,7 @@
     try {
       const successor = await claimChannelOwnership(id);
       toastSuccess(m.channels_claimed());
-      await refreshChannels();
+      await refreshChannels().catch((e) => console.warn('refreshChannels after claim failed:', e));
       await selectChannel(successor.channel_id);
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
@@ -2268,6 +2496,31 @@
   let roomOffersWaiting = $derived(
     roomTransfers.filter((t) => t.status === 'awaiting' || xferNeedsConsent(t)).length,
   );
+  /** How long `ember:channel-newer` events are gathered into one list re-read. */
+  const NEWER_REFRESH_MS = 2_000;
+  let newerLinesLabel = $derived.by(() => {
+    const count = selected?.newer_lines ?? 0;
+    return plural(count, {
+      one: m.channels_newer_lines_one,
+      other: () => m.channels_newer_lines_other({ count }),
+    });
+  });
+  let dismissingNewer = $state(false);
+  async function dismissNewer(channelId: string) {
+    if (dismissingNewer) return;
+    dismissingNewer = true;
+    try {
+      replaceChannel(await dismissChannelNewerLines(channelId));
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      dismissingNewer = false;
+    }
+  }
+  let updateBusy = $derived(
+    $updater.phase === 'checking' || $updater.phase === 'downloading' || $updater.phase === 'installing',
+  );
+
   let membersToggleLabel = $derived.by(() => {
     if (membersOpen) return m.channels_hide_members();
     if (roomOffersWaiting === 0) return m.channels_show_members();
@@ -2315,6 +2568,34 @@
   });
 </script>
 
+<!-- What the newer-Ember banners offer: the next step the updater can take. -->
+{#snippet updateAction()}
+  {#if $updater.phase === 'available'}
+    <button type="button" class="ghost" onclick={() => void installUpdate()}>{m.updater_install()}</button>
+  {:else if $updater.phase === 'ready'}
+    <button type="button" class="ghost" onclick={() => void restartToUpdate()}>{m.updater_restart_now()}</button>
+  {:else if $updater.phase === 'stalled' && $updater.installerReady}
+    <button type="button" class="ghost" onclick={() => void runStagedInstaller()}>{m.updater_stalled_run()}</button>
+  {:else}
+    <!-- Said here, so a check that finds nothing is not a button that just
+         flips back. The sender may be on a build that is not out yet. -->
+    {#if $updater.phase === 'uptodate'}
+      <span class="newer-result">{m.updater_uptodate()}</span>
+    {:else if $updater.phase === 'error'}
+      <span class="newer-result">{m.updater_error_title()}</span>
+    {/if}
+    <button type="button" class="ghost" disabled={updateBusy} onclick={() => void checkForUpdates()}>
+      {$updater.phase === 'checking' ? m.updater_checking() : m.settings_about_check_btn()}
+    </button>
+  {/if}
+{/snippet}
+
+{#snippet howBody()}
+  <p class="how-lede">{m.channels_page_subtitle()}</p>
+  <p class="how-limits">{m.channels_public_readable()}</p>
+  <p class="how-limits">{m.channels_limits_note()}</p>
+{/snippet}
+
 <div class="page-header">
   <div class="header-title">
     <h2>
@@ -2331,6 +2612,21 @@
           other: () => m.channels_count_other({ count: joinedCount }),
         })}
       </span>
+      <!-- Someone already in a room has read this, or does not need it, so it
+           folds into a button instead of holding a row above every room. -->
+      <details class="card-more how-more">
+        <summary title={m.channels_how_title()} aria-label={m.channels_how_title()}>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="8" cy="8" r="6.5"/>
+            <path d="M6.2 6.2a1.9 1.9 0 113.2 1.4c-.7.5-1.4.9-1.4 1.9"/>
+            <path d="M8 11.7v.1"/>
+          </svg>
+        </summary>
+        <div class="how-pop">
+          <p class="how-pop-title">{m.channels_how_title()}</p>
+          {@render howBody()}
+        </div>
+      </details>
     {/if}
   </div>
   <div class="header-actions">
@@ -2359,17 +2655,26 @@
 </div>
 
 <div class="page-content channels-page">
-  <details class="how-panel">
-    <summary class="how-title">{m.channels_how_title()}</summary>
-    <p class="how-lede">{m.channels_page_subtitle()}</p>
-    <p class="how-limits">{m.channels_public_readable()}</p>
-    <p class="how-limits">{m.channels_limits_note()}</p>
-  </details>
+  {#if joinedCount === 0}
+    <details class="how-panel">
+      <summary class="how-title">{m.channels_how_title()}</summary>
+      {@render howBody()}
+    </details>
+  {/if}
 
   {#if error}
     <div class="banner error-banner" role="alert">
       <span>{error}</span>
-      <button class="ghost" onclick={() => (error = null)}>{m.common_dismiss()}</button>
+      <!-- The full-page Retry only shows while the list is empty, and the
+           directory cache can fill it before the room list ever loads. -->
+      <div class="banner-actions">
+        {#if !channelsLoaded}
+          <button class="ghost" onclick={() => void loadChannels()} disabled={loading}>
+            {loading ? m.common_loading() : m.common_retry()}
+          </button>
+        {/if}
+        <button class="ghost" onclick={() => (error = null)}>{m.common_dismiss()}</button>
+      </div>
     </div>
   {/if}
 
@@ -2594,10 +2899,26 @@
                 <h3 class="list-section-label" id="rooms-section-discover">{m.channels_section_discover()}</h3>
               </div>
               <div role="list" aria-labelledby="rooms-section-discover">
-                {#each roomSections.discover as ch (ch.channel_id)}
+                {#each discoverShown as ch (ch.channel_id)}
                   {@render roomRow(ch)}
                 {/each}
               </div>
+              {#if likelySpam.length > 0}
+                <div class="likely-spam-row">
+                  <span class="muted">{showLikelySpam
+                    ? m.channels_likely_spam_shown()
+                    : plural(likelySpam.length, {
+                        one: m.channels_likely_spam_hidden_one,
+                        other: () => m.channels_likely_spam_hidden_other({ count: likelySpam.length }),
+                      })}</span>
+                  <button
+                    type="button"
+                    class="ghost"
+                    aria-expanded={showLikelySpam}
+                    onclick={() => (showLikelySpam = !showLikelySpam)}
+                  >{showLikelySpam ? m.channels_likely_spam_hide() : m.channels_likely_spam_show()}</button>
+                </div>
+              {/if}
             {/if}
             {#if visibleChannels.length === 0}
               <p class="muted list-empty">{m.channels_no_matches()}</p>
@@ -2617,8 +2938,19 @@
                   class:highlighted={highlightedRow?.channel_id === ch.channel_id}
                   class:joining={joiningIds.includes(ch.channel_id)}
                   class:moved={!!ch.successor_id}
+                  class:likely-spam={likelySpamIds.has(ch.channel_id)}
+                  class:has-unread={ch.in_room
+                    && ch.unread > 0
+                    && unreadBadgeTone(
+                      notifyLevelOf($effectiveNotifyLevels, ch.channel_id),
+                      $channelUnreadMentions.includes(ch.channel_id),
+                    ) === 'loud'}
                   data-room-id={ch.channel_id}
-                  title={ch.successor_id ? m.channels_transferred_badge() : undefined}
+                  title={ch.successor_id
+                    ? m.channels_transferred_badge()
+                    : likelySpamIds.has(ch.channel_id)
+                      ? m.channels_likely_spam_title()
+                      : undefined}
                   oncontextmenu={ch.in_room ? openCardMenu : undefined}
                 >
                   <button
@@ -2673,6 +3005,14 @@
                         </svg>
                       </span>
                     {/if}
+                    {#if ch.in_room && ch.channel_id in $channelSnoozes}
+                      {@const snoozeLabel = m.channels_snoozed_until({ time: snoozeEndLabel($channelSnoozes[ch.channel_id]) })}
+                      <span class="chan-snooze" role="img" title={snoozeLabel} aria-label={snoozeLabel}>
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <path d="M13 9.6A5.5 5.5 0 016.4 3a5.5 5.5 0 106.6 6.6z"/>
+                        </svg>
+                      </span>
+                    {/if}
                     {#if memberCount !== null}
                       {@const count = memberCount}
                       <!-- Joined rooms show who is here now but rank on the
@@ -2703,7 +3043,7 @@
                            `unreadBadgeTone`. -->
                       <span
                         class="count-pill unread"
-                        class:silenced={unreadBadgeTone(notifyLevelOf($channelNotifyLevels, ch.channel_id), mentioned) === 'quiet'}
+                        class:silenced={unreadBadgeTone(notifyLevelOf($effectiveNotifyLevels, ch.channel_id), mentioned) === 'quiet'}
                         aria-label={mentioned
                           ? m.channels_unread_mention_aria({ count: ch.unread })
                           : plural(ch.unread, {
@@ -2740,14 +3080,20 @@
                           >{rowFavourite ? m.channels_favourite_remove() : m.channels_favourite_add()}</button>
                           <div class="menu-sep" role="separator"></div>
                           {@render notifyChoices(ch.channel_id, rowLevel)}
+                          <!-- Last and on its own: a red button on every row made
+                               walking out the loudest thing in the list. It still
+                               asks before it goes. -->
+                          <div class="menu-sep" role="separator"></div>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            tabindex="-1"
+                            class="menu-item-danger"
+                            disabled={joiningIds.includes(ch.channel_id)}
+                            onclick={(e) => { closeCardMenu(e.currentTarget); requestLeave(ch.channel_id); }}
+                          >{m.channels_leave()}</button>
                         </div>
                       </details>
-                      <button
-                        type="button"
-                        class="chan-door chan-leave"
-                        disabled={joiningIds.includes(ch.channel_id)}
-                        onclick={() => requestLeave(ch.channel_id)}
-                      >{m.channels_leave()}</button>
                     {:else}
                       <button
                         type="button"
@@ -2790,7 +3136,12 @@
                 tabindex="-1"
                 class="menu-radio"
                 aria-checked={current === choice.level}
-                onclick={(e) => { closeCardMenu(e.currentTarget); setChannelNotifyLevel(channelId, choice.level); }}
+                onclick={(e) => {
+                  closeCardMenu(e.currentTarget);
+                  setChannelNotifyLevel(channelId, choice.level);
+                  // Picking a level is asking to hear the room that way now.
+                  endChannelSnooze(channelId);
+                }}
               >
                 <svg class="menu-check" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   {#if current === choice.level}<path d="M3.5 8.5l3 3 6-7"/>{/if}
@@ -2799,6 +3150,33 @@
               </button>
             {/each}
           </div>
+          {@const until = snoozedUntil($channelSnoozes, channelId)}
+          <!-- A room already set to Nothing has no alerts left to hold back. -->
+          {#if until !== null || current !== 'none'}
+            {@const snoozeHeading = until !== null
+              ? m.channels_snoozed_until({ time: snoozeEndLabel(until) })
+              : m.channels_snooze_heading()}
+            <div class="menu-sep" role="separator"></div>
+            <div role="group" aria-label={snoozeHeading}>
+              <span class="menu-heading" aria-hidden="true">{snoozeHeading}</span>
+              {#if until !== null}
+                <button
+                  type="button"
+                  role="menuitem"
+                  tabindex="-1"
+                  onclick={(e) => { closeCardMenu(e.currentTarget); endChannelSnooze(channelId); }}
+                >{m.channels_snooze_end()}</button>
+              {/if}
+              {#each SNOOZE_CHOICES as option (option.choice)}
+                <button
+                  type="button"
+                  role="menuitem"
+                  tabindex="-1"
+                  onclick={(e) => { closeCardMenu(e.currentTarget); snoozeChannel(channelId, option.choice); }}
+                >{option.label()}</button>
+              {/each}
+            </div>
+          {/if}
           <!-- These levels govern toasts; a desktop notification also needs
                the room-message switch in Settings, which is off by default,
                so "Mentions only" otherwise reads as a promise it cannot keep. -->
@@ -2952,6 +3330,22 @@
                     <span class="toggle-badge" aria-hidden="true">{roomOffersWaiting}</span>
                   {/if}
                 </button>
+                {#if selectedWelcomeHidden}
+                  <!-- The way back to a welcome the reader hid. Only here while
+                       it is hidden, so it costs the header nothing otherwise. -->
+                  <button
+                    class="icon-btn"
+                    onclick={() => toggleWelcomeFold(selected.channel_id, selected.welcome)}
+                    title={m.channels_welcome_show()}
+                    aria-label={m.channels_welcome_show()}
+                  >
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M2.5 6.5v3h2l4.5 3v-9l-4.5 3z"/>
+                      <path d="M11.2 5.6a3.4 3.4 0 010 4.8"/>
+                      <path d="M12.9 4a5.6 5.6 0 010 8"/>
+                    </svg>
+                  </button>
+                {/if}
                 <button
                   class="icon-btn"
                   class:on={searchOpen}
@@ -2970,15 +3364,17 @@
                 <details class="card-more notify-more">
                   <summary
                     class="icon-btn"
-                    class:on={selectedNotifyLevel !== 'all'}
-                    title={m.channels_notify_title({ level: notifyLevelLabel(selectedNotifyLevel) })}
+                    class:on={selectedNotifyLevel !== 'all' || selectedSnoozedUntil !== null}
+                    title={bellTitle}
                     aria-haspopup="menu"
-                    aria-label={m.channels_notify_title({ level: notifyLevelLabel(selectedNotifyLevel) })}
+                    aria-label={bellTitle}
                   >
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                       <path d="M6.2 12.2a1.9 1.9 0 003.6 0"/>
                       <path d="M3.6 12.2h8.8l-1.1-1.6V7.4a3.3 3.3 0 00-6.6 0v3.2z"/>
-                      {#if selectedNotifyLevel === 'none'}
+                      {#if selectedSnoozedUntil !== null}
+                        <path d="M11.2 1.6h3.2l-3.2 3.6h3.2"/>
+                      {:else if selectedNotifyLevel === 'none'}
                         <path d="M2.6 2.6l10.8 10.8"/>
                       {:else if selectedNotifyLevel === 'mentions'}
                         <circle cx="12.6" cy="3.4" r="1.9" fill="currentColor" stroke="none"/>
@@ -2996,12 +3392,24 @@
                 <!-- Delete room used to sit here, identical red text one gap
                      away from Leave. Only one of the two can be undone, so it
                      moved in beside the owner's other room settings. -->
+                <span class="conv-actions-sep" aria-hidden="true"></span>
                 <button class="conv-action conv-leave" onclick={() => requestLeave(selected.channel_id)}>{m.channels_leave()}</button>
               </div>
             </header>
-            {#if selected.welcome.trim()}
+            {#if selected.welcome.trim() && !selectedWelcomeHidden}
               <div class="welcome-banner" role="note">
                 <p><bdi dir="auto">{selected.welcome}</bdi></p>
+                <button
+                  type="button"
+                  class="welcome-toggle"
+                  title={m.channels_welcome_hide()}
+                  aria-label={m.channels_welcome_hide()}
+                  onclick={() => toggleWelcomeFold(selected.channel_id, selected.welcome)}
+                >
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+                    <path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/>
+                  </svg>
+                </button>
               </div>
             {/if}
             {#if selected.successor_id}
@@ -3014,10 +3422,48 @@
                 <span>{m.channels_transfer_started()}</span>
               </div>
             {/if}
-            {#if selected.key_behind}
+            {#if selected.newer_key}
+              <div class="key-behind-banner newer-banner" role="status">
+                <div class="newer-text">
+                  <strong>{m.channels_newer_key()}</strong>
+                  <span>{m.channels_newer_key_body()}</span>
+                </div>
+                <span class="newer-actions">{@render updateAction()}</span>
+              </div>
+            {:else if selected.key_behind}
               <div class="key-behind-banner" role="status">
                 <strong>{m.channels_key_behind()}</strong>
                 <span>{m.channels_key_behind_body()}</span>
+              </div>
+            {/if}
+            {#if selected.newer_lines > 0}
+              <div class="successor-banner" role="status">
+                <span>{newerLinesLabel}</span>
+                <span class="newer-actions">
+                  <!-- One update button per room: the key banner above has it. -->
+                  {#if !selected.newer_key}
+                    {@render updateAction()}
+                  {/if}
+                  <button
+                    type="button"
+                    class="ghost"
+                    disabled={dismissingNewer}
+                    onclick={() => void dismissNewer(selected.channel_id)}
+                  >{m.common_dismiss()}</button>
+                </span>
+              </div>
+            {/if}
+            {#if successorPromptShown}
+              <div class="successor-banner successor-prompt" role="status">
+                <span>{m.channels_successor_prompt()}</span>
+                <span class="newer-actions">
+                  <button type="button" class="ghost" onclick={() => (roomInfoOpen = true)}>
+                    {m.channels_successor_prompt_choose()}
+                  </button>
+                  <button type="button" class="ghost" onclick={() => dismissSuccessorPrompt(selected.channel_id)}>
+                    {m.channels_successor_prompt_later()}
+                  </button>
+                </span>
               </div>
             {/if}
             {#if !selected.is_owner && !selected.successor_id && nomineeNotice}
@@ -3055,6 +3501,7 @@
               >
                 <input
                   bind:value={searchQuery}
+                  bind:this={roomSearchEl}
                   placeholder={m.channels_search_placeholder()}
                   aria-label={m.channels_search_room()}
                   use:autoFocus
@@ -3112,6 +3559,7 @@
                 mentionCandidates={mentionCandidates}
                 focusRequest={transcriptFocus}
                 onfocusmissing={() => toast(m.channels_search_too_far())}
+                historyStartNote={selectedHistoryNote}
               />
             </div>
           {/if}
@@ -3342,7 +3790,7 @@
                   <span class="members-label">{m.channels_xfer_panel_title()}</span>
                   <span class="xfer-drawer-count">{roomTransfers.length}</span>
                   {#if roomXferRate > 0}
-                    <span class="xfer-drawer-rate">{formatSpeed(roomXferRate)}</span>
+                    <span class="xfer-drawer-rate">{formatLiveSpeed(roomXferRate)}</span>
                   {/if}
                   <svg class="xfer-drawer-chevron" class:flipped={xferCollapsed} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="m4 6 4 4 4-4"/>
@@ -3414,7 +3862,7 @@
                             {:else}
                               <span class="xfer-pct">{pct}%</span>
                               {#if rate > 0}
-                                <span class="xfer-speed">{formatSpeed(rate)}</span>
+                                <span class="xfer-speed">{formatLiveSpeed(rate)}</span>
                               {/if}
                               {#if left !== null}
                                 <span class="xfer-left">
@@ -3631,7 +4079,12 @@
             aria-label={m.channels_slow_mode_title()}
             disabled={savingSlowMode}
             value={String(selected.slow_mode_secs)}
-            onchange={(e) => void handleSlowMode(Number(e.currentTarget.value))}
+            onchange={(e) => {
+              const el = e.currentTarget;
+              void handleSlowMode(Number(el.value)).then((saved) => {
+                if (!saved && selected) restoreSelect(el, String(selected.slow_mode_secs));
+              });
+            }}
           >
             {#each SLOW_MODE_CHOICES as choice (choice)}
               <option value={String(choice)}>{slowModeLabel(choice)}</option>
@@ -3668,7 +4121,12 @@
             <select
               disabled={moderationBusy}
               value={selected.successor_nominee}
-              onchange={(e) => handleNominee(e.currentTarget.value)}
+              onchange={(e) => {
+                const el = e.currentTarget;
+                void handleNominee(el.value).then((saved) => {
+                  if (!saved && selected) restoreSelect(el, selected.successor_nominee);
+                });
+              }}
             >
               <option value="">{m.channels_succession_none()}</option>
               {#each sortedMembers as mem (mem.member_pubkey)}
@@ -3687,8 +4145,12 @@
                 aria-label={m.channels_succession_wait()}
                 disabled={moderationBusy}
                 value={String(selected.claim_after_days)}
-                onchange={(e) =>
-                  handleNominee(selected.successor_nominee, Number(e.currentTarget.value))}
+                onchange={(e) => {
+                  const el = e.currentTarget;
+                  void handleNominee(selected.successor_nominee, Number(el.value)).then((saved) => {
+                    if (!saved && selected) restoreSelect(el, String(selected.claim_after_days));
+                  });
+                }}
               >
                 {#each CLAIM_WINDOWS as days (days)}
                   <option value={String(days)}>{m.channels_succession_days({ days })}</option>
@@ -3749,9 +4211,11 @@
 
 <ConfirmDialog
   bind:open={forgetOpen}
-  title={m.channels_forget_confirm()}
-  message={m.channels_forget_confirm_body({ name: forgetTargetName })}
-  confirmLabel={m.channels_forget()}
+  title={forgetTargetStored ? m.channels_forget_confirm() : m.channels_hide_listing_confirm()}
+  message={forgetTargetStored
+    ? m.channels_forget_confirm_body({ name: forgetTargetName })
+    : m.channels_hide_listing_confirm_body({ name: forgetTargetName })}
+  confirmLabel={forgetTargetStored ? m.channels_forget() : m.channels_hide_listing()}
   danger
   onconfirm={handleForget}
 />
@@ -3892,6 +4356,37 @@
   }
 
   .how-lede { color: var(--text-secondary); }
+
+  .how-more > summary svg { width: 16px; height: 16px; }
+
+  /* Opens under the title it sits beside, so it grows toward the page rather
+     than off the window's left edge. */
+  .how-pop {
+    position: absolute;
+    top: calc(100% + 6px);
+    inset-inline-start: 0;
+    z-index: 20;
+    width: 380px;
+    max-width: calc(100vw - 32px);
+    padding: 12px 14px 4px;
+    background: var(--ctx-surface);
+    border: 1px solid var(--ctx-border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--ctx-shadow);
+  }
+
+  .how-pop-title {
+    margin: 0 0 6px;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .banner-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+  }
 
   .banner {
     flex-shrink: 0;
@@ -4364,27 +4859,6 @@
 
   .chan-join:hover:not(:disabled) { background: var(--accent-hover); }
 
-  /* Tinted rather than solid red: walking out of a room is reversible, so it
-     should read as the deliberate opposite of Join, not as a delete. Hover
-     commits to solid, which is where the click actually happens. */
-  .chan-leave {
-    background: color-mix(in srgb, var(--danger) 10%, transparent);
-    border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
-    color: var(--danger);
-    font-weight: 600;
-    transition:
-      background-color var(--transition-fast) ease,
-      border-color var(--transition-fast) ease,
-      color var(--transition-fast) ease,
-      transform var(--transition-fast) ease;
-  }
-
-  .chan-leave:hover:not(:disabled) {
-    background: var(--danger);
-    border-color: var(--danger);
-    color: var(--on-danger);
-  }
-
   .chan-door:active:not(:disabled) { transform: scale(0.94); }
 
   /* Plain text, not a chip. Bordered and filled it competed with the action
@@ -4409,6 +4883,18 @@
 
   .chan-row.moved .chan-name,
   .chan-row.moved .chan-avatar { opacity: 0.55; }
+  .chan-row.likely-spam .chan-name,
+  .chan-row.likely-spam .chan-avatar { opacity: 0.55; }
+
+  /* Folded spam is a line under Discover, not a row: it is never a room. */
+  .likely-spam-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 12px;
+    font-size: var(--font-size-sm);
+  }
 
   .chan-row:hover,
   .chan-row.highlighted { background: var(--bg-hover); }
@@ -4426,6 +4912,15 @@
 
   .chan-fav svg { width: 11px; height: 11px; }
 
+  .chan-snooze {
+    display: inline-flex;
+    flex-shrink: 0;
+    margin-inline-start: -4px;
+    color: var(--text-muted);
+  }
+
+  .chan-snooze svg { width: 12px; height: 12px; }
+
   /* Hidden until the row is reached, like Remove on a Discover row, and in
      the same slot, so joined and unjoined rows line up. */
   .row-more > summary {
@@ -4438,6 +4933,13 @@
   .chan-row:hover .row-more > summary,
   .chan-row:focus-within .row-more > summary,
   .row-more[open] > summary { opacity: 1; }
+
+  /* With Leave inside it, the menu is the only way out of a room from the
+     list, and a touch screen has no hover to reveal it. */
+  @media (hover: none) {
+    .row-more > summary,
+    .chan-forget { opacity: 1; }
+  }
 
   .chan-row.active {
     background: color-mix(in srgb, var(--accent) 12%, var(--bg-hover));
@@ -4507,9 +5009,16 @@
     line-height: 1.3;
   }
 
+  /* Regular until something is waiting, so the rooms worth opening stand out
+     by shape as well as by their pill. A quiet room's backlog stays regular,
+     matching its grey pill. */
   .chan-name {
-    font-weight: 600;
+    font-weight: 500;
     overflow-wrap: anywhere;
+  }
+
+  .chan-row.has-unread .chan-name {
+    font-weight: 700;
   }
 
   /* Inline after the last word, so it follows the name onto a second line. */
@@ -4657,12 +5166,12 @@
     align-items: center;
     justify-content: center;
     width: 22px;
-    height: 30px;
+    height: 32px;
     color: var(--accent);
     flex-shrink: 0;
   }
 
-  .enc-lock svg { width: 13px; height: 13px; }
+  .enc-lock svg { width: 14px; height: 14px; }
 
   .conv-actions-sep {
     width: 1px;
@@ -4679,20 +5188,21 @@
     border-radius: var(--radius-pill);
   }
 
-  /* Same treatment as Leave on the room card, so the two agree. Tinted at
-     rest because walking out is reversible; solid on hover, where the click
-     lands. */
+  /* Plain at rest: tinted red beside Copy invite, it was the loudest thing in
+     the header for the action least often wanted. Red once the pointer or
+     focus is on it, and it still asks before it goes. */
   .conv-leave {
-    background: color-mix(in srgb, var(--danger) 10%, transparent);
-    border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
-    color: var(--danger);
-    font-weight: 600;
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--text-secondary);
+    font-weight: 500;
   }
 
-  .conv-leave:hover:not(:disabled) {
-    background: var(--danger);
-    border-color: var(--danger);
-    color: var(--on-danger);
+  .conv-leave:hover:not(:disabled),
+  .conv-leave:focus-visible {
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
+    border-color: color-mix(in srgb, var(--danger) 35%, transparent);
+    color: var(--danger);
   }
 
   .conv-delete {
@@ -4800,12 +5310,12 @@
   .back-btn { display: none; }
 
   .icon-btn {
-    width: 30px;
-    height: 30px;
+    width: 32px;
+    height: 32px;
     border: none;
     border-radius: var(--radius-sm);
     background: transparent;
-    color: var(--text-muted);
+    color: var(--text-secondary);
     cursor: pointer;
     display: inline-flex;
     align-items: center;
@@ -4830,7 +5340,7 @@
 
   .icon-btn:active { transform: scale(0.94); }
 
-  .icon-btn svg { width: 16px; height: 16px; }
+  .icon-btn svg { width: 18px; height: 18px; }
 
   .successor-banner {
     display: flex;
@@ -4843,6 +5353,13 @@
     font-size: var(--font-size-md);
     color: var(--badge-warning-text);
     flex-shrink: 0;
+  }
+
+  /* A suggestion, not a warning. */
+  .successor-banner.successor-prompt {
+    border-bottom-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+    background: color-mix(in srgb, var(--accent) 9%, transparent);
+    color: var(--text-primary);
   }
 
   .key-behind-banner {
@@ -4860,6 +5377,32 @@
   .key-behind-banner strong {
     font-size: var(--font-size-md);
     color: var(--text-primary);
+  }
+
+  .key-behind-banner.newer-banner {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .newer-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .newer-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  .newer-result {
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
   }
 
   /* Transfers live at the foot of the members pane, beside the people they
@@ -5203,14 +5746,51 @@
     border-bottom: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border));
     background: color-mix(in srgb, var(--accent) 8%, var(--bg-tertiary));
     font-size: var(--font-size-sm);
-    color: var(--text-secondary);
+    color: var(--text-primary);
     line-height: 1.45;
     flex-shrink: 0;
     max-height: 4.8em;
     overflow: auto;
   }
 
-  .welcome-banner p { margin: 0; }
+  .welcome-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .welcome-banner p {
+    flex: 1;
+    min-width: 0;
+    margin: 0;
+  }
+
+  .welcome-toggle {
+    flex-shrink: 0;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-secondary);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+  }
+
+  .welcome-toggle:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .welcome-toggle:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  .welcome-toggle svg { width: 14px; height: 14px; }
 
   :global([data-theme="dark"]) .welcome-banner {
     background: color-mix(in srgb, var(--accent) 8%, var(--bg-secondary));
@@ -5412,10 +5992,10 @@
 
   .present-dot {
     position: absolute;
-    right: -1px;
-    bottom: -1px;
-    width: 9px;
-    height: 9px;
+    right: -2px;
+    bottom: -2px;
+    width: 11px;
+    height: 11px;
     border-radius: 50%;
     background: var(--success);
     box-shadow: 0 0 0 2px var(--bg-secondary);
@@ -5428,9 +6008,38 @@
     border: 2px solid var(--text-muted);
   }
 
+  /* The ring is cut from the row's own colour, so a hovered row does not
+     leave a halo of the panel's around the dot. */
+  .member-list li:hover .present-dot,
+  .member-list li:focus-within .present-dot {
+    box-shadow: 0 0 0 2px var(--bg-hover);
+  }
+
+  .member-list li:hover .present-dot.away,
+  .member-list li:focus-within .present-dot.away {
+    background: var(--bg-hover);
+  }
+
+  /* One per row was a column of identical dots down the panel. Revealed the
+     way the room list's are; right-click on the row opens it too. */
+  .member-list .card-more > summary {
+    opacity: 0;
+    transition:
+      opacity var(--transition-fast) ease,
+      background-color var(--transition-fast) ease;
+  }
+
+  .member-list li:hover .card-more > summary,
+  .member-list li:focus-within .card-more > summary,
+  .member-list .card-more[open] > summary { opacity: 1; }
+
+  @media (hover: none) {
+    .member-list .card-more > summary { opacity: 1; }
+  }
+
   .member-seen {
     font-size: var(--font-size-2xs);
-    color: var(--text-muted);
+    color: var(--text-secondary);
     white-space: nowrap;
   }
 
@@ -5588,8 +6197,9 @@
   /* The header's bell is an `icon-btn` that happens to open a menu, so it
      keeps that size rather than the row menus' smaller trigger. */
   .notify-more > summary {
-    width: 30px;
-    height: 30px;
+    width: 32px;
+    height: 32px;
+    color: var(--text-secondary);
   }
 
   .empty-state {

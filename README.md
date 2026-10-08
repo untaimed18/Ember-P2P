@@ -57,7 +57,7 @@ There is no bootstrap server and no bundled address list. A cold node gets in th
 3. **eD2K client-to-client sessions** — Peers that advertise the Ember capability bit over a normal eD2K transfer are cached with their UDP port and bridged in, via Noise_XX when no static key is known. This is the path for a client running with no KAD at all.
 4. **DHT gossip and `nodes_ember.dat`** — `FOUND_NODE` / `PEER_LIST` / `ANNOUNCE_PEER`, plus up to 200 persisted contacts, once the node has been online before.
 
-The rendezvous server behind [Friends](#friends--ember-exclusive-social-features) has **no role** in DHT bootstrap. A server-hosted bootstrap pool is explicitly not planned: it would hand whoever runs the server an identity-to-IP roster of every participant. Hardcoded seed lists and DNS SRV seeds are ruled out for the same reason — joining stays the rendezvous key, the bridges, gossip, and the persisted contact file.
+The rendezvous server behind [Friends](#friends--ember-exclusive-social-features-beta) has **no role** in DHT bootstrap. A server-hosted bootstrap pool is explicitly not planned: it would hand whoever runs the server an identity-to-IP roster of every participant. Hardcoded seed lists and DNS SRV seeds are ruled out for the same reason — joining stays the rendezvous key, the bridges, gossip, and the persisted contact file.
 
 The consequence is that every path except `nodes_ember.dat` presupposes either a live KAD connection or an eD2K transfer with an Ember-capable peer, so **a first run with KAD off and no servers has no way in**. Ember rides eMule's bootstrap by design. A fresh node can also legitimately sit at zero contacts for a minute or two while its first maintenance cycle runs the bridge; the Ember Network page reports **Connecting** for that window rather than claiming a fault.
 
@@ -164,7 +164,9 @@ Attestations are verified before the connection broker records a relay candidate
 
 Non-Ember eMule clients silently ignore the `0xF0` opcode — it causes no errors, disconnects, or side effects. Ember detects peer support via the private `OP_EMBER_HELLO` / `OP_EMBER_HELLOANSWER` handshake (not `ET_MOD_VERSION` or `CT_EMULE_MISCOPTIONS2`). EPX is only exchanged with peers that complete Ember Hello and whose advertised key binds to their Ember hash on that TCP session.
 
-## Friends — Ember-Exclusive Social Features
+## Friends — Ember-Exclusive Social Features (beta)
+
+Friends are in beta and the app marks them so: they are stable enough to use, but features are still being added and some behavior may change.
 
 Ember includes a friend system that works only between Ember users. It runs on a separate cryptographic identity from the eD2K one: an Ed25519 identity keypair generated on first launch, whose truncated BLAKE3 digest (`BLAKE3(ed25519_pub)[..16]`) is the 16-byte **Ember Hash**. That hash is distinct from the standard eD2K `user_hash` used for protocol operations and credits.
 
@@ -310,7 +312,7 @@ Ember's own additions — the [Ember Network](#ember-network) overlay and the [E
 
 ### Social
 
-- **Friends** — Ember-exclusive friend system with v3 Friend Codes, Noise-secured sessions, end-to-end encrypted chat, remote browsing, friends-only shares, file offers, priority uploads, a block list, and transfers that can work without HighID (see [above](#friends--ember-exclusive-social-features)).
+- **Friends (beta)** — Ember-exclusive friend system with v3 Friend Codes, Noise-secured sessions, end-to-end encrypted chat, remote browsing, friends-only shares, file offers, priority uploads, a block list, and transfers that can work without HighID (see [above](#friends--ember-exclusive-social-features-beta)).
 - **Channels (beta)** — Group rooms carried over the Ember Network itself: public rooms anyone can find, private rooms that need an invite, moderation with bans, moderators, owner-only invites and slow mode, and member-to-member file sending. Nobody publishes their IP address to the room (see [above](#channels--group-rooms-beta)).
 - **Credits & SecIdent** — RSA-based Secure Identification prevents credit theft; upload priority follows the standard credit ratio formula.
 
@@ -346,7 +348,7 @@ Ember ships for **Windows 10 and Windows 11**, and for **x86-64 Linux** as a `.d
 4. **KAD connects on its own** every launch, so there is nothing to press. eD2K servers are separate: connect from the eD2K Servers page, or enable Auto-Connect Server in Settings so Ember rejoins your last one on launch. A community `server.met` list can be downloaded from emule-security.org on first run.
 5. The [Ember Network](#ember-network) needs no connect step either — it is on by default and joins on its own, finding its first peers *through* KAD.
 6. Add folders to your library, search with the Global / KAD / Server / Ember methods, open `ed2k://` links, and start downloading. Ember handles multi-source transfers, queueing and source discovery on its own.
-7. Optionally open the Friends page, share your Friend Code and add theirs. Once mutual and online you get end-to-end encrypted chat, remote browsing and priority upload slots — see [Friends](#friends--ember-exclusive-social-features).
+7. Optionally open the Friends page, share your Friend Code and add theirs. Once mutual and online you get end-to-end encrypted chat, remote browsing and priority upload slots — see [Friends](#friends--ember-exclusive-social-features-beta).
 8. Optionally open the Channels page, pick a Channel username, then create a room or paste an invite. Discover lists public rooms other people have published — see [Channels](#channels--group-rooms-beta).
 
 ### Port forwarding
@@ -378,7 +380,7 @@ If you are stuck on a Low ID: confirm 4662/TCP and 4672/UDP are forwarded, check
 #### Prerequisites
 
 - [Rust](https://rustup.rs/) (1.94+, matching `rust-version` in [`src-tauri/Cargo.toml`](src-tauri/Cargo.toml))
-- [Node.js](https://nodejs.org/) (20.19+, 22.12+ or 24+, matching `engines` in [`package.json`](package.json); CI builds on 24)
+- [Node.js](https://nodejs.org/) (22.12+ or 24+, matching `engines` in [`package.json`](package.json); CI builds on 24)
 - **Windows**: Visual Studio Build Tools with C++ workload
 - **Linux**: WebKitGTK 4.1 and GTK 3 development packages. On Debian/Ubuntu:
 

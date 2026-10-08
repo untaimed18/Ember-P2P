@@ -421,10 +421,16 @@ fn plausible_version(version: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
 }
 
+/// The window's geometry with anything this build would not have written dropped.
+pub(crate) fn sanitize_window(mut window: WindowSnapshot) -> WindowSnapshot {
+    window.bounds = window.bounds.filter(Bounds::is_sane);
+    window.maximized_center = window.maximized_center.filter(Point::is_sane);
+    window
+}
+
 /// Drop every field that is not something this build would have written.
 fn sanitize(mut state: ResumeState) -> ResumeState {
-    state.window.bounds = state.window.bounds.filter(Bounds::is_sane);
-    state.window.maximized_center = state.window.maximized_center.filter(Point::is_sane);
+    state.window = sanitize_window(state.window);
     state.ed2k = state.ed2k.filter(|server| {
         server.port != 0 && server.ip.parse::<std::net::IpAddr>().is_ok()
     });
@@ -587,7 +593,7 @@ pub fn on_main_window_focused(window: &tauri::Window) {
 
 // ── Capturing ───────────────────────────────────────────────────────────────
 
-fn capture_window(app: &AppHandle) -> WindowSnapshot {
+pub(crate) fn capture_window(app: &AppHandle) -> WindowSnapshot {
     let chat_window_open = app.get_webview_window(CHAT_WINDOW_LABEL).is_some();
     let Some(window) = app.get_webview_window("main") else {
         return WindowSnapshot {

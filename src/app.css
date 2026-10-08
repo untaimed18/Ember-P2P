@@ -1579,6 +1579,7 @@ button.icon-close:active:not(:disabled) {
   .close-overlay,
   .shortcut-overlay,
   .browse-overlay,
+  .banned-overlay,
   .policy-reset-backdrop
 ) {
   backdrop-filter: blur(6px) saturate(1.15);

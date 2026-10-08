@@ -2,6 +2,7 @@
   import { onDestroy, tick, untrack } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import {
+    discardFailedChatMessage,
     getChatMessages,
     sendChatMessage,
     sendChatTyping,
@@ -18,11 +19,13 @@
   import { placeAttachments } from '$lib/chatAttachmentPlacement';
   import {
     deleteChannelMessage,
+    getChannelDraft,
     getChannelMessages,
     getChannelPins,
     markChannelMessagesRead,
     sendChannelMessage,
     sendChannelTyping,
+    setChannelDraft,
     setChannelMessagePinned,
     CHANNEL_PIN_MAX,
     REPLY_REFERENCE_BYTES,
@@ -84,13 +87,18 @@
   import { portal } from '$lib/actions/portal';
   import { rovingToolbar } from '$lib/actions/rovingToolbar';
   import { appSettings } from '$lib/stores/settings';
+  import { chatAllowedWith, readReceiptsWith } from '$lib/friendSettings';
   import { getDraft, setDraft, clearDraft, registerDraftFlusher } from '$lib/stores/chatTabs';
+  import { firstRowBelow, recalledScroll, rememberScroll, type ScrollSpot } from '$lib/chatScrollMemory';
+  import { insertAtSelection } from '$lib/emojiPicker';
+  import EmojiPicker from '$lib/components/EmojiPicker.svelte';
   import * as m from '$lib/paraglide/messages';
   import { codedErrorOf, translateError } from '$lib/i18n';
   import {
     copyToClipboard,
     formatCalendarDate,
     formatClockTime,
+    formatDateTime,
     insertMention,
     isAppVisible,
     mentionTokenAt,
@@ -150,6 +158,9 @@
     focusRequest?: { id: number } | null;
     /** The message could not be reached — too far back, or no longer stored. */
     onfocusmissing?: () => void;
+    /** Shown above the oldest message once the transcript is scrolled back to
+     *  the start of what this device holds, to say why it stops there. */
+    historyStartNote?: string;
   }
 
   type ConvMessage = ChatMessage & {
@@ -199,6 +210,7 @@
     mentionCandidates = [],
     focusRequest = null,
     onfocusmissing,
+    historyStartNote = '',
   }: Props = $props();
 
   let isChannel = $derived(channelId.length > 0);
@@ -216,12 +228,15 @@
     !isChannel && friendHash ? $onlineFriends.has(friendHash.toLowerCase()) : false,
   );
 
-  // The user can disable chat entirely in Settings; when off, the backend
-  // drops inbound and refuses outbound chat, so reflect that in the UI rather
-  // than letting the user type into a textarea whose sends will be rejected.
-  let chatDisabled = $derived(!isChannel && $appSettings?.friend_chat_disabled === true);
+  // The user can disable chat in Settings, or for this friend in theirs; when
+  // off, the backend drops inbound and refuses outbound chat, so reflect that
+  // in the UI rather than letting the user type into a textarea whose sends
+  // will be rejected.
+  let chatDisabled = $derived(
+    !isChannel && !!friendHash && !chatAllowedWith($appSettings, friendHash),
+  );
   let showReadReceipts = $derived(
-    !isChannel && $appSettings?.friend_chat_read_receipts !== false,
+    !isChannel && !!friendHash && readReceiptsWith($appSettings, friendHash),
   );
   let chatLocked = $state(false);
 
@@ -284,6 +299,9 @@
   let inputText = $state('');
   let loading = $state(false);
   let sending = $state(false);
+  /** Which send owns `sending`. A send that outlives a conversation switch
+   *  must not unlock the composer of a send started in the next one. */
+  let sendSeq = 0;
   let sendError: string | null = $state(null);
   let loadError: string | null = $state(null);
   // Non-blocking notice shown above the (successfully loaded) message list when
@@ -330,8 +348,10 @@
    * are merged into the transcript only where it is drawn, by time.
    */
   let attachments: ChatAttachment[] = $state([]);
-  /** Picking and hashing a file can take a while for a large one. */
-  let attaching = $state(false);
+  /** Friends a file is being picked and hashed for, which takes a while for a
+   *  large one. Per friend: the hash outlives a switch to another chat. */
+  let attachingFor: string[] = $state([]);
+  let attaching = $derived(friendHash !== '' && attachingFor.includes(friendHash));
   let friendTyping = $state(false);
   let typingHoldTimer: ReturnType<typeof setTimeout> | null = null;
   let lastTypingSentOn = false;
@@ -361,6 +381,24 @@
   let loadingOlder = $state(false);
   let hasMoreHistory = $state(false);
   let olderError = $state(false);
+  /**
+   * Holds the transcript's live region quiet while a page of history lands, so
+   * a screen reader announces arriving lines rather than reading out every row
+   * a load or "Load older" inserted. Released a frame after the load settles:
+   * the rows and the end of the load reach the DOM in the same flush, and a
+   * log that goes idle in that mutation announces all of them.
+   */
+  let transcriptBusy = $state(false);
+  $effect(() => {
+    if (loading || loadingOlder) {
+      transcriptBusy = true;
+      return;
+    }
+    const frame = requestAnimationFrame(() => {
+      transcriptBusy = false;
+    });
+    return () => cancelAnimationFrame(frame);
+  });
   // Pagination cursor: the smallest (oldest) DB row id we've loaded. Tracked
   // separately from `messages` because live messages use negative ids and the
   // MAX_LIVE_MESSAGES trim drops oldest-first — in a busy session that can
@@ -609,10 +647,15 @@
     return editClockNow / 1000 - msg.timestamp <= EDIT_WINDOW_SECS;
   }
 
-  function startEdit(msg: ConvMessage) {
+  /** The edit was opened with ↑ from the composer, so closing it goes back
+   *  there: the reader was typing, not reading back. */
+  let editFromComposer = false;
+
+  function startEdit(msg: ConvMessage, fromComposer = false) {
     editingId = msg.id;
     editDraft = msg.message;
     editError = null;
+    editFromComposer = fromComposer;
   }
 
   function cancelEdit() {
@@ -628,9 +671,18 @@
    * when the reader has already moved on to something else.
    */
   function restoreFocusAfterEdit(id: number) {
+    const toComposer = editFromComposer;
+    editFromComposer = false;
     void tick().then(() => {
       const active = document.activeElement;
       if (active && active !== document.body) return;
+      if (toComposer) {
+        // The newest line is the one that was edited, so the bottom is
+        // where the reader was and still is.
+        jumpToLatest();
+        focusComposer();
+        return;
+      }
       const edit = messagesContainerEl?.querySelector<HTMLElement>(
         `[data-msg-id="${id}"] .bubble-edit-btn`,
       );
@@ -1005,8 +1057,15 @@
     const friend = friendHash;
     if (key) {
       sendError = null;
+      sendSeq++;
       sending = false;
       inputText = getDraft(key);
+      if (channel) {
+        loadRoomDraft(channel);
+      } else {
+        roomDraftSeq++;
+        roomDraftReady = null;
+      }
       // Channel unread is cleared only after `markAsRead` succeeds. Clearing
       // the badge here raced a `refreshChannels` that still saw unread rows
       // and put the count back — or hid a room that was never actually marked.
@@ -1034,16 +1093,24 @@
       loading = true;
       loadingOlder = false;
       hasMoreHistory = false;
+      olderError = false;
       oldestDbId = null;
       unreadMarkerId = null;
       markerResolved = false;
       unreadDividerSeen = false;
       unreadDividerAbove = false;
       // Scroll position belongs to the conversation being left, not the one
-      // being opened: `loadMessages` lands this one on its own unread marker
-      // or at the bottom.
+      // being opened: `loadMessages` lands this one on its own unread marker,
+      // or with nothing unread where the reader last left it, or at the bottom.
       scrolledAway = false;
       missedWhileAway = false;
+      scrollSpotReady = false;
+      if (scrollSpotFrame) {
+        cancelAnimationFrame(scrollSpotFrame);
+        scrollSpotFrame = 0;
+      }
+      freshIds.clear();
+      unfoldedIds = new Set();
       // A jump asked for in the room being left means nothing in this one.
       queuedFocus = null;
       focusedId = null;
@@ -1056,6 +1123,7 @@
       reactions = {};
       picker = null;
       pickerPos = null;
+      emojiOpen = false;
       cancelEdit();
       // A pending reply is per room, like the draft restored above.
       replyTarget = channel ? getPendingReply(channel) : null;
@@ -1087,6 +1155,7 @@
       if (unlistenRead) { unlistenRead(); unlistenRead = null; }
       if (unlistenAttach) { unlistenAttach(); unlistenAttach = null; }
       if (key) setDraft(key, inputText);
+      flushRoomDraft();
       releaseChannelOnScreen?.();
       releaseChannelOnScreen = null;
       if (!channel) {
@@ -1112,7 +1181,100 @@
   $effect(() => {
     const key = conversationKey;
     if (!key) return;
-    return registerDraftFlusher(() => setDraft(key, inputText));
+    return registerDraftFlusher(() => {
+      setDraft(key, inputText);
+      flushRoomDraft();
+    });
+  });
+
+  // A room's draft also outlives a restart, sealed with the chat key on disk.
+  // Friend drafts stay in memory only (see `chatTabs`).
+  const ROOM_DRAFT_SAVE_MS = 600;
+  /** The room whose stored draft has been read. Until then the composer is not
+   *  written back, or the empty box of a room just opened would erase the copy
+   *  on disk before it had loaded. */
+  let roomDraftReady = $state<string | null>(null);
+  let roomDraftSeq = 0;
+  let roomDraftSaved = '';
+  let roomDraftPending: { channel: string; text: string } | null = null;
+  let roomDraftTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function flushRoomDraft() {
+    if (roomDraftTimer) {
+      clearTimeout(roomDraftTimer);
+      roomDraftTimer = null;
+    }
+    const pending = roomDraftPending;
+    roomDraftPending = null;
+    if (pending) void setChannelDraft(pending.channel, pending.text).catch(() => {});
+  }
+
+  /** A room whose stored draft was dropped while its read was still out, so
+   *  what that read brings back is the line just sent, not a draft. */
+  let roomDraftDropped: string | null = null;
+
+  /** Cancel a write of this room's draft that has not gone out yet. Called as
+   *  a send starts, so the timer cannot store the line while it is sending. */
+  function cancelRoomDraftWrite(channel: string) {
+    if (roomDraftPending?.channel !== channel) return;
+    roomDraftPending = null;
+    if (roomDraftTimer) {
+      clearTimeout(roomDraftTimer);
+      roomDraftTimer = null;
+    }
+  }
+
+  /** Drop a room's stored draft now, and any write of it still waiting, so a
+   *  line just sent cannot come back as a draft after a restart. */
+  function discardRoomDraft(channel: string) {
+    cancelRoomDraftWrite(channel);
+    if (roomDraftReady === channel) roomDraftSaved = '';
+    else roomDraftDropped = channel;
+    void setChannelDraft(channel, '').catch(() => {});
+  }
+
+  function loadRoomDraft(channel: string) {
+    const seq = ++roomDraftSeq;
+    roomDraftReady = null;
+    roomDraftDropped = null;
+    void getChannelDraft(channel)
+      .catch(() => '')
+      .then((read) => {
+        if (seq !== roomDraftSeq || channelId !== channel) return;
+        const stored = roomDraftDropped === channel ? '' : read;
+        roomDraftDropped = null;
+        // Text already in the box is newer: typed since opening, or kept in
+        // memory from earlier this session.
+        if (!inputText && stored) inputText = stored;
+        roomDraftSaved = stored;
+        roomDraftReady = channel;
+      });
+  }
+
+  // Quitting does not tear the conversation down, so the last keystrokes
+  // still waiting on the save timer would otherwise never reach the disk.
+  $effect(() => {
+    const flush = () => flushRoomDraft();
+    window.addEventListener('pagehide', flush);
+    window.addEventListener('beforeunload', flush);
+    return () => {
+      window.removeEventListener('pagehide', flush);
+      window.removeEventListener('beforeunload', flush);
+    };
+  });
+
+  function queueRoomDraftWrite(channel: string, text: string) {
+    roomDraftSaved = text;
+    roomDraftPending = { channel, text };
+    if (roomDraftTimer) clearTimeout(roomDraftTimer);
+    roomDraftTimer = setTimeout(flushRoomDraft, ROOM_DRAFT_SAVE_MS);
+  }
+
+  $effect(() => {
+    const channel = channelId;
+    const text = inputText;
+    if (!channel || roomDraftReady !== channel || text === roomDraftSaved) return;
+    queueRoomDraftWrite(channel, text);
   });
 
   async function setupListener(gen: number, hash: string, channel: string): Promise<boolean> {
@@ -1166,7 +1328,7 @@
             reply_parent_deleted: event.payload.reply_parent_deleted === true,
           }];
           commitLiveMessages(next, event.payload.direction === 'sent' || wasPinned);
-          noteMissedMessage(wasPinned, event.payload.direction);
+          noteMissedMessage(wasPinned, event.payload.direction, event.payload.sender_pubkey);
           // Not while the open is still seeking back for the first unread line:
           // clearing `read` now would stop that seek short and misplace the
           // divider. The read after the load covers this line too.
@@ -1247,28 +1409,42 @@
         if (direction === null) return;
           // Dedup duplicate backend emits: inbound chat can be delivered on
           // both the download and upload event loops for the same logical
-          // message. Inbound only — the outbound echo has a single emit site, so
-          // deduping it could only ever collapse two real messages.
+          // message.
           //
           // By durable row id when there is one, because it names the row: a
           // re-emit is caught exactly and two distinct messages never collide.
-          // The content tuple below cannot manage that — its timestamp is whole
-          // seconds, so a friend sending the same word twice inside one second
-          // produced one signature and the second bubble was dropped for good.
-          // `handleSend` renders nothing for a delivered message and relies on
-          // this echo, so there was nothing to reveal it short of a reload. The
-          // tuple stays as the fallback for an emit that carries no id.
+          // That holds for the outbound echo too — a snapshot taken after the
+          // row was marked delivered already holds it. The content tuple below
+          // cannot manage that — its timestamp is whole seconds, so a friend
+          // sending the same word twice inside one second produced one
+          // signature and the second bubble was dropped for good. `handleSend`
+          // renders nothing for a delivered message and relies on this echo, so
+          // there was nothing to reveal it short of a reload. The tuple stays
+          // as the fallback for an inbound emit that carries no id; the
+          // outbound echo has a single emit site, so a tuple match there could
+          // only ever collapse two real messages.
           const durableId = event.payload.id;
           const hasDurableId = typeof durableId === 'number' && durableId > 0;
-          const sig = `${event.payload.timestamp}|${direction}|${event.payload.message}`;
-          const isDuplicate =
-            direction === 'received' &&
-            (hasDurableId
-              ? messages.some((mm) => mm.id === durableId)
-              : messages
-                  .slice(-5)
-                  .some((mm) => `${mm.timestamp}|${mm.direction}|${mm.message}` === sig));
-          if (isDuplicate) return;
+          if (hasDurableId) {
+            const at = messages.findIndex((mm) => mm.id === durableId);
+            if (at !== -1) {
+              if (messages[at].delivery === 'queued') {
+                const next = [...messages];
+                next[at] = { ...next[at], delivery: 'delivered' };
+                messages = next;
+              }
+              return;
+            }
+          } else if (direction === 'received') {
+            const sig = `${event.payload.timestamp}|${direction}|${event.payload.message}`;
+            if (
+              messages
+                .slice(-5)
+                .some((mm) => `${mm.timestamp}|${mm.direction}|${mm.message}` === sig)
+            ) {
+              return;
+            }
+          }
           if (direction === 'received') setFriendTyping(false);
           const wasPinned = isPinnedToBottom();
           const next = [...messages, {
@@ -1455,8 +1631,25 @@
         );
         unreadMarkerId = firstUnread?.id ?? null;
       }
-      if (unreadMarkerId !== null) scrollToUnreadMarker();
-      else scrollToBottom(true);
+      // Only with nothing unread. Opening marks the room read at once, so
+      // landing back above new lines would leave them unmarked by the next
+      // visit: no divider, no pill, just lines the reader never saw. The
+      // divider is where to start when there is one.
+      const spot =
+        conversationKey && unreadMarkerId === null ? recalledScroll(conversationKey) : undefined;
+      const restored = !!spot && (await restoreScrollSpot(gen, spot));
+      if (!restored) {
+        if (gen !== loadGen) return;
+        if (unreadMarkerId !== null) scrollToUnreadMarker();
+        else scrollToBottom(true);
+      }
+      // A frame after the landing's own, so its scroll is not taken for the
+      // reader's.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (gen === loadGen) scrollSpotReady = true;
+        });
+      });
     } catch (e: unknown) {
       if (gen !== loadGen) return;
       if (messages.length === 0) {
@@ -1533,6 +1726,7 @@
     if (unlistenRead) { unlistenRead(); unlistenRead = null; }
     if (unlistenAttach) { unlistenAttach(); unlistenAttach = null; }
     liveError = false;
+    olderError = false;
     const listenerOk = await setupListener(gen, hash, channel);
     if (gen !== loadGen) return;
     await loadMessages(gen, hash, channel);
@@ -1807,6 +2001,10 @@
     const divider = box.querySelector<HTMLElement>('.conv-unread-divider');
     if (!divider) {
       unreadDividerAbove = false;
+      // Its line is not drawn: removed, from somebody since ignored, or
+      // trimmed off the top. With nothing to reach, the pill must stop
+      // promising unread lines below. Not while loading, when no row is drawn.
+      if (!loading) unreadDividerSeen = true;
       return;
     }
     const view = box.getBoundingClientRect();
@@ -1837,12 +2035,47 @@
     return el.scrollHeight - (el.scrollTop + el.clientHeight) < 80;
   }
 
+  /**
+   * Messages that arrived while the conversation was open, which slide in.
+   * The ones a load or a page of history brings are not here, so opening a
+   * room does not animate a hundred bubbles at once. Read when a row is first
+   * drawn, so it is written before the row is added and need not be reactive.
+   */
+  const freshIds = new Set<number>();
+  /** Comfortably past the slide-in. Dropped then, so a row drawn again later
+   *  (the list remounting on a retry, a member un-ignored) does not replay
+   *  it, and the set holds only the last moment's arrivals. */
+  const FRESH_MS = 1000;
+
+  function addFresh(id: number): void {
+    freshIds.add(id);
+    setTimeout(() => freshIds.delete(id), FRESH_MS);
+  }
+
+  function markFresh(next: readonly ConvMessage[]): void {
+    const known = new Set(messages.map((message) => message.id));
+    for (const message of next) {
+      if (!known.has(message.id)) addFresh(message.id);
+    }
+  }
+
   function commitLiveMessages(next: ConvMessage[], pinToBottom: boolean): void {
+    markFresh(next);
     const trimmed = next.length > MAX_LIVE_MESSAGES;
     const el = messagesContainerEl;
     const prevScrollHeight = trimmed && !pinToBottom ? (el?.scrollHeight ?? 0) : 0;
     const prevScrollTop = trimmed && !pinToBottom ? (el?.scrollTop ?? 0) : 0;
     messages = trimmed ? next.slice(next.length - MAX_LIVE_MESSAGES) : next;
+    if (trimmed) {
+      // The cursor named a row that has just been dropped; paging on from it
+      // would leave a gap between it and what is still loaded. Kept as it was
+      // when the trim evicted every stored row.
+      let oldestKept: number | null = null;
+      for (const message of messages) {
+        if (message.id > 0 && (oldestKept === null || message.id < oldestKept)) oldestKept = message.id;
+      }
+      if (oldestKept !== null) oldestDbId = oldestKept;
+    }
     if (pinToBottom) {
       scrollToBottom();
     } else if (trimmed) {
@@ -1872,16 +2105,102 @@
     scrolledAway = !pinned;
     if (pinned) missedWhileAway = false;
     checkUnreadDivider();
+    if (scrollSpotReady && !scrollSpotFrame) {
+      scrollSpotFrame = requestAnimationFrame(() => {
+        scrollSpotFrame = 0;
+        if (scrollSpotReady) captureScrollSpot();
+      });
+    }
   }
 
+  /** Off while a conversation is being opened and placed, when the scroll
+   *  events are the empty transcript and the landing, not the reader. */
+  let scrollSpotReady = false;
+  let scrollSpotFrame = 0;
+  /** Pages walked back to reach a remembered spot before giving up on it. */
+  const SCROLL_RESTORE_PAGES = 10;
+
+  function captureScrollSpot() {
+    const key = conversationKey;
+    const box = messagesContainerEl;
+    // Zero height is a hidden pane, where every rect reads as zero.
+    if (!key || !box || box.clientHeight === 0) return;
+    if (isPinnedToBottom()) {
+      rememberScroll(key, null);
+      return;
+    }
+    const top = box.getBoundingClientRect().top;
+    const rows = box.querySelectorAll<HTMLElement>('[data-msg-id]');
+    const first = firstRowBelow((i) => rows[i].getBoundingClientRect().bottom, rows.length, top);
+    // A line still being sent has no row id to come back to; the next one does.
+    for (let i = first; i < rows.length; i++) {
+      const id = Number(rows[i].dataset.msgId);
+      if (id > 0) {
+        rememberScroll(key, { id, offset: rows[i].getBoundingClientRect().top - top });
+        return;
+      }
+    }
+  }
+
+  /** Page back to a remembered message and put it where it was. False when it
+   *  cannot be reached or is not drawn, and the usual landing should run. */
+  async function restoreScrollSpot(gen: number, spot: ScrollSpot): Promise<boolean> {
+    for (
+      let page = 0;
+      page < SCROLL_RESTORE_PAGES && !messages.some((message) => message.id === spot.id);
+      page++
+    ) {
+      const before = oldestDbId;
+      if (before === null || before <= spot.id || !hasMoreHistory) break;
+      await loadOlderMessages();
+      if (gen !== loadGen) return false;
+      if (oldestDbId === before) break;
+    }
+    if (!visibleMessages.some((message) => message.id === spot.id)) return false;
+    await tick();
+    if (gen !== loadGen) return false;
+    // After the anchoring `loadOlderMessages` queues for itself, or it would
+    // land on top of this.
+    requestAnimationFrame(() => {
+      const box = messagesContainerEl;
+      const row = box?.querySelector<HTMLElement>(`[data-msg-id="${spot.id}"]`);
+      if (gen !== loadGen || !box || !row || box.clientHeight === 0) return;
+      // No further above the top than the row now reaches. A long post the
+      // reader had unfolded comes back folded, so the depth they were at
+      // inside it would land well past it, among lines not yet read.
+      const offset = Math.max(spot.offset, -Math.max(0, row.offsetHeight - 40));
+      box.scrollTop += row.getBoundingClientRect().top - box.getBoundingClientRect().top - offset;
+      scrolledAway = !isPinnedToBottom();
+      checkUnreadDivider();
+    });
+    return true;
+  }
+
+  /** Unread lines below the reader that they have not reached yet: coming back
+   *  to a remembered spot, or a jump that landed above the divider. */
+  let unreadAhead = $derived(unreadMarkerId !== null && !unreadDividerSeen && !unreadDividerAbove);
+
   function jumpToLatest() {
+    // To the first of them rather than past them. Once the divider has been on
+    // screen the next press goes the rest of the way.
+    const box = messagesContainerEl;
+    const divider = unreadAhead ? box?.querySelector<HTMLElement>('.conv-unread-divider') : null;
+    if (box && divider && divider.getBoundingClientRect().top >= box.getBoundingClientRect().bottom) {
+      divider.scrollIntoView({
+        block: 'start',
+        behavior: prefersReducedMotion.current ? 'auto' : 'smooth',
+      });
+      return;
+    }
     missedWhileAway = false;
     scrolledAway = false;
     scrollToBottom();
   }
 
-  /** Note an incoming message the reader is not positioned to see. */
-  function noteMissedMessage(wasPinned: boolean, direction: string) {
+  /** Note an incoming message the reader is not positioned to see. Not one
+   *  from somebody they ignore, which is never drawn for them to find. */
+  function noteMissedMessage(wasPinned: boolean, direction: string, sender?: string) {
+    if (sender && ignoredSenders.includes(sender.toLowerCase())) return;
     if (!wasPinned && direction === 'received') missedWhileAway = true;
   }
 
@@ -1944,18 +2263,21 @@
 
   async function sendAttachment() {
     if (attaching || isChannel || !friendHash) return;
-    attaching = true;
+    const friend = friendHash;
+    attachingFor = [...attachingFor, friend];
     try {
-      const sentOne = await pickAndSendChatAttachment(friendHash);
-      if (sentOne) {
+      const sentOne = await pickAndSendChatAttachment(friend);
+      // Another chat may be open by now. Its card loads with that friend's
+      // attachment list when their chat is next opened.
+      if (sentOne && friendHash === friend) {
         upsertAttachment(sentOne);
         scrollToBottom();
       }
     } catch (e) {
       toastError(translateError(e));
     } finally {
-      attaching = false;
-      chatInputEl?.focus();
+      attachingFor = attachingFor.filter((hash) => hash !== friend);
+      if (friendHash === friend) chatInputEl?.focus();
     }
   }
 
@@ -2102,6 +2424,7 @@
       const alreadyDelivered = result.id !== null && earlyDeliveredIds.delete(result.id);
       const existing = messages.findIndex((message) => message.id === durableId);
       if (existing === -1) {
+        addFresh(durableId);
         messages = [...messages, {
           id: durableId,
           direction: 'sent' as const,
@@ -2174,6 +2497,13 @@
     messages = messages.filter((message) => message.id !== msg.id);
     try {
       await deliverToFriend(h, restore.message);
+      // After the send, as on the room path: a delete that failed first
+      // would lose the text outright if the resend failed too.
+      if (msg.id > 0) {
+        await discardFailedChatMessage(h, msg.id).catch((e) =>
+          console.warn('ChatConversation: could not drop the abandoned message', e),
+        );
+      }
     } catch (e: unknown) {
       if (h === friendHash) {
         const next = [...messages];
@@ -2217,13 +2547,23 @@
         console.warn('ChatConversation: could not drop the abandoned room line', e),
       );
       if (channel === channelId) {
-        commitLiveMessages([...messages, fromChannelRow(sent)], true);
+        // Leaving and coming back during the send reloads the transcript,
+        // which may already hold the new row, and the old one too if its
+        // delete was still on the way. A keyed list holding either twice
+        // breaks.
+        const kept = messages.filter((message) => message.id !== msg.id);
+        commitLiveMessages(
+          kept.some((message) => message.id === sent.id) ? kept : [...kept, fromChannelRow(sent)],
+          true,
+        );
       }
     } catch (e: unknown) {
       if (channel === channelId) {
-        const next = [...messages];
-        next.splice(Math.min(at, next.length), 0, restore);
-        messages = next;
+        if (!messages.some((message) => message.id === restore.id)) {
+          const next = [...messages];
+          next.splice(Math.min(at, next.length), 0, restore);
+          messages = next;
+        }
         sendError = translateError(e, m.chat_failed_to_send());
       }
     } finally {
@@ -2249,6 +2589,7 @@
     const waitSecs = slowModeSecs;
     const h = friendHash;
     const key = conversationKey;
+    const seq = ++sendSeq;
     sending = true;
     sendError = null;
     if (channel) {
@@ -2256,6 +2597,9 @@
       // here would only spend a datagram per member. The next keystroke starts
       // a fresh one.
       roomTypingSentOn = false;
+      // Or the save timer stores the line while it is sending, and a quit
+      // before the clear lands keeps it as the draft.
+      cancelRoomDraftWrite(channel);
     } else {
       stopOutgoingTyping();
     }
@@ -2267,6 +2611,7 @@
         if (reply && getPendingReply(channel)?.msgId === reply.msgId) setPendingReply(channel, null);
         if (channel === channelId) {
           if (!messages.some((message) => message.id === sent.id)) {
+            addFresh(sent.id);
             messages = [...messages, fromChannelRow(sent)];
           }
           if (reply && replyTarget?.msgId === reply.msgId) replyTarget = null;
@@ -2278,6 +2623,7 @@
           }
         }
         clearDraft(key);
+        discardRoomDraft(channel);
         return;
       }
       await deliverToFriend(h, text);
@@ -2312,15 +2658,18 @@
         }
         if (channel === channelId) sendError = failed;
         else toastError(failed);
+        // Still in the composer, so it is a draft again: the write the send
+        // cancelled has to happen after all.
+        if (channel === channelId && roomDraftReady === channel) queueRoomDraftWrite(channel, inputText);
       } else if (h === friendHash) {
         sendError = failed;
       } else {
         toastError(failed);
       }
     } finally {
-      // `sending` is the editor's state, not tied to a friend — always release
-      // it so the (possibly newly-active) conversation's input is usable.
-      sending = false;
+      // A switch already released the composer for the next conversation, and
+      // a send started there owns it now.
+      if (seq === sendSeq) sending = false;
       // A disabled/readonly composer (and a clicked Send button) drop the
       // caret; put it back so the next message can be typed without a click.
       const stillHere = channel ? channel === channelId : h === friendHash;
@@ -2365,6 +2714,31 @@
    *  mount a conversation, so its id has to be per instance. */
   let formatHelpOpen = $state(false);
   const formatSheetId = $props.id();
+  let emojiOpen = $state(false);
+  const emojiPickerId = `${formatSheetId}-emoji`;
+  const COMPOSER_MAX_CHARS = 4096;
+
+  /** Put a picked emoji where the caret was. The textarea keeps its selection
+   *  while the picker has focus, so that is still the place the user meant. */
+  function insertEmoji(emoji: string) {
+    emojiOpen = false;
+    const el = chatInputEl;
+    const at = insertAtSelection(
+      inputText,
+      el?.selectionStart ?? inputText.length,
+      el?.selectionEnd ?? inputText.length,
+      emoji,
+      COMPOSER_MAX_CHARS,
+    );
+    if (at) {
+      inputText = at.text;
+      notifyOutgoingTyping(at.text);
+    }
+    tick().then(() => {
+      chatInputEl?.focus();
+      if (at) chatInputEl?.setSelectionRange(at.caret, at.caret);
+    });
+  }
   /** Describes the composer while it is replying, so a screen reader hears who
    *  the line will answer on focus. */
   const replyBarId = `${formatSheetId}-reply`;
@@ -2514,6 +2888,21 @@
       cancelReply();
       return;
     }
+    if (
+      e.key === 'ArrowUp' &&
+      !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey &&
+      inputText === '' &&
+      editingId === null
+    ) {
+      // Only the newest line we sent, even while it is still on its way: an
+      // older one is never what the key means, and `canEdit` refuses the rest.
+      const lastOwn = messages.findLast((line) => line.direction === 'sent');
+      if (lastOwn && canEdit(lastOwn)) {
+        e.preventDefault();
+        startEdit(lastOwn, true);
+      }
+      return;
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -2614,8 +3003,54 @@
     day: number | null;
     mentionsMe: boolean;
     blocks: FormatBlock[];
+    long: boolean;
   };
   let rowCache = new Map<number, CachedRow>();
+
+  /** Past this many drawn lines a message is folded until asked for. Judged
+   *  from the formatted text rather than measured, so it costs nothing per
+   *  bubble; set above the folded height (`.bubble-text.folded`) so whatever
+   *  folds really did overflow it, even in a wide window. */
+  const FOLD_MIN_LINES = 18;
+  /** Characters a wrapped line holds at the widest a bubble is drawn. */
+  const FOLD_LINE_CHARS = 80;
+
+  function plainInline(nodes: InlineNode[]): string {
+    let out = '';
+    for (const node of nodes) out += 'children' in node ? plainInline(node.children) : node.text;
+    return out;
+  }
+
+  function wrappedLines(text: string): number {
+    let lines = 0;
+    for (const line of text.split('\n')) lines += Math.max(1, Math.ceil(line.length / FOLD_LINE_CHARS));
+    return lines;
+  }
+
+  /** Code is counted a line per line, since it scrolls sideways instead of
+   *  wrapping: a one-line stack trace of two thousand characters is one line
+   *  tall, and folding it only hid it under the fade. */
+  function isLongMessage(blocks: FormatBlock[]): boolean {
+    let lines = 0;
+    for (const block of blocks) {
+      if (block.type === 'code') lines += block.text.split('\n').length;
+      else if (block.type === 'list') {
+        for (const item of block.items) lines += wrappedLines(plainInline(item));
+      } else lines += wrappedLines(plainInline(block.children));
+      if (lines > FOLD_MIN_LINES) return true;
+    }
+    return false;
+  }
+
+  /** Long messages the reader opened up. Per conversation, like the scroll
+   *  position: coming back to a room folds them again. */
+  let unfoldedIds = $state(new Set<number>());
+
+  function toggleFold(id: number) {
+    const next = new Set(unfoldedIds);
+    if (!next.delete(id)) next.add(id);
+    unfoldedIds = next;
+  }
   /** The pattern the cache was built against. A rename changes who is
    *  mentioned, so every cached verdict is stale. */
   let rowCachePattern: RegExp | null = null;
@@ -2645,7 +3080,9 @@
               // to a code span still counts; formatting is display-only.
               mentionsMe: msg.direction === 'received' && (pattern?.test(msg.message) ?? false),
               blocks: formatMessage(msg.message),
+              long: false,
             };
+      if (row !== hit) row.long = isLongMessage(row.blocks);
       next.set(msg.id, row);
       return row;
     });
@@ -2653,15 +3090,25 @@
     // Run and day boundaries stay outside the cache: they depend on a
     // message's neighbours, so inserting a line can change the row above it.
     // Both are plain comparisons rather than regex work.
+    //
+    // A day only ever opens forwards. Room catch-up appends lines in arrival
+    // order, not time order, so an older line landing after today's would
+    // otherwise close today and open it again under a second "Today". It sits
+    // in the day already open instead.
+    let latestDay: number | null = null;
+    const opensDay = derivedRows.map(({ day }) => {
+      if (day === null || (latestDay !== null && day <= latestDay)) return false;
+      latestDay = day;
+      return true;
+    });
     return messages.map((msg, i) => {
-      const { day, mentionsMe, blocks } = derivedRows[i];
+      const { day, mentionsMe, blocks, long } = derivedRows[i];
       const hasNext = i + 1 < messages.length;
-      const newDay = day !== null && (i === 0 || derivedRows[i - 1].day !== day);
+      const newDay = opensDay[i];
       const sameAuthorAsPrev = i > 0 && sameChannelAuthor(messages[i - 1], msg);
       const sameAuthorAsNext = hasNext && sameChannelAuthor(messages[i + 1], msg);
       // An undated row neither opens nor closes a day, so it stays with its run.
-      const sameDayAsNext =
-        hasNext && (day === null || derivedRows[i + 1].day === null || derivedRows[i + 1].day === day);
+      const sameDayAsNext = hasNext && (day === null || !opensDay[i + 1]);
       // Someone answering one of our lines is addressed to us the way a
       // mention is, so it is marked the same way. The backend's verdict covers
       // a parent paged out of view; a loaded one is checked directly.
@@ -2676,6 +3123,7 @@
         endsRun: !sameAuthorAsNext || !sameDayAsNext,
         mentionsMe: mentionsMe || repliesToMe,
         blocks,
+        long,
       };
     });
   });
@@ -2821,7 +3269,10 @@
 
 {#snippet messageTimestamp(msg: ConvMessage)}
   <div class="bubble-time">
-    {formatClock(msg.timestamp)}
+    <time
+      datetime={msg.timestamp ? new Date(msg.timestamp * 1000).toISOString() : undefined}
+      title={msg.timestamp ? formatDateTime(msg.timestamp, { dateStyle: 'full', timeStyle: 'medium' }) : undefined}
+    >{formatClock(msg.timestamp)}</time>
     {#if (msg.edited_at ?? 0) > 0}
       <span class="bubble-edited" title={m.channels_edited_at({ time: formatTime(msg.edited_at ?? 0) })}>
         {m.channels_edited()}
@@ -2953,7 +3404,7 @@
   <!-- Anchors the unread pill to the transcript's top edge, which moves with
        whether the header is shown. -->
   <div class="conv-transcript">
-  <div class="conv-messages" role="log" aria-label={m.chat_messages_label()} bind:this={messagesContainerEl} use:passiveScroll={onMessagesScroll}>
+  <div class="conv-messages" role="log" aria-label={m.chat_messages_label()} aria-busy={transcriptBusy} bind:this={messagesContainerEl} use:passiveScroll={onMessagesScroll}>
     {#if liveError && !loading && !loadError}
       <div class="conv-live-error" role="status">
         <span>{m.chat_live_unavailable()}</span>
@@ -3002,8 +3453,16 @@
             <span class="conv-load-older-error" role="alert">{m.chat_load_older_failed()}</span>
           {/if}
         </div>
+      {:else if historyStartNote && messages.length < MAX_LOADED_MESSAGES}
+        <!-- Not at the in-memory cap: there the start of what is loaded is
+             not the start of what this device has. -->
+        <p class="conv-history-start">{historyStartNote}</p>
       {/if}
-      {#each rows as row (row.msg.id)}
+      {#each rows as row, i (row.msg.id)}
+        <!-- A file card between two lines breaks their run, whoever sent them. -->
+        {@const startsRun = row.startsRun || attachmentPlacement.before.has(row.msg.id)}
+        {@const endsRun =
+          row.endsRun || (i + 1 < rows.length && attachmentPlacement.before.has(rows[i + 1].msg.id))}
         {#each attachmentPlacement.before.get(row.msg.id) ?? [] as a (a.xfer_id)}
           {@render attachmentRow(a)}
         {/each}
@@ -3024,9 +3483,14 @@
           class="conv-msg"
           class:sent={row.msg.direction === 'sent'}
           class:received={row.msg.direction === 'received'}
-          class:starts-run={row.startsRun}
+          class:starts-run={startsRun}
+          class:fresh={freshIds.has(row.msg.id)}
         >
-        {#if isChannel}
+        {#if isChannel && row.msg.direction === 'sent'}
+          <!-- Blue and on the right already says it is yours; the chip only
+               crowded the bubble. A screen reader still hears whose it is. -->
+          <span class="sr-only">{senderLabel(row.msg.sender_pubkey)}</span>
+        {:else if isChannel}
           <div class="bubble-who">
             <bdi dir="auto">{senderLabel(row.msg.sender_pubkey)}</bdi>
           </div>
@@ -3036,8 +3500,8 @@
           data-msg-id={row.msg.id}
           class:sent={row.msg.direction === 'sent'}
           class:received={row.msg.direction === 'received'}
-          class:starts-run={row.startsRun}
-          class:ends-run={row.endsRun}
+          class:starts-run={startsRun}
+          class:ends-run={endsRun}
           class:focused={row.msg.id === focusedId}
           class:mentions-me={row.mentionsMe}
         >
@@ -3118,15 +3582,30 @@
               </div>
             </div>
           {:else}
-          <div class="bubble-text">{#each row.blocks as block, bi (bi)}{#if block.type === 'text'}<bdi dir="auto">{@render inlineNodes(block.children)}</bdi>{:else}{@const codeKey = `${row.msg.id}:${bi}`}<div class="fmt-codeblock"><!-- Focusable so a long line can be scrolled sideways from the keyboard: a scroll container is the one non-widget that needs a tab stop. --><!-- svelte-ignore a11y_no_noninteractive_tabindex --><pre dir="auto" tabindex="0" role="group" aria-label={m.chat_code_block_label()}><code>{block.text}</code></pre><button
+          {@const folded = row.long && !unfoldedIds.has(row.msg.id)}
+          <!-- Tabbing to a link below the fold opens it up, rather than
+               scrolling the clipped box under its own edge. -->
+          <div
+            class="bubble-text"
+            class:folded
+            onfocusin={folded ? () => toggleFold(row.msg.id) : undefined}
+          >{#each row.blocks as block, bi (bi)}{#if block.type === 'text'}<bdi dir="auto">{@render inlineNodes(block.children)}</bdi>{:else if block.type === 'list'}{#if block.ordered}<ol class="fmt-list" start={block.start}>{#each block.items as item, ii (ii)}<li><bdi dir="auto">{@render inlineNodes(item)}</bdi></li>{/each}</ol>{:else}<ul class="fmt-list">{#each block.items as item, ii (ii)}<li><bdi dir="auto">{@render inlineNodes(item)}</bdi></li>{/each}</ul>{/if}{:else}{@const codeKey = `${row.msg.id}:${bi}`}<div class="fmt-codeblock"><!-- Focusable so a long line can be scrolled sideways from the keyboard: a scroll container is the one non-widget that needs a tab stop. --><!-- svelte-ignore a11y_no_noninteractive_tabindex --><pre dir="auto" tabindex="0" role="group" aria-label={m.chat_code_block_label()}><code>{block.text}</code></pre><button
                   type="button"
                   class="fmt-codeblock-copy"
                   onclick={() => void copyCodeBlock(codeKey, block.text)}
                   title={m.chat_copy_code()}
                   aria-label={copiedCodeKey === codeKey ? m.common_copied() : m.chat_copy_code()}
                 >{copiedCodeKey === codeKey ? m.common_copied() : m.common_copy()}</button></div>{/if}{/each}</div>
+          {#if row.long}
+            <button
+              type="button"
+              class="bubble-fold"
+              aria-expanded={!folded}
+              onclick={() => toggleFold(row.msg.id)}
+            >{folded ? m.chat_show_more() : m.chat_show_less()}</button>
           {/if}
-          {#if !isChannel && (row.endsRun || pending || failed || (row.msg.edited_at ?? 0) > 0)}
+          {/if}
+          {#if !isChannel && (endsRun || pending || failed || (row.msg.edited_at ?? 0) > 0)}
             {@render messageTimestamp(row.msg)}
           {/if}
           <!-- Copy is offered on every line. Edit and remove are channels
@@ -3373,17 +3852,17 @@
   {#if scrolledAway && messages.length > 0 && !loading}
     <button
       class="conv-jump"
-      class:has-unseen={missedWhileAway}
+      class:has-unseen={missedWhileAway || unreadAhead}
       class:above-typing={typingPillShown}
       type="button"
       onclick={jumpToLatest}
-      title={missedWhileAway ? m.chat_new_messages_below() : m.chat_jump_to_latest()}
-      aria-label={missedWhileAway ? m.chat_new_messages_below() : m.chat_jump_to_latest()}
+      title={missedWhileAway || unreadAhead ? m.chat_new_messages_below() : m.chat_jump_to_latest()}
+      aria-label={missedWhileAway || unreadAhead ? m.chat_new_messages_below() : m.chat_jump_to_latest()}
     >
       <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
         <path d="M8 3v9M4.5 8.5 8 12l3.5-3.5" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
-      <span>{missedWhileAway ? m.chat_new_messages_below() : m.chat_jump_to_latest()}</span>
+      <span>{missedWhileAway || unreadAhead ? m.chat_new_messages_below() : m.chat_jump_to_latest()}</span>
     </button>
   {/if}
   </div>
@@ -3536,10 +4015,14 @@
         onclick={refreshMentionToken}
         onkeyup={refreshMentionToken}
         onblur={() => (mentionStart = -1)}
-        placeholder={isChannel ? m.channels_send_placeholder() : m.chat_input_placeholder()}
+        placeholder={isChannel
+          ? friendName.trim()
+            ? m.channels_send_placeholder_named({ room: friendName.trim() })
+            : m.channels_send_placeholder()
+          : m.chat_input_placeholder()}
         aria-label={m.chat_input_label()}
         aria-describedby={isChannel && replyTarget ? replyBarId : undefined}
-        maxlength="4096"
+        maxlength={COMPOSER_MAX_CHARS}
         rows="2"
         readonly={sending}
       ></textarea>
@@ -3550,6 +4033,41 @@
           {m.chat_slow_mode_wait({ seconds: slowModeLeft })}
         </span>
       {/if}
+      <div
+        class="conv-emoji"
+        onfocusout={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) emojiOpen = false;
+        }}
+      >
+        <button
+          type="button"
+          class="conv-format-toggle conv-emoji-toggle"
+          class:open={emojiOpen}
+          onclick={() => (emojiOpen = !emojiOpen)}
+          disabled={sending}
+          title={m.chat_emoji_button()}
+          aria-label={m.chat_emoji_button()}
+          aria-expanded={emojiOpen}
+          aria-controls={emojiPickerId}
+        >
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="10" cy="10" r="7"/>
+            <path d="M7 11.8a3.6 3.6 0 0 0 6 0"/>
+            <line x1="7.6" y1="8" x2="7.6" y2="8.1"/>
+            <line x1="12.4" y1="8" x2="12.4" y2="8.1"/>
+          </svg>
+        </button>
+        {#if emojiOpen}
+          <EmojiPicker
+            id={emojiPickerId}
+            onpick={insertEmoji}
+            onclose={() => {
+              emojiOpen = false;
+              chatInputEl?.focus();
+            }}
+          />
+        {/if}
+      </div>
       <!-- A cheat-sheet rather than toolbar buttons: the markers are typed, and
            a row of B/I/S controls would crowd a composer the dock already
            keeps narrow. Closes on focus leaving it, so it never lingers. -->
@@ -3718,6 +4236,14 @@
     margin-bottom: 8px;
   }
 
+  .conv-history-start {
+    margin: 0 auto 10px;
+    max-width: 46ch;
+    text-align: center;
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+  }
+
   .conv-load-older-error {
     font-size: var(--font-size-xs);
     color: var(--danger);
@@ -3752,7 +4278,7 @@
     padding: 3px 10px;
     border-radius: var(--radius-pill);
     background: var(--bg-tertiary);
-    color: var(--text-muted);
+    color: var(--text-secondary);
     font-size: var(--font-size-xs);
     font-weight: 600;
     letter-spacing: 0.4px;
@@ -3818,20 +4344,43 @@
   .conv-msg {
     display: flex;
     flex-direction: column;
-    max-width: 80%;
+    max-width: min(640px, 80%);
     min-width: 0;
   }
 
   .conv-msg.sent { align-self: flex-end; align-items: flex-end; }
   .conv-msg.received { align-self: flex-start; align-items: flex-start; }
 
+  /* Grows from the side it belongs to, with a small overshoot. */
+  .conv-msg.fresh {
+    animation: conv-msg-in 220ms cubic-bezier(0.2, 0.9, 0.3, 1.15);
+  }
+
+  .conv-msg.fresh.sent { transform-origin: bottom right; }
+  .conv-msg.fresh.received { transform-origin: bottom left; }
+
+  @keyframes conv-msg-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px) scale(0.96);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .conv-msg.fresh {
+      animation: none;
+    }
+  }
+
   .conv-msg .conv-bubble {
     max-width: 100%;
   }
 
+  /* Narrow enough that a long line stays readable on a wide window: past
+     about 640px a paragraph runs well over the 75 characters an eye tracks. */
   .conversation.channel .conv-msg {
     position: relative;
-    max-width: min(720px, 72%);
+    max-width: min(640px, 72%);
     min-width: min(156px, 72%);
   }
 
@@ -3842,9 +4391,13 @@
     box-shadow: none;
   }
 
-  /* The sender's name chip sits in this corner, so it stays tight. */
-  .conversation.channel .conv-msg.received .conv-bubble,
+  /* No name chip on your own lines, so no room is kept for one. */
   .conversation.channel .conv-msg.sent .conv-bubble {
+    padding-top: 8px;
+  }
+
+  /* The sender's name chip sits in this corner, so it stays tight. */
+  .conversation.channel .conv-msg.received .conv-bubble {
     border-top-left-radius: var(--radius-md);
   }
 
@@ -3961,6 +4514,56 @@
 
   .bubble-text {
     white-space: pre-wrap;
+  }
+
+  /* Fourteen lines and a fade, so a long post shows what it is about without
+     taking the whole transcript. Below `FOLD_MIN_LINES`, so anything folded
+     really does run past it. */
+  .bubble-text.folded {
+    max-height: calc(1.4em * 14);
+    overflow: hidden;
+    mask-image: linear-gradient(to bottom, #000 calc(100% - 3em), transparent);
+  }
+
+  .bubble-fold {
+    display: block;
+    margin-top: 4px;
+    padding: 2px 0;
+    border: none;
+    background: none;
+    color: inherit;
+    font: inherit;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
+  }
+
+  .conv-bubble.received .bubble-fold {
+    color: var(--text-accent);
+  }
+
+  .bubble-fold:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  /* Lists keep the bubble's own line spacing; `pre-wrap` is reset inside so
+     the markup between items is not drawn as blank lines. */
+  .fmt-list {
+    margin: 2px 0;
+    padding-inline-start: 1.4em;
+    white-space: normal;
+  }
+
+  .fmt-list li {
+    white-space: pre-wrap;
+  }
+
+  .fmt-list li + li {
+    margin-top: 1px;
   }
 
   /* Tinted from `currentColor` so the same rule reads on an accent-filled sent
@@ -4081,15 +4684,6 @@
   .conversation.channel .conv-msg.received .bubble-who {
     top: -1px;
     inset-inline-start: -1px;
-  }
-
-  .conversation.channel .conv-msg.sent .bubble-who {
-    background: var(--on-accent);
-    border-color: color-mix(in srgb, var(--on-accent) 55%, var(--accent));
-    color: var(--accent);
-    box-shadow:
-      -1px -1px 0 var(--on-accent),
-      0 1px 2px color-mix(in srgb, #000 12%, transparent);
   }
 
   .conversation.channel .bubble-who bdi {
@@ -4812,6 +5406,15 @@
     color: color-mix(in srgb, var(--reaction-heart) 65%, var(--text-primary));
   }
 
+  /* On your own bubble the accent fill swallowed the gold and red, and the
+     counts with them. A face of their own keeps them as legible there as on
+     anyone else's. These chips are only a tally: nobody reacts to their own
+     line, so no hover or chosen state needs covering. */
+  .conversation.channel .conv-bubble.sent .reaction-btn {
+    background-color: var(--bg-surface);
+    border-color: color-mix(in srgb, var(--on-accent) 40%, transparent);
+  }
+
   .conversation.channel .reaction-btn.pulse-add {
     animation: reaction-pop 0.36s ease;
   }
@@ -5204,22 +5807,52 @@
 
   /* Static, so the sheet anchors to the composer row (the same box the mention
      list uses) rather than to this small button. */
-  .conv-format-help {
+  .conv-format-help,
+  .conv-emoji {
     display: flex;
     align-self: center;
   }
 
-  .conv-format-toggle {
-    width: 26px;
-    height: 26px;
-    padding: 0;
-    border: none;
-    border-radius: var(--radius-sm);
+  .conv-emoji-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .conv-emoji-toggle:disabled {
     background: transparent;
     color: var(--text-muted);
-    font-size: var(--font-size-xs);
+    opacity: 0.45;
+    cursor: default;
+  }
+
+  .conv-emoji-toggle svg {
+    width: 20px;
+    height: 20px;
+  }
+
+  /* The attach button's shape, so the composer's controls read as one row
+     beside Send rather than a pair of afterthoughts. A little smaller than it,
+     because the dock's composer can be 320px wide and the text box comes
+     first. */
+  .conv-format-toggle {
+    width: 32px;
+    height: 32px;
+    flex-shrink: 0;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
     font-weight: 700;
     cursor: pointer;
+    transition: background var(--transition-fast), color var(--transition-fast);
+  }
+
+  .conv-format-toggle:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
 
   .conv-format-toggle:hover,

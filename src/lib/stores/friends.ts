@@ -202,13 +202,6 @@ function writeFriendsList(friends: FriendInfo[]): void {
   rememberFriendNames(friends);
 }
 
-/** Authoritative write for the shared list and the name cache together.
- *  Supersedes any fetch still in flight. */
-export function setFriendsList(friends: FriendInfo[]): void {
-  friendsFetchLanded = ++friendsFetchTicket;
-  writeFriendsList(friends);
-}
-
 /** Publish a fetch's result unless a newer one already landed. Returns
  *  whether it was taken, so a caller can skip side effects (closing chat
  *  tabs, say) it would otherwise base on a superseded list. */
@@ -292,10 +285,11 @@ const announcedAttachments = new Set<string>();
 // Dedup window for inbound `ember:chat-message` events. The backend can deliver
 // the same logical message twice in quick succession (the download- and
 // upload-side session loops both surface it), which would otherwise double-bump
-// the unread badge. The signature includes the message timestamp, so two
-// genuinely-distinct messages (different timestamps) are never collapsed — only
-// true re-emits of the same `(hash, timestamp, body)` tuple are suppressed.
-// `ChatConversation` applies an equivalent dedup to the rendered bubble list.
+// the unread badge. Keyed by the durable row id when the event carries one: the
+// timestamp is whole seconds, so the same word sent twice inside one second is
+// two messages with one `(hash, timestamp, body)` tuple. The tuple is only the
+// fallback for an emit without an id. `ChatConversation` applies an equivalent
+// dedup to the rendered bubble list.
 const recentChatSigs = new Map<string, number>();
 const CHAT_SIG_TTL_MS = 10_000;
 
@@ -378,8 +372,8 @@ export async function initFriendsStore() {
         onlineFriends.update((s) => (s.has(hash) ? s : new Set([...s, hash])));
         searchingFriends.update((s) => { const next = new Set(s); next.delete(hash); return next; });
         clearSearchTimer(hash);
-        if (!wasOnline && shouldNotify('friend_online')) {
-          void notify('friend_online', m.notify_friend_online({ name: friendDisplayName(hash) }));
+        if (!wasOnline && shouldNotify('friend_online', hash)) {
+          void notify('friend_online', m.notify_friend_online({ name: friendDisplayName(hash) }), '', hash);
         }
       }),
     );
@@ -391,7 +385,7 @@ export async function initFriendsStore() {
       }),
     );
     registered.push(
-      await listen<{ user_hash: string; direction: string; message?: string; timestamp?: number }>('ember:chat-message', (event) => {
+      await listen<{ user_hash: string; id?: number; direction: string; message?: string; timestamp?: number }>('ember:chat-message', (event) => {
         const p = event.payload;
         const hash = validFriendHash(p?.user_hash);
         if (!hash) return;
@@ -402,7 +396,10 @@ export async function initFriendsStore() {
         for (const [k, exp] of recentChatSigs) {
           if (exp <= now) recentChatSigs.delete(k);
         }
-        const sig = `${hash}|${p.timestamp ?? ''}|${safeEventText(p.message)}`;
+        const sig =
+          typeof p.id === 'number' && p.id > 0
+            ? `${hash}#${p.id}`
+            : `${hash}|${p.timestamp ?? ''}|${safeEventText(p.message)}`;
         if (recentChatSigs.has(sig)) return;
         recentChatSigs.set(sig, now + CHAT_SIG_TTL_MS);
         // If the chat with this friend is open and focused, the
@@ -432,11 +429,12 @@ export async function initFriendsStore() {
         // The preview is capped hard: the shell renders it outside anything the
         // webview controls, and the backend strips direction overrides from
         // whatever gets there and escapes markup on the shells that parse it.
-        if (shouldNotify('friend_message')) {
+        if (shouldNotify('friend_message', hash)) {
           void notify(
             'friend_message',
             friendDisplayName(hash),
             safeEventText(p.message, 200),
+            hash,
           );
         }
       }),
@@ -473,11 +471,12 @@ export async function initFriendsStore() {
           // Bound the list so a misbehaving friend cannot grow it without end.
           return [...rest, { user_hash, file_hash, file_name, file_size, ember_file_hash }].slice(-20);
         });
-        if (shouldNotify('friend_message')) {
+        if (shouldNotify('friend_message', user_hash)) {
           void notify(
             'friend_message',
             m.notify_file_offer_title({ name: friendDisplayName(user_hash) }),
             file_name,
+            user_hash,
           );
         }
       }),
@@ -490,10 +489,11 @@ export async function initFriendsStore() {
         // already looking at that conversation: a file waiting for an answer,
         // and one that arrived by itself under the auto-accept ceiling.
         // Progress ticks repeat the same status many times a second, so each
-        // (transfer, moment) pair is announced once.
+        // (transfer, attempt, moment) is announced once. The attempt is part of
+        // it because "Try again" brings the same transfer back to an offer.
         const moment = a.status === 'awaiting' ? 'offer' : a.status === 'complete' ? 'done' : null;
         if (!moment) return;
-        const key = `${a.xfer_id}:${moment}`;
+        const key = `${a.xfer_id}:${a.attempt}:${moment}`;
         if (announcedAttachments.has(key)) return;
         announcedAttachments.add(key);
         if (announcedAttachments.size > 500) {
@@ -502,7 +502,7 @@ export async function initFriendsStore() {
         }
         if (get(activeChatHash) === a.user_hash && isAppVisible()) return;
         if (chatWindowShows(a.user_hash)) return;
-        if (!shouldNotify('friend_message')) return;
+        if (!shouldNotify('friend_message', a.user_hash)) return;
         const name = friendDisplayName(a.user_hash);
         void notify(
           'friend_message',
@@ -510,6 +510,7 @@ export async function initFriendsStore() {
             ? m.chat_attach_notify_offer({ name })
             : m.chat_attach_notify_received({ name }),
           safeEventText(a.name, 256),
+          a.user_hash,
         );
       }),
     );

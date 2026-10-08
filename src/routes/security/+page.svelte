@@ -23,6 +23,7 @@
   import { getSettings } from '$lib/api/settings';
   import { setAppSettings } from '$lib/stores/settings';
   import { networkStats } from '$lib/stores/network';
+  import BannedUsersDialog from '$lib/components/BannedUsersDialog.svelte';
   import IconX from '$lib/components/IconX.svelte';
 
   let stats = $state<IpFilterStats | null>(null);
@@ -50,6 +51,11 @@
         return m.security_ipfilter_live_reload_deferred({ entries: result.entryCount });
     }
   }
+
+  let showBanned = $state(false);
+  // Kept current by the dialog, which loads the list on mount, so the header
+  // button can show how many are banned before it is opened.
+  let bannedCount = $state(0);
 
   let showAddForm = $state(false);
   let newStartIp = $state('');
@@ -537,9 +543,17 @@
     >
       {showUrlForm ? m.common_cancel() : m.security_from_url()}
     </button>
+    <button class="ghost" onclick={() => (showBanned = true)} aria-haspopup="dialog">
+      {m.security_banned_users()}
+      {#if bannedCount > 0}
+        <span class="count-pill">{formatNumber(bannedCount)}</span>
+      {/if}
+    </button>
     <button class="ghost" onclick={() => void loadStats({ offset: listOffset })} disabled={loading}>{m.common_refresh()}</button>
   </div>
 </div>
+
+<BannedUsersDialog bind:open={showBanned} bind:count={bannedCount} />
 
 {#if showUrlForm}
   <div id="ipfilter-url-form" class="ipfilter-url-form" role="group" aria-label={m.security_fetch_url_aria()}>
@@ -837,6 +851,21 @@
   }
   .ipfilter-url-form button {
     flex-shrink: 0;
+  }
+
+  .count-pill {
+    display: inline-block;
+    min-width: 18px;
+    margin-left: 6px;
+    padding: 0 6px;
+    border-radius: var(--radius-pill);
+    background: color-mix(in srgb, var(--danger) 18%, transparent);
+    color: var(--danger);
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+    line-height: 18px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
   }
 
   /* --- Banners --- */

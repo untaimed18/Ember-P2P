@@ -2,7 +2,7 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 use tracing::{info, warn};
 
-use crate::app_state::AppState;
+use crate::app_state::{AppState, LaunchSettings};
 use crate::commands::errors::{coded, coded_ctx};
 use crate::network::kad::bootstrap;
 use crate::network::kad::ip_filter::count_valid_entries;
@@ -98,6 +98,10 @@ pub(crate) fn persist_with_root_transaction(
 /// setup/settings forms can round-trip one object, but `update_settings`
 /// always restores these values from the authoritative in-memory config.
 const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
+    // Written one friend at a time by `set_friend_overrides`. The Settings page
+    // holds a copy from whenever it opened, and saving that back would undo a
+    // change made since from the friend's card.
+    "friend_overrides",
     "shared_folders",
     "previous_download_folders",
     "default_shared_folder_seeded",
@@ -277,8 +281,8 @@ fn preview_player_was_picked(path: &std::path::Path) -> bool {
 /// the configured download path. That is the only way back for a root revoked
 /// because the user genuinely moved or reconnected the folder, and it is also
 /// exactly what an attacker wants after swapping a junction or a removable
-/// drive in underneath it. The flag itself arrives over IPC and the Settings
-/// page sets it on every save, so the flag cannot be the authorization —
+/// drive in underneath it. The flag itself arrives over IPC from a renderer
+/// that could set it on any save, so the flag cannot be the authorization —
 /// provenance is. Either this session's own picker produced that exact path,
 /// or the user answers a dialog the renderer can neither draw nor dismiss.
 ///
@@ -306,8 +310,7 @@ async fn download_root_reapproval_authorized(
         elide_for_dialog(download_folder)
     );
     // `None` means there is nothing to authorize, which is the ordinary case:
-    // the Settings page sends the flag on every save and almost every save
-    // finds the root intact.
+    // almost every save that carries the flag finds the root intact.
     let answer = tokio::task::spawn_blocking(move || {
         let path = std::path::Path::new(&folder);
         // An absent root keeps its record (`build_next` retains it on
@@ -692,6 +695,11 @@ pub async fn get_settings(state: tauri::State<'_, AppState>) -> Result<AppSettin
     Ok(config.settings.clone())
 }
 
+#[tauri::command]
+pub fn get_launch_settings(state: tauri::State<'_, AppState>) -> LaunchSettings {
+    state.launch_settings
+}
+
 /// Upper bounds for IPC inputs. These exist to prevent a malicious/buggy
 /// frontend from pushing multi-megabyte blobs through the Tauri bridge, which
 /// would bloat `config.json`, block the async runtime on serialize, and
@@ -800,6 +808,14 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
+    // A hand-edited or damaged entry is repaired or dropped, not a reason to
+    // reset every other setting.
+    let overrides = normalize_friend_overrides(settings.friend_overrides.clone());
+    if overrides != settings.friend_overrides {
+        settings.friend_overrides = overrides;
+        changed = true;
+    }
+
     // A username stored under the older, looser rule (spaces, punctuation, up
     // to 32 bytes) is not a corrupt config — but `validate_settings` now
     // refuses it, and on load that answer means backup-and-reset of every
@@ -846,7 +862,8 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
     }
 
     changed |= clamp_assign(&mut settings.max_concurrent_downloads, 1, 50);
-    changed |= clamp_assign(&mut settings.max_concurrent_uploads, 1, 50);
+    // 0 is Auto.
+    changed |= clamp_assign(&mut settings.max_concurrent_uploads, 0, 50);
     if settings.max_upload_speed > MAX_CONFIGURED_SPEED_BPS {
         settings.max_upload_speed = MAX_CONFIGURED_SPEED_BPS;
         changed = true;
@@ -855,6 +872,8 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         settings.max_download_speed = MAX_CONFIGURED_SPEED_BPS;
         changed = true;
     }
+    changed |= clamp_assign(&mut settings.alt_max_upload_speed, 0, MAX_CONFIGURED_SPEED_BPS);
+    changed |= clamp_assign(&mut settings.alt_max_download_speed, 0, MAX_CONFIGURED_SPEED_BPS);
     // Soft-disable USS when upload is unlimited (validate rejects that combo).
     if settings.uss_enabled && settings.max_upload_speed == 0 {
         settings.uss_enabled = false;
@@ -870,10 +889,10 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
     changed |= clamp_assign(&mut settings.multisource_retry_rounds, 1, 20);
-    changed |= clamp_assign(&mut settings.download_part_retry_rounds, 1, 20);
     changed |= clamp_assign(&mut settings.max_download_file_size_gib, 1, 593);
     changed |= clamp_assign(&mut settings.search_timeout_secs, 30, 600);
     changed |= clamp_assign(&mut settings.max_friends, 1, 500);
+    changed |= clamp_assign(&mut settings.low_disk_warning_mb, 0, 100 * 1024);
 
     // Friend session encryption is not a user-facing toggle; keep it on even
     // if an older config.json or hand edit turned it off.
@@ -1044,6 +1063,12 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB,
         ));
     }
+    if normalize_friend_overrides(settings.friend_overrides.clone()) != settings.friend_overrides {
+        return Err(coded(
+            "settings_friend_overrides_invalid",
+            "A friend's settings could not be saved",
+        ));
+    }
     if !crate::auto_update::record::CHECK_FREQUENCIES
         .contains(&settings.update_check_frequency.as_str())
     {
@@ -1146,7 +1171,7 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             "Max concurrent downloads must be between 1 and 50",
         ));
     }
-    if settings.max_concurrent_uploads == 0 || settings.max_concurrent_uploads > 50 {
+    if settings.max_concurrent_uploads > 50 {
         return Err(coded(
             "settings_max_concurrent_uploads_invalid",
             "Max concurrent uploads must be between 1 and 50",
@@ -1173,6 +1198,24 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         return Err(coded_ctx(
             "settings_max_download_speed_invalid",
             format!("Max download speed must be 0 or at most {MAX_CONFIGURED_SPEED_BPS} B/s"),
+            MAX_CONFIGURED_SPEED_BPS,
+        ));
+    }
+    if settings.alt_max_upload_speed > MAX_CONFIGURED_SPEED_BPS {
+        return Err(coded_ctx(
+            "settings_max_upload_speed_invalid",
+            format!(
+                "Alternative upload speed must be 0 or at most {MAX_CONFIGURED_SPEED_BPS} B/s"
+            ),
+            MAX_CONFIGURED_SPEED_BPS,
+        ));
+    }
+    if settings.alt_max_download_speed > MAX_CONFIGURED_SPEED_BPS {
+        return Err(coded_ctx(
+            "settings_max_download_speed_invalid",
+            format!(
+                "Alternative download speed must be 0 or at most {MAX_CONFIGURED_SPEED_BPS} B/s"
+            ),
             MAX_CONFIGURED_SPEED_BPS,
         ));
     }
@@ -1204,12 +1247,6 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         return Err(coded(
             "settings_multisource_retry_rounds_invalid",
             "Multi-source retry rounds must be between 1 and 20",
-        ));
-    }
-    if !(1..=20).contains(&settings.download_part_retry_rounds) {
-        return Err(coded(
-            "settings_download_part_retry_rounds_invalid",
-            "Part hash retry rounds must be between 1 and 20",
         ));
     }
     if !(1..=593).contains(&settings.max_download_file_size_gib) {
@@ -1499,6 +1536,21 @@ pub async fn update_settings(
         tokio::task::spawn_blocking(move || normalize_shared_folders(shared_folders))
             .await
             .map_err(|e| coded_ctx("settings_validation_task_failed", "Validation failed", e))??;
+    // Provenance before validation. `validate_settings` resolves the folder on
+    // disk, and resolving `\\host\share` opens an SMB session that hands the
+    // user's NTLM credentials to that host — so a changed folder the picker
+    // did not produce is refused before anything touches it. The full check,
+    // with the writability probe, still runs below.
+    if !settings.download_folder.is_empty()
+        && normalized_path_components(std::path::Path::new(&settings.download_folder))
+            != normalized_path_components(std::path::Path::new(&old_settings.download_folder))
+        && !download_root_was_picked(std::path::Path::new(&settings.download_folder))
+    {
+        return Err(coded(
+            "settings_download_folder_not_picked",
+            "Choose the download folder with Browse before saving",
+        ));
+    }
     {
         let settings_for_validation = settings.clone();
         tokio::task::spawn_blocking(move || validate_settings(&settings_for_validation))
@@ -1604,16 +1656,25 @@ pub async fn update_settings(
     );
     settings.settings_revision = old_settings.settings_revision.saturating_add(1);
 
-    let port_changed =
-        settings.tcp_port != old_settings.tcp_port || settings.udp_port != old_settings.udp_port;
-    // The network loop reads UPnP once, at startup, to decide whether to map
-    // ports, renew the lease and tear the mapping down on exit. Reporting this
-    // as applied claimed a live change that never happened: disabling left the
-    // mappings and their renewals running, and enabling did nothing at all.
-    // Restarting is what actually honours the new value, and it is also what
-    // removes the existing mapping, because shutdown tears down on the value it
-    // started with.
-    let upnp_changed = settings.upnp_enabled != old_settings.upnp_enabled;
+    // Before the write: a sign-in entry the OS refused must fail the save, not
+    // leave a setting that claims otherwise. A write that fails after this
+    // leaves the entry ahead of the file, which the next launch reconciles.
+    if settings.launch_at_login != old_settings.launch_at_login {
+        let enable = settings.launch_at_login;
+        let entry_app = app.clone();
+        let failed = |e: String| {
+            coded_ctx(
+                "settings_launch_at_login_failed",
+                "Could not change launch at sign-in",
+                e,
+            )
+        };
+        tokio::task::spawn_blocking(move || crate::login_launch::apply(&entry_app, enable))
+            .await
+            .map_err(|e| failed(e.to_string()))?
+            .map_err(failed)?;
+    }
+
     let download_folder_changed = !settings.download_folder.is_empty()
         && normalized_path_components(std::path::Path::new(&settings.download_folder))
             != normalized_path_components(std::path::Path::new(&old_settings.download_folder));
@@ -1655,8 +1716,7 @@ pub async fn update_settings(
             // this one has to stay writable because the form saves it with
             // everything else, so it is provenance that is checked instead.
             // Only a *change* is gated: an unchanged path re-saved by a
-            // background caller (the UPnP auto-disable handler persists through
-            // here with no user present) never reaches this branch.
+            // background caller with no user present never reaches this branch.
             if !download_root_was_picked(std::path::Path::new(&settings.download_folder)) {
                 return Err(coded(
                     "settings_download_folder_not_picked",
@@ -1698,11 +1758,10 @@ pub async fn update_settings(
         //
         // Deliberately narrow. Re-approval grants the sandbox to whatever
         // object now sits at the path, and `update_settings` is also reached
-        // from background paths with no user present — the UPnP auto-disable
-        // handler persists through it from a network event. The flag says the
-        // Settings save button was pressed, but it travels over IPC and the
-        // page sets it on every save, so it is treated as a request rather
-        // than as consent and `download_root_reapproval_authorized` decides.
+        // from background paths with no user present. The flag says the
+        // download folder was picked in Settings, but it travels over IPC, so
+        // it is treated as a request rather than as consent and
+        // `download_root_reapproval_authorized` decides.
         // It is also skipped unless something is actually there: a root that
         // is merely offline (unplugged drive, disconnected share) must keep
         // its record, which `build_next` retains on `NotFound`, rather than be
@@ -1770,7 +1829,8 @@ pub async fn update_settings(
         crate::commands::channels::apply_channel_username_locally(
             &state,
             &settings.channel_username,
-        );
+        )
+        .await;
     }
 
     // Keep the synchronous mirror used by the close-event handler in sync
@@ -1872,7 +1932,15 @@ pub async fn update_settings(
         });
     }
 
-    let outcome = if port_changed || upnp_changed {
+    // Compared with what this process started on, not with the previous save,
+    // so changing a port and then changing it back needs no restart. The
+    // network loop reads UPnP once, at startup, to decide whether to map
+    // ports, renew the lease and tear the mapping down on exit: disabling it
+    // mid-session would leave the mappings and their renewals running, and
+    // enabling it would do nothing. Restarting is what honours the new value,
+    // and it is also what removes the existing mapping, because shutdown tears
+    // down on the value it started with.
+    let outcome = if LaunchSettings::from_settings(&settings) != state.launch_settings {
         SettingsUpdateOutcome::RestartRequired
     } else {
         SettingsUpdateOutcome::Applied
@@ -2262,27 +2330,6 @@ pub fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
-    crate::commands::chat_window::set_chat_window_visible(&app, true);
-    if let Some(window) = app.get_webview_window("main") {
-        // Unminimize first — `show()` doesn't restore from minimized on
-        // Windows, only from the hidden state. Without this the tray-icon
-        // double-click would be a no-op for users who minimized through
-        // the title-bar instead of closing.
-        let _ = window.unminimize();
-        window.show().map_err(|e| {
-            coded_ctx(
-                "settings_show_window_failed",
-                "Failed to show main window",
-                e,
-            )
-        })?;
-        let _ = window.set_focus();
-    }
-    Ok(())
-}
-
-#[tauri::command]
 pub fn quit_app(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     // Mark the close as user-confirmed so the `WindowEvent::CloseRequested`
     // hook in `lib::run` lets the destroy proceed even when the saved
@@ -2293,6 +2340,64 @@ pub fn quit_app(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Res
         .store(true, std::sync::atomic::Ordering::Release);
     app.exit(0);
     Ok(())
+}
+
+/// Whether the main window holds a cancel or remove the user can still undo.
+/// Nothing reaches the backend until its Undo toast expires, so an exit
+/// started here first lets the window send it.
+static PENDING_UNDO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set once an exit has asked the window to send what is pending.
+static QUIT_FLUSH_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub const QUIT_REQUESTED_EVENT: &str = "ember:quit-requested";
+/// How long an exit waits for the window to send what is pending.
+const PENDING_UNDO_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
+
+#[tauri::command]
+pub fn set_pending_undo(pending: bool) {
+    PENDING_UNDO.store(pending, std::sync::atomic::Ordering::Release);
+}
+
+/// Exit Ember for a quit decided outside the window (the tray, "exit" as the
+/// close behavior, "when downloads finish"). With an Undo pending, the window
+/// is asked to commit it and exit through `quit_app`; it gets a few seconds
+/// before Ember exits regardless.
+pub fn exit_app(app: &tauri::AppHandle) {
+    let confirm_and_exit = |app: &tauri::AppHandle| {
+        if let Some(state) = app.try_state::<AppState>() {
+            state
+                .quit_confirmed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        app.exit(0);
+    };
+    if !PENDING_UNDO.load(std::sync::atomic::Ordering::Acquire) {
+        confirm_and_exit(app);
+        return;
+    }
+    // A second request (the X clicked again while nothing seems to happen)
+    // must not exit under the window's feet; the first one's fallback below
+    // still bounds the wait.
+    if QUIT_FLUSH_STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    if app.emit(QUIT_REQUESTED_EVENT, ()).is_err() {
+        confirm_and_exit(app);
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(PENDING_UNDO_FLUSH_WAIT).await;
+        // The window's `quit_app` got there first, and the shutdown is under
+        // way; a second exit could cut a slow one short.
+        let quitting = app
+            .try_state::<AppState>()
+            .is_some_and(|state| state.quit_confirmed.load(std::sync::atomic::Ordering::Acquire));
+        if quitting {
+            return;
+        }
+        tracing::warn!("The window did not finish its pending Undo actions in time; exiting");
+        confirm_and_exit(&app);
+    });
 }
 
 /// Consume a close request that arrived before the frontend listener was
@@ -2340,6 +2445,15 @@ pub fn take_pending_restore_expired_notice(
     Ok(state
         .pending_restore_expired_notice
         .swap(false, std::sync::atomic::Ordering::AcqRel))
+}
+
+/// Consume the folder an applied restore put in place of a download folder on
+/// a network share, if it did. One-shot like the latches above.
+#[tauri::command]
+pub fn take_pending_restore_download_folder_notice(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    Ok(state.pending_restore_download_folder_notice.lock().take())
 }
 
 const KNOWN_MET_NOTICE_NONE: u8 = 0;
@@ -2423,6 +2537,287 @@ pub async fn set_close_behavior(
     Ok(())
 }
 
+/// Per-friend overrides as this build keeps them: keys lowercased, entries
+/// under a key that is not a friend hash dropped, each value normalized,
+/// entries left with nothing to override dropped, and no more than
+/// [`crate::types::MAX_FRIEND_OVERRIDES`].
+pub(crate) fn normalize_friend_overrides(
+    overrides: std::collections::BTreeMap<String, crate::types::FriendOverrides>,
+) -> std::collections::BTreeMap<String, crate::types::FriendOverrides> {
+    overrides
+        .into_iter()
+        .map(|(key, value)| (key.to_ascii_lowercase(), value))
+        .filter(|(key, _)| crate::types::is_friend_override_key(key))
+        .map(|(key, value)| (key, value.normalized()))
+        .filter(|(_, value)| !value.is_empty())
+        .take(crate::types::MAX_FRIEND_OVERRIDES)
+        .collect()
+}
+
+/// Persist one change to the settings made outside the Settings page: under
+/// the save lock, before the in-memory copy moves, then handed to the network
+/// loop and announced to every open view. `change` returns false when there is
+/// nothing to save.
+pub(crate) async fn save_settings_change(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    change: impl FnOnce(&mut AppSettings) -> Result<bool, String>,
+) -> Result<AppSettings, String> {
+    let _settings_save_guard = state.settings_save_lock.lock().await;
+    let (new_settings, save_data) = {
+        let config = state.config.read().await;
+        let mut new_settings = config.settings.clone();
+        if !change(&mut new_settings)? {
+            return Ok(new_settings);
+        }
+        new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
+        let data = config.prepare_save_settings(&new_settings).map_err(|e| {
+            coded_ctx(
+                "settings_serialize_failed",
+                "Failed to serialize settings",
+                e,
+            )
+        })?;
+        (new_settings, data)
+    };
+    let (data, tmp, final_path) = save_data;
+    tokio::task::spawn_blocking(move || {
+        crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
+    })
+    .await
+    .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))?
+    .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?;
+    {
+        let mut config = state.config.write().await;
+        config.settings = new_settings.clone();
+    }
+    // Under the save lock, as `update_settings` does, so a concurrent save
+    // cannot land in the loop ahead of this one.
+    if let Err(e) = state
+        .network_tx
+        .send_timeout(
+            NetworkCommand::UpdateSettings {
+                settings: Box::new(new_settings.clone()),
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .await
+    {
+        tracing::warn!("Settings were saved, but the live network update was dropped: {e}");
+    }
+    if let Err(error) = app.emit(SETTINGS_CHANGED_EVENT, &new_settings) {
+        tracing::debug!("Could not emit the settings change: {error}");
+    }
+    Ok(new_settings)
+}
+
+/// Set one friend's exceptions to the friend settings, replacing what they
+/// had. Every field left unset follows the global setting; all of them unset
+/// removes the friend's entry.
+#[tauri::command]
+pub async fn set_friend_overrides(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    user_hash_hex: String,
+    overrides: crate::types::FriendOverrides,
+) -> Result<AppSettings, String> {
+    let key = user_hash_hex.trim().to_ascii_lowercase();
+    let mut hash = [0u8; 16];
+    if !crate::types::is_friend_override_key(&key) || hex::decode_to_slice(&key, &mut hash).is_err() {
+        return Err(coded("peers_not_friend", "That is not one of your friends"));
+    }
+    if !state.friend_hashes.read().await.contains(&hash) {
+        return Err(coded("peers_not_friend", "That is not one of your friends"));
+    }
+    let overrides = overrides.normalized();
+    let saved = save_settings_change(&app, &state, move |settings| {
+        let before = settings.friend_overrides.get(&key).cloned();
+        if overrides.is_empty() {
+            settings.friend_overrides.remove(&key);
+        } else {
+            if before.is_none()
+                && settings.friend_overrides.len() >= crate::types::MAX_FRIEND_OVERRIDES
+            {
+                return Err(coded(
+                    "settings_friend_overrides_invalid",
+                    "A friend's settings could not be saved",
+                ));
+            }
+            settings.friend_overrides.insert(key.clone(), overrides.clone());
+        }
+        Ok(settings.friend_overrides.get(&key) != before.as_ref())
+    })
+    .await?;
+    // Removed while this was saving: its own clear may have run first.
+    if !state.friend_hashes.read().await.contains(&hash) {
+        clear_friend_overrides(&app, &state, &hash).await?;
+        return Err(coded("peers_not_friend", "That is not one of your friends"));
+    }
+    Ok(saved)
+}
+
+/// Forget a removed friend's overrides, so adding them again starts from the
+/// global settings rather than from choices made about the old friendship.
+pub(crate) async fn clear_friend_overrides(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    friend: &[u8; 16],
+) -> Result<(), String> {
+    let key = hex::encode(friend);
+    save_settings_change(app, state, move |settings| Ok(settings.friend_overrides.remove(&key).is_some()))
+        .await
+        .map(|_| ())
+}
+
+/// The limits the tray and the status bar change without a trip to Settings.
+/// A field left out keeps its saved value.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuickLimitsPatch {
+    pub alt_speed_enabled: Option<bool>,
+    pub max_upload_speed: Option<u64>,
+    pub max_download_speed: Option<u64>,
+    pub alt_max_upload_speed: Option<u64>,
+    pub alt_max_download_speed: Option<u64>,
+}
+
+/// Carries the whole persisted [`AppSettings`] after a save made outside the
+/// Settings page, so open views can fold it in.
+pub const SETTINGS_CHANGED_EVENT: &str = "ember:settings-changed";
+
+/// Write `patch` into `settings`, returning whether Upload Speed Sense had to
+/// be turned off.
+///
+/// USS senses against the manual upload cap, so setting that cap to Unlimited
+/// turns it off — the same as applying Unlimited in Settings does. Refusing
+/// instead left the status bar's Unlimited button failing with an error
+/// about a feature the popover does not show.
+fn apply_quick_limits_patch(settings: &mut AppSettings, patch: &QuickLimitsPatch) -> bool {
+    if let Some(on) = patch.alt_speed_enabled {
+        settings.alt_speed_enabled = on;
+    }
+    if let Some(speed) = patch.max_upload_speed {
+        settings.max_upload_speed = speed;
+    }
+    if let Some(speed) = patch.max_download_speed {
+        settings.max_download_speed = speed;
+    }
+    if let Some(speed) = patch.alt_max_upload_speed {
+        settings.alt_max_upload_speed = speed;
+    }
+    if let Some(speed) = patch.alt_max_download_speed {
+        settings.alt_max_download_speed = speed;
+    }
+    let uss_off = settings.uss_enabled && settings.max_upload_speed == 0;
+    if uss_off {
+        settings.uss_enabled = false;
+    }
+    uss_off
+}
+
+/// Persist `patch`, put the resulting limits in force, and tell the frontend.
+pub async fn apply_quick_limits(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    patch: QuickLimitsPatch,
+) -> Result<AppSettings, String> {
+    let _settings_save_guard = state.settings_save_lock.lock().await;
+    let (new_settings, save_data, uss_turned_off) = {
+        let config = state.config.read().await;
+        let mut new_settings = config.settings.clone();
+        let uss_turned_off = apply_quick_limits_patch(&mut new_settings, &patch);
+        validate_quick_limits(&new_settings)?;
+        let limits = |s: &AppSettings| {
+            (
+                s.alt_speed_enabled,
+                s.max_upload_speed,
+                s.max_download_speed,
+                s.alt_max_upload_speed,
+                s.alt_max_download_speed,
+                s.uss_enabled,
+            )
+        };
+        if limits(&new_settings) == limits(&config.settings) {
+            return Ok(new_settings);
+        }
+        new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
+        let data = config.prepare_save_settings(&new_settings).map_err(|e| {
+            coded_ctx(
+                "settings_serialize_failed",
+                "Failed to serialize settings",
+                e,
+            )
+        })?;
+        (new_settings, data, uss_turned_off)
+    };
+    let (data, tmp, final_path) = save_data;
+    tokio::task::spawn_blocking(move || {
+        crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
+    })
+    .await
+    .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))?
+    .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?;
+    {
+        let mut config = state.config.write().await;
+        config.settings = new_settings.clone();
+    }
+    // The limits need nothing from the network loop, but USS does: its
+    // enabled flag and ping host live there, and only a settings update
+    // reaches them. Sent under the save lock, as `update_settings` does, so a
+    // concurrent save cannot land in the loop ahead of this one.
+    if uss_turned_off {
+        if let Err(e) = state
+            .network_tx
+            .send_timeout(
+                NetworkCommand::UpdateSettings {
+                    settings: Box::new(new_settings.clone()),
+                },
+                std::time::Duration::from_secs(5),
+            )
+            .await
+        {
+            tracing::warn!(
+                "Upload Speed Sense was turned off on disk, but the live network update was dropped: {e}"
+            );
+        }
+    }
+    crate::background::apply_effective_limits(app, state, &new_settings);
+    if let Err(error) = app.emit(SETTINGS_CHANGED_EVENT, &new_settings) {
+        tracing::debug!("Could not emit the settings change: {error}");
+    }
+    Ok(new_settings)
+}
+
+/// The subset of [`validate_settings`] a [`QuickLimitsPatch`] can break.
+fn validate_quick_limits(settings: &AppSettings) -> Result<(), String> {
+    let uploads = [settings.max_upload_speed, settings.alt_max_upload_speed];
+    if uploads.iter().any(|speed| *speed > MAX_CONFIGURED_SPEED_BPS) {
+        return Err(coded_ctx(
+            "settings_max_upload_speed_invalid",
+            format!("Upload speed must be 0 or at most {MAX_CONFIGURED_SPEED_BPS} B/s"),
+            MAX_CONFIGURED_SPEED_BPS,
+        ));
+    }
+    let downloads = [settings.max_download_speed, settings.alt_max_download_speed];
+    if downloads.iter().any(|speed| *speed > MAX_CONFIGURED_SPEED_BPS) {
+        return Err(coded_ctx(
+            "settings_max_download_speed_invalid",
+            format!("Download speed must be 0 or at most {MAX_CONFIGURED_SPEED_BPS} B/s"),
+            MAX_CONFIGURED_SPEED_BPS,
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_quick_limits(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    patch: QuickLimitsPatch,
+) -> Result<AppSettings, String> {
+    apply_quick_limits(&app, &state, patch).await
+}
+
 /// Official Ember project website (GitHub Pages).
 const EMBER_WEBSITE_URL: &str = "https://untaimed18.github.io/Ember-P2P/";
 
@@ -2436,6 +2831,22 @@ pub async fn open_ember_website() -> Result<(), String> {
         coded_ctx(
             "settings_open_website_failed",
             "Failed to open the Ember website",
+            e,
+        )
+    })
+}
+
+/// The project's Buy Me a Coffee page.
+const EMBER_SUPPORT_URL: &str = "https://buymeacoffee.com/emberp2p";
+
+/// Open the support page in the user's default browser. Hardcoded for the
+/// same reason as [`open_ember_website`].
+#[tauri::command]
+pub async fn open_support_page() -> Result<(), String> {
+    crate::security::filesystem::open_url_with_default_app(EMBER_SUPPORT_URL).map_err(|e| {
+        coded_ctx(
+            "settings_open_support_failed",
+            "Failed to open the support page",
             e,
         )
     })
@@ -2809,7 +3220,13 @@ pub async fn open_web_service(
             name: file_name.trim(),
             size: file_size,
         },
-    );
+    )
+    .ok_or_else(|| {
+        coded(
+            "settings_open_link_invalid",
+            "That link cannot be opened safely",
+        )
+    })?;
     let safe = validate_external_url(&filled)?;
     reject_non_public_external_host(&safe).await?;
     crate::security::filesystem::open_url_with_default_app(&safe).map_err(|e| {
@@ -3049,6 +3466,41 @@ pub async fn open_ember_share(target: String, text: String) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn friend_overrides_normalize_to_what_this_build_keeps() {
+        use crate::types::{FriendOverrides, CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB, MAX_FRIEND_OVERRIDES};
+        let chat_off = FriendOverrides {
+            chat: Some(false),
+            ..FriendOverrides::default()
+        };
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(hex::encode([1u8; 16]), chat_off.clone());
+        map.insert(hex::encode([2u8; 16]), FriendOverrides::default());
+        map.insert(hex::encode([0xABu8; 16]).to_ascii_uppercase(), chat_off.clone());
+        map.insert("not a hash".to_string(), chat_off.clone());
+        map.insert(
+            hex::encode([4u8; 16]),
+            FriendOverrides {
+                auto_accept_mb: Some(u64::MAX),
+                ..FriendOverrides::default()
+            },
+        );
+        let normalized = normalize_friend_overrides(map);
+        assert_eq!(normalized.len(), 3, "{normalized:?}");
+        assert_eq!(normalized.get(&hex::encode([1u8; 16])), Some(&chat_off));
+        assert_eq!(normalized.get(&hex::encode([0xABu8; 16])), Some(&chat_off), "lowercased, kept");
+        assert_eq!(
+            normalized[&hex::encode([4u8; 16])].auto_accept_mb,
+            Some(CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB)
+        );
+        assert_eq!(normalize_friend_overrides(normalized.clone()), normalized);
+
+        let many: std::collections::BTreeMap<_, _> = (0..MAX_FRIEND_OVERRIDES + 5)
+            .map(|i| (format!("{i:032x}"), chat_off.clone()))
+            .collect();
+        assert_eq!(normalize_friend_overrides(many).len(), MAX_FRIEND_OVERRIDES);
+    }
 
     #[test]
     fn known_met_notice_waits_for_the_frontend_and_is_taken_once() {
@@ -3592,6 +4044,38 @@ mod tests {
 
         let many: Vec<String> = (0..MAX_DOWNLOAD_CATEGORIES + 3).map(|i| format!("Cat {i}")).collect();
         assert_eq!(normalize_download_categories(&many).len(), MAX_DOWNLOAD_CATEGORIES);
+    }
+
+    #[test]
+    fn quick_unlimited_upload_turns_uss_off_instead_of_failing() {
+        let mut settings = AppSettings {
+            uss_enabled: true,
+            max_upload_speed: 512 * 1024,
+            ..AppSettings::default()
+        };
+        let patch = QuickLimitsPatch {
+            max_upload_speed: Some(0),
+            ..Default::default()
+        };
+        assert!(apply_quick_limits_patch(&mut settings, &patch));
+        assert!(!settings.uss_enabled);
+        assert!(validate_quick_limits(&settings).is_ok());
+        assert!(validate_settings(&settings).is_ok());
+
+        // A cap, or a patch that leaves the manual upload alone, keeps USS.
+        let mut capped = AppSettings {
+            uss_enabled: true,
+            max_upload_speed: 512 * 1024,
+            ..AppSettings::default()
+        };
+        let lower = QuickLimitsPatch {
+            max_upload_speed: Some(64 * 1024),
+            alt_speed_enabled: Some(true),
+            alt_max_upload_speed: Some(0),
+            ..Default::default()
+        };
+        assert!(!apply_quick_limits_patch(&mut capped, &lower));
+        assert!(capped.uss_enabled);
     }
 
     #[test]

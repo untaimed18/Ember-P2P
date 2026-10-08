@@ -982,6 +982,26 @@ pub async fn run_friend_session_over_transport(
                                                 }).await;
                                             }
                                         }
+                                        Some((super::messages::EMBER_EXT_DHT_MEET, body)) => {
+                                            // A relayed session has no address
+                                            // of the friend's own to ping.
+                                            if let (false, std::net::IpAddr::V4(peer_ip), Some((udp_port, answer))) = (
+                                                relayed,
+                                                addr.ip(),
+                                                super::messages::decode_dht_meet(body),
+                                            ) {
+                                                let _ = session_ul_event_tx.send(UploadEvent {
+                                                    transfer_id: String::new(),
+                                                    kind: UploadEventKind::EmberDhtMeet {
+                                                        ember_hash: peer_ember_hash,
+                                                        peer_ip,
+                                                        udp_port,
+                                                        answer,
+                                                        reply_tx: session_ember_session_handle.tx.clone(),
+                                                    },
+                                                }).await;
+                                            }
+                                        }
                                         Some((super::messages::EMBER_EXT_ATTACH_OFFER
                                             | super::messages::EMBER_EXT_ATTACH_REPLY
                                             | super::messages::EMBER_EXT_ATTACH_CANCEL, _)) => {
@@ -2172,7 +2192,7 @@ async fn read_packet_inner<R: AsyncReadExt + Unpin + ?Sized>(
     // Grow the buffer as bytes actually arrive rather than allocating the full
     // declared length (up to ~5 MiB) before reading. A peer that announces a
     // large packet then stalls would otherwise pin that allocation per
-    // friend-connect session (mirrors `read_packet_async` in transfer.rs).
+    // friend-connect session (mirrors `read_packet_body_ms` in multi_source.rs).
     let mut payload = Vec::new();
     let mut remaining = payload_len;
     const READ_STEP: usize = 65536;
@@ -2184,107 +2204,6 @@ async fn read_packet_inner<R: AsyncReadExt + Unpin + ?Sized>(
         remaining -= want;
     }
     Ok((protocol, opcode, payload))
-}
-
-/// Maximum time we'll wait for the peer's `OP_EMBER_HELLO` /
-/// `OP_EMBER_HELLOANSWER` after we send ours. Short enough that a
-/// vanilla eMule peer (which will never respond) doesn't add noticeable
-/// latency to friend-connect; long enough to absorb normal-internet
-/// jitter for the small handful of packets that may queue ahead of the
-/// Ember hello.
-#[allow(dead_code)]
-const EMBER_HELLO_TIMEOUT_SECS: u64 = 5;
-/// Cap on the number of unrelated packets we'll consume while looking
-/// for the peer's Ember hello. A well-behaved Ember peer sends its
-/// hello immediately after the EmuleInfo exchange, so 0–1 unrelated
-/// packets are normal (e.g. `OP_SECIDENTSTATE`); a higher count may
-/// indicate the peer is racing in unrelated traffic. Bounded so a
-/// chatty peer can't pin us in this loop.
-#[allow(dead_code)]
-const EMBER_HELLO_MAX_LOOKAHEAD: usize = 4;
-
-/// Drives a synchronous `OP_EMBER_HELLO` exchange right after the
-/// EmuleInfo round-trip. We send our hello (with our Ed25519 pubkey
-/// when available) and then read packets for up to
-/// [`EMBER_HELLO_TIMEOUT_SECS`] looking for the peer's hello. On
-/// success we populate `hello_caps.is_ember`, `.ember_hash`,
-/// `.ember_pubkey`, `.mod_version`, and `.peer_name` from the parsed
-/// payload — the only place in `friend_connect.rs` that ever sets
-/// `is_ember = true` (the public Hello / EmuleInfo handshake is kept
-/// byte-identical to vanilla eMule so anti-leecher mods don't queue-ban
-/// us, see the long comment in `messages.rs::build_emule_info`).
-///
-/// If the peer beat us to it and sent `OP_EMBER_HELLO` instead of an
-/// answer, we reply with our own `OP_EMBER_HELLOANSWER` so they also
-/// learn our pubkey in the same round-trip. Vanilla peers and older
-/// Ember peers that don't speak this opcode just hit the timeout and
-/// the handshake proceeds without `ember_pubkey` set — the downstream
-/// `is_ember` check at the call sites then bails cleanly.
-#[allow(dead_code)]
-async fn exchange_ember_hello<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    our_ember_hash: &[u8; 16],
-    our_nickname: &str,
-    our_pubkey: Option<&[u8; 32]>,
-    hello_caps: &mut PeerCapabilities,
-    addr: SocketAddr,
-) -> std::io::Result<()>
-where
-    R: AsyncReadExt + Unpin + ?Sized,
-    W: AsyncWriteExt + Unpin + ?Sized,
-{
-    let payload = build_ember_hello(our_ember_hash, our_nickname, our_pubkey);
-    write_packet(writer, OP_EMULEPROT, OP_EMBER_HELLO, &payload).await?;
-
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(EMBER_HELLO_TIMEOUT_SECS);
-    for _ in 0..EMBER_HELLO_MAX_LOOKAHEAD {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match tokio::time::timeout(remaining, read_packet_inner(reader)).await {
-            Ok(Ok((proto, opcode, packet_payload))) => {
-                if proto == OP_EMULEPROT
-                    && (opcode == OP_EMBER_HELLO || opcode == OP_EMBER_HELLOANSWER)
-                {
-                    if let Some(ident) = parse_ember_hello(&packet_payload) {
-                        hello_caps.is_ember = true;
-                        if !ident.mod_version.is_empty() {
-                            hello_caps.mod_version = ident.mod_version;
-                        }
-                        if !ident.nickname.is_empty() {
-                            hello_caps.peer_name = ident.nickname;
-                        }
-                        if ident.ember_hash != [0u8; 16] {
-                            hello_caps.ember_hash = Some(ident.ember_hash);
-                        }
-                        if let Some(pk) = ident.ed25519_pubkey {
-                            hello_caps.ember_pubkey = Some(pk);
-                        }
-                        if opcode == OP_EMBER_HELLO {
-                            let answer =
-                                build_ember_hello(our_ember_hash, our_nickname, our_pubkey);
-                            let _ =
-                                write_packet(writer, OP_EMULEPROT, OP_EMBER_HELLOANSWER, &answer)
-                                    .await;
-                        }
-                    }
-                    return Ok(());
-                }
-                debug!(
-                    "friend_connect {addr}: skipping proto=0x{proto:02X} op=0x{opcode:02X} while waiting for OP_EMBER_HELLO"
-                );
-            }
-            // Timeout or read error → peer is vanilla eMule, an older
-            // Ember release, or the connection died. Either way the
-            // caller will surface the actual failure mode (auth skipped
-            // or `is_ember` bail).
-            _ => return Ok(()),
-        }
-    }
-    Ok(())
 }
 
 /// Maximum unrelated packets we'll skip while looking for a

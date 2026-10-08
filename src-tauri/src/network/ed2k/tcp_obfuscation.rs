@@ -84,8 +84,10 @@ pub enum NegotiationResult {
     },
 }
 
-/// Negotiate an incoming TCP connection. Reads the first byte to determine
-/// if the connection is plain text or obfuscated.
+/// Negotiate an incoming TCP connection whose first byte the caller has
+/// already read. The upload listener inspects it to detect Ember's private v2
+/// preamble without changing the byte sequence fed to the standard eMule
+/// plain/RC4 negotiator when the discriminator is absent.
 ///
 /// - Plain: returns `NegotiationResult::Plain` with the first byte (the caller
 ///   must prepend it when parsing the first packet).
@@ -95,25 +97,6 @@ pub enum NegotiationResult {
 /// If `send_response` is false, the receive side of the handshake is verified
 /// but no response is sent. This is used for server port test probes where
 /// the server's simple test code doesn't expect a response.
-#[allow(dead_code)]
-pub async fn negotiate_incoming<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    user_hash: &[u8; 16],
-    send_response: bool,
-) -> io::Result<NegotiationResult>
-where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
-    let first_byte = reader.read_u8().await?;
-    negotiate_incoming_with_first_byte(reader, writer, user_hash, send_response, first_byte).await
-}
-
-/// Continue incoming obfuscation negotiation after a caller has inspected the
-/// first byte.  The upload listener uses this to detect Ember's private v2
-/// preamble without changing the byte sequence fed to the standard eMule
-/// plain/RC4 negotiator when the discriminator is absent.
 pub async fn negotiate_incoming_with_first_byte<R, W>(
     reader: &mut R,
     writer: &mut W,

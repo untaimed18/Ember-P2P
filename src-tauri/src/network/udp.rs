@@ -4,6 +4,7 @@
 //! way `command.rs` does.
 
 use super::*;
+use super::kad::search::SEARCH_RESULT_PAGE_SIZE;
 
 /// Serveable-parts bitmaps for downloads answering UDP reasks without a live
 /// tracker (paused or queued), keyed by transfer id. Filled from the live
@@ -1194,10 +1195,14 @@ pub(super) async fn handle_udp_packet_inner(
         }
     }
 
-    // eMule SetAlive: refresh the sender in the routing table on every valid message
-    if let std::net::IpAddr::V4(ipv4) = from.ip() {
-        state.routing_table.touch_contact_by_addr(ipv4, from.port());
-    }
+    // No refresh here by source address. eMule's SetAlive runs only on
+    // `CRoutingZone::Add`'s update path, keyed by the sender's KadID and
+    // behind the UDP-key check, which the Hello and BootstrapRes handlers
+    // below reach through `insert`. Refreshing whatever contact sat at this
+    // IP:port let spoofed packets revive dead contacts, and kept a departed
+    // node alive for ever once a different node took its address: the
+    // newcomer's own HelloRes refreshed the old entry, and the per-IP limit
+    // then kept the newcomer out.
 
     match msg {
         KadMessage::BootstrapReq => {
@@ -1266,14 +1271,18 @@ pub(super) async fn handle_udp_packet_inner(
             // handshake / UDP-key (or legacy challenge) path can promote
             // them. Remaining contacts wait to be verified lazily.
             let mut hello_addrs: Vec<(SocketAddr, KadId, u8)> = Vec::new();
-            for (i, c) in contacts.into_iter().enumerate() {
+            for (i, c) in contacts
+                .into_iter()
+                .filter(|c| c.udp_port != 0)
+                .enumerate()
+            {
                 let addr = SocketAddr::new(c.ip.into(), c.udp_port);
                 let id = c.id;
                 let ver = c.version;
                 if i < 8 {
                     hello_addrs.push((addr, id, ver));
                 }
-                state.routing_table.insert(c);
+                state.routing_table.insert_if_new(c);
             }
 
             // Hello the bootstrap node itself, then the first returned contacts.
@@ -1352,7 +1361,7 @@ pub(super) async fn handle_udp_packet_inner(
 
             // eMule: first FindNode(self) only after MIN2S(3) from KAD start (not on first packet).
             const SELF_LOOKUP_FIRST_DELAY_SECS: i64 = 3 * 60;
-            let now_ts = chrono::Utc::now().timestamp();
+            let now_ts = crate::network::monotonic_secs();
             if !state.self_lookup_done
                 && table_size >= 2
                 && now_ts >= state.kad_started_at + SELF_LOOKUP_FIRST_DELAY_SECS
@@ -1407,6 +1416,8 @@ pub(super) async fn handle_udp_packet_inner(
                 .iter()
                 .find(|t| matches!(&t.name, TagName::Id(TAG_SOURCEUPORT)))
                 .and_then(|t| t.uint16_value())
+                // eMule ignores a zero tag and keeps the datagram's port.
+                .filter(|&port| port != 0)
                 .unwrap_or(from.port());
 
             let now = chrono::Utc::now().timestamp();
@@ -1554,6 +1565,8 @@ pub(super) async fn handle_udp_packet_inner(
                 .iter()
                 .find(|t| matches!(&t.name, TagName::Id(TAG_SOURCEUPORT)))
                 .and_then(|t| t.uint16_value())
+                // eMule ignores a zero tag and keeps the datagram's port.
+                .filter(|&port| port != 0)
                 .unwrap_or(from.port());
             if !peer_udp_firewalled {
                 state.routing_table.insert(KadContact {
@@ -1899,6 +1912,10 @@ pub(super) async fn handle_udp_packet_inner(
                             if !c.is_kad2() {
                                 return false;
                             }
+                            // eMule `IsGoodIPPort`: nothing listens on port 0.
+                            if c.udp_port == 0 {
+                                return false;
+                            }
                             // eMule: reject DNS port 53 for old versions
                             if c.udp_port == 53 && c.version <= KADEMLIA_VERSION5_48A {
                                 return false;
@@ -2013,7 +2030,7 @@ pub(super) async fn handle_udp_packet_inner(
                         }
                     } else {
                         for c in &safe_contacts {
-                            state.routing_table.insert(c.clone());
+                            state.routing_table.insert_if_new(c.clone());
                         }
                     }
                 }
@@ -2366,7 +2383,7 @@ pub(super) async fn handle_udp_packet_inner(
             }
             if load >= 100 {
                 if let std::net::IpAddr::V4(ipv4) = from.ip() {
-                    let now = chrono::Utc::now().timestamp();
+                    let now = crate::network::monotonic_secs();
                     state.overloaded_nodes.insert(ipv4, now);
                     info!("Node {from} reported full load, will avoid publishing to it for 10 min");
                 }
@@ -2504,7 +2521,7 @@ pub(super) async fn handle_udp_packet_inner(
             let start = (start_position & 0x7FFF) as usize;
             let page = state
                 .dht_store
-                .search_keywords_page(&target, start, 200, |_, tags| {
+                .search_keywords_page(&target, start, SEARCH_RESULT_PAGE_SIZE, |_, tags| {
                     search_expr
                         .as_ref()
                         .is_none_or(|expr| matches_search_expr_for_tags(expr, tags))
@@ -2533,7 +2550,7 @@ pub(super) async fn handle_udp_packet_inner(
             let start = (start_position & 0x7FFF) as usize;
             let page = state
                 .dht_store
-                .search_sources_page(&target, start, 200, |_, tags| {
+                .search_sources_page(&target, start, SEARCH_RESULT_PAGE_SIZE, |_, tags| {
                     matches_requested_file_size_tags(tags, file_size)
                 });
 

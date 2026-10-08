@@ -6,12 +6,29 @@
   import { listen } from '@tauri-apps/api/event';
   import { networkStats, serverStatus } from '$lib/stores/network';
   import { getSharedFileCount } from '$lib/api/sharing';
-  import { formatBytes, formatNumber, formatSpeed } from '$lib/utils';
+  import { formatBytes, formatNumber, formatLiveSpeed } from '$lib/utils';
   import { addToast } from '$lib/stores/toast';
   import { emberJoinTimedOut } from '$lib/stores/emberJoin';
   import { isUploadCounterPhase } from '$lib/sharedFileStats';
   import { plural } from '$lib/plural';
+  import { appSettings } from '$lib/stores/settings';
   import * as m from '$lib/paraglide/messages';
+  import SpeedLimitsPopover from './SpeedLimitsPopover.svelte';
+
+  let limitsOpen = $state(false);
+  let uploadButton = $state<HTMLButtonElement>();
+  let downloadButton = $state<HTMLButtonElement>();
+  let limitsAnchor = $state<HTMLButtonElement>();
+  const altSpeedOn = $derived($appSettings?.alt_speed_enabled === true);
+
+  function toggleLimits(from: HTMLButtonElement | undefined) {
+    if (limitsOpen && limitsAnchor === from) {
+      limitsOpen = false;
+      return;
+    }
+    limitsAnchor = from;
+    limitsOpen = true;
+  }
 
   // Count / total size of files the user is actively sharing (the `shared`
   // flag is set), which is intentionally distinct from the total number of
@@ -263,18 +280,45 @@
       is tracked on the Statistics page — these numbers intentionally differ
       from a full "network bytes" view.
     -->
-    <!-- Buttons like the network dots: "why is it slow?" is answered on
-         Transfers, so the rates go there. -->
-    <button type="button" class="status-label status-item upload" title={m.statusbar_upload_title()} onclick={() => openPage('/transfers')}>
+    <!-- The rates open the speed limits: "it's too slow / it's eating my
+         connection" is answered by changing a cap. -->
+    {#if altSpeedOn}
+      <span class="alt-speed-badge" title={m.statusbar_alt_speed_on()}>
+        <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M2.5 11.5h9.5a2 2 0 0 0 2-2V8.5" />
+          <path d="M4 11.5V9a4 4 0 0 1 8 0v2.5" />
+          <circle cx="13.5" cy="7" r="1" />
+        </svg>
+        <span class="sr-only">{m.statusbar_alt_speed_on()}</span>
+      </span>
+    {/if}
+    <button
+      bind:this={uploadButton}
+      type="button"
+      class="status-label status-item upload"
+      title={m.statusbar_upload_title()}
+      aria-haspopup="dialog"
+      aria-expanded={limitsOpen && limitsAnchor === uploadButton}
+      onclick={() => toggleLimits(uploadButton)}
+    >
       <span aria-hidden="true">↑</span>
       <span class="sr-only">{m.statusbar_upload_sr()}</span>
-      {formatSpeed($networkStats.upload_speed)}
+      {formatLiveSpeed($networkStats.upload_speed)}
     </button>
-    <button type="button" class="status-label status-item download" title={m.statusbar_download_title()} onclick={() => openPage('/transfers')}>
+    <button
+      bind:this={downloadButton}
+      type="button"
+      class="status-label status-item download"
+      title={m.statusbar_download_title()}
+      aria-haspopup="dialog"
+      aria-expanded={limitsOpen && limitsAnchor === downloadButton}
+      onclick={() => toggleLimits(downloadButton)}
+    >
       <span aria-hidden="true">↓</span>
       <span class="sr-only">{m.statusbar_download_sr()}</span>
-      {formatSpeed($networkStats.download_speed)}
+      {formatLiveSpeed($networkStats.download_speed)}
     </button>
+    <SpeedLimitsPopover bind:open={limitsOpen} anchor={limitsAnchor} />
     <span class="status-item muted status-totals" role="img" title={m.statusbar_total_transferred({ up: formatBytes($networkStats.total_uploaded), down: formatBytes($networkStats.total_downloaded) })} aria-label={m.statusbar_total_transferred({ up: formatBytes($networkStats.total_uploaded), down: formatBytes($networkStats.total_downloaded) })}>
       <span aria-hidden="true">↑</span> {formatBytes($networkStats.total_uploaded)} / <span aria-hidden="true">↓</span> {formatBytes($networkStats.total_downloaded)}
     </span>
@@ -412,6 +456,12 @@
 
   .status-item.muted {
     color: var(--text-muted);
+  }
+
+  .alt-speed-badge {
+    display: inline-flex;
+    align-items: center;
+    color: var(--warning);
   }
 
   @keyframes status-pulse {

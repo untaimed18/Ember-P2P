@@ -3,13 +3,17 @@
   import PartsBar from '$lib/components/PartsBar.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import AddLinksDialog from '$lib/components/AddLinksDialog.svelte';
+  import { addLinksRequested, MAX_LINKS_TEXT_BYTES } from '$lib/clipboardWatch';
   import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
-  import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, setLocalCategory, IDLE_STATUSES, effectiveUploadSpeed } from '$lib/stores/transfers';
+  import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, holdDownloadRemoved, setLocalCategory, IDLE_STATUSES, effectiveUploadSpeed } from '$lib/stores/transfers';
+  import { addActionToast, removeToast, setToastMessage, toastError } from '$lib/stores/toast';
+  import { holdPendingCancel, releasePendingCancel } from '$lib/stores/pendingCancels';
+  import { finishAction, setFinishAction, type FinishAction } from '$lib/stores/finishAction';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
-    pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
-    clearCompleted, setTransferPriority, setTransferCategory, renameTransfer, setPreviewPriority,
-    pauseTransfersBatch, resumeTransfersBatch, stopTransfersBatch, cancelTransfersBatch,
+    pauseTransfer, stopTransfer, resumeTransfer, removeTransfer,
+    clearCompleted, moveTransfersInQueue, getDownloadQueueIds, setTransferPriority, setTransferCategory, renameTransfer, setPreviewPriority,
+    pauseTransfersBatch, resumeTransfersBatch, stopTransfersBatch, cancelTransfersBatch, getTransfers,
     getTransferSources, openFile, openTransferFileLocation, openDownloadsFolder, recoverArchive, startDownload,
     getUploadQueue, getKnownClients, getKnownClientCounts, getDownloadFileDetails,
   } from '$lib/api/transfers';
@@ -18,10 +22,10 @@
   import { previewFile } from '$lib/api/preview';
   import { addFriend, getFriends } from '$lib/api/friends';
   import { beginFriendsListFetch, commitFriendsList } from '$lib/stores/friends';
-  import { banPeer } from '$lib/api/kad';
+  import { banPeer, getBannedPeers, unbanPeer } from '$lib/api/kad';
   import { getPeerReputationBatch, labelForReputation, type PeerReputationInfo } from '$lib/api/reputation';
   import {
-    formatSize, formatSpeed, formatDate, formatDateWithYear, formatDurationSecs,
+    formatSize, formatLiveSpeed, formatDate, formatDateWithYear, formatDurationSecs,
     formatRemaining, formatRelativeTime, formatNumber, copyToClipboard, readFromClipboard,
   } from '$lib/utils';
   import { onMount, onDestroy, untrack } from 'svelte';
@@ -51,6 +55,7 @@
   import { isEmberBlake3Mismatch } from '$lib/emberIntegrity';
   import { uploadCapInForce, uploadScaleFactor, uploadSumBound } from '$lib/uploadSpeed';
   import { computeSegmentWindow, segmentRowOffset } from '$lib/segmentWindow';
+  import { adoptRowHeight } from '$lib/rowWindow';
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import IconX from '$lib/components/IconX.svelte';
@@ -382,6 +387,7 @@
     // is showing, so it primes its own count.
     void refreshKnownCounts();
     void refreshFriendHashes();
+    void refreshBanned();
     listen<{
       transfer_id: string; ip: string; port: number; status: string;
       queue_rank?: number; speed: number; transferred: number; client_software: string; peer_name: string;
@@ -510,8 +516,13 @@
       // Don't overwrite a prior KAD/server "found" summary with a single
       // peer timeout — failures still appear in the expanded source list.
       if (searchFoundIds.has(d.transfer_id)) return;
-      const label = d.kind === 'permanent' ? m.transfers_src_rejected() : d.kind === 'timeout' ? m.transfers_src_timed_out() : m.transfers_src_failed();
-      searchStatus.set(d.transfer_id, `${d.source} ${label}`);
+      const source = d.source;
+      const status = d.kind === 'permanent'
+        ? m.transfers_src_note_rejected({ source })
+        : d.kind === 'timeout'
+          ? m.transfers_src_note_timed_out({ source })
+          : m.transfers_src_note_failed({ source });
+      searchStatus.set(d.transfer_id, status);
       searchStatus = new Map(searchStatus);
     }).then((u) => { if (mounted) searchUnsubs.push(u); else u(); }).catch((e) => { console.error('Failed to subscribe to transfer:source-failed:', e); });
 
@@ -556,7 +567,6 @@
     userHash: '',
     name: '',
   });
-  let confirmClearCompleted = $state({ open: false, filter: '', count: 0 });
   // D27: confirmation + in-flight tracker for archive recovery, which
   // can take noticeable time for large partials and isn't reversible.
   let confirmRecover: { open: boolean; id: string; name: string } = $state({ open: false, id: '', name: '' });
@@ -1365,6 +1375,38 @@
     }
   }
 
+  // Manual bans, keyed by lowercase user hash to the id the ban was stored
+  // under, which is what an unban has to name. The Trust badge cannot stand in
+  // for this: its reputation mirror of a manual ban expires, the ban does not.
+  let bannedIds = $state<Map<string, string>>(new Map());
+  async function refreshBanned() {
+    try {
+      const peers = await getBannedPeers();
+      if (!mounted) return;
+      bannedIds = new Map(peers.map((p) => [p.user_hash.toLowerCase(), p.user_hash]));
+    } catch (e) {
+      // Non-fatal: without the list every peer just offers Ban.
+      console.warn('Failed to load banned peers:', e);
+    }
+  }
+  function bannedIdOf(userHash: string | null | undefined): string | undefined {
+    return userHash ? bannedIds.get(userHash.toLowerCase()) : undefined;
+  }
+  async function unbanUser(userHash: string, name: string) {
+    const id = bannedIdOf(userHash);
+    if (!id) return;
+    await unbanPeer(id);
+    const next = new Map(bannedIds);
+    next.delete(userHash.toLowerCase());
+    bannedIds = next;
+    // Same invalidation as a ban, so the Trust badge drops "banned" now.
+    const reps = { ...reputationMap };
+    delete reps[userHash];
+    reputationMap = reps;
+    void refreshReputations([userHash], true);
+    showInfo(m.transfers_unbanned_user({ name }));
+  }
+
   async function refreshFriendHashes() {
     friendHashesInFlight++;
     try {
@@ -1418,7 +1460,7 @@
   // only those near the viewport are mounted. The whole ledger is reachable;
   // it used to stop at its first 1,000 rows.
   let bottomPaneEl: HTMLDivElement | undefined = $state(undefined);
-  const queueWindow = new TableWindow(() => sortedUploadQueueClients.length, {
+  const queueWindow = new TableWindow(() => filteredUploadQueueClients.length, {
     minRows: 150,
     rowHeight: 28,
     rowSelector: 'tr.queue-row',
@@ -1742,7 +1784,22 @@
     });
     return sorted;
   });
-  let windowedQueueClients = $derived(queueWindow.slice(sortedUploadQueueClients));
+  /** Matches the peer's name, user hash or IP, its client software, the file
+   *  it waits for, or its country code. */
+  let queueFilter = $state('');
+  let filteredUploadQueueClients = $derived.by(() => {
+    const q = queueFilter.trim().toLowerCase();
+    if (!q) return sortedUploadQueueClients;
+    return sortedUploadQueueClients.filter((c) =>
+      c.file_name.toLowerCase().includes(q)
+      || (c.peer_name || '').toLowerCase().includes(q)
+      || (c.user_hash || '').toLowerCase().includes(q)
+      || (c.peer_ip || '').toLowerCase().includes(q)
+      || (c.client_software || '').toLowerCase().includes(q)
+      || (c.country_code || '').toLowerCase().includes(q)
+    );
+  });
+  let windowedQueueClients = $derived(queueWindow.slice(filteredUploadQueueClients));
 
   // --- Sorting ---
   type DlSortField = 'file_name' | 'total_size' | 'transferred' | 'completed_size' | 'speed' | 'progress' | 'sources' | 'priority' | 'status' | 'remaining' | 'last_seen_complete' | 'last_received' | 'category' | 'started_at';
@@ -1973,6 +2030,40 @@
     const entry = speedHistory.get(t.id);
     if (entry && entry.ewma > 0) return entry.ewma;
     return 0;
+  }
+
+  // The Speed columns' text. The live rate is recomputed on every progress
+  // event, several times a second, and a block leaving the backend's window
+  // moves it in a visible step, so printing it directly flickered too fast to
+  // read. The text instead follows it once a second, easing towards it the way
+  // eMule's list refreshes. Sorting and time left keep reading `liveSpeed`.
+  const SHOWN_SPEED_REFRESH_MS = 1000;
+  const SHOWN_SPEED_EASING = 0.5;
+  let shownSpeeds = $state<Record<string, number>>({});
+  function refreshShownSpeeds() {
+    const next: Record<string, number> = {};
+    for (const t of $transfers) {
+      const live = liveSpeed(t);
+      if (live <= 0) continue;
+      const prev = shownSpeeds[t.id];
+      next[t.id] = prev && prev > 0 ? prev + SHOWN_SPEED_EASING * (live - prev) : live;
+    }
+    shownSpeeds = next;
+  }
+  $effect(() => {
+    // Untracked: the refresh reads the rows and writes `shownSpeeds`, so a
+    // tracked call would re-run this effect on every update instead of once.
+    untrack(refreshShownSpeeds);
+    const timer = setInterval(refreshShownSpeeds, SHOWN_SPEED_REFRESH_MS);
+    return () => clearInterval(timer);
+  });
+  /** What a Speed cell prints. A row that stopped drops to 0 at once rather
+   *  than waiting out the refresh; one that just started shows its live rate
+   *  until the next refresh picks it up. */
+  function shownSpeed(t: Transfer): number {
+    const live = liveSpeed(t);
+    if (live <= 0) return 0;
+    return shownSpeeds[t.id] ?? live;
   }
 
   /** True when every byte is on disk, including the 1-byte hold
@@ -2214,8 +2305,17 @@
 
   /** Read the geometry the window depends on. Only the DOM knows where each
    *  section starts (banners and the header sit above it) and how tall a row
-   *  and the open source block really are. */
-  function measureDownloadWindow() {
+   *  and the open source block really are.
+   *
+   *  The row height is taken only when `takeRowHeight`, which a re-measure
+   *  caused by the window itself moving does not ask for. Rows differ in
+   *  height a little (a flag in one, a badge in another), so each window
+   *  measures a slightly different height; adopting it then picked another
+   *  window, which re-measured, which picked the first again, until Svelte
+   *  stopped the loop with `effect_update_depth_exceeded` mid-scroll. The same
+   *  feedback the search results and `TableWindow` refuse with
+   *  `adoptRowHeight`. */
+  function measureDownloadWindow(takeRowHeight = true) {
     const scroller = downloadsScrollEl;
     if (!scroller) return;
     const top = scroller.getBoundingClientRect().top;
@@ -2224,9 +2324,13 @@
     if (dlCompletedTopPadEl) dlCompletedBodyTop = dlCompletedTopPadEl.getBoundingClientRect().top - top;
     const table = downloadTableEl;
     if (!table) return;
-    const sample = table.querySelector<HTMLTableRowElement>('tr.dl-row:not(.expanded)');
-    const h = sample?.getBoundingClientRect().height ?? 0;
-    if (h > 0) dlRowHeight = h;
+    if (takeRowHeight) {
+      // Averaged over every rendered row, so one unusual row moves it little.
+      const rows = table.querySelectorAll<HTMLTableRowElement>('tr.dl-row:not(.expanded)');
+      let sum = 0;
+      for (const row of rows) sum += row.getBoundingClientRect().height;
+      if (rows.length > 0) dlRowHeight = adoptRowHeight(dlRowHeight, sum / rows.length);
+    }
     if (!expandedTransferId) {
       dlExpandedExtra = 0;
       return;
@@ -2263,11 +2367,17 @@
     void expandedTransferId;
     void expandedSources;
     void loadingSources;
+    untrack(() => measureDownloadWindow());
+  });
+  // And after the window itself moves, for where the sections and the open
+  // source block now sit — but not the row height, which the window is
+  // computed from: see `measureDownloadWindow`.
+  $effect(() => {
     void dlActiveWindow.start;
     void dlActiveWindow.end;
     void dlCompletedWindow.start;
     void dlCompletedWindow.end;
-    untrack(measureDownloadWindow);
+    untrack(() => measureDownloadWindow(false));
   });
 
   $effect(() => {
@@ -2713,6 +2823,13 @@
     return isPausedState(t) || isHeldForDrive(t);
   }
 
+  /** Rows that may be waiting in the download queue. The backend has the last
+   *  word: a searching row can be running instead. */
+  function canMoveInQueue(t: Transfer): boolean {
+    return t.direction === 'download'
+      && (t.status === 'queued' || t.status === 'searching' || t.status === 'paused' || t.status === 'stopped');
+  }
+
   // Not while the file is being hashed or moved: completion has already read
   // the name it will write, so a rename accepted there would leave the row
   // and the file on disk disagreeing. The backend refuses the same window.
@@ -2888,9 +3005,32 @@
     ctxPrioritySub = false;
     ctxCategorySub = false;
     ctxWebSub = false;
+    // A row outside the selection becomes the selection, as in Explorer and
+    // eMule, so the menu always acts on what is highlighted: on the whole
+    // selection when the row is part of it, on this row alone otherwise.
+    if (section !== 'upload' && !selectedDlIdSet.has(t.id)) {
+      selectedDownloadIds = [t.id];
+      lastClickedDlId = t.id;
+    }
     // Raw pointer position: `ctxMenuPosition` measures the rendered panel and
     // keeps it on screen.
     ctxMenu = { x: e.clientX, y: e.clientY, transfer: t, section };
+    ctxQueuedIds = null;
+    if (section !== 'upload') {
+      const menu = ctxMenu;
+      void getDownloadQueueIds()
+        .then((ids) => { if (ctxMenu === menu) ctxQueuedIds = new Set(ids); })
+        .catch((err: unknown) => console.warn('transfers: could not read the download queue', err));
+    }
+  }
+
+  /** The downloads waiting in the queue when the menu opened; `null` until
+   *  known. Only those can move in it: a paused row that was running keeps
+   *  its place among the running ones. */
+  let ctxQueuedIds = $state<Set<string> | null>(null);
+
+  function queueTargetsOf(rows: Transfer[], queued: Set<string> | null): Transfer[] {
+    return rows.filter((x) => (queued ? queued.has(x.id) : canMoveInQueue(x)));
   }
   function onKnownCtx(e: MouseEvent, client: KnownClient) {
     e.preventDefault();
@@ -3176,6 +3316,14 @@
           };
           return;
         }
+        case 'unban_user':
+          await unbanUser(
+            kc.user_hash,
+            (kc.ember_hash && friendNickById[kc.ember_hash.toLowerCase()])
+              || kc.peer_name
+              || kc.user_hash.slice(0, 8) + '\u2026',
+          );
+          break;
       }
     } catch (e: unknown) {
       transferError = toErrorMsg(e);
@@ -3186,31 +3334,47 @@
     // The row the menu was drawn from, which can have gained fields (an Ember
     // hash, say) since the right-click.
     const t = ctxTransfer ?? ctxMenu.transfer;
+    const targets = ctxTargets.length > 1 ? ctxTargets : [t];
+    const multi = targets.length > 1;
+    const queued = ctxQueuedIds;
     closeCtx();
     try {
       switch (action) {
-        case 'pause': await pauseTransfer(t.id); break;
-        case 'stop': await stopTransfer(t.id); break;
-        case 'resume': await resumeTransfer(t.id); break;
-        case 'cancel': confirmCancel = { open: true, id: t.id, name: t.file_name }; return;
-        // `markDownloadRemoved` before the store edit, as `removeTransfersBatch`
-        // does: a `getTransfers()` snapshot already in flight when the backend
-        // drops the row still carries it, and without the tombstone the next
-        // merge pushed the row straight back for a poll cycle.
-        case 'remove':
-          markDownloadRemoved(t.id);
-          try {
-            await removeTransfer(t.id);
-          } catch (e: unknown) {
-            clearDownloadRemoved(t.id);
-            throw e;
-          }
-          speedHistory.delete(t.id); forgetTransfer(t.id); transfers.update((list) => list.filter((x) => x.id !== t.id));
+        case 'pause':
+          if (multi) await runBatchCommand(targets.filter(canPause).map((x) => x.id), pauseTransfersBatch, m.transfers_batch_label_paused());
+          else await pauseTransfer(t.id);
           break;
+        case 'stop':
+          if (multi) await runBatchCommand(targets.filter(canStop).map((x) => x.id), stopTransfersBatch, m.transfers_batch_label_stopped());
+          else await stopTransfer(t.id);
+          break;
+        case 'resume':
+          if (multi) await runBatchCommand(targets.filter(canResume).map((x) => x.id), resumeTransfersBatch, m.transfers_batch_label_resumed());
+          else await resumeTransfer(t.id);
+          break;
+        case 'cancel': {
+          const ids = targets.filter((x) => !isFinished(x)).map((x) => x.id);
+          if (!multi) confirmCancel = { open: true, id: t.id, name: t.file_name };
+          else if (ids.length) {
+            const removeIds = targets.filter(isFinished).map((x) => x.id);
+            confirmBatchCancel = { open: true, ids, count: ids.length, removeIds, filter: '' };
+          }
+          return;
+        }
+        case 'remove': discardWithUndo([], targets.filter(isFinished).map((x) => x.id)); break;
         case 'open': await openFile(t.id); break;
         case 'open_location': await openTransferFileLocation(t.id); break;
         case 'rename': openRename(t); return;
-        case 'priority': if (extra) await setTransferPriority(t.id, extra as 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto'); break;
+        case 'priority': if (extra && PRIORITIES.includes(extra as Priority)) await setPriorityFor(targets, extra as Priority); break;
+        case 'queue_front':
+        case 'queue_back': {
+          const front = action === 'queue_front';
+          const moved = await moveTransfersInQueue(queueTargetsOf(targets, queued).map((x) => x.id), front);
+          if (moved === 0) showInfo(m.transfers_queue_none_waiting());
+          else if (front) showInfo(plural(moved, { one: m.transfers_queue_moved_front_one, other: () => m.transfers_queue_moved_front_other({ count: moved }) }));
+          else showInfo(plural(moved, { one: m.transfers_queue_moved_back_one, other: () => m.transfers_queue_moved_back_other({ count: moved }) }));
+          break;
+        }
         case 'find_sources': {
           try {
             await runFindSourcesWithStatus(t);
@@ -3240,8 +3404,9 @@
           confirmRecover = { open: true, id: t.id, name: t.file_name };
           return;
         }
-        case 'clear_completed': openClearCompletedConfirm(); return;
+        case 'clear_completed': clearCompletedWithUndo(); return;
         case 'copy_link': {
+          if (multi) { await copyDownloadLinks(targets); break; }
           const link = await formatEd2kLink(t.file_name, t.total_size, t.file_hash, t.ember_file_hash);
           // Via the helper, not `navigator.clipboard` directly: WebView2 can
           // deny the async clipboard API, and the helper falls back to execCommand.
@@ -3287,6 +3452,10 @@
           };
           return;
         }
+        case 'unban_user':
+          if (!t.user_hash) { transferError = m.transfers_no_user_hash(); break; }
+          await unbanUser(t.user_hash, t.peer_name || t.user_hash.slice(0, 8) + '\u2026');
+          break;
       }
     } catch (e: unknown) { transferError = toErrorMsg(e); }
   }
@@ -3396,7 +3565,7 @@
   // Mirrors MAX_ED2K_PASTE_BYTES on the Rust side (256 links x 1 KiB), so a
   // paste the backend would accept is never rejected here first. Backend
   // validation is still the real boundary; this is defense-in-depth + UX.
-  const MAX_PASTE_LEN = 256 * 1024;
+  const MAX_PASTE_LEN = MAX_LINKS_TEXT_BYTES;
   let pasteLinkBusy = $state(false);
 
   // Shared by the header button and the row context menu. Goes through
@@ -3474,6 +3643,19 @@
   /** The Add eD2K Links dialog: the header button opens it; Ctrl+V and the
    *  pane and row menus still paste straight from the clipboard. */
   let addLinksOpen = $state(false);
+  /** What Add links opens with instead of reading the clipboard. */
+  let addLinksText = $state<string | null>(null);
+  // The clipboard offer's "Add…", from whichever page the toast was on.
+  $effect(() => {
+    const offered = $addLinksRequested;
+    if (offered === null) return;
+    addLinksRequested.set(null);
+    addLinksText = offered;
+    addLinksOpen = true;
+  });
+  $effect(() => {
+    if (!addLinksOpen) addLinksText = null;
+  });
 
   async function queueLinksFromDialog(text: string) {
     if (pasteLinkBusy) return;
@@ -3625,60 +3807,244 @@
    *  the ack waits on. */
   const REMOVE_CONCURRENCY = 4;
 
-  /** Drop finished rows from the list. Same contract as the single-row
-   *  "Remove from List" action: the file on disk is left alone, only the
-   *  transfer record goes away, so this needs no confirmation. Rows leave
-   *  the table immediately and come back if the backend refuses. */
-  async function removeTransfersBatch(ids: string[], announceSuccess = true): Promise<void> {
-    if (!ids.length) return;
-    const idSet = new Set(ids);
-    const byId = new Map($transfers.map((t) => [t.id, t.file_name] as const));
+  async function handleBatchRemoveDownloads() {
+    discardWithUndo([], selectedBatchTransfers.filter((t) => isFinished(t)).map((t) => t.id));
+  }
+
+  /**
+   * Cancel `cancelIds` and drop `removeIds` from the list behind an Undo toast.
+   *
+   * The rows leave the table at once, but nothing is sent until the toast
+   * goes: a cancel deletes the `.part`, so it cannot be taken back once it
+   * has run. Live downloads are paused for the wait, so none can finish (or
+   * keep using bandwidth) after the user has given up on it, and Undo resumes
+   * exactly the ones this paused. Ember closing inside the window leaves them
+   * paused, which loses nothing.
+   *
+   * `clear` sends `removeIds`, all completed rows, through Clear completed:
+   * one request for the lot rather than one per row.
+   */
+  function discardWithUndo(cancelIds: string[], removeIds: string[], clear = false) {
+    const all = new Set([...cancelIds, ...removeIds]);
+    if (all.size === 0) return;
     let snapshots: Transfer[] = [];
     transfers.update((list) => {
-      snapshots = list.filter((x) => idSet.has(x.id));
-      return list.filter((x) => !idSet.has(x.id));
+      snapshots = list.filter((x) => all.has(x.id));
+      return list.filter((x) => !all.has(x.id));
     });
-    for (const id of idSet) {
-      markDownloadRemoved(id);
-      speedHistory.delete(id);
-      forgetTransfer(id);
-    }
-    selectedDownloadIds = selectedDownloadIds.filter((id) => !idSet.has(id));
-    if (lastClickedDlId && idSet.has(lastClickedDlId)) lastClickedDlId = null;
-    const failed: { id: string; name: string; error: string }[] = [];
-    // Re-marked as each call starts: the backend drops a row only then, and a
-    // large batch reaches its later rows after the 10 s tombstone set above
-    // has lapsed, so a poll put them back until their own remove landed.
-    const results = await mapSettledWithLimit(ids, REMOVE_CONCURRENCY, (id) => {
-      markDownloadRemoved(id);
-      return removeTransfer(id);
+    for (const id of all) holdDownloadRemoved(id);
+    const wasSelected = selectedDownloadIds.filter((id) => all.has(id));
+    selectedDownloadIds = selectedDownloadIds.filter((id) => !all.has(id));
+    if (lastClickedDlId && all.has(lastClickedDlId)) lastClickedDlId = null;
+
+    const byId = new Map(snapshots.map((s) => [s.id, s] as const));
+    const toPause = cancelIds.filter((id) => {
+      const row = byId.get(id);
+      return row !== undefined && canPause(row);
     });
-    results.forEach((r, i) => {
-      if (r.status === 'rejected') {
-        failed.push({ id: ids[i], name: byId.get(ids[i]) ?? '', error: toErrorMsg(r.reason) });
-      }
-    });
-    if (failed.length) {
-      const failedIds = new Set(failed.map((f) => f.id));
-      for (const id of failedIds) clearDownloadRemoved(id);
+    // Started now, awaited by both answers, so Undo cannot resume a row
+    // before its pause has landed. Held: the freed slots stay empty, so Undo
+    // finds the download running again rather than queued behind one started
+    // in its place. A failed batch may have paused some rows before it
+    // stopped, so Undo still tries them all; resuming a row that is not
+    // paused leaves it as it is.
+    const paused: Promise<string[]> = toPause.length
+      ? pauseTransfersBatch(toPause, { hold: true }).then(() => toPause, (e: unknown) => {
+          console.warn('transfers: could not pause before a deferred cancel', e);
+          return toPause;
+        })
+      : Promise.resolve([]);
+
+    /** What the toast says, for the rows still waiting on it. */
+    const discardMessage = () => {
+      const count = cancelIds.length + removeIds.length;
+      const only = count === 1 ? byId.get(cancelIds[0] ?? removeIds[0]) : undefined;
+      const name = only?.file_name ?? '';
+      return cancelIds.length > 0 && removeIds.length > 0
+        ? m.transfers_undo_discarded({ count })
+        : cancelIds.length > 0
+          ? (name ? m.transfers_undo_cancelled_one({ name }) : m.transfers_undo_cancelled_other({ count }))
+          : (name ? m.transfers_undo_removed_one({ name }) : m.transfers_undo_removed_other({ count }));
+    };
+
+    const restore = (ids: ReadonlySet<string>) => {
+      for (const id of ids) clearDownloadRemoved(id);
       transfers.update((list) => {
         const existing = new Set(list.map((x) => x.id));
         // Copies, not the snapshots themselves: the store skips merging a row
         // object it already reconciled, and these missed every poll since.
-        const toRestore = snapshots
-          .filter((s) => failedIds.has(s.id) && !existing.has(s.id))
-          .map((s) => ({ ...s }));
-        return toRestore.length ? [...list, ...toRestore] : list;
+        const back = snapshots.filter((s) => ids.has(s.id) && !existing.has(s.id)).map((s) => ({ ...s }));
+        return back.length ? [...list, ...back] : list;
       });
+    };
+
+    // Starting one of these again takes just that row back (`pendingCancels`).
+    const heldHashes = cancelIds.flatMap((id) => {
+      const hash = byId.get(id)?.file_hash;
+      return hash ? [[id, hash] as const] : [];
+    });
+    /** Rows taken back that way: no longer this toast's to restore or resume. */
+    const takenBack = new Set<string>();
+    const takeBacks = new Map<string, () => Promise<void>>();
+    const release = () => { for (const [hash, fn] of takeBacks) releasePendingCancel(hash, fn); };
+    let toastId = -1;
+    for (const [id, hash] of heldHashes) {
+      const takeBack = async () => {
+        takenBack.add(id);
+        cancelIds = cancelIds.filter((x) => x !== id);
+        restore(new Set([id]));
+        if (cancelIds.length === 0 && removeIds.length === 0) removeToast(toastId);
+        else setToastMessage(toastId, discardMessage());
+        if ((await paused).includes(id)) await resumeTransfersBatch([id]);
+      };
+      takeBacks.set(hash, takeBack);
+      holdPendingCancel(hash, takeBack);
     }
-    if (failed.length || announceSuccess) {
-      summarizeBatchResult(m.transfers_batch_label_removed(), ids.length, failed);
+
+    toastId = addActionToast(
+      'info',
+      discardMessage(),
+      {
+        label: m.common_undo(),
+        undo: true,
+        run: () => {
+          release();
+          const back = new Set([...all].filter((id) => !takenBack.has(id)));
+          restore(back);
+          // The rows that were selected are selected again.
+          selectedDownloadIds = [...new Set([...selectedDownloadIds, ...wasSelected.filter((id) => back.has(id))])];
+          void paused.then((ids) => {
+            const resume = ids.filter((id) => !takenBack.has(id));
+            if (resume.length) return resumeTransfersBatch(resume);
+          }).catch((e: unknown) => toastError(toErrorMsg(e)));
+        },
+      },
+      () => {
+        release();
+        return commitDiscard(cancelIds, removeIds, paused, restore, clear);
+      },
+    );
+  }
+
+  async function commitDiscard(
+    cancelIds: string[],
+    removeIds: string[],
+    paused: Promise<string[]>,
+    restore: (ids: ReadonlySet<string>) => void,
+    clear: boolean,
+  ) {
+    // The pause has to land before the cancel goes out behind it.
+    await paused;
+    let cancel = cancelIds;
+    let remove = removeIds;
+    // A row that could not be paused (verifying, moving into Downloads), or
+    // that "Resume all" in the tray restarted, may have finished while the
+    // toast was up, and cancelling a finished download records it in the
+    // history as cancelled. Finished rows are removed from the list instead,
+    // as the confirm dialogs already do.
+    if (cancelIds.length > 0) {
+      const pending = new Set(cancelIds);
+      try {
+        const finished = new Set(
+          (await getTransfers())
+            .filter((t) => pending.has(t.id) && (t.status === 'completed' || t.status === 'failed'))
+            .map((t) => t.id),
+        );
+        if (finished.size > 0) {
+          cancel = cancelIds.filter((id) => !finished.has(id));
+          remove = [...removeIds, ...finished];
+        }
+      } catch (e: unknown) {
+        console.warn('transfers: could not re-check rows before a deferred cancel', e);
+      }
+    }
+    for (const id of [...cancel, ...remove]) {
+      markDownloadRemoved(id);
+      speedHistory.delete(id);
+      forgetTransfer(id);
+    }
+    if (cancel.length > 0) {
+      try {
+        await cancelTransfersBatch(cancel);
+      } catch (e: unknown) {
+        restore(new Set(cancel));
+        toastError(toErrorMsg(e));
+      }
+    }
+    if (remove.length === 0) return;
+    if (!clear) {
+      // Reported by toast, not the page's banner: the toast may expire after
+      // the user has moved to another page.
+      const results = await mapSettledWithLimit(remove, REMOVE_CONCURRENCY, (id) => {
+        markDownloadRemoved(id);
+        return removeTransfer(id);
+      });
+      const failed = remove.flatMap((id, i) => {
+        const r = results[i];
+        return r.status === 'rejected' ? [{ id, error: toErrorMsg(r.reason) }] : [];
+      });
+      if (failed.length > 0) {
+        restore(new Set(failed.map((f) => f.id)));
+        const more = failed.length > 1 ? m.transfers_batch_failed_more({ count: failed.length - 1 }) : '';
+        toastError(`${failed[0].error}${more}`);
+      }
+      return;
+    }
+    try {
+      await clearCompleted(remove);
+    } catch (e: unknown) {
+      restore(new Set(remove));
+      toastError(toErrorMsg(e));
     }
   }
 
-  async function handleBatchRemoveDownloads() {
-    await removeTransfersBatch(selectedBatchTransfers.filter((t) => isFinished(t)).map((t) => t.id));
+  type Priority = 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto';
+  const PRIORITIES: Priority[] = ['verylow', 'low', 'normal', 'high', 'auto', 'release'];
+
+  /** Set one priority on every live row in `targets`. `set_transfer_priority`
+   *  has no batch form, so this runs a few at a time like Remove does. */
+  async function setPriorityFor(targets: Transfer[], prio: Priority) {
+    const live = targets.filter((t) => !isFinished(t));
+    if (live.length === 0) return;
+    if (live.length === 1) {
+      await setTransferPriority(live[0].id, prio);
+      return;
+    }
+    const results = await mapSettledWithLimit(live, REMOVE_CONCURRENCY, (t) => setTransferPriority(t.id, prio));
+    const failed: { id: string; name: string; error: string }[] = [];
+    results.forEach((r, i) => {
+      if (r.status === 'rejected') failed.push({ id: live[i].id, name: live[i].file_name, error: toErrorMsg(r.reason) });
+    });
+    summarizeBatchResult(m.transfers_batch_label_priority({ priority: priorityLabel(prio) }), live.length, failed);
   }
+
+  /** The rows a row-menu action applies to: the whole selection when the
+   *  clicked row is part of a multi-row selection, as in eMule. */
+  let ctxTargets = $derived.by((): Transfer[] => {
+    if (!ctxMenu || !ctxTransfer) return [];
+    if (ctxMenu.section === 'upload') return [ctxTransfer];
+    return categoryTargets(ctxTransfer);
+  });
+  let ctxMulti = $derived(ctxTargets.length > 1);
+
+  /** The value every target shares, or null when they differ. */
+  function sharedValue<T>(rows: Transfer[], pick: (t: Transfer) => T): T | null {
+    if (rows.length === 0) return null;
+    const first = pick(rows[0]);
+    return rows.every((t) => pick(t) === first) ? first : null;
+  }
+
+  async function applyBulkPriority(value: string) {
+    if (!PRIORITIES.includes(value as Priority)) return;
+    try {
+      await setPriorityFor(selectedBatchTransfers, value as Priority);
+    } catch (e: unknown) {
+      transferError = toErrorMsg(e);
+    }
+  }
+  let selectedLiveCount = $derived(selectedBatchTransfers.length - selectedFinishedCount);
+
+  let finishChoice = $derived<FinishAction>($finishAction?.action ?? 'none');
 
   let confirmBatchCancel = $state({
     open: false,
@@ -3715,13 +4081,24 @@
     return pool.filter((t) => t.status === 'completed');
   }
 
-  function openClearCompletedConfirm() {
-    const targets = clearCompletedTargets();
-    confirmClearCompleted = {
-      open: true,
-      filter: narrowLabel,
-      count: targets.length,
-    };
+  /** For a picker that acts on `change`. On a closed `<select>`, arrow keys and
+   *  type-ahead change the value and fire `change` at each step, so every
+   *  option passed on the way would be applied. Alt+↓, F4 and Space still
+   *  open the list, where the keys move without applying. */
+  /** Where the last pointer press landed, for telling a clicked checkbox from
+   *  one reached with Tab. */
+  let lastPointerTarget: EventTarget | null = null;
+
+  function holdClosedSelectKeys(e: KeyboardEvent) {
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+    const moves = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'];
+    if (moves.includes(e.key) || (e.key.length === 1 && e.key !== ' ')) e.preventDefault();
+  }
+
+  /** No confirmation: the rows can be had back from the Undo toast, and
+   *  clearing only takes them off the list. */
+  function clearCompletedWithUndo() {
+    discardWithUndo([], clearCompletedTargets().map((t) => t.id), true);
   }
 
   async function handleStopAll() {
@@ -3776,14 +4153,6 @@
       one: m.transfers_confirm_batch_cancel_one,
       few: () => m.transfers_confirm_batch_cancel_few({ count }),
       other: () => m.transfers_confirm_batch_cancel_other({ count }),
-    });
-  }
-
-  function clearCompletedFilteredMessage(count: number, filter: string): string {
-    return plural(count, {
-      one: () => m.transfers_confirm_clear_completed_filtered_one({ filter }),
-      few: () => m.transfers_confirm_clear_completed_filtered_few({ count, filter }),
-      other: () => m.transfers_confirm_clear_completed_filtered_other({ count, filter }),
     });
   }
 
@@ -4662,7 +5031,8 @@
   });
 </script>
 
-<svelte:document onclick={onDocClick} onkeydown={(e) => {
+<svelte:document onclick={onDocClick} onpointerdowncapture={(e) => (lastPointerTarget = e.target)} onkeydown={(e) => {
+  if (e.key === 'Tab') lastPointerTarget = null;
   if (e.key === 'Escape') {
     // The dialog handles its own Escape and stops it there; this is the
     // fallback for when focus has somehow ended up outside it, and it comes
@@ -4684,6 +5054,13 @@
         transferFilter = '';
         e.preventDefault();
         e.stopPropagation();
+      } else if (e.target instanceof HTMLInputElement && e.target.closest('.queue-search')) {
+        // Ahead of `.known-search`, which the queue filter's label also carries.
+        if (queueFilter) {
+          queueFilter = '';
+          e.preventDefault();
+          e.stopPropagation();
+        }
       } else if (e.target instanceof HTMLInputElement && e.target.closest('.known-search') && knownFilter) {
         knownFilter = '';
         e.preventDefault();
@@ -4699,8 +5076,13 @@
   // in a text input and no dialogs are open, so we don't disrupt the
   // filter box or confirm dialogs.
   const target = e.target as HTMLElement | null;
-  const inEditable = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
-  if (inEditable || ctxMenu || paneCtxMenu || knownCtxMenu || columnMenu || uploadsPaneCtxMenu || confirmCancel.open || confirmBan.open || confirmClearCompleted.open || confirmBatchCancel.open || confirmRecover.open || renameDialog.open) return;
+  // A row checkbox is not a text field: after ticking rows the list's keys
+  // must still work.
+  const inEditable = target && (
+    (target instanceof HTMLInputElement && !['checkbox', 'radio', 'button'].includes(target.type))
+    || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable
+  );
+  if (inEditable || ctxMenu || paneCtxMenu || knownCtxMenu || columnMenu || uploadsPaneCtxMenu || confirmCancel.open || confirmBan.open || confirmBatchCancel.open || confirmRecover.open || renameDialog.open) return;
   // A dialog owned elsewhere (the shortcut sheet, a settings modal) or the
   // chat dock has the keyboard; File Details is this page's own and keeps F2.
   if (target?.closest('.chat-dock')) return;
@@ -4725,14 +5107,57 @@
     return;
   }
   if (filteredSelectableDownloads.length === 0) return;
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && isShortcutLetter(e, 'a')) {
+    e.preventDefault();
+    selectedDownloadIds = filteredSelectableDownloads.map((t) => t.id);
+    lastClickedDlId = selectedDownloadIds[0] ?? null;
+    return;
+  }
+  // Space pauses the selection, or resumes it when nothing in it is running —
+  // one key for the toggle, as in most download managers.
+  if (e.key === ' ' && !e.ctrlKey && !e.metaKey && !e.altKey && selectedBatchTransfers.length > 0) {
+    if (target?.closest('button, a[href], summary, select, [role="button"], [role="menuitem"], [role="tab"]')) return;
+    // A checkbox reached with the keyboard keeps Space for ticking; one just
+    // clicked does not, or Space would untick the row the user meant to
+    // pause. Told apart by the last pointer press rather than
+    // `:focus-visible`, which Chromium may grant on the key press itself.
+    if (target instanceof HTMLInputElement && target !== lastPointerTarget) return;
+    e.preventDefault();
+    // Held down, it would flip pause and resume as each status lands.
+    if (e.repeat) return;
+    if (selectedPausableCount > 0) void handleBatchPauseDownloads();
+    else if (selectedResumableCount > 0) void handleBatchResumeDownloads();
+    return;
+  }
   const currentId = selectedDownloadIds[selectedDownloadIds.length - 1];
   const idx = currentId ? filteredSelectableDownloads.findIndex((t) => t.id === currentId) : -1;
-  if (e.key === 'ArrowDown') {
-    const next = filteredSelectableDownloads[Math.min(filteredSelectableDownloads.length - 1, idx + 1)];
-    if (next) { selectedDownloadIds = [next.id]; lastClickedDlId = next.id; e.preventDefault(); revealDownloadRow(next.id); }
-  } else if (e.key === 'ArrowUp') {
-    const next = filteredSelectableDownloads[Math.max(0, idx < 0 ? 0 : idx - 1)];
-    if (next) { selectedDownloadIds = [next.id]; lastClickedDlId = next.id; e.preventDefault(); revealDownloadRow(next.id); }
+  const lastIdx = filteredSelectableDownloads.length - 1;
+  let nextIdx: number | null = null;
+  if (e.key === 'ArrowDown') nextIdx = Math.min(lastIdx, idx + 1);
+  else if (e.key === 'ArrowUp') nextIdx = Math.max(0, idx < 0 ? 0 : idx - 1);
+  else if (e.key === 'Home' && !e.ctrlKey && !e.metaKey) nextIdx = 0;
+  else if (e.key === 'End' && !e.ctrlKey && !e.metaKey) nextIdx = lastIdx;
+  if (nextIdx !== null) {
+    const next = filteredSelectableDownloads[nextIdx];
+    if (!next) return;
+    e.preventDefault();
+    if (e.shiftKey) {
+      // Extend from the anchor, the row last clicked, to the new row; the
+      // new row goes last so the next Shift+arrow moves on from it.
+      let anchorIdx = resolveLastClickedDlIndex();
+      if (anchorIdx < 0) {
+        anchorIdx = idx < 0 ? nextIdx : idx;
+        lastClickedDlId = filteredSelectableDownloads[anchorIdx].id;
+      }
+      const lo = Math.min(anchorIdx, nextIdx);
+      const hi = Math.max(anchorIdx, nextIdx);
+      const range = filteredSelectableDownloads.slice(lo, hi + 1).map((t) => t.id).filter((id) => id !== next.id);
+      selectedDownloadIds = [...range, next.id];
+    } else {
+      selectedDownloadIds = [next.id];
+      lastClickedDlId = next.id;
+    }
+    revealDownloadRow(next.id);
   } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedDownloadIds.length > 0) {
     e.preventDefault();
     const cancelIds = selectedBatchTransfers.filter((t) => !isFinished(t)).map((t) => t.id);
@@ -4740,7 +5165,7 @@
     if (cancelIds.length === 0) {
       // Nothing live in the selection, so this is the Remove action —
       // which the footer button also performs without a prompt.
-      void removeTransfersBatch(removeIds);
+      discardWithUndo([], removeIds);
       return;
     }
     // Match the explicit UI control: prompt, don't just vaporize rows.
@@ -4770,7 +5195,7 @@
   </div>
 </div>
 
-<AddLinksDialog bind:open={addLinksOpen} busy={pasteLinkBusy} maxLength={MAX_PASTE_LEN} onsubmit={queueLinksFromDialog} />
+<AddLinksDialog bind:open={addLinksOpen} initialText={addLinksText} busy={pasteLinkBusy} maxLength={MAX_PASTE_LEN} onsubmit={queueLinksFromDialog} />
 <CategoriesDialog
   bind:open={categoriesDialog.open}
   categories={userCategories}
@@ -4850,6 +5275,36 @@
     <div class="pane-toolbar">
       <span class="pane-title">{m.transfers_downloading_count({ shown: filteredActiveDownloads.length, total: activeDownloads.length })}</span>
       <div class="toolbar-actions">
+        <label
+          class="finish-action"
+          class:armed={finishChoice !== 'none'}
+          title={$finishAction?.waitingForDownloads ? m.transfers_finish_action_waiting() : m.transfers_finish_action_title()}
+        >
+          <span>{m.transfers_finish_action_label()}</span>
+          <select
+            class="tb-btn tb-select"
+            value={finishChoice}
+            onkeydown={holdClosedSelectKeys}
+            onchange={(e) => {
+              const select = e.currentTarget;
+              setFinishAction(select.value as FinishAction).then(() => {
+                // Said once, out loud: otherwise only the tooltip explains
+                // why choosing it with nothing downloading does nothing yet.
+                if ($finishAction?.waitingForDownloads) showInfo(m.transfers_finish_action_waiting());
+              }, (err: unknown) => {
+                select.value = finishChoice;
+                transferError = toErrorMsg(err);
+              });
+            }}
+          >
+            <option value="none">{m.transfers_finish_action_none()}</option>
+            <option value="exit">{m.transfers_finish_action_exit()}</option>
+            {#if $finishAction?.sleepSupported}
+              <option value="sleep">{m.transfers_finish_action_sleep()}</option>
+            {/if}
+          </select>
+        </label>
+        <span class="toolbar-sep"></span>
         <button class="tb-btn tb-toggle" onclick={toggleAdvancedDlCols} title={m.transfers_toggle_cols_title()}>
           {showAdvancedDlCols ? m.transfers_toggle_compact() : m.transfers_toggle_full()}
         </button>
@@ -4864,7 +5319,7 @@
               <button type="button" role="menuitem" class="menu-danger" onclick={(e) => { handleCancelAll(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_cancel_all()}</button>
             {/if}
             {#if clearCompletedTargets().length > 0}
-              <button type="button" role="menuitem" onclick={(e) => { openClearCompletedConfirm(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_clear_completed()}</button>
+              <button type="button" role="menuitem" onclick={(e) => { clearCompletedWithUndo(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_clear_completed()}</button>
             {/if}
           </div>
         </details>
@@ -4960,8 +5415,8 @@
                 {:else if column.key === 'completed_size'}
                   <td class="num-cell">{formatSize(t.completed_size ?? t.transferred)}</td>
                 {:else if column.key === 'speed'}
-                  {@const spd = liveSpeed(t)}
-                  <td class="num-cell">{spd > 0 ? formatSpeed(spd) : '\u2014'}</td>
+                  {@const spd = shownSpeed(t)}
+                  <td class="num-cell">{spd > 0 ? formatLiveSpeed(spd) : '\u2014'}</td>
                 {:else if column.key === 'progress'}
                   <td class="progress-cell">
                     {#if t.status === 'searching' && t.sources === 0 && t.progress === 0}
@@ -5103,7 +5558,7 @@
                           <span class="source-tag" title={m.transfers_parts_title()}>{m.transfers_parts({ have: src.available_parts, total: src.total_parts })}</span>
                         {/if}
                         {#if src.speed > 0}
-                          <span class="source-tag source-tag-accent">{formatSpeed(src.speed)}</span>
+                          <span class="source-tag source-tag-accent">{formatLiveSpeed(src.speed)}</span>
                         {/if}
                         {#if src.transferred > 0}
                           <span class="source-tag">{formatSize(src.transferred)}</span>
@@ -5245,6 +5700,26 @@
           <button class="tb-btn" disabled={selectedPausableCount === 0} onclick={handleBatchPauseDownloads} title={m.transfers_batch_pause_title()}>{m.common_pause()}</button>
           <button class="tb-btn" disabled={selectedResumableCount === 0} onclick={handleBatchResumeDownloads} title={m.transfers_batch_resume_title()}>{m.common_resume()}</button>
           <button class="tb-btn" disabled={selectedStoppableCount === 0} onclick={handleBatchStopDownloads} title={m.transfers_batch_stop_title()}>{m.common_stop()}</button>
+          <select
+            class="tb-btn tb-select"
+            value=""
+            disabled={selectedLiveCount === 0}
+            aria-label={m.transfers_batch_priority_title()}
+            title={m.transfers_batch_priority_title()}
+            onkeydown={holdClosedSelectKeys}
+            onchange={(e) => {
+              const value = e.currentTarget.value;
+              // A prompt, not a state: it always reads "Priority", since a
+              // mixed selection has no one value to show.
+              e.currentTarget.value = '';
+              void applyBulkPriority(value);
+            }}
+          >
+            <option value="" disabled>{m.transfers_ctx_priority()}</option>
+            {#each PRIORITIES as prio}
+              <option value={prio}>{priorityLabel(prio)}</option>
+            {/each}
+          </select>
           <button class="tb-btn tb-danger" disabled={selectedCancellableCount === 0} onclick={handleBatchCancelDownloads} title={m.transfers_batch_cancel_title()}>{m.common_cancel()}</button>
           <button class="tb-btn" disabled={copyingAllDownloadLinks || linkableSelectedCount === 0} onclick={() => void copyDownloadLinks(selectedBatchTransfers)} title={m.transfers_copy_selected_links_title()}>{m.transfers_copy_links_btn()}</button>
           {#if selectedFinishedCount > 0}
@@ -5290,7 +5765,7 @@
           {/if}
           {#if isFinished(selectedTransfer)}
             {@const finishedId = selectedTransfer.id}
-            <button class="tb-btn" onclick={() => removeTransfersBatch([finishedId])} title={m.transfers_batch_remove_title()}>
+            <button class="tb-btn" onclick={() => discardWithUndo([], [finishedId])} title={m.transfers_batch_remove_title()}>
               {m.transfers_ctx_remove_from_list()}
             </button>
           {/if}
@@ -5489,8 +5964,8 @@
                   {:else if column.key === 'client_software'}
                     <td class="sw-cell" title={t.client_software || ''}><bdi dir="auto">{t.client_software || '\u2014'}</bdi></td>
                   {:else if column.key === 'speed'}
-                    {@const spd = liveSpeed(t)}
-                    <td class="num-cell">{spd > 0 ? formatSpeed(spd) : '\u2014'}</td>
+                    {@const spd = shownSpeed(t)}
+                    <td class="num-cell">{spd > 0 ? formatLiveSpeed(spd) : '\u2014'}</td>
                   {:else if column.key === 'transferred'}
                     <td class="num-cell">{formatSize(t.transferred)}</td>
                   {:else if column.key === 'total_size'}
@@ -5582,6 +6057,37 @@
              passive (no per-row context-menu actions yet — eMule's queue
              doesn't really have any either, since promotion happens by
              score). -->
+        {#if uploadQueueClients.length > 0}
+          <div class="known-toolbar" role="group" aria-label={m.transfers_queue_filter_aria()}>
+            <label class="pill-search known-search queue-search">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+                <circle cx="7" cy="7" r="4.5"/>
+                <line x1="10.5" y1="10.5" x2="14" y2="14"/>
+              </svg>
+              <input
+                type="text"
+                bind:value={queueFilter}
+                placeholder={m.transfers_queue_filter_placeholder()}
+                aria-label={m.transfers_queue_filter_aria()}
+              />
+              {#if queueFilter}
+                <button
+                  type="button"
+                  class="pill-search-clear"
+                  aria-label={m.transfers_known_clear_filter()}
+                  onclick={() => (queueFilter = '')}
+                ><IconX size={13} /></button>
+              {/if}
+            </label>
+            {#if queueFilter.trim() && filteredUploadQueueClients.length !== uploadQueueClients.length}
+              <div class="known-stats" aria-live="polite">
+                <span class="known-stat known-stat-match">
+                  {m.transfers_known_showing_label()} <strong>{filteredUploadQueueClients.length}</strong>
+                </span>
+              </div>
+            {/if}
+          </div>
+        {/if}
         <table
           class="transfer-table queue-table"
           bind:this={queueTableEl}
@@ -5692,6 +6198,17 @@
                     <p class="empty-sub">{m.transfers_loading_short()}</p>
                   </div>
                 {/if}
+              </td></tr>
+            {:else if filteredUploadQueueClients.length === 0}
+              <tr class="empty-row"><td colspan={queueColCount} class="empty-cell">
+                <div class="empty-state compact">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                    <circle cx="11" cy="11" r="8"></circle>
+                    <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                  </svg>
+                  <p class="empty-title">{m.transfers_queue_no_matches()}</p>
+                  <button class="secondary empty-action" type="button" onclick={() => (queueFilter = '')}>{m.transfers_known_clear_filter()}</button>
+                </div>
               </td></tr>
             {/if}
           </tbody>
@@ -6011,7 +6528,7 @@
                     {:else if column.key === 'file_name'}
                       <td class="name-cell" title={clientParent?.file_name || ''}><bdi dir="auto">{clientParent?.file_name || '\u2014'}</bdi></td>
                     {:else if column.key === 'speed'}
-                      <td class="num-cell">{src.status === 'transferring' ? formatSpeed(src.speed) : '\u2014'}</td>
+                      <td class="num-cell">{src.status === 'transferring' ? formatLiveSpeed(src.speed) : '\u2014'}</td>
                     {:else if column.key === 'downloaded'}
                       <td class="num-cell">{src.transferred > 0 ? formatSize(src.transferred) : '\u2014'}</td>
                     {:else if column.key === 'parts'}
@@ -6147,6 +6664,13 @@
      that only appears once you have already found the setting cannot tell you
      the feature exists. Uploads are left out: the question it answers is about
      a file you are trying to get, and a file you are sharing is the Library's. -->
+{#snippet queueMoveItems(rows: Transfer[])}
+  {@const none = ctxQueuedIds !== null && queueTargetsOf(rows, ctxQueuedIds).length === 0}
+  {@const hint = none ? m.transfers_queue_none_waiting() : m.transfers_ctx_queue_hint()}
+  <button class="ctx-item" role="menuitem" disabled={none} title={hint} onclick={() => ctxAction('queue_front')}>{m.transfers_ctx_queue_front()}</button>
+  <button class="ctx-item" role="menuitem" disabled={none} title={hint} onclick={() => ctxAction('queue_back')}>{m.transfers_ctx_queue_back()}</button>
+{/snippet}
+
 {#snippet webServicesSubmenu()}
   <div class="ctx-submenu-wrap" role="presentation">
     <button
@@ -6197,7 +6721,7 @@
     <button class="ctx-item" role="menuitem" disabled={pasteLinkBusy} onclick={() => { closePaneCtx(); void pasteLinksFromClipboard(); }}>{m.transfers_ctx_paste_link()}</button>
     <button class="ctx-item" role="menuitem" onclick={() => { closePaneCtx(); void handleOpenDownloadsFolder(); }}>{m.transfers_open_downloads_folder()}</button>
     <div class="ctx-sep" role="separator"></div>
-    <button class="ctx-item" role="menuitem" disabled={clearCompletedTargets().length === 0} onclick={() => { closePaneCtx(); openClearCompletedConfirm(); }}>{m.transfers_clear_completed()}</button>
+    <button class="ctx-item" role="menuitem" disabled={clearCompletedTargets().length === 0} onclick={() => { closePaneCtx(); clearCompletedWithUndo(); }}>{m.transfers_clear_completed()}</button>
     <button class="ctx-item ctx-danger" role="menuitem" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); handleCancelAll(); }}>{m.transfers_cancel_all()}</button>
   </div>
 {/if}
@@ -6215,9 +6739,109 @@
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
   <div class="ctx-menu" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }} onclick={(e) => e.stopPropagation()}>
     <div class="ctx-header" role="presentation">
-      <bdi dir="auto">{ctxTransfer.file_name}</bdi>
+      {#if ctxMulti}
+        {m.transfers_selected_count({ count: ctxTargets.length })}
+      {:else}
+        <bdi dir="auto">{ctxTransfer.file_name}</bdi>
+      {/if}
     </div>
-    {#if ctxMenu.section === 'active'}
+    <!-- By what the selection holds, not which row was right-clicked: a
+         selection with any live download gets the live menu either way. -->
+    {#if ctxMenu.section !== 'upload' && ctxMulti && ctxTargets.some((x) => !isFinished(x))}
+      {@const sharedPriority = sharedValue(ctxTargets.filter((x) => !isFinished(x)), (x) => x.priority)}
+      {@const sharedCategory = sharedValue(ctxTargets, (x) => x.category || 'None')}
+      {#if ctxTargets.some(canPause)}
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('pause')}>{m.common_pause()}</button>
+      {/if}
+      {#if ctxTargets.some(canStop)}
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('stop')}>{m.common_stop()}</button>
+      {/if}
+      {#if ctxTargets.some(canResume)}
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('resume')}>{m.common_resume()}</button>
+      {/if}
+      <div class="ctx-sep" role="separator"></div>
+      <div class="ctx-submenu-wrap" role="presentation">
+        <button
+          class="ctx-item ctx-sub"
+          class:ctx-sub-open={ctxPrioritySub}
+          role="menuitem"
+          aria-haspopup="menu"
+          aria-expanded={ctxPrioritySub}
+          disabled={ctxTargets.every(isFinished)}
+          onclick={() => ctxPrioritySub = !ctxPrioritySub}
+        >
+          {m.transfers_ctx_priority()}
+          {#if sharedPriority}<span class="ctx-hint">{priorityLabel(sharedPriority)}</span>{/if}
+        </button>
+        {#if ctxPrioritySub}
+          <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
+            {#each PRIORITIES as prio}
+              <button
+                class="ctx-item"
+                role="menuitemradio"
+                aria-checked={sharedPriority === prio}
+                onclick={() => ctxAction('priority', prio)}
+              >{priorityLabel(prio)}</button>
+            {/each}
+          </div>
+        {/if}
+      </div>
+      {#if ctxTargets.some(canMoveInQueue)}
+        {@render queueMoveItems(ctxTargets)}
+      {/if}
+      <div class="ctx-submenu-wrap" role="presentation">
+        <button
+          class="ctx-item ctx-sub"
+          class:ctx-sub-open={ctxCategorySub}
+          role="menuitem"
+          aria-haspopup="menu"
+          aria-expanded={ctxCategorySub}
+          onclick={() => ctxCategorySub = !ctxCategorySub}
+        >
+          {m.transfers_ctx_category()}
+          {#if sharedCategory}<span class="ctx-hint">{categoryLabel(sharedCategory)}</span>{/if}
+        </button>
+        {#if ctxCategorySub}
+          <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
+            {#each categoryOptions as cat (cat)}
+              <button
+                class="ctx-item"
+                role="menuitemradio"
+                aria-checked={sharedCategory === cat}
+                onclick={() => ctxAction('set_category', cat)}
+              >{categoryLabel(cat)}</button>
+            {/each}
+            <div class="ctx-sep" role="separator"></div>
+            <button class="ctx-item" role="menuitem" onclick={() => ctxTransfer && openNewCategory(ctxTransfer)}>{m.transfers_ctx_category_new()}</button>
+          </div>
+        {/if}
+      </div>
+      <div class="ctx-sep" role="separator"></div>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_copy_links_btn()}</button>
+      <button
+        class="ctx-item"
+        role="menuitem"
+        disabled={!relatedSearchReady}
+        title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
+        onclick={() => ctxAction('find_related_selected')}
+      >{m.search_ctx_find_related_selected({ count: ctxTargets.length })}</button>
+      <div class="ctx-sep" role="separator"></div>
+      {#if ctxTargets.some(isFinished)}
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_batch_remove({ count: ctxTargets.filter(isFinished).length })}</button>
+      {/if}
+      <button class="ctx-item ctx-danger" role="menuitem" disabled={ctxTargets.every(isFinished)} onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
+    {:else if ctxMenu.section !== 'upload' && ctxMulti}
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_copy_links_btn()}</button>
+      <button
+        class="ctx-item"
+        role="menuitem"
+        disabled={!relatedSearchReady}
+        title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
+        onclick={() => ctxAction('find_related_selected')}
+      >{m.search_ctx_find_related_selected({ count: ctxTargets.length })}</button>
+      <div class="ctx-sep" role="separator"></div>
+      <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_batch_remove({ count: ctxTargets.filter(isFinished).length })}</button>
+    {:else if ctxMenu.section === 'active'}
       {#if canPause(ctxTransfer)}
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('pause')}>{m.common_pause()}</button>
       {/if}
@@ -6275,6 +6899,9 @@
           </div>
         {/if}
       </div>
+      {#if canMoveInQueue(ctxTransfer)}
+        {@render queueMoveItems([ctxTransfer])}
+      {/if}
       <div class="ctx-submenu-wrap" role="presentation">
         <button
           class="ctx-item ctx-sub"
@@ -6315,15 +6942,6 @@
         onclick={() => ctxAction('find_related')}
       >{m.search_ctx_find_related()}</button>
       {@render webServicesSubmenu()}
-      {#if selectedDownloadCount > 1}
-        <button
-          class="ctx-item"
-          role="menuitem"
-          disabled={!relatedSearchReady}
-          title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
-          onclick={() => ctxAction('find_related_selected')}
-        >{m.search_ctx_find_related_selected({ count: selectedDownloadCount })}</button>
-      {/if}
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" disabled={clearCompletedTargets().length === 0} onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
       <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
@@ -6352,15 +6970,6 @@
         onclick={() => ctxAction('find_related')}
       >{m.search_ctx_find_related()}</button>
       {@render webServicesSubmenu()}
-      {#if selectedDownloadCount > 1}
-        <button
-          class="ctx-item"
-          role="menuitem"
-          disabled={!relatedSearchReady}
-          title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
-          onclick={() => ctxAction('find_related_selected')}
-        >{m.search_ctx_find_related_selected({ count: selectedDownloadCount })}</button>
-      {/if}
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" disabled={clearCompletedTargets().length === 0} onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
       <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_ctx_remove_from_list()}</button>
@@ -6381,7 +6990,11 @@
       >{m.search_ctx_find_related()}</button>
       {#if ctxTransfer.user_hash}
         <div class="ctx-sep" role="separator"></div>
-        <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('ban_user')}>{m.transfers_ctx_ban_user()}</button>
+        {#if bannedIdOf(ctxTransfer.user_hash)}
+          <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unban_user')}>{m.transfers_ctx_unban_user()}</button>
+        {:else}
+          <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('ban_user')}>{m.transfers_ctx_ban_user()}</button>
+        {/if}
       {/if}
     {/if}
   </div>
@@ -6418,9 +7031,15 @@
       {/if}
     {/if}
     <div class="ctx-sep" role="separator"></div>
-    <button class="ctx-item ctx-danger" role="menuitem" onclick={() => knownCtxAction('ban_user')}>
-      {m.transfers_ctx_ban_user()}
-    </button>
+    {#if bannedIdOf(knownCtxMenu.client.user_hash)}
+      <button class="ctx-item" role="menuitem" onclick={() => knownCtxAction('unban_user')}>
+        {m.transfers_ctx_unban_user()}
+      </button>
+    {:else}
+      <button class="ctx-item ctx-danger" role="menuitem" onclick={() => knownCtxAction('ban_user')}>
+        {m.transfers_ctx_ban_user()}
+      </button>
+    {/if}
   </div>
 {/if}
 
@@ -6436,29 +7055,7 @@
     // backend still cancels a finished row, recording it in the download
     // history as cancelled over its completed entry.
     if ($transfers.some((x) => x.id === id && isFinished(x))) return;
-    let snapshot: Transfer | undefined;
-    transfers.update((list) => {
-      snapshot = list.find((x) => x.id === id);
-      return list.filter((x) => x.id !== id);
-    });
-    // Drop the row immediately so a racing transfer-failed event can't
-    // paint the progress bar red before cancel finishes.
-    markDownloadRemoved(id);
-    speedHistory.delete(id);
-    forgetTransfer(id);
-    try {
-      await cancelTransfer(id);
-    } catch (e: unknown) {
-      clearDownloadRemoved(id);
-      if (snapshot) {
-        // A copy so the next poll merges it; see `removeTransfersBatch`.
-        const restore = { ...snapshot };
-        transfers.update((list) =>
-          list.some((x) => x.id === id) ? list : [...list, restore],
-        );
-      }
-      transferError = toErrorMsg(e);
-    }
+    discardWithUndo([id], []);
   }}
 />
 <ConfirmDialog
@@ -6476,34 +7073,9 @@
       delete next[confirmBan.userHash];
       reputationMap = next;
       void refreshReputations([confirmBan.userHash], true);
+      void refreshBanned();
       showInfo(m.transfers_banned_user({ name: confirmBan.name }));
     } catch (e: unknown) {
-      transferError = toErrorMsg(e);
-    }
-  }}
-/>
-
-<ConfirmDialog
-  bind:open={confirmClearCompleted.open}
-  title={m.transfers_clear_completed()}
-  message={confirmClearCompleted.filter
-    ? clearCompletedFilteredMessage(confirmClearCompleted.count, confirmClearCompleted.filter)
-    : m.transfers_confirm_clear_completed_msg()}
-  confirmLabel={m.common_clear()}
-  onconfirm={async () => {
-    let markedIds: string[] = [];
-    try {
-      if (downloadsNarrowed) {
-        await removeTransfersBatch(clearCompletedTargets().map((t) => t.id), false);
-      } else {
-        markedIds = $transfers.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id);
-        for (const id of markedIds) markDownloadRemoved(id);
-        await clearCompleted();
-        markedIds = [];
-        transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) { speedHistory.delete(id); forgetTransfer(id); } return remaining; });
-      }
-    } catch (e: unknown) {
-      for (const id of markedIds) clearDownloadRemoved(id);
       transferError = toErrorMsg(e);
     }
   }}
@@ -6543,40 +7115,19 @@
     // cancelled.
     const finishedNow = new Set($transfers.filter((x) => isFinished(x)).map((x) => x.id));
     const ids = confirmBatchCancel.ids.filter((id) => !finishedNow.has(id));
-    const idSet = new Set(ids);
     const removeIds = [
       ...confirmBatchCancel.removeIds,
       ...confirmBatchCancel.ids.filter((id) => finishedNow.has(id)),
     ];
-    let snapshots: Transfer[] = [];
-    // Optimistic remove — same rationale as single cancel above.
-    transfers.update((list) => {
-      snapshots = list.filter((x) => idSet.has(x.id));
-      return list.filter((x) => !idSet.has(x.id));
-    });
-    for (const id of idSet) {
-      markDownloadRemoved(id);
-      speedHistory.delete(id);
-      forgetTransfer(id);
-    }
+    discardWithUndo(ids, removeIds);
     selectedDownloadIds = [];
     lastClickedDlId = null;
-    try {
-      await cancelTransfersBatch(ids);
-      await removeTransfersBatch(removeIds);
-      requestAnimationFrame(() => {
-        (document.querySelector('.filter-input') as HTMLInputElement | null)?.focus();
-      });
-    } catch (e: unknown) {
-      for (const id of idSet) clearDownloadRemoved(id);
-      transfers.update((list) => {
-        const existing = new Set(list.map((x) => x.id));
-        // Copies so the next poll merges them; see `removeTransfersBatch`.
-        const toRestore = snapshots.filter((s) => !existing.has(s.id)).map((s) => ({ ...s }));
-        return toRestore.length ? [...list, ...toRestore] : list;
-      });
-      transferError = toErrorMsg(e);
-    }
+    // To the list, not the filter box: a text field there keeps Ctrl+Z for
+    // its own undo, and the Undo toast that just appeared is what the
+    // shortcut is for.
+    requestAnimationFrame(() => {
+      (selectAllDownloadsCheckbox ?? document.querySelector<HTMLInputElement>('.filter-input'))?.focus();
+    });
   }}
 />
 
@@ -7124,6 +7675,25 @@
   }
   .tb-btn-wrap .tb-btn:disabled {
     pointer-events: none;
+  }
+  .tb-btn.tb-select {
+    display: inline-block;
+    width: auto;
+    min-width: 0;
+    height: auto;
+    cursor: pointer;
+  }
+  .finish-action {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+  .finish-action.armed .tb-select {
+    border-color: var(--accent);
+    color: var(--accent);
   }
   /* A view option rather than an action: dashed until pointed at. */
   .tb-btn.tb-toggle {

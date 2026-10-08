@@ -952,6 +952,44 @@ pub fn path_matches_dir(path: &str, dir: &str) -> bool {
         || normalized_path.starts_with(&(normalized_dir.clone() + "/"))
 }
 
+/// True for a UNC share (`\\server\share`, `//server/share`, `\\?\UNC\…`) or
+/// any other `\\` or NT-namespace (`\??\`) path that does not name a local
+/// drive letter.
+///
+/// Merely resolving such a path makes Windows connect to the server over SMB
+/// and offer the user's NTLM credentials, so nothing a renderer or a link
+/// supplies may get Ember to touch one unchecked.
+pub(crate) fn is_network_path(path: &str) -> bool {
+    let normalized = path.trim().replace('/', "\\");
+    // The standard library hands `\??\` to Windows untouched, and
+    // `\??\UNC\server\share` reaches the share as surely as `\\?\UNC\` does.
+    let rest = match normalized.strip_prefix(r"\??\") {
+        Some(device) => Some(device),
+        None => normalized.strip_prefix(r"\\").map(|rest| {
+            rest.strip_prefix(r"?\")
+                .or_else(|| rest.strip_prefix(r".\"))
+                .unwrap_or(rest)
+        }),
+    };
+    let Some(device) = rest else {
+        return false;
+    };
+    // Windows collapses `..` in a `\\.\` path before resolving it, so
+    // `\\.\C:\..\UNC\server\share` climbs off the drive onto a share.
+    if device.split('\\').any(|component| component.trim() == "..") {
+        return true;
+    }
+    let names_local_drive = |device: &str| {
+        let bytes = device.as_bytes();
+        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+    };
+    // A plain `\\` path is a share whatever it names: `\\C:\x` is server "C:".
+    let is_device_path = normalized.starts_with(r"\??\")
+        || normalized.starts_with(r"\\?\")
+        || normalized.starts_with(r"\\.\");
+    !(is_device_path && names_local_drive(device))
+}
+
 /// `path` is `dir` or lies inside it, compared component by component so a
 /// drive root contains what is on it.
 ///

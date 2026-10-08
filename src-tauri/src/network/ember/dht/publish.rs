@@ -57,6 +57,16 @@ pub const CHANNEL_KIND_MODERATION: u8 = 3;
 pub const CHANNEL_KIND_HANDOFF: u8 = 4;
 pub const CHANNEL_KIND_EPOCH: u8 = 5;
 pub const CHANNEL_KIND_CLAIM: u8 = 6;
+/// The salts of the rooms an identity owns, signed by the identity; see
+/// [`channel::derive_owned_room_seed`].
+pub const CHANNEL_KIND_OWNED_ROOMS: u8 = 7;
+/// Version byte leading an owned-rooms list. A later version keeps this one's
+/// layout as its prefix and appends after it, so a build that knows only this
+/// one still reads every salt in a newer list, and storers keep it.
+const OWNED_ROOMS_VERSION: u8 = 1;
+/// Most salts one list carries. Well inside a record: an identity owns
+/// `MAX_OWNED_CHANNELS` rooms it made, and the rooms it took over.
+pub const OWNED_ROOMS_MAX: usize = 48;
 // Adding a kind here does *not* need an `EMBER_DHT_VERSION` bump, and must not
 // get one. That byte versions the frame *layout*, so that a peer handed a frame
 // it would misparse refuses it outright; bumping it partitions the transport for
@@ -356,6 +366,33 @@ fn decode_source_contact(data: &[u8], off: usize) -> Option<SourceContact> {
         }
     }
     Some(contact)
+}
+
+/// The salts an owned-rooms list carries: `version(1) || count(1) || salt*`,
+/// exactly for this version, and as the prefix of a later one, whose salts are
+/// read and whose additions are left alone.
+fn decode_owned_rooms_extra(extra: &[u8]) -> Option<Vec<channel::OwnedRoomSalt>> {
+    if extra.len() < 2 || extra[0] == 0 {
+        return None;
+    }
+    let count = extra[1] as usize;
+    let salts_end = 2 + count * 16;
+    // A later version may carry more than this one does; the record budget
+    // still bounds it.
+    let shaped = if extra[0] == OWNED_ROOMS_VERSION {
+        count <= OWNED_ROOMS_MAX && extra.len() == salts_end
+    } else {
+        extra.len() >= salts_end
+    };
+    if !shaped {
+        return None;
+    }
+    Some(
+        extra[2..salts_end]
+            .chunks_exact(16)
+            .map(|chunk| <[u8; 16]>::try_from(chunk).expect("16-byte chunk"))
+            .collect(),
+    )
 }
 
 /// Fixed-size prefix every record body carries before its file name:
@@ -862,6 +899,8 @@ pub struct ChannelModeration {
     /// Breaks ties between two snapshots stamped the same second. See
     /// [`moderation_supersedes`].
     pub signature: [u8; 64],
+    /// The room is private, as its owner signed it.
+    pub private: bool,
 }
 
 /// Whether a snapshot stamped `(timestamp, signature)` replaces the one held
@@ -1301,6 +1340,55 @@ impl SignedRecord {
         )
     }
 
+    /// The rooms `identity` owns, as the salts their seeds are derived from,
+    /// signed by the identity and filed under [`channel::owned_rooms_key`].
+    /// `None` past [`OWNED_ROOMS_MAX`], so the caller can say so rather than
+    /// publish a list the network refuses.
+    pub fn owned_rooms(salts: &[channel::OwnedRoomSalt], identity: &SigningKey) -> Option<Self> {
+        if salts.len() > OWNED_ROOMS_MAX {
+            return None;
+        }
+        let pubkey = identity.verifying_key().to_bytes();
+        let node_id = crypto::node_id_from_ed25519_bytes(&pubkey)?;
+        let mut extra = Vec::with_capacity(2 + salts.len() * 16);
+        extra.push(OWNED_ROOMS_VERSION);
+        extra.push(salts.len() as u8);
+        for salt in salts {
+            extra.extend_from_slice(salt);
+        }
+        Some(Self::build(
+            RECORD_TYPE_CHANNEL,
+            channel::owned_rooms_key(&pubkey),
+            node_id,
+            pubkey,
+            pack_channel_file_size(CHANNEL_KIND_OWNED_ROOMS, 0),
+            "",
+            None,
+            Some(extra),
+            identity,
+        ))
+    }
+
+    /// The salts in an owned-rooms list `identity_pubkey` signed, and when it
+    /// signed it.
+    pub fn parse_owned_rooms(
+        blob: &[u8],
+        identity_pubkey: &[u8; 32],
+    ) -> Option<(Vec<channel::OwnedRoomSalt>, i64)> {
+        let rec = Self::from_value_blob(blob)?;
+        if rec.record_type != RECORD_TYPE_CHANNEL
+            || rec.publisher_key != *identity_pubkey
+            || !rec.channel_store_ok()
+        {
+            return None;
+        }
+        let meta = rec.channel.as_ref()?;
+        if meta.kind != CHANNEL_KIND_OWNED_ROOMS {
+            return None;
+        }
+        Some((decode_owned_rooms_extra(&meta.extra)?, rec.timestamp))
+    }
+
     /// Parse an epoch record for `expected_channel_id`, returning the recipient
     /// it was sealed for, the epoch, and the sealed envelope.
     pub fn parse_channel_key_epoch(
@@ -1359,6 +1447,15 @@ impl SignedRecord {
         blob: &[u8],
         expected_channel_id: &[u8; 16],
     ) -> Option<([u8; 32], [u8; 32], [u8; 16], i64, bool)> {
+        Self::parse_channel_succession_claim_signed(blob, expected_channel_id).map(|(claim, _)| claim)
+    }
+
+    /// [`Self::parse_channel_succession_claim`] with the time the claimant
+    /// signed this copy at, which it chooses and renews on every republish.
+    pub fn parse_channel_succession_claim_signed(
+        blob: &[u8],
+        expected_channel_id: &[u8; 16],
+    ) -> Option<(([u8; 32], [u8; 32], [u8; 16], i64, bool), i64)> {
         let rec = Self::from_value_blob(blob)?;
         if rec.record_type != RECORD_TYPE_CHANNEL || rec.file_hash != *expected_channel_id {
             return None;
@@ -1374,11 +1471,8 @@ impl SignedRecord {
             channel::decode_claim_extra(&meta.extra)?;
         let keep = meta.flags & CHANNEL_FLAG_PRIVATE != 0;
         Some((
-            rec.publisher_key,
-            successor_pubkey,
-            successor_channel_id,
-            ts,
-            keep,
+            (rec.publisher_key, successor_pubkey, successor_channel_id, ts, keep),
+            rec.timestamp,
         ))
     }
 
@@ -1459,6 +1553,13 @@ impl SignedRecord {
                 self.publisher_key == self.ember_file_hash
                     && self.keyword_hash == channel::epoch_key(&self.file_hash, &member, epoch)
                     && channel::epoch_envelope_store_ok(envelope)
+            }
+            CHANNEL_KIND_OWNED_ROOMS => {
+                // Signed by the identity it lists rooms for, filed under the key
+                // that identity derives, and well formed.
+                self.publisher_key == self.ember_file_hash
+                    && self.keyword_hash == channel::owned_rooms_key(&self.publisher_key)
+                    && decode_owned_rooms_extra(&meta.extra).is_some()
             }
             CHANNEL_KIND_CLAIM => {
                 // Signed by the *nominee's* user key, not the room key — the
@@ -1712,6 +1813,7 @@ impl SignedRecord {
             timestamp: rec.timestamp,
             publisher_key: rec.publisher_key,
             signature: rec.signature,
+            private: meta.flags & CHANNEL_FLAG_PRIVATE != 0,
         })
     }
 
@@ -2814,29 +2916,10 @@ impl PublishManager {
         }
     }
 
-    /// Store on the closest contacts currently in `routing`: verified ones
-    /// first, with unverified leads filling any slots they leave empty (see
-    /// `RoutingTable::find_closest_prefer_verified`). Channel presence,
-    /// moderation, and handoff still use this snapshot.
-    ///
-    /// Leads stay in deliberately. On a young network they are most of the
-    /// table, and one that never answers costs a handshake and a target that
-    /// times out rather than a lost publish: nothing here parks a record for
-    /// failing, and the callers that care retry when it stored on nobody.
-    pub fn start_publish(
-        &mut self,
-        record: SignedRecord,
-        routing: &super::routing::RoutingTable,
-    ) -> Option<u32> {
-        let dht_key = EmberNodeId(record.keyword_hash);
-        let targets = routing.find_closest_prefer_verified(&dht_key, super::K_BUCKET_SIZE);
-        self.start_publish_to(record, targets)
-    }
-
     /// Start a publish onto an already-resolved target set.
     ///
-    /// Used by buddy `PROXY_STORE` and the harness so they share the same
-    /// lookup-backed replica set as library keyword/source publish, instead of
+    /// Every caller resolves the set the way library keyword/source publish
+    /// does, lookup-backed with the table's closest as fallback, instead of
     /// storing only on whoever happens to sit in this node's table.
     pub fn start_publish_to(
         &mut self,
@@ -4368,6 +4451,107 @@ mod tests {
             decoded_ok > 0,
             "the fuzz never produced a contact the decoder accepted"
         );
+    }
+
+    #[test]
+    fn an_epoch_record_in_a_later_envelope_version_is_stored_and_read_back() {
+        let room = SigningKey::from_bytes(&[0x52; 32]);
+        let room_pub = room.verifying_key().to_bytes();
+        let channel_id = channel::channel_id_from_pubkey(&room_pub);
+        let member = [0x61u8; 32];
+        let mut later = vec![0xEEu8; 200];
+        later[0] = 2;
+        let record = SignedRecord::channel_key_epoch(channel_id, room_pub, &member, 7, &later, &room);
+        assert!(record.channel_store_ok(), "a storer cannot read it, so it takes it");
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        assert_eq!(
+            SignedRecord::parse_channel_key_epoch(&blob, &channel_id),
+            Some((member, 7, later.clone())),
+            "and a member is handed it to decide whether it can open it"
+        );
+        let mut store = super::super::store::DhtStore::new();
+        assert!(store.store(record.keyword_hash, record.data.clone(), record.signature));
+
+        let bare = SignedRecord::channel_key_epoch(channel_id, room_pub, &member, 7, &[2], &room);
+        assert!(!bare.channel_store_ok(), "a version byte alone is no envelope");
+    }
+
+    fn owned_rooms_record_with_extra(identity: &SigningKey, keyword_of: &[u8; 32], extra: Vec<u8>) -> SignedRecord {
+        let pubkey = identity.verifying_key().to_bytes();
+        SignedRecord::build(
+            RECORD_TYPE_CHANNEL,
+            channel::owned_rooms_key(keyword_of),
+            crypto::node_id_from_ed25519_bytes(&pubkey).unwrap(),
+            pubkey,
+            pack_channel_file_size(CHANNEL_KIND_OWNED_ROOMS, 0),
+            "",
+            None,
+            Some(extra),
+            identity,
+        )
+    }
+
+    #[test]
+    fn an_owned_rooms_list_round_trips_and_only_its_identity_can_file_it() {
+        let identity = SigningKey::from_bytes(&[0x3C; 32]);
+        let pubkey = identity.verifying_key().to_bytes();
+        let salts: Vec<channel::OwnedRoomSalt> = (0..OWNED_ROOMS_MAX as u8).map(|i| [i; 16]).collect();
+        let record = SignedRecord::owned_rooms(&salts, &identity).expect("a full list fits");
+        assert_eq!(record.keyword_hash, channel::owned_rooms_key(&pubkey));
+        assert!(record.channel_store_ok());
+        assert!(
+            record.data.len() <= super::super::messages::MAX_STORE_RECORD_BYTES,
+            "the longest list still fits one STORE"
+        );
+        let mut store = super::super::store::DhtStore::new();
+        assert!(store.store(record.keyword_hash, record.data.clone(), record.signature));
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        let (read, signed_at) = SignedRecord::parse_owned_rooms(&blob, &pubkey).expect("parses");
+        assert_eq!(read, salts);
+        assert_eq!(signed_at, record.timestamp);
+        assert!(
+            SignedRecord::parse_owned_rooms(&blob, &[0x01; 32]).is_none(),
+            "read only as the identity it was asked for"
+        );
+
+        let empty = SignedRecord::owned_rooms(&[], &identity).unwrap();
+        assert!(empty.channel_store_ok(), "an empty list is published too");
+        assert!(SignedRecord::owned_rooms(&vec![[0u8; 16]; OWNED_ROOMS_MAX + 1], &identity).is_none());
+
+        // Filed under someone else's key: refused, so no identity can replace
+        // another's list.
+        let other = SigningKey::from_bytes(&[0x4D; 32]).verifying_key().to_bytes();
+        let mut extra = vec![OWNED_ROOMS_VERSION, 1];
+        extra.extend_from_slice(&[9u8; 16]);
+        assert!(!owned_rooms_record_with_extra(&identity, &other, extra.clone()).channel_store_ok());
+        assert!(owned_rooms_record_with_extra(&identity, &pubkey, extra.clone()).channel_store_ok());
+
+        // Miscounted, or trailing bytes this version does not have: refused.
+        let mut short = extra.clone();
+        short[1] = 2;
+        assert!(!owned_rooms_record_with_extra(&identity, &pubkey, short).channel_store_ok());
+        let mut trailing = extra.clone();
+        trailing.push(0);
+        assert!(!owned_rooms_record_with_extra(&identity, &pubkey, trailing).channel_store_ok());
+        assert!(!owned_rooms_record_with_extra(&identity, &pubkey, vec![0, 0]).channel_store_ok());
+    }
+
+    #[test]
+    fn a_later_owned_rooms_list_is_stored_and_its_salts_still_read() {
+        let identity = SigningKey::from_bytes(&[0x5E; 32]);
+        let pubkey = identity.verifying_key().to_bytes();
+        let mut extra = vec![OWNED_ROOMS_VERSION + 1, 2];
+        extra.extend_from_slice(&[1u8; 16]);
+        extra.extend_from_slice(&[2u8; 16]);
+        extra.extend_from_slice(b"what a later build adds");
+        let record = owned_rooms_record_with_extra(&identity, &pubkey, extra);
+        assert!(record.channel_store_ok());
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        let (salts, _) = SignedRecord::parse_owned_rooms(&blob, &pubkey).expect("its prefix reads");
+        assert_eq!(salts, vec![[1u8; 16], [2u8; 16]]);
     }
 
     /// The channel sub-decoders sit behind `channel_store_ok`, which is only

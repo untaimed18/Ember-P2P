@@ -1,4 +1,5 @@
 import { getLocale } from '$lib/i18n';
+import { noteOwnClipboardText } from '$lib/clipboardOwn';
 
 /**
  * Format a byte count as a human-readable string (e.g. "1.5 MB", "1,5 Mo").
@@ -37,6 +38,32 @@ export const formatSize = formatBytes;
 /** Format bytes/sec as a speed string (e.g. "1.5 MB/s", "1,5 МБ/с"). */
 export function formatSpeed(bytesPerSec: number): string {
   return `${formatBytes(bytesPerSec)}${SIZE_UNITS.perSecond}`;
+}
+
+/**
+ * [`formatSpeed`] for a rate that changes while it is on screen: always one
+ * decimal above bytes ("2.0 MB/s", not "2 MB/s"), so a right-aligned figure
+ * keeps its width as it moves instead of jumping sideways each time the
+ * decimal comes and goes.
+ */
+export function formatLiveSpeed(bytesPerSec: number): string {
+  const units = SIZE_UNITS.units;
+  if (!Number.isFinite(bytesPerSec) || bytesPerSec <= 0) {
+    return `${SIZE_FORMATTER.format(0)} ${units[0]}${SIZE_UNITS.perSecond}`;
+  }
+  let i = 0;
+  let val = bytesPerSec;
+  while (val >= 1024 && i < units.length - 1) {
+    val /= 1024;
+    i++;
+  }
+  // What would print as "1024" in this unit is shown as 1.0 of the next.
+  if (val >= (i === 0 ? 1023.5 : 1023.95) && i < units.length - 1) {
+    val /= 1024;
+    i++;
+  }
+  const number = i === 0 ? SIZE_FORMATTER.format(Math.round(val)) : FIXED_ONE_DECIMAL.format(val);
+  return `${number} ${units[i]}${SIZE_UNITS.perSecond}`;
 }
 
 /** The app language's label for 1024^`power` bytes: "KB", "Ko", "КБ". */
@@ -88,6 +115,11 @@ const SIZE_UNITS: { units: readonly string[]; perSecond: string } = ({
 } as Record<string, { units: readonly string[]; perSecond: string }>)[APP_LOCALE]
   ?? { units: ['B', 'KB', 'MB', 'GB', 'TB'], perSecond: '/s' };
 const SIZE_FORMATTER = new Intl.NumberFormat(APP_LOCALE, {
+  maximumFractionDigits: 1,
+  useGrouping: false,
+});
+const FIXED_ONE_DECIMAL = new Intl.NumberFormat(APP_LOCALE, {
+  minimumFractionDigits: 1,
   maximumFractionDigits: 1,
   useGrouping: false,
 });
@@ -303,12 +335,6 @@ export function formatRemaining(totalSize: number, transferred: number, speed: n
   return `${compactDuration(Math.round(remaining / speed))} (${remainStr})`;
 }
 
-/** Truncate a hex hash with ellipsis. */
-export function truncateHash(hash: string, len = 16): string {
-  if (hash.length <= len) return hash;
-  return `${hash.slice(0, len)}\u2026`;
-}
-
 const utf8 = new TextEncoder();
 
 /** The backend's nickname cap (`commands/settings.rs`), in UTF-8 bytes. */
@@ -417,6 +443,7 @@ export { TimeoutError, withTimeout } from './timeout';
  * without the backend command.
  */
 export async function copyToClipboard(text: string): Promise<boolean> {
+  noteOwnClipboardText(text);
   try {
     const { writeClipboardText } = await import('$lib/api/system');
     await writeClipboardText(text);

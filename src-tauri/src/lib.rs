@@ -27,6 +27,7 @@ mod background;
 mod bandwidth;
 mod commands;
 mod emule_import;
+mod finish_action;
 mod geoip;
 mod network;
 mod power;
@@ -35,15 +36,17 @@ pub mod security;
 mod session_end;
 mod sharing;
 mod storage;
+mod login_launch;
 mod tray;
 mod types;
 mod webservices;
+mod window_state;
 
 use futures::FutureExt;
 use tauri::Emitter;
 
 use std::sync::Arc;
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
 use tokio::sync::{mpsc, RwLock};
@@ -163,21 +166,67 @@ fn raise_open_file_limit() {
 
 /// The tray icon's menu, in the language the frontend last sent (`tray`).
 /// `cancel` is the silent-update countdown's "Cancel update" entry, shown above
-/// the others while the countdown runs.
+/// the others while the countdown runs. The "When downloads finish" countdown
+/// gets its own entry there too while it runs.
 pub(crate) fn build_tray_menu<R: tauri::Runtime, M: Manager<R>>(
     manager: &M,
     cancel: Option<&MenuItem<R>>,
 ) -> tauri::Result<Menu<R>> {
     let labels = tray::labels();
     let show_item = MenuItem::with_id(manager, "tray_show", &labels.show, true, None::<&str>)?;
+    let pause_item =
+        MenuItem::with_id(manager, "tray_pause_all", &labels.pause_all, true, None::<&str>)?;
+    let resume_item =
+        MenuItem::with_id(manager, "tray_resume_all", &labels.resume_all, true, None::<&str>)?;
+    let alt_speed_item = CheckMenuItem::with_id(
+        manager,
+        "tray_alt_speed",
+        &labels.alt_speed,
+        true,
+        tray::alt_speed_checked(),
+        None::<&str>,
+    )?;
     let quit_item = MenuItem::with_id(manager, "tray_quit", &labels.quit, true, None::<&str>)?;
-    match cancel {
-        Some(cancel) => {
-            let separator = PredefinedMenuItem::separator(manager)?;
-            Menu::with_items(manager, &[cancel, &separator, &show_item, &quit_item])
+    let actions_separator = PredefinedMenuItem::separator(manager)?;
+    let quit_separator = PredefinedMenuItem::separator(manager)?;
+    let ordinary: [&dyn IsMenuItem<R>; 7] = [
+        &show_item,
+        &actions_separator,
+        &pause_item,
+        &resume_item,
+        &alt_speed_item,
+        &quit_separator,
+        &quit_item,
+    ];
+    let finish_cancel = match finish_action::countdown_remaining_secs() {
+        Some((action, _)) => {
+            let label = match action {
+                finish_action::FinishAction::Sleep => &labels.cancel_sleep,
+                _ => &labels.cancel_exit,
+            };
+            Some(MenuItem::with_id(
+                manager,
+                finish_action::TRAY_CANCEL_ID,
+                label,
+                true,
+                None::<&str>,
+            )?)
         }
-        None => Menu::with_items(manager, &[&show_item, &quit_item]),
+        None => None,
+    };
+    let separator = PredefinedMenuItem::separator(manager)?;
+    let mut items: Vec<&dyn IsMenuItem<R>> = Vec::new();
+    if let Some(cancel) = cancel {
+        items.push(cancel);
     }
+    if let Some(item) = finish_cancel.as_ref() {
+        items.push(item);
+    }
+    if !items.is_empty() {
+        items.push(&separator);
+    }
+    items.extend(ordinary);
+    Menu::with_items(manager, &items)
 }
 
 async fn reconcile_shared_files(network_tx: &mpsc::Sender<network::NetworkCommand>) -> bool {
@@ -351,19 +400,19 @@ pub(crate) async fn run_graceful_shutdown(
     network::ed2k::peer_sessions::save_upload_requests(&storage::paths::resolve_data_dir());
 
     // Flush any learned spam signals not yet persisted by the periodic flush
-    // (e.g. an auto-not-spam that landed since the last tick). Wait briefly for
-    // the lock rather than the old non-blocking `try_write`, which silently
-    // skipped the save under contention. The network task has already shut down
-    // here, so the lock is normally free; the timeout is a safety net so
-    // shutdown can't hang.
+    // (e.g. an auto-not-spam that landed since the last tick). Through the save
+    // gate like every other spam-filter write: a periodic or IPC save still in
+    // flight would otherwise rename its older snapshot over this one. Bounded so
+    // a stuck writer cannot hang shutdown.
     match tokio::time::timeout_at(
         tokio::time::Instant::from_std(shutdown_deadline),
-        state.spam_filter.write(),
+        search::spam::SpamFilter::drain_saves(&state.spam_filter),
     )
     .await
     {
-        Ok(mut filter) => filter.save(),
-        Err(_) => tracing::warn!("Spam filter save skipped on shutdown: lock busy"),
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("Failed to save spam filter on shutdown: {e}"),
+        Err(_) => tracing::warn!("Spam filter save did not finish before the shutdown deadline"),
     };
 
     state.db.mark_clean_shutdown();
@@ -374,6 +423,50 @@ pub(crate) async fn run_graceful_shutdown(
 /// should exit rather than start Ember.
 pub fn run_update_watchdog_if_requested() -> bool {
     auto_update::watchdog::run_if_requested()
+}
+
+const FATAL_STARTUP_TITLE: &str = "Ember cannot start";
+
+/// Tell the user why Ember is about to exit when that happens before any
+/// window exists. Blocks until the dialog is dismissed. The text is English:
+/// the translations live in the frontend, which never loaded.
+///
+/// `setup` runs inside the event loop's first callback, on its thread, so
+/// nothing shown through that loop can appear until it returns: the dialog
+/// plugin's `blocking_show` would wait forever. `rfd`'s synchronous dialog
+/// runs a modal loop of its own on Windows and macOS.
+#[cfg(any(windows, target_os = "macos"))]
+fn show_fatal_startup_dialog(message: &str) {
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title(FATAL_STARTUP_TITLE)
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+}
+
+/// [`show_fatal_startup_dialog`] elsewhere, where `rfd`'s GTK dialog waits on
+/// the GLib main context the event loop holds, which would leave Ember running
+/// without a window and holding its instance lock. A separate dialog program
+/// has a main loop of its own; without one the log is all there is.
+#[cfg(not(any(windows, target_os = "macos")))]
+fn show_fatal_startup_dialog(message: &str) {
+    let dialogs: [(&str, Vec<&str>); 3] = [
+        (
+            "zenity",
+            vec!["--error", "--no-markup", "--title", FATAL_STARTUP_TITLE, "--text", message],
+        ),
+        ("kdialog", vec!["--error", message, "--title", FATAL_STARTUP_TITLE]),
+        ("xmessage", vec!["-center", message]),
+    ];
+    for (program, args) in dialogs {
+        match std::process::Command::new(program).args(&args).status() {
+            // 1 is the dialog closed without its button.
+            Ok(status) if matches!(status.code(), Some(0 | 1)) => return,
+            Ok(status) => tracing::debug!("{program} could not show the startup error: {status}"),
+            Err(error) => tracing::debug!("{program} could not show the startup error: {error}"),
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -690,6 +783,7 @@ pub fn run() {
             let mut restore_failed_notice = false;
             let mut restore_expired_notice = false;
             let mut restore_applied = false;
+            let mut restore_download_folder_notice = None;
             match storage::paths::ensure_data_dir_with_app(&app_handle) {
                 Ok(dir) => {
                     use commands::backup::StartupRestore;
@@ -708,8 +802,16 @@ pub fn run() {
                                 restore_failed_notice = true;
                             }
                         }
-                        Ok(StartupRestore::Applied) => restore_applied = true,
+                        Ok(StartupRestore::Applied {
+                            download_folder_replaced,
+                        }) => {
+                            restore_applied = true;
+                            restore_download_folder_notice = download_folder_replaced;
+                        }
                         Ok(StartupRestore::Expired) => restore_expired_notice = true,
+                        // The restored profile is the one in use; only the
+                        // staged copies were left behind, and are retried.
+                        Ok(StartupRestore::AlreadyApplied) => {}
                     }
                 }
                 Err(e) => tracing::error!("Failed to prepare the data dir: {e}"),
@@ -717,17 +819,32 @@ pub fn run() {
 
             let db = Arc::new(
                 Database::new(&app_handle).map_err(|e| {
-                    tracing::error!("Failed to initialize database: {e}");
+                    tracing::error!("Failed to initialize database: {e:#}");
+                    let failure = storage::database::OpenFailure::of(&e);
+                    show_fatal_startup_dialog(&failure.message(
+                        &storage::paths::resolve_data_dir_with_app(&app_handle),
+                        &e,
+                    ));
                     e
                 })?,
             );
 
+            // A database that came back from a backup, or was rebuilt, counts
+            // only the rooms made before it: the rooms this identity owns are
+            // looked for again before a number is handed out.
+            if restore_applied || db.corrupt_backup.is_some() {
+                commands::channel_recovery::owe_scan(&db);
+            }
             let mut config = AppConfig::load(&app_handle).map_err(|e| {
                 tracing::error!("Failed to load config: {e}");
                 e
             })?;
             let data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
             std::fs::create_dir_all(&data_dir)?;
+            let orphan_disposal = commands::transfers::OrphanDisposal::at_startup(
+                &data_dir,
+                restore_applied || db.corrupt_backup.is_some(),
+            );
             // Before the network task starts and before the window is shown:
             // both come back the way an update restart left them.
             auto_update::watchdog::schedule_cleanup(&data_dir);
@@ -766,14 +883,16 @@ pub fn run() {
                 emule_import::apply::pending_root_additions(&data_dir, emule_import.as_ref());
             // The backup deliberately leaves out `approved_roots.json`, whose
             // records bind folders to one machine's file identities, so the
-            // folders a restore just brought back are approved here, as the
-            // ones an eMule import names are. Left out, a restore onto a new
-            // install kept them configured but unapproved: every download
-            // refused its target and every upload its file.
+            // download folders a restore just brought back are approved here,
+            // as the ones an eMule import names are. Left out, a restore onto
+            // a new install kept them configured but unapproved, and every
+            // download refused its target. Its shared folders are not: an
+            // archive is not the user picking a folder to share, so they wait
+            // in the Library for the user to re-approve them.
             if restore_applied {
-                for root in &configured_roots {
-                    if !import_roots.contains(root) {
-                        import_roots.push(root.clone());
+                for root in settings.download_roots() {
+                    if !import_roots.contains(&root) {
+                        import_roots.push(root);
                     }
                 }
             }
@@ -996,6 +1115,7 @@ pub fn run() {
                 pending_folder_drop: Arc::new(tokio::sync::Mutex::new(None)),
                 security_policy: security_policy.clone(),
                 identity: identity.clone(),
+                launch_settings: app_state::LaunchSettings::from_settings(&settings),
                 config: Arc::new(RwLock::new(config)),
                 settings_save_lock: Arc::new(tokio::sync::Mutex::new(())),
                 restore_import_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1034,6 +1154,9 @@ pub fn run() {
                 pending_restore_expired_notice: Arc::new(std::sync::atomic::AtomicBool::new(
                     restore_expired_notice,
                 )),
+                pending_restore_download_folder_notice: Arc::new(parking_lot::Mutex::new(
+                    restore_download_folder_notice,
+                )),
                 close_behavior: Arc::new(parking_lot::RwLock::new(
                     settings.close_to_tray_behavior.clone(),
                 )),
@@ -1054,6 +1177,7 @@ pub fn run() {
             }
             background::spawn(app_handle.clone());
             auto_update::scheduler::spawn(app_handle.clone());
+            commands::channel_recovery::spawn_startup_scan(app_handle.clone());
 
             // Non-silent recovery notice: if config.json was corrupt at load,
             // tell the user (their settings were reset to defaults; the original
@@ -1145,15 +1269,50 @@ pub fn run() {
                             let _ = window.set_focus();
                         }
                     }
-                    auto_update::silent::TRAY_CANCEL_ID => auto_update::silent::postpone(),
-                    "tray_quit" => {
-                        if let Some(state) = app.try_state::<AppState>() {
-                            state
-                                .quit_confirmed
-                                .store(true, std::sync::atomic::Ordering::Release);
-                        }
-                        app.exit(0);
+                    auto_update::silent::TRAY_CANCEL_ID => {
+                        tauri::async_runtime::spawn(auto_update::silent::postpone());
                     }
+                    finish_action::TRAY_CANCEL_ID => {
+                        finish_action::cancel_finish_action(app.clone());
+                    }
+                    "tray_pause_all" | "tray_resume_all" => {
+                        let pause = event.id.as_ref() == "tray_pause_all";
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let Some(state) = app.try_state::<AppState>() else {
+                                return;
+                            };
+                            let result = if pause {
+                                commands::transfers::pause_all_transfers(app.clone(), state).await
+                            } else {
+                                commands::transfers::resume_all_transfers(app.clone(), state).await
+                            };
+                            if let Err(error) = result {
+                                tracing::warn!("Tray pause/resume all failed: {error}");
+                            }
+                        });
+                    }
+                    "tray_alt_speed" => {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let Some(state) = app.try_state::<AppState>() else {
+                                return;
+                            };
+                            let patch = commands::settings::QuickLimitsPatch {
+                                alt_speed_enabled: Some(!tray::alt_speed_checked()),
+                                ..Default::default()
+                            };
+                            if let Err(error) =
+                                commands::settings::apply_quick_limits(&app, &state, patch).await
+                            {
+                                tracing::warn!("Tray alternative speed toggle failed: {error}");
+                            }
+                            // The OS flips a check item on click by itself; put it back
+                            // in step with what was actually saved.
+                            auto_update::silent::rebuild_tray_menu(&app);
+                        });
+                    }
+                    "tray_quit" => commands::settings::exit_app(app),
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -1201,12 +1360,23 @@ pub fn run() {
             // "launch maximized" preference is applied here too: it is a
             // launch-time preference, so toggling it in Settings only changes
             // how the *next* launch opens.
+            let launch_window = resume_window.or_else(|| {
+                window_state::for_launch(
+                    settings
+                        .remember_window_position
+                        .then(|| window_state::load(&data_dir))
+                        .flatten(),
+                    settings.launch_maximized,
+                    login_launch::launched_at_login() && settings.start_hidden_at_login,
+                )
+            });
             auto_update::resume::show_main_window(
                 &app_handle,
-                resume_window.as_ref(),
+                launch_window.as_ref(),
                 tray::reachable(),
                 settings.launch_maximized,
             );
+            login_launch::reconcile_at_launch(&app_handle, settings.launch_at_login);
             auto_update::silent::spawn(app_handle.clone());
 
             let index_clone = local_index.clone();
@@ -2076,6 +2246,7 @@ pub fn run() {
                         local_index: net_index,
                         fresh_part_hashes: net_fresh_part_hashes,
                         db: net_db,
+                        orphan_disposal,
                         transfer_manager: net_transfers,
                         bandwidth_limiter: net_bw,
                         shared_peers: cached_peers_net,
@@ -2183,7 +2354,6 @@ pub fn run() {
             commands::search::cancel_search,
             commands::search::find_notes,
             commands::search::find_sources,
-            commands::search::compute_ed2k_hash,
             commands::search::publish_note,
             commands::search::format_ed2k_link,
             commands::search::format_ed2k_links,
@@ -2208,7 +2378,6 @@ pub fn run() {
             commands::transfers::cancel_transfers_batch,
             commands::transfers::pause_transfer,
             commands::transfers::resume_transfer,
-            commands::transfers::cancel_transfer,
             commands::transfers::remove_transfer,
             commands::transfers::get_transfers,
             commands::transfers::get_transfers_since,
@@ -2219,11 +2388,11 @@ pub fn run() {
             commands::transfers::clear_completed,
             commands::transfers::get_transfer_sources,
             commands::transfers::set_transfer_priority,
+            commands::transfers::move_transfers_in_queue,
+            commands::transfers::get_download_queue_ids,
             commands::transfers::set_transfer_category,
             commands::transfers::rename_transfer,
             commands::transfers::set_preview_priority,
-            commands::transfers::pause_all_transfers,
-            commands::transfers::resume_all_transfers,
             commands::transfers::stop_transfer,
             commands::transfers::open_file,
             commands::transfers::open_transfer_file_location,
@@ -2239,6 +2408,8 @@ pub fn run() {
             commands::chat_attachments::pick_and_send_chat_attachment,
             commands::chat_attachments::respond_chat_attachment,
             commands::chat_attachments::cancel_chat_attachment,
+            commands::chat_attachments::retry_chat_attachment,
+            commands::settings::set_friend_overrides,
             commands::chat_attachments::list_chat_attachments,
             commands::chat_attachments::open_chat_attachment,
             commands::chat_attachments::open_chat_files_folder,
@@ -2249,7 +2420,7 @@ pub fn run() {
             commands::sharing::confirm_dropped_folders,
             commands::sharing::dismiss_dropped_folders,
             commands::sharing::remove_shared_folder,
-            commands::sharing::get_shared_files,
+            commands::sharing::library_hashes_among,
             commands::sharing::get_shared_files_if_changed,
             commands::sharing::get_shared_file_count,
             commands::sharing::library_has_hashes,
@@ -2261,12 +2432,10 @@ pub fn run() {
             commands::sharing::set_folder_priority,
             commands::sharing::set_file_priority,
             commands::sharing::batch_set_priority,
-            commands::sharing::batch_share,
             commands::sharing::batch_unshare,
             commands::sharing::set_files_friends_only,
             commands::sharing::reload_shared_files,
             commands::sharing::unshare_file,
-            commands::sharing::share_file,
             commands::sharing::unshare_folder,
             commands::sharing::get_scan_status,
             commands::sharing::get_hashing_paused,
@@ -2282,10 +2451,10 @@ pub fn run() {
             commands::sharing::republish_file,
             commands::sharing::scan_missing_files,
             commands::sharing::remove_missing_files,
-            commands::peers::get_peers,
             commands::peers::get_network_stats,
             commands::peers::ban_peer,
             commands::peers::unban_peer,
+            commands::peers::get_banned_peers,
             commands::peers::add_friend,
             commands::peers::remove_friend,
             commands::peers::block_friend,
@@ -2296,12 +2465,12 @@ pub fn run() {
             commands::peers::get_my_ember_hash,
             commands::peers::reset_friend_code,
             commands::peers::send_chat_message,
+            commands::peers::discard_failed_chat_message,
             commands::peers::get_chat_messages,
             commands::peers::is_chat_locked,
             commands::peers::mark_messages_read,
             commands::peers::send_chat_typing,
             commands::peers::get_unread_message_counts,
-            commands::peers::get_pending_chat_counts,
             commands::peers::offer_file_to_friend,
             commands::peers::get_friend_requests,
             commands::peers::accept_friend_request,
@@ -2312,7 +2481,6 @@ pub fn run() {
             commands::peers::is_friend_discoverable,
             commands::peers::get_online_friends,
             commands::peers::kad_connect,
-            commands::peers::kad_disconnect,
             commands::peers::kad_bootstrap_ip,
             commands::peers::kad_bootstrap_url,
             commands::peers::kad_bootstrap_clients,
@@ -2320,7 +2488,6 @@ pub fn run() {
             commands::peers::get_kad_contacts,
             commands::peers::get_kad_searches,
             commands::peers::kad_cancel_search,
-            commands::peers::get_peer_reputation,
             commands::peers::get_peer_reputation_batch,
             commands::peers::get_reputation_stats,
             commands::peers::get_ember_diagnostics,
@@ -2329,6 +2496,8 @@ pub fn run() {
             commands::peers::get_ember_dht_store,
             $($harness,)*
             commands::channels::list_channels,
+            commands::channels::dismiss_channel_newer_lines,
+            commands::channel_recovery::recover_owned_channels,
             commands::channels::create_channel,
             commands::channels::join_channel,
             commands::channels::enter_channel,
@@ -2356,6 +2525,8 @@ pub fn run() {
             commands::channels::get_channel_reactions,
             commands::channels::send_channel_message,
             commands::channels::mark_channel_messages_read,
+            commands::channels::get_channel_draft,
+            commands::channels::set_channel_draft,
             commands::channels::gather_channels,
             commands::channels::cached_channels,
             commands::channels::update_channel_moderation,
@@ -2374,6 +2545,7 @@ pub fn run() {
             commands::channels::send_channel_transfer_standard_offer,
             commands::channels::list_channel_transfers,
             commands::settings::get_settings,
+            commands::settings::get_launch_settings,
             commands::settings::update_settings,
             commands::settings::pick_download_folder,
             commands::settings::pick_preview_player,
@@ -2387,15 +2559,18 @@ pub fn run() {
             commands::settings::download_nodes_dat,
             commands::settings::download_ipfilter,
             commands::settings::hide_to_tray,
-            commands::settings::show_main_window,
             commands::settings::quit_app,
+            commands::settings::set_pending_undo,
             commands::settings::set_close_behavior,
+            commands::settings::set_quick_limits,
             commands::settings::take_pending_close_request,
             commands::settings::take_pending_ember_default_on_notice,
             commands::settings::take_pending_restore_failed_notice,
             commands::settings::take_pending_restore_expired_notice,
+            commands::settings::take_pending_restore_download_folder_notice,
             commands::settings::take_pending_known_met_notice,
             commands::settings::open_ember_website,
+            commands::settings::open_support_page,
             commands::settings::get_ember_website_url,
             commands::settings::open_ember_share,
             commands::settings::open_external_url,
@@ -2459,6 +2634,10 @@ pub fn run() {
             auto_update::silent::silent_update_resume,
             auto_update::silent::note_user_activity,
             auto_update::silent::take_update_outcome,
+            finish_action::get_finish_action,
+            finish_action::set_finish_action,
+            finish_action::cancel_finish_action,
+            finish_action::run_finish_action_now,
             tray::set_tray_labels,
                     ]
                 };
@@ -2525,8 +2704,11 @@ pub fn run() {
                 return;
             }
 
-            if let tauri::WindowEvent::Focused(true) = event {
-                auto_update::resume::on_main_window_focused(window);
+            if let tauri::WindowEvent::Focused(focused) = event {
+                if *focused {
+                    auto_update::resume::on_main_window_focused(window);
+                }
+                background::note_main_window_focus(*focused);
                 return;
             }
 
@@ -2537,11 +2719,17 @@ pub fn run() {
             // draws the drop overlay; it just no longer decides what was
             // dropped.
             if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
-                let app_handle = window.app_handle().clone();
-                let paths = paths.clone();
-                tauri::async_runtime::spawn(async move {
-                    commands::sharing::share_dropped_paths(app_handle, paths).await;
-                });
+                let (collections, paths) =
+                    commands::deeplink::take_dropped_collections(paths.clone());
+                if !collections.is_empty() {
+                    commands::deeplink::dispatch_deep_links(window.app_handle(), collections);
+                }
+                if !paths.is_empty() {
+                    let app_handle = window.app_handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        commands::sharing::share_dropped_paths(app_handle, paths).await;
+                    });
+                }
                 return;
             }
 
@@ -2583,10 +2771,7 @@ pub fn run() {
                     // The same path as `quit_app`, so `RunEvent::Exit` still
                     // runs the shutdown.
                     api.prevent_close();
-                    state
-                        .quit_confirmed
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    app_handle.exit(0);
+                    commands::settings::exit_app(app_handle);
                 }
                 "tray" => {
                     api.prevent_close();
@@ -2637,7 +2822,14 @@ pub fn run() {
             std::process::exit(1);
         })
         .run(|app_handle, event| {
+            // Before the windows close, while the main one still reports where
+            // it is. An update install exits without this event; its own
+            // resume file carries the window instead.
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                window_state::save(app_handle);
+            }
             if let tauri::RunEvent::Exit = event {
+                window_state::save(app_handle);
                 // Exit is delivered on the main thread, outside the async
                 // runtime, and the process is torn down the moment this
                 // returns — block here until the teardown has finished

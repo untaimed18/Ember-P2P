@@ -53,8 +53,24 @@ export async function setTrayLabels(labels: {
   show: string;
   quit: string;
   cancelUpdate: string;
+  pauseAll: string;
+  resumeAll: string;
+  altSpeed: string;
+  cancelExit: string;
+  cancelSleep: string;
 }): Promise<void> {
-  return invoke('set_tray_labels', labels);
+  return invoke('set_tray_labels', {
+    labels: {
+      show: labels.show,
+      quit: labels.quit,
+      cancel_update: labels.cancelUpdate,
+      pause_all: labels.pauseAll,
+      resume_all: labels.resumeAll,
+      alt_speed: labels.altSpeed,
+      cancel_exit: labels.cancelExit,
+      cancel_sleep: labels.cancelSleep,
+    },
+  });
 }
 
 /** Write text to the system clipboard. See {@link readClipboardText}. */

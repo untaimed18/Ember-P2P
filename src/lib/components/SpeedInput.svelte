@@ -15,9 +15,12 @@
     value = $bindable(0),
     label = '',
     idScope = '',
+    onenter,
   }: {
     value: number;
     label?: string;
+    /** Called when Enter is pressed in the number box. */
+    onenter?: () => void;
     /**
      * Disambiguates the generated element id when several of these share a
      * label on one page.
@@ -47,8 +50,8 @@
   // decimal point in "50.5", adding a trailing zero, typing "0" into an
   // already-zero field. Writing the same primitive to a `$bindable` prop
   // invalidates nothing, so the effect never ran to clear the flag, and the
-  // next *external* write (Discard in Settings, "Run speed test" in the setup
-  // wizard) was swallowed — leaving the box showing an abandoned value that
+  // next *external* write (a save folding back in Settings, "Run speed test"
+  // in the setup wizard) was swallowed — leaving the box showing an abandoned value that
   // no longer matched the setting underneath it.
   let lastSyncedValue = -1;
   let inputEl: HTMLInputElement | undefined = $state(undefined);
@@ -84,7 +87,7 @@
     // Read `value` before the early return. Svelte re-collects dependencies on
     // every run, so bailing out first would drop `value` from the dependency
     // set and the effect would never run again — leaving the field frozen
-    // against external writes (speed-test "Apply recommended", Discard).
+    // against external writes (speed-test "Apply recommended", a revert).
     const next = value;
     if (next !== lastSyncedValue) {
       lastSyncedValue = next;
@@ -176,6 +179,12 @@
       step="any"
       value={displayValue}
       oninput={handleInput}
+      onkeydown={(e) => {
+        if (onenter && e.key === 'Enter' && !e.isComposing) {
+          e.preventDefault();
+          onenter();
+        }
+      }}
       onfocus={() => (focused = true)}
       onblur={() => { focused = false; syncFromBytes(value); }}
       class="speed-number"

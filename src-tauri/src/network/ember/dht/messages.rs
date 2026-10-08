@@ -128,6 +128,61 @@ const VALUE_EXT_TAG_MAX_SIZE: u8 = 0x02;
 const VALUE_EXT_TAG_FILE_TYPE: u8 = 0x03;
 const VALUE_EXT_TAG_EXTRA_KEYS: u8 = 0x04;
 const VALUE_EXT_TAG_FILE_EXTENSION: u8 = 0x05;
+const VALUE_EXT_TAG_RESUME_AFTER: u8 = 0x06;
+
+/// Records a page follow-up names to resume after; see [`ResumeAnchors`].
+pub const MAX_RESUME_ANCHORS: usize = 3;
+const RESUME_ANCHOR_LEN: usize = 8;
+
+/// A record's lasting identity under its key, as a page follow-up names it:
+/// the first four bytes of its file hash and of its publisher key, read from
+/// the body's fixed header. Records under a key dedupe on exactly that pair,
+/// and a republish replaces its record in place under a new signature, so
+/// this survives a republish where a signature prefix would not.
+///
+/// `None` for a body too short to carry the header, which the store refuses.
+pub fn record_anchor(data: &[u8]) -> Option<[u8; RESUME_ANCHOR_LEN]> {
+    if data.len() < super::publish::RECORD_HEADER_LEN {
+        return None;
+    }
+    let mut anchor = [0u8; RESUME_ANCHOR_LEN];
+    anchor[..4].copy_from_slice(&data[17..21]);
+    anchor[4..].copy_from_slice(&data[73..77]);
+    Some(anchor)
+}
+
+/// The records a `FIND_VALUE` page follow-up asks to resume after, nearest
+/// first.
+///
+/// `start_position` alone shifts under the searcher: a record before it that
+/// lapses between two pages moves every later one down a place, and the page
+/// then starts one record too far on and silently loses a result. Naming the
+/// record the last page ended on lets the responder find where that is *now*.
+/// More than one is named because the nearest can lapse as well; the
+/// responder resumes after the first it still holds, and falls back to the
+/// position when it holds none of them (as a peer predating this does).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResumeAnchors {
+    anchors: [[u8; RESUME_ANCHOR_LEN]; MAX_RESUME_ANCHORS],
+    len: u8,
+}
+
+impl ResumeAnchors {
+    pub fn push(&mut self, anchor: [u8; RESUME_ANCHOR_LEN]) {
+        if (self.len as usize) < MAX_RESUME_ANCHORS {
+            self.anchors[self.len as usize] = anchor;
+            self.len += 1;
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &[u8; RESUME_ANCHOR_LEN]> {
+        self.anchors[..self.len as usize].iter()
+    }
+}
 
 /// Longest eMule file-type string (`EmuleCollection` is 15).
 const MAX_VALUE_FILE_TYPE_BYTES: usize = 16;
@@ -187,8 +242,12 @@ impl ValueConstraints {
     }
 }
 
-fn encode_value_constraints(buf: &mut Vec<u8>, constraints: &ValueConstraints) {
-    if constraints.is_empty() {
+fn encode_value_constraints(
+    buf: &mut Vec<u8>,
+    constraints: &ValueConstraints,
+    resume_after: &ResumeAnchors,
+) {
+    if constraints.is_empty() && resume_after.is_empty() {
         return;
     }
     let mut tlv: Vec<u8> = Vec::new();
@@ -235,6 +294,10 @@ fn encode_value_constraints(buf: &mut Vec<u8>, constraints: &ValueConstraints) {
         }
         push(VALUE_EXT_TAG_EXTRA_KEYS, &keys);
     }
+    if !resume_after.is_empty() {
+        let anchors: Vec<u8> = resume_after.iter().flatten().copied().collect();
+        push(VALUE_EXT_TAG_RESUME_AFTER, &anchors);
+    }
     let Ok(len) = u16::try_from(tlv.len()) else {
         return;
     };
@@ -252,14 +315,15 @@ fn encode_value_constraints(buf: &mut Vec<u8>, constraints: &ValueConstraints) {
 /// answer less filtered — what a peer that has never heard of the block does,
 /// and always a correct answer. Failing the frame instead would turn a future
 /// sender's additions into a refusal.
-fn decode_value_constraints(rest: &[u8]) -> ValueConstraints {
+fn decode_value_constraints(rest: &[u8]) -> (ValueConstraints, ResumeAnchors) {
     let mut out = ValueConstraints::default();
+    let mut resume_after = ResumeAnchors::default();
     if rest.len() < 4 || u16::from_le_bytes([rest[0], rest[1]]) != VALUE_EXT_MAGIC {
-        return out;
+        return (out, resume_after);
     }
     let len = u16::from_le_bytes([rest[2], rest[3]]) as usize;
     let Some(tlv) = rest.get(4..4 + len) else {
-        return out;
+        return (out, resume_after);
     };
     let mut i = 0usize;
     while i + 2 <= tlv.len() {
@@ -316,6 +380,15 @@ fn decode_value_constraints(rest: &[u8]) -> ValueConstraints {
                     }
                 }
             }
+            VALUE_EXT_TAG_RESUME_AFTER => {
+                // Held to the cap across repeats too, so a peer cannot buy a
+                // longer scan of the key by naming more anchors.
+                for chunk in value.chunks_exact(RESUME_ANCHOR_LEN) {
+                    if let Ok(anchor) = <[u8; RESUME_ANCHOR_LEN]>::try_from(chunk) {
+                        resume_after.push(anchor);
+                    }
+                }
+            }
             // An unknown tag is skipped by its own length, which is the point of
             // the encoding: a newer peer may name things this build has no
             // opinion about.
@@ -323,7 +396,7 @@ fn decode_value_constraints(rest: &[u8]) -> ValueConstraints {
         }
         i += 2 + value_len;
     }
-    out
+    (out, resume_after)
 }
 
 /// Bytes a signed frame adds around its payload: the 22-byte header, the
@@ -610,6 +683,9 @@ pub enum DhtPayload {
         /// the rest *before* it packs a page. Empty when the search carried no
         /// filters, in which case nothing is written to the wire at all.
         constraints: ValueConstraints,
+        /// For a page follow-up, the records the last page ended on. Carried
+        /// in the same optional block as `constraints`.
+        resume_after: ResumeAnchors,
     },
     FoundValue {
         key: [u8; 16],
@@ -1415,12 +1491,33 @@ pub fn peek_store_batch_count(frame: &[u8]) -> Option<u32> {
 
 /// Build a FIND_VALUE request for one or more keys, starting at
 /// `start_position` in the responder's live list for `keys[0]`.
+#[cfg(test)]
 pub fn build_find_value(
     sender_id: EmberNodeId,
     request_id: u32,
     keys: Vec<[u8; 16]>,
     start_position: u16,
     constraints: ValueConstraints,
+) -> DhtMessage {
+    build_find_value_resuming(
+        sender_id,
+        request_id,
+        keys,
+        start_position,
+        constraints,
+        ResumeAnchors::default(),
+    )
+}
+
+/// Build a FIND_VALUE request that also names, for a page follow-up, the
+/// records the last page ended on (see [`ResumeAnchors`]).
+pub fn build_find_value_resuming(
+    sender_id: EmberNodeId,
+    request_id: u32,
+    keys: Vec<[u8; 16]>,
+    start_position: u16,
+    constraints: ValueConstraints,
+    resume_after: ResumeAnchors,
 ) -> DhtMessage {
     DhtMessage {
         version: EMBER_DHT_VERSION,
@@ -1432,6 +1529,7 @@ pub fn build_find_value(
             keys,
             start_position,
             constraints,
+            resume_after,
         },
         signature: [0u8; 64],
     }
@@ -1545,6 +1643,7 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
             keys,
             start_position,
             constraints,
+            resume_after,
         } => {
             let mut buf = Vec::with_capacity(1 + keys.len() * 16 + 2);
             // Same reasoning as `StoreBatch` above: a bare `as u8` truncates the
@@ -1569,7 +1668,7 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
             // after `start_position` never looks. Writes nothing when the search
             // carried no filters, so an unconstrained query is byte-identical to
             // what this built before the block existed.
-            encode_value_constraints(&mut buf, constraints);
+            encode_value_constraints(&mut buf, constraints, resume_after);
             buf
         }
         DhtPayload::FoundValue {
@@ -1938,11 +2037,12 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
             // to be *at least* long enough for the fields above, so a payload
             // carrying more than this build understands has always been valid —
             // which is what makes the block additive.
-            let constraints = decode_value_constraints(&data[pos_at + 2..]);
+            let (constraints, resume_after) = decode_value_constraints(&data[pos_at + 2..]);
             Ok(DhtPayload::FindValue {
                 keys,
                 start_position,
                 constraints,
+                resume_after,
             })
         }
         MSG_FOUND_VALUE => {
@@ -3041,11 +3141,12 @@ mod tests {
                 keys,
                 start_position,
                 constraints,
+                resume_after,
             } => {
                 assert_eq!(keys, vec![[0xA1; 16], [0xA2; 16]]);
                 assert_eq!(start_position, 4321);
                 assert!(
-                    constraints.is_empty(),
+                    constraints.is_empty() && resume_after.is_empty(),
                     "an unconstrained query must not grow a block"
                 );
             }
@@ -3098,10 +3199,12 @@ mod tests {
                 keys,
                 start_position,
                 constraints: got,
+                resume_after,
             } => {
                 assert_eq!(keys, vec![[0xA1; 16]]);
                 assert_eq!(start_position, 12);
                 assert_eq!(got, constraints);
+                assert!(resume_after.is_empty());
             }
             other => panic!("expected FindValue, got {other:?}"),
         }
@@ -3123,10 +3226,61 @@ mod tests {
                 keys,
                 start_position,
                 constraints: got,
+                ..
             } => {
                 assert_eq!(keys, vec![[0xA1; 16]]);
                 assert_eq!(start_position, 12);
                 assert!(got.is_empty());
+            }
+            other => panic!("expected FindValue, got {other:?}"),
+        }
+    }
+
+    /// Resume anchors ride the same optional block, alone or beside
+    /// constraints, are capped at decode, and leave the position an older
+    /// decoder reads exactly where it was.
+    #[test]
+    fn resume_anchors_round_trip_beside_constraints_and_stay_ignorable() {
+        let (sk, id) = test_keypair();
+        let mut anchors = ResumeAnchors::default();
+        anchors.push([1; 8]);
+        anchors.push([2; 8]);
+        let constraints = ValueConstraints {
+            file_extension: Some("mkv".to_string()),
+            ..Default::default()
+        };
+        for constraints in [ValueConstraints::default(), constraints] {
+            let ask = build_find_value_resuming(id, 3, vec![[0xA1; 16]], 40, constraints.clone(), anchors);
+            let decoded =
+                decode_message(&encode_message(&ask, &sk, true, &TEST_NOISE_PUB), true, &TEST_NOISE_PUB).unwrap();
+            match decoded.payload {
+                DhtPayload::FindValue { start_position, constraints: got, resume_after, .. } => {
+                    assert_eq!(start_position, 40);
+                    assert_eq!(got, constraints);
+                    assert_eq!(resume_after, anchors);
+                }
+                other => panic!("expected FindValue, got {other:?}"),
+            }
+            let base = encode_payload(
+                &build_find_value(id, 3, vec![[0xA1; 16]], 40, ValueConstraints::default()).payload,
+            );
+            assert!(encode_payload(&ask.payload).starts_with(&base));
+        }
+
+        // A peer naming more anchors than the cap buys no longer scan.
+        let mut payload = encode_payload(
+            &build_find_value(id, 3, vec![[0xA1; 16]], 40, ValueConstraints::default()).payload,
+        );
+        let value: Vec<u8> = (0..5u8).flat_map(|i| [i; 8]).collect();
+        let tlv_len = (2 + value.len()) as u16;
+        payload.extend_from_slice(&VALUE_EXT_MAGIC.to_le_bytes());
+        payload.extend_from_slice(&tlv_len.to_le_bytes());
+        payload.push(VALUE_EXT_TAG_RESUME_AFTER);
+        payload.push(value.len() as u8);
+        payload.extend_from_slice(&value);
+        match decode_payload(MSG_FIND_VALUE, &payload).unwrap() {
+            DhtPayload::FindValue { resume_after, .. } => {
+                assert_eq!(resume_after.iter().count(), MAX_RESUME_ANCHORS);
             }
             other => panic!("expected FindValue, got {other:?}"),
         }
@@ -3168,6 +3322,7 @@ mod tests {
                     keys,
                     start_position,
                     constraints,
+                    ..
                 }) => {
                     assert_eq!(keys, vec![[0xA1; 16]]);
                     assert_eq!(start_position, 3);

@@ -136,12 +136,6 @@ enum WriteOp {
         data: Vec<u8>,
         ack: oneshot::Sender<io::Result<()>>,
     },
-    #[allow(dead_code)]
-    Read {
-        offset: u64,
-        len: usize,
-        ack: oneshot::Sender<io::Result<Vec<u8>>>,
-    },
     /// Combined read + MD4 hash. Used for ed2k part verification — keeping
     /// the hash on the same thread as the read avoids a runtime hop and
     /// avoids blocking an async worker on `Md4::digest`.
@@ -255,27 +249,9 @@ pub struct PartFileWriter {
     inner: Arc<Inner>,
 }
 
-/// Open mode for `PartFileWriter::open`. Mirrors the two call sites from
-/// the previous mutex-based code:
-///   * single-source (`transfer.rs`) creates+sets length when starting a
-///     fresh download, or reuses an existing `.part` file when resuming;
-///   * multi-source (`multi_source.rs`) only ever attaches to a `.part`
-///     file that the single-source bootstrap already created.
-pub enum OpenMode {
-    /// Open existing or create new; if `set_len_to` is `Some(len)` and the
-    /// file is empty (or shorter than `len`), set length to `len`.
-    /// `truncate_existing` controls whether to wipe an existing file (only
-    /// safe when there's no resume metadata pointing into it).
-    CreateOrOpen {
-        set_len_to: Option<u64>,
-        truncate_existing: bool,
-    },
-    /// Open an existing read+write file. Errors if the file does not exist.
-    OpenExisting,
-}
-
 impl PartFileWriter {
-    /// Open the part file and spawn its dedicated worker thread.
+    /// Open an existing read+write part file and spawn its dedicated worker
+    /// thread. Errors if the file does not exist.
     ///
     /// The worker is a `std::thread::spawn` (not `tokio::task::spawn_blocking`)
     /// so it doesn't compete for slots in the bounded blocking pool with
@@ -288,13 +264,12 @@ impl PartFileWriter {
     /// resume and must never set it.
     pub async fn open(
         path: PathBuf,
-        mode: OpenMode,
         allowed_roots: Vec<String>,
         discard: Option<Arc<AtomicBool>>,
     ) -> io::Result<Self> {
-        // Claim the path before touching the file: `CreateOrOpen` can set (or
-        // truncate) the length, which must not happen while a previous
-        // generation's worker still holds the handle. See `PART_WRITER_GATES`.
+        // Claim the path before touching the file: a previous generation's
+        // worker may still hold the handle with writes queued. See
+        // `PART_WRITER_GATES`.
         let gate = writer_gate(&path);
         let permit = match tokio::time::timeout(WRITER_HANDOFF_TIMEOUT, gate.acquire_owned()).await
         {
@@ -313,16 +288,16 @@ impl PartFileWriter {
             }
         };
 
-        // Open on a blocking thread because creating + sizing the file can
-        // be slow on cold disks. After this returns the worker thread takes
-        // ownership of the handle.
+        // Open on a blocking thread because opening can be slow on cold
+        // disks. After this returns the worker thread takes ownership of the
+        // handle.
         let path_for_open = path.clone();
-        let file =
-            tokio::task::spawn_blocking(move || open_file(&path_for_open, mode, &allowed_roots))
-                .await
-                .map_err(|e| {
-                    io::Error::other(format!("spawn_blocking: {e}"))
-                })??;
+        let file = tokio::task::spawn_blocking(move || {
+            crate::security::filesystem::open_existing_approved(&path_for_open, &allowed_roots, true)
+                .map(|(_, file)| file)
+        })
+        .await
+        .map_err(|e| io::Error::other(format!("spawn_blocking: {e}")))??;
 
         let (tx, mut rx) = mpsc::channel::<WriteOp>(WRITER_QUEUE_CAPACITY);
         let discard_for_loop = discard.clone();
@@ -439,19 +414,6 @@ impl PartFileWriter {
         .await
     }
 
-    /// Read `len` bytes starting at `offset`.
-    #[allow(dead_code)]
-    pub async fn read(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        validate_range(offset, len)?;
-        let (ack, ack_rx) = oneshot::channel();
-        self.submit(
-            WRITER_IO_TIMEOUT,
-            WriteOp::Read { offset, len, ack },
-            ack_rx,
-        )
-        .await
-    }
-
     /// Read `len` bytes at `offset` AND compute their MD4 hash on the
     /// worker thread. Returns `(buffer, md4_hash)`. The buffer is returned
     /// alongside the hash so callers can run AICH recovery on a hash
@@ -475,48 +437,6 @@ impl PartFileWriter {
         let (ack, ack_rx) = oneshot::channel();
         self.submit(WRITER_SYNC_TIMEOUT, WriteOp::SyncData { ack }, ack_rx)
             .await
-    }
-}
-
-fn open_file(path: &Path, mode: OpenMode, allowed_roots: &[String]) -> io::Result<std::fs::File> {
-    match mode {
-        OpenMode::CreateOrOpen {
-            set_len_to,
-            truncate_existing,
-        } => {
-            // `<download_folder>/Temp` is otherwise only ever created during
-            // startup, which is best-effort because an unreachable download
-            // folder must not stop the app from launching (see `lib.rs`). Retry
-            // it here so a drive reconnected mid-session starts working without
-            // a restart. Best-effort on purpose: if this fails, the open below
-            // produces the real error. `open_or_create_approved` still performs
-            // every approved-root and reparse-point check on the final path, so
-            // creating the parent grants no additional reach.
-            if let Some(parent) = path.parent() {
-                if !parent.is_dir() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-            }
-            let (_verified, f) = crate::security::filesystem::open_or_create_approved(
-                path,
-                allowed_roots,
-                truncate_existing,
-            )?;
-            if let Some(len) = set_len_to {
-                if len > 0 {
-                    let cur = f.metadata()?.len();
-                    if cur != len {
-                        f.set_len(len)?;
-                    }
-                }
-            }
-            Ok(f)
-        }
-        OpenMode::OpenExisting => {
-            let (_, file) =
-                crate::security::filesystem::open_existing_approved(path, allowed_roots, true)?;
-            Ok(file)
-        }
     }
 }
 
@@ -577,15 +497,6 @@ fn writer_loop(
                 })();
                 let _ = ack.send(res);
             }
-            WriteOp::Read { offset, len, ack } => {
-                let res = (|| -> io::Result<Vec<u8>> {
-                    file.seek(SeekFrom::Start(offset))?;
-                    let mut buf = vec![0u8; len];
-                    file.read_exact(&mut buf)?;
-                    Ok(buf)
-                })();
-                let _ = ack.send(res);
-            }
             WriteOp::HashPartMd4 { offset, len, ack } => {
                 let res = (|| -> io::Result<(Vec<u8>, [u8; 16])> {
                     file.seek(SeekFrom::Start(offset))?;
@@ -641,7 +552,7 @@ fn writer_loop(
 mod tests {
     use super::*;
 
-    fn approved_temp_file(name: &str) -> (PathBuf, Vec<String>, PathBuf) {
+    fn approved_temp_file(name: &str, len: u64) -> (PathBuf, Vec<String>, PathBuf) {
         let base = std::env::temp_dir().join(format!(
             "ember-pfw-root-{}-{}-{name}",
             std::process::id(),
@@ -660,27 +571,19 @@ mod tests {
             std::slice::from_ref(&root_s),
         )
         .unwrap();
-        (root.join(format!("{name}.bin")), vec![root_s], base)
+        let path = root.join(format!("{name}.bin"));
+        std::fs::File::create(&path).unwrap().set_len(len).unwrap();
+        (path, vec![root_s], base)
     }
 
     #[tokio::test]
     async fn write_then_read_round_trip() {
         let _registry_guard = crate::security::filesystem::test_registry_lock();
-        let (path, allowed, base) = approved_temp_file("rt");
-        let writer = PartFileWriter::open(
-            path.clone(),
-            OpenMode::CreateOrOpen {
-                set_len_to: Some(1024),
-                truncate_existing: true,
-            },
-            allowed,
-            None,
-        )
-        .await
-        .unwrap();
+        let (path, allowed, base) = approved_temp_file("rt", 1024);
+        let writer = PartFileWriter::open(path.clone(), allowed, None).await.unwrap();
 
         writer.write(100, vec![0xABu8; 64]).await.unwrap();
-        let buf = writer.read(100, 64).await.unwrap();
+        let (buf, _) = writer.hash_part_md4(100, 64).await.unwrap();
         assert!(buf.iter().all(|&b| b == 0xAB));
 
         drop(writer);
@@ -690,18 +593,8 @@ mod tests {
     #[tokio::test]
     async fn hash_part_md4_matches_direct_md4() {
         let _registry_guard = crate::security::filesystem::test_registry_lock();
-        let (path, allowed, base) = approved_temp_file("md4");
-        let writer = PartFileWriter::open(
-            path.clone(),
-            OpenMode::CreateOrOpen {
-                set_len_to: Some(4096),
-                truncate_existing: true,
-            },
-            allowed,
-            None,
-        )
-        .await
-        .unwrap();
+        let (path, allowed, base) = approved_temp_file("md4", 4096);
+        let writer = PartFileWriter::open(path.clone(), allowed, None).await.unwrap();
 
         let payload: Vec<u8> = (0..4096u32).map(|i| (i & 0xFF) as u8).collect();
         writer.write(0, payload.clone()).await.unwrap();
@@ -720,18 +613,8 @@ mod tests {
     #[tokio::test]
     async fn concurrent_writes_serialize_correctly() {
         let _registry_guard = crate::security::filesystem::test_registry_lock();
-        let (path, allowed, base) = approved_temp_file("concurrent");
-        let writer = PartFileWriter::open(
-            path.clone(),
-            OpenMode::CreateOrOpen {
-                set_len_to: Some(1_000_000),
-                truncate_existing: true,
-            },
-            allowed,
-            None,
-        )
-        .await
-        .unwrap();
+        let (path, allowed, base) = approved_temp_file("concurrent", 1_000_000);
+        let writer = PartFileWriter::open(path.clone(), allowed, None).await.unwrap();
 
         let mut handles = Vec::new();
         for i in 0..50u64 {
@@ -746,7 +629,7 @@ mod tests {
         }
 
         for i in 0..50u64 {
-            let buf = writer.read(i * 2048, 1024).await.unwrap();
+            let (buf, _) = writer.hash_part_md4(i * 2048, 1024).await.unwrap();
             assert!(buf.iter().all(|&b| b == (i & 0xFF) as u8));
         }
 
@@ -757,19 +640,11 @@ mod tests {
     #[tokio::test]
     async fn discard_flag_releases_the_file_without_waiting_on_fsync() {
         let _registry_guard = crate::security::filesystem::test_registry_lock();
-        let (path, allowed, base) = approved_temp_file("abandon");
+        let (path, allowed, base) = approved_temp_file("abandon", 4096);
         let discard = Arc::new(AtomicBool::new(false));
-        let writer = PartFileWriter::open(
-            path.clone(),
-            OpenMode::CreateOrOpen {
-                set_len_to: Some(4096),
-                truncate_existing: true,
-            },
-            allowed,
-            Some(discard.clone()),
-        )
-        .await
-        .unwrap();
+        let writer = PartFileWriter::open(path.clone(), allowed, Some(discard.clone()))
+            .await
+            .unwrap();
         writer.write(0, vec![0xCDu8; 64]).await.unwrap();
         discard.store(true, Ordering::Release);
         drop(writer);
@@ -792,29 +667,15 @@ mod tests {
     #[tokio::test]
     async fn a_second_writer_waits_for_the_previous_one_to_close() {
         let _registry_guard = crate::security::filesystem::test_registry_lock();
-        let (path, allowed, base) = approved_temp_file("handoff");
-        let first = PartFileWriter::open(
-            path.clone(),
-            OpenMode::CreateOrOpen {
-                set_len_to: Some(4096),
-                truncate_existing: true,
-            },
-            allowed.clone(),
-            None,
-        )
-        .await
-        .unwrap();
+        let (path, allowed, base) = approved_temp_file("handoff", 4096);
+        let first = PartFileWriter::open(path.clone(), allowed.clone(), None)
+            .await
+            .unwrap();
 
         let second_path = path.clone();
         let second_allowed = allowed.clone();
         let mut second = tokio::spawn(async move {
-            PartFileWriter::open(
-                second_path,
-                OpenMode::OpenExisting,
-                second_allowed,
-                None,
-            )
-            .await
+            PartFileWriter::open(second_path, second_allowed, None).await
         });
 
         assert!(
@@ -844,19 +705,11 @@ mod tests {
     #[tokio::test]
     async fn a_writer_whose_transfer_is_only_cancelled_still_drains_and_syncs() {
         let _registry_guard = crate::security::filesystem::test_registry_lock();
-        let (path, allowed, base) = approved_temp_file("pause-drain");
+        let (path, allowed, base) = approved_temp_file("pause-drain", 4096);
         let control = crate::sharing::manager::TransferControl::new();
-        let writer = PartFileWriter::open(
-            path.clone(),
-            OpenMode::CreateOrOpen {
-                set_len_to: Some(4096),
-                truncate_existing: true,
-            },
-            allowed,
-            Some(control.discarding_flag()),
-        )
-        .await
-        .unwrap();
+        let writer = PartFileWriter::open(path.clone(), allowed, Some(control.discarding_flag()))
+            .await
+            .unwrap();
 
         // Exactly what Pause and Stop do to the control.
         control.pause();
@@ -896,18 +749,8 @@ mod tests {
     #[tokio::test]
     async fn a_wedged_writer_fails_fast_and_releases_the_file() {
         let _registry_guard = crate::security::filesystem::test_registry_lock();
-        let (path, allowed, base) = approved_temp_file("wedged");
-        let writer = PartFileWriter::open(
-            path.clone(),
-            OpenMode::CreateOrOpen {
-                set_len_to: Some(4096),
-                truncate_existing: true,
-            },
-            allowed,
-            None,
-        )
-        .await
-        .unwrap();
+        let (path, allowed, base) = approved_temp_file("wedged", 4096);
+        let writer = PartFileWriter::open(path.clone(), allowed, None).await.unwrap();
 
         // Exactly the state an expired acknowledgement leaves behind, without
         // having to wedge a real volume for five minutes.

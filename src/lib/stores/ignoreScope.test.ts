@@ -4,7 +4,6 @@ import {
   forgetChannelIgnores,
   ignoreScopeFor,
   ignoredKeysForChannel,
-  ignoredMemberKeys,
   ignoredMembers,
   ignoreMemberEverywhere,
   isMemberIgnored,
@@ -37,9 +36,9 @@ describe('ignore scope', () => {
 
     expect(isMemberIgnored(get(ignoredMembers), ALICE, ROOM_A)).toBe(true);
     expect(isMemberIgnored(get(ignoredMembers), ALICE, ROOM_B)).toBe(false);
-    // The global list drives surfaces that have no room context, so a
-    // room-scoped ignore must not silence someone app-wide.
-    expect(get(ignoredMemberKeys)).toEqual([]);
+    // Surfaces with no room context ask without one, so a room-scoped
+    // ignore must not silence someone app-wide.
+    expect(isMemberIgnored(get(ignoredMembers), ALICE)).toBe(false);
   });
 
   it('hides global and this-room entries together, nothing else', () => {

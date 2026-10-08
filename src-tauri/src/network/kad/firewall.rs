@@ -26,6 +26,13 @@ pub enum FirewallStatus {
     Firewalled,
 }
 
+/// One firewall check cycle's own verdict; see [`FirewallChecker::last_cycle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CycleResult {
+    pub tcp_open: Option<bool>,
+    pub udp_open: Option<bool>,
+}
+
 pub struct FirewallChecker {
     /// Per-reported-IP: set of /24 networks of the voters who reported it.
     /// K7: counting raw votes lets a Sybil cluster (or one attacker with
@@ -38,6 +45,10 @@ pub struct FirewallChecker {
     udp_status: FirewallStatus,
     tcp_responses_received: u32,
     tcp_requests_sent: u32,
+    /// `FIREWALLED_RES` answers this cycle. A peer sends one whether or not
+    /// its connect-back gets through, so it is what tells "nobody could
+    /// connect" apart from "nobody answered".
+    tcp_check_answers: u32,
     udp_firewall_responses_received: u32,
     udp_requests_sent: u32,
     last_check_start: i64,
@@ -64,6 +75,7 @@ impl FirewallChecker {
             udp_status: FirewallStatus::Unknown,
             tcp_responses_received: 0,
             tcp_requests_sent: 0,
+            tcp_check_answers: 0,
             udp_firewall_responses_received: 0,
             udp_requests_sent: 0,
             last_check_start: 0,
@@ -86,6 +98,7 @@ impl FirewallChecker {
         self.last_check_start = now;
         self.tcp_responses_received = 0;
         self.tcp_requests_sent = 0;
+        self.tcp_check_answers = 0;
         self.udp_firewall_responses_received = 0;
         self.udp_requests_sent = 0;
         self.pending_check_ips.clear();
@@ -144,6 +157,7 @@ impl FirewallChecker {
     /// and pass the reporter's source IP so we can enforce distinct-voter
     /// (distinct-/24) confirmation.
     pub fn handle_firewalled_response(&mut self, reported_ip: Ipv4Addr, reporter: Ipv4Addr) {
+        self.tcp_check_answers = self.tcp_check_answers.saturating_add(1);
         if crate::security::is_special_use_v4(reported_ip) {
             debug!("Ignoring private/reserved external IP vote: {reported_ip}");
             return;
@@ -371,6 +385,26 @@ impl FirewallChecker {
         true
     }
 
+    /// What the cycle `evaluate` just closed measured on its own, without the
+    /// rule that keeps a lasting status `Open` through a cycle nobody answered.
+    ///
+    /// Closed only on evidence: a peer answered and still nobody got through.
+    /// A side no peer answered for reads `None`, because silence says nothing
+    /// about our port — which is why `evaluate` will not downgrade on it either.
+    pub fn last_cycle(&self) -> CycleResult {
+        let tcp_open = if self.tcp_responses_received > 0 {
+            Some(true)
+        } else {
+            (self.tcp_check_answers > 0).then_some(false)
+        };
+        let udp_open = if self.udp_firewall_succeeded {
+            Some(true)
+        } else {
+            (self.udp_firewall_responses_received > 0).then_some(false)
+        };
+        CycleResult { tcp_open, udp_open }
+    }
+
     pub fn should_recheck(&self) -> bool {
         if self.checking {
             return false;
@@ -465,6 +499,39 @@ mod tests {
             FirewallStatus::Open,
             "LowID sticky must not erase proven TCP Open"
         );
+    }
+
+    #[test]
+    fn a_cycle_reports_its_own_verdict_even_while_the_status_stays_open() {
+        let mut fw = FirewallChecker::new();
+        fw.handle_tcp_connect_back();
+        fw.start_check();
+        assert_eq!(fw.last_cycle(), CycleResult { tcp_open: None, udp_open: None });
+
+        fw.record_tcp_request_sent(Ipv4Addr::new(8, 8, 8, 8));
+        fw.record_udp_firewall_request_sent(Ipv4Addr::new(9, 9, 9, 9));
+        assert_eq!(
+            fw.last_cycle(),
+            CycleResult { tcp_open: None, udp_open: None },
+            "asking proves nothing until somebody answers"
+        );
+
+        fw.handle_firewalled_response(Ipv4Addr::new(81, 2, 69, 160), Ipv4Addr::new(8, 8, 8, 8));
+        fw.handle_udp_firewall_result(false);
+        fw.last_check_start -= RESPONSE_WINDOW_SECS;
+        assert!(fw.evaluate());
+        assert_eq!(fw.tcp_status(), FirewallStatus::Open, "the lasting status is sticky");
+        assert_eq!(
+            fw.last_cycle(),
+            CycleResult { tcp_open: Some(false), udp_open: Some(false) },
+            "but peers answered and nobody got through in this cycle"
+        );
+
+        fw.start_check();
+        fw.record_tcp_request_sent(Ipv4Addr::new(8, 8, 8, 8));
+        fw.handle_tcp_connect_back();
+        assert_eq!(fw.last_cycle().tcp_open, Some(true));
+        assert_eq!(fw.last_cycle().udp_open, None, "no UDP answer came");
     }
 
     #[test]

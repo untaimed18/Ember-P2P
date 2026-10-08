@@ -139,6 +139,40 @@ fn restore_status_after_copy_check(
     true
 }
 
+/// Whether a user-cancel failure cannot be the registered worker's. A worker
+/// reports that cancel only once its own control is cancelled, so one arriving
+/// while the registered control is live came from a worker that control
+/// replaced, and the senders and handle it would tear down are the new one's.
+fn cancel_failure_is_superseded(error: &str, registered: Option<&TransferControl>) -> bool {
+    ed2k::transfer::is_user_cancel_error(error) && registered.is_some_and(|c| !c.is_cancelled())
+}
+
+/// Whether a `Failed` was sent by a worker whose control has since been
+/// replaced, so the senders, handle and row it would act on are a newer
+/// worker's. Such an event still ends the restore verification it reports. One
+/// sent by no worker, or arriving with no control registered, is handled as it
+/// always was.
+///
+/// Never a `Completed`. It is sent only once the file is in Downloads, by a
+/// finish task Pause and Stop cannot abort, so a Resume during a slow move
+/// starts a worker that finds no `.part` and begins the file again. Dropping
+/// the result left that worker re-downloading a file already finished;
+/// handling it completes the row, and `complete` cancels the newer worker.
+fn drop_superseded_terminal_event(event: &DownloadEvent, mgr: &mut TransferManager) -> bool {
+    let DownloadEvent::Failed { transfer_id, generation, .. } = event else {
+        return false;
+    };
+    let generation = *generation;
+    let superseded = generation
+        .zip(mgr.get_control(transfer_id))
+        .is_some_and(|(sender, registered)| sender != registered.generation());
+    if superseded {
+        mgr.finish_restore_verification(transfer_id, generation);
+        debug!("Ignoring {transfer_id}'s result from a worker that has since been replaced");
+    }
+    superseded
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn on_download_event(
     event: DownloadEvent,
@@ -222,13 +256,21 @@ pub(in crate::network) async fn on_download_event(
         });
         }
     }
+    if matches!(event, DownloadEvent::Failed { .. })
+        && drop_superseded_terminal_event(&event, &mut *transfer_manager.write().await)
+    {
+        return;
+    }
+    let mut completed_worker = None;
     if let DownloadEvent::Completed {
         ref transfer_id,
         ref final_path,
         part_hashes: ref event_part_hashes,
+        generation,
         ..
     } = event
     {
+        transfer_manager.write().await.finish_restore_verification(transfer_id, generation);
         {
             let mgr_snap = transfer_manager.read().await;
             if let Some(t) = mgr_snap.get_transfer(transfer_id) {
@@ -246,7 +288,7 @@ pub(in crate::network) async fn on_download_event(
         state.active_source_overflow.remove(transfer_id);
         state.active_kad_search_state.remove(transfer_id);
         state.per_file_sources.remove(transfer_id);
-        state.download_handles.remove(transfer_id);
+        completed_worker = state.download_handles.remove(transfer_id);
         forget_requeue_history(transfer_id);
         forget_completion_move_failures(transfer_id);
         {
@@ -756,7 +798,17 @@ pub(in crate::network) async fn on_download_event(
             }
         }
     }
-    if let DownloadEvent::Failed { ref transfer_id, ref error, ref failure_kind } = event {
+    if let DownloadEvent::Failed { ref transfer_id, ref error, ref failure_kind, generation } = event {
+        let superseded = {
+            let mut mgr = transfer_manager.write().await;
+            let restore_check = mgr.finish_restore_verification(transfer_id, generation);
+            !restore_check
+                && cancel_failure_is_superseded(error, mgr.get_control(transfer_id).as_deref())
+        };
+        if superseded {
+            debug!("Ignoring {transfer_id}'s cancel from a worker that has since been replaced");
+            return;
+        }
         state.active_source_senders.remove(transfer_id);
         state.active_established_senders.remove(transfer_id);
         state.active_source_overflow.remove(transfer_id);
@@ -849,55 +901,10 @@ pub(in crate::network) async fn on_download_event(
             }));
         }
 
-        // Dead source marking for individual sources is handled by
-        // SourceDetail "failed" events (which carry the actual IP/port).
-        // For single-source downloads that set peer_id, apply a
-        // belt-and-suspenders mark here as well.
-        if blames_source {
-            // Sources retired below are also dropped from the
-            // registry, which is what makes the count honest — see
-            // `retire_dead_source_from_registry`. Collected while the
-            // manager lock is held and applied after it is released.
-            let mut retire: Option<([u8; 16], Ipv4Addr, u16)> = None;
-            let mgr = transfer_manager.read().await;
-            if let Some(t) = mgr.get_transfer(transfer_id) {
-                if let Some((ip_str, port_str)) = t.peer_id.split_once(':') {
-                    if let (Ok(ip), Ok(port)) = (ip_str.parse::<Ipv4Addr>(), port_str.parse::<u16>()) {
-                        if *failure_kind == SourceFailureKind::Permanent {
-                            // The block time follows the *source's*
-                            // reachability, not ours — see
-                            // `add_dead_source`.
-                            let src_fw = state
-                                .per_file_sources
-                                .get(transfer_id)
-                                .is_some_and(|pfs| pfs.source_is_firewalled(ip, port, None));
-                            state.dead_sources.add_dead_source(0, u32::from(ip), port, src_fw);
-                            if let Ok(fh_bytes) = hex::decode(&t.file_hash) {
-                                if fh_bytes.len() == 16 {
-                                    let mut fh = [0u8; 16];
-                                    fh.copy_from_slice(&fh_bytes);
-                                    state.dead_sources.add_dead_source_for_file(fh, u32::from(ip), port);
-                                    retire = Some((fh, ip, port));
-                                }
-                            }
-                            debug!("Marked source {}:{} as dead after permanent failure: {}", ip, port, error);
-                        } else {
-                            if let Ok(fh_bytes) = hex::decode(&t.file_hash) {
-                                if fh_bytes.len() == 16 {
-                                    let mut fh = [0u8; 16];
-                                    fh.copy_from_slice(&fh_bytes);
-                                    state.dead_sources.add_transient_dead_source_for_file(fh, u32::from(ip), port);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            drop(mgr);
-            if let Some((fh, ip, port)) = retire {
-                retire_dead_source_from_registry(source_manager, &fh, ip, port).await;
-            }
-        }
+        // No source is marked dead here. A worker's own failure is not one
+        // source's: `peer_id` is only the address the download started with,
+        // and the failure may be another peer's or the whole file's. Each
+        // source's failures arrive as SourceDetail events with its address.
 
         // A restored download whose finished copy was not its file resumes
         // as it was left, and one the user had paused or stopped stays so.
@@ -1202,7 +1209,7 @@ pub(in crate::network) async fn on_download_event(
             }
         }
         if is_user_cancel {
-            // cancel_transfer / CancelDownload already removed the
+            // cancel_transfers_batch / CancelDownload already removed the
             // row and recorded history as "cancelled". Falling
             // through would emit transfer-failed and paint the
             // download bar red for a moment before the UI drops it.
@@ -1350,11 +1357,14 @@ pub(in crate::network) async fn on_download_event(
                         rv_url, nat_ctx,
                     ).await {
                         info!("Proactive friend session to {} failed: {e}", hex::encode(friend_eh));
-                        let _ = ultx2.send(upload_server::UploadEvent {
-                            transfer_id: String::new(),
-                            kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
-                        }).await;
                     }
+                    // Always release the outbound-task slot (success or
+                    // failure). On Ok the live session lives in ember_sessions;
+                    // the slot only gated this connect attempt.
+                    let _ = ultx2.send(upload_server::UploadEvent {
+                        transfer_id: String::new(),
+                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                    }).await;
                 });
             }
         }
@@ -1789,7 +1799,7 @@ pub(in crate::network) async fn on_download_event(
     // event can't unwind the whole network loop (→ outer catch →
     // shutdown). Mirrors the handle_command_inner/handle_udp_packet_inner
     // catch_unwind pattern.
-    if let Err(p) = std::panic::AssertUnwindSafe(handle_download_event(event, app_handle, transfer_manager, source_manager, db, &mut promoted, stats_manager, settings.remove_finished_downloads, a4af_shared, &settings.download_roots(), db_progress_last_persist, DB_PROGRESS_PERSIST_INTERVAL, &mut state.callback_row_pending_since, transfer_status_writes)).catch_unwind().await {
+    if let Err(p) = std::panic::AssertUnwindSafe(handle_download_event(event, app_handle, transfer_manager, source_manager, db, &mut promoted, stats_manager, settings.remove_finished_downloads, a4af_shared, &settings.download_roots(), db_progress_last_persist, DB_PROGRESS_PERSIST_INTERVAL, &mut state.callback_row_pending_since, transfer_status_writes, completed_worker)).catch_unwind().await {
         error!("handle_download_event panicked, dropping event: {}", describe_panic(&*p));
     }
 
@@ -1883,6 +1893,103 @@ mod friends_only_completion_tests {
         assert!(completed_download_friends_only(true, Some(true)));
         assert!(!completed_download_friends_only(false, Some(false)));
         assert!(!completed_download_friends_only(false, None));
+    }
+}
+
+#[cfg(test)]
+mod superseded_failure_tests {
+    use super::*;
+
+    #[test]
+    fn cancel_while_the_registered_control_is_live_is_a_replaced_workers() {
+        let replacement = TransferControl::new();
+        assert!(cancel_failure_is_superseded("cancelled by user", Some(&replacement)));
+    }
+
+    #[test]
+    fn cancel_of_the_registered_control_or_with_none_registered_is_handled() {
+        let cancelled = TransferControl::new();
+        cancelled.cancel();
+        assert!(!cancel_failure_is_superseded("cancelled by user", Some(&cancelled)));
+        assert!(!cancel_failure_is_superseded("cancelled by user", None));
+    }
+
+    #[test]
+    fn other_failures_are_never_taken_for_a_replaced_workers() {
+        let live = TransferControl::new();
+        assert!(!cancel_failure_is_superseded("connection reset by peer", Some(&live)));
+    }
+
+    fn completed(id: &str, generation: Option<u64>) -> DownloadEvent {
+        DownloadEvent::Completed {
+            transfer_id: id.to_string(),
+            final_path: None,
+            part_hashes: Vec::new(),
+            ember_verified: false,
+            generation,
+        }
+    }
+
+    fn failed(id: &str, generation: Option<u64>) -> DownloadEvent {
+        DownloadEvent::Failed {
+            transfer_id: id.to_string(),
+            error: "connection reset by peer".to_string(),
+            failure_kind: ed2k::transfer::SourceFailureKind::Transient,
+            generation,
+        }
+    }
+
+    #[test]
+    fn results_from_a_worker_replaced_by_resume_are_dropped() {
+        let mut mgr = TransferManager::new(2);
+        let paused = TransferControl::new();
+        mgr.register_control("dl", paused.clone());
+        mgr.register_control("dl", TransferControl::new());
+
+        let old = Some(paused.generation());
+        assert!(drop_superseded_terminal_event(&failed("dl", old), &mut mgr));
+        assert!(
+            !drop_superseded_terminal_event(&completed("dl", old), &mut mgr),
+            "a Completed means the file is already in Downloads, whoever sent it"
+        );
+    }
+
+    #[test]
+    fn results_from_the_registered_worker_are_handled() {
+        let mut mgr = TransferManager::new(2);
+        let worker = TransferControl::new();
+        mgr.register_control("dl", worker.clone());
+
+        let current = Some(worker.generation());
+        assert!(!drop_superseded_terminal_event(&failed("dl", current), &mut mgr));
+        assert!(!drop_superseded_terminal_event(&completed("dl", current), &mut mgr));
+    }
+
+    #[test]
+    fn results_from_no_worker_or_with_no_control_registered_are_handled() {
+        let mut mgr = TransferManager::new(2);
+        let gone = Some(TransferControl::new().generation());
+        assert!(!drop_superseded_terminal_event(&failed("dl", gone), &mut mgr));
+        assert!(!drop_superseded_terminal_event(&completed("dl", gone), &mut mgr));
+
+        mgr.register_control("dl", TransferControl::new());
+        assert!(!drop_superseded_terminal_event(&failed("dl", None), &mut mgr));
+        assert!(!drop_superseded_terminal_event(&completed("dl", None), &mut mgr));
+    }
+
+    #[test]
+    fn a_dropped_result_ends_only_its_own_restore_verification() {
+        let mut mgr = TransferManager::new(2);
+        let check = TransferControl::new();
+        mgr.begin_restore_verification("dl", &check);
+        mgr.register_control("dl", check.clone());
+        mgr.register_control("dl", TransferControl::new());
+
+        let other = Some(TransferControl::new().generation());
+        assert!(drop_superseded_terminal_event(&failed("dl", other), &mut mgr));
+        assert!(mgr.is_restore_verification_running("dl"));
+        assert!(drop_superseded_terminal_event(&failed("dl", Some(check.generation())), &mut mgr));
+        assert!(!mgr.is_restore_verification_running("dl"));
     }
 }
 

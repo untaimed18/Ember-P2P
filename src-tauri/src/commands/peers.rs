@@ -516,6 +516,7 @@ pub async fn add_friend(
 
 #[tauri::command]
 pub async fn remove_friend(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
 ) -> Result<(), String> {
@@ -545,7 +546,13 @@ pub async fn remove_friend(
         }
     }
 
-    tear_down_friend(&state, hash).await
+    tear_down_friend(&state, hash).await?;
+    // Best effort: the friendship is already gone, and an override left behind
+    // only applies if this hash is ever added again.
+    if let Err(e) = super::settings::clear_friend_overrides(&app, &state, &hash).await {
+        tracing::warn!("Could not clear a removed friend's settings: {e}");
+    }
+    Ok(())
 }
 
 /// Revoke every live grant held by a friend whose database rows have just
@@ -598,6 +605,7 @@ async fn tear_down_friend(state: &AppState, hash: [u8; 16]) -> Result<(), String
 /// them straight back to mutual without a prompt.
 #[tauri::command]
 pub async fn block_friend(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
 ) -> Result<(), String> {
@@ -611,7 +619,11 @@ pub async fn block_friend(
         .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("peers_failed_block_friend", "Failed to block", e))?;
 
-    tear_down_friend(&state, hash).await
+    tear_down_friend(&state, hash).await?;
+    if let Err(e) = super::settings::clear_friend_overrides(&app, &state, &hash).await {
+        tracing::warn!("Could not clear a blocked friend's settings: {e}");
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -873,7 +885,7 @@ pub async fn send_chat_message(
                 id,
             })
         }
-        Err(reason) if chat_failure_is_permanent(&reason) => Err(reason),
+        Err(reason) if chat_failure_is_permanent(&reason) => Err(code_permanent_chat_failure(reason)),
         Err(reason) => {
             // Every remaining failure means "we could not reach them right
             // now" — offline, a dial in flight, a dead channel. Keep the
@@ -895,6 +907,31 @@ pub async fn send_chat_message(
             })
         }
     }
+}
+
+/// Drop a sent message the outbox gave up on, after Resend put its text out as
+/// a new one. Without this the failed copy came back on the next load, next to
+/// the one that was delivered.
+#[tauri::command]
+pub async fn discard_failed_chat_message(
+    state: tauri::State<'_, AppState>,
+    user_hash_hex: String,
+    id: i64,
+) -> Result<(), String> {
+    let canonical = user_hash_hex.to_lowercase();
+    parse_user_hash(&canonical)?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.delete_failed_chat_message(&canonical, id))
+        .await
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| {
+            coded_ctx(
+                "peers_failed_discard_message",
+                "Failed to remove the failed message",
+                e,
+            )
+        })?;
+    Ok(())
 }
 
 #[derive(serde::Serialize)]
@@ -924,6 +961,29 @@ fn chat_failure_is_permanent(reason: &str) -> bool {
     lowered.contains("chatencryptfailed")
         || lowered.contains("can only chat with friends")
         || lowered.contains("chat is disabled")
+}
+
+/// The composer shows a permanent failure as it comes back, so the network
+/// task's bare English becomes a code the frontend translates.
+/// `ChatEncryptFailed` passes through: it is already a key `translateError`
+/// recognises.
+fn code_permanent_chat_failure(reason: String) -> String {
+    let lowered = reason.to_ascii_lowercase();
+    if lowered.contains("can only chat with friends") {
+        coded("peers_not_friend", "Can only chat with friends")
+    } else if lowered.contains("chat is disabled for this friend") {
+        coded(
+            "peers_attach_disabled_friend",
+            "Chatting with this friend is turned off in your settings for them",
+        )
+    } else if lowered.contains("chat is disabled") {
+        coded(
+            "peers_attach_disabled",
+            "Chatting with friends is turned off in Settings",
+        )
+    } else {
+        reason
+    }
 }
 
 /// Whether chat history is sealed because its encryption key could not be
@@ -1003,26 +1063,6 @@ pub async fn offer_file_to_friend(
     await_reply(rx, "peers_no_response", "No response").await?
 }
 
-/// Per-friend count of outbound messages still waiting for a session, so the
-/// chat dock can show an "unsent" marker without loading each conversation.
-#[tauri::command]
-pub async fn get_pending_chat_counts(
-    state: tauri::State<'_, AppState>,
-) -> Result<std::collections::HashMap<String, i64>, String> {
-    let db = state.db.clone();
-    let rows = tokio::task::spawn_blocking(move || db.pending_chat_counts())
-        .await
-        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
-        .map_err(|e| {
-            coded_ctx(
-                "peers_failed_load_pending_counts",
-                "Failed to load queued message counts",
-                e,
-            )
-        })?;
-    Ok(rows.into_iter().collect())
-}
-
 #[tauri::command]
 pub async fn mark_messages_read(
     state: tauri::State<'_, AppState>,
@@ -1047,7 +1087,7 @@ pub async fn mark_messages_read(
         })?;
     let send_receipt = {
         let cfg = state.config.read().await;
-        !cfg.settings.friend_chat_disabled && cfg.settings.friend_chat_read_receipts
+        cfg.settings.read_receipts_with(&eh)
     };
     if send_receipt {
         let db_hash = state.db.clone();
@@ -1472,16 +1512,6 @@ async fn resolve_kad_host(input: &str, port: u16) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub async fn get_peers(state: tauri::State<'_, AppState>) -> Result<Vec<PeerInfo>, String> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    state
-        .network_tx
-        .try_send(NetworkCommand::GetPeersSnapshot { tx })
-        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    await_reply(rx, "peers_failed_get_peers", "Failed to get peers").await
-}
-
-#[tauri::command]
 pub async fn get_network_stats(state: tauri::State<'_, AppState>) -> Result<NetworkStats, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -1558,20 +1588,50 @@ pub async fn unban_peer(state: tauri::State<'_, AppState>, peer_id: String) -> R
     Ok(())
 }
 
+/// A peer the user banned, as the Security page lists it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BannedPeerInfo {
+    /// The id the ban was placed under: the peer's eD2K user hash, hex.
+    pub user_hash: String,
+    /// Last name and client software the peer's credit record saw; empty
+    /// when we never learned them.
+    pub name: String,
+    pub client_software: String,
+    /// Addresses recorded against the ban, `ip:port`.
+    pub addresses: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn get_banned_peers(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<BannedPeerInfo>, String> {
+    let db = state.db.clone();
+    let rows = tokio::task::spawn_blocking(move || db.get_banned_peers())
+        .await
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| {
+            coded_ctx(
+                "peers_failed_load_banned_peers",
+                "Failed to load banned peers",
+                e,
+            )
+        })?;
+    Ok(rows
+        .into_iter()
+        .map(|(user_hash, addresses, name, client_software)| BannedPeerInfo {
+            user_hash,
+            name,
+            client_software,
+            addresses,
+        })
+        .collect())
+}
+
 #[tauri::command]
 pub fn kad_connect(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state
         .network_tx
         .try_send(NetworkCommand::KadConnect)
-        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    Ok(())
-}
-
-#[tauri::command]
-pub fn kad_disconnect(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state
-        .network_tx
-        .try_send(NetworkCommand::KadDisconnect)
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     Ok(())
 }
@@ -1843,34 +1903,16 @@ pub fn kad_cancel_search(state: tauri::State<'_, AppState>, id: String) -> Resul
     Ok(())
 }
 
-/// Look up the reputation record for a single peer by user-hash. The
-/// backend's `ReputationTracker` runs in-memory and is consulted for
-/// ban decisions; this is the only IPC surface that exposes its state
-/// to the UI (trust badge / per-peer diagnostics).
-#[tauri::command]
-pub async fn get_peer_reputation(
-    state: tauri::State<'_, AppState>,
-    user_hash_hex: String,
-) -> Result<Option<PeerReputationInfo>, String> {
-    let hash = parse_user_hash(&user_hash_hex.to_lowercase())?;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    state
-        .network_tx
-        .try_send(NetworkCommand::GetPeerReputation {
-            user_hash: hash,
-            tx,
-        })
-        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    await_reply(rx, "peers_no_response", "No response").await
-}
-
-/// Look up reputation for many peers in one round trip.
+/// Look up reputation for many peers in one round trip. The backend's
+/// `ReputationTracker` runs in-memory and is consulted for ban decisions;
+/// this and [`get_reputation_stats`] are the IPC surface that exposes its
+/// state to the UI.
 ///
 /// The Known Clients table needs a Trust badge per visible row and refreshes
-/// them on a timer, so the per-hash command it used to call put a hundred
-/// entries into the bounded network command channel every eight seconds and
-/// starved unrelated commands into `network_busy`. Every answer comes from the
-/// same in-memory tracker, so the fan-out bought nothing.
+/// them on a timer, so a per-hash command put a hundred entries into the
+/// bounded network command channel every eight seconds and starved unrelated
+/// commands into `network_busy`. Every answer comes from the same in-memory
+/// tracker, so the fan-out bought nothing.
 ///
 /// Malformed hashes are skipped rather than failing the whole request: the
 /// caller is rendering a table, and one bad row must not blank the other
@@ -1902,8 +1944,7 @@ pub async fn get_peer_reputation_batch(
     await_reply(rx, "peers_no_response", "No response").await
 }
 
-/// Aggregate reputation-tracker stats for the security / statistics
-/// UI. Same-only-path rationale as `get_peer_reputation`.
+/// Aggregate reputation-tracker stats for the security / statistics UI.
 #[tauri::command]
 pub async fn get_reputation_stats(
     state: tauri::State<'_, AppState>,
@@ -2801,8 +2842,8 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{
-        chat_failure_is_permanent, format_friend_code, parse_friend_code,
-        require_public_ember_peer_ip_for_mode, INTRO_SECRET_LEN,
+        chat_failure_is_permanent, code_permanent_chat_failure, format_friend_code,
+        parse_friend_code, require_public_ember_peer_ip_for_mode, INTRO_SECRET_LEN,
     };
 
     /// "Copy member ID" in a room yields a bare Ed25519 key. Add Friend has to
@@ -2946,6 +2987,7 @@ mod tests {
     fn chat_failure_classification_matches_network_wording() {
         for permanent in [
             "Chat is disabled in Friends settings",
+            "Chat is disabled for this friend",
             "Can only chat with friends",
             "ChatEncryptFailed",
         ] {
@@ -2968,6 +3010,24 @@ mod tests {
                 "{transient:?} must be queued and retried"
             );
         }
+    }
+
+    #[test]
+    fn permanent_chat_failures_reach_the_composer_coded() {
+        for (reason, code) in [
+            ("Chat is disabled in Friends settings", "peers_attach_disabled"),
+            ("Chat is disabled for this friend", "peers_attach_disabled_friend"),
+            ("Can only chat with friends", "peers_not_friend"),
+        ] {
+            let coded: serde_json::Value =
+                serde_json::from_str(&code_permanent_chat_failure(reason.to_string()))
+                    .expect("a coded error");
+            assert_eq!(coded["code"], code, "{reason:?}");
+        }
+        assert_eq!(
+            code_permanent_chat_failure("ChatEncryptFailed".to_string()),
+            "ChatEncryptFailed"
+        );
     }
 
     #[test]

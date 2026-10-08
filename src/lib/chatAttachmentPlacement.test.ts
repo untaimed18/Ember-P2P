@@ -73,10 +73,23 @@ describe('parseChatAttachment', () => {
     created_at: 1_700_000_000,
     has_file: false,
     risky: false,
+    attempt: 2,
+    retryable: false,
   };
 
   it('accepts a well-formed payload', () => {
     expect(parseChatAttachment(good)).toEqual(good);
+  });
+
+  it('reads a payload from before Try Again as a first attempt that cannot be retried', () => {
+    const { attempt: _a, retryable: _r, ...older } = good;
+    const p = parseChatAttachment(older);
+    expect(p?.attempt).toBe(0);
+    expect(p?.retryable).toBe(false);
+    expect(parseChatAttachment({ ...good, attempt: -3, retryable: 'yes' })).toMatchObject({
+      attempt: 0,
+      retryable: false,
+    });
   });
 
   it('refuses a payload whose ids are not hex of the right length', () => {

@@ -24,7 +24,11 @@ function inlineText(nodes: InlineNode[]): string {
 /** What a formatted message reads as with its markers taken away. */
 export function plainTextOf(blocks: FormatBlock[]): string {
   return blocks
-    .map((block) => (block.type === 'code' ? block.text : inlineText(block.children)))
+    .map((block) => {
+      if (block.type === 'code') return block.text;
+      if (block.type === 'list') return block.items.map(inlineText).join('\n');
+      return inlineText(block.children);
+    })
     .join('\n');
 }
 

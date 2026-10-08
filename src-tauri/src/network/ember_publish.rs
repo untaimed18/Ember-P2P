@@ -618,13 +618,6 @@ impl EmberBatchPublisher {
                 < std::time::Duration::from_secs(300)
         });
     }
-
-    pub(crate) fn clear(&mut self) {
-        self.queued.clear();
-        self.queued_count = 0;
-        self.in_flight.clear();
-        self.sent_window.clear();
-    }
 }
 
 /// Rounds of `PROXY_STORE` asks a buddy may let expire in a row, with nothing
@@ -757,10 +750,6 @@ impl EmberProxyBuddyPacer {
                     .last_ack
                     .is_some_and(|ack| now.saturating_duration_since(ack) < EMBER_BUDDY_SKIP)
         });
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.buddies.clear();
     }
 }
 

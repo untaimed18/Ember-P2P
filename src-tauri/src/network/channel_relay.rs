@@ -449,10 +449,9 @@ pub(super) const MAX_CHANNEL_RELAY_SESSIONS: usize = 8;
 /// WebSocket upgrade completes.
 ///
 /// Bounded because everything a session costs is claimed on the far side of
-/// it: one of [`MAX_CHANNEL_RELAY_SESSIONS`] outbox slots, and on the
-/// responder path one `friend_relay_ticket_sessions_in_flight` entry that is
-/// only released after the session returns. A peer that upgrades and then
-/// says nothing used to hold both for the life of the process.
+/// it: one of [`MAX_CHANNEL_RELAY_SESSIONS`] outbox slots, held until the
+/// session returns. A peer that upgrades and then says nothing used to hold
+/// one for the life of the process.
 pub(super) const CHANNEL_RELAY_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(super) fn maybe_offer_channel_relay(

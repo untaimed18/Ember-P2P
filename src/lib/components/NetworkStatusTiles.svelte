@@ -10,14 +10,14 @@
    * KAD's narrow right-hand column.
    */
   import { goto } from '$app/navigation';
-  import { networkStats, upnpAutoDisabled } from '$lib/stores/network';
+  import { networkStats } from '$lib/stores/network';
   import { appSettings } from '$lib/stores/settings';
   import { firewallStatusText } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
 
   // `appSettings` is null until the layout's first load lands; treat that as
   // enabled so the tile doesn't flash "Disabled" during start-up.
-  let upnpOff = $derived($appSettings?.upnp_enabled === false || $upnpAutoDisabled);
+  let upnpOff = $derived($appSettings?.upnp_enabled === false);
   let buddyStatus = $derived($networkStats.buddy_status || 'none');
 </script>
 
@@ -68,6 +68,8 @@
           onclick={() => void goto('/settings?section=network').catch((e) => console.warn('Failed to open settings:', e))}
           title={m.kad_upnp_disabled_title()}
         >{m.kad_upnp_disabled()}</button>
+      {:else if $networkStats.upnp_stood_down}
+        <span class="stat-value" title={m.kad_upnp_not_in_use_title()}>{m.kad_upnp_not_in_use()}</span>
       {:else}
         <span class="stat-value">{$networkStats.upnp_mapped ? m.kad_upnp_mapped() : m.kad_upnp_not_mapped()}</span>
       {/if}

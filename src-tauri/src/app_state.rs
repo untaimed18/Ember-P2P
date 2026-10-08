@@ -45,6 +45,25 @@ pub struct PendingFolderDrop {
     pub parents: Vec<String>,
 }
 
+/// The settings the network stack reads once, as this process started with
+/// them. A saved value that differs from one of these waits for a restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LaunchSettings {
+    pub tcp_port: u16,
+    pub udp_port: u16,
+    pub upnp_enabled: bool,
+}
+
+impl LaunchSettings {
+    pub fn from_settings(settings: &crate::types::AppSettings) -> Self {
+        Self {
+            tcp_port: settings.tcp_port,
+            udp_port: settings.udp_port,
+            upnp_enabled: settings.upnp_enabled,
+        }
+    }
+}
+
 /// Live shared-folder list visible to the upload server's security check.
 pub type SharedFolderList = Arc<RwLock<Vec<String>>>;
 
@@ -67,6 +86,8 @@ pub struct AppState {
     /// Process-wide persistent identity loaded exactly once during setup.
     pub identity: Arc<NodeIdentity>,
     pub config: Arc<RwLock<AppConfig>>,
+    /// See [`LaunchSettings`]. Fixed for the life of the process.
+    pub launch_settings: LaunchSettings,
     /// Serializes each read/modify/persist/commit settings transaction so
     /// concurrent commands cannot overwrite one another with stale clones.
     pub settings_save_lock: Arc<tokio::sync::Mutex<()>>,
@@ -125,7 +146,7 @@ pub struct AppState {
     /// Cached transfer statistics — updated by the network loop.
     pub cached_transfer_stats: Arc<RwLock<TransferStats>>,
     /// Cached shared files list — updated by sharing commands and the network
-    /// loop's background task so `get_shared_files` never contends with
+    /// loop's background task so `get_shared_files_if_changed` never contends with
     /// `local_index` writers (hashing, scanning, stats merge).
     pub cached_shared_files: Arc<RwLock<Vec<FileInfo>>>,
     /// Search spam filter for scoring and marking spam results.
@@ -185,6 +206,10 @@ pub struct AppState {
     /// waited longer than a launch will apply one. Consumed like the latch
     /// above: the staging directory is already gone, so it is the only trace.
     pub pending_restore_expired_notice: Arc<AtomicBool>,
+    /// The local folder an applied restore put in place of a download folder
+    /// on a network share, until the layout takes it to tell the user. The
+    /// config already names the replacement, so this is the only trace.
+    pub pending_restore_download_folder_notice: Arc<parking_lot::Mutex<Option<String>>>,
     /// Mirror of `config.settings.close_to_tray_behavior` behind a synchronous
     /// `parking_lot::RwLock` so the `WindowEvent::CloseRequested` handler can
     /// read it from the main UI thread without blocking on the async tokio
@@ -247,12 +272,6 @@ impl AppState {
         id
     }
 
-    /// Remove a background scan entry once it finishes; does not await.
-    #[allow(dead_code)]
-    pub async fn deregister_background_scan(&self, id: u64) {
-        self.background_scans.write().await.remove(&id);
-    }
-
     /// Await all currently-tracked background scans. Aborts any still running
     /// after a grace period so shutdown can't hang on a frozen hasher.
     ///
@@ -298,28 +317,6 @@ impl AppState {
             for ah in abort_handles {
                 ah.abort();
             }
-        }
-    }
-
-    /// Wait until `scanning_count` reaches zero or `grace` elapses. Used on
-    /// shutdown paths that don't own JoinHandles directly (e.g. the startup
-    /// scan spawned from `tauri::setup`).
-    #[allow(dead_code)]
-    pub async fn wait_scans_idle(&self, grace: std::time::Duration) {
-        let deadline = std::time::Instant::now() + grace;
-        while self
-            .scanning_count
-            .load(std::sync::atomic::Ordering::Relaxed)
-            > 0
-        {
-            if std::time::Instant::now() >= deadline {
-                tracing::warn!(
-                    "scan workers still active after {:?}; continuing shutdown",
-                    grace
-                );
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 }

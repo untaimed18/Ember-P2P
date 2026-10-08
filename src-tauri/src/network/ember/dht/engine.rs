@@ -2193,11 +2193,16 @@ impl EmberDht {
     /// unnarrowed on the ones that do not, where the caller's own filename filter
     /// still applies. Anything past [`messages::MAX_FIND_VALUE_KEYS_TOTAL`] is
     /// dropped; callers pass keys most-selective-first.
-    pub fn build_find_value(
+    ///
+    /// `resume_after` names, for a page follow-up, the records the last page
+    /// ended on, so the responder can find where they are now; it is empty for
+    /// a node's first query.
+    pub fn build_find_value_resuming(
         &mut self,
         mut keys: Vec<[u8; 16]>,
         start_position: u16,
         mut constraints: messages::ValueConstraints,
+        resume_after: messages::ResumeAnchors,
     ) -> (u32, Vec<u8>) {
         if keys.len() > messages::MAX_FIND_VALUE_KEYS {
             let surplus = keys.split_off(messages::MAX_FIND_VALUE_KEYS);
@@ -2207,15 +2212,27 @@ impl EmberDht {
             .extra_keys
             .truncate(messages::MAX_FIND_VALUE_EXTRA_KEYS);
         let request_id = self.next_request_id();
-        let msg = messages::build_find_value(
+        let msg = messages::build_find_value_resuming(
             self.local_id,
             request_id,
             keys,
             start_position,
             constraints,
+            resume_after,
         );
         let bytes = messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub);
         (request_id, bytes)
+    }
+
+    /// [`Self::build_find_value_resuming`] for a query that names no anchors.
+    #[cfg(test)]
+    pub fn build_find_value(
+        &mut self,
+        keys: Vec<[u8; 16]>,
+        start_position: u16,
+        constraints: messages::ValueConstraints,
+    ) -> (u32, Vec<u8>) {
+        self.build_find_value_resuming(keys, start_position, constraints, messages::ResumeAnchors::default())
     }
 
     /// Build a signed `STORE_BATCH` carrying as many of `records` as fit one
@@ -2906,6 +2923,7 @@ impl EmberDht {
                 mut keys,
                 start_position,
                 constraints,
+                resume_after,
             } => {
                 out.find_value_received = true;
                 // Keys the searcher could not fit in the count-prefixed run.
@@ -2919,9 +2937,13 @@ impl EmberDht {
                 // holds secondary keys, filter by `file_hash` intersection.
                 // Missing secondaries are skipped (sparse DHT locality) —
                 // filename AND at emit remains the cross-key filter.
-                if let Some(reply) =
-                    intersect_find_value_records(&self.store, &keys, start_position, &constraints)
-                {
+                if let Some(reply) = intersect_find_value_records(
+                    &self.store,
+                    &keys,
+                    start_position,
+                    &resume_after,
+                    &constraints,
+                ) {
                     out.find_value_hit = true;
                     out.find_value_withheld = reply.withheld.min(u16::MAX as usize) as u16;
                     let fv = messages::build_found_value(
@@ -3164,11 +3186,14 @@ use super::publish::file_hash_from_record_data;
 /// holding none. Serve the primary in that case too.
 ///
 /// `start_position` is the searcher's offset into our live list for the primary
-/// key. Returns `None` when the key is empty or the offset is past its end.
+/// key, and `resume_after` the records its last page ended on; see
+/// [`resume_start`]. Returns `None` when the key is empty or the offset is past
+/// its end.
 fn intersect_find_value_records(
     store: &DhtStore,
     keys: &[[u8; 16]],
     start_position: u16,
+    resume_after: &messages::ResumeAnchors,
     constraints: &messages::ValueConstraints,
 ) -> Option<FoundValueReply> {
     let (primary, mut filtered) = intersect_live_records(store, keys)?;
@@ -3205,7 +3230,7 @@ fn intersect_find_value_records(
     // same hot key advanced each other's windows. An offset the searcher owns
     // has neither problem, so the cursor is gone rather than kept alongside.
     let n = filtered.len();
-    let start = start_position as usize;
+    let start = resume_start(&filtered, start_position, resume_after);
     if start >= n {
         // Past the end. A searcher paging in good faith stops before this
         // (`next_position >= total_available` says the key is exhausted), so
@@ -3263,6 +3288,15 @@ fn intersect_find_value_records(
     // so it is always taken, so whichever of these two wins is greater than
     // `start` — which is what the searcher requires before it will page again.
     let next = first_passed_over.unwrap_or(past_last_taken);
+    // Reported in the searcher's numbering, which is where `start_position`
+    // lives. Where an anchor moved the start, our list shifted under the
+    // searcher; moving both figures by the same amount keeps what it checks —
+    // `next` past what it asked, and `next >= total` meaning exhausted — and
+    // keeps the blobs it received lined up from the position it asked for,
+    // which is how it picks the next page's anchors.
+    let to_searcher = |index: usize| {
+        (index as i64 + i64::from(start_position) - start as i64).clamp(0, i64::from(u16::MAX)) as u16
+    };
     Some(FoundValueReply {
         key: primary,
         blobs,
@@ -3273,9 +3307,39 @@ fn intersect_find_value_records(
         // carry — on the counters the spec names as the way to read how hard
         // the datagram ceiling binds on real keys.
         withheld: n - past_last_taken,
-        next_position: next.min(u16::MAX as usize) as u16,
-        total_available: n.min(u16::MAX as usize) as u16,
+        next_position: to_searcher(next),
+        total_available: to_searcher(n),
     })
+}
+
+/// Where a page begins in `filtered`: just after the nearest record the
+/// searcher's last page ended on that we still hold, else at `start_position`.
+///
+/// The position is what an older searcher sends, and it shifts: a record
+/// ahead of it that lapsed between pages moved every later one down a place,
+/// so the page would start one record too far on and the searcher would never
+/// see the one in between. The anchors find the same place by identity.
+///
+/// A record only ever moves *down* the list (a newcomer is appended, a
+/// republish replaces in place), so a match past the position is not where
+/// the page ended: the record lapsed and was stored again at the end, or the
+/// anchor collides with another. Resuming there would skip everything between.
+fn resume_start(
+    filtered: &[&super::store::DhtRecord],
+    start_position: u16,
+    resume_after: &messages::ResumeAnchors,
+) -> usize {
+    let start_position = start_position as usize;
+    let within = &filtered[..start_position.min(filtered.len())];
+    for anchor in resume_after.iter() {
+        if let Some(at) = within
+            .iter()
+            .position(|r| messages::record_anchor(&r.data).as_ref() == Some(anchor))
+        {
+            return at + 1;
+        }
+    }
+    start_position
 }
 
 /// A `FOUND_VALUE` answer plus where the searcher should resume.
@@ -4781,6 +4845,108 @@ mod tests {
             !reply.find_value_hit,
             "no match must not be answered as a hit"
         );
+    }
+
+    /// A record that lapses between two pages moves every later one down a
+    /// place. Paging by position alone then starts the next page one record too
+    /// far on and that record is never seen; the anchors the searcher sends
+    /// find where the last page ended instead. The anchors are picked the way
+    /// the searcher picks them, so both halves are exercised.
+    #[test]
+    fn a_record_lapsing_between_pages_does_not_hide_the_next_one() {
+        let mut a = dht(42);
+        let mut b = dht(43);
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
+        let a_addr = addr(42, 4672);
+        let b_addr = addr(43, 4672);
+
+        // Enough mid-sized records that a page holds only a few of them.
+        let name_len = messages::MAX_STORE_RECORD_BYTES / 4 - super::super::publish::RECORD_HEADER_LEN;
+        let mut key = [0u8; 16];
+        let mut hashes = Vec::new();
+        let mut bodies = Vec::new();
+        for i in 0..10u8 {
+            let mut file_hash = [0u8; 16];
+            file_hash[0] = i + 1;
+            hashes.push(file_hash);
+            let name = format!("{i}{}", "x".repeat(name_len - 1));
+            let record = a.build_keyword_record("ubuntu", file_hash, [0u8; 32], 4096, &name);
+            bodies.push(record.data.clone());
+            key = record.keyword_hash;
+            let (_rid, bytes) = a.build_store(key, record.data.clone(), record.signature);
+            assert!(b.handle_message(&bytes, a_addr, a_noise, 1000 + i as i64).stored_record);
+        }
+
+        let file_of = |blob: &Vec<u8>| {
+            super::super::publish::SignedRecord::from_value_blob(blob)
+                .expect("signed")
+                .file_hash
+        };
+
+        let (_rid, first) = a.build_find_value(vec![key], 0, messages::ValueConstraints::default());
+        let reply = b.handle_message(&first, a_addr, a_noise, 2000);
+        let page = a
+            .handle_message(&reply.responses[0], b_addr, b_noise, 2001)
+            .found_value
+            .expect("FOUND_VALUE");
+        let served = page.records.len();
+        assert!(served >= 2 && page.has_more(), "the key must take more than one page");
+        assert_eq!(page.next_position as usize, served);
+        let mut seen: HashSet<[u8; 16]> = page.records.iter().map(file_of).collect();
+
+        // The first record lapses before the follow-up arrives.
+        b.store.lapse_for_test(&key, 0);
+
+        let anchors = super::super::search::page_resume_anchors(&page.records, 0, page.next_position);
+        assert!(!anchors.is_empty());
+        let (_rid, follow) = a.build_find_value_resuming(
+            vec![key],
+            page.next_position,
+            messages::ValueConstraints::default(),
+            anchors,
+        );
+        let reply = b.handle_message(&follow, a_addr, a_noise, 2002);
+        let next = a
+            .handle_message(&reply.responses[0], b_addr, b_noise, 2003)
+            .found_value
+            .expect("FOUND_VALUE");
+        assert_eq!(
+            file_of(&next.records[0]),
+            hashes[served],
+            "the page resumes at the record after the last one served"
+        );
+        assert!(next.next_position > page.next_position, "and still advances in our numbering");
+        assert_eq!(next.total_available, 10, "with the total in our numbering too");
+        seen.extend(next.records.iter().map(file_of));
+
+        // Without anchors the same follow-up starts one record too far on.
+        let (_rid, by_position) =
+            a.build_find_value(vec![key], page.next_position, messages::ValueConstraints::default());
+        let reply = b.handle_message(&by_position, a_addr, a_noise, 2004);
+        let shifted = a
+            .handle_message(&reply.responses[0], b_addr, b_noise, 2005)
+            .found_value
+            .expect("FOUND_VALUE");
+        assert_eq!(file_of(&shifted.records[0]), hashes[served + 1]);
+        assert!(seen.contains(&hashes[served]));
+
+        // An anchor found only past the position cannot be where the page
+        // ended (records never move up the list), so the position stands.
+        let mut ahead = messages::ResumeAnchors::default();
+        ahead.push(messages::record_anchor(&bodies[9]).expect("a full header"));
+        let (_rid, misplaced) = a.build_find_value_resuming(
+            vec![key],
+            page.next_position,
+            messages::ValueConstraints::default(),
+            ahead,
+        );
+        let reply = b.handle_message(&misplaced, a_addr, a_noise, 2006);
+        let kept = a
+            .handle_message(&reply.responses[0], b_addr, b_noise, 2007)
+            .found_value
+            .expect("FOUND_VALUE");
+        assert_eq!(file_of(&kept.records[0]), hashes[served + 1]);
     }
 
     /// A record too large for the budget *left* on a page must be reached by a

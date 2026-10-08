@@ -81,7 +81,7 @@ pub(in crate::network) async fn on_bootstrap_tick(
     const SELF_LOOKUP_WARM_DELAY_SECS: i64 = 20;
     const SELF_LOOKUP_WARM_VERIFIED: usize = 16;
     const SELF_LOOKUP_REPEAT_SECS: i64 = 4 * 3600;
-    let now_ts = chrono::Utc::now().timestamp();
+    let now_ts = crate::network::monotonic_secs();
     let self_lookup_due = if !state.self_lookup_done {
         let elapsed = now_ts - state.kad_started_at;
         // eMule waits a flat 3 minutes before the first self-lookup.
@@ -263,6 +263,7 @@ pub(in crate::network) async fn on_bootstrap_tick(
         dispatch_udp_firewall_probe_requests(state, app_handle, settings);
     }
 
+    let mut finished_cycle = None;
     if state.firewall_checker.evaluate() {
         let was_tcp_fw = state.firewalled;
         let had_ip = state.external_ip.is_some();
@@ -313,6 +314,7 @@ pub(in crate::network) async fn on_bootstrap_tick(
             "tcp_status": format!("{:?}", tcp_status),
             "udp_status": format!("{:?}", udp_status),
         }));
+        finished_cycle = Some(state.firewall_checker.last_cycle());
         if was_tcp_fw && !state.firewalled {
             if state.buddy_manager.state() == BuddyState::FindingBuddy {
                 state.buddy_manager.find_failed();
@@ -409,6 +411,20 @@ pub(in crate::network) async fn on_bootstrap_tick(
             "external_ip": state.stats.external_ip,
             "tcp_status": state.stats.tcp_status,
             "udp_status": state.stats.udp_status,
+        }));
+    }
+
+    // The cycle's own answer, for "Test my ports": the lasting statuses never
+    // fall back from Open, so they cannot say a port closed. A connect-back
+    // swept up above landed inside the window this tick just closed.
+    // Ports as the probes named them, which a remapping NAT can make differ
+    // from the ones we listen on.
+    if let Some(cycle) = finished_cycle {
+        let _ = app_handle.emit("firewall-check-finished", serde_json::json!({
+            "tcp_port": advertised_tcp_port(state),
+            "udp_port": advertised_udp_port(state),
+            "tcp_open": if connect_back { Some(true) } else { cycle.tcp_open },
+            "udp_open": cycle.udp_open,
         }));
     }
 
@@ -705,10 +721,13 @@ pub(in crate::network) async fn on_bootstrap_tick(
                                 *upnp_maintain_started_at =
                                     Some(tokio::time::Instant::now());
                                 *upnp_maintain_handle = Some(tokio::spawn(async move {
-                                    let mapped = mappings.map_quic_port(upnp_quic_port).await;
-                                    if mapped {
+                                    if mappings.map_quic_port(upnp_quic_port).await {
                                         tracing::info!("UPnP: QUIC UDP port {upnp_quic_port} mapped");
                                     }
+                                    // The state every other pass reports: a
+                                    // refused QUIC port is not a lost TCP or
+                                    // KAD forward.
+                                    let mapped = mappings.is_mapped();
                                     let _ = tx.send(UpnpMaintainResult {
                                         revision,
                                         mappings,

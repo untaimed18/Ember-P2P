@@ -106,6 +106,9 @@ const APPLY_JOURNAL: &str = "APPLY.json";
 /// Left in staging when a finished restore's marker could not be removed, so
 /// the next launch discards the staged copies instead of applying them again.
 const APPLIED_SENTINEL: &str = "APPLIED";
+/// Left by a Discard that had to wait for a restart: the next launch rolls
+/// the interrupted apply back and drops the restore instead of retrying it.
+const DISCARD_REQUESTED: &str = "DISCARD";
 const BACKUP_DIR_PREFIX: &str = "pre-restore-";
 const BACKUP_EXTENSION: &str = "emberbackup";
 
@@ -116,6 +119,7 @@ const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// A file the backup carries.
+#[derive(Debug)]
 struct BackupFile {
     name: &'static str,
     /// DPAPI-wrapped on disk: unwrapped into the archive, re-wrapped on restore.
@@ -201,9 +205,14 @@ const BACKUP_FILES: &[BackupFile] = &[
 /// it with no record at all when startup had just created it fresh. Either way
 /// every download failed with "target is outside the approved roots" and,
 /// unlike a shared folder, there was no in-app way to re-approve it. Skipping it
-/// means a restored profile re-runs the migration and approves the configured
-/// roots on *this* machine.
+/// means startup approves a restored profile's download folders on *this*
+/// machine.
 const LEGACY_IGNORED_FILES: &[&str] = &["approved_roots.json"];
+
+/// The one key an export may leave out: when chat is locked it is unreadable to
+/// this account as well, so the backup loses nothing the profile can still use.
+const CHAT_KEY_FILE: &str = "chat-history.key";
+const DATABASE_FILE: &str = "ember.db";
 
 /// Zip entry holding the preferences the app window keeps in its own storage
 /// rather than in the data directory: language, theme, room lists and the like.
@@ -230,8 +239,10 @@ const WEBVIEW_PREF_KEYS: &[&str] = &[
     "ember.channels.favourites.v1",
     "ember.channels.hidden.v1",
     "ember.channels.ignored.v1",
+    "ember.channels.carried.v1",
     "search-recent-queries-v1",
     "search-prefs-v1",
+    "ember.highlight-matches.v1",
     "transfers-advanced-cols",
     "transfers-column-hidden-DownloadListCtrl",
     "transfers-column-hidden-UploadListCtrlV3",
@@ -290,6 +301,27 @@ fn parse_webview_prefs(raw: &[u8]) -> Option<WebviewPrefs> {
 
 fn backup_file(name: &str) -> Option<&'static BackupFile> {
     BACKUP_FILES.iter().find(|f| f.name == name)
+}
+
+/// Whether restoring `files` moves this device's chat-history key aside. A
+/// restored database opened under the old key shows its history as unavailable
+/// and seals new messages under a key the backup's rows do not use, so chat is
+/// left cleanly locked instead.
+fn restore_sets_aside_chat_key<S: AsRef<str>>(files: &[S]) -> bool {
+    let has = |name: &str| files.iter().any(|f| f.as_ref() == name);
+    has(DATABASE_FILE) && !has(CHAT_KEY_FILE)
+}
+
+/// Profile files a restore of `files` leaves as they are on this device.
+fn files_kept_from_profile<S: AsRef<str>>(files: &[S]) -> Vec<String> {
+    let chat_key_set_aside = restore_sets_aside_chat_key(files);
+    BACKUP_FILES
+        .iter()
+        .map(|f| f.name)
+        .filter(|name| !files.iter().any(|f| f.as_ref() == *name))
+        .filter(|name| !(chat_key_set_aside && *name == CHAT_KEY_FILE))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Whether `name` is a file an older version backed up that this one drops.
@@ -359,6 +391,8 @@ pub struct BackupSummary {
     pub bytes: u64,
     pub files: usize,
     pub created_at: i64,
+    /// Files left out because they could not be read; only [`CHAT_KEY_FILE`].
+    pub skipped: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -372,14 +406,21 @@ pub struct BackupPreview {
     /// True when the backup's database is newer than this build can open, in
     /// which case restoring it would be refused.
     pub schema_too_new: bool,
+    /// Profile files the backup does not carry, which keep this device's copy.
+    pub missing: Vec<String>,
+    /// The backup brings a database but no chat-history key, so this device's
+    /// key is set aside and chat history stays locked after the restore.
+    pub chat_key_set_aside: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct RestoreSummary {
     /// Files staged for the swap at next launch.
     pub staged: Vec<String>,
-    /// Files this build knows about that the backup did not carry.
+    /// Profile files the backup does not carry, which keep this device's copy.
     pub missing: Vec<String>,
+    /// See [`BackupPreview::chat_key_set_aside`].
+    pub chat_key_set_aside: bool,
     pub app_version: String,
     pub created_at: i64,
 }
@@ -757,14 +798,15 @@ fn temp_dir_in(data_dir: &Path, tag: &str) -> Result<PathBuf, String> {
 }
 
 /// Build the plaintext zip: `manifest.json` plus one entry per present file,
-/// and the app window's preferences when there are any.
+/// and the app window's preferences when there are any. Also returns the
+/// files left out because they could not be read.
 fn build_archive(
     data_dir: &Path,
     scratch: &Path,
     db: &crate::storage::database::Database,
     app_version: &str,
     webview_prefs: Option<&WebviewPrefs>,
-) -> Result<(PathBuf, Manifest), String> {
+) -> Result<(PathBuf, Manifest, Vec<String>), String> {
     let zip_path = scratch.join("payload.zip");
     let file = std::fs::File::create(&zip_path)
         .map_err(|e| coded_ctx("backup_export_failed", "Failed to create the archive", e))?;
@@ -773,6 +815,7 @@ fn build_archive(
         .compression_method(zip::CompressionMethod::Deflated);
 
     let mut entries = Vec::new();
+    let mut skipped = Vec::new();
     for spec in BACKUP_FILES {
         let bytes = if spec.database {
             let snapshot = scratch.join("ember.db.snapshot");
@@ -790,13 +833,28 @@ fn build_archive(
                     // other Windows account, which is the whole point of the
                     // feature. The plaintext is held in a `Zeroizing` buffer so
                     // it is wiped once this entry has been written.
-                    secret_store::unprotect(&raw).map_err(|e| {
-                        coded_ctx(
-                            "backup_export_failed",
-                            "Could not read protected key material for backup",
-                            e,
-                        )
-                    })?
+                    match secret_store::unprotect(&raw) {
+                        Ok(plaintext) => plaintext,
+                        // Only while chat is locked. With it unlocked the key is
+                        // the one history is sealed under: a backup without it
+                        // could never read the history it carries, and a restore
+                        // would set this device's working key aside.
+                        Err(e) if spec.name == CHAT_KEY_FILE && db.chat_locked() => {
+                            tracing::warn!(
+                                "Leaving {CHAT_KEY_FILE} out of the backup: chat is locked and \
+                                 the key cannot be read ({e})"
+                            );
+                            skipped.push(spec.name.to_string());
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(coded_ctx(
+                                "backup_export_failed",
+                                format!("Could not read the protected {}", spec.name),
+                                format!("{}: {e}", spec.name),
+                            ))
+                        }
+                    }
                 }
                 Ok(raw) => Zeroizing::new(raw),
                 // A file that was never created (no Kad contacts yet, no IP
@@ -868,7 +926,7 @@ fn build_archive(
         .map_err(|e| coded_ctx("backup_export_failed", "Failed to write the manifest", e))?;
     zip.finish()
         .map_err(|e| coded_ctx("backup_export_failed", "Failed to finish the archive", e))?;
-    Ok((zip_path, manifest))
+    Ok((zip_path, manifest, skipped))
 }
 
 fn validate_passphrase(passphrase: &str) -> Result<(), String> {
@@ -1077,7 +1135,7 @@ async fn write_backup(
         let scratch = temp_dir_in(&data_dir, "backup-tmp")?;
         let partial = partial_export_path(&dest);
         let result = (|| {
-            let (zip_path, manifest) = build_archive(
+            let (zip_path, manifest, skipped) = build_archive(
                 &data_dir,
                 &scratch,
                 &db,
@@ -1097,6 +1155,7 @@ async fn write_backup(
                 bytes,
                 files: manifest.files.len(),
                 created_at: manifest.created_at,
+                skipped,
             })
         })();
         // The scratch copy is plaintext identity material; never leave it
@@ -1188,17 +1247,49 @@ fn read_manifest(archive: &mut Archive) -> Result<Manifest, String> {
     Ok(manifest)
 }
 
+/// An archive entry that has verified, unpacked into the import's scratch
+/// directory.
+#[derive(Debug)]
+struct UnpackedEntry {
+    spec: &'static BackupFile,
+    path: PathBuf,
+}
+
+/// Passes writes through to `inner` while hashing and counting them.
+struct HashingWriter<W> {
+    inner: W,
+    hasher: blake3::Hasher,
+    written: u64,
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Read and verify the manifest and every entry of a decrypted archive,
-/// returning the entries in manifest order with their bytes.
+/// unpacking each entry into `unpack_dir` and returning them in manifest order.
 ///
-/// Everything is held in memory on purpose: nothing is written to the staging
-/// directory until the whole archive has verified, so a backup that turns out
-/// to be damaged half way through cannot leave a partial profile staged. The
-/// contents are profile state rather than media, and `MAX_TOTAL_BYTES` bounds
-/// the worst case.
-fn read_archive(zip_path: &Path) -> Result<(Manifest, Vec<(ManifestEntry, Vec<u8>)>), String> {
+/// Entries go to the scratch directory, not to staging: nothing is written to
+/// the staging directory until the whole archive has verified, so a backup
+/// that turns out to be damaged half way through cannot leave a partial
+/// profile staged.
+fn read_archive(
+    zip_path: &Path,
+    unpack_dir: &Path,
+) -> Result<(Manifest, Vec<UnpackedEntry>), String> {
     let mut archive = open_archive(zip_path)?;
     let manifest = read_manifest(&mut archive)?;
+    std::fs::create_dir_all(unpack_dir)
+        .map_err(|e| coded_ctx("backup_restore_failed", "Failed to unpack the backup", e))?;
 
     let mut total = 0u64;
     let mut out = Vec::new();
@@ -1212,10 +1303,20 @@ fn read_archive(zip_path: &Path) -> Result<(Manifest, Vec<(ManifestEntry, Vec<u8
         }
         // The allow-list is what keeps a crafted archive from naming
         // `..\..\something` or any path outside the data directory.
-        if backup_file(&entry.name).is_none() {
+        let Some(spec) = backup_file(&entry.name) else {
             return Err(coded_ctx(
                 "backup_corrupt_archive",
                 "The backup contains an unexpected file",
+                &entry.name,
+            ));
+        };
+        // Whether a file is re-wrapped is the allow-list's call. Taking the
+        // manifest's word would let an archive stage a key unwrapped, or wrap
+        // a plain file the app then cannot read.
+        if entry.rewrap != spec.secret {
+            return Err(coded_ctx(
+                "backup_corrupt_archive",
+                "The backup does not mark this file's protection correctly",
                 &entry.name,
             ));
         }
@@ -1233,32 +1334,43 @@ fn read_archive(zip_path: &Path) -> Result<(Manifest, Vec<(ManifestEntry, Vec<u8
                 e,
             )
         })?;
-        let mut bytes = Vec::new();
+        let path = unpack_dir.join(spec.name);
+        let unpack_error = |e: std::io::Error| {
+            coded_ctx("backup_restore_failed", "Failed to unpack the backup", e)
+        };
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(unpack_error)?;
+        crate::security::restrict_file_permissions(&path);
+        let mut sink = HashingWriter {
+            inner: std::io::BufWriter::new(file),
+            hasher: blake3::Hasher::new(),
+            written: 0,
+        };
         // Cap the bytes actually decompressed: the declared size above is
         // metadata the archive controls, and deflate keeps going regardless.
-        (&mut zipped)
-            .take(MAX_ENTRY_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| {
-                coded_ctx(
-                    "backup_corrupt_archive",
-                    format!("Failed to read {}", entry.name),
-                    e,
-                )
-            })?;
-        if bytes.len() as u64 > MAX_ENTRY_BYTES {
+        std::io::copy(&mut (&mut zipped).take(MAX_ENTRY_BYTES + 1), &mut sink).map_err(|e| {
+            coded_ctx(
+                "backup_corrupt_archive",
+                format!("Failed to read {}", entry.name),
+                e,
+            )
+        })?;
+        sink.flush().map_err(unpack_error)?;
+        if sink.written > MAX_ENTRY_BYTES {
             return Err(coded_ctx(
                 "backup_corrupt_archive",
                 "The backup contains a file that is too large",
                 &entry.name,
             ));
         }
-        total = total.saturating_add(bytes.len() as u64);
+        total = total.saturating_add(sink.written);
         if total > MAX_TOTAL_BYTES {
             return Err(coded("backup_corrupt_archive", "The backup is too large"));
         }
-        if bytes.len() as u64 != entry.size
-            || blake3::hash(&bytes).to_hex().to_string() != entry.blake3
+        if sink.written != entry.size || sink.hasher.finalize().to_hex().to_string() != entry.blake3
         {
             return Err(coded_ctx(
                 "backup_corrupt_archive",
@@ -1266,17 +1378,64 @@ fn read_archive(zip_path: &Path) -> Result<(Manifest, Vec<(ManifestEntry, Vec<u8
                 &entry.name,
             ));
         }
-        out.push((
-            ManifestEntry {
-                name: entry.name.clone(),
-                size: entry.size,
-                blake3: entry.blake3.clone(),
-                rewrap: entry.rewrap,
-            },
-            bytes,
-        ));
+        out.push(UnpackedEntry { spec, path });
     }
     Ok((manifest, out))
+}
+
+/// `schema_version` of the database a backup carries, read from the file
+/// rather than taken on the manifest's word.
+fn database_schema_version(path: &Path) -> Result<i64, String> {
+    let unreadable = |e: rusqlite::Error| {
+        coded_ctx(
+            "backup_corrupt_archive",
+            "The backup's database is not readable",
+            e,
+        )
+    };
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(unreadable)?;
+    conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(unreadable)
+}
+
+/// Verify a decrypted archive and stage it for the next launch.
+fn stage_archive(
+    zip_path: &Path,
+    scratch: &Path,
+    staging: &Path,
+) -> Result<RestoreSummary, String> {
+    let (manifest, entries) = read_archive(zip_path, &scratch.join("entries"))?;
+    let schema_version = match entries.iter().find(|e| e.spec.database) {
+        Some(db) => database_schema_version(&db.path)?,
+        None => 0,
+    };
+    if schema_version > crate::storage::database::MAX_SUPPORTED_SCHEMA_VERSION {
+        return Err(coded_ctx(
+            "backup_schema_too_new",
+            "This backup was made by a newer version of Ember",
+            format!(
+                "database v{} (this build supports v{})",
+                schema_version,
+                crate::storage::database::MAX_SUPPORTED_SCHEMA_VERSION
+            ),
+        ));
+    }
+    let webview_prefs = read_webview_prefs(zip_path, &manifest)?;
+    stage_restore(
+        staging,
+        &manifest,
+        schema_version,
+        entries,
+        webview_prefs.as_ref(),
+    )
 }
 
 /// Read and verify the app-window preferences a decrypted archive carries, if
@@ -1349,7 +1508,15 @@ fn staging_dir(data_dir: &Path) -> PathBuf {
 /// a marker are discarded by [`apply_pending_restore`] and do not count.
 pub(crate) fn pending_restore_still_staged(data_dir: &Path) -> bool {
     let staging = staging_dir(data_dir);
-    staging.join(STAGING_MARKER).is_file() && !staging.join(APPLIED_SENTINEL).exists()
+    staging.join(STAGING_MARKER).is_file()
+        && !staging.join(APPLIED_SENTINEL).exists()
+        && !staging_already_applied(&staging)
+}
+
+/// Leftovers of a restore that landed but whose staging could not be retired.
+/// Nothing is waiting there, whatever the marker says.
+fn staging_already_applied(staging: &Path) -> bool {
+    read_apply_journal(staging).is_some_and(|journal| journal.applied)
 }
 
 /// The marker a completed staging run leaves behind, or `None` when there is
@@ -1390,7 +1557,8 @@ fn staged_restore_expires_at(staged_at: i64) -> i64 {
 #[tauri::command]
 pub async fn pending_restore_status(app: tauri::AppHandle) -> Result<PendingRestoreStatus, String> {
     let data_dir = paths::resolve_data_dir_with_app(&app);
-    let pending = read_pending_marker(&staging_dir(&data_dir));
+    let staging = staging_dir(&data_dir);
+    let pending = read_pending_marker(&staging).filter(|_| !staging_already_applied(&staging));
     Ok(match pending {
         Some(p) => PendingRestoreStatus {
             pending: true,
@@ -1424,17 +1592,37 @@ pub async fn discard_pending_restore(
     if !staging.exists() {
         return Ok(());
     }
-    tokio::task::spawn_blocking(move || {
-        std::fs::remove_dir_all(&staging).map_err(|e| {
-            coded_ctx(
-                "backup_discard_failed",
-                "Failed to discard the staged restore",
-                e,
-            )
-        })
+    tokio::task::spawn_blocking(move || discard_staging(&staging))
+        .await
+        .map_err(|e| coded_ctx("backup_task_failed", "Restore task failed", e))?
+}
+
+fn discard_staging(staging: &Path) -> Result<(), String> {
+    // A startup rollback that could not put everything back leaves files of
+    // this restore live, listed only in the journal staging holds. They cannot
+    // be swapped back under the running app, and discarding would leave the
+    // profile mixed for good. The request is kept instead, so the next launch
+    // finishes the rollback and drops the restore rather than applying it.
+    if read_apply_journal(staging)
+        .is_some_and(|journal| !journal.applied && !journal.entries.is_empty())
+    {
+        if let Err(e) = crate::security::atomic_write(&staging.join(DISCARD_REQUESTED), b"1", false)
+        {
+            tracing::warn!("Could not record the request to discard the staged restore: {e}");
+        }
+        return Err(coded_ctx(
+            "backup_discard_failed",
+            "Part of this restore is already in place",
+            "restart Ember: it rolls the interrupted restore back and then discards it",
+        ));
+    }
+    std::fs::remove_dir_all(staging).map_err(|e| {
+        coded_ctx(
+            "backup_discard_failed",
+            "Failed to discard the staged restore",
+            e,
+        )
     })
-    .await
-    .map_err(|e| coded_ctx("backup_task_failed", "Restore task failed", e))?
 }
 
 #[tauri::command]
@@ -1474,6 +1662,7 @@ pub async fn preview_backup(
             // Sizes are the manifest's word, not the archive's; a crafted one
             // must not be able to overflow the total.
             let total_bytes = restorable().fold(0u64, |total, f| total.saturating_add(f.size));
+            let names: Vec<&str> = restorable().map(|f| f.name.as_str()).collect();
             Ok(BackupPreview {
                 app_version: manifest.app_version.clone(),
                 created_at: manifest.created_at,
@@ -1483,6 +1672,8 @@ pub async fn preview_backup(
                 includes_identity: manifest.files.iter().any(|f| f.name == "identity.json"),
                 schema_too_new: manifest.schema_version
                     > crate::storage::database::MAX_SUPPORTED_SCHEMA_VERSION,
+                missing: files_kept_from_profile(&names),
+                chat_key_set_aside: restore_sets_aside_chat_key(&names),
             })
         })();
         result
@@ -1513,7 +1704,7 @@ pub async fn import_backup(
             // restore. Debris from an import that died mid-write would
             // otherwise block every later attempt until the app restarted,
             // and with a message claiming a restore was queued when none was.
-            if read_pending_marker(&staging).is_some() {
+            if read_pending_marker(&staging).is_some() && !staging_already_applied(&staging) {
                 return Err(coded(
                     "backup_restore_pending",
                     "A restore is already waiting for the next restart",
@@ -1535,20 +1726,7 @@ pub async fn import_backup(
         let result = (|| {
             let zip_path = scratch.join("payload.zip");
             decrypt_stream(&source, &zip_path, &passphrase)?;
-            let (manifest, entries) = read_archive(&zip_path)?;
-            if manifest.schema_version > crate::storage::database::MAX_SUPPORTED_SCHEMA_VERSION {
-                return Err(coded_ctx(
-                    "backup_schema_too_new",
-                    "This backup was made by a newer version of Ember",
-                    format!(
-                        "database v{} (this build supports v{})",
-                        manifest.schema_version,
-                        crate::storage::database::MAX_SUPPORTED_SCHEMA_VERSION
-                    ),
-                ));
-            }
-            let webview_prefs = read_webview_prefs(&zip_path, &manifest)?;
-            stage_restore(&staging, &manifest, entries, webview_prefs.as_ref())
+            stage_archive(&zip_path, &scratch, &staging)
         })();
         let _ = std::fs::remove_dir_all(&scratch);
         if result.is_err() {
@@ -1568,7 +1746,8 @@ pub async fn import_backup(
 fn stage_restore(
     staging: &Path,
     manifest: &Manifest,
-    entries: Vec<(ManifestEntry, Vec<u8>)>,
+    schema_version: i64,
+    entries: Vec<UnpackedEntry>,
     webview_prefs: Option<&WebviewPrefs>,
 ) -> Result<RestoreSummary, String> {
     std::fs::create_dir_all(staging)
@@ -1576,31 +1755,42 @@ fn stage_restore(
     crate::security::restrict_file_permissions(staging);
 
     let mut staged = Vec::new();
-    for (entry, bytes) in entries {
-        let payload = if entry.rewrap {
+    for entry in entries {
+        let name = entry.spec.name;
+        let stage_error = |e: std::io::Error| {
+            coded_ctx(
+                "backup_restore_failed",
+                format!("Failed to stage {name}"),
+                e,
+            )
+        };
+        let target = staging.join(name);
+        if entry.spec.secret {
+            let plaintext = Zeroizing::new(std::fs::read(&entry.path).map_err(stage_error)?);
             // Bind the key material to this machine and account. A DPAPI
             // failure has to fail the restore: writing it in the clear would
             // leave the identity readable to anything that can read the file,
             // and `identity.protected` would then refuse the next launch.
-            Zeroizing::new(secret_store::protect(&bytes).map_err(|e| {
+            let payload = Zeroizing::new(secret_store::protect(&plaintext).map_err(|e| {
                 coded_ctx(
                     "backup_restore_failed",
                     "Could not protect the restored key material",
                     e,
                 )
-            })?)
+            })?);
+            crate::security::atomic_write(&target, &payload, true).map_err(stage_error)?;
         } else {
-            Zeroizing::new(bytes)
-        };
-        let target = staging.join(&entry.name);
-        crate::security::atomic_write(&target, &payload, true).map_err(|e| {
-            coded_ctx(
-                "backup_restore_failed",
-                format!("Failed to stage {}", entry.name),
-                e,
-            )
-        })?;
-        staged.push(entry.name.clone());
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&entry.path)
+                .and_then(|file| file.sync_all())
+                .map_err(stage_error)?;
+            if std::fs::rename(&entry.path, &target).is_err() {
+                copy_into_place(&entry.path, &target).map_err(stage_error)?;
+                crate::security::restrict_file_permissions(&target);
+            }
+        }
+        staged.push(name.to_string());
     }
 
     if let Some(prefs) = webview_prefs {
@@ -1621,7 +1811,7 @@ fn stage_restore(
         version: FORMAT_VERSION,
         staged_at: chrono::Utc::now().timestamp(),
         source_app_version: manifest.app_version.clone(),
-        schema_version: manifest.schema_version,
+        schema_version,
         files: staged.clone(),
         webview_prefs: webview_prefs.is_some(),
     };
@@ -1632,15 +1822,11 @@ fn stage_restore(
     crate::security::atomic_write(&staging.join(STAGING_MARKER), &marker, true)
         .map_err(|e| coded_ctx("backup_restore_failed", "Failed to stage the restore", e))?;
 
-    let missing = BACKUP_FILES
-        .iter()
-        .map(|f| f.name.to_string())
-        .filter(|name| !staged.contains(name))
-        .collect();
     let staged_len = staged.len();
     let summary = RestoreSummary {
+        missing: files_kept_from_profile(&staged),
+        chat_key_set_aside: restore_sets_aside_chat_key(&staged),
         staged,
-        missing,
         app_version: manifest.app_version.clone(),
         created_at: manifest.created_at,
     };
@@ -1663,8 +1849,23 @@ fn stage_restore(
 /// file beside the backup's copy of the rest, which is precisely the mixed
 /// state the rollback exists to prevent. Staging is removed only once the
 /// whole set has landed.
+///
+/// Synced before returning, since staging is deleted once every copy has
+/// returned and is then the only other copy of the restored bytes.
 fn copy_into_place(staged: &Path, live: &Path) -> std::io::Result<()> {
     std::fs::copy(staged, live)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(live)?
+        .sync_all()
+}
+
+/// Make the renames and new entries in `dir` durable.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
     Ok(())
 }
 
@@ -1675,10 +1876,17 @@ pub enum StartupRestore {
     /// the restore was refused and left staged for a later launch.
     NotApplied,
     /// Applied, with the displaced originals kept in `pre-restore-*`.
-    Applied,
+    /// `download_folder_replaced` is the local folder that took the place of a
+    /// restored download folder on a network share.
+    Applied {
+        download_folder_replaced: Option<String>,
+    },
     /// Staged longer than [`STAGED_RESTORE_MAX_AGE_SECS`] ago, and discarded
     /// without being applied.
     Expired,
+    /// Applied at an earlier launch, which could not retire the staged copies.
+    /// The profile in use is the restored one, whatever is left on disk.
+    AlreadyApplied,
 }
 
 /// Swap a staged restore into place. Called during startup before the
@@ -1701,6 +1909,19 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<StartupRestore>
                 "Could not remove {} ({e}); delete it by hand",
                 staging.display()
             );
+        }
+        return Ok(StartupRestore::NotApplied);
+    }
+    // The user asked to discard this restore while part of it was in place.
+    // Finish the rollback that left it so, then drop it; what still could not
+    // be put back keeps staging, and the request, for the next launch.
+    if staging.join(DISCARD_REQUESTED).exists() {
+        if staging.join(APPLY_JOURNAL).exists() {
+            abandon_interrupted_apply(data_dir, &staging);
+        }
+        if read_apply_journal(&staging).is_none_or(|journal| journal.entries.is_empty()) {
+            tracing::warn!("Discarded the staged restore as asked, after rolling it back");
+            let _ = std::fs::remove_dir_all(&staging);
         }
         return Ok(StartupRestore::NotApplied);
     }
@@ -1742,6 +1963,18 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<StartupRestore>
         );
         let _ = std::fs::remove_dir_all(&staging);
         return Ok(StartupRestore::Expired);
+    }
+
+    // Finished at an earlier launch, which could not retire staging. The app
+    // has run on the restored profile since, so applying it again would copy
+    // the backup over that session and drop the live database's sidecars.
+    if read_apply_journal(&staging).is_some_and(|journal| journal.applied) {
+        tracing::warn!(
+            "Removing the staged copies of a restore that was already applied: {}",
+            staging.display()
+        );
+        retire_applied_staging(&staging);
+        return Ok(StartupRestore::AlreadyApplied);
     }
 
     // Every refusal from here on leaves the restore staged for a later launch.
@@ -1831,6 +2064,10 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<StartupRestore>
     // restore can then be retried on the next launch, or discarded from
     // Settings > Backup if the cause is permanent. Removing staging here is
     // what previously turned a mid-restore failure into an unrecoverable one.
+    use crate::commands::transfers::OrphanDisposal;
+    if let Err(e) = OrphanDisposal::record_database_replacement(data_dir) {
+        tracing::warn!("Could not record that orphaned downloads are to be set aside: {e}");
+    }
     let (backup_dir, outcome) =
         swap_in_staged_files(data_dir, &staging, &pending.files, copy_into_place)?;
     let applied = match outcome {
@@ -1847,10 +2084,13 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<StartupRestore>
 
     // Before staging goes: while it exists a crash here re-runs the whole
     // apply, which ends up here again, and the repair is idempotent.
-    if pending.files.iter().any(|name| name == "config.json") {
-        sanitize_restored_config(data_dir);
-    }
+    let download_folder_replaced = if pending.files.iter().any(|name| name == "config.json") {
+        sanitize_restored_config(data_dir)
+    } else {
+        None
+    };
     hand_over_webview_prefs(data_dir, &staging, pending.webview_prefs);
+    mark_apply_finished(&staging);
     retire_applied_staging(&staging);
     tracing::warn!(
         "Applied a staged restore of {applied} file(s) from a backup made by Ember {}; the \
@@ -1858,7 +2098,9 @@ pub fn apply_pending_restore(data_dir: &Path) -> std::io::Result<StartupRestore>
         pending.source_app_version,
         backup_dir.display()
     );
-    Ok(StartupRestore::Applied)
+    Ok(StartupRestore::Applied {
+        download_folder_replaced,
+    })
 }
 
 /// Leave an applied restore's app-window preferences where
@@ -2007,6 +2249,10 @@ struct ApplyJournal {
     attempt: u32,
     #[serde(default)]
     in_progress: bool,
+    /// Every file landed. Recorded before staging is retired, so a staging
+    /// folder that survives retirement is never applied over the profile again.
+    #[serde(default)]
+    applied: bool,
     entries: Vec<Swapped>,
 }
 
@@ -2123,6 +2369,7 @@ fn open_apply_journal(data_dir: &Path, staging: &Path) -> std::io::Result<(PathB
                 backup_dir: name,
                 attempt: 0,
                 in_progress: false,
+                applied: false,
                 entries: Vec::new(),
             };
             write_apply_journal(staging, &journal)?;
@@ -2284,13 +2531,16 @@ fn swap_in_staged_files(
     journal.in_progress = true;
     let mut applied = 0usize;
     let mut failure: Option<String> = None;
-    for name in files {
+    // Moved aside like an original, with nothing copied in its place.
+    let set_aside = restore_sets_aside_chat_key(files).then_some(CHAT_KEY_FILE);
+    for name in files.iter().map(String::as_str).chain(set_aside) {
+        let copied_in = set_aside != Some(name);
         if backup_file(name).is_none() {
             tracing::warn!("Ignoring unexpected staged file {name}");
             continue;
         }
         let staged = staging.join(name);
-        if !staged.is_file() {
+        if copied_in && !staged.is_file() {
             // Checked before the loop, so this is a file that vanished under
             // us mid-apply. A failure rather than a skip, for the reason the
             // pre-flight gives.
@@ -2300,7 +2550,7 @@ fn swap_in_staged_files(
             break;
         }
         let live = data_dir.join(name);
-        let prior = journal.entries.iter().position(|e| e.name == *name);
+        let prior = journal.entries.iter().position(|e| e.name == name);
         // Anything else live is an original — possibly one the app created
         // after an earlier attempt rolled back — and is preserved like one.
         let live_is_restored = prior.is_some_and(|i| {
@@ -2315,6 +2565,9 @@ fn swap_in_staged_files(
                     break;
                 }
             };
+        if !copied_in && !displaced {
+            continue;
+        }
         let index = match prior {
             Some(i) => {
                 let entry = &mut journal.entries[i];
@@ -2325,7 +2578,7 @@ fn swap_in_staged_files(
             }
             None => {
                 journal.entries.push(Swapped {
-                    name: name.clone(),
+                    name: name.to_string(),
                     displaced,
                     sidecars: Vec::new(),
                     sidecars_done: false,
@@ -2355,6 +2608,9 @@ fn swap_in_staged_files(
             failure = Some(format!("could not record the restore's progress ({e})"));
             break;
         }
+        if !copied_in {
+            continue;
+        }
         match copy(&staged, &live) {
             Ok(()) => {
                 crate::security::restrict_file_permissions(&live);
@@ -2370,10 +2626,36 @@ fn swap_in_staged_files(
     }
 
     let Some(reason) = failure else {
+        for dir in [data_dir, backup_dir.as_path()] {
+            if let Err(e) = sync_dir(dir) {
+                tracing::warn!("Could not flush {} after the restore ({e})", dir.display());
+            }
+        }
+        // Left in progress: the apply is done only once the config repair and
+        // the preference hand-over have run (`mark_apply_finished`). A crash
+        // before then re-runs the whole apply, which is safe while the app has
+        // not yet run on the restored files.
         return Ok((backup_dir, Ok(applied)));
     };
     roll_back_journal(data_dir, staging, &backup_dir, &mut journal);
     Ok((backup_dir, Err(reason)))
+}
+
+/// Record in the journal that the restore has landed and been repaired. From
+/// here on the app runs on the restored files, so a later launch that finds
+/// staging still there must only retire it, never apply it again.
+fn mark_apply_finished(staging: &Path) {
+    let Some(mut journal) = read_apply_journal(staging) else {
+        return;
+    };
+    journal.in_progress = false;
+    journal.applied = true;
+    if let Err(e) = write_apply_journal(staging, &journal) {
+        tracing::error!(
+            "Could not record that the restore finished ({e}); only retiring its staging \
+             keeps the next launch from applying it again"
+        );
+    }
 }
 
 /// Put back everything the journal lists, newest first, so the profile goes
@@ -2532,8 +2814,9 @@ fn retire_applied_staging(staging: &Path) {
                 }
             }
             Err(e) => tracing::error!(
-                "Could not retire the applied restore at {} ({e}). It will be applied AGAIN on \
-                 the next launch unless that folder is deleted first.",
+                "Could not retire the applied restore at {} ({e}). Delete that folder by hand; \
+                 if its progress journal was not recorded either, the next launch applies it \
+                 AGAIN.",
                 staging.display()
             ),
         }
@@ -2611,28 +2894,27 @@ fn mark_restore_applied(staging: &Path) -> bool {
 /// otherwise leave Ember unable to launch at all on a machine without that
 /// drive, on the very path this feature exists to serve.
 ///
-/// The media player is always cleared. Of the folders, only the download
-/// folder is touched. Shared folders that are missing right
-/// now are left alone on purpose: `initialize_approved_roots` already treats an
-/// absent root as offline and keeps its approval, so dropping them here would
-/// silently delete a user's shares whenever they restored with an external
-/// drive unplugged.
+/// The media player is always cleared. A download folder that cannot be
+/// created, or is on a network share, is replaced by the local default, and
+/// every folder on a network share is dropped. Other shared folders are left
+/// alone, missing or not: a restore does not approve them (see `run`), so
+/// nothing in them is shared until the user re-approves them in the Library,
+/// and dropping the missing ones here would silently delete a user's shares
+/// whenever they restored with an external drive unplugged.
+///
+/// Returns the folder that replaced a download folder on a network share, for
+/// the notice telling the user to choose theirs again.
 ///
 /// Edited as raw JSON on purpose: this runs before the config is loaded, and
 /// round-tripping it through AppSettings here would rewrite fields the
 /// loader's own repair pass owns.
-fn sanitize_restored_config(data_dir: &Path) {
+fn sanitize_restored_config(data_dir: &Path) -> Option<String> {
     let path = data_dir.join("config.json");
-    let Ok(raw) = std::fs::read(&path) else {
-        return;
-    };
-    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
-        return;
-    };
-    let Some(obj) = value.as_object_mut() else {
-        return;
-    };
+    let raw = std::fs::read(&path).ok()?;
+    let mut value = serde_json::from_slice::<serde_json::Value>(&raw).ok()?;
+    let obj = value.as_object_mut()?;
     let mut changed = false;
+    let mut replaced_share = None;
 
     // A program Ember will execute. Settings only accepts one the native
     // picker produced this session; an archive is not that, and one carried
@@ -2658,34 +2940,76 @@ fn sanitize_restored_config(data_dir: &Path) {
         .and_then(|v| v.as_str())
         .map(str::to_owned)
     {
-        if !folder.is_empty() && std::fs::create_dir_all(Path::new(&folder)).is_err() {
+        // A share is not kept either: startup approves the restored download
+        // folders and opens them, and touching a share connects to its server
+        // and offers it the user's credentials, which an archive is not to
+        // bring about. The user picks it again in Settings if it was theirs.
+        let on_share = crate::security::is_network_path(&folder);
+        if !folder.is_empty()
+            && (on_share || std::fs::create_dir_all(Path::new(&folder)).is_err())
+        {
             let fallback = directories::UserDirs::new()
                 .and_then(|dirs| dirs.download_dir().map(|d| d.join("Ember")))
                 .unwrap_or_else(|| data_dir.join("Downloads"));
             tracing::warn!(
-                "Restored download folder {folder} cannot be created on this machine; using {} instead",
+                "Restored download folder {folder} {} on this machine; using {} instead",
+                if on_share { "is on a network share, which a restore does not open" } else { "cannot be created" },
                 fallback.display()
             );
             let _ = std::fs::create_dir_all(&fallback);
+            let fallback = fallback.to_string_lossy().to_string();
+            if on_share {
+                replaced_share = Some(fallback.clone());
+            }
             obj.insert(
                 "download_folder".to_string(),
-                serde_json::Value::String(fallback.to_string_lossy().to_string()),
+                serde_json::Value::String(fallback),
+            );
+            changed = true;
+        }
+    }
+
+    // The earlier download folders are approved and swept at startup too, and
+    // a shared folder without an approval on this machine is still looked at
+    // to offer re-approving it.
+    for (key, what) in [
+        ("previous_download_folders", "earlier download folder(s)"),
+        ("shared_folders", "shared folder(s)"),
+    ] {
+        let Some(folders) = obj.get_mut(key).and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        let before = folders.len();
+        folders.retain(|folder| {
+            !folder
+                .as_str()
+                .is_some_and(crate::security::is_network_path)
+        });
+        if folders.len() != before {
+            tracing::warn!(
+                "Dropped {} {what} on a network share from the restored config",
+                before - folders.len()
             );
             changed = true;
         }
     }
 
     if !changed {
-        return;
+        return None;
     }
     match serde_json::to_vec_pretty(&value) {
         Ok(data) => {
             if let Err(e) = crate::security::atomic_write(&path, &data, true) {
                 tracing::error!("Failed to write the repaired config after a restore: {e}");
+                return None;
             }
         }
-        Err(e) => tracing::error!("Failed to serialize the repaired config after a restore: {e}"),
+        Err(e) => {
+            tracing::error!("Failed to serialize the repaired config after a restore: {e}");
+            return None;
+        }
     }
+    replaced_share
 }
 
 #[cfg(test)]
@@ -2694,7 +3018,7 @@ mod tests {
 
     impl StartupRestore {
         fn applied(&self) -> bool {
-            matches!(self, StartupRestore::Applied)
+            matches!(self, StartupRestore::Applied { .. })
         }
     }
 
@@ -2703,6 +3027,10 @@ mod tests {
     fn apply_expecting_success(dir: &Path) -> PathBuf {
         let outcome = apply_pending_restore(dir).unwrap();
         assert!(outcome.applied(), "{outcome:?}");
+        assert!(
+            dir.join("set-aside-orphans").exists(),
+            "orphaned downloads are set aside from the moment the database is replaced"
+        );
         let mut backup_dirs = pre_restore_dirs(dir);
         assert_eq!(backup_dirs.len(), 1, "{backup_dirs:?}");
         backup_dirs.pop().unwrap()
@@ -3475,6 +3803,7 @@ mod tests {
                 backup_dir: "pre-restore-test".to_string(),
                 attempt: 1,
                 in_progress: crashed_attempt.is_some(),
+                applied: false,
                 entries: vec![db_entry(&["ember.db-wal"], 1)],
             };
 
@@ -3720,7 +4049,11 @@ mod tests {
         )
         .unwrap();
 
-        sanitize_restored_config(&dir);
+        assert_eq!(
+            sanitize_restored_config(&dir),
+            None,
+            "only a download folder on a share is announced"
+        );
 
         let repaired: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
@@ -3739,6 +4072,43 @@ mod tests {
             repaired["preview_player"].as_str().unwrap(),
             "",
             "a restored config must never name a program Ember will run"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restored_folders_on_a_network_share_are_not_kept() {
+        let dir = scratch("sanitize-share");
+        let share = r"\\192.0.2.1\share\Ember";
+        let local = dir.join("earlier").to_string_lossy().into_owned();
+        let local_share = dir.join("music").to_string_lossy().into_owned();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "download_folder": share,
+                "previous_download_folders": [r"\\192.0.2.1\old", local],
+                "shared_folders": [r"\\192.0.2.1\media", local_share],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let replaced = sanitize_restored_config(&dir);
+
+        let repaired: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+        let folder = repaired["download_folder"].as_str().unwrap();
+        assert!(!crate::security::is_network_path(folder), "{folder}");
+        assert_eq!(replaced.as_deref(), Some(folder), "the replacement is announced");
+        assert_eq!(
+            repaired["previous_download_folders"],
+            serde_json::json!([local]),
+            "a local earlier folder stays, a share goes"
+        );
+        assert_eq!(
+            repaired["shared_folders"],
+            serde_json::json!([local_share]),
+            "a local shared folder stays, a share goes"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3807,12 +4177,12 @@ mod tests {
         let entries: &[(&str, &[u8])] = &[("config.json", b"{}"), ("nodes.dat", b"contacts")];
         let zip_path = write_archive(&dir, entries, &manifest_for(entries));
 
-        let (manifest, read) = read_archive(&zip_path).unwrap();
+        let (manifest, read) = read_archive(&zip_path, &dir.join("entries")).unwrap();
         assert_eq!(manifest.app_version, "1.3.3");
         assert_eq!(read.len(), 2);
-        assert_eq!(read[0].0.name, "config.json");
-        assert_eq!(read[0].1, b"{}");
-        assert_eq!(read[1].1, b"contacts");
+        assert_eq!(read[0].spec.name, "config.json");
+        assert_eq!(std::fs::read(&read[0].path).unwrap(), b"{}");
+        assert_eq!(std::fs::read(&read[1].path).unwrap(), b"contacts");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3822,7 +4192,7 @@ mod tests {
         let entries: &[(&str, &[u8])] = &[("evil.exe", b"payload")];
         let zip_path = write_archive(&dir, entries, &manifest_for(entries));
 
-        let err = read_archive(&zip_path).unwrap_err();
+        let err = read_archive(&zip_path, &dir.join("entries")).unwrap_err();
         // Assert the reason, not just that it failed: a plain "missing entry"
         // rejection would pass a looser check while leaving the allow-list
         // itself unexercised.
@@ -3845,8 +4215,9 @@ mod tests {
         ];
         let zip_path = write_archive(&dir, entries, &manifest_for(entries));
 
-        let (_, read) = read_archive(&zip_path).expect("a 1.3.5 archive must still restore");
-        let names: Vec<&str> = read.iter().map(|(e, _)| e.name.as_str()).collect();
+        let (_, read) = read_archive(&zip_path, &dir.join("entries"))
+            .expect("a 1.3.5 archive must still restore");
+        let names: Vec<&str> = read.iter().map(|e| e.spec.name).collect();
         assert_eq!(
             names,
             vec!["config.json", "nodes.dat"],
@@ -3861,7 +4232,7 @@ mod tests {
         let entries: &[(&str, &[u8])] = &[("../../evil.exe", b"payload")];
         let zip_path = write_archive(&dir, entries, &manifest_for(entries));
 
-        assert!(read_archive(&zip_path).is_err());
+        assert!(read_archive(&zip_path, &dir.join("entries")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3879,7 +4250,7 @@ mod tests {
         manifest.files.push(duplicate);
         let zip_path = write_archive(&dir, entries, &manifest);
 
-        let err = read_archive(&zip_path).unwrap_err();
+        let err = read_archive(&zip_path, &dir.join("entries")).unwrap_err();
         assert!(err.contains("same file twice"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3892,7 +4263,7 @@ mod tests {
         // Same length, different content, so only the hash catches it.
         let zip_path = write_archive(&dir, tampered, &manifest_for(claimed));
 
-        let err = read_archive(&zip_path).unwrap_err();
+        let err = read_archive(&zip_path, &dir.join("entries")).unwrap_err();
         assert!(err.contains("backup_corrupt_archive"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3907,7 +4278,7 @@ mod tests {
         zip.write_all(b"{}").unwrap();
         zip.finish().unwrap();
 
-        let err = read_archive(&zip_path).unwrap_err();
+        let err = read_archive(&zip_path, &dir.join("entries")).unwrap_err();
         assert!(err.contains("backup_corrupt_archive"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3919,7 +4290,7 @@ mod tests {
         // Manifest promises two files, the zip only carries one.
         let zip_path = write_archive(&dir, &claimed[..1], &manifest_for(claimed));
 
-        let err = read_archive(&zip_path).unwrap_err();
+        let err = read_archive(&zip_path, &dir.join("entries")).unwrap_err();
         assert!(err.contains("backup_corrupt_archive"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3941,6 +4312,22 @@ mod tests {
         // plain file, and a DPAPI-wrapped secret.
         let db = crate::storage::database::Database::open_at(&source_dir.join("ember.db"))
             .expect("open source database");
+        // A private room this profile owns. Its seed is the only thing that can
+        // sign for it, sealed with the chat key, so losing either half of the
+        // pair in a move loses the room.
+        let room = "a1".repeat(16);
+        let (owner_seed, join_secret, rotated) = ([0x0Au8; 32], [0x0Bu8; 32], [0x0Cu8; 32]);
+        db.insert_channel(
+            &room,
+            &"b2".repeat(32),
+            "Owned room",
+            "private",
+            true,
+            Some(&owner_seed),
+            Some(&join_secret),
+        )
+        .expect("insert owned room");
+        db.insert_channel_key_epoch(&room, 1, &rotated).expect("rotate");
         let identity_plaintext = br#"{"kad_id":[1,2,3],"user_hash":"abc"}"#;
         std::fs::write(
             source_dir.join("identity.json"),
@@ -3952,8 +4339,9 @@ mod tests {
 
         // Export.
         let scratch_dir = temp_dir_in(&source_dir, "backup-tmp").expect("scratch");
-        let (zip_path, manifest) =
+        let (zip_path, manifest, skipped) =
             build_archive(&source_dir, &scratch_dir, &db, "1.3.3", None).expect("build archive");
+        assert!(skipped.is_empty(), "{skipped:?}");
         assert!(
             manifest.files.iter().any(|f| f.name == "ember.db"),
             "the database snapshot must be in the archive"
@@ -3986,14 +4374,24 @@ mod tests {
         let restore_scratch = temp_dir_in(&restore_dir, "restore-tmp").expect("scratch");
         let decrypted = restore_scratch.join("payload.zip");
         decrypt_stream(&archive, &decrypted, "correct horse battery").expect("decrypt");
-        let (read_manifest, entries) = read_archive(&decrypted).expect("verify archive");
-        assert_eq!(read_manifest.app_version, "1.3.3");
         let staging = staging_dir(&restore_dir);
-        assert!(read_webview_prefs(&decrypted, &read_manifest)
-            .expect("no preferences is not an error")
-            .is_none());
-        let summary = stage_restore(&staging, &read_manifest, entries, None).expect("stage");
+        let summary = stage_archive(&decrypted, &restore_scratch, &staging).expect("stage");
+        assert_eq!(summary.app_version, "1.3.3");
         assert!(summary.staged.iter().any(|n| n == "ember.db"));
+        assert!(
+            !summary.chat_key_set_aside,
+            "the backup carries its chat key"
+        );
+        let pending = read_pending_marker(&staging).expect("marker");
+        assert_eq!(
+            pending.schema_version,
+            crate::storage::database::MAX_SUPPORTED_SCHEMA_VERSION,
+            "the marker records the staged database's own schema"
+        );
+        assert!(
+            !pending.webview_prefs,
+            "a backup without preferences stages none"
+        );
         let _ = std::fs::remove_dir_all(&restore_scratch);
 
         // Nothing is in place until the swap runs, which is what startup does.
@@ -4037,6 +4435,23 @@ mod tests {
             restored_db.schema_version(),
             crate::storage::database::MAX_SUPPORTED_SCHEMA_VERSION
         );
+        // And the room still belongs to this profile: the restored chat key
+        // opens the seed that signs for it, and every key it has sealed with.
+        assert!(!restored_db.chat_locked(), "the chat key came with the backup");
+        assert_eq!(
+            restored_db.load_channel_owner_seed(&room).expect("read seed"),
+            Some(owner_seed),
+            "an owned room survives a move"
+        );
+        assert_eq!(
+            restored_db.load_channel_join_secret(&room).expect("read join secret"),
+            Some(join_secret)
+        );
+        assert_eq!(
+            restored_db.load_channel_key_epochs(&room).expect("read epochs"),
+            vec![(1, rotated)],
+            "and so do the room's rotated keys"
+        );
         drop(restored_db);
 
         // A first restore into an empty directory displaces nothing.
@@ -4075,7 +4490,7 @@ mod tests {
         let prefs = sample_prefs();
 
         let scratch_dir = temp_dir_in(&source_dir, "backup-tmp").expect("scratch");
-        let (zip_path, manifest) =
+        let (zip_path, manifest, _) =
             build_archive(&source_dir, &scratch_dir, &db, "1.7.1", Some(&prefs))
                 .expect("build archive");
         assert!(manifest.webview_prefs.is_some());
@@ -4098,11 +4513,11 @@ mod tests {
         let restore_scratch = temp_dir_in(&restore_dir, "restore-tmp").expect("scratch");
         let decrypted = restore_scratch.join("payload.zip");
         decrypt_stream(&archive, &decrypted, "correct horse battery").expect("decrypt");
-        let (read_manifest, entries) = read_archive(&decrypted).expect("verify archive");
-        let read_prefs = read_webview_prefs(&decrypted, &read_manifest).expect("read prefs");
+        let restored_manifest = read_manifest(&mut open_archive(&decrypted).unwrap()).unwrap();
+        let read_prefs = read_webview_prefs(&decrypted, &restored_manifest).expect("read prefs");
         assert_eq!(read_prefs.as_ref(), Some(&prefs));
         let staging = staging_dir(&restore_dir);
-        stage_restore(&staging, &read_manifest, entries, read_prefs.as_ref()).expect("stage");
+        stage_archive(&decrypted, &restore_scratch, &staging).expect("stage");
         let _ = std::fs::remove_dir_all(&restore_scratch);
         assert_eq!(
             take_restored_prefs(&restore_dir),
@@ -4166,7 +4581,7 @@ mod tests {
             .iter()
             .all(|f| backup_file(&f.name).is_some() || is_legacy_ignored(&f.name)));
 
-        let (_, entries) = read_archive(&zip_path).unwrap();
+        let (_, entries) = read_archive(&zip_path, &dir.join("entries")).unwrap();
         assert_eq!(entries.len(), 1, "the preferences are not a profile file");
         assert_eq!(
             read_webview_prefs(&zip_path, &manifest).unwrap(),
@@ -4316,5 +4731,316 @@ mod tests {
             staged_restore_expires_at(1_700_000_000),
             1_700_000_000 + STAGED_RESTORE_MAX_AGE_SECS
         );
+    }
+
+    #[test]
+    fn a_finished_swap_records_the_apply_as_done() {
+        let dir = scratch("journal-applied");
+        write_all(&dir, LIVE_PROFILE);
+        let (staging, names) = stage(&dir, STAGED_PROFILE);
+
+        swap(&dir, &staging, &names, copy_into_place).1.unwrap();
+        let journal = read_apply_journal(&staging).unwrap();
+        assert!(
+            !journal.applied,
+            "not done until the config repair and preference hand-over have run"
+        );
+        mark_apply_finished(&staging);
+        let journal = read_apply_journal(&staging).unwrap();
+        assert!(journal.applied);
+        assert!(!journal.in_progress);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Staging that outlives a finished apply must not be taken for a crash of
+    /// it: that re-copied the backup over the session since and deleted the
+    /// live database's write-ahead log.
+    #[test]
+    fn a_finished_apply_whose_staging_survived_is_not_applied_again() {
+        let dir = scratch("applied-journal-survives");
+        write_all(&dir, LIVE_PROFILE);
+        let (staging, names) = stage(&dir, STAGED_PROFILE);
+        write_marker(&staging, &["identity.json", "ember.db", "config.json"]);
+        swap(&dir, &staging, &names, copy_into_place).1.unwrap();
+        mark_apply_finished(&staging);
+        let session: &[(&str, &[u8])] = &[
+            ("ember.db", b"session-db"),
+            ("ember.db-wal", b"session-wal"),
+            ("config.json", b"session-config"),
+        ];
+        write_all(&dir, session);
+
+        assert!(!apply_pending_restore(&dir).unwrap().applied());
+        assert_contents(&dir, session);
+        assert!(!staging.exists(), "the leftover staging is retired");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_manifest_that_misstates_a_files_protection_is_refused() {
+        for name in ["identity.json", "config.json"] {
+            let dir = scratch("archive-rewrap");
+            let entries: &[(&str, &[u8])] = &[(name, b"{}")];
+            let mut manifest = manifest_for(entries);
+            manifest.files[0].rewrap = !backup_file(name).unwrap().secret;
+            let zip_path = write_archive(&dir, entries, &manifest);
+
+            let err = read_archive(&zip_path, &dir.join("entries")).unwrap_err();
+            assert!(err.contains("protection"), "{name}: {err}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    fn database_at_schema(path: &Path, version: i64) -> Vec<u8> {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO schema_version (version) VALUES ({version});"
+        ))
+        .unwrap();
+        drop(conn);
+        std::fs::read(path).unwrap()
+    }
+
+    #[test]
+    fn a_database_newer_than_its_manifest_claims_is_refused_at_import() {
+        let dir = scratch("archive-schema");
+        let db = database_at_schema(
+            &dir.join("newer.db"),
+            crate::storage::database::MAX_SUPPORTED_SCHEMA_VERSION + 1,
+        );
+        let entries: &[(&str, &[u8])] = &[("ember.db", &db)];
+        let manifest = manifest_for(entries);
+        assert_eq!(manifest.schema_version, 1);
+        let zip_path = write_archive(&dir, entries, &manifest);
+        let staging = staging_dir(&dir);
+
+        let err = stage_archive(&zip_path, &dir.join("scratch"), &staging).unwrap_err();
+        assert!(err.contains("backup_schema_too_new"), "{err}");
+        assert!(!staging.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_staged_restore_records_its_databases_own_schema_version() {
+        let dir = scratch("archive-schema-real");
+        let db = database_at_schema(&dir.join("older.db"), 7);
+        let entries: &[(&str, &[u8])] = &[("ember.db", &db), ("config.json", b"{}")];
+        let zip_path = write_archive(&dir, entries, &manifest_for(entries));
+        let staging = staging_dir(&dir);
+
+        stage_archive(&zip_path, &dir.join("scratch"), &staging).unwrap();
+        assert_eq!(read_pending_marker(&staging).unwrap().schema_version, 7);
+        assert_eq!(std::fs::read(staging.join("ember.db")).unwrap(), db);
+        assert_eq!(std::fs::read(staging.join("config.json")).unwrap(), b"{}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_backup_whose_database_is_not_a_database_is_refused_at_import() {
+        let dir = scratch("archive-not-db");
+        let entries: &[(&str, &[u8])] = &[("ember.db", b"definitely not sqlite, just some bytes")];
+        let zip_path = write_archive(&dir, entries, &manifest_for(entries));
+        let staging = staging_dir(&dir);
+
+        let err = stage_archive(&zip_path, &dir.join("scratch"), &staging).unwrap_err();
+        assert!(err.contains("database is not readable"), "{err}");
+        assert!(!staging.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_entry_failing_verification_leaves_nothing_staged() {
+        let dir = scratch("archive-late-damage");
+        let claimed: &[(&str, &[u8])] = &[("config.json", b"{}"), ("nodes.dat", b"contacts")];
+        let shipped: &[(&str, &[u8])] = &[("config.json", b"{}"), ("nodes.dat", b"tampered")];
+        let zip_path = write_archive(&dir, shipped, &manifest_for(claimed));
+        let staging = staging_dir(&dir);
+
+        let err = stage_archive(&zip_path, &dir.join("scratch"), &staging).unwrap_err();
+        assert!(err.contains("checksum"), "{err}");
+        assert!(!staging.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discarding_a_restore_a_rollback_left_partly_in_place_is_refused() {
+        let dir = scratch("discard-unresolved");
+        let (staging, _) = stage(&dir, &[("ember.db", b"restored-db")]);
+        write_marker(&staging, &["ember.db"]);
+        let (_, mut journal) = open_apply_journal(&dir, &staging).unwrap();
+        journal.attempt = 1;
+        journal.entries.push(db_entry(&[], 1));
+        write_apply_journal(&staging, &journal).unwrap();
+
+        let err = discard_staging(&staging).unwrap_err();
+        assert!(err.contains("backup_discard_failed"), "{err}");
+        assert!(
+            pending_restore_still_staged(&dir),
+            "the journal survives for the next launch"
+        );
+        assert!(staging.join(DISCARD_REQUESTED).exists(), "the request is kept");
+
+        journal.entries.clear();
+        write_apply_journal(&staging, &journal).unwrap();
+        discard_staging(&staging).unwrap();
+        assert!(!staging.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Discard that had to wait for a restart is honoured by that restart:
+    /// the interrupted apply is rolled back and the restore dropped, never
+    /// applied after all.
+    #[test]
+    fn a_discard_asked_for_mid_rollback_is_not_applied_at_the_next_launch() {
+        let dir = scratch("discard-next-launch");
+        write_all(&dir, LIVE_PROFILE);
+        let (staging, _) = stage(&dir, STAGED_PROFILE);
+        write_marker(&staging, &["identity.json", "ember.db", "config.json"]);
+        std::fs::write(staging.join(DISCARD_REQUESTED), b"1").unwrap();
+
+        assert!(!apply_pending_restore(&dir).unwrap().applied());
+        assert_contents(&dir, LIVE_PROFILE);
+        assert!(!staging.exists(), "the discarded restore is gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discarding_the_leftovers_of_a_finished_apply_is_allowed() {
+        let dir = scratch("discard-applied");
+        write_all(&dir, LIVE_PROFILE);
+        let (staging, names) = stage(&dir, STAGED_PROFILE);
+        write_marker(&staging, &["identity.json", "ember.db", "config.json"]);
+        swap(&dir, &staging, &names, copy_into_place).1.unwrap();
+        mark_apply_finished(&staging);
+
+        discard_staging(&staging).unwrap();
+        assert!(!staging.exists());
+        assert_contents(&dir, STAGED_PROFILE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn source_with_database(dir: &Path) -> crate::storage::database::Database {
+        crate::storage::database::Database::open_at(&dir.join("ember.db")).expect("open database")
+    }
+
+    /// A wrapped blob this account cannot unwrap on any platform.
+    const UNREADABLE_SECRET: &[u8] = b"EMBRSEC1 sealed for someone else";
+
+    #[test]
+    fn an_export_leaves_out_an_unreadable_chat_key_and_reports_it() {
+        let dir = scratch("export-locked-chat");
+        std::fs::write(dir.join(CHAT_KEY_FILE), UNREADABLE_SECRET).unwrap();
+        let db = source_with_database(&dir);
+        assert!(db.chat_locked());
+        std::fs::write(dir.join("config.json"), b"{}").unwrap();
+        let scratch_dir = temp_dir_in(&dir, "backup-tmp").unwrap();
+
+        let (_, manifest, skipped) = build_archive(&dir, &scratch_dir, &db, "1.3.3", None)
+            .expect("a locked chat must not fail the backup");
+        assert_eq!(skipped, vec![CHAT_KEY_FILE.to_string()]);
+        assert!(manifest.files.iter().all(|f| f.name != CHAT_KEY_FILE));
+        assert!(manifest.files.iter().any(|f| f.name == "config.json"));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With chat unlocked the key file is the one history is sealed under, so
+    /// failing to read it (a keyring locked since startup) fails the export
+    /// rather than producing a backup whose history nothing can open.
+    #[test]
+    fn an_export_with_chat_unlocked_refuses_to_leave_the_key_out() {
+        let dir = scratch("export-unlocked-chat");
+        let db = source_with_database(&dir);
+        assert!(!db.chat_locked());
+        std::fs::write(dir.join(CHAT_KEY_FILE), UNREADABLE_SECRET).unwrap();
+        let scratch_dir = temp_dir_in(&dir, "backup-tmp").unwrap();
+
+        let Err(error) = build_archive(&dir, &scratch_dir, &db, "1.3.3", None) else {
+            panic!("a working chat key that cannot be read fails the export");
+        };
+        assert!(error.contains(CHAT_KEY_FILE), "{error}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_export_that_cannot_read_the_identity_names_the_file() {
+        let dir = scratch("export-locked-identity");
+        let db = source_with_database(&dir);
+        std::fs::write(dir.join("identity.json"), UNREADABLE_SECRET).unwrap();
+        let scratch_dir = temp_dir_in(&dir, "backup-tmp").unwrap();
+
+        let err = build_archive(&dir, &scratch_dir, &db, "1.3.3", None).unwrap_err();
+        assert!(err.contains("backup_export_failed"), "{err}");
+        assert!(err.contains("identity.json"), "{err}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restored_database_without_its_chat_key_sets_the_live_key_aside() {
+        let dir = scratch("chat-key-aside");
+        write_all(
+            &dir,
+            &[("ember.db", b"live-db"), (CHAT_KEY_FILE, b"live-key")],
+        );
+        let (staging, names) = stage(&dir, &[("ember.db", b"restored-db")]);
+
+        let (backup_dir, outcome) = swap(&dir, &staging, &names, copy_into_place);
+        assert_eq!(outcome.unwrap(), 1, "the key is set aside, not restored");
+        assert!(!dir.join(CHAT_KEY_FILE).exists());
+        assert_contents(&backup_dir, &[(CHAT_KEY_FILE, b"live-key")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rolled_back_restore_returns_the_chat_key_it_set_aside() {
+        let dir = scratch("chat-key-aside-rollback");
+        write_all(
+            &dir,
+            &[("ember.db", b"live-db"), (CHAT_KEY_FILE, b"live-key")],
+        );
+        let (staging, names) = stage(&dir, &[("ember.db", b"restored-db")]);
+        let (backup_dir, outcome) = swap(&dir, &staging, &names, copy_into_place);
+        outcome.unwrap();
+        let mut journal = read_apply_journal(&staging).unwrap();
+
+        roll_back_journal(&dir, &staging, &backup_dir, &mut journal);
+        assert_contents(
+            &dir,
+            &[("ember.db", b"live-db"), (CHAT_KEY_FILE, b"live-key")],
+        );
+        assert!(journal.entries.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restore_with_no_live_chat_key_records_nothing_to_set_aside() {
+        let dir = scratch("chat-key-none");
+        std::fs::write(dir.join("ember.db"), b"live-db").unwrap();
+        let (staging, names) = stage(&dir, &[("ember.db", b"restored-db")]);
+
+        swap(&dir, &staging, &names, copy_into_place).1.unwrap();
+        let journal = read_apply_journal(&staging).unwrap();
+        assert!(journal.entries.iter().all(|e| e.name != CHAT_KEY_FILE));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_files_a_restore_keeps_exclude_a_chat_key_it_sets_aside() {
+        let without_key = ["ember.db", "config.json"];
+        assert!(restore_sets_aside_chat_key(&without_key));
+        let kept = files_kept_from_profile(&without_key);
+        assert!(!kept.iter().any(|f| f == CHAT_KEY_FILE), "{kept:?}");
+        assert!(kept.iter().any(|f| f == "identity.json"), "{kept:?}");
+        assert!(!kept.iter().any(|f| f == "ember.db"), "{kept:?}");
+
+        let config_only = ["config.json"];
+        assert!(!restore_sets_aside_chat_key(&config_only));
+        assert!(files_kept_from_profile(&config_only)
+            .iter()
+            .any(|f| f == CHAT_KEY_FILE));
+        assert!(!restore_sets_aside_chat_key(&["ember.db", CHAT_KEY_FILE]));
     }
 }

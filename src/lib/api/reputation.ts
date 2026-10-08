@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 
 /**
- * Per-peer reputation record returned by `get_peer_reputation`.
+ * Per-peer reputation record returned by `get_peer_reputation_batch`.
  *
  * Mirrors the backend `PeerReputationInfo` struct exposed from
  * `network::mod.rs`. `score` is the signed integer the backend uses
@@ -39,31 +39,19 @@ export interface ReputationStatsInfo {
 }
 
 /**
- * Fetch the reputation record for a specific peer user-hash (32 hex
- * chars). Returns `null` when the tracker has no entry for the peer
- * (e.g. a fresh connection that hasn't logged a success or failure
- * yet).
- *
- * The backend caps tracker size, so very-long-idle entries may have
- * been evicted; callers should treat `null` as "no record" rather
- * than "peer has never been seen".
- */
-export async function getPeerReputation(userHashHex: string): Promise<PeerReputationInfo | null> {
-  return invoke('get_peer_reputation', { userHashHex });
-}
-
-/**
  * Reputation for many peers in a single call, keyed by lowercase hex hash.
  *
- * Prefer this over looping `getPeerReputation` anywhere a table needs a badge
- * per row. Each single-peer call takes a slot in the backend's bounded command
- * channel, so a per-row fan-out on a repeating timer starves unrelated commands
- * into "Network busy" — while every answer comes from the same in-memory
- * tracker and could have been fetched at once.
+ * One call per table refresh rather than one per row: each call takes a slot
+ * in the backend's bounded command channel, so a per-row fan-out on a
+ * repeating timer starves unrelated commands into "Network busy" — while every
+ * answer comes from the same in-memory tracker and could have been fetched at
+ * once.
  *
  * Hashes the backend cannot parse are omitted from the result; a peer with no
  * tracker record is present with a `null` value, so a missing key means "not
- * answered" and a null one means "no record".
+ * answered" and a null one means "no record". The backend caps tracker size,
+ * so very-long-idle entries may have been evicted; treat `null` as "no record"
+ * rather than "peer has never been seen".
  */
 export async function getPeerReputationBatch(
   userHashes: string[],

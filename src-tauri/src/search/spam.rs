@@ -937,6 +937,9 @@ impl SpamFilter {
         self.gen = self.gen.wrapping_add(1);
     }
 
+    /// Writes inline without [`Self::save_gate`]; production saves go through
+    /// [`Self::drain_saves`].
+    #[cfg(test)]
     pub fn save(&mut self) {
         if !self.dirty {
             return;
@@ -2233,6 +2236,33 @@ mod tests {
         let latest = SpamFilter::load(&dir);
         assert!(latest.db.spam_hashes.contains(&hash_a));
         assert!(latest.db.spam_hashes.contains(&hash_b));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn drain_saves_waits_for_a_save_already_holding_the_gate() {
+        let dir = temp_dir("drain-gate");
+        let hash = "c".repeat(32);
+        let filter = std::sync::Arc::new(tokio::sync::RwLock::new(SpamFilter::load(&dir)));
+        filter
+            .write()
+            .await
+            .mark_spam(&sample_result(&hash, "gated.bin"), &[], None);
+
+        let gate = SpamFilter::save_gate().lock().await;
+        let drain = tokio::spawn({
+            let filter = filter.clone();
+            async move { SpamFilter::drain_saves(&filter).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!drain.is_finished());
+        assert!(filter.read().await.is_dirty());
+
+        drop(gate);
+        drain.await.unwrap().unwrap();
+        assert!(!filter.read().await.is_dirty());
+        assert!(SpamFilter::load(&dir).db.spam_hashes.contains(&hash));
 
         let _ = std::fs::remove_dir_all(dir);
     }

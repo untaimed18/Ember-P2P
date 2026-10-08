@@ -1,15 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
 import { withTimeout } from '$lib/utils';
-import type { NetworkStats, PeerInfo, KadContact, KadSearchEntry } from '$lib/types';
+import type { NetworkStats, KadContact, KadSearchEntry } from '$lib/types';
 
 // The KAD commands below take `withTimeout`'s 20 s default unless noted: long
 // enough for the legitimately slow ones (pinned HTTP download of a fresh
 // nodes.dat, firewall recheck) but short enough that a hung IPC doesn't feel
 // permanent.
-
-export async function getPeers(): Promise<PeerInfo[]> {
-  return invoke('get_peers');
-}
 
 export async function getNetworkStats(): Promise<NetworkStats> {
   return invoke('get_network_stats');
@@ -21,6 +17,23 @@ export async function banPeer(peerId: string): Promise<void> {
 
 export async function unbanPeer(peerId: string): Promise<void> {
   return invoke('unban_peer', { peerId });
+}
+
+/** A peer the user banned. `name` and `client_software` are what its credit
+ *  record last saw, and empty when it never learned them. */
+export interface BannedPeer {
+  /** The id the ban was placed under (the peer's eD2K user hash, hex) —
+   *  pass it back to `unbanPeer` unchanged. */
+  user_hash: string;
+  name: string;
+  client_software: string;
+  /** `ip:port` in the order they were recorded; the port is 0 when only the
+   *  IP was captured. */
+  addresses: string[];
+}
+
+export async function getBannedPeers(): Promise<BannedPeer[]> {
+  return invoke('get_banned_peers');
 }
 
 export async function kadConnect(): Promise<void> {

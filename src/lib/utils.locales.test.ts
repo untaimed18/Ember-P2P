@@ -109,6 +109,18 @@ describe('sizes in the app language', () => {
     expect([0, 1, 2, 3].map(fr.sizeUnitLabel)).toEqual(['o', 'Ko', 'Mo', 'Go']);
   });
 
+  it('keeps a live speed at one decimal so its width holds as it changes', async () => {
+    const en = await utilsIn('en');
+    expect(en.formatLiveSpeed(2 * 1024 * 1024)).toBe('2.0 MB/s');
+    expect(en.formatLiveSpeed(2.06 * 1024 * 1024)).toBe('2.1 MB/s');
+    expect(en.formatLiveSpeed(512)).toBe('512 B/s');
+    expect(en.formatLiveSpeed(1024 * 1024 - 1)).toBe('1.0 MB/s');
+    expect(en.formatLiveSpeed(1023.6)).toBe('1.0 KB/s');
+    expect(en.formatLiveSpeed(0)).toBe('0 B/s');
+    const fr = await utilsIn('fr');
+    expect(fr.formatLiveSpeed(3 * 1024 * 1024)).toBe('3,0 Mo/s');
+  });
+
   it('does not group the digits of a sub-kilobyte count', async () => {
     const { formatBytes } = await utilsIn('de');
     expect(formatBytes(1023)).toBe('1023 B');

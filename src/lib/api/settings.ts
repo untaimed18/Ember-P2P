@@ -1,12 +1,25 @@
 import { invoke } from '@tauri-apps/api/core';
 import * as m from '$lib/paraglide/messages';
-import type { AppSettings, WebService } from '$lib/types';
+import type { AppSettings, FriendOverrides, WebService } from '$lib/types';
+import { flushToastActionsBeforeExit } from '$lib/stores/toast';
 
 export type SettingsUpdateOutcome = 'applied' | 'restart_required' | 'deferred';
 export type LiveApplyOutcome = 'applied' | 'deferred' | 'failed';
 
 export async function getSettings(): Promise<AppSettings> {
   return invoke('get_settings');
+}
+
+/** The settings the network stack reads once, as this run of Ember started
+ *  with them. A saved value that differs takes effect after a restart. */
+export interface LaunchSettings {
+  tcp_port: number;
+  udp_port: number;
+  upnp_enabled: boolean;
+}
+
+export async function getLaunchSettings(): Promise<LaunchSettings> {
+  return invoke('get_launch_settings');
 }
 
 export interface UpdateSettingsResult {
@@ -30,8 +43,8 @@ export interface IpFilterDownloadResult {
 export interface UpdateSettingsOptions {
   /** Treat this save as consent to re-approve a download folder whose approval
    *  was revoked, which is otherwise unrecoverable in-app because re-picking the
-   *  same path is not a change. Only the Settings page's own save button sets
-   *  it: background callers (the UPnP auto-disable handler) reach this with no
+   *  same path is not a change. Only picking the folder in Settings sets it:
+   *  background callers (the UPnP auto-disable handler) reach this with no
    *  user present, and re-approval grants sandbox access to whatever object now
    *  sits at that path. */
   reapproveDownloadRoot?: boolean;
@@ -91,9 +104,20 @@ export async function hideToTray(): Promise<void> {
 
 /** Fully exit Ember. Routes through `app.exit(0)` on the Rust side so the
  *  existing network/save shutdown sequence (the same one triggered by
- *  File → Exit) runs before the process dies. */
+ *  File → Exit) runs before the process dies. A cancel or removal still
+ *  behind an Undo toast is sent first. */
 export async function quitApp(): Promise<void> {
+  await flushToastActionsBeforeExit();
   return invoke('quit_app');
+}
+
+/** Exits decided outside the window (the tray, "exit" on close, "when
+ *  downloads finish") ask through this to have pending Undo actions sent. */
+export const QUIT_REQUESTED_EVENT = 'ember:quit-requested';
+
+/** Whether a cancel or removal is waiting behind an Undo toast. */
+export async function setPendingUndo(pending: boolean): Promise<void> {
+  return invoke('set_pending_undo', { pending });
 }
 
 /** Persist the close-button behavior without serialising the whole
@@ -102,6 +126,36 @@ export async function quitApp(): Promise<void> {
  *  go through `updateSettings`. */
 export async function setCloseBehavior(behavior: 'ask' | 'tray' | 'exit'): Promise<void> {
   return invoke('set_close_behavior', { behavior });
+}
+
+/** The limits the tray and the status bar change directly. Fields left out
+ *  keep their saved values. */
+export interface QuickLimitsPatch {
+  alt_speed_enabled?: boolean;
+  max_upload_speed?: number;
+  max_download_speed?: number;
+  alt_max_upload_speed?: number;
+  alt_max_download_speed?: number;
+}
+
+/** Emitted with the full persisted settings after a save made outside the
+ *  Settings page (the tray's alternative-speed toggle, the status bar). */
+export const SETTINGS_CHANGED_EVENT = 'ember:settings-changed';
+
+/** Replace one friend's exceptions to the friend settings. A field left out
+ *  follows the global setting; none at all clears the friend's entry. Resolves
+ *  with the settings as saved; {@link SETTINGS_CHANGED_EVENT} follows. */
+export async function setFriendOverrides(
+  userHashHex: string,
+  overrides: FriendOverrides,
+): Promise<AppSettings> {
+  return invoke('set_friend_overrides', { userHashHex, overrides });
+}
+
+/** Persist and apply speed limits without a full settings save. Resolves with
+ *  the settings as saved; {@link SETTINGS_CHANGED_EVENT} follows. */
+export async function setQuickLimits(patch: QuickLimitsPatch): Promise<AppSettings> {
+  return invoke('set_quick_limits', { patch });
 }
 
 /** Consume a native close request that preceded listener registration. */
@@ -137,6 +191,14 @@ export async function takePendingRestoreExpiredNotice(): Promise<boolean> {
 }
 
 /**
+ * Consume the folder an applied restore put in place of a download folder on
+ * a network share, or null. Nothing else records that it happened.
+ */
+export async function takePendingRestoreDownloadFolderNotice(): Promise<string | null> {
+  return invoke('take_pending_restore_download_folder_notice');
+}
+
+/**
  * Consume the notice that known.met could not be read this session (`reset`:
  * the catalog was lost and sharing reset to fail-closed), or null.
  */
@@ -147,6 +209,11 @@ export async function takePendingKnownMetNotice(): Promise<{ reset: boolean } | 
 /** Open the official Ember website in the default browser. */
 export async function openEmberWebsite(): Promise<void> {
   return invoke('open_ember_website');
+}
+
+/** Open the project's Buy Me a Coffee page. The address is fixed in the backend. */
+export async function openSupportPage(): Promise<void> {
+  return invoke('open_support_page');
 }
 
 export async function getEmberWebsiteUrl(): Promise<string> {

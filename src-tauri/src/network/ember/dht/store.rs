@@ -6,8 +6,10 @@ use tracing::debug;
 use crate::network::ember::crypto;
 
 use super::publish::{
-    channel_flags_from_data, channel_kind_from_data, CHANNEL_FLAG_DEPARTED, CHANNEL_KIND_INDEX,
-    CHANNEL_KIND_PRESENCE, RECORD_TYPE_CHANNEL, RECORD_TYPE_KEYWORD, RECORD_TYPE_SOURCE,
+    channel_flags_from_data, channel_kind_from_data, CHANNEL_FLAG_DEPARTED, CHANNEL_KIND_CLAIM,
+    CHANNEL_KIND_EPOCH, CHANNEL_KIND_HANDOFF, CHANNEL_KIND_INDEX, CHANNEL_KIND_MODERATION,
+    CHANNEL_KIND_OWNED_ROOMS, CHANNEL_KIND_PRESENCE, RECORD_TYPE_CHANNEL,
+    RECORD_TYPE_KEYWORD, RECORD_TYPE_SOURCE,
 };
 use super::{scale, EmberNodeId};
 
@@ -182,6 +184,42 @@ const _: () = assert!(
     "a room listing must outlive the generic keyword TTL"
 );
 
+/// A room's "this room has moved" record: an owner's handoff, or a nominee's
+/// succession claim.
+///
+/// A member who was away when the room moved finds it here and nowhere else,
+/// and the old room's owner gives its seed up once the handoff lands, so for a
+/// day-long life the member who came back on day two was left in a room with
+/// nobody in it. Its signer republishes it on a long, bounded cadence (see
+/// `ember::channel::HANDOFF_RETIRED_REPUBLISH_SECS`), which is what keeps it on
+/// storers running older builds that still drop it after a day.
+const CHANNEL_HANDOFF_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
+
+// Same reasoning as the assertion above: equal to the keyword default, the
+// constant would compile and quietly put stranded members back.
+const _: () = assert!(
+    CHANNEL_HANDOFF_TTL.as_secs() >= CHANNEL_INDEX_TTL.as_secs()
+        && CHANNEL_HANDOFF_TTL.as_secs() > KEYWORD_RECORD_TTL.as_secs(),
+    "a handoff must outlive a room listing and the generic keyword TTL"
+);
+
+/// A room's governance snapshot, and each member's sealed copy of its current
+/// content key, the owner's own among them.
+///
+/// Only the owner can refresh either, and does every few hours while its
+/// device is up. The owner itself depends on them most when it is not: a
+/// device restored from a backup rebuilds the rooms it owns from these — the
+/// topic, bans, moderators and current key — and under the 24-hour keyword
+/// default a device that had been off for a weekend came back to a room it
+/// could sign for but not run. Newest still wins under the one store key, so
+/// the length only decides how long the last snapshot outlives its owner.
+const CHANNEL_GOVERNANCE_TTL: Duration = CHANNEL_HANDOFF_TTL;
+
+const _: () = assert!(
+    CHANNEL_GOVERNANCE_TTL.as_secs() > KEYWORD_RECORD_TTL.as_secs(),
+    "a room's governance must outlive the generic keyword TTL"
+);
+
 /// How long a record of this type lives, from its leading type byte.
 fn record_ttl(data: &[u8]) -> Duration {
     match data.first() {
@@ -197,6 +235,10 @@ fn record_ttl(data: &[u8]) -> Duration {
                 }
             }
             Some(CHANNEL_KIND_INDEX) => CHANNEL_INDEX_TTL,
+            Some(CHANNEL_KIND_HANDOFF | CHANNEL_KIND_CLAIM) => CHANNEL_HANDOFF_TTL,
+            Some(CHANNEL_KIND_MODERATION | CHANNEL_KIND_EPOCH | CHANNEL_KIND_OWNED_ROOMS) => {
+                CHANNEL_GOVERNANCE_TTL
+            }
             _ => KEYWORD_RECORD_TTL,
         },
         _ => KEYWORD_RECORD_TTL,
@@ -629,9 +671,9 @@ impl DhtStore {
         self.publisher_index.set_local(publisher_key);
     }
 
-    /// Resident record bytes. The observable side of the byte budget, kept
-    /// for the tests that pin eviction and for diagnostics.
-    #[allow(dead_code)]
+    /// Resident record bytes. The observable side of the byte budget, for the
+    /// tests that pin eviction.
+    #[cfg(test)]
     pub fn byte_len(&self) -> usize {
         self.bytes
     }
@@ -1355,9 +1397,18 @@ impl DhtStore {
     ///
     /// Only this module's tests call it, precisely because they need to
     /// observe pre-sweep state that `get_live` deliberately hides.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn get(&self, key: &[u8; 16]) -> Option<&Vec<DhtRecord>> {
         self.entries.get(key)
+    }
+
+    /// Make the `index`th record held under `key` lapse now, the way a record
+    /// does between two `FIND_VALUE` pages.
+    #[cfg(test)]
+    pub fn lapse_for_test(&mut self, key: &[u8; 16], index: usize) {
+        if let Some(record) = self.entries.get_mut(key).and_then(|records| records.get_mut(index)) {
+            record.expires_at_unix = 0;
+        }
     }
 
     /// Retrieve the **non-expired** records for a key. The FIND_VALUE responder
@@ -3707,12 +3758,12 @@ mod tests {
         );
     }
 
-    /// [`record_ttl`] singles out the index kind from inside the channel record
-    /// type, so the arm has to be narrow enough to leave the room's other records
-    /// on the default. Moderation standing in for all of them: it shares the type
-    /// byte and differs only in the packed kind.
+    /// [`record_ttl`] tells a room's records apart by the kind packed inside the
+    /// one channel record type, so each arm has to take only its own kinds:
+    /// the listing a week, the owner's governance and sealed keys a month, and
+    /// presence its own short life.
     #[test]
-    fn only_the_index_kind_of_a_channel_record_gets_the_long_ttl() {
+    fn each_kind_of_channel_record_gets_its_own_ttl() {
         use super::super::publish::{ModerationTail, SignedRecord};
         use crate::network::ember::channel::ChannelIdentity;
 
@@ -3728,6 +3779,8 @@ mod tests {
         );
         assert_eq!(record_ttl(&index.data), CHANNEL_INDEX_TTL);
 
+        // What a device restored from a backup rebuilds the rooms it owns from,
+        // so it has to outlast an owner's absence.
         let moderation = SignedRecord::channel_moderation(
             "",
             "",
@@ -3740,7 +3793,80 @@ mod tests {
             &ident.signing_key,
         )
         .expect("the fixture fits one record");
-        assert_eq!(record_ttl(&moderation.data), KEYWORD_RECORD_TTL);
+        assert_eq!(record_ttl(&moderation.data), CHANNEL_GOVERNANCE_TTL);
+        let epoch = SignedRecord::channel_key_epoch(
+            ident.channel_id,
+            ident.pubkey,
+            &[0x21; 32],
+            2,
+            &[1u8; crate::network::ember::channel::EPOCH_ENVELOPE_LEN],
+            &ident.signing_key,
+        );
+        assert_eq!(record_ttl(&epoch.data), CHANNEL_GOVERNANCE_TTL);
+        // The list a restored device finds those rooms from in the first place.
+        let owned = SignedRecord::owned_rooms(&[[3u8; 16]], &ed25519_dalek::SigningKey::from_bytes(&[0x43; 32]))
+            .expect("one salt fits");
+        assert_eq!(record_ttl(&owned.data), CHANNEL_GOVERNANCE_TTL);
+
+        let presence = SignedRecord::channel_presence(
+            "Ana",
+            ident.channel_id,
+            ident.pubkey,
+            &[0u8; 32],
+            false,
+            0,
+            &[0u8; 32],
+            &ident.signing_key,
+        );
+        assert_eq!(record_ttl(&presence.data), CHANNEL_PRESENCE_TTL);
+
+        // And a three-week-old snapshot is still one a restored owner finds.
+        let now = chrono::Utc::now().timestamp();
+        let mut weeks_old = moderation.data.clone();
+        weeks_old[105..113].copy_from_slice(&(now - 21 * 86_400).to_le_bytes());
+        assert!(record_is_current(&weeks_old, now));
+    }
+
+    /// A member who missed the move has only these two records to find the
+    /// successor by, so both outlive the day a moderation snapshot gets.
+    #[test]
+    fn handoff_and_claim_records_outlive_a_members_absence() {
+        use super::super::publish::SignedRecord;
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let old = ChannelIdentity::generate();
+        let successor = ChannelIdentity::generate();
+        let handoff = SignedRecord::channel_handoff(
+            7,
+            successor.pubkey,
+            old.channel_id,
+            old.pubkey,
+            true,
+            &old.signing_key,
+        );
+        assert_eq!(record_ttl(&handoff.data), CHANNEL_HANDOFF_TTL);
+
+        let nominee = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let claim = SignedRecord::channel_succession_claim(
+            old.channel_id,
+            old.pubkey,
+            &successor.pubkey,
+            1_700_000_000,
+            true,
+            &nominee,
+        );
+        assert_eq!(record_ttl(&claim.data), CHANNEL_HANDOFF_TTL);
+
+        let now = chrono::Utc::now().timestamp();
+        let week_old = {
+            let mut data = handoff.data.clone();
+            data[105..113].copy_from_slice(&(now - 7 * 86_400).to_le_bytes());
+            data
+        };
+        assert!(
+            record_is_current(&week_old, now),
+            "a week-old handoff is still one a returning member can follow"
+        );
     }
 
     /// Two snapshots an owner signed in the same second: every storer ends up

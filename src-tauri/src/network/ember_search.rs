@@ -55,6 +55,7 @@ pub(super) async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkSt
             contact,
             request_id: per_search_req_id,
             start_position,
+            resume_after,
         } = query;
         // The shortlist is not the routing table, and its contents arrive
         // straight out of a peer's `FOUND_NODE`. The table refuses an address
@@ -95,9 +96,12 @@ pub(super) async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkSt
                 keys.extend_from_slice(&extra_keys);
                 // Non-zero on a page follow-up: this node already answered and
                 // said it holds records past what its datagram could carry.
-                state
-                    .ember_dht
-                    .build_find_value(keys, start_position, constraints.clone())
+                state.ember_dht.build_find_value_resuming(
+                    keys,
+                    start_position,
+                    constraints.clone(),
+                    resume_after,
+                )
             }
         };
 
@@ -318,6 +322,11 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
             if let Some(search) = &search {
                 record_ember_find_value_quality(&mut state.ember_diagnostics, search);
             }
+            // Before the records, so a waiter that has them reads this too.
+            if let Some(responded) = state.ember_dht_value_lookup_responded.remove(&search_id) {
+                let count = search.as_ref().map_or(0, |s| s.responded_count());
+                responded.store(count, std::sync::atomic::Ordering::Release);
+            }
             let held = search
                 .as_mut()
                 .map(|s| std::mem::take(&mut s.results))
@@ -440,9 +449,14 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
             } else if let Some(channel_id) =
                 state.ember_channel_handoff_searches.remove(&search_id)
             {
-                state
-                    .ember_pending_channel_handoff
-                    .push((channel_id, into_blobs(held)));
+                // Same as moderation: finding nothing because nobody answered
+                // must not read, for a room we own, as our record being stored
+                // nowhere, which is what lets a banned nominee's commitment go.
+                let answered = search.as_ref().map_or(0, |s| s.responded_count());
+                let blobs = into_blobs(held);
+                if answered > 0 || !blobs.is_empty() {
+                    state.ember_pending_channel_handoff.push((channel_id, blobs));
+                }
             }
         }
     }

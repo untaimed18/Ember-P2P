@@ -262,16 +262,21 @@ back to the separate socket in case classification misbehaves in the field.
 
 ## Ember DHT
 
-### Resume `FIND_VALUE` pages by record, not by index
+### Resume `FIND_VALUE` pages by record, not by index — done in 1.7.2
 
 **Why:** A responder pages a key's records by position in its live list. When a
 record lapses between two page requests, or a secondary key's intersection
 turns empty, every later index shifts and one record is skipped for that walk.
 Duplicates are harmless (the searcher dedupes); a skip is a lost result.
 
-**To do:** Resume from the last blob's signature prefix instead of an index, as
-an additive field on `FIND_VALUE` / `FOUND_VALUE`, keeping the index as the
-fallback for peers that do not send it.
+**Done:** A page follow-up names the record the last page ended on, plus the
+two ahead of it, as resume anchors in the `FIND_VALUE` extension block (tag
+`0x06`). Only `FIND_VALUE` changed: the searcher can tell which blob the page
+ended on from the two positions it already has. The anchor is the record's
+publisher and file rather than its signature, because a republish replaces a
+record in place under a new signature. The index stays as the fallback, and is
+all a peer predating the tag reads. No wire version bump. See §6.9 of the
+specification.
 
 ### Digest corroboration against colluding storers (low)
 

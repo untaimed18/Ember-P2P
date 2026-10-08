@@ -120,46 +120,6 @@ pub(super) fn kad_searches_snapshot(state: &NetworkState) -> Vec<KadSearchInfo> 
         .collect()
 }
 
-pub(super) fn routing_peers_snapshot(state: &NetworkState) -> Vec<PeerInfo> {
-    state
-        .routing_table
-        .all_contacts()
-        .take(200)
-        .map(|contact| PeerInfo {
-            id: contact.id.to_hex(),
-            addresses: vec![format!("{}:{}", contact.ip, contact.udp_port)],
-            nickname: state
-                .peer_nicknames
-                .get(&contact.id)
-                .cloned()
-                .unwrap_or_default(),
-            last_seen: contact.last_seen,
-            files_shared: 0,
-            banned: false,
-        })
-        .collect()
-}
-
-pub(super) fn merge_saved_peers(mut peers: Vec<PeerInfo>, saved_peers: Vec<PeerInfo>) -> Vec<PeerInfo> {
-    for saved in saved_peers {
-        if let Some(existing) = peers.iter_mut().find(|peer| peer.id == saved.id) {
-            if !saved.nickname.is_empty() {
-                existing.nickname = saved.nickname;
-            }
-            if !saved.addresses.is_empty() {
-                existing.addresses = saved.addresses;
-            }
-            existing.last_seen = existing.last_seen.max(saved.last_seen);
-            existing.files_shared = existing.files_shared.max(saved.files_shared);
-            existing.banned = saved.banned;
-        } else if saved.banned {
-            peers.push(saved);
-        }
-    }
-
-    peers
-}
-
 /// Map a `IdentState` enum value into the short label the UI displays
 /// in the upload-pane "Queued" / "Known Clients" tabs. Mirrors the
 /// strings eMule itself uses in its "Identification" client-detail
@@ -478,9 +438,8 @@ pub(super) const MAX_KNOWN_CLIENT_ROWS: usize = 5_000;
 /// Kept immediately beside that function because the two have to agree: a tab
 /// label that disagrees with the table it opens is worse than a stale one. The
 /// only thing that decides which tab a record lands on is whether it resolves
-/// an Ember identity — from the persisted `ember_hash`, or from a live queue
-/// row that verified one this session before the credit flush landed — so this
-/// reproduces exactly that rule and nothing else. No friends lookup, no ident
+/// an Ember identity — see [`record_ember_identity`] — so this reproduces
+/// exactly that rule and nothing else. No friends lookup, no ident
 /// state, no credit ratio, no GeoIP, and no per-row allocation.
 pub(super) async fn known_client_counts(
     credit_manager: &Arc<RwLock<ed2k::credits::CreditManager>>,
@@ -513,7 +472,9 @@ pub(super) async fn known_client_counts(
         .map(|record| {
             (
                 record.last_seen,
-                record.ember_hash.is_some() || live_ember.contains(&record.user_hash),
+                record.ember_hash.is_some()
+                    || live_ember.contains(&record.user_hash)
+                    || record.proven_ember_hash.is_some(),
             )
         })
         .collect();
@@ -531,6 +492,20 @@ pub(super) async fn known_client_counts(
         }
     }
     counts
+}
+
+/// The Ember identity a credit row is shown under, which is what puts it on
+/// the Known Ember Peers tab: the friend-proven link first, then a queue row
+/// a friend session verified this run before the credit flush landed, then
+/// a non-friend's binding SecIdent vouched for (`proven_ember_hash`).
+fn record_ember_identity(
+    record: &ed2k::credits::CreditRecord,
+    live_ember: &std::collections::HashMap<[u8; 16], [u8; 16]>,
+) -> Option<[u8; 16]> {
+    record
+        .ember_hash
+        .or_else(|| live_ember.get(&record.user_hash).copied())
+        .or(record.proven_ember_hash)
 }
 
 pub(super) async fn known_clients_snapshot(
@@ -624,9 +599,7 @@ pub(super) async fn known_clients_snapshot(
         .iter()
         .enumerate()
         .map(|(idx, record)| {
-            let ember = record
-                .ember_hash
-                .or_else(|| live_ember.get(&record.user_hash).copied());
+            let ember = record_ember_identity(record, &live_ember);
             let meta_last_seen = ember
                 .and_then(|eh| friend_meta.get(&eh))
                 .map(|m| m.last_seen)
@@ -660,9 +633,7 @@ pub(super) async fn known_clients_snapshot(
                 ident_state_label(cm.get_current_ident_state(&record.user_hash, record.ident_ip))
                     .to_string();
             let credit_ratio = cm.get_score_ratio(&record.user_hash, record.ident_ip);
-            let ember = record
-                .ember_hash
-                .or_else(|| live_ember.get(&record.user_hash).copied());
+            let ember = record_ember_identity(record, &live_ember);
             let is_friend = ember.map(|eh| friends.contains(&eh)).unwrap_or(false);
             let meta = ember.and_then(|eh| friend_meta.get(&eh));
 

@@ -391,6 +391,15 @@ impl ApprovedRootRegistry {
                     }
                     Err(error) => return Err(error),
                 }
+            } else if crate::security::is_network_path(configured) {
+                // Looking at it would connect to its server and offer it the
+                // user's credentials, which only their approval may bring
+                // about. Treated as offline, and so unapproved, untouched.
+                tracing::warn!(
+                    "configured root on a network share has no approved identity record and is \
+                     not opened until re-approved: {}",
+                    configured_path.display()
+                );
             } else if std::fs::metadata(configured_path)
                 .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
             {
@@ -506,6 +515,21 @@ impl ApprovedRootRegistry {
         Ok(())
     }
 
+    /// The canonical target recorded when `configured` was approved, from
+    /// memory: no disk access.
+    fn recorded_canonical(&self, configured: &str) -> Option<String> {
+        self.roots
+            .read()
+            .get(&path_key(Path::new(configured)))
+            .map(|record| record.canonical.clone())
+    }
+
+    /// Whether `configured` has an approval record, from memory: no disk
+    /// access.
+    pub fn is_recorded(&self, configured: &Path) -> bool {
+        self.roots.read().contains_key(&path_key(configured))
+    }
+
     pub fn verify_root(&self, configured: &Path) -> io::Result<PathBuf> {
         let key = path_key(configured);
         let record = self.roots.read().get(&key).cloned().ok_or_else(|| {
@@ -536,6 +560,7 @@ impl ApprovedRootRegistry {
         candidate: &Path,
         allowed_roots: &[String],
     ) -> io::Result<PathBuf> {
+        refuse_network_path_outside(candidate, allowed_roots)?;
         let canonical = candidate.canonicalize()?;
         if !canonical.is_file() && !canonical.is_dir() {
             return Err(io::Error::new(
@@ -574,6 +599,7 @@ impl ApprovedRootRegistry {
         candidate: &Path,
         allowed_roots: &[String],
     ) -> io::Result<PathBuf> {
+        refuse_network_path_outside(candidate, allowed_roots)?;
         match object_identity(candidate) {
             Ok(identity) if identity.reparse_point => {
                 return Err(io::Error::new(
@@ -863,6 +889,61 @@ pub fn verify_existing_path(candidate: &Path, allowed_roots: &[String]) -> io::R
     approved_roots()?.verify_existing_path(candidate, allowed_roots)
 }
 
+/// A finished file at the path Ember recorded when it wrote it, resolved
+/// within the approved roots when it is still under one, else within the
+/// folder it was written into.
+///
+/// A download folder stops being an approved root once the user moves to
+/// another and no part file is left in it, but what Ember finished there is
+/// still the user's download. `recorded` must come from Ember's own record of
+/// that write, never from the renderer: outside the roots, all that vouches
+/// for it is that it still sits directly in a folder named `landing_dir`
+/// (`Downloads`, `Chat Files`), with neither that folder nor the file a
+/// reparse point, so nothing swapped in since can send the open elsewhere.
+pub fn verify_recorded_file(
+    recorded: &Path,
+    allowed_roots: &[String],
+    landing_dir: &str,
+) -> io::Result<PathBuf> {
+    verify_existing_path(recorded, allowed_roots)
+        .or_else(|error| verify_in_landing_dir(recorded, landing_dir).map_err(|_| error))
+}
+
+fn verify_in_landing_dir(recorded: &Path, landing_dir: &str) -> io::Result<PathBuf> {
+    refuse_network_path_outside(recorded, &[])?;
+    let outside = || {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "target is not where Ember recorded writing it",
+        )
+    };
+    let landing = recorded
+        .parent()
+        .filter(|parent| recorded.is_absolute() && is_landing_dir(parent, landing_dir))
+        .ok_or_else(outside)?;
+    ensure_not_reparse(landing)?;
+    let canonical_landing = landing.canonicalize()?;
+    let canonical = recorded.canonicalize()?;
+    if canonical.parent() != Some(canonical_landing.as_path()) || !canonical.is_file() {
+        return Err(outside());
+    }
+    ensure_not_reparse(&canonical)?;
+    Ok(canonical)
+}
+
+/// `dir` is named `landing_dir`, compared as the platform's file system
+/// compares names: a folder that already existed as `downloads` is reused,
+/// and canonical paths carry its own spelling.
+pub fn is_landing_dir(dir: &Path, landing_dir: &str) -> bool {
+    dir.file_name().is_some_and(|name| {
+        if cfg!(any(windows, target_os = "macos")) {
+            name.to_string_lossy().eq_ignore_ascii_case(landing_dir)
+        } else {
+            name == landing_dir
+        }
+    })
+}
+
 pub fn verify_output_path(candidate: &Path, allowed_roots: &[String]) -> io::Result<PathBuf> {
     approved_roots()?.verify_output_path(candidate, allowed_roots)
 }
@@ -1130,7 +1211,46 @@ fn verified_parent_handle(
     parent: &Path,
     allowed_roots: &[String],
 ) -> io::Result<(PathBuf, File, ObjectIdentity)> {
+    refuse_network_path_outside(parent, allowed_roots)?;
     open_verified_directory(parent, allowed_roots)
+}
+
+/// Refuse, before anything resolves it, a network path that is not inside an
+/// approved root by its text alone. Resolving `\\host\share\x` opens an SMB
+/// session that offers the user's NTLM credentials to that host, so the
+/// containment checks that canonicalize first had already leaked them by the
+/// time they said no. A share the user approved as a root still passes, and so
+/// does a path under a root's recorded canonical form: a mapped drive `Z:\x`
+/// canonicalizes to `\\?\UNC\server\share\x`, and the move into Downloads and
+/// the Library's delete work on canonical paths. A local path is checked
+/// exactly as before. Windows only: elsewhere `//x` is an ordinary path.
+fn refuse_network_path_outside(candidate: &Path, allowed_roots: &[String]) -> io::Result<()> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    let text = candidate.to_string_lossy();
+    if !crate::security::is_network_path(&text) {
+        return Ok(());
+    }
+    let registry = global_slot().read().clone();
+    let inside = allowed_roots
+        .iter()
+        .filter(|root| !root.is_empty())
+        .any(|root| {
+            crate::security::path_within_dir(&text, root)
+                || registry
+                    .as_ref()
+                    .and_then(|registry| registry.recorded_canonical(root))
+                    .is_some_and(|canonical| crate::security::path_within_dir(&text, &canonical))
+        });
+    if inside {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "network path is outside the approved roots",
+        ))
+    }
 }
 
 #[cfg(unix)]
@@ -1625,20 +1745,56 @@ pub fn rename_approved_no_replace(
     allowed_roots: &[String],
     expected_source: &ObjectIdentity,
 ) -> io::Result<PathBuf> {
+    move_approved_no_replace_inner(
+        source_path,
+        destination_path,
+        allowed_roots,
+        expected_source,
+        true,
+    )
+}
+
+/// [`rename_approved_no_replace`] into another approved directory on the same
+/// volume, so the file is renamed rather than copied: across volumes it fails
+/// instead. Both directories are pinned, and on Windows the exact opened
+/// object is moved.
+pub fn move_approved_no_replace(
+    source_path: &Path,
+    destination_path: &Path,
+    allowed_roots: &[String],
+    expected_source: &ObjectIdentity,
+) -> io::Result<PathBuf> {
+    move_approved_no_replace_inner(
+        source_path,
+        destination_path,
+        allowed_roots,
+        expected_source,
+        false,
+    )
+}
+
+fn move_approved_no_replace_inner(
+    source_path: &Path,
+    destination_path: &Path,
+    allowed_roots: &[String],
+    expected_source: &ObjectIdentity,
+    same_directory: bool,
+) -> io::Result<PathBuf> {
     let (parent, parent_handle, parent_identity, source_name) =
         split_verified_file_parent(source_path, allowed_roots)?;
-    let (_, _, destination_parent_identity, destination_name) =
+    let (destination_parent, destination_handle, destination_parent_identity, destination_name) =
         split_verified_file_parent(destination_path, allowed_roots)?;
-    if destination_parent_identity != parent_identity {
+    if same_directory && destination_parent_identity != parent_identity {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "approved rename must stay in one directory",
         ));
     }
-    let destination = parent.join(&destination_name);
+    let destination = destination_parent.join(&destination_name);
 
     #[cfg(unix)]
     {
+        let _ = &parent;
         let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         let source = openat_child(&parent_handle, &source_name, flags, 0)?;
         if &object_identity_from_file(&source)? != expected_source {
@@ -1647,8 +1803,8 @@ pub fn rename_approved_no_replace(
                 "approved rename source changed identity",
             ));
         }
-        rename_at_no_replace(&parent_handle, &source_name, &destination_name)?;
-        let renamed = openat_child(&parent_handle, &destination_name, flags, 0)?;
+        rename_at_no_replace(&parent_handle, &source_name, &destination_handle, &destination_name)?;
+        let renamed = openat_child(&destination_handle, &destination_name, flags, 0)?;
         if &object_identity_from_file(&renamed)? != expected_source {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -1661,6 +1817,7 @@ pub fn rename_approved_no_replace(
     {
         use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
         const DELETE_ACCESS: u32 = 0x0001_0000;
+        let _ = &parent_handle;
         let source = open_windows_path(
             &parent.join(&source_name),
             FILE_READ_ATTRIBUTES | DELETE_ACCESS,
@@ -1678,9 +1835,9 @@ pub fn rename_approved_no_replace(
                 "approved rename source changed before handle pinning",
             ));
         }
-        rename_opened_file_at(&source, &parent_handle, &destination_name)?;
-        if object_identity(&parent)? != parent_identity
-            || !opened_child_parent_matches(&source, &parent)?
+        rename_opened_file_at(&source, &destination_handle, &destination_name)?;
+        if object_identity(&destination_parent)? != destination_parent_identity
+            || !opened_child_parent_matches(&source, &destination_parent)?
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -1694,29 +1851,60 @@ pub fn rename_approved_no_replace(
 
 #[cfg(target_os = "linux")]
 fn rename_at_no_replace(
-    parent: &File,
+    from_parent: &File,
     from: &std::ffi::OsStr,
+    to_parent: &File,
     to: &std::ffi::OsStr,
 ) -> io::Result<()> {
     use std::os::fd::AsRawFd;
-    let (from, to) = (component_cstring(from)?, component_cstring(to)?);
-    let fd = parent.as_raw_fd();
-    if unsafe { libc::renameat2(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_NOREPLACE) } != 0 {
-        return Err(io::Error::last_os_error());
+    let (from_c, to_c) = (component_cstring(from)?, component_cstring(to)?);
+    let (from_fd, to_fd) = (from_parent.as_raw_fd(), to_parent.as_raw_fd());
+    if unsafe {
+        libc::renameat2(from_fd, from_c.as_ptr(), to_fd, to_c.as_ptr(), libc::RENAME_NOREPLACE)
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        // A file system without RENAME_NOREPLACE.
+        if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) {
+            return link_then_unlink_at(from_parent, from, to_parent, to);
+        }
+        return Err(error);
     }
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
 fn rename_at_no_replace(
-    parent: &File,
+    from_parent: &File,
     from: &std::ffi::OsStr,
+    to_parent: &File,
     to: &std::ffi::OsStr,
 ) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     let (from, to) = (component_cstring(from)?, component_cstring(to)?);
-    let fd = parent.as_raw_fd();
-    if unsafe { libc::renameatx_np(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_EXCL) } != 0 {
+    let (from_fd, to_fd) = (from_parent.as_raw_fd(), to_parent.as_raw_fd());
+    if unsafe { libc::renameatx_np(from_fd, from.as_ptr(), to_fd, to.as_ptr(), libc::RENAME_EXCL) }
+        != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn link_then_unlink_at(
+    from_parent: &File,
+    from: &std::ffi::OsStr,
+    to_parent: &File,
+    to: &std::ffi::OsStr,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let (from, to) = (component_cstring(from)?, component_cstring(to)?);
+    let (from_fd, to_fd) = (from_parent.as_raw_fd(), to_parent.as_raw_fd());
+    if unsafe { libc::linkat(from_fd, from.as_ptr(), to_fd, to.as_ptr(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::unlinkat(from_fd, from.as_ptr(), 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -1724,14 +1912,12 @@ fn rename_at_no_replace(
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn rename_at_no_replace(
-    _parent: &File,
-    _from: &std::ffi::OsStr,
-    _to: &std::ffi::OsStr,
+    from_parent: &File,
+    from: &std::ffi::OsStr,
+    to_parent: &File,
+    to: &std::ffi::OsStr,
 ) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "this platform has no rename that refuses to replace",
-    ))
+    link_then_unlink_at(from_parent, from, to_parent, to)
 }
 
 /// Rename the opened `file` to `parent/<name>`, refusing to replace an
@@ -2822,6 +3008,71 @@ pub fn object_identity(path: &Path) -> io::Result<ObjectIdentity> {
 mod tests {
     use super::*;
 
+    /// A network path outside every approved root is refused before anything
+    /// resolves it; one under an approved share, and any local path, go on to
+    /// the ordinary checks.
+    #[cfg(windows)]
+    #[test]
+    fn network_paths_outside_the_roots_are_refused_unresolved() {
+        let roots = vec![r"C:\Share".to_string(), r"\\nas\media".to_string()];
+        for refused in [
+            r"\\attacker\share\x.mkv",
+            r"//attacker/share/x.mkv",
+            r"\\?\UNC\attacker\share\x.mkv",
+            r"\\.\C:\..\UNC\attacker\share",
+            r"\\nas\other\x.mkv",
+        ] {
+            assert!(
+                refuse_network_path_outside(Path::new(refused), &roots).is_err(),
+                "{refused}"
+            );
+        }
+        // A UNC path's root is `\\server\share`, which `..` cannot climb above.
+        for passed in [
+            r"\\nas\media\film.mkv",
+            r"\\nas\media\..\film.mkv",
+            r"C:\Share\x.mkv",
+            r"D:\elsewhere\x.mkv",
+        ] {
+            assert!(refuse_network_path_outside(Path::new(passed), &roots).is_ok(), "{passed}");
+        }
+    }
+
+    /// A mapped drive canonicalizes to `\\?\UNC\…`: paths under an approved
+    /// root's recorded canonical form must pass, or nothing could complete
+    /// into, or be deleted from, a download folder on a mapped drive.
+    #[cfg(windows)]
+    #[test]
+    fn a_mapped_drive_roots_canonical_unc_paths_pass() {
+        let _guard = test_registry_lock();
+        let previous = global_slot().read().clone();
+        let identity: ObjectIdentity = serde_json::from_str("{}").unwrap();
+        let configured = r"Z:\Ember".to_string();
+        let mut roots = HashMap::new();
+        roots.insert(
+            path_key(Path::new(&configured)),
+            ApprovedRoot {
+                configured: configured.clone(),
+                canonical: r"\\?\UNC\nas\share\Ember".to_string(),
+                configured_identity: identity.clone(),
+                target_identity: identity,
+                volume: None,
+            },
+        );
+        *global_slot().write() = Some(Arc::new(ApprovedRootRegistry {
+            state_path: std::env::temp_dir().join("ember-unused-roots.json"),
+            roots: parking_lot::RwLock::new(roots),
+        }));
+        let allowed = [configured];
+        let canonical_part = Path::new(r"\\?\UNC\nas\share\Ember\Temp\x.part");
+        let other_share = Path::new(r"\\?\UNC\nas\other\x.part");
+        let accepted = refuse_network_path_outside(canonical_part, &allowed).is_ok();
+        let refused = refuse_network_path_outside(other_share, &allowed).is_err();
+        *global_slot().write() = previous;
+        assert!(accepted, "under the root's canonical form");
+        assert!(refused, "another share stays refused");
+    }
+
     /// A completion copy's name in a deep download folder runs past
     /// `MAX_PATH`; the handles Ember opens itself must still reach it.
     #[cfg(windows)]
@@ -2900,6 +3151,49 @@ mod tests {
         assert_eq!(std::fs::read(&published).unwrap(), b"copy");
         assert!(!staged.exists());
         assert_eq!(object_identity(&published).unwrap(), identity);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn approved_move_renames_the_pinned_file_into_another_directory_and_never_replaces() {
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-approved-move-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let (root, data) = (base.join("root"), base.join("data"));
+        let (dir, aside) = (root.join("Temp"), root.join("Temp").join("orphaned"));
+        for path in [&aside, &data] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let allowed = [root.to_string_lossy().into_owned()];
+        initialize_approved_roots(&data, &allowed).unwrap();
+        let part = dir.join("a.part");
+        std::fs::write(&part, b"progress").unwrap();
+        let identity = object_identity(&part).unwrap();
+        let taken = aside.join("taken.part");
+        std::fs::write(&taken, b"theirs").unwrap();
+
+        let error = move_approved_no_replace(&part, &taken, &allowed, &identity).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(std::fs::read(&taken).unwrap(), b"theirs");
+        let other = dir.join("b.part");
+        std::fs::write(&other, b"other").unwrap();
+        assert!(
+            move_approved_no_replace(&other, &aside.join("b.part"), &allowed, &identity).is_err(),
+            "only the pinned object is moved"
+        );
+
+        let moved = move_approved_no_replace(&part, &aside.join("a.part"), &allowed, &identity)
+            .unwrap();
+        assert_eq!(std::fs::read(aside.join("a.part")).unwrap(), b"progress");
+        assert!(!part.exists());
+        assert_eq!(
+            object_identity(&moved).unwrap(),
+            identity,
+            "renamed, not copied"
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 use crate::app_state::AppState;
 use crate::commands::errors::{await_reply, bounded_send, coded, coded_ctx, CMD_REPLY_TIMEOUT};
@@ -830,12 +830,21 @@ async fn preserve_failed_partial(
 /// lets it go — and what stops a finished file's `.part` whose removal failed
 /// after a copy from staying behind in it for good. The folders are swept in
 /// parallel, each for at most [`ORPHAN_SWEEP_FOLDER_BUDGET`].
+///
+/// With [`OrphanDisposal::SetAside`] a download's part files are moved into
+/// one `Temp/orphaned-<timestamp>/` folder per download folder instead of
+/// being removed; room transfers' are removed either way.
+///
+/// Returns whether every folder was swept to the end: not when one could not
+/// be reached or read, was given up on, or held an orphan that could be
+/// neither removed nor set aside.
 pub async fn sweep_orphan_part_files(
     download_roots: &[String],
     known_ids: &std::collections::HashSet<String>,
     db: &Database,
     cutoff: std::time::SystemTime,
-) {
+    disposal: OrphanDisposal,
+) -> bool {
     // Read once, up front, instead of querying per file. This runs inline on
     // the network task's startup gate, so a Temp directory full of stale
     // partials used to mean thousands of blocking queries before the loop
@@ -852,40 +861,223 @@ pub async fn sweep_orphan_part_files(
         }
     };
     let owns_partial = &owns_partial;
-    futures::future::join_all(download_roots.iter().map(|download_folder| async move {
-        let sweep = sweep_orphan_part_files_in(download_folder, known_ids, owns_partial, cutoff);
-        if tokio::time::timeout(ORPHAN_SWEEP_FOLDER_BUDGET, sweep).await.is_err() {
-            tracing::warn!("Orphan sweep: gave up on {download_folder}, which is not answering");
+    let set_aside_in = match disposal {
+        OrphanDisposal::Delete => None,
+        OrphanDisposal::SetAside { since } => Some(format!(
+            "orphaned-{}",
+            local_time(since)
+                .unwrap_or_else(chrono::Local::now)
+                .format("%Y%m%d-%H%M%S")
+        )),
+    };
+    let set_aside_in = set_aside_in.as_deref();
+    let swept = futures::future::join_all(download_roots.iter().map(|download_folder| async move {
+        let sweep = sweep_orphan_part_files_in(
+            download_folder,
+            known_ids,
+            owns_partial,
+            cutoff,
+            set_aside_in,
+        );
+        match tokio::time::timeout(ORPHAN_SWEEP_FOLDER_BUDGET, sweep).await {
+            Ok(complete) => complete,
+            Err(_) => {
+                tracing::warn!("Orphan sweep: gave up on {download_folder}, which is not answering");
+                false
+            }
         }
     }))
     .await;
+    swept.into_iter().all(|complete| complete)
+}
+
+/// What the startup sweep does with a download's part files that nothing
+/// claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanDisposal {
+    Delete,
+    /// `ember.db` was replaced, by corruption recovery or a restore, so a
+    /// download it does not list may still be one the user wants: only the
+    /// database that knew about it is gone.
+    ///
+    /// `since` is when, in Unix seconds. Every sweep until one finishes moves
+    /// into the same `orphaned-<since>` folder, so a `.part` and its
+    /// `.part.met` set aside on different launches still end up together.
+    SetAside { since: i64 },
+}
+
+/// In the data folder, holding when `ember.db` was replaced, from just before
+/// it is until a sweep has set aside every orphan in every download folder. A
+/// folder that was offline or given up on then is still swept that way once
+/// it is back, instead of having its orphans removed by a later, ordinary
+/// launch.
+const SET_ASIDE_ORPHANS_MARKER: &str = "set-aside-orphans";
+
+/// How long after `ember.db` was replaced orphans are still set aside. A part
+/// file that can never be moved, or a download folder that never comes back,
+/// would otherwise stop every later launch from removing any orphan at all.
+const SET_ASIDE_ORPHANS_MAX_SECS: i64 = 14 * 24 * 60 * 60;
+
+fn local_time(unix_secs: i64) -> Option<chrono::DateTime<chrono::Local>> {
+    chrono::DateTime::from_timestamp(unix_secs, 0).map(|time| time.with_timezone(&chrono::Local))
+}
+
+impl OrphanDisposal {
+    /// Record that `ember.db` in `data_dir` is about to be replaced. Called
+    /// before it is, so a launch that ends between the two still leaves the
+    /// next one setting orphans aside. Blocking.
+    pub fn record_database_replacement(data_dir: &Path) -> std::io::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        crate::security::atomic_write(
+            &data_dir.join(SET_ASIDE_ORPHANS_MARKER),
+            format!("{now}\n").as_bytes(),
+            false,
+        )
+    }
+
+    /// When the marker says `ember.db` was replaced, if there is one. Blocking.
+    fn recorded_replacement(data_dir: &Path, now: i64) -> Option<i64> {
+        let marker = data_dir.join(SET_ASIDE_ORPHANS_MARKER);
+        let modified = || {
+            std::fs::metadata(&marker)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .map(|time| chrono::DateTime::<chrono::Utc>::from(time).timestamp())
+                .unwrap_or(now)
+        };
+        match std::fs::read(&marker) {
+            Ok(raw) => Some(
+                std::str::from_utf8(&raw)
+                    .ok()
+                    .and_then(|text| text.trim().parse().ok())
+                    // Written empty before the time was recorded.
+                    .unwrap_or_else(modified),
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                tracing::warn!("Could not read {}: {error}", marker.display());
+                Some(modified())
+            }
+        }
+    }
+
+    /// How this launch's sweep treats orphans. `db_replaced` is whether this
+    /// launch replaced `ember.db`, which sets them aside even if the marker
+    /// could not be written. Blocking.
+    pub fn at_startup(data_dir: &Path, db_replaced: bool) -> Self {
+        let now = chrono::Utc::now().timestamp();
+        let recorded = Self::recorded_replacement(data_dir, now);
+        if db_replaced {
+            return Self::SetAside {
+                since: recorded.unwrap_or(now),
+            };
+        }
+        let Some(since) = recorded else {
+            return Self::Delete;
+        };
+        let format = |secs: i64| {
+            local_time(secs).map_or_else(
+                || secs.to_string(),
+                |time| time.format("%Y-%m-%d %H:%M").to_string(),
+            )
+        };
+        if now.saturating_sub(since) <= SET_ASIDE_ORPHANS_MAX_SECS {
+            tracing::warn!(
+                "ember.db was replaced on {} and no sweep since has reached every part file it \
+                 does not list, so they are set aside again instead of removed, until {}",
+                format(since),
+                format(since.saturating_add(SET_ASIDE_ORPHANS_MAX_SECS))
+            );
+            Self::SetAside { since }
+        } else {
+            tracing::warn!(
+                "ember.db was replaced on {}, more than {} days ago, and no sweep since has \
+                 reached every part file it does not list; removing them again from now on",
+                format(since),
+                SET_ASIDE_ORPHANS_MAX_SECS / 86_400
+            );
+            Self::set_aside_finished(data_dir);
+            Self::Delete
+        }
+    }
+
+    /// Record that a [`Self::SetAside`] sweep reached every orphan. Blocking.
+    pub fn set_aside_finished(data_dir: &Path) {
+        let marker = data_dir.join(SET_ASIDE_ORPHANS_MARKER);
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!("Could not remove {}: {error}", marker.display()),
+        }
+    }
 }
 
 /// An offline network share can hold every call into it for tens of seconds.
 const ORPHAN_SWEEP_FOLDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Move `path`, a part file in `<download_folder>/Temp`, into
+/// `<download_folder>/Temp/<folder>/` under its own name, by a rename that
+/// never replaces a file already there. Blocking.
+fn set_aside_orphan(
+    path: &Path,
+    download_folder: &Path,
+    folder: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let allowed = vec![download_folder.to_string_lossy().into_owned()];
+    let Some((verified, identity)) = pin_cleanup_target(path, &allowed)? else {
+        anyhow::bail!("{} is gone", path.display());
+    };
+    let name = verified
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{} has no file name", verified.display()))?
+        .to_owned();
+    let aside = crate::security::filesystem::prepare_approved_subdir(
+        &download_folder.join("Temp"),
+        folder,
+        &allowed,
+    )?;
+    Ok(crate::security::filesystem::move_approved_no_replace(
+        &verified,
+        &aside.join(name),
+        &allowed,
+        &identity,
+    )?)
+}
 
 async fn sweep_orphan_part_files_in(
     download_folder: &str,
     known_ids: &std::collections::HashSet<String>,
     owns_partial: &std::collections::HashSet<String>,
     cutoff: std::time::SystemTime,
-) {
+    set_aside_in: Option<&str>,
+) -> bool {
     let temp_dir = std::path::PathBuf::from(download_folder).join("Temp");
     if !tokio::fs::metadata(&temp_dir).await.is_ok_and(|m| m.is_dir()) {
-        return;
+        // No `Temp` holds no orphans; a folder that is not there may.
+        return tokio::fs::metadata(download_folder).await.is_ok();
     }
     let mut entries = match tokio::fs::read_dir(&temp_dir).await {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!("Orphan sweep: failed to read {}: {e}", temp_dir.display());
-            return;
+            return false;
         }
     };
     let mut swept_part: u32 = 0;
     let mut swept_met: u32 = 0;
+    let mut set_aside: u32 = 0;
     let mut skipped_known: u32 = 0;
     let mut failed: u32 = 0;
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(e) => {
+                failed += 1;
+                tracing::warn!("Orphan sweep: stopped reading {}: {e}", temp_dir.display());
+                break;
+            }
+        };
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -926,6 +1118,39 @@ async fn sweep_orphan_part_files_in(
             skipped_known += 1;
             continue;
         }
+        if let Some(folder) = set_aside_in.filter(|_| !room_xfer) {
+            let moved = tokio::task::spawn_blocking({
+                let (path, root, folder) =
+                    (path.clone(), std::path::PathBuf::from(download_folder), folder.to_string());
+                move || set_aside_orphan(&path, &root, &folder)
+            })
+            .await;
+            match moved {
+                Ok(Ok(aside)) => {
+                    set_aside += 1;
+                    tracing::warn!(
+                        "Orphan sweep: the database was replaced, so {} is kept as {}",
+                        path.display(),
+                        aside.display()
+                    );
+                }
+                Ok(Err(error)) => {
+                    failed += 1;
+                    tracing::warn!(
+                        "Orphan sweep: could not set aside {}, leaving it: {error:#}",
+                        path.display()
+                    );
+                }
+                Err(error) => {
+                    failed += 1;
+                    tracing::warn!(
+                        "Orphan sweep set-aside task failed for {}: {error}",
+                        path.display()
+                    );
+                }
+            }
+            continue;
+        }
         let allowed = vec![download_folder.to_string()];
         let deletion = tokio::task::spawn_blocking({
             let path = path.clone();
@@ -958,12 +1183,13 @@ async fn sweep_orphan_part_files_in(
             }
         }
     }
-    if swept_part > 0 || swept_met > 0 || failed > 0 {
+    if swept_part > 0 || swept_met > 0 || set_aside > 0 || failed > 0 {
         tracing::info!(
-            "Orphan sweep finished: removed {swept_part} .part and {swept_met} .part.met file(s) from {} ({skipped_known} skipped — still in use, {failed} failed to delete)",
+            "Orphan sweep finished: removed {swept_part} .part and {swept_met} .part.met file(s) and set aside {set_aside} from {} ({skipped_known} skipped — still in use, {failed} failed)",
             temp_dir.display()
         );
     }
+    failed == 0
 }
 
 #[tauri::command]
@@ -1330,11 +1556,20 @@ fn check_batch_size(transfer_ids: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// How long a held pause keeps its slots before queued downloads may have
+/// them: well past the Undo toast, which can be held open by hovering it.
+const HELD_PAUSE_RELEASE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// `hold` pauses without giving the freed download slots to queued rows: the
+/// pause before a cancel the user can still undo, so Undo finds its slot free
+/// and the download running again rather than queued behind one started in
+/// its place. The cancel promotes once it goes through.
 #[tauri::command]
 pub async fn pause_transfers_batch(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     transfer_ids: Vec<String>,
+    hold: Option<bool>,
 ) -> Result<(), String> {
     check_batch_size(&transfer_ids)?;
     let (paused, promoted) = {
@@ -1351,7 +1586,23 @@ pub async fn pause_transfers_batch(
                 control.cancel();
             }
         }
-        manager.pause_and_promote_many(&transfer_ids)
+        if hold.unwrap_or(false) {
+            // Should neither the cancel nor the Undo ever come (the page
+            // reloaded under its toast), the slots are not left empty for
+            // good. After an Undo they are taken again, and this finds none.
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(HELD_PAUSE_RELEASE).await;
+                let Some(state) = app.try_state::<AppState>() else {
+                    return;
+                };
+                let promoted = state.transfer_manager.write().await.promote_available();
+                start_promoted_downloads(&state, &promoted).await;
+            });
+            (manager.pause_many(&transfer_ids), Vec::new())
+        } else {
+            manager.pause_and_promote_many(&transfer_ids)
+        }
     };
     let statuses: Vec<(String, TransferStatus)> = paused
         .iter()
@@ -1569,8 +1820,8 @@ pub async fn cancel_transfers_batch(
                 .get_transfer(&transfer_id)
                 .map(|t| (t.file_hash.clone(), t.file_name.clone(), t.total_size));
             if let Some(control) = manager.get_control(&transfer_id) {
-                // Deletes the `.part` — see `cancel_transfer` for why this is
-                // `discard` rather than `cancel`.
+                // Discard, not cancel: this path deletes the `.part`, so the
+                // writer should drop its handle without fsyncing it first.
                 control.discard();
             }
             (manager.cancel(&transfer_id), info)
@@ -1599,9 +1850,9 @@ pub async fn cancel_transfers_batch(
         }
     }
 
-    // Wait for teardown acks concurrently (same wall-clock deadline as single cancel),
-    // then always remove DB rows — matching `cancel_transfer`. Retaining rows on
-    // ack timeout caused cancelled downloads to resurrect on the next launch.
+    // Wait for teardown acks concurrently under one wall-clock deadline, then
+    // always remove DB rows. Retaining rows on ack timeout caused cancelled
+    // downloads to resurrect on the next launch.
     let results = futures::future::join_all(pending_acks.into_iter().map(
         |(transfer_id, ack_rx)| async move {
             (
@@ -1766,22 +2017,21 @@ fn resolve_transfer_reveal_path(
     };
     let part_path = folders.part_path_for(&transfer.id);
 
-    let candidate = if final_path.is_file() {
-        final_path
+    let verified = if final_path.is_file() {
+        crate::security::filesystem::verify_recorded_file(&final_path, &folders.roots(), "Downloads")
     } else if part_path.is_file() {
-        part_path
+        crate::security::filesystem::verify_existing_path(&part_path, &folders.roots())
     } else {
         return Err(coded("transfers_file_not_found", "File not found on disk"));
     };
 
-    crate::security::filesystem::verify_existing_path(&candidate, &folders.roots())
-        .map_err(|e| {
-            coded_ctx(
-                "transfers_invalid_path",
-                "Invalid or changed download path",
-                e,
-            )
-        })
+    verified.map_err(|e| {
+        coded_ctx(
+            "transfers_invalid_path",
+            "Invalid or changed download path",
+            e,
+        )
+    })
 }
 
 #[tauri::command]
@@ -1871,21 +2121,21 @@ pub async fn open_file(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
-    let (transfer, dl_folder) = {
+    let (transfer, dl_folders) = {
         let (mgr, cfg) = tokio::join!(state.transfer_manager.read(), state.config.read(),);
         (
             mgr.get_transfer(&transfer_id).cloned(),
-            cfg.settings.download_folder.clone(),
+            cfg.settings.download_folders(),
         )
     };
     let transfer =
         transfer.ok_or_else(|| coded("transfers_transfer_not_found", "Transfer not found"))?;
     let safe_name = crate::security::sanitize_filename(&transfer.file_name);
-    let download_dir = std::path::PathBuf::from(&dl_folder).join("Downloads");
+    let download_dir = dl_folders.current.join("Downloads");
     // Prefer the exact path recorded at completion time. Falling back to
     // `Downloads/<name>` is only correct when no dedup suffix was applied;
     // the canonical-containment check below still confines either choice to
-    // the Downloads directory.
+    // a Downloads directory.
     let file_path = match transfer.completed_path.as_deref() {
         Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
         _ => download_dir.join(&safe_name),
@@ -1897,14 +2147,18 @@ pub async fn open_file(
                 "Download has not finished yet",
             ));
         }
-        let canonical = crate::security::filesystem::verify_existing_path(&file_path, &[dl_folder])
-            .map_err(|e| {
-                coded_ctx(
-                    "transfers_invalid_path",
-                    "Invalid or changed download path",
-                    e,
-                )
-            })?;
+        let canonical = crate::security::filesystem::verify_recorded_file(
+            &file_path,
+            &dl_folders.roots(),
+            "Downloads",
+        )
+        .map_err(|e| {
+            coded_ctx(
+                "transfers_invalid_path",
+                "Invalid or changed download path",
+                e,
+            )
+        })?;
         if crate::security::filesystem::passive_type_agrees(&transfer.file_name, &canonical) {
             crate::security::filesystem::open_with_default_app(&canonical)
                 .map_err(|e| coded_ctx("transfers_open_file_failed", "Failed to open file", e))
@@ -1929,6 +2183,18 @@ pub async fn resume_transfer(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
+    // `resume` refuses this too; said here so the click is not silently lost.
+    if state
+        .transfer_manager
+        .read()
+        .await
+        .is_restore_verification_running(&transfer_id)
+    {
+        return Err(coded(
+            "transfers_still_verifying",
+            "This download is still being checked after restart. Resume it when the check finishes.",
+        ));
+    }
     let held_over = !start_held_over(&state, std::slice::from_ref(&transfer_id))
         .await
         .is_empty();
@@ -1984,89 +2250,6 @@ pub async fn resume_transfer(
         start_promoted_downloads(&state, &promoted).await;
     }
     start_queued_discovery(&state, &rediscover).await;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn cancel_transfer(
-    state: tauri::State<'_, AppState>,
-    transfer_id: String,
-) -> Result<(), String> {
-    let (promoted, cancelled_info) = {
-        let mut manager = state.transfer_manager.write().await;
-        let info = manager
-            .get_transfer(&transfer_id)
-            .map(|t| (t.file_hash.clone(), t.file_name.clone(), t.total_size));
-        if let Some(control) = manager.get_control(&transfer_id) {
-            // Discard, not cancel: this path deletes the `.part`, so the writer
-            // should drop its handle without fsyncing it first.
-            control.discard();
-        }
-        (manager.cancel(&transfer_id), info)
-    };
-
-    if let Some((file_hash, file_name, file_size)) = cancelled_info {
-        let db = state.db.clone();
-        db_blocking(move || {
-            if let Err(e) =
-                db.record_download_history(&file_hash, &file_name, file_size, "cancelled")
-            {
-                tracing::warn!("Failed to record cancelled download history for {file_hash}: {e}");
-            }
-        })
-        .await;
-    }
-
-    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-    let (send_result, dl_roots) = tokio::join!(
-        bounded_send(
-            &state.network_tx,
-            NetworkCommand::CancelDownload {
-                transfer_id: transfer_id.clone(),
-                cleanup_ack: Some(ack_tx),
-            },
-        ),
-        async { state.config.read().await.settings.download_roots() },
-    );
-    // Wait for the network task to confirm it released the file before we
-    // delete the partials. On timeout / closed channel we still proceed
-    // (best-effort cleanup), but log it: deleting while the task may still
-    // hold a handle is the race this ack exists to avoid.
-    //
-    // A send that never landed is reported as itself rather than as a closed
-    // ack channel: the ack sender went out with the undelivered command, so
-    // awaiting it would only mint a misleading "channel closed" line.
-    // `cancel_transfers_batch` already distinguishes the two.
-    if let Err(e) = send_result {
-        tracing::warn!(
-            "cancel_transfer: network task unavailable for {transfer_id}; proceeding with best-effort cleanup ({e})"
-        );
-    } else {
-        match tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(_)) => tracing::warn!(
-                "Cancel cleanup ack channel closed without ack for {transfer_id}; proceeding with best-effort cleanup"
-            ),
-            Err(_) => tracing::warn!(
-                "Timed out waiting for cancel cleanup ack for {transfer_id}; proceeding with best-effort cleanup"
-            ),
-        }
-    }
-    cleanup_partial_files(&state.db, &dl_roots, &transfer_id).await;
-    spawn_deferred_partial_cleanup(state.db.clone(), dl_roots, transfer_id.clone());
-
-    {
-        let db = state.db.clone();
-        let tid = transfer_id.clone();
-        db_blocking(move || {
-            if let Err(e) = db.remove_transfer(&tid) {
-                tracing::warn!("Failed to remove transfer {tid} from database: {e}");
-            }
-        })
-        .await;
-    }
-
-    start_promoted_downloads(&state, &promoted).await;
     Ok(())
 }
 
@@ -2144,7 +2327,9 @@ pub async fn remove_transfer(
     // delete the partials (best-effort on timeout/closed channel, but log the
     // race window — deleting while the task may still hold a handle is exactly
     // what this ack exists to avoid). An undelivered command is reported as
-    // itself; see `cancel_transfer`.
+    // itself rather than as a closed ack channel: the ack sender went out with
+    // the undelivered command, so awaiting it would only mint a misleading
+    // "channel closed" line.
     if let Err(e) = send_result {
         tracing::warn!(
             "remove_transfer: network task unavailable for {transfer_id}; proceeding with best-effort cleanup ({e})"
@@ -2318,6 +2503,38 @@ pub async fn set_transfer_priority(
         manager.set_priority(&transfer_id, &priority);
     }
     Ok(())
+}
+
+/// The downloads waiting in the download queue, front first. A paused row
+/// that was running is not among them: it keeps its place among the running.
+#[tauri::command]
+pub async fn get_download_queue_ids(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    Ok(state
+        .transfer_manager
+        .read()
+        .await
+        .queue
+        .iter()
+        .filter(|t| t.direction == crate::types::TransferDirection::Download)
+        .map(|t| t.id.clone())
+        .collect())
+}
+
+/// Move queued downloads to the front or the back of the download queue.
+/// Returns how many were waiting there to be moved.
+#[tauri::command]
+pub async fn move_transfers_in_queue(
+    state: tauri::State<'_, AppState>,
+    transfer_ids: Vec<String>,
+    to_front: bool,
+) -> Result<u32, String> {
+    check_batch_size(&transfer_ids)?;
+    let moved = state
+        .transfer_manager
+        .write()
+        .await
+        .move_queued(&transfer_ids, to_front);
+    Ok(u32::try_from(moved).unwrap_or(u32::MAX))
 }
 
 #[tauri::command]
@@ -2515,7 +2732,6 @@ pub async fn set_preview_priority(
 /// the user resumes a transfer concurrently, the resume and the broadcast
 /// pause may interleave; last command wins per transfer. Callers should
 /// debounce in the UI rather than expect a transactional guarantee.
-#[tauri::command]
 pub async fn pause_all_transfers(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -2575,7 +2791,6 @@ pub async fn pause_all_transfers(
     Ok(())
 }
 
-#[tauri::command]
 /// Resume every paused / stopped download. See pause_all_transfers for the
 /// same eventual-consistency caveat.
 pub async fn resume_all_transfers(
@@ -2645,8 +2860,20 @@ pub async fn get_transfer_sources(
     Ok(manager.get_source_details(&transfer_id))
 }
 
+/// Clear completed rows: every one, or only those in `transfer_ids`. A listed
+/// row that is not completed (any more) is left alone.
 #[tauri::command]
-pub async fn clear_completed(state: tauri::State<'_, AppState>) -> Result<u32, String> {
+pub async fn clear_completed(
+    state: tauri::State<'_, AppState>,
+    transfer_ids: Option<Vec<String>>,
+) -> Result<u32, String> {
+    let only = match transfer_ids {
+        Some(ids) => {
+            check_batch_size(&ids)?;
+            Some(ids.into_iter().collect::<std::collections::HashSet<String>>())
+        }
+        None => None,
+    };
     // L1: completed rows have no live network state (their upload/download
     // tasks already returned), so there's nothing for CancelDownload to
     // clean up. Just drop from the manager's completed bucket and delete
@@ -2655,7 +2882,7 @@ pub async fn clear_completed(state: tauri::State<'_, AppState>) -> Result<u32, S
     let mut manager = state.transfer_manager.write().await;
     let mut ids: Vec<String> = Vec::new();
     manager.completed.retain(|t| {
-        if t.status == TransferStatus::Completed {
+        if t.status == TransferStatus::Completed && only.as_ref().is_none_or(|only| only.contains(&t.id)) {
             ids.push(t.id.clone());
             false
         } else {
@@ -3044,8 +3271,14 @@ mod ipc_lifecycle_tests {
         std::fs::write(&owned, b"unfinished").unwrap();
         let known: std::collections::HashSet<String> = [live.to_string()].into();
 
-        super::sweep_orphan_part_files(&folders.roots(), &known, &db, std::time::UNIX_EPOCH)
-            .await;
+        super::sweep_orphan_part_files(
+            &folders.roots(),
+            &known,
+            &db,
+            std::time::UNIX_EPOCH,
+            super::OrphanDisposal::Delete,
+        )
+        .await;
         for file in &orphans {
             assert!(
                 file.exists(),
@@ -3055,7 +3288,14 @@ mod ipc_lifecycle_tests {
         }
 
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        super::sweep_orphan_part_files(&folders.roots(), &known, &db, later).await;
+        super::sweep_orphan_part_files(
+            &folders.roots(),
+            &known,
+            &db,
+            later,
+            super::OrphanDisposal::Delete,
+        )
+        .await;
         for file in &orphans {
             assert!(!file.exists(), "{}", file.display());
         }
@@ -3241,11 +3481,221 @@ mod ipc_lifecycle_tests {
         std::fs::write(&room_part, b"fresh").unwrap();
 
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
-        super::sweep_orphan_part_files(&folders.roots(), &Default::default(), &db, later).await;
+        super::sweep_orphan_part_files(
+            &folders.roots(),
+            &Default::default(),
+            &db,
+            later,
+            super::OrphanDisposal::Delete,
+        )
+        .await;
         assert!(part.exists());
         assert!(room_part.exists());
         drop(db);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// The set-aside folders a sweep made in `temp`.
+    fn set_aside_folders(temp: &Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(temp)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("orphaned-"))
+            })
+            .collect()
+    }
+
+    /// A replaced database lists none of the downloads still in progress, so
+    /// their part files are moved aside, not deleted, and an ordinary sweep
+    /// afterwards leaves them there.
+    #[tokio::test]
+    async fn after_the_database_was_replaced_the_startup_sweep_sets_orphans_aside() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (folders, base) = approved_old_and_new_folders("set-aside");
+        let db = test_db(&base);
+        let new_temp = folders.current.join("Temp");
+        let old_temp = folders.previous[0].join("Temp");
+        let (unlisted, listed) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let unlisted_files = [
+            new_temp.join(format!("{unlisted}.part")),
+            new_temp.join(format!("{unlisted}.part.met")),
+            old_temp.join(format!("{unlisted}.part")),
+        ];
+        for file in &unlisted_files {
+            std::fs::write(file, b"progress").unwrap();
+        }
+        let owned = new_temp.join(format!("{listed}.part"));
+        std::fs::write(&owned, b"unfinished").unwrap();
+        let room_part = new_temp.join(format!("ember-xfer-{}.part", "cd".repeat(16)));
+        std::fs::write(&room_part, b"room").unwrap();
+        let known: std::collections::HashSet<String> = [listed.to_string()].into();
+
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let complete = super::sweep_orphan_part_files(
+            &folders.roots(),
+            &known,
+            &db,
+            later,
+            super::OrphanDisposal::SetAside {
+                since: chrono::Utc::now().timestamp(),
+            },
+        )
+        .await;
+
+        assert!(complete);
+        for file in &unlisted_files {
+            assert!(!file.exists(), "{}", file.display());
+            let temp = file.parent().unwrap();
+            let aside = set_aside_folders(temp);
+            assert_eq!(aside.len(), 1, "{aside:?}");
+            let kept = aside[0].join(file.file_name().unwrap());
+            assert_eq!(std::fs::read(&kept).unwrap(), b"progress", "{}", kept.display());
+        }
+        assert!(owned.exists(), "a download still in the list keeps its part where it is");
+        assert!(!room_part.exists(), "a room transfer never outlives the run that started it");
+
+        super::sweep_orphan_part_files(
+            &folders.roots(),
+            &known,
+            &db,
+            later,
+            super::OrphanDisposal::Delete,
+        )
+        .await;
+        let aside = set_aside_folders(&new_temp);
+        assert!(aside[0].join(format!("{unlisted}.part")).exists());
+        assert!(aside[0].join(format!("{unlisted}.part.met")).exists());
+        drop(db);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Each launch of one replacement sets aside into the same folder, so a
+    /// `.part.met` that could only be moved later joins its `.part`, and what
+    /// is already there is never replaced.
+    #[tokio::test]
+    async fn a_later_sweep_sets_aside_beside_what_an_earlier_one_moved_without_replacing_it() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (folders, base) = approved_old_and_new_folders("set-aside-later");
+        let db = test_db(&base);
+        let temp = folders.current.join("Temp");
+        let orphan = uuid::Uuid::new_v4();
+        let (part, met) = (
+            temp.join(format!("{orphan}.part")),
+            temp.join(format!("{orphan}.part.met")),
+        );
+        std::fs::write(&part, b"progress").unwrap();
+        let disposal = super::OrphanDisposal::SetAside {
+            since: chrono::Utc::now().timestamp() - 3600,
+        };
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let (roots, known) = (folders.roots(), std::collections::HashSet::new());
+        let sweep = || super::sweep_orphan_part_files(&roots, &known, &db, later, disposal);
+
+        assert!(sweep().await);
+        std::fs::write(&met, b"metadata").unwrap();
+        assert!(sweep().await);
+        let aside = set_aside_folders(&temp);
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        let (kept_part, kept_met) = (
+            aside[0].join(format!("{orphan}.part")),
+            aside[0].join(format!("{orphan}.part.met")),
+        );
+        assert_eq!(std::fs::read(&kept_part).unwrap(), b"progress");
+        assert_eq!(std::fs::read(&kept_met).unwrap(), b"metadata");
+
+        std::fs::write(&part, b"another").unwrap();
+        assert!(!sweep().await, "a name already set aside is not replaced");
+        assert_eq!(std::fs::read(&part).unwrap(), b"another");
+        assert_eq!(std::fs::read(&kept_part).unwrap(), b"progress");
+        drop(db);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Orphans are set aside from the moment the database is about to be
+    /// replaced until a sweep has reached every download folder, so one that
+    /// was not there then is not swept by deletion when it comes back.
+    #[tokio::test]
+    async fn orphans_are_set_aside_until_a_sweep_reaches_every_download_folder() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (folders, base) = approved_old_and_new_folders("set-aside-marker");
+        let data = base.join("data");
+        let db = test_db(&base);
+        use super::OrphanDisposal;
+        let set_aside =
+            |disposal: OrphanDisposal| matches!(disposal, OrphanDisposal::SetAside { .. });
+
+        assert_eq!(OrphanDisposal::at_startup(&data, false), OrphanDisposal::Delete);
+        assert!(
+            set_aside(OrphanDisposal::at_startup(&data, true)),
+            "a launch that replaced the database sets aside even without the marker"
+        );
+        assert_eq!(OrphanDisposal::at_startup(&data, false), OrphanDisposal::Delete);
+        OrphanDisposal::record_database_replacement(&data).unwrap();
+        let disposal = OrphanDisposal::at_startup(&data, false);
+        assert!(set_aside(disposal), "a launch that ended after the replacement still counts");
+        assert_eq!(OrphanDisposal::at_startup(&data, true), disposal);
+
+        let mut roots = folders.roots();
+        roots.push(base.join("unplugged").to_string_lossy().into_owned());
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let complete =
+            super::sweep_orphan_part_files(&roots, &Default::default(), &db, later, disposal).await;
+        assert!(!complete, "a download folder that is not there was not swept");
+        assert!(set_aside(OrphanDisposal::at_startup(&data, false)));
+        let complete = super::sweep_orphan_part_files(
+            &folders.roots(),
+            &Default::default(),
+            &db,
+            later,
+            disposal,
+        )
+        .await;
+        assert!(complete);
+
+        OrphanDisposal::set_aside_finished(&data);
+        assert_eq!(OrphanDisposal::at_startup(&data, false), OrphanDisposal::Delete);
+        drop(db);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn orphans_are_removed_again_once_the_replacement_is_two_weeks_old() {
+        let data = std::env::temp_dir().join(format!(
+            "ember-set-aside-bound-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&data).unwrap();
+        use super::OrphanDisposal;
+        let marker = data.join(super::SET_ASIDE_ORPHANS_MARKER);
+        let now = chrono::Utc::now().timestamp();
+
+        let recent = now - 13 * 24 * 60 * 60;
+        std::fs::write(&marker, format!("{recent}\n")).unwrap();
+        assert_eq!(
+            OrphanDisposal::at_startup(&data, false),
+            OrphanDisposal::SetAside { since: recent }
+        );
+
+        std::fs::write(&marker, format!("{}\n", now - 15 * 24 * 60 * 60)).unwrap();
+        assert_eq!(OrphanDisposal::at_startup(&data, false), OrphanDisposal::Delete);
+        assert!(!marker.exists(), "the marker is dropped with the bound");
+
+        std::fs::write(&marker, b"").unwrap();
+        assert!(
+            matches!(
+                OrphanDisposal::at_startup(&data, false),
+                OrphanDisposal::SetAside { since } if since >= now - 60
+            ),
+            "an empty marker from an earlier build counts from when it was written"
+        );
+        let _ = std::fs::remove_dir_all(data);
     }
 
     #[test]
@@ -3275,6 +3725,73 @@ mod ipc_lifecycle_tests {
 
         let revealed = super::resolve_transfer_reveal_path(&transfer, &folders).unwrap();
         assert_eq!(revealed, part.canonicalize().unwrap());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Changing the download folder drops the old one from the approved roots
+    /// once no part file is left in it, but what finished there is still the
+    /// user's download and Open / Show in folder must still reach it.
+    #[test]
+    fn reveal_finds_a_finished_download_in_a_folder_that_is_no_longer_approved() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (root, base) = approved_download_folder("replaced-folder");
+        let finished = base.join("old").join("Downloads").join("movie (1).mkv");
+        std::fs::create_dir_all(finished.parent().unwrap()).unwrap();
+        std::fs::write(&finished, b"finished-bytes").unwrap();
+        let mut transfer: Transfer = serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "file_name": "movie.mkv",
+            "file_hash": hex::encode([0x5B; 16]),
+            "peer_id": "",
+            "peer_name": "",
+            "direction": "download",
+            "status": "completed",
+            "progress": 100.0,
+            "speed": 0,
+            "total_size": 14,
+            "transferred": 14,
+            "started_at": 0,
+        }))
+        .unwrap();
+        transfer.completed_path = Some(finished.to_string_lossy().into_owned());
+        let folders =
+            crate::storage::part_folders::DownloadFolders::new(&root.to_string_lossy(), &[]);
+
+        let revealed = super::resolve_transfer_reveal_path(&transfer, &folders).unwrap();
+        assert_eq!(revealed, finished.canonicalize().unwrap());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Outside the approved roots only the landing folder Ember wrote into
+    /// vouches for a recorded path, so anything not directly inside a folder of
+    /// that name stays refused.
+    #[test]
+    fn a_recorded_file_outside_the_roots_must_sit_directly_in_its_landing_folder() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (root, base) = approved_download_folder("landing");
+        let roots = [root.to_string_lossy().into_owned()];
+        let old = base.join("old");
+        let direct = old.join("Chat Files").join("photo.jpg");
+        let nested = old.join("Chat Files").join("sub").join("photo.jpg");
+        let elsewhere = old.join("Documents").join("photo.jpg");
+        for file in [&direct, &nested, &elsewhere] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, b"jpeg").unwrap();
+        }
+        let verify = |path: &std::path::Path, landing: &str| {
+            crate::security::filesystem::verify_recorded_file(path, &roots, landing)
+        };
+
+        assert_eq!(
+            verify(&direct, "Chat Files").unwrap(),
+            direct.canonicalize().unwrap()
+        );
+        assert!(verify(&direct, "Downloads").is_err());
+        assert!(verify(&nested, "Chat Files").is_err());
+        assert!(verify(&elsewhere, "Chat Files").is_err());
+        let climbed_out = old.join("Chat Files").join("..").join("Documents").join("photo.jpg");
+        assert!(verify(&climbed_out, "Chat Files").is_err());
+        assert!(verify(&old.join("Chat Files").join("missing.jpg"), "Chat Files").is_err());
         let _ = std::fs::remove_dir_all(base);
     }
 

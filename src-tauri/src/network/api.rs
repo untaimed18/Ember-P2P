@@ -180,7 +180,6 @@ pub enum NetworkCommand {
         block_private: bool,
     },
     KadConnect,
-    KadDisconnect,
     KadBootstrapIp {
         ip: String,
         port: u16,
@@ -210,9 +209,6 @@ pub enum NetworkCommand {
     },
     RecheckFirewall {
         tx: oneshot::Sender<Result<usize, String>>,
-    },
-    GetPeersSnapshot {
-        tx: oneshot::Sender<Vec<PeerInfo>>,
     },
     GetNetworkStatsSnapshot {
         tx: oneshot::Sender<NetworkStats>,
@@ -371,6 +367,8 @@ pub enum NetworkCommand {
     /// in-memory known.met catalog, then acknowledges central processing.
     SetFilesShared {
         updates: Vec<(String, bool)>,
+        /// Who the unshares in `updates` are by.
+        origin: crate::storage::share_intent::UnshareOrigin,
         tx: oneshot::Sender<Result<usize, String>>,
     },
     /// Persist the friends-only scope for a batch of content hashes.
@@ -423,6 +421,12 @@ pub enum NetworkCommand {
     },
     /// Stop an attachment in either direction, and tell the friend.
     CancelChatAttachment {
+        xfer_id: [u8; 16],
+        tx: oneshot::Sender<Result<(), String>>,
+    },
+    /// Try a failed attachment again under the same transfer id, so it stays
+    /// one card in the conversation.
+    RetryChatAttachment {
         xfer_id: [u8; 16],
         tx: oneshot::Sender<Result<(), String>>,
     },
@@ -511,10 +515,6 @@ pub enum NetworkCommand {
     /// showing offline (chat/browse disabled) until a fresh session forms.
     GetOnlineFriends {
         tx: oneshot::Sender<Vec<String>>,
-    },
-    GetPeerReputation {
-        user_hash: [u8; 16],
-        tx: oneshot::Sender<Option<PeerReputationInfo>>,
     },
     /// Reputation for many peers at once, keyed by lowercase hex user hash.
     ///
@@ -869,7 +869,7 @@ pub(super) fn ember_dht_contact_info(
     }
 }
 
-/// Per-peer reputation snapshot. Returned by the `get_peer_reputation`
+/// Per-peer reputation snapshot. Returned by the `get_peer_reputation_batch`
 /// Tauri command so the UI can render a verification / trust badge
 /// next to a peer (upload queue, transfer detail panel, etc.).
 #[derive(Debug, Clone, serde::Serialize)]

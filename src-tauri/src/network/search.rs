@@ -1698,6 +1698,8 @@ pub(super) fn release_ember_search_state(
     if let Some(tx) = state.ember_dht_pending_value_lookups.remove(&search_id) {
         let _ = tx.send(Vec::new());
     }
+    // Left at zero: an abandoned walk answers for nothing.
+    state.ember_dht_value_lookup_responded.remove(&search_id);
     // An abandoned download source lookup just means "no sources found this
     // round"; drop its bookkeeping so the map cannot leak across a
     // long-running download.

@@ -405,10 +405,9 @@ pub fn blake3_file_cancellable(
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// In-memory equivalent of [`ed2k_hash_file`]. Used by the
-/// `compute_ed2k_hash` Tauri command (for UI-side hashing of
-/// arbitrary byte buffers — clipboard paste, drag-drop, etc.) and by
-/// transfer-verification unit tests.
+/// In-memory equivalent of [`ed2k_hash_file`], for transfer-verification
+/// unit tests.
+#[cfg(test)]
 pub fn ed2k_hash_bytes(data: &[u8]) -> String {
     let file_size = data.len() as u64;
 

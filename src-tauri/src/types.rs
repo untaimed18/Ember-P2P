@@ -657,6 +657,10 @@ pub struct NetworkStats {
     pub firewalled: bool,
     pub buddy_status: String,
     pub upnp_mapped: bool,
+    /// UPnP removed its forwards because the router's address is not the one
+    /// peers see (a VPN, typically). Not a failure; nothing for the user to do.
+    #[serde(default)]
+    pub upnp_stood_down: bool,
     pub stores_acknowledged: u32,
     pub kad_users_estimate: u32,
     #[serde(default)]
@@ -896,6 +900,17 @@ pub struct EmberDiagnostics {
     /// builds that predate the sub-type, or have nothing verified to share.
     #[serde(default)]
     pub ember_dht_friend_contacts_learned: u32,
+    /// Times we asked a friend to meet over UDP (`EMBER_EXT_DHT_MEET`) because
+    /// we held no verified contact for it.
+    #[serde(default)]
+    pub ember_dht_friend_meets: u32,
+    /// Friends that became verified contacts within a meet's interval.
+    ///
+    /// Read against the meets: attempts that never convert are the
+    /// both-ends-symmetric case the simultaneous open cannot cross, measured
+    /// rather than assumed.
+    #[serde(default)]
+    pub ember_dht_friend_meets_converted: u32,
     /// Iterative Ember DHT lookups currently running (gauge, not a
     /// counter).
     #[serde(default)]
@@ -1343,6 +1358,7 @@ impl Default for NetworkStats {
             firewalled: false,
             buddy_status: String::from("none"),
             upnp_mapped: false,
+            upnp_stood_down: false,
             stores_acknowledged: 0,
             kad_users_estimate: 0,
             tcp_status: String::from("Unknown"),
@@ -1396,6 +1412,9 @@ pub struct AppSettings {
     pub max_upload_speed: u64,
     pub max_download_speed: u64,
     pub max_concurrent_downloads: u32,
+    /// Most upload slots open at once, or `0` for Auto: eMule has no such
+    /// setting and opens slots by how much the upload rate can feed
+    /// (`CUploadQueue::AcceptNewClient`).
     #[serde(default = "default_max_uploads")]
     pub max_concurrent_uploads: u32,
     pub tcp_port: u16,
@@ -1555,9 +1574,6 @@ pub struct AppSettings {
     /// Extra multi-source retry rounds after initial source tasks (default 3)
     #[serde(default = "default_multisource_retry_rounds")]
     pub multisource_retry_rounds: u32,
-    /// Per-source part hash failure retry rounds during data transfer (default 3)
-    #[serde(default = "default_download_part_retry_rounds")]
-    pub download_part_retry_rounds: u32,
     /// Maximum download file size in GiB (1–593; default 593 — the ed2k
     /// part-count ceiling, see `ed2k_download_limits`)
     #[serde(default = "default_max_download_file_size_gib")]
@@ -1625,6 +1641,18 @@ pub struct AppSettings {
     /// outright, so this never makes a stranger's file land on disk.
     #[serde(default = "default_chat_attachment_auto_accept_mb")]
     pub chat_attachment_auto_accept_mb: u64,
+    /// Per-friend exceptions to the friend settings above, keyed by the
+    /// friend's lowercase hex hash. A field left unset follows the global
+    /// setting, so a friend with no entry is treated exactly as before.
+    ///
+    /// Backend-owned: only `set_friend_overrides` writes it, one friend at a
+    /// time, so a whole-settings save from a page opened earlier cannot put
+    /// back an override the user has since changed.
+    ///
+    /// Read leniently: an entry this build cannot read is dropped on its own,
+    /// rather than failing the whole config and resetting every setting.
+    #[serde(default, deserialize_with = "deserialize_friend_overrides")]
+    pub friend_overrides: std::collections::BTreeMap<String, FriendOverrides>,
     /// Rendezvous server URL for friend discovery
     #[serde(default = "default_rendezvous_url")]
     pub rendezvous_url: String,
@@ -1829,6 +1857,51 @@ pub struct AppSettings {
     /// See [`crate::bandwidth::schedule`].
     #[serde(default)]
     pub bandwidth_schedule: Vec<crate::bandwidth::schedule::BandwidthScheduleRule>,
+
+    /// Use [`Self::alt_max_upload_speed`] / [`Self::alt_max_download_speed`]
+    /// in place of every other limit, the schedule included, until switched
+    /// off again. Flipped from the tray and the status bar as well as Settings.
+    #[serde(default)]
+    pub alt_speed_enabled: bool,
+    /// Bytes per second; 0 is unlimited, as for the manual limits.
+    #[serde(default = "default_alt_max_upload_speed")]
+    pub alt_max_upload_speed: u64,
+    #[serde(default = "default_alt_max_download_speed")]
+    pub alt_max_download_speed: u64,
+
+    /// Register Ember to start when the user signs in. The OS entry is written
+    /// when this changes, and a leftover one removed at launch while it is off.
+    #[serde(default)]
+    pub launch_at_login: bool,
+    /// A launch at sign-in comes up in the tray rather than on the desktop.
+    #[serde(default = "default_true")]
+    pub start_hidden_at_login: bool,
+    /// Reopen the main window where it was when Ember last quit
+    /// (`window-state.json`). Off opens it the default way.
+    #[serde(default = "default_true")]
+    pub remember_window_position: bool,
+
+    /// When the window gains focus with eD2K links on the clipboard, offer to
+    /// add them. Off unless asked for: it reads the clipboard without a
+    /// click, and only at that moment.
+    #[serde(default)]
+    pub watch_clipboard_links: bool,
+    /// Warn once the download folder's drive has less than this much free
+    /// space while downloads are running. 0 turns the warning off.
+    #[serde(default = "default_low_disk_warning_mb")]
+    pub low_disk_warning_mb: u32,
+}
+
+fn default_low_disk_warning_mb() -> u32 {
+    1024
+}
+
+fn default_alt_max_upload_speed() -> u64 {
+    50 * 1024
+}
+
+fn default_alt_max_download_speed() -> u64 {
+    200 * 1024
 }
 
 /// Live state of the features that act on their own between saves: the
@@ -1847,6 +1920,8 @@ pub struct RuntimeStatus {
     /// The schedule rule in force, or `None` when the manual limits are.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schedule: Option<crate::bandwidth::schedule::ActiveScheduleRule>,
+    /// The alternative limits are in force, overriding manual and schedule.
+    pub alt_speed: bool,
     /// Whether this platform can hold a sleep inhibitor at all.
     pub sleep_inhibit_supported: bool,
     /// Whether one is held right now.
@@ -1858,7 +1933,6 @@ pub struct RuntimeStatus {
 pub struct Ed2kDownloadLimits {
     pub queue_wait_secs: u64,
     pub multisource_retry_rounds: u32,
-    pub part_retry_rounds: u32,
     pub max_download_bytes: u64,
 }
 
@@ -1874,7 +1948,6 @@ impl AppSettings {
         Ed2kDownloadLimits {
             queue_wait_secs: self.download_queue_wait_secs.clamp(60, 14400),
             multisource_retry_rounds: self.multisource_retry_rounds.clamp(1, 20),
-            part_retry_rounds: self.download_part_retry_rounds.clamp(1, 20),
             max_download_bytes,
         }
     }
@@ -2126,8 +2199,9 @@ pub struct KnownClient {
     pub nickname: String,
 }
 
+/// Auto: as many upload slots as the upload rate can feed, by eMule's rule.
 fn default_max_uploads() -> u32 {
-    5
+    0
 }
 
 fn default_max_sources_per_file() -> u32 {
@@ -2147,10 +2221,6 @@ fn default_download_queue_wait_secs() -> u64 {
 }
 
 fn default_multisource_retry_rounds() -> u32 {
-    3
-}
-
-fn default_download_part_retry_rounds() -> u32 {
     3
 }
 
@@ -2183,6 +2253,126 @@ fn default_chat_attachment_auto_accept_mb() -> u64 {
 /// Matches the attachment size cap, past which the value means nothing.
 pub const CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB: u64 =
     crate::network::ember::attach::ATTACH_MAX_BYTES / (1024 * 1024);
+
+/// Friends with overrides kept at most: past the friends list's own ceiling
+/// of 500, so a real list always fits and a hand-edited file cannot grow the
+/// config without bound.
+pub const MAX_FRIEND_OVERRIDES: usize = 1_000;
+
+/// One friend's exceptions to the global friend settings. Every field left
+/// `None` follows the global one. The friend's name is not here: it is the
+/// nickname in the friends table, which the user already sets.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FriendOverrides {
+    /// Chat with this friend, both ways. Off also refuses their files, as the
+    /// global chat switch does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<bool>,
+    /// Files this friend sends: in chat, and file offers. Has no default of
+    /// its own — unset follows chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<bool>,
+    /// Their files at or under this many megabytes are fetched without asking;
+    /// `Some(0)` always asks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_accept_mb: Option<u64>,
+    /// Let this friend browse our shared files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browse: Option<bool>,
+    /// Read receipts with this friend, both ways.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_receipts: Option<bool>,
+    /// Tell us when this friend comes online.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_online: Option<bool>,
+    /// Tell us about this friend's messages and files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_messages: Option<bool>,
+}
+
+impl FriendOverrides {
+    /// Nothing differs from the global settings, so no entry is needed.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The same overrides with the ceiling held to
+    /// [`CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB`], past which it means nothing.
+    pub fn normalized(mut self) -> Self {
+        self.auto_accept_mb = self
+            .auto_accept_mb
+            .map(|mb| mb.min(CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB));
+        self
+    }
+}
+
+fn deserialize_friend_overrides<'de, D>(
+    deserializer: D,
+) -> Result<std::collections::BTreeMap<String, FriendOverrides>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let serde_json::Value::Object(raw) = serde_json::Value::deserialize(deserializer)? else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    Ok(raw
+        .into_iter()
+        .filter_map(|(key, value)| Some((key, serde_json::from_value(value).ok()?)))
+        .collect())
+}
+
+/// Whether `key` is the form [`AppSettings::friend_overrides`] is keyed by.
+pub fn is_friend_override_key(key: &str) -> bool {
+    key.len() == 32 && key.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+impl AppSettings {
+    fn overrides_for(&self, friend: &[u8; 16]) -> Option<&FriendOverrides> {
+        if self.friend_overrides.is_empty() {
+            return None;
+        }
+        self.friend_overrides.get(&hex::encode(friend))
+    }
+
+    /// Chat with `friend`, both ways.
+    pub fn chat_allowed_with(&self, friend: &[u8; 16]) -> bool {
+        self.overrides_for(friend)
+            .and_then(|o| o.chat)
+            .unwrap_or(!self.friend_chat_disabled)
+    }
+
+    /// Files from `friend`: chat attachments and file offers. Never while chat
+    /// with them is off, whatever the files setting says.
+    pub fn files_allowed_from(&self, friend: &[u8; 16]) -> bool {
+        self.chat_allowed_with(friend)
+            && self.overrides_for(friend).and_then(|o| o.files).unwrap_or(true)
+    }
+
+    /// The auto-accept ceiling for `friend`'s files, in megabytes.
+    pub fn auto_accept_mb_for(&self, friend: &[u8; 16]) -> u64 {
+        self.overrides_for(friend)
+            .and_then(|o| o.auto_accept_mb)
+            .unwrap_or(self.chat_attachment_auto_accept_mb)
+            .min(CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB)
+    }
+
+    /// Whether `friend` may browse our shared files.
+    pub fn browse_allowed_for(&self, friend: &[u8; 16]) -> bool {
+        self.overrides_for(friend)
+            .and_then(|o| o.browse)
+            .unwrap_or(!self.friend_browse_disabled)
+    }
+
+    /// Read receipts with `friend`, both ways. Never while chat with them is
+    /// off.
+    pub fn read_receipts_with(&self, friend: &[u8; 16]) -> bool {
+        self.chat_allowed_with(friend)
+            && self
+                .overrides_for(friend)
+                .and_then(|o| o.read_receipts)
+                .unwrap_or(self.friend_chat_read_receipts)
+    }
+}
 
 /// Default rendezvous server URL.
 ///
@@ -2326,7 +2516,7 @@ impl Default for AppSettings {
             max_upload_speed: 0,
             max_download_speed: 0,
             max_concurrent_downloads: 5,
-            max_concurrent_uploads: 5,
+            max_concurrent_uploads: default_max_uploads(),
             tcp_port: DEFAULT_TCP_PORT,
             udp_port: DEFAULT_UDP_PORT,
             folder_priorities: std::collections::HashMap::new(),
@@ -2337,7 +2527,7 @@ impl Default for AppSettings {
             withheld_folder_files: std::collections::HashMap::new(),
             shared_folder_scan_cursors: std::collections::HashMap::new(),
             nodes_dat_path: String::new(),
-            upnp_enabled: false,
+            upnp_enabled: true,
             stun_keepalive_enabled: true,
             obfuscation_enabled: true,
             ip_filter_enabled: true,
@@ -2373,7 +2563,6 @@ impl Default for AppSettings {
             spam_filter_profile: default_spam_filter_profile(),
             download_queue_wait_secs: default_download_queue_wait_secs(),
             multisource_retry_rounds: default_multisource_retry_rounds(),
-            download_part_retry_rounds: default_download_part_retry_rounds(),
             max_download_file_size_gib: default_max_download_file_size_gib(),
             search_timeout_secs: default_search_timeout_secs(),
             save_search_history: true,
@@ -2387,6 +2576,7 @@ impl Default for AppSettings {
             friend_session_encryption: true,
             channel_file_offers: default_channel_file_offers(),
             chat_attachment_auto_accept_mb: default_chat_attachment_auto_accept_mb(),
+            friend_overrides: std::collections::BTreeMap::new(),
             max_friends: default_max_friends(),
             rendezvous_url: default_rendezvous_url(),
             ember_native_enabled: true,
@@ -2415,6 +2605,14 @@ impl Default for AppSettings {
             prevent_sleep_while_active: true,
             bandwidth_schedule_enabled: false,
             bandwidth_schedule: Vec::new(),
+            alt_speed_enabled: false,
+            alt_max_upload_speed: default_alt_max_upload_speed(),
+            alt_max_download_speed: default_alt_max_download_speed(),
+            launch_at_login: false,
+            start_hidden_at_login: true,
+            remember_window_position: true,
+            watch_clipboard_links: false,
+            low_disk_warning_mb: default_low_disk_warning_mb(),
         }
     }
 }
@@ -2491,6 +2689,129 @@ pub struct TransferSourcesPayload<'a> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_friend_override_wins_over_the_global_setting_and_only_for_that_friend() {
+        let ana = [0xA1; 16];
+        let ben = [0xB2; 16];
+        let mut settings = AppSettings {
+            friend_chat_disabled: true,
+            friend_browse_disabled: false,
+            friend_chat_read_receipts: true,
+            chat_attachment_auto_accept_mb: 25,
+            ..AppSettings::default()
+        };
+        assert!(!settings.chat_allowed_with(&ana));
+        assert!(!settings.files_allowed_from(&ana));
+        assert!(!settings.read_receipts_with(&ana));
+        assert!(settings.browse_allowed_for(&ana));
+        assert_eq!(settings.auto_accept_mb_for(&ana), 25);
+
+        settings.friend_overrides.insert(
+            hex::encode(ana),
+            FriendOverrides {
+                chat: Some(true),
+                browse: Some(false),
+                auto_accept_mb: Some(0),
+                ..FriendOverrides::default()
+            },
+        );
+        assert!(settings.chat_allowed_with(&ana));
+        assert!(settings.files_allowed_from(&ana));
+        assert!(settings.read_receipts_with(&ana));
+        assert!(!settings.browse_allowed_for(&ana));
+        assert_eq!(settings.auto_accept_mb_for(&ana), 0, "0 is always ask");
+        assert!(!settings.chat_allowed_with(&ben));
+        assert!(settings.browse_allowed_for(&ben));
+        assert_eq!(settings.auto_accept_mb_for(&ben), 25);
+    }
+
+    #[test]
+    fn files_and_read_receipts_never_outlive_chat_with_a_friend() {
+        let ana = [0xA1; 16];
+        let mut settings = AppSettings::default();
+        settings.friend_overrides.insert(
+            hex::encode(ana),
+            FriendOverrides {
+                chat: Some(false),
+                files: Some(true),
+                read_receipts: Some(true),
+                ..FriendOverrides::default()
+            },
+        );
+        assert!(!settings.files_allowed_from(&ana));
+        assert!(!settings.read_receipts_with(&ana));
+
+        settings.friend_overrides.insert(
+            hex::encode(ana),
+            FriendOverrides {
+                files: Some(false),
+                ..FriendOverrides::default()
+            },
+        );
+        assert!(settings.chat_allowed_with(&ana));
+        assert!(!settings.files_allowed_from(&ana));
+    }
+
+    #[test]
+    fn a_friend_auto_accept_ceiling_is_held_to_the_global_maximum() {
+        let ana = [0xA1; 16];
+        let over = FriendOverrides {
+            auto_accept_mb: Some(u64::MAX),
+            ..FriendOverrides::default()
+        };
+        assert_eq!(
+            over.clone().normalized().auto_accept_mb,
+            Some(CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB)
+        );
+        let mut settings = AppSettings::default();
+        settings.friend_overrides.insert(hex::encode(ana), over);
+        assert_eq!(settings.auto_accept_mb_for(&ana), CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB);
+    }
+
+    #[test]
+    fn friend_overrides_leave_unset_fields_out_of_the_saved_config() {
+        let only_chat = FriendOverrides {
+            chat: Some(false),
+            ..FriendOverrides::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&only_chat).unwrap(),
+            serde_json::json!({ "chat": false })
+        );
+        let parsed: FriendOverrides = serde_json::from_str(r#"{"chat":false}"#).unwrap();
+        assert_eq!(parsed, only_chat);
+        assert!(FriendOverrides::default().is_empty());
+        assert!(!only_chat.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_friend_override_is_dropped_without_failing_the_config() {
+        let ana = hex::encode([0xA1; 16]);
+        let ben = hex::encode([0xB2; 16]);
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value["friend_overrides"] = serde_json::json!({
+            ana.clone(): { "chat": false },
+            ben.clone(): { "chat": "no" },
+        });
+        value["max_friends"] = serde_json::json!(123);
+        let parsed: AppSettings = serde_json::from_str(&value.to_string()).expect("config still loads");
+        assert_eq!(parsed.max_friends, 123, "fields after it still read");
+        assert_eq!(parsed.friend_overrides.len(), 1);
+        assert_eq!(parsed.friend_overrides[&ana].chat, Some(false));
+
+        value["friend_overrides"] = serde_json::json!(5);
+        let parsed: AppSettings = serde_json::from_str(&value.to_string()).expect("config still loads");
+        assert!(parsed.friend_overrides.is_empty());
+    }
+
+    #[test]
+    fn friend_override_keys_are_lowercase_friend_hashes() {
+        assert!(is_friend_override_key(&hex::encode([0xAB; 16])));
+        assert!(!is_friend_override_key(&hex::encode([0xAB; 16]).to_ascii_uppercase()));
+        assert!(!is_friend_override_key("abc"));
+        assert!(!is_friend_override_key(&"g".repeat(32)));
+    }
+
     /// `as_wire` is what `transfer-source-detail` events carry and what the
     /// frontend's `SourceInfo['status']` union enumerates, while the
     /// `list_transfer_sources` snapshot carries the serde rendering of the same
@@ -2545,7 +2866,8 @@ mod tests {
                 name: "some movie.avi",
                 size: 700,
             },
-        );
+        )
+        .expect("the shipped default names its own site whatever the file");
         assert!(
             filled.ends_with("FFDD6A41A2B30F27A1C3858A433B9822"),
             "the hash has to reach the URL, upper-cased: {filled}"
@@ -2775,5 +3097,19 @@ mod tests {
         let defaults = AppSettings::default();
         assert!(!defaults.bandwidth_schedule_enabled);
         assert!(defaults.bandwidth_schedule.is_empty());
+    }
+
+    /// UPnP starts on for a new profile only. `upnp_enabled` has no serde
+    /// default, so every saved config carries the user's own answer and an
+    /// upgrade must not turn it on for someone who forwards ports by hand.
+    #[test]
+    fn upnp_starts_on_for_new_profiles_and_a_saved_off_stays_off() {
+        let defaults = AppSettings::default();
+        assert!(defaults.upnp_enabled);
+        let mut value = serde_json::to_value(&defaults).expect("serialize default settings");
+        value["upnp_enabled"] = serde_json::json!(false);
+        let parsed: AppSettings =
+            serde_json::from_value(value).expect("a saved config still loads");
+        assert!(!parsed.upnp_enabled);
     }
 }

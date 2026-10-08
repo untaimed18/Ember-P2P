@@ -12,6 +12,8 @@ const row = (status: ChatAttachment['status'], transferred = 0): ChatAttachment 
   created_at: 1_700_000_000,
   has_file: status === 'complete',
   risky: false,
+  attempt: 0,
+  retryable: status === 'failed',
 });
 
 describe('mergeChatAttachment', () => {
@@ -40,6 +42,16 @@ describe('mergeChatAttachment', () => {
     expect(mergeChatAttachment(row('active', 300), row('active', 700)).transferred).toBe(700);
   });
 
+  it('lets "Try again" leave an ending, and keeps late updates from the old attempt out', () => {
+    const failed = row('failed', 300);
+    const retried = { ...row('offered'), attempt: 1 };
+    expect(mergeChatAttachment(failed, retried)).toBe(retried);
+    expect(mergeChatAttachment(retried, failed)).toBe(retried);
+    const moving = { ...row('active', 200), attempt: 1 };
+    expect(mergeChatAttachment(moving, row('active', 900))).toBe(moving);
+    expect(mergeChatAttachment(moving, { ...row('active', 500), attempt: 1 }).transferred).toBe(500);
+  });
+
   it('treats the specific failures as endings', () => {
     const unreachable = row('unreachable');
     expect(mergeChatAttachment(unreachable, row('active', 100))).toBe(unreachable);
@@ -59,5 +71,14 @@ describe('parseChatAttachment', () => {
 
   it('drops an unknown status', () => {
     expect(parseChatAttachment({ ...row('failed'), status: 'exploded' })).toBeNull();
+  });
+
+  it('reads the attempt and whether it can be retried, defaulting for an older backend', () => {
+    expect(parseChatAttachment({ ...row('failed'), attempt: 2, retryable: true })).toMatchObject({
+      attempt: 2,
+      retryable: true,
+    });
+    const { attempt: _a, retryable: _r, ...older } = row('failed');
+    expect(parseChatAttachment(older)).toMatchObject({ attempt: 0, retryable: false });
   });
 });

@@ -147,6 +147,11 @@ pub struct ServerEntry {
     /// don't index a given hash, so the per-packet `udp_consecutive_failures`
     /// counter otherwise raced past the exclusion threshold under load.)
     pub last_udp_query_at: i64,
+    /// Last time (Unix timestamp, seconds) we sent this server a UDP status
+    /// ping. Runtime-only, like eMule's `CServer::GetLastPingedTime` minus
+    /// the persistence: it is the per-server gate for the 4.5 h status
+    /// cadence, so it has to live as long as the entry does.
+    pub last_udp_ping_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +218,7 @@ impl ServerEntry {
             last_udp_reply_at: 0,
             last_udp_source_reply_at: 0,
             last_udp_query_at: 0,
+            last_udp_ping_at: 0,
         }
     }
 }
@@ -261,34 +267,13 @@ fn apply_server_int_tag(entry: &mut ServerEntry, name_id: u8, v: u32) {
 
 pub struct ServerList {
     servers: Vec<ServerEntry>,
-    #[allow(dead_code)] // round-robin cursor for get_next_server
-    current_index: usize,
-    needs_sort: bool,
 }
 
 impl ServerList {
     pub fn new() -> Self {
         Self {
             servers: Vec::new(),
-            current_index: 0,
-            needs_sort: false,
         }
-    }
-
-    #[allow(dead_code)] // used by get_next_server
-    fn connect_cooldown_secs(entry: &ServerEntry) -> i64 {
-        // High priority still gets first pick when healthy, but after a
-        // failed login we want a long enough window for auto-reconnect to
-        // try Normal servers instead of hammering the same dead High entry.
-        // First failure → 2 minutes.
-        let base: i64 = match entry.priority {
-            ServerPriority::High => 60,
-            ServerPriority::Normal => 30,
-            ServerPriority::Low => 45,
-        };
-        let exponent = entry.fail_count.min(5);
-        let cooldown = base.saturating_mul(1_i64 << exponent);
-        cooldown.min(1800)
     }
 
     pub fn add(&mut self, entry: ServerEntry) {
@@ -305,7 +290,6 @@ impl ServerList {
                 return;
             }
             self.servers.push(entry);
-            self.needs_sort = true;
         }
     }
 
@@ -388,7 +372,6 @@ impl ServerList {
             return AddServerOutcome::AtCapacity;
         }
         self.servers.push(entry);
-        self.needs_sort = true;
         AddServerOutcome::Added
     }
 
@@ -414,6 +397,7 @@ impl ServerList {
         }
         let mut added = 0;
         let mut filtered = 0;
+        let mut unroutable = 0;
         let mut duplicate = 0;
         let mut at_capacity = 0;
         for _ in 0..count {
@@ -426,7 +410,11 @@ impl ServerList {
                 Err(_) => break,
             };
             let ip = Ipv4Addr::from(ip_raw.to_le_bytes());
-            if ip.is_unspecified() || port == 0 {
+            // Whatever the IP filter says, and before it has loaded: a loopback
+            // or LAN address from a remote server names one of its machines,
+            // never one of ours.
+            if port == 0 || crate::security::is_special_use_v4(ip) {
+                unroutable += 1;
                 continue;
             }
             let mut entry = ServerEntry::new(ip.to_string(), port);
@@ -442,10 +430,11 @@ impl ServerList {
         // Always summarise the push if it carried anything actionable —
         // before, a list of 27 entries that were all IP-filtered would
         // produce 27 INFO lines and no aggregate. Now: one line.
-        if added > 0 || filtered > 0 || at_capacity > 0 {
+        if added > 0 || filtered > 0 || unroutable > 0 || at_capacity > 0 {
             info!(
                 "Server list push: {added} added, {filtered} blocked by IP filter, \
-                 {duplicate} duplicate, {at_capacity} dropped at capacity (out of {count})",
+                 {unroutable} unroutable, {duplicate} duplicate, \
+                 {at_capacity} dropped at capacity (out of {count})",
             );
         }
         added
@@ -455,47 +444,6 @@ impl ServerList {
         let before = self.servers.len();
         self.servers.retain(|s| !(s.ip == ip && s.port == port));
         self.servers.len() != before
-    }
-
-    /// Round-robin pick among cooldown-eligible servers. Currently unused by
-    /// production auto-connect (preferred-server only), but kept for unit tests
-    /// covering failure cooldown and for any future list-walk reconnect mode.
-    #[allow(dead_code)]
-    pub fn get_next_server(&mut self) -> Option<&ServerEntry> {
-        if self.servers.is_empty() {
-            return None;
-        }
-        let now = chrono::Utc::now().timestamp();
-
-        if self.needs_sort {
-            self.servers.sort_by(|a, b| {
-                let pa = match a.priority {
-                    ServerPriority::High => 0,
-                    ServerPriority::Normal => 1,
-                    ServerPriority::Low => 2,
-                };
-                let pb = match b.priority {
-                    ServerPriority::High => 0,
-                    ServerPriority::Normal => 1,
-                    ServerPriority::Low => 2,
-                };
-                pa.cmp(&pb).then(a.fail_count.cmp(&b.fail_count))
-            });
-            self.needs_sort = false;
-        }
-
-        let len = self.servers.len();
-        for _ in 0..len {
-            let idx = self.current_index % len;
-            self.current_index = (self.current_index + 1) % len;
-            let entry = &self.servers[idx];
-            let cooldown = Self::connect_cooldown_secs(entry);
-            if entry.last_failed_at > 0 && (now - entry.last_failed_at) < cooldown {
-                continue;
-            }
-            return Some(entry);
-        }
-        None
     }
 
     /// Clear per-server connect cooldowns so an explicit user Connect can
@@ -518,7 +466,6 @@ impl ServerList {
         {
             entry.fail_count += 1;
             entry.last_failed_at = chrono::Utc::now().timestamp();
-            self.needs_sort = true;
         }
         // eMule: remove non-static servers that exceed MAX_SERVERFAILCOUNT
         self.servers.retain(|s| {
@@ -574,6 +521,16 @@ impl ServerList {
         }
     }
 
+    pub fn record_udp_ping_sent(&mut self, ip: &str, port: u16, at: i64) {
+        if let Some(entry) = self
+            .servers
+            .iter_mut()
+            .find(|s| s.ip == ip && s.port == port)
+        {
+            entry.last_udp_ping_at = at;
+        }
+    }
+
     /// Record that this server sent us *any* UDP reply (status response
     /// or found-sources). Resets both failure counters, as eMule's
     /// `ResetFailedCount` on every server UDP packet does
@@ -587,9 +544,6 @@ impl ServerList {
             .iter_mut()
             .find(|s| s.ip == ip && s.port == port)
         {
-            if entry.udp_consecutive_failures != 0 || entry.fail_count != 0 {
-                self.needs_sort = true;
-            }
             entry.udp_consecutive_failures = 0;
             entry.fail_count = 0;
             entry.last_udp_reply_at = chrono::Utc::now().timestamp();
@@ -619,9 +573,6 @@ impl ServerList {
             .iter_mut()
             .find(|s| s.ip == ip && s.port == port)
         {
-            if entry.fail_count != 0 {
-                self.needs_sort = true;
-            }
             entry.fail_count = 0;
             entry.last_ping = chrono::Utc::now().timestamp();
             entry.last_failed_at = 0;
@@ -656,14 +607,8 @@ impl ServerList {
         }
     }
 
-    /// Set a server's connection priority.
-    ///
-    /// Marks the list for re-sorting, because priority is the first key
-    /// [`Self::get_next_server`] orders by and it also sets the post-failure
-    /// cooldown in [`Self::connect_cooldown_secs`] — neither of which would
-    /// notice the new value until the list is sorted again.
-    ///
-    /// Returns whether the server was in the list.
+    /// Set a server's connection priority. Returns whether the server was in
+    /// the list.
     pub fn set_priority(&mut self, ip: &str, port: u16, priority: ServerPriority) -> bool {
         match self
             .servers
@@ -671,10 +616,7 @@ impl ServerList {
             .find(|s| s.ip == ip && s.port == port)
         {
             Some(entry) => {
-                if entry.priority != priority {
-                    entry.priority = priority;
-                    self.needs_sort = true;
-                }
+                entry.priority = priority;
                 true
             }
             None => false,
@@ -867,7 +809,6 @@ impl ServerList {
             list.add(entry);
         }
 
-        list.needs_sort = !list.servers.is_empty();
         info!("Loaded {} servers from server.met", list.len());
         Ok(list)
     }
@@ -1112,9 +1053,6 @@ impl ServerList {
             stats.added += 1;
         }
 
-        if stats.added > 0 || stats.updated > 0 {
-            self.needs_sort = true;
-        }
         info!(
             "Merged server.met data: {} added, {} updated, {} filtered, {} dropped at capacity \
              ({} total in file)",
@@ -1282,22 +1220,6 @@ impl ServerList {
             }
         }
         None
-    }
-
-    /// Backwards-compatible wrapper that returns just the BaseKey when
-    /// the caller doesn't need the canonical TCP port. The canonical-
-    /// port consumer ([`try_recv_with`]) uses [`lookup_for_udp_addr`]
-    /// directly; this thinner wrapper is kept around for any future
-    /// caller that just wants "do we have a key for this address?".
-    /// Returns `None` when no server matches OR when the matching
-    /// server has no key yet.
-    #[allow(dead_code)]
-    pub fn server_udp_key_for_addr(&self, ip: std::net::Ipv4Addr, src_port: u16) -> Option<u32> {
-        let (key, _) = self.lookup_for_udp_addr(ip, src_port)?;
-        if key == 0 {
-            return None;
-        }
-        Some(key)
     }
 
     /// Store per-server UDP capability flags from status ping responses.
@@ -1555,26 +1477,6 @@ mod tests {
     }
 
     #[test]
-    fn get_next_server_skips_failed_high_for_healthy_normal() {
-        let mut list = high_then_normal_list();
-        let security = list.get_next_server().expect("fixture list has servers");
-        assert_eq!(security.name, "High Priority");
-        let sec_ip = security.ip.clone();
-        let sec_port = security.port;
-
-        list.record_failure(&sec_ip, sec_port);
-
-        let next = list
-            .get_next_server()
-            .expect("another server should be eligible");
-        assert_ne!(
-            (next.ip.as_str(), next.port),
-            (sec_ip.as_str(), sec_port),
-            "failed High-priority server must be on cooldown so Normal servers can be tried"
-        );
-    }
-
-    #[test]
     fn find_emule_sunrise_prefers_known_addr_then_name() {
         let mut list = ServerList::new();
         list.add(ServerEntry {
@@ -1600,32 +1502,19 @@ mod tests {
     #[test]
     fn clear_connect_cooldowns_allows_retrying_high_again() {
         let mut list = high_then_normal_list();
-        let security = list.get_next_server().unwrap();
-        let sec_ip = security.ip.clone();
-        let sec_port = security.port;
-        list.record_failure(&sec_ip, sec_port);
-
-        // While cooling down, High must not be returned.
-        let during = list.get_next_server().unwrap();
-        assert_ne!(
-            (during.ip.as_str(), during.port),
-            (sec_ip.as_str(), sec_port)
-        );
+        let failed_at = |list: &ServerList| {
+            list.find_by_addr("1.1.1.1", 1000)
+                .expect("fixture has the High server")
+                .last_failed_at
+        };
+        list.record_failure("1.1.1.1", 1000);
+        assert!(failed_at(&list) > 0, "a failed login starts the cooldown");
 
         list.clear_connect_cooldowns();
-        // After an explicit Connect clears cooldowns, High is eligible again
-        // (may not be the immediate next round-robin slot — scan one full pass).
-        let mut found = false;
-        for _ in 0..list.servers().len() {
-            let s = list.get_next_server().unwrap();
-            if s.ip == sec_ip && s.port == sec_port {
-                found = true;
-                break;
-            }
-        }
-        assert!(
-            found,
-            "cleared cooldowns should make the failed High server eligible again"
+        assert_eq!(
+            failed_at(&list),
+            0,
+            "an explicit Connect clears the cooldown so the High server can be retried"
         );
     }
 
@@ -1644,5 +1533,48 @@ mod tests {
             "blocked".to_string(),
         );
         assert!(ServerList::is_ip_filtered("8.8.8.8", &mut filter));
+    }
+
+    #[test]
+    fn a_server_list_push_never_adds_special_use_addresses() {
+        let pushed = [
+            ([127, 0, 0, 1], 4661u16),
+            ([192, 168, 1, 10], 4661),
+            ([10, 0, 0, 1], 4661),
+            ([169, 254, 3, 4], 4661),
+            ([224, 0, 0, 1], 4661),
+            ([0, 0, 0, 0], 4661),
+            ([255, 255, 255, 255], 4661),
+            ([8, 8, 8, 8], 0),
+            ([8, 8, 8, 8], 4661),
+        ];
+        let mut payload = vec![pushed.len() as u8];
+        for (octets, port) in pushed {
+            payload.extend_from_slice(&octets);
+            payload.extend_from_slice(&port.to_le_bytes());
+        }
+        // Neither a disabled filter nor one still loading may let them through.
+        for mut filter in [
+            crate::network::kad::ip_filter::IpFilter::new(false, false),
+            crate::network::kad::ip_filter::IpFilter::new(true, false),
+        ] {
+            let mut list = ServerList::new();
+            assert_eq!(list.add_from_server_list_packet(&payload, true, &mut filter), 1);
+            let added: Vec<_> = list
+                .servers()
+                .iter()
+                .map(|s| (s.ip.as_str(), s.port))
+                .collect();
+            assert_eq!(added, vec![("8.8.8.8", 4661)]);
+        }
+    }
+
+    #[test]
+    fn a_server_the_user_adds_by_hand_may_be_on_the_lan() {
+        let mut filter = crate::network::kad::ip_filter::IpFilter::new(false, false);
+        let mut list = ServerList::new();
+        let outcome =
+            list.add_filtered(ServerEntry::new("192.168.1.10".into(), 4661), true, &mut filter);
+        assert!(matches!(outcome, AddServerOutcome::Added));
     }
 }

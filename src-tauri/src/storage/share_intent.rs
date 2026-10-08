@@ -27,6 +27,27 @@ struct PersistedShareIntent {
     denied: HashSet<String>,
     #[serde(default)]
     explicit_allow: HashSet<String>,
+    /// Hashes the user restricted to friends. known.met keeps the same flag,
+    /// but alone it was the only copy: a lost or partly read catalog lifted
+    /// every restriction, and fail-closed mode still offered a hash in
+    /// `explicit_allow` publicly. Absent in files written before 1.7.2, so
+    /// the first load after an upgrade seeds it from known.met.
+    #[serde(default)]
+    friends_only: HashSet<String>,
+    /// The `denied` hashes a partly shared folder's list withheld, rather than
+    /// the user. Widening that share offers these again; the user's own
+    /// unshares stay. See [`UnshareOrigin`].
+    #[serde(default)]
+    auto_denied: HashSet<String>,
+    /// The `denied` hashes whose origin is not known: denied before origins
+    /// were recorded, or re-derived from known.met, which keeps none.
+    #[serde(default)]
+    origin_unknown: HashSet<String>,
+    /// Origins are recorded in this store. False for one written before
+    /// 1.7.2, or rewritten since by a build that drops the two sets above;
+    /// its denials are then all of unknown origin.
+    #[serde(default)]
+    origins_recorded: bool,
 }
 
 impl Default for PersistedShareIntent {
@@ -37,7 +58,81 @@ impl Default for PersistedShareIntent {
             fail_closed: false,
             denied: HashSet::new(),
             explicit_allow: HashSet::new(),
+            friends_only: HashSet::new(),
+            auto_denied: HashSet::new(),
+            origin_unknown: HashSet::new(),
+            origins_recorded: true,
         }
+    }
+}
+
+/// Who took a hash off the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnshareOrigin {
+    /// The user unshared it. Replaces any origin the hash had.
+    User,
+    /// A partly shared folder's list withheld it.
+    Allowlist,
+    /// Not known: a denial re-asserted from the Library or known.met state.
+    Unknown,
+}
+
+impl PersistedShareIntent {
+    fn origin_of(&self, key: &str) -> Option<UnshareOrigin> {
+        if !self.denied.contains(key) {
+            None
+        } else if self.auto_denied.contains(key) {
+            Some(UnshareOrigin::Allowlist)
+        } else if self.origin_unknown.contains(key) {
+            Some(UnshareOrigin::Unknown)
+        } else {
+            Some(UnshareOrigin::User)
+        }
+    }
+
+    /// Deny `key`. Only the user's own unshare changes the origin of a hash
+    /// already denied: a list withholding what the user unshared, or a
+    /// re-asserted denial, must not make it look automatic.
+    fn deny(&mut self, key: String, origin: UnshareOrigin) {
+        self.explicit_allow.remove(&key);
+        let newly = !self.denied.contains(&key);
+        if origin == UnshareOrigin::User {
+            self.auto_denied.remove(&key);
+            self.origin_unknown.remove(&key);
+        } else if newly {
+            match origin {
+                UnshareOrigin::Allowlist => self.auto_denied.insert(key.clone()),
+                _ => self.origin_unknown.insert(key.clone()),
+            };
+        }
+        self.denied.insert(key);
+    }
+
+    fn allow(&mut self, key: String) {
+        self.denied.remove(&key);
+        self.auto_denied.remove(&key);
+        self.origin_unknown.remove(&key);
+        self.explicit_allow.insert(key);
+    }
+
+    fn deny_in_effect(&self, key: &str, origin: UnshareOrigin) -> bool {
+        self.denied.contains(key)
+            && !self.explicit_allow.contains(key)
+            && (origin != UnshareOrigin::User || self.origin_of(key) == Some(UnshareOrigin::User))
+    }
+
+    /// Origins for a store that kept none, and the origin sets cut back to
+    /// what is still denied.
+    fn settle_origins(&mut self) {
+        if !self.origins_recorded {
+            self.origin_unknown = self.denied.clone();
+            self.auto_denied.clear();
+            self.origins_recorded = true;
+        }
+        let denied = &self.denied;
+        self.auto_denied.retain(|key| denied.contains(key));
+        self.origin_unknown
+            .retain(|key| denied.contains(key) && !self.auto_denied.contains(key));
     }
 }
 
@@ -194,26 +289,43 @@ impl ShareIntentStore {
     /// each pass, and each persist is a pretty-printed, fsync'd rewrite of
     /// the whole store.
     pub fn set_explicit_batch(&self, updates: &[([u8; 16], bool)]) -> io::Result<bool> {
-        self.apply_explicit_batch(updates, None)
+        self.apply_explicit_batch(updates, None, UnshareOrigin::User)
+    }
+
+    /// [`Self::set_explicit_batch`], with the denials in it recorded as made
+    /// by `origin`.
+    pub fn set_explicit_batch_from(
+        &self,
+        updates: &[([u8; 16], bool)],
+        origin: UnshareOrigin,
+    ) -> io::Result<bool> {
+        self.apply_explicit_batch(updates, None, origin)
     }
 
     /// [`Self::set_explicit_batch`] for a decision made at [`write_ticket`]
     /// `ticket` and applied later: any hash written since then is left alone.
     /// Last-applied-wins is wrong for a write that was queued before a newer
     /// one — a deferred unshare landing after the user re-shared would deny
-    /// the file for good while the Library and known.met say shared.
+    /// the file for good while the Library and known.met say shared. The
+    /// denials re-assert state seen elsewhere, so they are of unknown origin.
     pub fn set_explicit_batch_unless_newer(
         &self,
         updates: &[([u8; 16], bool)],
         ticket: u64,
     ) -> io::Result<bool> {
-        self.apply_explicit_batch(updates, Some(ticket))
+        self.apply_explicit_batch(updates, Some(ticket), UnshareOrigin::Unknown)
+    }
+
+    /// Who unshared `hash`, or `None` when it is not denied.
+    pub fn unshare_origin(&self, hash: &[u8; 16]) -> Option<UnshareOrigin> {
+        self.state.read().origin_of(&normalize_hash(hash))
     }
 
     fn apply_explicit_batch(
         &self,
         updates: &[([u8; 16], bool)],
         ticket: Option<u64>,
+        origin: UnshareOrigin,
     ) -> io::Result<bool> {
         let mut state = self.state.write();
         let mut write_seq = self.write_seq.lock();
@@ -230,7 +342,7 @@ impl ShareIntentStore {
             if *shared {
                 state.explicit_allow.contains(&key) && !state.denied.contains(&key)
             } else {
-                state.denied.contains(&key) && !state.explicit_allow.contains(&key)
+                state.deny_in_effect(&key, origin)
             }
         });
         if !in_effect {
@@ -238,11 +350,9 @@ impl ShareIntentStore {
             for (hash, shared) in &updates {
                 let key = normalize_hash(hash);
                 if *shared {
-                    state.denied.remove(&key);
-                    state.explicit_allow.insert(key);
+                    state.allow(key);
                 } else {
-                    state.explicit_allow.remove(&key);
-                    state.denied.insert(key);
+                    state.deny(key, origin);
                 }
             }
             if state
@@ -301,6 +411,42 @@ impl ShareIntentStore {
 
     pub fn is_fail_closed(&self) -> bool {
         self.state.read().fail_closed
+    }
+
+    pub fn is_friends_only(&self, hash: &[u8; 16]) -> bool {
+        self.state.read().friends_only.contains(&normalize_hash(hash))
+    }
+
+    /// Record friends-only choices. Returns whether anything changed (and was
+    /// persisted); a batch already in effect is not rewritten.
+    pub fn set_friends_only_batch(&self, updates: &[([u8; 16], bool)]) -> io::Result<bool> {
+        let in_effect = {
+            let state = self.state.read();
+            updates
+                .iter()
+                .all(|(hash, on)| state.friends_only.contains(&normalize_hash(hash)) == *on)
+        };
+        if in_effect {
+            return Ok(false);
+        }
+        self.mutate(|state| {
+            for (hash, on) in updates {
+                let key = normalize_hash(hash);
+                if *on {
+                    state.friends_only.insert(key);
+                } else {
+                    state.friends_only.remove(&key);
+                }
+            }
+            if state.friends_only.len() > MAX_INTENTS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "share-intent store exceeds its safety limit",
+                ));
+            }
+            Ok(())
+        })?;
+        Ok(true)
     }
 }
 
@@ -403,12 +549,15 @@ fn read_persisted(path: &Path) -> io::Result<PersistedShareIntent> {
             .len()
             .saturating_add(parsed.explicit_allow.len())
             > MAX_INTENTS
+            || parsed.friends_only.len() > MAX_INTENTS
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "share-intent store exceeds its safety limit",
             ));
         }
+        let mut parsed = parsed;
+        parsed.settle_origins();
         parsed
     } else {
         PersistedShareIntent::default()
@@ -427,9 +576,15 @@ fn absorb_known_catalog(data_dir: &Path, state: &mut PersistedShareIntent) {
         Ok(known) if known_existed => {
             state.catalog_seen = true;
             for record in known.all_records().filter(|record| !record.is_shared) {
-                let key = normalize_hash(&record.file_hash);
-                state.explicit_allow.remove(&key);
-                state.denied.insert(key);
+                state.deny(normalize_hash(&record.file_hash), UnshareOrigin::Unknown);
+            }
+            // Added, never removed here: lifting a restriction goes through
+            // `set_friends_only_batch` together with the known.met record.
+            for record in known.all_records().filter(|record| record.friends_only) {
+                if state.friends_only.len() >= MAX_INTENTS {
+                    break;
+                }
+                state.friends_only.insert(normalize_hash(&record.file_hash));
             }
             // The unshares and restrictions past the readable part are gone
             // with it, as for a catalog that could not be read at all.
@@ -538,9 +693,56 @@ pub fn effective_shared(hash: &[u8; 16], catalog_value: bool) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the user restricted this content to friends. A store that failed to
+/// initialize answers false here, but shares nothing at all then
+/// ([`effective_shared`] is false for every hash).
+pub fn is_friends_only(hash: &[u8; 16]) -> bool {
+    global()
+        .map(|store| store.is_friends_only(hash))
+        .unwrap_or(false)
+}
+
+/// Every friends-only hash, for the backstops that otherwise read only
+/// known.met. Never waits: before the store has settled this is empty, and
+/// known.met's own records still apply.
+pub fn friends_only_hashes_if_ready() -> HashSet<[u8; 16]> {
+    let Some(Ok(store)) = global_slot().resolved() else {
+        return HashSet::new();
+    };
+    let state = store.state.read();
+    state
+        .friends_only
+        .iter()
+        .filter_map(|key| {
+            let mut hash = [0u8; 16];
+            hex::decode_to_slice(key, &mut hash).ok()?;
+            Some(hash)
+        })
+        .collect()
+}
+
+/// See [`ShareIntentStore::set_friends_only_batch`].
+pub fn set_friends_only_batch(updates: &[([u8; 16], bool)]) -> io::Result<bool> {
+    global()?.set_friends_only_batch(updates)
+}
+
 /// Returns whether the store changed (and was persisted).
 pub fn set_explicit_batch(updates: &[([u8; 16], bool)]) -> io::Result<bool> {
     global()?.set_explicit_batch(updates)
+}
+
+/// See [`ShareIntentStore::set_explicit_batch_from`].
+pub fn set_explicit_batch_from(
+    updates: &[([u8; 16], bool)],
+    origin: UnshareOrigin,
+) -> io::Result<bool> {
+    global()?.set_explicit_batch_from(updates, origin)
+}
+
+/// See [`ShareIntentStore::unshare_origin`]. `None` too when the store is not
+/// available.
+pub fn unshare_origin(hash: &[u8; 16]) -> Option<UnshareOrigin> {
+    global().ok()?.unshare_origin(hash)
 }
 
 /// See [`ShareIntentStore::set_explicit_batch_unless_newer`].
@@ -599,6 +801,88 @@ mod tests {
             }),
             write_seq: parking_lot::Mutex::new(HashMap::new()),
         }
+    }
+
+    #[test]
+    fn friends_only_choices_are_kept_and_lifted() {
+        let store = test_store(false);
+        let (a, b) = ([0x61; 16], [0x62; 16]);
+        assert!(store.set_friends_only_batch(&[(a, true), (b, true)]).unwrap());
+        assert!(store.is_friends_only(&a) && store.is_friends_only(&b));
+        assert!(!store.set_friends_only_batch(&[(a, true)]).unwrap(), "already in effect");
+
+        assert!(store.set_friends_only_batch(&[(b, false)]).unwrap());
+        assert!(store.is_friends_only(&a) && !store.is_friends_only(&b));
+
+        let written: PersistedShareIntent =
+            serde_json::from_slice(&std::fs::read(&store.path).unwrap()).unwrap();
+        assert!(written.friends_only.contains(&hex::encode(a)), "persisted");
+        assert!(!written.friends_only.contains(&hex::encode(b)));
+        let _ = std::fs::remove_file(&store.path);
+    }
+
+    #[test]
+    fn a_store_written_before_friends_only_was_kept_still_loads() {
+        let old = br#"{"version":1,"catalog_seen":true,"fail_closed":false,"denied":[],"explicit_allow":[]}"#;
+        let parsed: PersistedShareIntent = serde_json::from_slice(old).unwrap();
+        assert!(parsed.friends_only.is_empty());
+    }
+
+    #[test]
+    fn an_unshare_keeps_who_made_it() {
+        let store = test_store(false);
+        let (listed, by_user, both) = ([0x71; 16], [0x72; 16], [0x73; 16]);
+        store
+            .set_explicit_batch_from(&[(listed, false), (both, false)], UnshareOrigin::Allowlist)
+            .unwrap();
+        store.set_explicit_batch(&[(by_user, false), (both, false)]).unwrap();
+        assert_eq!(store.unshare_origin(&listed), Some(UnshareOrigin::Allowlist));
+        assert_eq!(store.unshare_origin(&by_user), Some(UnshareOrigin::User));
+        assert_eq!(store.unshare_origin(&both), Some(UnshareOrigin::User), "the user's unshare wins");
+
+        // A list withholding, or a re-asserted denial, does not relabel the
+        // user's unshare.
+        assert!(!store
+            .set_explicit_batch_from(&[(by_user, false)], UnshareOrigin::Allowlist)
+            .unwrap());
+        store.set_explicit_batch_unless_newer(&[(by_user, false)], write_ticket()).unwrap();
+        assert_eq!(store.unshare_origin(&by_user), Some(UnshareOrigin::User));
+
+        // A share clears the origin, and a later denial records its own.
+        store.set_explicit_batch(&[(listed, true)]).unwrap();
+        assert_eq!(store.unshare_origin(&listed), None);
+        store.set_explicit_batch_unless_newer(&[(listed, false)], write_ticket()).unwrap();
+        assert_eq!(store.unshare_origin(&listed), Some(UnshareOrigin::Unknown));
+
+        let written: PersistedShareIntent =
+            serde_json::from_slice(&std::fs::read(&store.path).unwrap()).unwrap();
+        assert!(written.origins_recorded);
+        assert!(written.origin_unknown.contains(&hex::encode(listed)));
+        let _ = std::fs::remove_file(&store.path);
+    }
+
+    /// A store from before origins were recorded, or rewritten by such a
+    /// build after a downgrade, cannot say who unshared anything.
+    #[test]
+    fn a_store_without_origins_loads_its_denials_as_unknown() {
+        let base = temp_base("origins");
+        let path = base.join(STATE_FILE);
+        let hash = hex::encode([0x74; 16]);
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"catalog_seen":true,"fail_closed":false,"denied":["{hash}"],"explicit_allow":[],"auto_denied":["{hash}"]}}"#
+            ),
+        )
+        .unwrap();
+        let state = read_persisted(&path).unwrap();
+        assert!(state.origins_recorded);
+        assert_eq!(state.origin_of(&hash), Some(UnshareOrigin::Unknown));
+
+        let mut fresh = PersistedShareIntent::default();
+        fresh.settle_origins();
+        assert!(fresh.origins_recorded, "a new store records origins from the start");
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

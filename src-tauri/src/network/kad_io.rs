@@ -614,24 +614,6 @@ pub(super) fn reach_evidence_survives(
     }
 }
 
-/// The external address KAD's UDP firewall check proved reachable, if Ember
-/// should inherit that proof when KAD stops.
-///
-/// The check proves the shared socket accepts unsolicited datagrams, and
-/// disconnecting KAD does not close it. Ember keeps running on that port, so
-/// the proof stays true for Ember after KAD discards its own verdict.
-pub(super) fn kad_udp_proof_to_inherit(
-    udp_fw_verified: bool,
-    udp_firewalled: bool,
-    external_ip: Option<Ipv4Addr>,
-) -> Option<Ipv4Addr> {
-    if udp_fw_verified && !udp_firewalled {
-        external_ip
-    } else {
-        None
-    }
-}
-
 pub(super) fn set_external_ip(state: &mut NetworkState, ip: Option<Ipv4Addr>) {
     if state.external_ip != ip {
         state.server_list.invalidate_udp_keys_for_public_ip(ip);
@@ -1183,15 +1165,5 @@ mod reach_evidence_tests {
             proven_at,
             now
         ));
-    }
-
-    #[test]
-    fn ember_inherits_only_a_verified_open_kad_udp_result() {
-        assert_eq!(kad_udp_proof_to_inherit(true, false, Some(A)), Some(A));
-        // Never verified, or verified firewalled: nothing to inherit.
-        assert_eq!(kad_udp_proof_to_inherit(false, false, Some(A)), None);
-        assert_eq!(kad_udp_proof_to_inherit(true, true, Some(A)), None);
-        // A proof that names no address cannot be tied to one.
-        assert_eq!(kad_udp_proof_to_inherit(true, false, None), None);
     }
 }

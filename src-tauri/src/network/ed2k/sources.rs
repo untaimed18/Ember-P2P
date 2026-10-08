@@ -37,6 +37,11 @@ const MAX_UNREGISTERED_SX_STAMPS: usize = 1024;
 /// eMule: minimum gap between TCP connection attempts to the same source (20 min)
 const MIN_TCP_RECONNECT_SECS: i64 = 1200;
 
+/// How long after our `OP_CALLBACKREQUEST` a LowID source's connection to us
+/// counts as its answer. The server relays the request at once, and the peer
+/// dials straight back, well inside eMule's 40 s `CONNECTION_TIMEOUT`.
+pub const SERVER_CALLBACK_ANSWER_WINDOW: Duration = Duration::from_secs(60);
+
 /// Whether a stored source may be forwarded in an OP_ANSWERSOURCES(2) reply.
 ///
 /// Matches eMule's `CreateSrcInfoPacket`, whose very first test is
@@ -1194,7 +1199,6 @@ impl PerFileSourceList {
     /// filter the returned sources through `DeadSourceList::is_dead_source_for_file`
     /// before initiating connections.
     #[cfg(test)]
-    #[allow(dead_code)]
     pub fn sources_ready_for_reask(&self) -> Vec<(Ipv4Addr, u16)> {
         self.sources_ready_for_reask_at(Instant::now())
     }
@@ -1435,6 +1439,11 @@ pub struct SourceEntry {
     pub last_sx_sent: Option<Instant>,
     /// When we last sent OP_CALLBACKREQUEST for this LowID source (`None` = never)
     pub last_callback_at: Option<Instant>,
+    /// When a connection last answered our callback request as this LowID
+    /// source. It confirms `user_hash`, which otherwise may be whatever a
+    /// source exchange said, and a later answer than `last_callback_at`
+    /// means that request has had its one answer.
+    pub callback_answered_at: Option<Instant>,
     /// Inbound TCP source port from a callback / push-grant adoption — the
     /// peer's ephemeral outbound port for this session, not its listening
     /// port. Kept in-memory for live identity lookups (`get_user_hash_by_addr`)
@@ -1451,6 +1460,17 @@ pub struct SourceEntry {
     /// records are unchanged, so older builds still read the file (they just
     /// ignore the trailer).
     pub origin: Option<crate::types::SourceOrigin>,
+}
+
+impl SourceEntry {
+    /// We asked this LowID source to call back within
+    /// [`SERVER_CALLBACK_ANSWER_WINDOW`], and nothing has answered as it since.
+    fn awaits_callback_answer(&self) -> bool {
+        self.last_callback_at.is_some_and(|asked| {
+            asked.elapsed() < SERVER_CALLBACK_ANSWER_WINDOW
+                && self.callback_answered_at.is_none_or(|answered| answered < asked)
+        })
+    }
 }
 
 /// Which entry to drop when a file's source list is already at capacity.
@@ -1880,6 +1900,7 @@ impl SourceManager {
             last_asked: None,
             last_sx_sent: None,
             last_callback_at: None,
+            callback_answered_at: None,
             not_for_reconnect,
             origin,
         });
@@ -2909,6 +2930,7 @@ impl SourceManager {
                     last_asked: None,
                     last_sx_sent: None,
                     last_callback_at: None,
+                    callback_answered_at: None,
                     not_for_reconnect: false,
                     // Filled from the trailing `EORG` section after every v1
                     // record is in, so a v1-only file still loads.
@@ -3052,6 +3074,9 @@ impl SourceManager {
             existing.server_ip = server_ip;
             existing.server_port = server_port;
             if user_hash != [0u8; 16] {
+                if existing.user_hash != user_hash {
+                    existing.callback_answered_at = None;
+                }
                 existing.user_hash = user_hash;
             }
             if connect_options != 0 {
@@ -3087,27 +3112,10 @@ impl SourceManager {
             last_asked: None,
             last_sx_sent: None,
             last_callback_at: None,
+            callback_answered_at: None,
             not_for_reconnect: false,
             origin,
         });
-    }
-
-    /// Return non-expired LowID sources that need server callbacks.
-    #[allow(dead_code)]
-    pub fn get_lowid_sources(&self, file_hash: &[u8; 16]) -> Vec<(u32, u16, u32, u16)> {
-        let now = chrono::Utc::now().timestamp();
-        self.sources
-            .get(file_hash)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|e| {
-                        now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS && e.client_id > 0
-                    })
-                    .map(|e| (e.client_id, e.tcp_port, e.server_ip, e.server_port))
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     /// Return non-expired LowID sources that haven't had a callback requested
@@ -3180,51 +3188,6 @@ impl SourceManager {
         out
     }
 
-    /// D11: return LowID sources for a file that are eligible for a
-    /// callback, grouped by the server they were announced through. Lets
-    /// the caller switch eMule servers on the fly (or talk to multiple
-    /// servers) without losing track of a LowID source that was only ever
-    /// seen through a different server.
-    ///
-    /// Returns `Vec<(server_ip, server_port, Vec<client_id>)>`.
-    #[allow(dead_code)]
-    pub fn get_lowid_sources_by_server(
-        &self,
-        file_hash: &[u8; 16],
-        min_interval_secs: i64,
-    ) -> Vec<(u32, u16, Vec<u32>)> {
-        let now = chrono::Utc::now().timestamp();
-        let min_interval = Duration::from_secs(min_interval_secs.max(0) as u64);
-        let entries = match self.sources.get(file_hash) {
-            Some(e) => e,
-            None => return Vec::new(),
-        };
-        let mut grouped: std::collections::HashMap<(u32, u16), Vec<u32>> =
-            std::collections::HashMap::new();
-        for e in entries {
-            if e.client_id == 0 {
-                continue;
-            }
-            if now.saturating_sub(e.last_seen) >= SOURCE_EXPIRY_SECS {
-                continue;
-            }
-            if e.server_ip == 0 || e.server_port == 0 {
-                continue;
-            }
-            if e.last_callback_at.is_some_and(|at| at.elapsed() < min_interval) {
-                continue;
-            }
-            grouped
-                .entry((e.server_ip, e.server_port))
-                .or_default()
-                .push(e.client_id);
-        }
-        grouped
-            .into_iter()
-            .map(|((ip, port), ids)| (ip, port, ids))
-            .collect()
-    }
-
     /// Record that OP_CALLBACKREQUEST was sent for a LowID source. Now that
     /// `register_lowid_source` keeps one row per `(client_id, server)`, a file
     /// can legitimately hold several rows sharing a `client_id` (the same low ID
@@ -3268,6 +3231,12 @@ impl SourceManager {
     /// default) are indistinguishable here, so we leave them alone rather than
     /// risk pinning the wrong identity onto a peer. `listening_port == 0` or a
     /// zero `user_hash` matches nothing.
+    ///
+    /// Only for a connection [`Self::find_answered_callback_files`] took for a
+    /// callback answer, and only rows it could have matched take part: a hash
+    /// is stamped only onto a row still waiting for its answer, and a known
+    /// hash counts only once confirmed or while waiting. The linked row's
+    /// request is then answered.
     pub fn link_lowid_callback_identity(
         &mut self,
         server_ip: u32,
@@ -3279,6 +3248,7 @@ impl SourceManager {
             return;
         }
         let now = chrono::Utc::now().timestamp();
+        let answered_at = Instant::now();
         for entries in self.sources.values_mut() {
             let mut exact_idx: Option<usize> = None;
             let mut hashless_idx: Option<usize> = None;
@@ -3289,26 +3259,32 @@ impl SourceManager {
                     && e.server_ip == server_ip
                     && e.server_port == server_port
                 {
-                    if e.user_hash == user_hash {
+                    if e.user_hash == user_hash
+                        && (e.callback_answered_at.is_some() || e.awaits_callback_answer())
+                    {
                         exact_idx = Some(i);
                         break;
-                    } else if e.user_hash == [0u8; 16] {
+                    } else if e.user_hash == [0u8; 16] && e.awaits_callback_answer() {
                         hashless_count += 1;
                         hashless_idx = Some(i);
                     }
                 }
             }
-            if let Some(i) = exact_idx {
+            let linked = exact_idx.or(hashless_idx.filter(|_| hashless_count == 1));
+            if let Some(i) = linked {
+                entries[i].user_hash = user_hash;
                 entries[i].last_seen = now;
-            } else if hashless_count == 1 {
-                if let Some(i) = hashless_idx {
-                    entries[i].user_hash = user_hash;
-                    entries[i].last_seen = now;
-                }
+                entries[i].callback_answered_at = Some(answered_at);
             }
         }
     }
 
+    /// Files with a LowID source on `(server_ip, server_port)` listening on
+    /// `tcp_port` (0 = any) that could be the peer with `user_hash`.
+    ///
+    /// Rows carrying that hash win. Failing those, a row whose hash is still
+    /// unknown matches only when it is the sole candidate; a row that already
+    /// knows a different hash is another peer, whatever its port.
     pub fn find_lowid_files_by_port(
         &self,
         server_ip: u32,
@@ -3316,27 +3292,43 @@ impl SourceManager {
         tcp_port: u16,
         user_hash: Option<[u8; 16]>,
     ) -> Vec<[u8; 16]> {
-        let now = chrono::Utc::now().timestamp();
-        let candidates: Vec<[u8; 16]> = self
-            .sources
-            .iter()
-            .filter_map(|(file_hash, entries)| {
-                entries
-                    .iter()
-                    .any(|e| {
-                        now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS
-                            && e.client_id > 0
-                            && (tcp_port == 0 || e.tcp_port == tcp_port)
-                            && e.server_ip == server_ip
-                            && e.server_port == server_port
-                    })
-                    .then_some(*file_hash)
-            })
-            .collect();
+        self.lowid_files_matching(server_ip, server_port, tcp_port, user_hash, false)
+    }
 
-        if let Some(hash) = user_hash.filter(|h| *h != [0u8; 16]) {
-            let filtered: Vec<[u8; 16]> = self
-                .sources
+    /// The files an inbound connection answers an `OP_CALLBACKREQUEST` of ours
+    /// for: [`Self::find_lowid_files_by_port`], counting only rows still
+    /// waiting for the answer to one we sent within
+    /// [`SERVER_CALLBACK_ANSWER_WINDOW`]. A peer that merely listens on the
+    /// same port as a LowID source — 4662 for most — is otherwise taken for
+    /// it, and its upload request is never served.
+    ///
+    /// A row whose hash an earlier answer confirmed matches that hash at any
+    /// time: a LowID uploader dials us when it grants the slot we queued for,
+    /// long after the callback that queued us.
+    pub fn find_answered_callback_files(
+        &self,
+        server_ip: u32,
+        server_port: u16,
+        tcp_port: u16,
+        user_hash: Option<[u8; 16]>,
+    ) -> Vec<[u8; 16]> {
+        if tcp_port == 0 {
+            return Vec::new();
+        }
+        self.lowid_files_matching(server_ip, server_port, tcp_port, user_hash, true)
+    }
+
+    fn lowid_files_matching(
+        &self,
+        server_ip: u32,
+        server_port: u16,
+        tcp_port: u16,
+        user_hash: Option<[u8; 16]>,
+        callback_answers_only: bool,
+    ) -> Vec<[u8; 16]> {
+        let now = chrono::Utc::now().timestamp();
+        let files_where = |identity: &dyn Fn(&SourceEntry) -> bool| -> Vec<[u8; 16]> {
+            self.sources
                 .iter()
                 .filter_map(|(file_hash, entries)| {
                     entries
@@ -3347,16 +3339,26 @@ impl SourceManager {
                                 && (tcp_port == 0 || e.tcp_port == tcp_port)
                                 && e.server_ip == server_ip
                                 && e.server_port == server_port
-                                && e.user_hash == hash
+                                && identity(e)
                         })
                         .then_some(*file_hash)
                 })
-                .collect();
-            if !filtered.is_empty() {
-                return filtered;
-            }
-        }
+                .collect()
+        };
+        let awaiting = |e: &SourceEntry| !callback_answers_only || e.awaits_callback_answer();
 
+        let candidates = match user_hash.filter(|h| *h != [0u8; 16]) {
+            Some(hash) => {
+                let exact = files_where(&|e| {
+                    e.user_hash == hash && (e.callback_answered_at.is_some() || awaiting(e))
+                });
+                if !exact.is_empty() {
+                    return exact;
+                }
+                files_where(&|e| e.user_hash == [0u8; 16] && awaiting(e))
+            }
+            None => files_where(&awaiting),
+        };
         if candidates.len() == 1 {
             candidates
         } else {
@@ -4275,6 +4277,7 @@ mod tests {
             "ephemeral session port must not be dialable"
         );
 
+        sm.mark_callback_sent(&hash, 5);
         sm.link_lowid_callback_identity(srv_ip, srv_port, listening_port, peer_hash);
 
         assert_eq!(
@@ -4316,6 +4319,8 @@ mod tests {
         let mut sm = SourceManager::new();
         sm.register_lowid_source(hash, 5, listening_port, srv_ip, srv_port, [0u8; 16], 0, None);
         sm.register_lowid_source(hash, 7, listening_port, srv_ip, srv_port, [0u8; 16], 0, None);
+        sm.mark_callback_sent(&hash, 5);
+        sm.mark_callback_sent(&hash, 7);
 
         sm.link_lowid_callback_identity(srv_ip, srv_port, listening_port, peer_hash);
 
@@ -4349,6 +4354,8 @@ mod tests {
         for e in sm.sources.get_mut(&hash).unwrap().iter_mut() {
             e.last_seen = stale;
         }
+        sm.mark_callback_sent(&hash, 5);
+        sm.mark_callback_sent(&hash, 7);
 
         sm.link_lowid_callback_identity(srv_ip, srv_port, listening_port, known_hash);
 
@@ -4358,6 +4365,199 @@ mod tests {
         assert!(known.last_seen > stale, "exact-hash row refreshed");
         assert_eq!(other.last_seen, stale, "unrelated row untouched");
         assert_eq!(other.user_hash, [0u8; 16], "unrelated row not stamped");
+    }
+
+    const CB_SRV_IP: u32 = u32::from_le_bytes([5, 6, 7, 8]);
+    const CB_SRV_PORT: u16 = 4661;
+
+    #[test]
+    fn inbound_connection_is_no_callback_answer_unless_we_asked_for_one() {
+        let file = [0xC1; 16];
+        let peer = [0x11; 16];
+        let mut sm = SourceManager::new();
+        sm.register_lowid_source(file, 5, 4662, CB_SRV_IP, CB_SRV_PORT, [0u8; 16], 0, None);
+
+        assert!(
+            sm.find_answered_callback_files(CB_SRV_IP, CB_SRV_PORT, 4662, Some(peer)).is_empty(),
+            "a peer on a LowID source's port is not its callback until we request one"
+        );
+        sm.mark_callback_sent(&file, 5);
+        assert_eq!(
+            sm.find_answered_callback_files(CB_SRV_IP, CB_SRV_PORT, 4662, Some(peer)),
+            vec![file]
+        );
+    }
+
+    #[test]
+    fn callback_request_older_than_the_answer_window_is_not_answered() {
+        let file = [0xC2; 16];
+        let mut sm = SourceManager::new();
+        sm.register_lowid_source(file, 5, 4662, CB_SRV_IP, CB_SRV_PORT, [0u8; 16], 0, None);
+        let asked = Instant::now()
+            .checked_sub(SERVER_CALLBACK_ANSWER_WINDOW + Duration::from_secs(1))
+            .expect("monotonic clock is past the answer window");
+        for e in sm.sources.get_mut(&file).unwrap().iter_mut() {
+            e.last_callback_at = Some(asked);
+        }
+
+        assert!(sm
+            .find_answered_callback_files(CB_SRV_IP, CB_SRV_PORT, 4662, Some([0x11; 16]))
+            .is_empty());
+    }
+
+    #[test]
+    fn port_match_with_another_peers_known_hash_is_not_a_callback_answer() {
+        let file = [0xC3; 16];
+        let mut sm = SourceManager::new();
+        sm.register_lowid_source(file, 5, 4662, CB_SRV_IP, CB_SRV_PORT, [0xAA; 16], 0, None);
+        sm.mark_callback_sent(&file, 5);
+
+        let stranger = Some([0xBB; 16]);
+        assert!(sm.find_answered_callback_files(CB_SRV_IP, CB_SRV_PORT, 4662, stranger).is_empty());
+        assert!(sm.find_lowid_files_by_port(CB_SRV_IP, CB_SRV_PORT, 4662, stranger).is_empty());
+        assert_eq!(
+            sm.find_answered_callback_files(CB_SRV_IP, CB_SRV_PORT, 4662, Some([0xAA; 16])),
+            vec![file]
+        );
+    }
+
+    #[test]
+    fn hashless_callback_rows_match_only_when_unambiguous() {
+        let (first, second) = ([0xC4; 16], [0xC5; 16]);
+        let peer = Some([0x11; 16]);
+        let mut sm = SourceManager::new();
+        sm.register_lowid_source(first, 5, 4662, CB_SRV_IP, CB_SRV_PORT, [0u8; 16], 0, None);
+        sm.register_lowid_source(second, 7, 4662, CB_SRV_IP, CB_SRV_PORT, [0u8; 16], 0, None);
+        sm.mark_callback_sent(&first, 5);
+
+        assert_eq!(
+            sm.find_answered_callback_files(CB_SRV_IP, CB_SRV_PORT, 4662, peer),
+            vec![first],
+            "only the row we asked a callback of is a candidate"
+        );
+        sm.mark_callback_sent(&second, 7);
+        assert!(
+            sm.find_answered_callback_files(CB_SRV_IP, CB_SRV_PORT, 4662, peer).is_empty(),
+            "two hash-less candidates on one port cannot be told apart"
+        );
+    }
+
+    #[test]
+    fn callback_answer_needs_the_hello_listening_port() {
+        let file = [0xC6; 16];
+        let mut sm = SourceManager::new();
+        sm.register_lowid_source(file, 5, 4662, CB_SRV_IP, CB_SRV_PORT, [0u8; 16], 0, None);
+        sm.mark_callback_sent(&file, 5);
+
+        assert!(sm.find_answered_callback_files(CB_SRV_IP, CB_SRV_PORT, 0, None).is_empty());
+        assert!(sm.find_answered_callback_files(CB_SRV_IP, CB_SRV_PORT, 4663, None).is_empty());
+    }
+
+    fn age_callback_stamps_past_the_answer_window(sm: &mut SourceManager, file: &[u8; 16]) {
+        let long_ago = Instant::now()
+            .checked_sub(SERVER_CALLBACK_ANSWER_WINDOW + Duration::from_secs(1))
+            .expect("monotonic clock is past the answer window");
+        for e in sm.sources.get_mut(file).unwrap().iter_mut() {
+            e.last_callback_at = e.last_callback_at.map(|_| long_ago);
+            e.callback_answered_at = e.callback_answered_at.map(|_| long_ago);
+        }
+    }
+
+    #[test]
+    fn confirmed_lowid_source_is_recognised_by_hash_after_the_answer_window() {
+        let file = [0xC7; 16];
+        let peer = [0x11; 16];
+        let mut sm = SourceManager::new();
+        sm.register_lowid_source(file, 5, 4662, CB_SRV_IP, CB_SRV_PORT, [0u8; 16], 0, None);
+        sm.mark_callback_sent(&file, 5);
+        sm.link_lowid_callback_identity(CB_SRV_IP, CB_SRV_PORT, 4662, peer);
+        age_callback_stamps_past_the_answer_window(&mut sm, &file);
+
+        assert_eq!(
+            sm.find_answered_callback_files(CB_SRV_IP, CB_SRV_PORT, 4662, Some(peer)),
+            vec![file],
+            "a queued-on LowID uploader dialing us to grant the slot is still its source"
+        );
+        assert!(sm
+            .find_answered_callback_files(CB_SRV_IP, CB_SRV_PORT, 4662, Some([0x22; 16]))
+            .is_empty());
+    }
+
+    #[test]
+    fn unconfirmed_known_hash_needs_a_pending_callback_request() {
+        let file = [0xC8; 16];
+        let peer = [0x11; 16];
+        let mut sm = SourceManager::new();
+        sm.register_lowid_source(file, 5, 4662, CB_SRV_IP, CB_SRV_PORT, peer, 0, None);
+
+        assert!(
+            sm.find_answered_callback_files(CB_SRV_IP, CB_SRV_PORT, 4662, Some(peer)).is_empty(),
+            "a hash only a source exchange vouched for is not matched unasked"
+        );
+        sm.mark_callback_sent(&file, 5);
+        assert_eq!(
+            sm.find_answered_callback_files(CB_SRV_IP, CB_SRV_PORT, 4662, Some(peer)),
+            vec![file]
+        );
+    }
+
+    #[test]
+    fn answered_callback_request_takes_no_second_hashless_answer() {
+        let file = [0xC9; 16];
+        let mut sm = SourceManager::new();
+        sm.register_lowid_source(file, 5, 4662, CB_SRV_IP, CB_SRV_PORT, [0u8; 16], 0, None);
+        sm.mark_callback_sent(&file, 5);
+        assert_eq!(
+            sm.find_answered_callback_files(CB_SRV_IP, CB_SRV_PORT, 4662, None),
+            vec![file]
+        );
+
+        sm.link_lowid_callback_identity(CB_SRV_IP, CB_SRV_PORT, 4662, [0x11; 16]);
+
+        assert!(sm.find_answered_callback_files(CB_SRV_IP, CB_SRV_PORT, 4662, None).is_empty());
+    }
+
+    #[test]
+    fn identity_link_stamps_only_rows_waiting_for_a_callback_answer() {
+        let (asked, unasked) = ([0xCA; 16], [0xCB; 16]);
+        let peer = [0x11; 16];
+        let mut sm = SourceManager::new();
+        sm.register_lowid_source(asked, 5, 4662, CB_SRV_IP, CB_SRV_PORT, [0u8; 16], 0, None);
+        sm.register_lowid_source(unasked, 7, 4662, CB_SRV_IP, CB_SRV_PORT, [0u8; 16], 0, None);
+
+        sm.link_lowid_callback_identity(CB_SRV_IP, CB_SRV_PORT, 4662, peer);
+        assert!(
+            sm.sources.values().flatten().all(|e| e.user_hash == [0u8; 16]),
+            "nothing was waiting for an answer"
+        );
+
+        sm.mark_callback_sent(&asked, 5);
+        sm.link_lowid_callback_identity(CB_SRV_IP, CB_SRV_PORT, 4662, peer);
+        assert_eq!(sm.sources[&asked][0].user_hash, peer);
+        assert_eq!(
+            sm.sources[&unasked][0].user_hash,
+            [0u8; 16],
+            "a row sharing the port that we did not ask stays unclaimed"
+        );
+    }
+
+    #[test]
+    fn reannounced_hash_drops_the_callback_confirmation() {
+        let file = [0xCC; 16];
+        let (peer, reannounced) = ([0x11; 16], [0x33; 16]);
+        let mut sm = SourceManager::new();
+        sm.register_lowid_source(file, 5, 4662, CB_SRV_IP, CB_SRV_PORT, [0u8; 16], 0, None);
+        sm.mark_callback_sent(&file, 5);
+        sm.link_lowid_callback_identity(CB_SRV_IP, CB_SRV_PORT, 4662, peer);
+        age_callback_stamps_past_the_answer_window(&mut sm, &file);
+
+        sm.register_lowid_source(file, 5, 4662, CB_SRV_IP, CB_SRV_PORT, reannounced, 0, None);
+
+        for hash in [peer, reannounced] {
+            assert!(sm
+                .find_answered_callback_files(CB_SRV_IP, CB_SRV_PORT, 4662, Some(hash))
+                .is_empty());
+        }
     }
 
     #[test]
@@ -4674,6 +4874,7 @@ mod tests {
         let mut sm = SourceManager::new();
 
         sm.register_lowid_source(hash, 5, 4662, srv_ip, 4661, [0u8; 16], 0, Some(SourceOrigin::Server));
+        sm.mark_callback_sent(&hash, 5);
         sm.link_lowid_callback_identity(srv_ip, 4661, 4662, peer);
         sm.register_inbound_callback_ports(hash, real_ip, 51000, 4662, peer, 0, false, None);
 

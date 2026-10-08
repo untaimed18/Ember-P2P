@@ -697,30 +697,40 @@ impl PublishManager {
 
     fn build_keyword_entry(file: &PublishableFile) -> PublishEntry {
         let complete_sources = file.complete_sources.max(1);
+        let mut tags = vec![
+            KadTag {
+                name: TagName::Id(TAG_FILENAME),
+                value: TagValue::String(file.file_name.clone()),
+            },
+            KadTag {
+                name: TagName::Id(TAG_FILESIZE),
+                value: TagValue::Uint64(file.file_size),
+            },
+        ];
+        // The type as eMule publishes and searches it: archives and disc
+        // images go out as "Pro" (`OtherFunctions.cpp`, `GetFileTypeByName`),
+        // and storage nodes compare the tag by equality, so "Arc"/"Iso" here
+        // left every such file out of Archive, CD-Image and Program searches.
+        // No type, no tag, as in eMule.
+        if let Some(file_type) =
+            crate::search::merge::wire_search_file_type(Some(file.file_type.as_str()))
+        {
+            tags.push(KadTag {
+                name: TagName::Id(TAG_FILETYPE),
+                value: TagValue::String(file_type.to_string()),
+            });
+        }
+        tags.push(KadTag {
+            name: TagName::Id(TAG_SOURCES),
+            value: TagValue::Uint32(complete_sources),
+        });
+        tags.push(KadTag {
+            name: TagName::Id(TAG_COMPLETE_SOURCES),
+            value: TagValue::Uint32(complete_sources),
+        });
         PublishEntry {
             id: file.file_hash,
-            tags: vec![
-                KadTag {
-                    name: TagName::Id(TAG_FILENAME),
-                    value: TagValue::String(file.file_name.clone()),
-                },
-                KadTag {
-                    name: TagName::Id(TAG_FILESIZE),
-                    value: TagValue::Uint64(file.file_size),
-                },
-                KadTag {
-                    name: TagName::Id(TAG_FILETYPE),
-                    value: TagValue::String(file.file_type.clone()),
-                },
-                KadTag {
-                    name: TagName::Id(TAG_SOURCES),
-                    value: TagValue::Uint32(complete_sources),
-                },
-                KadTag {
-                    name: TagName::Id(TAG_COMPLETE_SOURCES),
-                    value: TagValue::Uint32(complete_sources),
-                },
-            ],
+            tags,
         }
     }
 
@@ -1030,6 +1040,30 @@ mod tests {
             keyword_publishable: true,
             last_source_publish: 0,
         })
+    }
+
+    #[test]
+    fn archives_and_disc_images_publish_as_program_like_emule() {
+        let type_of = |file_type: &str| {
+            let entry = PublishManager::build_keyword_entry(&PublishableFile {
+                file_hash: KadId([0x42; 16]),
+                file_name: "set.zip".to_string(),
+                file_size: 1024,
+                file_type: file_type.to_string(),
+                complete_sources: 1,
+                keyword_publishable: true,
+                last_source_publish: 0,
+            });
+            entry
+                .tags
+                .iter()
+                .find(|tag| matches!(tag.name, TagName::Id(TAG_FILETYPE)))
+                .and_then(|tag| tag.string_value().map(str::to_string))
+        };
+        assert_eq!(type_of("Arc").as_deref(), Some("Pro"));
+        assert_eq!(type_of("Iso").as_deref(), Some("Pro"));
+        assert_eq!(type_of("Video").as_deref(), Some("Video"));
+        assert_eq!(type_of(""), None, "no type, no tag");
     }
 
     /// A keyword publish has to leave as about as many datagrams as eMule's

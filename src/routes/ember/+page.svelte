@@ -24,11 +24,18 @@
     EmberDhtStoreEntry,
   } from '$lib/types';
   import { copyToClipboard, formatDurationSecs, formatNumber } from '$lib/utils';
-  import { getLocale } from '$lib/i18n';
+  import { getLocale, translateError } from '$lib/i18n';
   import { EMBER_DIAG_FAILURE_THRESHOLD } from '$lib/emberJoin';
   import { emberJoinTimedOut } from '$lib/stores/emberJoin';
   import { checkForUpdates, installUpdate, restartToUpdate, updater } from '$lib/stores/updater';
   import NetworkStatusTiles from '$lib/components/NetworkStatusTiles.svelte';
+  import PortTest from '$lib/components/PortTest.svelte';
+  import { appSettings } from '$lib/stores/settings';
+  import { networkStats } from '$lib/stores/network';
+  import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+  import IconX from '$lib/components/IconX.svelte';
+  import { relaunch } from '@tauri-apps/plugin-process';
+  import { flushToastActionsBeforeExit } from '$lib/stores/toast';
   import * as m from '$lib/paraglide/messages';
 
   let diag = $state<EmberDiagnostics | null>(null);
@@ -36,7 +43,37 @@
   let searches = $state<EmberDhtSearchEntry[]>([]);
   let storeEntries = $state<EmberDhtStoreEntry[]>([]);
   let contactFilter = $state('');
+  let metricFilter = $state('');
   let detailsOpen = $state(false);
+
+  // Device-local view state, like collapsed sections elsewhere: not carried
+  // by a profile backup.
+  const DETAILS_OPEN_KEY = 'ember.page.details-open.v1';
+  const GROWING_DISMISSED_KEY = 'ember.page.growing-dismissed.v1';
+  function readFlag(key: string): boolean {
+    try {
+      return typeof localStorage !== 'undefined' && localStorage.getItem(key) === '1';
+    } catch {
+      return false;
+    }
+  }
+  function writeFlag(key: string, on: boolean) {
+    try {
+      if (on) localStorage.setItem(key, '1');
+      else localStorage.removeItem(key);
+    } catch {
+      // Storage disabled: the choice holds for this visit.
+    }
+  }
+  const detailsInitiallyOpen = readFlag(DETAILS_OPEN_KEY);
+  let growingDismissed = $state(readFlag(GROWING_DISMISSED_KEY));
+  function dismissGrowing() {
+    growingDismissed = true;
+    writeFlag(GROWING_DISMISSED_KEY, true);
+  }
+  let showRestartPrompt = $state(false);
+  let restarting = $state(false);
+  let restartError = $state('');
 
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let unmounted = false;
@@ -105,6 +142,7 @@
 
   function onDetailsToggle(e: Event & { currentTarget: HTMLDetailsElement }) {
     detailsOpen = e.currentTarget.open;
+    writeFlag(DETAILS_OPEN_KEY, detailsOpen);
     void refreshLists();
   }
 
@@ -133,6 +171,22 @@
 
   let copiedKey = $state<string | null>(null);
   let copyTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Same relaunch as a port change in Settings: confirm first, paint the
+  // full-screen "Restarting Ember" overlay, then Tauri's relaunch().
+  async function performRestart() {
+    showRestartPrompt = false;
+    restartError = '';
+    restarting = true;
+    try {
+      // Also sends anything still behind an Undo toast.
+      await Promise.all([new Promise((r) => setTimeout(r, 600)), flushToastActionsBeforeExit()]);
+      await relaunch();
+    } catch (e) {
+      restarting = false;
+      restartError = m.settings_restart_failed({ error: translateError(e) });
+    }
+  }
 
   async function copyText(value: string, key: string) {
     if (!value) return;
@@ -250,6 +304,19 @@
           : m.ember_dht_udp_unreachable_hint(),
   );
 
+  // What a relayed user can do about it. Forwarding on the router does nothing
+  // while traffic leaves through a VPN (the backend has stood UPnP down for
+  // exactly that), and is no advice at all once UPnP has already forwarded
+  // the ports, so those cases point elsewhere.
+  let relayedFix = $derived.by(() => {
+    if (reachability !== 'relayed' || !$appSettings) return '';
+    const ports = { tcp: $appSettings.tcp_port, udp: $appSettings.udp_port };
+    if (!$appSettings.upnp_enabled) return m.ember_health_relayed_fix_upnp_off(ports);
+    if ($networkStats.upnp_stood_down) return m.ember_health_relayed_fix_vpn(ports);
+    if ($networkStats.upnp_mapped) return m.ember_health_relayed_fix_forwarded();
+    return m.ember_health_relayed_fix(ports);
+  });
+
   // Deliberately the live count of files with a placed source record, not the
   // session `*_published` counters: those only ever climb, so they would keep
   // claiming "Published" after the user unshared everything, and a keyword ack
@@ -359,6 +426,8 @@
     { id: 'gossip-introducers-rationed', k: m.ember_stat_gossip_introducers_rationed(), v: formatNumber(diag?.ember_dht_gossip_introducers_rationed ?? 0) },
     { id: 'friend-contact-asks', k: m.ember_stat_friend_contact_asks(), v: formatNumber(diag?.ember_dht_friend_contact_asks ?? 0) },
     { id: 'friend-contacts-learned', k: m.ember_stat_friend_contacts_learned(), v: formatNumber(diag?.ember_dht_friend_contacts_learned ?? 0) },
+    { id: 'friend-meets', k: m.ember_stat_friend_meets(), v: formatNumber(diag?.ember_dht_friend_meets ?? 0) },
+    { id: 'friend-meets-converted', k: m.ember_stat_friend_meets_converted(), v: formatNumber(diag?.ember_dht_friend_meets_converted ?? 0) },
     { id: 'liveness-pings', k: m.ember_stat_liveness_pings(), v: formatNumber(diag?.ember_dht_liveness_pings_sent ?? 0) },
     { id: 'pongs-received', k: m.ember_stat_pongs_received(), v: formatNumber(diag?.ember_dht_pongs_received ?? 0) },
     { id: 'peers', k: m.ember_stat_peers(), v: formatNumber(diag?.ember_peers_known ?? 0) },
@@ -424,6 +493,26 @@
     ];
   });
 
+  let filteredMetrics = $derived.by(() => {
+    const q = metricFilter.trim().toLowerCase();
+    if (!q) return metrics;
+    return metrics.filter((metric) => metric.k.toLowerCase().includes(q));
+  });
+
+  /** Everything this page shows, as plain text for a bug report. */
+  function diagnosticsText(): string {
+    const lines = [
+      `${m.nav_ember_network()} — ${new Date().toISOString()}`,
+      `${statusLabel}${statusHint ? ` — ${statusHint}` : ''}`,
+      `${m.ember_health_reachability()}: ${reachabilityLabel}`,
+      `${m.ember_health_sharing()}: ${sharingPillLabel}`,
+      `${m.ember_node_id_label()}: ${diag?.ember_dht_node_id || '—'}`,
+      '',
+      ...metrics.map((metric) => `${metric.k}: ${metric.v}`),
+    ];
+    return lines.join('\n');
+  }
+
   onMount(() => {
     refreshDiag();
     // Skip the poll while the window is hidden, like every other poll in the
@@ -457,15 +546,41 @@
      with an `h1`, which put the same chrome at two different heading levels
      and two different type sizes depending on where you'd navigated from. -->
 <header class="page-header">
-  <div>
+  <div class="page-heading">
     <h2>{m.nav_ember_network()}</h2>
     <p class="page-subtitle">{m.ember_page_subtitle()}</p>
+  </div>
+  <div class="header-actions">
+    <button
+      type="button"
+      class="secondary"
+      onclick={() => { restartError = ''; showRestartPrompt = true; }}
+      disabled={restarting}
+    >
+      {m.ember_restart_button()}
+    </button>
   </div>
 </header>
 
 <div class="page-content">
   <div class="ember-inner">
-  <div class="banner banner-info" role="note">{m.ember_network_growing()}</div>
+  {#if restartError}
+    <div class="banner banner-error" role="alert">{restartError}</div>
+  {/if}
+  {#if !growingDismissed}
+    <div class="banner banner-info banner-dismissable" role="note">
+      <span>{m.ember_network_growing()}</span>
+      <button
+        type="button"
+        class="banner-dismiss"
+        onclick={dismissGrowing}
+        title={m.common_dismiss()}
+        aria-label={m.common_dismiss()}
+      >
+        <IconX size={11} />
+      </button>
+    </div>
+  {/if}
 
   <section class="hero" class:state-off={heroState === 'loading'} class:state-connecting={heroState === 'connecting'} class:state-connected={heroState === 'connected'} class:state-no-peers={heroState === 'no_peers'} aria-live="polite">
     <div class="hero-glow" aria-hidden="true"></div>
@@ -564,6 +679,10 @@
             <span class="badge" class:tone-success={reachabilityTone === 'ok'} class:tone-warning={reachabilityTone === 'warn'} class:tone-muted={reachabilityTone === 'muted'}>{reachabilityLabel}</span>
           </div>
           <p class="hint">{reachabilityHint}</p>
+          {#if relayedFix}
+            <p class="hint">{relayedFix}</p>
+          {/if}
+          <PortTest />
         </div>
       </div>
 
@@ -605,7 +724,7 @@
     and `onDetailsToggle` is what starts/stops polling the three snapshot
     commands that feed the tables.
   -->
-  <details class="card advanced" ontoggle={onDetailsToggle}>
+  <details class="card advanced" open={detailsInitiallyOpen} ontoggle={onDetailsToggle}>
     <summary>
       <span class="chevron" aria-hidden="true">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="12" height="12">
@@ -653,20 +772,45 @@
 
       {#if isActive}
         <section class="sub-card">
-          <h3>{m.ember_dht_status_title()}</h3>
+          <div class="panel-head">
+            <h3>{m.ember_dht_status_title()}</h3>
+            <div class="panel-tools">
+              <input
+                class="filter-input"
+                type="search"
+                bind:value={metricFilter}
+                placeholder={m.ember_metrics_filter()}
+                aria-label={m.ember_metrics_filter()}
+              />
+              <button
+                type="button"
+                class="copy-btn"
+                onclick={() => copyText(diagnosticsText(), 'diagnostics')}
+              >
+                {#if copiedKey === 'diagnostics'}{m.ember_copied()}
+                {:else if copiedKey === 'diagnostics:error'}{m.ember_copy_failed()}
+                {:else}{m.ember_copy_diagnostics()}{/if}
+              </button>
+            </div>
+          </div>
           <div class="metric-grid">
-            {#each metrics as metric (metric.id)}
+            {#each filteredMetrics as metric (metric.id)}
               <div class="metric">
                 <span class="metric-k">{metric.k}</span>
                 <span class="metric-v">{metric.v}</span>
               </div>
+            {:else}
+              <p class="hint metric-empty">{m.ember_metrics_filter_empty()}</p>
             {/each}
           </div>
         </section>
 
         <section class="sub-card">
           <div class="panel-head">
-            <h3>{m.ember_dht_contacts_title()}</h3>
+            <h3>
+              {m.ember_dht_contacts_title()}
+              <span class="count-pill">{contactFilter.trim() ? `${formatNumber(filteredContacts.length)} / ` : ''}{formatNumber(contacts.length)}</span>
+            </h3>
             <input
               class="filter-input"
               type="search"
@@ -702,7 +846,7 @@
         </section>
 
         <section class="sub-card">
-          <h3>{m.ember_dht_searches_title()}</h3>
+          <h3>{m.ember_dht_searches_title()} <span class="count-pill">{formatNumber(searches.length)}</span></h3>
           <div class="table-wrap">
             <table class="dht-table">
               <thead>
@@ -734,7 +878,7 @@
         </section>
 
         <section class="sub-card">
-          <h3>{m.ember_dht_store_title()}</h3>
+          <h3>{m.ember_dht_store_title()} <span class="count-pill">{formatNumber(storeEntries.length)}</span></h3>
           <p class="hint">{m.ember_dht_store_hint()}</p>
           <div class="table-wrap">
             <table class="dht-table">
@@ -767,6 +911,29 @@
   </div>
 </div>
 
+<!--
+  Confirmed like the port-change prompt in Settings, with the same
+  "Restart now" label and the same relaunch overlay.
+-->
+<ConfirmDialog
+  bind:open={showRestartPrompt}
+  title={m.ember_restart_dialog_title()}
+  message={m.ember_restart_dialog_message()}
+  confirmLabel={m.settings_restart_now()}
+  cancelLabel={m.common_cancel()}
+  onconfirm={performRestart}
+/>
+
+{#if restarting}
+  <div class="restart-overlay" role="status" aria-label={m.settings_restarting_aria()}>
+    <div class="restart-card">
+      <div class="spinner lg"></div>
+      <h2 class="restart-title">{m.settings_restarting_title()}</h2>
+      <p class="restart-sub">{m.ember_restarting_sub()}</p>
+    </div>
+  </div>
+{/if}
+
 <style>
   /*
    * Fixed `.page-header` + scrollable `.page-content` (the app-wide
@@ -780,6 +947,20 @@
     display: flex;
     flex-direction: column;
     gap: 16px;
+  }
+
+  .page-header {
+    gap: 16px;
+  }
+
+  .page-heading {
+    min-width: 0;
+  }
+
+  .header-actions {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
   }
 
   /* Size/weight come from the global `.page-header h2` rule; only the layout
@@ -1154,6 +1335,34 @@
     margin: 0;
   }
 
+  .panel-tools {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    justify-content: flex-end;
+    min-width: 0;
+  }
+
+  .count-pill {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 0 7px;
+    border-radius: var(--radius-pill);
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    line-height: 1.6;
+    vertical-align: 1px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .metric-empty {
+    grid-column: 1 / -1;
+    margin: 6px 0 0;
+  }
+
   .filter-input {
     flex: 1;
     min-width: 140px;
@@ -1269,6 +1478,31 @@
     gap: 8px;
   }
 
+  .banner-dismissable {
+    justify-content: space-between;
+  }
+
+  .banner-dismiss {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background var(--transition-fast) ease, color var(--transition-fast) ease;
+  }
+
+  .banner-dismiss:hover {
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    color: var(--text-primary);
+  }
+
   .banner-error {
     background: color-mix(in srgb, var(--danger) 12%, transparent);
     border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
@@ -1334,7 +1568,43 @@
     .stat { transition: none; }
   }
 
+  /* Same overlay as a port-change restart in Settings. */
+  .restart-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 99999;
+    display: grid;
+    place-items: center;
+    background: var(--bg-primary);
+    padding: 20px;
+  }
+
+  .restart-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .restart-title {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--accent);
+    margin: 0;
+  }
+
+  .restart-sub {
+    font-size: var(--font-size-base);
+    color: var(--text-muted);
+    margin: 0;
+  }
+
   @media (max-width: 760px) {
+    .page-header {
+      align-items: flex-start;
+      flex-direction: column;
+    }
+
     .stat-grid {
       grid-template-columns: 1fr 1fr;
     }

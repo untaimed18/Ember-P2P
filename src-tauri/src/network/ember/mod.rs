@@ -21,7 +21,6 @@ pub mod udp_mux;
 // used by those same paths.
 pub mod dht;
 pub mod reputation;
-#[allow(dead_code)]
 pub mod transfer;
 pub mod transport;
 pub mod xfer;
@@ -162,7 +161,7 @@ pub type EmberPayloadGeneration = Arc<AtomicU64>;
 ///       for each source: ipv4(4) + tcp_port(u16 LE) + udp_port(u16 LE) + flags(u8)
 ///   + ember_peer_count(u16 LE) +
 ///     for each peer: ipv4(4) + tcp_port(u16 LE)
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn build_exchange_payload(entries: &[EmberFileEntry], peers: &[EmberPeer]) -> Vec<u8> {
     build_exchange_payload_with_relay_attestations(entries, peers, &[])
 }

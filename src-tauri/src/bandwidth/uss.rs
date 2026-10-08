@@ -390,13 +390,6 @@ impl UploadSpeedSense {
             self.current_limit = self.current_limit.clamp(lo, max_upload);
         }
     }
-
-    /// Override ping tolerance (multiplier of baseline RTT). Kept for future
-    /// settings exposure; the default is tuned for KAD peer RTT noise.
-    #[allow(dead_code)]
-    pub fn set_tolerance(&mut self, tolerance: f64) {
-        self.ping_tolerance = tolerance.max(1.0);
-    }
 }
 
 /// Floor for USS: at least 4 KiB/s, and at least 10% of the configured cap so

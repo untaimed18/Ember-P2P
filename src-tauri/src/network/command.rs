@@ -1694,6 +1694,23 @@ async fn handle_command_inner(
                             debug!("Previous download worker for {teardown_tid} finished teardown");
                         });
                     }
+                    // The worker's own Completed / Failed are honoured only
+                    // while its control is the registered one, and Pause and
+                    // Cancel reach it only through the registry. Not for a
+                    // control already cancelled: a late command from before a
+                    // Pause must not displace the control a later Resume made.
+                    if !control.is_cancelled() {
+                        let mut mgr = transfer_manager.write().await;
+                        if let Some(existing) = mgr.get_control(&tid2) {
+                            if !std::sync::Arc::ptr_eq(&existing, &control) {
+                                existing.cancel();
+                                mgr.register_control(&tid2, control.clone());
+                            }
+                        } else if mgr.get_transfer(&tid2).is_some() {
+                            mgr.register_control(&tid2, control.clone());
+                        }
+                    }
+                    let generation = Some(control.generation());
                     let handle = tokio::spawn(async move {
                         if let Err(e) = ms_download.run(tx).await {
                             error!("Multi-source download failed: {e}");
@@ -1703,6 +1720,7 @@ async fn handle_command_inner(
                                     transfer_id: tid,
                                     error: e.to_string(),
                                     failure_kind: kind,
+                                    generation,
                                 })
                                 .await;
                         }
@@ -2305,19 +2323,6 @@ async fn handle_command_inner(
                 }
             }
             info!("Unbanned peer {peer_id_hex}");
-        }
-
-        NetworkCommand::GetPeersSnapshot { tx } => {
-            let peers = routing_peers_snapshot(state);
-            let db_for_peers = db.clone();
-            tokio::spawn(async move {
-                let saved_peers = tokio::task::spawn_blocking(move || {
-                    db_for_peers.get_peers().unwrap_or_default()
-                })
-                .await
-                .unwrap_or_default();
-                let _ = tx.send(merge_saved_peers(peers, saved_peers));
-            });
         }
 
         NetworkCommand::GetNetworkStatsSnapshot { tx } => {
@@ -3023,9 +3028,14 @@ async fn handle_command_inner(
             state
                 .ember_dht_pending_value_lookups
                 .insert(search_id, records_tx);
+            let responded = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            state
+                .ember_dht_value_lookup_responded
+                .insert(search_id, responded.clone());
             let _ = tx.send(Ok(EmberValueLookupPending {
                 search_id,
                 records_rx,
+                responded,
             }));
 
             // Kick off the first round (and resolve immediately if the
@@ -3040,10 +3050,7 @@ async fn handle_command_inner(
             }
             #[cfg(debug_assertions)]
             let key_hex = hex::encode(record.keyword_hash);
-            let publish_id = match state
-                .ember_publish
-                .start_publish(*record, state.ember_dht.routing())
-            {
+            let publish_id = match start_own_channel_publish(state, *record) {
                 Some(id) => id,
                 None => {
                     let _ = tx.send(Err(format!(
@@ -3104,9 +3111,14 @@ async fn handle_command_inner(
             state
                 .ember_dht_pending_value_lookups
                 .insert(search_id, records_tx);
+            let responded = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            state
+                .ember_dht_value_lookup_responded
+                .insert(search_id, responded.clone());
             let _ = tx.send(Ok(EmberValueLookupPending {
                 search_id,
                 records_rx,
+                responded,
             }));
             drive_ember_search(socket, state, search_id).await;
         }
@@ -4023,8 +4035,10 @@ async fn handle_command_inner(
                 .into_iter()
                 .take(applied_bootstrap_contact_count(declared_count))
                 .collect();
+            // Insert-only: a supplied list is hearsay about contacts we may
+            // already know better (`RoutingTable::insert_if_new`).
             let count = count_accepted_bootstrap_contacts(contacts.iter().cloned(), |contact| {
-                state.routing_table.insert(contact)
+                state.routing_table.insert_if_new(contact)
             });
             let table_size = state.routing_table.len();
             info!(
@@ -4401,7 +4415,7 @@ async fn handle_command_inner(
             state.stats.status = NetworkStatus::Connecting;
             state.self_lookup_done = false;
             state.last_self_lookup = 0;
-            state.kad_started_at = chrono::Utc::now().timestamp();
+            state.kad_started_at = crate::network::monotonic_secs();
             state
                 .routing_table
                 .reset_big_timer_global(chrono::Utc::now().timestamp());
@@ -4471,458 +4485,6 @@ async fn handle_command_inner(
             //
             // eD2K is intentionally not started here — use the Servers page
             // (or Settings → Auto-Connect Server) to join a server.
-        }
-
-        NetworkCommand::KadDisconnect => {
-            info!("KAD disconnect requested");
-            let rendezvous_was_registered = state.rendezvous_registered;
-
-            // Save routing table before clearing (eMule saves on Stop)
-            let contacts = state.routing_table.export_bootstrap_contacts(200);
-            let nodes_path = state.data_dir.join("nodes.dat");
-            let nodes_save_lock = state.nodes_save_lock.clone();
-            // The *write* was already off the loop; the wait for the lock was
-            // not, and that was the stall. Acquiring `nodes_save_lock` can take
-            // as long as the periodic writer's own fsync, so one Disconnect
-            // click could hold the network task for up to 5 s here — and KAD is
-            // only what the user asked to tear down: the Ember overlay and eD2K
-            // peer UDP ride the same socket and the same task, so both went
-            // deaf and in-flight Ember lookups timed out.
-            //
-            // Moving the wait into the task is safe because the lock is what
-            // provides the ordering, not this call site: the blocking save
-            // still holds the guard, so the shutdown writer continues to
-            // serialize behind it rather than renaming an older snapshot over a
-            // newer one.
-            tokio::spawn(async move {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    nodes_save_lock.lock_owned(),
-                )
-                .await
-                {
-                    Ok(ownership) => {
-                        let contact_count = contacts.len();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            let _ownership = ownership;
-                            if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {
-                                error!("Failed to save nodes.dat on disconnect: {e}");
-                            } else {
-                                info!("Saved {contact_count} contacts to nodes.dat on disconnect");
-                            }
-                        })
-                        .await;
-                    }
-                    Err(_) => warn!(
-                        "Skipped disconnect nodes.dat checkpoint because the serialized periodic writer did not finish"
-                    ),
-                }
-            });
-
-            // Stop all searches and cancel pending oneshot channels.
-            //
-            // The active keyword search goes through the real teardown first,
-            // because nulling `active_search_request` by hand — which is what
-            // this used to do, further down — skips everything cancelling a
-            // search actually means. No `search-complete` reaches the frontend,
-            // so the tab spins until its ten-minute ed2k grace period expires;
-            // `udp_search_queue` keeps its backlog and the UDP timer goes on
-            // sending up to `MAX_UDP_SEARCH_QUEUE` `OP_GLOBSEARCH` packets for
-            // a search the user cancelled by pressing Disconnect; and the Ember
-            // keyword walk keeps running against an id nothing will match
-            // again. The drains below still cover the searches this does not:
-            // `find_notes` carries its own request id.
-            if let Some(active_id) = state
-                .active_search_request
-                .as_ref()
-                .map(|active| active.request_id)
-            {
-                cancel_search_request(state, app_handle, active_id);
-            }
-            state.search_manager = SearchManager::new();
-            // The rebuilt manager hands out ids from 1 again, so a tracked
-            // lookup id would capture whichever unrelated search reuses it. The
-            // lookup never finished, so it does not count toward the backoff.
-            if state.ember_rendezvous_search.take().is_some() {
-                state.ember_rendezvous_looked_up_at = 0;
-            }
-            for (
-                _,
-                PendingKeywordSearch {
-                    tx, local_results, ..
-                },
-            ) in state.pending_keyword_searches.drain()
-            {
-                let _ = tx.send(local_results);
-            }
-            for (_, (_, tx)) in state.pending_notes_searches.drain() {
-                let _ = tx.send(Ok(Vec::new()));
-            }
-            // `cancel_search_request` above already cleared it, along with the
-            // UDP queue and the `search-complete` the frontend waits on.
-            state.active_search_request = None;
-            state.udp_search_queue.clear();
-            state.download_source_searches.clear();
-            state.store_keyword_searches.clear();
-            // A disconnect drops the rendezvous advert along with everything
-            // else, so we are no longer listed and must re-advertise.
-            if state
-                .store_source_searches
-                .values()
-                .any(|(hash, _)| *hash == kad::publish::ember_rendezvous_key())
-            {
-                state.ember_rendezvous_published_at = 0;
-            }
-            state.store_source_searches.clear();
-            state.pending_note_publishes.clear();
-            state.publish_pending.clear();
-            state.source_publish_acks.clear();
-            state.pending_udp_reasks.clear();
-            state.server_udp_source_reask_at.clear();
-
-            // Reset network state (eMule resets firewall, deletes routing zone)
-            state.routing_table.clear();
-            // A surviving HighID server session still proves two things this
-            // reset used to throw away: our external address, and that our TCP
-            // port is reachable. The address is not even lost — the session is
-            // still holding the client ID `live_highid_external_ip` derives it
-            // from. Discarding them left hole punching, relay and source
-            // records with no notion of where we are, and advertised us as
-            // firewalled while a server was demonstrably connecting back, with
-            // nothing to restore either until the next server login. That was
-            // harmless while this handler also dropped the server; it is
-            // reachable now that it leaves the server alone.
-            let surviving_highid = live_highid_external_ip(state);
-            // KAD's verdict on our UDP port goes with the session below, but the
-            // port itself stays open and Ember keeps using it. Without this a
-            // node that was reachable a moment ago publishes as relayed until
-            // two strangers happen to reach it unsolicited.
-            if let Some(ip) = kad_udp_proof_to_inherit(
-                state.udp_fw_verified,
-                state.udp_firewalled,
-                state.external_ip,
-            ) {
-                state.ember_udp_reachable_at = Some(chrono::Utc::now().timestamp());
-                state.ember_reach_external_ip = Some(ip);
-            }
-            set_external_ip(state, surviving_highid);
-            state.external_udp_port = None;
-            state.firewalled = surviving_highid.is_none();
-            // New KAD session (possibly a different network): any STUN
-            // candidate/suspend progress and remapped advertise ports from
-            // before this disconnect are stale. Also resets the live
-            // advertise_tcp_port/advertise_udp_port atomics the upload
-            // listener reads directly, back to Settings ports. Done after
-            // `firewalled` is updated so update_publish_manager_state (called
-            // inside) reflects the post-disconnect state, not the pre-reset one.
-            // (reset_stun_keepalive_session also bumps mapping_ka_generation,
-            // invalidating any in-flight STUN/TCP-hold cycle from before this
-            // disconnect — see its doc comment.)
-            reset_stun_keepalive_session(state);
-            state.firewalled_shared.store(
-                surviving_highid.is_none(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            state.firewall_checks_sent = 0;
-            state.firewall_checker = FirewallChecker::new();
-            // Hand the fresh checker back the one report that is still true.
-            // KAD's peer votes went with the session; the server's HighID
-            // stands for as long as that session does, and this is the same
-            // single-reporter path the server-connect handler uses for it.
-            if let Some(ip) = surviving_highid {
-                state.firewall_checker.handle_server_highid_response(ip);
-                // Paired, as both real HighID paths pair them: a HighID is a
-                // TCP connect-back, so it proves the port is open and not just
-                // what our address is. The address alone left `tcp_status` at
-                // `Unknown` while `firewalled` said false, and
-                // `kad_source_publish_treat_as_firewalled` reads the status
-                // rather than the flag — so the node published no source
-                // records at all until a fresh KAD firewall check completed.
-                state.firewall_checker.handle_tcp_connect_back();
-            }
-            // Recompute publish state now that the checker is the one the rest
-            // of the session will read. `reset_stun_keepalive_session` above
-            // refreshed it too, but that ran before the checker was replaced,
-            // so its `tcp_status()` reading was the pre-reset one.
-            update_publish_manager_state(state);
-            state.self_lookup_done = false;
-            state.last_self_lookup = 0;
-            state.last_kad_contact = None;
-            state.udp_firewalled = true;
-            state.udp_fw_verified = false;
-            kad::firewall::publish_local_firewall(state.firewalled, state.udp_firewalled);
-            state.overloaded_nodes.clear();
-            state.buddy_manager.reset().await;
-            state.buddy_event_rx = None;
-            state.serving_event_rx = None;
-            *state.shared_buddy_info.write().await = None;
-            state.peer_nicknames.clear();
-            state.publish_confirmed = 0;
-            state.first_publish_done = false;
-            state.kad_initial_source_burst_done = false;
-            state.friend_presence_initial_done = false;
-            state.last_presence_blocked = false;
-            state.friend_search_initial_done = false;
-            state.friend_search_initial_queue.clear();
-            state.friend_search_started_at = None;
-            state.friend_search_waiting_since = None;
-            state.friend_search_followup_at = None;
-            state.friend_search_followup_done = false;
-            state.rendezvous_register_generation =
-                state.rendezvous_register_generation.saturating_add(1);
-            state.nat_probe_generation = state.nat_probe_generation.saturating_add(1);
-            state.rendezvous_registered = false;
-            state.rendezvous_last_register = None;
-            // Backoff earned on the old connection must not hold up the first
-            // registration after reconnecting.
-            state.rendezvous_register_fail_streak = 0;
-            state.rendezvous_last_attempt = None;
-            if rendezvous_was_registered {
-                let rv_url = settings.rendezvous_url.clone();
-                let rv_hash = ember_hash;
-                let rv_secret = ed25519_secret_key;
-                tokio::spawn(async move {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(3),
-                        rendezvous::unregister(&rv_url, &rv_hash, &rv_secret),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            debug!("Failed to unregister from rendezvous server on disconnect: {e}")
-                        }
-                        Err(_) => debug!("Rendezvous unregister timed out on disconnect; skipping"),
-                    }
-                });
-            }
-            // Emit offline for all previously-online friends
-            for eh in state.online_friends.keys() {
-                let _ = app_handle.emit(
-                    "ember:friend-offline",
-                    serde_json::json!({
-                        "user_hash": hex::encode(eh),
-                    }),
-                );
-            }
-            state.online_friends.clear();
-            state.outbound_session_tasks.clear();
-
-            // Retire the live friend streams too, not just the UI's view of
-            // them. `online_friends` is what the Friends page renders, but
-            // chat, file offers and browse all route through `ember_sessions`
-            // — so clearing only the former left every friend shown as offline
-            // while messages still sent successfully on the surviving socket.
-            // It also blocked recovery: `FindFriendAndConnect` skips a peer
-            // that still has a fresh session, so the reconnect the user would
-            // reach for never dialled.
-            {
-                let mut sessions = state.ember_sessions.write().await;
-                for handle in sessions.values() {
-                    handle.close();
-                }
-                sessions.clear();
-            }
-
-            // Abort all active download tasks — they hold open TCP connections
-            // to peers and will keep transferring data even though the network
-            // is logically disconnected.  Re-queue each as a pending download
-            // so they resume automatically when the user reconnects.
-            // Save .part.met for in-progress downloads before aborting tasks.
-            // Snapshot tracker handles first, then await each lock with a
-            // short bound so a mid-write tracker doesn't silently miss its
-            // resume metadata.
-            let disconnect_trackers: Vec<_> = state
-                .tracker_registry
-                .lock()
-                .iter()
-                .map(|(tid, tracker)| (tid.clone(), tracker.clone()))
-                .collect();
-            // Also off the loop: joining every registered tracker's save added
-            // up to 8 s to the stall above. The snapshots hold cloned `Arc`s, so
-            // clearing `tracker_registry` below cannot invalidate them.
-            //
-            // This does let a save race the aborts that follow, where before it
-            // completed first. That is an acceptable trade: the abort could
-            // already land mid-write regardless of this ordering, a missed tail
-            // of ranges only costs re-downloading them (the part file itself is
-            // written by the coordinator, not the tracker), and
-            // `save_part_tracker_snapshot` already degrades to a warning if it
-            // cannot take the read lock within its own 2 s bound.
-            tokio::spawn(async move {
-                let tracker_saves = futures::future::join_all(disconnect_trackers.into_iter().map(
-                    |(tid, tracker)| async move {
-                        save_part_tracker_snapshot(tracker, &tid, "disconnect").await;
-                    },
-                ));
-                if tokio::time::timeout(std::time::Duration::from_secs(8), tracker_saves)
-                    .await
-                    .is_err()
-                {
-                    warn!("Timed out saving some .part.met file(s) during disconnect");
-                }
-            });
-
-            // Cancel each active download's control BEFORE aborting its worker
-            // handle. The per-source connection tasks are detached
-            // `tokio::spawn`s; aborting the worker handle does NOT abort them,
-            // so without cancelling the shared control they keep their TCP
-            // connections open and keep transferring even though the network is
-            // logically disconnected. Cancelling trips the cooperative
-            // `check_control` at the top of each source loop so they bail and
-            // drop their sockets. The re-queue below registers fresh controls
-            // for the resume-on-reconnect entries, so this only affects the
-            // now-dead generation.
-            {
-                let mgr = transfer_manager.read().await;
-                for tid in state.download_handles.keys() {
-                    if let Some(control) = mgr.get_control(tid) {
-                        control.cancel();
-                    }
-                }
-            }
-
-            for (tid, handle) in state.download_handles.drain() {
-                handle.abort();
-                tokio::spawn(async move {
-                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
-                    debug!("Aborted download task {tid} on KAD disconnect");
-                });
-            }
-
-            // Clear the registry — tasks are gone, trackers are saved.
-            state.tracker_registry.lock().clear();
-            state.active_source_senders.clear();
-            // Lockstep cleanup — KAD disconnect tears down all
-            // workers, so the established-source channel map must be
-            // cleared too. Without this, on reconnect new downloads
-            // would create new entries while stale closed senders
-            // remain forever.
-            state.active_established_senders.clear();
-            state.active_source_overflow.clear();
-            state.active_kad_search_state.clear();
-
-            // Move all active downloads back to pending so they can be
-            // restarted when the network is reconnected.
-            {
-                let mut mgr = transfer_manager.write().await;
-                let active_tids: Vec<String> = mgr
-                    .get_all()
-                    .iter()
-                    .filter(|t| {
-                        t.status == TransferStatus::Active
-                            && t.direction == TransferDirection::Download
-                    })
-                    .map(|t| t.id.clone())
-                    .collect();
-                for tid in &active_tids {
-                    if state.pending_downloads.contains_key(tid) {
-                        continue;
-                    }
-                    if let Some(t) = mgr.get_transfer(tid).cloned() {
-                        let control = TransferControl::new();
-                        mgr.register_control(tid, control.clone());
-                        mgr.update_sources(tid, t.sources, 0, 0);
-                        mgr.update_status(tid, TransferStatus::Searching);
-                        insert_pending_download_bounded(
-                            &mut state.pending_downloads,
-                            tid.clone(),
-                            PendingDownload {
-                                transfer_id: tid.clone(),
-                                file_hash: t.file_hash.clone(),
-                                file_name: t.file_name.clone(),
-                                file_size: t.total_size,
-                                expected_aich: t.expected_aich.clone(),
-                                control,
-                                search_count: 0,
-                                last_search_at: None,
-                                priority: priority_str_to_u32(&t.priority),
-                            },
-                        );
-                        if let Some(pfs) = state.per_file_sources.get_mut(tid) {
-                            pfs.reset_active_states();
-                        }
-                        let _ = app_handle.emit(
-                            "transfer-status",
-                            serde_json::json!({
-                                "id": tid,
-                                "status": "searching",
-                                "sources": t.sources,
-                            }),
-                        );
-                    }
-                }
-            }
-
-            // Disconnecting does NOT stop serving uploads, and nothing here
-            // touches the upload listener.
-            //
-            // eMule's own global Disconnect is three calls — `StopConnectionTry`,
-            // `serverconnect->Disconnect()` and `Kademlia::CKademlia::Stop()`
-            // (`emuleDlg.cpp`, `CemuleDlg::CloseConnection`) — and none of them
-            // goes near the listen socket. `CListenSocket::StopListening` is
-            // called from exactly one place, `OnAccept` shedding load when there
-            // are too many sockets (`ListenSocket.cpp:2014`), never from a
-            // disconnect. So a disconnected eMule keeps accepting: a peer holding
-            // a queue slot, or one that learned our address by source exchange,
-            // can still finish its download. That is why a queue survives a
-            // reconnect.
-            //
-            // Stop the outbound half — no new download workers, no friend
-            // dials, no server search — but only when leaving KAD actually
-            // leaves the node with no eD2K transport at all.
-            //
-            // KAD off with a server still connected is a normal eMule mode, not
-            // an offline node, and this is the command's only caller: the
-            // Disconnect button in the KAD Network page header. Raising the
-            // outbound gate unconditionally is what made leaving one network
-            // read as going offline, and it is why the upload exemption keyed on
-            // a live server session could never fire — this handler used to
-            // tear that session down itself a few lines later.
-            // `pending_server_connect` counts: this handler deliberately lets a
-            // connect in flight finish, and its completion arm sets
-            // `server_connected` without ever clearing `user_offline`. Reading
-            // that third state as "offline" stranded a node that went on to get
-            // a perfectly good HighID session with its outbound half suppressed
-            // for the rest of the run — no new download workers, no friend
-            // dials, no UDP global search — and nothing to lift it. The window
-            // is seconds wide on startup with `auto_connect_server`.
-            let server_session_survives = state.server_connected
-                || state.server_connection.is_some()
-                || state.pending_server_connect.is_some();
-            state.user_offline.store(
-                !server_session_survives,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-
-            state.stats.status = NetworkStatus::Disconnected;
-            state.stats.connected_peers = 0;
-            state.stats.external_ip = surviving_highid
-                .map(|ip| ip.to_string())
-                .unwrap_or_default();
-            state.stats.firewalled = state.firewalled;
-            state.stats.buddy_status = "none".to_string();
-            state.stats.stores_acknowledged = 0;
-            let _ = app_handle.emit("network-status", NetworkStatus::Disconnected);
-
-            // The eD2K server session is deliberately left alone, including a
-            // connect still in flight. KAD and the server are independent
-            // networks in eMule and in the protocol, and using one without the
-            // other is ordinary: server-only with KAD disabled, or KAD-only
-            // with no server. The server's own Disconnect is
-            // `NetworkCommand::DisconnectServer`, reached from the Servers
-            // page, and it is equally careful not to touch KAD.
-
-            // Deliberately not "all activity stopped": the Ember overlay has no
-            // off switch and keeps its DHT, channel transfers and publishing
-            // republish cycle running by design, and uploads keep serving (see
-            // the note above). What this tears down is KAD itself, friend
-            // sessions and the active download workers.
-            if server_session_survives {
-                info!("KAD disconnected — eD2K server session left connected");
-            } else {
-                info!("KAD disconnected — no eD2K transport left, outbound work stopped");
-            }
         }
 
         NetworkCommand::KadBootstrapIp { ip, port, tx } => {
@@ -5004,7 +4566,7 @@ async fn handle_command_inner(
             let count = contacts.len();
             info!("KAD bootstrap from {count} downloaded contact(s)");
             for c in &contacts {
-                state.routing_table.insert(c.clone());
+                state.routing_table.insert_if_new(c.clone());
             }
             for contact in contacts.iter().take(20) {
                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
@@ -5390,7 +4952,7 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(()));
         }
 
-        NetworkCommand::SetFilesShared { updates, tx } => {
+        NetworkCommand::SetFilesShared { updates, origin, tx } => {
             let mut parsed = Vec::with_capacity(updates.len());
             let mut error = None;
             for (file_hash_hex, shared) in updates {
@@ -5499,7 +5061,10 @@ async fn handle_command_inner(
                         .collect();
                     if !strays.is_empty() {
                         if let Err(rollback_error) =
-                            crate::storage::share_intent::set_explicit_batch(&strays)
+                            crate::storage::share_intent::set_explicit_batch_from(
+                                &strays,
+                                crate::storage::share_intent::UnshareOrigin::Unknown,
+                            )
                         {
                             error!(
                                 "Failed to withdraw share intent after a known.met save failure; \
@@ -5513,7 +5078,9 @@ async fn handle_command_inner(
                     return;
                 }
                 if !denies.is_empty() {
-                    if let Err(e) = crate::storage::share_intent::set_explicit_batch(&denies) {
+                    if let Err(e) =
+                        crate::storage::share_intent::set_explicit_batch_from(&denies, origin)
+                    {
                         *known_files = before.clone();
                         let ownership = state.known_met_save_lock.clone().lock_owned().await;
                         let known_path = state.data_dir.join("known.met");
@@ -5665,6 +5232,11 @@ async fn handle_command_inner(
             let _ = tx.send(result);
         }
 
+        NetworkCommand::RetryChatAttachment { xfer_id, tx } => {
+            let result = super::chat_attach::retry(state, db, app_handle, settings, xfer_id).await;
+            let _ = tx.send(result);
+        }
+
         NetworkCommand::ForgetKnownPaths { paths } => {
             let forgotten = known_files.forget_paths(&paths);
             debug!("known.met forgot {forgotten} of {} gone paths", paths.len());
@@ -5706,6 +5278,35 @@ async fn handle_command_inner(
                 let _ = tx.send(Err(error));
                 return;
             }
+            // The share intent's copy first, so a restriction outlives a lost
+            // or partly read known.met. Off the loop: it is an fsync'd write.
+            // A restriction it cannot record still stands on known.met (or the
+            // caller's pending intents). A lift it cannot record fails here,
+            // before known.met changes: left behind, the intent's entry would
+            // put the restriction straight back at the next reconcile.
+            let intent_updates = parsed.clone();
+            let intent_result = tokio::task::spawn_blocking(move || {
+                let previous: Vec<([u8; 16], bool)> = intent_updates
+                    .iter()
+                    .map(|(hash, _)| (*hash, crate::storage::share_intent::is_friends_only(hash)))
+                    .collect();
+                crate::storage::share_intent::set_friends_only_batch(&intent_updates)
+                    .map(|_| previous)
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|result| result.map_err(|e| e.to_string()));
+            let intent_previous = match intent_result {
+                Ok(previous) => Some(previous),
+                Err(e) if parsed.iter().any(|(_, friends_only)| !friends_only) => {
+                    let _ = tx.send(Err(format!("Failed to persist file share scope: {e}")));
+                    return;
+                }
+                Err(e) => {
+                    warn!("Could not record friends-only choices in the share intent: {e}");
+                    None
+                }
+            };
             let before = known_files.clone();
             let mut unrecorded = Vec::new();
             for (hash, friends_only) in &parsed {
@@ -5735,6 +5336,18 @@ async fn handle_command_inner(
                 match save_result {
                     Err(e) => {
                         *known_files = before;
+                        // The caller rolls its rows back on this error, so the
+                        // intent goes back too, or it would bring the change
+                        // the user was told failed back at the next reconcile.
+                        if let Some(previous) = intent_previous {
+                            let restored = tokio::task::spawn_blocking(move || {
+                                crate::storage::share_intent::set_friends_only_batch(&previous)
+                            })
+                            .await;
+                            if !matches!(restored, Ok(Ok(_))) {
+                                warn!("Could not roll back friends-only choices in the share intent");
+                            }
+                        }
                         let _ = tx.send(Err(format!("Failed to persist file share scope: {e}")));
                         return;
                     }
@@ -6436,8 +6049,12 @@ async fn handle_command_inner(
             message,
             tx,
         } => {
-            if settings.friend_chat_disabled {
-                let _ = tx.send(Err("Chat is disabled in Friends settings".into()));
+            if !settings.chat_allowed_with(&friend_eh) {
+                let _ = tx.send(Err(if settings.friend_chat_disabled {
+                    "Chat is disabled in Friends settings".into()
+                } else {
+                    "Chat is disabled for this friend".into()
+                }));
             } else if !friend_hashes.read().await.contains(&friend_eh) {
                 let _ = tx.send(Err("Can only chat with friends".into()));
             } else {
@@ -6828,7 +6445,7 @@ async fn handle_command_inner(
             ember_hash: friend_eh,
             typing,
         } => {
-            if settings.friend_chat_disabled || !friend_hashes.read().await.contains(&friend_eh) {
+            if !settings.chat_allowed_with(&friend_eh) || !friend_hashes.read().await.contains(&friend_eh) {
                 return;
             }
             let _ = send_encrypted_chat_ext(
@@ -6845,8 +6462,7 @@ async fn handle_command_inner(
             ember_hash: friend_eh,
             body_hash,
         } => {
-            if settings.friend_chat_disabled
-                || !settings.friend_chat_read_receipts
+            if !settings.read_receipts_with(&friend_eh)
                 || !friend_hashes.read().await.contains(&friend_eh)
             {
                 return;
@@ -7223,6 +6839,7 @@ async fn handle_command_inner(
             state.friend_reconnect_last.remove(&removed_hash);
             state.recent_ember_chat.remove(&removed_hash);
             super::browse::forget_friend_scope(removed_hash);
+            super::chat_attach::forget_friend(state, settings, &removed_hash);
 
             if let Some(pending) = state.pending_browse_requests.remove(&removed_hash) {
                 for request in pending {
@@ -7496,43 +7113,6 @@ async fn handle_command_inner(
             );
 
             let _ = tx.send(Ok(()));
-        }
-
-        NetworkCommand::GetPeerReputation { user_hash, tx } => {
-            // Apply any pending hourly decay before snapshotting so the UI
-            // shows the same score the tracker would act on, not a stale
-            // pre-decay value.
-            state.reputation.maybe_decay();
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let manual_banned = shared_banned_hashes
-                .read()
-                .map(|s| s.contains(&user_hash))
-                .unwrap_or(false);
-            let info = match state.reputation.get_peer(&user_hash) {
-                Some(p) => Some(PeerReputationInfo {
-                    score: p.score,
-                    successful_transfers: p.successful_transfers,
-                    failed_transfers: p.failed_transfers,
-                    is_banned: p.is_banned(now) || manual_banned,
-                    first_seen: p.first_seen,
-                    last_interaction: p.last_interaction,
-                }),
-                // Manual ban with no tracker history still needs a row so
-                // the Known Clients Trust column shows "banned".
-                None if manual_banned => Some(PeerReputationInfo {
-                    score: 0,
-                    successful_transfers: 0,
-                    failed_transfers: 0,
-                    is_banned: true,
-                    first_seen: now,
-                    last_interaction: now,
-                }),
-                None => None,
-            };
-            let _ = tx.send(info);
         }
 
         NetworkCommand::GetPeerReputationBatch { user_hashes, tx } => {

@@ -91,7 +91,7 @@ pub fn signing_key_from_bytes(bytes: &[u8; 32]) -> SigningKey {
 /// Production hashing streams through [`Blake3FileHasher`] instead, since
 /// shared files are too large to hold in memory; this one-shot form backs
 /// the tests that pin the two against each other.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn blake3_hash_file(data: &[u8]) -> [u8; 32] {
     *blake3::hash(data).as_bytes()
 }

@@ -158,7 +158,7 @@ pub fn encrypt_send_server(payload: &[u8], base_key: u32) -> Vec<u8> {
 }
 
 /// Result of a server-obfuscation decrypt attempt.
-pub enum DecryptOutcome<'a> {
+pub enum DecryptOutcome {
     /// The packet's first byte is `0xE3` — it's plain, no obfuscation
     /// applied. Caller should parse `data` directly.
     Plain,
@@ -177,11 +177,6 @@ pub enum DecryptOutcome<'a> {
     InvalidPadding,
     /// `base_key` was 0 — caller must skip decryption.
     NoKey,
-    #[allow(dead_code)]
-    /// Reserved for future use (e.g. an explicit "this peer is on the
-    /// banned list" gate). Currently never returned; included so callers
-    /// that exhaustively match get a stable surface.
-    Rejected(&'a str),
 }
 
 /// Try to interpret an inbound UDP datagram as either plain or
@@ -196,7 +191,7 @@ pub enum DecryptOutcome<'a> {
 ///
 /// `base_key` must be the server's known `dwServerUDPKey`; pass 0 to
 /// short-circuit (returns `NoKey`).
-pub fn decrypt_received_server(data: &[u8], base_key: u32) -> DecryptOutcome<'static> {
+pub fn decrypt_received_server(data: &[u8], base_key: u32) -> DecryptOutcome {
     if data.is_empty() {
         return DecryptOutcome::TooShort;
     }
@@ -406,7 +401,7 @@ mod tests {
         );
     }
 
-    fn outcome_label(o: &DecryptOutcome<'_>) -> &'static str {
+    fn outcome_label(o: &DecryptOutcome) -> &'static str {
         match o {
             DecryptOutcome::Plain => "Plain",
             DecryptOutcome::Decrypted(_) => "Decrypted",
@@ -414,7 +409,6 @@ mod tests {
             DecryptOutcome::TooShort => "TooShort",
             DecryptOutcome::InvalidPadding => "InvalidPadding",
             DecryptOutcome::NoKey => "NoKey",
-            DecryptOutcome::Rejected(_) => "Rejected",
         }
     }
 }

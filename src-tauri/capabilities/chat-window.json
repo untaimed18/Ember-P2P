@@ -1,10 +1,18 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "identifier": "chat-window",
-  "description": "The popped-out chat window. It needs events (every chat update arrives as one, and it reports what it shows to the main window) and to follow the theme; it does not get `process:allow-restart`. Opening, closing and focusing windows go through Ember's own commands, so no window-management permission is granted here.",
+  "description": "The popped-out chat window, granted only what its code calls: events (every chat update arrives as one, and it reports what it shows to the main window; `onMoved`, `onResized` and `onThemeChanged` are event listeners too), the window reads it uses to remember its bounds, and reading and setting its theme. It does not get `core:default` (no tray, menu, image, path or webview access) or `process:allow-restart`. Opening, closing and focusing windows go through Ember's own commands, so no window-management permission is granted here.",
   "windows": ["chat"],
   "permissions": [
-    "core:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:event:allow-emit",
+    "core:window:allow-is-minimized",
+    "core:window:allow-is-maximized",
+    "core:window:allow-scale-factor",
+    "core:window:allow-outer-position",
+    "core:window:allow-inner-size",
+    "core:window:allow-theme",
     "core:window:allow-set-theme"
   ]
 }

@@ -950,35 +950,19 @@ impl PartTracker {
             .count()
     }
 
-    pub fn needed_parts(&self, available: &[bool]) -> Vec<usize> {
-        (0..self.part_count)
-            .filter(|&i| {
-                !self.is_part_complete(i)
-                    && (available.is_empty() || available.get(i).copied().unwrap_or(false))
-            })
-            .collect()
-    }
-
     pub fn part_range(&self, part_idx: usize) -> (u64, u64) {
         let start = part_idx as u64 * PARTSIZE;
         let end = ((part_idx as u64 + 1) * PARTSIZE).min(self.file_size);
         (start, end)
     }
 
-    /// Count bytes a peer just sent us, whether or not they were needed.
+    /// The wire-byte counter, for counting bytes a peer just sent us without
+    /// the tracker lock, whether or not they were needed.
     ///
     /// Mirrors eMule's `m_uTransferred += transize` (`PartFile.cpp:3957`), which
     /// runs before the gap check and so includes duplicate ranges and the
     /// compressed payload. Uncapped: eMule's figure routinely passes the file
     /// size on a download that re-fetched a corrupt part.
-    ///
-    /// Takes `&self`, so a caller holding only a read guard can count. Prefer
-    /// [`Self::transferred_counter`] on a hot path and skip the lock entirely.
-    pub fn add_transferred(&self, wire_bytes: u64) {
-        self.transferred.fetch_add(wire_bytes, Ordering::Relaxed);
-    }
-
-    /// The wire-byte counter itself, for incrementing without the tracker lock.
     pub fn transferred_counter(&self) -> Arc<AtomicU64> {
         self.transferred.clone()
     }
@@ -1687,7 +1671,7 @@ impl PartTracker {
     /// Whether any source worker currently claims `part_idx`. Production code
     /// wants the whole bitmap ([`Self::in_progress_flags`]) for the chunk
     /// selector; this is the single-part form used by tests.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_in_progress(&self, part_idx: usize) -> bool {
         self.in_progress_claims
             .get(part_idx)
@@ -1796,8 +1780,7 @@ impl PartTracker {
         }
     }
 
-    /// Currently reserved write sub-ranges (tests / diagnostics).
-    #[allow(dead_code)]
+    /// Currently reserved write sub-ranges.
     pub fn write_reservation_count(&self) -> usize {
         self.write_reservations.len()
     }
@@ -2460,9 +2443,10 @@ mod tests {
         assert_eq!(tracker.transferred(), 0);
 
         // 40 bytes land, then the same 40 arrive again from a second source.
-        tracker.add_transferred(40);
+        let counter = tracker.transferred_counter();
+        counter.fetch_add(40, Ordering::Relaxed);
         tracker.fill_range(0, 40);
-        tracker.add_transferred(40);
+        counter.fetch_add(40, Ordering::Relaxed);
 
         assert_eq!(
             tracker.transferred(),
@@ -2477,7 +2461,7 @@ mod tests {
 
         // Re-fetching the whole file pushes Transferred past the file size, which
         // eMule allows and the UI must not cap.
-        tracker.add_transferred(100);
+        counter.fetch_add(100, Ordering::Relaxed);
         assert!(tracker.transferred() > tracker.file_size);
 
         let expected = tracker.transferred();
@@ -3232,7 +3216,6 @@ mod tests {
             assert_eq!(tracker.gap_list(), &[(0, file_size)], "size {file_size}");
             assert!(!tracker.all_complete(), "size {file_size}");
             assert_eq!(tracker.completed_bytes(), 0, "size {file_size}");
-            assert!(tracker.needed_parts(&[]).is_empty(), "size {file_size}");
             assert!(tracker.completed_parts().is_empty(), "size {file_size}");
             assert!(tracker.serveable_parts().is_empty(), "size {file_size}");
             assert!(

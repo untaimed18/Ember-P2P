@@ -1,6 +1,6 @@
 [package]
 name = "ember"
-version = "1.7.1"
+version = "1.7.2"
 description = "A decentralized P2P file sharing application"
 authors = ["untaimed18"]
 license = "GPL-3.0-only"
@@ -81,6 +81,9 @@ tauri-plugin-process = "2"
 # JS API is not exposed to the webview, so the text is composed (and localized)
 # in the frontend and the OS call is made here.
 tauri-plugin-notification = "2"
+# Launch at sign-in, driven by the `launch_at_login` setting. Used directly
+# rather than through `tauri-plugin-autostart`; see `login_launch.rs`.
+auto-launch = "0.6"
 # Clipboard access for the copy/paste affordances (eD2K links, Ember IDs,
 # channel invites). The webview's own `navigator.clipboard` is not a
 # substitute — WebKitGTK, the Linux webview, refuses programmatic reads
@@ -107,7 +110,7 @@ arboard = { version = "3", default-features = false, features = ["wayland-data-c
 tauri-plugin-updater = "2"
 rsa = "0.9"
 num-bigint-dig = "0.8"
-opener = "0.8"
+opener = "0.9"
 crc32fast = "1"
 zeroize = { version = "1", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
@@ -130,7 +133,7 @@ x509-cert = { version = "0.3", default-features = false }
 strsim = "0.11"
 zip = "8"
 fs2 = "0.4"
-maxminddb = "0.29"
+maxminddb = "0.32"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 parking_lot = "0.12"
 # Direct `notify` rather than `notify-debouncer-mini`: the mini crate drops
@@ -155,9 +158,19 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 # pull in a second, incompatible hashing stack.
 hkdf = "0.12"
 argon2 = "0.5"
+# Library deletes go to the Recycle Bin / Trash, so a delete is recoverable and
+# a compromised webview cannot wipe shared folders for good.
+trash = "5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# The copy `tauri-plugin-dialog` already links, for the one dialog a launch
+# that ends inside `setup` shows: a database that cannot be opened. Not on
+# Linux, where its GTK dialog would wait on the main context the event loop
+# already holds.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+rfd = { version = "0.16", default-features = false, features = ["common-controls-v6"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["apple-native"] }
@@ -165,7 +178,7 @@ keyring = { version = "3", default-features = false, features = ["apple-native"]
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["sync-secret-service"] }
 # D-Bus for the sleep inhibitor (`src/power.rs`) and the tray-host probe
-# (`src/tray_host.rs`). The same crate and major version `notify-rust` already
+# (`src/tray.rs`). The same crate and major version `notify-rust` already
 # links for desktop notifications, so this adds no second D-Bus stack.
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 
@@ -184,6 +197,9 @@ windows-sys = { version = "0.61", features = [
     # `SetThreadExecutionState`, the sleep inhibitor held during transfers
     # (see `src/power.rs`).
     "Win32_System_Power",
+    # `RegGetValueW`, to tell a missing launch-at-sign-in `Run` value from one
+    # the user disabled in Task Manager (see `src/login_launch.rs`).
+    "Win32_System_Registry",
     "Win32_System_Threading",
 ] }
 

@@ -23,11 +23,22 @@
   import { shortcutModAria, shortcutModSymbol } from '$lib/platform';
   import { isShortcutLetter } from '$lib/shortcutKey';
   import { appSettings } from '$lib/stores/settings';
+  import { runLatestUndo, toastError } from '$lib/stores/toast';
+  import { openSupportPage } from '$lib/api/settings';
+  import { translateError } from '$lib/i18n';
   import { onMount } from 'svelte';
 
   let aboutOpen = $state(false);
   let shortcutsOpen = $state(false);
   let shareOpen = $state(false);
+
+  async function openCoffee() {
+    try {
+      await openSupportPage();
+    } catch (e) {
+      toastError(translateError(e));
+    }
+  }
   // Shared with the keyboard cheat-sheet so Alt+N is numbered against the
   // list the user can actually see.
   let visibleNav = $derived(visibleNavItems($appSettings?.ember_native_enabled));
@@ -295,6 +306,8 @@
   function isTypingTarget(t: EventTarget | null): boolean {
     if (!(t instanceof HTMLElement)) return false;
     const tag = t.tagName;
+    // A checkbox, radio or button input takes no text.
+    if (t instanceof HTMLInputElement && ['checkbox', 'radio', 'button', 'submit', 'reset'].includes(t.type)) return false;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
     if (t.isContentEditable) return true;
     return false;
@@ -326,6 +339,14 @@
       return;
     }
     if (modalOpen) return;
+    // Ctrl/Cmd+Z takes the newest Undo toast (a cancel, a removal), which is
+    // otherwise the last thing in the tab order. Typing keeps the field's own
+    // undo.
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && isShortcutLetter(e, 'z')) {
+      if (isTypingTarget(e.target)) return;
+      if (runLatestUndo()) e.preventDefault();
+      return;
+    }
     // Ctrl/Cmd+B toggles the sidebar. Matches VS Code/Slack/Discord
     // convention and frees up horizontal space for data-dense pages
     // without the user needing to reach for the mouse. Blocked while
@@ -489,7 +510,7 @@
             {/if}
           </span>
           <span class="nav-label">{item.label()}</span>
-          {#if item.id === 'channels'}
+          {#if item.id === 'channels' || item.id === 'friends'}
             <span class="beta-badge">{m.common_beta()}</span>
           {/if}
           {#if item.id === 'transfers' && activeTransferCount > 0}
@@ -605,6 +626,26 @@
         </svg>
       </span>
       <span>{m.sidebar_share_ember()}</span>
+    </button>
+    <!-- Always there, never in the way: a row like its neighbours, with only
+         the cup in colour. No badge, no pulse, nothing that asks twice. -->
+    <button
+      type="button"
+      class="about-btn coffee-btn"
+      onclick={() => void openCoffee()}
+      title={m.support_button_title()}
+      aria-label={m.support_button_title()}
+    >
+      <span class="about-icon" aria-hidden="true">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path class="coffee-steam" d="M7 2.5c-.75.8-.75 1.8 0 2.6" />
+          <path class="coffee-steam coffee-steam-late" d="M10 2.5c-.75.8-.75 1.8 0 2.6" />
+          <path class="coffee-cup" d="M3.5 7.5h10v3.6a4.4 4.4 0 0 1-4.4 4.4H7.9a4.4 4.4 0 0 1-4.4-4.4z" />
+          <path d="M13.5 8.75h1.1a2.3 2.3 0 0 1 0 4.6h-1.35" />
+          <line x1="2.5" y1="17.75" x2="14.5" y2="17.75" />
+        </svg>
+      </span>
+      <span class="coffee-label">{m.support_button()}</span>
     </button>
     <div class="footer-sep" aria-hidden="true"></div>
     <button
@@ -839,6 +880,58 @@
     outline: 2px solid var(--accent);
     outline-offset: -2px;
     background: var(--bg-hover);
+  }
+
+  /* Buy Me a Coffee's yellow, on the cup only: enough to find it, too little
+     to nag. The row itself is as quiet as the others until hovered. */
+  .coffee-btn {
+    --coffee-yellow: #ffdd00;
+  }
+
+  .coffee-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .coffee-btn .coffee-cup {
+    fill: var(--coffee-yellow);
+    fill-opacity: 0.85;
+  }
+
+  .coffee-btn .coffee-steam {
+    opacity: 0;
+    transform-box: fill-box;
+  }
+
+  .coffee-btn:hover,
+  .coffee-btn:focus-visible {
+    /* Amber rather than the cup's yellow: yellow over the blue-grey hover
+       tint mixes to olive. */
+    background: color-mix(in srgb, #ffa800 8%, var(--bg-hover));
+    color: var(--text-primary);
+  }
+
+  .coffee-btn:hover .coffee-steam {
+    animation: coffee-steam 1.4s ease-in-out infinite;
+  }
+
+  .coffee-btn:hover .coffee-steam-late {
+    animation-delay: 0.35s;
+  }
+
+  @keyframes coffee-steam {
+    0% { opacity: 0; transform: translateY(1.5px); }
+    40% { opacity: 0.85; }
+    100% { opacity: 0; transform: translateY(-2px); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .coffee-btn:hover .coffee-steam {
+      animation: none;
+      opacity: 0.7;
+    }
   }
 
   /* Collapse is a window control rather than one of the four things you open

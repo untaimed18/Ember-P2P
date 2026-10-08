@@ -101,6 +101,28 @@ describe('shouldNotify', () => {
     }
   });
 
+  it("lets one friend's own setting win over the category, but not the master switch", () => {
+    const ana = '0123456789abcdef0123456789abcdef';
+    appSettings.set(
+      settingsWith({
+        notify_friend_online: false,
+        friend_overrides: { [ana]: { notify_online: true, notify_messages: false } },
+      }),
+    );
+    expect(shouldNotify('friend_online', ana)).toBe(true);
+    expect(shouldNotify('friend_online')).toBe(false);
+    expect(shouldNotify('friend_message', ana)).toBe(false);
+    expect(shouldNotify('friend_message')).toBe(true);
+
+    appSettings.set(
+      settingsWith({
+        notifications_enabled: false,
+        friend_overrides: { [ana]: { notify_online: true } },
+      }),
+    );
+    expect(shouldNotify('friend_online', ana)).toBe(false);
+  });
+
   it('notifies for a visible-but-unfocused window', () => {
     // A window sitting behind the editor on a second monitor is not being
     // watched, even though `visibilityState` still says "visible".

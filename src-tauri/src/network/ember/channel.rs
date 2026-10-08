@@ -31,7 +31,7 @@ const HANDOFF_KEY_PREFIX: &[u8] = b"ember:channel:handoff:v1";
 const EPOCH_KEY_PREFIX: &[u8] = b"ember:channel:epoch:v1";
 const CLAIM_KEY_PREFIX: &[u8] = b"ember:channel:claim:v1";
 const EPOCH_AAD_DOMAIN: &[u8] = b"ember-channel-key-epoch-v1\0";
-const EPOCH_ENVELOPE_VERSION: u8 = 1;
+pub const EPOCH_ENVELOPE_VERSION: u8 = 1;
 /// `version(1) + nonce + key(32) + tag`.
 pub const EPOCH_ENVELOPE_LEN: usize = 1 + GOSSIP_NONCE_LEN + 32 + GOSSIP_TAG_LEN;
 const HANDOFF_OFFER_DOMAIN: &[u8] = b"ember-channel-handoff-offer-v1\0";
@@ -540,6 +540,45 @@ pub fn handoff_republish_due(
     }
     HandoffRepublish::Publish
 }
+
+/// How often the signer of a finished move republishes its record. A quarter
+/// of the day older storers keep it for, as the owner does for moderation.
+pub const HANDOFF_RETIRED_REPUBLISH_SECS: i64 = 6 * 3600;
+/// How long after a move its signer keeps republishing. A member away longer
+/// than this, plus the record's own life on storers that keep it a month,
+/// finds the old room silent.
+pub const HANDOFF_RETIRED_KEEP_SECS: i64 = 90 * 86_400;
+/// Least gap between publishes of a handoff an owner committed to on finding
+/// its nominee's claim. Not bounded by an offer's window, because there was
+/// no offer: the members are already following the claim, and the record is
+/// what brings the rest of them along.
+pub const HANDOFF_CLAIMED_REPUBLISH_SECS: i64 = 5 * 60;
+/// How long after coming back from a claimable silence an owner still takes a
+/// claim it finds as one the silence allowed: a dozen of its handoff fetches.
+///
+/// Past that, finding a claim shows only that the claimant has one out now.
+/// They re-sign it every few hours and choose the time they sign it with, so
+/// neither its date nor the stamp it cites can show it was made before we came
+/// back; a claim first published since then is a race against our return.
+pub const OWNER_RETURN_CLAIM_WINDOW_SECS: i64 = 12 * HANDOFF_FETCH_SECS;
+
+/// Whether a succession claim citing `witnessed_ts` is one the members could
+/// rightly have honoured while we, the owner, were silent from `silent_from`
+/// (our last stamp before going quiet) until `silent_until` (the first after).
+///
+/// It has to cite that last stamp or something newer — the members it was
+/// shown to held at least that — and its window has to have run out before we
+/// came back, or the claimant raced our return rather than our absence.
+pub fn claim_fits_owner_silence(
+    witnessed_ts: i64,
+    silent_from: i64,
+    silent_until: i64,
+    claim_after_days: i64,
+) -> bool {
+    claim_after_days > 0
+        && witnessed_ts >= silent_from
+        && witnessed_ts.saturating_add(claim_after_days.saturating_mul(86_400)) <= silent_until
+}
 // --- Ember Transfer -------------------------------------------------------
 //
 // One member hands a file to one other member. Nothing is broadcast: the
@@ -654,6 +693,70 @@ pub fn channel_id_from_pubkey(pubkey: &[u8; 32]) -> [u8; 16] {
 /// channels carry an extra 32-byte secret in the invite.
 pub fn public_join_secret(channel_pubkey: &[u8; 32]) -> [u8; 32] {
     *channel_pubkey
+}
+
+/// BLAKE3 `derive_key` context for a room seed this identity owns.
+const OWNED_ROOM_SEED_CONTEXT: &str = "ember-channel-owned-room-seed-v1";
+/// BLAKE3 `derive_key` context for a private room's first content key, from
+/// its owner seed.
+const OWNED_JOIN_SECRET_CONTEXT: &str = "ember-channel-owned-join-secret-v1";
+
+/// Prefix of the DHT key an identity files its owned-rooms list under.
+const OWNED_ROOMS_KEY_PREFIX: &[u8] = b"ember:identity:owned-rooms:v1";
+
+/// Random part of a room seed this identity owns; see
+/// [`derive_owned_room_seed`].
+pub type OwnedRoomSalt = [u8; 16];
+
+/// The seed of the room this identity owns under `salt`.
+///
+/// A random seed per room made every room a secret of its own: a backup taken
+/// before it was created could not bring it back, so losing the device lost the
+/// room. Derived from the identity instead, the room comes back from the
+/// identity and the salt, and the salts travel in a list the identity signs and
+/// keeps on the network ([`owned_rooms_key`]), so one backup of the identity is
+/// enough for every room it will ever own.
+///
+/// The salt is random rather than a count, on purpose. A count would have to
+/// be proved unused before it was handed out again, and nothing on the network
+/// can prove that — a record can lapse or be withheld — so a wrong guess would
+/// give a second room the keys of a first. A random salt makes the worst a
+/// lost list can do losing the room, never sharing its keys.
+///
+/// One-way and domain-separated: a salt says nothing without the identity's
+/// secret, so the list does not reveal which rooms are this identity's.
+pub fn derive_owned_room_seed(identity_seed: &[u8; 32], salt: &OwnedRoomSalt) -> [u8; 32] {
+    let mut material = [0u8; 48];
+    material[..32].copy_from_slice(identity_seed);
+    material[32..].copy_from_slice(salt);
+    let seed = blake3::derive_key(OWNED_ROOM_SEED_CONTEXT, &material);
+    zeroize::Zeroize::zeroize(&mut material);
+    seed
+}
+
+/// A fresh salt for a room this identity is about to own.
+pub fn generate_owned_room_salt() -> OwnedRoomSalt {
+    let mut salt = [0u8; 16];
+    OsRng.fill_bytes(&mut salt);
+    salt
+}
+
+/// DHT key of the list of rooms `identity_pubkey` owns.
+pub fn owned_rooms_key(identity_pubkey: &[u8; 32]) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(OWNED_ROOMS_KEY_PREFIX);
+    hasher.update(identity_pubkey);
+    let hash = hasher.finalize();
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&hash.as_bytes()[..16]);
+    key
+}
+
+/// The first content key of a private room whose seed is `owner_seed`, so the
+/// owner can rebuild it from the seed. Later keys are random (see the rotation)
+/// and come back from the owner's own sealed copy instead.
+pub fn derive_owned_join_secret(owner_seed: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key(OWNED_JOIN_SECRET_CONTEXT, owner_seed)
 }
 
 pub fn generate_private_join_secret() -> [u8; 32] {
@@ -903,8 +1006,30 @@ fn epoch_aad(channel_id: &[u8; 16], epoch: i64) -> Vec<u8> {
 
 /// Storers cannot open an epoch blob, so they check only that it is the right
 /// shape — a truncated or padded one is dropped rather than stored to mislead.
+///
+/// The shape is only known for the version this build seals. A later version
+/// is stored on its leading byte alone, within the record size every store
+/// already enforces: refusing it would mean a later key scheme could not be
+/// published until every node on the network had updated, when only the room's
+/// own members need to read it. Version 0 was never written and is refused.
+///
+/// A storer keeps one record per publisher under a key, so a later version
+/// sealed under [`epoch_key`] replaces this one rather than sitting beside it.
+/// A build that wants members still on this version to keep reading has to
+/// file the later one under a key of its own.
 pub fn epoch_envelope_store_ok(extra: &[u8]) -> bool {
-    extra.len() == EPOCH_ENVELOPE_LEN && extra[0] == EPOCH_ENVELOPE_VERSION
+    match extra.first() {
+        Some(&EPOCH_ENVELOPE_VERSION) => extra.len() == EPOCH_ENVELOPE_LEN,
+        Some(&version) => version > EPOCH_ENVELOPE_VERSION && extra.len() > 1,
+        None => false,
+    }
+}
+
+/// Whether this build can open an epoch envelope's version. A sealed key in a
+/// version it cannot is a room that has moved to a newer Ember, not a key that
+/// has yet to arrive.
+pub fn epoch_envelope_version_supported(version: u8) -> bool {
+    version == EPOCH_ENVELOPE_VERSION
 }
 
 /// Rendezvous capability two channel members compute for each other.
@@ -1395,6 +1520,12 @@ pub struct ChannelGossip {
 // it still read, an impersonator would just send the old frame and the
 // signature would buy nothing.
 const CHAT_PLAIN_VERSION: u8 = 15;
+
+/// Whether an opened frame is a chat line by its leading byte, without the
+/// signature check `decode_channel_chat_plain` does.
+pub fn is_chat_plain(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&CHAT_PLAIN_VERSION)
+}
 // 2 was unsigned moderator gossip. Same hole chat closed: the content key
 // proves membership, not who sent the frame. Retired rather than accepted
 // alongside, or an impersonator would just send the old frame.
@@ -1410,6 +1541,12 @@ const HANDOFF_OFFER_PLAIN_VERSION: u8 = 6;
 // was not, so any content-key holder who saw the flooded offer could race the
 // nominee and point the DHT handoff at a successor they own.
 const HANDOFF_READY_PLAIN_VERSION: u8 = 17;
+/// A ready that also carries the successor key's signature over the same
+/// preimage, proving the nominee holds the key it names. A new number rather
+/// than a longer 17, because every build so far decodes 17 at exactly 137
+/// bytes and would drop a longer one; nominees send this beside the legacy
+/// frame, which is what owners on those builds still act on.
+const HANDOFF_READY_PROVEN_PLAIN_VERSION: u8 = 29;
 const MOD_SIG_DOMAIN: &[u8] = b"ember-channel-mod-author-v1\0";
 const SYNC_SIG_DOMAIN: &[u8] = b"ember-channel-sync-author-v1\0";
 const HANDOFF_READY_DOMAIN: &[u8] = b"ember-channel-handoff-ready-v1\0";
@@ -1485,6 +1622,141 @@ const XFER_SEEN_PLAIN_VERSION: u8 = 28;
 /// How long a sender waits to hear that its sealed offer was read before it
 /// asks whether to send the plain one as well.
 pub const XFER_PLAIN_OFFER_FALLBACK_SECS: u64 = 10;
+
+/// Lowest leading byte of an extension frame. Every kind from here up is laid
+/// out as [`ChannelExtFrame`]: `kind || flags || sender || signature || body`.
+///
+/// Every kind below this was given a layout of its own, which only a build
+/// that knows it can parse. One this build has never heard of fell through to
+/// the chat decoder and was dropped without being passed on, so in a room of
+/// mostly older members a new kind of frame reached only the newer members a
+/// newer member happened to be connected to. Builds that know this layout check
+/// an extension frame's author and pass it on whatever its kind, under the same
+/// rules a chat line meets, so a kind added later travels through them as far
+/// as chat does. Kinds 30 to 63 stay unassigned.
+pub const EXT_KIND_MIN: u8 = 64;
+/// Set on an extension frame a person would have seen: a reader that does not
+/// know the kind tells its user something here needs a newer Ember, rather
+/// than leaving a gap they cannot see. Unset for anything with nothing to show.
+pub const EXT_FLAG_DISPLAY: u8 = 0x01;
+const EXT_SIG_DOMAIN: &[u8] = b"ember-channel-ext-author-v1\0";
+/// `kind(1) + flags(1) + sender(32) + signature(64)`.
+const EXT_HEADER_LEN: usize = 1 + 1 + 32 + 64;
+
+/// An extension frame, its author checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelExtFrame {
+    pub kind: u8,
+    pub flags: u8,
+    pub sender: [u8; 32],
+    pub signature: [u8; 64],
+    pub body: Vec<u8>,
+}
+
+impl ChannelExtFrame {
+    pub fn displayable(&self) -> bool {
+        self.flags & EXT_FLAG_DISPLAY != 0
+    }
+}
+
+/// Extension kinds this build reads. None yet: a kind is added here by the
+/// build that first gives it a meaning, and every build before that passes it
+/// on and, if it is displayable, says so.
+const UNDERSTOOD_EXT_KINDS: &[u8] = &[];
+
+pub fn ext_kind_understood(kind: u8) -> bool {
+    UNDERSTOOD_EXT_KINDS.contains(&kind)
+}
+
+/// What an extension frame's author signs: the same room, id and time binding
+/// a chat line's signature has, and the kind and flags too, so neither can be
+/// changed by a member passing the frame on.
+fn ext_sig_preimage(
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+    kind: u8,
+    flags: u8,
+    sender: &[u8; 32],
+    body: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(EXT_SIG_DOMAIN.len() + 16 + 16 + 8 + 2 + 32 + body.len());
+    out.extend_from_slice(EXT_SIG_DOMAIN);
+    out.extend_from_slice(channel_id);
+    out.extend_from_slice(msg_id);
+    out.extend_from_slice(&timestamp.to_le_bytes());
+    out.push(kind);
+    out.push(flags);
+    out.extend_from_slice(sender);
+    out.extend_from_slice(body);
+    out
+}
+
+/// Build an extension frame. `None` for a kind below [`EXT_KIND_MIN`], which
+/// belongs to a layout of its own. No kind is sent yet; this is the one way a
+/// later one will be.
+#[allow(dead_code)]
+pub fn encode_channel_ext_frame(
+    signing_key: &SigningKey,
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+    kind: u8,
+    flags: u8,
+    body: &[u8],
+) -> Option<Vec<u8>> {
+    if kind < EXT_KIND_MIN {
+        return None;
+    }
+    let sender = signing_key.verifying_key().to_bytes();
+    let signature = crypto::sign(
+        signing_key,
+        &ext_sig_preimage(channel_id, msg_id, timestamp, kind, flags, &sender, body),
+    );
+    let mut out = Vec::with_capacity(EXT_HEADER_LEN + body.len());
+    out.push(kind);
+    out.push(flags);
+    out.extend_from_slice(&sender);
+    out.extend_from_slice(&signature);
+    out.extend_from_slice(body);
+    Some(out)
+}
+
+/// Read an extension frame, or nothing if it is not one or its author cannot
+/// be proved. Unknown flag bits are kept, not refused: they are signed, and a
+/// later build may give them a meaning.
+pub fn decode_channel_ext_frame(
+    bytes: &[u8],
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+) -> Option<ChannelExtFrame> {
+    if bytes.len() < EXT_HEADER_LEN || bytes[0] < EXT_KIND_MIN {
+        return None;
+    }
+    let kind = bytes[0];
+    let flags = bytes[1];
+    let mut sender = [0u8; 32];
+    sender.copy_from_slice(&bytes[2..34]);
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(&bytes[34..98]);
+    let body = &bytes[EXT_HEADER_LEN..];
+    let author = crypto::verifying_key_from_bytes(&sender)?;
+    if !crypto::verify(
+        &author,
+        &ext_sig_preimage(channel_id, msg_id, timestamp, kind, flags, &sender, body),
+        &signature,
+    ) {
+        return None;
+    }
+    Some(ChannelExtFrame {
+        kind,
+        flags,
+        sender,
+        signature,
+        body: body.to_vec(),
+    })
+}
 const TYPING_SIG_DOMAIN: &[u8] = b"ember-channel-typing-author-v1\0";
 const PRESENCE_BEACON_SIG_DOMAIN: &[u8] = b"ember-channel-presence-beacon-v1\0";
 const MOD_ACTION_BAN: u8 = 1;
@@ -2797,8 +3069,8 @@ pub fn typing_send_allow(
 /// Admit one inbound typing frame from `author` in `channel_id`, or refuse it.
 ///
 /// Its own map rather than the chat budget's: sharing it would let a member's
-/// typing spend the allowance their next line needs. Same refuse-when-full rule
-/// as [`author_gossip_allow`], for the same reason.
+/// typing spend the allowance their next line needs. Bounded the same way as
+/// [`author_gossip_allow`].
 pub fn typing_recv_allow(
     seen: &mut HashMap<([u8; 16], [u8; 32]), VecDeque<Instant>>,
     channel_id: [u8; 16],
@@ -2806,9 +3078,7 @@ pub fn typing_recv_allow(
     now: Instant,
 ) -> bool {
     let key = (channel_id, *author);
-    if seen.len() >= CHANNEL_GOSSIP_AUTHOR_CAP && !seen.contains_key(&key) {
-        return false;
-    }
+    make_room_in_rate_map(seen, &key, CHANNEL_GOSSIP_AUTHOR_CAP);
     rate_window_allow(
         seen.entry(key).or_default(),
         now,
@@ -3920,6 +4190,66 @@ pub fn decode_channel_handoff_ready(
     Some((sender, successor, version))
 }
 
+/// [`encode_channel_handoff_ready`] with the successor key's own signature
+/// over the same preimage appended.
+pub fn encode_channel_handoff_ready_proven(
+    signing_key: &SigningKey,
+    successor_signing_key: &SigningKey,
+    channel_id: &[u8; 16],
+    sender_pubkey: &[u8; 32],
+    version: u64,
+) -> Vec<u8> {
+    let successor_pubkey = successor_signing_key.verifying_key().to_bytes();
+    let mut out = encode_channel_handoff_ready(
+        signing_key,
+        channel_id,
+        sender_pubkey,
+        &successor_pubkey,
+        version,
+    );
+    out[0] = HANDOFF_READY_PROVEN_PLAIN_VERSION;
+    let proof = crypto::sign(
+        successor_signing_key,
+        &handoff_ready_preimage(channel_id, sender_pubkey, &successor_pubkey, version),
+    );
+    out.extend_from_slice(&proof);
+    out
+}
+
+/// Decode a ready that proves its successor key. Both signatures must verify:
+/// a frame claiming the proof and failing it is refused outright rather than
+/// read as the legacy ready it starts with.
+pub fn decode_channel_handoff_ready_proven(
+    bytes: &[u8],
+    channel_id: &[u8; 16],
+) -> Option<([u8; 32], [u8; 32], u64)> {
+    if bytes.len() != 137 + 64 || bytes[0] != HANDOFF_READY_PROVEN_PLAIN_VERSION {
+        return None;
+    }
+    let mut legacy = bytes[..137].to_vec();
+    legacy[0] = HANDOFF_READY_PLAIN_VERSION;
+    let (sender, successor, version) = decode_channel_handoff_ready(&legacy, channel_id)?;
+    let proof: [u8; 64] = bytes[137..].try_into().ok()?;
+    let vk = crypto::verifying_key_from_bytes(&successor)?;
+    if !crypto::verify(
+        &vk,
+        &handoff_ready_preimage(channel_id, &sender, &successor, version),
+        &proof,
+    ) {
+        return None;
+    }
+    Some((sender, successor, version))
+}
+
+/// Whether a successor key named for `channel_id` could be a room at all: a
+/// real Ed25519 point, and not the room it is meant to replace. Checked on
+/// every ready, proven or not, because an owner still has to act on legacy
+/// readies and those prove nothing about the key.
+pub fn handoff_successor_fits(channel_id: &[u8; 16], successor_pubkey: &[u8; 32]) -> bool {
+    crypto::verifying_key_from_bytes(successor_pubkey).is_some()
+        && channel_id_from_pubkey(successor_pubkey) != *channel_id
+}
+
 /// Extra blob for a DHT handoff record: version, successor pubkey/id, flags.
 pub fn encode_handoff_extra(
     version: u64,
@@ -4011,14 +4341,38 @@ pub fn rate_window_allow(
     true
 }
 
+/// Make a slot for `key` in a full per-author rate map by dropping the pair
+/// heard from longest ago.
+///
+/// The map is shared by every room, and it used to refuse anyone new once it
+/// was full. Throwaway keys cost nothing to make, so a handful of frames
+/// naming a few hundred of them shut every member this device was not already
+/// tracking out of every room, private ones included, for as long as the
+/// stream kept up. Dropping the stalest entry keeps the same bound on size and
+/// costs its owner only the rest of a short window; the newcomer is tracked
+/// from here on, so nothing is admitted untracked.
+fn make_room_in_rate_map<K: Eq + std::hash::Hash + Copy>(
+    seen: &mut HashMap<K, VecDeque<Instant>>,
+    key: &K,
+    cap: usize,
+) {
+    if seen.len() < cap || seen.contains_key(key) {
+        return;
+    }
+    // An empty window sorts first, being the one with nothing left to lose.
+    let stalest = seen
+        .iter()
+        .min_by_key(|(_, times)| times.back().copied())
+        .map(|(k, _)| *k);
+    if let Some(stalest) = stalest {
+        seen.remove(&stalest);
+    }
+}
+
 /// Admit one chat message from `author` in `channel_id`, or refuse it as a
 /// flood. Keyed on the room as well as the author so a member who is noisy in
-/// one room is not throttled in another.
-///
-/// Refuses outright once `CHANNEL_GOSSIP_AUTHOR_CAP` other pairs are tracked:
-/// the map is the only thing standing between a stream of invented authors and
-/// unbounded growth, and an admitted-but-untracked message would let exactly
-/// that stream past.
+/// one room is not throttled in another. Bounded at
+/// `CHANNEL_GOSSIP_AUTHOR_CAP` pairs; see [`make_room_in_rate_map`].
 pub fn author_gossip_allow(
     seen: &mut HashMap<([u8; 16], [u8; 32]), VecDeque<Instant>>,
     channel_id: [u8; 16],
@@ -4026,9 +4380,7 @@ pub fn author_gossip_allow(
     now: Instant,
 ) -> bool {
     let key = (channel_id, *author);
-    if seen.len() >= CHANNEL_GOSSIP_AUTHOR_CAP && !seen.contains_key(&key) {
-        return false;
-    }
+    make_room_in_rate_map(seen, &key, CHANNEL_GOSSIP_AUTHOR_CAP);
     let times = seen.entry(key).or_default();
     rate_window_allow(
         times,
@@ -4043,9 +4395,8 @@ pub fn author_gossip_allow(
 /// Deliberately its own budget rather than sharing the chat one. Answering a
 /// catch-up is the most expensive thing an unproven peer can ask us to do, and
 /// the honest rate is one request per room every few minutes, so the two are
-/// nowhere near each other. Shares the cap and the refuse-when-full rule with
-/// [`author_gossip_allow`] for the same reason: an untracked requester waved
-/// through is exactly the stream of invented identities the cap exists to stop.
+/// nowhere near each other. Shares the cap and the way a full map makes room
+/// with [`author_gossip_allow`].
 pub fn history_sync_allow(
     seen: &mut HashMap<([u8; 16], [u8; 32]), VecDeque<Instant>>,
     channel_id: [u8; 16],
@@ -4053,9 +4404,7 @@ pub fn history_sync_allow(
     now: Instant,
 ) -> bool {
     let key = (channel_id, *author);
-    if seen.len() >= CHANNEL_GOSSIP_AUTHOR_CAP && !seen.contains_key(&key) {
-        return false;
-    }
+    make_room_in_rate_map(seen, &key, CHANNEL_GOSSIP_AUTHOR_CAP);
     let times = seen.entry(key).or_default();
     rate_window_allow(
         times,
@@ -5890,27 +6239,34 @@ mod tests {
         assert_eq!(order.len(), before);
     }
 
-    /// Once the map is full an unknown author must be refused, not admitted
-    /// untracked — otherwise a stream of invented authors walks straight past
-    /// the limit that is meant to stop it.
+    /// A map full of invented authors must not shut a real one out, and must
+    /// not grow past its cap or let the newcomer through untracked.
     #[test]
-    fn a_full_author_map_refuses_newcomers_rather_than_forgetting_them() {
+    fn a_full_author_map_makes_room_by_dropping_the_stalest() {
         let mut seen = HashMap::new();
         let room = [0x07u8; 16];
+        let t0 = Instant::now();
         for i in 0..CHANNEL_GOSSIP_AUTHOR_CAP {
             let mut author = [0u8; 32];
             author[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            assert!(author_gossip_allow(&mut seen, room, &author, Instant::now()));
+            assert!(author_gossip_allow(&mut seen, room, &author, t0 + Duration::from_millis(i as u64)));
         }
         assert_eq!(seen.len(), CHANNEL_GOSSIP_AUTHOR_CAP);
+        let later = t0 + Duration::from_secs(5);
+        let real = [0xFFu8; 32];
         assert!(
-            !author_gossip_allow(&mut seen, room, &[0xFFu8; 32], Instant::now()),
-            "the map is full, so an untracked author is refused"
+            author_gossip_allow(&mut seen, room, &real, later),
+            "a newcomer is admitted even with the map full"
         );
-        assert_eq!(
-            seen.len(),
-            CHANNEL_GOSSIP_AUTHOR_CAP,
-            "and refusing does not grow the map"
+        assert_eq!(seen.len(), CHANNEL_GOSSIP_AUTHOR_CAP, "without the map growing");
+        assert!(seen.contains_key(&(room, real)), "and is tracked from then on");
+        assert!(!seen.contains_key(&(room, [0u8; 32])), "the oldest entry gave up its slot");
+        for _ in 1..CHANNEL_GOSSIP_PER_AUTHOR_PER_SEC {
+            assert!(author_gossip_allow(&mut seen, room, &real, later));
+        }
+        assert!(
+            !author_gossip_allow(&mut seen, room, &real, later),
+            "and is held to the same rate as anyone"
         );
     }
 
@@ -6418,6 +6774,93 @@ mod tests {
             decode_channel_handoff_ready(&legacy, &room).is_none(),
             "unsigned Ready frames are refused"
         );
+    }
+
+    /// The proof has to be made by the key the ready names, and the frame has
+    /// to stay invisible to the legacy decoder so owners on older builds act
+    /// only on the legacy ready sent beside it.
+    #[test]
+    fn a_proven_handoff_ready_requires_the_successor_key_and_hides_from_legacy_decoders() {
+        let nominee = SigningKey::generate(&mut OsRng);
+        let nominee_pk = nominee.verifying_key().to_bytes();
+        let successor = ChannelIdentity::generate();
+        let room = [0x22u8; 16];
+        let proven = encode_channel_handoff_ready_proven(
+            &nominee,
+            &successor.signing_key,
+            &room,
+            &nominee_pk,
+            11,
+        );
+        assert_eq!(
+            decode_channel_handoff_ready_proven(&proven, &room),
+            Some((nominee_pk, successor.pubkey, 11))
+        );
+        assert!(
+            decode_channel_handoff_ready(&proven, &room).is_none(),
+            "a build that knows only the legacy ready must not read this one"
+        );
+        assert!(decode_channel_handoff_ready_proven(&proven, &[0u8; 16]).is_none());
+
+        let legacy = encode_channel_handoff_ready(&nominee, &room, &nominee_pk, &successor.pubkey, 11);
+        assert!(
+            decode_channel_handoff_ready_proven(&legacy, &room).is_none(),
+            "a legacy ready proves nothing about the successor key"
+        );
+
+        // The nominee naming a key someone else holds, with a proof made by a
+        // key the ready does not name.
+        let stranger = ChannelIdentity::generate();
+        let mut borrowed = legacy.clone();
+        borrowed[0] = HANDOFF_READY_PROVEN_PLAIN_VERSION;
+        borrowed.extend_from_slice(&crypto::sign(
+            &stranger.signing_key,
+            &handoff_ready_preimage(&room, &nominee_pk, &successor.pubkey, 11),
+        ));
+        assert!(
+            decode_channel_handoff_ready_proven(&borrowed, &room).is_none(),
+            "the proof must come from the successor key the ready names"
+        );
+    }
+
+    #[test]
+    fn a_successor_key_that_is_the_room_itself_does_not_fit() {
+        let room = ChannelIdentity::generate();
+        let successor = ChannelIdentity::generate();
+        assert!(handoff_successor_fits(&room.channel_id, &successor.pubkey));
+        assert!(
+            !handoff_successor_fits(&room.channel_id, &room.pubkey),
+            "a handoff naming the room it moves loops the room into itself"
+        );
+        let not_a_point = (0u8..=255)
+            .map(|b| [b; 32])
+            .find(|pk| crypto::verifying_key_from_bytes(pk).is_none())
+            .expect("some constant fill is not a curve point");
+        assert!(
+            !handoff_successor_fits(&room.channel_id, &not_a_point),
+            "a key that is not a point cannot be a room"
+        );
+    }
+
+    #[test]
+    fn an_owner_honours_only_a_claim_its_own_silence_allowed() {
+        let day = 86_400;
+        let from = 1_000 * day;
+        let until = from + 20 * day;
+        assert!(claim_fits_owner_silence(from, from, until, 14));
+        assert!(
+            claim_fits_owner_silence(from + day, from, until, 14),
+            "a claim citing a later stamp than ours still ran out before we came back"
+        );
+        assert!(
+            !claim_fits_owner_silence(from - day, from, until, 14),
+            "members held our last stamp, so a claim citing an older one was refused"
+        );
+        assert!(
+            !claim_fits_owner_silence(from + 7 * day, from, until, 14),
+            "its window had not run out when we came back"
+        );
+        assert!(!claim_fits_owner_silence(from, from, until, 0), "no window, no succession");
     }
 
     #[test]
@@ -7624,14 +8067,15 @@ mod tests {
             assert!(author_gossip_allow(&mut chat, room, &ada, t0));
         }
 
-        // A full map refuses a newcomer rather than growing.
+        // A full map makes room for a newcomer rather than growing.
         let mut full: HashMap<([u8; 16], [u8; 32]), VecDeque<Instant>> = HashMap::new();
         for i in 0..CHANNEL_GOSSIP_AUTHOR_CAP {
             let mut author = [0u8; 32];
             author[..8].copy_from_slice(&(i as u64).to_le_bytes());
             assert!(typing_recv_allow(&mut full, room, &author, t0));
         }
-        assert!(!typing_recv_allow(&mut full, room, &[0xFFu8; 32], t0));
+        assert!(typing_recv_allow(&mut full, room, &[0xFFu8; 32], t0));
+        assert_eq!(full.len(), CHANNEL_GOSSIP_AUTHOR_CAP);
         prune_rate_windows(&mut full, later + Duration::from_secs(60), Duration::from_secs(60));
         assert!(full.is_empty());
         assert!(typing_recv_allow(&mut full, room, &[0xFFu8; 32], later));
@@ -7759,6 +8203,213 @@ mod tests {
             15 => V167Branch::Chat,
             _ => V167Branch::DroppedWithDebugLog,
         }
+    }
+
+    /// A room this identity owns is found again from the identity and its
+    /// salt alone, so the derivation has to be stable, and distinct per salt
+    /// and per identity.
+    #[test]
+    fn an_owned_room_seed_comes_from_the_identity_and_its_salt() {
+        let identity = [0x11u8; 32];
+        let other = [0x12u8; 32];
+        let (a, b) = ([0xA0u8; 16], [0xB0u8; 16]);
+        let first = derive_owned_room_seed(&identity, &a);
+        assert_eq!(first, derive_owned_room_seed(&identity, &a), "the same every time");
+        assert_ne!(first, derive_owned_room_seed(&identity, &b));
+        assert_ne!(first, derive_owned_room_seed(&other, &a));
+        assert_ne!(first, identity, "never the identity itself");
+        let room = ChannelIdentity::from_seed(&first);
+        assert_ne!(
+            room.channel_id,
+            ChannelIdentity::from_seed(&derive_owned_room_seed(&identity, &b)).channel_id
+        );
+        let join = derive_owned_join_secret(&first);
+        assert_eq!(join, derive_owned_join_secret(&first));
+        assert_ne!(join, first, "the room key is not the signing seed");
+        assert_ne!(join, derive_owned_join_secret(&derive_owned_room_seed(&identity, &b)));
+        assert_ne!(generate_owned_room_salt(), generate_owned_room_salt());
+        assert_ne!(owned_rooms_key(&[1u8; 32]), owned_rooms_key(&[2u8; 32]));
+        // Pinned, so a change to the derivation cannot slip by: every room a
+        // user made would stop being found.
+        assert_eq!(
+            hex::encode(derive_owned_room_seed(&[0u8; 32], &[0u8; 16])),
+            "f982f4676919993879dc656983b99bf64c3d13b8971b668c5feb11e54f726ada"
+        );
+        assert_eq!(
+            hex::encode(derive_owned_join_secret(&[0u8; 32])),
+            "27ec5a96727b86e57ea4af798bb24b4516251798a9f2e88d20f57817b50388d8"
+        );
+        assert_eq!(hex::encode(owned_rooms_key(&[0u8; 32])), "3de512871cd4704d180ce03fb2c45054");
+    }
+
+    /// The owner's own sealed copy of a rotated key is what a restored device
+    /// reads the key back from: sealed to itself, opened by itself.
+    #[test]
+    fn an_owner_can_seal_a_room_key_to_itself_and_open_it_again() {
+        let owner = SigningKey::from_bytes(&[0x33; 32]);
+        let owner_pub = owner.verifying_key().to_bytes();
+        let channel_id = [0x44u8; 16];
+        let wrap = derive_channel_epoch_secret(&owner.to_bytes(), &owner_pub, &channel_id, 3)
+            .expect("an identity can derive with itself");
+        let sealed = seal_channel_key_epoch(&wrap, &channel_id, 3, &[0x55; 32]);
+        let reopened = derive_channel_epoch_secret(&owner.to_bytes(), &owner_pub, &channel_id, 3)
+            .expect("derives again");
+        assert_eq!(open_channel_key_epoch(&reopened, &channel_id, 3, &sealed), Some([0x55; 32]));
+        let member = SigningKey::from_bytes(&[0x66; 32]);
+        let member_side =
+            derive_channel_epoch_secret(&member.to_bytes(), &owner_pub, &channel_id, 3).unwrap();
+        assert_eq!(
+            open_channel_key_epoch(&member_side, &channel_id, 3, &sealed),
+            None,
+            "nobody else opens the owner's own copy"
+        );
+    }
+
+    fn ext_frame(signer: &SigningKey, kind: u8, flags: u8, body: &[u8]) -> Vec<u8> {
+        encode_channel_ext_frame(signer, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS, kind, flags, body)
+            .expect("an extension kind")
+    }
+
+    /// The author, kind and flags of an extension frame are what lets a build
+    /// that has never heard of its kind check it and pass it on, so all of them
+    /// have to be bound to the room, the id and the time.
+    #[test]
+    fn an_extension_frame_proves_its_author_kind_and_flags() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let frame = ext_frame(&alice, 200, EXT_FLAG_DISPLAY | 0x80, b"later");
+        let read = decode_channel_ext_frame(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS)
+            .expect("a well-formed frame reads");
+        assert_eq!(read.kind, 200);
+        assert_eq!(read.sender, alice.verifying_key().to_bytes());
+        assert_eq!(read.body, b"later");
+        assert!(read.displayable());
+        assert_eq!(read.flags, EXT_FLAG_DISPLAY | 0x80, "unknown flag bits are kept");
+
+        // An empty body is a frame too.
+        assert!(decode_channel_ext_frame(
+            &ext_frame(&alice, EXT_KIND_MIN, 0, b""),
+            &CHAT_CHANNEL,
+            &CHAT_MSG_ID,
+            CHAT_TS
+        )
+        .is_some_and(|f| !f.displayable() && f.body.is_empty()));
+
+        // Any byte changed in transit, header or body, breaks it.
+        for at in [0usize, 1, 2, 40, frame.len() - 1] {
+            let mut bent = frame.clone();
+            bent[at] ^= if at == 0 { 0x01 } else { 0xFF };
+            assert!(
+                decode_channel_ext_frame(&bent, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none(),
+                "byte {at} is covered"
+            );
+        }
+        // So does lifting it into another room, under another id, or re-dating it.
+        assert!(decode_channel_ext_frame(&frame, &[0x77; 16], &CHAT_MSG_ID, CHAT_TS).is_none());
+        assert!(decode_channel_ext_frame(&frame, &CHAT_CHANNEL, &[0x77; 16], CHAT_TS).is_none());
+        assert!(decode_channel_ext_frame(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS + 1).is_none());
+        // And a truncated header is not a frame.
+        assert!(decode_channel_ext_frame(&frame[..97], &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+    }
+
+    #[test]
+    fn extension_kinds_start_above_every_layout_of_their_own() {
+        let alice = SigningKey::generate(&mut OsRng);
+        assert!(encode_channel_ext_frame(&alice, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS, EXT_KIND_MIN - 1, 0, b"")
+            .is_none());
+        // A frame of a fixed layout is not read as an extension frame.
+        assert!(decode_channel_ext_frame(&chat_frame(&alice, "hi"), &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS)
+            .is_none());
+        for version in [
+            CHAT_PLAIN_VERSION,
+            MOD_ACTION_PLAIN_VERSION,
+            SYNC_REQUEST_PLAIN_VERSION,
+            HANDOFF_OFFER_PLAIN_VERSION,
+            HANDOFF_READY_PLAIN_VERSION,
+            HANDOFF_READY_PROVEN_PLAIN_VERSION,
+            CHAT_EDIT_PLAIN_VERSION,
+            REACTION_PLAIN_VERSION,
+            XFER_OFFER_PLAIN_VERSION,
+            XFER_REPLY_PLAIN_VERSION,
+            XFER_BLOCK_REQUEST_PLAIN_VERSION,
+            XFER_CANCEL_PLAIN_VERSION,
+            XFER_DONE_PLAIN_VERSION,
+            XFER_BLOCK_DATA_SEALED_VERSION,
+            PRESENCE_BEACON_PLAIN_VERSION,
+            TYPING_PLAIN_VERSION,
+            XFER_STREAM_SEALED_VERSION,
+            XFER_OFFER_SEALED_VERSION,
+            ROOM_FRIEND_REQUEST_PLAIN_VERSION,
+            XFER_SEEN_PLAIN_VERSION,
+        ] {
+            assert!(version < EXT_KIND_MIN, "{version} would be read as an extension frame");
+        }
+        assert!(!ext_kind_understood(EXT_KIND_MIN));
+        assert!(!ext_kind_understood(u8::MAX));
+    }
+
+    /// None of the decoders the dispatch tries ahead of extension frames may
+    /// claim one, or a later kind would be misread as an older one.
+    #[test]
+    fn no_fixed_layout_decoder_claims_an_extension_frame() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let frame = ext_frame(&alice, 90, EXT_FLAG_DISPLAY, &[0u8; 300]);
+        assert!(xfer_frame_peek(&frame).is_none());
+        assert!(decode_channel_presence_beacons(&frame, &CHAT_CHANNEL, 0, CHAT_TS).is_none());
+        assert!(
+            decode_channel_handoff_offer(&frame, &CHAT_CHANNEL, &alice.verifying_key().to_bytes())
+                .is_none()
+        );
+        assert!(decode_channel_typing(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        assert!(decode_room_friend_request(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        assert!(decode_channel_handoff_ready(&frame, &CHAT_CHANNEL).is_none());
+        assert!(decode_channel_handoff_ready_proven(&frame, &CHAT_CHANNEL).is_none());
+        assert!(decode_channel_sync_request(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        assert!(decode_channel_mod_action(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        assert!(decode_channel_chat_edit(&frame, &CHAT_CHANNEL).is_none());
+        assert!(decode_channel_reactions(&frame, &CHAT_CHANNEL).is_none());
+        assert!(decode_channel_chat_plain(&frame, &CHAT_CHANNEL, &CHAT_MSG_ID, CHAT_TS).is_none());
+        // And builds before this one route it to their drop-with-a-log branch,
+        // which is all they can do with it.
+        assert_eq!(v1_6_7_branch(&frame), V167Branch::DroppedWithDebugLog);
+    }
+
+    #[test]
+    fn a_later_key_envelope_is_stored_but_only_this_version_is_opened() {
+        let owner = SigningKey::generate(&mut OsRng);
+        let member = SigningKey::generate(&mut OsRng);
+        let channel_id = [0x31u8; 16];
+        let epoch = 4;
+        let wrap = derive_channel_epoch_secret(
+            &owner.to_bytes(),
+            &member.verifying_key().to_bytes(),
+            &channel_id,
+            epoch,
+        )
+        .expect("derives");
+        let sealed = seal_channel_key_epoch(&wrap, &channel_id, epoch, &[0x42; 32]);
+        assert!(epoch_envelope_store_ok(&sealed));
+        assert!(epoch_envelope_version_supported(sealed[0]));
+
+        // A later version is stored at whatever length it needs, short or long,
+        // since storers cannot read it and only the members can.
+        for len in [2usize, 40, EPOCH_ENVELOPE_LEN, 600] {
+            let mut later = vec![0xEEu8; len];
+            later[0] = EPOCH_ENVELOPE_VERSION + 1;
+            assert!(epoch_envelope_store_ok(&later), "length {len}");
+            assert!(open_channel_key_epoch(&wrap, &channel_id, epoch, &later).is_none());
+        }
+        assert!(!epoch_envelope_version_supported(EPOCH_ENVELOPE_VERSION + 1));
+
+        // Never-written shapes stay refused: nothing, a bare version byte, version 0.
+        assert!(!epoch_envelope_store_ok(&[]));
+        assert!(!epoch_envelope_store_ok(&[EPOCH_ENVELOPE_VERSION + 1]));
+        let mut zero = sealed.clone();
+        zero[0] = 0;
+        assert!(!epoch_envelope_store_ok(&zero));
+        // This version keeps its exact shape.
+        let mut padded = sealed.clone();
+        padded.push(0);
+        assert!(!epoch_envelope_store_ok(&padded));
     }
 
     #[test]

@@ -93,6 +93,7 @@
         { keys: ['?'], label: () => m.shortcuts_show_shortcuts() },
         { keys: ['F1'], label: () => m.shortcuts_show_shortcuts() },
         { keys: [modifierKey, 'B'], label: () => m.shortcuts_toggle_sidebar() },
+        { keys: [modifierKey, 'Z'], label: () => m.shortcuts_undo_latest() },
         ...navShortcuts,
         ...(settingsHasNavDigit
           ? []
@@ -126,6 +127,7 @@
       title: () => m.shortcuts_section_library(),
       shortcuts: [
         { keys: ['/'], label: () => m.shortcuts_library_focus_search() },
+        { keys: [modifierKey, 'F'], label: () => m.shortcuts_library_focus_search() },
         { keys: [modifierKey, 'A'], label: () => m.shortcuts_library_select_all() },
         { keys: [modifierKey, 'D'], label: () => m.shortcuts_library_clear_selection() },
         { keys: [modifierKey, 'C'], label: () => m.shortcuts_library_copy_links() },
@@ -141,13 +143,34 @@
       title: () => m.shortcuts_section_search(),
       shortcuts: [
         { keys: ['/'], label: () => m.shortcuts_library_focus_search() },
+        { keys: [modifierKey, 'F'], label: () => m.search_filter_results() },
         { keys: [modifierKey, 'C'], label: () => m.shortcuts_search_copy_links() },
+        { keys: ['↑ / ↓'], label: () => m.shortcuts_search_navigate() },
+        { keys: ['Shift', '↑ / ↓'], label: () => m.shortcuts_search_extend() },
+        { keys: ['Home / End'], label: () => m.shortcuts_search_jump_ends() },
+        { keys: ['PgUp / PgDn'], label: () => m.shortcuts_library_page() },
+        { keys: ['Space'], label: () => m.shortcuts_library_toggle_check() },
+        { keys: ['Enter'], label: () => m.shortcuts_search_download() },
+      ],
+    },
+    {
+      title: () => m.nav_settings(),
+      shortcuts: [
+        { keys: ['/'], label: () => m.shortcuts_library_focus_search() },
+        { keys: [modifierKey, 'F'], label: () => m.shortcuts_library_focus_search() },
+        { keys: ['↑ / ↓'], label: () => m.shortcuts_settings_sections() },
+        { keys: ['Enter'], label: () => m.shortcuts_settings_apply() },
+        { keys: ['Esc'], label: () => m.shortcuts_settings_revert() },
       ],
     },
     {
       title: () => m.shortcuts_section_transfers(),
       shortcuts: [
         { keys: ['↑ / ↓'], label: () => m.shortcuts_transfers_navigate() },
+        { keys: ['Shift', '↑ / ↓'], label: () => m.shortcuts_transfers_extend() },
+        { keys: ['Home / End'], label: () => m.shortcuts_transfers_jump_ends() },
+        { keys: [modifierKey, 'A'], label: () => m.shortcuts_transfers_select_all() },
+        { keys: ['Space'], label: () => m.shortcuts_transfers_pause_resume() },
         { keys: [modifierKey, 'V'], label: () => m.shortcuts_transfers_paste_links() },
         { keys: ['F2'], label: () => m.shortcuts_transfers_rename() },
         { keys: ['Delete'], label: () => m.shortcuts_transfers_delete() },
@@ -170,6 +193,8 @@
         { keys: [modifierKey, 'K'], label: () => m.shortcuts_channels_search() },
         { keys: ['↑ / ↓'], label: () => m.shortcuts_channels_search_navigate() },
         { keys: ['Enter'], label: () => m.shortcuts_channels_search_open() },
+        { keys: [modifierKey, 'F'], label: () => m.shortcuts_channels_find_messages() },
+        { keys: ['↑'], label: () => m.shortcuts_channels_edit_last() },
       ],
     },
   ]);

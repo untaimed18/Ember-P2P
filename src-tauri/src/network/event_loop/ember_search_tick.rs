@@ -1014,6 +1014,12 @@ async fn apply_channel_ingest_results(
             serde_json::json!({ "channel_id": hex::encode(channel_id) }),
         );
     }
+    for channel_id in results.needs_newer {
+        let _ = app_handle.emit(
+            "ember:channel-newer",
+            serde_json::json!({ "channel_id": hex::encode(channel_id) }),
+        );
+    }
     for (channel_id, successor_id) in results.followed {
         let _ = app_handle.emit(
             "ember:channel-handoff",
@@ -1023,5 +1029,23 @@ async fn apply_channel_ingest_results(
                 "phase": "followed",
             }),
         );
+    }
+    // A record of ours we had withdrawn, or whose nominee has been banned
+    // since, turned out to be stored. The members are following it, so we are
+    // too, and the owner should hear why the room is moving.
+    for (channel_id, successor_id) in results.adopted {
+        let _ = app_handle.emit(
+            "ember:channel-handoff",
+            serde_json::json!({
+                "channel_id": hex::encode(channel_id),
+                "successor_id": hex::encode(successor_id),
+                "phase": "adopted",
+            }),
+        );
+    }
+    for channel_id in results.handoff_absent {
+        if let Some(started) = state.channel_handoff_fetch_at.get(&channel_id).copied() {
+            state.channel_handoff_absent_at.insert(channel_id, started);
+        }
     }
 }

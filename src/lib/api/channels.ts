@@ -49,6 +49,12 @@ export interface ChannelInfo {
   /** The owner's default language code for the room, empty for none. Shown as
    *  a flag; nothing is filtered on it. */
   language: string;
+  /** Lines sent here that this version cannot show because they need a newer
+   *  Ember. Cleared by {@link dismissChannelNewerLines}. */
+  newer_lines: number;
+  /** The room's current key needs a newer Ember to open, so new messages stay
+   *  locked until this device updates. Only ever set alongside `key_behind`. */
+  newer_key: boolean;
 }
 
 /** Most messages a room can pin, mirroring `CHANNEL_PIN_MAX` in
@@ -301,6 +307,29 @@ export async function markChannelMessagesRead(channelId: string): Promise<void> 
   return invoke('mark_channel_messages_read', { channelId });
 }
 
+/** The line left half-typed in a room, sealed with the chat key on disk.
+ *  Empty when there is none or chat is locked. */
+export async function getChannelDraft(channelId: string): Promise<string> {
+  return invoke('get_channel_draft', { channelId });
+}
+
+/** Writes per room, chained so they land in the order they were made: each is
+ *  its own blocking task on the backend, and a save that overtook the clear
+ *  sent after it put a line already sent back as the draft. */
+const draftWrites = new Map<string, Promise<void>>();
+
+/** Keep a room's draft across restarts; an empty `text` drops it. */
+export function setChannelDraft(channelId: string, text: string): Promise<void> {
+  const write = (draftWrites.get(channelId) ?? Promise.resolve())
+    .catch(() => {})
+    .then(() => invoke<void>('set_channel_draft', { channelId, text }));
+  draftWrites.set(channelId, write);
+  void write.finally(() => {
+    if (draftWrites.get(channelId) === write) draftWrites.delete(channelId);
+  }).catch(() => {});
+  return write;
+}
+
 /** Substring search over this device's stored history for one room. Local
  *  only — nothing is asked of the network. */
 export async function searchChannelMessages(
@@ -484,6 +513,12 @@ export async function setChannelMessagePinned(
   return invoke('set_channel_message_pinned', { channelId, msgId, pinned });
 }
 
+/** The user has seen that some of a room's lines need a newer Ember. Resolves
+ *  with the room as it reads now. */
+export async function dismissChannelNewerLines(channelId: string): Promise<ChannelInfo> {
+  return invoke('dismiss_channel_newer_lines', { channelId });
+}
+
 /** The room's pins, oldest first, resolved against local history. */
 export async function getChannelPins(channelId: string): Promise<ChannelPinInfo[]> {
   return invoke('get_channel_pins', { channelId });
@@ -563,6 +598,27 @@ export async function sendChannelTransferStandardOffer(xferId: string): Promise<
 
 export async function listChannelTransfers(): Promise<ChannelTransferInfo[]> {
   return invoke('list_channel_transfers');
+}
+
+/** What a look for this identity's rooms found. */
+export interface OwnedRoomScan {
+  /** Rooms put back on this device, or made ours again. */
+  recovered: number;
+  /** The identity's list of rooms was read. False when the network could not
+   *  be reached well enough to be sure; the look is worth repeating then. */
+  confirmed: boolean;
+  /** Rooms in the list that could not be settled this time. Ember keeps
+   *  looking at them on its own. */
+  unsettled: number;
+}
+
+/** Emitted when rooms this identity owns were put back: `{ count }`. */
+export const CHANNELS_RECOVERED_EVENT = 'ember:channels-recovered';
+
+/** Look the network over for rooms this identity owns that this device does
+ *  not hold, and put them back. */
+export async function recoverOwnedChannels(): Promise<OwnedRoomScan> {
+  return invoke('recover_owned_channels');
 }
 
 /** Open the folder received room transfers are saved to. It is not shared,
