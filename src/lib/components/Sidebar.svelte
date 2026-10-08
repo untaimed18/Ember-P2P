@@ -510,7 +510,7 @@
             {/if}
           </span>
           <span class="nav-label">{item.label()}</span>
-          {#if item.id === 'channels'}
+          {#if item.id === 'channels' || item.id === 'friends'}
             <span class="beta-badge">{m.common_beta()}</span>
           {/if}
           {#if item.id === 'transfers' && activeTransferCount > 0}

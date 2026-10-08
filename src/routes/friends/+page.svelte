@@ -970,7 +970,10 @@
 {/if}
 
 <div class="page-header">
-  <h2>{m.nav_friends()}</h2>
+  <h2 class="friends-title">
+    {m.nav_friends()}
+    <span class="beta-badge">{m.common_beta()}</span>
+  </h2>
   <div class="header-actions">
     <button class="ghost" onclick={() => loadFriends()} disabled={loading}>{m.common_refresh()}</button>
   </div>
@@ -1646,6 +1649,13 @@
 </div>
 
 <style>
+  .friends-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0;
+  }
+
   .friends-content {
     padding: 20px;
   }
