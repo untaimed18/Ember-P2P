@@ -55,6 +55,7 @@
   import { isEmberBlake3Mismatch } from '$lib/emberIntegrity';
   import { uploadCapInForce, uploadScaleFactor, uploadSumBound } from '$lib/uploadSpeed';
   import { computeSegmentWindow, segmentRowOffset } from '$lib/segmentWindow';
+  import { adoptRowHeight } from '$lib/rowWindow';
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import IconX from '$lib/components/IconX.svelte';
@@ -2304,8 +2305,17 @@
 
   /** Read the geometry the window depends on. Only the DOM knows where each
    *  section starts (banners and the header sit above it) and how tall a row
-   *  and the open source block really are. */
-  function measureDownloadWindow() {
+   *  and the open source block really are.
+   *
+   *  The row height is taken only when `takeRowHeight`, which a re-measure
+   *  caused by the window itself moving does not ask for. Rows differ in
+   *  height a little (a flag in one, a badge in another), so each window
+   *  measures a slightly different height; adopting it then picked another
+   *  window, which re-measured, which picked the first again, until Svelte
+   *  stopped the loop with `effect_update_depth_exceeded` mid-scroll. The same
+   *  feedback the search results and `TableWindow` refuse with
+   *  `adoptRowHeight`. */
+  function measureDownloadWindow(takeRowHeight = true) {
     const scroller = downloadsScrollEl;
     if (!scroller) return;
     const top = scroller.getBoundingClientRect().top;
@@ -2314,9 +2324,13 @@
     if (dlCompletedTopPadEl) dlCompletedBodyTop = dlCompletedTopPadEl.getBoundingClientRect().top - top;
     const table = downloadTableEl;
     if (!table) return;
-    const sample = table.querySelector<HTMLTableRowElement>('tr.dl-row:not(.expanded)');
-    const h = sample?.getBoundingClientRect().height ?? 0;
-    if (h > 0) dlRowHeight = h;
+    if (takeRowHeight) {
+      // Averaged over every rendered row, so one unusual row moves it little.
+      const rows = table.querySelectorAll<HTMLTableRowElement>('tr.dl-row:not(.expanded)');
+      let sum = 0;
+      for (const row of rows) sum += row.getBoundingClientRect().height;
+      if (rows.length > 0) dlRowHeight = adoptRowHeight(dlRowHeight, sum / rows.length);
+    }
     if (!expandedTransferId) {
       dlExpandedExtra = 0;
       return;
@@ -2353,11 +2367,17 @@
     void expandedTransferId;
     void expandedSources;
     void loadingSources;
+    untrack(() => measureDownloadWindow());
+  });
+  // And after the window itself moves, for where the sections and the open
+  // source block now sit — but not the row height, which the window is
+  // computed from: see `measureDownloadWindow`.
+  $effect(() => {
     void dlActiveWindow.start;
     void dlActiveWindow.end;
     void dlCompletedWindow.start;
     void dlCompletedWindow.end;
-    untrack(measureDownloadWindow);
+    untrack(() => measureDownloadWindow(false));
   });
 
   $effect(() => {
