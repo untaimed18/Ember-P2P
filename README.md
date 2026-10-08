@@ -6,6 +6,10 @@ It also runs a network of its own: the [**Ember Network**](#ember-network) is an
 
 No spyware. No ads. No nonsense.
 
+## Join Our Reddit Community!
+
+https://www.reddit.com/r/EmberP2P/
+
 ## Design Philosophy
 
 Ember is a ground-up rewrite of the eMule concept using modern technologies:
