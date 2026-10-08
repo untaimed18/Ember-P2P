@@ -151,6 +151,7 @@
     searchEnterTarget,
     sectionRooms,
   } from '$lib/channelSections';
+  import { LIKELY_SPAM_SCORE, listingSpamScores } from '$lib/channelListingSpam';
   import { isApplePlatform, shortcutModAria } from '$lib/platform';
   import { isShortcutLetter } from '$lib/shortcutKey';
 
@@ -192,6 +193,9 @@
   let leaveTargetId = $state<string | null>(null);
   let forgetOpen = $state(false);
   let forgetTargetId = $state<string | null>(null);
+  /** Whether the room being removed has saved messages here, or is only a
+   *  Discover listing, which removing just hides. */
+  let forgetTargetStored = $state(true);
   let forgettingIds = $state<string[]>([]);
   let usernameDraft = $state('');
   let claimingUsername = $state(false);
@@ -504,6 +508,50 @@
       && foldedWelcomes[selected.channel_id] === welcomeFingerprint(selected.welcome),
   );
 
+  /**
+   * Owners asked to name a successor once their room has people in it.
+   *
+   * Without one, an owner who vanishes leaves a room nobody can ever moderate
+   * again, and the setting that prevents it sits in Room settings where nobody
+   * goes looking until it is too late. Asked once per room: Not now is kept
+   * on this device, and naming anyone ends it.
+   */
+  const SUCCESSOR_PROMPT_MEMBERS = 3;
+  const SUCCESSOR_PROMPT_KEY = 'ember.channels.successor-prompt-dismissed.v1';
+  const SUCCESSOR_PROMPT_MAX = 200;
+
+  function loadSuccessorPromptDismissed(): string[] {
+    try {
+      const parsed: unknown = JSON.parse(localStorage.getItem(SUCCESSOR_PROMPT_KEY) ?? '[]');
+      return Array.isArray(parsed)
+        ? parsed.filter((id): id is string => typeof id === 'string' && /^[0-9a-f]{32}$/.test(id))
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  let successorPromptDismissed = $state<string[]>(loadSuccessorPromptDismissed());
+  let successorPromptShown = $derived(
+    !!selected
+      && selected.is_owner
+      && !selected.successor_id
+      && !selected.successor_nominee
+      && !successorPromptDismissed.includes(selected.channel_id)
+      && members.filter((mem) => !mem.is_self && !mem.banned).length >= SUCCESSOR_PROMPT_MEMBERS,
+  );
+
+  function dismissSuccessorPrompt(channelId: string) {
+    successorPromptDismissed = [...successorPromptDismissed.filter((id) => id !== channelId), channelId].slice(
+      -SUCCESSOR_PROMPT_MAX,
+    );
+    try {
+      localStorage.setItem(SUCCESSOR_PROMPT_KEY, JSON.stringify(successorPromptDismissed));
+    } catch {
+      // Quota exceeded / private mode. Holds for this session.
+    }
+  }
+
   function toggleWelcomeFold(channelId: string, welcome: string) {
     const print = welcomeFingerprint(welcome);
     const { [channelId]: current, ...rest } = foldedWelcomes;
@@ -538,6 +586,10 @@
   let selectedKeyBehind = $derived(selected?.key_behind ?? false);
   /** Zero for anyone the room exempts, so the composer has one number to read
    *  rather than a rule to re-derive. */
+  /** Members only come in partway: catch-up brings the most recent lines from
+   *  before they joined and nothing earlier. The owner has been here since
+   *  the start. */
+  let selectedHistoryNote = $derived(selected && !selected.is_owner ? m.channels_history_start() : '');
   let selectedSlowMode = $derived(
     selected && !selected.is_owner && !selected.you_are_moderator
       ? selected.slow_mode_secs
@@ -702,13 +754,25 @@
   });
   let favouriteSet = $derived(new Set($favouriteChannels));
   let roomSections = $derived(sectionRooms(visibleChannels, $favouriteChannels));
+  /** Scored across every listing, not just those the search leaves, so a
+   *  flood of copies is still a flood while the user types its name. */
+  let listingScores = $derived(listingSpamScores([...discoveredById.values()]));
+  let showLikelySpam = $state(false);
+  let likelySpam = $derived(
+    roomSections.discover.filter((ch) => (listingScores.get(ch.channel_id) ?? 0) >= LIKELY_SPAM_SCORE),
+  );
+  let likelySpamIds = $derived(new Set(likelySpam.map((ch) => ch.channel_id)));
+  /** Discover as drawn: likely spam folded away unless the user asked for it. */
+  let discoverShown = $derived(
+    showLikelySpam ? roomSections.discover : roomSections.discover.filter((ch) => !likelySpamIds.has(ch.channel_id)),
+  );
   /** Every joined room in display order, whatever the search box holds:
    *  Alt+↑/↓ steps through the rooms you are in, not the ones a half-typed
    *  query happens to leave on screen. */
   let joinedInOrder = $derived(sectionRooms(sortedChannels, $favouriteChannels).yours);
   /** Every row in the order it is drawn, which is the order the search box's
    *  arrow keys walk. */
-  let orderedRows = $derived([...roomSections.yours, ...roomSections.discover]);
+  let orderedRows = $derived([...roomSections.yours, ...discoverShown]);
   let unreadJoinedIds = $derived(
     channelList.filter((c) => c.in_room && c.unread > 0).map((c) => c.channel_id),
   );
@@ -1784,6 +1848,9 @@
 
   function requestForget(channelId: string) {
     forgetTargetId = channelId;
+    // Read now, not while the dialog closes: removing a stored room drops its
+    // row, which would flip the wording under the closing animation.
+    forgetTargetStored = storedChannelIds.has(channelId);
     forgetOpen = true;
   }
 
@@ -2832,10 +2899,26 @@
                 <h3 class="list-section-label" id="rooms-section-discover">{m.channels_section_discover()}</h3>
               </div>
               <div role="list" aria-labelledby="rooms-section-discover">
-                {#each roomSections.discover as ch (ch.channel_id)}
+                {#each discoverShown as ch (ch.channel_id)}
                   {@render roomRow(ch)}
                 {/each}
               </div>
+              {#if likelySpam.length > 0}
+                <div class="likely-spam-row">
+                  <span class="muted">{showLikelySpam
+                    ? m.channels_likely_spam_shown()
+                    : plural(likelySpam.length, {
+                        one: m.channels_likely_spam_hidden_one,
+                        other: () => m.channels_likely_spam_hidden_other({ count: likelySpam.length }),
+                      })}</span>
+                  <button
+                    type="button"
+                    class="ghost"
+                    aria-expanded={showLikelySpam}
+                    onclick={() => (showLikelySpam = !showLikelySpam)}
+                  >{showLikelySpam ? m.channels_likely_spam_hide() : m.channels_likely_spam_show()}</button>
+                </div>
+              {/if}
             {/if}
             {#if visibleChannels.length === 0}
               <p class="muted list-empty">{m.channels_no_matches()}</p>
@@ -2855,6 +2938,7 @@
                   class:highlighted={highlightedRow?.channel_id === ch.channel_id}
                   class:joining={joiningIds.includes(ch.channel_id)}
                   class:moved={!!ch.successor_id}
+                  class:likely-spam={likelySpamIds.has(ch.channel_id)}
                   class:has-unread={ch.in_room
                     && ch.unread > 0
                     && unreadBadgeTone(
@@ -2862,7 +2946,11 @@
                       $channelUnreadMentions.includes(ch.channel_id),
                     ) === 'loud'}
                   data-room-id={ch.channel_id}
-                  title={ch.successor_id ? m.channels_transferred_badge() : undefined}
+                  title={ch.successor_id
+                    ? m.channels_transferred_badge()
+                    : likelySpamIds.has(ch.channel_id)
+                      ? m.channels_likely_spam_title()
+                      : undefined}
                   oncontextmenu={ch.in_room ? openCardMenu : undefined}
                 >
                   <button
@@ -3365,6 +3453,19 @@
                 </span>
               </div>
             {/if}
+            {#if successorPromptShown}
+              <div class="successor-banner successor-prompt" role="status">
+                <span>{m.channels_successor_prompt()}</span>
+                <span class="newer-actions">
+                  <button type="button" class="ghost" onclick={() => (roomInfoOpen = true)}>
+                    {m.channels_successor_prompt_choose()}
+                  </button>
+                  <button type="button" class="ghost" onclick={() => dismissSuccessorPrompt(selected.channel_id)}>
+                    {m.channels_successor_prompt_later()}
+                  </button>
+                </span>
+              </div>
+            {/if}
             {#if !selected.is_owner && !selected.successor_id && nomineeNotice}
               <div class="successor-banner" role="status">
                 <span>{nomineeNotice}</span>
@@ -3458,6 +3559,7 @@
                 mentionCandidates={mentionCandidates}
                 focusRequest={transcriptFocus}
                 onfocusmissing={() => toast(m.channels_search_too_far())}
+                historyStartNote={selectedHistoryNote}
               />
             </div>
           {/if}
@@ -4109,9 +4211,11 @@
 
 <ConfirmDialog
   bind:open={forgetOpen}
-  title={m.channels_forget_confirm()}
-  message={m.channels_forget_confirm_body({ name: forgetTargetName })}
-  confirmLabel={m.channels_forget()}
+  title={forgetTargetStored ? m.channels_forget_confirm() : m.channels_hide_listing_confirm()}
+  message={forgetTargetStored
+    ? m.channels_forget_confirm_body({ name: forgetTargetName })
+    : m.channels_hide_listing_confirm_body({ name: forgetTargetName })}
+  confirmLabel={forgetTargetStored ? m.channels_forget() : m.channels_hide_listing()}
   danger
   onconfirm={handleForget}
 />
@@ -4779,6 +4883,18 @@
 
   .chan-row.moved .chan-name,
   .chan-row.moved .chan-avatar { opacity: 0.55; }
+  .chan-row.likely-spam .chan-name,
+  .chan-row.likely-spam .chan-avatar { opacity: 0.55; }
+
+  /* Folded spam is a line under Discover, not a row: it is never a room. */
+  .likely-spam-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 12px;
+    font-size: var(--font-size-sm);
+  }
 
   .chan-row:hover,
   .chan-row.highlighted { background: var(--bg-hover); }
@@ -5237,6 +5353,13 @@
     font-size: var(--font-size-md);
     color: var(--badge-warning-text);
     flex-shrink: 0;
+  }
+
+  /* A suggestion, not a warning. */
+  .successor-banner.successor-prompt {
+    border-bottom-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+    background: color-mix(in srgb, var(--accent) 9%, transparent);
+    color: var(--text-primary);
   }
 
   .key-behind-banner {

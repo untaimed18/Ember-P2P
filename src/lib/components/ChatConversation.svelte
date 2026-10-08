@@ -158,6 +158,9 @@
     focusRequest?: { id: number } | null;
     /** The message could not be reached — too far back, or no longer stored. */
     onfocusmissing?: () => void;
+    /** Shown above the oldest message once the transcript is scrolled back to
+     *  the start of what this device holds, to say why it stops there. */
+    historyStartNote?: string;
   }
 
   type ConvMessage = ChatMessage & {
@@ -207,6 +210,7 @@
     mentionCandidates = [],
     focusRequest = null,
     onfocusmissing,
+    historyStartNote = '',
   }: Props = $props();
 
   let isChannel = $derived(channelId.length > 0);
@@ -3449,6 +3453,10 @@
             <span class="conv-load-older-error" role="alert">{m.chat_load_older_failed()}</span>
           {/if}
         </div>
+      {:else if historyStartNote && messages.length < MAX_LOADED_MESSAGES}
+        <!-- Not at the in-memory cap: there the start of what is loaded is
+             not the start of what this device has. -->
+        <p class="conv-history-start">{historyStartNote}</p>
       {/if}
       {#each rows as row, i (row.msg.id)}
         <!-- A file card between two lines breaks their run, whoever sent them. -->
@@ -4226,6 +4234,14 @@
     align-items: center;
     gap: 4px;
     margin-bottom: 8px;
+  }
+
+  .conv-history-start {
+    margin: 0 auto 10px;
+    max-width: 46ch;
+    text-align: center;
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
   }
 
   .conv-load-older-error {
