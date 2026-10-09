@@ -209,6 +209,16 @@
   // by right-clicking a column header, with no on-screen hint that it
   // existed at all.
   export function openColumnMenu(e: MouseEvent) {
+    // A click from the keyboard (Enter/Space on the button) has no pointer
+    // position: open below the button rather than in the window's corner.
+    const anchor = e.currentTarget;
+    if (e.detail === 0 && anchor instanceof HTMLElement) {
+      e.preventDefault();
+      e.stopPropagation();
+      const rect = anchor.getBoundingClientRect();
+      colMenu = { x: rect.left, y: rect.bottom + 2 };
+      return;
+    }
     openMenu(e);
   }
 
@@ -267,8 +277,10 @@
     if (savedHidden) {
       try {
         const parsed = JSON.parse(savedHidden);
-        colHidden = Object.fromEntries(ALL_COLUMNS.map(c => [c.key, false]));
+        // Only a list replaces the defaults; anything else leaves them alone
+        // rather than showing every default-hidden column.
         if (Array.isArray(parsed)) {
+          colHidden = Object.fromEntries(ALL_COLUMNS.map(c => [c.key, false]));
           for (const k of parsed) {
             if (typeof k === 'string' && k !== FIXED_KEY && ALL_COLUMNS.some(c => c.key === k)) {
               colHidden[k] = true;
@@ -406,7 +418,12 @@
   }
 
   function onDragOver(e: DragEvent, key: string) {
-    if (!activeDrag || activeDrag.key === key) return;
+    if (!activeDrag) return;
+    if (activeDrag.key === key) {
+      // Back over the column being dragged: dropping here changes nothing.
+      dropTarget = null;
+      return;
+    }
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
     const el = e.currentTarget;
@@ -467,6 +484,9 @@
 
   function closeMenu() { colMenu = null; }
 
+  // Registered for the capture phase: the page listens on the document too, and
+  // a bubble-phase stop could not keep its Escape from also clearing the
+  // selection (closing the drawer and stopping playback).
   function onDocumentKeydown(event: KeyboardEvent) {
     if (event.key === 'Escape' && colMenu) {
       event.preventDefault();
@@ -565,7 +585,7 @@
   });
 </script>
 
-<svelte:document onclick={() => closeMenu()} onkeydown={onDocumentKeydown} />
+<svelte:document onclick={() => closeMenu()} onkeydowncapture={onDocumentKeydown} />
 
 <div class="library-virtual-table-root">
 <div class="vtable-header" bind:this={headerWrap} style="padding-right:{scrollbarWidth}px;">
@@ -599,7 +619,13 @@
             draggable={canDrag(col.key)}
             aria-sort={col.sortField ? ariaSort(col.sortField) : undefined}
             onclick={() => onHeaderClick(col)}
-            onkeydown={(e) => { if (col.sortField) sortOnKey(e, col.sortField); }}
+            onkeydown={(e) => {
+              if (!col.sortField) return;
+              sortOnKey(e, col.sortField);
+              // Sorting is all these keys do here; on the page they would also
+              // open or check the selected row.
+              if (e.key === 'Enter' || e.key === ' ') e.stopPropagation();
+            }}
             ondragstart={(e) => onDragStart(e, col.key)}
             ondragover={(e) => onDragOver(e, col.key)}
             ondrop={(e) => onDrop(e, col.key)}
@@ -642,7 +668,7 @@
             aria-selected={selectedPath === file.path}
             onclick={() => onSelectPath(file.path)}
             ondblclick={() => onOpenFile(file.path)}
-            oncontextmenu={(e) => onRowContextMenu(e, file)}
+            oncontextmenu={(e) => { closeMenu(); onRowContextMenu(e, file); }}
             onkeydown={(e) => onRowKeydown(e, file)}
             style="height:{ROW_HEIGHT}px;"
           >

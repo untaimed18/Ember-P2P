@@ -339,6 +339,9 @@ export interface CategoryMoveReport {
   moved: number;
   /** Files that were in it already. */
   unchanged: number;
+  /** Finished downloads in the transfer list that took the category, whether
+   *  their file moved or not. */
+  recategorized: number;
   /** A coded error for each file that stayed where it was. */
   failed: string[];
 }
@@ -348,6 +351,13 @@ export interface CategoryMoveReport {
  *  itself. A finished download in the transfer list takes the category too. */
 export async function moveFilesToCategory(paths: string[], category: string): Promise<CategoryMoveReport> {
   return invoke('move_files_to_category', { paths, category });
+}
+
+/** Rename a Library file inside its folder. The row follows the file, so
+ *  nothing is hashed again. Rejects when the name is invalid or taken (an
+ *  existing file is never replaced). Resolves with the file's new path. */
+export async function renameLibraryFile(filePath: string, newName: string): Promise<string> {
+  return invoke('rename_library_file', { filePath, newName });
 }
 
 export async function openSharedFolder(filePath: string): Promise<void> {

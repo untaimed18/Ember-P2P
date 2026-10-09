@@ -2760,12 +2760,15 @@ fn move_if_still_the_download(
 /// the file's new place, so the two pages agree on both. Matched on the hash
 /// as well as the path, as [`relocate_library_files`] is. Best effort.
 ///
+/// A file that stayed where it was is passed with `to` equal to `from`: its
+/// download takes the category all the same. Returns how many downloads did.
+///
 /// [`relocate_library_files`]: crate::commands::sharing::relocate_library_files
 pub(crate) async fn follow_moved_finished_downloads(
     state: &AppState,
     moves: &[crate::commands::sharing::FileMove],
     category: &str,
-) {
+) -> usize {
     let moved: HashMap<String, (&str, String)> = moves
         .iter()
         .map(|mv| {
@@ -2777,28 +2780,75 @@ pub(crate) async fn follow_moved_finished_downloads(
         .collect();
     let followed: Vec<String> = {
         let mut manager = state.transfer_manager.write().await;
-        let hits: Vec<(String, String)> = manager
+        let hits: Vec<(String, String, bool)> = manager
             .completed
             .iter()
             .filter(|t| t.direction == TransferDirection::Download)
             .filter_map(|t| {
                 let recorded = t.completed_path.as_deref()?;
                 let (hash, to) = moved.get(&crate::search::index::normalize_path_key(recorded))?;
-                t.file_hash.eq_ignore_ascii_case(hash).then(|| (t.id.clone(), to.clone()))
+                t.file_hash
+                    .eq_ignore_ascii_case(hash)
+                    .then(|| (t.id.clone(), to.clone(), t.category != category))
             })
             .collect();
-        for (id, to) in &hits {
+        for (id, to, _) in &hits {
             manager.set_category(id, category);
             manager.set_completed_path(id, to.clone());
         }
-        hits.into_iter().map(|(id, _)| id).collect()
+        // Only the downloads whose category this actually changed.
+        hits.into_iter().filter(|(_, _, changed)| *changed).map(|(id, _, _)| id).collect()
     };
+    let count = followed.len();
     for id in followed {
         let db = state.db.clone();
         let cat = category.to_string();
         let persisted = tokio::task::spawn_blocking(move || db.update_transfer_category(&id, &cat)).await;
         if !matches!(persisted, Ok(Ok(_))) {
             tracing::warn!("Could not save the category of a finished download moved from the Library");
+        }
+    }
+    count
+}
+
+/// A Library file was renamed: a finished download in the transfer list that
+/// wrote it takes the new name and path, so the two pages agree. Matched on the
+/// hash as well as the path, as [`follow_moved_finished_downloads`] is. Best
+/// effort.
+pub(crate) async fn follow_renamed_finished_download(
+    state: &AppState,
+    renamed: &crate::commands::sharing::FileMove,
+) {
+    let Some(name) = renamed.to.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let to = renamed.to.to_string_lossy().into_owned();
+    let from_key = crate::search::index::normalize_path_key(&renamed.from);
+    let followed: Vec<String> = {
+        let mut manager = state.transfer_manager.write().await;
+        let ids: Vec<String> = manager
+            .completed
+            .iter()
+            .filter(|t| t.direction == TransferDirection::Download)
+            .filter(|t| {
+                t.completed_path
+                    .as_deref()
+                    .is_some_and(|p| crate::search::index::normalize_path_key(p) == from_key)
+                    && t.file_hash.eq_ignore_ascii_case(&renamed.hash)
+            })
+            .map(|t| t.id.clone())
+            .collect();
+        for id in &ids {
+            manager.follow_renamed_file(id, &name, to.clone());
+        }
+        ids
+    };
+    for id in followed {
+        let db = state.db.clone();
+        let name = name.clone();
+        let persisted = tokio::task::spawn_blocking(move || db.update_transfer_file_name(&id, &name)).await;
+        if !matches!(persisted, Ok(Ok(_))) {
+            tracing::warn!("Could not save the new name of a finished download renamed in the Library");
         }
     }
 }

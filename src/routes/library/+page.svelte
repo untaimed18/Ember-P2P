@@ -29,6 +29,7 @@
     setFolderPriority,
     getFileMediaMetadata,
     moveFilesToCategory,
+    renameLibraryFile,
     openLibraryFolder,
     type SharedFolderPick,
   } from '$lib/api/sharing';
@@ -209,7 +210,8 @@
   /** Bumped to pause the in-app player (e.g. before Open Externally). */
   let playerStopToken = $state(0);
 
-  let hashedLibraryFiles = $derived.by(() => files.filter((f) => !!f.hash));
+  // From `treeFiles`: the collection picker needs names, sizes and hashes only.
+  let hashedLibraryFiles = $derived.by(() => treeFiles.filter((f) => !!f.hash));
   /** The collection picker selects by hash, so its total counts hashes too. */
   let hashedUniqueCount = $derived(new Set(hashedLibraryFiles.map((f) => f.hash)).size);
 
@@ -226,6 +228,88 @@
     if (!createCollectionOpen || !createCollectionOverlay) return;
     return inertBackground(createCollectionOverlay);
   });
+  /** Where the last press on a dialog backdrop began. A click that ends on
+   *  the backdrop closes the dialog only if it began there too: a selection
+   *  dragged out of a text field must not close it and lose what was typed. */
+  let overlayPressTarget: EventTarget | null = null;
+
+  // --- Rename file ---
+  let renameDialog = $state({
+    open: false,
+    path: '',
+    oldName: '',
+    value: '',
+    error: null as string | null,
+    busy: false,
+  });
+  let renameOverlayEl: HTMLDivElement | undefined = $state(undefined);
+  let renameModalEl: HTMLDivElement | undefined = $state(undefined);
+  let renameInputEl: HTMLInputElement | undefined = $state(undefined);
+  let renameReturnFocus: HTMLElement | null = null;
+  $effect(() => {
+    if (!renameDialog.open || !renameOverlayEl) return;
+    return inertBackground(renameOverlayEl);
+  });
+
+  function openRename(f: FileInfo) {
+    // The backend refuses a file that is still being hashed; say so up front.
+    if (!f.hash) {
+      toastWarning(m.library_rename_not_hashed());
+      return;
+    }
+    const active = typeof document !== 'undefined' ? document.activeElement : null;
+    renameReturnFocus = active instanceof HTMLElement && active !== document.body ? active : null;
+    renameDialog = { open: true, path: f.path, oldName: f.name, value: f.name, error: null, busy: false };
+    requestAnimationFrame(() => {
+      const input = renameInputEl;
+      if (!input) return;
+      input.focus();
+      // Select the name but not the extension, so typing keeps `.mkv` intact.
+      const dot = f.name.lastIndexOf('.');
+      input.setSelectionRange(0, dot > 0 ? dot : f.name.length);
+    });
+  }
+
+  function closeRename() {
+    if (renameDialog.busy) return;
+    renameDialog.open = false;
+    const target = renameReturnFocus;
+    renameReturnFocus = null;
+    requestAnimationFrame(() => {
+      if (target && document.contains(target)) target.focus();
+    });
+  }
+
+  async function submitRename() {
+    if (!renameDialog.open || renameDialog.busy) return;
+    const { path, oldName } = renameDialog;
+    const value = renameDialog.value.trim();
+    if (!value) return;
+    if (value === oldName) {
+      closeRename();
+      return;
+    }
+    renameDialog.busy = true;
+    renameDialog.error = null;
+    try {
+      const newPath = await renameLibraryFile(path, value);
+      if (selectedPath === path) selectedPath = newPath;
+      if (checkedPaths.has(path)) {
+        const next = new Set(checkedPaths);
+        next.delete(path);
+        next.add(newPath);
+        checkedPaths = next;
+      }
+      renameDialog.busy = false;
+      closeRename();
+      await refresh();
+      toastSuccess(m.library_renamed_named({ oldName, name: value }));
+    } catch (e: unknown) {
+      renameDialog.busy = false;
+      renameDialog.error = toErr(e);
+    }
+  }
+
   let addFolderOpen = $state(false);
   let newCollName = $state('');
   let newCollAuthor = $state('');
@@ -594,8 +678,11 @@
     }
   }
 
+  let removingMissing = $state(false);
+
   async function handleRemoveMissing() {
-    if (missingPathSet.size === 0) return;
+    if (missingPathSet.size === 0 || removingMissing) return;
+    removingMissing = true;
     try {
       // The materialized path set is capped at 10,000, but confirmation
       // authorizes the loop below to remove every missing index row.
@@ -603,8 +690,8 @@
       const confirmed = await askConfirm(
         plural(count, {
           one: m.library_confirm_remove_missing_one,
-          few: () => m.library_confirm_remove_missing_few({ count }),
-          other: () => m.library_confirm_remove_missing_other({ count }),
+          few: () => m.library_confirm_remove_missing_few({ count: formatNumber(count) }),
+          other: () => m.library_confirm_remove_missing_other({ count: formatNumber(count) }),
         }),
         m.library_remove_missing_title(),
       );
@@ -624,6 +711,8 @@
       await refresh();
     } catch (e: unknown) {
       toastError(toErr(e));
+    } finally {
+      removingMissing = false;
     }
   }
 
@@ -637,6 +726,13 @@
       );
       if (!confirmed) return;
       const removed = await removeMissingFiles([f.path]);
+      if (removed === 0) {
+        // The backend checks again and keeps a file that has come back (a
+        // drive remounted): nothing was removed, so nothing here changes.
+        toastInfo(m.library_no_missing());
+        await refreshMissingSet(true);
+        return;
+      }
       toastSuccess(removedMissingText(removed));
       const next = new Set(missingPathSet);
       next.delete(f.path);
@@ -870,7 +966,10 @@
     refreshWaiters = [];
     loadStalled = false;
     const releaseId = setTimeout(() => {
-      if (gen === loadGen) loadStalled = true;
+      // Replaced by a forced load, which took these callers over and runs
+      // its own cap: releasing them here would send them on early.
+      if (gen !== loadGen) return;
+      loadStalled = true;
       for (const resolve of answering) resolve();
       for (const resolve of refreshWaiters) resolve();
     }, REFRESH_WAIT_CAP_MS);
@@ -962,6 +1061,9 @@
         lastLoadError = toErr(e);
         error = lastLoadError;
       }
+      // Offer Retry: the spinner is otherwise all that shows, and nothing
+      // retries a first load that failed outright.
+      if (!initialLoadDone) firstLoadSlow = true;
     } finally {
       clearTimeout(timeoutId);
       clearTimeout(releaseId);
@@ -994,21 +1096,21 @@
   function copiedLinksText(count: number): string {
     return plural(count, {
       one: m.library_copied_link_one,
-      other: () => m.library_copied_links_other({ count }),
+      other: () => m.library_copied_links_other({ count: formatNumber(count) }),
     });
   }
 
   function removedMissingText(count: number): string {
     return plural(count, {
       one: m.library_removed_missing_one,
-      other: () => m.library_removed_missing_other({ count }),
+      other: () => m.library_removed_missing_other({ count: formatNumber(count) }),
     });
   }
 
   function unsharedText(count: number): string {
     return plural(count, {
       one: m.library_unshared_one,
-      other: () => m.library_unshared_other({ count }),
+      other: () => m.library_unshared_other({ count: formatNumber(count) }),
     });
   }
 
@@ -1129,12 +1231,20 @@
     bulkBusy = true;
     const folder = categoryDestinationLabel(categorySubdir(category, categoryFolders));
     try {
-      const report = { moved: 0, unchanged: 0, failed: [] as string[] };
+      const report = { moved: 0, unchanged: 0, recategorized: 0, failed: [] as string[] };
       for (let i = 0; i < targets.length; i += MAX_CATEGORY_MOVE_BATCH) {
         const batch = targets.slice(i, i + MAX_CATEGORY_MOVE_BATCH);
-        const part = await moveFilesToCategory(batch.map((t) => t.path), category);
+        let part: Awaited<ReturnType<typeof moveFilesToCategory>>;
+        try {
+          part = await moveFilesToCategory(batch.map((t) => t.path), category);
+        } catch (e: unknown) {
+          // Earlier batches did move; keep their count and go on with the rest.
+          report.failed.push(typeof e === 'string' ? e : toErr(e));
+          continue;
+        }
         report.moved += part.moved;
         report.unchanged += part.unchanged;
+        report.recategorized += part.recategorized;
         report.failed.push(...part.failed);
       }
       if (report.moved > 0) {
@@ -1146,6 +1256,8 @@
                 other: () => m.library_moved_count_other({ count: formatNumber(report.moved), folder }),
               }),
         );
+      } else if (report.failed.length === 0 && report.recategorized > 0) {
+        toastSuccess(m.library_category_set_in_place({ category: downloadCategoryLabel(category), folder }));
       } else if (report.failed.length === 0) {
         toastInfo(m.library_move_already_there({ folder }));
       }
@@ -1405,6 +1517,7 @@
       if (mounted) {
         scanning = false;
         error = toErr(e);
+        await syncHashingPaused();
       }
     } finally {
       if (mounted) reloading = false;
@@ -1418,6 +1531,11 @@
 
   let stopConfirmVisible = $state(false);
   let stoppingHashing = $state(false);
+  // A pass that finishes while the Stop confirmation is up leaves nothing to
+  // confirm; the banner would only stand there, over the Resume banner.
+  $effect(() => {
+    if (stopConfirmVisible && !scanning && !hashProgress) stopConfirmVisible = false;
+  });
   /** A `preview_stop_hashing` round trip is in flight. Keeps Stop from being
    *  pressed twice while it waits. */
   let stopPreviewPending = $state(false);
@@ -1492,6 +1610,9 @@
   async function handleStopConfirm() {
     stopConfirmVisible = false;
     stopConfirmUnknown = false;
+    // The pass may have finished while the banner was up. Stopping nothing
+    // would still pause hashing, and hold the file watcher's rescans with it.
+    if (!scanning && !hashProgress) return;
     stoppingHashing = true;
     try {
       await stopHashing();
@@ -1528,7 +1649,23 @@
       await resumeHashing();
       await refresh();
     } catch (e: unknown) {
-      if (mounted) error = toErr(e);
+      if (!mounted) return;
+      error = toErr(e);
+      scanning = false;
+      await syncHashingPaused();
+    }
+  }
+
+  /** After a Resume or Reload that failed, take the backend's word on whether
+   *  hashing is still paused: a refusal (another pass still winding down) leaves
+   *  it paused, and the Resume banner must come back or nothing can restart it. */
+  async function syncHashingPaused() {
+    const epoch = hashingStateEpoch;
+    try {
+      const paused = await getHashingPaused();
+      if (mounted && hashingStateEpoch === epoch) stoppedByUser = paused;
+    } catch {
+      /* unknown: leave the state the action set */
     }
   }
 
@@ -1755,7 +1892,7 @@
       );
       toastSuccess(plural(count, {
         one: () => m.library_set_priority_one({ priority: priorityLabel(priority) }),
-        other: () => m.library_set_priority_other({ priority: priorityLabel(priority), count }),
+        other: () => m.library_set_priority_other({ priority: priorityLabel(priority), count: formatNumber(count) }),
       }));
     } catch (e: unknown) { error = toErr(e); }
     finally {
@@ -1840,6 +1977,7 @@
       );
       if (!confirmed) return;
       let deleted = 0;
+      const deletedPaths = new Set<string>();
       const failures: string[] = [];
       // One IPC per file, so this is the slowest bulk action by a wide margin
       // and the one most in need of saying where it has got to.
@@ -1848,6 +1986,7 @@
         try {
           await deleteSharedFile(f.path, f.hash || undefined);
           deleted++;
+          deletedPaths.add(f.path);
         } catch (e: unknown) {
           failures.push(`${f.name}: ${toErr(e)}`);
           // "Keep file" in the backend's delete-permanently question (a file
@@ -1858,17 +1997,21 @@
         bulkProgress = { done: index + 1, total: targets.length };
       }
       bulkProgress = null;
-      if (selectedPath && targets.some((f) => f.path === selectedPath)) {
+      if (selectedPath && deletedPaths.has(selectedPath)) {
         selectedPath = null;
       }
-      clearChecked();
+      // Files that failed, or were never tried after a "Keep file", stay
+      // checked so a retry does not mean selecting them all again.
+      const remaining = targets.filter((f) => !deletedPaths.has(f.path)).map((f) => f.path);
+      if (remaining.length === 0) clearChecked();
+      else checkedPaths = new Set(remaining);
       await refresh();
       if (deleted > 0) {
         const base = plural(deleted, {
           one: m.library_deleted_one,
-          other: () => m.library_deleted_other({ count: deleted }),
+          other: () => m.library_deleted_other({ count: formatNumber(deleted) }),
         });
-        toastSuccess(failures.length ? m.library_deleted_with_failures({ base, failed: failures.length }) : base);
+        toastSuccess(failures.length ? m.library_deleted_with_failures({ base, failed: formatNumber(failures.length) }) : base);
       }
       if (failures.length > 0) {
         toastError(failures[0]);
@@ -2006,10 +2149,18 @@
     expandedFolders = next;
   }
 
+  // Once per folder picked: the tree is rebuilt on every refresh, and
+  // re-expanding then would reopen an ancestor the user has since collapsed.
+  let autoExpandedFor: string | null = null;
   $effect(() => {
-    if (!filterFolder) return;
+    if (!filterFolder) {
+      autoExpandedFor = null;
+      return;
+    }
+    if (autoExpandedFor === filterFolder) return;
     const ancestors = ancestorFolderPaths(folderTree, filterFolder, normalizePathForMatch);
     if (ancestors.length === 0) return;
+    autoExpandedFor = filterFolder;
     const next = new Set(untrack(() => expandedFolders));
     let changed = false;
     for (const path of ancestors) {
@@ -2225,6 +2376,9 @@
     // once the debounced fetch for THIS hash lands. Refuse to save until then,
     // otherwise we'd persist empty/stale fields over the file's real comment.
     if (commentLoading) return;
+    // The button's own gating, for Ctrl+Enter: no second save while one is in
+    // flight, and no "Saved" for a write of what is already saved.
+    if (commentSaveState === 'saving' || !commentDirty) return;
     commentSaveState = 'saving';
     commentSaveMessage = m.library_saving();
     // What is being saved, not what the editor holds when the save returns:
@@ -2290,6 +2444,15 @@
   const enterHoverSub = ctxSubs.enter;
   const leaveHoverSub = ctxSubs.leave;
   const clickHoverSub = ctxSubs.click;
+  /** Enter, Space or ArrowRight on a submenu's own item opens it; keys from
+   *  inside the open submenu bubble here and are left alone. */
+  function onSubmenuKey(e: KeyboardEvent, which: HoverSub) {
+    if (e.target !== e.currentTarget) return;
+    if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowRight') {
+      e.preventDefault();
+      openHoverSub(which);
+    }
+  }
   // Empty until settings load, so the submenu shows its "configure in Settings"
   // hint rather than a stale list.
   let webServices = $derived($appSettings?.web_services ?? []);
@@ -2326,11 +2489,18 @@
       .filter((el) => el.closest('[role="menu"]') === menu);
   }
 
+  /** Focus inside either menu: an item of one about to unmount is no place to
+   *  hand focus back to when the other closes. */
+  function inOpenMenu(el: HTMLElement): boolean {
+    return !!ctxMenuEl?.contains(el) || !!folderCtxEl?.contains(el);
+  }
+
   function onCtx(e: MouseEvent, f: FileInfo) {
     e.preventDefault();
     ctxSubs.open(null);
+    folderCtx = null;
     const active = document.activeElement;
-    if (active instanceof HTMLElement && active !== document.body && !ctxMenuEl?.contains(active)) {
+    if (active instanceof HTMLElement && active !== document.body && !inOpenMenu(active)) {
       ctxReturnFocus = active;
     }
     // Highlight the target row without opening the properties drawer
@@ -2345,7 +2515,42 @@
   function closeCtx() {
     ctxSubs.open(null);
     ctxMenu = null;
+    folderCtx = null;
     ctxReturnFocus = null;
+  }
+
+  // Right-click on a folder in the sidebar tree: the row's inline buttons, plus
+  // copying the path, in a menu that does not depend on hovering the row.
+  let folderCtx: { x: number; y: number; folder: string; isShare: boolean } | null = $state(null);
+  let folderCtxEl: HTMLDivElement | undefined = $state(undefined);
+
+  function onFolderCtx(e: MouseEvent, folder: string, isShare: boolean) {
+    e.preventDefault();
+    e.stopPropagation();
+    ctxSubs.open(null);
+    ctxMenu = null;
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && active !== document.body && !inOpenMenu(active)) {
+      ctxReturnFocus = active;
+    }
+    folderCtx = { x: e.clientX, y: e.clientY, folder, isShare };
+    void tick().then(() => ctxMenuItems(folderCtxEl)[0]?.focus());
+  }
+
+  async function folderCtxAction(action: 'open' | 'copy_path' | 'reapprove' | 'unshare' | 'remove') {
+    if (!folderCtx) return;
+    const { folder } = folderCtx;
+    closeCtxAndRefocus();
+    switch (action) {
+      case 'open': await openTreeFolder(folder); break;
+      case 'copy_path':
+        if (await writeClipboard(folder)) toastSuccess(m.library_copied_folder_path());
+        else toastError(m.library_copy_failed());
+        break;
+      case 'reapprove': await handleReapproveFolder(folder); break;
+      case 'unshare': await handleUnshareFolder(folder); break;
+      case 'remove': await handleRemoveFolder(folder); break;
+    }
   }
   function closeCtxAndRefocus() {
     const target = ctxReturnFocus;
@@ -2355,7 +2560,8 @@
 
   /** Arrow-key movement inside the open context menu. Returns true when handled. */
   function handleCtxMenuKey(e: KeyboardEvent): boolean {
-    const active = document.activeElement instanceof HTMLElement && ctxMenuEl?.contains(document.activeElement)
+    const menuEl = ctxMenuEl ?? folderCtxEl;
+    const active = document.activeElement instanceof HTMLElement && menuEl?.contains(document.activeElement)
       ? document.activeElement
       : null;
     if (
@@ -2363,7 +2569,7 @@
       || e.key === 'PageUp' || e.key === 'PageDown'
     ) {
       e.preventDefault();
-      const items = ctxMenuItems(active?.closest('[role="menu"]') ?? ctxMenuEl);
+      const items = ctxMenuItems(active?.closest('[role="menu"]') ?? menuEl);
       if (items.length === 0) return true;
       const i = active ? items.indexOf(active) : -1;
       const next =
@@ -2396,7 +2602,9 @@
     if (!(el instanceof HTMLElement)) return false;
     if (el.isContentEditable) return true;
     const tag = el.tagName;
-    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+    // The drawer's player takes Space, arrows and Home/End for its own
+    // controls; as row shortcuts they toggled a check or tore the player down.
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'VIDEO' || tag === 'AUDIO';
   }
 
   /**
@@ -2420,15 +2628,7 @@
     const f = selectedFile;
     if (!f) return;
     try {
-      const confirmed = await askConfirm(
-        m.library_confirm_delete_single({ name: f.name }),
-        m.library_delete_file_title(),
-      );
-      if (!confirmed) return;
-      await deleteSharedFile(f.path, f.hash || undefined);
-      if (selectedPath === f.path) selectedPath = null;
-      toastSuccess(m.library_deleted_named({ name: f.name }));
-      await refresh();
+      await deleteOneFile(f);
     } catch (e: unknown) { error = toErr(e); }
   }
 
@@ -2479,8 +2679,11 @@
 
   function onPageKeyDown(e: KeyboardEvent) {
     if (!mounted) return;
-    if (ctxMenu && e.key === 'Escape') { closeCtxAndRefocus(); e.preventDefault(); e.stopPropagation(); return; }
-    if (ctxMenu && handleCtxMenuKey(e)) return;
+    if ((ctxMenu || folderCtx) && e.key === 'Escape') { closeCtxAndRefocus(); e.preventDefault(); e.stopPropagation(); return; }
+    if ((ctxMenu || folderCtx) && handleCtxMenuKey(e)) return;
+    // A menu that is open owns the keyboard: Delete or F2 here would act on
+    // the selected row, which is often not the one right-clicked.
+    if (ctxMenu || folderCtx) return;
 
     // Ignore shortcuts while a modal is open. Must run before Escape so a
     // discard/delete confirm isn't also treated as "deselect the row".
@@ -2488,7 +2691,7 @@
     // panel is an inline collapsible (the file table stays visible and
     // interactive below it), not a modal, and it has no keyboard handling of
     // its own that these shortcuts could conflict with.
-    if (createCollectionOpen || addFolderOpen || confirmOpen || confirmDiscardComment || stopConfirmVisible) {
+    if (createCollectionOpen || renameDialog.open || addFolderOpen || confirmOpen || confirmDiscardComment || stopConfirmVisible) {
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
@@ -2577,6 +2780,13 @@
       if (!hasChecked && !hasSelected) return;
       e.preventDefault();
       void copyLinkForSelection();
+      return;
+    }
+
+    // F2 renames the selected row, as in a file manager.
+    if (e.key === 'F2' && selectedFile && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+      e.preventDefault();
+      openRename(selectedFile);
       return;
     }
 
@@ -2675,6 +2885,7 @@
           break;
         case 'open_file': await openSharedFileExternally(f.path); break;
         case 'open_folder': await openSharedFolder(f.path); break;
+        case 'rename': openRename(f); break;
         case 'move_category':
           if (extra !== undefined) await moveToCategory(categoryMoveTargets(f), extra);
           break;
@@ -2719,35 +2930,18 @@
           ]);
           break;
         }
-        case 'delete': {
-          const confirmed = await askConfirm(
-            m.library_confirm_delete_single({ name: f.name }),
-            m.library_delete_file_title(),
-          );
-          if (!confirmed) break;
-          await deleteSharedFile(f.path, f.hash || undefined);
-          if (selectedPath === f.path) selectedPath = null;
-          toastSuccess(m.library_deleted_named({ name: f.name }));
-          await refresh();
+        case 'delete':
+          await deleteOneFile(f);
           break;
-        }
         case 'priority':
           if (extra) await applyFilePriority(f, extra as FileInfo['priority']);
           break;
         case 'copy_link':
           await copyFileLink(f, extra === 'aich' || extra === 'sources' ? extra : undefined);
           break;
-        case 'unshare': {
-          const confirmed = await askConfirm(
-            m.library_confirm_unshare_file({ name: f.name }),
-            m.library_unshare_file_title(),
-          );
-          if (!confirmed) break;
-          await unshareFile(f.path, f.hash || undefined);
-          await refresh();
-          toastSuccess(m.library_unshared_named({ name: f.name }));
+        case 'unshare':
+          await unshareOneFile(f);
           break;
-        }
         case 'send_to_friend': {
           if (!extra) break;
           const { offerFileToFriend } = await import('$lib/api/friends');
@@ -2774,6 +2968,39 @@
 
   // One file's settings and links, for the context menu and the details
   // drawer alike. They throw; each caller reports the error its own way.
+
+  async function unshareOneFile(f: FileInfo) {
+    const confirmed = await askConfirm(
+      m.library_confirm_unshare_file({ name: f.name }),
+      m.library_unshare_file_title(),
+    );
+    if (!confirmed) return;
+    await unshareFile(f.path, f.hash || undefined);
+    await refresh();
+    toastSuccess(m.library_unshared_named({ name: f.name }));
+  }
+
+  /** Files a delete is confirming or running for. A second Delete press while
+   *  the first is still on its way would ask again and delete a file now gone. */
+  const deletingPaths = new Set<string>();
+
+  async function deleteOneFile(f: FileInfo) {
+    if (deletingPaths.has(f.path)) return;
+    deletingPaths.add(f.path);
+    try {
+      const confirmed = await askConfirm(
+        m.library_confirm_delete_single({ name: f.name }),
+        m.library_delete_file_title(),
+      );
+      if (!confirmed) return;
+      await deleteSharedFile(f.path, f.hash || undefined);
+      if (selectedPath === f.path) selectedPath = null;
+      toastSuccess(m.library_deleted_named({ name: f.name }));
+      await refresh();
+    } finally {
+      deletingPaths.delete(f.path);
+    }
+  }
 
   async function applyFilePriority(f: FileInfo, priority: FileInfo['priority']) {
     await setFilePriority(f.path, priority);
@@ -2866,9 +3093,18 @@
     }
   }
 
+  /** Bumped whenever a drawer change settles or is turned away, so a control
+   *  that shows what was asked for (the friends-only switch) is redrawn from
+   *  the file's state even when that state did not change. */
+  let drawerSettled = $state(0);
+  let friendsToggleWrap: HTMLSpanElement | undefined = $state(undefined);
+
   /** A drawer control that changes the file; one at a time. */
   async function drawerChange(action: () => Promise<void>) {
-    if (drawerBusy) return;
+    if (drawerBusy) {
+      drawerSettled += 1;
+      return;
+    }
     drawerBusy = true;
     try {
       await action();
@@ -2876,6 +3112,7 @@
       error = toErr(e);
     } finally {
       drawerBusy = false;
+      drawerSettled += 1;
     }
   }
 
@@ -3010,7 +3247,8 @@
         sortField,
         sortAsc,
         showDuplicatesOnly,
-        showMissingOnly,
+        // Still waiting on the first missing-file scan: keep what was saved.
+        showMissingOnly: showMissingOnly || pendingRestoreMissingOnly,
         shareScopeFilter: pendingShareScope ?? shareScopeFilter,
         topPanelOpen,
         topPanelMetric,
@@ -3485,7 +3723,7 @@
     <button
       class="dupes-toggle"
       class:active={showDuplicatesOnly}
-      disabled={duplicateHashes.size === 0}
+      disabled={duplicateHashes.size === 0 && !showDuplicatesOnly}
       onclick={() => (showDuplicatesOnly = !showDuplicatesOnly)}
       title={duplicateHashes.size === 0
         ? m.library_no_duplicates()
@@ -3499,7 +3737,7 @@
     <button
       class="dupes-toggle missing-toggle"
       class:active={showMissingOnly}
-      disabled={missingScanInFlight || (missingTotalCount === 0 && missingPathSet.size === 0)}
+      disabled={!showMissingOnly && (missingScanInFlight || (missingTotalCount === 0 && missingPathSet.size === 0))}
       onclick={() => (showMissingOnly = !showMissingOnly)}
       title={
         missingScanInFlight
@@ -3525,6 +3763,7 @@
     {#if showMissingOnly && missingPathSet.size > 0}
       <button
         class="dupes-toggle missing-remove-btn"
+        disabled={removingMissing}
         onclick={handleRemoveMissing}
         title={m.library_remove_missing_tooltip()}
       >{m.library_remove_missing()}</button>
@@ -3556,6 +3795,7 @@
     </button>
     <button
       class="dupes-toggle columns-btn"
+      disabled={!libraryTableRef}
       onclick={(e) => libraryTableRef?.openColumnMenu(e)}
       title={m.library_columns_title()}
     >
@@ -3658,8 +3898,8 @@
 
 {#if createCollectionOpen}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="modal-overlay" bind:this={createCollectionOverlay} role="dialog" aria-modal="true" aria-labelledby="create-coll-title" aria-busy={creatingCollection} tabindex="-1" onclick={(e) => {
-    if (e.target === e.currentTarget && !creatingCollection) closeCreateDialog();
+  <div class="modal-overlay" bind:this={createCollectionOverlay} role="dialog" aria-modal="true" aria-labelledby="create-coll-title" aria-busy={creatingCollection} tabindex="-1" onmousedown={(e) => (overlayPressTarget = e.target)} onclick={(e) => {
+    if (e.target === e.currentTarget && overlayPressTarget === e.currentTarget && !creatingCollection) closeCreateDialog();
   }} onkeydown={(e) => {
     if (e.key === 'Escape') {
       e.preventDefault();
@@ -3768,6 +4008,62 @@
   </div>
 {/if}
 
+{#if renameDialog.open}
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div
+    class="modal-overlay"
+    bind:this={renameOverlayEl}
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="lib-rename-title"
+    aria-busy={renameDialog.busy}
+    tabindex="-1"
+    onmousedown={(e) => (overlayPressTarget = e.target)}
+    onclick={(e) => { if (e.target === e.currentTarget && overlayPressTarget === e.currentTarget) closeRename(); }}
+    onkeydown={(e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        closeRename();
+        return;
+      }
+      trapTabKey(e, renameModalEl);
+    }}
+  >
+    <div class="modal-content rename-modal" bind:this={renameModalEl}>
+      <div class="modal-header">
+        <span id="lib-rename-title" class="modal-title">{m.library_rename_title()}</span>
+        <button type="button" class="icon-close" onclick={closeRename} disabled={renameDialog.busy} aria-label={m.common_close()}><IconX size={15} /></button>
+      </div>
+      <form onsubmit={(e) => { e.preventDefault(); void submitRename(); }}>
+        <div class="modal-body">
+        <div class="form-row">
+          <label class="form-label" for="lib-rename-input">{m.library_rename_label()}</label>
+          <input
+            id="lib-rename-input"
+            type="text"
+            class="form-input"
+            bind:this={renameInputEl}
+            bind:value={renameDialog.value}
+            disabled={renameDialog.busy}
+            spellcheck="false"
+            autocomplete="off"
+            maxlength="255"
+          />
+        </div>
+        {#if renameDialog.error}
+          <p class="rename-error" role="alert">{renameDialog.error}</p>
+        {/if}
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="ghost" onclick={closeRename} disabled={renameDialog.busy}>{m.common_cancel()}</button>
+          <button type="submit" disabled={renameDialog.busy || !renameDialog.value.trim()}>{m.library_rename_save()}</button>
+        </div>
+      </form>
+    </div>
+  </div>
+{/if}
+
 {#if error}
   <div class="error-banner" role="alert">
     <span>{error}</span>
@@ -3852,6 +4148,7 @@
           class:active={filterFolder !== null && pathsEqualForFolder(filterFolder, folder)}
           style="--depth: {row.depth}"
           onclick={() => filterFolder = folder}
+          oncontextmenu={(e) => onFolderCtx(e, folder, row.isShare)}
           role="button"
           tabindex="0"
           aria-expanded={row.hasChildren ? row.expanded : undefined}
@@ -3953,25 +4250,6 @@
               {@render openFolderButton(folder)}
               <button
                 type="button"
-                class="tree-btn tree-unshare"
-                onclick={(e) => { e.stopPropagation(); handleUnshareFolder(folder); }}
-                title={m.library_unshare_folder_title()}
-                aria-label={m.library_unshare_folder_title()}
-              >
-                <span class="tree-btn-idle" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
-                    <circle cx="18" cy="5" r="3" />
-                    <circle cx="6" cy="12" r="3" />
-                    <circle cx="18" cy="19" r="3" />
-                    <line x1="8.59" y1="13.51" x2="15.42" y2="17.49" />
-                    <line x1="15.41" y1="6.51" x2="8.59" y2="10.49" />
-                    <line x1="4" y1="4" x2="20" y2="20" />
-                  </svg>
-                </span>
-                <span class="tree-btn-confirm" aria-hidden="true"><IconX size={12} /></span>
-              </button>
-              <button
-                type="button"
                 class="tree-btn tree-remove"
                 onclick={(e) => { e.stopPropagation(); handleRemoveFolder(folder); }}
                 title={m.library_remove_folder_btn_title()}
@@ -3986,6 +4264,15 @@
                   </svg>
                 </span>
                 <span class="tree-btn-confirm" aria-hidden="true"><IconX size={12} /></span>
+              </button>
+              <button
+                type="button"
+                class="tree-unshare-btn"
+                onclick={(e) => { e.stopPropagation(); handleUnshareFolder(folder); }}
+                title={m.library_unshare_folder_title()}
+                aria-label={m.library_unshare_folder_title()}
+              >
+                {m.library_bulk_unshare()}
               </button>
             </span>
             {/if}
@@ -4101,7 +4388,7 @@
     }}
     role="slider"
     tabindex="0"
-    aria-orientation="vertical"
+    aria-orientation="horizontal"
     aria-valuenow={sidebarWidth}
     aria-valuemin={120}
     aria-valuemax={400}
@@ -4319,6 +4606,18 @@
             {/if}
           </span>
         </div>
+        <button
+          type="button"
+          class="icon-close drawer-close"
+          disabled={!selectedFile.hash}
+          onclick={() => { const f = selectedFile; if (f) openRename(f); }}
+          title={selectedFile.hash ? m.library_rename_title() : m.library_rename_not_hashed()}
+          aria-label={m.library_rename_title()}
+        >
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
+            <path d="M10.5 2.5l3 3L6 13H3v-3z"/>
+          </svg>
+        </button>
         <button type="button" class="icon-close drawer-close" onclick={() => requestSelectPath(null)} title={m.library_close_details()} aria-label={m.library_close_details()}>
           <IconX size={15} />
         </button>
@@ -4326,7 +4625,7 @@
 
       <div class="drawer-actions">
         {#if inAppPlayerKind}
-          <button class="drawer-action-btn" onclick={() => openSharedFileExternally(selectedFile.path)} title={m.library_open_externally_title()}>
+          <button class="drawer-action-btn" onclick={() => { const f = selectedFile; if (f) void openSharedFileExternally(f.path); }} title={m.library_open_externally_title()}>
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
               <path d="M9 3h4v4"/>
               <path d="M13 3L7 9"/>
@@ -4335,7 +4634,7 @@
             {m.library_open_externally()}
           </button>
         {:else}
-          <button class="drawer-action-btn" onclick={() => openSharedFile(selectedFile.path)} title={m.library_open_file_title()}>
+          <button class="drawer-action-btn" onclick={() => { const f = selectedFile; if (f) void openSharedFile(f.path); }} title={m.library_open_file_title()}>
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
               <path d="M2 2.5h4.5l1.5 2H14v9H2z"/>
               <path d="M6 8.5l2 2 2-2"/>
@@ -4344,7 +4643,7 @@
             {m.library_open_file()}
           </button>
         {/if}
-        <button class="drawer-action-btn" onclick={() => openSharedFolder(selectedFile.path)} title={m.library_open_folder_title()}>
+        <button class="drawer-action-btn" onclick={() => { const f = selectedFile; if (f) void openSharedFolder(f.path); }} title={m.library_open_folder_title()}>
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
             <path d="M2 2.5h4.5l1.5 2H14v9H2z"/>
           </svg>
@@ -4365,6 +4664,40 @@
             {m.servers_copy_ed2k_link()}
           </button>
         {/if}
+        <!-- Taking the file off the network or the disk: kept apart from the
+             everyday actions, and icon-only so the row fits on one line. -->
+        <span class="drawer-actions-end">
+          {#if selectedFile.hash && selectedFile.shared}
+            <button
+              class="drawer-icon-btn drawer-action-warn"
+              disabled={drawerBusy}
+              title={m.library_unshare_file_title()}
+              aria-label={m.library_unshare_file_title()}
+              onclick={() => { const f = selectedFile; if (f) void drawerChange(() => unshareOneFile(f)); }}
+            >
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 10.5v2a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-2"/>
+                <path d="M8 9.5V3"/>
+                <path d="M5.5 5.5 8 3l2.5 2.5"/>
+                <path d="M2 2l12 12"/>
+              </svg>
+            </button>
+          {/if}
+          <button
+            class="drawer-icon-btn drawer-action-danger"
+            disabled={drawerBusy}
+            title={m.library_delete_file_title()}
+            aria-label={m.library_delete_file_title()}
+            onclick={() => { const f = selectedFile; if (f) void drawerChange(() => deleteOneFile(f)); }}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="3 6 5 6 21 6" />
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+              <line x1="10" y1="11" x2="10" y2="17" />
+              <line x1="14" y1="11" x2="14" y2="17" />
+            </svg>
+          </button>
+        </span>
       </div>
 
       <div class="drawer-body">
@@ -4438,42 +4771,55 @@
                  file is being looked at. Both wait for the hash, as there. -->
             <span class="meta-label" id="drawer-priority-label">{m.library_col_priority()}</span>
             <span class="meta-value">
-              <!-- Remounted once a change settles, like the switch below, so a
-                   refused change does not stay selected. -->
-              {#key `${selectedFile.path}:${selectedFile.priority}:${drawerBusy}`}
-                <select
-                  class="drawer-select prio-{selectedFile.priority}"
-                  aria-labelledby="drawer-priority-label"
-                  value={selectedFile.priority}
-                  disabled={!selectedFile.hash || drawerBusy}
-                  onchange={(e) => {
-                    const f = selectedFile;
-                    const next = e.currentTarget.value as FileInfo['priority'];
-                    if (f && next !== f.priority) void drawerChange(() => applyFilePriority(f, next));
-                  }}
-                >
-                  {#each PRIORITY_CHOICES as prio (prio)}
-                    <option value={prio}>{priorityLabel(prio)}</option>
-                  {/each}
-                </select>
-              {/key}
+              <!-- Neither remounted nor disabled while a change runs: both drop
+                   keyboard focus, and arrowing through a closed select fires a
+                   change per step. Once the change settles the select is set
+                   back to the file's priority, so a refused one does not stay
+                   selected. -->
+              <select
+                class="drawer-select prio-{selectedFile.priority}"
+                aria-labelledby="drawer-priority-label"
+                value={selectedFile.priority}
+                disabled={!selectedFile.hash}
+                onchange={(e) => {
+                  const el = e.currentTarget;
+                  const f = selectedFile;
+                  const next = el.value as FileInfo['priority'];
+                  if (!f || next === f.priority) return;
+                  void drawerChange(() => applyFilePriority(f, next)).then(() => {
+                    el.value = selectedFile?.priority ?? f.priority;
+                  });
+                }}
+              >
+                {#each PRIORITY_CHOICES as prio (prio)}
+                  <option value={prio}>{priorityLabel(prio)}</option>
+                {/each}
+              </select>
             </span>
             <span class="meta-label">{m.library_friends_only_toggle()}</span>
             <span class="meta-value meta-toggle">
               <!-- Remounted from the file's state once a change settles: the
                    switch flips itself on click, and a change that failed must
-                   not leave it showing what was only asked for. -->
-              {#key `${selectedFile.path}:${selectedFile.friends_only}:${drawerBusy}`}
-                <ToggleSwitch
-                  checked={selectedFile.friends_only}
-                  disabled={!selectedFile.hash || drawerBusy}
-                  ariaLabel={m.library_friends_only_toggle()}
-                  onchange={(restrict) => {
-                    const f = selectedFile;
-                    if (f && restrict !== f.friends_only) void drawerChange(() => applyFriendsOnly(f, restrict));
-                  }}
-                />
-              {/key}
+                   not leave it showing what was only asked for. Keyed on
+                   settles rather than on busy, so it remounts once per change
+                   instead of twice, and focus is handed to the new one. -->
+              <span class="meta-toggle-wrap" bind:this={friendsToggleWrap}>
+                {#key `${selectedFile.path}:${selectedFile.friends_only}:${drawerSettled}`}
+                  <ToggleSwitch
+                    checked={selectedFile.friends_only}
+                    disabled={!selectedFile.hash}
+                    ariaLabel={m.library_friends_only_toggle()}
+                    onchange={(restrict) => {
+                      const f = selectedFile;
+                      if (!f || restrict === f.friends_only) return;
+                      void drawerChange(() => applyFriendsOnly(f, restrict)).then(async () => {
+                        await tick();
+                        friendsToggleWrap?.querySelector<HTMLElement>('button, input, [role="switch"]')?.focus();
+                      });
+                    }}
+                  />
+                {/key}
+              </span>
               <span class="meta-hint">{m.library_friends_only_hint()}</span>
             </span>
             {#if selectedFile.complete_sources > 0}
@@ -4630,7 +4976,7 @@
                 </div>
                 {#if ourComment.length > EMULE_COMMENT_LIMIT}
                   <div class="comment-limit-note" id="comment-limit-note">
-                    {m.library_comment_emule_limit({ count: ourComment.length, limit: EMULE_COMMENT_LIMIT })}
+                    {m.library_comment_emule_limit({ count: formatNumber(ourComment.length), limit: formatNumber(EMULE_COMMENT_LIMIT) })}
                   </div>
                 {/if}
                 {#if commentSaveState !== 'idle'}
@@ -4682,11 +5028,18 @@
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('properties')}>{m.library_properties()}</button>
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_file')}>{m.library_open_file()}</button>
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_folder')}>{m.library_open_folder()}</button>
+    <button
+      class="ctx-item"
+      role="menuitem"
+      disabled={!fileHashed}
+      title={fileHashed ? undefined : m.library_rename_not_hashed()}
+      onclick={() => ctxAction('rename')}
+    >{m.library_rename()}</button>
     {#if moveTargets.length > 0}
       <!-- Only for files a category can move: hashed, and in Downloads. A
-           category's destination is shown beside it, and the folder the
-           file is already in is greyed out, so the choice says where the
-           file will go rather than leaving the user to remember. -->
+           category's destination is shown beside it, so the choice says where
+           the file will go. One whose folder the file is already in can still
+           be picked: the file stays put and its download takes the category. -->
       {@const here = moveTargets.length === 1 ? categorySubdirOfFile(moveTargets[0]) : null}
       <div
         class="ctx-item ctx-sub"
@@ -4711,13 +5064,18 @@
           : m.library_ctx_move_to_category()}
         {#if ctxCategorySub}
           <div class="ctx-submenu ctx-scroll" role="menu" use:ctxSubmenuPlacement>
+            {#if here !== null && categoryOptions.every((category) => sameCategorySubdir(here, categorySubdir(category, categoryFolders), IS_WINDOWS))}
+              <!-- Every category files into the folder this file is already in,
+                   usually because none has a folder of its own: say so, rather
+                   than leave a column of greyed-out names to puzzle over. -->
+              <div class="ctx-label ctx-note" role="presentation">{m.library_ctx_no_category_folders()}</div>
+            {/if}
             {#each categoryOptions as category (category)}
               {@const subdir = categorySubdir(category, categoryFolders)}
               {@const isHere = here !== null && sameCategorySubdir(here, subdir, IS_WINDOWS)}
               <button
                 class="ctx-item"
                 role="menuitem"
-                disabled={isHere}
                 title={isHere ? m.library_move_already_here() : undefined}
                 onclick={() => ctxAction('move_category', category)}
               >
@@ -4743,7 +5101,7 @@
         onmouseenter={() => enterHoverSub('priority')}
         onmouseleave={leaveHoverSub}
         onclick={(e) => clickHoverSub(e, 'priority')}
-        onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') openHoverSub('priority'); }}
+        onkeydown={(e) => onSubmenuKey(e, 'priority')}
       >
         {m.library_col_priority()}
         <span class="ctx-hint">{priorityLabel(ctxMenu.file.priority)}</span>
@@ -4777,7 +5135,7 @@
         onmouseenter={() => enterHoverSub('copy')}
         onmouseleave={leaveHoverSub}
         onclick={(e) => clickHoverSub(e, 'copy')}
-        onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') openHoverSub('copy'); }}
+        onkeydown={(e) => onSubmenuKey(e, 'copy')}
       >
         {m.servers_copy_ed2k_link()}
         {#if ctxCopySub}
@@ -4849,7 +5207,7 @@
         >{m.search_ctx_find_related_selected({
           // The search sends the clicked row plus the checked ones, so an
           // unchecked clicked row is one more than the checked count.
-          count: checkedPaths.has(ctxMenu.file.path) ? checkedCount : checkedCount + 1,
+          count: formatNumber(checkedPaths.has(ctxMenu.file.path) ? checkedCount : checkedCount + 1),
         })}</button>
       {/if}
       <div class="ctx-sep" role="separator"></div>
@@ -4864,7 +5222,7 @@
           onmouseenter={() => enterHoverSub('send')}
           onmouseleave={leaveHoverSub}
           onclick={(e) => clickHoverSub(e, 'send')}
-          onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') openHoverSub('send'); }}
+          onkeydown={(e) => onSubmenuKey(e, 'send')}
         >
           {m.library_send_to_friend()}
           {#if ctxSendSub}
@@ -4896,13 +5254,32 @@
           onclick={() => ctxAction('friends_only')}
           title={m.library_friends_only_hint()}
         >{m.library_friends_only_toggle()}</button>
-        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unshare')}>{m.library_unshare_file()}</button>
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unshare')}>{m.library_bulk_unshare()}</button>
       {/if}
     {:else}
       <button class="ctx-item ctx-disabled" role="menuitem" disabled>{m.library_hashing_in_progress()}</button>
     {/if}
     <div class="ctx-sep" role="separator"></div>
-    <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('delete')}>{m.library_delete_file_title()}</button>
+    <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('delete')}>{m.common_delete()}</button>
+  </div>
+{/if}
+
+{#if folderCtx}
+  {@const fc = folderCtx}
+  <div class="ctx-menu" role="menu" bind:this={folderCtxEl} use:ctxMenuPosition={{ x: fc.x, y: fc.y }}>
+    <div class="ctx-header" role="presentation">
+      <bdi dir="auto">{fc.folder.split(/[\\/]/).filter(Boolean).pop() || fc.folder}</bdi>
+    </div>
+    <button class="ctx-item" role="menuitem" onclick={() => folderCtxAction('open')}>{m.library_open_this_folder()}</button>
+    <button class="ctx-item" role="menuitem" onclick={() => folderCtxAction('copy_path')}>{m.library_meta_copy_path()}</button>
+    {#if fc.isShare}
+      {#if unapprovedFolders.some((f) => pathsEqualForFolder(f, fc.folder))}
+        <button class="ctx-item" role="menuitem" title={m.library_folder_unapproved_title()} onclick={() => folderCtxAction('reapprove')}>{m.library_folder_reapprove()}</button>
+      {/if}
+      <div class="ctx-sep" role="separator"></div>
+      <button class="ctx-item" role="menuitem" title={m.library_unshare_folder_title()} onclick={() => folderCtxAction('unshare')}>{m.library_bulk_unshare()}</button>
+      <button class="ctx-item ctx-danger" role="menuitem" onclick={() => folderCtxAction('remove')}>{m.library_remove_folder_btn_title()}</button>
+    {/if}
   </div>
 {/if}
 
@@ -5419,17 +5796,33 @@
   button.tree-btn:focus-visible .tree-btn-idle { display: none; }
   button.tree-btn:hover .tree-btn-confirm,
   button.tree-btn:focus-visible .tree-btn-confirm { display: inline-flex; }
-  button.tree-btn.tree-unshare,
-  button.tree-btn.tree-unshare:active:not(:disabled) {
-    color: var(--warning);
-    border-color: color-mix(in srgb, var(--warning) 55%, var(--border));
-    background: color-mix(in srgb, var(--warning) 18%, var(--bg-secondary));
+  button.tree-unshare-btn {
+    flex-shrink: 0;
+    height: 22px;
+    padding: 0 8px;
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    line-height: 20px;
+    white-space: nowrap;
+    border-radius: var(--radius-sm);
+    color: color-mix(in srgb, var(--warning) 70%, var(--text-primary));
+    border: 1px solid color-mix(in srgb, var(--warning) 65%, var(--border));
+    background: color-mix(in srgb, var(--warning) 20%, var(--bg-secondary));
+    transform: none;
+    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
   }
-  button.tree-btn.tree-unshare:hover,
-  button.tree-btn.tree-unshare:focus-visible {
+  button.tree-unshare-btn:hover,
+  button.tree-unshare-btn:focus-visible {
     color: var(--on-warning);
     border-color: var(--warning);
     background: var(--warning);
+  }
+  button.tree-unshare-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  button.tree-unshare-btn:active:not(:disabled) {
+    transform: none;
   }
   button.tree-unapproved {
     flex-shrink: 0;
@@ -5550,9 +5943,9 @@
 
   /* --- Detail drawer (right side) --- */
   .detail-drawer {
-    width: min(420px, 38vw);
+    width: min(520px, 40vw);
     min-width: 0;
-    max-width: 520px;
+    max-width: 600px;
     flex-shrink: 0;
     display: flex;
     flex-direction: column;
@@ -6089,6 +6482,10 @@
     align-items: flex-start;
     gap: 10px;
   }
+  .meta-toggle-wrap {
+    display: inline-flex;
+    flex-shrink: 0;
+  }
   .meta-hint {
     font-size: var(--font-size-xs);
     line-height: 1.4;
@@ -6166,7 +6563,9 @@
     display: inline-flex;
     align-items: center;
     gap: 5px;
-    padding: 5px 12px;
+    height: 30px;
+    box-sizing: border-box;
+    padding: 0 10px;
     font-size: var(--font-size-sm);
     font-weight: 500;
     border: 1px solid var(--border);
@@ -6184,6 +6583,64 @@
   .drawer-action-btn svg {
     flex-shrink: 0;
   }
+  .drawer-actions-end {
+    display: inline-flex;
+    gap: 6px;
+    margin-left: auto;
+  }
+  /* Square, the height of the labelled buttons beside them. Named with the
+     element so the global `button` colours and padding do not win. */
+  button.drawer-icon-btn {
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--bg-surface);
+    cursor: pointer;
+    transform: none;
+    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+  }
+  button.drawer-icon-btn svg {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+  }
+  button.drawer-icon-btn:active:not(:disabled) { transform: none; }
+  button.drawer-icon-btn:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+  button.drawer-icon-btn.drawer-action-warn {
+    color: color-mix(in srgb, var(--warning) 75%, var(--text-primary));
+    border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+    background: color-mix(in srgb, var(--warning) 8%, var(--bg-surface));
+  }
+  button.drawer-icon-btn.drawer-action-warn:hover:not(:disabled),
+  button.drawer-icon-btn.drawer-action-warn:focus-visible {
+    color: var(--on-warning);
+    background: var(--warning);
+    border-color: var(--warning);
+  }
+  button.drawer-icon-btn.drawer-action-danger {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+    background: color-mix(in srgb, var(--danger) 7%, var(--bg-surface));
+  }
+  button.drawer-icon-btn.drawer-action-danger:hover:not(:disabled),
+  button.drawer-icon-btn.drawer-action-danger:focus-visible {
+    color: var(--on-danger);
+    background: var(--danger);
+    border-color: var(--danger);
+  }
+  button.drawer-icon-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .drawer-close + .drawer-close { margin-left: -7px; }
   .meta-badges { display: inline-flex; gap: 4px; }
   /* Tinted-chip recipe matching the same badges in the file table
      (LibraryVirtualTable's .shared-badge) so KAD/eD2K/AICH read as the
@@ -6485,6 +6942,34 @@
     width: min(520px, calc(100vw - 2rem));
     max-width: calc(100vw - 2rem);
   }
+  .ctx-label.ctx-note {
+    max-width: 260px;
+    padding: 5px 10px 7px 26px;
+    font-size: var(--font-size-xs);
+    font-weight: 400;
+    letter-spacing: 0;
+    text-transform: none;
+    white-space: normal;
+    color: var(--text-secondary);
+  }
+  .rename-modal {
+    width: min(480px, calc(100vw - 2rem));
+    max-width: calc(100vw - 2rem);
+  }
+  .rename-modal .form-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .rename-modal .form-input {
+    width: 100%;
+    box-sizing: border-box;
+  }
+  .rename-error {
+    margin: 8px 0 0;
+    color: var(--danger);
+    font-size: var(--font-size-sm);
+    overflow-wrap: anywhere;
+  }
   .modal-header {
     display: flex;
     align-items: center;
@@ -6604,7 +7089,7 @@
     .detail-drawer {
       position: absolute;
       inset: 0 0 0 auto;
-      width: min(90vw, 400px);
+      width: min(90vw, 480px);
       min-width: 0;
       z-index: 1100;
       box-shadow: var(--shadow-panel-left);
@@ -6623,7 +7108,7 @@
     .inline-stats { display: none; }
     .sidebar,
     .sidebar-divider { display: none; }
-    .detail-drawer { width: min(100vw, 420px); }
+    .detail-drawer { width: min(100vw, 480px); }
     .modal-body { padding: 12px; }
     .modal-footer,
     .modal-header { padding-left: 12px; padding-right: 12px; }

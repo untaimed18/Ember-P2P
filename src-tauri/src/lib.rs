@@ -2449,6 +2449,7 @@ pub fn run() {
             commands::sharing::open_shared_folder,
             commands::sharing::open_library_folder,
             commands::sharing::move_files_to_category,
+            commands::sharing::rename_library_file,
             commands::sharing::delete_shared_file,
             commands::sharing::republish_file,
             commands::sharing::scan_missing_files,

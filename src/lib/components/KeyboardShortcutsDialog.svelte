@@ -132,6 +132,7 @@
         { keys: [modifierKey, 'D'], label: () => m.shortcuts_library_clear_selection() },
         { keys: [modifierKey, 'C'], label: () => m.shortcuts_library_copy_links() },
         { keys: ['Enter'], label: () => m.shortcuts_library_open() },
+        { keys: ['F2'], label: () => m.shortcuts_library_rename() },
         { keys: ['Delete'], label: () => m.shortcuts_library_delete() },
         { keys: ['Space'], label: () => m.shortcuts_library_toggle_check() },
         { keys: ['↑ / ↓'], label: () => m.shortcuts_library_navigate() },

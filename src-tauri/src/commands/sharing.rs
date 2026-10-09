@@ -1069,6 +1069,13 @@ pub(crate) async fn relocate_library_files(
             if let Some(name) = mv.to.file_name() {
                 row.name = name.to_string_lossy().into_owned();
             }
+            // Derived from the name as the indexer derives it: a rename can
+            // change it, and the type filter and search tags read it.
+            row.extension = mv
+                .to
+                .extension()
+                .map(|e| e.to_string_lossy().into_owned())
+                .unwrap_or_default();
             if let Some(folder) = mv.to.parent() {
                 row.folder = folder.to_string_lossy().into_owned();
             }
@@ -1111,6 +1118,9 @@ pub struct CategoryMoveReport {
     moved: u32,
     /// Files already there, left as they were.
     unchanged: u32,
+    /// Finished downloads in the transfer list that took the category, moved
+    /// or not.
+    recategorized: u32,
     /// One coded error per file that stayed where it was.
     failed: Vec<String>,
 }
@@ -1151,7 +1161,13 @@ pub async fn move_files_to_category(
     let mut candidates = Vec::new();
     {
         let index = state.local_index.read().await;
+        // Once per file: a second copy of a path would find it already moved
+        // and be reported as a failure.
+        let mut seen = HashSet::new();
         for path in paths {
+            if !seen.insert(crate::search::index::normalize_path_key(&path)) {
+                continue;
+            }
             match index.get_by_path(&path) {
                 Some(row) if !row.hash.is_empty() => {
                     candidates.push((row.path.clone(), row.name.clone(), row.hash.clone()))
@@ -1187,11 +1203,15 @@ pub async fn move_files_to_category(
     .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))?;
 
     let mut moves = Vec::new();
-    let mut unchanged = 0u32;
+    let mut stayed = Vec::new();
     for (path, name, hash, result) in outcome {
         match result {
             Ok(Some(to)) => moves.push(FileMove { from: path, to, hash }),
-            Ok(None) => unchanged += 1,
+            Ok(None) => stayed.push(FileMove {
+                to: std::path::PathBuf::from(&path),
+                from: path,
+                hash,
+            }),
             Err(e) => {
                 warn!("Could not move {path} into the {category:?} category's folder: {e:#}");
                 failed.push(coded_ctx(
@@ -1202,16 +1222,167 @@ pub async fn move_files_to_category(
             }
         }
     }
+    let mut recategorized = 0usize;
     if !moves.is_empty() {
-        crate::commands::transfers::follow_moved_finished_downloads(&state, &moves, &category).await;
+        recategorized +=
+            crate::commands::transfers::follow_moved_finished_downloads(&state, &moves, &category).await;
         relocate_library_files(&app, &state, &moves).await;
         info!("Moved {} library file(s) into the {category:?} category's folder", moves.len());
     }
+    // Already in the category's folder: nothing to move, but a finished
+    // download that wrote the file still takes the category picked.
+    if !stayed.is_empty() {
+        recategorized +=
+            crate::commands::transfers::follow_moved_finished_downloads(&state, &stayed, &category).await;
+    }
     Ok(CategoryMoveReport {
         moved: u32::try_from(moves.len()).unwrap_or(u32::MAX),
-        unchanged,
+        unchanged: u32::try_from(stayed.len()).unwrap_or(u32::MAX),
+        recategorized: u32::try_from(recategorized).unwrap_or(u32::MAX),
         failed,
     })
+}
+
+/// Rename a Library file in place, keeping it in its folder. The row follows
+/// the file as it does for a category move, so nothing is hashed again and
+/// peers and uploads find it under the new name. Returns the file's new path.
+///
+/// The name must already be a valid file name: one that would have to be
+/// altered to be safe (a separator, a reserved character) is refused rather
+/// than quietly turned into a different name from the one typed. An existing
+/// file is never replaced.
+#[tauri::command]
+pub async fn rename_library_file(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    file_path: String,
+    new_name: String,
+) -> Result<String, String> {
+    if file_path.len() > MAX_PATH_LEN {
+        return Err(coded_ctx(
+            "sharing_file_path_too_long",
+            format!("File path exceeds {MAX_PATH_LEN} bytes"),
+            MAX_PATH_LEN,
+        ));
+    }
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() || trimmed.len() > 255 {
+        return Err(coded("sharing_rename_invalid_name", "Enter a valid file name"));
+    }
+    let sanitized = crate::security::sanitize_filename(trimmed);
+    if sanitized != trimmed {
+        return Err(coded_ctx(
+            "sharing_rename_invalid_name",
+            "Enter a valid file name",
+            trimmed,
+        ));
+    }
+
+    let (indexed_path, old_name, hash) = {
+        let index = state.local_index.read().await;
+        let row = index.get_by_path(&file_path).ok_or_else(|| {
+            coded(
+                "sharing_file_not_in_index",
+                "File is not in the shared-file index",
+            )
+        })?;
+        (row.path.clone(), row.name.clone(), row.hash.clone())
+    };
+    if hash.is_empty() {
+        return Err(coded_ctx(
+            "sharing_rename_not_hashed",
+            "The file is still being hashed",
+            old_name,
+        ));
+    }
+    if old_name == sanitized {
+        return Ok(indexed_path);
+    }
+    let allowed_dirs = {
+        let config = state.config.read().await;
+        shared_access_dirs(&config)
+    };
+
+    let new_path = tokio::task::spawn_blocking({
+        let indexed_path = indexed_path.clone();
+        let sanitized = sanitized.clone();
+        move || -> Result<std::path::PathBuf, String> {
+            let (canonical, opened) = crate::security::filesystem::open_existing_approved(
+                std::path::Path::new(&indexed_path),
+                &allowed_dirs,
+                false,
+            )
+            .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid or changed path", e))?;
+            let identity = crate::security::filesystem::opened_file_identity(&opened)
+                .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid or changed path", e))?;
+            // Released before the rename: Windows will not rename a file this
+            // call still holds open.
+            drop(opened);
+            let parent = canonical
+                .parent()
+                .ok_or_else(|| coded("sharing_invalid_path", "Invalid or changed path"))?;
+            let destination = parent.join(&sanitized);
+            let taken = std::fs::symlink_metadata(&destination);
+            if let Ok(taken) = taken {
+                // Only a change of capitals on a case-insensitive file system
+                // lands here legitimately: the name "taken" is this very file.
+                // Not a link to it (canonicalize would follow one, and the
+                // rename below would then replace the link), and resolved on
+                // both sides, since the index may spell the name in other
+                // capitals than the disk does.
+                let same_file = !taken.file_type().is_symlink()
+                    && std::fs::canonicalize(&destination)
+                        .ok()
+                        .zip(std::fs::canonicalize(&canonical).ok())
+                        .is_some_and(|(a, b)| a == b)
+                    && destination
+                        .file_name()
+                        .zip(canonical.file_name())
+                        .is_some_and(|(a, b)| {
+                            a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+                        });
+                if !same_file {
+                    return Err(coded_ctx(
+                        "sharing_rename_exists",
+                        "A file with that name already exists",
+                        &sanitized,
+                    ));
+                }
+                std::fs::rename(&canonical, &destination)
+                    .map_err(|e| coded_ctx("sharing_rename_failed", "The file could not be renamed", e))?;
+                return Ok(destination);
+            }
+            crate::security::filesystem::rename_approved_no_replace(
+                &canonical,
+                &destination,
+                &allowed_dirs,
+                &identity,
+            )
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    coded_ctx(
+                        "sharing_rename_exists",
+                        "A file with that name already exists",
+                        &sanitized,
+                    )
+                } else {
+                    coded_ctx("sharing_rename_failed", "The file could not be renamed", e)
+                }
+            })
+        }
+    })
+    .await
+    .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))??;
+
+    let mv = FileMove {
+        from: indexed_path,
+        to: new_path.clone(),
+        hash,
+    };
+    crate::commands::transfers::follow_renamed_finished_download(&state, &mv).await;
+    relocate_library_files(&app, &state, std::slice::from_ref(&mv)).await;
+    info!("Renamed library file {old_name:?} to {sanitized:?}");
+    Ok(new_path.to_string_lossy().into_owned())
 }
 
 /// Open a folder of the Library's tree — a shared folder or one inside it,

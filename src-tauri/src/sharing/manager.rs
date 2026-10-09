@@ -1184,6 +1184,17 @@ impl TransferManager {
         }
     }
 
+    /// A finished download's file was renamed in the Library: the row takes the
+    /// new name and place, so the Transfers page keeps pointing at the file.
+    /// ([`set_file_name`](Self::set_file_name) refuses finished rows, whose file
+    /// a rename of the *row* would desync; this is the rename of the file.)
+    pub fn follow_renamed_file(&mut self, id: &str, name: &str, path: String) {
+        if let Some(t) = self.get_transfer_mut(id) {
+            t.file_name = name.to_string();
+            t.completed_path = Some(path);
+        }
+    }
+
     /// Records whether `DownloadEvent::Completed` actually re-checked this
     /// download's Ember content BLAKE3 hash and matched it, so the Transfers
     /// UI can show a badge for a check that ran rather than inferring one
