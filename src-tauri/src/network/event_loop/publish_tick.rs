@@ -79,12 +79,13 @@ pub(in crate::network) async fn on_publish_tick(
         } else {
             info!(
                 "Ember publish cycle: contacts={contacts} ({verified} verified), \
-                 due={}, selected={}, awaiting placement={unplaced}, queued={queued}, \
-                 in-flight={in_flight}, sent={} in {} frame(s), behind handshake={} \
-                 in {} frame(s), held over={}, dropped={}, re-armed={}, \
+                 due={}, selected={}, awaiting lookup={}, awaiting placement={unplaced}, \
+                 queued={queued}, in-flight={in_flight}, sent={} in {} frame(s), \
+                 behind handshake={} in {} frame(s), held over={}, dropped={}, re-armed={}, \
                  acked={} of {} total, failed={} of {} total",
                 pass.due,
                 pass.selected,
+                pass.awaiting_lookup,
                 pass.flush.records_sent,
                 pass.flush.frames_sent,
                 pass.flush.records_behind_handshake,

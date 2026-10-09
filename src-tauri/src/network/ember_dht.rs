@@ -156,7 +156,12 @@ pub(super) fn fail_ember_record_pending(
     let Some(unplaced) = schedule.unplaced.get_mut(&slot) else {
         return false;
     };
-    unplaced.remove(&reference.key);
+    // A key another storer already took is not lost because this one refused
+    // it. Marking the round partial regardless sent a file whose every key had
+    // landed back for three thirty-minute retries of its whole keyword set.
+    if !unplaced.remove(&reference.key) {
+        return false;
+    }
     let round_open = !unplaced.is_empty();
     schedule.partial.insert(slot);
     if round_open {
@@ -442,6 +447,7 @@ pub(super) fn ember_ping_timeout_is_a_fault(last_seen: Option<i64>, sent_unix: i
 /// actually reached the wire or is still queued behind a Noise handshake.
 pub(super) fn new_ember_maint_ping(
     node_id: ember::dht::EmberNodeId,
+    addr: std::net::SocketAddr,
     behind_handshake: bool,
     now_unix: i64,
 ) -> EmberMaintPing {
@@ -452,6 +458,7 @@ pub(super) fn new_ember_maint_ping(
     };
     EmberMaintPing {
         node_id,
+        addr,
         deadline: std::time::Instant::now() + budget,
         sent_unix: now_unix,
     }
@@ -463,6 +470,10 @@ pub(super) struct EmberMaintPing {
     /// comes from this identity, so a guessed request id cannot keep a dead
     /// contact alive.
     pub(super) node_id: ember::dht::EmberNodeId,
+    /// Where the ping went. A gossiped lead's address is the introducer's
+    /// choice, and node IDs are free, so deduplicating probes by ID alone let
+    /// one frame aim a probe per fabricated ID at a single address.
+    pub(super) addr: std::net::SocketAddr,
     /// When silence becomes a failure. Held per ping rather than as one
     /// constant because a frame queued behind a Noise handshake has not left
     /// yet, and charging it the same budget as one already on the wire faulted
@@ -643,12 +654,8 @@ pub(super) const EMBER_MAINT_MAX_PINGS: usize = 8;
 /// wider budget.
 pub(super) const EMBER_MAINT_MAX_PINGS_STARVED: usize = 32;
 
-/// Verified contacts below which the starved ping budget applies. One
-/// k-bucket, the same bar the bridge and rendezvous lookup use for "joined".
-pub(super) const EMBER_PING_STARVED_BELOW: usize = ember::dht::K_BUCKET_SIZE;
-
-/// Liveness pings this cycle, from how many contacts have answered and how many
-/// there are to keep an eye on.
+/// Liveness pings this cycle, from whether the table is still joining (see
+/// [`ember_dht_starved`]) and how many contacts there are to keep an eye on.
 ///
 /// A flat eight a minute is the same absolute rate whether the table holds
 /// twenty contacts or two thousand, and the table can hold `128 * K` of them.
@@ -663,8 +670,8 @@ pub(super) const EMBER_PING_STARVED_BELOW: usize = ember::dht::K_BUCKET_SIZE;
 /// scale the same way — there are always exactly `ID_BITS` buckets however
 /// large the network gets, and three a minute already rotates all of them well
 /// inside `EMBER_BUCKET_REFRESH_SECS`.
-pub(super) fn ember_maint_ping_budget(verified: usize, contacts: usize) -> usize {
-    if verified < EMBER_PING_STARVED_BELOW {
+pub(super) fn ember_maint_ping_budget(starved: bool, contacts: usize) -> usize {
+    if starved {
         return EMBER_MAINT_MAX_PINGS_STARVED;
     }
     let ticks_per_window =
@@ -712,6 +719,103 @@ pub(super) const EMBER_MAINT_MAX_ANNOUNCE_STARVED: usize = 16;
 /// in the wrong direction: one usable contact is too thin a frontier for a
 /// lookup to discover anyone new.
 pub(super) const EMBER_KAD_BRIDGE_UNTIL_CONTACTS: usize = ember::dht::K_BUCKET_SIZE;
+
+/// How long a table short of [`EMBER_KAD_BRIDGE_UNTIL_CONTACTS`] verified
+/// contacts may go without gaining one before the join counts as settled.
+///
+/// The bar alone cannot end a join on an overlay of twenty nodes or fewer: a
+/// node can only ever verify the others, so on a young network every
+/// cold-start allowance — the flattened bridge backoff, the 1 Hz bridge pass,
+/// the address-book top-up and re-offer, unrationed gossip probes, the wider
+/// ping and announce budgets — stayed on for the life of the process, spent on
+/// re-dialling the peers it already held and on leads that never answer.
+/// Fifteen minutes is many rounds of every one of those mechanisms; a network
+/// that has shown us no one new in that time has nobody new to show.
+pub(super) const EMBER_JOIN_SETTLE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// How far the current join has got: the most verified contacts it has held,
+/// and when that last rose.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct EmberJoinProgress {
+    peak: usize,
+    peak_at: std::time::Instant,
+}
+
+impl EmberJoinProgress {
+    pub(super) fn new(now: std::time::Instant) -> Self {
+        Self { peak: 0, peak_at: now }
+    }
+
+    /// Fold in the verified count. Growth restarts the settle clock, and so
+    /// does losing more than half the peak: that is the overlay going away
+    /// under us, which is a new join rather than a settled one.
+    pub(super) fn note(&mut self, verified: usize, now: std::time::Instant) {
+        if verified > self.peak || verified.saturating_mul(2) < self.peak {
+            self.peak = verified;
+            self.peak_at = now;
+        }
+    }
+
+    /// Whether the table is still joining: short of a working set, and either
+    /// empty or still finding peers.
+    pub(super) fn starved(&self, verified: usize, now: std::time::Instant) -> bool {
+        verified < EMBER_KAD_BRIDGE_UNTIL_CONTACTS
+            && (verified == 0 || now.saturating_duration_since(self.peak_at) < EMBER_JOIN_SETTLE)
+    }
+}
+
+/// Whether the table is still joining. See [`EmberJoinProgress`].
+///
+/// "Thin" — fewer than [`EMBER_KAD_BRIDGE_UNTIL_CONTACTS`] verified contacts —
+/// is not the same question. A settled small overlay is permanently thin and
+/// should still let the bridge reach peers that appear later, at the bridge's
+/// ordinary backoff; what it must not do is behave as if it had just started.
+pub(super) fn ember_dht_starved(state: &mut NetworkState) -> bool {
+    let verified = state.ember_dht.routing().verified_len();
+    let now = std::time::Instant::now();
+    state.ember_join_progress.note(verified, now);
+    state.ember_join_progress.starved(verified, now)
+}
+
+/// Whether storer-side replication is off because every peer already holds
+/// every record: with fewer than k proven contacts we are among the k closest
+/// to every key, and so is everyone we know.
+pub(super) fn ember_storer_republish_paused(state: &NetworkState) -> bool {
+    state.ember_dht.routing().verified_len() < ember::dht::K_BUCKET_SIZE
+}
+
+/// Records waiting on storer replication, or none while it is paused, so the
+/// gauge does not report work that is deliberately never done.
+pub(super) fn ember_republish_backlog(state: &NetworkState) -> usize {
+    if ember_storer_republish_paused(state) {
+        return 0;
+    }
+    state
+        .ember_dht
+        .republish_backlog(std::time::Duration::from_secs(EMBER_RECORD_REPUBLISH_SECS))
+}
+
+/// Addresses of contacts that have answered us, in the table or held for an
+/// eD2K session: the peers a bridge pass has nothing to learn from.
+pub(super) fn ember_verified_addrs(state: &NetworkState) -> HashSet<(Ipv4Addr, u16)> {
+    state
+        .ember_dht
+        .contacts()
+        .into_iter()
+        .filter(|c| c.is_verified())
+        .filter_map(|c| match c.addr.ip() {
+            IpAddr::V4(v4) => Some((v4, c.addr.port())),
+            IpAddr::V6(_) => None,
+        })
+        .chain(
+            state
+                .ember_session_dht_contacts
+                .iter()
+                .filter(|(_, c)| c.is_verified())
+                .map(|(addr, _)| *addr),
+        )
+        .collect()
+}
 
 /// Minimum spacing between asking one friend for its Ember DHT contacts.
 ///
@@ -1175,7 +1279,7 @@ pub(super) async fn probe_bucket_oldest(
         if sent && delivery_certain {
             state.ember_dht_maint_pings.insert(
                 wire_req_id,
-                new_ember_maint_ping(*oldest_id, behind_handshake, now),
+                new_ember_maint_ping(*oldest_id, *oldest_addr, behind_handshake, now),
             );
             state.ember_diagnostics.ember_dht_liveness_pings_sent = state
                 .ember_diagnostics
@@ -1229,10 +1333,23 @@ pub(super) async fn run_ember_kad_bridge(
     // table state: a forced run against a healthy table is still a healthy
     // table, and letting `force` stand in for it re-dialled every address the
     // backoff was resting.
-    let starved = state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS;
-    if !(force || starved) {
+    //
+    // A thin table that has settled still bridges, at the ordinary backoff:
+    // on a small overlay that is how a peer appearing later is found, and a
+    // node short of a working set must not shut the one door KAD gives it.
+    let thin = state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS;
+    let starved = ember_dht_starved(state);
+    if !(force || thin) {
         return 0;
     }
+    // Never a peer that is already a working contact. A signed frame clears an
+    // address's backoff, so the peers that answer were due again at once and,
+    // ranked first for having no misses, took the budget every pass: on a
+    // small overlay the bridge spent itself re-pinging the handful of peers it
+    // had, every few seconds, for good. A peer that drops out of the table
+    // stops being excluded, which is when re-bridging it helps.
+    let held = ember_verified_addrs(state);
+    let not_held = |ip: &Ipv4Addr, port: &u16| !held.contains(&(*ip, *port));
     let mut sent = 0usize;
     let mut xx_sent = 0usize;
     // The budget has to be charged against peers *dialled*, not datagrams that
@@ -1245,14 +1362,20 @@ pub(super) async fn run_ember_kad_bridge(
     // XX first, up to its reserve, so the IK pass cannot crowd it out; see
     // `EMBER_BRIDGE_XX_RESERVE_DIVISOR`. Whatever the reserve does not find a
     // candidate for is still on the table for the IK pass below.
+    // Asked for `held.len()` more than wanted and filtered after, so the
+    // candidates keep their ranking and a held peer costs the pass nothing.
     let reserve = xx_bridge_reserve(max_pings, !state.ember_keyless_peers.is_empty());
-    let reserved_xx = xx_bridge_candidates(
+    let reserved_xx: Vec<(Ipv4Addr, u16)> = xx_bridge_candidates(
         &state.ember_keyless_peers,
         &state.ember_noise_keys,
         &state.ember_kad_bridge_attempted,
-        reserve,
+        if reserve == 0 { 0 } else { reserve.saturating_add(held.len()) },
         starved,
-    );
+    )
+    .into_iter()
+    .filter(|(ip, port)| not_held(ip, port))
+    .take(reserve)
+    .collect();
     for (ip, port) in &reserved_xx {
         dialled += 1;
         if send_ember_bridge_ping(socket, state, *ip, *port, None).await {
@@ -1261,12 +1384,17 @@ pub(super) async fn run_ember_kad_bridge(
         }
     }
 
-    let candidates = kad_bridge_candidates(
+    let ik_budget = max_pings.saturating_sub(dialled);
+    let candidates: Vec<(Ipv4Addr, u16, [u8; 32])> = kad_bridge_candidates(
         &state.ember_noise_keys,
         &state.ember_kad_bridge_attempted,
-        max_pings.saturating_sub(dialled),
+        if ik_budget == 0 { 0 } else { ik_budget.saturating_add(held.len()) },
         starved,
-    );
+    )
+    .into_iter()
+    .filter(|(ip, port, _)| not_held(ip, port))
+    .take(ik_budget)
+    .collect();
     for (ip, port, noise_pub) in candidates {
         dialled += 1;
         if send_ember_bridge_ping(socket, state, ip, port, Some(&noise_pub)).await {
@@ -1278,17 +1406,23 @@ pub(super) async fn run_ember_kad_bridge(
     // reserve already dialled is excluded explicitly rather than trusting the
     // attempted set alone: a transport error there records no attempt, and the
     // same address must not be charged twice in one pass.
-    let xx_candidates = xx_bridge_candidates(
+    let xx_budget = max_pings.saturating_sub(dialled);
+    let xx_candidates: Vec<(Ipv4Addr, u16)> = xx_bridge_candidates(
         &state.ember_keyless_peers,
         &state.ember_noise_keys,
         &state.ember_kad_bridge_attempted,
-        max_pings.saturating_sub(dialled),
+        if xx_budget == 0 {
+            0
+        } else {
+            xx_budget.saturating_add(held.len()).saturating_add(reserved_xx.len())
+        },
         starved,
-    );
+    )
+    .into_iter()
+    .filter(|(ip, port)| not_held(ip, port) && !reserved_xx.contains(&(*ip, *port)))
+    .take(xx_budget)
+    .collect();
     for (ip, port) in xx_candidates {
-        if reserved_xx.contains(&(ip, port)) {
-            continue;
-        }
         if send_ember_bridge_ping(socket, state, ip, port, None).await {
             xx_sent += 1;
             sent += 1;
@@ -1390,8 +1524,11 @@ pub(super) async fn run_ember_maintenance(
             state.ember_last_overlay_contacts = contacts;
         }
         // Short of an empty table, re-offer the book on a slow clock while the
-        // table is still thin; see `BootstrapCache::rearm_stale_offers`.
-        if state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS {
+        // table is still joining; see `BootstrapCache::rearm_stale_offers`.
+        // Not merely while thin: a settled small overlay re-offered the same
+        // dead entries every half hour for good, and each was pinged three
+        // times and evicted again.
+        if ember_dht_starved(state) {
             let reoffered = state
                 .ember_bootstrap_cache
                 .rearm_stale_offers(now_secs, EMBER_REOFFER_AFTER_SECS);
@@ -1583,9 +1720,7 @@ pub(super) async fn run_ember_maintenance(
         .map(|c| c.node_id)
         .collect();
     let outstanding = state.ember_bootstrap_cache.offers_outstanding(&held_leads);
-    if state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS
-        && outstanding < EMBER_SEED_BATCH
-    {
+    if ember_dht_starved(state) && outstanding < EMBER_SEED_BATCH {
         let local_id = state.ember_dht.local_id();
         // Only what the outstanding seeds leave of one batch, or 31 unproven
         // seeds earned 32 more and the two shared one batch's ping budget.
@@ -1707,8 +1842,12 @@ pub(super) async fn run_ember_maintenance(
     //     selected key, and with only the nodes_ember.dat lead to ask, those
     //     FIND_NODEs are two more unanswered queries on the same handshake
     //     that the liveness ping is already waiting on.
+    prune_ember_publish_target_waits(state);
     if state.ember_dht.routing().verified_len() > 0 {
-        let lookups = ember_target_lookups_this_cycle(state.ember_publish_target_queue.len());
+        let lookups = ember_target_lookups_this_cycle(
+            state.ember_publish_target_queue.len(),
+            ember_publish_lookups_awaited(state),
+        );
         for _ in 0..lookups {
             let Some(key) = state.ember_publish_target_queue.pop_front() else {
                 break;
@@ -1734,7 +1873,7 @@ pub(super) async fn run_ember_maintenance(
     //    faults it (and eventually evicts it) in the 1-second sweep.
     let now = chrono::Utc::now().timestamp();
     let ping_budget = ember_maint_ping_budget(
-        state.ember_dht.routing().verified_len(),
+        ember_dht_starved(state),
         state.ember_dht.contact_count(),
     );
     let due =
@@ -1814,7 +1953,7 @@ pub(super) async fn run_ember_maintenance(
         if send_ok && delivery_certain {
             state.ember_dht_maint_pings.insert(
                 wire_req_id,
-                new_ember_maint_ping(contact.node_id, behind_handshake, now),
+                new_ember_maint_ping(contact.node_id, contact.addr, behind_handshake, now),
             );
             result.liveness_pings_sent += 1;
             state.ember_diagnostics.ember_dht_liveness_pings_sent = state
@@ -1916,9 +2055,17 @@ pub(super) async fn run_ember_maintenance(
     //    coverage while our own records are what the user actually shared; and
     //    nothing at all while the queue is already backed up, so replication can
     //    never be the reason our own publishing is skipped.
+    //
+    //    And nothing while fewer than k contacts have answered us. Then we are
+    //    among the k closest to every key, as is every peer we know, so each
+    //    record already went to all of them from its publisher and a search
+    //    asks all of them: storer replication re-sent identical bytes that
+    //    extend nobody's copy, at two signature checks per record on the far
+    //    side, against a backlog the budget could never drain.
     let republish_interval = std::time::Duration::from_secs(EMBER_RECORD_REPUBLISH_SECS);
-    result.republish_due = state.ember_dht.republish_backlog(republish_interval);
-    let republish_budget = if ember_publish_queue_is_backed_up(state) {
+    let everyone_holds_everything = ember_storer_republish_paused(state);
+    result.republish_due = ember_republish_backlog(state);
+    let republish_budget = if everyone_holds_everything || ember_publish_queue_is_backed_up(state) {
         0
     } else {
         (ember_deliverable_records_per_tick(ember_publishable_peer_count(state)) / 2)
@@ -1933,18 +2080,11 @@ pub(super) async fn run_ember_maintenance(
     };
     result.republish_selected = republish_batch.len();
     for (data, signature) in republish_batch {
-        let record = match ember::dht::publish::SignedRecord::from_wire(&data, signature) {
-            Some(r) => r,
-            None => {
-                // take_republish_batch already stamped last_republished.
-                if data.len() >= 17 {
-                    let mut key = [0u8; 16];
-                    key.copy_from_slice(&data[1..17]);
-                    state.ember_dht.mark_republish_due(&key, &signature);
-                    result.republish_rearmed += 1;
-                }
-                continue;
-            }
+        // A body that does not parse now never will, so it is left stamped
+        // rather than re-armed: re-arming made it take a budget slot every tick
+        // until it expired.
+        let Some(record) = ember::dht::publish::SignedRecord::from_wire(&data, signature) else {
+            continue;
         };
         let targets = ember_overlay_publish_targets_within(state, record.keyword_hash, 0);
         // Replication carries someone else's record, so there is no local
@@ -1989,12 +2129,11 @@ pub(super) async fn run_ember_maintenance(
     //    contact's `last_seen`, so "freshest first" made the same two peers
     //    the freshest again every cycle and pinned the mechanism to them for
     //    the life of the process.
-    let announce_budget =
-        if state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS {
-            EMBER_MAINT_MAX_ANNOUNCE_STARVED
-        } else {
-            EMBER_MAINT_MAX_ANNOUNCE
-        };
+    let announce_budget = if ember_dht_starved(state) {
+        EMBER_MAINT_MAX_ANNOUNCE_STARVED
+    } else {
+        EMBER_MAINT_MAX_ANNOUNCE
+    };
     let announce_targets = ember_dht_announce_targets(
         state.ember_dht.contacts(),
         &state.ember_session_dht_contacts,
@@ -2102,9 +2241,7 @@ pub(super) async fn run_ember_maintenance(
         result.republish_selected,
         result.records_republished,
         result.republish_rearmed,
-        state
-            .ember_dht
-            .republish_backlog(std::time::Duration::from_secs(EMBER_RECORD_REPUBLISH_SECS)),
+        ember_republish_backlog(state),
     );
 
     result
@@ -2608,13 +2745,11 @@ pub(super) async fn handle_ember_dht_message(
 
     probe_bucket_oldest(socket, state, &inbound.ping_oldest, now).await;
 
-    // While the public table is still too thin to run lookups, ask this
-    // peer for their contact list now instead of waiting for the 60s tick.
-    // A session-only friend (LAN with `block_private_ips`) was previously
-    // never an announce target at all.
-    if inbound.sender_id.is_some()
-        && state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS
-    {
+    // While the public table is still joining, ask this peer for their
+    // contact list now instead of waiting for the 60s tick. A session-only
+    // friend (LAN with `block_private_ips`) was previously never an announce
+    // target at all.
+    if inbound.sender_id.is_some() && ember_dht_starved(state) {
         if let Some(contact) = inbound.sender_contact.clone() {
             if ember_announce_due(
                 &state.ember_announced_at,

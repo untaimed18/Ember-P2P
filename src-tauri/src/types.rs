@@ -817,9 +817,9 @@ pub struct EmberDiagnostics {
     pub ember_dht_verified_contacts: u32,
     /// Rough size of the whole Ember network, from how tightly the peers we
     /// have proven are packed around our own ID (see
-    /// `RoutingTable::estimated_network_size`). Zero while too few have
-    /// answered for the density to mean anything. A diagnostic only: it is an
-    /// estimate, and a determined peer could skew it.
+    /// `RoutingTable::estimated_network_size`), never below the peers that
+    /// have answered plus ourselves; zero with nobody at all. A diagnostic
+    /// only: it is an estimate, and a determined peer could skew it.
     #[serde(default)]
     pub ember_dht_estimated_nodes: u32,
     /// Records held for other publishers that are due to be replicated onward

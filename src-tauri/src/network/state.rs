@@ -930,20 +930,31 @@ pub(super) struct NetworkState {
     /// as the network grows. Storer-side replication drags them back over a few
     /// hours, so it self-heals rather than failing outright — but starting in
     /// the right place is cheaper than converging on it.
-    /// Node IDs, deliberately, not whole contacts. An earlier version cached the
-    /// `EmberContact` values a lookup returned, address and Noise key included,
-    /// and nothing revalidated them before the send — so for the whole four-hour
-    /// life of an entry a publish kept addressing peers the routing table had
-    /// since evicted, faulted for missed pings, or dropped on an IP-filter
-    /// reload. Since the schedule only advances on an ack, those records were
-    /// then re-queued every tick for four hours. An ID has to be resolved through
-    /// the table at send time, which drops anyone no longer admitted and always
-    /// uses the address the table holds now.
-    pub(super) ember_publish_targets: HashMap<[u8; 16], (Vec<ember::dht::EmberNodeId>, i64)>,
-    /// Keys waiting for such a lookup, oldest first. Publishing never blocks on
-    /// this: a key with no cached set publishes from the table now and gets a
-    /// better set for its next republish.
+    ///
+    /// Once k contacts have answered us, storers refuse what is not near them,
+    /// so a record sent beside the true closest is not stored at all and there
+    /// is nothing for replication to drag back; see
+    /// [`ember_publish_awaits_lookup`].
+    ///
+    /// Each entry is resolved through the table at send time, so a contact it
+    /// still holds is addressed where the table says, and anyone it evicted,
+    /// faulted or filtered out drops away rather than being dialled at a
+    /// remembered address for the entry's four-hour life. The contacts are kept
+    /// whole for the one exception: within [`EMBER_PUBLISH_TARGETS_DETACHED_SECS`]
+    /// of the lookup, a node it found but the table did not keep is still used.
+    /// A far key's closest nodes all fall in one bucket, which is already full,
+    /// and their replacement-cache slots are taken by the next lookup there —
+    /// so resolving by ID alone lost most of a fresh answer within the minute
+    /// it took to publish against it.
+    pub(super) ember_publish_targets: HashMap<[u8; 16], (Vec<ember::dht::EmberContact>, i64)>,
+    /// Keys waiting for such a lookup, oldest first. On a small table
+    /// publishing never blocks on this: a key with no cached set publishes
+    /// from the table now and gets a better set for its next republish.
     pub(super) ember_publish_target_queue: std::collections::VecDeque<[u8; 16]>,
+    /// Keys whose publish is waiting on a target lookup: when the wait began,
+    /// and whether the lookup has since ended, whatever it found. See
+    /// [`ember_publish_awaits_lookup`].
+    pub(super) ember_publish_target_waits: HashMap<[u8; 16], (i64, bool)>,
     /// In-flight target lookups, search id to the key each is resolving.
     pub(super) ember_publish_target_lookups: HashMap<u32, [u8; 16]>,
     /// Whether this session managed to read `store_ember.dat` (or found there was
@@ -1004,6 +1015,8 @@ pub(super) struct NetworkState {
     /// spacing rather than inheriting the maintenance tick's per-cycle budget.
     /// See [`EMBER_BRIDGE_FAST_INTERVAL`].
     pub(super) ember_bridge_fast_at: Option<std::time::Instant>,
+    /// How far the current overlay join has got. See [`EmberJoinProgress`].
+    pub(super) ember_join_progress: EmberJoinProgress,
 
     /// Start of the current one-second gossip-probe window and how many probes
     /// it has spent, so a per-tick budget cannot be re-granted to every inbound

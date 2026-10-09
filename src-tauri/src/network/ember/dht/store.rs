@@ -102,6 +102,18 @@ const MAX_KEYS_PER_PUBLISHER: usize = MAX_KEYS / 8;
 /// with few keys and large records instead of many small ones.
 const MAX_BYTES_PER_PUBLISHER: usize = MAX_STORE_BYTES / 8;
 
+/// The shares while we know fewer than k proven contacts, so are among the k
+/// closest to every key and hold every record anyone publishes.
+///
+/// The eighth above rests on responsibility doing the filtering, and here
+/// nothing does: on an overlay of a few nodes, each holding the whole network,
+/// one honest library can be a quarter of everything. Held to an eighth, it is
+/// refused new keys whatever their distance and evicted first — and since
+/// every node reaches the same verdict, its records go from all of them at
+/// once. Half still keeps one identity from taking the store.
+const MAX_KEYS_PER_PUBLISHER_UNFILTERED: usize = MAX_KEYS / 2;
+const MAX_BYTES_PER_PUBLISHER_UNFILTERED: usize = MAX_STORE_BYTES / 2;
+
 /// What one resident record costs the budget.
 ///
 /// Counting only `data.len()` understated the real figure badly: a `DhtRecord`
@@ -519,8 +531,8 @@ impl PublisherIndex {
         self.recount();
     }
 
-    #[cfg(test)]
     fn set_shares(&mut self, key_share: usize, byte_share: usize) {
+        self.no_crowding_victim = false;
         self.key_share = key_share;
         self.byte_share = byte_share;
         self.recount();
@@ -550,6 +562,10 @@ pub struct DhtStore {
     entries: HashMap<[u8; 16], Vec<DhtRecord>>,
     /// Who holds how much of `entries`. See [`PublisherIndex`].
     publisher_index: PublisherIndex,
+    /// Whether records reach us only for keys we are among the k closest to,
+    /// which is what the per-publisher shares are sized for. See
+    /// [`MAX_KEYS_PER_PUBLISHER_UNFILTERED`].
+    responsibility_filtered: bool,
     /// Current permissiveness of the abuse limits, refreshed from the routing
     /// table. Defaults to the most permissive tier so a store used before the
     /// scale is known never rejects a legitimate record.
@@ -624,6 +640,7 @@ impl DhtStore {
         Self {
             entries: HashMap::new(),
             publisher_index: PublisherIndex::new(MAX_KEYS_PER_PUBLISHER, MAX_BYTES_PER_PUBLISHER),
+            responsibility_filtered: true,
             scale: scale::NetworkScale::Bootstrap,
             republish_cursor: None,
             bytes: 0,
@@ -657,6 +674,24 @@ impl DhtStore {
     /// Track how permissive the abuse limits should currently be.
     pub fn set_scale(&mut self, scale: scale::NetworkScale) {
         self.scale = scale;
+    }
+
+    /// Tell the store whether the proximity gate is filtering what reaches it,
+    /// which sets how large a share one publisher may hold.
+    pub fn set_responsibility_filtered(&mut self, filtered: bool) {
+        if self.responsibility_filtered == filtered {
+            return;
+        }
+        self.responsibility_filtered = filtered;
+        if filtered {
+            self.publisher_index
+                .set_shares(MAX_KEYS_PER_PUBLISHER, MAX_BYTES_PER_PUBLISHER);
+        } else {
+            self.publisher_index.set_shares(
+                MAX_KEYS_PER_PUBLISHER_UNFILTERED,
+                MAX_BYTES_PER_PUBLISHER_UNFILTERED,
+            );
+        }
     }
 
     /// Tell the store our node ID so it can rank records by responsibility
@@ -1196,8 +1231,10 @@ impl DhtStore {
                 // schedule regardless — while leaving our copy claiming an
                 // expiry no reader could derive. Stamping `last_republished` is
                 // the part that was actually wanted: it stops us re-sending
-                // this record on the very next tick.
+                // this record on the very next tick — which a re-armed record
+                // would still do unless its flag is cleared with it.
                 records[pos].last_republished = now;
+                records[pos].republish_due = false;
                 return true;
             }
             // A replacement that moves the record to another address takes a
@@ -2349,6 +2386,29 @@ mod tests {
         assert_eq!(store.key_count(), 8, "and nothing may be displaced for it");
         assert_eq!(store.reject_stats().key_cap, 1);
         store.assert_publisher_index_consistent();
+    }
+
+    /// While the proximity gate is off every node holds every record, so an
+    /// eighth of the store is a fair split among only a handful of publishers
+    /// and an honest library crosses it. The share widens there and returns
+    /// once records arrive only for keys we are responsible for.
+    #[test]
+    fn the_publisher_shares_widen_while_nothing_filters_by_responsibility() {
+        let mut store = DhtStore::new();
+        let (_, big) = keypair();
+        store.publisher_index.charge(&big, 0, true);
+        store.publisher_index.load.get_mut(&big).unwrap().keys = MAX_KEYS_PER_PUBLISHER;
+        store.publisher_index.recount();
+        assert!(store.publisher_index.anyone_over_share(), "an eighth is the filtered share");
+
+        store.set_responsibility_filtered(false);
+        assert!(
+            !store.publisher_index.anyone_over_share(),
+            "a quarter of a small overlay's records is an honest library, not crowding"
+        );
+
+        store.set_responsibility_filtered(true);
+        assert!(store.publisher_index.anyone_over_share());
     }
 
     /// The other half of the same rule, and what makes it more than a refusal:

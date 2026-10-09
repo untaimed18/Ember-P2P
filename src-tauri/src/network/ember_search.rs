@@ -73,9 +73,31 @@ pub(super) async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkSt
         // whole shortlist without dialling anyone. "Known bad" is the right
         // question for whether to dial; the routing table draws the same
         // distinction for admission versus eviction.
-        if state.ember_dht.routing().definitely_blocked(&contact.addr)
-            || ember_addr_banned(state, contact.addr)
-        {
+        //
+        // A session peer is judged as every other session dial is, by
+        // `ember_addr_ip_verdict`: a LAN address an eD2K session introduced is
+        // allowed under `block_private_ips`, the range filter and bans still
+        // apply. The table's gate refuses it outright — which is the reason the
+        // peer is held as a session contact and pinned onto value searches in
+        // the first place — so judging the pin by that gate meant it was never
+        // asked. Only a known block or ban refuses it, as above: a filter still
+        // loading is not one.
+        let session_peer = match contact.addr.ip() {
+            IpAddr::V4(v4) => state
+                .ember_session_dht_contacts
+                .contains_key(&(v4, contact.addr.port())),
+            IpAddr::V6(_) => false,
+        };
+        let refused = if session_peer {
+            matches!(
+                ember_addr_ip_verdict(state, contact.addr),
+                EmberIpVerdict::Blocked | EmberIpVerdict::Banned
+            )
+        } else {
+            state.ember_dht.routing().definitely_blocked(&contact.addr)
+                || ember_addr_banned(state, contact.addr)
+        };
+        if refused {
             debug!(
                 "Ember search {search_id}: refusing to query {} — the IP policy blocks it",
                 contact.addr
@@ -281,6 +303,7 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
             // so a walk that reached nobody leaves the key queued rather than
             // pinning an empty target set for the whole TTL.
             if let Some(key) = state.ember_publish_target_lookups.remove(&search_id) {
+                note_ember_target_lookup_ended(state, key);
                 if contacts.is_empty() {
                     debug!(
                         "Ember DHT: target lookup for {} found nobody; keeping the table's answer",
@@ -302,12 +325,22 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
                         }
                     }
                     let now = chrono::Utc::now().timestamp();
-                    // IDs only — see `NetworkState::ember_publish_targets` for why
-                    // the addresses are deliberately not kept.
-                    let ids: Vec<ember::dht::EmberNodeId> =
-                        contacts.iter().map(|c| c.node_id).collect();
-                    let learned = ids.len();
-                    state.ember_publish_targets.insert(key, (ids, now));
+                    // Each answered this walk over a Noise session to the
+                    // address and key the shortlist holds, so that is what is
+                    // kept, stamped as heard from — the shortlist's copy of a
+                    // contact learned from `FOUND_NODE` never reads as verified.
+                    // See `NetworkState::ember_publish_targets` for how long an
+                    // address the table did not keep is trusted.
+                    let found: Vec<ember::dht::EmberContact> = contacts
+                        .into_iter()
+                        .map(|mut c| {
+                            c.last_seen = now;
+                            c.failed_queries = 0;
+                            c
+                        })
+                        .collect();
+                    let learned = found.len();
+                    state.ember_publish_targets.insert(key, (found, now));
                     debug!(
                         "Ember DHT: {learned} publish targets learned for {}",
                         hex::encode(key)

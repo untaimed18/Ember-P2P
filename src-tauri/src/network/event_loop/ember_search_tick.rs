@@ -70,8 +70,7 @@ pub(in crate::network) async fn on_ember_search_tick(
         && state
             .ember_bridge_fast_at
             .is_none_or(|at| at.elapsed() >= EMBER_BRIDGE_FAST_INTERVAL)
-        && state.ember_dht.routing().verified_len()
-            < EMBER_KAD_BRIDGE_UNTIL_CONTACTS
+        && ember_dht_starved(state)
     {
         state.ember_bridge_fast_at = Some(std::time::Instant::now());
         run_ember_kad_bridge(

@@ -298,10 +298,11 @@ pub(super) const EMBER_BRIDGE_RETRY_MAX: std::time::Duration = std::time::Durati
 /// that never got a second chance.
 ///
 /// Costing nothing is what makes this safe rather than merely helpful. The
-/// bridge only runs while starved, it is capped at
+/// flattening only holds while the join is still finding peers (see
+/// [`ember_dht_starved`]), the bridge is capped at
 /// [`EMBER_KAD_BRIDGE_MAX_PINGS`] per cycle, and the maintenance tick driving it
 /// is 60 seconds — so the flattened rate is one datagram per candidate per
-/// minute, and it stops of its own accord the moment the table fills.
+/// minute, and it returns to the ordinary backoff once the join settles.
 pub(super) fn bridge_retry_after(failed_attempts: u32, starved: bool) -> std::time::Duration {
     if starved {
         return EMBER_BRIDGE_RETRY_FIRST;
@@ -1315,6 +1316,9 @@ pub(super) fn ember_overlay_publish_targets_within(
         key,
         now,
     );
+    // A lookup-found node the table did not keep never passed the table's
+    // ban-aware dial paths, so the ban list is applied here.
+    targets.retain(|c| !ember_addr_banned(state, c.addr));
     ember_top_up_session_targets(&state.ember_session_dht_contacts, &mut targets);
     targets
 }
@@ -1655,7 +1659,10 @@ pub(super) async fn note_connected_ember_peer(
         return;
     }
     let key = (ip, udp_port);
-    let starved = state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS;
+    if ember_verified_addrs(state).contains(&key) {
+        return;
+    }
+    let starved = ember_dht_starved(state);
     if !bridge_retry_due(
         &state.ember_kad_bridge_attempted,
         &key,
@@ -1774,7 +1781,9 @@ fn note_ember_bridge_attempt(state: &mut NetworkState, ip: Ipv4Addr, udp_port: u
 /// gossip — nothing here is trusted further than a `FOUND_NODE` would be.
 ///
 /// Only while the table is short of a working set, so a healthy node never
-/// spends a byte on this. Returns how many friends were asked.
+/// spends a byte on this. Thin rather than still joining: a friend can come
+/// online long after a small overlay has settled, and for a node behind a
+/// relay it may be the only way in. Returns how many friends were asked.
 pub(super) async fn ask_friends_for_ember_contacts(state: &mut NetworkState) -> usize {
     if state.ember_dht.routing().verified_len() >= EMBER_KAD_BRIDGE_UNTIL_CONTACTS {
         return 0;
@@ -2276,7 +2285,7 @@ pub(super) async fn probe_ember_gossip_leads(
         return;
     }
     let local_id = state.ember_dht.local_id();
-    let starved = state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS;
+    let starved = ember_dht_starved(state);
     let budget = if starved {
         EMBER_MAINT_MAX_PINGS_STARVED
     } else {
@@ -2322,10 +2331,14 @@ pub(super) async fn probe_ember_gossip_leads(
         {
             continue;
         }
+        // By address as well as by identity: the address is whatever the
+        // introducer wrote beside a free keypair, so one frame naming many IDs
+        // at a single address would otherwise spend a probe on each of them —
+        // the whole budget aimed wherever the sender likes.
         if state
             .ember_dht_maint_pings
             .values()
-            .any(|p| p.node_id == contact.node_id)
+            .any(|p| p.node_id == contact.node_id || p.addr == contact.addr)
         {
             continue;
         }
@@ -2407,6 +2420,7 @@ pub(super) async fn probe_ember_gossip_leads(
                 wire_req_id,
                 new_ember_maint_ping(
                     contact.node_id,
+                    contact.addr,
                     behind_handshake,
                     chrono::Utc::now().timestamp(),
                 ),

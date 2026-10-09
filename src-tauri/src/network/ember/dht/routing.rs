@@ -5,7 +5,7 @@ use tracing::{debug, info, trace};
 
 use crate::network::kad::{dht_common, ip_filter};
 
-use super::{scale, EmberContact, EmberNodeId, ID_BITS, K_BUCKET_SIZE};
+use super::{scale, EmberContact, EmberNodeId, ALPHA, ID_BITS, K_BUCKET_SIZE};
 
 /// How far past `now` a stamp may sit before
 /// [`RoutingTable::clamp_future_timestamps`] treats it as left behind by a
@@ -1008,12 +1008,24 @@ impl RoutingTable {
         }
 
         let bucket = &mut self.buckets[bucket_idx];
-        // Bucket is full — add to replacement cache and request ping of oldest
+        // Bucket is full — add to replacement cache and request ping of oldest,
+        // unless the oldest has answered recently enough that there is nothing
+        // to ask. On a large overlay the far buckets are always full and every
+        // non-resident sender lands here, so pinging unconditionally turned the
+        // inbound frame rate into an outbound ping rate: each answered probe
+        // rotates the bucket, and the next frame probed the next-oldest.
         let oldest = bucket.oldest_contact().unwrap();
+        let oldest_in_doubt = !oldest.is_verified()
+            || oldest.failed_queries > 0
+            || chrono::Utc::now().timestamp().saturating_sub(oldest.last_seen)
+                >= super::CONTACT_TIMEOUT_SECS;
         let ping_addr = oldest.addr;
         let ping_id = oldest.node_id;
         let ping_noise = oldest.noise_pub;
         self.add_to_cache(bucket_idx, contact, scale);
+        if !oldest_in_doubt {
+            return AddResult::Rejected;
+        }
 
         AddResult::PingOldest {
             addr: ping_addr,
@@ -1472,9 +1484,10 @@ impl RoutingTable {
     /// The nodes nearest us occupy a slice of the keyspace: if the furthest of
     /// the `m` closest sits at XOR distance `d`, then a `d / 2^128` fraction of
     /// the space holds `m` nodes, so the whole space holds about
-    /// `m * 2^128 / d`. Counting leading zero bits turns that into a shift — a
-    /// distance with `lz` leading zeros is about `2^(128 - lz)` — which leaves
-    /// `m << lz`.
+    /// `m * 2^128 / d` — ourselves included, since the `m`-th nearest of `n`
+    /// others is expected at `m / (n + 1)` of the space. Computed in full
+    /// rather than by counting leading zero bits: rounding `d` up to a power of
+    /// two read low by up to half, and in steps of `m · 2^k`.
     ///
     /// eMule KAD extrapolates from the depth of its zone tree instead
     /// (`CRoutingZone::EstimateCount`), which this table has no equivalent of,
@@ -1483,9 +1496,9 @@ impl RoutingTable {
     ///
     /// Only verified contacts count: gossip is free to send, so counting leads
     /// would let anyone move the figure by announcing invented neighbours.
-    /// `None` until enough peers have answered for a density to mean anything.
-    /// A sparse neighbourhood reads low rather than high, which is the safe
-    /// direction — it never claims the network is bigger than we can see.
+    /// Never below the nodes we can actually see — the answered contacts and
+    /// ourselves — which is also all it reports while too few have answered
+    /// for a density to mean anything, and `None` only with nobody at all.
     ///
     /// This is a diagnostic, not an input to any limit. Someone willing to grind
     /// keys until several of them land very close to our ID could inflate what
@@ -1503,28 +1516,26 @@ impl RoutingTable {
             .filter(|c| c.is_verified())
             .map(|c| self.local_id.distance(&c.node_id).0)
             .collect();
-        if distances.len() < MIN_SAMPLE {
+        if distances.is_empty() {
             return None;
+        }
+        let seen = distances.len() as u64 + 1;
+        if distances.len() < MIN_SAMPLE {
+            return Some(seen);
         }
         distances.sort_unstable();
 
         // One k-bucket's worth is the neighbourhood Kademlia actually keeps
         // track of; sampling wider would measure buckets we only partly fill.
         let sample = distances.len().min(K_BUCKET_SIZE);
-        let furthest = distances[sample - 1];
-
-        let mut leading_zeros = 0u32;
-        for byte in furthest {
-            if byte == 0 {
-                leading_zeros += 8;
-            } else {
-                leading_zeros += byte.leading_zeros();
-                break;
-            }
+        let furthest = u128::from_be_bytes(distances[sample - 1]);
+        if furthest == 0 {
+            return Some(seen);
         }
-
-        let span = 1u64.checked_shl(leading_zeros).unwrap_or(u64::MAX);
-        Some((sample as u64).saturating_mul(span))
+        // `as` saturates from f64, so a pathologically tight neighbourhood
+        // reads as the largest figure rather than wrapping.
+        let estimate = (sample as f64 * 2f64.powi(128) / furthest as f64).round() as u64;
+        Some(estimate.max(seen))
     }
 
     /// Return the `count` closest contacts to `target`, verified ones first
@@ -1583,6 +1594,26 @@ impl RoutingTable {
             out.extend(leads.into_iter().map(|(_, _, c)| c.clone()));
         }
         out
+    }
+
+    /// Seeds for an iterative lookup toward `target`: as
+    /// [`Self::find_closest_prefer_verified`], but leads only while fewer than
+    /// [`ALPHA`] contacts have answered us.
+    ///
+    /// A lookup finishes only once every seed has answered or timed out, and a
+    /// lead that never answers holds it for the full handshake budget. With
+    /// fewer than `count` verified contacts — every overlay of `count` nodes or
+    /// fewer, permanently — each lookup was padded to `count` with leads, so one
+    /// silent lead put a twelve-second floor under every search until liveness
+    /// pings had struck it out, and a fresh one took its place. Once a first
+    /// wave of proven contacts exists the walk discovers the rest through their
+    /// answers, and leads are still verified by the probe and ping paths.
+    pub fn find_lookup_seeds(&self, target: &EmberNodeId, count: usize) -> Vec<EmberContact> {
+        let mut seeds = self.find_closest_prefer_verified(target, count);
+        if seeds.iter().filter(|c| c.is_verified()).count() >= ALPHA.min(count) {
+            seeds.retain(|c| c.is_verified());
+        }
+        seeds
     }
 
     /// Return the `count` closest contacts to `target`.
@@ -2483,7 +2514,9 @@ mod tests {
         let local = make_id(0);
         let mut rt = RoutingTable::new(local, false);
 
-        // Fill bucket 127 (all contacts with high bit set)
+        // Fill bucket 127 (all contacts with high bit set), last heard from
+        // long enough ago that the oldest is in doubt.
+        let stale = chrono::Utc::now().timestamp() - super::super::CONTACT_TIMEOUT_SECS - 1;
         for i in 0x80..0x80 + K_BUCKET_SIZE as u8 {
             // Use different subnets to avoid diversity rejection
             let c = EmberContact {
@@ -2491,7 +2524,7 @@ mod tests {
                 addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, i, 1, 1)), 4662),
                 noise_pub: [i; 32],
                 ed25519_pub: [i; 32],
-                last_seen: chrono::Utc::now().timestamp(),
+                last_seen: stale,
                 failed_queries: 0,
             };
             assert!(matches!(rt.add_contact(c), AddResult::Added));
@@ -2513,6 +2546,35 @@ mod tests {
         assert!(matches!(
             rt.add_contact(extra),
             AddResult::PingOldest { .. }
+        ));
+    }
+
+    /// A full bucket whose oldest answered recently has nothing to ask it. On a
+    /// large overlay the far buckets are always full and every non-resident
+    /// sender reaches this path, so probing regardless turned inbound traffic
+    /// into a matching stream of outbound pings.
+    #[test]
+    fn a_full_bucket_of_fresh_contacts_parks_the_newcomer_without_a_ping() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        for i in 0x80..0x80 + K_BUCKET_SIZE as u8 {
+            assert!(matches!(
+                rt.add_contact(contact_at(i, 80, i, 1, 1)),
+                AddResult::Added
+            ));
+        }
+        let newcomer = contact_at(0x80 + K_BUCKET_SIZE as u8, 80, 200, 1, 1);
+        assert!(matches!(rt.add_contact(newcomer.clone()), AddResult::Rejected));
+        assert!(
+            rt.cached_contacts().iter().any(|c| c.node_id == newcomer.node_id),
+            "the newcomer still waits in the replacement cache"
+        );
+
+        // The same bucket with a faulted oldest does ask.
+        rt.mark_failed(&make_id(0x80));
+        assert!(matches!(
+            rt.add_contact(contact_at(0x80 + K_BUCKET_SIZE as u8 + 1, 80, 201, 1, 1)),
+            AddResult::PingOldest { node_id, .. } if node_id == make_id(0x80)
         ));
     }
 
@@ -2759,12 +2821,13 @@ mod tests {
     fn mark_alive_moves_contact_to_back() {
         let local = make_id(0);
         let mut rt = RoutingTable::new(local, false);
-        // Fill bucket 127 with distinct-subnet contacts.
+        // Fill bucket 127 with distinct-subnet contacts, all gone quiet long
+        // enough that the oldest is worth a probe.
+        let stale = chrono::Utc::now().timestamp() - super::super::CONTACT_TIMEOUT_SECS - 1;
         for i in 0x80..0x80 + K_BUCKET_SIZE as u8 {
-            assert!(matches!(
-                rt.add_contact(contact_at(i, 80, i, 1, 1)),
-                AddResult::Added
-            ));
+            let mut c = contact_at(i, 80, i, 1, 1);
+            c.last_seen = stale;
+            assert!(matches!(rt.add_contact(c), AddResult::Added));
         }
         // Refresh the current oldest (0x80); it must no longer be the eviction
         // candidate once it moves to the back of the LRU deque.
@@ -3116,6 +3179,35 @@ mod tests {
         assert!(rt
             .find_closest_prefer_verified(&make_id(0x10), 0)
             .is_empty());
+    }
+
+    /// A lookup waits for every seed, so a silent lead held each one for the
+    /// whole handshake budget. Below a full first wave of proven contacts the
+    /// leads are still needed; past it they only slow the walk down.
+    #[test]
+    fn lookup_seeds_drop_leads_once_a_first_wave_has_answered() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        for lead in [0x10u8, 0x11, 0x12] {
+            rt.add_contact(gossip_contact(lead));
+        }
+
+        for (n, id) in (0x20u8..).take(ALPHA - 1).enumerate() {
+            rt.add_contact(make_contact(id, 4672));
+            assert_eq!(
+                rt.find_lookup_seeds(&make_id(0x10), K_BUCKET_SIZE).len(),
+                n + 1 + 3,
+                "short of a first wave, leads still pad the seeds"
+            );
+        }
+
+        rt.add_contact(make_contact(0x20 + ALPHA as u8, 4672));
+        let seeds = rt.find_lookup_seeds(&make_id(0x10), K_BUCKET_SIZE);
+        assert_eq!(seeds.len(), ALPHA);
+        assert!(
+            seeds.iter().all(|c| c.is_verified()),
+            "with a first wave proven, no lead seeds the lookup"
+        );
     }
 
     /// Ranking these by health was tried and reverted; this pins the ordering so
@@ -3640,9 +3732,9 @@ mod tests {
         // A newcomer to the same bucket is cached, not admitted.
         let newcomer = contact_at(0xA5, 90, 1, 1, 1);
         let newcomer_id = newcomer.node_id;
-        assert!(matches!(
+        assert!(!matches!(
             rt.add_contact(newcomer.clone()),
-            AddResult::PingOldest { .. }
+            AddResult::Added
         ));
 
         // An unrelated removal frees a slot, and the newcomer arrives again
@@ -3878,14 +3970,15 @@ mod tests {
         assert_eq!(rt.verified_len(), 3);
         assert_eq!(
             rt.estimated_network_size(),
-            None,
-            "three peers is not a density"
+            Some(4),
+            "three peers is not a density, but it is three peers and us"
         );
 
-        // A fourth, the furthest of them half the keyspace away: four nodes
-        // spread over everything is what a four-node network looks like.
+        // A fourth, the furthest of them half the keyspace away: four nodes in
+        // half the space is a network of eight. Rounding the distance up to the
+        // whole keyspace used to read this as four.
         rt.add_contact(contact_in_bucket(local, 127, seen));
-        assert_eq!(rt.estimated_network_size(), Some(4));
+        assert_eq!(rt.estimated_network_size(), Some(8));
 
         // The same peer count packed ten bits tighter describes a network 2^10
         // times larger, which is the whole point of measuring density.
@@ -3893,7 +3986,7 @@ mod tests {
         for bucket in 114..118 {
             tight.add_contact(contact_in_bucket(local, bucket, seen));
         }
-        assert_eq!(tight.estimated_network_size(), Some(4 * 1024));
+        assert_eq!(tight.estimated_network_size(), Some(8 * 1024));
 
         // Gossip is free to send, so it must not move the figure at all.
         let mut gossiped = RoutingTable::new(local, false);
@@ -3902,6 +3995,31 @@ mod tests {
         }
         assert!(gossiped.total_contacts() >= 4);
         assert_eq!(gossiped.estimated_network_size(), None);
+    }
+
+    /// A distance that is not a power of two used to be rounded up to one, so
+    /// the figure moved in coarse steps and read low by up to half.
+    #[test]
+    fn network_size_is_not_quantised_to_powers_of_two() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        // Seven peers whose furthest is three quarters of the way across.
+        for (i, top) in [0x10u8, 0x20, 0x30, 0x40, 0x50, 0x60, 0xC0].iter().enumerate() {
+            let mut id = [0u8; 16];
+            id[0] = *top;
+            id[15] = i as u8 + 1;
+            rt.add_contact(EmberContact {
+                node_id: EmberNodeId(id),
+                addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, i as u8 + 1, 1, 1)), 4672),
+                noise_pub: [i as u8 + 1; 32],
+                ed25519_pub: [i as u8 + 1; 32],
+                last_seen: 1_700_000_000,
+                failed_queries: 0,
+            });
+        }
+        assert_eq!(rt.verified_len(), 7);
+        // 7 · 2^128 / (0.75 · 2^128) ≈ 9.33. The old shift read 7.
+        assert_eq!(rt.estimated_network_size(), Some(9));
     }
 
     /// The private-IP setting is a user preference that can change at runtime,

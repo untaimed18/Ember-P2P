@@ -1725,8 +1725,11 @@ pub(super) fn release_ember_search_state(
     // `maybe_finish_ember_search`: if every send in its first batch fails, the
     // whole shortlist goes back to Pending, so the search never reports
     // complete, and with no wire request registered nothing re-drives it. The
-    // key recovers on its own — the next publish re-queues it.
-    state.ember_publish_target_lookups.remove(&search_id);
+    // key recovers on its own — the next publish re-queues it — and a publish
+    // waiting on it stops waiting.
+    if let Some(key) = state.ember_publish_target_lookups.remove(&search_id) {
+        note_ember_target_lookup_ended(state, key);
+    }
     state.ember_search.remove(search_id);
     state
         .ember_dht_search_requests

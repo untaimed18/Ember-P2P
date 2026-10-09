@@ -2007,6 +2007,10 @@ impl EmberDht {
     fn sync_store_scale(&mut self) {
         let scale = self.routing.scale();
         self.store.set_scale(scale);
+        // The proximity gate below is off until k contacts have answered, and
+        // the store's per-publisher shares are only meaningful while it is on.
+        self.store
+            .set_responsibility_filtered(self.routing.verified_len() >= K_BUCKET_SIZE);
     }
 
     /// Whether we are one of the nodes responsible for holding `key`.

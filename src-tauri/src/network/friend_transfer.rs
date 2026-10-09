@@ -1160,8 +1160,18 @@ mod friend_transfer_tests {
 
         let key = [0xAB; 16];
         let now = 1_700_000_000i64;
-        let mut cache: HashMap<[u8; 16], (Vec<ember::dht::EmberNodeId>, i64)> = HashMap::new();
+        let mut cache: HashMap<[u8; 16], (Vec<ember::dht::EmberContact>, i64)> = HashMap::new();
         let mut queue: VecDeque<[u8; 16]> = VecDeque::new();
+        // What a lookup files: the nodes that answered it, at the addresses they
+        // answered from.
+        let found = |id: ember::dht::EmberNodeId, octet: u8| ember::dht::EmberContact {
+            node_id: id,
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(81, 1, octet, 1)), 4672),
+            noise_pub: [octet; 32],
+            ed25519_pub: [octet; 32],
+            last_seen: now,
+            failed_queries: 0,
+        };
 
         // Nothing learned yet: fall back to the table, but queue the key.
         let from_table = ember_publish_targets_for(&cache, &mut queue, EMBER_PUBLISH_TARGET_QUEUE_MAX, &routing, key, now);
@@ -1172,50 +1182,69 @@ mod friend_transfer_tests {
         let _ = ember_publish_targets_for(&cache, &mut queue, EMBER_PUBLISH_TARGET_QUEUE_MAX, &routing, key, now);
         assert_eq!(queue.len(), 1, "one entry per key");
 
-        // A resolved lookup is remembered by ID. Only IDs the table still holds
-        // resolve, so a peer that has since been evicted, faulted or filtered out
-        // drops away instead of being dialled at a remembered address for hours.
+        // A resolved lookup is resolved through the table: a node it still holds
+        // is addressed where the table says. One it does not hold is used only
+        // while the lookup is fresh, so a peer since evicted, faulted or filtered
+        // out is not dialled at a remembered address for the entry's whole life.
         let known = ember::dht::EmberNodeId([0x41; 16]);
         let also_known = ember::dht::EmberNodeId([0x42; 16]);
         let evicted_since = ember::dht::EmberNodeId([0xAA; 16]);
-        cache.insert(key, (vec![known, also_known, evicted_since], now));
+        cache.insert(
+            key,
+            (
+                vec![found(known, 9), found(also_known, 10), found(evicted_since, 11)],
+                now,
+            ),
+        );
         queue.clear();
         let fresh = ember_publish_targets_for(&cache, &mut queue, EMBER_PUBLISH_TARGET_QUEUE_MAX, &routing, key, now);
-        assert!(
-            fresh.iter().any(|c| c.node_id == known),
-            "a target the table still holds is used"
+        let held = fresh.iter().find(|c| c.node_id == known).expect("a target the table still holds is used");
+        assert_eq!(
+            held.addr,
+            routing.get_contact(&known).unwrap().addr,
+            "at the address the table holds, not the one remembered"
         );
         assert!(
-            !fresh.iter().any(|c| c.node_id == evicted_since),
-            "one it no longer holds must not be dialled"
+            fresh.iter().any(|c| c.node_id == evicted_since),
+            "a node the lookup just found is used though the table did not keep it"
         );
         assert!(
             queue.is_empty(),
             "an entry still carrying most of its set needs no new lookup"
         );
 
+        let later = now + EMBER_PUBLISH_TARGETS_DETACHED_SECS;
+        let aged = ember_publish_targets_for(&cache, &mut queue, EMBER_PUBLISH_TARGET_QUEUE_MAX, &routing, key, later);
+        assert!(
+            !aged.iter().any(|c| c.node_id == evicted_since),
+            "once the lookup is no longer fresh, one the table no longer holds is not dialled"
+        );
+
         // The set is topped up from our own closest, so a walk that converged
         // early — or an entry thinned by eviction — still fans out to as many
         // replicas as the table can offer.
         assert_eq!(
-            fresh.len(),
+            aged.len(),
             4,
             "the shortfall is made up from the routing table"
         );
 
-        // An entry well inside its TTL whose nodes have mostly gone — evicted,
+        // An entry inside its TTL whose nodes have mostly gone — evicted,
         // faulted or filtered out — has to ask again. Keying this on freshness alone
         // left it publishing to fallbacks for the rest of the entry's life, which is
         // worse than holding no entry at all.
         cache.insert(
             key,
             (
-                vec![evicted_since, ember::dht::EmberNodeId([0xBB; 16])],
+                vec![
+                    found(evicted_since, 11),
+                    found(ember::dht::EmberNodeId([0xBB; 16]), 12),
+                ],
                 now,
             ),
         );
         queue.clear();
-        let all_gone = ember_publish_targets_for(&cache, &mut queue, EMBER_PUBLISH_TARGET_QUEUE_MAX, &routing, key, now);
+        let all_gone = ember_publish_targets_for(&cache, &mut queue, EMBER_PUBLISH_TARGET_QUEUE_MAX, &routing, key, later);
         assert_eq!(
             queue.len(),
             1,
@@ -1227,7 +1256,7 @@ mod friend_transfer_tests {
         );
 
         // And it is re-learned rather than trusted forever.
-        cache.insert(key, (vec![known], now));
+        cache.insert(key, (vec![found(known, 9)], now));
         queue.clear();
         let stale_at = now + EMBER_PUBLISH_TARGETS_TTL_SECS;
         let stale = ember_publish_targets_for(&cache, &mut queue, EMBER_PUBLISH_TARGET_QUEUE_MAX, &routing, key, stale_at);
@@ -1266,7 +1295,7 @@ mod friend_transfer_tests {
 
         let key = [0xAB; 16];
         let now = 1_700_000_000i64;
-        let mut cache: HashMap<[u8; 16], (Vec<ember::dht::EmberNodeId>, i64)> = HashMap::new();
+        let mut cache: HashMap<[u8; 16], (Vec<ember::dht::EmberContact>, i64)> = HashMap::new();
         let mut queue: VecDeque<[u8; 16]> = VecDeque::new();
 
         let from_table = ember_publish_targets_for(&cache, &mut queue, EMBER_PUBLISH_TARGET_QUEUE_MAX, &routing, key, now);
@@ -1276,8 +1305,22 @@ mod friend_transfer_tests {
 
         // A lookup that remembered the lead must not revive it as a STORE
         // target either: resolve against the table as it is now, then skip
-        // anyone still unverified.
-        cache.insert(key, (vec![ember::dht::EmberNodeId([0x40; 16])], now));
+        // anyone still unverified — even when the lookup's own copy says it
+        // answered, the table's word on a contact it holds wins.
+        cache.insert(
+            key,
+            (
+                vec![ember::dht::EmberContact {
+                    node_id: ember::dht::EmberNodeId([0x40; 16]),
+                    addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, 1, 1, 1)), 4672),
+                    noise_pub: [0x40; 32],
+                    ed25519_pub: [0x40; 32],
+                    last_seen: now,
+                    failed_queries: 0,
+                }],
+                now,
+            ),
+        );
         queue.clear();
         let from_cache = ember_publish_targets_for(&cache, &mut queue, EMBER_PUBLISH_TARGET_QUEUE_MAX, &routing, key, now);
         assert!(
@@ -1301,7 +1344,7 @@ mod friend_transfer_tests {
 
         let local = ember::dht::EmberNodeId([0u8; 16]);
         let routing = ember::dht::routing::RoutingTable::new(local, true);
-        let cache: HashMap<[u8; 16], (Vec<ember::dht::EmberNodeId>, i64)> = HashMap::new();
+        let cache: HashMap<[u8; 16], (Vec<ember::dht::EmberContact>, i64)> = HashMap::new();
         let mut queue: VecDeque<[u8; 16]> = VecDeque::new();
         let key = [0xCD; 16];
         let mut targets = ember_publish_targets_for(&cache, &mut queue, EMBER_PUBLISH_TARGET_QUEUE_MAX, &routing, key, 1_700_000_000);

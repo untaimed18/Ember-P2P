@@ -2612,13 +2612,93 @@ fn the_named_buddy_survives_a_missed_query() {
 /// Target lookups keep pace with the queue instead of a fixed two a minute.
 #[test]
 fn target_lookups_scale_with_the_queue() {
-    assert_eq!(ember_target_lookups_this_cycle(0), EMBER_MAINT_MIN_TARGET_LOOKUPS);
-    assert_eq!(ember_target_lookups_this_cycle(100), EMBER_MAINT_MIN_TARGET_LOOKUPS);
-    assert_eq!(ember_target_lookups_this_cycle(300), 5);
+    assert_eq!(ember_target_lookups_this_cycle(0, false), EMBER_MAINT_MIN_TARGET_LOOKUPS);
+    assert_eq!(ember_target_lookups_this_cycle(100, false), EMBER_MAINT_MIN_TARGET_LOOKUPS);
+    assert_eq!(ember_target_lookups_this_cycle(300, false), 5);
     assert_eq!(
-        ember_target_lookups_this_cycle(EMBER_PUBLISH_TARGET_QUEUE_MAX),
+        ember_target_lookups_this_cycle(EMBER_PUBLISH_TARGET_QUEUE_MAX, false),
         EMBER_MAINT_MAX_TARGET_LOOKUPS
     );
+}
+
+/// Once storers refuse what is not near them, a key with no looked-up target
+/// set waits for its lookup instead of going to our own table's closest, where
+/// it would be refused. A small table is the network's answer and never waits,
+/// and no wait outlives its lookup or its time limit.
+#[test]
+fn a_publish_waits_for_its_target_lookup_only_where_storers_filter_by_proximity() {
+    use std::collections::VecDeque;
+    let k = ember::dht::K_BUCKET_SIZE;
+    let key = [0x5A; 16];
+    let now = 1_700_000_000i64;
+    let mut cache: HashMap<[u8; 16], (Vec<ember::dht::EmberContact>, i64)> = HashMap::new();
+    let mut waits = HashMap::new();
+    let mut queue = VecDeque::new();
+
+    assert!(
+        !ember_publish_awaits_lookup_in(k - 1, &cache, &mut waits, &mut queue, false, key, now),
+        "below k answered contacts every node is among the closest; nothing waits"
+    );
+    assert!(waits.is_empty() && queue.is_empty());
+
+    assert!(ember_publish_awaits_lookup_in(k, &cache, &mut waits, &mut queue, false, key, now));
+    assert_eq!(queue.len(), 1, "the wait queues its lookup");
+    assert!(
+        ember_publish_awaits_lookup_in(k, &cache, &mut waits, &mut queue, false, key, now + 60),
+        "and keeps waiting while the lookup runs"
+    );
+    assert_eq!(queue.len(), 1, "without queueing it twice");
+
+    // A lookup already in flight is not queued again.
+    let other = [0x5B; 16];
+    assert!(ember_publish_awaits_lookup_in(k, &cache, &mut waits, &mut queue, true, other, now));
+    assert_eq!(queue.len(), 1);
+
+    // Its lookup landing ends the wait.
+    let found = ember::dht::EmberContact {
+        node_id: ember::dht::EmberNodeId([0x77; 16]),
+        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(81, 2, 3, 4)), 4672),
+        noise_pub: [0x77; 32],
+        ed25519_pub: [0x77; 32],
+        last_seen: now,
+        failed_queries: 0,
+    };
+    cache.insert(key, (vec![found], now + 90));
+    assert!(!ember_publish_awaits_lookup_in(k, &cache, &mut waits, &mut queue, false, key, now + 120));
+
+    // A lookup that ended with nothing, or never ran in time, ends it too, so a
+    // file is never held back for long on its account.
+    waits.get_mut(&other).unwrap().1 = true;
+    assert!(!ember_publish_awaits_lookup_in(k, &cache, &mut waits, &mut queue, false, other, now + 60));
+    let slow = [0x5C; 16];
+    assert!(ember_publish_awaits_lookup_in(k, &cache, &mut waits, &mut queue, false, slow, now));
+    assert!(!ember_publish_awaits_lookup_in(
+        k,
+        &cache,
+        &mut waits,
+        &mut queue,
+        false,
+        slow,
+        now + EMBER_PUBLISH_LOOKUP_WAIT_SECS
+    ));
+}
+
+/// A lookup a publish is waiting on holds a file back, so the queue drains in
+/// minutes then rather than over the hour an ordinary refresh can take.
+#[test]
+fn awaited_target_lookups_drain_within_a_few_cycles() {
+    assert_eq!(ember_target_lookups_this_cycle(0, true), EMBER_MAINT_MIN_TARGET_LOOKUPS);
+    assert_eq!(ember_target_lookups_this_cycle(20, true), 5);
+    assert_eq!(
+        ember_target_lookups_this_cycle(EMBER_PUBLISH_TARGET_QUEUE_MAX, true),
+        EMBER_MAINT_MAX_AWAITED_TARGET_LOOKUPS
+    );
+    for queued in [0, 1, 20, 100, EMBER_PUBLISH_TARGET_QUEUE_MAX] {
+        assert!(
+            ember_target_lookups_this_cycle(queued, true)
+                >= ember_target_lookups_this_cycle(queued, false)
+        );
+    }
 }
 
 /// Which of a file's keys resolves last is timing, not outcome: a timeout
@@ -2725,6 +2805,51 @@ fn a_round_that_placed_one_key_is_published_when_its_last_key_is_dropped() {
     assert!(untrack_ember_record_pending(sched.borrow(), dropped));
     assert!(sched.keyword_at.contains_key(&landed.file_hash));
     assert!(sched.unplaced.is_empty() && sched.placed.is_empty());
+}
+
+/// A key that never left the host is as unplaced as one every storer refused,
+/// so its round comes back on the partial retry instead of standing as
+/// complete for the whole interval with that word unsearchable.
+#[test]
+fn a_key_dropped_unsent_brings_its_round_back_on_the_partial_retry() {
+    let mut sched = TestSchedule::default();
+    let landed = record_ref(12, 120);
+    let dropped = record_ref(12, 121);
+    let now = std::time::Instant::now();
+
+    track_ember_record_pending(sched.borrow(), landed);
+    track_ember_record_pending(sched.borrow(), dropped);
+    assert!(!place_ember_record_pending(sched.borrow(), landed, now));
+    assert!(untrack_ember_record_pending(sched.borrow(), dropped));
+    let due = sched.keyword_at[&landed.file_hash];
+    assert!(
+        due <= std::time::Instant::now() + EMBER_KEYWORD_PARTIAL_RETRY,
+        "the dropped word must come back on the partial retry"
+    );
+    assert_eq!(sched.rounds_failed(landed), 1);
+}
+
+/// One storer refusing a key another has already taken loses nothing. Marking
+/// the round partial anyway sent a fully placed file back for three retries of
+/// its whole keyword set.
+#[test]
+fn a_refusal_of_a_key_another_storer_took_leaves_the_round_whole() {
+    let mut sched = TestSchedule::default();
+    let taken = record_ref(13, 130);
+    let waiting = record_ref(13, 131);
+    let now = std::time::Instant::now();
+
+    track_ember_record_pending(sched.borrow(), taken);
+    track_ember_record_pending(sched.borrow(), waiting);
+    assert!(!place_ember_record_pending(sched.borrow(), taken, now));
+    assert!(!fail_ember_record_pending(sched.borrow(), taken, now));
+    assert!(place_ember_record_pending(sched.borrow(), waiting, now));
+    assert_eq!(
+        sched.keyword_at[&taken.file_hash],
+        now + EMBER_KEYWORD_REPUBLISH,
+        "every key landed, so the full interval applies"
+    );
+    assert_eq!(sched.rounds_failed(taken), 0);
 }
 
 fn queued_copy(reference: EmberRecordRef) -> EmberQueuedRecord {
@@ -3008,18 +3133,54 @@ fn the_daily_verified_peak_follows_the_local_calendar_day() {
 /// minutes, during which publishes had one target and lookups one seed.
 #[test]
 fn a_starved_table_gets_a_wider_ping_budget() {
-    let starved = EMBER_PING_STARVED_BELOW;
-    assert_eq!(ember_maint_ping_budget(0, 0), EMBER_MAINT_MAX_PINGS_STARVED);
-    assert_eq!(
-        ember_maint_ping_budget(starved - 1, starved - 1),
-        EMBER_MAINT_MAX_PINGS_STARVED
-    );
+    assert_eq!(ember_maint_ping_budget(true, 0), EMBER_MAINT_MAX_PINGS_STARVED);
+    assert_eq!(ember_maint_ping_budget(true, 19), EMBER_MAINT_MAX_PINGS_STARVED);
     // Once joined, a small table drops back to the steady-state trickle.
-    assert_eq!(
-        ember_maint_ping_budget(starved, starved),
-        EMBER_MAINT_MAX_PINGS
-    );
+    assert_eq!(ember_maint_ping_budget(false, 20), EMBER_MAINT_MAX_PINGS);
     const _: () = assert!(EMBER_MAINT_MAX_PINGS_STARVED > EMBER_MAINT_MAX_PINGS);
+}
+
+/// The join used to end only at twenty verified contacts, which an overlay of
+/// twenty nodes or fewer can never reach, so every cold-start allowance stayed
+/// on for the life of the process.
+#[test]
+fn a_small_overlay_settles_once_it_stops_finding_peers() {
+    let t0 = std::time::Instant::now();
+    let mut join = EmberJoinProgress::new(t0);
+
+    assert!(join.starved(0, t0), "an empty table is joining");
+    join.note(0, t0 + EMBER_JOIN_SETTLE * 2);
+    assert!(
+        join.starved(0, t0 + EMBER_JOIN_SETTLE * 2),
+        "an empty table never settles"
+    );
+
+    join.note(7, t0);
+    assert!(join.starved(7, t0 + EMBER_JOIN_SETTLE / 2), "still finding peers");
+    assert!(
+        !join.starved(7, t0 + EMBER_JOIN_SETTLE),
+        "seven verified and none new for the settle window is a settled overlay"
+    );
+
+    // A newcomer is growth: the join resumes until it stops again.
+    let grew = t0 + EMBER_JOIN_SETTLE * 2;
+    join.note(8, grew);
+    assert!(join.starved(8, grew + EMBER_JOIN_SETTLE / 2));
+    assert!(!join.starved(8, grew + EMBER_JOIN_SETTLE));
+
+    // Losing a peer or two is ordinary churn and stays settled.
+    let later = grew + EMBER_JOIN_SETTLE * 2;
+    join.note(6, later);
+    assert!(!join.starved(6, later));
+
+    // Losing most of the overlay is a new join.
+    join.note(3, later);
+    assert!(join.starved(3, later + EMBER_JOIN_SETTLE / 2));
+
+    // A working set is never starved, however recently it grew.
+    let full = EMBER_KAD_BRIDGE_UNTIL_CONTACTS;
+    join.note(full, later);
+    assert!(!join.starved(full, later));
 }
 
 /// The budget used to be one absolute rate for every table size, so a full
@@ -3027,11 +3188,10 @@ fn a_starved_table_gets_a_wider_ping_budget() {
 /// touched stayed dead until the much later stale sweep.
 #[test]
 fn the_ping_budget_follows_the_size_of_the_table() {
-    let joined = EMBER_PING_STARVED_BELOW;
     let full = ember::dht::K_BUCKET_SIZE * ember::dht::ID_BITS;
 
-    let small = ember_maint_ping_budget(joined, 60);
-    let large = ember_maint_ping_budget(joined, 600);
+    let small = ember_maint_ping_budget(false, 60);
+    let large = ember_maint_ping_budget(false, 600);
     assert!(
         large > small,
         "a bigger table has more to check, so it must check more"
@@ -3040,7 +3200,7 @@ fn the_ping_budget_follows_the_size_of_the_table() {
     // Never below the old trickle, and never above a rate the join path
     // already sustains.
     for contacts in [0, 1, 60, 600, 6_000, full, usize::MAX] {
-        let budget = ember_maint_ping_budget(joined, contacts);
+        let budget = ember_maint_ping_budget(false, contacts);
         assert!(
             (EMBER_MAINT_MAX_PINGS..=EMBER_MAINT_MAX_PINGS_STARVED).contains(&budget),
             "{contacts} contacts produced {budget}"
@@ -5680,14 +5840,16 @@ fn friend_contacts_behind_a_full_bucket_ask_for_the_incumbent_to_be_probed() {
             failed_queries: 0,
         }
     };
-    let now = chrono::Utc::now().timestamp();
+    // Quiet long enough that the incumbent is worth asking about; a bucket of
+    // contacts heard from moments ago parks the newcomer without a probe.
+    let quiet = chrono::Utc::now().timestamp() - ember::dht::CONTACT_TIMEOUT_SECS - 1;
     for i in 1..=ember::dht::K_BUCKET_SIZE as u8 {
         assert!(matches!(
-            dht.offer_contact(in_far_bucket(i, [80, i, 1, 1], now)),
+            dht.offer_contact(in_far_bucket(i, [80, i, 1, 1], quiet)),
             ember::dht::routing::AddResult::Added
         ));
     }
-    let incumbent = in_far_bucket(1, [80, 1, 1, 1], now).node_id;
+    let incumbent = in_far_bucket(1, [80, 1, 1, 1], quiet).node_id;
 
     let fresh_bucket = {
         let mut id = local.0;
@@ -5715,8 +5877,9 @@ fn friend_contacts_behind_a_full_bucket_ask_for_the_incumbent_to_be_probed() {
 fn a_queued_ping_gets_the_longer_deadline() {
     let node = ember::dht::EmberNodeId([3; 16]);
     let before = std::time::Instant::now();
-    let direct = new_ember_maint_ping(node, false, 1_000);
-    let queued = new_ember_maint_ping(node, true, 1_000);
+    let addr: SocketAddr = "203.0.113.3:4672".parse().unwrap();
+    let direct = new_ember_maint_ping(node, addr, false, 1_000);
+    let queued = new_ember_maint_ping(node, addr, true, 1_000);
     assert!(queued.deadline > direct.deadline);
     assert!(direct.deadline >= before + EMBER_MAINT_PING_TIMEOUT);
     assert!(queued.deadline >= before + EMBER_MAINT_PING_QUEUED_TIMEOUT);
