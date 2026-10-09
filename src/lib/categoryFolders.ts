@@ -29,8 +29,17 @@ function isReservedDeviceName(name: string): boolean {
   return RESERVED_DEVICE.test(stem);
 }
 
+/** `sanitize_filename`'s cap, in UTF-8 bytes: the limit Linux puts on one name. */
+const MAX_NAME_BYTES = 255;
+const utf8 = new TextEncoder();
+
 function sanitizeSegment(segment: string): string {
-  const safe = segment.replace(UNSAFE_CHAR, '_');
+  let safe = segment.replace(UNSAFE_CHAR, '_');
+  if (utf8.encode(safe).length > MAX_NAME_BYTES) {
+    const chars = Array.from(safe);
+    while (utf8.encode(chars.join('')).length > MAX_NAME_BYTES) chars.pop();
+    safe = chars.join('').replace(/[. ]+$/, '');
+  }
   return isReservedDeviceName(safe) ? `_${safe}` : safe;
 }
 
@@ -52,4 +61,72 @@ export function categoryFolderSegments(value: string): string[] {
 export function normalizeCategoryFolder(value: string): string | null {
   const segments = categoryFolderSegments(value);
   return segments.length > 0 ? segments.join('/') : null;
+}
+
+/** `path`'s folders, outermost first, without Windows' extended-length prefix
+ *  (`\\?\C:\…`), which a finished download is recorded with. */
+function pathSegments(path: string): string[] {
+  return path
+    .replace(/^[\\/]{2}\?[\\/]UNC[\\/]/i, '\\\\')
+    .replace(/^[\\/]{2}\?[\\/]/, '')
+    .split(/[\\/]/)
+    .filter(Boolean);
+}
+
+function sameSegments(a: string[], b: string[], caseInsensitive: boolean): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((segment, i) =>
+    caseInsensitive ? segment.toLowerCase() === b[i].toLowerCase() : segment === b[i],
+  );
+}
+
+/**
+ * The folders below `<downloadFolder>/Downloads` that the file at `filePath`
+ * is in, outermost first — `[]` directly in Downloads — or `null` when it is
+ * not inside that Downloads at all, or deeper than a category folder can be,
+ * which are the files a category cannot move.
+ */
+export function downloadsSubdirOf(
+  filePath: string,
+  downloadFolder: string,
+  caseInsensitive: boolean,
+): string[] | null {
+  if (!downloadFolder) return null;
+  const downloads = [...pathSegments(downloadFolder), 'Downloads'];
+  const dirs = pathSegments(filePath);
+  dirs.pop();
+  if (dirs.length < downloads.length) return null;
+  if (!sameSegments(dirs.slice(0, downloads.length), downloads, caseInsensitive)) return null;
+  const below = dirs.slice(downloads.length);
+  return below.length <= CATEGORY_FOLDER_MAX_DEPTH ? below : null;
+}
+
+/** The folders below Downloads that `category` files its downloads in: `[]`
+ *  for one with no folder, which is Downloads itself. */
+export function categorySubdir(category: string, folders: Record<string, string>): string[] {
+  const folder = folders[category];
+  return folder ? categoryFolderSegments(folder) : [];
+}
+
+/** The categories whose folder is `subdir`. None for `[]`: Downloads itself is
+ *  where every category without a folder goes, so it is no one's folder. */
+export function categoriesWithFolder(
+  subdir: string[],
+  folders: Record<string, string>,
+  caseInsensitive: boolean,
+): string[] {
+  if (subdir.length === 0) return [];
+  return Object.keys(folders).filter((category) =>
+    sameSegments(categorySubdir(category, folders), subdir, caseInsensitive),
+  );
+}
+
+/** Whether `a` and `b` name the same place below Downloads. */
+export function sameCategorySubdir(a: string[], b: string[], caseInsensitive: boolean): boolean {
+  return sameSegments(a, b, caseInsensitive);
+}
+
+/** Where a category files its downloads, as shown: `Downloads/<folder>`. */
+export function categoryDestinationLabel(subdir: string[]): string {
+  return ['Downloads', ...subdir].join('/');
 }

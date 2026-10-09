@@ -1174,8 +1174,10 @@ impl TransferManager {
     }
 
     /// Record the actual on-disk destination of a finished download so the
-    /// Open/Reveal commands can target it directly. Call this while the row is
-    /// still in `active`/`queue` (before [`complete`](Self::complete) moves it).
+    /// Open/Reveal commands can target it directly. At completion, call this
+    /// while the row is still in `active`/`queue` (before
+    /// [`complete`](Self::complete) moves it); a finished row takes it too, when
+    /// a category change has moved its file.
     pub fn set_completed_path(&mut self, id: &str, path: String) {
         if let Some(t) = self.get_transfer_mut(id) {
             t.completed_path = Some(path);
@@ -2172,8 +2174,8 @@ impl TransferManager {
     }
 
     pub fn set_category(&mut self, id: &str, category: &str) {
-        // Only a download still to finish decides where it lands; a finished
-        // one keeps its file where it is, as in eMule.
+        // A download still to finish lands in the category's folder when it
+        // does; a finished one's file is moved by the command that called this.
         if let Some(transfer) = self.active.get_mut(id) {
             transfer.category = category.to_string();
             crate::storage::category_folders::note_category(id, category);

@@ -328,6 +328,28 @@ export async function openSharedFile(filePath: string): Promise<void> {
   return invoke('open_shared_file', { filePath });
 }
 
+/** Open a folder of the Library's tree itself (a shared folder or one inside
+ *  it), where `openSharedFolder` opens the folder a file is in. */
+export async function openLibraryFolder(folderPath: string): Promise<void> {
+  return invoke('open_library_folder', { folderPath });
+}
+
+export interface CategoryMoveReport {
+  /** Files now in the category's folder. */
+  moved: number;
+  /** Files that were in it already. */
+  unchanged: number;
+  /** A coded error for each file that stayed where it was. */
+  failed: string[];
+}
+
+/** Move Library files into the folder `category` names inside Downloads, as a
+ *  finished download moves when its category changes. `'None'` is Downloads
+ *  itself. A finished download in the transfer list takes the category too. */
+export async function moveFilesToCategory(paths: string[], category: string): Promise<CategoryMoveReport> {
+  return invoke('move_files_to_category', { paths, category });
+}
+
 export async function openSharedFolder(filePath: string): Promise<void> {
   return invoke('open_shared_folder', { filePath });
 }

@@ -1021,6 +1021,234 @@ async fn forget_gone_paths(state: &AppState, paths: Vec<String>) {
     }
 }
 
+/// Files in the library were moved by Ember, each from `.0` to `.1`, as a
+/// finished download's is when its category changes: each row follows its
+/// file, keeping everything but where it is, so nothing is hashed again and
+/// uploads, which look the path up by hash, find it there. known.met forgets
+/// the old paths and learns the new ones at the reconcile, which sees a known
+/// hash at a path it has no record of. Best effort, after the moves happened.
+/// One file Ember moved: from where, to where, and the content hash it was
+/// moved as (empty when it had none), which is what the bookkeeping after it
+/// matches on as well as the path.
+pub(crate) struct FileMove {
+    pub from: String,
+    pub to: std::path::PathBuf,
+    pub hash: String,
+}
+
+pub(crate) async fn relocate_library_files(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    moves: &[FileMove],
+) {
+    if moves.is_empty() {
+        return;
+    }
+    let mut renamed: HashMap<String, String> = HashMap::new();
+    {
+        let mut index = state.local_index.write().await;
+        let mut rows = Vec::new();
+        for mv in moves {
+            // The hash as well as the path: the old name is free once the file
+            // has left it, and a download finishing under that name in between
+            // has its own row there, which is not this file's to take over.
+            let ours = index
+                .get_by_path(&mv.from)
+                .is_some_and(|row| mv.hash.is_empty() || row.hash.eq_ignore_ascii_case(&mv.hash));
+            if !ours {
+                continue;
+            }
+            let Some(mut row) = index.remove_file_by_path(&mv.from) else {
+                continue;
+            };
+            let to_path = mv.to.to_string_lossy().into_owned();
+            // A stale row already at the new path would otherwise lend this
+            // one its flags when the two are merged.
+            index.remove_file_by_path(&to_path);
+            row.path = to_path.clone();
+            if let Some(name) = mv.to.file_name() {
+                row.name = name.to_string_lossy().into_owned();
+            }
+            if let Some(folder) = mv.to.parent() {
+                row.folder = folder.to_string_lossy().into_owned();
+            }
+            rows.push(row);
+            renamed.insert(crate::search::index::normalize_path_key(&mv.from), to_path);
+        }
+        // In one call: `add_file` scans the whole index for a path it has not
+        // indexed, which every new path is, once per file under the lock.
+        index.add_files(rows);
+    }
+    if !renamed.is_empty() {
+        // Re-pathed here first: the refresh carries each row's published
+        // badges over by path, and would otherwise drop these.
+        let mut cache = state.cached_shared_files.write().await;
+        for row in cache.iter_mut() {
+            if let Some(to) = renamed.get(&crate::search::index::normalize_path_key(&row.path)) {
+                row.path = to.clone();
+            }
+        }
+    }
+    refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+    // Every file that left its path, row or not: known.met's record of the old
+    // place is stale either way.
+    forget_gone_paths(state, moves.iter().map(|mv| mv.from.clone()).collect()).await;
+    reconcile_shared_files_best_effort(&state.network_tx).await;
+    let _ = app.emit(
+        "shared-files-changed",
+        serde_json::json!({ "phase": "moved", "count": moves.len() }),
+    );
+}
+
+/// The most files one [`move_files_to_category`] call moves: a selection in
+/// the Library, never a whole folder tree.
+const MAX_CATEGORY_MOVE_PATHS: usize = 5_000;
+
+/// What [`move_files_to_category`] did.
+#[derive(serde::Serialize)]
+pub struct CategoryMoveReport {
+    /// Files now in the category's folder.
+    moved: u32,
+    /// Files already there, left as they were.
+    unchanged: u32,
+    /// One coded error per file that stayed where it was.
+    failed: Vec<String>,
+}
+
+/// Move Library files into the folder `category` names inside the `Downloads`
+/// they are in, the way a finished download is moved when its category
+/// changes, and give any finished download in the transfer list that wrote
+/// one of them that category. For files the transfer list no longer has —
+/// anything finished before the last restart — this is the only way to file
+/// them. A file must be in the library, hashed, and inside a `Downloads` of a
+/// download folder; anything else stays where it is and is reported.
+#[tauri::command]
+pub async fn move_files_to_category(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    paths: Vec<String>,
+    category: String,
+) -> Result<CategoryMoveReport, String> {
+    check_path_batch(&paths, MAX_CATEGORY_MOVE_PATHS)?;
+    if category.len() > 256 {
+        return Err(coded(
+            "transfers_category_too_long",
+            "Category name too long (max 256 bytes)",
+        ));
+    }
+    let category = if category == "None" { String::new() } else { category };
+    let (roots, subdir) = {
+        let config = state.config.read().await;
+        let subdir = config
+            .settings
+            .download_category_folders
+            .get(&category)
+            .map(|folder| crate::storage::category_folders::folder_segments(folder))
+            .unwrap_or_default();
+        (config.settings.download_folders().roots(), subdir)
+    };
+    let mut failed = Vec::new();
+    let mut candidates = Vec::new();
+    {
+        let index = state.local_index.read().await;
+        for path in paths {
+            match index.get_by_path(&path) {
+                Some(row) if !row.hash.is_empty() => {
+                    candidates.push((row.path.clone(), row.name.clone(), row.hash.clone()))
+                }
+                Some(row) => failed.push(coded_ctx(
+                    "sharing_move_not_hashed",
+                    "The file is still being hashed",
+                    &row.name,
+                )),
+                None => failed.push(coded_ctx(
+                    "sharing_move_not_in_library",
+                    "The file is no longer in the library",
+                    path,
+                )),
+            }
+        }
+    }
+    let outcome = tokio::task::spawn_blocking(move || {
+        candidates
+            .into_iter()
+            .map(|(path, name, hash)| {
+                let result = crate::network::ed2k::transfer::move_finished_download(
+                    std::path::Path::new(&path),
+                    &roots,
+                    &subdir,
+                    &name,
+                );
+                (path, name, hash, result)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))?;
+
+    let mut moves = Vec::new();
+    let mut unchanged = 0u32;
+    for (path, name, hash, result) in outcome {
+        match result {
+            Ok(Some(to)) => moves.push(FileMove { from: path, to, hash }),
+            Ok(None) => unchanged += 1,
+            Err(e) => {
+                warn!("Could not move {path} into the {category:?} category's folder: {e:#}");
+                failed.push(coded_ctx(
+                    "sharing_move_to_category_failed",
+                    "The file could not be moved",
+                    format!("{name}: {e:#}"),
+                ));
+            }
+        }
+    }
+    if !moves.is_empty() {
+        crate::commands::transfers::follow_moved_finished_downloads(&state, &moves, &category).await;
+        relocate_library_files(&app, &state, &moves).await;
+        info!("Moved {} library file(s) into the {category:?} category's folder", moves.len());
+    }
+    Ok(CategoryMoveReport {
+        moved: u32::try_from(moves.len()).unwrap_or(u32::MAX),
+        unchanged,
+        failed,
+    })
+}
+
+/// Open a folder of the Library's tree — a shared folder or one inside it,
+/// such as a download category's — in the file manager.
+#[tauri::command]
+pub async fn open_library_folder(
+    state: tauri::State<'_, AppState>,
+    folder_path: String,
+) -> Result<(), String> {
+    if folder_path.len() > MAX_PATH_LEN {
+        return Err(coded_ctx(
+            "sharing_file_path_too_long",
+            format!("File path exceeds {MAX_PATH_LEN} bytes"),
+            MAX_PATH_LEN,
+        ));
+    }
+    let allowed_dirs = {
+        let config = state.config.read().await;
+        shared_access_dirs(&config)
+    };
+    tokio::task::spawn_blocking(move || {
+        let canonical = crate::security::filesystem::verify_existing_path(
+            std::path::Path::new(&folder_path),
+            &allowed_dirs,
+        )
+        .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid or changed path", e))?;
+        // Only a directory: handing a file to the default-app launcher runs it.
+        if !canonical.is_dir() {
+            return Err(coded("sharing_invalid_path", "Invalid or changed path"));
+        }
+        crate::security::filesystem::open_with_default_app(&canonical)
+            .map_err(|e| coded_ctx("sharing_open_folder_failed", "Failed to open folder", e))
+    })
+    .await
+    .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))?
+}
+
 /// Tell known.met that `removed` folders left the library: it forgets the
 /// paths under them that the shared and download folders left do not cover.
 /// Run after the config no longer lists them. Best effort, as

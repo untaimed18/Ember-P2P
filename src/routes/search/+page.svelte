@@ -42,14 +42,14 @@
     queryHasNetworkKeyword,
   } from '$lib/searchQuery';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
-  import { onDestroy, onMount, untrack } from 'svelte';
+  import { onDestroy, onMount, tick, untrack } from 'svelte';
   import { get } from 'svelte/store';
   import { listen } from '@tauri-apps/api/event';
   import type { SearchResult, SpamExplanation } from '$lib/types';
   import { formatNumber, formatSize, formatLiveSpeed, copyToClipboard, sizeUnitLabel } from '$lib/utils';
   import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import { addToast } from '$lib/stores/toast';
-  import { inertBackground, trapTabKey } from '$lib/a11y';
+  import { inertBackground, menuKeydown, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { hoverSubmenus } from '$lib/hoverSubmenus';
   import { passiveScroll } from '$lib/actions/passiveScroll';
@@ -325,12 +325,13 @@
   // so its completed/cancelled badge appears without a reload. A
   // `completedHandled` guard keeps this from re-firing on every transfers-store
   // tick for hashes that stay terminal in the list.
+  // Bounded by the transfer list: a hash leaves it once it has left the list
+  // and its departure has been handled. Evicting the oldest at a fixed cap
+  // instead re-handled every terminal hash on every tick once more than the
+  // cap sat in the list, each evicting the next.
   const completedHandled = new Set<string>();
-  // Bound the dedupe set so a very long session with thousands of completed
-  // downloads can't grow it without limit. Sets preserve insertion order, so
-  // dropping the oldest entry evicts the least-recently-completed hash.
-  const COMPLETED_HANDLED_CAP = 2000;
   const seenDownloadHashes = new Set<string>();
+  const HISTORY_SETTLE_RECHECK_MS = 5000;
   $effect(() => {
     const list = $transfers;
     if (destroyed) return;
@@ -347,10 +348,6 @@
       }
       if (completedHandled.has(t.file_hash)) continue;
       completedHandled.add(t.file_hash);
-      if (completedHandled.size > COMPLETED_HANDLED_CAP) {
-        const oldest = completedHandled.values().next().value;
-        if (oldest !== undefined) completedHandled.delete(oldest);
-      }
       invalidateHistory(t.file_hash);
       queueHistoryFetch([t.file_hash]);
     }
@@ -359,13 +356,18 @@
       if (present.has(hash)) continue;
       seenDownloadHashes.delete(hash);
       if (completedHandled.has(hash)) continue;
-      completedHandled.add(hash);
-      if (completedHandled.size > COMPLETED_HANDLED_CAP) {
-        const oldest = completedHandled.values().next().value;
-        if (oldest !== undefined) completedHandled.delete(oldest);
-      }
       invalidateHistory(hash);
       queueHistoryFetch([hash]);
+      // A cancel drops the row before the backend has written its history
+      // entry, which waits on the teardown; asked only now, the badge would
+      // stay blank until the page remounted.
+      safeTimeout(() => {
+        invalidateHistory(hash);
+        queueHistoryFetch([hash]);
+      }, HISTORY_SETTLE_RECHECK_MS);
+    }
+    for (const hash of completedHandled) {
+      if (!present.has(hash)) completedHandled.delete(hash);
     }
   });
 
@@ -435,6 +437,8 @@
   // Track failure flag separately so the CSS class doesn't depend on
   // substring matching against the (now localized) status text.
   let bulkDownloadHasFailures = $state(false);
+  /** Only the newest bulk message's timer clears it. */
+  let bulkMessageToken = 0;
   let checkedCount = $derived(checkedKeys.size);
   /** What the ticked results weigh, shown beside the count before a bulk
    *  download. */
@@ -677,8 +681,36 @@
   /// throws away the results the user was looking at.
   function openColumnMenuFromHeader(e: MouseEvent) {
     e.preventDefault();
+    // At the pointer, not under the Columns button: that button scrolls away
+    // with the results while the sticky header stays, so once scrolled the
+    // menu opened above the viewport and only the dead keyboard showed it.
+    const panelHeight = MEDIA_COLUMNS.length * 32 + 16;
+    columnMenuAt = {
+      x: Math.max(8, Math.min(e.clientX, window.innerWidth - 200)),
+      y: Math.max(8, Math.min(e.clientY, window.innerHeight - panelHeight - 8)),
+    };
     showColumnMenu = true;
   }
+
+  let columnMenuEl = $state<HTMLDetailsElement | undefined>(undefined);
+  let columnMenuPanelEl = $state<HTMLDivElement | undefined>(undefined);
+  let columnMenuAt = $state<{ x: number; y: number } | null>(null);
+  $effect(() => {
+    if (!showColumnMenu) columnMenuAt = null;
+  });
+  // The guess above only keeps the pointer's corner on screen; the panel's
+  // real size depends on the locale's labels, so it is measured once drawn
+  // and pulled back inside the window. Writes only when it moves, so the
+  // second run finds nothing to do.
+  $effect(() => {
+    const at = columnMenuAt;
+    const panel = columnMenuPanelEl;
+    if (!at || !panel) return;
+    const rect = panel.getBoundingClientRect();
+    const x = Math.max(8, Math.min(at.x, window.innerWidth - rect.width - 8));
+    const y = Math.max(8, Math.min(at.y, window.innerHeight - rect.height - 8));
+    if (x !== at.x || y !== at.y) columnMenuAt = { x, y };
+  });
 
   /// Origins whose Complete Sources figure was counted by something able to
   /// count it: a server reads its own source table, an Ember row counts
@@ -754,11 +786,13 @@
   /// Ranks by the share shown, so the column sorts by what it displays. eMule
   /// compares the same ratio. Unknown ranks lowest; the absolute count breaks
   /// ties so that two complete sources out of two do not outrank fifty out of
-  /// fifty.
+  /// fifty — but only where the column shows that count, so the `?` rows are
+  /// not ordered by the claim the column declines to show.
   function completeSourcesForSort(r: SearchResult): number {
     const state = completeState(r);
-    const percent = state.kind === 'unknown' ? -1 : state.kind === 'yes' ? 100 : state.percent;
-    return percent * 100_000 + Math.min(99_999, r.file.complete_sources ?? 0);
+    if (state.kind === 'unknown') return -100_000;
+    if (state.kind === 'yes') return 100 * 100_000;
+    return state.percent * 100_000 + Math.min(99_999, state.complete);
   }
 
   let destroyed = false;
@@ -884,21 +918,21 @@
     // Sources column: numeric equality (and optional >= with leading `>`),
     // not substring-on-number which made "1" match 10/12/21 (SF11).
     if (filterColumn === 'sources') {
-      for (const token of tokens) {
+      for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i];
         const isNot = token.startsWith('-');
-        const raw = (isNot ? token.slice(1) : token).trim();
-        if (!raw) continue;
-        let found = false;
-        if (raw.startsWith('>=')) {
-          const n = Number.parseInt(raw.slice(2), 10);
-          found = Number.isFinite(n) && result.availability >= n;
-        } else if (raw.startsWith('>')) {
-          const n = Number.parseInt(raw.slice(1), 10);
-          found = Number.isFinite(n) && result.availability > n;
-        } else {
-          const n = Number.parseInt(raw, 10);
-          found = Number.isFinite(n) && result.availability === n;
-        }
+        let raw = (isNot ? token.slice(1) : token).trim();
+        // `> 5` and `>= 5` as typed with a space: the operator takes the
+        // number after it.
+        if ((raw === '>' || raw === '>=') && i + 1 < tokens.length) raw += tokens[++i];
+        const op = raw.startsWith('>=') ? '>=' : raw.startsWith('>') ? '>' : '';
+        const n = Number.parseInt(raw.slice(op.length), 10);
+        // No number yet — a bare `>` mid-typing, or a word — filters nothing,
+        // rather than matching no row and emptying the table.
+        if (!Number.isFinite(n)) continue;
+        const found = op === '>=' ? result.availability >= n
+          : op === '>' ? result.availability > n
+          : result.availability === n;
         if (isNot === found) return true;
       }
       return false;
@@ -1277,13 +1311,14 @@
   // Before the first render rather than in `onMount`: the results are already
   // in the store when the page comes back, and restoring afterwards filtered
   // and laid out the whole list under the default filters only to redo it.
+  //
+  // The panel comes back from the prefs alone. They are written on every
+  // change, so they hold it as the user left it; laying the tab's original
+  // search parameters over them threw away every filter edited since.
   loadPersistedPrefs();
   {
     const restoredTab = get(searchTabs).find((t) => t.id === get(activeSearchTabId));
-    if (restoredTab) {
-      barQuery = restoredTab.query;
-      restoreTabSearchParams(restoredTab);
-    }
+    if (restoredTab) barQuery = restoredTab.query;
   }
   prefsRestored = true;
 
@@ -1460,9 +1495,12 @@
     );
   }
 
-  const DL_STATUS_PRIORITY: Record<string, number> = {
+  // Keyed by the full status union so a status added later cannot rank as
+  // zero unnoticed and let a finished copy mask a live download.
+  const DL_STATUS_PRIORITY: Record<Transfer['status'], number> = {
     active: 6, verifying: 5, completing: 5, hashing: 5,
-    queued: 4, searching: 4, paused: 3, stopped: 2, completed: 1, failed: 0,
+    queued: 4, searching: 4, paused: 3, insufficient: 3, noneneeded: 3,
+    stopped: 2, completed: 1, failed: 0,
   };
 
   function buildDownloadsByHash(list: readonly Transfer[]): Map<string, Transfer> {
@@ -1613,9 +1651,8 @@
     const out: SearchResult[] = [];
     let spamCount = 0;
     let ownedCount = 0;
+    let bothCount = 0;
     for (const r of visibleResults) {
-      if (r.is_spam) spamCount++;
-      if (spamHidden && r.is_spam) continue;
       if (hasType && resultType(r) !== filterType) continue;
       if (hasExt && (r.file.extension ?? '').toLowerCase() !== ext) continue;
       if (minBytes > 0 && r.file.size < minBytes) continue;
@@ -1635,9 +1672,22 @@
         && (r.file.complete_sources ?? 0) < minComplete
       ) continue;
       if (isFilteredByText(r)) continue;
-      // Last, so the count is of rows only this filter hides: "Show files I
-      // already have" must bring back as many as it says.
-      if (ownedHidden && alreadyHave(r)) {
+      // Each count is of rows only its own filter hides, after every other
+      // one: "Hide spam (12)" and "Show files I already have" must each bring
+      // back as many as they say. A row both hide is in neither count — taking
+      // away one of the two still leaves it hidden — but in `bothCount`, so
+      // the empty state can still name what is hiding it.
+      const spam = r.is_spam;
+      const owned = ownedHidden && alreadyHave(r);
+      if (spam && owned && spamHidden) {
+        bothCount++;
+        continue;
+      }
+      if (spam) {
+        if (!owned) spamCount++;
+        if (spamHidden) continue;
+      }
+      if (owned) {
         ownedCount++;
         continue;
       }
@@ -1698,12 +1748,14 @@
       return sortDir === 'asc' ? cmp : -cmp;
     });
 
-    return { rows: out, spamCount, ownedCount };
+    return { rows: out, spamCount, ownedCount, bothCount };
   });
 
   let filteredResults: SearchResult[] = $derived(filterPass.rows);
   let spamHiddenCount = $derived(filterPass.spamCount);
   let ownedHiddenCount = $derived(filterPass.ownedCount);
+  /** Rows hidden by both the spam and the owned filter: in neither count. */
+  let bothHiddenCount = $derived(filterPass.bothCount);
 
   /** Already in the library. A download still in progress, or a finished one
    *  whose file has since left the library, is not something we have. Judged
@@ -1762,14 +1814,24 @@
     ownedCheckTimer = setTimeout(() => void checkOwned(), Math.max(0, Math.min(delayMs, left)));
   }
 
+  /** One check at a time: with a slow library, every results sync asking for
+   *  the same unanswered rows again piled up requests of thousands of hashes. */
+  let ownedCheckInFlight = false;
+  let ownedCheckQueued = false;
+
   async function checkOwned() {
     ownedCheckWaitingSince = null;
     if (!hideOwned) return;
+    if (ownedCheckInFlight) {
+      ownedCheckQueued = true;
+      return;
+    }
     const generation = ownedCacheGeneration;
     const unchecked = [...new Set(
       visibleResults.map((r) => r.file.hash?.toLowerCase()).filter((h): h is string => !!h && !ownedCache.has(h)),
     )];
     if (unchecked.length === 0) return;
+    ownedCheckInFlight = true;
     try {
       const owned = await libraryHashesAmong(unchecked);
       if (generation !== ownedCacheGeneration) return;
@@ -1780,6 +1842,12 @@
       ownedCache = next;
     } catch (e) {
       console.warn('search: could not check which results are in the library', e);
+    } finally {
+      ownedCheckInFlight = false;
+      if (ownedCheckQueued && !destroyed) {
+        ownedCheckQueued = false;
+        scheduleOwnedCheck(0);
+      }
     }
   }
 
@@ -1791,12 +1859,18 @@
     const hashes = [...ownedCache.keys()];
     if (!hideOwned || hashes.length === 0) {
       ownedCache = new Map();
+      // The bump discarded any first check still in flight.
+      if (hideOwned) scheduleOwnedCheck(0);
       return;
     }
     try {
       const owned = await libraryHashesAmong(hashes);
       if (generation !== ownedCacheGeneration) return;
-      ownedCache = new Map(hashes.map((hash) => [hash, owned.has(hash)]));
+      // Merged, not replaced: a check started after the bump shares this
+      // generation, and its answers are newer than anything asked here.
+      const next = new Map(ownedCache);
+      for (const hash of hashes) next.set(hash, owned.has(hash));
+      ownedCache = next;
     } catch (e) {
       console.warn('search: could not re-check the library', e);
       if (generation === ownedCacheGeneration) ownedCache = new Map();
@@ -1806,13 +1880,20 @@
   }
 
   // Results stream in and the filter can be switched on at any time; checked
-  // in batches rather than per arriving row. Nothing answered yet — the page
-  // just mounted over results already in the store — is asked at once, since
-  // every row is on its fallback until then.
+  // in batches rather than per arriving row. A list with nothing answered yet
+  // — the page just mounted over results already in the store, or switched
+  // to a tab nobody asked about — is asked at once, since every row is on its
+  // fallback until then.
   $effect(() => {
     void visibleResults;
     if (!hideOwned) return;
-    untrack(() => scheduleOwnedCheck(ownedCache.size === 0 ? 0 : OWNED_CHECK_DEBOUNCE_MS));
+    untrack(() => {
+      const answered = visibleResults.some((r) => {
+        const hash = r.file.hash?.toLowerCase();
+        return !!hash && ownedCache.has(hash);
+      });
+      scheduleOwnedCheck(answered ? OWNED_CHECK_DEBOUNCE_MS : 0);
+    });
   });
 
   // A download finishing into the library, or a file leaving it, changes what
@@ -2148,7 +2229,13 @@
   }
 
   function selectSearchTab(tabId: string) {
+    // Clicking the tab already shown is not a switch, and must not throw away
+    // its ticks, selection and filter edits as one.
+    if (tabId === get(activeSearchTabId)) return;
     setActiveSearchTab(tabId);
+    // The scroller is shared by every tab; left where it was, a long tab
+    // opened at the previous one's offset, thousands of rows in.
+    if (resultsScrollEl) resultsScrollEl.scrollTop = 0;
     const t = get(searchTabs).find((x) => x.id === tabId);
     if (t) {
       barQuery = t.query;
@@ -2230,14 +2317,24 @@
    */
   function searchAgain(tab: SearchTab) {
     if (tab.isSearching || tab.related || !tab.query) return;
+    const panel = { barQuery, searchMethod, searchFileType };
+    const existing = new Set(get(searchTabs).map((t) => t.id));
     barQuery = tab.query;
     searchMethod = tab.method;
     searchFileType = tab.fileType ?? '';
     // `handleSearch` opens the new tab before its first await, so it is in
     // the store by the time this returns, unless a gate refused the search.
+    // Refused, the active tab is still one that was already there — often not
+    // `tab` at all, since the button shows on background tabs too — and
+    // treating it as the new one moved it into `tab`'s slot and dropped `tab`.
     void handleSearch(tab.query);
     const newId = get(activeSearchTabId);
-    if (!newId || newId === tab.id) return;
+    if (!newId || existing.has(newId)) {
+      barQuery = panel.barQuery;
+      searchMethod = panel.searchMethod;
+      searchFileType = panel.searchFileType;
+      return;
+    }
     searchTabs.update((tabs) => {
       const oldIdx = tabs.findIndex((t) => t.id === tab.id);
       const newIdx = tabs.findIndex((t) => t.id === newId);
@@ -2272,7 +2369,13 @@
 
   async function performCloseSearchTab(tab: SearchTab) {
     clearSearchTimeoutForRequest(tab.requestId);
+    const wasActive = get(activeSearchTabId) === tab.id;
     await closeSearchTab(tab.id);
+    // The closed tab's result hashes are no longer referenced; drop their
+    // history bookkeeping so it doesn't accumulate across the session.
+    pruneHistoryToVisible();
+    // A background tab closing leaves the one on screen as it was.
+    if (!wasActive) return;
     selectedResultKey = null;
     notes = [];
     notesRequestId += 1;
@@ -2281,9 +2384,7 @@
     spamExplainError = null;
     clearChecked();
     closeContextMenu();
-    // The closed tab's result hashes are no longer referenced; drop their
-    // history bookkeeping so it doesn't accumulate across the session.
-    pruneHistoryToVisible();
+    if (resultsScrollEl) resultsScrollEl.scrollTop = 0;
     const next = get(activeSearchTabId);
     if (next) {
       const nt = get(searchTabs).find((x) => x.id === next);
@@ -2334,13 +2435,17 @@
     // over from the last hand-typed search would narrow a related search twice
     // over — as constraints on the wire, and again as the client-side filter
     // over the results — and hide the very files the seed went looking for.
-    if (plan) {
-      clearRelatedSearchFilters();
-    } else {
-      // eMule/backend: Program clears the local type filter so Arc/Iso hits
-      // from a Pro-wire search remain visible. Keep Arc/Iso as client filters.
-      filterType = searchFileType === 'Pro' ? '' : searchFileType;
-    }
+    // Applied to the panel only once the search is past every gate below: a
+    // refused one must leave the filters the user is looking at alone.
+    const applyPanelFilters = () => {
+      if (plan) {
+        clearRelatedSearchFilters();
+      } else {
+        // eMule/backend: Program clears the local type filter so Arc/Iso hits
+        // from a Pro-wire search remain visible. Keep Arc/Iso as client filters.
+        filterType = searchFileType === 'Pro' ? '' : searchFileType;
+      }
+    };
     const wireFileType = plan ? undefined : searchFileType || undefined;
     // `sizeToBytes` rounds and bounds; NaN, Infinity (e.g. "1e400") and
     // negatives all come back as `undefined`, which is the same "no constraint"
@@ -2422,6 +2527,7 @@
       networkAlertOpen = true;
       return;
     }
+    applyPanelFilters();
     const previousSearching = get(searchTabs).filter((t) => t.isSearching);
     for (const t of previousSearching) {
       searchInvokeSettled.add(t.requestId);
@@ -2683,8 +2789,13 @@
     }
   });
 
+  // Keyed on the dialog being open, not only on the element: the binding
+  // stays set through the closing fade, and a background still inert then
+  // turned away the focus handed back to the row below. A boolean, so a row
+  // replaced by a streamed merge does not lift and re-apply it.
+  let detailsOpen = $derived(!!selectedResult);
   $effect(() => {
-    if (!detailsOverlayEl) return;
+    if (!detailsOverlayEl || !detailsOpen) return;
     return inertBackground(detailsOverlayEl);
   });
 
@@ -2728,10 +2839,24 @@
     noteRating = 0;
     noteComment = '';
     publishMessage = '';
+    // Only another file's dialog is free of a publish still out: reopening
+    // the same file must not offer the button that would publish it twice.
+    if (publishingHash !== result.file.hash) {
+      publishingNote = false;
+      publishSeq += 1;
+    }
     const requestId = ++notesRequestId;
     const fileHash = result.file.hash;
     const key = resultKey(result);
     const query = currentSearchQuery();
+    // A library file still being hashed has nothing to look notes or a spam
+    // verdict up by; both commands refuse it, and the dialog showed their two
+    // errors for a file that is merely not hashed yet.
+    if (!fileHash) {
+      loadingNotes = false;
+      spamExplainLoading = false;
+      return;
+    }
 
     // Load notes and spam explanation independently so one slow request
     // does not block the other from rendering in the details panel.
@@ -2819,8 +2944,19 @@
     }
   }
 
-  function openSpamTooltip(result: SearchResult) {
+  /** Viewport placement for the open spam tooltip. Fixed rather than absolute
+   *  under its badge: the name cell clips its overflow for the ellipsis, and
+   *  clipped the reasons along with it. */
+  let spamTooltipStyle = $state('');
+  const SPAM_TOOLTIP_ROOM_PX = 180;
+
+  function openSpamTooltip(result: SearchResult, anchor: HTMLElement) {
     const key = resultKey(result);
+    const rect = anchor.getBoundingClientRect();
+    const right = Math.max(8, window.innerWidth - rect.right);
+    spamTooltipStyle = rect.bottom + SPAM_TOOLTIP_ROOM_PX > window.innerHeight
+      ? `right: ${right}px; bottom: ${window.innerHeight - rect.top + 6}px;`
+      : `right: ${right}px; top: ${rect.bottom + 6}px;`;
     spamTooltipKey = key;
     void ensureSpamExplanation(result);
   }
@@ -2829,11 +2965,43 @@
     spamTooltipKey = null;
   }
 
+  function onResultsScroll() {
+    // Fixed to the viewport, the tooltip would stay put while its row moved.
+    if (spamTooltipKey !== null) closeSpamTooltip();
+    scheduleRowWindowUpdate();
+  }
+
   let publishingNote = $state(false);
+  /** Lets only the newest message's timer clear it: an older one firing
+   *  after a second publish wiped the new message early. */
+  let publishMessageToken = 0;
+  function showPublishMessage(text: string, success: boolean, ms: number) {
+    publishMessage = text;
+    publishSuccess = success;
+    const token = ++publishMessageToken;
+    safeTimeout(() => {
+      if (token === publishMessageToken) publishMessage = '';
+    }, ms);
+  }
+
+  /** The publish `publishingNote` describes. Opening another file's dialog
+   *  clears the flag, so a publish still out for the last one does not hold
+   *  this one's button. */
+  let publishSeq = 0;
+  /** The file the publish `publishingNote` describes is for. */
+  let publishingHash: string | null = null;
+
   async function handlePublishNote() {
-    if (!selectedResult || publishingNote) return;
+    if (!selectedResult?.file.hash || publishingNote) return;
     publishingNote = true;
+    const publishId = ++publishSeq;
+    publishingHash = selectedResult.file.hash;
     publishMessage = '';
+    // The backend can take seconds to answer, and the dialog may be showing
+    // another file by then: that file's form and status line are not this
+    // publish's to touch, so its outcome goes to a toast instead.
+    const requestId = notesRequestId;
+    const stillShown = () => requestId === notesRequestId;
     // The rating input is a free-form number field; browsers can submit
     // out-of-range or fractional values (and an empty field yields NaN).
     // Clamp to the backend's 0..5 integer contract before publishing.
@@ -2849,22 +3017,31 @@
         selectedResult.file.name,
         selectedResult.file.size,
       );
-      publishMessage =
+      const text =
         raw === 'search_note_publish_queued'
           ? m.search_note_publish_queued()
           : raw === 'search_note_publish_started'
             ? m.search_note_publish_started()
             : raw;
-      publishSuccess = true;
+      if (!stillShown()) {
+        addToast('success', text);
+        return;
+      }
+      showPublishMessage(text, true, 3000);
       noteComment = '';
       noteRating = 0;
-      safeTimeout(() => publishMessage = '', 3000);
     } catch (e: unknown) {
-      publishMessage = translateError(e, m.search_publish_failed());
-      publishSuccess = false;
-      safeTimeout(() => publishMessage = '', 5000);
+      const text = translateError(e, m.search_publish_failed());
+      if (!stillShown()) {
+        addToast('error', text);
+        return;
+      }
+      showPublishMessage(text, false, 5000);
     } finally {
-      publishingNote = false;
+      if (publishId === publishSeq) {
+        publishingNote = false;
+        publishingHash = null;
+      }
     }
   }
 
@@ -3052,7 +3229,17 @@
     // Raw pointer position: `ctxMenuPosition` measures the rendered panel and
     // keeps it on screen.
     contextMenu = { x: e.clientX, y: e.clientY, result };
+    // The menu is rendered at the end of the page, and the row keys stand
+    // down while it is open, so without this the keyboard could not reach it.
+    const active = document.activeElement;
+    ctxReturnFocus = active instanceof HTMLElement && active !== document.body ? active : null;
+    void tick().then(() => ctxMenuEl?.querySelector<HTMLElement>('.ctx-item:not([disabled])')?.focus());
   }
+
+  let ctxMenuEl: HTMLDivElement | undefined = $state(undefined);
+  /** Where focus was when the menu opened, handed back when Escape closes it.
+   *  Not on other closes: a click elsewhere has put focus where it wants. */
+  let ctxReturnFocus: HTMLElement | null = null;
 
   function closeContextMenu() {
     contextMenu = null;
@@ -3324,6 +3511,15 @@
     scheduleRowWindowUpdate();
   }
 
+  /** Where a keystroke is text being typed. A checkbox is an `<input>` but
+   *  not one of these: clicking a row's tick focuses it, and the page's
+   *  shortcuts must keep working after that. */
+  function isTextEntry(el: EventTarget | null): boolean {
+    if (!(el instanceof HTMLElement)) return false;
+    if (el.isContentEditable || el.tagName === 'TEXTAREA') return true;
+    return el instanceof HTMLInputElement && el.type !== 'checkbox';
+  }
+
   function isActivationTarget(el: EventTarget | null): boolean {
     return (
       el instanceof HTMLElement &&
@@ -3359,17 +3555,12 @@
       }
       cursorKey = resultKey(next);
       revealResultRow(nextIdx);
-      // A checkbox or button clicked earlier (in a row, the header, the
-      // toolbar) keeps focus, and would take the Space or Enter meant for the
-      // row the cursor is now on. Text fields never get here.
+      // A control clicked earlier (a checkbox or button in a row or the
+      // toolbar, a sort header, the syntax help's summary) keeps focus, and
+      // would take the Space or Enter meant for the row the cursor is now on.
+      // Text fields never get here.
       const focused = document.activeElement;
-      if (
-        focused instanceof HTMLButtonElement
-        || (focused instanceof HTMLInputElement && focused.type === 'checkbox')
-        || (focused instanceof HTMLElement && resultsBodyEl?.contains(focused))
-      ) {
-        (focused as HTMLElement).blur();
-      }
+      if (focused instanceof HTMLElement && focused !== document.body) focused.blur();
       return true;
     }
     if (isActivationTarget(e.target)) return false;
@@ -3540,6 +3731,7 @@
     if (bulkDownloadPending || checkedKeys.size === 0) return;
     bulkDownloadPending = true;
     bulkDownloadMessage = '';
+    bulkMessageToken += 1;
     bulkDownloadHasFailures = false;
     const toDownload = filteredResults.filter((r) => checkedKeys.has(resultKey(r)));
 
@@ -3624,7 +3816,9 @@
     if (failed > 0) parts.push(m.search_bulk_failed({ count: failed }));
     bulkDownloadMessage = parts.join(', ');
     bulkDownloadHasFailures = failed > 0;
+    const token = ++bulkMessageToken;
     safeTimeout(() => {
+      if (token !== bulkMessageToken) return;
       bulkDownloadMessage = '';
       bulkDownloadHasFailures = false;
     }, 3000);
@@ -3705,8 +3899,12 @@
 
 <svelte:document
   onpointerdown={(e) => {
+    const inside = (el: HTMLElement | undefined) => e.target instanceof Node && !!el?.contains(e.target);
+    // Open, the Columns menu also holds off the row keys, so a click that
+    // only dismissed it visually would leave the keyboard dead.
+    if (showColumnMenu && !inside(columnMenuEl)) showColumnMenu = false;
     if (!syntaxHelpEl || !syntaxHelpEl.open) return;
-    if (e.target instanceof Node && syntaxHelpEl.contains(e.target)) return;
+    if (inside(syntaxHelpEl)) return;
     syntaxHelpEl.open = false;
   }}
   onkeydown={(e) => {
@@ -3723,6 +3921,9 @@
       e.stopPropagation();
     } else if (contextMenu) {
       closeContextMenu();
+      const back = ctxReturnFocus;
+      ctxReturnFocus = null;
+      if (back && document.contains(back)) back.focus();
       e.preventDefault();
       e.stopPropagation();
     } else if (
@@ -3761,8 +3962,7 @@
   // field already has focus so it stays a typeable character there, and while a
   // modifier is held so it cannot shadow a browser or OS shortcut.
   if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
-    const target = e.target as HTMLElement | null;
-    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
+    if (isTextEntry(e.target)) return;
     if (confirmOpen || selectedResult) return;
     e.preventDefault();
     searchBar?.focusInput();
@@ -3772,8 +3972,7 @@
   // nothing is ticked. Skipped while text is selected or focus is in a field,
   // so the normal copy still works in the query box.
   if ((e.ctrlKey || e.metaKey) && isShortcutLetter(e, 'c')) {
-    const target = e.target as HTMLElement | null;
-    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
+    if (isTextEntry(e.target)) return;
     if (confirmOpen || networkAlertOpen || selectedResult || !(window.getSelection()?.isCollapsed ?? true)) return;
     if (filteredResults.length === 0) return;
     e.preventDefault();
@@ -3972,7 +4171,7 @@
       </select>
     </div>
 
-    <button class="ghost advanced-toggle" aria-expanded={showAdvancedFilters} aria-controls="search-advanced-filters" onclick={() => (showAdvancedFilters = !showAdvancedFilters)}>
+    <button class="ghost advanced-toggle" aria-expanded={showAdvancedFilters} aria-controls={showAdvancedFilters ? 'search-advanced-filters' : undefined} onclick={() => (showAdvancedFilters = !showAdvancedFilters)}>
       {showAdvancedFilters ? m.search_hide_advanced() : (advancedFilterCount > 0 ? m.search_advanced_filters_count({ count: advancedFilterCount }) : m.search_advanced_filters())}
     </button>
 
@@ -4089,6 +4288,7 @@
           type="text"
           placeholder={m.search_ext_placeholder()}
           bind:value={filterExtension}
+          maxlength="16"
           class="ext-input"
         />
       </div>
@@ -4127,7 +4327,7 @@
   <p class="filter-help">{m.search_filter_help_prefix()} <code>-</code> {m.search_filter_help_suffix()}</p>
 </div>
 
-<div class="page-content results-scroll" bind:this={resultsScrollEl} use:passiveScroll={scheduleRowWindowUpdate}>
+<div class="page-content results-scroll" bind:this={resultsScrollEl} use:passiveScroll={onResultsScroll}>
   {#if emberDrivesThisSearch && emberReadinessUnknown}
     <div class="search-readiness-hint" role="status">
       {m.search_network_ember_diagnostics_hint()}
@@ -4216,7 +4416,11 @@
            the user can retype. Saying so is the difference between the
            feature looking broken and looking finished. -->
       <p class="empty-title">{activeTab?.related ? m.search_no_results_related() : m.search_no_results()}</p>
-      <p class="empty-sub">{activeTab?.related ? m.search_no_results_related_hint() : m.search_no_results_hint()}</p>
+      <!-- A search that failed is explained by the banner above; advice to
+           reword the query would point at the wrong cause. -->
+      {#if !activeTab?.error}
+        <p class="empty-sub">{activeTab?.related ? m.search_no_results_related_hint() : m.search_no_results_hint()}</p>
+      {/if}
       {#if extensionOnlyHintExt}
         <p class="empty-sub">{m.search_extension_keyword_hint({ ext: extensionOnlyHintExt })}</p>
       {/if}
@@ -4231,8 +4435,8 @@
           {#if filteredResults.length > 0}
             {plural(filteredResults.length, { one: m.search_showing_one, other: () => m.search_showing_other({ count: formatNumber(filteredResults.length) }) })}{#if resultsHidden > 0} {m.search_filtered_from({ total: formatNumber(visibleResults.length) })}{/if}
           {:else if visibleResults.length > 0 && !hasActiveFilters}
-            {@const spamHides = hideSpam && spamHiddenCount > 0}
-            {@const ownedHides = hideOwned && ownedHiddenCount > 0}
+            {@const spamHides = hideSpam && spamHiddenCount + bothHiddenCount > 0}
+            {@const ownedHides = hideOwned && ownedHiddenCount + bothHiddenCount > 0}
             {spamHides && ownedHides ? m.search_no_results_filters() : spamHides ? allHiddenSpamLabel : allHiddenOwnedLabel}
           {:else if visibleResults.length > 0}
             {plural(visibleResults.length, {
@@ -4254,7 +4458,7 @@
         {/if}
       </div>
       <div class="results-info-actions">
-        <details class="column-menu" bind:open={showColumnMenu}>
+        <details class="column-menu" bind:open={showColumnMenu} bind:this={columnMenuEl}>
           <summary class="column-menu-summary" title={m.search_columns_aria()} aria-label={m.search_columns_aria()} aria-haspopup="true">
             <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
               <rect x="2" y="2.5" width="12" height="11" rx="1.5"/>
@@ -4263,7 +4467,13 @@
             </svg>
             {m.search_columns_button()}
           </summary>
-          <div class="column-menu-panel" role="group" aria-label={m.search_columns_aria()}>
+          <div
+            class="column-menu-panel"
+            bind:this={columnMenuPanelEl}
+            role="group"
+            aria-label={m.search_columns_aria()}
+            style={columnMenuAt ? `position: fixed; left: ${columnMenuAt.x}px; top: ${columnMenuAt.y}px; right: auto;` : undefined}
+          >
             {#each MEDIA_COLUMNS as col}
               <label class="column-menu-item">
                 <input type="checkbox" checked={columnVis[col.key]} onchange={() => toggleColumn(col.key)} />
@@ -4313,6 +4523,7 @@
               type="checkbox"
               bind:this={selectAllCheckbox}
               checked={allFilteredChecked}
+              disabled={filteredResults.length === 0}
               onchange={toggleCheckAll}
               aria-label={m.search_select_all_results()}
               title={m.search_select_all_results()}
@@ -4450,16 +4661,16 @@
                       class="spam-flag-btn"
                       type="button"
                       aria-label={m.search_show_spam_reason()}
-                      onclick={() => openSpamTooltip(result)}
-                      onfocus={() => openSpamTooltip(result)}
-                      onmouseenter={() => openSpamTooltip(result)}
+                      onclick={(e) => openSpamTooltip(result, e.currentTarget)}
+                      onfocus={(e) => openSpamTooltip(result, e.currentTarget)}
+                      onmouseenter={(e) => openSpamTooltip(result, e.currentTarget)}
                       onmouseleave={closeSpamTooltip}
                       onblur={closeSpamTooltip}
                     >
                       {m.search_spam_label()}
                     </button>
                     {#if spamTooltipKey === resultKey(result)}
-                      <div class="spam-tooltip" role="tooltip">
+                      <div class="spam-tooltip" role="tooltip" style={spamTooltipStyle}>
                         {#if spamExplainPending[resultKey(result)]}
                           <div class="spam-tooltip-title">{m.search_spam_evaluating()}</div>
                         {:else if spamExplainErrors[resultKey(result)]}
@@ -4625,8 +4836,8 @@
               <line x1="1" y1="1" x2="23" y2="23"/>
             </svg>
           </div>
-          {@const spamHides = hideSpam && spamHiddenCount > 0}
-          {@const ownedHides = hideOwned && ownedHiddenCount > 0}
+          {@const spamHides = hideSpam && spamHiddenCount + bothHiddenCount > 0}
+          {@const ownedHides = hideOwned && ownedHiddenCount + bothHiddenCount > 0}
           <p class="empty-title">
             {spamHides && ownedHides ? m.search_no_results_filters() : spamHides ? allHiddenSpamLabel : allHiddenOwnedLabel}
           </p>
@@ -4648,7 +4859,14 @@
         onclick={closeContextMenu}
         oncontextmenu={(e) => { e.preventDefault(); closeContextMenu(); }}
       ></button>
-      <div class="ctx-menu" role="menu" use:ctxMenuPosition={{ x: contextMenu.x, y: contextMenu.y }}>
+      <div
+        class="ctx-menu"
+        role="menu"
+        tabindex="-1"
+        bind:this={ctxMenuEl}
+        onkeydown={(e) => menuKeydown(e, e.currentTarget)}
+        use:ctxMenuPosition={{ x: contextMenu.x, y: contextMenu.y }}
+      >
         <div class="ctx-header" role="presentation">
           <bdi dir="auto">{displayName(contextMenu.result)}</bdi>
         </div>
@@ -4938,7 +5156,7 @@
               <input id="note-rating" type="number" min="0" max="5" bind:value={noteRating} />
               <label for="note-comment">{m.search_comment_label()}</label>
               <input id="note-comment" type="text" maxlength="4096" bind:value={noteComment} placeholder={m.search_comment_placeholder()} />
-              <button onclick={handlePublishNote} disabled={publishingNote}>{publishingNote ? m.search_publishing() : m.search_publish_note()}</button>
+              <button onclick={handlePublishNote} disabled={publishingNote || !selectedResult.file.hash}>{publishingNote ? m.search_publishing() : m.search_publish_note()}</button>
               {#if publishMessage}
                 <span class={publishSuccess ? 'success-msg' : 'error-msg'}>{publishMessage}</span>
               {/if}
@@ -6184,9 +6402,7 @@
   }
 
   .spam-tooltip {
-    position: absolute;
-    top: calc(100% + 6px);
-    right: 0;
+    position: fixed;
     z-index: 9999;
     width: min(360px, 70vw);
     padding: 8px 10px;
@@ -6317,17 +6533,21 @@
     box-shadow: inset 3px 0 0 0 var(--warning);
   }
 
-  .row-dl-completed {
-    background: color-mix(in srgb, var(--success) 5%, transparent) !important;
+  /* On the cells, as an image layer over whatever colour they already have:
+     on the row it sat under the striped rows' opaque cell background, so
+     every other downloading row showed no tint. A ticked row's `background`
+     shorthand still clears it. */
+  tr.row-dl-completed td {
+    background-image: linear-gradient(color-mix(in srgb, var(--success) 5%, transparent), color-mix(in srgb, var(--success) 5%, transparent));
   }
-  .row-dl-active {
-    background: color-mix(in srgb, var(--accent) 5%, transparent) !important;
+  tr.row-dl-active td {
+    background-image: linear-gradient(color-mix(in srgb, var(--accent) 5%, transparent), color-mix(in srgb, var(--accent) 5%, transparent));
   }
-  .row-dl-queued {
-    background: color-mix(in srgb, var(--text-secondary) 4%, transparent) !important;
+  tr.row-dl-queued td {
+    background-image: linear-gradient(color-mix(in srgb, var(--text-secondary) 4%, transparent), color-mix(in srgb, var(--text-secondary) 4%, transparent));
   }
-  .row-dl-failed {
-    background: color-mix(in srgb, var(--danger) 5%, transparent) !important;
+  tr.row-dl-failed td {
+    background-image: linear-gradient(color-mix(in srgb, var(--danger) 5%, transparent), color-mix(in srgb, var(--danger) 5%, transparent));
   }
 
   /* Context menu styling is shared app-wide — see `.ctx-menu` in app.css. */

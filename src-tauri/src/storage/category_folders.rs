@@ -177,6 +177,12 @@ mod tests {
             normalize_folder(&long).map(|f| f.chars().count()),
             Some(MAX_SEGMENT_CHARS)
         );
+        // Within the 255 bytes Linux allows a name: 64 four-byte characters
+        // would be 256. `categoryFolders.ts` pins the same 63.
+        let emoji = "\u{1F3AC}".repeat(MAX_SEGMENT_CHARS + 2);
+        let segment = folder_segments(&emoji).remove(0);
+        assert_eq!(segment.chars().count(), 63);
+        assert!(segment.len() <= 255);
     }
 
     #[test]

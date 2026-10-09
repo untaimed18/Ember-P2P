@@ -5,15 +5,15 @@
   import AddLinksDialog from '$lib/components/AddLinksDialog.svelte';
   import { addLinksRequested, MAX_LINKS_TEXT_BYTES } from '$lib/clipboardWatch';
   import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
-  import { normalizeCategoryFolder } from '$lib/categoryFolders';
+  import { categoryDestinationLabel, categorySubdir, normalizeCategoryFolder } from '$lib/categoryFolders';
   import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, holdDownloadRemoved, setLocalCategory, IDLE_STATUSES, effectiveUploadSpeed } from '$lib/stores/transfers';
-  import { addActionToast, removeToast, setToastMessage, toastError } from '$lib/stores/toast';
+  import { addActionToast, removeToast, setToastMessage, toastError, toastSuccess } from '$lib/stores/toast';
   import { holdPendingCancel, releasePendingCancel } from '$lib/stores/pendingCancels';
   import { finishAction, setFinishAction, type FinishAction } from '$lib/stores/finishAction';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
     pauseTransfer, stopTransfer, resumeTransfer, removeTransfer,
-    clearCompleted, moveTransfersInQueue, getDownloadQueueIds, setTransferPriority, setTransferCategory, renameTransfer, setPreviewPriority,
+    clearCompleted, moveTransfersInQueue, getDownloadQueueIds, setTransferPriority, setTransfersCategory, renameTransfer, setPreviewPriority,
     pauseTransfersBatch, resumeTransfersBatch, stopTransfersBatch, cancelTransfersBatch, getTransfers,
     getTransferSources, openFile, openTransferFileLocation, openDownloadsFolder, recoverArchive, startDownload,
     getUploadQueue, getKnownClients, getKnownClientCounts, getDownloadFileDetails,
@@ -47,6 +47,8 @@
   import { mapSettledWithLimit } from '$lib/concurrency';
   import * as m from '$lib/paraglide/messages';
   import { plural } from '$lib/plural';
+  import { BUILTIN_DOWNLOAD_CATEGORIES, downloadCategoryLabel } from '$lib/downloadCategories';
+  import { categoriesDialogRequested } from '$lib/stores/categoriesDialog';
   import {
     translateError,
     transferFailureKindText,
@@ -2151,7 +2153,7 @@
   });
 
   // --- Categories ---
-  const BUILTIN_CATEGORIES = ['Audio', 'Video', 'Image', 'Archive', 'Document', 'Program'] as const;
+  const BUILTIN_CATEGORIES = BUILTIN_DOWNLOAD_CATEGORIES;
   let userCategories = $derived($appSettings?.download_categories ?? []);
   let categoryCounts = $derived.by(() => {
     const counts: Record<string, number> = {};
@@ -2943,6 +2945,12 @@
   let categoryOptions = $derived(['None', ...BUILTIN_CATEGORIES, ...userCategories]);
 
   let categoriesDialog = $state<{ open: boolean; assignIds: string[] }>({ open: false, assignIds: [] });
+  // "Edit categories…" in the Library brings the user here for the dialog.
+  $effect(() => {
+    if (!$categoriesDialogRequested) return;
+    categoriesDialogRequested.set(false);
+    categoriesDialog = { open: true, assignIds: [] };
+  });
 
   /** A category set from the menu goes to the whole selection when the
    *  clicked row is part of it, as in eMule. */
@@ -2950,17 +2958,32 @@
     return selectedDlIdSet.has(t.id) && selectedBatchTransfers.length > 1 ? selectedBatchTransfers : [t];
   }
 
-  async function assignCategory(targets: Transfer[], category: string) {
-    const done = new Set<string>();
-    try {
-      for (const target of targets) {
-        await setTransferCategory(target.id, category);
-        done.add(target.id);
-      }
-    } finally {
-      // The backend sends no event for this; show what it accepted right away.
-      if (done.size > 0) setLocalCategory(done, category);
+  /** A finished download's file moves to the new category's folder, as it
+   *  would have had the category been set before it finished, unless
+   *  `moveFinished` is off: taking away a category the user deleted is not a
+   *  request to move anything. */
+  async function assignCategory(targets: Transfer[], category: string, moveFinished = true) {
+    if (targets.length === 0) return;
+    const changes = await setTransfersCategory(targets.map((t) => t.id), category, moveFinished);
+    // The backend sends no event for this; show what it accepted right away.
+    if (changes.changed.length > 0) setLocalCategory(new Set(changes.changed), category);
+    if (changes.moved > 0) {
+      const folder = categoryDestinationLabel(categorySubdir(category, $appSettings?.download_category_folders ?? {}));
+      toastSuccess(plural(changes.moved, {
+        one: () => m.transfers_category_moved_one({ folder }),
+        other: () => m.transfers_category_moved_other({ count: formatNumber(changes.moved), folder }),
+      }));
     }
+    const [firstFailure] = changes.move_failed;
+    if (changes.move_failed.length === 1) {
+      toastError(translateError(firstFailure, m.transfers_operation_failed()));
+    } else if (changes.move_failed.length > 1) {
+      toastError(m.library_move_failed_many({
+        count: formatNumber(changes.move_failed.length),
+        detail: translateError(firstFailure, m.transfers_operation_failed()),
+      }));
+    }
+    if (changes.error) throw changes.error;
   }
 
   function isCategoryTaken(name: string): boolean {
@@ -3031,7 +3054,7 @@
 
   async function removeUserCategory(name: string) {
     const members = allDownloads.filter((t) => t.category === name);
-    if (members.length > 0) await assignCategory(members, '');
+    if (members.length > 0) await assignCategory(members, '', false);
     await saveUserCategories((current) => current.filter((cat) => cat !== name));
     if (categoryFilter === name) categoryFilter = '';
   }
@@ -4797,16 +4820,7 @@
    *  (`'None'`, `'Audio'`, …) is preserved as the API contract; only the
    *  user-visible label is translated. */
   function categoryLabel(cat: string): string {
-    switch (cat) {
-      case 'None': return m.transfers_cat_none();
-      case 'Audio': return m.transfers_cat_audio();
-      case 'Video': return m.transfers_cat_video();
-      case 'Image': return m.transfers_cat_image();
-      case 'Archive': return m.transfers_cat_archive();
-      case 'Document': return m.transfers_cat_document();
-      case 'Program': return m.transfers_cat_program();
-      default: return cat;
-    }
+    return downloadCategoryLabel(cat);
   }
 
   function identStateLabel(state: string): string {
@@ -5299,31 +5313,39 @@
         {/if}
       </label>
     </div>
-    {#if categoryChips.length > 0}
-      <div class="category-chips" role="group" aria-label={m.transfers_category_filter_aria()}>
+    <!-- Shown even before any download has a category: it is where the
+         categories and their folders are set up, and hidden it could not be
+         found until something else had already made one. -->
+    <div class="category-chips" role="group" aria-label={m.transfers_category_filter_aria()}>
+      <button
+        type="button"
+        class="category-chip"
+        class:active={!activeCategory}
+        aria-pressed={!activeCategory}
+        onclick={() => (categoryFilter = '')}
+      >{m.transfers_category_filter_all()} <span class="category-chip-count">{formatNumber(allDownloads.length)}</span></button>
+      {#each categoryChips as cat (cat)}
         <button
           type="button"
           class="category-chip"
-          class:active={!activeCategory}
-          aria-pressed={!activeCategory}
-          onclick={() => (categoryFilter = '')}
-        >{m.transfers_category_filter_all()} <span class="category-chip-count">{formatNumber(allDownloads.length)}</span></button>
-        {#each categoryChips as cat (cat)}
-          <button
-            type="button"
-            class="category-chip"
-            class:active={activeCategory === cat}
-            aria-pressed={activeCategory === cat}
-            onclick={() => (categoryFilter = activeCategory === cat ? '' : cat)}
-          >{categoryLabel(cat)} <span class="category-chip-count">{formatNumber(categoryCounts[cat] ?? 0)}</span></button>
-        {/each}
-        <button
-          type="button"
-          class="category-chip category-chip-edit"
-          onclick={() => (categoriesDialog = { open: true, assignIds: [] })}
-        >{m.transfers_category_edit()}</button>
-      </div>
-    {/if}
+          class:active={activeCategory === cat}
+          aria-pressed={activeCategory === cat}
+          onclick={() => (categoryFilter = activeCategory === cat ? '' : cat)}
+        >{categoryLabel(cat)} <span class="category-chip-count">{formatNumber(categoryCounts[cat] ?? 0)}</span></button>
+      {/each}
+      <button
+        type="button"
+        class="category-edit"
+        title={m.transfers_category_edit_title()}
+        onclick={() => (categoriesDialog = { open: true, assignIds: [] })}
+      >
+        <svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M10.6 2.5H16a1.5 1.5 0 0 1 1.5 1.5v5.4a1.5 1.5 0 0 1-.44 1.06l-6.6 6.6a1.5 1.5 0 0 1-2.12 0l-5.4-5.4a1.5 1.5 0 0 1 0-2.12l6.6-6.6a1.5 1.5 0 0 1 1.06-.44z"/>
+          <circle cx="13.6" cy="6.4" r="1.2"/>
+        </svg>
+        {m.transfers_category_edit()}
+      </button>
+    </div>
     <div class="pane-toolbar">
       <span class="pane-title">{m.transfers_downloading_count({ shown: filteredActiveDownloads.length, total: activeDownloads.length })}</span>
       <div class="toolbar-actions">
@@ -6723,6 +6745,43 @@
   <button class="ctx-item" role="menuitem" disabled={none} title={hint} onclick={() => ctxAction('queue_back')}>{m.transfers_ctx_queue_back()}</button>
 {/snippet}
 
+<!-- `current` is the category the rows share ('None' for none), or null when
+     they differ. The choice goes to every row `categoryTargets(t)` names. -->
+{#snippet categorySubmenu(t: Transfer, current: string | null)}
+  <div
+    class="ctx-submenu-wrap"
+    role="presentation"
+    onmouseenter={() => ctxSubs.enter('category')}
+    onmouseleave={ctxSubs.leave}
+  >
+    <button
+      class="ctx-item ctx-sub"
+      class:ctx-sub-open={ctxCategorySub}
+      role="menuitem"
+      aria-haspopup="menu"
+      aria-expanded={ctxCategorySub}
+      onclick={(e) => ctxSubs.click(e, 'category')}
+    >
+      {m.transfers_ctx_category()}
+      {#if current}<span class="ctx-hint">{categoryLabel(current)}</span>{/if}
+    </button>
+    {#if ctxCategorySub}
+      <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
+        {#each categoryOptions as cat (cat)}
+          <button
+            class="ctx-item"
+            role="menuitemradio"
+            aria-checked={current === cat}
+            onclick={() => ctxAction('set_category', cat)}
+          >{categoryLabel(cat)}</button>
+        {/each}
+        <div class="ctx-sep" role="separator"></div>
+        <button class="ctx-item" role="menuitem" onclick={() => openNewCategory(t)}>{m.transfers_ctx_category_new()}</button>
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
 {#snippet webServicesSubmenu()}
   <div
     class="ctx-submenu-wrap"
@@ -6851,38 +6910,7 @@
       {#if ctxTargets.some(canMoveInQueue)}
         {@render queueMoveItems(ctxTargets)}
       {/if}
-      <div
-        class="ctx-submenu-wrap"
-        role="presentation"
-        onmouseenter={() => ctxSubs.enter('category')}
-        onmouseleave={ctxSubs.leave}
-      >
-        <button
-          class="ctx-item ctx-sub"
-          class:ctx-sub-open={ctxCategorySub}
-          role="menuitem"
-          aria-haspopup="menu"
-          aria-expanded={ctxCategorySub}
-          onclick={(e) => ctxSubs.click(e, 'category')}
-        >
-          {m.transfers_ctx_category()}
-          {#if sharedCategory}<span class="ctx-hint">{categoryLabel(sharedCategory)}</span>{/if}
-        </button>
-        {#if ctxCategorySub}
-          <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
-            {#each categoryOptions as cat (cat)}
-              <button
-                class="ctx-item"
-                role="menuitemradio"
-                aria-checked={sharedCategory === cat}
-                onclick={() => ctxAction('set_category', cat)}
-              >{categoryLabel(cat)}</button>
-            {/each}
-            <div class="ctx-sep" role="separator"></div>
-            <button class="ctx-item" role="menuitem" onclick={() => ctxTransfer && openNewCategory(ctxTransfer)}>{m.transfers_ctx_category_new()}</button>
-          </div>
-        {/if}
-      </div>
+      {@render categorySubmenu(ctxTransfer, sharedCategory ?? null)}
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_copy_links_btn()}</button>
       <button
@@ -6898,6 +6926,8 @@
       {/if}
       <button class="ctx-item ctx-danger" role="menuitem" disabled={ctxTargets.every(isFinished)} onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
     {:else if ctxMenu.section !== 'upload' && ctxMulti}
+      {@render categorySubmenu(ctxTransfer, sharedValue(ctxTargets, (x) => x.category || 'None') ?? null)}
+      <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_copy_links_btn()}</button>
       <button
         class="ctx-item"
@@ -6974,38 +7004,7 @@
       {#if canMoveInQueue(ctxTransfer)}
         {@render queueMoveItems([ctxTransfer])}
       {/if}
-      <div
-        class="ctx-submenu-wrap"
-        role="presentation"
-        onmouseenter={() => ctxSubs.enter('category')}
-        onmouseleave={ctxSubs.leave}
-      >
-        <button
-          class="ctx-item ctx-sub"
-          class:ctx-sub-open={ctxCategorySub}
-          role="menuitem"
-          aria-haspopup="menu"
-          aria-expanded={ctxCategorySub}
-          onclick={(e) => ctxSubs.click(e, 'category')}
-        >
-          {m.transfers_ctx_category()}
-          <span class="ctx-hint">{categoryLabel(ctxTransfer.category || 'None')}</span>
-        </button>
-        {#if ctxCategorySub}
-          <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
-            {#each categoryOptions as cat (cat)}
-              <button
-                class="ctx-item"
-                role="menuitemradio"
-                aria-checked={(cat === 'None' && !ctxTransfer.category) || ctxTransfer.category === cat}
-                onclick={() => ctxAction('set_category', cat)}
-              >{categoryLabel(cat)}</button>
-            {/each}
-            <div class="ctx-sep" role="separator"></div>
-            <button class="ctx-item" role="menuitem" onclick={() => ctxTransfer && openNewCategory(ctxTransfer)}>{m.transfers_ctx_category_new()}</button>
-          </div>
-        {/if}
-      </div>
+      {@render categorySubmenu(ctxTransfer, ctxTransfer.category || 'None')}
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
       <button class="ctx-item" role="menuitem" disabled={pasteLinkBusy} onclick={() => ctxAction('paste_link')}>{m.transfers_ctx_paste_link()}</button>
@@ -7036,6 +7035,12 @@
       <button class="ctx-item" role="menuitem" onclick={() => { const t = ctxTransfer!; closeCtx(); openFileDetails(t); }}>{m.transfers_ctx_file_details()}</button>
       {#if canRename(ctxTransfer)}
         <button class="ctx-item" role="menuitem" onclick={() => { const t = ctxTransfer!; closeCtx(); openRename(t); }}>{m.transfers_ctx_rename()}</button>
+      {/if}
+      <!-- A finished download's file moves to the folder of the category
+           picked here, so a download that finished before it could be
+           categorised can still be filed. -->
+      {#if ctxTransfer.status === 'completed'}
+        {@render categorySubmenu(ctxTransfer, ctxTransfer.category || 'None')}
       {/if}
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
@@ -7698,9 +7703,37 @@
   .category-chip.active .category-chip-count {
     color: inherit;
   }
-  .category-chip-edit {
+  /* The way into categories and their folders, so it reads as an action
+     rather than one more filter: accent-tinted, with an icon, and pinned to
+     the right edge so a long row of chips cannot scroll it out of view. The
+     opaque base under the tint hides the chips that scroll beneath it. */
+  .category-edit {
+    position: sticky;
+    right: 0;
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
     margin-left: auto;
-    border-style: dashed;
+    padding: 3px 11px 3px 9px;
+    border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+    border-radius: var(--radius-pill);
+    background:
+      linear-gradient(color-mix(in srgb, var(--accent) 12%, transparent), color-mix(in srgb, var(--accent) 12%, transparent)),
+      var(--bg-primary);
+    box-shadow: -10px 0 8px -6px var(--bg-primary);
+    color: var(--accent);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    white-space: nowrap;
+    transition: background var(--transition-fast), border-color var(--transition-fast);
+  }
+  .category-edit:hover:not(:disabled) {
+    border-color: var(--accent);
+    background:
+      linear-gradient(color-mix(in srgb, var(--accent) 22%, transparent), color-mix(in srgb, var(--accent) 22%, transparent)),
+      var(--bg-primary);
+    color: var(--accent);
   }
   /* The Known Clients search, at the right of the downloads overview bar. */
   .pill-search.dl-filter {

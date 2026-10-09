@@ -28,8 +28,20 @@
     getFolderPriorities,
     setFolderPriority,
     getFileMediaMetadata,
+    moveFilesToCategory,
+    openLibraryFolder,
     type SharedFolderPick,
   } from '$lib/api/sharing';
+  import { goto } from '$app/navigation';
+  import { BUILTIN_DOWNLOAD_CATEGORIES, downloadCategoryLabel } from '$lib/downloadCategories';
+  import {
+    categoriesWithFolder,
+    categoryDestinationLabel,
+    categorySubdir,
+    downloadsSubdirOf,
+    sameCategorySubdir,
+  } from '$lib/categoryFolders';
+  import { categoriesDialogRequested } from '$lib/stores/categoriesDialog';
   import { getFileComments, setFileComment, type FileCommentInfo } from '$lib/api/comments';
   import { getStatistics, type TransferStats } from '$lib/api/statistics';
   import { formatEd2kLink, formatEd2kLinks, buildEd2kLink } from '$lib/api/search';
@@ -74,7 +86,7 @@
     flattenLibraryFolderTree,
   } from '$lib/libraryFolderTree';
   import * as m from '$lib/paraglide/messages';
-  import { codedErrorOf, translateError } from '$lib/i18n';
+  import { codedErrorOf, getLocale, translateError } from '$lib/i18n';
   import { highlightMatches } from '$lib/stores/highlight';
   import { plural } from '$lib/plural';
   import { openChatFilesFolder } from '$lib/api/friends';
@@ -675,7 +687,13 @@
 
   function normalizePathForMatch(path: string): string {
     let normalized = path.replace(/\\/g, '/').replace(/\/+$/, '');
-    if (IS_WINDOWS) normalized = normalized.toLowerCase();
+    if (IS_WINDOWS) {
+      // The extended form a finished download is recorded in names the same
+      // file as the plain one its shared folder is stored in; without this
+      // it sat outside every folder in the tree until a rescan re-recorded it.
+      normalized = normalized.replace(/^\/\/\?\/UNC\//i, '//').replace(/^\/\/\?\//, '');
+      normalized = normalized.toLowerCase();
+    }
     return normalized;
   }
 
@@ -1059,6 +1077,130 @@
       toastError(error);
     }
   }
+
+  /** A folder of the sidebar tree itself, where `openSharedFolder` opens the
+   *  folder a file is in. */
+  async function openTreeFolder(path: string) {
+    try {
+      await openLibraryFolder(path);
+    } catch (e: unknown) {
+      error = toErr(e);
+      toastError(error);
+    }
+  }
+
+  // --- Download categories ---
+  //
+  // A finished download is filed in its category's folder inside Downloads,
+  // and the transfer list that could change a category forgets finished
+  // downloads at the next start. The Library holds the files for good, so it
+  // is where a file can be filed again, and where category folders are shown
+  // for what they are.
+  let categoryFolders = $derived($appSettings?.download_category_folders ?? {});
+  let categoryOptions = $derived([
+    'None',
+    ...BUILTIN_DOWNLOAD_CATEGORIES,
+    ...($appSettings?.download_categories ?? []),
+  ]);
+  let downloadFolder = $derived($appSettings?.download_folder ?? '');
+
+  /** Where below Downloads a file is, or null when no category can move it:
+   *  not in Downloads, deeper than a category folder, or not hashed yet. */
+  function categorySubdirOfFile(f: FileInfo): string[] | null {
+    return f.hash ? downloadsSubdirOf(f.path, downloadFolder, IS_WINDOWS) : null;
+  }
+
+  /** The files a category picked for `f` applies to: the checked selection
+   *  when `f` is in it, as for the other bulk actions, less those no
+   *  category can move. */
+  function categoryMoveTargets(f: FileInfo): FileInfo[] {
+    const rows = checkedCount > 1 && checkedPaths.has(f.path) ? getCheckedFiles() : [f];
+    return rows.filter((row) => categorySubdirOfFile(row) !== null);
+  }
+
+  /** The backend's cap on one move request. */
+  const MAX_CATEGORY_MOVE_BATCH = 5_000;
+
+  async function moveToCategory(targets: FileInfo[], category: string) {
+    // Waits on the other bulk actions as they wait on each other: a delete or
+    // unshare running over the same files, or this move fired twice, would
+    // find paths already gone and report failures for files that moved.
+    if (targets.length === 0 || bulkBusy) return;
+    bulkBusy = true;
+    const folder = categoryDestinationLabel(categorySubdir(category, categoryFolders));
+    try {
+      const report = { moved: 0, unchanged: 0, failed: [] as string[] };
+      for (let i = 0; i < targets.length; i += MAX_CATEGORY_MOVE_BATCH) {
+        const batch = targets.slice(i, i + MAX_CATEGORY_MOVE_BATCH);
+        const part = await moveFilesToCategory(batch.map((t) => t.path), category);
+        report.moved += part.moved;
+        report.unchanged += part.unchanged;
+        report.failed.push(...part.failed);
+      }
+      if (report.moved > 0) {
+        toastSuccess(
+          targets.length === 1
+            ? m.library_moved_one({ name: targets[0].name, folder })
+            : plural(report.moved, {
+                one: () => m.library_moved_count_one({ folder }),
+                other: () => m.library_moved_count_other({ count: formatNumber(report.moved), folder }),
+              }),
+        );
+      } else if (report.failed.length === 0) {
+        toastInfo(m.library_move_already_there({ folder }));
+      }
+      if (report.failed.length === 1) {
+        toastError(translateError(report.failed[0], m.transfers_operation_failed()));
+      } else if (report.failed.length > 1) {
+        toastError(m.library_move_failed_many({
+          count: formatNumber(report.failed.length),
+          detail: translateError(report.failed[0], m.transfers_operation_failed()),
+        }));
+      }
+    } catch (e: unknown) {
+      error = toErr(e);
+      toastError(error);
+    } finally {
+      await refresh();
+      bulkBusy = false;
+    }
+  }
+
+  function editCategories() {
+    categoriesDialogRequested.set(true);
+    // Cleared if the page never comes up, or the dialog would open on some
+    // later, unrelated visit to Transfers.
+    goto('/transfers').catch(() => categoriesDialogRequested.set(false));
+  }
+
+  const categoryListFormat = new Intl.ListFormat(getLocale(), { style: 'short', type: 'conjunction' });
+
+  /** The categories whose folder a sidebar folder is, for its marker. */
+  function categoriesOfTreeFolder(path: string): string[] {
+    const subdir = downloadsSubdirOf(`${path}/_`, downloadFolder, IS_WINDOWS);
+    return subdir ? categoriesWithFolder(subdir, categoryFolders, IS_WINDOWS) : [];
+  }
+
+  /** Every category folder that is set, as a path, so the tree shows one
+   *  before a download has landed in it: set up, it is somewhere to look. */
+  let categoryFolderPaths = $derived.by(() => {
+    if (!downloadFolder) return [] as string[];
+    const sep = downloadFolder.includes('\\') && !downloadFolder.includes('/') ? '\\' : '/';
+    const downloads = `${downloadFolder.replace(/[\\/]+$/, '')}${sep}Downloads`;
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const category of Object.keys(categoryFolders)) {
+      const subdir = categorySubdir(category, categoryFolders);
+      if (subdir.length === 0) continue;
+      const path = [downloads, ...subdir].join(sep);
+      const key = IS_WINDOWS ? path.toLowerCase() : path;
+      if (!seen.has(key)) {
+        seen.add(key);
+        out.push(path);
+      }
+    }
+    return out;
+  });
 
   /** Soft confirm when copying a very large link list to the clipboard. */
   const COPY_ALL_LINKS_CONFIRM_AT = 5_000;
@@ -1844,7 +1986,9 @@
   // One pass over the library builds the whole sidebar: the tree's top level
   // is the shared folders, each carrying the count and size of everything
   // beneath it, with a file attributed to the deepest share that contains it.
-  let folderTree = $derived(buildLibraryFolderTree(folders, treeFiles, normalizePathForMatch));
+  let folderTree = $derived(
+    buildLibraryFolderTree(folders, treeFiles, normalizePathForMatch, categoryFolderPaths),
+  );
   /** Files under each shared folder, for the remove-folder confirmation. */
   let shareFileCounts = $derived.by(() => {
     const counts = new Map<string, number>();
@@ -2127,17 +2271,19 @@
   let ctxCopySub = $state(false);
   let ctxSendSub = $state(false);
   let ctxWebSub = $state(false);
+  let ctxCategorySub = $state(false);
 
   // Submenus open on hover, on click and from the keyboard; see `hoverSubmenus`.
-  type HoverSub = 'priority' | 'copy' | 'send' | 'web';
+  type HoverSub = 'priority' | 'copy' | 'send' | 'web' | 'category';
   const ctxSubs = hoverSubmenus<HoverSub>(
-    () => (ctxPrioritySub ? 'priority' : ctxCopySub ? 'copy' : ctxSendSub ? 'send' : ctxWebSub ? 'web' : null),
+    () => (ctxPrioritySub ? 'priority' : ctxCopySub ? 'copy' : ctxSendSub ? 'send' : ctxWebSub ? 'web' : ctxCategorySub ? 'category' : null),
     (which) => {
       ctxPrioritySub = which === 'priority';
       ctxCopySub = which === 'copy';
       if (which === 'send' && !ctxSendSub) void loadSendableFriends();
       ctxSendSub = which === 'send';
       ctxWebSub = which === 'web';
+      ctxCategorySub = which === 'category';
     },
   );
   const openHoverSub = ctxSubs.open;
@@ -2529,6 +2675,10 @@
           break;
         case 'open_file': await openSharedFileExternally(f.path); break;
         case 'open_folder': await openSharedFolder(f.path); break;
+        case 'move_category':
+          if (extra !== undefined) await moveToCategory(categoryMoveTargets(f), extra);
+          break;
+        case 'edit_categories': editCategories(); break;
         // The backend reads the template from settings by index and does the
         // substituting, and collects the native confirmation — so there is
         // deliberately no prompt here and no URL built in this renderer.
@@ -3641,6 +3791,21 @@
   </div>
 {/if}
 
+{#snippet openFolderButton(folder: string)}
+  <button
+    type="button"
+    class="tree-btn tree-open"
+    onclick={(e) => { e.stopPropagation(); void openTreeFolder(folder); }}
+    title={m.library_open_this_folder()}
+    aria-label={m.library_open_this_folder()}
+  >
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M2 6.2h12.4L13 12.4a1 1 0 0 1-1 .8H3.4a1 1 0 0 1-1-.7z"/>
+      <path d="M2 6.2 3.3 4.4A1 1 0 0 1 4.1 4h2.1L7.6 5.4H12"/>
+    </svg>
+  </button>
+{/snippet}
+
 <div class="shared-layout" class:dragging={sidebarDragging}>
   <!-- Sidebar: folder filter tree -->
   <div class="sidebar" style="width: {sidebarWidth}px; min-width: {sidebarWidth}px;">
@@ -3679,6 +3844,8 @@
       </div>
       {#each folderRows as row (row.path)}
         {@const folder = row.path}
+        {@const rowCategories = row.isShare ? [] : categoriesOfTreeFolder(folder).map(downloadCategoryLabel)}
+        {@const namedOtherwise = rowCategories.some((label) => label.toLocaleLowerCase() !== row.name.toLocaleLowerCase())}
         <div
           class="tree-item"
           class:child={!row.isShare}
@@ -3734,9 +3901,26 @@
             <span class="tree-folder-name" title={folder}>
               {row.name}
             </span>
+            {#if rowCategories.length > 0}
+              <!-- Where finished downloads of these categories go: says what the
+                   folder is for, and names the category when the folder is
+                   called something else. -->
+              {@const names = categoryListFormat.format(rowCategories)}
+              <span class="tree-category" title={m.library_folder_category_title({ names })}>
+                <svg viewBox="0 0 20 20" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M10.6 2.5H16a1.5 1.5 0 0 1 1.5 1.5v5.4a1.5 1.5 0 0 1-.44 1.06l-6.6 6.6a1.5 1.5 0 0 1-2.12 0l-5.4-5.4a1.5 1.5 0 0 1 0-2.12l6.6-6.6a1.5 1.5 0 0 1 1.06-.44z"/>
+                  <circle cx="13.6" cy="6.4" r="1.2"/>
+                </svg>
+                {#if namedOtherwise}<bdi dir="auto" aria-hidden="true">{names}</bdi>{/if}
+                <span class="sr-only">{m.library_folder_category_title({ names })}</span>
+              </span>
+            {/if}
           </span>
           <div class="tree-meta">
             <span class="tree-count">{formatNumber(row.count)} &middot; {formatSize(row.size)}</span>
+            {#if !row.isShare && row.count > 0}
+              <span class="tree-actions">{@render openFolderButton(folder)}</span>
+            {/if}
             {#if row.isShare}
             {#if unapprovedFolders.some((f) => pathsEqualForFolder(f, folder))}
               <button
@@ -3766,6 +3950,7 @@
               <option value="auto">{m.library_priority_auto()}</option>
             </select>
             <span class="tree-actions">
+              {@render openFolderButton(folder)}
               <button
                 type="button"
                 class="tree-btn tree-unshare"
@@ -4489,6 +4674,7 @@
 <!-- Context menu -->
 {#if ctxMenu}
   {@const fileHashed = !!ctxMenu.file.hash}
+  {@const moveTargets = categoryMoveTargets(ctxMenu.file)}
   <div class="ctx-menu" role="menu" bind:this={ctxMenuEl} use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}>
     <div class="ctx-header" role="presentation">
       <bdi dir="auto">{ctxMenu.file.name}</bdi>
@@ -4496,6 +4682,55 @@
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('properties')}>{m.library_properties()}</button>
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_file')}>{m.library_open_file()}</button>
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_folder')}>{m.library_open_folder()}</button>
+    {#if moveTargets.length > 0}
+      <!-- Only for files a category can move: hashed, and in Downloads. A
+           category's destination is shown beside it, and the folder the
+           file is already in is greyed out, so the choice says where the
+           file will go rather than leaving the user to remember. -->
+      {@const here = moveTargets.length === 1 ? categorySubdirOfFile(moveTargets[0]) : null}
+      <div
+        class="ctx-item ctx-sub"
+        class:ctx-sub-open={ctxCategorySub}
+        role="menuitem"
+        tabindex="0"
+        aria-haspopup="menu"
+        aria-expanded={ctxCategorySub}
+        onmouseenter={() => enterHoverSub('category')}
+        onmouseleave={leaveHoverSub}
+        onclick={(e) => clickHoverSub(e, 'category')}
+        onkeydown={(e) => {
+          if (e.target !== e.currentTarget) return;
+          if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowRight') {
+            e.preventDefault();
+            openHoverSub('category');
+          }
+        }}
+      >
+        {moveTargets.length > 1
+          ? m.library_ctx_move_to_category_count({ count: formatNumber(moveTargets.length) })
+          : m.library_ctx_move_to_category()}
+        {#if ctxCategorySub}
+          <div class="ctx-submenu ctx-scroll" role="menu" use:ctxSubmenuPlacement>
+            {#each categoryOptions as category (category)}
+              {@const subdir = categorySubdir(category, categoryFolders)}
+              {@const isHere = here !== null && sameCategorySubdir(here, subdir, IS_WINDOWS)}
+              <button
+                class="ctx-item"
+                role="menuitem"
+                disabled={isHere}
+                title={isHere ? m.library_move_already_here() : undefined}
+                onclick={() => ctxAction('move_category', category)}
+              >
+                {downloadCategoryLabel(category)}
+                <span class="ctx-hint"><bdi dir="auto">{categoryDestinationLabel(subdir)}</bdi></span>
+              </button>
+            {/each}
+            <div class="ctx-sep" role="separator"></div>
+            <button class="ctx-item" role="menuitem" onclick={() => ctxAction('edit_categories')}>{m.library_ctx_edit_categories()}</button>
+          </div>
+        {/if}
+      </div>
+    {/if}
     <div class="ctx-sep" role="separator"></div>
     {#if fileHashed}
       <div
@@ -5217,6 +5452,36 @@
   }
   button.tree-unapproved:active:not(:disabled) {
     transform: none;
+  }
+  button.tree-btn.tree-open {
+    color: var(--text-secondary);
+    border-color: var(--border);
+  }
+  button.tree-btn.tree-open:hover,
+  button.tree-btn.tree-open:focus-visible {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+    background: color-mix(in srgb, var(--accent) 14%, var(--bg-secondary));
+  }
+  /* Marks a download category's folder: the same tag as the Transfers page's
+     categories, so the two read as one feature. */
+  .tree-category {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    max-width: 100%;
+    margin-left: 6px;
+    padding: 1px 6px;
+    border-radius: var(--radius-pill);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+    line-height: 1.4;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   button.tree-btn.tree-remove,
   button.tree-btn.tree-remove:active:not(:disabled) {

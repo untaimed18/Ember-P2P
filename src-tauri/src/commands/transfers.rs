@@ -2544,12 +2544,48 @@ pub async fn move_transfers_in_queue(
     Ok(u32::try_from(moved).unwrap_or(u32::MAX))
 }
 
+/// What changing downloads' category did. A finished download's file moves to
+/// the new category's folder; one still downloading lands there when it
+/// finishes.
+#[derive(serde::Serialize, Default)]
+pub struct CategoryChanges {
+    /// The downloads whose category was changed, in the order asked.
+    changed: Vec<String>,
+    /// Why the rest were not, when saving the category failed; the change
+    /// stops there.
+    error: Option<String>,
+    /// Finished downloads whose file was moved.
+    moved: u32,
+    /// One coded error per finished download whose file stayed where it was.
+    /// Its category is changed regardless.
+    move_failed: Vec<String>,
+}
+
+/// A finished download to file under its new category.
+struct FinishedToMove {
+    id: String,
+    from: String,
+    file_name: String,
+    file_hash: String,
+    size: u64,
+    /// The hash of the Library row at `from`, if one is there.
+    indexed_hash: Option<String>,
+}
+
+/// Change the category of downloads, in one call for a whole selection: each
+/// finished one has its file moved, and the Library and known.met follow the
+/// moves once at the end rather than once per file. `move_finished: false`
+/// relabels finished downloads and leaves their files, as removing a category
+/// does.
 #[tauri::command]
-pub async fn set_transfer_category(
+pub async fn set_transfers_category(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    transfer_id: String,
+    transfer_ids: Vec<String>,
     category: String,
-) -> Result<(), String> {
+    move_finished: Option<bool>,
+) -> Result<CategoryChanges, String> {
+    check_batch_size(&transfer_ids)?;
     if category.len() > 256 {
         return Err(coded(
             "transfers_category_too_long",
@@ -2557,29 +2593,214 @@ pub async fn set_transfer_category(
         ));
     }
     let db = state.db.clone();
-    let tid = transfer_id.clone();
+    let ids = transfer_ids.clone();
     let cat = category.clone();
-    tokio::task::spawn_blocking(move || db.update_transfer_category(&tid, &cat))
-        .await
-        .map_err(|e| {
-            coded_ctx(
-                "transfers_category_task_failed",
-                "Category update failed",
-                e,
-            )
-        })?
-        .map_err(|e| {
-            coded_ctx(
-                "transfers_category_persist_failed",
-                "Category update failed",
-                e,
-            )
-        })?;
+    let (saved, error) = tokio::task::spawn_blocking(move || {
+        let mut saved = Vec::new();
+        for id in ids {
+            if let Err(e) = db.update_transfer_category(&id, &cat) {
+                return (
+                    saved,
+                    Some(coded_ctx("transfers_category_persist_failed", "Category update failed", e)),
+                );
+            }
+            saved.push(id);
+        }
+        (saved, None)
+    })
+    .await
+    .map_err(|e| coded_ctx("transfers_category_task_failed", "Category update failed", e))?;
+
+    let mut finished = Vec::new();
     {
         let mut manager = state.transfer_manager.write().await;
-        manager.set_category(&transfer_id, &category);
+        for id in &saved {
+            manager.set_category(id, &category);
+            if !move_finished.unwrap_or(true) {
+                continue;
+            }
+            let Some(t) = manager.get_transfer(id).filter(|t| {
+                t.direction == TransferDirection::Download
+                    && t.status == crate::types::TransferStatus::Completed
+            }) else {
+                continue;
+            };
+            let Some(from) = t.completed_path.clone().filter(|p| !p.is_empty()) else {
+                continue;
+            };
+            finished.push(FinishedToMove {
+                id: id.clone(),
+                from,
+                file_name: t.file_name.clone(),
+                file_hash: t.file_hash.clone(),
+                size: t.total_size,
+                indexed_hash: None,
+            });
+        }
     }
-    Ok(())
+    let mut changes = CategoryChanges { changed: saved, error, ..Default::default() };
+    if finished.is_empty() {
+        return Ok(changes);
+    }
+    {
+        let index = state.local_index.read().await;
+        for item in &mut finished {
+            item.indexed_hash = index
+                .get_by_path(&item.from)
+                .map(|row| row.hash.clone())
+                .filter(|hash| !hash.is_empty());
+        }
+    }
+
+    // From the saved settings rather than the folders the network loop holds:
+    // those follow a settings change only once the loop reaches it, and a
+    // category made with its folder and assigned straight after is the
+    // common case, not a race to lose.
+    let (roots, subdir) = {
+        let config = state.config.read().await;
+        let subdir = config
+            .settings
+            .download_category_folders
+            .get(&category)
+            .map(|folder| crate::storage::category_folders::folder_segments(folder))
+            .unwrap_or_default();
+        (config.settings.download_folders().roots(), subdir)
+    };
+    let outcome = tokio::task::spawn_blocking(move || {
+        finished
+            .into_iter()
+            .map(|item| {
+                let result = move_if_still_the_download(&item, &roots, &subdir);
+                (item, result)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| coded_ctx("transfers_category_task_failed", "Category update failed", e))?;
+
+    let mut moves = Vec::new();
+    {
+        let mut manager = state.transfer_manager.write().await;
+        for (item, result) in outcome {
+            match result {
+                Ok(Some(to)) => {
+                    manager.set_completed_path(&item.id, to.to_string_lossy().into_owned());
+                    tracing::info!("Moved finished download {} to {}", item.id, to.display());
+                    moves.push(crate::commands::sharing::FileMove {
+                        from: item.from,
+                        to,
+                        hash: item.file_hash,
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "Could not move finished download {} into its category's folder: {e}",
+                        item.id
+                    );
+                    changes.move_failed.push(e);
+                }
+            }
+        }
+    }
+    changes.moved = u32::try_from(moves.len()).unwrap_or(u32::MAX);
+    crate::commands::sharing::relocate_library_files(&app, &state, &moves).await;
+    Ok(changes)
+}
+
+/// Move a finished download's file to `subdir`, after checking that the file
+/// at its recorded place is still the one it downloaded: by the Library's hash
+/// for it when there is one, by size otherwise. Something else written there
+/// since — the user moved the download away and another of the same name
+/// finished — must not be filed under this download's category. Blocking.
+fn move_if_still_the_download(
+    item: &FinishedToMove,
+    roots: &[String],
+    subdir: &[String],
+) -> Result<Option<std::path::PathBuf>, String> {
+    let not_this_file = || {
+        coded_ctx(
+            "transfers_category_not_the_download",
+            "The file at the download's place is no longer the one it downloaded",
+            &item.file_name,
+        )
+    };
+    match &item.indexed_hash {
+        Some(hash) if !hash.eq_ignore_ascii_case(&item.file_hash) => return Err(not_this_file()),
+        Some(_) => {}
+        None => match std::fs::metadata(&item.from) {
+            Ok(meta) if meta.len() == item.size => {}
+            Ok(_) => return Err(not_this_file()),
+            Err(e) => {
+                return Err(coded_ctx(
+                    "transfers_category_move_failed",
+                    "The file could not be moved to the category's folder",
+                    format!("{}: {e}", item.file_name),
+                ))
+            }
+        },
+    }
+    crate::network::ed2k::transfer::move_finished_download(
+        std::path::Path::new(&item.from),
+        roots,
+        subdir,
+        &item.file_name,
+    )
+    .map_err(|e| {
+        coded_ctx(
+            "transfers_category_move_failed",
+            "The file could not be moved to the category's folder",
+            format!("{}: {e:#}", item.file_name),
+        )
+    })
+}
+
+/// Library files the Library moved into `category`'s folder: a finished
+/// download in the transfer list that wrote one of them takes the category and
+/// the file's new place, so the two pages agree on both. Matched on the hash
+/// as well as the path, as [`relocate_library_files`] is. Best effort.
+///
+/// [`relocate_library_files`]: crate::commands::sharing::relocate_library_files
+pub(crate) async fn follow_moved_finished_downloads(
+    state: &AppState,
+    moves: &[crate::commands::sharing::FileMove],
+    category: &str,
+) {
+    let moved: HashMap<String, (&str, String)> = moves
+        .iter()
+        .map(|mv| {
+            (
+                crate::search::index::normalize_path_key(&mv.from),
+                (mv.hash.as_str(), mv.to.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+    let followed: Vec<String> = {
+        let mut manager = state.transfer_manager.write().await;
+        let hits: Vec<(String, String)> = manager
+            .completed
+            .iter()
+            .filter(|t| t.direction == TransferDirection::Download)
+            .filter_map(|t| {
+                let recorded = t.completed_path.as_deref()?;
+                let (hash, to) = moved.get(&crate::search::index::normalize_path_key(recorded))?;
+                t.file_hash.eq_ignore_ascii_case(hash).then(|| (t.id.clone(), to.clone()))
+            })
+            .collect();
+        for (id, to) in &hits {
+            manager.set_category(id, category);
+            manager.set_completed_path(id, to.clone());
+        }
+        hits.into_iter().map(|(id, _)| id).collect()
+    };
+    for id in followed {
+        let db = state.db.clone();
+        let cat = category.to_string();
+        let persisted = tokio::task::spawn_blocking(move || db.update_transfer_category(&id, &cat)).await;
+        if !matches!(persisted, Ok(Ok(_))) {
+            tracing::warn!("Could not save the category of a finished download moved from the Library");
+        }
+    }
 }
 
 #[tauri::command]

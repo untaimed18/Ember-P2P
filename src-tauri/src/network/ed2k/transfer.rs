@@ -1178,7 +1178,9 @@ pub(crate) fn prepare_completed_subdir(
     let allowed = vec![download_root.to_string_lossy().into_owned()];
     let mut dir = downloads.clone();
     for segment in subdir {
-        match crate::security::filesystem::prepare_approved_subdir(&dir, segment, &allowed) {
+        match crate::security::filesystem::prepare_approved_subdir_like_parent(
+            &dir, segment, &allowed,
+        ) {
             Ok(next) => dir = next,
             Err(e) => {
                 tracing::warn!(
@@ -1191,6 +1193,77 @@ pub(crate) fn prepare_completed_subdir(
         }
     }
     Ok(dir)
+}
+
+/// Move a finished download's `file` into the category folder `subdir` of the
+/// `Downloads` it is in, under the first free name from `file_name`: for a
+/// download whose category was changed after it finished, which is often the
+/// only chance a fast one gives. `roots` are the download folders, the
+/// current one and those still holding something; the file stays inside the
+/// one it landed in, so the move is a rename and never a copy, and anything
+/// not in a `Downloads` of one of them is left where it is. `None` when the
+/// file is in that folder already. Unlike a completion, a category folder
+/// that cannot be made is an error: the file is in place already, and moving
+/// it to `Downloads` instead is not what the user asked for. Blocking.
+pub(crate) fn move_finished_download(
+    file: &std::path::Path,
+    roots: &[String],
+    subdir: &[String],
+    file_name: &str,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    let canonical_file = std::fs::canonicalize(file)?;
+    let canonical_parent = canonical_file
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("finished file has no folder"))?
+        .to_path_buf();
+    let root = roots
+        .iter()
+        .find(|root| {
+            std::fs::canonicalize(std::path::Path::new(root).join("Downloads")).is_ok_and(
+                |downloads| {
+                    canonical_parent.starts_with(&downloads)
+                        && canonical_parent.components().count()
+                            <= downloads.components().count()
+                                + crate::storage::category_folders::MAX_DEPTH
+                },
+            )
+        })
+        .ok_or_else(|| anyhow::anyhow!("{} is not in a Downloads folder", file.display()))?;
+    let allowed = vec![root.clone()];
+    let mut dir = prepare_completed_dir(std::path::Path::new(root))?;
+    for segment in subdir {
+        dir = crate::security::filesystem::prepare_approved_subdir_like_parent(
+            &dir, segment, &allowed,
+        )?;
+    }
+    if std::fs::canonicalize(&dir)? == canonical_parent {
+        return Ok(None);
+    }
+    let identity = {
+        let (_, opened) =
+            crate::security::filesystem::open_existing_approved(file, &allowed, false)?;
+        crate::security::filesystem::opened_file_identity(&opened)?
+    };
+    let target = dir.join(crate::security::sanitize_filename(file_name));
+    for suffix in 0..=10_000u32 {
+        let candidate = dedup_candidate(&target, suffix);
+        // Taken is decided before the attempt, not after: where the file
+        // system lacks a no-replace rename, the move is a link then an unlink,
+        // and an unlink that fails leaves the new name behind. Read as a
+        // collision, that made another link under the next name, and another.
+        // A dangling symlink counts as taken.
+        if std::fs::symlink_metadata(&candidate).is_ok() {
+            continue;
+        }
+        match crate::security::filesystem::move_approved_no_replace(
+            file, &candidate, &allowed, &identity,
+        ) {
+            Ok(moved) => return Ok(Some(moved)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    anyhow::bail!("no free name for {}", target.display())
 }
 
 /// Move a verified `.part` into `<download_root>/Downloads/<file_name>`.
@@ -2281,6 +2354,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(final_path, downloads.join("other.bin"), "falls back to Downloads");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A download recategorised after it finished has its file moved into the
+    /// new category's folder, under its own name when that is free, and back
+    /// to Downloads when the new category has none.
+    #[test]
+    fn a_finished_download_moves_to_its_new_category_folder() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-recategorise-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let root = base.join("dl");
+        let data = base.join("data");
+        for dir in [root.join("Downloads"), data.clone(), base.join("elsewhere")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let root_string = root.to_string_lossy().into_owned();
+        let roots = vec![root_string.clone()];
+        crate::security::filesystem::initialize_approved_roots(&data, std::slice::from_ref(&root_string))
+            .unwrap();
+        let downloads = root.canonicalize().unwrap().join("Downloads");
+        // Landed as `movie (1).mkv` beside another download of the same name.
+        let landed = downloads.join("movie (1).mkv");
+        std::fs::write(&landed, b"finished bytes").unwrap();
+        std::fs::write(downloads.join("movie.mkv"), b"another file").unwrap();
+
+        let video = vec!["Video".to_string()];
+        let moved = move_finished_download(&landed, &roots, &video, "movie.mkv").unwrap().unwrap();
+        assert_eq!(moved, downloads.join("Video").join("movie.mkv"), "its own name, now free");
+        assert_eq!(std::fs::read(&moved).unwrap(), b"finished bytes");
+        assert!(!landed.exists());
+        assert_eq!(std::fs::read(downloads.join("movie.mkv")).unwrap(), b"another file");
+
+        assert_eq!(
+            move_finished_download(&moved, &roots, &video, "movie.mkv").unwrap(),
+            None,
+            "already in that folder"
+        );
+
+        // Back to Downloads, where `movie.mkv` is taken.
+        let back = move_finished_download(&moved, &roots, &[], "movie.mkv").unwrap().unwrap();
+        assert_eq!(back, downloads.join("movie (1).mkv"));
+        assert_eq!(std::fs::read(&back).unwrap(), b"finished bytes");
+
+        // Nothing outside a Downloads folder is moved.
+        let outside = base.join("elsewhere").join("movie.mkv");
+        std::fs::write(&outside, b"not ours").unwrap();
+        assert!(move_finished_download(&outside, &roots, &video, "movie.mkv").is_err());
+        assert!(outside.exists());
+
+        // A file where the folder would go is an error, not a move to Downloads.
+        std::fs::write(downloads.join("Blocked"), b"not a folder").unwrap();
+        assert!(
+            move_finished_download(&back, &roots, &["Blocked".to_string()], "movie.mkv").is_err()
+        );
+        assert!(back.exists());
         let _ = std::fs::remove_dir_all(base);
     }
 
