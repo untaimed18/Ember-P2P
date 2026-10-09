@@ -102,6 +102,7 @@ pub(super) fn apply_network_settings(
         std::sync::atomic::Ordering::Relaxed,
     );
     *state.download_folders.write() = new_settings.download_folders();
+    crate::storage::category_folders::set_folders(&new_settings.download_category_folders);
     state.filter_incoming_shared.store(
         new_settings.filter_incoming_connections,
         std::sync::atomic::Ordering::Relaxed,

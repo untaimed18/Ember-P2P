@@ -788,6 +788,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let (xfer_finish_tx, mut xfer_finish_rx) = mpsc::unbounded_channel::<XferFinishResult>();
     let (xfer_stream_tx, xfer_stream_rx) = mpsc::unbounded_channel::<StreamFetchOutcome>();
 
+    // Before anything below can finish a download or sweep where finished
+    // files land; `apply_network_settings` keeps it current from here.
+    crate::storage::category_folders::set_folders(&settings.download_category_folders);
+
     let mut state = NetworkState {
         local_id,
         user_hash,

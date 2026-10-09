@@ -81,6 +81,7 @@
   import { openChannelFilesFolder } from '$lib/api/channels';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
+  import { hoverSubmenus } from '$lib/hoverSubmenus';
   import { appSettings } from '$lib/stores/settings';
   import { openWebService } from '$lib/api/settings';
   import { serviceAvailableFor } from '$lib/webServices';
@@ -2127,50 +2128,22 @@
   let ctxSendSub = $state(false);
   let ctxWebSub = $state(false);
 
-  // Hover intent for the submenus that open on hover. The path from a parent
-  // item to its submenu crosses the gap beside the item and often clips a
-  // neighbouring item, or the file list when the menu sits near an edge.
-  // Closing on the first `mouseleave` snapped the submenu shut on the way to
-  // it, so leaving waits a moment, reaching the submenu (a child of the item,
-  // so it re-enters the item) cancels that, and brushing past another parent
-  // item only switches to it if the pointer stays there.
+  // Submenus open on hover, on click and from the keyboard; see `hoverSubmenus`.
   type HoverSub = 'priority' | 'copy' | 'send' | 'web';
-  const CTX_SUB_INTENT_MS = 300;
-  let ctxSubTimer: ReturnType<typeof setTimeout> | undefined;
-  function openHoverSub(which: HoverSub | null) {
-    clearTimeout(ctxSubTimer);
-    ctxPrioritySub = which === 'priority';
-    ctxCopySub = which === 'copy';
-    if (which === 'send' && !ctxSendSub) void loadSendableFriends();
-    ctxSendSub = which === 'send';
-    ctxWebSub = which === 'web';
-  }
-  function enterHoverSub(which: HoverSub) {
-    clearTimeout(ctxSubTimer);
-    const open: HoverSub | null = ctxPrioritySub
-      ? 'priority'
-      : ctxCopySub
-        ? 'copy'
-        : ctxSendSub
-          ? 'send'
-          : ctxWebSub
-            ? 'web'
-            : null;
-    if (open === null || open === which) openHoverSub(which);
-    else ctxSubTimer = setTimeout(() => openHoverSub(which), CTX_SUB_INTENT_MS);
-  }
-  function leaveHoverSub() {
-    clearTimeout(ctxSubTimer);
-    ctxSubTimer = setTimeout(() => openHoverSub(null), CTX_SUB_INTENT_MS);
-  }
-  /** A click on a parent item opens its submenu. Without stopping it here the
-   *  click reached the document handler and dismissed the whole menu. Clicks
-   *  on the submenu's own items are left alone: they run their action. */
-  function clickHoverSub(e: MouseEvent, which: HoverSub) {
-    if (e.target instanceof Element && e.target.closest('.ctx-submenu')) return;
-    e.stopPropagation();
-    openHoverSub(which);
-  }
+  const ctxSubs = hoverSubmenus<HoverSub>(
+    () => (ctxPrioritySub ? 'priority' : ctxCopySub ? 'copy' : ctxSendSub ? 'send' : ctxWebSub ? 'web' : null),
+    (which) => {
+      ctxPrioritySub = which === 'priority';
+      ctxCopySub = which === 'copy';
+      if (which === 'send' && !ctxSendSub) void loadSendableFriends();
+      ctxSendSub = which === 'send';
+      ctxWebSub = which === 'web';
+    },
+  );
+  const openHoverSub = ctxSubs.open;
+  const enterHoverSub = ctxSubs.enter;
+  const leaveHoverSub = ctxSubs.leave;
+  const clickHoverSub = ctxSubs.click;
   // Empty until settings load, so the submenu shows its "configure in Settings"
   // hint rather than a stale list.
   let webServices = $derived($appSettings?.web_services ?? []);
@@ -2209,11 +2182,7 @@
 
   function onCtx(e: MouseEvent, f: FileInfo) {
     e.preventDefault();
-    clearTimeout(ctxSubTimer);
-    ctxPrioritySub = false;
-    ctxCopySub = false;
-    ctxSendSub = false;
-    ctxWebSub = false;
+    ctxSubs.open(null);
     const active = document.activeElement;
     if (active instanceof HTMLElement && active !== document.body && !ctxMenuEl?.contains(active)) {
       ctxReturnFocus = active;
@@ -2228,12 +2197,8 @@
     void tick().then(() => ctxMenuItems(ctxMenuEl)[0]?.focus());
   }
   function closeCtx() {
-    clearTimeout(ctxSubTimer);
+    ctxSubs.open(null);
     ctxMenu = null;
-    ctxPrioritySub = false;
-    ctxCopySub = false;
-    ctxSendSub = false;
-    ctxWebSub = false;
     ctxReturnFocus = null;
   }
   function closeCtxAndRefocus() {
@@ -2274,11 +2239,7 @@
       if (!parentItem) return false;
       e.preventDefault();
       parentItem.focus();
-      clearTimeout(ctxSubTimer);
-      ctxPrioritySub = false;
-      ctxCopySub = false;
-      ctxSendSub = false;
-      ctxWebSub = false;
+      ctxSubs.open(null);
       return true;
     }
     return false;

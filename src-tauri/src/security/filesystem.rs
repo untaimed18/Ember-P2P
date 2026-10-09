@@ -905,11 +905,24 @@ pub fn verify_recorded_file(
     allowed_roots: &[String],
     landing_dir: &str,
 ) -> io::Result<PathBuf> {
-    verify_existing_path(recorded, allowed_roots)
-        .or_else(|error| verify_in_landing_dir(recorded, landing_dir).map_err(|_| error))
+    verify_recorded_file_nested(recorded, allowed_roots, landing_dir, 0)
 }
 
-fn verify_in_landing_dir(recorded: &Path, landing_dir: &str) -> io::Result<PathBuf> {
+/// [`verify_recorded_file`], where outside the roots the file may also sit up
+/// to `max_depth` folders below `landing_dir` — a download category's folder
+/// inside `Downloads` — none of them a reparse point either.
+pub fn verify_recorded_file_nested(
+    recorded: &Path,
+    allowed_roots: &[String],
+    landing_dir: &str,
+    max_depth: usize,
+) -> io::Result<PathBuf> {
+    verify_existing_path(recorded, allowed_roots).or_else(|error| {
+        verify_in_landing_dir(recorded, landing_dir, max_depth).map_err(|_| error)
+    })
+}
+
+fn verify_in_landing_dir(recorded: &Path, landing_dir: &str, max_depth: usize) -> io::Result<PathBuf> {
     refuse_network_path_outside(recorded, &[])?;
     let outside = || {
         io::Error::new(
@@ -917,14 +930,26 @@ fn verify_in_landing_dir(recorded: &Path, landing_dir: &str) -> io::Result<PathB
             "target is not where Ember recorded writing it",
         )
     };
-    let landing = recorded
-        .parent()
-        .filter(|parent| recorded.is_absolute() && is_landing_dir(parent, landing_dir))
+    if !recorded.is_absolute() {
+        return Err(outside());
+    }
+    // The nearest ancestor named `landing_dir`, at most `max_depth` folders
+    // above the file's own.
+    let (depth, landing) = recorded
+        .ancestors()
+        .skip(1)
+        .take(max_depth + 1)
+        .enumerate()
+        .find(|(_, dir)| is_landing_dir(dir, landing_dir))
         .ok_or_else(outside)?;
-    ensure_not_reparse(landing)?;
+    for dir in recorded.ancestors().skip(1).take(depth + 1) {
+        ensure_not_reparse(dir)?;
+    }
     let canonical_landing = landing.canonicalize()?;
     let canonical = recorded.canonicalize()?;
-    if canonical.parent() != Some(canonical_landing.as_path()) || !canonical.is_file() {
+    if canonical.ancestors().nth(depth + 1) != Some(canonical_landing.as_path())
+        || !canonical.is_file()
+    {
         return Err(outside());
     }
     ensure_not_reparse(&canonical)?;

@@ -872,6 +872,9 @@ export interface AppSettings {
   web_services: WebService[];
   /** Download categories the user made, offered beside the built-in ones. */
   download_categories?: string[];
+  /** Each category's folder inside Downloads, `/`-separated; a category with
+   *  no entry finishes in Downloads itself. */
+  download_category_folders?: Record<string, string>;
   block_private_ips: boolean;
   filter_servers_by_ip: boolean;
   add_servers_from_server: boolean;

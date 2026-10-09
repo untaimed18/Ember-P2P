@@ -5,6 +5,7 @@
   import AddLinksDialog from '$lib/components/AddLinksDialog.svelte';
   import { addLinksRequested, MAX_LINKS_TEXT_BYTES } from '$lib/clipboardWatch';
   import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
+  import { normalizeCategoryFolder } from '$lib/categoryFolders';
   import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, holdDownloadRemoved, setLocalCategory, IDLE_STATUSES, effectiveUploadSpeed } from '$lib/stores/transfers';
   import { addActionToast, removeToast, setToastMessage, toastError } from '$lib/stores/toast';
   import { holdPendingCancel, releasePendingCancel } from '$lib/stores/pendingCancels';
@@ -39,6 +40,7 @@
   import { scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
+  import { hoverSubmenus } from '$lib/hoverSubmenus';
   import { appSettings, setAppSettings } from '$lib/stores/settings';
   import { getSettings, openWebService, updateSettings } from '$lib/api/settings';
   import { serviceAvailableFor } from '$lib/webServices';
@@ -2928,6 +2930,16 @@
   let ctxPrioritySub = $state(false);
   let ctxCategorySub = $state(false);
   let ctxWebSub = $state(false);
+  // Submenus open on hover and on click, as the Library's do; see `hoverSubmenus`.
+  type CtxSub = 'priority' | 'category' | 'web';
+  const ctxSubs = hoverSubmenus<CtxSub>(
+    () => (ctxPrioritySub ? 'priority' : ctxCategorySub ? 'category' : ctxWebSub ? 'web' : null),
+    (which) => {
+      ctxPrioritySub = which === 'priority';
+      ctxCategorySub = which === 'category';
+      ctxWebSub = which === 'web';
+    },
+  );
   let categoryOptions = $derived(['None', ...BUILTIN_CATEGORIES, ...userCategories]);
 
   let categoriesDialog = $state<{ open: boolean; assignIds: string[] }>({ open: false, assignIds: [] });
@@ -2958,25 +2970,63 @@
     ) || userCategories.some((cat) => cat.toLocaleLowerCase() === folded);
   }
 
-  /** Edits the categories as the backend holds them now, not as this page last saw them. */
-  async function saveUserCategories(edit: (current: string[]) => string[]): Promise<{ before: string[]; saved: string[] }> {
+  /** Edits the categories and their folders as the backend holds them now,
+   *  not as this page last saw them. */
+  async function saveCategorySettings(
+    edit: (categories: string[], folders: Record<string, string>) => {
+      categories: string[];
+      folders: Record<string, string>;
+    },
+  ): Promise<{ before: string[]; saved: string[] }> {
     const current = await getSettings();
     const before = current.download_categories ?? [];
-    const result = await updateSettings({ ...current, download_categories: edit(before) });
+    const next = edit(before, current.download_category_folders ?? {});
+    const result = await updateSettings({
+      ...current,
+      download_categories: next.categories,
+      download_category_folders: next.folders,
+    });
     setAppSettings(result.settings);
     return { before, saved: result.settings.download_categories ?? [] };
   }
 
-  async function addUserCategory(name: string) {
+  function saveUserCategories(edit: (current: string[]) => string[]) {
+    return saveCategorySettings((categories, folders) => ({ categories: edit(categories), folders }));
+  }
+
+  /** Where a category's downloads finish; `null` is Downloads itself. */
+  async function setCategoryFolder(category: string, folder: string | null) {
+    await saveCategorySettings((categories, folders) => {
+      const next = { ...folders };
+      if (folder) next[category] = folder;
+      else delete next[category];
+      return { categories, folders: next };
+    });
+  }
+
+  async function addUserCategory(name: string, ownFolder: boolean) {
     const { before, saved } = await saveUserCategories((current) => [...current, name]);
     // The name as the backend kept it, which may be trimmed or cut; none when
     // it cleaned the name into one that already exists.
     const kept = saved.find((cat) => !before.includes(cat));
     if (!kept) throw new Error(m.transfers_categories_exists());
+    // Named after the category as kept, so it matches what the backend holds.
+    // A folder that could not be saved is reported once the downloads asked
+    // for have their category anyway.
+    let folderError: unknown = null;
+    const folder = ownFolder ? normalizeCategoryFolder(kept) : null;
+    if (folder) {
+      try {
+        await setCategoryFolder(kept, folder);
+      } catch (e: unknown) {
+        folderError = e;
+      }
+    }
     const ids = new Set(categoriesDialog.assignIds);
     if (ids.size > 0) {
       await assignCategory(allDownloads.filter((t) => ids.has(t.id)), kept);
     }
+    if (folderError) throw folderError;
   }
 
   async function removeUserCategory(name: string) {
@@ -3002,9 +3052,7 @@
     closeKnownCtx();
     closePaneCtx();
     closeUploadsPaneCtx();
-    ctxPrioritySub = false;
-    ctxCategorySub = false;
-    ctxWebSub = false;
+    ctxSubs.open(null);
     // A row outside the selection becomes the selection, as in Explorer and
     // eMule, so the menu always acts on what is highlighted: on the whole
     // selection when the row is part of it, on this row alone otherwise.
@@ -3258,7 +3306,7 @@
     }
   }
 
-  function closeCtx() { ctxMenu = null; ctxPrioritySub = false; ctxCategorySub = false; ctxWebSub = false; }
+  function closeCtx() { ctxMenu = null; ctxSubs.open(null); }
   function closeKnownCtx() { knownCtxMenu = null; }
   function closeColumnMenu() { columnMenu = null; }
   function closePaneCtx() { paneCtxMenu = null; }
@@ -5199,11 +5247,15 @@
 <CategoriesDialog
   bind:open={categoriesDialog.open}
   categories={userCategories}
+  builtins={BUILTIN_CATEGORIES}
+  labelFor={categoryLabel}
+  folders={$appSettings?.download_category_folders ?? {}}
   counts={categoryCounts}
   assignCount={categoriesDialog.assignIds.length}
   isTaken={isCategoryTaken}
   onadd={addUserCategory}
   onremove={removeUserCategory}
+  onfolder={setCategoryFolder}
 />
 
 {#if transferError}
@@ -6672,14 +6724,19 @@
 {/snippet}
 
 {#snippet webServicesSubmenu()}
-  <div class="ctx-submenu-wrap" role="presentation">
+  <div
+    class="ctx-submenu-wrap"
+    role="presentation"
+    onmouseenter={() => ctxSubs.enter('web')}
+    onmouseleave={ctxSubs.leave}
+  >
     <button
       class="ctx-item ctx-sub"
       class:ctx-sub-open={ctxWebSub}
       role="menuitem"
       aria-haspopup="menu"
       aria-expanded={ctxWebSub}
-      onclick={() => (ctxWebSub = !ctxWebSub)}
+      onclick={(e) => ctxSubs.click(e, 'web')}
     >{m.webservices_ctx_menu()}</button>
     {#if ctxWebSub}
       {@const hash = ctxTransfer?.file_hash ?? ''}
@@ -6760,7 +6817,12 @@
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('resume')}>{m.common_resume()}</button>
       {/if}
       <div class="ctx-sep" role="separator"></div>
-      <div class="ctx-submenu-wrap" role="presentation">
+      <div
+        class="ctx-submenu-wrap"
+        role="presentation"
+        onmouseenter={() => { if (!ctxTargets.every(isFinished)) ctxSubs.enter('priority'); }}
+        onmouseleave={ctxSubs.leave}
+      >
         <button
           class="ctx-item ctx-sub"
           class:ctx-sub-open={ctxPrioritySub}
@@ -6768,7 +6830,7 @@
           aria-haspopup="menu"
           aria-expanded={ctxPrioritySub}
           disabled={ctxTargets.every(isFinished)}
-          onclick={() => ctxPrioritySub = !ctxPrioritySub}
+          onclick={(e) => ctxSubs.click(e, 'priority')}
         >
           {m.transfers_ctx_priority()}
           {#if sharedPriority}<span class="ctx-hint">{priorityLabel(sharedPriority)}</span>{/if}
@@ -6789,14 +6851,19 @@
       {#if ctxTargets.some(canMoveInQueue)}
         {@render queueMoveItems(ctxTargets)}
       {/if}
-      <div class="ctx-submenu-wrap" role="presentation">
+      <div
+        class="ctx-submenu-wrap"
+        role="presentation"
+        onmouseenter={() => ctxSubs.enter('category')}
+        onmouseleave={ctxSubs.leave}
+      >
         <button
           class="ctx-item ctx-sub"
           class:ctx-sub-open={ctxCategorySub}
           role="menuitem"
           aria-haspopup="menu"
           aria-expanded={ctxCategorySub}
-          onclick={() => ctxCategorySub = !ctxCategorySub}
+          onclick={(e) => ctxSubs.click(e, 'category')}
         >
           {m.transfers_ctx_category()}
           {#if sharedCategory}<span class="ctx-hint">{categoryLabel(sharedCategory)}</span>{/if}
@@ -6874,14 +6941,19 @@
       <!-- `role="presentation"` on the wrapper, `role="menuitem"` on the button:
            a `role="menu"` may only own menuitems, so a plain div between the two
            drops this entry out of the menu's structure entirely. -->
-      <div class="ctx-submenu-wrap" role="presentation">
+      <div
+        class="ctx-submenu-wrap"
+        role="presentation"
+        onmouseenter={() => ctxSubs.enter('priority')}
+        onmouseleave={ctxSubs.leave}
+      >
         <button
           class="ctx-item ctx-sub"
           class:ctx-sub-open={ctxPrioritySub}
           role="menuitem"
           aria-haspopup="menu"
           aria-expanded={ctxPrioritySub}
-          onclick={() => ctxPrioritySub = !ctxPrioritySub}
+          onclick={(e) => ctxSubs.click(e, 'priority')}
         >
           {m.transfers_ctx_priority()}
           <span class="ctx-hint">{priorityLabel(ctxTransfer.priority)}</span>
@@ -6902,14 +6974,19 @@
       {#if canMoveInQueue(ctxTransfer)}
         {@render queueMoveItems([ctxTransfer])}
       {/if}
-      <div class="ctx-submenu-wrap" role="presentation">
+      <div
+        class="ctx-submenu-wrap"
+        role="presentation"
+        onmouseenter={() => ctxSubs.enter('category')}
+        onmouseleave={ctxSubs.leave}
+      >
         <button
           class="ctx-item ctx-sub"
           class:ctx-sub-open={ctxCategorySub}
           role="menuitem"
           aria-haspopup="menu"
           aria-expanded={ctxCategorySub}
-          onclick={() => ctxCategorySub = !ctxCategorySub}
+          onclick={(e) => ctxSubs.click(e, 'category')}
         >
           {m.transfers_ctx_category()}
           <span class="ctx-hint">{categoryLabel(ctxTransfer.category || 'None')}</span>

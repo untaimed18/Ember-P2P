@@ -751,6 +751,27 @@ fn normalize_download_categories(names: &[String]) -> Vec<String> {
     kept
 }
 
+/// The category folders kept: one per category that exists — a built-in other
+/// than `None`, or one of `categories` — each folder cleaned by
+/// `category_folders::normalize_folder`, and none whose folder cleans to
+/// nothing. Removing a category therefore drops its folder with it.
+fn normalize_download_category_folders(
+    folders: &std::collections::BTreeMap<String, String>,
+    categories: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    folders
+        .iter()
+        .filter(|(category, _)| {
+            (BUILTIN_DOWNLOAD_CATEGORIES.contains(&category.as_str()) && category.as_str() != "None")
+                || categories.iter().any(|name| name == *category)
+        })
+        .filter_map(|(category, folder)| {
+            crate::storage::category_folders::normalize_folder(folder)
+                .map(|folder| (category.clone(), folder))
+        })
+        .collect()
+}
+
 fn clamp_assign<T: Ord + Copy>(value: &mut T, min: T, max: T) -> bool {
     let clamped = (*value).clamp(min, max);
     if clamped != *value {
@@ -910,6 +931,14 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
     let categories = normalize_download_categories(&settings.download_categories);
     if categories != settings.download_categories {
         settings.download_categories = categories;
+        changed = true;
+    }
+    let category_folders = normalize_download_category_folders(
+        &settings.download_category_folders,
+        &settings.download_categories,
+    );
+    if category_folders != settings.download_category_folders {
+        settings.download_category_folders = category_folders;
         changed = true;
     }
 
@@ -1497,6 +1526,10 @@ pub async fn update_settings(
     }
     settings.web_services = kept_services;
     settings.download_categories = normalize_download_categories(&settings.download_categories);
+    settings.download_category_folders = normalize_download_category_folders(
+        &settings.download_category_folders,
+        &settings.download_categories,
+    );
     // Not exposed in Settings UI — always keep friend sessions encrypted.
     settings.friend_session_encryption = true;
     // Ember overlay is always on. The Settings / Ember-page switches stay
@@ -4044,6 +4077,43 @@ mod tests {
 
         let many: Vec<String> = (0..MAX_DOWNLOAD_CATEGORIES + 3).map(|i| format!("Cat {i}")).collect();
         assert_eq!(normalize_download_categories(&many).len(), MAX_DOWNLOAD_CATEGORIES);
+    }
+
+    /// A folder belongs to a category that exists, built in or the user's,
+    /// and is cleaned like a file name. Removing a category takes its folder.
+    #[test]
+    fn category_folders_follow_the_categories_and_are_cleaned() {
+        let mut settings = AppSettings {
+            download_categories: vec!["TV Series".into()],
+            ..AppSettings::default()
+        };
+        for (category, folder) in [
+            ("TV Series", " TV: Series "),
+            ("Video", "Video/Films"),
+            ("None", "Elsewhere"),
+            ("Gone", "Gone"),
+            ("Audio", " .. "),
+        ] {
+            settings
+                .download_category_folders
+                .insert(category.into(), folder.into());
+        }
+        assert!(soft_repair_settings(&mut settings));
+        let kept: Vec<(&str, &str)> = settings
+            .download_category_folders
+            .iter()
+            .map(|(c, f)| (c.as_str(), f.as_str()))
+            .collect();
+        assert_eq!(kept, vec![("TV Series", "TV_ Series"), ("Video", "Video/Films")]);
+        assert!(!soft_repair_settings(&mut settings), "a clean map is left alone");
+
+        settings.download_categories.clear();
+        assert!(soft_repair_settings(&mut settings));
+        assert_eq!(
+            settings.download_category_folders.keys().collect::<Vec<_>>(),
+            vec!["Video"],
+            "the removed category's folder goes with it"
+        );
     }
 
     #[test]

@@ -1164,6 +1164,35 @@ pub(crate) fn prepare_completed_dir(
         .map_err(|e| download_folder_error("preparing Downloads", download_root, e))
 }
 
+/// The folder a finished download lands in: `<download_root>/Downloads`, then
+/// `subdir`'s folders inside it, each made inside the approved root the way
+/// `Downloads` is. When a category folder cannot be made — a file in its
+/// place, a junction, no permission — the download lands in `Downloads`
+/// itself: the user asked for a place to file it, not for it to fail. Only
+/// `Downloads` failing is an error. Blocking.
+pub(crate) fn prepare_completed_subdir(
+    download_root: &std::path::Path,
+    subdir: &[String],
+) -> anyhow::Result<std::path::PathBuf> {
+    let downloads = prepare_completed_dir(download_root)?;
+    let allowed = vec![download_root.to_string_lossy().into_owned()];
+    let mut dir = downloads.clone();
+    for segment in subdir {
+        match crate::security::filesystem::prepare_approved_subdir(&dir, segment, &allowed) {
+            Ok(next) => dir = next,
+            Err(e) => {
+                tracing::warn!(
+                    "Could not use the category folder {} in {}: {e}. Finishing into Downloads.",
+                    subdir.join("/"),
+                    downloads.display()
+                );
+                return Ok(downloads);
+            }
+        }
+    }
+    Ok(dir)
+}
+
 /// Move a verified `.part` into `<download_root>/Downloads/<file_name>`.
 /// `download_root` is the download folder current at completion, which need
 /// not be the one holding the `.part`. Blocking.
@@ -1174,7 +1203,27 @@ pub(crate) fn move_part_to_downloads(
     file_name: &str,
     expected_source_identity: &crate::security::filesystem::ObjectIdentity,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let completed_dir = prepare_completed_dir(download_root)?;
+    move_part_to_completed(
+        part_path,
+        part_root,
+        download_root,
+        &[],
+        file_name,
+        expected_source_identity,
+    )
+}
+
+/// [`move_part_to_downloads`], into the category folder `subdir` inside
+/// `Downloads` (see [`prepare_completed_subdir`]). Blocking.
+pub(crate) fn move_part_to_completed(
+    part_path: &std::path::Path,
+    part_root: &std::path::Path,
+    download_root: &std::path::Path,
+    subdir: &[String],
+    file_name: &str,
+    expected_source_identity: &crate::security::filesystem::ObjectIdentity,
+) -> anyhow::Result<std::path::PathBuf> {
+    let completed_dir = prepare_completed_subdir(download_root, subdir)?;
     move_part_between_roots_approved(
         part_path,
         part_root,
@@ -2176,6 +2225,62 @@ mod tests {
             TransferFailureCode::CompletionMoveFailed,
             "{changed}"
         );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A download filed under a category lands in that category's folder
+    /// inside Downloads, made as needed; when the folder cannot be made it
+    /// lands in Downloads itself rather than failing.
+    #[test]
+    fn a_categorised_download_completes_into_its_folder_inside_downloads() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-completion-category-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let root = base.join("dl");
+        let data = base.join("data");
+        for dir in [root.join("Temp"), data.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let root_string = root.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(&data, std::slice::from_ref(&root_string))
+            .unwrap();
+        let part_with = |name: &str| {
+            let part = root.join("Temp").join(name);
+            std::fs::write(&part, b"verified bytes").unwrap();
+            let (_, opened) = crate::security::filesystem::open_existing_approved(
+                &part,
+                std::slice::from_ref(&root_string),
+                false,
+            )
+            .unwrap();
+            let identity = crate::security::filesystem::opened_file_identity(&opened).unwrap();
+            (part, identity)
+        };
+        let downloads = root.canonicalize().unwrap().join("Downloads");
+
+        let subdir = vec!["Video".to_string(), "TV Series".to_string()];
+        let (part, identity) = part_with("episode.part");
+        let final_path =
+            move_part_to_completed(&part, &root, &root, &subdir, "episode.mkv", &identity).unwrap();
+        assert_eq!(final_path, downloads.join("Video").join("TV Series").join("episode.mkv"));
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"verified bytes");
+
+        // A file where the category's folder would go.
+        std::fs::write(downloads.join("Blocked"), b"not a folder").unwrap();
+        let (part, identity) = part_with("other.part");
+        let final_path = move_part_to_completed(
+            &part,
+            &root,
+            &root,
+            &["Blocked".to_string()],
+            "other.bin",
+            &identity,
+        )
+        .unwrap();
+        assert_eq!(final_path, downloads.join("other.bin"), "falls back to Downloads");
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -3435,8 +3540,18 @@ pub(crate) fn settle_stale_completion_copies(
     owner: &dyn Fn(&str) -> CopyOwner,
 ) {
     let allowed = [root.to_string()];
-    for dir in finished_file_dirs() {
-        let dir = std::path::Path::new(root).join(dir);
+    // The category folders inside Downloads as well: a completion copy is
+    // made beside where its file is published.
+    let category_dirs = crate::storage::category_folders::finished_download_dirs(
+        std::path::Path::new(root),
+    )
+    .into_iter()
+    .skip(1);
+    let dirs = finished_file_dirs()
+        .into_iter()
+        .map(|dir| std::path::Path::new(root).join(dir))
+        .chain(category_dirs);
+    for dir in dirs {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -3641,8 +3756,24 @@ pub(crate) fn recover_completion_copy(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("completion copy has no folder"))?;
     let elsewhere = !crate::storage::part_folders::same_folder(root, download_root);
+    // Its category's folder, when the download it names still has one; a
+    // finished download's no longer does, and lands in Downloads.
+    let subdir = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(parse_completion_copy_name)
+        .map(crate::storage::category_folders::completion_subdir)
+        .unwrap_or_default();
+    let downloads = std::path::Path::new(download_root).join("Downloads");
+    let category_dir = subdir.iter().fold(downloads.clone(), |dir, segment| dir.join(segment));
     let places = std::iter::once((dir.to_path_buf(), root)).chain(
-        elsewhere.then(|| (std::path::Path::new(download_root).join("Downloads"), download_root)),
+        elsewhere
+            .then(|| {
+                std::iter::once((downloads.clone(), download_root))
+                    .chain((!subdir.is_empty()).then(|| (category_dir.clone(), download_root)))
+            })
+            .into_iter()
+            .flatten(),
     );
     for (dir, dir_root) in places {
         for published in published_names(&dir, &name) {
@@ -3653,10 +3784,11 @@ pub(crate) fn recover_completion_copy(
         }
     }
     if elsewhere {
-        let published = move_part_to_downloads(
+        let published = move_part_to_completed(
             path,
             std::path::Path::new(root),
             std::path::Path::new(download_root),
+            &subdir,
             &name,
             &copy.identity,
         )?;

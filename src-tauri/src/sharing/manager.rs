@@ -992,6 +992,7 @@ impl TransferManager {
             self.active.insert(id, transfer);
             return true;
         }
+        crate::storage::category_folders::note_category(&id, &transfer.category);
         // Keep Insufficient in `active` (eMule ResumeFileInsufficient) so
         // Resume finds the row, the orphan `.part` sweep knows the UUID,
         // and we never rewrite the status to Searching/Queued.
@@ -1236,6 +1237,9 @@ impl TransferManager {
             }
             self.speed_history.remove(id);
             self.source_details.remove(id);
+            // Its file is already where it finished; a later category change
+            // must not reach a completion that is over.
+            crate::storage::category_folders::forget(id);
             return Some(self.promote_next());
         }
         None
@@ -2146,6 +2150,7 @@ impl TransferManager {
         self.controls.remove(id);
         self.speed_history.remove(id);
         self.source_details.remove(id);
+        crate::storage::category_folders::forget(id);
         if was_active {
             self.promote_next()
         } else {
@@ -2167,10 +2172,14 @@ impl TransferManager {
     }
 
     pub fn set_category(&mut self, id: &str, category: &str) {
+        // Only a download still to finish decides where it lands; a finished
+        // one keeps its file where it is, as in eMule.
         if let Some(transfer) = self.active.get_mut(id) {
             transfer.category = category.to_string();
+            crate::storage::category_folders::note_category(id, category);
         } else if let Some(transfer) = self.queued_mut(id) {
             transfer.category = category.to_string();
+            crate::storage::category_folders::note_category(id, category);
         } else if let Some(transfer) = self.completed.iter_mut().find(|t| t.id == id) {
             transfer.category = category.to_string();
         }

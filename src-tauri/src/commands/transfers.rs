@@ -2018,7 +2018,12 @@ fn resolve_transfer_reveal_path(
     let part_path = folders.part_path_for(&transfer.id);
 
     let verified = if final_path.is_file() {
-        crate::security::filesystem::verify_recorded_file(&final_path, &folders.roots(), "Downloads")
+        crate::security::filesystem::verify_recorded_file_nested(
+            &final_path,
+            &folders.roots(),
+            "Downloads",
+            crate::storage::category_folders::MAX_DEPTH,
+        )
     } else if part_path.is_file() {
         crate::security::filesystem::verify_existing_path(&part_path, &folders.roots())
     } else {
@@ -2147,10 +2152,12 @@ pub async fn open_file(
                 "Download has not finished yet",
             ));
         }
-        let canonical = crate::security::filesystem::verify_recorded_file(
+        // A category's folder inside Downloads is where Ember wrote it too.
+        let canonical = crate::security::filesystem::verify_recorded_file_nested(
             &file_path,
             &dl_folders.roots(),
             "Downloads",
+            crate::storage::category_folders::MAX_DEPTH,
         )
         .map_err(|e| {
             coded_ctx(
@@ -3792,6 +3799,39 @@ mod ipc_lifecycle_tests {
         let climbed_out = old.join("Chat Files").join("..").join("Documents").join("photo.jpg");
         assert!(verify(&climbed_out, "Chat Files").is_err());
         assert!(verify(&old.join("Chat Files").join("missing.jpg"), "Chat Files").is_err());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A download filed under a category finishes in a folder inside
+    /// Downloads, and must still open once its download folder is an old one —
+    /// but no deeper than a category folder can be, and never by climbing out.
+    #[test]
+    fn a_recorded_download_may_sit_in_a_category_folder_inside_downloads() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (root, base) = approved_download_folder("category-landing");
+        let roots = [root.to_string_lossy().into_owned()];
+        let downloads = base.join("old").join("Downloads");
+        let filed = downloads.join("Video").join("TV Series").join("episode.mkv");
+        let too_deep = downloads.join("a").join("b").join("c").join("d").join("episode.mkv");
+        let beside = base.join("old").join("Documents").join("episode.mkv");
+        for file in [&filed, &too_deep, &beside] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, b"mkv").unwrap();
+        }
+        let max = crate::storage::category_folders::MAX_DEPTH;
+        let verify = |path: &std::path::Path| {
+            crate::security::filesystem::verify_recorded_file_nested(path, &roots, "Downloads", max)
+        };
+
+        assert_eq!(verify(&filed).unwrap(), filed.canonicalize().unwrap());
+        assert!(verify(&too_deep).is_err(), "deeper than a category folder can be");
+        assert!(verify(&beside).is_err());
+        let climbed_out = downloads.join("Video").join("..").join("..").join("Documents").join("episode.mkv");
+        assert!(verify(&climbed_out).is_err());
+        assert!(
+            crate::security::filesystem::verify_recorded_file(&filed, &roots, "Downloads").is_err(),
+            "the plain check still wants the file directly in Downloads"
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 

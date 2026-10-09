@@ -1,3 +1,4 @@
+pub mod category_folders;
 pub mod config;
 pub mod database;
 pub mod deferred_removals;

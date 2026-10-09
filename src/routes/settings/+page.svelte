@@ -1678,7 +1678,6 @@
     // Taken at the start: the form stays live while the save is in flight,
     // and a field edited again meanwhile must stay a pending change.
     const sent = cloneValue(settings as unknown as Record<string, unknown>);
-    const restartBefore = restartReason;
     const errorKey = fields.join(',');
     const fail = (message: string) => {
       if (options.revertOnFailure) revertFields(fields, sent);
@@ -1729,8 +1728,11 @@
         isWarn,
         isWarn ? 8000 : 2000,
       );
+      // No prompt here: the ports and UPnP are usually changed together, and
+      // asking after each one interrupted the user mid-edit and made them
+      // dismiss it before touching the next. The badge and the header banner
+      // say a restart is pending; the prompt waits until they leave Settings.
       if (!restartReason) showRestartPrompt = false;
-      else if (restartReason !== restartBefore) showRestartPrompt = true;
       return true;
     } catch (e) {
       console.error('Failed to save settings:', e);
@@ -2131,9 +2133,12 @@
   let leaveConfirmOpen = $state(false);
   let pendingLeaveHref: string | null = null;
   let leaveConfirmed = false;
+  // The pending-restart reason the leave prompt last asked about, so "Later"
+  // is asked once per set of changes rather than on every visit's exit.
+  let restartAskedFor: string | null = null;
 
   beforeNavigate((nav) => {
-    if (leaveConfirmed || !hasUnsavedChanges) return;
+    if (leaveConfirmed) return;
     // A document unload is already covered by `beforeunload`, and `goto` could
     // not re-issue it anyway. This covers both `leave` and link navigations to
     // non-SvelteKit routes, which are also flagged `willUnload`.
@@ -2143,19 +2148,31 @@
     // Hash/query navigation within the same route (the skip-to-content link)
     // isn't leaving the form, so there is nothing to discard.
     if (to.pathname === nav.from?.url.pathname) return;
-    nav.cancel();
-    pendingLeaveHref = to.href;
-    leaveConfirmOpen = true;
+    if (hasUnsavedChanges) {
+      nav.cancel();
+      pendingLeaveHref = to.href;
+      leaveConfirmOpen = true;
+      return;
+    }
+    // Leaving is when the user has finished with the ports, so this is where
+    // a restart they still need is offered — once, whichever of them changed.
+    if (restartReason && restartReason !== restartAskedFor && !restarting) {
+      nav.cancel();
+      restartAskedFor = restartReason;
+      pendingLeaveHref = to.href;
+      showRestartPrompt = true;
+    }
   });
 
-  function confirmLeaveWithoutSaving() {
+  /** Carry on to wherever the user was going when a leave prompt stopped them. */
+  function resumeLeave() {
     const href = pendingLeaveHref;
     pendingLeaveHref = null;
     if (!href) return;
     leaveConfirmed = true;
     void goto(href).catch((e) => {
       leaveConfirmed = false;
-      console.error('Navigation after discarding settings failed:', e);
+      console.error('Navigation after leaving settings failed:', e);
     });
   }
 
@@ -4933,11 +4950,12 @@
 </div>
 
 <!--
-  Restart confirmation prompt — fires after a save leaves the ports or UPnP
-  different from what Ember started with. The network stack reads them only
-  at startup, so the save persists the value but the running listener keeps
-  the old one until restart. "Later" leaves the banner in the header. Same
-  UX as the setup wizard's "Launch Ember" relaunch step.
+  Restart confirmation prompt — asked when the user leaves Settings while the
+  saved ports or UPnP differ from what Ember started with. The network stack
+  reads them only at startup, so the save persists the value but the running
+  listener keeps the old one until restart. "Later" carries on to where they
+  were going and leaves the banner; Escape stays on Settings. Same UX as the
+  setup wizard's "Launch Ember" relaunch step.
 -->
 <ConfirmDialog
   bind:open={showRestartPrompt}
@@ -4945,7 +4963,9 @@
   message={m.settings_restart_dialog_message({ reason: restartReason })}
   confirmLabel={m.settings_restart_now()}
   cancelLabel={m.settings_restart_later()}
-  onconfirm={performRestart}
+  onconfirm={() => { pendingLeaveHref = null; void performRestart(); }}
+  oncancel={resumeLeave}
+  ondismiss={() => { pendingLeaveHref = null; restartAskedFor = null; }}
 />
 
 <!--
@@ -5033,7 +5053,7 @@
   message={m.settings_unsaved_leave_message()}
   confirmLabel={m.settings_unsaved_leave_confirm()}
   danger={true}
-  onconfirm={confirmLeaveWithoutSaving}
+  onconfirm={resumeLeave}
   oncancel={() => { pendingLeaveHref = null; }}
 />
 

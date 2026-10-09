@@ -1472,6 +1472,15 @@ pub struct AppSettings {
     /// names live here; each download stores its own category string.
     #[serde(default)]
     pub download_categories: Vec<String>,
+    /// Where finished downloads of a category go: category value (one of
+    /// `download_categories` or a built-in such as `Video`) to a folder inside
+    /// `Downloads`, up to three levels written with `/`. A category with no
+    /// entry finishes in `Downloads` itself. Read when a download finishes,
+    /// so a change reaches downloads already running, and a finished file is
+    /// never moved because its category changed. See
+    /// `storage::category_folders`.
+    #[serde(default)]
+    pub download_category_folders: std::collections::BTreeMap<String, String>,
     /// Block private/LAN/CGNAT IPs across KAD contact admission, outbound
     /// dials, UDP ingest, and (when filter-incoming is on) inbound TCP.
     /// Bogus/unroutable space is always rejected regardless of this toggle.
@@ -2535,6 +2544,7 @@ impl Default for AppSettings {
             allow_shared_files_browse: false,
             web_services: default_web_services(),
             download_categories: Vec::new(),
+            download_category_folders: std::collections::BTreeMap::new(),
             block_private_ips: true,
             filter_servers_by_ip: true,
             add_servers_from_server: true,

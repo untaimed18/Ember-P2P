@@ -51,6 +51,7 @@
   import { addToast } from '$lib/stores/toast';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
+  import { hoverSubmenus } from '$lib/hoverSubmenus';
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { adoptRowHeight, computeRowWindow } from '$lib/rowWindow';
   import { openWebService } from '$lib/api/settings';
@@ -582,6 +583,13 @@
   let showSpamHelp = $state(false);
   let contextMenu: { x: number; y: number; result: SearchResult } | null = $state(null);
   let ctxWebSub = $state(false);
+  // Opens on hover and on click, as the Library's submenus do; see `hoverSubmenus`.
+  const ctxSubs = hoverSubmenus<'web'>(
+    () => (ctxWebSub ? 'web' : null),
+    (which) => {
+      ctxWebSub = which === 'web';
+    },
+  );
   // Empty until settings load, so the submenu shows its "configure in
   // Settings" hint rather than a stale list.
   let webServices = $derived($appSettings?.web_services ?? []);
@@ -1266,15 +1274,20 @@
     untrack(recomputeEmberJoinState);
   });
 
-  onMount(() => {
-    loadPersistedPrefs();
+  // Before the first render rather than in `onMount`: the results are already
+  // in the store when the page comes back, and restoring afterwards filtered
+  // and laid out the whole list under the default filters only to redo it.
+  loadPersistedPrefs();
+  {
     const restoredTab = get(searchTabs).find((t) => t.id === get(activeSearchTabId));
     if (restoredTab) {
       barQuery = restoredTab.query;
       restoreTabSearchParams(restoredTab);
     }
-    prefsRestored = true;
+  }
+  prefsRestored = true;
 
+  onMount(() => {
     // Arriving on this page puts the caret in the query box. Typing is what
     // someone came here to do, and it saves a click every single time.
     //
@@ -1695,14 +1708,39 @@
   /** Already in the library. A download still in progress, or a finished one
    *  whose file has since left the library, is not something we have. Judged
    *  by hash against the library as it is now: the `Local` tag a row got when
-   *  the search started is only a fallback until that has been asked, since
-   *  it neither follows the library nor covers a copy under another name. */
+   *  the search started, or a download of the file having finished, is only
+   *  a fallback until that has been asked, since neither follows the library
+   *  and the tag does not cover a copy under another name. */
   function alreadyHave(r: SearchResult): boolean {
     const hash = r.file.hash?.toLowerCase();
     const known = hash ? ownedCache.get(hash) : undefined;
     if (known !== undefined) return known;
-    return !!r.result_origin?.includes('Local');
+    return !!r.result_origin?.includes('Local') || (!!hash && finishedDownloadHashes.has(hash));
   }
+
+  function finishedDownloads(list: readonly Transfer[]): Set<string> {
+    const done = new Set<string>();
+    for (const t of list) {
+      if (t.direction === 'download' && t.status === 'completed' && t.file_hash) {
+        done.add(t.file_hash.toLowerCase());
+      }
+    }
+    return done;
+  }
+
+  /** The cache starts empty each time the page mounts, so without this a
+   *  download that finished while the user was elsewhere showed its row on
+   *  return until the library check hid it. Replaced only when its members
+   *  change, not on every progress tick of the transfers store. */
+  let finishedDownloadHashes = $state.raw(finishedDownloads(get(transfers)));
+  $effect(() => {
+    const done = finishedDownloads($transfers);
+    untrack(() => {
+      const prev = finishedDownloadHashes;
+      if (done.size === prev.size && [...done].every((h) => prev.has(h))) return;
+      finishedDownloadHashes = done;
+    });
+  });
 
   /** Library membership by hash, for every tab, until the library changes.
    *  Replaced rather than mutated so the filter pass sees each answer. */
@@ -1768,11 +1806,13 @@
   }
 
   // Results stream in and the filter can be switched on at any time; checked
-  // in batches rather than per arriving row.
+  // in batches rather than per arriving row. Nothing answered yet — the page
+  // just mounted over results already in the store — is asked at once, since
+  // every row is on its fallback until then.
   $effect(() => {
     void visibleResults;
     if (!hideOwned) return;
-    untrack(() => scheduleOwnedCheck());
+    untrack(() => scheduleOwnedCheck(ownedCache.size === 0 ? 0 : OWNED_CHECK_DEBOUNCE_MS));
   });
 
   // A download finishing into the library, or a file leaving it, changes what
@@ -3007,6 +3047,8 @@
 
   function showContextMenu(e: MouseEvent, result: SearchResult) {
     e.preventDefault();
+    // Every opening starts with its submenu shut, however the last one closed.
+    ctxSubs.open(null);
     // Raw pointer position: `ctxMenuPosition` measures the rendered panel and
     // keeps it on screen.
     contextMenu = { x: e.clientX, y: e.clientY, result };
@@ -4659,11 +4701,14 @@
           tabindex="0"
           aria-haspopup="menu"
           aria-expanded={ctxWebSub}
-          onclick={(e) => { e.stopPropagation(); ctxWebSub = !ctxWebSub; }}
+          onmouseenter={() => ctxSubs.enter('web')}
+          onmouseleave={ctxSubs.leave}
+          onclick={(e) => ctxSubs.click(e, 'web')}
           onkeydown={(e) => {
+            if (e.target !== e.currentTarget) return;
             if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowRight') {
               e.preventDefault();
-              ctxWebSub = true;
+              ctxSubs.open('web');
             }
           }}
         >

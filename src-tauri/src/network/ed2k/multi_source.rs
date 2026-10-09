@@ -5162,6 +5162,10 @@ impl MultiSourceDownload {
                 let pp = part_path.clone();
                 let pp_root = part_root.clone();
                 let download_root = self.download_folders.read().current.clone();
+                // The category it has now, not when it started, as with the
+                // download folder above.
+                let category_subdir =
+                    crate::storage::category_folders::completion_subdir(&self.transfer_id);
                 let met_roots = allowed_roots.clone();
                 let finish_tracker = tracker.clone();
                 let finish_part_hashes = part_hashes.clone();
@@ -5175,10 +5179,11 @@ impl MultiSourceDownload {
                 // `.part` gone, and Resume downloaded the whole file again.
                 let finish = tokio::spawn(async move {
                     let actual_final = tokio::task::spawn_blocking(move || {
-                        super::transfer::move_part_to_downloads(
+                        super::transfer::move_part_to_completed(
                             &pp,
                             &pp_root,
                             &download_root,
+                            &category_subdir,
                             &safe_name,
                             &verified_identity,
                         )
