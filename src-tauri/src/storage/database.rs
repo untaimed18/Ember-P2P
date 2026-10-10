@@ -3605,7 +3605,8 @@ impl Database {
                 status = ?2,
                 transferred = COALESCE(?3, transferred),
                 dest_path = COALESCE(?4, dest_path)
-             WHERE xfer_id = ?1 AND status IN ('offered', 'awaiting', 'accepted', 'active')",
+             WHERE xfer_id = ?1
+               AND status IN ('queued', 'offered', 'awaiting', 'accepted', 'active')",
             rusqlite::params![xfer_id, status, transferred.map(|t| t as i64), dest_path],
         )?;
         Ok(moved > 0)
@@ -3804,7 +3805,7 @@ impl Database {
     /// can tell an open conversation.
     pub fn expire_chat_attachments(&self, now: i64) -> anyhow::Result<Vec<String>> {
         let conn = self.conn.lock();
-        let moved: Vec<String> = conn
+        let mut moved: Vec<String> = conn
             .prepare(
                 "UPDATE chat_attachments SET status = 'expired'
                  WHERE expires_at <= ?1
@@ -3814,8 +3815,66 @@ impl Database {
             )?
             .query_map(rusqlite::params![now], |row| row.get(0))?
             .collect::<Result<_, _>>()?;
+        // A queued file that never went out is told apart from an offer
+        // nobody answered: the friend never saw this one.
+        let undelivered: Vec<String> = conn
+            .prepare(
+                "UPDATE chat_attachments SET status = 'undelivered'
+                 WHERE expires_at <= ?1 AND direction = 'sent' AND status = 'queued'
+                 RETURNING xfer_id",
+            )?
+            .query_map(rusqlite::params![now], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        moved.extend(undelivered);
         Self::prune_settled_chat_attachments_locked(&conn, now)?;
         Ok(moved)
+    }
+
+    /// Files queued for `friend_hash` while they were unreachable, oldest
+    /// first, at most `limit`.
+    pub fn queued_chat_attachments(&self, friend_hash: &str, limit: usize) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let ids = conn
+            .prepare(
+                "SELECT xfer_id FROM chat_attachments
+                 WHERE friend_hash = ?1 AND direction = 'sent' AND status = 'queued'
+                 ORDER BY created_at ASC, rowid ASC LIMIT ?2",
+            )?
+            .query_map(rusqlite::params![friend_hash, limit as i64], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(ids)
+    }
+
+    /// How many files we sent `friend_hash` are in `status` and still in date
+    /// at `now`. One past its expiry is as good as settled, even before the
+    /// sweep marks it so.
+    pub fn count_sent_chat_attachments(
+        &self,
+        friend_hash: &str,
+        status: &str,
+        now: i64,
+    ) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM chat_attachments
+             WHERE friend_hash = ?1 AND direction = 'sent' AND status = ?2 AND expires_at > ?3",
+            rusqlite::params![friend_hash, status, now],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// Friends with at least one file queued for them.
+    pub fn friends_with_queued_chat_attachments(&self) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let hashes = conn
+            .prepare(
+                "SELECT DISTINCT friend_hash FROM chat_attachments
+                 WHERE direction = 'sent' AND status = 'queued'",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(hashes)
     }
 
     /// Delete settled attachment rows whose last date is past the retention
@@ -3825,7 +3884,7 @@ impl Database {
         let cutoff = now.saturating_sub(CHAT_ATTACHMENT_RETENTION_SECS);
         let deleted = conn.execute(
             "DELETE FROM chat_attachments
-             WHERE status NOT IN ('offered', 'awaiting', 'accepted', 'active')
+             WHERE status NOT IN ('queued', 'offered', 'awaiting', 'accepted', 'active')
                AND expires_at < ?1 AND created_at < ?1",
             rusqlite::params![cutoff],
         )?;
@@ -5687,7 +5746,7 @@ impl Database {
     ///
     /// `Ok(None)` — blocked, nothing written.
     /// `Ok(Some(mutual))` — row written. `mutual` is true when a matching
-    /// `friend_requests` row existed and was consumed (same grant as
+    /// verified `friend_requests` row existed and was consumed (same grant as
     /// `accept_friend_request`), so pasting someone's code after they already
     /// asked is not left as a one-sided friend plus a leftover request.
     pub fn add_friend(
@@ -5711,6 +5770,14 @@ impl Database {
             return Ok(None);
         }
 
+        // Only a request proven to come from the key holder counts as their
+        // acceptance. An unverified row is just a claimed hash: taking it would
+        // grant mutual access the real person never gave, and store the
+        // claimant's address and key as theirs.
+        tx.execute(
+            "DELETE FROM friend_requests WHERE sender_hash = ?1 AND COALESCE(verified, 0) = 0",
+            params![user_hash],
+        )?;
         let pending: Option<(String, String, u16, Option<Vec<u8>>)> = {
             let mut stmt = tx.prepare(
                 "SELECT sender_nickname, COALESCE(sender_ip, ''), COALESCE(sender_port, 0), sender_pubkey \
@@ -6127,6 +6194,17 @@ impl Database {
             tx.commit()?;
             return Ok(false);
         }
+        // As removal does: queued messages would otherwise stay counted as
+        // pending, and a `sent` attachment row is a live read grant that a
+        // later re-add would bring back.
+        tx.execute(
+            "DELETE FROM chat_messages WHERE friend_hash = ?1",
+            params![user_hash],
+        )?;
+        tx.execute(
+            "DELETE FROM chat_attachments WHERE friend_hash = ?1",
+            params![user_hash],
+        )?;
         // Our own outbound queue for this identity is moot now: a withdrawal
         // of the request they have just refused would dial them to take back
         // something already gone.
@@ -6150,16 +6228,16 @@ impl Database {
     pub fn reject_and_queue_friend_decline(&self, user_hash: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
-        let pending: Option<(String, i64, bool)> = tx
+        let pending: Option<(String, i64, bool, bool)> = tx
             .query_row(
                 "SELECT COALESCE(sender_ip, ''), COALESCE(sender_port, 0),
-                        sender_pubkey IS NOT NULL AND COALESCE(verified, 0) != 0
+                        sender_pubkey IS NOT NULL, COALESCE(verified, 0) != 0
                  FROM friend_requests WHERE sender_hash = ?1",
                 params![user_hash],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        let Some((last_ip, last_port, keyed)) = pending else {
+        let Some((last_ip, last_port, has_key, verified)) = pending else {
             tx.commit()?;
             return Ok(false);
         };
@@ -6186,8 +6264,14 @@ impl Database {
         // presence for us. A request that came through a room has only the
         // second. Anything else is still rejected locally — the queue is about
         // delivery, not about the decision.
+        //
+        // An unverified request is only a claimed hash, so nothing is owed to
+        // it: the courier would fall back to the rendezvous and deliver the
+        // refusal to the real key holder, deleting an add of theirs that this
+        // rejection was never about.
         let addressed = !last_ip.is_empty() && last_port > 0;
-        if addressed || keyed {
+        let owed = verified && (addressed || has_key);
+        if owed {
             tx.execute(
                 "INSERT INTO friend_request_declines (user_hash, last_ip, last_port, queued_at) \
                  VALUES (?1, ?2, ?3, ?4) \
@@ -6202,7 +6286,7 @@ impl Database {
             )?;
         }
         tx.commit()?;
-        Ok(addressed || keyed)
+        Ok(owed)
     }
 
     /// Refusals not yet delivered, as `(user_hash, last_ip, last_port)`.
@@ -6381,6 +6465,22 @@ impl Database {
         Ok(Self::blocked_in(&conn, user_hash)?)
     }
 
+    /// True when `user_hash` is a mutual friend and not blocked. Checked after
+    /// a mutual grant reaches memory, since a removal or block can commit
+    /// between the grant's write and its in-memory insert.
+    pub fn is_unblocked_mutual_friend(&self, user_hash: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM friends WHERE user_hash = ?1 AND mutual = 1 \
+                 AND NOT EXISTS (SELECT 1 FROM friend_blocks WHERE user_hash = ?1)",
+                params![user_hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     /// The block test as run *inside* an open transaction.
     ///
     /// Every path that can grant an identity access has to consult this
@@ -6432,22 +6532,6 @@ impl Database {
             "SELECT user_hash, nickname, blocked_at FROM friend_blocks \
              ORDER BY blocked_at DESC",
         )?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
-
-    pub fn get_friends(&self) -> anyhow::Result<Vec<(String, String, i64)>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare("SELECT user_hash, nickname, added_at FROM friends ORDER BY added_at DESC")?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((
@@ -6669,14 +6753,15 @@ impl Database {
         // sea of spoofed ones in the UI list. We pick 100 unique
         // pending requests as a generous practical ceiling. When
         // overflowing, evict the oldest **unverified** rows first,
-        // then the oldest that came through a room, and only then
-        // — and only for a request from a session — the oldest
-        // verified one. A request through a room is proven by a key
-        // anyone can mint, so it may displace noise and its own kind
-        // but never a request a session proved; with nothing it may
-        // displace, it is refused. A repeat request from a sender
-        // already present is exempt from the cap — it just refreshes
-        // the existing row via the UPSERT.
+        // then — for a verified request — the oldest that came
+        // through a room. An unverified request may only displace
+        // its own kind. Nothing displaces a request a session proved:
+        // a fresh key costs nothing, so a flood of new identities
+        // could otherwise wipe every genuine request the user has
+        // not answered yet. With nothing it may displace, a request
+        // is refused. A repeat request from a sender already present
+        // is exempt from the cap — it just refreshes the existing
+        // row via the UPSERT.
         const MAX_FRIEND_REQUESTS: i64 = 100;
         let already_present: i64 = tx
             .query_row(
@@ -6691,12 +6776,9 @@ impl Database {
                 .unwrap_or(0);
             if total >= MAX_FRIEND_REQUESTS {
                 let mut remaining = (total - MAX_FRIEND_REQUESTS + 1).max(1);
-                let mut tiers = vec![
-                    "COALESCE(verified, 0) = 0",
-                    "COALESCE(verified, 0) != 0 AND via_room != ''",
-                ];
-                if via_room.is_empty() {
-                    tiers.push("1");
+                let mut tiers = vec!["COALESCE(verified, 0) = 0"];
+                if verified {
+                    tiers.push("COALESCE(verified, 0) != 0 AND via_room != ''");
                 }
                 for tier in tiers {
                     if remaining <= 0 {
@@ -6824,6 +6906,15 @@ impl Database {
         Ok(rows)
     }
 
+    pub fn has_friend_request(&self, sender_hash: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM friend_requests WHERE sender_hash = ?1)",
+            params![sender_hash],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn remove_friend_request(&self, sender_hash: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         conn.execute(
@@ -6938,6 +7029,17 @@ impl Database {
 
         tx.execute(
             "DELETE FROM friend_requests WHERE sender_hash = ?1",
+            params![sender_hash],
+        )?;
+        // Accepting is the opposite answer to an earlier refusal (or removal)
+        // still waiting for delivery; sending it afterwards would undo the
+        // friendship on their side. Same rule as `add_friend`.
+        tx.execute(
+            "DELETE FROM friend_request_declines WHERE user_hash = ?1",
+            params![sender_hash],
+        )?;
+        tx.execute(
+            "DELETE FROM friend_request_retractions WHERE user_hash = ?1",
             params![sender_hash],
         )?;
         tx.commit()?;
@@ -13552,7 +13654,7 @@ mod tests {
     #[test]
     fn adding_without_a_nickname_keeps_the_request_name() {
         let db = friends_only_db();
-        db.add_friend_request("bb", None, "Bob", "5.6.7.8", 4662, false)
+        db.add_friend_request("bb", None, "Bob", "5.6.7.8", 4662, true)
             .expect("queue request");
         assert_eq!(db.add_friend("bb", "", None).expect("add"), Some(true));
         let friends = db.get_friends_full().expect("list");
@@ -13839,8 +13941,8 @@ mod tests {
         db.conn
             .lock()
             .execute(
-                "INSERT INTO friend_requests (sender_hash, sender_nickname, sender_ip, sender_port) \
-                 VALUES ('44', 'Asker', '203.0.113.9', 4662)",
+                "INSERT INTO friend_requests (sender_hash, sender_nickname, sender_ip, sender_port, verified) \
+                 VALUES ('44', 'Asker', '203.0.113.9', 4662, 1)",
                 [],
             )
             .expect("seed request");
@@ -13854,6 +13956,65 @@ mod tests {
         let queued = db.pending_friend_request_declines().expect("list");
         assert_eq!(queued.len(), 1);
         assert_eq!((queued[0].1.as_str(), queued[0].2), ("203.0.113.9", 4662));
+    }
+
+    /// An unverified request is only a claimed hash. Its refusal would be
+    /// delivered to the real key holder, so none is queued.
+    #[test]
+    fn rejecting_an_unverified_request_owes_no_decline() {
+        let db = friends_only_db();
+        db.add_friend_request("45", Some(&[9u8; 32]), "Claim", "203.0.113.9", 4662, false)
+            .expect("seed request");
+        assert!(!db.reject_and_queue_friend_decline("45").expect("reject"));
+        assert_eq!(
+            row_count(&db, "SELECT COUNT(*) FROM friend_requests WHERE sender_hash = '45'"),
+            0
+        );
+        assert!(db.pending_friend_request_declines().expect("list").is_empty());
+    }
+
+    /// Adding someone by code only counts their pending request as acceptance
+    /// when it was proven to come from them.
+    #[test]
+    fn adding_a_friend_does_not_consume_an_unverified_request() {
+        let db = friends_only_db();
+        db.add_friend_request("46", Some(&[9u8; 32]), "Claim", "203.0.113.9", 4662, false)
+            .expect("seed unverified");
+        assert_eq!(db.add_friend("46", "Real", None).expect("add"), Some(false));
+        assert_eq!(
+            row_count(&db, "SELECT COUNT(*) FROM friend_requests WHERE sender_hash = '46'"),
+            0,
+            "the claim is dropped"
+        );
+        assert_eq!(
+            row_count(&db, "SELECT COUNT(*) FROM friends WHERE user_hash = '46' AND last_ip IS NOT NULL AND last_ip != ''"),
+            0,
+            "the claimant's address is not stored as theirs"
+        );
+
+        db.add_friend_request("47", Some(&[9u8; 32]), "Proven", "203.0.113.9", 4662, true)
+            .expect("seed verified");
+        assert_eq!(db.add_friend("47", "", None).expect("add"), Some(true));
+    }
+
+    /// Accepting is the opposite answer to an undelivered refusal, which must
+    /// not be sent afterwards and undo the friendship on their side.
+    #[test]
+    fn accepting_a_request_cancels_an_undelivered_decline() {
+        let db = friends_only_db();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO friend_request_declines (user_hash, last_ip, last_port, queued_at) \
+                 VALUES ('48', '203.0.113.9', 4662, 0)",
+                [],
+            )
+            .expect("seed decline");
+        db.add_friend_request("48", Some(&[9u8; 32]), "Again", "203.0.113.9", 4662, true)
+            .expect("seed request");
+        db.accept_friend_request("48").expect("accept");
+        assert!(db.pending_friend_request_declines().expect("list").is_empty());
+        assert!(db.is_unblocked_mutual_friend("48").expect("lookup"));
     }
 
     /// A request that arrived without a usable address is still rejected — the
@@ -13953,6 +14114,27 @@ mod tests {
         );
     }
 
+    /// A fresh key costs nothing, so a flood of new identities must not wipe
+    /// the genuine requests a user has not answered yet.
+    #[test]
+    fn a_full_table_of_proven_requests_is_never_displaced() {
+        let db = friends_only_db();
+        for i in 0..100 {
+            db.add_friend_request(&format!("s{i:02}"), None, "Real", "1.2.3.4", 4662, true)
+                .expect("session request");
+        }
+        assert!(!db
+            .add_friend_request("new-proven", None, "Flood", "5.6.7.8", 4662, true)
+            .expect("proven newcomer"));
+        assert!(!db
+            .add_friend_request("new-claim", None, "Flood", "5.6.7.8", 4662, false)
+            .expect("unproven newcomer"));
+        assert_eq!(
+            row_count(&db, "SELECT COUNT(*) FROM friend_requests WHERE sender_hash LIKE 's%'"),
+            100
+        );
+    }
+
     #[test]
     fn a_room_brings_only_its_hourly_share_of_new_requests() {
         let db = friends_only_db();
@@ -14036,8 +14218,8 @@ mod tests {
         db.conn
             .lock()
             .execute(
-                "INSERT INTO friend_requests (sender_hash, sender_nickname, sender_ip, sender_port) \
-                 VALUES ('88', 'Persistent', '203.0.113.10', 4663)",
+                "INSERT INTO friend_requests (sender_hash, sender_nickname, sender_ip, sender_port, verified) \
+                 VALUES ('88', 'Persistent', '203.0.113.10', 4663, 1)",
                 [],
             )
             .expect("seed request");
@@ -16456,6 +16638,79 @@ mod tests {
         assert_eq!(db.expire_chat_attachments(now + 61).expect("sweep").len(), 1);
         assert_eq!(db.chat_attachment(&"aa".repeat(16)).expect("row").status, "active");
         assert_eq!(db.chat_attachment(&"bb".repeat(16)).expect("row").status, "expired");
+        drop_attach_test_db(db, path);
+    }
+
+    fn queue_attachment(db: &Database, id: &str, friend: &str, created: i64, expires: i64) {
+        db.upsert_chat_attachment(
+            &id.repeat(16),
+            friend,
+            "sent",
+            "f.bin",
+            10,
+            &"33".repeat(32),
+            Some("C:\\files\\f.bin"),
+            "queued",
+            created,
+            expires,
+        )
+        .expect("queue");
+    }
+
+    /// A queued file was never offered, so nothing may read it, and it is
+    /// sent oldest first once the friend is back.
+    #[test]
+    fn a_queued_attachment_is_not_a_grant_and_goes_out_oldest_first() {
+        let (db, path) = attach_test_db("queued-grant");
+        let friend = "58".repeat(8);
+        let now = 3_000_000i64;
+        queue_attachment(&db, "c2", &friend, now + 5, now + 600);
+        queue_attachment(&db, "c1", &friend, now, now + 600);
+        queue_attachment(&db, "c3", &"59".repeat(8), now, now + 600);
+
+        assert!(db.chat_attachment_grant(&"c1".repeat(16), &friend, now).is_none());
+        assert_eq!(
+            db.queued_chat_attachments(&friend, 10).expect("list"),
+            vec!["c1".repeat(16), "c2".repeat(16)]
+        );
+        assert_eq!(db.queued_chat_attachments(&friend, 1).expect("list").len(), 1);
+        assert_eq!(db.count_sent_chat_attachments(&friend, "queued", now).expect("count"), 2);
+        assert_eq!(
+            db.count_sent_chat_attachments(&friend, "queued", now + 600).expect("count"),
+            0,
+            "nothing is in date once its time is up"
+        );
+        let mut waiting = db.friends_with_queued_chat_attachments().expect("friends");
+        waiting.sort();
+        assert_eq!(waiting, vec!["58".repeat(8), "59".repeat(8)]);
+
+        // Offered once the friend is back: now it is a grant.
+        assert!(db
+            .reopen_chat_attachment(&"c1".repeat(16), &["queued"], "offered", Some(now + 300))
+            .expect("offer"));
+        assert!(db.chat_attachment_grant(&"c1".repeat(16), &friend, now).is_some());
+        drop_attach_test_db(db, path);
+    }
+
+    /// A queue that outlived its time ends as undelivered, which says the
+    /// friend never saw it. One still in date stays queued however old it is.
+    #[test]
+    fn a_queued_attachment_ends_undelivered_only_when_its_time_runs_out() {
+        let (db, path) = attach_test_db("queued-expiry");
+        let friend = "5a".repeat(8);
+        let now = 3_000_000i64;
+        queue_attachment(&db, "d1", &friend, now, now + 60);
+        let long_ago = now - CHAT_ATTACHMENT_RETENTION_SECS - 10;
+        queue_attachment(&db, "d2", &friend, long_ago, now + 600);
+
+        assert_eq!(db.expire_chat_attachments(now + 61).expect("sweep"), vec!["d1".repeat(16)]);
+        assert_eq!(db.chat_attachment(&"d1".repeat(16)).expect("row").status, "undelivered");
+        assert_eq!(db.chat_attachment(&"d2".repeat(16)).expect("row").status, "queued");
+
+        // And a cancel reaches a queued file.
+        assert!(db
+            .advance_chat_attachment(&"d2".repeat(16), "cancelled", None, None)
+            .expect("cancel"));
         drop_attach_test_db(db, path);
     }
 

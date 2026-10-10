@@ -486,6 +486,10 @@ pub(in crate::network) async fn on_upload_event(
             peer_addr,
         )
         .await;
+        // An answer frees a place for the next queued file.
+        if friend_hashes.read().await.contains(&attach_eh) {
+            chat_attach::send_queued(state, db, app_handle, settings, attach_eh).await;
+        }
     }
     if let UploadEventKind::EmberAttachCancel { ember_hash: attach_eh, xfer_id, reason } = event.kind {
         chat_attach::on_cancel(
@@ -574,7 +578,12 @@ pub(in crate::network) async fn on_upload_event(
             | UploadEventKind::EmberChatRead { ember_hash, .. }
             | UploadEventKind::EmberBrowseRequest { ember_hash, .. }
             | UploadEventKind::EmberBrowseResponse { ember_hash, .. }
-            | UploadEventKind::EmberFriendRequest { ember_hash, .. } => Some(*ember_hash),
+            // An unverified request is only a claimed hash. Counting it would
+            // let anyone mark a friend online, and online friends are skipped
+            // by every reconnect path.
+            | UploadEventKind::EmberFriendRequest { ember_hash, verified: true, .. } => {
+                Some(*ember_hash)
+            }
             _ => None,
         };
         if let Some(eh) = activity_eh {
@@ -638,6 +647,8 @@ pub(in crate::network) async fn on_upload_event(
                     )
                     .await;
                 }
+                // Files queued while they were away, the same way.
+                chat_attach::send_queued(state, db, app_handle, settings, *ember_hash).await;
             }
             if still_friend && !ip.is_unspecified() && *port > 0 {
                 let hash_hex = hex::encode(ember_hash);
@@ -656,6 +667,7 @@ pub(in crate::network) async fn on_upload_event(
                     source_manager,
                     credit_manager,
                     transfer_manager,
+                    friend_hashes,
                     *ember_hash,
                     Some(*peer_user_hash),
                     *ip,
@@ -694,6 +706,7 @@ pub(in crate::network) async fn on_upload_event(
                     source_manager,
                     credit_manager,
                     transfer_manager,
+                    friend_hashes,
                     *ember_hash,
                     None,
                     *ip,
@@ -742,6 +755,7 @@ pub(in crate::network) async fn on_upload_event(
                         source_manager,
                         credit_manager,
                         transfer_manager,
+                        friend_hashes,
                         *ember_hash,
                         None,
                         *v4,
@@ -771,6 +785,7 @@ pub(in crate::network) async fn on_upload_event(
                         *ember_hash,
                     )
                     .await;
+                    chat_attach::send_queued(state, db, app_handle, settings, *ember_hash).await;
                 }
                 if settings.read_receipts_with(ember_hash) {
                     flush_pending_read_receipt(
@@ -851,8 +866,17 @@ pub(in crate::network) async fn on_upload_event(
                 // hold authenticated, so the grant has to be
                 // revoked the same way removal revokes it.
                 friend_hashes.write().await.remove(&decline_hash);
+                mutual_friend_hashes.write().await.remove(&decline_hash);
                 crate::network::friend_intro::forget_friend_intro_secret(&decline_hash);
-                ed2k::upload::revoke_all_secure_sessions(decline_hash);
+                crate::network::friends::forget_friend_network_state(
+                    state,
+                    settings,
+                    app_handle,
+                    upload_queue_handle,
+                    decline_hash,
+                    "Friend request was declined",
+                )
+                .await;
                 // As removal does. Off this loop: the save hands the
                 // settings back to it and would wait on itself.
                 let clear_app = app_handle.clone();
@@ -1013,6 +1037,7 @@ pub(in crate::network) async fn on_upload_event(
         session_id,
         ref reply_tx,
         supports_ebr1,
+        supports_scope,
     } = event.kind
     {
         // Mutual, not merely listed. The UI already hides Browse
@@ -1127,10 +1152,17 @@ pub(in crate::network) async fn on_upload_event(
                 }
             }
             let mut scope_delivered = true;
-            // Pre-EBR1 requesters predate the scope frame too. It goes
-            // first on the same stream so it is already attached to the
-            // pending request when the answer lands.
-            if supports_ebr1 && !restricted_entries.is_empty() {
+            // A requester that has not said it understands the scope
+            // frame would drop it, file friends-only entries as public
+            // and republish them. Leave them out instead.
+            if !(supports_ebr1 && supports_scope) && !restricted_entries.is_empty() {
+                encoded_entries.retain(|(h, ..)| !restricted_entries.contains(h));
+                restricted_entries.clear();
+                scope_delivered = false;
+            }
+            // It goes first on the same stream so it is already attached
+            // to the pending request when the answer lands.
+            if !restricted_entries.is_empty() {
                 let scope = crate::network::browse::encode_browse_scope(restricted_entries.iter());
                 let frame = ed2k::messages::build_ember_ext_frame(
                     ed2k::messages::EMBER_EXT_BROWSE_SCOPE,
@@ -1395,24 +1427,33 @@ pub(in crate::network) async fn on_upload_event(
                 obj
             })
             .collect();
-        if let Some(request_id) = complete_browse_request(
+        match complete_browse_request(
             &mut state.pending_browse_requests,
             browse_eh,
             session_id,
         ) {
-            crate::network::browse::record_friend_listing(browse_eh, listed.iter(), &restricted);
-            let _ = app_handle.emit("ember:browse-result", serde_json::json!({
-                "user_hash": hash_hex,
-                "request_id": request_id,
-                "files": files,
-                "total": total,
-            }));
-            dispatch_browse_head(state, app_handle, browse_eh).await;
-        } else {
-            debug!(
-                "Ignoring stale or unbound browse response from {} session {}",
-                hash_hex, session_id
-            );
+            Some(completion) => {
+                crate::network::browse::record_friend_listing(
+                    browse_eh,
+                    listed.iter(),
+                    &restricted,
+                );
+                if let crate::network::browse::BrowseCompletion::Deliver(request_id) = completion {
+                    let _ = app_handle.emit("ember:browse-result", serde_json::json!({
+                        "user_hash": hash_hex,
+                        "request_id": request_id,
+                        "files": files,
+                        "total": total,
+                    }));
+                }
+                dispatch_browse_head(state, app_handle, browse_eh).await;
+            }
+            None => {
+                debug!(
+                    "Ignoring stale or unbound browse response from {} session {}",
+                    hash_hex, session_id
+                );
+            }
         }
     }
 

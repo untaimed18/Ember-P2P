@@ -1027,47 +1027,42 @@ pub fn run() {
             let startup_network_tx = network_tx.clone();
 
             let upload_shared_folders: app_state::SharedFolderList = Arc::new(RwLock::new(settings.shared_folders.clone()));
-            let friend_hashes: app_state::SharedFriendHashes = {
-                let mut set = std::collections::HashSet::new();
-                if let Ok(rows) = db.get_friends() {
-                    for (hash_hex, _, _) in &rows {
-                        if let Ok(bytes) = hex::decode(hash_hex) {
-                            if bytes.len() == 16 {
-                                let mut h = [0u8; 16];
-                                h.copy_from_slice(&bytes);
-                                set.insert(h);
-                            }
-                        }
-                    }
-                    if !set.is_empty() {
-                        info!("Loaded {} friends from database", set.len());
-                    }
-                }
-                Arc::new(RwLock::new(set))
-            };
             // Mutual friends are the subset that also added us back. Friend-only
-            // shares and browse answers key off this rather than `friend_hashes`,
-            // so a one-sided add cannot reach private content.
-            let mutual_friend_hashes: app_state::SharedFriendHashes = {
-                let mut set = std::collections::HashSet::new();
-                if let Ok(rows) = db.get_friends_full() {
-                    for row in &rows {
-                        if !row.6 {
-                            continue;
-                        }
-                        if let Ok(bytes) = hex::decode(&row.0) {
-                            if bytes.len() == 16 {
-                                let mut h = [0u8; 16];
-                                h.copy_from_slice(&bytes);
-                                set.insert(h);
+            // shares and browse answers key off that rather than every friend,
+            // so a one-sided add cannot reach private content. Both come from
+            // one read so they cannot disagree, and a failed read is logged
+            // loudly: every friend would otherwise look like a stranger and
+            // the friend limit would count from zero.
+            let (friend_hashes, mutual_friend_hashes): (
+                app_state::SharedFriendHashes,
+                app_state::SharedFriendHashes,
+            ) = {
+                let mut friends = std::collections::HashSet::new();
+                let mut mutual = std::collections::HashSet::new();
+                match db.get_friends_full() {
+                    Ok(rows) => {
+                        for row in &rows {
+                            let Ok(hash) = <[u8; 16]>::try_from(
+                                hex::decode(&row.0).unwrap_or_default().as_slice(),
+                            ) else {
+                                continue;
+                            };
+                            friends.insert(hash);
+                            if row.6 {
+                                mutual.insert(hash);
                             }
                         }
+                        if !friends.is_empty() {
+                            info!(
+                                "Loaded {} friends ({} mutual) from database",
+                                friends.len(),
+                                mutual.len()
+                            );
+                        }
                     }
-                    if !set.is_empty() {
-                        info!("Loaded {} mutual friends from database", set.len());
-                    }
+                    Err(e) => tracing::error!("Failed to load the friend list: {e}"),
                 }
-                Arc::new(RwLock::new(set))
+                (Arc::new(RwLock::new(friends)), Arc::new(RwLock::new(mutual)))
             };
 
             let shared_folder_watcher = sharing::watcher::SharedFoldersWatcher::start(

@@ -52,6 +52,18 @@ describe('mergeChatAttachment', () => {
     expect(mergeChatAttachment(moving, { ...row('active', 500), attempt: 1 }).transferred).toBe(500);
   });
 
+  // A queued file goes out as a new attempt once the friend is back, and one
+  // that lapsed in the queue is an ending until it is tried again.
+  it('moves a queued file on to its offer, and keeps an undelivered one ended', () => {
+    const queued = row('queued');
+    const offered = { ...row('offered'), attempt: 1 };
+    expect(mergeChatAttachment(queued, offered)).toBe(offered);
+    expect(mergeChatAttachment(queued, row('offered')).status).toBe('offered');
+    const undelivered = row('undelivered');
+    expect(mergeChatAttachment(undelivered, row('queued'))).toBe(undelivered);
+    expect(mergeChatAttachment(undelivered, { ...row('queued'), attempt: 1 }).status).toBe('queued');
+  });
+
   it('treats the specific failures as endings', () => {
     const unreachable = row('unreachable');
     expect(mergeChatAttachment(unreachable, row('active', 100))).toBe(unreachable);
@@ -64,7 +76,7 @@ describe('parseChatAttachment', () => {
   // An event whose status the parser does not know is dropped, so a status the
   // backend emits has to be listed here or its bubble never updates.
   it('accepts every status the backend can emit', () => {
-    for (const status of ['unreachable', 'source_gone', 'failed'] as const) {
+    for (const status of ['unreachable', 'source_gone', 'failed', 'queued', 'undelivered'] as const) {
       expect(parseChatAttachment(row(status))?.status).toBe(status);
     }
   });

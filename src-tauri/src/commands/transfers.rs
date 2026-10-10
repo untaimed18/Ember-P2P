@@ -1318,6 +1318,24 @@ pub async fn start_download(
         control.pause();
     }
 
+    // Decided here, before the row is saved, rather than only once the
+    // network task gets `StartDownload`: a quit in between would bring the
+    // download back public, and a publish tick could advertise it meanwhile.
+    // The network task still applies its fuller check (known.met included)
+    // and can only add the restriction, never lift it.
+    let from_restricting_friend = match (
+        friend_ember_hash,
+        hex::decode(file_hash.trim()).ok().and_then(|b| <[u8; 16]>::try_from(b).ok()),
+    ) {
+        (Some(friend), Some(hash)) if crate::network::friend_marked_friends_only(friend, &hash) => {
+            let index = state.local_index.read().await;
+            !index
+                .get_by_hash(&hex::encode(hash))
+                .is_some_and(|file| !file.friends_only)
+        }
+        _ => false,
+    };
+
     let transfer = Transfer {
         id: transfer_id.clone(),
         file_name: file_name.clone(),
@@ -1376,7 +1394,7 @@ pub async fn start_download(
         up_part_count: None,
         up_peer_part_status: None,
         ember_verified: false,
-        friends_only: false,
+        friends_only: from_restricting_friend,
     };
 
     let active_now = {

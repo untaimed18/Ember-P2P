@@ -6,6 +6,60 @@
 
 use super::*;
 
+/// Withdraw everything the network task holds for an identity that is no
+/// longer a friend: sessions, online state, pending browses, attachment and
+/// browse-scope state, and friend priority on their queue rows.
+///
+/// Shared by removal, blocking and their refusal of our request, which differ
+/// only in why the friendship ended. The caller has already dropped the hash
+/// from the friend sets.
+pub(super) async fn forget_friend_network_state(
+    state: &mut NetworkState,
+    settings: &AppSettings,
+    app_handle: &tauri::AppHandle,
+    upload_queue: &ed2k::upload::UploadQueueRef,
+    friend: [u8; 16],
+    browse_error: &str,
+) {
+    ed2k::upload::revoke_all_secure_sessions(friend);
+    state.online_friends.remove(&friend);
+    let _ = retire_current_ember_session(&state.ember_sessions, friend).await;
+    // A remove followed by a re-add must not wait out a stale search slot.
+    state.outbound_session_tasks.remove(&friend);
+    state.friend_reconnect_last.remove(&friend);
+    state.recent_ember_chat.remove(&friend);
+    super::browse::forget_friend_scope(friend);
+    super::chat_attach::forget_friend(state, settings, &friend);
+
+    if let Some(pending) = state.pending_browse_requests.remove(&friend) {
+        for request in pending {
+            let _ = app_handle.emit(
+                "ember:browse-error",
+                serde_json::json!({
+                    "user_hash": hex::encode(friend),
+                    "request_id": request.request_id,
+                    "reason": browse_error,
+                }),
+            );
+        }
+    }
+
+    // Queue entries outlive their originating TCP connection for eMule
+    // seniority. Strip only the friend-priority bit; standard queue and
+    // file-transfer behaviour and verified Ember accounting stay intact.
+    let mut queue = upload_queue.lock().await;
+    for entry in queue.iter_mut() {
+        let matches_friend = entry.ember_pubkey.is_some_and(|pk| {
+            crate::network::ember::crypto::verifying_key_from_bytes(&pk).is_some_and(|vk| {
+                crate::network::ember::crypto::node_id_from_public_key(&vk) == friend
+            })
+        });
+        if matches_friend {
+            entry.is_friend_slot = false;
+        }
+    }
+}
+
 pub(super) fn matching_active_transfer_ids_for_hash(
     state: &NetworkState,
     transfer_manager: &TransferManager,
@@ -30,6 +84,7 @@ pub(super) async fn reseed_friend_endpoint(
     source_manager: &Arc<RwLock<ed2k::sources::SourceManager>>,
     credit_manager: &Arc<RwLock<CreditManager>>,
     transfer_manager: &Arc<RwLock<TransferManager>>,
+    friend_hashes: &crate::app_state::SharedFriendHashes,
     ember_hash: [u8; 16],
     peer_user_hash: Option<[u8; 16]>,
     ip: std::net::Ipv4Addr,
@@ -46,7 +101,28 @@ pub(super) async fn reseed_friend_endpoint(
     // learned from a prior HELLO+hash↔pubkey check this session.
     let user_hash = match peer_user_hash.filter(|h| *h != [0u8; 16]) {
         Some(uh) => {
-            credit_manager.write().await.set_ember_hash(uh, ember_hash);
+            // Read first so no friend-set lock is held across the credit write.
+            // A binding to someone no longer a friend is stale and may move.
+            let bound = credit_manager.read().await.persisted_ember_hash(&uh);
+            let bound_to_other_friend = match bound {
+                Some(other) if other != ember_hash => {
+                    friend_hashes.read().await.contains(&other)
+                }
+                _ => false,
+            };
+            if !credit_manager
+                .write()
+                .await
+                .claim_ember_hash(uh, ember_hash, |_| !bound_to_other_friend)
+            {
+                warn!(
+                    "Friend {} claims eD2K user hash {}, which is bound to another friend; \
+                     not relocating its sources",
+                    crate::security::short_hash(&ember_hash),
+                    crate::security::short_hash(&uh)
+                );
+                return;
+            }
             uh
         }
         None => match credit_manager
@@ -524,6 +600,70 @@ pub(super) fn friend_discoverable_event(
     payload
 }
 
+const NEW_FRIEND_REQUEST_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+const NEW_FRIEND_REQUESTS_PER_IP: u32 = 3;
+const NEW_VERIFIED_FRIEND_REQUESTS_TOTAL: u32 = 30;
+const NEW_UNVERIFIED_FRIEND_REQUESTS_TOTAL: u32 = 30;
+
+/// How many requests from identities not already pending we queue per window,
+/// per source IP and in total. Each one is a row and a desktop notification,
+/// and a fresh Ed25519 key costs nothing, so being verified does not stop a
+/// flood. Unverified requests have their own total, so a flood of them cannot
+/// use up the room genuine ones need. Charged only for requests actually
+/// queued. Fixed windows: the per-IP map holds no more than the totals.
+struct NewFriendRequestRate {
+    window_start: std::time::Instant,
+    verified: u32,
+    unverified: u32,
+    per_ip: HashMap<std::net::IpAddr, u32>,
+}
+
+impl NewFriendRequestRate {
+    fn roll(&mut self, now: std::time::Instant) {
+        if now.duration_since(self.window_start) >= NEW_FRIEND_REQUEST_WINDOW {
+            self.window_start = now;
+            self.verified = 0;
+            self.unverified = 0;
+            self.per_ip.clear();
+        }
+    }
+
+    fn has_room(&mut self, ip: Option<std::net::IpAddr>, verified: bool, now: std::time::Instant) -> bool {
+        self.roll(now);
+        let total_full = if verified {
+            self.verified >= NEW_VERIFIED_FRIEND_REQUESTS_TOTAL
+        } else {
+            self.unverified >= NEW_UNVERIFIED_FRIEND_REQUESTS_TOTAL
+        };
+        !total_full
+            && ip.is_none_or(|ip| {
+                self.per_ip.get(&ip).copied().unwrap_or(0) < NEW_FRIEND_REQUESTS_PER_IP
+            })
+    }
+
+    fn charge(&mut self, ip: Option<std::net::IpAddr>, verified: bool, now: std::time::Instant) {
+        self.roll(now);
+        if verified {
+            self.verified += 1;
+        } else {
+            self.unverified += 1;
+        }
+        if let Some(ip) = ip {
+            *self.per_ip.entry(ip).or_insert(0) += 1;
+        }
+    }
+}
+
+static NEW_FRIEND_REQUEST_RATE: std::sync::LazyLock<parking_lot::Mutex<NewFriendRequestRate>> =
+    std::sync::LazyLock::new(|| {
+        parking_lot::Mutex::new(NewFriendRequestRate {
+            window_start: std::time::Instant::now(),
+            verified: 0,
+            unverified: 0,
+            per_ip: HashMap::new(),
+        })
+    });
+
 /// Handle an inbound Ember friend request, shared by the download-side and
 /// upload-side session event loops so the approval / auto-confirm / queue
 /// policy can't drift between the two ingress paths (it previously lived as two
@@ -557,6 +697,8 @@ pub(super) async fn process_inbound_friend_request(
         Promoted,
         PromotionSkipped,
         IgnoredUnverifiedReciprocal,
+        RateLimited,
+        NotQueued,
         Queued,
         Failed(String),
     }
@@ -614,6 +756,16 @@ pub(super) async fn process_inbound_friend_request(
             // and do not ask again. A later verified session completes it.
             FriendRequestDbOutcome::IgnoredUnverifiedReciprocal
         } else {
+            // A repeat from a sender already pending only refreshes its row.
+            let source_ip: Option<std::net::IpAddr> = ip_q.parse().ok();
+            let is_new = !db_q.has_friend_request(&h_q).unwrap_or(false);
+            if is_new
+                && !NEW_FRIEND_REQUEST_RATE
+                    .lock()
+                    .has_room(source_ip, verified, std::time::Instant::now())
+            {
+                return FriendRequestDbOutcome::RateLimited;
+            }
             match db_q.add_friend_request(
                 &h_q,
                 peer_pubkey_q.as_ref(),
@@ -622,9 +774,19 @@ pub(super) async fn process_inbound_friend_request(
                 peer_port,
                 verified,
             ) {
-                Ok(true) => FriendRequestDbOutcome::Queued,
-                // Blocked between the check above and the insert.
-                Ok(false) => FriendRequestDbOutcome::Blocked,
+                Ok(true) => {
+                    if is_new {
+                        NEW_FRIEND_REQUEST_RATE.lock().charge(
+                            source_ip,
+                            verified,
+                            std::time::Instant::now(),
+                        );
+                    }
+                    FriendRequestDbOutcome::Queued
+                }
+                // Blocked between the check above and the insert, or the
+                // table is full of requests this one may not displace.
+                Ok(false) => FriendRequestDbOutcome::NotQueued,
                 Err(e) => FriendRequestDbOutcome::Failed(e.to_string()),
             }
         }
@@ -657,20 +819,24 @@ pub(super) async fn process_inbound_friend_request(
             // on the live set the wire consults.
             mutual_friend_hashes.write().await.insert(req_hash);
             // `set_friend_mutual` refuses a blocked identity outright, so this
-            // covers only the block that commits after it and before the line
-            // above. Reading after the grant rather than before is what makes
-            // that safe: blocking writes its row before clearing this set, so
-            // either we see the row here, or its teardown has still to run and
-            // will clear the entry itself.
+            // covers only a block or removal that commits after it and before
+            // the line above. Reading after the grant rather than before is
+            // what makes that safe: both write the database before clearing
+            // this set, so either we see it here, or their teardown has still
+            // to run and will clear the entry itself.
             let db_b = db.clone();
             let h_b = hash_hex.clone();
-            let blocked_now = tokio::task::spawn_blocking(move || db_b.is_friend_blocked(&h_b))
-                .await
-                .map(|r| r.unwrap_or(false))
-                .unwrap_or(false);
-            if blocked_now {
+            let still_mutual =
+                tokio::task::spawn_blocking(move || db_b.is_unblocked_mutual_friend(&h_b))
+                    .await
+                    .map(|r| r.unwrap_or(true))
+                    .unwrap_or(true);
+            if !still_mutual {
                 mutual_friend_hashes.write().await.remove(&req_hash);
-                debug!("Revoked auto-confirm for {} — blocked mid-flight", hash_hex);
+                debug!(
+                    "Revoked auto-confirm for {} — removed or blocked mid-flight",
+                    hash_hex
+                );
                 return;
             }
             if let std::collections::hash_map::Entry::Vacant(e) = online_friends.entry(req_hash) {
@@ -709,6 +875,18 @@ pub(super) async fn process_inbound_friend_request(
         FriendRequestDbOutcome::IgnoredUnverifiedReciprocal => {
             debug!(
                 "Ignoring unverified reciprocal friend request from {} (already added; waiting for PoP)",
+                hash_hex
+            );
+        }
+        FriendRequestDbOutcome::RateLimited => {
+            debug!(
+                "Dropping friend request from {} ({}): too many new requests",
+                hash_hex, peer_ip
+            );
+        }
+        FriendRequestDbOutcome::NotQueued => {
+            debug!(
+                "Friend request from {} not queued: blocked, or the request list is full",
                 hash_hex
             );
         }
@@ -1391,5 +1569,60 @@ mod hash_only_backfill_tests {
         );
         let quiet = friend_discoverable_event(&rendezvous::RegistrationOutcome::default(), false);
         assert!(quiet.get("legacy_stranded_friends").is_none());
+    }
+}
+
+#[cfg(test)]
+mod new_friend_request_rate_tests {
+    use super::*;
+
+    fn fresh(now: std::time::Instant) -> NewFriendRequestRate {
+        NewFriendRequestRate { window_start: now, verified: 0, unverified: 0, per_ip: HashMap::new() }
+    }
+
+    fn admit(rate: &mut NewFriendRequestRate, ip: Option<std::net::IpAddr>, verified: bool, now: std::time::Instant) -> bool {
+        let room = rate.has_room(ip, verified, now);
+        if room {
+            rate.charge(ip, verified, now);
+        }
+        room
+    }
+
+    #[test]
+    fn one_address_gets_only_its_share_per_window() {
+        let now = std::time::Instant::now();
+        let mut rate = fresh(now);
+        let ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        for _ in 0..NEW_FRIEND_REQUESTS_PER_IP {
+            assert!(admit(&mut rate, Some(ip), true, now));
+        }
+        assert!(!admit(&mut rate, Some(ip), true, now));
+        assert!(admit(&mut rate, Some("203.0.113.10".parse().unwrap()), true, now), "others are unaffected");
+        assert!(admit(&mut rate, Some(ip), true, now + NEW_FRIEND_REQUEST_WINDOW), "and it comes back");
+    }
+
+    #[test]
+    fn an_unverified_flood_leaves_room_for_verified_requests() {
+        let now = std::time::Instant::now();
+        let mut rate = fresh(now);
+        for i in 0..NEW_UNVERIFIED_FRIEND_REQUESTS_TOTAL {
+            let ip = std::net::IpAddr::from([10, 0, (i / 256) as u8, (i % 256) as u8]);
+            assert!(admit(&mut rate, Some(ip), false, now));
+        }
+        assert!(!admit(&mut rate, Some("198.51.100.1".parse().unwrap()), false, now));
+        assert!(!admit(&mut rate, None, false, now));
+        assert!(admit(&mut rate, Some("198.51.100.2".parse().unwrap()), true, now));
+        assert!(rate.per_ip.len() as u32 <= NEW_UNVERIFIED_FRIEND_REQUESTS_TOTAL + NEW_VERIFIED_FRIEND_REQUESTS_TOTAL);
+    }
+
+    #[test]
+    fn checking_for_room_charges_nothing() {
+        let now = std::time::Instant::now();
+        let mut rate = fresh(now);
+        let ip: std::net::IpAddr = "203.0.113.11".parse().unwrap();
+        for _ in 0..10 {
+            assert!(rate.has_room(Some(ip), true, now));
+        }
+        assert_eq!(rate.verified, 0);
     }
 }

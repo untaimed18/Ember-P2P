@@ -35,6 +35,35 @@ pub(crate) struct PendingBrowseRequest {
     /// Distinct files the friend would list without the answer's size cap
     /// (`EMBER_EXT_BROWSE_SUMMARY`). `None` from a peer that predates it.
     pub(crate) total: Option<u32>,
+    /// When the wire request was queued. Bounds how long an abandoned request
+    /// may wait for its answer.
+    pub(crate) dispatched_at: Option<std::time::Instant>,
+    /// Set when the user cancelled this request after it was sent. It stays at
+    /// the head to absorb the answer already on its way, which would otherwise
+    /// be taken for the next request's, until [`ABANDONED_BROWSE_HOLD`] after
+    /// it was sent, in case that answer never comes.
+    pub(crate) abandoned: bool,
+}
+
+/// How long after sending a cancelled request still holds the head for its
+/// answer. Matches the dialog's own browse timeout: a request cancelled by
+/// that timeout is past the hold already and goes at once, so a retry is not
+/// stuck behind an answer that is never coming.
+const ABANDONED_BROWSE_HOLD: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn past_abandoned_hold(request: &PendingBrowseRequest) -> bool {
+    request
+        .dispatched_at
+        .is_some_and(|at| at.elapsed() >= ABANDONED_BROWSE_HOLD)
+}
+
+/// What [`complete_browse_request`] did with an answer.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BrowseCompletion {
+    /// The answer is for this live request.
+    Deliver(String),
+    /// The answer was for a request the user had cancelled; nobody is waiting.
+    Absorbed,
 }
 
 pub(crate) type PendingBrowseRequests = HashMap<[u8; 16], VecDeque<PendingBrowseRequest>>;
@@ -68,6 +97,8 @@ pub(crate) fn enqueue_browse_request(
         dispatched: false,
         scope: None,
         total: None,
+        dispatched_at: None,
+        abandoned: false,
     });
     Ok(())
 }
@@ -319,7 +350,7 @@ pub(crate) fn complete_browse_request(
     pending: &mut PendingBrowseRequests,
     friend: [u8; 16],
     session_id: u64,
-) -> Option<String> {
+) -> Option<BrowseCompletion> {
     let queue = pending.get_mut(&friend)?;
     if queue
         .front()
@@ -327,11 +358,15 @@ pub(crate) fn complete_browse_request(
     {
         return None;
     }
-    let request_id = queue.pop_front()?.request_id;
+    let head = queue.pop_front()?;
     if queue.is_empty() {
         pending.remove(&friend);
     }
-    Some(request_id)
+    Some(if head.abandoned {
+        BrowseCompletion::Absorbed
+    } else {
+        BrowseCompletion::Deliver(head.request_id)
+    })
 }
 
 pub(crate) fn remove_browse_requests_for_session(
@@ -357,39 +392,37 @@ pub(crate) fn remove_browse_requests_for_session(
     removed
 }
 
-/// Cancel a request. Cancelling the active head invalidates every request
-/// bound to that session: a late reply cannot be distinguished on the wire,
-/// so the caller must retire the session before starting another browse.
+/// Cancel a request. `false` when there was no such request.
+///
+/// A request already sent stays at the head, marked abandoned, to absorb its
+/// answer: the wire answer carries no request id, so it would otherwise be
+/// shown as the next request's. Anything not yet on the wire just goes. The
+/// session is left alone either way — closing it would drop the friend's chat
+/// and everything else it carries just because a dialog was closed.
 pub(crate) fn cancel_browse_request(
     pending: &mut PendingBrowseRequests,
     friend: [u8; 16],
     request_id: &str,
-) -> Option<(Option<u64>, Vec<String>)> {
-    let queue = pending.get_mut(&friend)?;
-    let position = queue
+) -> bool {
+    let Some(queue) = pending.get_mut(&friend) else {
+        return false;
+    };
+    let Some(position) = queue
         .iter()
-        .position(|request| request.request_id == request_id)?;
-    if position != 0 {
-        queue.remove(position);
-        return Some((None, Vec::new()));
+        .position(|request| request.request_id == request_id)
+    else {
+        return false;
+    };
+    let request = &mut queue[position];
+    if position == 0 && request.dispatched && !past_abandoned_hold(request) {
+        request.abandoned = true;
+        return true;
     }
-
-    let session_id = queue.front()?.session_id;
-    let mut invalidated = Vec::new();
-    queue.retain(|request| {
-        if request.session_id == session_id {
-            if request.request_id != request_id {
-                invalidated.push(request.request_id.clone());
-            }
-            false
-        } else {
-            true
-        }
-    });
+    queue.remove(position);
     if queue.is_empty() {
         pending.remove(&friend);
     }
-    Some((Some(session_id), invalidated))
+    true
 }
 
 /// Bind an on-demand browse placeholder (session ID 0) to the freshly opened
@@ -459,6 +492,12 @@ pub(crate) async fn dispatch_browse_head(
         else {
             return;
         };
+        if head.abandoned && past_abandoned_hold(&head) {
+            // Its answer never came. Nobody is waiting on it, so no event.
+            let _ =
+                remove_browse_request(&mut state.pending_browse_requests, friend, &head.request_id);
+            continue;
+        }
         // Session ID 0 is a placeholder while an on-demand dial is in
         // progress. Its `EmberBrowseSessionReady` event will re-enter this
         // dispatcher after binding the real session ID.
@@ -469,12 +508,24 @@ pub(crate) async fn dispatch_browse_head(
         let current = state.ember_sessions.read().await.get(&friend).cloned();
         let reason = match current {
             Some(handle) if handle.session_id() == head.session_id && handle.is_fresh() => {
+                let scope_aware = ed2k::messages::build_ember_ext_frame(
+                    ed2k::messages::EMBER_EXT_BROWSE_SCOPE_AWARE,
+                    &[],
+                );
                 let mut packet = Vec::with_capacity(10);
                 packet.push(OP_EMULEPROT);
                 packet.extend_from_slice(&(5u32).to_le_bytes());
                 packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
                 packet.extend_from_slice(ed2k::multi_source::BROWSE_RESPONSE_V1_MAGIC);
-                match handle.tx.try_send(packet) {
+                // Both or neither: the frame alone would take the request's
+                // slot, and the request alone would get a listing without its
+                // friends-only files. Same channel, so the frame arrives first.
+                let sent = if handle.tx.capacity() < 2 && !handle.tx.is_closed() {
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(packet))
+                } else {
+                    handle.tx.try_send(scope_aware).and_then(|()| handle.tx.try_send(packet))
+                };
+                match sent {
                     Ok(()) => {
                         if let Some(request) = state
                             .pending_browse_requests
@@ -486,8 +537,17 @@ pub(crate) async fn dispatch_browse_head(
                             })
                         {
                             request.dispatched = true;
+                            request.dispatched_at = Some(std::time::Instant::now());
                         }
                         return;
+                    }
+                    // Full is a burst (a chat backlog flushed on reconnect),
+                    // not a dead session: fail just this request.
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        crate::commands::errors::coded(
+                            "browse_session_busy",
+                            "Friend session is busy; try again in a moment",
+                        )
                     }
                     Err(error) => {
                         let _ =

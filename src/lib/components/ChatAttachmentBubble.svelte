@@ -65,6 +65,8 @@
     const name = friendName;
     if (asking) return m.chat_attach_retry_asking({ name });
     switch (attachment.status) {
+      case 'queued':
+        return m.chat_attach_queued({ name });
       case 'offered':
         return m.chat_attach_waiting({ name });
       case 'awaiting':
@@ -102,6 +104,8 @@
         return m.chat_attach_failed();
       case 'expired':
         return sent ? m.chat_attach_expired_sent({ name }) : m.chat_attach_expired_received();
+      case 'undelivered':
+        return m.chat_attach_undelivered({ name });
       default:
         return m.chat_attach_failed();
     }
@@ -255,7 +259,7 @@
         onclick={() => run(() => respondChatAttachment(attachment.xfer_id, false))}
       >{m.chat_attach_decline()}</button>
     </div>
-  {:else if attachment.status === 'offered' || moving}
+  {:else if attachment.status === 'queued' || attachment.status === 'offered' || moving}
     <div class="attach-actions">
       <button
         type="button"

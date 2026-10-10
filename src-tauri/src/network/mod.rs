@@ -108,6 +108,12 @@ use self::browse::{
     remove_browse_requests_for_session, send_browse_response_to_origin, PendingBrowseRequests,
 };
 use self::command::handle_command;
+
+/// Whether `friend` told us `file_hash` is friends-only on their side, from
+/// what their browse answers and offers said this run.
+pub(crate) fn friend_marked_friends_only(friend: [u8; 16], file_hash: &[u8; 16]) -> bool {
+    browse::friend_marked_friends_only(friend, file_hash)
+}
 use self::host_port_map::HostPortMap;
 use self::ember_publish::{
     ember_batch_ack_deadline, EmberBatchInFlight, EmberBatchPublisher, EmberFlushStats,

@@ -13,6 +13,7 @@ import {
   type FriendRequestInfo,
   type IncomingFileOffer,
 } from '$lib/api/friends';
+import type { StartDownloadResponse } from '$lib/types';
 import { toast, toastError, toastSuccess } from '$lib/stores/toast';
 import { notify, shouldNotify } from '$lib/notifications';
 import { chatWindowShows, isChatWindow } from '$lib/windowRole';
@@ -62,6 +63,20 @@ export const discoverabilityFailed = writable(false);
  * that is not a choice to lose to a dismissed notification.
  */
 export const fileOffers = writable<IncomingFileOffer[]>([]);
+/** {@link offerKey} of the offer being accepted, or null. Shared because the
+ *  Friends page and the chat dock list the same offers. */
+export const acceptingOffer = writable<string | null>(null);
+
+export function offerKey(userHash: string, fileHash: string): string {
+  return `${userHash.toLowerCase()}:${fileHash.toLowerCase()}`;
+}
+/**
+ * Mutual friends we hold no key for and no longer publish the legacy intro
+ * for, from the latest presence registration. Only a current Friend Code lets
+ * them find us. Nothing can be asked for it, so it fills on the first
+ * registration after launch and is kept here so that it outlives the page.
+ */
+export const legacyStrandedFriends = writable<Set<string>>(new Set());
 
 // L19: per-friend timers that automatically clear stale "searching"
 // state. The backend emits `friend-searching` and is supposed to
@@ -163,19 +178,30 @@ export function rememberFriendName(friendHash: string, nickname: string): void {
   });
 }
 
-/** Replace the cache from an authoritative list (the Friends page's own load). */
+/** Replace the cache from an authoritative list. A name the list no longer
+ *  carries goes too: a removed friend's name would otherwise keep counting
+ *  toward {@link friendNameIsAmbiguous} for everyone still listed. */
 export function rememberFriendNames(friends: FriendInfo[]): void {
+  const next = new Map<string, string>();
+  for (const friend of friends) {
+    const name = (friend.nickname ?? '').trim();
+    if (name) next.set(friend.user_hash.toLowerCase(), name);
+  }
   friendNames.update((names) => {
-    let changed = false;
+    if (names.size !== next.size) return next;
+    for (const [hash, name] of next) if (names.get(hash) !== name) return next;
+    return names;
+  });
+}
+
+/** Drop one friend's name, for an identity that was removed or blocked. */
+export function forgetFriendName(friendHash: string): void {
+  const hash = friendHash.toLowerCase();
+  friendNames.update((names) => {
+    if (!names.has(hash)) return names;
     const next = new Map(names);
-    for (const friend of friends) {
-      const hash = friend.user_hash.toLowerCase();
-      const name = (friend.nickname ?? '').trim();
-      if (!name || next.get(hash) === name) continue;
-      next.set(hash, name);
-      changed = true;
-    }
-    return changed ? next : names;
+    next.delete(hash);
+    return next;
   });
 }
 
@@ -212,15 +238,34 @@ export function commitFriendsList(ticket: number, friends: FriendInfo[]): boolea
   return true;
 }
 
-export async function refreshFriendsList(): Promise<void> {
+/** Refuse every ticket handed out so far; the next one is still taken. */
+function retireFriendsFetches(): void {
+  friendsFetchLanded = friendsFetchTicket + 1;
+}
+
+/**
+ * Apply an edit the backend has already accepted (a rename, say) without
+ * waiting for a fetch. Every fetch still in flight was issued before the edit
+ * and would put the old row back, so all of them are retired. Follow with
+ * {@link refreshFriendsList} for the row as the backend stored it.
+ */
+export function patchFriendsList(edit: (friends: FriendInfo[]) => FriendInfo[]): void {
+  retireFriendsFetches();
+  writeFriendsList(edit(get(friendsList)));
+}
+
+/** Resolves with the list it published, or `null` when it failed or a newer
+ *  fetch had already landed. */
+export async function refreshFriendsList(): Promise<FriendInfo[] | null> {
   const epoch = storeEpoch;
   const ticket = beginFriendsListFetch();
   try {
     const friends = await getFriends();
-    if (epoch !== storeEpoch) return;
-    commitFriendsList(ticket, friends);
+    if (epoch !== storeEpoch) return null;
+    return commitFriendsList(ticket, friends) ? friends : null;
   } catch (e) {
     console.warn('friends: refresh list failed', e);
+    return null;
   }
 }
 
@@ -293,6 +338,20 @@ const announcedAttachments = new Set<string>();
 const recentChatSigs = new Map<string, number>();
 const CHAT_SIG_TTL_MS = 10_000;
 
+/**
+ * What live events changed while the startup snapshots were in flight. A
+ * snapshot can predate those events, so for a hash recorded here the store's
+ * current value beats the snapshot's. Null outside a seed.
+ */
+interface SeedLive {
+  online: Set<string>;
+  requests: Set<string>;
+  /** Hash → whether it was cleared, rather than only bumped. */
+  unread: Map<string, boolean>;
+  discoverable: boolean;
+}
+let seedLive: SeedLive | null = null;
+
 let initialized = false;
 let unlisteners: UnlistenFn[] = [];
 // Bumped by `cleanupFriendsStore`; see the matching comment in
@@ -326,6 +385,55 @@ export function beginFriendRequestMutation() {
 export function endFriendRequestMutation() {
   friendRequestMutationInFlight = Math.max(0, friendRequestMutationInFlight - 1);
   friendRequestsGen++;
+  if (friendRequestMutationInFlight === 0 && friendRequestReloadDropped) {
+    friendRequestReloadDropped = false;
+    scheduleFriendRequestRefetch();
+  }
+}
+
+/** A {@link reloadFriendRequests} was dropped, so nothing has reconciled the
+ *  list since; the last mutation to finish schedules a refetch. */
+let friendRequestReloadDropped = false;
+
+/** Remove a request the user just answered or blocked. Bumps the generation:
+ *  any fetch already in flight may still hold the row. */
+export function dropFriendRequest(senderHash: string): void {
+  const hash = senderHash.toLowerCase();
+  friendRequestsGen++;
+  friendRequests.update((cur) => {
+    const next = cur.filter((r) => r.sender_hash !== hash);
+    return next.length === cur.length ? cur : next;
+  });
+}
+
+/**
+ * Re-read the request queue after a local accept, reject or add. Dropped when
+ * another mutation began, ended or removed a row meanwhile, since the answer
+ * may predate that change and put a dismissed row back.
+ */
+export async function reloadFriendRequests(): Promise<void> {
+  const epoch = storeEpoch;
+  const gen = friendRequestsGen;
+  try {
+    const reqs = await getFriendRequests();
+    if (epoch !== storeEpoch) return;
+    if (gen !== friendRequestsGen) {
+      retryDroppedFriendRequestRead();
+      return;
+    }
+    friendRequests.set(reqs);
+  } catch (e) {
+    // The optimistic update already adjusted the list.
+    console.warn('friends: request reload failed', e);
+  }
+}
+
+/** A read of the request queue was discarded because the list changed under
+ *  it. Something still has to reconcile: the last mutation to finish if one
+ *  is running, otherwise a fresh debounced read. */
+function retryDroppedFriendRequestRead() {
+  if (friendRequestMutationInFlight > 0) friendRequestReloadDropped = true;
+  else scheduleFriendRequestRefetch();
 }
 
 function scheduleFriendRequestRefetch() {
@@ -333,9 +441,14 @@ function scheduleFriendRequestRefetch() {
   friendRequestRefetchTimer = setTimeout(() => {
     friendRequestRefetchTimer = null;
     const gen = friendRequestsGen;
+    const epoch = storeEpoch;
     getFriendRequests()
       .then((reqs) => {
-        if (friendRequestMutationInFlight > 0 || gen !== friendRequestsGen) return;
+        if (epoch !== storeEpoch) return;
+        if (friendRequestMutationInFlight > 0 || gen !== friendRequestsGen) {
+          retryDroppedFriendRequestRead();
+          return;
+        }
         friendRequests.set(reqs);
       })
       .catch((err) => {
@@ -369,6 +482,7 @@ export async function initFriendsStore() {
         // minutes for a friend who never left is the fastest way to get the
         // whole feature switched off.
         const wasOnline = get(onlineFriends).has(hash);
+        seedLive?.online.add(hash);
         onlineFriends.update((s) => (s.has(hash) ? s : new Set([...s, hash])));
         searchingFriends.update((s) => { const next = new Set(s); next.delete(hash); return next; });
         clearSearchTimer(hash);
@@ -381,6 +495,7 @@ export async function initFriendsStore() {
       await listen<{ user_hash: string }>('ember:friend-offline', (event) => {
         const hash = validFriendHash(event.payload?.user_hash);
         if (!hash) return;
+        seedLive?.online.add(hash);
         onlineFriends.update((s) => { const next = new Set(s); next.delete(hash); return next; });
       }),
     );
@@ -412,6 +527,7 @@ export async function initFriendsStore() {
         const beingRead =
           (isAppVisible() && get(activeChatHash) === hash) || chatWindowShows(hash);
         if (!beingRead) {
+          if (seedLive && !seedLive.unread.has(hash)) seedLive.unread.set(hash, false);
           unreadCounts.update((m) => {
             const next = new Map(m);
             next.set(hash, (next.get(hash) || 0) + 1);
@@ -462,6 +578,7 @@ export async function initFriendsStore() {
         const emberRaw = (event.payload?.ember_file_hash ?? '').trim().toLowerCase();
         const ember_file_hash =
           emberRaw.length === 64 && /^[0-9a-f]+$/.test(emberRaw) ? emberRaw : undefined;
+        const friends_only = event.payload?.friends_only === true;
         fileOffers.update((offers) => {
           // A friend re-offering the same file replaces the earlier prompt
           // instead of stacking duplicates.
@@ -469,7 +586,10 @@ export async function initFriendsStore() {
             (o) => !(o.user_hash === user_hash && o.file_hash === file_hash),
           );
           // Bound the list so a misbehaving friend cannot grow it without end.
-          return [...rest, { user_hash, file_hash, file_name, file_size, ember_file_hash }].slice(-20);
+          return [
+            ...rest,
+            { user_hash, file_hash, file_name, file_size, ember_file_hash, friends_only },
+          ].slice(-20);
         });
         if (shouldNotify('friend_message', user_hash)) {
           void notify(
@@ -529,6 +649,7 @@ export async function initFriendsStore() {
           const alreadyPending = get(friendRequests).some(
             (r) => r.sender_hash === sender_hash,
           );
+          seedLive?.requests.add(sender_hash);
           // Optimistic merge from the event payload so we don't pay
           // for a full DB round-trip on every inbound request. The
           // backend may emit the same logical request twice in quick
@@ -622,6 +743,7 @@ export async function initFriendsStore() {
         if (!hash) return;
         // They cancelled before we answered, so the card goes without comment —
         // there is nothing left to accept and nothing for the user to decide.
+        seedLive?.requests.add(hash);
         friendRequests.update((cur) => cur.filter((r) => r.sender_hash !== hash));
         scheduleFriendRequestRefetch();
       }),
@@ -634,6 +756,7 @@ export async function initFriendsStore() {
         // without asking us. Drop any leftover request row from the old
         // path that queued that accept, then say what happened — otherwise
         // the reply the user was waiting for arrives with no sign at all.
+        seedLive?.requests.add(hash);
         friendRequests.update((cur) => cur.filter((r) => r.sender_hash !== hash));
         scheduleFriendRequestRefetch();
         const nickname = safeEventText(event.payload?.nickname, 128);
@@ -644,8 +767,24 @@ export async function initFriendsStore() {
       }),
     );
     registered.push(
-      await listen<{ discoverable: boolean; nodes: number; reason?: string; initial?: boolean }>('ember:friend-discoverable', (event) => {
+      await listen<{
+        discoverable: boolean;
+        nodes: number;
+        reason?: string;
+        initial?: boolean;
+        intro_ok?: boolean;
+        legacy_stranded_friends?: unknown;
+      }>('ember:friend-discoverable', (event) => {
+        // A failed registration carries no presence detail; keep the last answer.
+        if (typeof event.payload?.intro_ok === 'boolean') {
+          const raw = event.payload.legacy_stranded_friends;
+          const hashes = Array.isArray(raw)
+            ? raw.map(validFriendHash).filter((h): h is string => h !== null)
+            : [];
+          legacyStrandedFriends.set(new Set(hashes));
+        }
         if (typeof event.payload?.discoverable === 'boolean') {
+          if (seedLive) seedLive.discoverable = true;
           isDiscoverable.set(event.payload.discoverable);
           // Only an *initial* registration failure counts as confirmed: it
           // means presence was never established. A failed heartbeat also
@@ -693,41 +832,70 @@ export async function initFriendsStore() {
   }
   unlisteners.push(...registered);
 
-  // Every await below re-checks `myEpoch` before touching a store: a
-  // cleanup that lands between two of these calls must not let the later
-  // one's response repopulate a store that was just reset for the next
-  // init cycle.
-  try {
-    const reqs = await getFriendRequests();
-    if (myEpoch !== storeEpoch) return;
-    friendRequests.set(reqs);
-  } catch (e) {
-    noteFriendsSeedFailure('getFriendRequests', e);
-  }
+  // The seeds are independent and run together. Each re-checks `myEpoch`
+  // before touching a store: a cleanup that lands while one is in flight must
+  // not let its response repopulate a store that was just reset for the next
+  // init cycle. The listeners above are live throughout, so each seed also
+  // defers to what they changed meanwhile (see `SeedLive`).
+  const live: SeedLive = { online: new Set(), requests: new Set(), unread: new Map(), discoverable: false };
+  seedLive = live;
 
-  try {
-    const counts = await getUnreadMessageCounts();
-    if (myEpoch !== storeEpoch) return;
-    // Merge rather than replace: the `ember:chat-message` listener is
-    // registered above, so an inbound message that lands during init has
-    // already bumped `unreadCounts`. A blind `set` would drop that live
-    // increment. Take the max per friend so we neither lose a bump that the
-    // DB snapshot hasn't captured yet nor double-count one it already has.
-    unreadCounts.update((cur) => {
-      const next = new Map<string, number>();
-      for (const [hash, n] of counts) {
-        const key = hash.toLowerCase();
-        next.set(key, Math.max(next.get(key) ?? 0, n));
+  const seedRequests = async () => {
+    const gen = friendRequestsGen;
+    try {
+      const reqs = await getFriendRequests();
+      if (myEpoch !== storeEpoch) return;
+      // The list changed meanwhile (a block does not reload it), so this
+      // answer may be stale; read again rather than leave it unreconciled.
+      if (gen !== friendRequestsGen) {
+        retryDroppedFriendRequestRead();
+        return;
       }
-      for (const [hash, n] of cur) {
-        const key = hash.toLowerCase();
-        next.set(key, Math.max(next.get(key) ?? 0, n));
+      friendRequests.update((cur) => {
+        if (live.requests.size === 0) return reqs;
+        const kept = cur.filter((r) => live.requests.has(r.sender_hash));
+        const rest = reqs.filter((r) => !live.requests.has(r.sender_hash));
+        return [...kept, ...rest].sort((a, b) => b.received_at - a.received_at);
+      });
+    } catch (e) {
+      noteFriendsSeedFailure('getFriendRequests', e);
+    }
+  };
+
+  const seedUnread = async () => {
+    try {
+      // A message is stored before it is announced, so the snapshot is exact
+      // for every friend nothing happened to while it was being read. For one
+      // that did, it may or may not include the change: ask once more, and if
+      // that is not quiet either, a clear (which follows a successful
+      // mark-read) stands, and a bump takes the larger count, which can at
+      // worst miss one message.
+      for (let attempt = 0; ; attempt++) {
+        live.unread = new Map();
+        const counts = await getUnreadMessageCounts();
+        if (myEpoch !== storeEpoch) return;
+        const touched = live.unread;
+        if (touched.size > 0 && attempt === 0) continue;
+        const snapshot = new Map<string, number>();
+        for (const [hash, n] of counts) snapshot.set(hash.toLowerCase(), n);
+        unreadCounts.update((cur) => {
+          const next = new Map<string, number>();
+          for (const [hash, n] of snapshot) {
+            if (n > 0 && !touched.has(hash)) next.set(hash, n);
+          }
+          for (const [hash, cleared] of touched) {
+            const now = cur.get(hash) ?? 0;
+            const n = cleared ? now : Math.max(now, snapshot.get(hash) ?? 0);
+            if (n > 0) next.set(hash, n);
+          }
+          return next;
+        });
+        return;
       }
-      return next;
-    });
-  } catch (e) {
-    noteFriendsSeedFailure('getUnreadMessageCounts', e);
-  }
+    } catch (e) {
+      noteFriendsSeedFailure('getUnreadMessageCounts', e);
+    }
+  };
 
   // M6: previously `isDiscoverable` only flipped when the backend
   // emitted `ember:friend-discoverable`, which doesn't fire until
@@ -736,39 +904,53 @@ export async function initFriendsStore() {
   // seconds even when the user already had discovery enabled in a
   // prior session. Seed the store from the same backend status the
   // event would carry, so the UI is correct on first paint.
-  try {
-    const discoverable = await isFriendDiscoverable();
-    if (myEpoch !== storeEpoch) return;
-    isDiscoverable.set(discoverable);
-  } catch (e) {
-    noteFriendsSeedFailure('isFriendDiscoverable', e);
-  }
+  const seedDiscoverable = async () => {
+    try {
+      const discoverable = await isFriendDiscoverable();
+      if (myEpoch !== storeEpoch || live.discoverable) return;
+      isDiscoverable.set(discoverable);
+    } catch (e) {
+      noteFriendsSeedFailure('isFriendDiscoverable', e);
+    }
+  };
 
   // Seed the online set from the backend's current view so friends don't all
   // show offline (chat/browse disabled) until the next `ember:friend-online`
-  // transition. Merge rather than replace so any online event that landed
-  // during init isn't dropped.
-  try {
-    const online = await getOnlineFriends();
-    if (myEpoch !== storeEpoch) return;
-    onlineFriends.update((s) => new Set([...s, ...online.map((h) => h.toLowerCase())]));
-  } catch (e) {
-    noteFriendsSeedFailure('getOnlineFriends', e);
-  }
+  // transition. A friend an online/offline event moved meanwhile keeps what
+  // the event said.
+  const seedOnline = async () => {
+    try {
+      const online = await getOnlineFriends();
+      if (myEpoch !== storeEpoch) return;
+      onlineFriends.update((s) => {
+        const next = new Set(s);
+        for (const raw of online) {
+          const hash = raw.toLowerCase();
+          if (!live.online.has(hash)) next.add(hash);
+        }
+        return next.size === s.size ? s : next;
+      });
+    } catch (e) {
+      noteFriendsSeedFailure('getOnlineFriends', e);
+    }
+  };
 
   // Names, so a notification raised before the user has opened /friends can
-  // still say who it is about. Last of the seeds because nothing blocks on it:
-  // `friendDisplayName` degrades to a short hash until this lands. Ticketed
-  // like every other fetch: this one sits behind a long chain of awaits, so a
-  // page that loaded the list meanwhile must not be rolled back to it.
-  const seedTicket = beginFriendsListFetch();
-  try {
-    const friends = await getFriends();
-    if (myEpoch !== storeEpoch) return;
-    commitFriendsList(seedTicket, friends);
-  } catch (e) {
-    noteFriendsSeedFailure('getFriends', e);
-  }
+  // still say who it is about. Ticketed like every other fetch, so a page that
+  // loaded the list meanwhile is not rolled back to this one.
+  const seedFriends = async () => {
+    const seedTicket = beginFriendsListFetch();
+    try {
+      const friends = await getFriends();
+      if (myEpoch !== storeEpoch) return;
+      commitFriendsList(seedTicket, friends);
+    } catch (e) {
+      noteFriendsSeedFailure('getFriends', e);
+    }
+  };
+
+  await Promise.all([seedRequests(), seedUnread(), seedDiscoverable(), seedOnline(), seedFriends()]);
+  if (seedLive === live) seedLive = null;
 }
 
 /** Frontend-only: a window cleared a friend's unread count. The other window
@@ -777,6 +959,7 @@ const UNREAD_CLEARED_EVENT = 'ember-ui:unread-cleared';
 
 function dropUnread(friendHash: string) {
   const hash = friendHash.toLowerCase();
+  seedLive?.unread.set(hash, true);
   unreadCounts.update((m) => {
     if (!m.has(hash) && !m.has(friendHash)) return m;
     const next = new Map(m);
@@ -834,9 +1017,11 @@ export function cleanupFriendsStore() {
   // numbers a fetch from the previous one is still holding, and the page
   // callers commit against their own `destroyed`/`mounted` flag rather than
   // `storeEpoch` — so a remount is exactly when a stale list could land.
-  friendsFetchLanded = friendsFetchTicket;
+  retireFriendsFetches();
   friendRequestsGen++;
   friendRequestMutationInFlight = 0;
+  friendRequestReloadDropped = false;
+  seedLive = null;
   // Re-armed for the next init. Latched for the lifetime of the module, the
   // "already said so" memo meant a second cycle that failed again — Ember turned
   // off and on, a dev remount — loaded nothing and said nothing, leaving an empty
@@ -856,30 +1041,41 @@ export function cleanupFriendsStore() {
   isDiscoverable.set(false);
   discoverabilityFailed.set(false);
   fileOffers.set([]);
+  acceptingOffer.set(null);
+  legacyStrandedFriends.set(new Set());
   activeChatHash.set(null);
 }
 
-/** Accept an unsolicited friend file offer through the normal download path. */
-export async function acceptIncomingFileOffer(offer: IncomingFileOffer) {
-  const { startDownload } = await import('$lib/api/transfers');
-  const friend = get(friendsList).find(
-    (row) => row.user_hash.toLowerCase() === offer.user_hash.toLowerCase(),
-  );
-  const ip = friend?.last_ip?.trim() ?? '';
-  const port = friend?.last_port ?? 0;
-  const res = await startDownload(
-    offer.file_hash,
-    offer.file_name,
-    offer.file_size,
-    ip && port > 0 ? ip : '',
-    ip && port > 0 ? port : 0,
-    undefined,
-    offer.ember_file_hash,
-    undefined,
-    offer.user_hash,
-  );
-  clearFileOffer(offer.user_hash, offer.file_hash);
-  return res;
+/** Accept an unsolicited friend file offer through the normal download path.
+ *  Resolves with `null`, starting nothing, while another accept is running. */
+export async function acceptIncomingFileOffer(
+  offer: IncomingFileOffer,
+): Promise<StartDownloadResponse | null> {
+  if (get(acceptingOffer) !== null) return null;
+  acceptingOffer.set(offerKey(offer.user_hash, offer.file_hash));
+  try {
+    const { startDownload } = await import('$lib/api/transfers');
+    const friend = get(friendsList).find(
+      (row) => row.user_hash.toLowerCase() === offer.user_hash.toLowerCase(),
+    );
+    const ip = friend?.last_ip?.trim() ?? '';
+    const port = friend?.last_port ?? 0;
+    const res = await startDownload(
+      offer.file_hash,
+      offer.file_name,
+      offer.file_size,
+      ip && port > 0 ? ip : '',
+      ip && port > 0 ? port : 0,
+      undefined,
+      offer.ember_file_hash,
+      undefined,
+      offer.user_hash,
+    );
+    clearFileOffer(offer.user_hash, offer.file_hash);
+    return res;
+  } finally {
+    acceptingOffer.set(null);
+  }
 }
 
 /** Frontend-only: a window accepted or dismissed a file offer. Both windows

@@ -5224,8 +5224,9 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::ChatAttachmentPreflight { ember_hash: friend_eh, tx } => {
+            // A friend we cannot reach yet still gets the file: it queues.
             let result = if friend_hashes.read().await.contains(&friend_eh) {
-                super::chat_attach::offer_preflight(state, settings, &friend_eh)
+                super::chat_attach::offer_path(state, settings, &friend_eh)
                     .await
                     .map(|_| ())
             } else {
@@ -6518,26 +6519,7 @@ async fn handle_command_inner(
             ember_hash: friend_eh,
             request_id,
         } => {
-            if let Some((retired_session_id, invalidated)) =
-                cancel_browse_request(&mut state.pending_browse_requests, friend_eh, &request_id)
-            {
-                if let Some(session_id) = retired_session_id.filter(|id| *id != 0) {
-                    // A browse response cannot be cancelled on the ED2K wire.
-                    // Retire this canonical session so its late response is
-                    // never attributed to a later local request.
-                    let _ =
-                        retire_ember_session(&state.ember_sessions, friend_eh, session_id).await;
-                    for invalidated_id in invalidated {
-                        let _ = app_handle.emit(
-                            "ember:browse-error",
-                            serde_json::json!({
-                                "user_hash": hex::encode(friend_eh),
-                                "request_id": invalidated_id,
-                                "reason": "Browse session was reset after cancellation",
-                            }),
-                        );
-                    }
-                }
+            if cancel_browse_request(&mut state.pending_browse_requests, friend_eh, &request_id) {
                 dispatch_browse_head(state, app_handle, friend_eh).await;
             }
         }
@@ -6733,7 +6715,7 @@ async fn handle_command_inner(
                                     db_for_clear.clear_friend_address(&hash_hex_clear)
                                 })
                                 .await;
-                                let _ = cancel_browse_request(
+                                let _ = remove_browse_request(
                                     &mut state.pending_browse_requests,
                                     friend_eh,
                                     &request_id,
@@ -6866,51 +6848,15 @@ async fn handle_command_inner(
             ember_hash: removed_hash,
             tx,
         } => {
-            upload_server::revoke_all_secure_sessions(removed_hash);
-            state.online_friends.remove(&removed_hash);
-            let _ = retire_current_ember_session(&state.ember_sessions, removed_hash).await;
-            // Also drop any pending outbound-search slot so a remove
-            // immediately followed by re-add isn't blocked for up to
-            // 10 minutes by a stale entry.
-            state.outbound_session_tasks.remove(&removed_hash);
-            state.friend_reconnect_last.remove(&removed_hash);
-            state.recent_ember_chat.remove(&removed_hash);
-            super::browse::forget_friend_scope(removed_hash);
-            super::chat_attach::forget_friend(state, settings, &removed_hash);
-
-            if let Some(pending) = state.pending_browse_requests.remove(&removed_hash) {
-                for request in pending {
-                    let _ = app_handle.emit(
-                        "ember:browse-error",
-                        serde_json::json!({
-                            "user_hash": hex::encode(removed_hash),
-                            "request_id": request.request_id,
-                            "reason": "Friend was removed",
-                        }),
-                    );
-                }
-            }
-
-            // Queue entries outlive their originating TCP connection for
-            // eMule seniority.  Strip only the friend-priority bit; standard
-            // queue/file-transfer behavior and verified Ember accounting stay
-            // intact.
-            {
-                let mut queue = upload_queue.lock().await;
-                for entry in queue.iter_mut() {
-                    let matches_removed = entry.ember_pubkey.is_some_and(|pk| {
-                        crate::network::ember::crypto::verifying_key_from_bytes(&pk).is_some_and(
-                            |vk| {
-                                crate::network::ember::crypto::node_id_from_public_key(&vk)
-                                    == removed_hash
-                            },
-                        )
-                    });
-                    if matches_removed {
-                        entry.is_friend_slot = false;
-                    }
-                }
-            }
+            super::friends::forget_friend_network_state(
+                state,
+                settings,
+                app_handle,
+                upload_queue,
+                removed_hash,
+                "Friend was removed",
+            )
+            .await;
             let _ = tx.send(());
         }
 

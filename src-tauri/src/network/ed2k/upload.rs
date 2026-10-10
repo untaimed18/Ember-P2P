@@ -420,7 +420,11 @@ fn note_upload_refusal(path: &std::path::Path, allowed_roots: &[String], error: 
 /// harmless. Private content is the opposite: honouring a one-sided add there
 /// would let anyone who learns our Ember hash add us and read our friends-only
 /// library. So this additionally requires that the peer added us back.
+///
+/// Membership of both sets is required: removal clears the two separately, so
+/// a grant racing a removal can leave a stale mutual entry behind.
 async fn mutual_friend_access(
+    friend_hashes: &Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     mutual_friend_hashes: &Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     peer_ember_hash: Option<[u8; 16]>,
     secure_v2_authenticated: bool,
@@ -429,7 +433,11 @@ async fn mutual_friend_access(
         return false;
     }
     match peer_ember_hash {
-        Some(hash) => mutual_friend_hashes.read().await.contains(&hash),
+        Some(hash) => {
+            // Separate statements, so neither guard is held while taking the other.
+            let mutual = mutual_friend_hashes.read().await.contains(&hash);
+            mutual && friend_hashes.read().await.contains(&hash)
+        }
         None => false,
     }
 }
@@ -1371,6 +1379,11 @@ const CLIENT_TIMEOUT_SECS: u64 = 120;
 /// 150 queued peers where aMule reached ~400 on the same share and server
 /// (issue #111).
 const QUEUED_SOCKET_IDLE_SECS: u64 = 40;
+
+/// How often we send `OP_EMBER_KEEPALIVE` on an Ember friend session we own,
+/// counted from our previous keepalive. Matches the dialling side's interval in
+/// `friend_connect`, and is no more than half the secure stream's record timeout.
+const FRIEND_SESSION_KEEPALIVE_SECS: u64 = 90;
 /// One wall-clock budget covers transport discrimination, optional
 /// obfuscation/secure-stream negotiation, and receipt of the first complete
 /// eD2K frame.
@@ -2650,6 +2663,9 @@ pub enum UploadEventKind {
         session_id: u64,
         reply_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
         supports_ebr1: bool,
+        /// The session has sent `EMBER_EXT_BROWSE_SCOPE_AWARE`, so it will
+        /// honour friends-only markings. Without it, none are listed.
+        supports_scope: bool,
     },
     /// Incoming Ember browse response from a friend (outbound session).
     /// Each entry is `(ed2k_hash_hex, size, name, optional_aich_hash_hex, optional_ember_hex)`.
@@ -5339,9 +5355,33 @@ impl UploadHandler {
     /// Nothing is charged while the friends-only catalog is still loading:
     /// every indexed file is refused to strangers alike until it lands, so
     /// those misses say nothing about the asker.
-    async fn note_unservable_file_request(&self, peer_ip: std::net::IpAddr, file_hash: [u8; 16]) {
+    ///
+    /// Nor for anything asked under the user hash of a mutual friend. A
+    /// friend's downloader dials plain eD2K first and only then escalates to
+    /// the secure transfer, so queueing a dozen friends-only files from Browse
+    /// would otherwise ban the friend's IP for two hours. The hash is only
+    /// claimed, but sparing the counter grants nothing: the answer stays
+    /// `OP_FILEREQANSNOFIL`. It has to cover every miss, not just restricted
+    /// ones, or whether a ban follows would tell restricted from absent.
+    async fn note_unservable_file_request(
+        &self,
+        peer_ip: std::net::IpAddr,
+        peer_user_hash: [u8; 16],
+        file_hash: [u8; 16],
+    ) {
         if !friends_only_snapshot_ready(&self.friends_only_hashes) {
             return;
+        }
+        let claimed_friend = self
+            .credit_manager
+            .read()
+            .await
+            .get_record(&peer_user_hash)
+            .and_then(|record| record.ember_hash);
+        if let Some(friend) = claimed_friend {
+            if self.mutual_friend_hashes.read().await.contains(&friend) {
+                return;
+            }
         }
         let banned = self
             .abuse_tracker
@@ -5400,6 +5440,7 @@ impl UploadHandler {
                 // the lock.
                 if self.hash_is_friends_only(file_hash).await
                     && !mutual_friend_access(
+                        &self.friend_hashes,
                         &self.mutual_friend_hashes,
                         peer.ember_hash,
                         peer.secure_v2_authenticated,
@@ -5477,6 +5518,7 @@ impl UploadHandler {
         if (self.hash_is_friends_only(file_hash).await
             || self.partial_restricted_by_friend(file_hash).await)
             && !mutual_friend_access(
+                &self.friend_hashes,
                 &self.mutual_friend_hashes,
                 peer.ember_hash,
                 peer.secure_v2_authenticated,
@@ -5559,6 +5601,7 @@ impl UploadHandler {
         };
         if self.hash_is_friends_only(file_hash).await {
             return mutual_friend_access(
+                &self.friend_hashes,
                 &self.mutual_friend_hashes,
                 peer.ember_hash,
                 peer.secure_v2_authenticated,
@@ -5586,6 +5629,7 @@ impl UploadHandler {
         match live_download {
             Some(true) => {
                 mutual_friend_access(
+                    &self.friend_hashes,
                     &self.mutual_friend_hashes,
                     peer.ember_hash,
                     peer.secure_v2_authenticated,
@@ -8196,6 +8240,9 @@ impl UploadHandler {
         // sessions send immediately below; classic Ember file sockets
         // send after HELLO (or when the user adds the peer mid-session).
         let mut friend_request_sent = false;
+        // Set once the friend sends `EMBER_EXT_BROWSE_SCOPE_AWARE`; until then
+        // our browse answers on this session leave friends-only files out.
+        let mut peer_scope_aware = false;
         let mut identity_emitted = false;
         if is_friend && !hello_caps.is_ember {
             info!("Peer {peer_addr} is a friend but is_ember=false, skipping friend request");
@@ -8928,7 +8975,13 @@ impl UploadHandler {
                 let wait_secs = if queued_identity.is_some() {
                     1
                 } else if owns_ember_slot {
-                    90
+                    // Due when our own last keepalive is, not 90s after the
+                    // last inbound packet: the friend's keepalives would
+                    // otherwise keep pushing ours back, and as neither side
+                    // answers one, the friend's reader would starve.
+                    FRIEND_SESSION_KEEPALIVE_SECS
+                        .saturating_sub(last_friend_keepalive.elapsed().as_secs())
+                        .max(1)
                 } else if slot_guard.is_active() {
                     SLOT_IDLE_TIMEOUT_SECS
                 } else {
@@ -8982,6 +9035,22 @@ impl UploadHandler {
                 match read_result {
                     Ok(Some(Ok(p))) => {
                         last_inbound = std::time::Instant::now();
+                        // Also due here, not only on the read timeout: inbound
+                        // packets less than the wait apart would postpone it
+                        // for as long as they kept coming.
+                        if owns_ember_slot
+                            && last_friend_keepalive.elapsed().as_secs()
+                                >= FRIEND_SESSION_KEEPALIVE_SECS
+                        {
+                            last_friend_keepalive = std::time::Instant::now();
+                            if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_KEEPALIVE, &[])
+                                .await
+                                .is_err()
+                            {
+                                debug!("Friend keepalive failed, closing session");
+                                break;
+                            }
+                        }
                         p
                     }
                     Ok(Some(Err(e))) => {
@@ -9269,9 +9338,12 @@ impl UploadHandler {
                             continue;
                         }
                         if owns_ember_slot {
-                            if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_KEEPALIVE, &[]).await.is_err() {
-                                debug!("Friend keepalive failed, closing session");
-                                break;
+                            if last_friend_keepalive.elapsed().as_secs() >= FRIEND_SESSION_KEEPALIVE_SECS {
+                                last_friend_keepalive = std::time::Instant::now();
+                                if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_KEEPALIVE, &[]).await.is_err() {
+                                    debug!("Friend keepalive failed, closing session");
+                                    break;
+                                }
                             }
                             continue;
                         }
@@ -9658,7 +9730,7 @@ impl UploadHandler {
                                 &hash,
                             )
                             .await?;
-                            self.note_unservable_file_request(peer_addr.ip(), hash).await;
+                            self.note_unservable_file_request(peer_addr.ip(), peer_user_hash, hash).await;
                             current_file_hash = None;
                             total_size = 0;
                         }
@@ -9721,7 +9793,7 @@ impl UploadHandler {
                                 &hash,
                             )
                             .await?;
-                            self.note_unservable_file_request(peer_addr.ip(), hash).await;
+                            self.note_unservable_file_request(peer_addr.ip(), peer_user_hash, hash).await;
                             if !slot_guard.is_active() {
                                 current_file_hash = None;
                                 total_size = 0;
@@ -9772,7 +9844,7 @@ impl UploadHandler {
                             &h,
                         )
                         .await?;
-                        self.note_unservable_file_request(peer_addr.ip(), h).await;
+                        self.note_unservable_file_request(peer_addr.ip(), peer_user_hash, h).await;
                         if !slot_guard.is_active() {
                             current_file_hash = None;
                             total_size = 0;
@@ -13620,6 +13692,7 @@ impl UploadHandler {
                                     reply_tx: outbound_tx.clone(),
                                     supports_ebr1:
                                         super::multi_source::browse_request_supports_v1(&payload),
+                                    supports_scope: peer_scope_aware,
                                 },
                             }).await;
                         }
@@ -13884,6 +13957,9 @@ impl UploadHandler {
                                         })
                                         .await;
                                 }
+                            }
+                            Some((super::messages::EMBER_EXT_BROWSE_SCOPE_AWARE, _)) => {
+                                peer_scope_aware = true;
                             }
                             // A sub-type this build predates. Ignoring it is
                             // the whole point of the envelope.

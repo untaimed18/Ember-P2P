@@ -998,7 +998,7 @@ fn browse_responses_are_bound_to_the_sending_session() {
     assert_eq!(complete_browse_request(&mut pending, friend, 12), None);
     assert_eq!(
         complete_browse_request(&mut pending, friend, 11),
-        Some("first".into())
+        Some(crate::network::browse::BrowseCompletion::Deliver("first".into()))
     );
     // The replacement-session request is now the unsent head. The
     // dispatcher must see this transition and send it on session 12.
@@ -1020,26 +1020,57 @@ async fn browse_response_uses_origin_stream_during_dual_dial() {
     assert!(canonical_rx.try_recv().is_err());
 }
 
+/// Cancelling a sent browse keeps it at the head to absorb its answer, so the
+/// next request on the same session is not shown the cancelled one's reply,
+/// and the session itself survives.
 #[test]
-fn cancelling_active_browse_retires_its_session_queue() {
+fn a_cancelled_sent_browse_absorbs_its_late_answer() {
+    use crate::network::browse::BrowseCompletion;
     let friend = [0xB2; 16];
     let mut pending = PendingBrowseRequests::new();
     enqueue_browse_request(&mut pending, friend, "cancelled".into(), 21).unwrap();
+    pending.get_mut(&friend).unwrap().front_mut().unwrap().dispatched = true;
     enqueue_browse_request(&mut pending, friend, "queued".into(), 21).unwrap();
 
+    assert!(cancel_browse_request(&mut pending, friend, "cancelled"));
     assert_eq!(
-        cancel_browse_request(&mut pending, friend, "cancelled"),
-        Some((Some(21), vec!["queued".into()]))
+        complete_browse_request(&mut pending, friend, 21),
+        Some(BrowseCompletion::Absorbed),
+        "the late answer is the cancelled request's, not the next one's"
     );
-    // A late response after cancellation cannot be shown as either the
-    // cancelled request or a later browse on the replacement session.
-    assert_eq!(complete_browse_request(&mut pending, friend, 21), None);
-    enqueue_browse_request(&mut pending, friend, "replacement".into(), 22).unwrap();
-    assert_eq!(complete_browse_request(&mut pending, friend, 21), None);
     assert_eq!(
-        complete_browse_request(&mut pending, friend, 22),
-        Some("replacement".into())
+        complete_browse_request(&mut pending, friend, 21),
+        Some(BrowseCompletion::Deliver("queued".into()))
     );
+    assert!(!cancel_browse_request(&mut pending, friend, "cancelled"), "already gone");
+}
+
+/// A request cancelled by the dialog's timeout has been out longer than the
+/// hold, so its answer is not coming: it goes at once, and a retry queued
+/// next is not stuck behind it.
+#[test]
+fn a_browse_cancelled_after_the_hold_goes_at_once() {
+    let friend = [0xB4; 16];
+    let mut pending = PendingBrowseRequests::new();
+    enqueue_browse_request(&mut pending, friend, "timed-out".into(), 31).unwrap();
+    {
+        let head = pending.get_mut(&friend).unwrap().front_mut().unwrap();
+        head.dispatched = true;
+        head.dispatched_at = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(31));
+    }
+    assert!(cancel_browse_request(&mut pending, friend, "timed-out"));
+    assert!(!pending.contains_key(&friend), "nothing left to absorb an answer");
+}
+
+/// Nothing is on the wire for a request not yet sent, so cancelling it just
+/// removes it.
+#[test]
+fn cancelling_an_unsent_browse_just_removes_it() {
+    let friend = [0xB3; 16];
+    let mut pending = PendingBrowseRequests::new();
+    enqueue_browse_request(&mut pending, friend, "unsent".into(), 0).unwrap();
+    assert!(cancel_browse_request(&mut pending, friend, "unsent"));
+    assert!(!pending.contains_key(&friend));
 }
 
 /// Removing a friend who still had a live session hung the entire network
@@ -1087,7 +1118,7 @@ async fn removing_a_friend_retires_its_session_without_deadlocking() {
 }
 
 #[tokio::test]
-async fn cancelling_browse_retires_the_live_session_before_rebrowse() {
+async fn retiring_a_session_closes_only_that_session_once() {
     let friend = [0xC3; 16];
     let sessions: upload_server::EmberSessionMap = Arc::new(RwLock::new(HashMap::new()));
     let (first_tx, _first_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
@@ -1096,10 +1127,6 @@ async fn cancelling_browse_retires_the_live_session_before_rebrowse() {
     let mut first_shutdown = first.subscribe_shutdown();
     sessions.write().await.insert(friend, first);
 
-    let mut pending = PendingBrowseRequests::new();
-    enqueue_browse_request(&mut pending, friend, "first".into(), first_id).unwrap();
-    let (retired, _) = cancel_browse_request(&mut pending, friend, "first").unwrap();
-    assert_eq!(retired, Some(first_id));
     assert!(retire_ember_session(&sessions, friend, first_id).await);
     first_shutdown
         .changed()
@@ -1108,8 +1135,8 @@ async fn cancelling_browse_retires_the_live_session_before_rebrowse() {
     assert!(*first_shutdown.borrow());
     assert!(!sessions.read().await.contains_key(&friend));
 
-    // A re-browse receives a distinct session, and an accidental repeat
-    // cancellation cannot close the retired session a second time.
+    // A reconnect receives a distinct session, and a repeat retire cannot
+    // close the retired session a second time.
     assert!(!retire_ember_session(&sessions, friend, first_id).await);
     let (second_tx, _second_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
     let second = upload_server::EmberSessionHandle::new(second_tx, [0u8; 32]);

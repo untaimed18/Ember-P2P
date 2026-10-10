@@ -4,14 +4,18 @@ import {
   beginFriendsListFetch,
   cleanupFriendsStore,
   commitFriendsList,
+  forgetFriendName,
+  friendLabel,
+  friendNames,
   friendsList,
+  patchFriendsList,
 } from './friends';
 import type { FriendInfo } from '$lib/api/friends';
 
-function friend(userHash: string): FriendInfo {
+function friend(userHash: string, nickname = ''): FriendInfo {
   return {
     user_hash: userHash,
-    nickname: '',
+    nickname,
     added_at: 0,
     last_ip: '',
     last_port: 0,
@@ -57,5 +61,50 @@ describe('shared friends list ordering', () => {
     expect(commitFriendsList(fresh, [friend(A)])).toBe(true);
     expect(commitFriendsList(stale, [friend(B)])).toBe(false);
     expect(get(friendsList).map((f) => f.user_hash)).toEqual([A]);
+  });
+
+  it('refuses a fetch from before a teardown even when it lands first', () => {
+    const stale = beginFriendsListFetch();
+    cleanupFriendsStore();
+
+    expect(commitFriendsList(stale, [friend(B)])).toBe(false);
+    expect(get(friendsList)).toEqual([]);
+    expect(commitFriendsList(beginFriendsListFetch(), [friend(A)])).toBe(true);
+  });
+
+  it('keeps a local edit over a fetch that was already in flight', () => {
+    commitFriendsList(beginFriendsListFetch(), [friend(A, 'Old')]);
+    const inFlight = beginFriendsListFetch();
+
+    patchFriendsList((list) => list.map((f) => ({ ...f, nickname: 'New' })));
+    expect(commitFriendsList(inFlight, [friend(A, 'Old')])).toBe(false);
+    expect(get(friendsList)[0].nickname).toBe('New');
+    expect(get(friendNames).get(A)).toBe('New');
+
+    expect(commitFriendsList(beginFriendsListFetch(), [friend(A, 'Saved')])).toBe(true);
+    expect(get(friendNames).get(A)).toBe('Saved');
+  });
+});
+
+describe('friend name cache', () => {
+  it('follows the list, so a removed friend stops making a namesake ambiguous', () => {
+    commitFriendsList(beginFriendsListFetch(), [friend(A, 'Bob'), friend(B, 'Bob')]);
+    expect(friendLabel(A, null, get(friendNames))).toBe(`Bob (${A.slice(0, 8)}\u2026)`);
+
+    commitFriendsList(beginFriendsListFetch(), [friend(A, 'Bob')]);
+    expect([...get(friendNames).keys()]).toEqual([A]);
+    expect(friendLabel(A, null, get(friendNames))).toBe('Bob');
+  });
+
+  it('drops a name that was cleared in the list', () => {
+    commitFriendsList(beginFriendsListFetch(), [friend(A, 'Ana')]);
+    commitFriendsList(beginFriendsListFetch(), [friend(A, '')]);
+    expect(get(friendNames).has(A)).toBe(false);
+  });
+
+  it('forgets one friend on request', () => {
+    commitFriendsList(beginFriendsListFetch(), [friend(A, 'Ana'), friend(B, 'Bea')]);
+    forgetFriendName(A.toUpperCase());
+    expect([...get(friendNames).keys()]).toEqual([B]);
   });
 });

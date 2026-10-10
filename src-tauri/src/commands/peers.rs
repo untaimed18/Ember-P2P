@@ -462,6 +462,7 @@ pub async fn add_friend(
                 ));
             }
         }
+        revoke_mutual_if_withdrawn(&state, hash, &canonical).await;
     }
 
     // Registered before the lookup below is queued, which is the first thing
@@ -553,6 +554,22 @@ pub async fn remove_friend(
         tracing::warn!("Could not clear a removed friend's settings: {e}");
     }
     Ok(())
+}
+
+/// Undo an in-memory mutual grant whose friend row was removed (or blocked)
+/// after the grant committed but before it reached `mutual_friend_hashes`.
+/// Removal clears the set as its last act, so a grant landing after that
+/// would otherwise outlive the friendship until restart.
+async fn revoke_mutual_if_withdrawn(state: &AppState, hash: [u8; 16], canonical: &str) {
+    let db = state.db.clone();
+    let db_hash = canonical.to_string();
+    let still_mutual =
+        tokio::task::spawn_blocking(move || db.is_unblocked_mutual_friend(&db_hash)).await;
+    // A failed lookup keeps the grant: the row was committed moments ago, and
+    // `mutual_friend_access` also requires live friend membership.
+    if matches!(still_mutual, Ok(Ok(false))) {
+        state.mutual_friend_hashes.write().await.remove(&hash);
+    }
 }
 
 /// Revoke every live grant held by a friend whose database rows have just
@@ -1281,6 +1298,7 @@ pub async fn accept_friend_request(
             ));
         }
     }
+    revoke_mutual_if_withdrawn(&state, hash, &canonical).await;
 
     // Reuse the IP/port the requester left in their friend_requests
     // row (captured by `add_friend_request` at receive time). Without

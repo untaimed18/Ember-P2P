@@ -1380,6 +1380,35 @@ impl CreditManager {
         record.ember_hash = Some(ember_hash);
     }
 
+    /// [`Self::set_ember_hash`] for a `user_hash` the Ember identity only
+    /// *claims*: a Noise session proves the key, but the eD2K hash in its
+    /// HELLO is whatever the peer put there. Persists the link only when the
+    /// user hash is unbound, already bound to this identity, or bound to one
+    /// `replaceable` gives up (one that is no longer a friend, say), so one
+    /// friend cannot take over another's hash. `false` when nothing was written.
+    pub fn claim_ember_hash(
+        &mut self,
+        user_hash: [u8; 16],
+        ember_hash: [u8; 16],
+        replaceable: impl FnOnce([u8; 16]) -> bool,
+    ) -> bool {
+        if user_hash == [0u8; 16] || ember_hash == [0u8; 16] {
+            return false;
+        }
+        if let Some(bound) = self.credits.get(&user_hash).and_then(|record| record.ember_hash) {
+            if bound != ember_hash && !replaceable(bound) {
+                return false;
+            }
+        }
+        self.set_ember_hash(user_hash, ember_hash);
+        true
+    }
+
+    /// The Ember identity persisted for `user_hash`, if any.
+    pub fn persisted_ember_hash(&self, user_hash: &[u8; 16]) -> Option<[u8; 16]> {
+        self.credits.get(user_hash).and_then(|record| record.ember_hash)
+    }
+
     /// Remember, for this run only, the Ember identity an unauthenticated
     /// session bound to `user_hash` with the offline binding check.
     ///
@@ -3269,6 +3298,23 @@ mod tests {
         cm.get_or_create(key(u64::MAX));
         assert!(cm.get_record(&key(0)).is_some(), "a freshly seen record survives");
         assert_eq!(cm.credits.len(), MAX_CREDIT_RECORDS);
+    }
+
+    /// A friend's session proves its key, not the eD2K hash it names, so it
+    /// may not take over a hash already bound to someone else.
+    #[test]
+    fn a_claimed_user_hash_never_displaces_another_identitys_binding() {
+        let mut cm = CreditManager::new();
+        let victim = [0x53u8; 16];
+        let victim_ember = [0x64u8; 16];
+        let friend_ember = [0x65u8; 16];
+        assert!(cm.claim_ember_hash(victim, victim_ember, |_| false), "unbound: taken");
+        assert!(cm.claim_ember_hash(victim, victim_ember, |_| false), "same identity: fine");
+        assert!(!cm.claim_ember_hash(victim, friend_ember, |_| false));
+        assert_eq!(cm.get_record(&victim).and_then(|r| r.ember_hash), Some(victim_ember));
+        // An identity that is no longer a friend gives the hash up.
+        assert!(cm.claim_ember_hash(victim, friend_ember, |bound| bound == victim_ember));
+        assert_eq!(cm.persisted_ember_hash(&victim), Some(friend_ember));
     }
 
     #[test]

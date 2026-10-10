@@ -3981,20 +3981,19 @@
         </ul>
       {/if}
       {#if !isChannel}
-        <!-- Disabled rather than hidden while the friend is offline: the bytes
-             move over a live connection between the two of you, and a button
-             that vanished would give no hint why. -->
+        <!-- Usable while the friend is offline too: the file waits and is
+             offered when they are back, which the title says. -->
         <button
           type="button"
           class="conv-attach"
           class:busy={attaching}
           onclick={sendAttachment}
-          disabled={attaching || !isOnline}
+          disabled={attaching}
           title={attaching
             ? m.chat_attach_preparing()
             : isOnline
               ? m.chat_attach_button()
-              : m.chat_attach_offline({ name: friendName || friendHash.slice(0, 8) })}
+              : m.chat_attach_button_offline({ name: friendName || friendHash.slice(0, 8) })}
           aria-label={m.chat_attach_button()}
           aria-busy={attaching}
         >

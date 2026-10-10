@@ -282,8 +282,12 @@ pub(crate) const FRIEND_RELAY_TICKET_INITIATOR_WAIT: std::time::Duration =
     std::time::Duration::from_secs(45);
 pub(crate) const FRIEND_RELAY_TICKET_RESPONDER_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(1);
+/// Outer bound on one whole mailbox poll. Must cover both of
+/// `poll_friend_relay_tickets`' attempts at [`FRIEND_RELAY_MAILBOX_POLL_TIMEOUT`]
+/// each: a shorter one cancelled a cold poll before the client was cached, so
+/// every later poll was cold too and tickets were never seen.
 pub(crate) const FRIEND_RELAY_TICKET_POLL_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(3);
+    std::time::Duration::from_secs(17);
 pub(crate) const FRIEND_RELAY_TICKET_ACTION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10);
 const RELAY_TICKET_READ_NONCE_DOMAIN: &[u8] = b"ember-relay-ticket-read-nonce-v1\0";
@@ -3807,6 +3811,11 @@ mod relay_ticket_tests {
         std::fs::write(&path, oversized).unwrap();
         assert!(load_v4_servers(&path).is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_outer_poll_timeout_covers_both_mailbox_attempts() {
+        assert!(FRIEND_RELAY_TICKET_POLL_TIMEOUT > FRIEND_RELAY_MAILBOX_POLL_TIMEOUT * 2);
     }
 
     #[test]

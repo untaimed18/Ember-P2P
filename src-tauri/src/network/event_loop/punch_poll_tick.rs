@@ -149,7 +149,16 @@ pub(in crate::network) async fn on_punch_poll_tick(
     // outbound packet the uploader's stream would be dropped by the
     // downloader's NAT.
     let now = tokio::time::Instant::now();
-    let owe_serve_punch = !state.friend_xfer_punch_serve.is_empty();
+    // The TTL is honoured here, not only by the 5-minute cleanup tick: an
+    // entry past it would hand a later social punch from that friend the
+    // serve role, and keep this fast poll running for nothing.
+    let live_punch_serve = || {
+        state.friend_xfer_punch_serve.iter().filter(|(_, accepted)| {
+            accepted.elapsed().as_secs()
+                < crate::network::friend_transfer::FRIEND_XFER_PUNCH_SERVE_TTL_SECS
+        })
+    };
+    let owe_serve_punch = live_punch_serve().next().is_some();
     let awaiting_punch = state.friend_xfer_attempts.values().any(|attempt| {
         matches!(attempt.transport, FriendXferTransport::Punch { .. })
             && now
@@ -188,10 +197,8 @@ pub(in crate::network) async fn on_punch_poll_tick(
     // Friends we owe an uploader-role punch, keyed by the
     // same hashed rendezvous id the mailbox reports, so
     // the task can match without re-deriving.
-    let punch_serve_friends: HashMap<String, [u8; 16]> = state
-        .friend_xfer_punch_serve
-        .keys()
-        .map(|hash| (rendezvous::hashed_id(hash), *hash))
+    let punch_serve_friends: HashMap<String, [u8; 16]> = live_punch_serve()
+        .map(|(hash, _)| (rendezvous::hashed_id(hash), *hash))
         .collect();
     let known_punch_friends: HashMap<String, [u8; 16]> = friend_hashes
         .read()

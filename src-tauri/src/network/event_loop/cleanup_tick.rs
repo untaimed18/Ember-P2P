@@ -130,6 +130,28 @@ pub(in crate::network) async fn on_cleanup_tick(
             .retain(|id, _| *id == rendezvous_key || publish.has_record(id));
     }
 
+    // Chat files queued for a friend who became reachable without a
+    // session event that sends them: a relayed session that went
+    // direct, or direct connections that were not ready yet.
+    {
+        let db_queued = db.clone();
+        if let Ok(Ok(waiting)) =
+            tokio::task::spawn_blocking(move || db_queued.friends_with_queued_chat_attachments()).await
+        {
+            for friend_hex in waiting {
+                let Ok(friend) =
+                    <[u8; 16]>::try_from(hex::decode(&friend_hex).unwrap_or_default().as_slice())
+                else {
+                    continue;
+                };
+                if friend_hashes.read().await.contains(&friend) {
+                    crate::network::chat_attach::send_queued(state, db, app_handle, settings, friend)
+                        .await;
+                }
+            }
+        }
+    }
+
     // Forget inbound rate-limit stamps once they can no longer
     // reject anything.
     {

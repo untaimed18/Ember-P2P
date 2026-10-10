@@ -27,22 +27,31 @@
     clearUnread,
     beginFriendRequestMutation,
     endFriendRequestMutation,
+    dropFriendRequest,
+    reloadFriendRequests,
     fileOffers as fileOffersStore,
     clearFileOffer,
     clearFileOffersForFriend,
-    rememberFriendName,
+    forgetFriendName,
+    friendLabel as sharedFriendLabel,
     friendNames as friendNamesStore,
     friendsList as friendsListStore,
     beginFriendsListFetch,
     commitFriendsList,
+    patchFriendsList,
+    refreshFriendsList,
     acceptIncomingFileOffer,
+    acceptingOffer as acceptingOfferStore,
+    offerKey,
+    legacyStrandedFriends as legacyStrandedFriendsStore,
   } from '$lib/stores/friends';
+  import { minuteClock } from '$lib/stores/clock';
   import { appSettings } from '$lib/stores/settings';
   import { networkStats } from '$lib/stores/network';
   import { menuKeydown } from '$lib/a11y';
   import IconX from '$lib/components/IconX.svelte';
   import FriendSettingsDialog from '$lib/components/FriendSettingsDialog.svelte';
-  import { chatAllowedWith, friendOverrides } from '$lib/friendSettings';
+  import { chatAllowedWith, friendNameTooLong, friendOverrides, FRIEND_NAME_MAX_BYTES } from '$lib/friendSettings';
 
   let friends: FriendInfo[] = $derived($friendsListStore);
   function chatDisabledFor(hash: string): boolean {
@@ -72,10 +81,7 @@
   let myHashCopyTimer: ReturnType<typeof setTimeout> | undefined;
   let confirmResetCodeOpen = $state(false);
   let resettingCode = $state(false);
-  /** Mutual friends we hold no key for and no longer publish the legacy intro
-   *  for, from the latest presence registration. Only a current Friend Code
-   *  lets them find us. */
-  let legacyStrandedFriends = $state(new Set<string>());
+  let legacyStrandedFriends = $derived($legacyStrandedFriendsStore);
 
   let showAddForm = $state(false);
   let newHash = $state('');
@@ -92,8 +98,11 @@
   /** Either a friend or a stranger from the approval queue — blocking works
    *  the same for both, so only the name and hash are carried. */
   let pendingBlock: { user_hash: string; nickname: string } | null = $state(null);
+  /** Display name for the block dialog, kept for its outro like `removeDialog`. */
+  let blockDialogName = $state('');
   let blocked: BlockedInfo[] = $state([]);
   let blockedOpen = $state(false);
+  let unblocking: Set<string> = $state(new Set());
   /** Chat history sealed because its key could not be recovered. Worth saying
    *  plainly: the app otherwise looks healthy, so conversations reading as
    *  empty and sends failing would be a mystery. */
@@ -115,17 +124,6 @@
 
   let friendRequests: FriendRequestInfo[] = $derived($friendRequestsStore);
   let pendingOffers = $derived($fileOffersStore);
-  /** Offer currently being accepted, so its buttons can be disabled. */
-  let acceptingOffer: string | null = $state(null);
-
-  function offerKey(userHash: string, fileHash: string): string {
-    return `${userHash}:${fileHash}`;
-  }
-
-  function friendLabel(userHash: string): string {
-    const f = friends.find(x => x.user_hash.toLowerCase() === userHash.toLowerCase());
-    return f?.nickname || userHash.slice(0, 8) + '\u2026';
-  }
 
   /** Blank for a sizeless offer; otherwise the app-wide byte format, so an
    *  offer and the transfer it becomes are not measured differently. */
@@ -145,23 +143,19 @@
     file_size: number;
     ember_file_hash?: string;
   }) {
-    const key = offerKey(offer.user_hash, offer.file_hash);
-    if (acceptingOffer) return;
-    acceptingOffer = key;
     try {
       const res = await acceptIncomingFileOffer(offer);
+      if (!res) return;
       // The backend reports an offer we already hold as `already_queued`
       // rather than an error, so saying "downloading" would claim something
       // new started when nothing did.
       flash(
-        res?.already_queued
+        res.already_queued
           ? m.search_already_queued_name({ name: offer.file_name })
           : m.friends_offer_accepted({ name: offer.file_name }),
       );
     } catch (e: unknown) {
       error = toErr(e);
-    } finally {
-      acceptingOffer = null;
     }
   }
   let failedSearchToastsShown = new Set<string>();
@@ -215,8 +209,8 @@
 
   let filtered = $derived.by(() => {
     let list = friends;
-    if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase();
+    const q = searchQuery.trim().toLowerCase();
+    if (q) {
       list = list.filter(
         (f) => f.user_hash.toLowerCase().includes(q) || f.nickname.toLowerCase().includes(q),
       );
@@ -260,9 +254,8 @@
     browseOpen = false;
   }
 
-  function formatLastSeen(ts: number): string {
+  function formatLastSeen(ts: number, now: number): string {
     if (!ts) return '';
-    const now = Date.now() / 1000;
     const diff = now - ts;
     if (diff < 60) return m.friends_just_now();
     if (diff < 3600) return m.friends_minutes_ago({ minutes: Math.floor(diff / 60) });
@@ -274,18 +267,6 @@
     return isFriendOnline(f.user_hash) ? 'online' : 'offline';
   }
 
-  async function reloadFriendRequests() {
-    try {
-      const { getFriendRequests } = await import('$lib/api/friends');
-      const reqs = await getFriendRequests();
-      friendRequestsStore.set(reqs);
-    } catch (e) {
-      // Non-fatal: the optimistic update already adjusted the list. Log so a
-      // persistent reconciliation failure is visible in devtools.
-      console.warn('reloadFriendRequests failed:', e);
-    }
-  }
-
   async function handleAcceptRequest(req: FriendRequestInfo) {
     if (processingRequests.has(req.sender_hash)) return;
     processingRequests.add(req.sender_hash);
@@ -295,7 +276,7 @@
       await acceptFriendRequest(req.sender_hash);
       // Optimistically drop the accepted row so it disappears immediately even
       // if the follow-up reconciliation fetch fails.
-      friendRequestsStore.update(reqs => reqs.filter(r => r.sender_hash !== req.sender_hash));
+      dropFriendRequest(req.sender_hash);
       flash(m.friends_accepted_request({ name: req.sender_nickname || req.sender_hash.slice(0, 8) + '\u2026' }));
       await reloadFriendRequests();
       await loadFriends();
@@ -336,7 +317,7 @@
     beginFriendRequestMutation();
     try {
       await rejectFriendRequest(req.sender_hash);
-      friendRequestsStore.update(reqs => reqs.filter(r => r.sender_hash !== req.sender_hash));
+      dropFriendRequest(req.sender_hash);
       flash(m.friends_rejected_local());
       await reloadFriendRequests();
       await loadFriends();
@@ -463,16 +444,6 @@
       if (!event.payload.firewalled) recheckingFirewall = false;
     }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); })
       .catch((e) => console.error('friends: failed to register firewall-status listener', e));
-
-    listen<{ intro_ok?: boolean; legacy_stranded_friends?: unknown }>('ember:friend-discoverable', (event) => {
-      if (destroyed) return;
-      // A failed registration carries no presence detail; keep the last answer.
-      if (typeof event.payload?.intro_ok !== 'boolean') return;
-      const raw = event.payload.legacy_stranded_friends;
-      const hashes = Array.isArray(raw) ? raw.map(validFriendHash).filter((h): h is string => h !== null) : [];
-      legacyStrandedFriends = new Set(hashes);
-    }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); })
-      .catch((e) => console.error('friends: failed to register ember:friend-discoverable listener', e));
 
     listen<{ user_hash: string; reason?: string; legacy_code?: boolean }>('ember:friend-search-failed', (event) => {
       if (destroyed) return;
@@ -601,8 +572,14 @@
     }
   }
 
+  /** The header's Refresh: everything this page loads from the backend. */
+  async function refreshAll() {
+    await Promise.all([loadFriends(), reloadFriendRequests(), loadBlocked()]);
+  }
+
   function confirmBlock(user_hash: string, nickname: string) {
     pendingBlock = { user_hash, nickname };
+    blockDialogName = nickname || user_hash.slice(0, 8) + '\u2026';
     confirmBlockOpen = true;
   }
 
@@ -645,8 +622,9 @@
         clearUnread(target.user_hash);
         clearFriendSearch(target.user_hash);
         removeChatForFriend(target.user_hash);
-        friendRequestsStore.update(reqs => reqs.filter(r => r.sender_hash !== target.user_hash));
+        dropFriendRequest(target.user_hash);
         clearFileOffersForFriend(target.user_hash);
+        forgetFriendName(target.user_hash);
       }
       endFriendRequestMutation();
       processingRequests.delete(target.user_hash);
@@ -655,12 +633,18 @@
   }
 
   async function handleUnblock(b: BlockedInfo) {
+    if (unblocking.has(b.user_hash)) return;
+    unblocking = new Set(unblocking).add(b.user_hash);
     try {
       await unblockFriend(b.user_hash);
       flash(m.friends_unblocked({ name: b.nickname || b.user_hash.slice(0, 8) + '\u2026' }));
       await loadBlocked();
     } catch (e: unknown) {
       error = toErr(e);
+    } finally {
+      const next = new Set(unblocking);
+      next.delete(b.user_hash);
+      unblocking = next;
     }
   }
 
@@ -674,6 +658,7 @@
     const nick = newNickname.trim();
     if (!hash) { addError = m.friends_validation_hash_required(); return; }
     if (!isAcceptedFriendInput(hash)) { addError = m.friends_validation_hash_format(); return; }
+    if (friendNameTooLong(nick)) { addError = m.friend_settings_name_too_long({ max: FRIEND_NAME_MAX_BYTES }); return; }
     const canonicalHash = friendHashFromCode(hash);
     // A current code for someone already listed is how a one-sided add made
     // from an older code becomes findable, so it goes through as an update.
@@ -757,6 +742,7 @@
       // the user's friend list and silently fail to send.
       removeChatForFriend(f.user_hash);
       clearFileOffersForFriend(f.user_hash);
+      forgetFriendName(f.user_hash);
       const shown = f.nickname || f.user_hash.slice(0, 8) + '\u2026';
       flash(
         f.mutual
@@ -780,6 +766,11 @@
     saveEditPending = true;
     const hash = editingHash;
     const nick = editNickname.trim();
+    if (friendNameTooLong(nick)) {
+      error = m.friend_settings_name_too_long({ max: FRIEND_NAME_MAX_BYTES });
+      saveEditPending = false;
+      return;
+    }
     try {
       await renameFriend(hash, nick);
       // Blur-to-save means the user may already be renaming a different friend
@@ -796,26 +787,24 @@
    *  to every place that shows it. */
   async function renameFriend(hash: string, nick: string): Promise<void> {
     await updateFriendNickname(hash, nick);
-    friendsListStore.update((list) =>
+    patchFriendsList((list) =>
       list.map((f) => (f.user_hash === hash ? { ...f, nickname: nick } : f)),
     );
+    showFriendName(hash, nick);
+    // The backend drops characters it will not store, so the saved name can
+    // differ from the typed one. Whatever list the store holds once this
+    // settles postdates the rename.
+    void refreshFriendsList().then(() => {
+      const saved = friends.find((f) => f.user_hash === hash);
+      if (saved && saved.nickname !== nick) showFriendName(hash, saved.nickname);
+    });
+  }
+
+  /** The open settings dialog and the chat tab keep their own copy of the
+   *  name; the list and the name cache follow the store. */
+  function showFriendName(hash: string, nick: string) {
     if (settingsFor?.user_hash === hash) settingsFor = { ...settingsFor, nickname: nick };
-    // Push the rename through to any open chat tab so the strip
-    // and the conversation header don't keep the old nickname.
     renameChatTab(hash, nick || hash.slice(0, 8) + '\u2026');
-    if (nick) {
-      rememberFriendName(hash, nick);
-    } else {
-      // `rememberFriendName` ignores an empty name, so a cleared nickname
-      // would keep labelling the dock and toasts from the cache.
-      const key = hash.toLowerCase();
-      friendNamesStore.update((names) => {
-        if (!names.has(key)) return names;
-        const next = new Map(names);
-        next.delete(key);
-        return next;
-      });
-    }
   }
 
   function cancelEdit() {
@@ -946,7 +935,7 @@
 <ConfirmDialog
   bind:open={confirmBlockOpen}
   title={m.friends_confirm_block_title()}
-  message={m.friends_confirm_block_message({ name: pendingBlock ? (pendingBlock.nickname || pendingBlock.user_hash.slice(0, 8) + '\u2026') : '' })}
+  message={m.friends_confirm_block_message({ name: blockDialogName })}
   confirmLabel={m.friends_block()}
   danger={true}
   onconfirm={handleBlock}
@@ -975,7 +964,7 @@
     <span class="beta-badge">{m.common_beta()}</span>
   </h2>
   <div class="header-actions">
-    <button class="ghost" onclick={() => loadFriends()} disabled={loading}>{m.common_refresh()}</button>
+    <button class="ghost" onclick={() => void refreshAll()} disabled={loading}>{m.common_refresh()}</button>
   </div>
 </div>
 
@@ -1146,21 +1135,28 @@
               </svg>
             </div>
             <div class="request-info">
-              <span class="request-name"><bdi>{offer.file_name}</bdi></span>
+              <span class="request-name">
+                <bdi>{offer.file_name}</bdi>
+                {#if offer.friends_only}
+                  <span class="request-badge request-badge-friends" title={m.browse_friends_only_title()}>{m.library_friends_only_badge()}</span>
+                {/if}
+              </span>
               <span class="request-hash">
-                {m.friends_offer_from({ name: friendLabel(offer.user_hash) })}
+                {m.friends_offer_from({ name: sharedFriendLabel(offer.user_hash, null, $friendNamesStore) })}
                 {#if offer.file_size}&nbsp;&middot;&nbsp;{formatOfferSize(offer.file_size)}{/if}
               </span>
             </div>
             <div class="request-actions">
               <button
                 class="request-accept"
-                disabled={acceptingOffer !== null}
+                disabled={$acceptingOfferStore !== null}
                 onclick={() => acceptOffer(offer)}
               >{m.friends_offer_download()}</button>
+              <!-- Only the offer being accepted is held, as in the dock:
+                   dismissing another one starts nothing. -->
               <button
                 class="request-reject"
-                disabled={acceptingOffer !== null}
+                disabled={$acceptingOfferStore === offerKey(offer.user_hash, offer.file_hash)}
                 onclick={() => clearFileOffer(offer.user_hash, offer.file_hash)}
               >{m.common_dismiss()}</button>
             </div>
@@ -1183,6 +1179,7 @@
       <p class="requests-explainer">{m.friends_requests_verified_explainer()}</p>
       <div class="requests-list">
         {#each friendRequests as req (req.sender_hash)}
+          {@const reqName = sharedFriendLabel(req.sender_hash, req.sender_nickname, $friendNamesStore)}
           <div
             class="request-card"
             in:fly={{ y: 6, duration: 200 }}
@@ -1220,12 +1217,12 @@
               <span class="request-hash" title={req.sender_hash}>{req.sender_hash.slice(0, 8)}&hellip;{req.sender_hash.slice(-6)}</span>
             </div>
             <div class="request-actions">
-              <button class="request-accept" onclick={() => handleAcceptRequest(req)} disabled={processingRequests.has(req.sender_hash)}>{m.friends_accept()}</button>
-              <button class="request-reject" onclick={() => handleRejectRequest(req)} disabled={processingRequests.has(req.sender_hash)}>{m.friends_reject()}</button>
+              <button class="request-accept" onclick={() => handleAcceptRequest(req)} disabled={processingRequests.has(req.sender_hash)} aria-label={m.friends_accept_aria({ name: reqName })}>{m.friends_accept()}</button>
+              <button class="request-reject" onclick={() => handleRejectRequest(req)} disabled={processingRequests.has(req.sender_hash)} aria-label={m.friends_reject_aria({ name: reqName })}>{m.friends_reject()}</button>
               <!-- Rejecting only clears the row; the same stranger can ask
                    again immediately. Blocking from here is the way to make
                    a persistent requester stop. -->
-              <button class="request-block" onclick={() => confirmBlock(req.sender_hash, req.sender_nickname)} disabled={processingRequests.has(req.sender_hash)}>{m.friends_block()}</button>
+              <button class="request-block" onclick={() => confirmBlock(req.sender_hash, req.sender_nickname)} disabled={processingRequests.has(req.sender_hash)} aria-label={m.friends_block_aria({ name: reqName })}>{m.friends_block()}</button>
             </div>
           </div>
         {/each}
@@ -1413,10 +1410,11 @@
               placeholder={m.friends_nickname_edit_placeholder()}
               use:autoFocus
               aria-label={m.friends_nickname_edit_placeholder()}
+              aria-invalid={friendNameTooLong(editNickname)}
             />
           {:else}
             <div class="card-name-row">
-              <button class="nick-btn" onclick={() => startEdit(f)} title={m.friends_edit_nickname_title()}>
+              <button class="nick-btn" onclick={() => startEdit(f)} title={m.friends_edit_nickname_title()} aria-label={m.friends_edit_nickname_aria({ name: f.nickname ? shortName : m.friends_no_nickname() })}>
                 <!-- `<bdi>` isolates the peer-supplied nickname from
                      the surrounding UI direction. -->
                 {#if f.nickname}<bdi dir="auto">{f.nickname}</bdi>{:else}{m.friends_no_nickname()}{/if}
@@ -1451,7 +1449,7 @@
             {:else if presence === 'online'}
               <span class="status-online">{m.friends_status_online()}</span>
             {:else if f.last_seen}
-              {m.friends_status_last_seen({ when: formatLastSeen(f.last_seen) })}
+              {m.friends_status_last_seen({ when: formatLastSeen(f.last_seen, $minuteClock) })}
             {:else}
               {m.friends_status_added({ when: formatDate(f.added_at) })}
             {/if}
@@ -1518,6 +1516,7 @@
               class="card-more-menu"
               role="menu"
               tabindex="-1"
+              aria-describedby="card-facts-{f.user_hash}"
               onkeydown={(e) => menuKeydown(e, e.currentTarget)}
             >
               <button
@@ -1557,7 +1556,9 @@
                 <span>{copiedHash === f.user_hash ? m.friends_copied_title() : m.friends_copy_id_title()}</span>
                 <span class="menu-item-sub">{truncatedId}</span>
               </button>
-              <div class="card-more-facts">
+              <!-- A menu may only hold items, so the facts are hidden from the
+                   menu's tree and read as its description instead. -->
+              <div class="card-more-facts" id="card-facts-{f.user_hash}" aria-hidden="true">
                 {#if lastAddr}
                   <span class="card-more-fact">{m.friends_last_address({ addr: lastAddr })}</span>
                 {/if}
@@ -1638,7 +1639,7 @@
                 <bdi dir="auto" class="blocked-name">{b.nickname || m.friends_unknown_sender()}</bdi>
                 <span class="blocked-hash" title={b.user_hash}>{b.user_hash.slice(0, 8)}&hellip;{b.user_hash.slice(-6)}</span>
               </div>
-              <button class="ghost" onclick={() => handleUnblock(b)} aria-label={m.friends_unblock_aria({ name: b.nickname || b.user_hash.slice(0, 8) + '\u2026' })}>{m.friends_unblock()}</button>
+              <button class="ghost" onclick={() => handleUnblock(b)} disabled={unblocking.has(b.user_hash)} aria-label={m.friends_unblock_aria({ name: b.nickname || b.user_hash.slice(0, 8) + '\u2026' })}>{m.friends_unblock()}</button>
             </div>
           {/each}
         </div>
@@ -2692,6 +2693,11 @@
     background: color-mix(in srgb, var(--warning) 14%, transparent);
     color: var(--warning);
     border: 1px solid color-mix(in srgb, var(--warning) 35%, transparent);
+  }
+  .request-badge-friends {
+    background: var(--accent-dim);
+    color: var(--accent);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
   }
 
   .request-actions {
