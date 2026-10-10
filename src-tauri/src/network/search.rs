@@ -782,6 +782,135 @@ pub(super) struct ActiveSearchRequest {
     /// Cross-packet spam batch context for this search (same-name/many-hashes
     /// across UDP/Kad/server pages, not only inside one emit).
     pub(super) batch_spam: crate::search::spam::BatchSpamContext,
+    /// The expression the UDP global leg sent, kept so Search More can put the
+    /// same question to the servers this search did not reach. Empty when the
+    /// search had no UDP leg, which is also what keeps Search More from adding
+    /// one.
+    pub(super) udp_search_expr: Vec<u8>,
+    /// The connected server ended this search's leg while still flagging more
+    /// results — the page cap or the result cap stopped it, not the server —
+    /// so Search More can ask it for further pages.
+    pub(super) server_has_more: bool,
+}
+
+/// What Search More found to do for a finished search: how many servers it
+/// asked that the search had not reached, and whether it asked the connected
+/// server for further pages. `started` is false when there was nothing left.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct SearchMoreOutcome {
+    pub started: bool,
+    pub servers: u32,
+    pub server_pages: bool,
+}
+
+/// Global-search packets for the servers in the list that `request` has not
+/// asked: never sent one, or queued and dropped when the sweep stopped early
+/// (its source backstop, its deadline, or the queue cap). A server that was
+/// asked and stayed silent is not asked again.
+pub(super) fn unasked_udp_search_packets(
+    state: &NetworkState,
+    request: &ActiveSearchRequest,
+) -> Vec<(Vec<u8>, std::net::SocketAddr)> {
+    if request.udp_search_expr.is_empty()
+        || state.user_offline.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Vec::new();
+    }
+    let uses_64bit_search = kad::messages::search_expression_uses_64bit(&request.udp_search_expr);
+    let connected_addr = state.server_addr;
+    state
+        .server_list
+        .servers()
+        .iter()
+        .filter(|server| is_eligible_udp_server(server, connected_addr))
+        .filter_map(|server| {
+            ServerUdpSocket::build_global_search_packet(server, &request.udp_search_expr, uses_64bit_search)
+        })
+        .filter(|(_, addr)| match addr.ip() {
+            std::net::IpAddr::V4(ip) => !request.udp_search_sent_ips.contains(&ip),
+            std::net::IpAddr::V6(_) => false,
+        })
+        .take(MAX_UDP_SEARCH_QUEUE)
+        .collect()
+}
+
+/// Whether the connected server can still give `request` more pages: it said
+/// so when the leg ended, and it is the same server, still connected. A new
+/// session forgets the search (`reset_ed2k_server_session` clears the flag).
+pub(super) fn server_can_give_more(state: &NetworkState, request: &ActiveSearchRequest) -> bool {
+    request.server_has_more
+        && state.server_connected
+        && state.server_connection.is_some()
+        && request.server_ip.is_some()
+        && state.server_addr.map(|a| a.ip().to_string()) == request.server_ip
+}
+
+/// Whether Search More has anything to do for `request`.
+pub(super) fn search_more_available(state: &NetworkState, request: &ActiveSearchRequest) -> bool {
+    server_can_give_more(state, request) || !unasked_udp_search_packets(state, request).is_empty()
+}
+
+/// Continue the finished search `request_id`: ask the servers it did not reach
+/// and the connected server's further pages, streaming into the same request
+/// id so the results land in the same tab. Kad and Ember are not walked again —
+/// neither can page, and a second walk of the same keyword asks the same
+/// closest nodes for the same records.
+pub(super) fn start_search_more(
+    state: &mut NetworkState,
+    request_id: u64,
+) -> SearchMoreOutcome {
+    if state.active_search_request.is_some() {
+        return SearchMoreOutcome::default();
+    }
+    let Some(mut request) = state.finished_search.take() else {
+        return SearchMoreOutcome::default();
+    };
+    if request.request_id != request_id {
+        state.finished_search = Some(request);
+        return SearchMoreOutcome::default();
+    }
+    let packets = unasked_udp_search_packets(state, &request);
+    let server_pages = server_can_give_more(state, &request);
+    if packets.is_empty() && !server_pages {
+        state.finished_search = Some(request);
+        return SearchMoreOutcome::default();
+    }
+
+    let servers = u32::try_from(packets.len()).unwrap_or(u32::MAX);
+    if !packets.is_empty() {
+        state.udp_search_queue.clear();
+        for (packet, addr) in packets {
+            state.udp_search_queue.push_back((request_id, packet, addr));
+        }
+        // A fresh backstop: it bounds one sweep, and this is another.
+        request.udp_found_sources = 0;
+        request.udp_pending = true;
+        state.server_udp_search_age = 0;
+        request.udp_search_deadline = chrono::Utc::now().timestamp()
+            + state.udp_search_queue.len() as i64
+            + UDP_SEARCH_HARD_DEADLINE_BUFFER_SECS;
+    }
+    if server_pages {
+        // eMule's More: a fresh allowance of pages from where the server left
+        // off, the first asked on the next server tick.
+        request.server_has_more = false;
+        request.server_result_count = 0;
+        request.server_pending = true;
+        state.server_search_more_requests = 0;
+        state.server_search_more_due_at = Some(std::time::Instant::now());
+        state.pending_server_search = Some(PendingServerSearch {
+            tx: None,
+            results: Vec::new(),
+            request_id,
+        });
+        state.server_search_age = 0;
+    }
+    info!(
+        "Search More for request {request_id}: {servers} server(s) not yet asked{}",
+        if server_pages { ", plus the connected server's next pages" } else { "" }
+    );
+    state.active_search_request = Some(request);
+    SearchMoreOutcome { started: true, servers, server_pages }
 }
 
 /// Ceiling on the sources a single file may be credited with from one DHT leg,
@@ -862,6 +991,16 @@ pub(super) struct SearchProgressEvent {
 #[derive(Clone, serde::Serialize)]
 pub(super) struct SearchCompleteEvent {
     pub(super) request_id: u64,
+    /// Search More has something to do for this search; see
+    /// [`search_more_available`].
+    pub(super) can_search_more: bool,
+}
+
+impl SearchCompleteEvent {
+    /// A search that ended with nothing left for Search More.
+    pub(super) fn done(request_id: u64) -> Self {
+        Self { request_id, can_search_more: false }
+    }
 }
 
 /// A note (comment/rating) we have explicitly published to the KAD DHT via
@@ -1383,12 +1522,23 @@ pub(super) fn maybe_finish_active_search(
             && !active.ember_pending
     });
     if should_complete {
-        // Before the request is dropped: it owns the per-leg tallies.
+        // Before the request is put aside: it owns the per-leg tallies.
         note_dht_recall_sample(state);
-        state.active_search_request = None;
+        // Kept rather than dropped, so Search More can continue it with what
+        // it already knows: the servers it asked, the rows it streamed (a
+        // re-sighting then updates a row instead of adding it again), and its
+        // spam context. Replaced by the next search.
+        let finished = state.active_search_request.take();
+        let can_search_more = finished
+            .as_ref()
+            .is_some_and(|request| search_more_available(state, request));
+        state.finished_search = finished;
         state.server_search_age = 0;
         state.server_udp_search_age = 0;
-        let _ = app_handle.emit("search-complete", SearchCompleteEvent { request_id });
+        let _ = app_handle.emit(
+            "search-complete",
+            SearchCompleteEvent { request_id, can_search_more },
+        );
     }
 }
 
@@ -1833,6 +1983,14 @@ pub(super) fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri
         state.server_search_age = 0;
         state.server_udp_search_age = 0;
         state.udp_search_queue.clear();
-        let _ = app_handle.emit("search-complete", SearchCompleteEvent { request_id });
+        let _ = app_handle.emit("search-complete", SearchCompleteEvent::done(request_id));
+    }
+    // A stopped search is not continued: the page has already let go of its id.
+    if state
+        .finished_search
+        .as_ref()
+        .is_some_and(|finished| finished.request_id == request_id)
+    {
+        state.finished_search = None;
     }
 }

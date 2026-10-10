@@ -205,6 +205,10 @@ pub(super) struct NetworkState {
     /// until the server tick receives OP_SEARCHRESULT.
     pub(super) pending_server_search: Option<PendingServerSearch>,
     pub(super) active_search_request: Option<ActiveSearchRequest>,
+    /// The latest search once it has finished, kept so Search More can
+    /// continue it (`start_search_more`). Replaced by the next search and
+    /// dropped when that one is cancelled.
+    pub(super) finished_search: Option<ActiveSearchRequest>,
     /// eMule OP_QUERY_MORE_RESULT: when the next page of the current server
     /// search may be asked for. Set only when the server flagged more results;
     /// `None` means no page is owed.

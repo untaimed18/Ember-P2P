@@ -85,6 +85,21 @@ export async function cancelSearch(requestId: number): Promise<void> {
   return invoke('cancel_search', { requestId });
 }
 
+/** What Search More found to do: the eD2K servers it asked that the search had
+ *  not reached, and whether it asked the connected server for more pages.
+ *  `started` is false when there was nothing left to ask. */
+export interface SearchMoreOutcome {
+  started: boolean;
+  servers: number;
+  server_pages: boolean;
+}
+
+/** Continue the latest finished search where it stopped. New results stream
+ *  into the same request id, and `search-complete` fires for it again. */
+export async function searchMore(requestId: number): Promise<SearchMoreOutcome> {
+  return invoke('search_more', { requestId });
+}
+
 export type Ed2kLinkFile = {
   name: string;
   size: number;

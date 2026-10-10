@@ -247,6 +247,8 @@ async fn handle_command_inner(
                 cancel_search_request(state, app_handle, prior_id);
             }
             state.active_search_request = None;
+            // Only the latest search can be continued with Search More.
+            state.finished_search = None;
             // Any second server request still queued belongs to that prior
             // search, which is now gone; this one queues its own below.
             state.server_followup_search = None;
@@ -292,6 +294,8 @@ async fn handle_command_inner(
                 // streamed packet of this search scores them as files we hold
                 // rather than as rows in whatever result set they arrived in.
                 batch_spam: crate::search::spam::BatchSpamContext::for_owned_hashes(owned_hashes),
+                udp_search_expr: Vec::new(),
+                server_has_more: false,
             };
 
             // eMule's native "Search Related Files": the connected server is
@@ -374,7 +378,7 @@ async fn handle_command_inner(
                 if let Some(tx) = tx.take() {
                     let _ = tx.send(local_results.take().unwrap_or_default());
                 }
-                let _ = app_handle.emit("search-complete", SearchCompleteEvent { request_id });
+                let _ = app_handle.emit("search-complete", SearchCompleteEvent::done(request_id));
                 return;
             }
             active_request.keywords = keywords.clone();
@@ -489,6 +493,7 @@ async fn handle_command_inner(
 
             // --- UDP global search ---
             if legs.udp {
+                active_request.udp_search_expr = search_expr.clone();
                 let uses_64bit_search = kad::messages::search_expression_uses_64bit(&search_expr);
                 let connected_addr = state.server_addr;
                 let servers = state.server_list.servers().to_vec();
@@ -747,12 +752,16 @@ async fn handle_command_inner(
                     && !active_request.udp_pending
                     && !active_request.ember_pending
                 {
-                    let _ = app_handle.emit("search-complete", SearchCompleteEvent { request_id });
+                    let _ = app_handle.emit("search-complete", SearchCompleteEvent::done(request_id));
                     return;
                 }
             }
 
             state.active_search_request = Some(active_request);
+        }
+
+        NetworkCommand::SearchMore { request_id, tx } => {
+            let _ = tx.send(start_search_more(state, request_id));
         }
 
         NetworkCommand::CancelSearch { request_id } => {

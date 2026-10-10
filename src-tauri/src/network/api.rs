@@ -51,6 +51,12 @@ pub enum NetworkCommand {
         /// taking the index lock once per inbound result packet to work it out.
         owned_hashes: Vec<String>,
     },
+    /// Continue the finished search `request_id` (the latest one) on the
+    /// networks that can give more; see `start_search_more`.
+    SearchMore {
+        request_id: u64,
+        tx: oneshot::Sender<SearchMoreOutcome>,
+    },
     StartDownload {
         file_hash: String,
         file_name: String,

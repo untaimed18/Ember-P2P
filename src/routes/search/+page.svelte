@@ -1,6 +1,6 @@
 <script lang="ts">
   import SearchBar from '$lib/components/SearchBar.svelte';
-  import { searchFiles, cancelSearch, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, removeDownloadHistoryEntry, formatEd2kLink, formatEd2kLinks, type SearchMethod, type RelatedPlan } from '$lib/api/search';
+  import { searchFiles, cancelSearch, searchMore, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, removeDownloadHistoryEntry, formatEd2kLink, formatEd2kLinks, type SearchMethod, type RelatedPlan } from '$lib/api/search';
   import {
     pendingRelatedSearch,
     relationKindLabel,
@@ -2709,6 +2709,54 @@
     );
   }
 
+  /**
+   * Search More: carry on the active tab's finished search where it stopped,
+   * on the networks that can give more (the eD2K servers it did not reach, the
+   * connected server's next pages). New rows land in the same tab, merged with
+   * the ones it already has; Stop works on it as on any search.
+   */
+  let searchMoreBusy = $state(false);
+  async function continueSearch() {
+    const t = activeTab;
+    if (!t || t.isSearching || !t.canSearchMore || searchMoreBusy) return;
+    const requestId = t.requestId;
+    searchMoreBusy = true;
+    // Shown as searching straight away, so a second click has nothing to press.
+    patchSearchTabByRequestId(requestId, (tab) => ({
+      ...tab,
+      isSearching: true,
+      canSearchMore: false,
+      progress: null,
+      error: null,
+    }));
+    try {
+      const outcome = await searchMore(requestId);
+      if (!outcome.started) {
+        patchSearchTabByRequestId(requestId, (tab) => ({ ...tab, isSearching: false }));
+        addToast('info', m.search_more_nothing_left());
+        return;
+      }
+      // There is no invoke left to wait on: `search-complete` ends it, and the
+      // fallback covers that event going missing.
+      searchInvokeSettled.add(requestId);
+      armSearchCompletionFallback(requestId, t.method);
+      addToast(
+        'info',
+        outcome.servers > 0
+          ? plural(outcome.servers, {
+              one: m.search_more_asking_one,
+              other: () => m.search_more_asking_other({ count: formatNumber(outcome.servers) }),
+            })
+          : m.search_more_asking_server(),
+      );
+    } catch (e: unknown) {
+      patchSearchTabByRequestId(requestId, (tab) => ({ ...tab, isSearching: false, canSearchMore: true }));
+      addToast('error', translateError(e, m.search_more_failed()));
+    } finally {
+      searchMoreBusy = false;
+    }
+  }
+
   // `tabId` defaults to the active tab (toolbar Stop button), but a search
   // running in a background tab previously had no way to be stopped without
   // switching to it first — the tab strip's per-tab stop control below
@@ -3417,6 +3465,8 @@
               shedKeys: undefined,
               error: null,
               isSearching: false,
+              // Its id is gone, so the network cannot continue it.
+              canSearchMore: false,
               progress: null,
             }
           : t,
@@ -4049,6 +4099,24 @@
     </button>
   {:else}
     <button onclick={() => handleSearch(barQuery)} disabled={searchSubmitBlocked} title={searchSubmitBlocked ? searchNetworkHint(searchMethod) : undefined}>{m.search_title()}</button>
+    {#if activeTab?.canSearchMore}
+      <!-- Only offered when the finished search stopped on its own limits
+           with somewhere left to ask; see `can_search_more`. -->
+      <button
+        type="button"
+        class="ghost search-more-btn"
+        onclick={() => void continueSearch()}
+        disabled={searchMoreBusy}
+        title={m.search_more_title()}
+      >
+        <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="7" cy="7" r="4.5"/>
+          <path d="M10.5 10.5 14 14"/>
+          <path d="M7 5v4M5 7h4"/>
+        </svg>
+        {m.search_more()}
+      </button>
+    {/if}
   {/if}
 </div>
 
@@ -6076,6 +6144,14 @@
     background: var(--accent-fill);
     color: var(--text-accent);
   }
+
+  .search-more-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+  .search-more-btn svg { flex-shrink: 0; }
 
   .stop-btn {
     display: inline-flex;

@@ -2352,6 +2352,7 @@ pub fn run() {
             commands::search::plan_related_search,
             commands::search::related_search_supported,
             commands::search::cancel_search,
+            commands::search::search_more,
             commands::search::find_notes,
             commands::search::find_sources,
             commands::search::publish_note,

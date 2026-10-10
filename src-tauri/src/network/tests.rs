@@ -1213,6 +1213,8 @@ fn sample_active_search_request(request_id: u64) -> ActiveSearchRequest {
         streamed_hashes: std::collections::HashSet::new(),
         exclude_hashes: std::collections::HashSet::new(),
         batch_spam: crate::search::spam::BatchSpamContext::default(),
+        udp_search_expr: Vec::new(),
+        server_has_more: false,
     }
 }
 

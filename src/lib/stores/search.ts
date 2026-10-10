@@ -48,6 +48,10 @@ export type SearchTab = {
    *  detected by the length check in `mergeIntoTab` and the map is rebuilt. */
   resultIndex?: Map<string, number>;
   isSearching: boolean;
+  /** The finished search can be continued with Search More: it stopped on
+   *  its own limits with eD2K servers left to ask, or with the connected
+   *  server holding more pages. Only ever true on the latest search. */
+  canSearchMore?: boolean;
   progress: { nodes_contacted: number; results_so_far: number; phase: string } | null;
   error: string | null;
   /** Results dropped because the tab reached its cap, least available first.
@@ -812,7 +816,9 @@ export function openSearchTab(query: string, method: SearchMethod, fileType?: st
     // buffer are keyed by the in-flight request, not the discarded nonce.
     const searchingIds = tabs.filter((t) => t.isSearching).map((t) => t.requestId);
     const next = tabs.map((t) => {
-      if (!t.isSearching) return t;
+      // The network keeps only the latest search to continue; a new one
+      // replaces it, so no older tab can offer Search More any longer.
+      if (!t.isSearching) return t.canSearchMore ? { ...t, canSearchMore: false } : t;
       stoppedOthers = true;
       return { ...t, isSearching: false, progress: null, requestId: newSearchNonce() };
     });
@@ -1160,9 +1166,10 @@ export async function initSearchStore() {
       }
       scheduleFlush();
     }));
-    registered.push(await listen<{ request_id: number }>('search-complete', (event) => {
+    registered.push(await listen<{ request_id: number; can_search_more?: boolean }>('search-complete', (event) => {
       const requestId = validRequestId(event.payload?.request_id);
       if (requestId === null) return;
+      const canSearchMore = event.payload?.can_search_more === true;
       // Flush any buffered `search-results` for this request synchronously
       // before flipping `isSearching` off — otherwise the spinner could
       // disappear while the last batch of results is still queued for the
@@ -1174,7 +1181,7 @@ export async function initSearchStore() {
       const activeId = get(activeSearchTabId);
       searchTabs.update((tabs) =>
         updateTabByRequestId(tabs, requestId, (t) =>
-          trimIdleTab({ ...t, isSearching: false, progress: null }, activeId),
+          trimIdleTab({ ...t, isSearching: false, progress: null, canSearchMore }, activeId),
         ),
       );
     }));

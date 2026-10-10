@@ -126,6 +126,9 @@ export function forPersist(tab: SearchTab, limit = PERSIST_MAX_RESULTS): SearchT
     // against nothing.
     isSearching: false,
     progress: null,
+    // The network forgets the search across a restart, so there is nothing
+    // left for Search More to continue.
+    canSearchMore: undefined,
     // And the id itself has to go, or the next search will collide with it.
     // See `RESTORED_REQUEST_ID`.
     requestId: RESTORED_REQUEST_ID,

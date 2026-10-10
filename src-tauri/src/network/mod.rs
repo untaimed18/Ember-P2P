@@ -165,6 +165,7 @@ pub(crate) use self::downloads::{
     TransferStatusWriteClock,
 };
 pub(crate) use self::friends::{deliver_friend_request_verdict, FriendRequestVerdict};
+pub use self::search::SearchMoreOutcome;
 pub use self::server::{clear_server_log_history, server_log_history, ServerLogLine};
 pub use self::state::{
     EmberMaintenanceResult, EmberPublishPending, EmberPublishResult, EmberValueLookupPending,
@@ -811,6 +812,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         pending_keyword_searches: HashMap::new(),
         pending_server_search: None,
         active_search_request: None,
+        finished_search: None,
         server_search_more_due_at: None,
         server_search_more_requests: 0,
         server_followup_search: None,
