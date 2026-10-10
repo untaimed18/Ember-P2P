@@ -588,12 +588,24 @@
     }
   }
 
-  /** Auto is a switch, so it applies at once like the others. Turning it off
-   *  starts from the old fixed default, which the number box then edits. */
+  /** The last saved fixed number, so turning Auto off brings it back. */
+  let lastFixedUploads = 5;
+
+  /** Auto is a switch, so it applies at once and, like the others, flips
+   *  back if the save fails. Turning it off restores the last saved fixed
+   *  number, which the number box then edits. An unapplied edit in the box is
+   *  dropped rather than saved by the switch. */
   function setMaxUploadsAuto(auto: boolean) {
     if (!settings) return;
-    settings.max_concurrent_uploads = auto ? 0 : 5;
-    void applyFields(['max_concurrent_uploads']);
+    const saved = savedSettings?.max_concurrent_uploads ?? 0;
+    if (auto && saved > 0) lastFixedUploads = saved;
+    settings.max_concurrent_uploads = auto ? 0 : lastFixedUploads;
+    // Checked when the save runs, not now: a second flip while the first is
+    // in flight must still be saved once the first lands.
+    const fields = ['max_concurrent_uploads'] as const;
+    void enqueueSave(async () =>
+      fieldsDirty(fields) ? saveFields(fields, { revertOnFailure: true }) : true,
+    );
   }
 
   function applyRecommended() {
@@ -1507,12 +1519,13 @@
     }
   });
 
-  // Shown while either the saved or the edited value is a number, so a 0
-  // typed into the box (Auto) stays visible with its Apply button.
-  let maxUploadsBoxShown = $derived.by(() => {
+  // True only while editing a fixed number: both the saved and the edited
+  // value are non-zero. Flipping Auto changes one of them to or from 0, so the
+  // Apply button never flashes while that switch is saving.
+  let maxUploadsEditingNumber = $derived.by(() => {
     const current = settings;
     const saved = savedSettings;
-    return current?.max_concurrent_uploads !== 0 || saved?.max_concurrent_uploads !== 0;
+    return current?.max_concurrent_uploads !== 0 && saved?.max_concurrent_uploads !== 0;
   });
 
   function fieldValue(source: AppSettings, key: string): unknown {
@@ -3200,19 +3213,37 @@
                 <span class="hint">{m.settings_max_downloads_hint()}</span>
               </div>
               <div class="field half">
-                <label for={maxUploadsBoxShown ? 'max-uploads' : 'max-uploads-auto'}>{m.settings_max_uploads()}</label>
+                <label for="max-uploads">{m.settings_max_uploads()}</label>
                 <div class="apply-input">
-                  <label class="auto-choice">
-                    <input
-                      id="max-uploads-auto"
-                      type="checkbox"
+                  <span class="auto-switch">
+                    <ToggleSwitch
                       checked={settings.max_concurrent_uploads === 0}
-                      onchange={(e) => setMaxUploadsAuto(e.currentTarget.checked)}
+                      label={m.settings_max_uploads_auto()}
+                      onchange={setMaxUploadsAuto}
                     />
-                    {m.settings_max_uploads_auto()}
-                  </label>
-                  {#if maxUploadsBoxShown}
-                    <input id="max-uploads" type="number" min="1" max="50" bind:value={settings.max_concurrent_uploads} onkeydown={(e) => applyOnEnter(e, ['max_concurrent_uploads'])} />
+                  </span>
+                  <!-- The box stays put and just dims while Auto is on, so
+                       toggling never shifts the layout. Apply is only offered
+                       for edits to a fixed number, not for the Auto switch
+                       itself, which saves on its own. -->
+                  <input
+                    id="max-uploads"
+                    type="number"
+                    min="1"
+                    max="50"
+                    placeholder={m.settings_max_uploads_auto()}
+                    disabled={settings.max_concurrent_uploads === 0}
+                    value={settings.max_concurrent_uploads === 0 ? '' : settings.max_concurrent_uploads}
+                    oninput={(e) => {
+                      const box = e.currentTarget;
+                      const n = box.valueAsNumber;
+                      // 0 means Auto, which only the switch may set.
+                      if (n < 1) box.value = '1';
+                      settings!.max_concurrent_uploads = (Number.isNaN(n) ? null : Math.max(n, 1)) as number;
+                    }}
+                    onkeydown={(e) => applyOnEnter(e, ['max_concurrent_uploads'])}
+                  />
+                  {#if maxUploadsEditingNumber}
                     {@render applyButton(['max_concurrent_uploads'], m.settings_max_uploads())}
                   {/if}
                 </div>
@@ -5486,13 +5517,10 @@
     padding: 7px 14px;
   }
 
-  .auto-choice {
+  /* The Auto switch sits beside the number box, vertically centred on it. */
+  .auto-switch {
     display: inline-flex;
-    align-items: center;
-    gap: 6px;
     align-self: center;
-    font-size: var(--font-size-md);
-    color: var(--text-secondary);
     white-space: nowrap;
   }
 
