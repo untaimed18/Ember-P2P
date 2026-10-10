@@ -168,7 +168,6 @@
       title: () => m.shortcuts_section_transfers(),
       shortcuts: [
         { keys: ['↑ / ↓'], label: () => m.shortcuts_transfers_navigate() },
-        { keys: ['Shift', '↑ / ↓'], label: () => m.shortcuts_transfers_extend() },
         { keys: ['Home / End'], label: () => m.shortcuts_transfers_jump_ends() },
         { keys: [modifierKey, 'A'], label: () => m.shortcuts_transfers_select_all() },
         { keys: ['Space'], label: () => m.shortcuts_transfers_pause_resume() },

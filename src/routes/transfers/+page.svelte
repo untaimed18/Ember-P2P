@@ -1001,7 +1001,18 @@
   $effect(() => {
     try { localStorage.setItem(FILTER_KEY, transferFilter); } catch { /* ignore */ }
   });
-  let selectedDownloadIds = $state<string[]>([]);
+  /** Rows whose box is ticked. Only the boxes change this (each row's, the
+   *  header's, Ctrl+A, Clear): clicking, double-clicking or right-clicking a
+   *  row never ticks it. */
+  let checkedDownloadIds = $state<string[]>([]);
+  let checkedDlIdSet = $derived(new Set(checkedDownloadIds));
+  /** The row clicked or arrowed to: highlighted, shown in the footer and the
+   *  clients pane, and what the keys act on while no box is ticked. */
+  let focusedDlId = $state<string | null>(null);
+  /** What actions apply to: the ticked rows, or the focused row when none are. */
+  let selectedDownloadIds = $derived<string[]>(
+    checkedDownloadIds.length > 0 ? checkedDownloadIds : focusedDlId ? [focusedDlId] : [],
+  );
   let selectedDlIdSet = $derived(new Set(selectedDownloadIds));
   let lastClickedDlId = $state<string | null>(null);
   /**
@@ -2423,9 +2434,10 @@
     measureDownloadWindow();
   }
 
+  /** The focused row, for the footer and the clients pane. */
   let selectedTransfer = $derived.by(() => {
-    if (selectedDownloadIds.length !== 1) return null;
-    return allDownloads.find((t) => t.id === selectedDownloadIds[0]) ?? null;
+    if (!focusedDlId) return null;
+    return allDownloads.find((t) => t.id === focusedDlId) ?? null;
   });
 
   let selectedDownloadCount = $derived(selectedDownloadIds.length);
@@ -2435,35 +2447,13 @@
     return filteredSelectableDownloads.findIndex((t) => t.id === lastClickedDlId);
   }
 
-  let preClickSelection: string[] | null = null;
-  let lastRowClickTime = 0;
-
+  /** A click on a row focuses it and nothing else: ticking is the box's job,
+   *  so Shift- and Ctrl-clicks on a row no longer build a ticked set either
+   *  (Shift-click on the boxes still ticks a range). */
   function onDownloadRowClick(e: MouseEvent, t: Transfer) {
-    const now = Date.now();
-    if (now - lastRowClickTime > 400) {
-      preClickSelection = [...selectedDownloadIds];
-    }
-    lastRowClickTime = now;
-
-    const idx = filteredSelectableDownloads.indexOf(t);
-    const lastIdx = resolveLastClickedDlIndex();
-    if (e.shiftKey && lastIdx >= 0) {
-      e.preventDefault();
-      const lo = Math.min(lastIdx, idx);
-      const hi = Math.max(lastIdx, idx);
-      const rangeIds = filteredSelectableDownloads.slice(lo, hi + 1).map((x) => x.id);
-      const merged = new Set([...selectedDownloadIds, ...rangeIds]);
-      selectedDownloadIds = [...merged];
-    } else if (e.ctrlKey || e.metaKey) {
-      e.preventDefault();
-      if (selectedDlIdSet.has(t.id)) {
-        selectedDownloadIds = selectedDownloadIds.filter((id) => id !== t.id);
-      } else {
-        selectedDownloadIds = [...selectedDownloadIds, t.id];
-      }
-    } else {
-      selectedDownloadIds = [t.id];
-    }
+    // No text selection from a Shift-click.
+    if (e.shiftKey) e.preventDefault();
+    focusedDlId = t.id;
     lastClickedDlId = t.id;
   }
 
@@ -2474,13 +2464,13 @@
       const lo = Math.min(lastIdx, idx);
       const hi = Math.max(lastIdx, idx);
       const rangeIds = filteredSelectableDownloads.slice(lo, hi + 1).map((x) => x.id);
-      const merged = new Set([...selectedDownloadIds, ...rangeIds]);
-      selectedDownloadIds = [...merged];
+      const merged = new Set([...checkedDownloadIds, ...rangeIds]);
+      checkedDownloadIds = [...merged];
     } else {
-      if (selectedDlIdSet.has(t.id)) {
-        selectedDownloadIds = selectedDownloadIds.filter((id) => id !== t.id);
+      if (checkedDlIdSet.has(t.id)) {
+        checkedDownloadIds = checkedDownloadIds.filter((id) => id !== t.id);
       } else {
-        selectedDownloadIds = [...selectedDownloadIds, t.id];
+        checkedDownloadIds = [...checkedDownloadIds, t.id];
       }
     }
     lastClickedDlId = t.id;
@@ -2488,10 +2478,10 @@
 
   let allVisibleDlChecked = $derived(
     filteredSelectableDownloads.length > 0 &&
-    filteredSelectableDownloads.every((t) => selectedDlIdSet.has(t.id))
+    filteredSelectableDownloads.every((t) => checkedDlIdSet.has(t.id))
   );
   let someVisibleDlChecked = $derived(
-    filteredSelectableDownloads.some((t) => selectedDlIdSet.has(t.id))
+    filteredSelectableDownloads.some((t) => checkedDlIdSet.has(t.id))
   );
   let selectAllDownloadsCheckbox: HTMLInputElement | undefined = $state(undefined);
   $effect(() => {
@@ -2504,15 +2494,15 @@
   function toggleDlCheckAll() {
     if (allVisibleDlChecked) {
       const visibleIds = visibleSelectableDownloadIds;
-      selectedDownloadIds = selectedDownloadIds.filter((id) => !visibleIds.has(id));
+      checkedDownloadIds = checkedDownloadIds.filter((id) => !visibleIds.has(id));
     } else {
-      const merged = new Set([...selectedDownloadIds, ...filteredSelectableDownloads.map((t) => t.id)]);
-      selectedDownloadIds = [...merged];
+      const merged = new Set([...checkedDownloadIds, ...filteredSelectableDownloads.map((t) => t.id)]);
+      checkedDownloadIds = [...merged];
     }
   }
 
   function clearDlSelection() {
-    selectedDownloadIds = [];
+    checkedDownloadIds = [];
     lastClickedDlId = null;
   }
 
@@ -3076,13 +3066,11 @@
     closePaneCtx();
     closeUploadsPaneCtx();
     ctxSubs.open(null);
-    // A row outside the selection becomes the selection, as in Explorer and
-    // eMule, so the menu always acts on what is highlighted: on the whole
-    // selection when the row is part of it, on this row alone otherwise.
-    if (section !== 'upload' && !selectedDlIdSet.has(t.id)) {
-      selectedDownloadIds = [t.id];
-      lastClickedDlId = t.id;
-    }
+    // The selection is left alone: here it is also the checkbox set, so making
+    // the row the selection ticked its box, dropped the rows checked before,
+    // and brought up the bulk bar. The menu acts on the whole selection when
+    // the row is part of it and on this row alone otherwise (`ctxTargets`);
+    // the row is marked while the menu is open (`ctx-target`).
     // Raw pointer position: `ctxMenuPosition` measures the rendered panel and
     // keeps it on screen.
     ctxMenu = { x: e.clientX, y: e.clientY, transfer: t, section };
@@ -3904,8 +3892,9 @@
       return list.filter((x) => !all.has(x.id));
     });
     for (const id of all) holdDownloadRemoved(id);
-    const wasSelected = selectedDownloadIds.filter((id) => all.has(id));
-    selectedDownloadIds = selectedDownloadIds.filter((id) => !all.has(id));
+    const wasChecked = checkedDownloadIds.filter((id) => all.has(id));
+    checkedDownloadIds = checkedDownloadIds.filter((id) => !all.has(id));
+    if (focusedDlId && all.has(focusedDlId)) focusedDlId = null;
     if (lastClickedDlId && all.has(lastClickedDlId)) lastClickedDlId = null;
 
     const byId = new Map(snapshots.map((s) => [s.id, s] as const));
@@ -3982,8 +3971,8 @@
           release();
           const back = new Set([...all].filter((id) => !takenBack.has(id)));
           restore(back);
-          // The rows that were selected are selected again.
-          selectedDownloadIds = [...new Set([...selectedDownloadIds, ...wasSelected.filter((id) => back.has(id))])];
+          // The rows that were ticked are ticked again.
+          checkedDownloadIds = [...new Set([...checkedDownloadIds, ...wasChecked.filter((id) => back.has(id))])];
           void paused.then((ids) => {
             const resume = ids.filter((id) => !takenBack.has(id));
             if (resume.length) return resumeTransfersBatch(resume);
@@ -5070,8 +5059,8 @@
   let lastAutoExpandedClientsId: string | null = null;
   $effect(() => {
     if (bottomView !== 'download_clients') { lastAutoExpandedClientsId = null; return; }
-    if (selectedDownloadIds.length !== 1) { lastAutoExpandedClientsId = null; return; }
-    const id = selectedDownloadIds[0];
+    if (!focusedDlId) { lastAutoExpandedClientsId = null; return; }
+    const id = focusedDlId;
     if (expandedTransferId === id) { lastAutoExpandedClientsId = id; return; }
     // User explicitly collapsed this row's panel — don't reopen it.
     if (lastAutoExpandedClientsId === id) return;
@@ -5081,10 +5070,11 @@
 
   $effect.pre(() => {
     const visible = visibleSelectableDownloadIds;
-    const next = selectedDownloadIds.filter((id) => visible.has(id));
-    if (next.length !== selectedDownloadIds.length) {
-      selectedDownloadIds = next;
+    const next = checkedDownloadIds.filter((id) => visible.has(id));
+    if (next.length !== checkedDownloadIds.length) {
+      checkedDownloadIds = next;
     }
+    if (focusedDlId && !visible.has(focusedDlId)) focusedDlId = null;
     // L12: keep the shift-range anchor in sync with selection pruning so
     // Shift+Click doesn't reach back to a row that's no longer visible.
     if (lastClickedDlId && !visible.has(lastClickedDlId)) {
@@ -5152,7 +5142,9 @@
   if (e.key === 'F2') {
     const t = fileDetailsId
       ? (fileDetailsTransfer && canRename(fileDetailsTransfer) ? fileDetailsTransfer : null)
-      : [...selectedBatchTransfers].reverse().find((row) => canRename(row));
+      : selectedTransfer
+        ? (canRename(selectedTransfer) ? selectedTransfer : null)
+        : [...selectedBatchTransfers].reverse().find((row) => canRename(row));
     if (t) {
       e.preventDefault();
       openRename(t);
@@ -5171,8 +5163,9 @@
   if (filteredSelectableDownloads.length === 0) return;
   if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && isShortcutLetter(e, 'a')) {
     e.preventDefault();
-    selectedDownloadIds = filteredSelectableDownloads.map((t) => t.id);
-    lastClickedDlId = selectedDownloadIds[0] ?? null;
+    // Select all is the header box's job done from the keyboard: it ticks.
+    checkedDownloadIds = filteredSelectableDownloads.map((t) => t.id);
+    lastClickedDlId = checkedDownloadIds[0] ?? null;
     return;
   }
   // Space pauses the selection, or resumes it when nothing in it is running —
@@ -5191,7 +5184,7 @@
     else if (selectedResumableCount > 0) void handleBatchResumeDownloads();
     return;
   }
-  const currentId = selectedDownloadIds[selectedDownloadIds.length - 1];
+  const currentId = focusedDlId ?? checkedDownloadIds[checkedDownloadIds.length - 1];
   const idx = currentId ? filteredSelectableDownloads.findIndex((t) => t.id === currentId) : -1;
   const lastIdx = filteredSelectableDownloads.length - 1;
   let nextIdx: number | null = null;
@@ -5203,22 +5196,9 @@
     const next = filteredSelectableDownloads[nextIdx];
     if (!next) return;
     e.preventDefault();
-    if (e.shiftKey) {
-      // Extend from the anchor, the row last clicked, to the new row; the
-      // new row goes last so the next Shift+arrow moves on from it.
-      let anchorIdx = resolveLastClickedDlIndex();
-      if (anchorIdx < 0) {
-        anchorIdx = idx < 0 ? nextIdx : idx;
-        lastClickedDlId = filteredSelectableDownloads[anchorIdx].id;
-      }
-      const lo = Math.min(anchorIdx, nextIdx);
-      const hi = Math.max(anchorIdx, nextIdx);
-      const range = filteredSelectableDownloads.slice(lo, hi + 1).map((t) => t.id).filter((id) => id !== next.id);
-      selectedDownloadIds = [...range, next.id];
-    } else {
-      selectedDownloadIds = [next.id];
-      lastClickedDlId = next.id;
-    }
+    // Moves the focus only, Shift or not: the boxes are ticked by hand.
+    focusedDlId = next.id;
+    lastClickedDlId = next.id;
     revealDownloadRow(next.id);
   } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedDownloadIds.length > 0) {
     e.preventDefault();
@@ -5466,15 +5446,16 @@
               class="dl-row {t.status}"
               class:row-alt={((dlActiveWindow.start + i) & 1) === 1}
               class:expanded={expandedTransferId === t.id}
-              class:selected={selectedDlIdSet.has(t.id)}
+              class:selected={focusedDlId === t.id || checkedDlIdSet.has(t.id)}
+              class:ctx-target={ctxMenu?.transfer.id === t.id && focusedDlId !== t.id && !checkedDlIdSet.has(t.id)}
               onclick={(e) => onDownloadRowClick(e, t)}
               oncontextmenu={(e) => onCtx(e, t, 'active')}
-              ondblclick={() => { if (preClickSelection !== null) { selectedDownloadIds = preClickSelection; preClickSelection = null; } toggleSourceDetail(t); }}
+              ondblclick={() => toggleSourceDetail(t)}
             >
               <td class="col-dl-check">
                 <input
                   type="checkbox"
-                  checked={selectedDlIdSet.has(t.id)}
+                  checked={checkedDlIdSet.has(t.id)}
                   onclick={(e) => { e.stopPropagation(); toggleDlCheck(t, e.shiftKey); }}
                   aria-label={m.transfers_select_row({ name: t.file_name })}
                 />
@@ -5669,14 +5650,15 @@
               <tr
                 class="dl-row completed-row {t.status}"
                 class:row-alt={((filteredActiveDownloads.length + dlCompletedWindow.start + i) & 1) === 1}
-                class:selected={selectedDlIdSet.has(t.id)}
+                class:selected={focusedDlId === t.id || checkedDlIdSet.has(t.id)}
+                class:ctx-target={ctxMenu?.transfer.id === t.id && focusedDlId !== t.id && !checkedDlIdSet.has(t.id)}
                 onclick={(e) => onDownloadRowClick(e, t)}
                 oncontextmenu={(e) => onCtx(e, t, 'completed')}
               >
                 <td class="col-dl-check">
                   <input
                     type="checkbox"
-                    checked={selectedDlIdSet.has(t.id)}
+                    checked={checkedDlIdSet.has(t.id)}
                     onclick={(e) => { e.stopPropagation(); toggleDlCheck(t, e.shiftKey); }}
                     aria-label={m.transfers_select_row({ name: t.file_name })}
                   />
@@ -5765,7 +5747,7 @@
         </tbody>
       </table>
     </div>
-    {#if selectedDownloadCount > 1}
+    {#if checkedDownloadIds.length > 0}
       <div class="selection-footer">
         <div class="selection-meta">
           <strong>{m.transfers_selected_count({ count: selectedDownloadCount })}</strong>
@@ -6632,7 +6614,7 @@
                   <p class="empty-sub">{m.transfers_loading_sources_dots()}</p>
                 </div>
               </td></tr>
-            {:else if selectedDownloadIds.length > 1}
+            {:else if !focusedDlId && checkedDownloadIds.length > 1}
               <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
                 <div class="empty-state compact">
                   <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
@@ -6645,7 +6627,7 @@
                   <p class="empty-sub">{m.transfers_empty_multiple_selected_sub()}</p>
                 </div>
               </td></tr>
-            {:else if selectedDownloadIds.length === 1 && !activeDownloads.some((d) => d.id === selectedDownloadIds[0])}
+            {:else if focusedDlId && !activeDownloads.some((d) => d.id === focusedDlId)}
               <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
                 <div class="empty-state compact">
                   <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
@@ -7202,7 +7184,7 @@
       ...confirmBatchCancel.ids.filter((id) => finishedNow.has(id)),
     ];
     discardWithUndo(ids, removeIds);
-    selectedDownloadIds = [];
+    checkedDownloadIds = [];
     lastClickedDlId = null;
     // To the list, not the filter box: a text field there keeps Ctrl+Z for
     // its own undo, and the Undo toast that just appeared is what the
@@ -8139,6 +8121,12 @@
   .transfer-table tbody tr.dl-row.selected,
   .transfer-table tbody tr.dl-row.selected:hover {
     background: var(--table-row-selected);
+  }
+  /* The row a context menu is open for, when it is not part of the selection:
+     marked as the Library marks it, without selecting (and so checking) it. */
+  .transfer-table tbody tr.dl-row.ctx-target,
+  .transfer-table tbody tr.dl-row.ctx-target:hover {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
   }
 
   .col-dl-check {

@@ -3978,7 +3978,6 @@
   "shortcuts_settings_sections": "Spostarsi tra le sezioni (nell'elenco delle sezioni)",
   "shortcuts_settings_apply": "Applica l'impostazione digitata",
   "shortcuts_settings_revert": "Annulla un'impostazione digitata non ancora applicata",
-  "shortcuts_transfers_extend": "Estendi la selezione su o giù",
   "shortcuts_transfers_jump_ends": "Vai al primo o all’ultimo download",
   "shortcuts_transfers_select_all": "Seleziona tutti i download mostrati",
   "shortcuts_transfers_pause_resume": "Metti in pausa i download selezionati, o riprendili se nessuno è attivo",

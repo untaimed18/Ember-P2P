@@ -3978,7 +3978,6 @@
   "shortcuts_settings_sections": "Moverse entre secciones (en la lista de secciones)",
   "shortcuts_settings_apply": "Aplicar el ajuste escrito",
   "shortcuts_settings_revert": "Deshacer un ajuste escrito que aún no se ha aplicado",
-  "shortcuts_transfers_extend": "Ampliar la selección hacia arriba o abajo",
   "shortcuts_transfers_jump_ends": "Ir a la primera o última descarga",
   "shortcuts_transfers_select_all": "Seleccionar todas las descargas mostradas",
   "shortcuts_transfers_pause_resume": "Pausar las descargas seleccionadas, o reanudarlas si ninguna está en curso",

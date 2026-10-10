@@ -3978,7 +3978,6 @@
   "shortcuts_settings_sections": "Passer d'une section à l'autre (dans la liste des sections)",
   "shortcuts_settings_apply": "Appliquer le paramètre saisi",
   "shortcuts_settings_revert": "Annuler une saisie pas encore appliquée",
-  "shortcuts_transfers_extend": "Étendre la sélection vers le haut ou le bas",
   "shortcuts_transfers_jump_ends": "Aller au premier ou au dernier téléchargement",
   "shortcuts_transfers_select_all": "Sélectionner tous les téléchargements affichés",
   "shortcuts_transfers_pause_resume": "Mettre en pause les téléchargements sélectionnés, ou les reprendre si aucun n’est actif",

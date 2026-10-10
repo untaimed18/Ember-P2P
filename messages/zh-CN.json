@@ -3978,7 +3978,6 @@
   "shortcuts_settings_sections": "在分区之间切换（在分区列表中）",
   "shortcuts_settings_apply": "应用输入的设置",
   "shortcuts_settings_revert": "撤销尚未应用的输入",
-  "shortcuts_transfers_extend": "向上或向下扩展选择",
   "shortcuts_transfers_jump_ends": "跳到第一个或最后一个下载",
   "shortcuts_transfers_select_all": "选择显示的全部下载",
   "shortcuts_transfers_pause_resume": "暂停所选下载；若都未在运行则继续",

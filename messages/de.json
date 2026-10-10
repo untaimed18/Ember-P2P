@@ -3978,7 +3978,6 @@
   "shortcuts_settings_sections": "Zwischen Bereichen wechseln (in der Bereichsliste)",
   "shortcuts_settings_apply": "Eingegebene Einstellung übernehmen",
   "shortcuts_settings_revert": "Noch nicht übernommene Eingabe zurücksetzen",
-  "shortcuts_transfers_extend": "Auswahl nach oben oder unten erweitern",
   "shortcuts_transfers_jump_ends": "Zum ersten oder letzten Download springen",
   "shortcuts_transfers_select_all": "Alle angezeigten Downloads auswählen",
   "shortcuts_transfers_pause_resume": "Ausgewählte Downloads pausieren oder fortsetzen, wenn keiner läuft",

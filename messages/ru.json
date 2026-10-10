@@ -3978,7 +3978,6 @@
   "shortcuts_settings_sections": "Переход между разделами (в списке разделов)",
   "shortcuts_settings_apply": "Применить введённое значение",
   "shortcuts_settings_revert": "Отменить ещё не применённое значение",
-  "shortcuts_transfers_extend": "Расширить выделение вверх или вниз",
   "shortcuts_transfers_jump_ends": "Перейти к первой или последней загрузке",
   "shortcuts_transfers_select_all": "Выделить все показанные загрузки",
   "shortcuts_transfers_pause_resume": "Приостановить выбранные загрузки или возобновить, если ни одна не идёт",

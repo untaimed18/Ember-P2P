@@ -3978,7 +3978,6 @@
   "shortcuts_settings_sections": "在分區之間切換（在分區清單中）",
   "shortcuts_settings_apply": "套用輸入的設定",
   "shortcuts_settings_revert": "復原尚未套用的輸入",
-  "shortcuts_transfers_extend": "向上或向下延伸選取範圍",
   "shortcuts_transfers_jump_ends": "跳到第一個或最後一個下載",
   "shortcuts_transfers_select_all": "選取顯示的所有下載",
   "shortcuts_transfers_pause_resume": "暫停所選下載；若都未在執行則繼續",
