@@ -3152,7 +3152,7 @@ async fn handle_command_inner(
                 return;
             }
             if let Some(gossip) = ember::channel::ChannelGossip::decode(&body) {
-                let _ = remember_channel_gossip(state, gossip.msg_id);
+                remember_originated_gossip(state, &gossip);
             }
             fanout_channel_gossip_body(socket, state, db, body, None).await;
         }
@@ -3284,8 +3284,26 @@ async fn handle_command_inner(
             // the file's name and size. A recipient on v1.6.x cannot read it
             // either, so unless this one is known to, the plain offer is kept
             // and the user is asked about it if the recipient stays silent.
+            // The file as it stands now, which the block path checks before it
+            // serves a byte. Off this task: an open can stall on a scanner.
+            let stamp_path = path.clone();
+            let stamp = match tokio::task::spawn_blocking(move || {
+                ember::xfer::SourceStamp::of_path(&stamp_path)
+            })
+            .await
+            {
+                Ok(Ok(stamp)) if stamp.size() == size => stamp,
+                _ => {
+                    let _ = tx.send(Err(coded(
+                        "channels_xfer_source_changed",
+                        "The file changed or was moved before it could be offered",
+                    )));
+                    return;
+                }
+            };
             let mut send =
-                ember::xfer::SendState::new(channel_id, peer, key, name.clone(), size, path.clone());
+                ember::xfer::SendState::new(channel_id, peer, key, name.clone(), size, path.clone())
+                    .with_source_stamp(stamp);
             if ember::xfer::holds_plain_offer(size, member_reads_sealed_offers(state, db, &peer)) {
                 send.hold_plain_offer(
                     ember::channel::encode_xfer_offer(&key, &offer),
@@ -3368,6 +3386,30 @@ async fn handle_command_inner(
                     )));
                     return;
                 }
+                // No longer in the room it came from — left, deleted, or walked
+                // out when the directory listed it gone. Its frames are dropped
+                // from here on, so the transfer could never finish.
+                if !cached_channel_view(state, db, offer.channel_id)
+                    .is_some_and(|view| view.row.in_room_now())
+                {
+                    state.xfer_pending.remove(&xfer_id);
+                    emit_xfer_update(
+                        app_handle,
+                        &xfer_id,
+                        &offer.channel_id,
+                        &offer.peer,
+                        "receive",
+                        &offer.name,
+                        offer.size,
+                        0,
+                        "not_allowed",
+                    );
+                    let _ = tx.send(Err(coded(
+                        "channels_xfer_no_member",
+                        "That member is not in this room",
+                    )));
+                    return;
+                }
                 // Banned since the prompt appeared. The offer path refuses a
                 // banned sender outright, and nothing re-read that decision
                 // afterwards — so a member evicted while their dialog sat on
@@ -3412,7 +3454,16 @@ async fn handle_command_inner(
                 .await
                 .ok()
                 .flatten();
-                if free.is_some_and(|free| free < offer.size.saturating_add(XFER_DISK_HEADROOM)) {
+                // Receives already running grow their part files as data
+                // arrives, so what they still owe is spoken for too.
+                let owed: u64 = state
+                    .xfer_recv
+                    .values()
+                    .map(|recv| recv.size.saturating_sub(recv.bytes_received()))
+                    .fold(0, u64::saturating_add);
+                if free.is_some_and(|free| {
+                    free < offer.size.saturating_add(XFER_DISK_HEADROOM).saturating_add(owed)
+                }) {
                     let _ = tx.send(Err(coded(
                         "channels_xfer_no_space",
                         "Not enough free disk space for this file",

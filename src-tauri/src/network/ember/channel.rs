@@ -1074,8 +1074,23 @@ pub fn derive_channel_presence_capability(
 /// ([`gossip_is_catch_up_shaped`]), and a TTL-1 frame is never taken as
 /// evidence, which costs only a live line on its final hop that presence will
 /// vouch for anyway. Chat display can still show the author either way.
-pub fn chat_author_joins_gossip_roster(private: bool, opened: OpenedUnder, ttl: u8) -> bool {
-    private && opened == OpenedUnder::Current && !gossip_is_catch_up_shaped(ttl)
+///
+/// The TTL is outside the seal, so a relay could raise it on a re-serve. The
+/// line must also be live by its signed time ([`gossip_fresh_for_relay`]),
+/// which re-serves of anything older are not. Members whose builds send
+/// key-proven beacons are admitted by those instead; this path remains for
+/// builds that do not.
+pub fn chat_author_joins_gossip_roster(
+    private: bool,
+    opened: OpenedUnder,
+    ttl: u8,
+    timestamp: i64,
+    now: i64,
+) -> bool {
+    private
+        && opened == OpenedUnder::Current
+        && !gossip_is_catch_up_shaped(ttl)
+        && gossip_fresh_for_relay(timestamp, now)
 }
 
 /// Which of a room's content keys opened a frame.
@@ -1396,13 +1411,22 @@ impl ChannelInvite {
         let mut name = String::new();
         let mut join_secret = None;
         let mut key_epoch = 0u64;
+        let mut seen_pk = false;
+        let mut seen_k = false;
         for pair in query.split('&') {
             if pair.is_empty() {
                 continue;
             }
             let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
             match key {
-                "pk" => pubkey = hex_32(value),
+                // Each at most once: a second copy would decide which room, or
+                // whether it is private, by whichever came last.
+                "pk" if seen_pk => return None,
+                "k" if seen_k => return None,
+                "pk" => {
+                    seen_pk = true;
+                    pubkey = hex_32(value);
+                }
                 // Bounded before decoding, not after. The name is the one
                 // variable-length field in an invite, `percent_decode` sizes its
                 // buffer from the input, and this runs on a string the user
@@ -1415,11 +1439,24 @@ impl ChannelInvite {
                     name = percent_decode(value)?
                 }
                 "name" => return None,
-                "k" => join_secret = hex_32(value),
+                // A secret that is there but does not parse is refused, not
+                // dropped: dropping it would join a private room as public,
+                // announcing the user's membership to anyone and never repaired.
+                "k" => {
+                    seen_k = true;
+                    join_secret = Some(hex_32(value)?);
+                }
                 // Unparseable is the same as absent: an invite is user-pasted,
                 // so a mangled epoch must not throw the whole thing away when
-                // the secret itself is intact.
-                "e" => key_epoch = value.parse().unwrap_or(0),
+                // the secret itself is intact. So is an implausible one, which
+                // would pin this member's epoch above every real rotation.
+                "e" => {
+                    key_epoch = value
+                        .parse()
+                        .ok()
+                        .filter(|epoch| *epoch <= INVITE_KEY_EPOCH_MAX)
+                        .unwrap_or(0)
+                }
                 _ => {}
             }
         }
@@ -1442,6 +1479,10 @@ impl ChannelInvite {
         })
     }
 }
+
+/// Highest key epoch an invite may name. A room rotates its key once per ban
+/// of a member, so this is far beyond any real room.
+const INVITE_KEY_EPOCH_MAX: u64 = 1_000_000;
 
 fn hex_16(s: &str) -> Option<[u8; 16]> {
     let bytes = hex::decode(s).ok()?;
@@ -2456,6 +2497,22 @@ pub fn keep_latest_beacon(latest: &mut HashMap<[u8; 32], PresenceBeacon>, beacon
 /// member used to stick a ban or freeze catch-up for everyone who stored it.
 pub fn gossip_timestamp_ok(timestamp: i64, now: i64) -> bool {
     timestamp > 0 && timestamp <= now.saturating_add(CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS)
+}
+
+/// How old a signed frame may be and still be relayed, or charged to its
+/// author's send budget.
+///
+/// Timestamps have no other age limit, and the seen-set forgets ids within
+/// hours, so without this anyone holding old traffic could replay it: each
+/// copy would spend the real author's per-second allowance on every node it
+/// reached and silence them. Catch-up serves old lines one hop at a time, so
+/// nothing honest needs an old frame passed on.
+pub const CHANNEL_GOSSIP_RELAY_FRESH_SECS: i64 = 10 * 60;
+
+/// Whether a frame dated `timestamp` is recent enough to relay; see
+/// [`CHANNEL_GOSSIP_RELAY_FRESH_SECS`].
+pub fn gossip_fresh_for_relay(timestamp: i64, now: i64) -> bool {
+    now.saturating_sub(timestamp) <= CHANNEL_GOSSIP_RELAY_FRESH_SECS
 }
 
 /// How long after sending a line its author may still revise it.
@@ -4351,7 +4408,7 @@ pub fn rate_window_allow(
 /// stream kept up. Dropping the stalest entry keeps the same bound on size and
 /// costs its owner only the rest of a short window; the newcomer is tracked
 /// from here on, so nothing is admitted untracked.
-fn make_room_in_rate_map<K: Eq + std::hash::Hash + Copy>(
+pub fn make_room_in_rate_map<K: Eq + std::hash::Hash + Copy>(
     seen: &mut HashMap<K, VecDeque<Instant>>,
     key: &K,
     cap: usize,
@@ -5394,6 +5451,36 @@ mod tests {
         assert_eq!(ChannelInvite::parse(&public.format()).unwrap().key_epoch, 0);
     }
 
+    /// A private invite whose secret is mangled must not join the room as
+    /// public, and a second copy of a field must not decide which room it is.
+    #[test]
+    fn a_mangled_or_doubled_private_invite_is_refused() {
+        let ident = ChannelIdentity::generate();
+        let secret = generate_private_join_secret();
+        let invite = ChannelInvite {
+            channel_id: ident.channel_id,
+            pubkey: ident.pubkey,
+            name: "Secret".into(),
+            join_secret: secret,
+            private: true,
+            key_epoch: 3,
+        };
+        let uri = invite.format();
+        let k = format!("&k={}", hex::encode(secret));
+        assert!(ChannelInvite::parse(&uri.replace(&k, "&k=zz")).is_none(), "a bad secret");
+        assert!(ChannelInvite::parse(&format!("{uri}{k}")).is_none(), "a second secret");
+        assert!(
+            ChannelInvite::parse(&format!("{uri}&pk={}", hex::encode(ident.pubkey))).is_none(),
+            "a second pubkey"
+        );
+        let huge = uri.replace("&e=3", &format!("&e={}", u64::MAX));
+        assert_eq!(
+            ChannelInvite::parse(&huge).expect("the secret is intact").key_epoch,
+            0,
+            "an implausible epoch is read as absent"
+        );
+    }
+
     #[test]
     fn invite_with_mismatched_id_is_rejected() {
         let ident = ChannelIdentity::generate();
@@ -5485,15 +5572,26 @@ mod tests {
             assert_eq!(plain, b"hi");
             assert_eq!(opened, OpenedUnder::Retired);
             assert!(
-                !chat_author_joins_gossip_roster(true, opened, CHANNEL_MSG_TTL_DEFAULT),
+                !chat_author_joins_gossip_roster(true, opened, CHANNEL_MSG_TTL_DEFAULT, 1_000, 1_000),
                 "an evicted member holds every retired key; a line under one \
                  must not put a fresh identity on the roster"
             );
         }
         assert!(
-            !chat_author_joins_gossip_roster(true, OpenedUnder::Current, 1),
+            !chat_author_joins_gossip_roster(true, OpenedUnder::Current, 1, 1_000, 1_000),
             "a catch-up re-serve is sealed by the responder, not the author, so \
              its current-key seal says nothing about who wrote the line"
+        );
+        assert!(
+            !chat_author_joins_gossip_roster(
+                true,
+                OpenedUnder::Current,
+                CHANNEL_MSG_TTL_DEFAULT,
+                1_000,
+                1_000 + CHANNEL_GOSSIP_RELAY_FRESH_SECS + 1,
+            ),
+            "the TTL is unauthenticated, so an old line re-served with it raised \
+             must not admit its author either"
         );
         assert!(open(&content_key(&[0x04u8; 32])).is_none());
         assert!(open_with_content_keys::<()>(&[], |_| Some(())).is_none());
@@ -5544,12 +5642,13 @@ mod tests {
 
     #[test]
     fn a_public_chat_line_does_not_insert_a_stranger_into_the_neighbor_set() {
+        let now = 1_800_000_000;
         assert!(
-            !chat_author_joins_gossip_roster(false, OpenedUnder::Current, CHANNEL_MSG_TTL_DEFAULT),
+            !chat_author_joins_gossip_roster(false, OpenedUnder::Current, CHANNEL_MSG_TTL_DEFAULT, now, now),
             "public rooms take neighbors from presence, not from chat authors"
         );
         assert!(
-            chat_author_joins_gossip_roster(true, OpenedUnder::Current, CHANNEL_MSG_TTL_DEFAULT),
+            chat_author_joins_gossip_roster(true, OpenedUnder::Current, CHANNEL_MSG_TTL_DEFAULT, now, now),
             "a live private chat line is already evidence of membership"
         );
 

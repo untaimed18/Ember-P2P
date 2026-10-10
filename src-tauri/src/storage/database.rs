@@ -423,6 +423,17 @@ impl StoredChannel {
     }
 }
 
+/// A leave notice owed for a room whose row is gone; see
+/// [`Database::owed_channel_departures`].
+#[derive(Debug, Clone)]
+pub struct OwedChannelDeparture {
+    pub channel_id: String,
+    pub channel_pubkey: [u8; 32],
+    pub private: bool,
+    /// The secret the room sealed with when the notice became owed.
+    pub join_secret: [u8; 32],
+}
+
 /// The contents of one owner moderation snapshot, as
 /// [`Database::apply_channel_moderation`] stores them. The trailing facts are
 /// `None` when the record does not carry them.
@@ -7849,6 +7860,13 @@ impl Database {
             "DELETE FROM channel_newer_frames WHERE channel_id = ?1",
             params![channel_id],
         )?;
+        // Back in a room we had forgotten: a leave notice still owed from then
+        // would tell the room to drop the roster row we are about to earn.
+        Self::ensure_channel_departures_owed_locked(conn)?;
+        conn.execute(
+            "DELETE FROM channel_departures_owed WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
         Ok(())
     }
 
@@ -7889,8 +7907,26 @@ impl Database {
         // reads; the owner seed and join secret left behind could still sign
         // for the room and mint invites to it, with nothing able to remove
         // them later, since `forget_channel` refuses a row we own.
+        //
+        // Our presence in the room is retracted from the owed-notice queue,
+        // captured while the room's key is still here to seal it: inside the
+        // room, or already out of it with the notice not yet delivered.
+        let departure: Option<(bool, i64)> = tx
+            .query_row(
+                "SELECT in_room, departure_due_at FROM channels
+                 WHERE channel_id = ?1 AND deleted = 0",
+                params![channel_id],
+                |row| Ok((row.get::<_, i64>(0)? != 0, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((in_room, due)) = departure {
+            if in_room || due > 0 {
+                let now = chrono::Utc::now().timestamp();
+                self.owe_channel_departure_locked(&tx, channel_id, if due > 0 { due } else { now })?;
+            }
+        }
         let n = tx.execute(
-            "UPDATE channels SET in_room = 0, deleted = 1,
+            "UPDATE channels SET in_room = 0, deleted = 1, departure_due_at = 0,
                  pending_successor = '', pending_handoff_version = 0,
                  owner_seed = NULL, join_secret = NULL, topic = '', welcome = ''
              WHERE channel_id = ?1",
@@ -7918,6 +7954,16 @@ impl Database {
             )?;
             tx.execute(
                 "DELETE FROM channel_members WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+            Self::ensure_channel_owner_bans_locked(&tx)?;
+            tx.execute(
+                "DELETE FROM channel_owner_bans WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+            Self::ensure_channel_history_sync_locked(&tx)?;
+            tx.execute(
+                "DELETE FROM channel_history_sync WHERE channel_id = ?1",
                 params![channel_id],
             )?;
             tx.execute(
@@ -8009,12 +8055,30 @@ impl Database {
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
+        // A leave notice still owed outlives the row it was owed from: the
+        // retry loop reads it from here once the room is gone.
+        let departure_due: i64 = tx
+            .query_row(
+                "SELECT departure_due_at FROM channels WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if departure_due > 0 {
+            self.owe_channel_departure_locked(&tx, channel_id, departure_due)?;
+        }
         tx.execute(
             "DELETE FROM channel_messages WHERE channel_id = ?1",
             params![channel_id],
         )?;
         tx.execute(
             "DELETE FROM channel_message_reactions WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        Self::ensure_channel_history_sync_locked(&tx)?;
+        tx.execute(
+            "DELETE FROM channel_history_sync WHERE channel_id = ?1",
             params![channel_id],
         )?;
         Self::ensure_channel_newer_frames_locked(&tx)?;
@@ -8056,7 +8120,7 @@ impl Database {
             Some(pk) => tx.execute(
                 "DELETE FROM channel_members
                  WHERE channel_id = ?1
-                   AND NOT (banned = 1 AND lower(member_pubkey) = lower(?2))",
+                   AND NOT (banned = 1 AND member_pubkey = lower(?2))",
                 params![channel_id, pk],
             )?,
             None => tx.execute(
@@ -8064,6 +8128,13 @@ impl Database {
                 params![channel_id],
             )?,
         };
+        Self::ensure_channel_owner_bans_locked(&tx)?;
+        tx.execute(
+            "DELETE FROM channel_owner_bans WHERE channel_id = ?1 AND member_pubkey NOT IN (
+                 SELECT member_pubkey FROM channel_members WHERE channel_id = ?1
+             )",
+            params![channel_id],
+        )?;
         Self::ensure_channel_drafts_locked(&tx)?;
         tx.execute(
             "DELETE FROM channel_drafts WHERE channel_id = ?1",
@@ -8080,6 +8151,228 @@ impl Database {
         tx.commit()?;
         bump_channel_roster_generation(channel_id);
         Ok(n > 0)
+    }
+
+    /// Leave notices still owed for rooms whose row is gone (forgotten) or
+    /// destroyed (an owner's delete). Created on first use, like
+    /// [`Self::ensure_channel_drafts_locked`]. The secret is the one the room
+    /// sealed with when the notice became owed, under the chat key; empty for
+    /// a public room, whose secret is derived from its pubkey.
+    fn ensure_channel_departures_owed_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_departures_owed (
+                channel_id TEXT PRIMARY KEY,
+                channel_pubkey TEXT NOT NULL,
+                private INTEGER NOT NULL DEFAULT 0,
+                secret_enc TEXT,
+                due_at INTEGER NOT NULL,
+                owed_since INTEGER NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Carry the leave notice owed for `channel_id` over to
+    /// `channel_departures_owed`, inside the caller's transaction and before
+    /// the room's key is dropped. A private room this device is behind on is
+    /// skipped: its presence was never visible under the room's current key,
+    /// so there is nothing there to retract, and a notice under an older key
+    /// would only reach the members a rotation evicted.
+    fn owe_channel_departure_locked(
+        &self,
+        conn: &Connection,
+        channel_id: &str,
+        due_at: i64,
+    ) -> anyhow::Result<()> {
+        let Some((pubkey, visibility, epoch, wanted)) = conn
+            .query_row(
+                "SELECT pubkey, visibility, key_epoch, key_epoch_wanted FROM channels
+                 WHERE channel_id = ?1",
+                params![channel_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            return Ok(());
+        };
+        let private = visibility == crate::network::ember::channel::CHANNEL_KIND_PRIVATE;
+        let secret_enc = if private {
+            Self::ensure_channel_owner_key_pending_locked(conn)?;
+            let pending: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM channel_owner_key_pending WHERE channel_id = ?1)",
+                params![channel_id],
+                |row| row.get(0),
+            )?;
+            if wanted > epoch || pending {
+                return Ok(());
+            }
+            let Some(chat_key) = self.chat_key.as_deref() else {
+                return Ok(());
+            };
+            let Some(secret) = self.load_current_channel_secret_locked(conn, channel_id)? else {
+                return Ok(());
+            };
+            Some(Self::encrypt_channel_secret(chat_key, channel_id, "departure", &secret)?)
+        } else {
+            None
+        };
+        Self::ensure_channel_departures_owed_locked(conn)?;
+        conn.execute(
+            "INSERT INTO channel_departures_owed
+                (channel_id, channel_pubkey, private, secret_enc, due_at, owed_since)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(channel_id) DO UPDATE SET
+                channel_pubkey = excluded.channel_pubkey,
+                private = excluded.private,
+                secret_enc = excluded.secret_enc,
+                due_at = excluded.due_at",
+            params![
+                channel_id,
+                pubkey.to_ascii_lowercase(),
+                i64::from(private),
+                secret_enc,
+                due_at.max(1),
+                chrono::Utc::now().timestamp()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// How long an owed leave notice is worth retrying: past two presence
+    /// windows nobody is still counting us as present anyway.
+    const CHANNEL_DEPARTURE_OWED_KEEP_SECS: i64 = 2 * PRESENCE_FRESH_SECS;
+
+    /// Owed leave notices due by `now`, oldest first. Lapsed ones, and any
+    /// whose secret no longer opens, are dropped on the way.
+    pub fn owed_channel_departures(&self, now: i64) -> anyhow::Result<Vec<OwedChannelDeparture>> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_departures_owed_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM channel_departures_owed WHERE owed_since < ?1 OR owed_since > ?2",
+            params![
+                now.saturating_sub(Self::CHANNEL_DEPARTURE_OWED_KEEP_SECS),
+                now.saturating_add(Self::CHANNEL_DEPARTURE_OWED_KEEP_SECS)
+            ],
+        )?;
+        let rows: Vec<(String, String, bool, Option<String>)> = {
+            let mut stmt = conn.prepare(
+                "SELECT channel_id, channel_pubkey, private, secret_enc
+                 FROM channel_departures_owed WHERE due_at <= ?1 ORDER BY due_at",
+            )?;
+            let mapped = stmt.query_map(params![now], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0, row.get(3)?))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for (channel_id, pubkey_hex, private, secret_enc) in rows {
+            let pubkey = hex::decode(&pubkey_hex)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok());
+            let id_ok = hex::decode(&channel_id).is_ok_and(|b| b.len() == 16);
+            let secret = match (pubkey, private, secret_enc.as_deref(), self.chat_key.as_deref()) {
+                (Some(pk), false, _, _) => Some(crate::network::ember::channel::public_join_secret(&pk)),
+                (Some(_), true, Some(enc), Some(key)) => {
+                    Self::decrypt_channel_secret(key, &channel_id, "departure", enc).ok()
+                }
+                _ => None,
+            };
+            match (pubkey, secret) {
+                (Some(channel_pubkey), Some(join_secret)) if id_ok => out.push(OwedChannelDeparture {
+                    channel_id,
+                    channel_pubkey,
+                    private,
+                    join_secret,
+                }),
+                _ => {
+                    conn.execute(
+                        "DELETE FROM channel_departures_owed WHERE channel_id = ?1",
+                        params![channel_id],
+                    )?;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Take the next attempt at an owed leave notice, moving it to
+    /// `next_attempt`. `false` when it is no longer owed.
+    pub fn claim_owed_channel_departure(
+        &self,
+        channel_id: &str,
+        next_attempt: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_departures_owed_locked(&conn)?;
+        Ok(conn.execute(
+            "UPDATE channel_departures_owed SET due_at = ?2 WHERE channel_id = ?1",
+            params![channel_id, next_attempt.max(1)],
+        )? > 0)
+    }
+
+    /// The owed leave notice landed.
+    pub fn clear_owed_channel_departure(&self, channel_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_departures_owed_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM channel_departures_owed WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        Ok(())
+    }
+
+    /// Per-room catch-up watermark, created on first use: the newest message
+    /// timestamp a history-sync reply has carried this device through.
+    fn ensure_channel_history_sync_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_history_sync (
+                channel_id TEXT PRIMARY KEY,
+                synced_through INTEGER NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// The room's catch-up watermark, or `None` when no catch-up reply has
+    /// advanced it yet (or the room is not here).
+    pub fn channel_history_synced_through(&self, channel_id: &str) -> anyhow::Result<Option<i64>> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_history_sync_locked(&conn)?;
+        Ok(conn
+            .query_row(
+                "SELECT synced_through FROM channel_history_sync WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Move the room's catch-up watermark forward to `ts`. Never backwards, and
+    /// nothing for a room that is not here or was deleted.
+    pub fn advance_channel_history_synced_through(
+        &self,
+        channel_id: &str,
+        ts: i64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_history_sync_locked(&conn)?;
+        conn.execute(
+            "INSERT INTO channel_history_sync (channel_id, synced_through)
+             SELECT ?1, ?2 WHERE EXISTS (
+                 SELECT 1 FROM channels WHERE channel_id = ?1 AND deleted = 0
+             )
+             ON CONFLICT(channel_id) DO UPDATE SET
+                synced_through = MAX(synced_through, excluded.synced_through)",
+            params![channel_id, ts],
+        )?;
+        Ok(())
     }
 
     /// Half-typed room lines, kept across a restart. Sealed with the chat key
@@ -8588,6 +8881,40 @@ impl Database {
             bump_channel_roster_generation(channel_id);
         }
         Ok(outcome)
+    }
+
+    /// Undo [`Self::adopt_recovered_owned_channel`] when the room's governance
+    /// snapshot did not land on it, so nothing signs for the room from an empty
+    /// state. A row the recovery inserted goes entirely; one it adopted from a
+    /// membership goes back to being a membership, keys and history kept.
+    pub fn release_recovered_owned_channel(
+        &self,
+        channel_id: &str,
+        outcome: RecoveredChannel,
+    ) -> anyhow::Result<()> {
+        match outcome {
+            RecoveredChannel::Inserted => {
+                self.delete_channel(channel_id, None)?;
+            }
+            RecoveredChannel::Adopted => {
+                let conn = self.conn.lock();
+                let tx = conn.unchecked_transaction()?;
+                tx.execute(
+                    "UPDATE channels SET is_owner = 0, owner_seed = NULL WHERE channel_id = ?1",
+                    params![channel_id],
+                )?;
+                Self::ensure_channel_owner_key_pending_locked(&tx)?;
+                tx.execute(
+                    "DELETE FROM channel_owner_key_pending WHERE channel_id = ?1",
+                    params![channel_id],
+                )?;
+                tx.commit()?;
+                drop(conn);
+                bump_channel_roster_generation(channel_id);
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn channel_draft_aad(channel_id: &str) -> Vec<u8> {
@@ -9437,6 +9764,12 @@ impl Database {
                  FROM channel_members WHERE channel_id = ?1",
                 params![old_channel_id, successor_channel_id],
             )?;
+            Self::ensure_channel_owner_bans_locked(tx)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO channel_owner_bans (channel_id, member_pubkey)
+                 SELECT ?2, member_pubkey FROM channel_owner_bans WHERE channel_id = ?1",
+                params![old_channel_id, successor_channel_id],
+            )?;
         }
         tx.execute(
             "UPDATE channels SET successor_id = ?2, is_owner = 0, owner_seed = NULL,
@@ -9495,9 +9828,16 @@ impl Database {
         old_channel_id: &str,
         successor_channel_id: &str,
     ) -> anyhow::Result<()> {
-        let history = self.get_channel_messages(old_channel_id, 5_000, None)?;
+        let history = self.get_channel_messages_opened(old_channel_id, 5_000, None)?;
         let mut copied_unread = Vec::new();
-        for row in history.into_iter().rev() {
+        // A line that would not open here is left behind rather than copied as
+        // its "unavailable" stand-in, which the successor would then hold as
+        // though its author had written it.
+        for row in history
+            .into_iter()
+            .rev()
+            .filter_map(|(row, readable)| readable.then_some(row))
+        {
             let msg_id = format!("handoff-{old_channel_id}-{}", row.id);
             // No signature travels with a handoff copy. The author signed the
             // line against the *old* room's id, so the original does not verify
@@ -10540,6 +10880,19 @@ impl Database {
         Ok(true)
     }
 
+    /// Whether `channel_id` has a row here that has not been deleted. Writes
+    /// that arrive from the network check this inside their own transaction:
+    /// the packet paths read the room from a cache that can outlive a forget
+    /// or a delete by a second, and a row written after the purge would stay
+    /// for good.
+    fn channel_live_locked(conn: &Connection, channel_id: &str) -> anyhow::Result<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM channels WHERE channel_id = ?1 AND deleted = 0)",
+            params![channel_id],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn upsert_channel_member(
         &self,
         channel_id: &str,
@@ -10556,6 +10909,9 @@ impl Database {
         let last_seen = last_seen.min(now);
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
+        if !Self::channel_live_locked(&tx, channel_id)? {
+            return Ok(ChannelMemberWrite::Refused);
+        }
         let prior: Option<(String, i64)> = tx
             .query_row(
                 "SELECT nickname, last_seen FROM channel_members
@@ -10742,6 +11098,13 @@ impl Database {
         Ok(n > 0)
     }
 
+    /// Apply a member's own leave notice, stamped `last_seen`.
+    ///
+    /// A plain row is deleted. A row that carries more than presence is only
+    /// aged out (`last_seen = 0`): a ban, a moderator flag, or the
+    /// `ban_revised_at` watermark that orders ban gossip. Deleting a moderator's
+    /// row on their leave made the owner's next snapshot — built from this
+    /// table — demote them for the whole room, with nothing to restore it.
     pub fn remove_channel_member(
         &self,
         channel_id: &str,
@@ -10749,12 +11112,23 @@ impl Database {
         last_seen: i64,
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
-        let n = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        let deleted = tx.execute(
             "DELETE FROM channel_members
              WHERE channel_id = ?1 AND member_pubkey = ?2 AND banned = 0
+               AND moderator = 0 AND ban_revised_at = 0
                AND last_seen <= ?3",
             params![channel_id, member_pubkey, last_seen],
         )?;
+        let aged = tx.execute(
+            "UPDATE channel_members SET last_seen = 0
+             WHERE channel_id = ?1 AND member_pubkey = ?2 AND banned = 0
+               AND (moderator = 1 OR ban_revised_at > 0)
+               AND last_seen > 0 AND last_seen <= ?3",
+            params![channel_id, member_pubkey, last_seen],
+        )?;
+        tx.commit()?;
+        let n = deleted + aged;
         drop(conn);
         if n > 0 {
             bump_channel_roster_generation(channel_id);
@@ -10805,12 +11179,12 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT c.channel_id FROM channel_members m
              JOIN channels c ON c.channel_id = m.channel_id
-             WHERE lower(m.member_pubkey) = lower(?1) AND m.banned = 0 AND m.last_seen > 0
+             WHERE m.member_pubkey = lower(?1) AND m.banned = 0 AND m.last_seen > 0
                AND c.in_room = 1 AND c.deleted = 0
                AND NOT EXISTS (
                    SELECT 1 FROM channel_members us
                    WHERE us.channel_id = c.channel_id
-                     AND lower(us.member_pubkey) = lower(?2) AND us.banned = 1)
+                     AND us.member_pubkey = lower(?2) AND us.banned = 1)
              ORDER BY m.last_seen DESC LIMIT ?3",
         )?;
         let rows = stmt
@@ -10976,8 +11350,22 @@ impl Database {
         )
     }
 
-    /// Apply a gossip ban/unban from a delegated moderator. Wins only if newer
-    /// than the last owner snapshot *and* any previous revision on that row.
+    /// Apply a gossip ban/unban from a delegated moderator.
+    ///
+    /// Ordered on the action's signed timestamp, held to no later than our own
+    /// clock. Stored unclamped, a moderator a few minutes fast — or one dating
+    /// a ban ahead on purpose — would outrank the owner's next snapshot, which
+    /// only clears bans revised at or before its own time, and the owner would
+    /// then republish that ban as their own. The clamp only reorders actions
+    /// dated ahead of us, which an honest clock does not produce. The action
+    /// has to be no older than the last owner snapshot and strictly newer than
+    /// the row's last revision, except that at an equal timestamp a ban beats
+    /// an unban. Two actions of the same kind at the same timestamp are one
+    /// action.
+    ///
+    /// Returns whether the row changed, so a replay of an action already
+    /// applied returns `false`. A room that is not here, or was deleted,
+    /// takes nothing.
     pub fn apply_channel_ban_action(
         &self,
         channel_id: &str,
@@ -10991,15 +11379,18 @@ impl Database {
         }
         let timestamp = timestamp.min(now);
         let conn = self.conn.lock();
-        let snapshot: i64 = conn
+        let tx = conn.unchecked_transaction()?;
+        let Some((snapshot, deleted)) = tx
             .query_row(
-                "SELECT moderation_updated_at FROM channels WHERE channel_id = ?1",
+                "SELECT moderation_updated_at, deleted FROM channels WHERE channel_id = ?1",
                 params![channel_id],
-                |row| row.get(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0)),
             )
             .optional()?
-            .unwrap_or(0);
-        if timestamp < snapshot {
+        else {
+            return Ok(false);
+        };
+        if deleted || timestamp < snapshot {
             return Ok(false);
         }
         // A ban that cannot be published is not a ban, and this is the one path
@@ -11016,10 +11407,10 @@ impl Database {
         // still refreshes `ban_revised_at` at exactly the cap. Unbans are never
         // refused: they only ever clear a row.
         if banned {
-            let held: i64 = conn.query_row(
+            let held: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM channel_members
                  WHERE channel_id = ?1 AND banned = 1
-                   AND lower(member_pubkey) <> lower(?2)",
+                   AND member_pubkey <> lower(?2)",
                 params![channel_id, member_pubkey],
                 |row| row.get(0),
             )?;
@@ -11027,14 +11418,16 @@ impl Database {
                 return Ok(false);
             }
         }
-        let n = conn.execute(
+        let n = tx.execute(
             "INSERT INTO channel_members
                 (channel_id, member_pubkey, nickname, last_seen, banned, moderator, ban_revised_at)
              VALUES (?1, ?2, '', 0, ?3, 0, ?4)
              ON CONFLICT(channel_id, member_pubkey) DO UPDATE SET
                 banned = excluded.banned,
                 ban_revised_at = excluded.ban_revised_at
-             WHERE channel_members.ban_revised_at <= excluded.ban_revised_at",
+             WHERE excluded.ban_revised_at > channel_members.ban_revised_at
+                OR (excluded.ban_revised_at = channel_members.ban_revised_at
+                    AND excluded.banned = 1 AND channel_members.banned = 0)",
             params![
                 channel_id,
                 member_pubkey,
@@ -11042,10 +11435,71 @@ impl Database {
                 timestamp
             ],
         )?;
+        // A ban the owner signed stops being one the moment it is lifted. A
+        // moderator restating it leaves it the owner's.
+        if n > 0 && !banned {
+            Self::ensure_channel_owner_bans_locked(&tx)?;
+            tx.execute(
+                "DELETE FROM channel_owner_bans WHERE channel_id = ?1 AND member_pubkey = ?2",
+                params![channel_id, member_pubkey],
+            )?;
+        }
+        tx.commit()?;
+        drop(conn);
         if n > 0 {
             bump_channel_roster_generation(channel_id);
         }
         Ok(n > 0)
+    }
+
+    /// Whether a delegated moderator's ban or unban naming `target_pubkey`
+    /// (hex) must be refused in this room.
+    ///
+    /// `true` when the target is any of:
+    /// - the room's owner, as named by the owner's signed snapshot;
+    /// - a moderator (`moderator = 1` on their roster row, banned or not):
+    ///   moderators do not act on each other, only the owner does;
+    /// - currently banned under a ban the owner's own snapshot carried (see
+    ///   `channel_owner_bans`): a moderator may not lift what the owner signed.
+    ///
+    /// `false` otherwise, including for a room or member this device has no row
+    /// for. The owner's own commands do not go through this; it is for the
+    /// moderator command path and for ingest of moderator gossip.
+    pub fn channel_ban_target_protected(
+        &self,
+        channel_id: &str,
+        target_pubkey: &str,
+    ) -> anyhow::Result<bool> {
+        let target = target_pubkey.to_ascii_lowercase();
+        let conn = self.conn.lock();
+        Self::ensure_channel_owner_bans_locked(&conn)?;
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM channels
+                            WHERE channel_id = ?1 AND owner_pubkey <> ''
+                              AND lower(owner_pubkey) = ?2)
+                 OR EXISTS(SELECT 1 FROM channel_members
+                            WHERE channel_id = ?1 AND member_pubkey = ?2 AND moderator = 1)
+                 OR EXISTS(SELECT 1 FROM channel_members m
+                            JOIN channel_owner_bans o
+                              ON o.channel_id = m.channel_id AND o.member_pubkey = m.member_pubkey
+                            WHERE m.channel_id = ?1 AND m.member_pubkey = ?2 AND m.banned = 1)",
+            params![channel_id, target],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Bans an owner snapshot carried and that still stand, created on first use
+    /// like `channel_owner_silences`. A row here means the member's current ban
+    /// is the owner's word rather than only a moderator's gossip.
+    fn ensure_channel_owner_bans_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_owner_bans (
+                channel_id TEXT NOT NULL,
+                member_pubkey TEXT NOT NULL,
+                PRIMARY KEY (channel_id, member_pubkey)
+            );",
+        )?;
+        Ok(())
     }
 
     /// Apply an owner-signed moderation snapshot if it is newer than what we hold.
@@ -11366,8 +11820,27 @@ impl Database {
             // exactly the state this whole change exists to undo.
             tx.execute(
                 "UPDATE channel_members SET banned = 0
-                 WHERE channel_id = ?1 AND lower(member_pubkey) = lower(?2)",
+                 WHERE channel_id = ?1 AND member_pubkey = lower(?2)",
                 params![channel_id, hex_owner],
+            )?;
+        }
+        // Which bans now stand on the owner's word: those this snapshot carried
+        // and that took (a newer moderator unban outranks it), and none that no
+        // longer stand at all.
+        Self::ensure_channel_owner_bans_locked(tx)?;
+        tx.execute(
+            "DELETE FROM channel_owner_bans WHERE channel_id = ?1 AND member_pubkey NOT IN (
+                 SELECT member_pubkey FROM channel_members WHERE channel_id = ?1 AND banned = 1
+             )",
+            params![channel_id],
+        )?;
+        for pk in banned_pubkeys.iter().take(32) {
+            tx.execute(
+                "INSERT OR IGNORE INTO channel_owner_bans (channel_id, member_pubkey)
+                 SELECT channel_id, member_pubkey FROM channel_members
+                 WHERE channel_id = ?1 AND member_pubkey = ?2 AND banned = 1
+                   AND ban_revised_at = ?3",
+                params![channel_id, hex::encode(pk), timestamp],
             )?;
         }
         if let Some(nominee) = successor_nominee {
@@ -11845,6 +12318,9 @@ impl Database {
         };
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
+        if !Self::channel_live_locked(&tx, channel_id)? {
+            anyhow::bail!("channel {channel_id} is not on this device");
+        }
         let now = if timestamp > 0 {
             timestamp
         } else {
@@ -12233,6 +12709,22 @@ impl Database {
         limit: i64,
         before_id: Option<i64>,
     ) -> anyhow::Result<Vec<ChannelMessageRow>> {
+        Ok(self
+            .get_channel_messages_opened(channel_id, limit, before_id)?
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect())
+    }
+
+    /// [`Self::get_channel_messages`], with whether each body actually opened.
+    /// A row that did not carries [`CHAT_UNAVAILABLE_TEXT`] in its place, which
+    /// is for drawing and must never be stored as though someone wrote it.
+    fn get_channel_messages_opened(
+        &self,
+        channel_id: &str,
+        limit: i64,
+        before_id: Option<i64>,
+    ) -> anyhow::Result<Vec<(ChannelMessageRow, bool)>> {
         type PageRow = (i64, String, String, String, i64, bool, i64, String, i64, Option<String>);
         let (rows, parents) = {
             let conn = self.conn.lock();
@@ -12296,62 +12788,46 @@ impl Database {
                 .unwrap_or_default();
             (reply_to, lookup.parent, lookup.deleted)
         };
-        let Some(chat_key) = self.chat_key.as_deref() else {
-            return Ok(rows
-                .into_iter()
-                .map(
-                    |(id, sender, direction, _, timestamp, read, edited_at, msg_id, delivery, reply_to)| {
-                        let (reply_to, reply_parent, reply_parent_deleted) = reply_fields(reply_to);
-                        ChannelMessageRow {
-                            id,
-                            sender_pubkey: sender,
-                            direction,
-                            message: CHAT_UNAVAILABLE_TEXT.to_string(),
-                            timestamp,
-                            read,
-                            edited_at,
-                            msg_id,
-                            delivery,
-                            reply_to,
-                            reply_parent,
-                            reply_parent_deleted,
-                        }
-                    },
-                )
-                .collect());
-        };
+        let chat_key = self.chat_key.as_deref();
         let mut messages = Vec::with_capacity(rows.len());
         for (id, sender, direction, stored, timestamp, read, edited_at, msg_id, delivery, reply_to) in
             rows
         {
-            let message = match Self::decrypt_channel_message_body(
-                chat_key, id, channel_id, &direction, timestamp, &stored,
-            ) {
-                // The body the member sees. The stored text keeps the signed
-                // trailer for re-serving; `reply_to` already says what it held.
-                Ok(message) => {
-                    crate::network::ember::channel::chat_display_text(&message).to_string()
-                }
-                Err(error) => {
-                    tracing::warn!("Channel message {id} in {channel_id} is unavailable: {error}");
-                    CHAT_UNAVAILABLE_TEXT.to_string()
-                }
+            let opened = match chat_key {
+                Some(chat_key) => match Self::decrypt_channel_message_body(
+                    chat_key, id, channel_id, &direction, timestamp, &stored,
+                ) {
+                    // The body the member sees. The stored text keeps the signed
+                    // trailer for re-serving; `reply_to` already says what it held.
+                    Ok(message) => {
+                        Some(crate::network::ember::channel::chat_display_text(&message).to_string())
+                    }
+                    Err(error) => {
+                        tracing::warn!("Channel message {id} in {channel_id} is unavailable: {error}");
+                        None
+                    }
+                },
+                None => None,
             };
+            let readable = opened.is_some();
             let (reply_to, reply_parent, reply_parent_deleted) = reply_fields(reply_to);
-            messages.push(ChannelMessageRow {
-                id,
-                sender_pubkey: sender,
-                direction,
-                message,
-                timestamp,
-                read,
-                edited_at,
-                msg_id,
-                delivery,
-                reply_to,
-                reply_parent,
-                reply_parent_deleted,
-            });
+            messages.push((
+                ChannelMessageRow {
+                    id,
+                    sender_pubkey: sender,
+                    direction,
+                    message: opened.unwrap_or_else(|| CHAT_UNAVAILABLE_TEXT.to_string()),
+                    timestamp,
+                    read,
+                    edited_at,
+                    msg_id,
+                    delivery,
+                    reply_to,
+                    reply_parent,
+                    reply_parent_deleted,
+                },
+                readable,
+            ));
         }
         Ok(messages)
     }
@@ -12684,6 +13160,12 @@ impl Database {
         }
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
+        // A room forgotten or deleted mid-flight takes nothing, the line a
+        // revision would create included: the same rule every other write here
+        // keeps inside its own transaction.
+        if !Self::channel_live_locked(&tx, channel_id)? {
+            return Ok(ChannelEditOutcome::Forgotten);
+        }
         let existing: Option<(i64, String, String, i64, i64, i64)> = tx
             .query_row(
                 "SELECT id, sender_pubkey, direction, timestamp, edited_at, first_seen_at
@@ -12855,6 +13337,74 @@ impl Database {
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
+        if !Self::channel_live_locked(&tx, channel_id)? {
+            return Ok(false);
+        }
+        let (changed, target_present) =
+            Self::write_channel_reaction_locked(&tx, channel_id, msg_id, member_pubkey, reaction, reacted_at, sig)?;
+        if !target_present {
+            Self::sweep_orphan_channel_reactions_locked(&tx, channel_id)?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// [`Self::set_channel_message_reaction`] for a whole frame's worth of
+    /// entries, in one transaction. Each entry is
+    /// `(target_msg_id_hex, member_hex, reaction, reacted_at, signature_hex)`
+    /// and is judged exactly as the single call judges it (newest
+    /// `reacted_at` wins, a tie keeps what is stored). The orphan sweep runs at
+    /// most once, at the end, if any entry named a line this device does not
+    /// hold. Returns the indices into `entries` that changed state; a room that
+    /// is not here, or was deleted, takes none.
+    pub fn apply_channel_reactions_batch(
+        &self,
+        channel_id: &str,
+        entries: &[(String, String, u8, i64, String)],
+    ) -> anyhow::Result<Vec<usize>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        if !Self::channel_live_locked(&tx, channel_id)? {
+            return Ok(Vec::new());
+        }
+        let mut changed = Vec::new();
+        let mut orphan = false;
+        for (index, (msg_id, member, reaction, reacted_at, sig)) in entries.iter().enumerate() {
+            let (moved, present) = Self::write_channel_reaction_locked(
+                &tx,
+                channel_id,
+                msg_id,
+                member,
+                *reaction,
+                *reacted_at,
+                sig,
+            )?;
+            if moved {
+                changed.push(index);
+            }
+            orphan |= !present;
+        }
+        if orphan {
+            Self::sweep_orphan_channel_reactions_locked(&tx, channel_id)?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// One reaction upsert inside the caller's transaction. Returns whether it
+    /// changed the row, and whether the line it names is held here.
+    fn write_channel_reaction_locked(
+        tx: &Connection,
+        channel_id: &str,
+        msg_id: &str,
+        member_pubkey: &str,
+        reaction: u8,
+        reacted_at: i64,
+        sig: &str,
+    ) -> anyhow::Result<(bool, bool)> {
         let changed = tx.execute(
             "INSERT INTO channel_message_reactions
                  (channel_id, msg_id, member_pubkey, reaction, reacted_at, sig)
@@ -12890,26 +13440,29 @@ impl Database {
             params![channel_id, msg_id],
             |row| row.get(0),
         )?;
-        if !target_present {
-            // Newest kept, oldest dropped: a reaction that has waited longest
-            // for its line is the one least likely to ever be matched.
-            tx.execute(
-                "DELETE FROM channel_message_reactions
-                 WHERE rowid IN (
-                     SELECT r.rowid FROM channel_message_reactions r
-                     WHERE r.channel_id = ?1
-                       AND NOT EXISTS (
-                           SELECT 1 FROM channel_messages m
-                           WHERE m.channel_id = r.channel_id AND m.msg_id = r.msg_id
-                       )
-                     ORDER BY r.reacted_at DESC
-                     LIMIT -1 OFFSET ?2
-                 )",
-                params![channel_id, Self::CHANNEL_ORPHAN_REACTIONS_PER_CHANNEL],
-            )?;
-        }
-        tx.commit()?;
-        Ok(changed > 0)
+        Ok((changed > 0, target_present))
+    }
+
+    /// Keep only the newest [`Self::CHANNEL_ORPHAN_REACTIONS_PER_CHANNEL`]
+    /// reactions to lines this device does not hold. Newest kept, oldest
+    /// dropped: a reaction that has waited longest for its line is the one
+    /// least likely to ever be matched.
+    fn sweep_orphan_channel_reactions_locked(tx: &Connection, channel_id: &str) -> anyhow::Result<()> {
+        tx.execute(
+            "DELETE FROM channel_message_reactions
+             WHERE rowid IN (
+                 SELECT r.rowid FROM channel_message_reactions r
+                 WHERE r.channel_id = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM channel_messages m
+                       WHERE m.channel_id = r.channel_id AND m.msg_id = r.msg_id
+                   )
+                 ORDER BY r.reacted_at DESC
+                 LIMIT -1 OFFSET ?2
+             )",
+            params![channel_id, Self::CHANNEL_ORPHAN_REACTIONS_PER_CHANNEL],
+        )?;
+        Ok(())
     }
 
     /// Reactions for lines this device does not hold, per room.
@@ -16501,13 +17054,348 @@ mod tests {
         let after_touch = generation();
         assert!(after_touch > after_insert, "a touch that brought the row back to fresh");
 
-        assert!(db.apply_channel_ban_action(&channel, &member, true, now).unwrap());
+        assert!(db.apply_channel_ban_action(&channel, &member, true, now - 1).unwrap());
         let after_ban = generation();
         assert!(after_ban > after_touch, "a ban");
 
+        // At the ban's own second a ban beats an unban, so the lift is a second on.
+        assert!(!db.apply_channel_ban_action(&channel, &member, false, now - 1).unwrap());
         assert!(db.apply_channel_ban_action(&channel, &member, false, now).unwrap());
+        let after_unban = generation();
+        // The row carries the ban watermark now, so a leave ages it rather than
+        // deleting it — and that is still a roster change.
         assert!(db.remove_channel_member(&channel, &member, i64::MAX).unwrap());
-        assert!(generation() > after_ban, "a removal");
+        assert!(generation() > after_unban, "a removal");
+        drop_scratch_db(db, path);
+    }
+
+    fn ban_state(db: &Database, channel: &str, member: &str) -> (bool, i64) {
+        db.conn
+            .lock()
+            .query_row(
+                "SELECT banned, ban_revised_at FROM channel_members
+                 WHERE channel_id = ?1 AND member_pubkey = ?2",
+                params![channel, member],
+                |row| Ok((row.get::<_, i64>(0)? != 0, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    /// Ban gossip is ordered on its signed time, whichever order it arrives
+    /// in, and an action already applied is not applied again.
+    #[test]
+    fn channel_ban_actions_order_on_their_signed_time_not_arrival() {
+        let (db, path) = scratch_db("ban-order");
+        let channel = "c1".repeat(16);
+        let member = "d2".repeat(32);
+        db.insert_channel(&channel, &"e3".repeat(32), "Room", "public", false, None, None)
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        // Reordered: the newer unban lands first, the older ban after it.
+        assert!(db.apply_channel_ban_action(&channel, &member, false, now - 30).unwrap());
+        assert!(!db.apply_channel_ban_action(&channel, &member, true, now - 40).unwrap());
+        assert_eq!(ban_state(&db, &channel, &member), (false, now - 30));
+
+        assert!(db.apply_channel_ban_action(&channel, &member, true, now - 20).unwrap());
+        assert_eq!(ban_state(&db, &channel, &member), (true, now - 20));
+        assert!(!db.apply_channel_ban_action(&channel, &member, false, now - 25).unwrap());
+
+        // An identical replay changes nothing and says so.
+        assert!(!db.apply_channel_ban_action(&channel, &member, true, now - 20).unwrap());
+
+        // A stamp ahead of our clock is held to it, so a moderator running fast
+        // cannot outrank the owner's next snapshot.
+        let ahead = "d3".repeat(32);
+        assert!(db.apply_channel_ban_action(&channel, &ahead, true, now + 240).unwrap());
+        let (banned, revised) = ban_state(&db, &channel, &ahead);
+        assert!(banned);
+        assert!(revised <= chrono::Utc::now().timestamp(), "stored no later than our clock");
+        drop_scratch_db(db, path);
+    }
+
+    /// Two actions in the same second settle the same way on every device: the
+    /// ban wins in either arrival order, and the same kind twice is one action.
+    #[test]
+    fn same_second_ban_and_unban_settle_on_the_ban_in_either_order() {
+        let (db, path) = scratch_db("ban-tie");
+        let channel = "c4".repeat(16);
+        let first = "d5".repeat(32);
+        let second = "d6".repeat(32);
+        db.insert_channel(&channel, &"e6".repeat(32), "Room", "public", false, None, None)
+            .unwrap();
+        let at = chrono::Utc::now().timestamp();
+
+        assert!(db.apply_channel_ban_action(&channel, &first, true, at).unwrap());
+        assert!(!db.apply_channel_ban_action(&channel, &first, false, at).unwrap());
+        assert_eq!(ban_state(&db, &channel, &first), (true, at));
+
+        assert!(db.apply_channel_ban_action(&channel, &second, false, at).unwrap());
+        assert!(db.apply_channel_ban_action(&channel, &second, true, at).unwrap());
+        assert_eq!(ban_state(&db, &channel, &second), (true, at));
+        assert!(!db.apply_channel_ban_action(&channel, &second, true, at).unwrap());
+        assert!(!db.apply_channel_ban_action(&channel, &second, false, at).unwrap());
+        drop_scratch_db(db, path);
+    }
+
+    /// A leave notice must not take a moderator's flag, a ban, or the ban
+    /// watermark with it: the owner's next snapshot is built from this table.
+    #[test]
+    fn a_leave_ages_a_moderator_or_watermarked_row_instead_of_deleting_it() {
+        let (db, path) = scratch_db("leave-keeps-mods");
+        let channel = "c7".repeat(16);
+        let moderator = [0x71u8; 32];
+        let plain = "a8".repeat(32);
+        let unbanned = "a9".repeat(32);
+        db.insert_channel(&channel, &"e7".repeat(32), "Room", "public", false, None, None)
+            .unwrap();
+        assert!(db
+            .apply_channel_moderation(&channel, "", "", 1, &[], &[moderator], None, None, None, None, None, None)
+            .unwrap());
+        let mod_hex = hex::encode(moderator);
+        let now = chrono::Utc::now().timestamp();
+        for pk in [&mod_hex, &plain, &unbanned] {
+            db.upsert_channel_member(&channel, pk, "n", now - 5, None).unwrap();
+        }
+        assert!(db.apply_channel_ban_action(&channel, &unbanned, false, now).unwrap());
+
+        assert!(db.remove_channel_member(&channel, &mod_hex, now).unwrap());
+        assert!(db.remove_channel_member(&channel, &plain, now).unwrap());
+        assert!(db.remove_channel_member(&channel, &unbanned, now).unwrap());
+        assert!(
+            !db.remove_channel_member(&channel, &mod_hex, now).unwrap(),
+            "an already aged row is not a change"
+        );
+
+        let rows = db.list_channel_members(&channel).unwrap();
+        let find = |pk: &str| rows.iter().find(|r| r.member_pubkey == pk);
+        let kept = find(&mod_hex).expect("the moderator's row stays");
+        assert!(kept.moderator);
+        assert_eq!(kept.last_seen, 0, "and reads as gone");
+        assert!(find(&plain).is_none(), "a plain row goes");
+        assert_eq!(ban_state(&db, &channel, &unbanned), (false, now), "the watermark stays");
+        assert_eq!(db.list_moderator_channel_pubkeys(&channel).unwrap(), vec![moderator]);
+        drop_scratch_db(db, path);
+    }
+
+    /// What a moderator may not touch: the owner, another moderator, and a ban
+    /// the owner's snapshot carried — until that ban is lifted.
+    #[test]
+    fn owner_signed_bans_moderators_and_the_owner_are_protected_from_moderators() {
+        let (db, path) = scratch_db("ban-protected");
+        let channel = "ca".repeat(16);
+        let owner = [0x0Au8; 32];
+        let moderator = [0x0Bu8; 32];
+        let owner_banned = [0x0Cu8; 32];
+        let mod_banned = "0d".repeat(32);
+        let member = "0e".repeat(32);
+        db.insert_channel(&channel, &"eb".repeat(32), "Room", "public", false, None, None)
+            .unwrap();
+        let snap = chrono::Utc::now().timestamp() - 100;
+        assert!(db
+            .apply_channel_moderation(
+                &channel, "", "", snap, &[owner_banned], &[moderator], Some(&owner),
+                None, None, None, None, None,
+            )
+            .unwrap());
+        assert!(db.apply_channel_ban_action(&channel, &mod_banned, true, snap + 10).unwrap());
+        let protected = |pk: &str| db.channel_ban_target_protected(&channel, pk).unwrap();
+
+        assert!(protected(&hex::encode(owner)));
+        assert!(protected(&hex::encode(moderator)));
+        assert!(protected(&hex::encode(owner_banned).to_ascii_uppercase()));
+        assert!(!protected(&mod_banned), "a moderator's own ban another may lift");
+        assert!(!protected(&member));
+        assert!(!db.channel_ban_target_protected(&"ff".repeat(16), &member).unwrap());
+
+        // The owner lifting it ends the protection; a later snapshot that
+        // carries the moderator's ban makes that one the owner's.
+        assert!(db
+            .apply_channel_moderation(
+                &channel, "", "", snap + 20, &[[0x0Du8; 32]], &[moderator], Some(&owner),
+                None, None, None, None, None,
+            )
+            .unwrap());
+        assert!(!protected(&hex::encode(owner_banned)));
+        assert!(protected(&mod_banned));
+        drop_scratch_db(db, path);
+    }
+
+    /// Network writes for a room that is gone, or was destroyed, are refused
+    /// inside their own transaction.
+    #[test]
+    fn writes_for_a_forgotten_or_deleted_room_are_refused() {
+        let (db, path) = scratch_db("dead-room-writes");
+        let gone = "cb".repeat(16);
+        let deleted = "cc".repeat(16);
+        let member = "ad".repeat(32);
+        db.insert_channel(&deleted, &"ec".repeat(32), "Room", "public", true, None, None)
+            .unwrap();
+        assert!(db.tombstone_channel(&deleted).unwrap());
+        let now = chrono::Utc::now().timestamp();
+        for room in [&gone, &deleted] {
+            assert!(db
+                .insert_channel_message(room, &member, "received", "hi", &"11".repeat(16), now, "", false)
+                .is_err());
+            assert_eq!(
+                db.upsert_channel_member(room, &member, "n", now, None).unwrap(),
+                ChannelMemberWrite::Refused
+            );
+            assert!(!db
+                .set_channel_message_reaction(room, &"11".repeat(16), &member, 1, now, "")
+                .unwrap());
+            assert!(!db.apply_channel_ban_action(room, &member, true, now).unwrap());
+            assert!(db
+                .apply_channel_reactions_batch(room, &[("11".repeat(16), member.clone(), 1, now, String::new())])
+                .unwrap()
+                .is_empty());
+        }
+        let rows: i64 = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM channel_messages) + (SELECT COUNT(*) FROM channel_members)
+                      + (SELECT COUNT(*) FROM channel_message_reactions)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+        drop_scratch_db(db, path);
+    }
+
+    /// A batch is judged entry by entry like the single write, in one go.
+    #[test]
+    fn a_reaction_batch_reports_only_the_entries_that_changed() {
+        let (db, path) = scratch_db("reaction-batch");
+        let channel = "cd".repeat(16);
+        let held = "21".repeat(16);
+        let missing = "22".repeat(16);
+        let a = "a1".repeat(32);
+        let b = "b1".repeat(32);
+        db.insert_channel(&channel, &"ed".repeat(32), "Room", "public", false, None, None)
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        db.insert_channel_message(&channel, &a, "received", "line", &held, now - 50, "", false)
+            .unwrap();
+        assert!(db.set_channel_message_reaction(&channel, &held, &a, 2, now - 10, "").unwrap());
+
+        let entries = vec![
+            (held.clone(), a.clone(), 3, now - 20, String::new()), // older: refused
+            (held.clone(), a.clone(), 3, now - 10, String::new()), // tie: refused
+            (held.clone(), b.clone(), 1, now - 5, "ab".to_string()),
+            (missing.clone(), b.clone(), 4, now - 5, String::new()), // early, kept
+            (held.clone(), a.clone(), 0, now, String::new()),        // newer clear
+        ];
+        assert_eq!(db.apply_channel_reactions_batch(&channel, &entries).unwrap(), vec![2, 3, 4]);
+        assert!(db.apply_channel_reactions_batch(&channel, &entries).unwrap().is_empty(), "a replay");
+        let mut live = db.channel_message_reactions(&channel).unwrap();
+        live.sort();
+        assert_eq!(live, vec![(held.clone(), b.clone(), 1), (missing.clone(), b.clone(), 4)]);
+        drop_scratch_db(db, path);
+    }
+
+    /// The catch-up watermark only moves forward, and goes with the room.
+    #[test]
+    fn the_channel_history_watermark_only_advances() {
+        let (db, path) = scratch_db("history-watermark");
+        let channel = "ce".repeat(16);
+        db.advance_channel_history_synced_through(&channel, 50).unwrap();
+        assert_eq!(db.channel_history_synced_through(&channel).unwrap(), None, "no room, no mark");
+        db.insert_channel(&channel, &"ee".repeat(32), "Room", "public", false, None, None)
+            .unwrap();
+        assert_eq!(db.channel_history_synced_through(&channel).unwrap(), None);
+        db.advance_channel_history_synced_through(&channel, 100).unwrap();
+        db.advance_channel_history_synced_through(&channel, 40).unwrap();
+        assert_eq!(db.channel_history_synced_through(&channel).unwrap(), Some(100));
+        db.advance_channel_history_synced_through(&channel, 120).unwrap();
+        assert_eq!(db.channel_history_synced_through(&channel).unwrap(), Some(120));
+        assert!(db.delete_channel(&channel, None).unwrap());
+        assert_eq!(db.channel_history_synced_through(&channel).unwrap(), None);
+        drop_scratch_db(db, path);
+    }
+
+    /// Forgetting a room whose leave notice had not landed, and deleting a room
+    /// we own while inside it, both leave the notice owed with the key it needs.
+    #[test]
+    fn a_leave_notice_outlives_forget_and_owner_delete() {
+        let (db, path) = scratch_db("owed-departures");
+        let public = "cf".repeat(16);
+        let public_pk = [0xEFu8; 32];
+        let private = "d0".repeat(16);
+        let secret = [0x44u8; 32];
+        let behind = "d1".repeat(16);
+        db.insert_channel(&public, &hex::encode(public_pk), "Pub", "public", false, None, None)
+            .unwrap();
+        db.insert_channel(&private, &"f0".repeat(32), "Priv", "private", true, Some(&[1u8; 32]), Some(&secret))
+            .unwrap();
+        db.insert_channel(&behind, &"f1".repeat(32), "Behind", "private", false, None, Some(&secret))
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        assert!(db.set_channel_in_room(&public, false).unwrap());
+        db.mark_channel_departure_due(&public, now).unwrap();
+        assert!(db.delete_channel(&public, None).unwrap());
+        assert!(db.tombstone_channel(&private).unwrap(), "deleted from inside");
+        assert!(db.set_channel_in_room(&behind, false).unwrap());
+        db.mark_channel_departure_due(&behind, now).unwrap();
+        db.conn
+            .lock()
+            .execute("UPDATE channels SET key_epoch_wanted = 3 WHERE channel_id = ?1", params![behind])
+            .unwrap();
+        assert!(db.delete_channel(&behind, None).unwrap());
+
+        // A second's slack: the delete stamps the notice with its own clock.
+        let mut owed = db.owed_channel_departures(now + 5).unwrap();
+        owed.sort_by(|a, b| a.channel_id.cmp(&b.channel_id));
+        assert_eq!(owed.len(), 2, "not the room we were behind on");
+        assert_eq!(owed[0].channel_id, public);
+        assert!(!owed[0].private);
+        assert_eq!(owed[0].join_secret, crate::network::ember::channel::public_join_secret(&public_pk));
+        assert_eq!(owed[1].channel_id, private);
+        assert!(owed[1].private);
+        assert_eq!(owed[1].join_secret, secret);
+
+        assert!(db.claim_owed_channel_departure(&private, now + 60).unwrap());
+        assert_eq!(db.owed_channel_departures(now + 5).unwrap().len(), 1, "claimed is not due");
+        db.clear_owed_channel_departure(&private).unwrap();
+        // Joining the forgotten room again withdraws its notice.
+        db.insert_channel(&public, &hex::encode(public_pk), "Pub", "public", false, None, None)
+            .unwrap();
+        assert!(db.owed_channel_departures(now + 120).unwrap().is_empty());
+        drop_scratch_db(db, path);
+    }
+
+    /// A handoff copies only what opened; a stand-in for a line that would not
+    /// is never stored as something its author wrote.
+    #[test]
+    fn a_handoff_leaves_unreadable_lines_behind() {
+        let (db, path) = scratch_db("handoff-unreadable");
+        let old = "d2".repeat(16);
+        let successor_pk = [0xD3u8; 32];
+        let successor = hex::encode(crate::network::ember::channel::channel_id_from_pubkey(&successor_pk));
+        let author = "a2".repeat(32);
+        db.insert_channel(&old, &"f2".repeat(32), "Room", "public", false, None, None)
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        db.insert_channel_message(&old, &author, "received", "kept", &"31".repeat(16), now - 2, "", true)
+            .unwrap();
+        let broken = db
+            .insert_channel_message(&old, &author, "received", "lost", &"32".repeat(16), now - 1, "", true)
+            .unwrap();
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE channel_messages SET message = 'not a sealed body' WHERE id = ?1",
+                params![broken],
+            )
+            .unwrap();
+        assert!(db
+            .apply_channel_handoff(&old, &hex::encode(successor_pk), &successor, 1, false, None)
+            .unwrap());
+        let copied = db.get_channel_messages(&successor, 10, None).unwrap();
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].message, "kept");
         drop_scratch_db(db, path);
     }
 
@@ -18707,10 +19595,10 @@ mod tests {
         // A ban on someone never seen here leaves a row once it is lifted.
         let stranger = "44".repeat(32);
         assert!(db
-            .apply_channel_ban_action(&channel_id, &stranger, true, now)
+            .apply_channel_ban_action(&channel_id, &stranger, true, now - 1)
             .unwrap());
         assert!(db
-            .apply_channel_ban_action(&channel_id, &stranger, false, now + 1)
+            .apply_channel_ban_action(&channel_id, &stranger, false, now)
             .unwrap());
         assert_eq!(
             db.list_channels().unwrap()[0].roster_count,

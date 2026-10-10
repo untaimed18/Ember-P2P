@@ -359,6 +359,7 @@ async fn restore_room(
         let pk = hex::encode(ident.pubkey);
         let records = records.to_vec();
         let channel_id = ident.channel_id;
+        let snapshot_ts = snapshot.timestamp;
         tokio::task::spawn_blocking(move || {
             let outcome = db.adopt_recovered_owned_channel(
                 &id,
@@ -389,6 +390,20 @@ async fn restore_room(
                     channel_id,
                     &records,
                 );
+                // The governance has to be on the room before anything signs
+                // for it: otherwise, once the restore guard drops, the owner
+                // loop republishes a snapshot with no bans and no topic that
+                // outranks the real one. "Not newer" is fine for a room held as
+                // a member, which already had it; only a room still behind the
+                // snapshot found is a failure. Given back, it is looked at
+                // again on the next scan.
+                let governed = db
+                    .get_channel(&id)?
+                    .is_some_and(|row| row.moderation_updated_at >= snapshot_ts);
+                if !governed {
+                    db.release_recovered_owned_channel(&id, outcome)?;
+                    anyhow::bail!("the room's governance snapshot did not apply");
+                }
                 // Ingest leaves an owner's own name alone, which for a room we
                 // held as a member is the name its invite gave it; the owner's
                 // snapshot is the one to keep.

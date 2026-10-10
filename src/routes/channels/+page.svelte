@@ -386,8 +386,17 @@
     };
   });
 
+  /** Closing without saving drops the drafts, so the next open shows the room
+   *  as it is and moderation events go back to keeping the fields current. */
   function closeRoomSettings() {
     roomInfoOpen = false;
+    // A save still in flight re-seeds these when it lands; resetting them now
+    // would lose what was typed if that save fails.
+    if (savingModeration || renaming) return;
+    editingModeration = false;
+    editTopic = selected?.topic ?? '';
+    editWelcome = selected?.welcome ?? '';
+    renameDraft = selected?.name ?? '';
   }
 
   function onRoomSettingsKey(e: KeyboardEvent) {
@@ -1068,7 +1077,7 @@
       return;
     }
     if (roomInfoOpen) {
-      roomInfoOpen = false;
+      closeRoomSettings();
       e.preventDefault();
       return;
     }
@@ -1224,6 +1233,38 @@
     };
     document.addEventListener('visibilitychange', onGatherVisibilityChange);
     let cancelled = false;
+    // Members, moderation and handoff events each re-read the whole list, and
+    // gossip delivers them in bursts. One read per window, carrying out what
+    // any of the folded events asked to happen after it.
+    let listRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+    let listRefreshReseed = false;
+    let listRefreshRoster = false;
+    const scheduleListRefresh = (after: { reseed?: boolean; roster?: boolean } = {}) => {
+      listRefreshReseed ||= !!after.reseed;
+      listRefreshRoster ||= !!after.roster;
+      if (listRefreshTimer !== undefined) return;
+      listRefreshTimer = setTimeout(() => {
+        listRefreshTimer = undefined;
+        const reseed = listRefreshReseed;
+        const roster = listRefreshRoster;
+        listRefreshReseed = false;
+        listRefreshRoster = false;
+        if (cancelled) return;
+        refreshChannels()
+          .then(() => {
+            if (cancelled) return;
+            if (reseed) {
+              const ch = $channelsStore.find((c) => c.channel_id === selectedId);
+              if (ch && !editingModeration) {
+                editTopic = ch.topic;
+                editWelcome = ch.welcome;
+              }
+            }
+            if (roster && selectedId) void refreshMembers(selectedId);
+          })
+          .catch(() => {});
+      }, LIST_REFRESH_MS);
+    };
     channelPresenceConfig()
       .then((config) => {
         if (!cancelled) presenceConfig = config;
@@ -1232,7 +1273,7 @@
     let unlistenMembers: UnlistenFn | undefined;
     listen<{ channel_id: string }>('ember:channel-members', (event) => {
       const id = event.payload.channel_id;
-      refreshChannels().catch(() => {});
+      scheduleListRefresh();
       if (id === selectedId) void refreshMembers(id);
     })
       .then((fn) => {
@@ -1270,15 +1311,7 @@
     let unlistenModeration: UnlistenFn | undefined;
     listen<{ channel_id: string }>('ember:channel-moderation', (event) => {
       const id = event.payload.channel_id;
-      refreshChannels()
-        .then(() => {
-          const ch = $channelsStore.find((c) => c.channel_id === selectedId);
-          if (ch && !editingModeration) {
-            editTopic = ch.topic;
-            editWelcome = ch.welcome;
-          }
-        })
-        .catch(() => {});
+      scheduleListRefresh({ reseed: true });
       if (id === selectedId) void refreshMembers(id);
     })
       .then((fn) => {
@@ -1314,11 +1347,7 @@
           Object.entries(transferSent).filter(([key]) => key !== moved),
         );
       }
-      refreshChannels()
-        .then(() => {
-          if (selectedId) void refreshMembers(selectedId);
-        })
-        .catch(() => {});
+      scheduleListRefresh({ roster: true });
     })
       .then((fn) => {
         if (cancelled) fn();
@@ -1371,6 +1400,7 @@
       unlistenModeration?.();
       unlistenNewer?.();
       clearTimeout(newerRefresh);
+      clearTimeout(listRefreshTimer);
       unlistenHandoff?.();
       unlistenFound?.();
       document.removeEventListener('pointerdown', onCardMenuPointerDown);
@@ -1729,7 +1759,7 @@
       // The optimistic walk-out has to come back too, not just the row.
       // Refreshing alone restored membership in the list while leaving the
       // user out on the directory, still a member and with no way to tell.
-      await refreshChannels();
+      await refreshChannels().catch((err) => console.warn('refreshChannels after failed leave failed:', err));
       discovered = discovered.map((item) =>
         item.channel_id === id ? { ...item, joined: true } : item,
       );
@@ -1814,7 +1844,11 @@
   }
 
   async function joinCard(ch: ChannelInfo) {
-    if (needsUsername) return;
+    if (needsUsername) {
+      // The row itself stays clickable, so say why nothing happened.
+      toast(m.channels_username_required());
+      return;
+    }
     if (joiningIds.includes(ch.channel_id)) return;
     joiningIds = [...joiningIds, ch.channel_id];
     error = null;
@@ -1940,8 +1974,13 @@
       const updated = await updateChannelModeration(id, editTopic, editWelcome);
       replaceChannel(updated);
       // The form is the selected room's; if that has changed, the room now on
-      // screen still has its own edit open.
-      if (selectedId === id) editingModeration = false;
+      // screen still has its own edit open. Re-seeded from what was stored,
+      // which the backend may have trimmed.
+      if (selectedId === id) {
+        editingModeration = false;
+        editTopic = updated.topic;
+        editWelcome = updated.welcome;
+      }
       toastSuccess(m.channels_moderation_saved());
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
@@ -2498,6 +2537,9 @@
   );
   /** How long `ember:channel-newer` events are gathered into one list re-read. */
   const NEWER_REFRESH_MS = 2_000;
+  /** The same for members, moderation and handoff events, kept short because
+   *  a ban or a handoff is something the user is waiting to see land. */
+  const LIST_REFRESH_MS = 250;
   let newerLinesLabel = $derived.by(() => {
     const count = selected?.newer_lines ?? 0;
     return plural(count, {

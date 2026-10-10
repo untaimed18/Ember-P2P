@@ -376,6 +376,16 @@
   // queued bubble. Keep their durable row IDs briefly so that response can
   // reconcile the bubble instead of leaving it permanently queued.
   const earlyDeliveredIds = new Set<number>();
+  /** The room equivalent, keeping the state itself: a room line can also be
+   *  reported failed before the send's response appends it. */
+  const earlyRoomDelivery = new Map<number, 'delivered' | 'queued' | 'failed'>();
+
+  function withEarlyRoomDelivery(row: ConvMessage): ConvMessage {
+    const early = earlyRoomDelivery.get(row.id);
+    if (early === undefined) return row;
+    earlyRoomDelivery.delete(row.id);
+    return { ...row, delivery: early };
+  }
 
   const PAGE_SIZE = 100;
   let loadingOlder = $state(false);
@@ -531,6 +541,19 @@
     isChannel ? resolvePins(stablePinnedIds, pinLookups, messagesByMsgId, removedMsgIds) : [],
   );
   let shownPinIndex = $derived(clampPinIndex(pinIndex, pinEntries.length));
+  /** Pins whose line was removed from this device. The bar drops them, so
+   *  they must not fill the cap either; the backend still counts them until
+   *  the owner's next commit, which `setPinned` makes first. */
+  let removedPinIds = $derived(
+    stablePinnedIds.filter(
+      (id) => removedMsgIds.has(id) || pinLookups.some((pin) => pin.msg_id === id && pin.deleted),
+    ),
+  );
+  let activePinnedIds = $derived(
+    removedPinIds.length === 0
+      ? stablePinnedIds
+      : stablePinnedIds.filter((id) => !removedPinIds.includes(id)),
+  );
   /** What the bar last showed, to tell a new pin from one taken away. */
   let lastPins: { channel: string; ids: string[] } = { channel: '', ids: [] };
 
@@ -574,13 +597,25 @@
     const channel = channelId;
     if (!channel || pinBusy) return;
     pinBusy = true;
+    // The latest room state any step returned, applied even if a later step
+    // fails: an unpin that landed has already changed the room.
+    let info: ChannelInfo | null = null;
     try {
-      const info = await setChannelMessagePinned(channel, msgId, pinned);
-      if (channel === channelId) onchannelupdate?.(info);
+      // Only as many as the backend's cap needs: it still counts pins whose
+      // line was removed here, and those cannot be taken down from the bar.
+      // Unpinning is room-wide, so none goes that the new pin does not need.
+      if (pinned) {
+        const overCap = stablePinnedIds.length + 1 - CHANNEL_PIN_MAX;
+        for (const stale of removedPinIds.slice(0, Math.max(0, overCap))) {
+          info = await setChannelMessagePinned(channel, stale, false);
+        }
+      }
+      info = await setChannelMessagePinned(channel, msgId, pinned);
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
       pinBusy = false;
+      if (info && channel === channelId) onchannelupdate?.(info);
     }
   }
 
@@ -1088,6 +1123,7 @@
       messages = [];
       attachments = [];
       earlyDeliveredIds.clear();
+      earlyRoomDelivery.clear();
       loadError = null;
       liveError = false;
       loading = true;
@@ -1357,6 +1393,12 @@
           if (event.payload.channel_id !== channel) return;
           const delivery = event.payload.delivery;
           if (delivery !== 'delivered' && delivery !== 'queued' && delivery !== 'failed') return;
+          if (!messages.some((message) => message.id === event.payload.id)) {
+            // Only a send or resend still waiting on its response can be
+            // about to add this row; anything else would sit here unused.
+            if (sending || resendingId !== null) earlyRoomDelivery.set(event.payload.id, delivery);
+            return;
+          }
           messages = messages.map((message) =>
             message.id === event.payload.id ? { ...message, delivery } : message,
           );
@@ -2553,7 +2595,9 @@
         // breaks.
         const kept = messages.filter((message) => message.id !== msg.id);
         commitLiveMessages(
-          kept.some((message) => message.id === sent.id) ? kept : [...kept, fromChannelRow(sent)],
+          kept.some((message) => message.id === sent.id)
+            ? kept
+            : [...kept, withEarlyRoomDelivery(fromChannelRow(sent))],
           true,
         );
       }
@@ -2612,7 +2656,7 @@
         if (channel === channelId) {
           if (!messages.some((message) => message.id === sent.id)) {
             addFresh(sent.id);
-            messages = [...messages, fromChannelRow(sent)];
+            messages = [...messages, withEarlyRoomDelivery(fromChannelRow(sent))];
           }
           if (reply && replyTarget?.msgId === reply.msgId) replyTarget = null;
           inputText = '';
@@ -3182,6 +3226,31 @@
     });
   });
 
+  let slowModeWaiting = $derived(slowModeLeft > 0);
+  let slowModeAnnouncement = $state('');
+  let slowModeWasWaiting = false;
+  let slowModeAnnouncedKey = '';
+
+  $effect(() => {
+    const waiting = slowModeWaiting;
+    const key = conversationKey;
+    untrack(() => {
+      // A switch drops the wait without it having run out, so it is not
+      // announced as over; whatever this run saw is the previous room's.
+      if (key !== slowModeAnnouncedKey) {
+        slowModeAnnouncedKey = key;
+        slowModeWasWaiting = false;
+        slowModeAnnouncement = '';
+        return;
+      }
+      if (waiting === slowModeWasWaiting) return;
+      slowModeWasWaiting = waiting;
+      slowModeAnnouncement = waiting
+        ? m.chat_slow_mode_started({ seconds: slowModeLeft })
+        : m.chat_slow_mode_ready();
+    });
+  });
+
   /**
    * Hand a link in a message to the backend, which decides whether it may be
    * opened and asks the user itself.
@@ -3644,7 +3713,7 @@
                 </button>
               {/if}
               {#if isChannel && canPin && row.msg.id > 0 && row.msg.msg_id?.length === 32 && editingId !== row.msg.id}
-                {@const action = pinAction(row.msg.msg_id, stablePinnedIds, CHANNEL_PIN_MAX)}
+                {@const action = pinAction(row.msg.msg_id, activePinnedIds, CHANNEL_PIN_MAX)}
                 {@const pinLabel =
                   action === 'unpin'
                     ? m.channels_unpin_message()
@@ -4025,10 +4094,11 @@
         rows="2"
         readonly={sending}
       ></textarea>
+      <!-- The count changes every second, and even a polite region reads out
+           each change, so only the start and end of the wait are spoken. -->
+      <span class="sr-only" role="status" aria-live="polite">{slowModeAnnouncement}</span>
       {#if slowModeLeft > 0}
-        <!-- Polite: it changes every second, and a live region that asserted
-             would talk over everything else in the room. -->
-        <span class="conv-slow-mode" role="status" aria-live="polite">
+        <span class="conv-slow-mode" aria-hidden="true">
           {m.chat_slow_mode_wait({ seconds: slowModeLeft })}
         </span>
       {/if}

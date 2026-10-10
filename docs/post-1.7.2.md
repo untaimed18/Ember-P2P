@@ -1,5 +1,9 @@
 # After 1.7.2: planned for 1.7.3
 
+Everything here that 1.7.3 did not get to has moved to `docs/post-1.7.3.md`,
+which is now the plan to work from. Of this list, 1.7.3 did only the sending
+half of "Offers that wait for the friend".
+
 What is left before Channels can drop its BETA badge, plus the known limits
 of the work 1.7.2 shipped. Ordered by priority. Item 1 needs a decision
 before items 2 and 4 can be finished, because it decides what the formats

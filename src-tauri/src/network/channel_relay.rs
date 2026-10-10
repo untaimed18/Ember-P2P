@@ -489,6 +489,11 @@ pub(super) fn maybe_offer_channel_relay(
     {
         return;
     }
+    // Entries older than the interval decide nothing, so they go here rather
+    // than accumulating one per peer ever offered to.
+    state
+        .channel_relay_offer_at
+        .retain(|_, at| now.saturating_duration_since(*at) < CHANNEL_RELAY_OFFER_INTERVAL);
     state.channel_relay_offer_at.insert(peer_pubkey, now);
     state.channel_relay_pending.insert(peer_pubkey);
     let rv_url = settings.rendezvous_url.clone();

@@ -106,7 +106,7 @@ async fn send_xfer_frame_via(
     let body = gossip.encode();
     // Remember our own id: a relay can loop the frame back, and the dedup set
     // is what stops us reading our own block as an inbound one.
-    let _ = remember_channel_gossip(state, gossip.msg_id);
+    remember_originated_gossip(state, &gossip);
     let node_id = ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(&peer));
     if let Some(contact) = state.ember_dht.routing().get_contact(&node_id).cloned() {
         if ember_has_live_session(state, &contact) {
@@ -1457,9 +1457,13 @@ pub(super) async fn apply_xfer_offer(
     // second valid offer under an id already on screen: the prompt would then
     // describe one file while Accept fetched whichever one landed last, and a
     // reused id could park a pending offer beside a transfer already running.
+    // Including a receive still being verified: its part file is named by
+    // the id alone, and accepting a second offer under it would truncate the
+    // file mid-check.
     if state.xfer_pending.contains_key(&offer.xfer_id)
         || state.xfer_recv.contains_key(&offer.xfer_id)
         || state.xfer_send.contains_key(&offer.xfer_id)
+        || state.xfer_finishing.contains_key(&offer.xfer_id)
     {
         debug!(
             "Ember channel xfer: ignoring a repeated offer for transfer {}",
@@ -1559,6 +1563,7 @@ pub(super) async fn apply_xfer_offer(
             "xfer_id": hex::encode(offer.xfer_id),
             "channel_id": ch.channel_id,
             "peer_pubkey": sender_hex,
+            "risky": crate::security::is_dangerous_extension(&name),
             "name": name,
             "size": offer.size,
         }),

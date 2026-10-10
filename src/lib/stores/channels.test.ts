@@ -24,10 +24,12 @@ import {
   loadChannelFavourites,
   loadChannelNotifyLevels,
   mergeChannelUnreadFromSnapshot,
+  mergeTransferSnapshot,
   messageMentionsName,
   notifyLevelOf,
   parseChannelSnoozes,
   refreshChannels,
+  replaceChannel,
   setChannelNotifyLevel,
   snoozeChannel,
   snoozedUntil,
@@ -35,12 +37,14 @@ import {
   toggleChannelFavourite,
   totalChannelUnread,
   unreadBadgeTone,
+  unreadIdsToPreserve,
   xferNeedsConsent,
   xferStartsAsking,
 } from './channels';
 import {
   getChannelMessages,
   listChannels,
+  listChannelTransfers,
   type ChannelInfo,
   type ChannelMessageInfo,
   type ChannelTransferInfo,
@@ -491,6 +495,46 @@ describe('awaitingChannelOffers', () => {
   });
 });
 
+describe('transfer snapshots', () => {
+  const PEER = 'ee'.repeat(32);
+  const offer = (extra: Partial<ChannelTransferInfo> = {}) =>
+    ({
+      xfer_id: 'x1',
+      channel_id: A,
+      peer_pubkey: PEER,
+      direction: 'receive',
+      name: 'report.pdf.exe',
+      size: 1,
+      transferred: 0,
+      status: 'awaiting',
+      ...extra,
+    }) as ChannelTransferInfo;
+
+  it('keeps a snapshot-only field while live fields win', () => {
+    const merged = mergeTransferSnapshot(
+      { x1: offer({ status: 'active', transferred: 5 }) },
+      [offer({ risky: true }), offer({ xfer_id: 'x2' })],
+    );
+    expect(merged.x1).toMatchObject({ status: 'active', transferred: 5, risky: true });
+    expect(merged.x2).toMatchObject({ xfer_id: 'x2', status: 'awaiting' });
+  });
+
+  it('reads risky from an offer, and asks the snapshot when the offer lacks it', async () => {
+    vi.mocked(listChannels).mockResolvedValue([]);
+    await initChannelsStore();
+    const onOffer = eventHandlers.get('ember:xfer-offer');
+    vi.mocked(listChannelTransfers).mockClear();
+    onOffer?.({ payload: { ...offer(), xfer_id: 'x1', risky: true } });
+    expect(get(channelTransfers).x1.risky).toBe(true);
+    expect(vi.mocked(listChannelTransfers)).not.toHaveBeenCalled();
+
+    vi.mocked(listChannelTransfers).mockResolvedValueOnce([offer({ xfer_id: 'x2', risky: true })]);
+    onOffer?.({ payload: { ...offer(), xfer_id: 'x2' } });
+    expect('risky' in get(channelTransfers).x2).toBe(false);
+    await vi.waitFor(() => expect(get(channelTransfers).x2.risky).toBe(true));
+  });
+});
+
 describe('xferNeedsConsent', () => {
   const sent = (extra: Partial<ChannelTransferInfo> = {}) =>
     ({
@@ -576,9 +620,11 @@ describe('unread counters', () => {
     const firstSnap = new Promise<ChannelInfo[]>((resolve) => {
       releaseFirst = resolve;
     });
+    // The second snapshot starts after the bump, so the database it reads
+    // already holds the line that caused it.
     vi.mocked(listChannels)
       .mockImplementationOnce(() => firstSnap)
-      .mockResolvedValueOnce([room({ channel_id: A, unread: 0, name: 'Fresh' })]);
+      .mockResolvedValueOnce([room({ channel_id: A, unread: 1, name: 'Fresh' })]);
 
     const first = refreshChannels();
     bumpChannelUnread(A);
@@ -592,6 +638,40 @@ describe('unread counters', () => {
     await first;
     expect(get(channels)[0].unread).toBe(1);
     expect(get(channels)[0].name).toBe('Fresh');
+  });
+
+  it('preserves a bump only past the snapshot start, and a clear regardless', () => {
+    const dirty = new Map([
+      [A, { rev: 2, cleared: false }],
+      [B, { rev: 5, cleared: false }],
+      ['33'.repeat(16), { rev: 1, cleared: true }],
+    ]);
+    expect(unreadIdsToPreserve(dirty, 3)).toEqual([B, '33'.repeat(16)]);
+    expect(unreadIdsToPreserve(dirty, 5)).toEqual(['33'.repeat(16)]);
+  });
+
+  it('does not count a line twice when its bump lands after the snapshot that holds it', async () => {
+    channels.set([room({ channel_id: A, unread: 1 })]);
+    bumpChannelUnread(A);
+    expect(get(channels)[0].unread).toBe(2);
+    vi.mocked(listChannels).mockResolvedValueOnce([room({ channel_id: A, unread: 1 })]);
+    await refreshChannels();
+    expect(get(channels)[0].unread).toBe(1);
+  });
+
+  it('keeps a clear over a snapshot taken before the mark-read landed', async () => {
+    channels.set([room({ channel_id: A, unread: 3 })]);
+    clearChannelUnread(A);
+    vi.mocked(listChannels).mockResolvedValueOnce([room({ channel_id: A, unread: 3 })]);
+    await refreshChannels();
+    expect(get(channels)[0].unread).toBe(0);
+  });
+
+  it('keeps live unread and the roster count when a command hands back a row', () => {
+    channels.set([room({ channel_id: A, unread: 0, member_count: 4, topic: 'old' })]);
+    bumpChannelUnread(A);
+    replaceChannel(room({ channel_id: A, unread: 9, member_count: 1, topic: 'new' }));
+    expect(get(channels)[0]).toMatchObject({ unread: 1, member_count: 4, topic: 'new' });
   });
 
   it('settles an overtaken refresh only once the newer one has landed', async () => {
