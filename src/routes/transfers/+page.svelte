@@ -1,6 +1,8 @@
 <script lang="ts">
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import PartsBar from '$lib/components/PartsBar.svelte';
+  import FileTypeIcon from '$lib/components/FileTypeIcon.svelte';
+  import { extensionFromPath, fileTypeKey } from '$lib/fileTypes';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import AddLinksDialog from '$lib/components/AddLinksDialog.svelte';
   import { addLinksRequested, MAX_LINKS_TEXT_BYTES } from '$lib/clipboardWatch';
@@ -7370,20 +7372,32 @@
         </button>
       </div>
       <div class="modal-body">
+        <!-- The file leads: its type, its full name (release names need the
+             width), and where it stands. -->
         <div class="dl-details-hero">
-          {#if canRename(t)}
-            <button
-              type="button"
-              class="dl-details-name-btn"
-              title={m.transfers_file_details_rename()}
-              onclick={() => openRename(t)}
-            >
+          <FileTypeIcon kind={fileTypeKey(extensionFromPath(t.file_name))} size={44} />
+          <div class="dl-details-hero-text">
+            {#if canRename(t)}
+              <button
+                type="button"
+                class="dl-details-name-btn"
+                title={m.transfers_file_details_rename()}
+                onclick={() => openRename(t)}
+              >
+                <bdi class="dl-details-name" dir="auto">{t.file_name}</bdi>
+              </button>
+            {:else}
               <bdi class="dl-details-name" dir="auto">{t.file_name}</bdi>
-            </button>
-          {:else}
-            <bdi class="dl-details-name" dir="auto">{t.file_name}</bdi>
-          {/if}
-          <span class="dl-details-sub">{formatSize(t.total_size)}</span>
+            {/if}
+            <div class="dl-details-meta">
+              <span class="dl-details-status status-{t.status}">{dlStatusLabel(t)}</span>
+              <span class="dl-details-sub">{formatSize(t.total_size)}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="dl-details-progress">
+          <ProgressBar value={t.progress} color={downloadProgressColor(t)} label={t.file_name} />
         </div>
 
         {#if fileDetailsLoading && !d}
@@ -7398,91 +7412,124 @@
                  path never registers one; either way the file has parts, we
                  just cannot see them from here. The figures below do not all
                  depend on the map, so the dialog is not a dead end. -->
-            <p class="dl-details-note">{m.transfers_file_details_untracked()}</p>
+            <p class="dl-details-note dl-details-callout">{m.transfers_file_details_untracked()}</p>
           {:else}
-          <div class="dl-chunk-block">
-            <span class="dl-chunk-label">{m.transfers_file_details_chunk_map()}</span>
-            <PartsBar
-              partStatus={d.local_part_status}
-              peerPartStatus={d.swarm_part_status}
-              peerSense="swarm"
-              partCount={d.part_count}
-              transferred={d.completed_bytes}
-              total={t.total_size}
-              title={m.transfers_file_details_chunk_map_title()}
-            />
-            <span class="dl-chunk-legend">
-              {m.transfers_file_details_legend({
-                have: fileDetailsHaveParts,
-                parts: d.part_count,
-              })}
-            </span>
-          </div>
+            <section class="dl-details-card">
+              <h4 class="dl-details-card-title">{m.transfers_file_details_chunk_map()}</h4>
+              <PartsBar
+                partStatus={d.local_part_status}
+                peerPartStatus={d.swarm_part_status}
+                peerSense="swarm"
+                partCount={d.part_count}
+                transferred={d.completed_bytes}
+                total={t.total_size}
+                title={m.transfers_file_details_chunk_map_title()}
+              />
+              <span class="dl-chunk-legend">
+                {m.transfers_file_details_legend({
+                  have: fileDetailsHaveParts,
+                  parts: d.part_count,
+                })}
+              </span>
+            </section>
           {/if}
 
-          <dl class="dl-details-grid">
-            {#if hasMap}
-              <dt>{m.transfers_file_details_verified()}</dt>
-              <dd>{m.transfers_file_details_parts_of({
-                n: d.verified_parts,
-                parts: d.part_count,
-              })}</dd>
+          <section class="dl-details-card">
+            <h4 class="dl-details-card-title">{m.transfers_file_details_section_progress()}</h4>
+            <dl class="dl-details-tiles">
+              <!-- The tracker's figures where there is one, the transfer row's
+                   otherwise: both are gap-derived, and a dialog that shows
+                   nothing at all once a download finishes is worse than one
+                   that shows the row it already had. -->
+              <div class="dl-details-tile">
+                <dt>{m.transfers_file_details_on_disk()}</dt>
+                <dd>{formatSize(hasMap ? d.completed_bytes : t.completed_size)}</dd>
+              </div>
+              <div class="dl-details-tile">
+                <dt>{m.transfers_file_details_remaining()}</dt>
+                <dd>{formatSize(hasMap
+                  ? d.remaining_bytes
+                  : Math.max(0, t.total_size - t.completed_size))}</dd>
+              </div>
+              <!-- Wire bytes, which exceed the file once a corrupt part has
+                   been re-fetched. Worth showing next to the on-disk figure,
+                   because the gap between them is what a bad source costs. -->
+              <div class="dl-details-tile">
+                <dt>{m.transfers_file_details_transferred()}</dt>
+                <dd>{formatSize(hasMap ? d.transferred : t.transferred)}</dd>
+              </div>
+              {#if hasMap}
+                <div class="dl-details-tile">
+                  <dt>{m.transfers_file_details_verified()}</dt>
+                  <dd>{m.transfers_file_details_parts_of({
+                    n: d.verified_parts,
+                    parts: d.part_count,
+                  })}</dd>
+                </div>
+                <div class="dl-details-tile">
+                  <dt>{m.transfers_file_details_in_progress()}</dt>
+                  <dd>{d.in_progress_parts}</dd>
+                </div>
+              {/if}
+            </dl>
+          </section>
 
-              <dt>{m.transfers_file_details_in_progress()}</dt>
-              <dd>{d.in_progress_parts}</dd>
-            {/if}
-
-            <!-- The tracker's figures where there is one, the transfer row's
-                 otherwise: both are gap-derived, and a dialog that shows
-                 nothing at all once a download finishes is worse than one that
-                 shows the row it already had. -->
-            <dt>{m.transfers_file_details_on_disk()}</dt>
-            <dd>{formatSize(hasMap ? d.completed_bytes : t.completed_size)}</dd>
-
-            <dt>{m.transfers_file_details_remaining()}</dt>
-            <dd>{formatSize(hasMap
-              ? d.remaining_bytes
-              : Math.max(0, t.total_size - t.completed_size))}</dd>
-
-            <!-- Wire bytes, which exceed the file once a corrupt part has been
-                 re-fetched. Worth showing next to the on-disk figure, because
-                 the gap between them is what a bad source costs. -->
-            <dt>{m.transfers_file_details_transferred()}</dt>
-            <dd>{formatSize(hasMap ? d.transferred : t.transferred)}</dd>
-
-            {#if hasMap}
-              <dt>{m.transfers_file_details_availability()}</dt>
-              <dd>
-                {#if d.sources_with_bitmaps === 0}
-                  {m.common_unknown()}
-                {:else}
-                  {m.transfers_file_details_rarest({
-                    n: d.rarest_part_sources,
-                    sources: d.sources_with_bitmaps,
-                  })}
-                {/if}
-              </dd>
-            {/if}
-
-            <dt>{m.transfers_col_last_seen_complete()}</dt>
-            <dd>
-              <!-- Relative here, where the question is "is this file still
-                   out there"; the column gives the absolute date. Both take
-                   unix *seconds* — `formatRelativeTime` compares against
-                   `Date.now() / 1000`, so passing milliseconds would read as
-                   "now" for every value. -->
-              {t.last_seen_complete
-                ? formatRelativeTime(t.last_seen_complete)
-                : m.common_unknown()}
-            </dd>
-
-            <dt>{m.transfers_col_sources()}</dt>
-            <dd>{sourcesLabel(t)}</dd>
-          </dl>
+          <section class="dl-details-card">
+            <h4 class="dl-details-card-title">{m.transfers_file_details_section_availability()}</h4>
+            <dl class="dl-details-tiles">
+              <div class="dl-details-tile">
+                <dt>{m.transfers_col_sources()}</dt>
+                <dd>{sourcesLabel(t)}</dd>
+              </div>
+              {#if hasMap}
+                <div class="dl-details-tile">
+                  <dt>{m.transfers_file_details_availability()}</dt>
+                  <dd>
+                    {#if d.sources_with_bitmaps === 0}
+                      {m.common_unknown()}
+                    {:else}
+                      {m.transfers_file_details_rarest({
+                        n: d.rarest_part_sources,
+                        sources: d.sources_with_bitmaps,
+                      })}
+                    {/if}
+                  </dd>
+                </div>
+              {/if}
+              <div class="dl-details-tile">
+                <dt>{m.transfers_col_last_seen_complete()}</dt>
+                <dd>
+                  <!-- Relative here, where the question is "is this file
+                       still out there"; the column gives the absolute date.
+                       Both take unix *seconds* — `formatRelativeTime` compares
+                       against `Date.now() / 1000`, so passing milliseconds
+                       would read as "now" for every value. -->
+                  {t.last_seen_complete
+                    ? formatRelativeTime(t.last_seen_complete)
+                    : m.common_unknown()}
+                </dd>
+              </div>
+            </dl>
+          </section>
         {/if}
       </div>
-      <div class="modal-footer">
-        <button type="button" class="ghost" onclick={closeFileDetails}>{m.common_close()}</button>
+      <div class="modal-footer dl-details-footer">
+        <button
+          type="button"
+          class="ghost"
+          disabled={copyingAllDownloadLinks || !t.file_hash?.trim()}
+          onclick={() => void copyDownloadLinks([t])}
+        >{m.transfers_ctx_copy_link()}</button>
+        <button
+          type="button"
+          class="ghost"
+          onclick={() => void openTransferFileLocation(t.id).catch((e: unknown) => { transferError = toErrorMsg(e); })}
+        >{m.transfers_ctx_open_location()}</button>
+        <span class="dl-details-footer-spacer"></span>
+        {#if canRename(t)}
+          <button type="button" class="ghost" onclick={() => openRename(t)}>{m.transfers_ctx_rename()}</button>
+        {/if}
+        <button type="button" onclick={closeFileDetails}>{m.common_close()}</button>
       </div>
     </div>
   </div>
@@ -7614,17 +7661,121 @@
      release names need the full width. */
   .dl-details-hero {
     display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    margin-bottom: 14px;
+  }
+
+  .dl-details-hero-text {
+    display: flex;
     flex-direction: column;
-    gap: 4px;
-    padding-bottom: 12px;
-    margin-bottom: 12px;
-    border-bottom: 1px solid var(--border);
+    gap: 6px;
+    min-width: 0;
+    flex: 1;
   }
 
   .dl-details-name {
     font-weight: 600;
     font-size: var(--font-size-md);
+    line-height: 1.35;
     overflow-wrap: anywhere;
+  }
+
+  .dl-details-meta {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .dl-details-status {
+    padding: 1px 8px;
+    border-radius: var(--radius-pill);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    color: var(--badge-accent-text);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+  .dl-details-status.status-completed {
+    color: var(--success);
+    background: color-mix(in srgb, var(--success) 14%, transparent);
+  }
+  .dl-details-status.status-paused,
+  .dl-details-status.status-stopped {
+    color: var(--warning);
+    background: color-mix(in srgb, var(--warning) 14%, transparent);
+  }
+  .dl-details-status.status-failed {
+    color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 14%, transparent);
+  }
+
+  .dl-details-progress {
+    margin-bottom: 16px;
+  }
+
+  /* Each group of figures on its own card, so the eye can find "how much is
+     left" and "who has it" without reading a single long list. */
+  .dl-details-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 14px;
+    margin-bottom: 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-primary);
+  }
+  .dl-details-card:last-child {
+    margin-bottom: 0;
+  }
+
+  .dl-details-card-title {
+    margin: 0;
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-secondary);
+  }
+
+  .dl-details-tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 12px 16px;
+    margin: 0;
+  }
+
+  .dl-details-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .dl-details-tile dt {
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+  }
+
+  .dl-details-tile dd {
+    margin: 0;
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    overflow-wrap: anywhere;
+  }
+
+  .dl-details-callout {
+    padding: 10px 12px;
+    margin-bottom: 12px;
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--accent) 8%, var(--bg-primary));
+    border: 1px solid color-mix(in srgb, var(--accent) 25%, var(--border));
+  }
+
+  .dl-details-footer-spacer {
+    flex: 1;
   }
 
   .dl-details-name-btn {
@@ -7693,39 +7844,6 @@
     color: var(--text-secondary);
   }
 
-  .dl-chunk-block {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    margin-bottom: 14px;
-  }
-
-  .dl-chunk-label {
-    font-size: var(--font-size-xs);
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--text-secondary);
-  }
-
-  .dl-details-grid {
-    display: grid;
-    grid-template-columns: minmax(0, auto) minmax(0, 1fr);
-    gap: 6px 16px;
-    margin: 0;
-    font-size: var(--font-size-sm);
-  }
-
-  .dl-details-grid dt {
-    color: var(--text-secondary);
-  }
-
-  .dl-details-grid dd {
-    margin: 0;
-    font-variant-numeric: tabular-nums;
-    overflow-wrap: anywhere;
-  }
-
   @media (max-width: 760px) {
     .modal-overlay {
       padding: 0;
@@ -7739,13 +7857,8 @@
       border-radius: 0;
     }
 
-    .dl-details-grid {
-      grid-template-columns: minmax(0, 1fr);
-      gap: 0;
-    }
-
-    .dl-details-grid dt {
-      margin-top: 6px;
+    .dl-details-footer {
+      flex-wrap: wrap;
     }
   }
 

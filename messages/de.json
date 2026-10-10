@@ -2016,6 +2016,8 @@
   "transfers_rename_label": "Dateiname",
   "transfers_rename_save": "Umbenennen",
   "transfers_file_details_title": "Dateidetails",
+  "transfers_file_details_section_progress": "Fortschritt",
+  "transfers_file_details_section_availability": "Verfügbarkeit",
   "transfers_file_details_failed": "Dateidetails konnten nicht gelesen werden.",
   "transfers_file_details_untracked": "Für diesen Download ist keine Teileübersicht verfügbar.",
   "transfers_file_details_chunk_map": "Teileübersicht",

@@ -2016,6 +2016,8 @@
   "transfers_rename_label": "Nome file",
   "transfers_rename_save": "Rinomina",
   "transfers_file_details_title": "Dettagli file",
+  "transfers_file_details_section_progress": "Avanzamento",
+  "transfers_file_details_section_availability": "Disponibilità",
   "transfers_file_details_failed": "Impossibile leggere i dettagli del file.",
   "transfers_file_details_untracked": "Nessuna mappa delle parti disponibile per questo download.",
   "transfers_file_details_chunk_map": "Mappa delle parti",

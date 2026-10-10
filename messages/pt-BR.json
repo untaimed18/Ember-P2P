@@ -2016,6 +2016,8 @@
   "transfers_rename_label": "Nome do arquivo",
   "transfers_rename_save": "Renomear",
   "transfers_file_details_title": "Detalhes do arquivo",
+  "transfers_file_details_section_progress": "Progresso",
+  "transfers_file_details_section_availability": "Disponibilidade",
   "transfers_file_details_failed": "Não foi possível ler os detalhes do arquivo.",
   "transfers_file_details_untracked": "Não há mapa de partes para este download.",
   "transfers_file_details_chunk_map": "Mapa de partes",

@@ -2016,6 +2016,8 @@
   "transfers_rename_label": "Имя файла",
   "transfers_rename_save": "Переименовать",
   "transfers_file_details_title": "Сведения о файле",
+  "transfers_file_details_section_progress": "Ход загрузки",
+  "transfers_file_details_section_availability": "Доступность",
   "transfers_file_details_failed": "Не удалось прочитать сведения о файле.",
   "transfers_file_details_untracked": "Карта частей для этой загрузки недоступна.",
   "transfers_file_details_chunk_map": "Карта частей",

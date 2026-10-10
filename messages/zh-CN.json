@@ -2016,6 +2016,8 @@
   "transfers_rename_label": "文件名",
   "transfers_rename_save": "重命名",
   "transfers_file_details_title": "文件详情",
+  "transfers_file_details_section_progress": "进度",
+  "transfers_file_details_section_availability": "可用性",
   "transfers_file_details_failed": "无法读取文件详情。",
   "transfers_file_details_untracked": "此下载没有分块图。",
   "transfers_file_details_chunk_map": "分块图",

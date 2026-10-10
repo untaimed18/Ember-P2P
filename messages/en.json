@@ -2016,6 +2016,8 @@
   "transfers_rename_label": "File name",
   "transfers_rename_save": "Rename",
   "transfers_file_details_title": "File Details",
+  "transfers_file_details_section_progress": "Progress",
+  "transfers_file_details_section_availability": "Availability",
   "transfers_file_details_failed": "Could not read file details.",
   "transfers_file_details_untracked": "No part map is available for this download.",
   "transfers_file_details_chunk_map": "Chunk map",

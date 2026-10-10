@@ -2016,6 +2016,8 @@
   "transfers_rename_label": "Nom du fichier",
   "transfers_rename_save": "Renommer",
   "transfers_file_details_title": "Détails du fichier",
+  "transfers_file_details_section_progress": "Progression",
+  "transfers_file_details_section_availability": "Disponibilité",
   "transfers_file_details_failed": "Impossible de lire les détails du fichier.",
   "transfers_file_details_untracked": "Aucune carte des parties n'est disponible pour ce téléchargement.",
   "transfers_file_details_chunk_map": "Carte des parties",
