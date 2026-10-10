@@ -12,7 +12,7 @@
   import { finishAction, setFinishAction, type FinishAction } from '$lib/stores/finishAction';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
-    pauseTransfer, stopTransfer, resumeTransfer, removeTransfer,
+    pauseTransfer, stopTransfer, resumeTransfer, removeTransfer, deleteFinishedDownloads,
     clearCompleted, moveTransfersInQueue, getDownloadQueueIds, setTransferPriority, setTransfersCategory, renameTransfer, setPreviewPriority,
     pauseTransfersBatch, resumeTransfersBatch, stopTransfersBatch, cancelTransfersBatch, getTransfers,
     getTransferSources, openFile, openTransferFileLocation, openDownloadsFolder, recoverArchive, startDownload,
@@ -2528,7 +2528,10 @@
   let selectedPausableCount = $derived(selectedBatchTransfers.filter((t) => canPause(t)).length);
   let selectedResumableCount = $derived(selectedBatchTransfers.filter((t) => canResume(t)).length);
   let selectedStoppableCount = $derived(selectedBatchTransfers.filter((t) => canStop(t)).length);
-  let selectedCancellableCount = $derived(selectedBatchTransfers.filter((t) => !isFinished(t)).length);
+  // Finished downloads count: cancelling one deletes its file.
+  let selectedCancellableCount = $derived(
+    selectedBatchTransfers.filter((t) => !isFinished(t) || t.status === 'completed').length,
+  );
   let selectedFinishedCount = $derived(selectedBatchTransfers.filter((t) => isFinished(t)).length);
   // The rate a row's Speed cell actually prints, for the sorts and counts that
   // have to agree with it. `liveSpeed` already prefers the backend rate and
@@ -3412,12 +3415,7 @@
           else await resumeTransfer(t.id);
           break;
         case 'cancel': {
-          const ids = targets.filter((x) => !isFinished(x)).map((x) => x.id);
-          if (!multi) confirmCancel = { open: true, id: t.id, name: t.file_name };
-          else if (ids.length) {
-            const removeIds = targets.filter(isFinished).map((x) => x.id);
-            confirmBatchCancel = { open: true, ids, count: ids.length, removeIds, filter: '' };
-          }
+          openCancelConfirm(targets);
           return;
         }
         case 'remove': discardWithUndo([], targets.filter(isFinished).map((x) => x.id)); break;
@@ -4110,19 +4108,102 @@
     open: false,
     ids: [] as string[],
     count: 0,
-    // Finished rows caught up in the same gesture: they can't be cancelled,
+    // Failed rows caught up in the same gesture: they can't be cancelled,
     // so they're removed from the list once the cancels go through.
     removeIds: [] as string[],
+    // Finished downloads whose file this cancel deletes; `deleteName` names
+    // the one when there is only one.
+    deleteIds: [] as string[],
+    deleteName: '',
     // Non-empty when the command was scoped by the filter box, so the prompt
     // can say which subset is about to disappear.
     filter: '',
   });
 
   function handleBatchCancelDownloads() {
-    const ids = selectedBatchTransfers.filter((t) => !isFinished(t)).map((t) => t.id);
-    const removeIds = selectedBatchTransfers.filter((t) => isFinished(t)).map((t) => t.id);
-    if (!ids.length) return;
-    confirmBatchCancel = { open: true, ids, count: ids.length, removeIds, filter: '' };
+    openCancelConfirm(selectedBatchTransfers);
+  }
+
+  /** Cancel `rows`: a download still running is cancelled (its partial file
+   *  deleted, with Undo), a finished one has its file deleted — to the Recycle
+   *  Bin, or permanently when Settings says so — and a failed one is taken off
+   *  the list. One running row gets the single-download prompt. */
+  function openCancelConfirm(rows: Transfer[]) {
+    const ids = rows.filter((t) => !isFinished(t)).map((t) => t.id);
+    const deleteRows = rows.filter((t) => t.status === 'completed');
+    const removeIds = rows.filter((t) => t.status === 'failed').map((t) => t.id);
+    if (rows.length === 1 && ids.length === 1) {
+      confirmCancel = { open: true, id: rows[0].id, name: rows[0].file_name };
+      return;
+    }
+    if (ids.length === 0 && deleteRows.length === 0) return;
+    confirmBatchCancel = {
+      open: true,
+      ids,
+      count: ids.length,
+      removeIds,
+      deleteIds: deleteRows.map((t) => t.id),
+      deleteName: deleteRows.length === 1 ? deleteRows[0].file_name : '',
+      filter: '',
+    };
+  }
+
+  /** The prompt's line about finished downloads whose file is deleted. */
+  function deleteFinishedMessage(count: number, name: string): string {
+    const permanently = $appSettings?.delete_permanently === true;
+    if (count === 1 && name) {
+      return permanently
+        ? m.transfers_confirm_delete_finished_permanent_named({ name })
+        : m.transfers_confirm_delete_finished_bin_named({ name });
+    }
+    return permanently
+      ? plural(count, {
+          one: m.transfers_confirm_delete_finished_permanent_one,
+          other: () => m.transfers_confirm_delete_finished_permanent_other({ count: formatNumber(count) }),
+        })
+      : plural(count, {
+          one: m.transfers_confirm_delete_finished_bin_one,
+          other: () => m.transfers_confirm_delete_finished_bin_other({ count: formatNumber(count) }),
+        });
+  }
+
+  /** Delete the files of finished downloads and take them off the list. Not
+   *  behind Undo like a cancel: the file is gone (or in the Recycle Bin, which
+   *  is its own undo), so the prompt before this is the confirmation. */
+  async function deleteFinished(ids: string[]) {
+    if (ids.length === 0) return;
+    try {
+      const report = await deleteFinishedDownloads(ids);
+      const removed = new Set(report.removed);
+      if (removed.size > 0) {
+        for (const id of removed) {
+          markDownloadRemoved(id);
+          speedHistory.delete(id);
+          forgetTransfer(id);
+        }
+        transfers.update((list) => list.filter((x) => !removed.has(x.id)));
+        if (checkedDownloadIds.some((id) => removed.has(id))) {
+          checkedDownloadIds = checkedDownloadIds.filter((id) => !removed.has(id));
+        }
+        if (focusedDlId && removed.has(focusedDlId)) focusedDlId = null;
+        const permanently = $appSettings?.delete_permanently === true;
+        showInfo(permanently
+          ? plural(removed.size, {
+              one: m.transfers_deleted_finished_permanent_one,
+              other: () => m.transfers_deleted_finished_permanent_other({ count: formatNumber(removed.size) }),
+            })
+          : plural(removed.size, {
+              one: m.transfers_deleted_finished_bin_one,
+              other: () => m.transfers_deleted_finished_bin_other({ count: formatNumber(removed.size) }),
+            }));
+      }
+      if (report.failed.length > 0) {
+        const more = report.failed.length > 1 ? m.transfers_batch_failed_more({ count: report.failed.length - 1 }) : '';
+        toastError(`${toErrorMsg(report.failed[0])}${more}`);
+      }
+    } catch (e: unknown) {
+      toastError(toErrorMsg(e));
+    }
   }
 
   /** Rows a global "...All" command applies to. A narrowed filter box scopes
@@ -4183,6 +4264,8 @@
       ids,
       count: ids.length,
       removeIds: [],
+      deleteIds: [],
+      deleteName: '',
       filter: narrowLabel,
     };
   }
@@ -5200,6 +5283,11 @@
     focusedDlId = next.id;
     lastClickedDlId = next.id;
     revealDownloadRow(next.id);
+  } else if (e.key === 'Delete' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && selectedDownloadIds.length > 0) {
+    // Shift+Delete is Cancel, as a file manager's is the stronger Delete: it
+    // also deletes the files of finished downloads, behind Cancel's prompt.
+    e.preventDefault();
+    openCancelConfirm(selectedBatchTransfers);
   } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedDownloadIds.length > 0) {
     e.preventDefault();
     const cancelIds = selectedBatchTransfers.filter((t) => !isFinished(t)).map((t) => t.id);
@@ -5211,7 +5299,10 @@
       return;
     }
     // Match the explicit UI control: prompt, don't just vaporize rows.
-    confirmBatchCancel = { open: true, ids: cancelIds, count: cancelIds.length, removeIds, filter: '' };
+    // Delete takes finished rows off the list, as Remove does, and leaves
+    // their files alone; deleting a finished file is Cancel's, behind its own
+    // prompt.
+    confirmBatchCancel = { open: true, ids: cancelIds, count: cancelIds.length, removeIds, deleteIds: [], deleteName: '', filter: '' };
   }
 }} />
 
@@ -6906,7 +6997,7 @@
       {#if ctxTargets.some(isFinished)}
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_batch_remove({ count: ctxTargets.filter(isFinished).length })}</button>
       {/if}
-      <button class="ctx-item ctx-danger" role="menuitem" disabled={ctxTargets.every(isFinished)} onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
+      <button class="ctx-item ctx-danger" role="menuitem" disabled={!ctxTargets.some((x) => !isFinished(x) || x.status === 'completed')} onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
     {:else if ctxMenu.section !== 'upload' && ctxMulti}
       {@render categorySubmenu(ctxTransfer, sharedValue(ctxTargets, (x) => x.category || 'None') ?? null)}
       <div class="ctx-sep" role="separator"></div>
@@ -6919,7 +7010,10 @@
         onclick={() => ctxAction('find_related_selected')}
       >{m.search_ctx_find_related_selected({ count: ctxTargets.length })}</button>
       <div class="ctx-sep" role="separator"></div>
-      <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_batch_remove({ count: ctxTargets.filter(isFinished).length })}</button>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_batch_remove({ count: ctxTargets.filter(isFinished).length })}</button>
+      {#if ctxTargets.some((x) => x.status === 'completed')}
+        <button class="ctx-item ctx-danger" role="menuitem" title={m.transfers_cancel_finished_title()} onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
+      {/if}
     {:else if ctxMenu.section === 'active'}
       {#if canPause(ctxTransfer)}
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('pause')}>{m.common_pause()}</button>
@@ -7036,7 +7130,12 @@
       {@render webServicesSubmenu()}
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" disabled={clearCompletedTargets().length === 0} onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
-      <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_ctx_remove_from_list()}</button>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_ctx_remove_from_list()}</button>
+      {#if ctxTransfer.status === 'completed'}
+        <!-- Cancel on a finished download deletes its file, which Remove
+             from List never does. -->
+        <button class="ctx-item ctx-danger" role="menuitem" title={m.transfers_cancel_finished_title()} onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
+      {/if}
     {:else}
       {@const uploadFriendHash = emberHashForUpload(ctxTransfer)}
       <!-- Upload context menu -->
@@ -7167,11 +7266,20 @@
 
 <ConfirmDialog
   bind:open={confirmBatchCancel.open}
-  title={m.transfers_confirm_batch_cancel_title()}
-  message={confirmBatchCancel.removeIds.length > 0
-    ? batchCancelMixedMessage(confirmBatchCancel.count, confirmBatchCancel.removeIds.length)
-    : batchCancelMessage(confirmBatchCancel.count, confirmBatchCancel.filter)}
-  confirmLabel={m.transfers_confirm_batch_cancel_label()}
+  title={confirmBatchCancel.count === 0 ? m.transfers_confirm_delete_finished_title() : m.transfers_confirm_batch_cancel_title()}
+  message={[
+    confirmBatchCancel.count === 0
+      ? ''
+      : confirmBatchCancel.removeIds.length > 0
+        ? batchCancelMixedMessage(confirmBatchCancel.count, confirmBatchCancel.removeIds.length)
+        : batchCancelMessage(confirmBatchCancel.count, confirmBatchCancel.filter),
+    confirmBatchCancel.deleteIds.length > 0
+      ? deleteFinishedMessage(confirmBatchCancel.deleteIds.length, confirmBatchCancel.deleteName)
+      : '',
+  ].filter(Boolean).join('\n\n')}
+  confirmLabel={confirmBatchCancel.count === 0
+    ? ($appSettings?.delete_permanently ? m.transfers_confirm_delete_finished_permanent_label() : m.transfers_confirm_delete_finished_bin_label())
+    : m.transfers_confirm_batch_cancel_label()}
   danger={true}
   onconfirm={async () => {
     // As for a single cancel: rows that finished while the dialog was open
@@ -7183,7 +7291,8 @@
       ...confirmBatchCancel.removeIds,
       ...confirmBatchCancel.ids.filter((id) => finishedNow.has(id)),
     ];
-    discardWithUndo(ids, removeIds);
+    if (ids.length > 0 || removeIds.length > 0) discardWithUndo(ids, removeIds);
+    void deleteFinished(confirmBatchCancel.deleteIds);
     checkedDownloadIds = [];
     lastClickedDlId = null;
     // To the list, not the filter box: a text field there keeps Ctrl+Z for

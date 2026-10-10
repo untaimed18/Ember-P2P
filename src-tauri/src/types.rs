@@ -1433,6 +1433,11 @@ pub struct AppSettings {
     /// Enable IP filter to block known-bad IP ranges (loads ipfilter.dat)
     #[serde(default = "default_true")]
     pub ip_filter_enabled: bool,
+    /// Download the bundled default IP filter again once the installed one is
+    /// a day old (`ipfilter_update`). Only a list that came from the default
+    /// URL is replaced, and the user's own range edits are re-applied to it.
+    #[serde(default = "default_true")]
+    pub ip_filter_auto_update: bool,
     /// Apply IP filter ranges / private blocking to incoming TCP upload
     /// connections only. Off by default: VPN IPs commonly appear in
     /// ipfilter.dat "hosting" ranges, silently breaking connectivity for
@@ -1596,6 +1601,13 @@ pub struct AppSettings {
     /// "history is saved" behavior.
     #[serde(default = "default_true")]
     pub save_search_history: bool,
+    /// Where deleting a file sends it — the Library's Delete and a finished
+    /// download's Cancel: false (the default) moves it to the Recycle Bin /
+    /// Trash, true deletes it outright. Turning it on takes a native
+    /// confirmation in `update_settings`, so a compromised webview cannot
+    /// switch it on and then wipe shared folders for good through Delete.
+    #[serde(default)]
+    pub delete_permanently: bool,
     /// Whether the first-time setup wizard has been completed
     #[serde(default)]
     pub setup_complete: bool,
@@ -2540,6 +2552,7 @@ impl Default for AppSettings {
             stun_keepalive_enabled: true,
             obfuscation_enabled: true,
             ip_filter_enabled: true,
+            ip_filter_auto_update: true,
             filter_incoming_connections: false,
             allow_shared_files_browse: false,
             web_services: default_web_services(),
@@ -2576,6 +2589,7 @@ impl Default for AppSettings {
             max_download_file_size_gib: default_max_download_file_size_gib(),
             search_timeout_secs: default_search_timeout_secs(),
             save_search_history: true,
+            delete_permanently: false,
             setup_complete: false,
             default_shared_folder_seeded: false,
             settings_revision: 0,

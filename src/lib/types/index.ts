@@ -860,6 +860,8 @@ export interface AppSettings {
   stun_keepalive_enabled: boolean;
   obfuscation_enabled: boolean;
   ip_filter_enabled: boolean;
+  /** Download the bundled default IP filter again once it is a day old. */
+  ip_filter_auto_update: boolean;
   filter_incoming_connections: boolean;
   /** Answer standard ed2k "View Files" requests from any compatible client
    *  (eMule, aMule, MLDonkey, ...) with our real shared-file list. Off by
@@ -918,6 +920,10 @@ export interface AppSettings {
    *  storage (the search-history dropdown), and any existing history is
    *  cleared. Defaults to true. */
   save_search_history: boolean;
+  /** Deleting a file (the Library's Delete, Cancel on a finished download)
+   *  removes it outright instead of moving it to the Recycle Bin / Trash.
+   *  Turning it on asks for a native confirmation; declining leaves it off. */
+  delete_permanently: boolean;
   setup_complete: boolean;
   /** Internal migration marker; preserve when round-tripping settings.
    *  Backend-owned via `BACKEND_OWNED_SETTINGS_FIELDS`

@@ -104,6 +104,19 @@ export async function removeTransfer(transferId: string): Promise<void> {
   return invoke('remove_transfer', { transferId });
 }
 
+/** What `deleteFinishedDownloads` did: the rows taken off the list (file
+ *  deleted, or already gone) and a coded error for each file that was kept. */
+export interface FinishedDeleteReport {
+  removed: string[];
+  failed: string[];
+}
+
+/** Cancel finished downloads: delete each one's file (to the Recycle Bin, or
+ *  permanently when Settings says so) and take it off the list. */
+export async function deleteFinishedDownloads(transferIds: string[]): Promise<FinishedDeleteReport> {
+  return invoke('delete_finished_downloads', { transferIds });
+}
+
 export async function getTransfers(): Promise<Transfer[]> {
   return invoke('get_transfers');
 }

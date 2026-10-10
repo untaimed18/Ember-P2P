@@ -29,6 +29,7 @@ mod commands;
 mod emule_import;
 mod finish_action;
 mod geoip;
+mod ipfilter_update;
 mod network;
 mod power;
 mod search;
@@ -1177,6 +1178,7 @@ pub fn run() {
             }
             background::spawn(app_handle.clone());
             auto_update::scheduler::spawn(app_handle.clone());
+            ipfilter_update::spawn(app_handle.clone());
             commands::channel_recovery::spawn_startup_scan(app_handle.clone());
 
             // Non-silent recovery notice: if config.json was corrupt at load,
@@ -2451,6 +2453,7 @@ pub fn run() {
             commands::sharing::open_library_folder,
             commands::sharing::move_files_to_category,
             commands::sharing::rename_library_file,
+            commands::transfers::delete_finished_downloads,
             commands::sharing::delete_shared_file,
             commands::sharing::republish_file,
             commands::sharing::scan_missing_files,
@@ -2590,6 +2593,8 @@ pub fn run() {
             commands::security::remove_ip_filter_range,
             commands::security::set_ip_filter_enabled,
             commands::security::set_block_private_ips,
+            commands::security::set_ip_filter_auto_update,
+            commands::security::get_ip_filter_update_info,
             commands::security::download_and_load_ipfilter,
             commands::security::update_ipfilter_from_url,
             commands::security::pick_and_import_ipfilter_file,

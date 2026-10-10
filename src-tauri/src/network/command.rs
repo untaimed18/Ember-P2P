@@ -4183,12 +4183,21 @@ async fn handle_command_inner(
                         return Err("Failed to parse IP filter".into());
                     }
                 };
+                // The user's own additions and removals outlive the list they
+                // were made on (`storage::ipfilter_edits`).
+                let edits = crate::storage::ipfilter_edits::load(
+                    load_path.parent().unwrap_or(std::path::Path::new(".")),
+                );
+                if !edits.is_empty() {
+                    edits.apply(&mut fresh);
+                }
                 if let (Some(staged), Some(bytes)) = (staged_path, staged_bytes) {
                     // `ipfilter.dat` is always loaded as text on startup.
                     // Preserve `.p2p` text verbatim, but convert `.p2b`
                     // binary input into canonical eMule text before it
-                    // replaces that stable path.
-                    let persisted_bytes = if imported_p2b {
+                    // replaces that stable path. With edits re-applied the
+                    // list on disk has to carry them too.
+                    let persisted_bytes = if imported_p2b || !edits.is_empty() {
                         fresh.canonical_dat_bytes()
                     } else {
                         bytes
@@ -4201,6 +4210,15 @@ async fn handle_command_inner(
                         return Err(format!("Failed to persist imported IP filter: {error}"));
                     }
                     info!("Persisted imported IP filter to {:?}", load_path);
+                } else if !edits.is_empty() {
+                    // A downloaded list was written to ipfilter.dat before
+                    // this reload; rewrite it with the edits in, or the next
+                    // start would load the list without them.
+                    if let Err(error) =
+                        write_ipfilter_dat_superseding(&load_path, &fresh.canonical_dat_bytes())
+                    {
+                        warn!("Could not save the IP filter with your edits re-applied: {error}");
+                    }
                 }
                 info!("ReloadIpFilter: parsed {range_count} ranges from {path:?}");
                 Ok(fresh)
@@ -4265,6 +4283,13 @@ async fn handle_command_inner(
             if let (Ok(start), Ok(end)) = (start_ip.parse::<Ipv4Addr>(), end_ip.parse::<Ipv4Addr>())
             {
                 ensure_ipfilter_loaded(state).await;
+                {
+                    let data_dir = state.data_dir.clone();
+                    let (s, e, d) = (u32::from(start), u32::from(end), description.clone());
+                    tokio::task::spawn_blocking(move || {
+                        crate::storage::ipfilter_edits::update(&data_dir, |edits| edits.record_add(s, e, d))
+                    });
+                }
                 state.ip_filter.add_range(start, end, description);
                 state
                     .ip_filter
@@ -4295,6 +4320,13 @@ async fn handle_command_inner(
             ensure_ipfilter_loaded(state).await;
             let removed = state.ip_filter.remove_range(&start_ip, &end_ip);
             if removed {
+                if let (Ok(start), Ok(end)) = (start_ip.parse::<Ipv4Addr>(), end_ip.parse::<Ipv4Addr>()) {
+                    let data_dir = state.data_dir.clone();
+                    let (s, e) = (u32::from(start), u32::from(end));
+                    tokio::task::spawn_blocking(move || {
+                        crate::storage::ipfilter_edits::update(&data_dir, |edits| edits.record_remove(s, e))
+                    });
+                }
                 state
                     .ip_filter
                     .update_shared_snapshot(&state.shared_ip_filter);

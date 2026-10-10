@@ -2260,6 +2260,148 @@ pub async fn resume_transfer(
     Ok(())
 }
 
+/// What [`delete_finished_downloads`] did.
+#[derive(serde::Serialize)]
+pub struct FinishedDeleteReport {
+    /// Downloads taken off the list: their file deleted, or already gone.
+    removed: Vec<String>,
+    /// One coded error per download whose file was kept, and whose row stays.
+    failed: Vec<String>,
+}
+
+/// Cancel finished downloads: delete each one's file — to the Recycle Bin, or
+/// outright when the user chose that in Settings — and take it off the list. A
+/// file the Library holds goes through the Library's own delete, so it also
+/// leaves the index and every network it was published on.
+///
+/// Only the file the download wrote is touched: the recorded path must still
+/// resolve inside a `Downloads` folder, hold the download's size, and, where
+/// the Library has hashed it, its hash. A file already gone just takes the row
+/// with it. When the user keeps a file the Recycle Bin would not take, the
+/// rest are left alone too, as the Library's bulk delete does.
+#[tauri::command]
+pub async fn delete_finished_downloads(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    transfer_ids: Vec<String>,
+) -> Result<FinishedDeleteReport, String> {
+    check_batch_size(&transfer_ids)?;
+    let (rows, dl_folders, permanently) = {
+        let (mgr, cfg) = tokio::join!(state.transfer_manager.read(), state.config.read());
+        let rows: Vec<Option<Transfer>> = transfer_ids
+            .iter()
+            .map(|id| mgr.get_transfer(id).cloned())
+            .collect();
+        (rows, cfg.settings.download_folders(), cfg.settings.delete_permanently)
+    };
+    let roots = dl_folders.roots();
+    let mut report = FinishedDeleteReport { removed: Vec::new(), failed: Vec::new() };
+    for (transfer_id, row) in transfer_ids.into_iter().zip(rows) {
+        let Some(transfer) = row else {
+            report.failed.push(coded_ctx("transfers_transfer_not_found", "Transfer not found", &transfer_id));
+            continue;
+        };
+        if transfer.direction != TransferDirection::Download || transfer.status != TransferStatus::Completed {
+            report.failed.push(coded_ctx(
+                "transfers_delete_not_finished",
+                "Only a finished download's file can be deleted",
+                &transfer.file_name,
+            ));
+            continue;
+        }
+        let recorded = match transfer.completed_path.as_deref() {
+            Some(p) if !p.is_empty() => PathBuf::from(p),
+            _ => dl_folders
+                .current
+                .join("Downloads")
+                .join(crate::security::sanitize_filename(&transfer.file_name)),
+        };
+        let resolved = tokio::task::spawn_blocking({
+            let recorded = recorded.clone();
+            let roots = roots.clone();
+            let expected_size = transfer.total_size;
+            move || -> Result<Option<(PathBuf, crate::security::filesystem::ObjectIdentity)>, String> {
+                if std::fs::symlink_metadata(&recorded).is_err() {
+                    return Ok(None);
+                }
+                let canonical = crate::security::filesystem::verify_recorded_file_nested(
+                    &recorded,
+                    &roots,
+                    "Downloads",
+                    crate::storage::category_folders::MAX_DEPTH,
+                )
+                .map_err(|e| coded_ctx("transfers_invalid_path", "Invalid or changed download path", e))?;
+                let (_, opened) =
+                    crate::security::filesystem::open_existing_approved(&canonical, &roots, false)
+                        .map_err(|e| coded_ctx("transfers_invalid_path", "Invalid or changed download path", e))?;
+                let size = opened
+                    .metadata()
+                    .map_err(|e| coded_ctx("transfers_invalid_path", "Invalid or changed download path", e))?
+                    .len();
+                if size != expected_size {
+                    return Err(coded("transfers_delete_file_changed", "The file there is no longer this download"));
+                }
+                let identity = crate::security::filesystem::opened_file_identity(&opened)
+                    .map_err(|e| coded_ctx("transfers_invalid_path", "Invalid or changed download path", e))?;
+                Ok(Some((canonical, identity)))
+            }
+        })
+        .await
+        .map_err(|e| coded_ctx("transfers_delete_task_failed", "Delete task failed", e))?;
+
+        let deleted = match resolved {
+            Err(e) => Err(e),
+            Ok(None) => Ok(()),
+            Ok(Some((canonical, identity))) => {
+                let canonical_str = canonical.to_string_lossy().into_owned();
+                let indexed = match crate::commands::sharing::indexed_library_entry(&state, &canonical_str).await {
+                    Some(entry) => Some(entry),
+                    None => {
+                        crate::commands::sharing::indexed_library_entry(&state, &recorded.to_string_lossy()).await
+                    }
+                };
+                match indexed {
+                    Some((_, hash)) if !hash.is_empty() && !hash.eq_ignore_ascii_case(&transfer.file_hash) => {
+                        Err(coded("transfers_delete_file_changed", "The file there is no longer this download"))
+                    }
+                    Some((indexed_path, _)) => {
+                        crate::commands::sharing::delete_indexed_library_file(&app, &state, &indexed_path)
+                            .await
+                            .map(|_| ())
+                    }
+                    None => {
+                        crate::commands::sharing::recycle_library_file(&app, &canonical, &roots, &identity, permanently)
+                            .await
+                    }
+                }
+            }
+        };
+        match deleted {
+            Ok(()) => {
+                if let Err(e) = remove_transfer(state.clone(), transfer_id.clone()).await {
+                    tracing::warn!("The file of {transfer_id} was deleted but its row could not be removed: {e}");
+                }
+                report.removed.push(transfer_id);
+            }
+            Err(e) => {
+                // "Keep file" at the delete-permanently question: the rest are
+                // very likely in the same place, so stop rather than ask again.
+                let declined = e.contains("\"sharing_delete_declined\"");
+                report.failed.push(e);
+                if declined {
+                    break;
+                }
+            }
+        }
+    }
+    tracing::info!(
+        "Deleted the files of {} finished download(s){}",
+        report.removed.len(),
+        if report.failed.is_empty() { String::new() } else { format!(", {} kept", report.failed.len()) }
+    );
+    Ok(report)
+}
+
 #[tauri::command]
 pub async fn remove_transfer(
     state: tauri::State<'_, AppState>,

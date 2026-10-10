@@ -1967,12 +1967,20 @@
     const totalBytes = targets.reduce((sum, f) => sum + f.size, 0);
     bulkBusy = true;
     try {
+      const size = formatSize(totalBytes);
+      const count = formatNumber(targets.length);
       const confirmed = await askConfirm(
-        plural(targets.length, {
-          one: () => m.library_confirm_delete_one({ size: formatSize(totalBytes) }),
-          few: () => m.library_confirm_delete_few({ count: formatNumber(targets.length), size: formatSize(totalBytes) }),
-          other: () => m.library_confirm_delete_other({ count: formatNumber(targets.length), size: formatSize(totalBytes) }),
-        }),
+        $appSettings?.delete_permanently
+          ? plural(targets.length, {
+              one: () => m.library_confirm_delete_one_permanent({ size }),
+              few: () => m.library_confirm_delete_few_permanent({ count, size }),
+              other: () => m.library_confirm_delete_other_permanent({ count, size }),
+            })
+          : plural(targets.length, {
+              one: () => m.library_confirm_delete_one({ size }),
+              few: () => m.library_confirm_delete_few({ count, size }),
+              other: () => m.library_confirm_delete_other({ count, size }),
+            }),
         m.library_delete_files_title(),
       );
       if (!confirmed) return;
@@ -2989,7 +2997,9 @@
     deletingPaths.add(f.path);
     try {
       const confirmed = await askConfirm(
-        m.library_confirm_delete_single({ name: f.name }),
+        $appSettings?.delete_permanently
+          ? m.library_confirm_delete_single_permanent({ name: f.name })
+          : m.library_confirm_delete_single({ name: f.name }),
         m.library_delete_file_title(),
       );
       if (!confirmed) return;

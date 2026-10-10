@@ -3290,6 +3290,16 @@
               </div>
               <ToggleSwitch bind:checked={settings.remove_finished_downloads} ariaLabel={m.settings_auto_remove()} />
             </div>
+            <!-- Turning it on raises a native confirmation from the backend;
+                 declining it leaves the save holding the Recycle Bin, which
+                 the switch then shows again. -->
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_delete_permanently()}</span>
+                <span class="hint">{m.settings_delete_permanently_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.delete_permanently} ariaLabel={m.settings_delete_permanently()} />
+            </div>
             <div class="field toggle-row">
               <div class="toggle-info">
                 <span class="toggle-title">{m.settings_watch_clipboard_label()}</span>

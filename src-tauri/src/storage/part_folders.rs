@@ -481,6 +481,20 @@ pub fn previous_after_change(
     old_previous: &[String],
     new_current: &str,
 ) -> Vec<String> {
+    previous_after_change_keeping(old_current, old_previous, new_current, &[])
+}
+
+/// [`previous_after_change`], also keeping a folder that holds one of
+/// `finished_files`: the files of finished downloads the transfer list still
+/// shows. Open, Reveal and Cancel on such a row need the folder approved, so
+/// it stays until the list forgets them — at the next start, where
+/// [`retain_needed`] no longer counts them. Blocking.
+pub fn previous_after_change_keeping(
+    old_current: &str,
+    old_previous: &[String],
+    new_current: &str,
+    finished_files: &[String],
+) -> Vec<String> {
     let mut previous: Vec<String> = Vec::new();
     for folder in std::iter::once(old_current).chain(old_previous.iter().map(String::as_str)) {
         if folder.is_empty()
@@ -489,7 +503,10 @@ pub fn previous_after_change(
         {
             continue;
         }
-        if holds_parts(Path::new(folder), |_| true) {
+        let holds_finished = finished_files
+            .iter()
+            .any(|file| crate::security::path_within_dir(file, folder));
+        if holds_finished || holds_parts(Path::new(folder), |_| true) {
             previous.push(folder.to_string());
         }
     }
@@ -1025,6 +1042,32 @@ mod tests {
         let kept = previous_after_change(&current, &older, &new);
         assert_eq!(kept.len(), MAX_PREVIOUS_DOWNLOAD_FOLDERS);
         assert_eq!(kept[0], current, "the folder just left is the newest");
+    }
+
+    #[test]
+    fn a_folder_holding_a_listed_finished_download_is_kept_on_a_change() {
+        let scratch = Scratch::new();
+        let a = scratch.folder("a");
+        let b = scratch.folder("b");
+        let finished = std::path::Path::new(&a)
+            .join("Downloads")
+            .join("film.mkv")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            previous_after_change_keeping(&a, &[], &b, std::slice::from_ref(&finished)),
+            vec![a.clone()],
+            "its finished file keeps the folder"
+        );
+        let elsewhere = std::path::Path::new(&b)
+            .join("Downloads")
+            .join("film.mkv")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            previous_after_change_keeping(&a, &[], &b, &[elsewhere]).is_empty(),
+            "a finished file in another folder does not"
+        );
     }
 
     #[test]

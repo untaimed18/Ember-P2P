@@ -2398,13 +2398,18 @@ pub(crate) fn file_in_shared_folders(file_path: &str, shared_folders: &[String])
 /// compromised webview cannot wipe shared folders for good with a loop of
 /// calls. Only where the bin will not take the file (some network shares) is
 /// it deleted outright, and then only after a native confirmation the
-/// renderer can neither draw nor answer.
-async fn recycle_library_file(
+/// renderer can neither draw nor answer. `permanently` is the user's Settings
+/// choice to skip the bin, which itself took a native confirmation to make.
+pub(crate) async fn recycle_library_file(
     app: &tauri::AppHandle,
     path: &std::path::Path,
     allowed_roots: &[String],
     expected: &crate::security::filesystem::ObjectIdentity,
+    permanently: bool,
 ) -> Result<(), String> {
+    if permanently {
+        return delete_file_with_retry(path, allowed_roots, expected, 6, 250).await;
+    }
     // A network share has no Recycle Bin, and the shell then deletes for good
     // without a word, so such a file goes straight to the question below. A
     // mapped drive counts: the path here is canonical, `\\?\UNC\…`.
@@ -8670,6 +8675,36 @@ pub async fn delete_shared_file(
             MAX_PATH_LEN,
         ));
     }
+    let (canonical, removed) = delete_indexed_library_file(&app, &state, &file_path).await?;
+    info!(
+        "Deleted shared file {}{}{}",
+        canonical.display(),
+        if removed { "" } else { " (index race)" },
+        file_hash
+            .filter(|hash| !hash.is_empty())
+            .map(|hash| format!(" ({hash})"))
+            .unwrap_or_default()
+    );
+    Ok(())
+}
+
+/// The Library's row for `path`, if it holds one: the path it is indexed
+/// under and the file's ed2k hash (empty while it is still being hashed).
+pub(crate) async fn indexed_library_entry(state: &AppState, path: &str) -> Option<(String, String)> {
+    let index = state.local_index.read().await;
+    index.get_by_path(path).map(|file| (file.path.clone(), file.hash.clone()))
+}
+
+/// Delete an indexed Library file — to the Recycle Bin, or outright when the
+/// user chose that in Settings — and take it out of the library: the index,
+/// known.met, and every network it was published on. Returns the canonical
+/// path deleted and whether the index still held the row when it was removed.
+pub(crate) async fn delete_indexed_library_file(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    file_path: &str,
+) -> Result<(std::path::PathBuf, bool), String> {
+    let file_path = file_path.to_string();
     // This command is the Library's destructive action. Do not let its broad
     // shared/download containment scope become a generic delete primitive for
     // active `.part` files or any other unindexed download.
@@ -8685,9 +8720,9 @@ pub async fn delete_shared_file(
                 )
             })?
     };
-    let allowed_dirs = {
+    let (allowed_dirs, permanently) = {
         let config = state.config.read().await;
-        shared_access_dirs(&config)
+        (shared_access_dirs(&config), config.settings.delete_permanently)
     };
 
     let (canonical, expected_identity) = tokio::task::spawn_blocking({
@@ -8732,7 +8767,7 @@ pub async fn delete_shared_file(
     .await
     .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))??;
 
-    recycle_library_file(&app, &canonical, &allowed_dirs, &expected_identity).await?;
+    recycle_library_file(app, &canonical, &allowed_dirs, &expected_identity, permanently).await?;
 
     let canonical_str = canonical.to_string_lossy().to_string();
     let (removed, removed_hashes, unpublish) = {
@@ -8758,27 +8793,13 @@ pub async fn delete_shared_file(
     // named here or its Ember records live out their TTL and light the badge
     // again on the next launch.
     unpublish_ember_files(&state.network_tx, unpublish).await;
-    forget_gone_paths(&state, vec![canonical_str.clone(), file_path.clone()]).await;
+    forget_gone_paths(state, vec![canonical_str.clone(), file_path.clone()]).await;
     reconcile_shared_files_best_effort(&state.network_tx).await;
     let _ = app.emit(
         "shared-files-changed",
         serde_json::json!({ "file_deleted": true }),
     );
-
-    info!(
-        "Deleted shared file {}{}{}",
-        canonical.display(),
-        if removed.is_none() {
-            " (index race)"
-        } else {
-            ""
-        },
-        file_hash
-            .filter(|hash| !hash.is_empty())
-            .map(|hash| format!(" ({hash})"))
-            .unwrap_or_default()
-    );
-    Ok(())
+    Ok((canonical, removed.is_some()))
 }
 
 /// Check the filesystem for every file being offered and return the list of
