@@ -477,12 +477,26 @@ export interface EmberDiagnostics {
   ember_dht_keywords_published: number;
   /** Slice 14: inbound Ember DHT frames dropped by per-IP rate limits. */
   ember_dht_rate_limited: number;
+  /** Ember datagrams dropped before decryption: sender on the ban list. */
+  ember_udp_dropped_banned?: number;
+  /** Ember datagrams dropped before decryption by the per-IP packet limit. */
+  ember_udp_dropped_rate_limited?: number;
+  /** Room frames and EPX dropped because the IP filter lists the sender. */
+  ember_udp_dropped_filtered?: number;
+  /** Peers that answered us but were refused a routing slot: unroutable or private. */
+  ember_dht_refused_ip_policy?: number;
+  /** As above, for a /24 at its share of the bucket or table. */
+  ember_dht_refused_subnet?: number;
+  /** As above, for an address at its share of the table. */
+  ember_dht_refused_per_ip?: number;
   /** Slice 14: STORE frames rejected as short-window signature replays. */
   ember_dht_store_replays: number;
   /** Slice 15: LowID/firewalled but still publishing Ember DHT sources. */
   ember_dht_firewalled_publishing: boolean;
   /** Firewalled with no HighID buddy — Ember source STORE is skipped. */
   ember_dht_waiting_buddy: boolean;
+  /** Firewalled Ember users we are relaying for right now (live count). */
+  ember_dht_relaying_for?: number;
   /** Slice 15: Ember on but no external IPv4 available for source records. */
   ember_dht_udp_unreachable: boolean;
   /** Whether the three reachability flags above have been evaluated since diagnostics were last reset. */

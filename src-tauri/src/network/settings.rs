@@ -161,8 +161,6 @@ pub(super) fn apply_network_settings(
             .update_shared_snapshot(&state.shared_ip_filter);
         if new_settings.ip_filter_enabled {
             state.routing_table.evict_filtered_contacts();
-            purge_ember_ip_blocked_peers(state);
-            state.ember_dht.evict_filtered_contacts();
         }
     }
     if state.ip_filter.blocks_private() != new_settings.block_private_ips {
@@ -177,9 +175,10 @@ pub(super) fn apply_network_settings(
         state
             .routing_table
             .set_block_private_ips(new_settings.block_private_ips);
-        // Ember shares the user's IP policy: both stacks dial peers from the
-        // same socket, so a contact the user has blocked must be refused by
-        // whichever table would otherwise hand it to us.
+        // Ember shares the private-IP preference (though not the range
+        // filter): both stacks dial peers from the same socket, so a contact
+        // the user has blocked must be refused by whichever table would
+        // otherwise hand it to us.
         purge_ember_ip_blocked_peers(state);
         state
             .ember_dht

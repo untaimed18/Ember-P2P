@@ -612,11 +612,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
     let shared_ip_filter = ip_filter.create_shared_snapshot();
     routing_table.set_ip_filter(shared_ip_filter.clone());
-    // Kad already has `nodes.dat` in the table (inserted above). Ember's
-    // `nodes_ember.dat` is loaded after `NetworkState` is built, so the
-    // fail-closed snapshot is attached there — not here. Both stacks then
-    // share the same policy: a blocked address is refused whichever table
-    // learned it, and `evict_filtered_contacts` runs once ranges are ready.
+    // Kad already has `nodes.dat` in the table (inserted above). The Ember
+    // table gets no range filter at all, only the private/bogus policy; see
+    // `ember::dht::routing::RoutingTable::admits_addr`.
     let ember_dht =
         ember::dht::engine::EmberDht::new(
             identity.ed25519_secret_key,
@@ -1278,11 +1276,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // Seed the Ember DHT routing table from the last session's persisted
     // contacts (slice 7). This is the native equivalent of KAD's
     // `nodes.dat` and is what lets Ember rejoin the DHT after a restart
-    // without depending on KAD source publishes for discovery. Loaded
-    // *before* the fail-closed IP filter is attached: Ember contacts are
-    // never Kad bootstrap seeds, so `admits_addr` would otherwise refuse
-    // the entire file. `load_contacts` also detaches the range filter for
-    // the same reason if one is already present.
+    // without depending on KAD source publishes for discovery.
     let nodes_ember_path = data_dir.join("nodes_ember.dat");
     crate::security::recover_interrupted_replace(&nodes_ember_path);
     if nodes_ember_path.exists() {
@@ -1349,9 +1343,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         state.ember_nodes_file = ember::dht::bootstrap::NodesFileState::Loaded;
         debug!("No nodes_ember.dat found; Ember DHT routing table starts empty");
     }
-    state
-        .ember_dht
-        .set_ip_filter(state.shared_ip_filter.clone());
 
     {
         let highwater_path = ember_highwater_path(&data_dir);

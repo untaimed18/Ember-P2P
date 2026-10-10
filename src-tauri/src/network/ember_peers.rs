@@ -703,20 +703,16 @@ pub(super) fn remember_ember_session_dht_contact(state: &mut NetworkState, conta
     record_ember_session_dht_contact(&mut state.ember_session_dht_contacts, contact);
 }
 
-/// What the user's IP policy says about talking to an Ember peer.
+/// What the user's IP policy says about talking to an Ember DHT peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EmberIpVerdict {
     Allowed,
-    /// Bogus space or a filter hit.
+    /// Unroutable space, or LAN/CGNAT while `block_private_ips` is on.
     Blocked,
     /// A ban. Refused like a block, but bans expire and are per IP, where one
     /// misbehaving client can share its address with other Ember peers behind
     /// the same NAT, so it is no reason to forget the peers cached there.
     Banned,
-    /// An enabled filter is still loading its ranges. Not grounds to forget the
-    /// peer, but not grounds to dial a stranger either: inbound fails closed in
-    /// the same window.
-    Pending,
 }
 
 impl EmberIpVerdict {
@@ -726,17 +722,17 @@ impl EmberIpVerdict {
     }
 }
 
-/// The user's IP policy for an Ember peer at `ip`, on the terms
-/// [`ember_udp_ip_filter_allows`] applies to inbound traffic. A LAN/CGNAT peer
-/// introduced over a live session is exempt from the filter — that is what keeps
-/// a LAN friend reachable under `block_private_ips`, or under a list that covers
-/// private space — and while the filter loads only introduced peers are allowed.
-/// A ban holds whatever the filter says.
+/// The user's IP policy for an Ember DHT peer at `ip`, on the terms
+/// [`ember_udp_recv_allowed`] applies to inbound traffic. The `ipfilter.dat`
+/// ranges are not part of it; see
+/// [`ember::dht::routing::RoutingTable::admits_addr`]. A LAN/CGNAT peer
+/// introduced over a live session is exempt from `block_private_ips` — that is
+/// what keeps a LAN friend reachable — and a ban holds regardless.
 ///
 /// `session_introduced` walks the session maps, so it is only asked when its
 /// answer can change the verdict.
 pub(super) fn ember_ip_verdict(
-    filter: &IpFilter,
+    block_private: bool,
     banned: &HashSet<Ipv4Addr>,
     ip: Ipv4Addr,
     session_introduced: impl FnOnce() -> bool,
@@ -744,36 +740,27 @@ pub(super) fn ember_ip_verdict(
     if crate::security::is_bogus_v4(ip) {
         return EmberIpVerdict::Blocked;
     }
-    let ban = banned.contains(&ip);
-    let lan = crate::security::is_lan_or_cgnat_v4(ip);
-    let loading = filter.is_enabled() && !filter.ranges_ready();
-    let verdict = if (lan || loading) && session_introduced() {
-        EmberIpVerdict::Allowed
-    } else if loading {
-        EmberIpVerdict::Pending
-    } else if filter.is_blocked_readonly(ip) {
+    if block_private && crate::security::is_lan_or_cgnat_v4(ip) && !session_introduced() {
         return EmberIpVerdict::Blocked;
-    } else {
-        EmberIpVerdict::Allowed
-    };
-    if ban {
+    }
+    if banned.contains(&ip) {
         EmberIpVerdict::Banned
     } else {
-        verdict
+        EmberIpVerdict::Allowed
     }
 }
 
 pub(super) fn ember_peer_ip_verdict(state: &NetworkState, ip: Ipv4Addr, udp_port: u16) -> EmberIpVerdict {
-    ember_ip_verdict(&state.ip_filter, &state.banned_ips, ip, || {
+    ember_ip_verdict(state.ip_filter.blocks_private(), &state.banned_ips, ip, || {
         ember_session_introduced(state, ip, udp_port)
     })
 }
 
 /// Whether the ban list holds `addr`'s IPv4 address.
 ///
-/// For the dial paths that check the routing table's filter gate instead of
-/// [`ember_addr_ip_verdict`]: the table knows the user's filter but not the ban
-/// list, so without this a banned address kept being queried, pinged and
+/// For the dial paths that check the routing table's IP gate instead of
+/// [`ember_addr_ip_verdict`]: the table knows the private-IP policy but not the
+/// ban list, so without this a banned address kept being queried, pinged and
 /// re-learned from gossip after it faulted out.
 pub(super) fn ember_addr_banned(state: &NetworkState, addr: SocketAddr) -> bool {
     match addr.ip() {
@@ -785,7 +772,7 @@ pub(super) fn ember_addr_banned(state: &NetworkState, addr: SocketAddr) -> bool 
 }
 
 /// [`ember_peer_ip_verdict`] for a socket address. A genuinely IPv6 peer is
-/// outside what the IPv4 filter and ban list can represent.
+/// outside what the IPv4 ban list can represent.
 pub(super) fn ember_addr_ip_verdict(state: &NetworkState, addr: SocketAddr) -> EmberIpVerdict {
     let v4 = match addr.ip() {
         IpAddr::V4(v4) => v4,
@@ -800,13 +787,12 @@ pub(super) fn ember_addr_ip_verdict(state: &NetworkState, addr: SocketAddr) -> E
 /// Forget cached Ember peers the user's IP policy now refuses, and stop the
 /// queued STOREs and buddy proxy publishes aimed at them.
 ///
-/// `evict_filtered_contacts` covers the routing table; these are the caches
+/// `set_block_private_ips` covers the routing table; these are the caches
 /// beside it that feed the bridge, search seeding and the publish top-up, so
 /// every site that changes the policy calls both — this one first, while the
 /// table still holds the address of a buddy it is about to evict. Only a firm
-/// [`EmberIpVerdict::Blocked`] forgets cached peers: a filter still loading
-/// leaves the caches for the call that follows its load, and a ban only stops
-/// the queued work.
+/// [`EmberIpVerdict::Blocked`] forgets cached peers; a ban only stops the
+/// queued work.
 pub(super) fn purge_ember_ip_blocked_peers(state: &mut NetworkState) {
     // Every verdict is taken before anything is removed: a LAN peer's exemption
     // rests on the very session maps this clears.
@@ -1684,10 +1670,9 @@ pub(super) async fn send_ember_bridge_ping(
     noise_pub: Option<&[u8; 32]>,
 ) -> bool {
     // Candidates come from KAD tags and eD2K sessions, neither of which the
-    // user's filter or ban list has seen. A firm block is forgotten here so the
-    // address stops taking a candidate slot; a ban is rested on the retry
-    // backoff like an unanswered dial, since it lifts; a filter still loading
-    // is only waited out.
+    // user's IP policy or ban list has seen. A firm block is forgotten here so
+    // the address stops taking a candidate slot; a ban is rested on the retry
+    // backoff like an unanswered dial, since it lifts.
     match ember_peer_ip_verdict(state, ip, udp_port) {
         EmberIpVerdict::Allowed => {}
         EmberIpVerdict::Blocked => {
@@ -1700,7 +1685,6 @@ pub(super) async fn send_ember_bridge_ping(
             note_ember_bridge_attempt(state, ip, udp_port);
             return false;
         }
-        EmberIpVerdict::Pending => return false,
     }
     let addr = SocketAddr::new(IpAddr::V4(ip), udp_port);
     let sent = send_ember_dht_ping(socket, state, addr, noise_pub).await;
@@ -2121,7 +2105,7 @@ pub(super) async fn answer_friend_meet(
     if within_window(state.ember_friend_meets_pinged.get(&friend)) {
         return;
     }
-    // The user's filter and bans hold for a friend's address too; this is
+    // The user's IP policy and bans hold for a friend's address too; this is
     // not a bridge attempt, so none of the bridge's bookkeeping applies.
     if !matches!(ember_peer_ip_verdict(state, peer_ip, udp_port), EmberIpVerdict::Allowed) {
         return;

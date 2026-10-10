@@ -996,22 +996,10 @@ impl EmberDht {
         self.routing.export_bootstrap_contacts(max)
     }
 
-    /// Share the user's range IP filter with the routing table so blocked
-    /// addresses are refused on admission.
-    pub fn set_ip_filter(&mut self, filter: crate::network::kad::ip_filter::SharedIpFilter) {
-        self.routing.set_ip_filter(filter);
-    }
-
     /// Hot-update the LAN/CGNAT admission policy, evicting contacts the new
     /// policy rejects. Returns how many were dropped.
     pub fn set_block_private_ips(&mut self, block_private: bool) -> usize {
         self.routing.set_block_private_ips(block_private)
-    }
-
-    /// Re-apply the current IP policy to the whole table, for when the user
-    /// reloads `ipfilter.dat`.
-    pub fn evict_filtered_contacts(&mut self) -> usize {
-        self.routing.evict_filtered_contacts()
     }
 
     /// Admit cached leads the IP policy now allows. See
@@ -1633,6 +1621,16 @@ impl EmberDht {
             }
         }
         client.files.insert(file_hash, (token, now));
+    }
+
+    /// Firewalled Ember users we are relaying for: publishers whose
+    /// `PROXY_STORE` we accepted within [`CALLBACK_CLIENT_TTL`], so a searcher's
+    /// `CALLBACK_REQ` for their files is still bounced to them through us.
+    pub fn relaying_for_count(&self, now: Instant) -> usize {
+        self.callback_clients
+            .values()
+            .filter(|client| now.saturating_duration_since(client.last_seen) < CALLBACK_CLIENT_TTL)
+            .count()
     }
 
     /// Whether [`Self::remember_callback_client`] would take `publisher` from
@@ -6919,6 +6917,20 @@ mod tests {
     /// per-subnet share.
     fn client_addr(i: usize) -> SocketAddr {
         SocketAddr::from(([198, 18 + (i / 250) as u8, (i % 250) as u8, 1], 4672))
+    }
+
+    /// The Ember page's "relaying for N users" counts publishers still inside
+    /// the callback window, not every one ever seen.
+    #[test]
+    fn relaying_for_counts_only_publishers_inside_the_callback_window() {
+        let mut buddy = dht(142);
+        let now = Instant::now();
+        for i in 0..3 {
+            let id = EmberNodeId([i as u8, 0x42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            buddy.remember_callback_client(id, client_addr(i), [1; 32], [7; 16], Some([9; 16]), now);
+        }
+        assert_eq!(buddy.relaying_for_count(now), 3);
+        assert_eq!(buddy.relaying_for_count(now + CALLBACK_CLIENT_TTL), 0);
     }
 
     /// Each callback client holds a grant: files whose records name us and

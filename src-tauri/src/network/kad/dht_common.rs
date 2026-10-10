@@ -101,23 +101,6 @@ impl IpAdmissionGate {
         self.range_filter = Some(filter);
     }
 
-    /// Detach the range filter, handing it back for [`Self::restore_range_filter`].
-    ///
-    /// For a bulk restore from disk, which must not be judged by a filter that
-    /// is still fail-closed: at startup every non-seed address reads as blocked
-    /// until `ipfilter.dat` is applied, which would refuse an entire saved
-    /// contact file. The private/bogus rules still apply while it is detached,
-    /// and blocked ranges are dropped afterwards by
-    /// [`evict_blocked_contacts`] once the list is ready.
-    pub fn take_range_filter(&mut self) -> Option<ip_filter::SharedIpFilter> {
-        self.range_filter.take()
-    }
-
-    /// Put back a filter taken by [`Self::take_range_filter`].
-    pub fn restore_range_filter(&mut self, filter: Option<ip_filter::SharedIpFilter>) {
-        self.range_filter = filter;
-    }
-
     /// Hot-update the private/LAN admission flag.
     ///
     /// Returns whether this call *enabled* the block, i.e. whether the caller
@@ -170,9 +153,8 @@ impl IpAdmissionGate {
     ///
     /// The same distinction applies during the startup fail-closed window:
     /// [`ip_filter::IpFilterSnapshot::is_blocked_for_kad`] treats every
-    /// non-seed as blocked until `ipfilter.dat` is applied, and Ember contacts
-    /// are never Kad bootstrap seeds, so evicting against that answer would
-    /// wipe the whole KAD routing table and `nodes_ember.dat` on every launch.
+    /// non-seed as blocked until `ipfilter.dat` is applied, so evicting against
+    /// that answer would wipe the whole KAD routing table on every launch.
     /// Hence the plain [`ip_filter::IpFilterSnapshot::is_blocked`] here, gated
     /// on the ranges having actually landed.
     pub fn is_definitely_blocked(&self, ip: Ipv4Addr) -> bool {

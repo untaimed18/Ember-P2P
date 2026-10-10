@@ -1008,7 +1008,7 @@ pub(super) async fn flush_ember_batch_publish(socket: &UdpSocket, state: &mut Ne
             .ember_batch_publish
             .queued_count
             .saturating_sub(queued.len());
-        // A ban or filter change can land between queueing and this flush.
+        // A ban or policy change can land between queueing and this flush.
         if ember_addr_ip_verdict(state, contact.addr).refuses() {
             let (dropped, rearmed) = release_ember_queued_records(state, queued);
             stats.records_dropped += dropped;
@@ -2139,8 +2139,8 @@ pub(super) async fn maybe_publish_ember_sources(
     // port, and it must not be reachable only on the paths that get that far:
     // three of the returns below (empty publishable table, no external IPv4,
     // IPv6-only mapping) sat above it, and the first of those is exactly what a
-    // node hits when `evict_filtered_contacts` momentarily empties the table on
-    // an ipfilter reload.
+    // node hits when turning on `block_private_ips` momentarily empties the
+    // table.
     //
     // This is the only periodic sweep of `ember_pending_proxy_overlay`, and
     // `ember_publish_staleness` returns `None` for any file with an `unplaced`

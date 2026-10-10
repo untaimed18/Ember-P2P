@@ -1033,11 +1033,12 @@ footer.doc-end {
 <h3>5.4 Admission</h3>
 <p>A contact is refused if any of the following hold:</p>
 <ul>
-  <li>Port is 0, or the address is filtered by the user’s <code>ipfilter.dat</code>.</li>
+  <li>Port is 0, or the address is unroutable (loopback, multicast, reserved and documentation space).</li>
   <li>Private / LAN / CGNAT addresses while “block private IPs” is on (same preference as KAD; toggling it on evicts already-admitted matches).</li>
   <li>The per-IP or per-subnet diversity cap for the current <code>NetworkScale</code> is full (see §12).</li>
   <li>The Ed25519 key is not a valid curve point, or <code>BLAKE3(key)[..16]</code> disagrees with the advertised ID.</li>
 </ul>
+<p>The user’s <code>ipfilter.dat</code> is not an admission rule. Common lists block whole hosting and VPN networks, which would shut those users out of the overlay, and every reachable node is already listed under the public KAD rendezvous key, so the filter would hide nothing. It still applies to eD2K, KAD, file transfers, room frames and EPX.</p>
 
 <h3>5.5 Store proximity</h3>
 <p>

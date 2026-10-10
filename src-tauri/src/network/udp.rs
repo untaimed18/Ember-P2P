@@ -374,7 +374,49 @@ pub(super) async fn handle_udp_packet_inner(
         return;
     }
 
-    // Security: IP filter and ban check (applied to ALL incoming UDP, including ED2K peer messages).
+    // Ember-native UDP dispatch (feature-gated). Ahead of the IP filter below,
+    // which the Ember DHT does not use; `ember_udp_recv_allowed` applies
+    // Ember's own gate and room/EPX frames are filtered after decryption.
+    //
+    // KAD/eD2K packets begin with `OP_EDONKEYHEADER` (0xE3) or
+    // `OP_EMULEPROT` (0xC5); the obfuscated KAD path uses other first
+    // bytes too, but never the Ember magic `0xEB 0x3E`. Routing on the
+    // magic prefix means we never accidentally divert real KAD traffic
+    // to the Noise transport, even when the feature flag is on.
+    //
+    // When the flag is off, we silently drop the packet — this matches
+    // the documented "designed but not yet integrated" behavior of any
+    // future Ember-native peer that finds itself talking to a build
+    // where the user hasn't opted in. We deliberately don't fall
+    // through to KAD parsing (which would log "unknown packet type"
+    // warnings and waste cycles parsing garbage).
+    if ember::transport::EmberTransport::is_ember_packet(data) {
+        if settings.ember_native_enabled {
+            // Defense-in-depth: in practice the event loop's Ember
+            // fast-path intercepts these packets before `handle_udp_packet`,
+            // but if that ever changes, the same gate still runs here.
+            if ember_udp_recv_allowed(state, from) {
+                handle_ember_native_udp(
+                    socket,
+                    data,
+                    from,
+                    state,
+                    transfer_manager,
+                    source_manager,
+                    local_index,
+                    db,
+                    app_handle,
+                    bandwidth_limiter,
+                )
+                .await;
+            }
+        } else {
+            debug!("Dropping Ember-magic UDP packet from {from}: ember_native_enabled=false");
+        }
+        return;
+    }
+
+    // Security: IP filter and ban check (applied to all incoming eD2K and KAD UDP).
     // Reject pure IPv6 — ed2k is IPv4-only and we cannot filter/ban non-v4 addresses.
     let from_ipv4 = match from.ip() {
         std::net::IpAddr::V4(v4) => v4,
@@ -398,49 +440,6 @@ pub(super) async fn handle_udp_packet_inner(
     }
     if state.banned_ips.contains(&from_ipv4) {
         debug!("Dropping UDP packet from banned peer {from}");
-        return;
-    }
-
-    // Ember-native UDP dispatch (feature-gated).
-    //
-    // KAD/eD2K packets begin with `OP_EDONKEYHEADER` (0xE3) or
-    // `OP_EMULEPROT` (0xC5); the obfuscated KAD path uses other first
-    // bytes too, but never the Ember magic `0xEB 0x3E`. Routing on the
-    // magic prefix means we never accidentally divert real KAD traffic
-    // to the Noise transport, even when the feature flag is on.
-    //
-    // When the flag is off, we silently drop the packet — this matches
-    // the documented "designed but not yet integrated" behavior of any
-    // future Ember-native peer that finds itself talking to a build
-    // where the user hasn't opted in. We deliberately don't fall
-    // through to KAD parsing (which would log "unknown packet type"
-    // warnings and waste cycles parsing garbage).
-    if ember::transport::EmberTransport::is_ember_packet(data) {
-        if settings.ember_native_enabled {
-            // Defense-in-depth: in practice the event loop's Ember
-            // fast-path intercepts these packets before `handle_udp_packet`,
-            // but if that ever changes, the shared gate (IP-filter + ban +
-            // per-IP rate limit) still runs here. The IP-filter/ban checks
-            // above already ran for KAD's sake; re-running them is two cheap
-            // set lookups against a path that's normally unreached.
-            if ember_udp_recv_allowed(state, from) {
-                handle_ember_native_udp(
-                    socket,
-                    data,
-                    from,
-                    state,
-                    transfer_manager,
-                    source_manager,
-                    local_index,
-                    db,
-                    app_handle,
-                    bandwidth_limiter,
-                )
-                .await;
-            }
-        } else {
-            debug!("Dropping Ember-magic UDP packet from {from}: ember_native_enabled=false");
-        }
         return;
     }
 

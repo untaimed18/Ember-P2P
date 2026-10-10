@@ -2361,6 +2361,10 @@ async fn handle_command_inner(
             let (ember_contacts, ember_verified) = ember_dht_ui_contact_counts(state);
             diag.ember_dht_contacts = ember_contacts;
             diag.ember_dht_verified_contacts = ember_verified;
+            diag.ember_dht_relaying_for = u32::try_from(
+                state.ember_dht.relaying_for_count(std::time::Instant::now()),
+            )
+            .unwrap_or(u32::MAX);
             // The headline count is buckets + cache + session extras, and those
             // three behave nothing alike — only the first is liveness-pinged.
             // Splitting them is what tells "we hold twelve peers" apart from
@@ -4232,8 +4236,6 @@ async fn handle_command_inner(
                         .ip_filter
                         .update_shared_snapshot(&state.shared_ip_filter);
                     state.routing_table.evict_filtered_contacts();
-                    purge_ember_ip_blocked_peers(state);
-                    state.ember_dht.evict_filtered_contacts();
                     info!(
                         "Reloaded IP filter: {} ranges",
                         state.ip_filter.range_count(),
@@ -4295,8 +4297,6 @@ async fn handle_command_inner(
                     .ip_filter
                     .update_shared_snapshot(&state.shared_ip_filter);
                 state.routing_table.evict_filtered_contacts();
-                purge_ember_ip_blocked_peers(state);
-                state.ember_dht.evict_filtered_contacts();
                 spawn_save_ipfilter_dat(&state.ip_filter, state.data_dir.join("ipfilter.dat"));
                 info!(
                     "Added IP filter range {start_ip} - {end_ip}, total ranges: {}",
@@ -4417,8 +4417,6 @@ async fn handle_command_inner(
                 .update_shared_snapshot(&state.shared_ip_filter);
             if enabled {
                 state.routing_table.evict_filtered_contacts();
-                purge_ember_ip_blocked_peers(state);
-                state.ember_dht.evict_filtered_contacts();
                 apply_server_ip_filter(
                     state,
                     shared_server_addr,

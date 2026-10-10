@@ -59,29 +59,20 @@ pub(super) async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkSt
         } = query;
         // The shortlist is not the routing table, and its contents arrive
         // straight out of a peer's `FOUND_NODE`. The table refuses an address
-        // the user blocked, but a search dialled its own shortlist directly, so
-        // a peer could name any IPv4 address it liked — a blocked range,
-        // special-use space, or a third party — and have us open unsolicited
-        // Noise handshakes to it. Getting into the top of the shortlist is
-        // cheap, since the node id is the attacker's to choose. Every other
-        // Ember dial path already consults this gate.
-        //
-        // `definitely_blocked`, not `!admits_addr`: the latter is fail-*closed*
-        // while `ipfilter.dat` is still parsing, and Ember addresses are never
-        // Kad seeds, so during that window it refuses every peer — which would
-        // have made a search on any node with the filter enabled retire its
-        // whole shortlist without dialling anyone. "Known bad" is the right
-        // question for whether to dial; the routing table draws the same
-        // distinction for admission versus eviction.
+        // its IP policy blocks, but a search dialled its own shortlist
+        // directly, so a peer could name any IPv4 address it liked —
+        // special-use space, a LAN under `block_private_ips`, or a banned
+        // host — and have us open unsolicited Noise handshakes to it. Getting
+        // into the top of the shortlist is cheap, since the node id is the
+        // attacker's to choose. Every other Ember dial path already consults
+        // this gate.
         //
         // A session peer is judged as every other session dial is, by
         // `ember_addr_ip_verdict`: a LAN address an eD2K session introduced is
-        // allowed under `block_private_ips`, the range filter and bans still
-        // apply. The table's gate refuses it outright — which is the reason the
-        // peer is held as a session contact and pinned onto value searches in
-        // the first place — so judging the pin by that gate meant it was never
-        // asked. Only a known block or ban refuses it, as above: a filter still
-        // loading is not one.
+        // allowed under `block_private_ips`, and bans still apply. The table's
+        // gate refuses it outright — which is the reason the peer is held as a
+        // session contact and pinned onto value searches in the first place —
+        // so judging the pin by that gate meant it was never asked.
         let session_peer = match contact.addr.ip() {
             IpAddr::V4(v4) => state
                 .ember_session_dht_contacts

@@ -323,6 +323,10 @@ pub(super) fn mirror_ember_dht_counters(state: &NetworkState, diag: &mut EmberDi
     diag.ember_dht_rate_limited = saturating_u32(state.ember_dht_protection.dropped_rate_limited());
     diag.ember_dht_store_addr_ceiling =
         saturating_u32(state.ember_dht_protection.dropped_store_addr_ceiling());
+    let refusals = state.ember_dht.routing().refusals();
+    diag.ember_dht_refused_ip_policy = saturating_u32(refusals.ip_policy);
+    diag.ember_dht_refused_subnet = saturating_u32(refusals.subnet);
+    diag.ember_dht_refused_per_ip = saturating_u32(refusals.per_ip);
 }
 
 /// Whether this node may advertise itself under the rendezvous key: an

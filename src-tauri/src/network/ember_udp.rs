@@ -5,14 +5,13 @@
 
 use super::*;
 
-/// IP-filter half of Ember UDP ingest.
+/// IP-filter verdict for the Ember traffic the filter still covers: room
+/// frames and EPX source exchange (see [`ember_non_dht_ip_filtered`]).
 ///
 /// Fail-closed (`enabled && !ranges_ready`) is for *strangers*. Contacts we
-/// already hold, just dialled, or introduced over a live session must still
-/// get their replies — otherwise `nodes_ember.dat` bootstrap pongs are dropped
-/// for the whole `ipfilter.dat` parse and the overlay never rejoins. Once
-/// ranges are ready, only a LAN/CGNAT session introduction may bypass a real
-/// block (same as before).
+/// already hold, just dialled, or introduced over a live session keep their
+/// traffic while `ipfilter.dat` parses. Once ranges are ready, only a LAN/CGNAT
+/// session introduction may bypass a real block.
 ///
 /// `known_peer` and `session_introduced` read the routing table and the
 /// session maps, so they are only asked when the verdict turns on them.
@@ -47,25 +46,25 @@ pub(super) fn verified_session_node_id(
         .map(|c| c.node_id.0)
 }
 
-/// Security gate for inbound Ember-native UDP, mirroring the IP-filter +
-/// ban-list + per-IP rate-limit checks `handle_udp_packet` applies to
-/// KAD/eD2K traffic. The event loop's Ember fast-path dispatches *above*
-/// `handle_udp_packet` (so Ember keeps working while KAD is disconnected),
-/// so without running these checks here a peer could drive unbounded Noise
-/// handshakes — pure CPU for us — straight past flood protection.
+/// Security gate for inbound Ember-native UDP: unroutable sources, LAN/CGNAT
+/// under `block_private_ips` (unless introduced over a live session), the ban
+/// list and a per-IP rate limit. The event loop's Ember fast-path dispatches
+/// *above* `handle_udp_packet` (so Ember keeps working while KAD is
+/// disconnected), so without running these checks here a peer could drive
+/// unbounded Noise handshakes — pure CPU for us — straight past flood
+/// protection.
+///
+/// The user's IP filter is deliberately not applied here: this gate sees DHT
+/// traffic, and the DHT does not use the filter (see
+/// [`ember::dht::routing::RoutingTable::admits_addr`]). Room frames and EPX,
+/// which share the transport, are filtered after decryption instead.
 ///
 /// Returns `true` if the packet may be processed, `false` if it should be
 /// dropped. Takes `&mut NetworkState` because the rate limiter records the
-/// hit. IP-filter and ban-list are IPv4 structures: they're enforced for
-/// any v4 / v4-mapped source, while a genuinely v6-only Ember peer skips
-/// those two (they can't represent it) but is still rate-limited.
+/// hit. The ban list is an IPv4 structure: it's enforced for any v4 /
+/// v4-mapped source, while a genuinely v6-only Ember peer skips it but is
+/// still rate-limited.
 pub(super) fn ember_udp_recv_allowed(state: &mut NetworkState, from: SocketAddr) -> bool {
-    // Both the IP filter and the rate limiter may ask; the answer cannot change
-    // in between, so it is computed at most once per datagram.
-    let mut ember_known = None;
-    let mut ember_known_peer = |state: &NetworkState| {
-        *ember_known.get_or_insert_with(|| ember_udp_is_known_peer(state, from))
-    };
     if let Some(v4) = match from.ip() {
         std::net::IpAddr::V4(v4) => Some(v4),
         std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
@@ -74,20 +73,17 @@ pub(super) fn ember_udp_recv_allowed(state: &mut NetworkState, from: SocketAddr)
             debug!("Dropping Ember UDP from blocked IP {from}");
             return false;
         }
-        if state.banned_ips.contains(&v4) {
-            debug!("Dropping Ember UDP from banned peer {from}");
+        if state.ip_filter.blocks_private()
+            && crate::security::is_lan_or_cgnat_v4(v4)
+            && !ember_session_introduced(state, v4, from.port())
+        {
+            debug!("Dropping Ember UDP from private IP {from} (block_private_ips)");
             return false;
         }
-        let fail_closed = state.ip_filter.is_enabled() && !state.ip_filter.ranges_ready();
-        let blocked = !fail_closed && state.ip_filter.is_blocked_readonly(v4);
-        if !ember_udp_ip_filter_allows(
-            blocked,
-            fail_closed,
-            || ember_known_peer(state),
-            crate::security::is_lan_or_cgnat_v4(v4),
-            || ember_session_introduced(state, v4, from.port()),
-        ) {
-            debug!("Dropping Ember UDP from blocked IP {from}");
+        if state.banned_ips.contains(&v4) {
+            debug!("Dropping Ember UDP from banned peer {from}");
+            state.ember_diagnostics.ember_udp_dropped_banned =
+                state.ember_diagnostics.ember_udp_dropped_banned.saturating_add(1);
             return false;
         }
     }
@@ -103,18 +99,42 @@ pub(super) fn ember_udp_recv_allowed(state: &mut NetworkState, from: SocketAddr)
         std::net::IpAddr::V4(v4) => {
             state.routing_table.has_contact_ip(v4)
                 || state.flood_protection.has_recent_ip(from.ip())
-                || ember_known_peer(state)
+                || ember_udp_is_known_peer(state, from)
         }
-        _ => state.flood_protection.has_recent_ip(from.ip()) || ember_known_peer(state),
+        _ => state.flood_protection.has_recent_ip(from.ip()) || ember_udp_is_known_peer(state, from),
     };
     if state
         .flood_protection
         .check_ember_rate_limit(from.ip(), known_peer)
     {
         debug!("Rate limit exceeded for Ember UDP from {from}, dropping packet");
+        state.ember_diagnostics.ember_udp_dropped_rate_limited =
+            state.ember_diagnostics.ember_udp_dropped_rate_limited.saturating_add(1);
         return false;
     }
     true
+}
+
+/// Whether the user's IP filter refuses the Ember traffic from `from` that is
+/// not the DHT: room frames, which carry room file transfers, and EPX source
+/// exchange. Both share the DHT's Noise transport, so they can only be told
+/// apart after decryption; they keep the filter the DHT itself does without.
+pub(super) fn ember_non_dht_ip_filtered(state: &NetworkState, from: SocketAddr) -> bool {
+    let Some(v4) = (match from.ip() {
+        std::net::IpAddr::V4(v4) => Some(v4),
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+    }) else {
+        return false;
+    };
+    let fail_closed = state.ip_filter.is_enabled() && !state.ip_filter.ranges_ready();
+    let blocked = !fail_closed && state.ip_filter.is_blocked_readonly(v4);
+    !ember_udp_ip_filter_allows(
+        blocked,
+        fail_closed,
+        || ember_udp_is_known_peer(state, from),
+        crate::security::is_lan_or_cgnat_v4(v4),
+        || ember_session_introduced(state, v4, from.port()),
+    )
 }
 
 /// Drive `EmberTransport` for an inbound Ember-magic UDP packet,
@@ -224,8 +244,29 @@ pub(super) async fn handle_ember_native_udp_inner(
     // ahead of controls, so a deferred control released by a DHT frame is
     // handled after it. Nothing here depends on the relative order of the
     // two kinds.
+    // Asked at most once per datagram, and only if it carries a room frame or
+    // EPX; DHT frames never consult the filter.
+    let mut non_dht_filtered = None;
+    let mut refuse_non_dht = |state: &mut NetworkState| {
+        let refused =
+            *non_dht_filtered.get_or_insert_with(|| ember_non_dht_ip_filtered(state, from));
+        if refused {
+            debug!("Dropping Ember room/EPX frame from IP-filtered {from}");
+            state.ember_diagnostics.ember_udp_dropped_filtered =
+                state.ember_diagnostics.ember_udp_dropped_filtered.saturating_add(1);
+        }
+        refused
+    };
+
     if let Some(remote_noise_pub) = outcome.remote_noise_pub {
         for payload in &outcome.app_payloads {
+            let is_room_frame = matches!(
+                payload.get(1).copied(),
+                Some(ember::dht::messages::MSG_CHANNEL_MSG | ember::dht::messages::MSG_CHANNEL_RELAY)
+            );
+            if is_room_frame && refuse_non_dht(state) {
+                continue;
+            }
             handle_ember_dht_message(
                 socket,
                 payload,
@@ -241,6 +282,14 @@ pub(super) async fn handle_ember_native_udp_inner(
     }
 
     for control in outcome.controls {
+        let is_epx = matches!(
+            control,
+            ember::transport::EmberControlMessage::ExchangeRequest
+                | ember::transport::EmberControlMessage::ExchangeData { .. }
+        );
+        if is_epx && refuse_non_dht(state) {
+            continue;
+        }
         handle_ember_control_message(
             socket,
             control,

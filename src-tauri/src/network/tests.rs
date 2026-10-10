@@ -5031,54 +5031,34 @@ fn our_own_echoed_source_record_is_not_harvested_as_a_bridge_key() {
 }
 
 #[test]
-fn the_ember_ip_verdict_honours_ranges_and_bans_but_spares_introduced_lan_peers() {
+fn the_ember_ip_verdict_honours_private_space_and_bans_but_spares_introduced_lan_peers() {
     let public = Ipv4Addr::new(8, 8, 8, 8);
-    let listed = Ipv4Addr::new(9, 9, 9, 9);
     let lan = Ipv4Addr::new(192, 168, 1, 20);
-    let mut filter = IpFilter::new(true, true);
-    filter.add_range(listed, listed, "test".into());
-    filter.add_range(lan, lan, "private space on the list".into());
-    filter.mark_ranges_ready();
     let mut banned = HashSet::new();
 
-    assert_eq!(ember_ip_verdict(&filter, &banned, public, || false), EmberIpVerdict::Allowed);
-    assert_eq!(ember_ip_verdict(&filter, &banned, listed, || false), EmberIpVerdict::Blocked);
-    // An introduction exempts only a LAN/CGNAT address, as inbound does.
-    assert_eq!(ember_ip_verdict(&filter, &banned, listed, || true), EmberIpVerdict::Blocked);
-    assert_eq!(ember_ip_verdict(&filter, &banned, lan, || false), EmberIpVerdict::Blocked);
-    assert_eq!(ember_ip_verdict(&filter, &banned, lan, || true), EmberIpVerdict::Allowed);
+    assert_eq!(ember_ip_verdict(true, &banned, public, || false), EmberIpVerdict::Allowed);
+    assert_eq!(ember_ip_verdict(true, &banned, lan, || false), EmberIpVerdict::Blocked);
+    assert_eq!(ember_ip_verdict(true, &banned, lan, || true), EmberIpVerdict::Allowed);
+    assert_eq!(ember_ip_verdict(false, &banned, lan, || false), EmberIpVerdict::Allowed);
+    assert_eq!(
+        ember_ip_verdict(false, &banned, Ipv4Addr::new(203, 0, 113, 5), || true),
+        EmberIpVerdict::Blocked,
+        "unroutable space is refused whatever the settings or introductions say"
+    );
 
-    // A ban refuses the peer without forgetting it, even where the introduction
-    // would exempt it from the filter; a filter hit still wins over a ban.
+    // A ban refuses the peer without forgetting it, even where an introduction
+    // would exempt it from the private block.
     banned.insert(public);
     banned.insert(lan);
-    banned.insert(listed);
-    assert_eq!(ember_ip_verdict(&filter, &banned, public, || false), EmberIpVerdict::Banned);
-    assert_eq!(ember_ip_verdict(&filter, &banned, lan, || true), EmberIpVerdict::Banned);
-    assert_eq!(ember_ip_verdict(&filter, &banned, listed, || false), EmberIpVerdict::Blocked);
+    assert_eq!(ember_ip_verdict(true, &banned, public, || false), EmberIpVerdict::Banned);
+    assert_eq!(ember_ip_verdict(true, &banned, lan, || true), EmberIpVerdict::Banned);
     assert!(EmberIpVerdict::Banned.refuses() && EmberIpVerdict::Blocked.refuses());
-    assert!(!EmberIpVerdict::Pending.refuses() && !EmberIpVerdict::Allowed.refuses());
-    assert_eq!(
-        ember_ip_verdict(&filter, &banned, Ipv4Addr::new(203, 0, 113, 5), || true),
-        EmberIpVerdict::Blocked
-    );
-}
+    assert!(!EmberIpVerdict::Allowed.refuses());
 
-#[test]
-fn a_loading_ember_ip_filter_neither_dials_strangers_nor_forgets_them() {
-    let filter = IpFilter::new(true, false);
-    assert!(!filter.ranges_ready());
-    let banned = HashSet::new();
-    let public = Ipv4Addr::new(8, 8, 8, 8);
-    assert_eq!(ember_ip_verdict(&filter, &banned, public, || false), EmberIpVerdict::Pending);
-    assert_eq!(ember_ip_verdict(&filter, &banned, public, || true), EmberIpVerdict::Allowed);
-
-    // The introduction lookup walks the session maps, so a public address on a
-    // settled filter must not pay for it.
-    let mut settled = IpFilter::new(false, false);
-    settled.mark_ranges_ready();
+    // The introduction lookup walks the session maps, so a public address must
+    // not pay for it.
     assert_eq!(
-        ember_ip_verdict(&settled, &banned, public, || panic!("not needed")),
+        ember_ip_verdict(true, &HashSet::new(), public, || panic!("not needed")),
         EmberIpVerdict::Allowed
     );
 }

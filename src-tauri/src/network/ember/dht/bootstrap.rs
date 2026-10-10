@@ -43,8 +43,8 @@ const MAX_STORE_EMBER_BYTES: u64 = 64 * 1024 * 1024;
 /// Deliberately best-effort and silent: we would rather commit the new file
 /// than refuse the save because a backup could not be made. This is what makes
 /// a thinned-table write recoverable — `save_nodes` only refuses to overwrite
-/// when the table is *empty*, so a table cut to a handful of contacts by
-/// `evict_filtered_contacts`, a `block_private_ips` toggle, or `remove_stale`
+/// when the table is *empty*, so a table cut to a handful of contacts by a
+/// `block_private_ips` toggle or by `remove_stale`
 /// after an outage will legitimately be persisted over a healthy 200-contact
 /// file, and without this the previous contents were unrecoverable. Mirrors
 /// `kad/bootstrap.rs`, which has kept a `.bak` for `nodes.dat` all along.

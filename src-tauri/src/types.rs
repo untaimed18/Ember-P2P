@@ -1036,6 +1036,32 @@ pub struct EmberDiagnostics {
     /// together is one address flooding the store under rotating identities.
     #[serde(default)]
     pub ember_dht_rate_limited: u32,
+    /// Ember datagrams dropped before decryption because the sender's IP is on
+    /// the ban list (eD2K reputation bans and manual bans included).
+    #[serde(default)]
+    pub ember_udp_dropped_banned: u32,
+    /// Ember datagrams dropped before decryption by the per-IP packet rate
+    /// limit. Distinct from `ember_dht_rate_limited`, which counts decrypted
+    /// DHT frames refused by the frame limiter.
+    #[serde(default)]
+    pub ember_udp_dropped_rate_limited: u32,
+    /// Room frames and EPX controls dropped after decryption because the IP
+    /// filter lists the sender. DHT frames never consult the filter.
+    #[serde(default)]
+    pub ember_udp_dropped_filtered: u32,
+    /// Routing-table admissions refused to a peer that had already answered us,
+    /// because its address is unroutable or private under `block_private_ips`.
+    /// Attempts, not peers: a refused peer is offered again with each frame.
+    #[serde(default)]
+    pub ember_dht_refused_ip_policy: u32,
+    /// As `ember_dht_refused_ip_policy`, for a /24 already at its share of the
+    /// bucket or the table.
+    #[serde(default)]
+    pub ember_dht_refused_subnet: u32,
+    /// As `ember_dht_refused_ip_policy`, for an address already at its share
+    /// of the table.
+    #[serde(default)]
+    pub ember_dht_refused_per_ip: u32,
     /// Slice 14: inbound STORE frames rejected as short-window signature replays.
     #[serde(default)]
     pub ember_dht_store_replays: u32,
@@ -1061,6 +1087,11 @@ pub struct EmberDiagnostics {
     /// PROXY_STORE requests we accepted and fanned out as a HighID buddy.
     #[serde(default)]
     pub ember_dht_buddy_forwards: u32,
+    /// Firewalled Ember users we are relaying for right now: publishers whose
+    /// PROXY_STORE we accepted within the callback window, whose searchers'
+    /// callback requests we still pass on. Live, not a session total.
+    #[serde(default)]
+    pub ember_dht_relaying_for: u32,
     /// Firewalled source records we parked because the buddy named in the
     /// trailer had not signed for that endpoint — a forged or lapsed
     /// endorsement, or a record published before endorsements existed. Rising
