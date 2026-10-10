@@ -3326,7 +3326,31 @@
   function closePaneCtx() { paneCtxMenu = null; }
   function closeUploadsPaneCtx() { uploadsPaneCtxMenu = null; }
 
-  function onDocClick() {
+  /** Let go of the highlighted download: no row is current, and the clients
+   *  pane stops showing the one a double-click opened. */
+  function clearDownloadFocus() {
+    if (!focusedDlId && !expandedTransferId) return;
+    focusedDlId = null;
+    if (expandedTransferId) {
+      const open = allDownloads.find((t) => t.id === expandedTransferId);
+      if (open) void toggleSourceDetail(open);
+      else expandedTransferId = null;
+    }
+  }
+
+  function onDocClick(e: MouseEvent) {
+    // A click away from the list lets go of the highlighted download, as a
+    // file manager does. Not one on what acts on it: a row, the footer that
+    // shows it, the clients pane beside it, a menu or dialog, or any control.
+    const target = e.target instanceof Element ? e.target : null;
+    if (
+      target?.isConnected
+      && !target.closest(
+        '.dl-row, .source-child-row, thead, .selection-footer, .uploads-pane, .ctx-menu, [role="dialog"], [aria-modal="true"], button, input, select, textarea, a, label, summary, [role="menuitem"]',
+      )
+    ) {
+      clearDownloadFocus();
+    }
     closeCtx();
     closeKnownCtx();
     closeColumnMenu();
@@ -5198,6 +5222,14 @@
         }
       } else if (e.target instanceof HTMLInputElement && e.target.closest('.known-search') && knownFilter) {
         knownFilter = '';
+        e.preventDefault();
+        e.stopPropagation();
+      } else if (
+        (focusedDlId || expandedTransferId)
+        && !(e.target instanceof HTMLElement && e.target.closest('input, textarea, select, [aria-modal="true"]'))
+      ) {
+        // Nothing else to close: let go of the highlighted download.
+        clearDownloadFocus();
         e.preventDefault();
         e.stopPropagation();
       }
