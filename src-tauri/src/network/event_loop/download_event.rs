@@ -1314,6 +1314,7 @@ pub(in crate::network) async fn on_download_event(
                 source_manager,
                 credit_manager,
                 transfer_manager,
+                friend_hashes,
                 friend_eh,
                 None,
                 v4,

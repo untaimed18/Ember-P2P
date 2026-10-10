@@ -11,12 +11,15 @@
   import { translateError } from '$lib/i18n';
   import { appSettings, setAppSettings } from '$lib/stores/settings';
   import { setFriendOverrides } from '$lib/api/settings';
-  import { compactOverrides, friendOverrides, FRIEND_AUTO_ACCEPT_MAX_MB } from '$lib/friendSettings';
+  import {
+    compactOverrides,
+    friendNameTooLong,
+    friendOverrides,
+    FRIEND_AUTO_ACCEPT_MAX_MB,
+    FRIEND_NAME_MAX_BYTES as NAME_MAX_BYTES,
+  } from '$lib/friendSettings';
   import type { FriendInfo } from '$lib/api/friends';
   import type { FriendOverrides } from '$lib/types';
-
-  /** The backend's limit on a friend's name, in bytes. */
-  const NAME_MAX_BYTES = 64;
 
   let {
     friend,
@@ -76,8 +79,7 @@
   let notificationsOff = $derived($appSettings?.notifications_enabled === false);
   let autoDefaultMb = $derived($appSettings?.chat_attachment_auto_accept_mb ?? 0);
 
-  let nameBytes = $derived(new TextEncoder().encode(name.trim()).length);
-  let nameTooLong = $derived(nameBytes > NAME_MAX_BYTES);
+  let nameTooLong = $derived(friendNameTooLong(name));
   let autoMbValid = $derived(
     autoChoice !== 'up_to' || (Number.isInteger(autoMb) && autoMb >= 1 && autoMb <= FRIEND_AUTO_ACCEPT_MAX_MB),
   );

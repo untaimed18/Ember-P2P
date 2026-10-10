@@ -88,10 +88,11 @@ pub(super) fn reverify_complete_part_file(
         anyhow::bail!("cancelled by user");
     }
     let safe_name = crate::security::sanitize_filename(file_name);
-    let actual_final = ed2k::transfer::move_part_to_downloads(
+    let actual_final = ed2k::transfer::move_part_to_completed(
         &part_path,
         part_dir,
         download_dir,
+        &crate::storage::category_folders::completion_subdir(transfer_id),
         &safe_name,
         &verified_identity,
     )?;

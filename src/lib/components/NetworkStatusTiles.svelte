@@ -15,6 +15,12 @@
   import { firewallStatusText } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
 
+  /** Replaces the KAD buddy tile. The Ember page passes its own relay tile:
+   *  KAD's buddy says nothing about Ember, which has a relay of its own. */
+  let {
+    relayTile,
+  }: { relayTile?: { label: string; help: string; value: string; title: string } } = $props();
+
   // `appSettings` is null until the layout's first load lands; treat that as
   // enabled so the tile doesn't flash "Disabled" during start-up.
   let upnpOff = $derived($appSettings?.upnp_enabled === false);
@@ -88,18 +94,25 @@
         {/if}
       </span>
     </div>
-    <div class="stat-tile">
-      <!-- "Buddy" is eMule vocabulary with no meaning outside it, so the
-           label carries its own explanation. -->
-      <span class="stat-label" title={m.kad_stat_buddy_help()}>{m.kad_stat_buddy()}</span>
-      <span class="stat-value">
-        {buddyStatus === 'none' ? m.kad_buddy_none() :
-         buddyStatus.startsWith('connected') ? m.kad_buddy_connected() :
-         buddyStatus.startsWith('connecting') ? m.kad_buddy_connecting() :
-         buddyStatus.startsWith('serving') ? m.kad_buddy_serving() :
-         m.common_unknown()}
-      </span>
-    </div>
+    {#if relayTile}
+      <div class="stat-tile">
+        <span class="stat-label" title={relayTile.help}>{relayTile.label}</span>
+        <span class="stat-value" title={relayTile.title}>{relayTile.value}</span>
+      </div>
+    {:else}
+      <div class="stat-tile">
+        <!-- "Buddy" is eMule vocabulary with no meaning outside it, so the
+             label carries its own explanation. -->
+        <span class="stat-label" title={m.kad_stat_buddy_help()}>{m.kad_stat_buddy()}</span>
+        <span class="stat-value">
+          {buddyStatus === 'none' ? m.kad_buddy_none() :
+           buddyStatus.startsWith('connected') ? m.kad_buddy_connected() :
+           buddyStatus.startsWith('connecting') ? m.kad_buddy_connecting() :
+           buddyStatus.startsWith('serving') ? m.kad_buddy_serving() :
+           m.common_unknown()}
+        </span>
+      </div>
+    {/if}
   </div>
 </div>
 

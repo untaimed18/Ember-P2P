@@ -217,6 +217,10 @@ pub struct SendState {
     /// The plain offer, held back until the recipient has had time to say it
     /// read the sealed one; see `channel::XFER_SEEN_PLAIN_VERSION`.
     plain_offer: Option<PlainOffer>,
+    /// The file as offered; see [`SourceStamp`]. `None` serves unchecked.
+    source: Option<SourceStamp>,
+    /// Blocks read since the open handle was last checked against `source`.
+    reads_since_check: usize,
 }
 
 /// A plain offer that has not gone out. Every member it is forwarded through
@@ -269,6 +273,47 @@ pub fn holds_plain_offer(size: u64, reads_sealed: bool) -> bool {
 /// fires, for the recipient to repeat a verdict it may have missed.
 pub const XFER_VERDICT_WAIT_SECS: u64 = 30;
 
+/// Which file an offer was made from: its identity on disk, size and
+/// modification time, taken when it was offered.
+///
+/// The block path opens the file by name on the first request, which can be
+/// minutes later. Without this it would send whatever was at the path by then
+/// — a newer save of the file, or something a link now points at — and the
+/// recipient would hold those bytes before its final hash check threw them out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceStamp {
+    object: crate::security::filesystem::ObjectIdentity,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl SourceStamp {
+    pub fn of(file: &std::fs::File) -> std::io::Result<Self> {
+        let meta = file.metadata()?;
+        Ok(Self {
+            object: crate::security::filesystem::opened_file_identity(file)?,
+            size: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+
+    /// Open `path` and stamp it.
+    pub fn of_path(path: &std::path::Path) -> std::io::Result<Self> {
+        Self::of(&std::fs::File::open(path)?)
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+fn source_changed() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "the offered file changed or was replaced",
+    )
+}
+
 /// What the stall sweep should do with a send that has gone quiet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendStall {
@@ -308,6 +353,8 @@ impl SendState {
             streamed: 0,
             reporter: ProgressReporter::default(),
             asked_at: None,
+            source: None,
+            reads_since_check: 0,
             plain_offer: None,
         }
     }
@@ -415,14 +462,39 @@ impl SendState {
         question_down
     }
 
+    /// Only serve the file as it was when offered; see [`SourceStamp`].
+    pub fn with_source_stamp(mut self, stamp: SourceStamp) -> Self {
+        self.source = Some(stamp);
+        self
+    }
+
     /// Read one block, opening the file on first use and keeping the handle.
+    ///
+    /// Fails, which ends the transfer as "source gone", once the file is no
+    /// longer the one offered: checked when it is opened, and again once per
+    /// window of blocks from the handle already held.
     pub fn read_block(&mut self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
         if self.handle.is_none() {
+            let file = std::fs::File::open(&self.path)?;
+            if self.source.as_ref().is_some_and(|stamp| SourceStamp::of(&file).ok().as_ref() != Some(stamp)) {
+                return Err(source_changed());
+            }
             self.handle = Some(std::io::BufReader::with_capacity(
                 XFER_WINDOW_BLOCKS * XFER_BLOCK_SIZE,
-                std::fs::File::open(&self.path)?,
+                file,
             ));
             self.read_pos = Some(0);
+            self.reads_since_check = 0;
+        }
+        self.reads_since_check += 1;
+        if self.reads_since_check >= XFER_WINDOW_BLOCKS {
+            self.reads_since_check = 0;
+            let held = self.handle.as_ref().map(|reader| SourceStamp::of(reader.get_ref()));
+            if let (Some(stamp), Some(held)) = (self.source.as_ref(), held) {
+                if held.ok().as_ref() != Some(stamp) {
+                    return Err(source_changed());
+                }
+            }
         }
         let resuming_at = self.read_pos.take();
         let file = self
@@ -1698,6 +1770,32 @@ mod tests {
         // continuing from wherever the last read left off.
         assert_eq!(send.read_block(0, 4).unwrap(), vec![1u8; 4]);
         drop(guard);
+    }
+
+    /// A file saved over after it was offered is not served as the offer: the
+    /// recipient would hold the new bytes before its hash check refused them.
+    #[test]
+    fn a_file_replaced_after_its_offer_is_not_served() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-xfer-stamp-{}-{}.bin",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let size = XFER_BLOCK_SIZE as u64 * 2;
+        std::fs::write(&path, vec![1u8; size as usize]).unwrap();
+        let stamp = SourceStamp::of_path(&path).unwrap();
+        let mut unchanged =
+            SendState::new([0u8; 16], [0u8; 32], [3u8; 32], "f".into(), size, path.clone())
+                .with_source_stamp(stamp.clone());
+        assert_eq!(unchanged.read_block(0, 4).unwrap(), vec![1u8; 4]);
+        drop(unchanged);
+
+        let mut send = SendState::new([0u8; 16], [0u8; 32], [3u8; 32], "f".into(), size, path.clone())
+            .with_source_stamp(stamp);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, vec![2u8; size as usize]).unwrap();
+        assert!(send.read_block(0, XFER_BLOCK_SIZE).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

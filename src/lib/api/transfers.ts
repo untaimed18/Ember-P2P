@@ -104,6 +104,19 @@ export async function removeTransfer(transferId: string): Promise<void> {
   return invoke('remove_transfer', { transferId });
 }
 
+/** What `deleteFinishedDownloads` did: the rows taken off the list (file
+ *  deleted, or already gone) and a coded error for each file that was kept. */
+export interface FinishedDeleteReport {
+  removed: string[];
+  failed: string[];
+}
+
+/** Cancel finished downloads: delete each one's file (to the Recycle Bin, or
+ *  permanently when Settings says so) and take it off the list. */
+export async function deleteFinishedDownloads(transferIds: string[]): Promise<FinishedDeleteReport> {
+  return invoke('delete_finished_downloads', { transferIds });
+}
+
 export async function getTransfers(): Promise<Transfer[]> {
   return invoke('get_transfers');
 }
@@ -213,8 +226,30 @@ export async function setTransferPriority(transferId: string, priority: 'verylow
   return invoke('set_transfer_priority', { transferId, priority });
 }
 
-export async function setTransferCategory(transferId: string, category: string): Promise<void> {
-  return invoke('set_transfer_category', { transferId, category });
+/** What changing downloads' category did: a finished download's file moves to
+ *  the new category's folder; one still downloading lands there when it
+ *  finishes. */
+export interface CategoryChanges {
+  /** The downloads whose category was changed. */
+  changed: string[];
+  /** Why the rest were not (a coded error), when saving stopped part way. */
+  error: string | null;
+  /** Finished downloads whose file was moved. */
+  moved: number;
+  /** A coded error for each finished download whose file stayed where it
+   *  was; its category is changed regardless. */
+  move_failed: string[];
+}
+
+/** One call for a whole selection. `moveFinished: false` relabels finished
+ *  downloads and leaves their files where they are, as removing a category
+ *  does. */
+export async function setTransfersCategory(
+  transferIds: string[],
+  category: string,
+  moveFinished = true,
+): Promise<CategoryChanges> {
+  return invoke('set_transfers_category', { transferIds, category, moveFinished });
 }
 
 /** Rename a download while it is still in progress. Returns the sanitized name. */

@@ -34,6 +34,39 @@ describe('buildLibraryFolderTree', () => {
     expect(tree[0].children[0].children[0].count).toBe(1);
   });
 
+  it('files a finished download recorded in the extended form under its plain share', () => {
+    const plain = (path: string) =>
+      win(path).replace(/^\/\/\?\/unc\//, '//').replace(/^\/\/\?\//, '');
+    const tree = buildLibraryFolderTree(
+      ['C:\\Users\\me\\Ember\\Downloads'],
+      [
+        { path: '\\\\?\\C:\\Users\\me\\Ember\\Downloads\\TV Series\\Drama\\ep1.mkv', size: 7 },
+        { path: 'C:\\Users\\me\\Ember\\Downloads\\Video\\clip.mp4', size: 3 },
+      ],
+      plain,
+    );
+    expect(tree[0].count).toBe(2);
+    expect(tree[0].children.map((n) => n.name)).toEqual(['TV Series', 'Video']);
+    expect(tree[0].children[0].children[0].name).toBe('Drama');
+  });
+
+  it('shows a folder set up before anything is in it, inside its share only', () => {
+    const tree = buildLibraryFolderTree(
+      ['C:\\Ember\\Downloads'],
+      [{ path: 'C:\\Ember\\Downloads\\Video\\clip.mp4', size: 3 }],
+      win,
+      ['C:\\Ember\\Downloads\\Video', 'C:\\Ember\\Downloads\\TV Series\\Drama', 'D:\\Elsewhere\\Music'],
+    );
+    const [video, tv] = [tree[0].children[1], tree[0].children[0]];
+    expect(video.name).toBe('Video');
+    expect(video.count).toBe(1);
+    expect(tv.name).toBe('TV Series');
+    expect(tv.count).toBe(0);
+    expect(tv.children[0].name).toBe('Drama');
+    expect(tree[0].count).toBe(1);
+    expect(tree).toHaveLength(1);
+  });
+
   it('attributes a file to the deepest overlapping share', () => {
     const tree = buildLibraryFolderTree(
       ['C:\\Media', 'C:\\Media\\Music'],

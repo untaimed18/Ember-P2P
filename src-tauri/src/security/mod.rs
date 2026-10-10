@@ -1923,22 +1923,75 @@ pub fn normalize_inbound_friend_nickname(payload: &[u8]) -> String {
 /// effect; stripping on the way out closes the storage and
 /// roundtrip vector.
 pub fn sanitize_chat_text(text: &str) -> String {
-    const MAX_CHAT_LEN: usize = 4096;
-
     text.chars()
-        .filter(|c| {
-            // Drop ASCII control chars except newline (\n) and
-            // carriage return (\r) — the textarea normalises CRLF
-            // to LF on submit, and a lone CR is rare but harmless.
-            // Tab (\t) is also kept; users sometimes paste tab-
-            // delimited fragments.
-            if *c == '\n' || *c == '\r' || *c == '\t' {
-                return true;
-            }
-            !c.is_control() && *c != '\0' && !is_invisible_or_bidi_control(*c)
-        })
+        .filter(|c| keep_in_chat_text(*c))
         .take(MAX_CHAT_LEN)
         .collect()
+}
+
+/// Characters, after filtering, that one chat or room line may hold.
+pub const MAX_CHAT_LEN: usize = 4096;
+
+fn keep_in_chat_text(c: char) -> bool {
+    // Drop ASCII control chars except newline (\n) and
+    // carriage return (\r) — the textarea normalises CRLF
+    // to LF on submit, and a lone CR is rare but harmless.
+    // Tab (\t) is also kept; users sometimes paste tab-
+    // delimited fragments.
+    if c == '\n' || c == '\r' || c == '\t' {
+        return true;
+    }
+    !c.is_control() && c != '\0' && !is_invisible_or_bidi_control(c)
+}
+
+/// Joiners and emoji presentation selectors that message text needs and names
+/// do not: ZWNJ and ZWJ (Persian and Indic spelling, multi-part emoji) and
+/// VS15/VS16 (text or emoji presentation). Bidi controls and every other
+/// invisible stay stripped.
+fn is_message_text_joiner(c: char) -> bool {
+    matches!(c, '\u{200C}' | '\u{200D}' | '\u{FE0E}' | '\u{FE0F}')
+}
+
+/// [`sanitize_chat_text`] for a message body that arrived from a peer: keeps
+/// the joiners in [`is_message_text_joiner`], and refuses rather than
+/// truncates. `None` when the filtered text runs past [`MAX_CHAT_LEN`]
+/// characters.
+///
+/// Tolerant on receipt so a build that does send joiners still has its lines
+/// stored as signed. What we send goes through
+/// [`sanitize_outgoing_message_text`] instead.
+///
+/// Not for names, file names or any other label: a zero-width joiner there
+/// makes two different strings read the same.
+pub fn sanitize_message_text(text: &str) -> Option<String> {
+    filter_message_text(text, true)
+}
+
+/// What the local user may send as a message body, or `None` when it runs past
+/// [`MAX_CHAT_LEN`] characters after filtering — refused rather than cut, so
+/// they can shorten it instead of sending a line that is not what they typed.
+///
+/// Joiners are stripped, as they always were: builds already in rooms strip
+/// them on receipt, so a line that kept them would no longer match its
+/// signature there — not re-served in catch-up, and an edit not even relayed.
+pub fn sanitize_outgoing_message_text(text: &str) -> Option<String> {
+    filter_message_text(text, false)
+}
+
+fn filter_message_text(text: &str, keep_joiners: bool) -> Option<String> {
+    let mut out = String::with_capacity(text.len().min(MAX_CHAT_LEN * 4));
+    let mut count = 0usize;
+    for c in text.chars() {
+        if !(keep_in_chat_text(c) || (keep_joiners && is_message_text_joiner(c))) {
+            continue;
+        }
+        count += 1;
+        if count > MAX_CHAT_LEN {
+            return None;
+        }
+        out.push(c);
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -2181,6 +2234,42 @@ mod tests {
         let wire =
             crate::network::ember::channel::with_reply_trailer("ok", Some(&[0xABu8; 16]));
         assert_eq!(sanitize_chat_text(&wire), wire);
+        assert_eq!(sanitize_message_text(&wire).as_deref(), Some(wire.as_str()));
+    }
+
+    #[test]
+    fn message_text_keeps_joiners_strips_bidi_and_refuses_overlong() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert_eq!(sanitize_message_text(family).as_deref(), Some(family));
+        let heart = "\u{2764}\u{FE0F}";
+        assert_eq!(sanitize_message_text(heart).as_deref(), Some(heart));
+        let persian = "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}";
+        assert_eq!(sanitize_message_text(persian).as_deref(), Some(persian));
+        assert_eq!(
+            sanitize_message_text("paypal\u{202E}moc\u{200B}.lapyap").as_deref(),
+            Some("paypalmoc.lapyap"),
+        );
+        assert_eq!(sanitize_message_text("a\nb\0").as_deref(), Some("a\nb"));
+        // Names still lose them.
+        assert_eq!(sanitize_display_name("a\u{200D}b"), "ab");
+        // The cap is on what survives the filter, and is a refusal.
+        assert_eq!(sanitize_message_text(&"x".repeat(MAX_CHAT_LEN)).map(|s| s.len()), Some(MAX_CHAT_LEN));
+        assert_eq!(sanitize_message_text(&"x".repeat(MAX_CHAT_LEN + 1)), None);
+        let padded = format!("{}{}", "x".repeat(MAX_CHAT_LEN), "\u{200B}".repeat(10));
+        assert!(sanitize_message_text(&padded).is_some(), "stripped characters do not count");
+    }
+
+    /// What we send still strips joiners, as builds in the room do on receipt,
+    /// but is refused rather than cut when it runs long.
+    #[test]
+    fn outgoing_message_text_strips_joiners_and_refuses_overlong() {
+        assert_eq!(sanitize_outgoing_message_text("\u{2764}\u{FE0F}").as_deref(), Some("\u{2764}"));
+        assert_eq!(
+            sanitize_outgoing_message_text("\u{2764}\u{FE0F} hi").as_deref(),
+            Some(sanitize_chat_text("\u{2764}\u{FE0F} hi").as_str()),
+            "matches what older builds keep, so signatures still agree there"
+        );
+        assert_eq!(sanitize_outgoing_message_text(&"x".repeat(MAX_CHAT_LEN + 1)), None);
     }
 
     #[cfg(target_os = "windows")]

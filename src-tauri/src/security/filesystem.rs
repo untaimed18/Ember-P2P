@@ -905,11 +905,24 @@ pub fn verify_recorded_file(
     allowed_roots: &[String],
     landing_dir: &str,
 ) -> io::Result<PathBuf> {
-    verify_existing_path(recorded, allowed_roots)
-        .or_else(|error| verify_in_landing_dir(recorded, landing_dir).map_err(|_| error))
+    verify_recorded_file_nested(recorded, allowed_roots, landing_dir, 0)
 }
 
-fn verify_in_landing_dir(recorded: &Path, landing_dir: &str) -> io::Result<PathBuf> {
+/// [`verify_recorded_file`], where outside the roots the file may also sit up
+/// to `max_depth` folders below `landing_dir` — a download category's folder
+/// inside `Downloads` — none of them a reparse point either.
+pub fn verify_recorded_file_nested(
+    recorded: &Path,
+    allowed_roots: &[String],
+    landing_dir: &str,
+    max_depth: usize,
+) -> io::Result<PathBuf> {
+    verify_existing_path(recorded, allowed_roots).or_else(|error| {
+        verify_in_landing_dir(recorded, landing_dir, max_depth).map_err(|_| error)
+    })
+}
+
+fn verify_in_landing_dir(recorded: &Path, landing_dir: &str, max_depth: usize) -> io::Result<PathBuf> {
     refuse_network_path_outside(recorded, &[])?;
     let outside = || {
         io::Error::new(
@@ -917,14 +930,26 @@ fn verify_in_landing_dir(recorded: &Path, landing_dir: &str) -> io::Result<PathB
             "target is not where Ember recorded writing it",
         )
     };
-    let landing = recorded
-        .parent()
-        .filter(|parent| recorded.is_absolute() && is_landing_dir(parent, landing_dir))
+    if !recorded.is_absolute() {
+        return Err(outside());
+    }
+    // The nearest ancestor named `landing_dir`, at most `max_depth` folders
+    // above the file's own.
+    let (depth, landing) = recorded
+        .ancestors()
+        .skip(1)
+        .take(max_depth + 1)
+        .enumerate()
+        .find(|(_, dir)| is_landing_dir(dir, landing_dir))
         .ok_or_else(outside)?;
-    ensure_not_reparse(landing)?;
+    for dir in recorded.ancestors().skip(1).take(depth + 1) {
+        ensure_not_reparse(dir)?;
+    }
     let canonical_landing = landing.canonicalize()?;
     let canonical = recorded.canonicalize()?;
-    if canonical.parent() != Some(canonical_landing.as_path()) || !canonical.is_file() {
+    if canonical.ancestors().nth(depth + 1) != Some(canonical_landing.as_path())
+        || !canonical.is_file()
+    {
         return Err(outside());
     }
     ensure_not_reparse(&canonical)?;
@@ -1905,7 +1930,11 @@ fn link_then_unlink_at(
         return Err(io::Error::last_os_error());
     }
     if unsafe { libc::unlinkat(from_fd, from.as_ptr(), 0) } != 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        // Not moved after all: take the new name back off, so a retry does
+        // not find it taken and link the file under yet another name.
+        unsafe { libc::unlinkat(to_fd, to.as_ptr(), 0) };
+        return Err(error);
     }
     Ok(())
 }
@@ -2168,6 +2197,31 @@ pub fn prepare_approved_subdir(
     name: &str,
     allowed_roots: &[String],
 ) -> io::Result<PathBuf> {
+    prepare_approved_subdir_with(root, name, allowed_roots, false)
+}
+
+/// [`prepare_approved_subdir`] for a folder the user files finished downloads
+/// in, such as a download category's: on Unix one it creates takes the
+/// permission bits of `root` (still under the umask) rather than owner-only,
+/// so a `Downloads` opened up to a media server running as another user
+/// opens its category folders too, and a private one keeps them private.
+/// Windows folders inherit their parent's ACL either way.
+pub fn prepare_approved_subdir_like_parent(
+    root: &Path,
+    name: &str,
+    allowed_roots: &[String],
+) -> io::Result<PathBuf> {
+    prepare_approved_subdir_with(root, name, allowed_roots, true)
+}
+
+fn prepare_approved_subdir_with(
+    root: &Path,
+    name: &str,
+    allowed_roots: &[String],
+    like_parent: bool,
+) -> io::Result<PathBuf> {
+    #[cfg(windows)]
+    let _ = like_parent;
     let file_name = single_path_component(std::ffi::OsStr::new(name))?;
     let (verified_root, root_handle, root_identity) = open_verified_directory(root, allowed_roots)?;
     #[cfg(unix)]
@@ -2198,8 +2252,17 @@ pub fn prepare_approved_subdir(
             #[cfg(unix)]
             {
                 use std::os::fd::AsRawFd;
+                use std::os::unix::fs::PermissionsExt;
+                let mode = if like_parent {
+                    root_handle.metadata()?.permissions().mode() & 0o777
+                } else {
+                    0o700
+                };
                 let name = component_cstring(file_name)?;
-                if unsafe { libc::mkdirat(root_handle.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+                if unsafe {
+                    libc::mkdirat(root_handle.as_raw_fd(), name.as_ptr(), mode as libc::mode_t)
+                } != 0
+                {
                     return Err(io::Error::last_os_error());
                 }
             }
@@ -3106,6 +3169,50 @@ mod tests {
             windows_wide_path(Path::new(&share)),
             wide(&format!("\\\\?\\UNC\\nas\\media\\{}\0", "d".repeat(260)))
         );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A category folder takes its parent's permission bits under the umask,
+    /// so a media server allowed into Downloads is allowed into it; the
+    /// ordinary approved folders stay owner-only.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_category_folder_is_as_open_as_the_folder_it_is_made_in() {
+        use std::os::unix::fs::PermissionsExt;
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-subdir-mode-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let (root, data) = (base.join("root"), base.join("data"));
+        let downloads = root.join("Downloads");
+        for path in [&downloads, &data] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let allowed = [root.to_string_lossy().into_owned()];
+        initialize_approved_roots(&data, &allowed).unwrap();
+        let umask = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Umask:"))
+                    .and_then(|value| u32::from_str_radix(value.trim(), 8).ok())
+            })
+            .unwrap_or(0o022);
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        for parent_mode in [0o755, 0o750, 0o700] {
+            std::fs::set_permissions(&downloads, std::fs::Permissions::from_mode(parent_mode))
+                .unwrap();
+            let name = format!("Cat{parent_mode:o}");
+            let made = prepare_approved_subdir_like_parent(&downloads, &name, &allowed).unwrap();
+            assert_eq!(mode(&made), parent_mode & !umask, "under {parent_mode:o}");
+        }
+        std::fs::set_permissions(&downloads, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let private = prepare_approved_subdir(&downloads, "Plain", &allowed).unwrap();
+        assert_eq!(mode(&private), 0o700 & !umask);
         let _ = std::fs::remove_dir_all(base);
     }
 

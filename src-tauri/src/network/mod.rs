@@ -108,6 +108,12 @@ use self::browse::{
     remove_browse_requests_for_session, send_browse_response_to_origin, PendingBrowseRequests,
 };
 use self::command::handle_command;
+
+/// Whether `friend` told us `file_hash` is friends-only on their side, from
+/// what their browse answers and offers said this run.
+pub(crate) fn friend_marked_friends_only(friend: [u8; 16], file_hash: &[u8; 16]) -> bool {
+    browse::friend_marked_friends_only(friend, file_hash)
+}
 use self::host_port_map::HostPortMap;
 use self::ember_publish::{
     ember_batch_ack_deadline, EmberBatchInFlight, EmberBatchPublisher, EmberFlushStats,
@@ -165,6 +171,7 @@ pub(crate) use self::downloads::{
     TransferStatusWriteClock,
 };
 pub(crate) use self::friends::{deliver_friend_request_verdict, FriendRequestVerdict};
+pub use self::search::SearchMoreOutcome;
 pub use self::server::{clear_server_log_history, server_log_history, ServerLogLine};
 pub use self::state::{
     EmberMaintenanceResult, EmberPublishPending, EmberPublishResult, EmberValueLookupPending,
@@ -611,11 +618,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
     let shared_ip_filter = ip_filter.create_shared_snapshot();
     routing_table.set_ip_filter(shared_ip_filter.clone());
-    // Kad already has `nodes.dat` in the table (inserted above). Ember's
-    // `nodes_ember.dat` is loaded after `NetworkState` is built, so the
-    // fail-closed snapshot is attached there — not here. Both stacks then
-    // share the same policy: a blocked address is refused whichever table
-    // learned it, and `evict_filtered_contacts` runs once ranges are ready.
+    // Kad already has `nodes.dat` in the table (inserted above). The Ember
+    // table gets no range filter at all, only the private/bogus policy; see
+    // `ember::dht::routing::RoutingTable::admits_addr`.
     let ember_dht =
         ember::dht::engine::EmberDht::new(
             identity.ed25519_secret_key,
@@ -788,6 +793,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let (xfer_finish_tx, mut xfer_finish_rx) = mpsc::unbounded_channel::<XferFinishResult>();
     let (xfer_stream_tx, xfer_stream_rx) = mpsc::unbounded_channel::<StreamFetchOutcome>();
 
+    // Before anything below can finish a download or sweep where finished
+    // files land; `apply_network_settings` keeps it current from here.
+    crate::storage::category_folders::set_folders(&settings.download_category_folders);
+
     let mut state = NetworkState {
         local_id,
         user_hash,
@@ -807,6 +816,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         pending_keyword_searches: HashMap::new(),
         pending_server_search: None,
         active_search_request: None,
+        finished_search: None,
         server_search_more_due_at: None,
         server_search_more_requests: 0,
         server_followup_search: None,
@@ -1013,6 +1023,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_session_hold_pinged: HashSet::new(),
         ember_publish_targets: HashMap::new(),
         ember_publish_target_queue: std::collections::VecDeque::new(),
+        ember_publish_target_waits: HashMap::new(),
         ember_publish_target_lookups: HashMap::new(),
         ember_store_loaded: false,
         ember_reach_witness: None,
@@ -1028,6 +1039,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_friend_meets_asked: HashMap::new(),
         ember_friend_meets_pinged: HashMap::new(),
             ember_bridge_fast_at: None,
+            ember_join_progress: EmberJoinProgress::new(std::time::Instant::now()),
             ember_gossip_probe_window: (std::time::Instant::now(), 0),
             ember_publish_beat_acked: 0,
             ember_publish_beat_failed: 0,
@@ -1270,11 +1282,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // Seed the Ember DHT routing table from the last session's persisted
     // contacts (slice 7). This is the native equivalent of KAD's
     // `nodes.dat` and is what lets Ember rejoin the DHT after a restart
-    // without depending on KAD source publishes for discovery. Loaded
-    // *before* the fail-closed IP filter is attached: Ember contacts are
-    // never Kad bootstrap seeds, so `admits_addr` would otherwise refuse
-    // the entire file. `load_contacts` also detaches the range filter for
-    // the same reason if one is already present.
+    // without depending on KAD source publishes for discovery.
     let nodes_ember_path = data_dir.join("nodes_ember.dat");
     crate::security::recover_interrupted_replace(&nodes_ember_path);
     if nodes_ember_path.exists() {
@@ -1341,9 +1349,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         state.ember_nodes_file = ember::dht::bootstrap::NodesFileState::Loaded;
         debug!("No nodes_ember.dat found; Ember DHT routing table starts empty");
     }
-    state
-        .ember_dht
-        .set_ip_filter(state.shared_ip_filter.clone());
 
     {
         let highwater_path = ember_highwater_path(&data_dir);

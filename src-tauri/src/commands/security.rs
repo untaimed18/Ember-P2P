@@ -124,9 +124,13 @@ async fn restore_settings_after_send_failure(
     Ok(())
 }
 
+/// Reload the installed list into the running filter. `enable` also switches
+/// the filter on, as an install the user asked for does; an automatic update
+/// leaves the switch as the user set it.
 async fn apply_ipfilter_reload(
     state: &tauri::State<'_, AppState>,
     path: PathBuf,
+    enable: bool,
 ) -> IpFilterApplyOutcome {
     let (tx, rx) = oneshot::channel();
     if let Err(error) = state
@@ -145,6 +149,7 @@ async fn apply_ipfilter_reload(
         }
     };
     match ipfilter_outcome_from_ack(Some(ack)) {
+        IpFilterApplyOutcome::Applied if !enable => IpFilterApplyOutcome::Applied,
         IpFilterApplyOutcome::Applied => {
             // The settings write above made this sticky; this queue send is
             // intentionally best-effort because a saturated network task can
@@ -497,6 +502,72 @@ pub async fn set_ip_filter_enabled(
     Ok(())
 }
 
+/// Where the installed IP filter came from and when, for the Security page.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IpFilterUpdateInfo {
+    /// The Auto-update switch.
+    pub auto_update: bool,
+    /// The installed list is the bundled default, which is the only one the
+    /// automatic updates replace.
+    pub from_default: bool,
+    /// Unix seconds the installed list was written; 0 when unknown.
+    pub updated_at: i64,
+}
+
+#[tauri::command]
+pub async fn get_ip_filter_update_info(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<IpFilterUpdateInfo, String> {
+    let auto_update = state.config.read().await.settings.ip_filter_auto_update;
+    let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
+    let record = tokio::task::spawn_blocking(move || crate::ipfilter_update::read_record(&data_dir))
+        .await
+        .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?;
+    Ok(IpFilterUpdateInfo {
+        auto_update,
+        from_default: record.from_default,
+        updated_at: record.updated_at,
+    })
+}
+
+/// The Security page's Auto-update switch. Turning it on checks at once, so a
+/// list already a day old is updated now rather than at the next poll.
+#[tauri::command]
+pub async fn set_ip_filter_auto_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    {
+        let _settings_save_guard = state.settings_save_lock.lock().await;
+        let (new_settings, save_data) = {
+            let config = state.config.read().await;
+            let mut new_settings = config.settings.clone();
+            new_settings.ip_filter_auto_update = enabled;
+            new_settings.settings_revision = config.settings.settings_revision.saturating_add(1);
+            let data = config
+                .prepare_save_settings(&new_settings)
+                .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
+            (new_settings, data)
+        };
+        tokio::task::spawn_blocking(move || {
+            crate::storage::config::AppConfig::write_to_disk(&save_data.0, &save_data.1, &save_data.2)
+        })
+        .await
+        .map_err(|e| coded_ctx("security_save_task_failed", "Save task failed", e))?
+        .map_err(|e| coded_ctx("security_failed_to_save_config", "Failed to save config", e))?;
+        state.config.write().await.settings = new_settings;
+    }
+    if enabled {
+        tauri::async_runtime::spawn(async move {
+            crate::ipfilter_update::maybe_update(&app).await;
+        });
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn set_block_private_ips(
     state: tauri::State<'_, AppState>,
@@ -546,6 +617,17 @@ pub async fn set_block_private_ips(
 pub async fn download_and_load_ipfilter(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
+) -> Result<IpFilterApplyResult, String> {
+    install_default_ipfilter(&app, &state, true).await
+}
+
+/// Download the bundled default list and install it. `enable` switches the
+/// filter on as well, which an install the user asked for does and an
+/// automatic update (`ipfilter_update`) does not.
+pub(crate) async fn install_default_ipfilter(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+    enable: bool,
 ) -> Result<IpFilterApplyResult, String> {
     info!("Downloading ipfilter.zip from {DEFAULT_IPFILTER_ARCHIVE_URL}");
 
@@ -619,7 +701,7 @@ pub async fn download_and_load_ipfilter(
         ));
     }
 
-    let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
+    let data_dir = crate::storage::paths::resolve_data_dir_with_app(app);
     tokio::fs::create_dir_all(&data_dir).await.map_err(|e| {
         coded_ctx(
             "security_failed_to_create_data_dir",
@@ -649,14 +731,27 @@ pub async fn download_and_load_ipfilter(
                 )
             })?;
     }
+    note_ipfilter_installed(&data_dir, true).await;
 
-    persist_ip_filter_enabled(&state).await?;
-    let outcome = apply_ipfilter_reload(&state, filter_path).await;
+    if enable {
+        persist_ip_filter_enabled(state).await?;
+    }
+    let outcome = apply_ipfilter_reload(state, filter_path, enable).await;
     info!("Downloaded ipfilter.dat with {entry_count} entries ({outcome:?})");
     Ok(IpFilterApplyResult {
         outcome,
         entry_count,
     })
+}
+
+/// Record where the list just installed came from, for the automatic updates:
+/// they only ever replace a list that came from the default URL.
+pub(crate) async fn note_ipfilter_installed(data_dir: &std::path::Path, from_default: bool) {
+    let dir = data_dir.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        crate::ipfilter_update::note_installed(&dir, from_default)
+    })
+    .await;
 }
 
 /// Ask the user, natively, before a list from a renderer-supplied URL
@@ -876,9 +971,11 @@ pub async fn update_ipfilter_from_url(
                 )
             })?;
     }
+    // The default URL typed in counts as the default list.
+    note_ipfilter_installed(&data_dir, url == DEFAULT_IPFILTER_ARCHIVE_URL).await;
 
     persist_ip_filter_enabled(&state).await?;
-    let outcome = apply_ipfilter_reload(&state, filter_path).await;
+    let outcome = apply_ipfilter_reload(&state, filter_path, true).await;
     info!(
         "Downloaded IP filter from custom URL (zip={is_zip}, entries={entry_count}, outcome={outcome:?})"
     );
@@ -1187,7 +1284,12 @@ async fn import_ipfilter_at_path(
         (path, entry_count)
     };
     persist_ip_filter_enabled(&state).await?;
-    let outcome = apply_ipfilter_reload(&state, load_path).await;
+    let outcome = apply_ipfilter_reload(&state, load_path, true).await;
+    // A list the user picked is theirs: the automatic updates leave it alone
+    // until the default list is installed again.
+    if !matches!(outcome, IpFilterApplyOutcome::Failed) {
+        note_ipfilter_installed(&crate::storage::paths::resolve_data_dir_with_app(&app), false).await;
+    }
     info!("Imported IP filter with {entry_count} entries ({outcome:?})");
     Ok(IpFilterApplyResult {
         outcome,

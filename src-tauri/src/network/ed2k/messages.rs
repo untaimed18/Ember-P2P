@@ -330,6 +330,17 @@ pub const EMBER_EXT_BROWSE_SUMMARY: u8 = 0x0C;
 /// only a real `PONG` creates a contact. A peer that predates it ignores it.
 pub const EMBER_EXT_DHT_MEET: u8 = 0x0D;
 
+/// [`OP_EMBER_EXT`] sub-type, empty body: "I understand
+/// [`EMBER_EXT_BROWSE_SCOPE`]". Sent ahead of each [`OP_EMBER_BROWSE_REQ`];
+/// the answerer remembers it for the session.
+///
+/// The `EBR1` request marker predates the scope frame, so it cannot say
+/// whether the requester will honour friends-only markings. A requester that
+/// drops the scope frame as unknown files friends-only entries as public and
+/// republishes them, so an answerer lists friends-only files only to a
+/// session that has sent this.
+pub const EMBER_EXT_BROWSE_SCOPE_AWARE: u8 = 0x0E;
+
 const DHT_MEET_FLAG_ANSWER: u8 = 0x01;
 
 /// [`EMBER_EXT_DHT_MEET`] body: `udp_port(2, LE) || flags(1)`.
@@ -3380,6 +3391,7 @@ mod tests {
             EMBER_EXT_BROWSE_SCOPE,
             EMBER_EXT_BROWSE_SUMMARY,
             EMBER_EXT_DHT_MEET,
+            EMBER_EXT_BROWSE_SCOPE_AWARE,
         ];
         let mut seen = std::collections::HashSet::new();
         for sub_type in sub_types {

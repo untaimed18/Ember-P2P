@@ -477,12 +477,26 @@ export interface EmberDiagnostics {
   ember_dht_keywords_published: number;
   /** Slice 14: inbound Ember DHT frames dropped by per-IP rate limits. */
   ember_dht_rate_limited: number;
+  /** Ember datagrams dropped before decryption: sender on the ban list. */
+  ember_udp_dropped_banned?: number;
+  /** Ember datagrams dropped before decryption by the per-IP packet limit. */
+  ember_udp_dropped_rate_limited?: number;
+  /** Room frames and EPX dropped because the IP filter lists the sender. */
+  ember_udp_dropped_filtered?: number;
+  /** Peers that answered us but were refused a routing slot: unroutable or private. */
+  ember_dht_refused_ip_policy?: number;
+  /** As above, for a /24 at its share of the bucket or table. */
+  ember_dht_refused_subnet?: number;
+  /** As above, for an address at its share of the table. */
+  ember_dht_refused_per_ip?: number;
   /** Slice 14: STORE frames rejected as short-window signature replays. */
   ember_dht_store_replays: number;
   /** Slice 15: LowID/firewalled but still publishing Ember DHT sources. */
   ember_dht_firewalled_publishing: boolean;
   /** Firewalled with no HighID buddy — Ember source STORE is skipped. */
   ember_dht_waiting_buddy: boolean;
+  /** Firewalled Ember users we are relaying for right now (live count). */
+  ember_dht_relaying_for?: number;
   /** Slice 15: Ember on but no external IPv4 available for source records. */
   ember_dht_udp_unreachable: boolean;
   /** Whether the three reachability flags above have been evaluated since diagnostics were last reset. */
@@ -860,6 +874,8 @@ export interface AppSettings {
   stun_keepalive_enabled: boolean;
   obfuscation_enabled: boolean;
   ip_filter_enabled: boolean;
+  /** Download the bundled default IP filter again once it is a day old. */
+  ip_filter_auto_update: boolean;
   filter_incoming_connections: boolean;
   /** Answer standard ed2k "View Files" requests from any compatible client
    *  (eMule, aMule, MLDonkey, ...) with our real shared-file list. Off by
@@ -872,6 +888,9 @@ export interface AppSettings {
   web_services: WebService[];
   /** Download categories the user made, offered beside the built-in ones. */
   download_categories?: string[];
+  /** Each category's folder inside Downloads, `/`-separated; a category with
+   *  no entry finishes in Downloads itself. */
+  download_category_folders?: Record<string, string>;
   block_private_ips: boolean;
   filter_servers_by_ip: boolean;
   add_servers_from_server: boolean;
@@ -915,6 +934,10 @@ export interface AppSettings {
    *  storage (the search-history dropdown), and any existing history is
    *  cleared. Defaults to true. */
   save_search_history: boolean;
+  /** Deleting a file (the Library's Delete, Cancel on a finished download)
+   *  removes it outright instead of moving it to the Recycle Bin / Trash.
+   *  Turning it on asks for a native confirmation; declining leaves it off. */
+  delete_permanently: boolean;
   setup_complete: boolean;
   /** Internal migration marker; preserve when round-tripping settings.
    *  Backend-owned via `BACKEND_OWNED_SETTINGS_FIELDS`

@@ -8,6 +8,9 @@
     downloadAndLoadIpfilter,
     updateIpfilterFromUrl,
     pickAndImportIpfilterFile,
+    getIpFilterUpdateInfo,
+    setIpFilterAutoUpdate,
+    type IpFilterUpdateInfo,
     type IpFilterStats,
     type IpFilterEntry,
     type IpFilterApplyResult,
@@ -15,13 +18,15 @@
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import { passiveScroll } from '$lib/actions/passiveScroll';
-  import { formatNumber } from '$lib/utils';
+  import { formatNumber, formatRelativeTime } from '$lib/utils';
   import { onMount, untrack } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
   import { getSettings } from '$lib/api/settings';
-  import { setAppSettings } from '$lib/stores/settings';
+  import { appSettings, setAppSettings } from '$lib/stores/settings';
+  import { get } from 'svelte/store';
   import { networkStats } from '$lib/stores/network';
   import BannedUsersDialog from '$lib/components/BannedUsersDialog.svelte';
   import IconX from '$lib/components/IconX.svelte';
@@ -165,6 +170,18 @@
   }
 
   onMount(() => {
+    void loadUpdateInfo();
+    // An automatic update that lands while the page is open: show it.
+    let unlistenAutoUpdate: (() => void) | null = null;
+    void listen<number>('ipfilter-auto-updated', (event) => {
+      if (unmounted) return;
+      flash(m.security_ipfilter_auto_updated({ entries: formatNumber(event.payload ?? 0) }));
+      void loadStats();
+      void loadUpdateInfo();
+    }).then((unlisten) => {
+      if (unmounted) unlisten();
+      else unlistenAutoUpdate = unlisten;
+    });
     void (async () => {
       await loadStats();
       // Startup deferred ipfilter load may still be in flight — re-poll
@@ -177,8 +194,52 @@
         await loadStats();
       }
     })();
-    return () => { unmounted = true; clearTimeout(flashTimer); clearTimeout(fetchTimer); };
+    return () => {
+      unmounted = true;
+      clearTimeout(flashTimer);
+      clearTimeout(fetchTimer);
+      unlistenAutoUpdate?.();
+    };
   });
+
+  // --- Automatic updates of the default list ---
+  let updateInfo = $state<IpFilterUpdateInfo | null>(null);
+  // Seeded from the cached settings, so the switch does not flash off while
+  // its state loads.
+  let autoUpdate = $state(get(appSettings)?.ip_filter_auto_update ?? true);
+  let autoUpdateSaving = $state(false);
+
+  async function loadUpdateInfo() {
+    try {
+      const info = await getIpFilterUpdateInfo();
+      if (unmounted) return;
+      updateInfo = info;
+      if (!autoUpdateSaving) autoUpdate = info.autoUpdate;
+    } catch {
+      // The switch stays as it was; the page works without the date.
+    }
+  }
+
+  async function persistAutoUpdate(next: boolean) {
+    autoUpdateSaving = true;
+    try {
+      await setIpFilterAutoUpdate(next);
+      await syncIpFilterSettingsCache();
+      await loadUpdateInfo();
+    } catch (e: unknown) {
+      autoUpdate = !next;
+      error = toErrorMsg(e);
+    } finally {
+      autoUpdateSaving = false;
+    }
+  }
+
+  /** The switch's tooltip: what it does, and why it is waiting when it is. */
+  let autoUpdateTitle = $derived(
+    autoUpdate && updateInfo && !updateInfo.fromDefault
+      ? m.security_auto_update_paused_title()
+      : m.security_auto_update_title(),
+  );
 
   let loadStatsSeq = 0;
   // Number of optimistic enable/block-private toggles whose backend write is
@@ -359,6 +420,7 @@
       flash(ipFilterApplyMessage(result));
       await syncIpFilterSettingsCache();
       await loadStats();
+      void loadUpdateInfo();
     } catch (e: unknown) {
       if (unmounted) return;
       error = toErrorMsg(e);
@@ -380,6 +442,7 @@
         flash(ipFilterApplyMessage(result));
         await syncIpFilterSettingsCache();
         await loadStats();
+        void loadUpdateInfo();
       }
     } catch (e: unknown) {
       if (unmounted) return;
@@ -412,6 +475,7 @@
       flash(ipFilterApplyMessage(result));
       await syncIpFilterSettingsCache();
       await loadStats();
+      void loadUpdateInfo();
       // Collapse the form on success — saves a click and signals
       // completion. The URL is preserved so users who want to refetch
       // the same list (e.g. after an upstream update) can reopen and
@@ -608,6 +672,17 @@
           label={m.security_block_private_label()}
           onchange={(v) => { void persistBlockPrivate(v); }}
         />
+        <!-- Refreshes the bundled default list once it is a day old: on a
+             timer, and at the next launch when the day ran out while Ember
+             was closed. -->
+        <span class="auto-update-toggle" title={autoUpdateTitle}>
+          <ToggleSwitch
+            bind:checked={autoUpdate}
+            disabled={autoUpdateSaving}
+            label={m.security_auto_update_label()}
+            onchange={(v) => { void persistAutoUpdate(v); }}
+          />
+        </span>
         <button class="ghost add-range-btn" onclick={() => (showAddForm = !showAddForm)}>
           {showAddForm ? m.common_cancel() : m.security_add_range()}
         </button>
@@ -623,6 +698,14 @@
         <span class="inline-stat" class:hits-stat={stats.total_hits > 0}>
           {hitsCountText(stats.total_hits)}
         </span>
+        {#if updateInfo && updateInfo.updatedAt > 0}
+          <span class="inline-sep">&middot;</span>
+          <span class="inline-stat" title={autoUpdateTitle}>
+            {autoUpdate && !updateInfo.fromDefault
+              ? m.security_list_updated_paused({ when: formatRelativeTime(updateInfo.updatedAt) })
+              : m.security_list_updated({ when: formatRelativeTime(updateInfo.updatedAt) })}
+          </span>
+        {/if}
       </div>
     </div>
 
@@ -885,6 +968,9 @@
     align-items: center;
     gap: 18px;
     flex-wrap: wrap;
+  }
+  .auto-update-toggle {
+    display: inline-flex;
   }
   .controls-right {
     display: flex;

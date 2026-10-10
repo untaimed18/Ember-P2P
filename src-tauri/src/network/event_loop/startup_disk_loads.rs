@@ -85,8 +85,6 @@ pub(in crate::network) async fn apply_deferred_disk_loads(
                             .ip_filter
                             .update_shared_snapshot(&state.shared_ip_filter);
                         state.routing_table.evict_filtered_contacts();
-                        purge_ember_ip_blocked_peers(state);
-                        state.ember_dht.evict_filtered_contacts();
                     }
                     known_files.absorb_missing_from(loads.known_files);
                     sync_shared_friends_only_hashes(shared_friends_only_hashes, known_files);

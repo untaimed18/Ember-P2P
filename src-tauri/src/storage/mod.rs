@@ -1,7 +1,9 @@
+pub mod category_folders;
 pub mod config;
 pub mod database;
 pub mod deferred_removals;
 pub mod identity;
+pub mod ipfilter_edits;
 pub mod known_files;
 pub mod part_folders;
 pub mod paths;

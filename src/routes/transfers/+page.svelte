@@ -1,18 +1,21 @@
 <script lang="ts">
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import PartsBar from '$lib/components/PartsBar.svelte';
+  import FileTypeIcon from '$lib/components/FileTypeIcon.svelte';
+  import { extensionFromPath, fileTypeKey } from '$lib/fileTypes';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import AddLinksDialog from '$lib/components/AddLinksDialog.svelte';
   import { addLinksRequested, MAX_LINKS_TEXT_BYTES } from '$lib/clipboardWatch';
   import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
+  import { categoryDestinationLabel, categorySubdir, normalizeCategoryFolder } from '$lib/categoryFolders';
   import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, holdDownloadRemoved, setLocalCategory, IDLE_STATUSES, effectiveUploadSpeed } from '$lib/stores/transfers';
-  import { addActionToast, removeToast, setToastMessage, toastError } from '$lib/stores/toast';
+  import { addActionToast, removeToast, setToastMessage, toastError, toastSuccess } from '$lib/stores/toast';
   import { holdPendingCancel, releasePendingCancel } from '$lib/stores/pendingCancels';
   import { finishAction, setFinishAction, type FinishAction } from '$lib/stores/finishAction';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
-    pauseTransfer, stopTransfer, resumeTransfer, removeTransfer,
-    clearCompleted, moveTransfersInQueue, getDownloadQueueIds, setTransferPriority, setTransferCategory, renameTransfer, setPreviewPriority,
+    pauseTransfer, stopTransfer, resumeTransfer, removeTransfer, deleteFinishedDownloads,
+    clearCompleted, moveTransfersInQueue, getDownloadQueueIds, setTransferPriority, setTransfersCategory, renameTransfer, setPreviewPriority,
     pauseTransfersBatch, resumeTransfersBatch, stopTransfersBatch, cancelTransfersBatch, getTransfers,
     getTransferSources, openFile, openTransferFileLocation, openDownloadsFolder, recoverArchive, startDownload,
     getUploadQueue, getKnownClients, getKnownClientCounts, getDownloadFileDetails,
@@ -39,12 +42,15 @@
   import { scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
+  import { hoverSubmenus } from '$lib/hoverSubmenus';
   import { appSettings, setAppSettings } from '$lib/stores/settings';
   import { getSettings, openWebService, updateSettings } from '$lib/api/settings';
   import { serviceAvailableFor } from '$lib/webServices';
   import { mapSettledWithLimit } from '$lib/concurrency';
   import * as m from '$lib/paraglide/messages';
   import { plural } from '$lib/plural';
+  import { BUILTIN_DOWNLOAD_CATEGORIES, downloadCategoryLabel } from '$lib/downloadCategories';
+  import { categoriesDialogRequested } from '$lib/stores/categoriesDialog';
   import {
     translateError,
     transferFailureKindText,
@@ -997,7 +1003,18 @@
   $effect(() => {
     try { localStorage.setItem(FILTER_KEY, transferFilter); } catch { /* ignore */ }
   });
-  let selectedDownloadIds = $state<string[]>([]);
+  /** Rows whose box is ticked. Only the boxes change this (each row's, the
+   *  header's, Ctrl+A, Clear): clicking, double-clicking or right-clicking a
+   *  row never ticks it. */
+  let checkedDownloadIds = $state<string[]>([]);
+  let checkedDlIdSet = $derived(new Set(checkedDownloadIds));
+  /** The row clicked or arrowed to: highlighted, shown in the footer and the
+   *  clients pane, and what the keys act on while no box is ticked. */
+  let focusedDlId = $state<string | null>(null);
+  /** What actions apply to: the ticked rows, or the focused row when none are. */
+  let selectedDownloadIds = $derived<string[]>(
+    checkedDownloadIds.length > 0 ? checkedDownloadIds : focusedDlId ? [focusedDlId] : [],
+  );
   let selectedDlIdSet = $derived(new Set(selectedDownloadIds));
   let lastClickedDlId = $state<string | null>(null);
   /**
@@ -2149,7 +2166,7 @@
   });
 
   // --- Categories ---
-  const BUILTIN_CATEGORIES = ['Audio', 'Video', 'Image', 'Archive', 'Document', 'Program'] as const;
+  const BUILTIN_CATEGORIES = BUILTIN_DOWNLOAD_CATEGORIES;
   let userCategories = $derived($appSettings?.download_categories ?? []);
   let categoryCounts = $derived.by(() => {
     const counts: Record<string, number> = {};
@@ -2419,9 +2436,10 @@
     measureDownloadWindow();
   }
 
+  /** The focused row, for the footer and the clients pane. */
   let selectedTransfer = $derived.by(() => {
-    if (selectedDownloadIds.length !== 1) return null;
-    return allDownloads.find((t) => t.id === selectedDownloadIds[0]) ?? null;
+    if (!focusedDlId) return null;
+    return allDownloads.find((t) => t.id === focusedDlId) ?? null;
   });
 
   let selectedDownloadCount = $derived(selectedDownloadIds.length);
@@ -2431,35 +2449,13 @@
     return filteredSelectableDownloads.findIndex((t) => t.id === lastClickedDlId);
   }
 
-  let preClickSelection: string[] | null = null;
-  let lastRowClickTime = 0;
-
+  /** A click on a row focuses it and nothing else: ticking is the box's job,
+   *  so Shift- and Ctrl-clicks on a row no longer build a ticked set either
+   *  (Shift-click on the boxes still ticks a range). */
   function onDownloadRowClick(e: MouseEvent, t: Transfer) {
-    const now = Date.now();
-    if (now - lastRowClickTime > 400) {
-      preClickSelection = [...selectedDownloadIds];
-    }
-    lastRowClickTime = now;
-
-    const idx = filteredSelectableDownloads.indexOf(t);
-    const lastIdx = resolveLastClickedDlIndex();
-    if (e.shiftKey && lastIdx >= 0) {
-      e.preventDefault();
-      const lo = Math.min(lastIdx, idx);
-      const hi = Math.max(lastIdx, idx);
-      const rangeIds = filteredSelectableDownloads.slice(lo, hi + 1).map((x) => x.id);
-      const merged = new Set([...selectedDownloadIds, ...rangeIds]);
-      selectedDownloadIds = [...merged];
-    } else if (e.ctrlKey || e.metaKey) {
-      e.preventDefault();
-      if (selectedDlIdSet.has(t.id)) {
-        selectedDownloadIds = selectedDownloadIds.filter((id) => id !== t.id);
-      } else {
-        selectedDownloadIds = [...selectedDownloadIds, t.id];
-      }
-    } else {
-      selectedDownloadIds = [t.id];
-    }
+    // No text selection from a Shift-click.
+    if (e.shiftKey) e.preventDefault();
+    focusedDlId = t.id;
     lastClickedDlId = t.id;
   }
 
@@ -2470,13 +2466,13 @@
       const lo = Math.min(lastIdx, idx);
       const hi = Math.max(lastIdx, idx);
       const rangeIds = filteredSelectableDownloads.slice(lo, hi + 1).map((x) => x.id);
-      const merged = new Set([...selectedDownloadIds, ...rangeIds]);
-      selectedDownloadIds = [...merged];
+      const merged = new Set([...checkedDownloadIds, ...rangeIds]);
+      checkedDownloadIds = [...merged];
     } else {
-      if (selectedDlIdSet.has(t.id)) {
-        selectedDownloadIds = selectedDownloadIds.filter((id) => id !== t.id);
+      if (checkedDlIdSet.has(t.id)) {
+        checkedDownloadIds = checkedDownloadIds.filter((id) => id !== t.id);
       } else {
-        selectedDownloadIds = [...selectedDownloadIds, t.id];
+        checkedDownloadIds = [...checkedDownloadIds, t.id];
       }
     }
     lastClickedDlId = t.id;
@@ -2484,10 +2480,10 @@
 
   let allVisibleDlChecked = $derived(
     filteredSelectableDownloads.length > 0 &&
-    filteredSelectableDownloads.every((t) => selectedDlIdSet.has(t.id))
+    filteredSelectableDownloads.every((t) => checkedDlIdSet.has(t.id))
   );
   let someVisibleDlChecked = $derived(
-    filteredSelectableDownloads.some((t) => selectedDlIdSet.has(t.id))
+    filteredSelectableDownloads.some((t) => checkedDlIdSet.has(t.id))
   );
   let selectAllDownloadsCheckbox: HTMLInputElement | undefined = $state(undefined);
   $effect(() => {
@@ -2500,15 +2496,15 @@
   function toggleDlCheckAll() {
     if (allVisibleDlChecked) {
       const visibleIds = visibleSelectableDownloadIds;
-      selectedDownloadIds = selectedDownloadIds.filter((id) => !visibleIds.has(id));
+      checkedDownloadIds = checkedDownloadIds.filter((id) => !visibleIds.has(id));
     } else {
-      const merged = new Set([...selectedDownloadIds, ...filteredSelectableDownloads.map((t) => t.id)]);
-      selectedDownloadIds = [...merged];
+      const merged = new Set([...checkedDownloadIds, ...filteredSelectableDownloads.map((t) => t.id)]);
+      checkedDownloadIds = [...merged];
     }
   }
 
   function clearDlSelection() {
-    selectedDownloadIds = [];
+    checkedDownloadIds = [];
     lastClickedDlId = null;
   }
 
@@ -2534,7 +2530,10 @@
   let selectedPausableCount = $derived(selectedBatchTransfers.filter((t) => canPause(t)).length);
   let selectedResumableCount = $derived(selectedBatchTransfers.filter((t) => canResume(t)).length);
   let selectedStoppableCount = $derived(selectedBatchTransfers.filter((t) => canStop(t)).length);
-  let selectedCancellableCount = $derived(selectedBatchTransfers.filter((t) => !isFinished(t)).length);
+  // Finished downloads count: cancelling one deletes its file.
+  let selectedCancellableCount = $derived(
+    selectedBatchTransfers.filter((t) => !isFinished(t) || t.status === 'completed').length,
+  );
   let selectedFinishedCount = $derived(selectedBatchTransfers.filter((t) => isFinished(t)).length);
   // The rate a row's Speed cell actually prints, for the sorts and counts that
   // have to agree with it. `liveSpeed` already prefers the backend rate and
@@ -2928,9 +2927,25 @@
   let ctxPrioritySub = $state(false);
   let ctxCategorySub = $state(false);
   let ctxWebSub = $state(false);
+  // Submenus open on hover and on click, as the Library's do; see `hoverSubmenus`.
+  type CtxSub = 'priority' | 'category' | 'web';
+  const ctxSubs = hoverSubmenus<CtxSub>(
+    () => (ctxPrioritySub ? 'priority' : ctxCategorySub ? 'category' : ctxWebSub ? 'web' : null),
+    (which) => {
+      ctxPrioritySub = which === 'priority';
+      ctxCategorySub = which === 'category';
+      ctxWebSub = which === 'web';
+    },
+  );
   let categoryOptions = $derived(['None', ...BUILTIN_CATEGORIES, ...userCategories]);
 
   let categoriesDialog = $state<{ open: boolean; assignIds: string[] }>({ open: false, assignIds: [] });
+  // "Edit categories…" in the Library brings the user here for the dialog.
+  $effect(() => {
+    if (!$categoriesDialogRequested) return;
+    categoriesDialogRequested.set(false);
+    categoriesDialog = { open: true, assignIds: [] };
+  });
 
   /** A category set from the menu goes to the whole selection when the
    *  clicked row is part of it, as in eMule. */
@@ -2938,17 +2953,32 @@
     return selectedDlIdSet.has(t.id) && selectedBatchTransfers.length > 1 ? selectedBatchTransfers : [t];
   }
 
-  async function assignCategory(targets: Transfer[], category: string) {
-    const done = new Set<string>();
-    try {
-      for (const target of targets) {
-        await setTransferCategory(target.id, category);
-        done.add(target.id);
-      }
-    } finally {
-      // The backend sends no event for this; show what it accepted right away.
-      if (done.size > 0) setLocalCategory(done, category);
+  /** A finished download's file moves to the new category's folder, as it
+   *  would have had the category been set before it finished, unless
+   *  `moveFinished` is off: taking away a category the user deleted is not a
+   *  request to move anything. */
+  async function assignCategory(targets: Transfer[], category: string, moveFinished = true) {
+    if (targets.length === 0) return;
+    const changes = await setTransfersCategory(targets.map((t) => t.id), category, moveFinished);
+    // The backend sends no event for this; show what it accepted right away.
+    if (changes.changed.length > 0) setLocalCategory(new Set(changes.changed), category);
+    if (changes.moved > 0) {
+      const folder = categoryDestinationLabel(categorySubdir(category, $appSettings?.download_category_folders ?? {}));
+      toastSuccess(plural(changes.moved, {
+        one: () => m.transfers_category_moved_one({ folder }),
+        other: () => m.transfers_category_moved_other({ count: formatNumber(changes.moved), folder }),
+      }));
     }
+    const [firstFailure] = changes.move_failed;
+    if (changes.move_failed.length === 1) {
+      toastError(translateError(firstFailure, m.transfers_operation_failed()));
+    } else if (changes.move_failed.length > 1) {
+      toastError(m.library_move_failed_many({
+        count: formatNumber(changes.move_failed.length),
+        detail: translateError(firstFailure, m.transfers_operation_failed()),
+      }));
+    }
+    if (changes.error) throw changes.error;
   }
 
   function isCategoryTaken(name: string): boolean {
@@ -2958,30 +2988,68 @@
     ) || userCategories.some((cat) => cat.toLocaleLowerCase() === folded);
   }
 
-  /** Edits the categories as the backend holds them now, not as this page last saw them. */
-  async function saveUserCategories(edit: (current: string[]) => string[]): Promise<{ before: string[]; saved: string[] }> {
+  /** Edits the categories and their folders as the backend holds them now,
+   *  not as this page last saw them. */
+  async function saveCategorySettings(
+    edit: (categories: string[], folders: Record<string, string>) => {
+      categories: string[];
+      folders: Record<string, string>;
+    },
+  ): Promise<{ before: string[]; saved: string[] }> {
     const current = await getSettings();
     const before = current.download_categories ?? [];
-    const result = await updateSettings({ ...current, download_categories: edit(before) });
+    const next = edit(before, current.download_category_folders ?? {});
+    const result = await updateSettings({
+      ...current,
+      download_categories: next.categories,
+      download_category_folders: next.folders,
+    });
     setAppSettings(result.settings);
     return { before, saved: result.settings.download_categories ?? [] };
   }
 
-  async function addUserCategory(name: string) {
+  function saveUserCategories(edit: (current: string[]) => string[]) {
+    return saveCategorySettings((categories, folders) => ({ categories: edit(categories), folders }));
+  }
+
+  /** Where a category's downloads finish; `null` is Downloads itself. */
+  async function setCategoryFolder(category: string, folder: string | null) {
+    await saveCategorySettings((categories, folders) => {
+      const next = { ...folders };
+      if (folder) next[category] = folder;
+      else delete next[category];
+      return { categories, folders: next };
+    });
+  }
+
+  async function addUserCategory(name: string, ownFolder: boolean) {
     const { before, saved } = await saveUserCategories((current) => [...current, name]);
     // The name as the backend kept it, which may be trimmed or cut; none when
     // it cleaned the name into one that already exists.
     const kept = saved.find((cat) => !before.includes(cat));
     if (!kept) throw new Error(m.transfers_categories_exists());
+    // Named after the category as kept, so it matches what the backend holds.
+    // A folder that could not be saved is reported once the downloads asked
+    // for have their category anyway.
+    let folderError: unknown = null;
+    const folder = ownFolder ? normalizeCategoryFolder(kept) : null;
+    if (folder) {
+      try {
+        await setCategoryFolder(kept, folder);
+      } catch (e: unknown) {
+        folderError = e;
+      }
+    }
     const ids = new Set(categoriesDialog.assignIds);
     if (ids.size > 0) {
       await assignCategory(allDownloads.filter((t) => ids.has(t.id)), kept);
     }
+    if (folderError) throw folderError;
   }
 
   async function removeUserCategory(name: string) {
     const members = allDownloads.filter((t) => t.category === name);
-    if (members.length > 0) await assignCategory(members, '');
+    if (members.length > 0) await assignCategory(members, '', false);
     await saveUserCategories((current) => current.filter((cat) => cat !== name));
     if (categoryFilter === name) categoryFilter = '';
   }
@@ -3002,16 +3070,12 @@
     closeKnownCtx();
     closePaneCtx();
     closeUploadsPaneCtx();
-    ctxPrioritySub = false;
-    ctxCategorySub = false;
-    ctxWebSub = false;
-    // A row outside the selection becomes the selection, as in Explorer and
-    // eMule, so the menu always acts on what is highlighted: on the whole
-    // selection when the row is part of it, on this row alone otherwise.
-    if (section !== 'upload' && !selectedDlIdSet.has(t.id)) {
-      selectedDownloadIds = [t.id];
-      lastClickedDlId = t.id;
-    }
+    ctxSubs.open(null);
+    // The selection is left alone: here it is also the checkbox set, so making
+    // the row the selection ticked its box, dropped the rows checked before,
+    // and brought up the bulk bar. The menu acts on the whole selection when
+    // the row is part of it and on this row alone otherwise (`ctxTargets`);
+    // the row is marked while the menu is open (`ctx-target`).
     // Raw pointer position: `ctxMenuPosition` measures the rendered panel and
     // keeps it on screen.
     ctxMenu = { x: e.clientX, y: e.clientY, transfer: t, section };
@@ -3258,13 +3322,37 @@
     }
   }
 
-  function closeCtx() { ctxMenu = null; ctxPrioritySub = false; ctxCategorySub = false; ctxWebSub = false; }
+  function closeCtx() { ctxMenu = null; ctxSubs.open(null); }
   function closeKnownCtx() { knownCtxMenu = null; }
   function closeColumnMenu() { columnMenu = null; }
   function closePaneCtx() { paneCtxMenu = null; }
   function closeUploadsPaneCtx() { uploadsPaneCtxMenu = null; }
 
-  function onDocClick() {
+  /** Let go of the highlighted download: no row is current, and the clients
+   *  pane stops showing the one a double-click opened. */
+  function clearDownloadFocus() {
+    if (!focusedDlId && !expandedTransferId) return;
+    focusedDlId = null;
+    if (expandedTransferId) {
+      const open = allDownloads.find((t) => t.id === expandedTransferId);
+      if (open) void toggleSourceDetail(open);
+      else expandedTransferId = null;
+    }
+  }
+
+  function onDocClick(e: MouseEvent) {
+    // A click away from the list lets go of the highlighted download, as a
+    // file manager does. Not one on what acts on it: a row, the footer that
+    // shows it, the clients pane beside it, a menu or dialog, or any control.
+    const target = e.target instanceof Element ? e.target : null;
+    if (
+      target?.isConnected
+      && !target.closest(
+        '.dl-row, .source-child-row, thead, .selection-footer, .uploads-pane, .ctx-menu, [role="dialog"], [aria-modal="true"], button, input, select, textarea, a, label, summary, [role="menuitem"]',
+      )
+    ) {
+      clearDownloadFocus();
+    }
     closeCtx();
     closeKnownCtx();
     closeColumnMenu();
@@ -3353,12 +3441,7 @@
           else await resumeTransfer(t.id);
           break;
         case 'cancel': {
-          const ids = targets.filter((x) => !isFinished(x)).map((x) => x.id);
-          if (!multi) confirmCancel = { open: true, id: t.id, name: t.file_name };
-          else if (ids.length) {
-            const removeIds = targets.filter(isFinished).map((x) => x.id);
-            confirmBatchCancel = { open: true, ids, count: ids.length, removeIds, filter: '' };
-          }
+          openCancelConfirm(targets);
           return;
         }
         case 'remove': discardWithUndo([], targets.filter(isFinished).map((x) => x.id)); break;
@@ -3833,8 +3916,9 @@
       return list.filter((x) => !all.has(x.id));
     });
     for (const id of all) holdDownloadRemoved(id);
-    const wasSelected = selectedDownloadIds.filter((id) => all.has(id));
-    selectedDownloadIds = selectedDownloadIds.filter((id) => !all.has(id));
+    const wasChecked = checkedDownloadIds.filter((id) => all.has(id));
+    checkedDownloadIds = checkedDownloadIds.filter((id) => !all.has(id));
+    if (focusedDlId && all.has(focusedDlId)) focusedDlId = null;
     if (lastClickedDlId && all.has(lastClickedDlId)) lastClickedDlId = null;
 
     const byId = new Map(snapshots.map((s) => [s.id, s] as const));
@@ -3911,8 +3995,8 @@
           release();
           const back = new Set([...all].filter((id) => !takenBack.has(id)));
           restore(back);
-          // The rows that were selected are selected again.
-          selectedDownloadIds = [...new Set([...selectedDownloadIds, ...wasSelected.filter((id) => back.has(id))])];
+          // The rows that were ticked are ticked again.
+          checkedDownloadIds = [...new Set([...checkedDownloadIds, ...wasChecked.filter((id) => back.has(id))])];
           void paused.then((ids) => {
             const resume = ids.filter((id) => !takenBack.has(id));
             if (resume.length) return resumeTransfersBatch(resume);
@@ -4050,19 +4134,102 @@
     open: false,
     ids: [] as string[],
     count: 0,
-    // Finished rows caught up in the same gesture: they can't be cancelled,
+    // Failed rows caught up in the same gesture: they can't be cancelled,
     // so they're removed from the list once the cancels go through.
     removeIds: [] as string[],
+    // Finished downloads whose file this cancel deletes; `deleteName` names
+    // the one when there is only one.
+    deleteIds: [] as string[],
+    deleteName: '',
     // Non-empty when the command was scoped by the filter box, so the prompt
     // can say which subset is about to disappear.
     filter: '',
   });
 
   function handleBatchCancelDownloads() {
-    const ids = selectedBatchTransfers.filter((t) => !isFinished(t)).map((t) => t.id);
-    const removeIds = selectedBatchTransfers.filter((t) => isFinished(t)).map((t) => t.id);
-    if (!ids.length) return;
-    confirmBatchCancel = { open: true, ids, count: ids.length, removeIds, filter: '' };
+    openCancelConfirm(selectedBatchTransfers);
+  }
+
+  /** Cancel `rows`: a download still running is cancelled (its partial file
+   *  deleted, with Undo), a finished one has its file deleted — to the Recycle
+   *  Bin, or permanently when Settings says so — and a failed one is taken off
+   *  the list. One running row gets the single-download prompt. */
+  function openCancelConfirm(rows: Transfer[]) {
+    const ids = rows.filter((t) => !isFinished(t)).map((t) => t.id);
+    const deleteRows = rows.filter((t) => t.status === 'completed');
+    const removeIds = rows.filter((t) => t.status === 'failed').map((t) => t.id);
+    if (rows.length === 1 && ids.length === 1) {
+      confirmCancel = { open: true, id: rows[0].id, name: rows[0].file_name };
+      return;
+    }
+    if (ids.length === 0 && deleteRows.length === 0) return;
+    confirmBatchCancel = {
+      open: true,
+      ids,
+      count: ids.length,
+      removeIds,
+      deleteIds: deleteRows.map((t) => t.id),
+      deleteName: deleteRows.length === 1 ? deleteRows[0].file_name : '',
+      filter: '',
+    };
+  }
+
+  /** The prompt's line about finished downloads whose file is deleted. */
+  function deleteFinishedMessage(count: number, name: string): string {
+    const permanently = $appSettings?.delete_permanently === true;
+    if (count === 1 && name) {
+      return permanently
+        ? m.transfers_confirm_delete_finished_permanent_named({ name })
+        : m.transfers_confirm_delete_finished_bin_named({ name });
+    }
+    return permanently
+      ? plural(count, {
+          one: m.transfers_confirm_delete_finished_permanent_one,
+          other: () => m.transfers_confirm_delete_finished_permanent_other({ count: formatNumber(count) }),
+        })
+      : plural(count, {
+          one: m.transfers_confirm_delete_finished_bin_one,
+          other: () => m.transfers_confirm_delete_finished_bin_other({ count: formatNumber(count) }),
+        });
+  }
+
+  /** Delete the files of finished downloads and take them off the list. Not
+   *  behind Undo like a cancel: the file is gone (or in the Recycle Bin, which
+   *  is its own undo), so the prompt before this is the confirmation. */
+  async function deleteFinished(ids: string[]) {
+    if (ids.length === 0) return;
+    try {
+      const report = await deleteFinishedDownloads(ids);
+      const removed = new Set(report.removed);
+      if (removed.size > 0) {
+        for (const id of removed) {
+          markDownloadRemoved(id);
+          speedHistory.delete(id);
+          forgetTransfer(id);
+        }
+        transfers.update((list) => list.filter((x) => !removed.has(x.id)));
+        if (checkedDownloadIds.some((id) => removed.has(id))) {
+          checkedDownloadIds = checkedDownloadIds.filter((id) => !removed.has(id));
+        }
+        if (focusedDlId && removed.has(focusedDlId)) focusedDlId = null;
+        const permanently = $appSettings?.delete_permanently === true;
+        showInfo(permanently
+          ? plural(removed.size, {
+              one: m.transfers_deleted_finished_permanent_one,
+              other: () => m.transfers_deleted_finished_permanent_other({ count: formatNumber(removed.size) }),
+            })
+          : plural(removed.size, {
+              one: m.transfers_deleted_finished_bin_one,
+              other: () => m.transfers_deleted_finished_bin_other({ count: formatNumber(removed.size) }),
+            }));
+      }
+      if (report.failed.length > 0) {
+        const more = report.failed.length > 1 ? m.transfers_batch_failed_more({ count: report.failed.length - 1 }) : '';
+        toastError(`${toErrorMsg(report.failed[0])}${more}`);
+      }
+    } catch (e: unknown) {
+      toastError(toErrorMsg(e));
+    }
   }
 
   /** Rows a global "...All" command applies to. A narrowed filter box scopes
@@ -4123,6 +4290,8 @@
       ids,
       count: ids.length,
       removeIds: [],
+      deleteIds: [],
+      deleteName: '',
       filter: narrowLabel,
     };
   }
@@ -4749,16 +4918,7 @@
    *  (`'None'`, `'Audio'`, …) is preserved as the API contract; only the
    *  user-visible label is translated. */
   function categoryLabel(cat: string): string {
-    switch (cat) {
-      case 'None': return m.transfers_cat_none();
-      case 'Audio': return m.transfers_cat_audio();
-      case 'Video': return m.transfers_cat_video();
-      case 'Image': return m.transfers_cat_image();
-      case 'Archive': return m.transfers_cat_archive();
-      case 'Document': return m.transfers_cat_document();
-      case 'Program': return m.transfers_cat_program();
-      default: return cat;
-    }
+    return downloadCategoryLabel(cat);
   }
 
   function identStateLabel(state: string): string {
@@ -5008,8 +5168,8 @@
   let lastAutoExpandedClientsId: string | null = null;
   $effect(() => {
     if (bottomView !== 'download_clients') { lastAutoExpandedClientsId = null; return; }
-    if (selectedDownloadIds.length !== 1) { lastAutoExpandedClientsId = null; return; }
-    const id = selectedDownloadIds[0];
+    if (!focusedDlId) { lastAutoExpandedClientsId = null; return; }
+    const id = focusedDlId;
     if (expandedTransferId === id) { lastAutoExpandedClientsId = id; return; }
     // User explicitly collapsed this row's panel — don't reopen it.
     if (lastAutoExpandedClientsId === id) return;
@@ -5019,10 +5179,11 @@
 
   $effect.pre(() => {
     const visible = visibleSelectableDownloadIds;
-    const next = selectedDownloadIds.filter((id) => visible.has(id));
-    if (next.length !== selectedDownloadIds.length) {
-      selectedDownloadIds = next;
+    const next = checkedDownloadIds.filter((id) => visible.has(id));
+    if (next.length !== checkedDownloadIds.length) {
+      checkedDownloadIds = next;
     }
+    if (focusedDlId && !visible.has(focusedDlId)) focusedDlId = null;
     // L12: keep the shift-range anchor in sync with selection pruning so
     // Shift+Click doesn't reach back to a row that's no longer visible.
     if (lastClickedDlId && !visible.has(lastClickedDlId)) {
@@ -5065,6 +5226,14 @@
         knownFilter = '';
         e.preventDefault();
         e.stopPropagation();
+      } else if (
+        (focusedDlId || expandedTransferId)
+        && !(e.target instanceof HTMLElement && e.target.closest('input, textarea, select, [aria-modal="true"]'))
+      ) {
+        // Nothing else to close: let go of the highlighted download.
+        clearDownloadFocus();
+        e.preventDefault();
+        e.stopPropagation();
       }
     }
     return;
@@ -5090,7 +5259,9 @@
   if (e.key === 'F2') {
     const t = fileDetailsId
       ? (fileDetailsTransfer && canRename(fileDetailsTransfer) ? fileDetailsTransfer : null)
-      : [...selectedBatchTransfers].reverse().find((row) => canRename(row));
+      : selectedTransfer
+        ? (canRename(selectedTransfer) ? selectedTransfer : null)
+        : [...selectedBatchTransfers].reverse().find((row) => canRename(row));
     if (t) {
       e.preventDefault();
       openRename(t);
@@ -5109,8 +5280,9 @@
   if (filteredSelectableDownloads.length === 0) return;
   if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && isShortcutLetter(e, 'a')) {
     e.preventDefault();
-    selectedDownloadIds = filteredSelectableDownloads.map((t) => t.id);
-    lastClickedDlId = selectedDownloadIds[0] ?? null;
+    // Select all is the header box's job done from the keyboard: it ticks.
+    checkedDownloadIds = filteredSelectableDownloads.map((t) => t.id);
+    lastClickedDlId = checkedDownloadIds[0] ?? null;
     return;
   }
   // Space pauses the selection, or resumes it when nothing in it is running —
@@ -5129,7 +5301,7 @@
     else if (selectedResumableCount > 0) void handleBatchResumeDownloads();
     return;
   }
-  const currentId = selectedDownloadIds[selectedDownloadIds.length - 1];
+  const currentId = focusedDlId ?? checkedDownloadIds[checkedDownloadIds.length - 1];
   const idx = currentId ? filteredSelectableDownloads.findIndex((t) => t.id === currentId) : -1;
   const lastIdx = filteredSelectableDownloads.length - 1;
   let nextIdx: number | null = null;
@@ -5141,23 +5313,15 @@
     const next = filteredSelectableDownloads[nextIdx];
     if (!next) return;
     e.preventDefault();
-    if (e.shiftKey) {
-      // Extend from the anchor, the row last clicked, to the new row; the
-      // new row goes last so the next Shift+arrow moves on from it.
-      let anchorIdx = resolveLastClickedDlIndex();
-      if (anchorIdx < 0) {
-        anchorIdx = idx < 0 ? nextIdx : idx;
-        lastClickedDlId = filteredSelectableDownloads[anchorIdx].id;
-      }
-      const lo = Math.min(anchorIdx, nextIdx);
-      const hi = Math.max(anchorIdx, nextIdx);
-      const range = filteredSelectableDownloads.slice(lo, hi + 1).map((t) => t.id).filter((id) => id !== next.id);
-      selectedDownloadIds = [...range, next.id];
-    } else {
-      selectedDownloadIds = [next.id];
-      lastClickedDlId = next.id;
-    }
+    // Moves the focus only, Shift or not: the boxes are ticked by hand.
+    focusedDlId = next.id;
+    lastClickedDlId = next.id;
     revealDownloadRow(next.id);
+  } else if (e.key === 'Delete' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && selectedDownloadIds.length > 0) {
+    // Shift+Delete is Cancel, as a file manager's is the stronger Delete: it
+    // also deletes the files of finished downloads, behind Cancel's prompt.
+    e.preventDefault();
+    openCancelConfirm(selectedBatchTransfers);
   } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedDownloadIds.length > 0) {
     e.preventDefault();
     const cancelIds = selectedBatchTransfers.filter((t) => !isFinished(t)).map((t) => t.id);
@@ -5169,7 +5333,10 @@
       return;
     }
     // Match the explicit UI control: prompt, don't just vaporize rows.
-    confirmBatchCancel = { open: true, ids: cancelIds, count: cancelIds.length, removeIds, filter: '' };
+    // Delete takes finished rows off the list, as Remove does, and leaves
+    // their files alone; deleting a finished file is Cancel's, behind its own
+    // prompt.
+    confirmBatchCancel = { open: true, ids: cancelIds, count: cancelIds.length, removeIds, deleteIds: [], deleteName: '', filter: '' };
   }
 }} />
 
@@ -5199,11 +5366,15 @@
 <CategoriesDialog
   bind:open={categoriesDialog.open}
   categories={userCategories}
+  builtins={BUILTIN_CATEGORIES}
+  labelFor={categoryLabel}
+  folders={$appSettings?.download_category_folders ?? {}}
   counts={categoryCounts}
   assignCount={categoriesDialog.assignIds.length}
   isTaken={isCategoryTaken}
   onadd={addUserCategory}
   onremove={removeUserCategory}
+  onfolder={setCategoryFolder}
 />
 
 {#if transferError}
@@ -5247,31 +5418,39 @@
         {/if}
       </label>
     </div>
-    {#if categoryChips.length > 0}
-      <div class="category-chips" role="group" aria-label={m.transfers_category_filter_aria()}>
+    <!-- Shown even before any download has a category: it is where the
+         categories and their folders are set up, and hidden it could not be
+         found until something else had already made one. -->
+    <div class="category-chips" role="group" aria-label={m.transfers_category_filter_aria()}>
+      <button
+        type="button"
+        class="category-chip"
+        class:active={!activeCategory}
+        aria-pressed={!activeCategory}
+        onclick={() => (categoryFilter = '')}
+      >{m.transfers_category_filter_all()} <span class="category-chip-count">{formatNumber(allDownloads.length)}</span></button>
+      {#each categoryChips as cat (cat)}
         <button
           type="button"
           class="category-chip"
-          class:active={!activeCategory}
-          aria-pressed={!activeCategory}
-          onclick={() => (categoryFilter = '')}
-        >{m.transfers_category_filter_all()} <span class="category-chip-count">{formatNumber(allDownloads.length)}</span></button>
-        {#each categoryChips as cat (cat)}
-          <button
-            type="button"
-            class="category-chip"
-            class:active={activeCategory === cat}
-            aria-pressed={activeCategory === cat}
-            onclick={() => (categoryFilter = activeCategory === cat ? '' : cat)}
-          >{categoryLabel(cat)} <span class="category-chip-count">{formatNumber(categoryCounts[cat] ?? 0)}</span></button>
-        {/each}
-        <button
-          type="button"
-          class="category-chip category-chip-edit"
-          onclick={() => (categoriesDialog = { open: true, assignIds: [] })}
-        >{m.transfers_category_edit()}</button>
-      </div>
-    {/if}
+          class:active={activeCategory === cat}
+          aria-pressed={activeCategory === cat}
+          onclick={() => (categoryFilter = activeCategory === cat ? '' : cat)}
+        >{categoryLabel(cat)} <span class="category-chip-count">{formatNumber(categoryCounts[cat] ?? 0)}</span></button>
+      {/each}
+      <button
+        type="button"
+        class="category-edit"
+        title={m.transfers_category_edit_title()}
+        onclick={() => (categoriesDialog = { open: true, assignIds: [] })}
+      >
+        <svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M10.6 2.5H16a1.5 1.5 0 0 1 1.5 1.5v5.4a1.5 1.5 0 0 1-.44 1.06l-6.6 6.6a1.5 1.5 0 0 1-2.12 0l-5.4-5.4a1.5 1.5 0 0 1 0-2.12l6.6-6.6a1.5 1.5 0 0 1 1.06-.44z"/>
+          <circle cx="13.6" cy="6.4" r="1.2"/>
+        </svg>
+        {m.transfers_category_edit()}
+      </button>
+    </div>
     <div class="pane-toolbar">
       <span class="pane-title">{m.transfers_downloading_count({ shown: filteredActiveDownloads.length, total: activeDownloads.length })}</span>
       <div class="toolbar-actions">
@@ -5392,15 +5571,16 @@
               class="dl-row {t.status}"
               class:row-alt={((dlActiveWindow.start + i) & 1) === 1}
               class:expanded={expandedTransferId === t.id}
-              class:selected={selectedDlIdSet.has(t.id)}
+              class:selected={focusedDlId === t.id || checkedDlIdSet.has(t.id)}
+              class:ctx-target={ctxMenu?.transfer.id === t.id && focusedDlId !== t.id && !checkedDlIdSet.has(t.id)}
               onclick={(e) => onDownloadRowClick(e, t)}
               oncontextmenu={(e) => onCtx(e, t, 'active')}
-              ondblclick={() => { if (preClickSelection !== null) { selectedDownloadIds = preClickSelection; preClickSelection = null; } toggleSourceDetail(t); }}
+              ondblclick={() => toggleSourceDetail(t)}
             >
               <td class="col-dl-check">
                 <input
                   type="checkbox"
-                  checked={selectedDlIdSet.has(t.id)}
+                  checked={checkedDlIdSet.has(t.id)}
                   onclick={(e) => { e.stopPropagation(); toggleDlCheck(t, e.shiftKey); }}
                   aria-label={m.transfers_select_row({ name: t.file_name })}
                 />
@@ -5595,14 +5775,15 @@
               <tr
                 class="dl-row completed-row {t.status}"
                 class:row-alt={((filteredActiveDownloads.length + dlCompletedWindow.start + i) & 1) === 1}
-                class:selected={selectedDlIdSet.has(t.id)}
+                class:selected={focusedDlId === t.id || checkedDlIdSet.has(t.id)}
+                class:ctx-target={ctxMenu?.transfer.id === t.id && focusedDlId !== t.id && !checkedDlIdSet.has(t.id)}
                 onclick={(e) => onDownloadRowClick(e, t)}
                 oncontextmenu={(e) => onCtx(e, t, 'completed')}
               >
                 <td class="col-dl-check">
                   <input
                     type="checkbox"
-                    checked={selectedDlIdSet.has(t.id)}
+                    checked={checkedDlIdSet.has(t.id)}
                     onclick={(e) => { e.stopPropagation(); toggleDlCheck(t, e.shiftKey); }}
                     aria-label={m.transfers_select_row({ name: t.file_name })}
                   />
@@ -5691,7 +5872,7 @@
         </tbody>
       </table>
     </div>
-    {#if selectedDownloadCount > 1}
+    {#if checkedDownloadIds.length > 0}
       <div class="selection-footer">
         <div class="selection-meta">
           <strong>{m.transfers_selected_count({ count: selectedDownloadCount })}</strong>
@@ -6558,7 +6739,7 @@
                   <p class="empty-sub">{m.transfers_loading_sources_dots()}</p>
                 </div>
               </td></tr>
-            {:else if selectedDownloadIds.length > 1}
+            {:else if !focusedDlId && checkedDownloadIds.length > 1}
               <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
                 <div class="empty-state compact">
                   <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
@@ -6571,7 +6752,7 @@
                   <p class="empty-sub">{m.transfers_empty_multiple_selected_sub()}</p>
                 </div>
               </td></tr>
-            {:else if selectedDownloadIds.length === 1 && !activeDownloads.some((d) => d.id === selectedDownloadIds[0])}
+            {:else if focusedDlId && !activeDownloads.some((d) => d.id === focusedDlId)}
               <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
                 <div class="empty-state compact">
                   <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
@@ -6671,15 +6852,57 @@
   <button class="ctx-item" role="menuitem" disabled={none} title={hint} onclick={() => ctxAction('queue_back')}>{m.transfers_ctx_queue_back()}</button>
 {/snippet}
 
+<!-- `current` is the category the rows share ('None' for none), or null when
+     they differ. The choice goes to every row `categoryTargets(t)` names. -->
+{#snippet categorySubmenu(t: Transfer, current: string | null)}
+  <div
+    class="ctx-submenu-wrap"
+    role="presentation"
+    onmouseenter={() => ctxSubs.enter('category')}
+    onmouseleave={ctxSubs.leave}
+  >
+    <button
+      class="ctx-item ctx-sub"
+      class:ctx-sub-open={ctxCategorySub}
+      role="menuitem"
+      aria-haspopup="menu"
+      aria-expanded={ctxCategorySub}
+      onclick={(e) => ctxSubs.click(e, 'category')}
+    >
+      {m.transfers_ctx_category()}
+      {#if current}<span class="ctx-hint">{categoryLabel(current)}</span>{/if}
+    </button>
+    {#if ctxCategorySub}
+      <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
+        {#each categoryOptions as cat (cat)}
+          <button
+            class="ctx-item"
+            role="menuitemradio"
+            aria-checked={current === cat}
+            onclick={() => ctxAction('set_category', cat)}
+          >{categoryLabel(cat)}</button>
+        {/each}
+        <div class="ctx-sep" role="separator"></div>
+        <button class="ctx-item" role="menuitem" onclick={() => openNewCategory(t)}>{m.transfers_ctx_category_new()}</button>
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
 {#snippet webServicesSubmenu()}
-  <div class="ctx-submenu-wrap" role="presentation">
+  <div
+    class="ctx-submenu-wrap"
+    role="presentation"
+    onmouseenter={() => ctxSubs.enter('web')}
+    onmouseleave={ctxSubs.leave}
+  >
     <button
       class="ctx-item ctx-sub"
       class:ctx-sub-open={ctxWebSub}
       role="menuitem"
       aria-haspopup="menu"
       aria-expanded={ctxWebSub}
-      onclick={() => (ctxWebSub = !ctxWebSub)}
+      onclick={(e) => ctxSubs.click(e, 'web')}
     >{m.webservices_ctx_menu()}</button>
     {#if ctxWebSub}
       {@const hash = ctxTransfer?.file_hash ?? ''}
@@ -6760,7 +6983,12 @@
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('resume')}>{m.common_resume()}</button>
       {/if}
       <div class="ctx-sep" role="separator"></div>
-      <div class="ctx-submenu-wrap" role="presentation">
+      <div
+        class="ctx-submenu-wrap"
+        role="presentation"
+        onmouseenter={() => { if (!ctxTargets.every(isFinished)) ctxSubs.enter('priority'); }}
+        onmouseleave={ctxSubs.leave}
+      >
         <button
           class="ctx-item ctx-sub"
           class:ctx-sub-open={ctxPrioritySub}
@@ -6768,7 +6996,7 @@
           aria-haspopup="menu"
           aria-expanded={ctxPrioritySub}
           disabled={ctxTargets.every(isFinished)}
-          onclick={() => ctxPrioritySub = !ctxPrioritySub}
+          onclick={(e) => ctxSubs.click(e, 'priority')}
         >
           {m.transfers_ctx_priority()}
           {#if sharedPriority}<span class="ctx-hint">{priorityLabel(sharedPriority)}</span>{/if}
@@ -6789,33 +7017,7 @@
       {#if ctxTargets.some(canMoveInQueue)}
         {@render queueMoveItems(ctxTargets)}
       {/if}
-      <div class="ctx-submenu-wrap" role="presentation">
-        <button
-          class="ctx-item ctx-sub"
-          class:ctx-sub-open={ctxCategorySub}
-          role="menuitem"
-          aria-haspopup="menu"
-          aria-expanded={ctxCategorySub}
-          onclick={() => ctxCategorySub = !ctxCategorySub}
-        >
-          {m.transfers_ctx_category()}
-          {#if sharedCategory}<span class="ctx-hint">{categoryLabel(sharedCategory)}</span>{/if}
-        </button>
-        {#if ctxCategorySub}
-          <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
-            {#each categoryOptions as cat (cat)}
-              <button
-                class="ctx-item"
-                role="menuitemradio"
-                aria-checked={sharedCategory === cat}
-                onclick={() => ctxAction('set_category', cat)}
-              >{categoryLabel(cat)}</button>
-            {/each}
-            <div class="ctx-sep" role="separator"></div>
-            <button class="ctx-item" role="menuitem" onclick={() => ctxTransfer && openNewCategory(ctxTransfer)}>{m.transfers_ctx_category_new()}</button>
-          </div>
-        {/if}
-      </div>
+      {@render categorySubmenu(ctxTransfer, sharedCategory ?? null)}
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_copy_links_btn()}</button>
       <button
@@ -6829,8 +7031,10 @@
       {#if ctxTargets.some(isFinished)}
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_batch_remove({ count: ctxTargets.filter(isFinished).length })}</button>
       {/if}
-      <button class="ctx-item ctx-danger" role="menuitem" disabled={ctxTargets.every(isFinished)} onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
+      <button class="ctx-item ctx-danger" role="menuitem" disabled={!ctxTargets.some((x) => !isFinished(x) || x.status === 'completed')} onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
     {:else if ctxMenu.section !== 'upload' && ctxMulti}
+      {@render categorySubmenu(ctxTransfer, sharedValue(ctxTargets, (x) => x.category || 'None') ?? null)}
+      <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_copy_links_btn()}</button>
       <button
         class="ctx-item"
@@ -6840,7 +7044,10 @@
         onclick={() => ctxAction('find_related_selected')}
       >{m.search_ctx_find_related_selected({ count: ctxTargets.length })}</button>
       <div class="ctx-sep" role="separator"></div>
-      <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_batch_remove({ count: ctxTargets.filter(isFinished).length })}</button>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_batch_remove({ count: ctxTargets.filter(isFinished).length })}</button>
+      {#if ctxTargets.some((x) => x.status === 'completed')}
+        <button class="ctx-item ctx-danger" role="menuitem" title={m.transfers_cancel_finished_title()} onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
+      {/if}
     {:else if ctxMenu.section === 'active'}
       {#if canPause(ctxTransfer)}
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('pause')}>{m.common_pause()}</button>
@@ -6874,14 +7081,19 @@
       <!-- `role="presentation"` on the wrapper, `role="menuitem"` on the button:
            a `role="menu"` may only own menuitems, so a plain div between the two
            drops this entry out of the menu's structure entirely. -->
-      <div class="ctx-submenu-wrap" role="presentation">
+      <div
+        class="ctx-submenu-wrap"
+        role="presentation"
+        onmouseenter={() => ctxSubs.enter('priority')}
+        onmouseleave={ctxSubs.leave}
+      >
         <button
           class="ctx-item ctx-sub"
           class:ctx-sub-open={ctxPrioritySub}
           role="menuitem"
           aria-haspopup="menu"
           aria-expanded={ctxPrioritySub}
-          onclick={() => ctxPrioritySub = !ctxPrioritySub}
+          onclick={(e) => ctxSubs.click(e, 'priority')}
         >
           {m.transfers_ctx_priority()}
           <span class="ctx-hint">{priorityLabel(ctxTransfer.priority)}</span>
@@ -6902,33 +7114,7 @@
       {#if canMoveInQueue(ctxTransfer)}
         {@render queueMoveItems([ctxTransfer])}
       {/if}
-      <div class="ctx-submenu-wrap" role="presentation">
-        <button
-          class="ctx-item ctx-sub"
-          class:ctx-sub-open={ctxCategorySub}
-          role="menuitem"
-          aria-haspopup="menu"
-          aria-expanded={ctxCategorySub}
-          onclick={() => ctxCategorySub = !ctxCategorySub}
-        >
-          {m.transfers_ctx_category()}
-          <span class="ctx-hint">{categoryLabel(ctxTransfer.category || 'None')}</span>
-        </button>
-        {#if ctxCategorySub}
-          <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
-            {#each categoryOptions as cat (cat)}
-              <button
-                class="ctx-item"
-                role="menuitemradio"
-                aria-checked={(cat === 'None' && !ctxTransfer.category) || ctxTransfer.category === cat}
-                onclick={() => ctxAction('set_category', cat)}
-              >{categoryLabel(cat)}</button>
-            {/each}
-            <div class="ctx-sep" role="separator"></div>
-            <button class="ctx-item" role="menuitem" onclick={() => ctxTransfer && openNewCategory(ctxTransfer)}>{m.transfers_ctx_category_new()}</button>
-          </div>
-        {/if}
-      </div>
+      {@render categorySubmenu(ctxTransfer, ctxTransfer.category || 'None')}
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
       <button class="ctx-item" role="menuitem" disabled={pasteLinkBusy} onclick={() => ctxAction('paste_link')}>{m.transfers_ctx_paste_link()}</button>
@@ -6960,6 +7146,12 @@
       {#if canRename(ctxTransfer)}
         <button class="ctx-item" role="menuitem" onclick={() => { const t = ctxTransfer!; closeCtx(); openRename(t); }}>{m.transfers_ctx_rename()}</button>
       {/if}
+      <!-- A finished download's file moves to the folder of the category
+           picked here, so a download that finished before it could be
+           categorised can still be filed. -->
+      {#if ctxTransfer.status === 'completed'}
+        {@render categorySubmenu(ctxTransfer, ctxTransfer.category || 'None')}
+      {/if}
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
       <button
@@ -6972,7 +7164,12 @@
       {@render webServicesSubmenu()}
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" disabled={clearCompletedTargets().length === 0} onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
-      <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_ctx_remove_from_list()}</button>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_ctx_remove_from_list()}</button>
+      {#if ctxTransfer.status === 'completed'}
+        <!-- Cancel on a finished download deletes its file, which Remove
+             from List never does. -->
+        <button class="ctx-item ctx-danger" role="menuitem" title={m.transfers_cancel_finished_title()} onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
+      {/if}
     {:else}
       {@const uploadFriendHash = emberHashForUpload(ctxTransfer)}
       <!-- Upload context menu -->
@@ -7103,11 +7300,20 @@
 
 <ConfirmDialog
   bind:open={confirmBatchCancel.open}
-  title={m.transfers_confirm_batch_cancel_title()}
-  message={confirmBatchCancel.removeIds.length > 0
-    ? batchCancelMixedMessage(confirmBatchCancel.count, confirmBatchCancel.removeIds.length)
-    : batchCancelMessage(confirmBatchCancel.count, confirmBatchCancel.filter)}
-  confirmLabel={m.transfers_confirm_batch_cancel_label()}
+  title={confirmBatchCancel.count === 0 ? m.transfers_confirm_delete_finished_title() : m.transfers_confirm_batch_cancel_title()}
+  message={[
+    confirmBatchCancel.count === 0
+      ? ''
+      : confirmBatchCancel.removeIds.length > 0
+        ? batchCancelMixedMessage(confirmBatchCancel.count, confirmBatchCancel.removeIds.length)
+        : batchCancelMessage(confirmBatchCancel.count, confirmBatchCancel.filter),
+    confirmBatchCancel.deleteIds.length > 0
+      ? deleteFinishedMessage(confirmBatchCancel.deleteIds.length, confirmBatchCancel.deleteName)
+      : '',
+  ].filter(Boolean).join('\n\n')}
+  confirmLabel={confirmBatchCancel.count === 0
+    ? ($appSettings?.delete_permanently ? m.transfers_confirm_delete_finished_permanent_label() : m.transfers_confirm_delete_finished_bin_label())
+    : m.transfers_confirm_batch_cancel_label()}
   danger={true}
   onconfirm={async () => {
     // As for a single cancel: rows that finished while the dialog was open
@@ -7119,8 +7325,9 @@
       ...confirmBatchCancel.removeIds,
       ...confirmBatchCancel.ids.filter((id) => finishedNow.has(id)),
     ];
-    discardWithUndo(ids, removeIds);
-    selectedDownloadIds = [];
+    if (ids.length > 0 || removeIds.length > 0) discardWithUndo(ids, removeIds);
+    void deleteFinished(confirmBatchCancel.deleteIds);
+    checkedDownloadIds = [];
     lastClickedDlId = null;
     // To the list, not the filter box: a text field there keeps Ctrl+Z for
     // its own undo, and the Undo toast that just appeared is what the
@@ -7165,20 +7372,32 @@
         </button>
       </div>
       <div class="modal-body">
+        <!-- The file leads: its type, its full name (release names need the
+             width), and where it stands. -->
         <div class="dl-details-hero">
-          {#if canRename(t)}
-            <button
-              type="button"
-              class="dl-details-name-btn"
-              title={m.transfers_file_details_rename()}
-              onclick={() => openRename(t)}
-            >
+          <FileTypeIcon kind={fileTypeKey(extensionFromPath(t.file_name))} size={44} />
+          <div class="dl-details-hero-text">
+            {#if canRename(t)}
+              <button
+                type="button"
+                class="dl-details-name-btn"
+                title={m.transfers_file_details_rename()}
+                onclick={() => openRename(t)}
+              >
+                <bdi class="dl-details-name" dir="auto">{t.file_name}</bdi>
+              </button>
+            {:else}
               <bdi class="dl-details-name" dir="auto">{t.file_name}</bdi>
-            </button>
-          {:else}
-            <bdi class="dl-details-name" dir="auto">{t.file_name}</bdi>
-          {/if}
-          <span class="dl-details-sub">{formatSize(t.total_size)}</span>
+            {/if}
+            <div class="dl-details-meta">
+              <span class="dl-details-status status-{t.status}">{dlStatusLabel(t)}</span>
+              <span class="dl-details-sub">{formatSize(t.total_size)}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="dl-details-progress">
+          <ProgressBar value={t.progress} color={downloadProgressColor(t)} label={t.file_name} />
         </div>
 
         {#if fileDetailsLoading && !d}
@@ -7193,91 +7412,124 @@
                  path never registers one; either way the file has parts, we
                  just cannot see them from here. The figures below do not all
                  depend on the map, so the dialog is not a dead end. -->
-            <p class="dl-details-note">{m.transfers_file_details_untracked()}</p>
+            <p class="dl-details-note dl-details-callout">{m.transfers_file_details_untracked()}</p>
           {:else}
-          <div class="dl-chunk-block">
-            <span class="dl-chunk-label">{m.transfers_file_details_chunk_map()}</span>
-            <PartsBar
-              partStatus={d.local_part_status}
-              peerPartStatus={d.swarm_part_status}
-              peerSense="swarm"
-              partCount={d.part_count}
-              transferred={d.completed_bytes}
-              total={t.total_size}
-              title={m.transfers_file_details_chunk_map_title()}
-            />
-            <span class="dl-chunk-legend">
-              {m.transfers_file_details_legend({
-                have: fileDetailsHaveParts,
-                parts: d.part_count,
-              })}
-            </span>
-          </div>
+            <section class="dl-details-card">
+              <h4 class="dl-details-card-title">{m.transfers_file_details_chunk_map()}</h4>
+              <PartsBar
+                partStatus={d.local_part_status}
+                peerPartStatus={d.swarm_part_status}
+                peerSense="swarm"
+                partCount={d.part_count}
+                transferred={d.completed_bytes}
+                total={t.total_size}
+                title={m.transfers_file_details_chunk_map_title()}
+              />
+              <span class="dl-chunk-legend">
+                {m.transfers_file_details_legend({
+                  have: fileDetailsHaveParts,
+                  parts: d.part_count,
+                })}
+              </span>
+            </section>
           {/if}
 
-          <dl class="dl-details-grid">
-            {#if hasMap}
-              <dt>{m.transfers_file_details_verified()}</dt>
-              <dd>{m.transfers_file_details_parts_of({
-                n: d.verified_parts,
-                parts: d.part_count,
-              })}</dd>
+          <section class="dl-details-card">
+            <h4 class="dl-details-card-title">{m.transfers_file_details_section_progress()}</h4>
+            <dl class="dl-details-tiles">
+              <!-- The tracker's figures where there is one, the transfer row's
+                   otherwise: both are gap-derived, and a dialog that shows
+                   nothing at all once a download finishes is worse than one
+                   that shows the row it already had. -->
+              <div class="dl-details-tile">
+                <dt>{m.transfers_file_details_on_disk()}</dt>
+                <dd>{formatSize(hasMap ? d.completed_bytes : t.completed_size)}</dd>
+              </div>
+              <div class="dl-details-tile">
+                <dt>{m.transfers_file_details_remaining()}</dt>
+                <dd>{formatSize(hasMap
+                  ? d.remaining_bytes
+                  : Math.max(0, t.total_size - t.completed_size))}</dd>
+              </div>
+              <!-- Wire bytes, which exceed the file once a corrupt part has
+                   been re-fetched. Worth showing next to the on-disk figure,
+                   because the gap between them is what a bad source costs. -->
+              <div class="dl-details-tile">
+                <dt>{m.transfers_file_details_transferred()}</dt>
+                <dd>{formatSize(hasMap ? d.transferred : t.transferred)}</dd>
+              </div>
+              {#if hasMap}
+                <div class="dl-details-tile">
+                  <dt>{m.transfers_file_details_verified()}</dt>
+                  <dd>{m.transfers_file_details_parts_of({
+                    n: d.verified_parts,
+                    parts: d.part_count,
+                  })}</dd>
+                </div>
+                <div class="dl-details-tile">
+                  <dt>{m.transfers_file_details_in_progress()}</dt>
+                  <dd>{d.in_progress_parts}</dd>
+                </div>
+              {/if}
+            </dl>
+          </section>
 
-              <dt>{m.transfers_file_details_in_progress()}</dt>
-              <dd>{d.in_progress_parts}</dd>
-            {/if}
-
-            <!-- The tracker's figures where there is one, the transfer row's
-                 otherwise: both are gap-derived, and a dialog that shows
-                 nothing at all once a download finishes is worse than one that
-                 shows the row it already had. -->
-            <dt>{m.transfers_file_details_on_disk()}</dt>
-            <dd>{formatSize(hasMap ? d.completed_bytes : t.completed_size)}</dd>
-
-            <dt>{m.transfers_file_details_remaining()}</dt>
-            <dd>{formatSize(hasMap
-              ? d.remaining_bytes
-              : Math.max(0, t.total_size - t.completed_size))}</dd>
-
-            <!-- Wire bytes, which exceed the file once a corrupt part has been
-                 re-fetched. Worth showing next to the on-disk figure, because
-                 the gap between them is what a bad source costs. -->
-            <dt>{m.transfers_file_details_transferred()}</dt>
-            <dd>{formatSize(hasMap ? d.transferred : t.transferred)}</dd>
-
-            {#if hasMap}
-              <dt>{m.transfers_file_details_availability()}</dt>
-              <dd>
-                {#if d.sources_with_bitmaps === 0}
-                  {m.common_unknown()}
-                {:else}
-                  {m.transfers_file_details_rarest({
-                    n: d.rarest_part_sources,
-                    sources: d.sources_with_bitmaps,
-                  })}
-                {/if}
-              </dd>
-            {/if}
-
-            <dt>{m.transfers_col_last_seen_complete()}</dt>
-            <dd>
-              <!-- Relative here, where the question is "is this file still
-                   out there"; the column gives the absolute date. Both take
-                   unix *seconds* — `formatRelativeTime` compares against
-                   `Date.now() / 1000`, so passing milliseconds would read as
-                   "now" for every value. -->
-              {t.last_seen_complete
-                ? formatRelativeTime(t.last_seen_complete)
-                : m.common_unknown()}
-            </dd>
-
-            <dt>{m.transfers_col_sources()}</dt>
-            <dd>{sourcesLabel(t)}</dd>
-          </dl>
+          <section class="dl-details-card">
+            <h4 class="dl-details-card-title">{m.transfers_file_details_section_availability()}</h4>
+            <dl class="dl-details-tiles">
+              <div class="dl-details-tile">
+                <dt>{m.transfers_col_sources()}</dt>
+                <dd>{sourcesLabel(t)}</dd>
+              </div>
+              {#if hasMap}
+                <div class="dl-details-tile">
+                  <dt>{m.transfers_file_details_availability()}</dt>
+                  <dd>
+                    {#if d.sources_with_bitmaps === 0}
+                      {m.common_unknown()}
+                    {:else}
+                      {m.transfers_file_details_rarest({
+                        n: d.rarest_part_sources,
+                        sources: d.sources_with_bitmaps,
+                      })}
+                    {/if}
+                  </dd>
+                </div>
+              {/if}
+              <div class="dl-details-tile">
+                <dt>{m.transfers_col_last_seen_complete()}</dt>
+                <dd>
+                  <!-- Relative here, where the question is "is this file
+                       still out there"; the column gives the absolute date.
+                       Both take unix *seconds* — `formatRelativeTime` compares
+                       against `Date.now() / 1000`, so passing milliseconds
+                       would read as "now" for every value. -->
+                  {t.last_seen_complete
+                    ? formatRelativeTime(t.last_seen_complete)
+                    : m.common_unknown()}
+                </dd>
+              </div>
+            </dl>
+          </section>
         {/if}
       </div>
-      <div class="modal-footer">
-        <button type="button" class="ghost" onclick={closeFileDetails}>{m.common_close()}</button>
+      <div class="modal-footer dl-details-footer">
+        <button
+          type="button"
+          class="ghost"
+          disabled={copyingAllDownloadLinks || !t.file_hash?.trim()}
+          onclick={() => void copyDownloadLinks([t])}
+        >{m.transfers_ctx_copy_link()}</button>
+        <button
+          type="button"
+          class="ghost"
+          onclick={() => void openTransferFileLocation(t.id).catch((e: unknown) => { transferError = toErrorMsg(e); })}
+        >{m.transfers_ctx_open_location()}</button>
+        <span class="dl-details-footer-spacer"></span>
+        {#if canRename(t)}
+          <button type="button" class="ghost" onclick={() => openRename(t)}>{m.transfers_ctx_rename()}</button>
+        {/if}
+        <button type="button" onclick={closeFileDetails}>{m.common_close()}</button>
       </div>
     </div>
   </div>
@@ -7409,17 +7661,121 @@
      release names need the full width. */
   .dl-details-hero {
     display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    margin-bottom: 14px;
+  }
+
+  .dl-details-hero-text {
+    display: flex;
     flex-direction: column;
-    gap: 4px;
-    padding-bottom: 12px;
-    margin-bottom: 12px;
-    border-bottom: 1px solid var(--border);
+    gap: 6px;
+    min-width: 0;
+    flex: 1;
   }
 
   .dl-details-name {
     font-weight: 600;
     font-size: var(--font-size-md);
+    line-height: 1.35;
     overflow-wrap: anywhere;
+  }
+
+  .dl-details-meta {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .dl-details-status {
+    padding: 1px 8px;
+    border-radius: var(--radius-pill);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    color: var(--badge-accent-text);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+  .dl-details-status.status-completed {
+    color: var(--success);
+    background: color-mix(in srgb, var(--success) 14%, transparent);
+  }
+  .dl-details-status.status-paused,
+  .dl-details-status.status-stopped {
+    color: var(--warning);
+    background: color-mix(in srgb, var(--warning) 14%, transparent);
+  }
+  .dl-details-status.status-failed {
+    color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 14%, transparent);
+  }
+
+  .dl-details-progress {
+    margin-bottom: 16px;
+  }
+
+  /* Each group of figures on its own card, so the eye can find "how much is
+     left" and "who has it" without reading a single long list. */
+  .dl-details-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 14px;
+    margin-bottom: 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-primary);
+  }
+  .dl-details-card:last-child {
+    margin-bottom: 0;
+  }
+
+  .dl-details-card-title {
+    margin: 0;
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-secondary);
+  }
+
+  .dl-details-tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 12px 16px;
+    margin: 0;
+  }
+
+  .dl-details-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .dl-details-tile dt {
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+  }
+
+  .dl-details-tile dd {
+    margin: 0;
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    overflow-wrap: anywhere;
+  }
+
+  .dl-details-callout {
+    padding: 10px 12px;
+    margin-bottom: 12px;
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--accent) 8%, var(--bg-primary));
+    border: 1px solid color-mix(in srgb, var(--accent) 25%, var(--border));
+  }
+
+  .dl-details-footer-spacer {
+    flex: 1;
   }
 
   .dl-details-name-btn {
@@ -7488,39 +7844,6 @@
     color: var(--text-secondary);
   }
 
-  .dl-chunk-block {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    margin-bottom: 14px;
-  }
-
-  .dl-chunk-label {
-    font-size: var(--font-size-xs);
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--text-secondary);
-  }
-
-  .dl-details-grid {
-    display: grid;
-    grid-template-columns: minmax(0, auto) minmax(0, 1fr);
-    gap: 6px 16px;
-    margin: 0;
-    font-size: var(--font-size-sm);
-  }
-
-  .dl-details-grid dt {
-    color: var(--text-secondary);
-  }
-
-  .dl-details-grid dd {
-    margin: 0;
-    font-variant-numeric: tabular-nums;
-    overflow-wrap: anywhere;
-  }
-
   @media (max-width: 760px) {
     .modal-overlay {
       padding: 0;
@@ -7534,13 +7857,8 @@
       border-radius: 0;
     }
 
-    .dl-details-grid {
-      grid-template-columns: minmax(0, 1fr);
-      gap: 0;
-    }
-
-    .dl-details-grid dt {
-      margin-top: 6px;
+    .dl-details-footer {
+      flex-wrap: wrap;
     }
   }
 
@@ -7621,9 +7939,37 @@
   .category-chip.active .category-chip-count {
     color: inherit;
   }
-  .category-chip-edit {
+  /* The way into categories and their folders, so it reads as an action
+     rather than one more filter: accent-tinted, with an icon, and pinned to
+     the right edge so a long row of chips cannot scroll it out of view. The
+     opaque base under the tint hides the chips that scroll beneath it. */
+  .category-edit {
+    position: sticky;
+    right: 0;
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
     margin-left: auto;
-    border-style: dashed;
+    padding: 3px 11px 3px 9px;
+    border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+    border-radius: var(--radius-pill);
+    background:
+      linear-gradient(color-mix(in srgb, var(--accent) 12%, transparent), color-mix(in srgb, var(--accent) 12%, transparent)),
+      var(--bg-primary);
+    box-shadow: -10px 0 8px -6px var(--bg-primary);
+    color: var(--accent);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    white-space: nowrap;
+    transition: background var(--transition-fast), border-color var(--transition-fast);
+  }
+  .category-edit:hover:not(:disabled) {
+    border-color: var(--accent);
+    background:
+      linear-gradient(color-mix(in srgb, var(--accent) 22%, transparent), color-mix(in srgb, var(--accent) 22%, transparent)),
+      var(--bg-primary);
+    color: var(--accent);
   }
   /* The Known Clients search, at the right of the downloads overview bar. */
   .pill-search.dl-filter {
@@ -8029,6 +8375,12 @@
   .transfer-table tbody tr.dl-row.selected,
   .transfer-table tbody tr.dl-row.selected:hover {
     background: var(--table-row-selected);
+  }
+  /* The row a context menu is open for, when it is not part of the selection:
+     marked as the Library marks it, without selecting (and so checking) it. */
+  .transfer-table tbody tr.dl-row.ctx-target,
+  .transfer-table tbody tr.dl-row.ctx-target:hover {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
   }
 
   .col-dl-check {

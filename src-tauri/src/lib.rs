@@ -29,6 +29,7 @@ mod commands;
 mod emule_import;
 mod finish_action;
 mod geoip;
+mod ipfilter_update;
 mod network;
 mod power;
 mod search;
@@ -1026,47 +1027,42 @@ pub fn run() {
             let startup_network_tx = network_tx.clone();
 
             let upload_shared_folders: app_state::SharedFolderList = Arc::new(RwLock::new(settings.shared_folders.clone()));
-            let friend_hashes: app_state::SharedFriendHashes = {
-                let mut set = std::collections::HashSet::new();
-                if let Ok(rows) = db.get_friends() {
-                    for (hash_hex, _, _) in &rows {
-                        if let Ok(bytes) = hex::decode(hash_hex) {
-                            if bytes.len() == 16 {
-                                let mut h = [0u8; 16];
-                                h.copy_from_slice(&bytes);
-                                set.insert(h);
-                            }
-                        }
-                    }
-                    if !set.is_empty() {
-                        info!("Loaded {} friends from database", set.len());
-                    }
-                }
-                Arc::new(RwLock::new(set))
-            };
             // Mutual friends are the subset that also added us back. Friend-only
-            // shares and browse answers key off this rather than `friend_hashes`,
-            // so a one-sided add cannot reach private content.
-            let mutual_friend_hashes: app_state::SharedFriendHashes = {
-                let mut set = std::collections::HashSet::new();
-                if let Ok(rows) = db.get_friends_full() {
-                    for row in &rows {
-                        if !row.6 {
-                            continue;
-                        }
-                        if let Ok(bytes) = hex::decode(&row.0) {
-                            if bytes.len() == 16 {
-                                let mut h = [0u8; 16];
-                                h.copy_from_slice(&bytes);
-                                set.insert(h);
+            // shares and browse answers key off that rather than every friend,
+            // so a one-sided add cannot reach private content. Both come from
+            // one read so they cannot disagree, and a failed read is logged
+            // loudly: every friend would otherwise look like a stranger and
+            // the friend limit would count from zero.
+            let (friend_hashes, mutual_friend_hashes): (
+                app_state::SharedFriendHashes,
+                app_state::SharedFriendHashes,
+            ) = {
+                let mut friends = std::collections::HashSet::new();
+                let mut mutual = std::collections::HashSet::new();
+                match db.get_friends_full() {
+                    Ok(rows) => {
+                        for row in &rows {
+                            let Ok(hash) = <[u8; 16]>::try_from(
+                                hex::decode(&row.0).unwrap_or_default().as_slice(),
+                            ) else {
+                                continue;
+                            };
+                            friends.insert(hash);
+                            if row.6 {
+                                mutual.insert(hash);
                             }
                         }
+                        if !friends.is_empty() {
+                            info!(
+                                "Loaded {} friends ({} mutual) from database",
+                                friends.len(),
+                                mutual.len()
+                            );
+                        }
                     }
-                    if !set.is_empty() {
-                        info!("Loaded {} mutual friends from database", set.len());
-                    }
+                    Err(e) => tracing::error!("Failed to load the friend list: {e}"),
                 }
-                Arc::new(RwLock::new(set))
+                (Arc::new(RwLock::new(friends)), Arc::new(RwLock::new(mutual)))
             };
 
             let shared_folder_watcher = sharing::watcher::SharedFoldersWatcher::start(
@@ -1177,6 +1173,7 @@ pub fn run() {
             }
             background::spawn(app_handle.clone());
             auto_update::scheduler::spawn(app_handle.clone());
+            ipfilter_update::spawn(app_handle.clone());
             commands::channel_recovery::spawn_startup_scan(app_handle.clone());
 
             // Non-silent recovery notice: if config.json was corrupt at load,
@@ -2352,6 +2349,7 @@ pub fn run() {
             commands::search::plan_related_search,
             commands::search::related_search_supported,
             commands::search::cancel_search,
+            commands::search::search_more,
             commands::search::find_notes,
             commands::search::find_sources,
             commands::search::publish_note,
@@ -2390,7 +2388,7 @@ pub fn run() {
             commands::transfers::set_transfer_priority,
             commands::transfers::move_transfers_in_queue,
             commands::transfers::get_download_queue_ids,
-            commands::transfers::set_transfer_category,
+            commands::transfers::set_transfers_category,
             commands::transfers::rename_transfer,
             commands::transfers::set_preview_priority,
             commands::transfers::stop_transfer,
@@ -2447,6 +2445,10 @@ pub fn run() {
             commands::sharing::open_shared_file,
             commands::sharing::resolve_media_asset_path,
             commands::sharing::open_shared_folder,
+            commands::sharing::open_library_folder,
+            commands::sharing::move_files_to_category,
+            commands::sharing::rename_library_file,
+            commands::transfers::delete_finished_downloads,
             commands::sharing::delete_shared_file,
             commands::sharing::republish_file,
             commands::sharing::scan_missing_files,
@@ -2586,6 +2588,8 @@ pub fn run() {
             commands::security::remove_ip_filter_range,
             commands::security::set_ip_filter_enabled,
             commands::security::set_block_private_ips,
+            commands::security::set_ip_filter_auto_update,
+            commands::security::get_ip_filter_update_info,
             commands::security::download_and_load_ipfilter,
             commands::security::update_ipfilter_from_url,
             commands::security::pick_and_import_ipfilter_file,

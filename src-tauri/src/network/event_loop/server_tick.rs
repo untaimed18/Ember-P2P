@@ -332,6 +332,16 @@ pub(in crate::network) async fn on_server_tick(
                                         request_id,
                                     });
                                 } else {
+                                    // Stopped by our page or result cap
+                                    // while the server still had more:
+                                    // Search More can pick up from here.
+                                    if more {
+                                        if let Some(active) = state.active_search_request.as_mut() {
+                                            if active.request_id == request_id {
+                                                active.server_has_more = true;
+                                            }
+                                        }
+                                    }
                                     end_or_continue_server_search_leg(
                                         state,
                                         request_id,

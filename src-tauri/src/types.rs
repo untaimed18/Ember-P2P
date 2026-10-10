@@ -817,9 +817,9 @@ pub struct EmberDiagnostics {
     pub ember_dht_verified_contacts: u32,
     /// Rough size of the whole Ember network, from how tightly the peers we
     /// have proven are packed around our own ID (see
-    /// `RoutingTable::estimated_network_size`). Zero while too few have
-    /// answered for the density to mean anything. A diagnostic only: it is an
-    /// estimate, and a determined peer could skew it.
+    /// `RoutingTable::estimated_network_size`), never below the peers that
+    /// have answered plus ourselves; zero with nobody at all. A diagnostic
+    /// only: it is an estimate, and a determined peer could skew it.
     #[serde(default)]
     pub ember_dht_estimated_nodes: u32,
     /// Records held for other publishers that are due to be replicated onward
@@ -1036,6 +1036,32 @@ pub struct EmberDiagnostics {
     /// together is one address flooding the store under rotating identities.
     #[serde(default)]
     pub ember_dht_rate_limited: u32,
+    /// Ember datagrams dropped before decryption because the sender's IP is on
+    /// the ban list (eD2K reputation bans and manual bans included).
+    #[serde(default)]
+    pub ember_udp_dropped_banned: u32,
+    /// Ember datagrams dropped before decryption by the per-IP packet rate
+    /// limit. Distinct from `ember_dht_rate_limited`, which counts decrypted
+    /// DHT frames refused by the frame limiter.
+    #[serde(default)]
+    pub ember_udp_dropped_rate_limited: u32,
+    /// Room frames and EPX controls dropped after decryption because the IP
+    /// filter lists the sender. DHT frames never consult the filter.
+    #[serde(default)]
+    pub ember_udp_dropped_filtered: u32,
+    /// Routing-table admissions refused to a peer that had already answered us,
+    /// because its address is unroutable or private under `block_private_ips`.
+    /// Attempts, not peers: a refused peer is offered again with each frame.
+    #[serde(default)]
+    pub ember_dht_refused_ip_policy: u32,
+    /// As `ember_dht_refused_ip_policy`, for a /24 already at its share of the
+    /// bucket or the table.
+    #[serde(default)]
+    pub ember_dht_refused_subnet: u32,
+    /// As `ember_dht_refused_ip_policy`, for an address already at its share
+    /// of the table.
+    #[serde(default)]
+    pub ember_dht_refused_per_ip: u32,
     /// Slice 14: inbound STORE frames rejected as short-window signature replays.
     #[serde(default)]
     pub ember_dht_store_replays: u32,
@@ -1061,6 +1087,11 @@ pub struct EmberDiagnostics {
     /// PROXY_STORE requests we accepted and fanned out as a HighID buddy.
     #[serde(default)]
     pub ember_dht_buddy_forwards: u32,
+    /// Firewalled Ember users we are relaying for right now: publishers whose
+    /// PROXY_STORE we accepted within the callback window, whose searchers'
+    /// callback requests we still pass on. Live, not a session total.
+    #[serde(default)]
+    pub ember_dht_relaying_for: u32,
     /// Firewalled source records we parked because the buddy named in the
     /// trailer had not signed for that endpoint — a forged or lapsed
     /// endorsement, or a record published before endorsements existed. Rising
@@ -1433,6 +1464,11 @@ pub struct AppSettings {
     /// Enable IP filter to block known-bad IP ranges (loads ipfilter.dat)
     #[serde(default = "default_true")]
     pub ip_filter_enabled: bool,
+    /// Download the bundled default IP filter again once the installed one is
+    /// a day old (`ipfilter_update`). Only a list that came from the default
+    /// URL is replaced, and the user's own range edits are re-applied to it.
+    #[serde(default = "default_true")]
+    pub ip_filter_auto_update: bool,
     /// Apply IP filter ranges / private blocking to incoming TCP upload
     /// connections only. Off by default: VPN IPs commonly appear in
     /// ipfilter.dat "hosting" ranges, silently breaking connectivity for
@@ -1472,6 +1508,15 @@ pub struct AppSettings {
     /// names live here; each download stores its own category string.
     #[serde(default)]
     pub download_categories: Vec<String>,
+    /// Where finished downloads of a category go: category value (one of
+    /// `download_categories` or a built-in such as `Video`) to a folder inside
+    /// `Downloads`, up to three levels written with `/`. A category with no
+    /// entry finishes in `Downloads` itself. Read when a download finishes,
+    /// so a change reaches downloads already running, and a finished file is
+    /// never moved because its category changed. See
+    /// `storage::category_folders`.
+    #[serde(default)]
+    pub download_category_folders: std::collections::BTreeMap<String, String>,
     /// Block private/LAN/CGNAT IPs across KAD contact admission, outbound
     /// dials, UDP ingest, and (when filter-incoming is on) inbound TCP.
     /// Bogus/unroutable space is always rejected regardless of this toggle.
@@ -1587,6 +1632,13 @@ pub struct AppSettings {
     /// "history is saved" behavior.
     #[serde(default = "default_true")]
     pub save_search_history: bool,
+    /// Where deleting a file sends it — the Library's Delete and a finished
+    /// download's Cancel: false (the default) moves it to the Recycle Bin /
+    /// Trash, true deletes it outright. Turning it on takes a native
+    /// confirmation in `update_settings`, so a compromised webview cannot
+    /// switch it on and then wipe shared folders for good through Delete.
+    #[serde(default)]
+    pub delete_permanently: bool,
     /// Whether the first-time setup wizard has been completed
     #[serde(default)]
     pub setup_complete: bool,
@@ -2531,10 +2583,12 @@ impl Default for AppSettings {
             stun_keepalive_enabled: true,
             obfuscation_enabled: true,
             ip_filter_enabled: true,
+            ip_filter_auto_update: true,
             filter_incoming_connections: false,
             allow_shared_files_browse: false,
             web_services: default_web_services(),
             download_categories: Vec::new(),
+            download_category_folders: std::collections::BTreeMap::new(),
             block_private_ips: true,
             filter_servers_by_ip: true,
             add_servers_from_server: true,
@@ -2566,6 +2620,7 @@ impl Default for AppSettings {
             max_download_file_size_gib: default_max_download_file_size_gib(),
             search_timeout_secs: default_search_timeout_secs(),
             save_search_history: true,
+            delete_permanently: false,
             setup_complete: false,
             default_shared_folder_seeded: false,
             settings_revision: 0,

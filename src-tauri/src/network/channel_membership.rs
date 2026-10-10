@@ -539,6 +539,18 @@ pub(super) async fn maybe_publish_channel_presence(
         let mut channel_pubkey = [0u8; 32];
         channel_pubkey.copy_from_slice(&pk_bytes);
         let private = ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE;
+        // Nor the newest epoch we hold, when the room has moved past it: a
+        // member behind the room's key, or a recovered room of ours still
+        // fetching its key back, would announce itself under a key only the
+        // evicted can read. Looked at again after a retry interval rather than
+        // left due, where it would take one of this tick's slots every tick.
+        if private && private_room_key_behind(db, &ch) {
+            let _ = db.touch_channel_presence(
+                &channel_id_hex,
+                now - ember::channel::PRESENCE_REPUBLISH_SECS + ember::channel::PRESENCE_RETRY_SECS,
+            );
+            continue;
+        }
         // The current epoch, not the `join_secret` column: a private room's
         // presence extra is sealed with the content key, and publishing it under
         // a retired epoch would leave an evicted member able to enumerate the
@@ -682,6 +694,13 @@ pub(super) async fn publish_channel_departures(
             let _ = db.clear_channel_departure(&channel_id_hex);
             continue;
         };
+        // Behind the room's key, our presence was never readable under the key
+        // members look at now, so there is nothing for a notice to retract —
+        // and one sealed under the key we do hold would only reach the evicted.
+        if ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE && private_room_key_behind(db, &ch) {
+            let _ = db.clear_channel_departure(&channel_id_hex);
+            continue;
+        }
         // The epoch the room is on now, not the one we left under: the presence
         // key is derived from it, and members are only looking at the current
         // one.
@@ -728,6 +747,78 @@ pub(super) async fn publish_channel_departures(
         });
         drive_ember_publish(socket, state, publish_id).await;
     }
+    publish_owed_channel_departures(socket, state, db, &nickname, identity, &signing, now).await;
+}
+
+/// Leave notices owed for rooms whose row is already gone: forgotten after a
+/// leave that had not landed, or destroyed by their owner. The room's key was
+/// captured when the notice became owed (see
+/// `Database::owed_channel_departures`); otherwise retried exactly like the
+/// in-room notices above.
+async fn publish_owed_channel_departures(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    nickname: &str,
+    identity: &crate::storage::identity::NodeIdentity,
+    signing: &ed25519_dalek::SigningKey,
+    now: i64,
+) {
+    let Ok(owed) = db.owed_channel_departures(now) else {
+        return;
+    };
+    for departure in owed.into_iter().take(2) {
+        let Ok(cid) = hex::decode(&departure.channel_id)
+            .map_err(|_| ())
+            .and_then(|b| <[u8; 16]>::try_from(b).map_err(|_| ()))
+        else {
+            let _ = db.clear_owed_channel_departure(&departure.channel_id);
+            continue;
+        };
+        let retry_at = now + ember::channel::PRESENCE_RETRY_SECS;
+        if !db
+            .claim_owed_channel_departure(&departure.channel_id, retry_at)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let record = ember::dht::publish::SignedRecord::channel_presence_departure(
+            nickname,
+            cid,
+            departure.channel_pubkey,
+            &departure.join_secret,
+            departure.private,
+            ember::channel::presence_epoch(now),
+            &identity.noise_public_key,
+            signing,
+        );
+        let Some(publish_id) = start_own_channel_publish(state, record) else {
+            continue;
+        };
+        let (tx, rx) = oneshot::channel();
+        state.ember_dht_pending_publishes.insert(publish_id, tx);
+        let retry_db = db.clone();
+        let retry_id = departure.channel_id.clone();
+        tokio::spawn(async move {
+            if rx.await.is_ok_and(|result| result.stored_on > 0) {
+                let _ = retry_db.clear_owed_channel_departure(&retry_id);
+            }
+        });
+        drive_ember_publish(socket, state, publish_id).await;
+    }
+}
+
+/// A private room whose current key this device does not hold yet: the owner
+/// has announced a newer epoch than the newest held, or this is a recovered
+/// room of ours still fetching its key back. A failed read counts as behind.
+fn private_room_key_behind(db: &Database, ch: &crate::storage::database::StoredChannel) -> bool {
+    if ch.visibility != ember::channel::CHANNEL_KIND_PRIVATE {
+        return false;
+    }
+    ch.key_epoch_wanted > ch.key_epoch
+        || db
+            .channel_owner_key_pending(&ch.channel_id)
+            .map_or(true, |pending| pending.is_some())
 }
 
 /// A room's identity and reading keys, as the packet paths need them.

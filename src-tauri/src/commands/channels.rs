@@ -622,6 +622,13 @@ fn sanitize_welcome(welcome: &str) -> Result<String, String> {
     Ok(truncate_bytes(cleaned, CHANNEL_WELCOME_MAX))
 }
 
+fn message_too_long() -> String {
+    coded(
+        "channels_message_size_invalid",
+        "Message must be between 1 and 4096 bytes",
+    )
+}
+
 fn truncate_bytes(s: String, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s;
@@ -1102,6 +1109,11 @@ pub async fn join_channel(
                 "This channel has been deleted",
             ));
         }
+        // The invite's key is not taken for a room already held. An invite is
+        // unauthenticated, nothing signed commits to an epoch's key, and the
+        // store keeps the first key it is given for an epoch: a crafted invite
+        // would have this device seal under a key its author reads, and block
+        // the genuine one when it arrived.
         // Local rows already know `deleted`. A directory round-trip here made
         // re-entry wait on Rendezvous even though membership is local.
         return enter_stored_channel(&state, &channel_id_hex, &username).await;
@@ -1318,7 +1330,19 @@ pub(crate) async fn enter_stored_channel(
         private,
         key_epoch: row.key_epoch.max(0) as u64,
     };
-    publish_join_presence(state, &invite, username).await;
+    // Inside, but silent, while this device is behind the room's key: presence
+    // sealed under an older key only reaches the members a rotation evicted.
+    // Being inside is still what sends the key-epoch loop looking, and the
+    // presence loop announces us once the key is here.
+    if private && private_room_key_behind(state, &row).await {
+        let _ = state
+            .network_tx
+            .try_send(NetworkCommand::RefreshChannelMembers {
+                channel_id: invite.channel_id,
+            });
+    } else {
+        publish_join_presence(state, &invite, username).await;
+    }
     let db = state.db.clone();
     let id = channel_id.to_string();
     let our_pk = hex::encode(state.identity.ed25519_public_key);
@@ -1339,6 +1363,25 @@ pub(crate) async fn enter_stored_channel(
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_join_failed", "Failed to join channel", e))?;
     Ok(refreshed)
+}
+
+/// A private room whose current key this device does not hold yet: the owner
+/// has announced a newer epoch, or this is a recovered room of ours still
+/// fetching its key back. A failed read counts as behind.
+async fn private_room_key_behind(state: &AppState, row: &StoredChannel) -> bool {
+    if row.visibility != CHANNEL_KIND_PRIVATE {
+        return false;
+    }
+    if row.key_epoch_wanted > row.key_epoch {
+        return true;
+    }
+    let db = state.db.clone();
+    let id = row.channel_id.clone();
+    tokio::task::spawn_blocking(move || db.channel_owner_key_pending(&id))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .is_none_or(|pending| pending.is_some())
 }
 
 async fn publish_join_presence(state: &AppState, invite: &ChannelInvite, username: &str) {
@@ -1397,12 +1440,14 @@ pub async fn leave_channel(
     }
     if let Ok(bytes) = hex::decode(&channel_id) {
         if let Ok(id) = <[u8; 16]>::try_from(bytes.as_slice()) {
-            let _ = state
-                .network_tx
-                .try_send(NetworkCommand::DropChannelTransfers {
+            let _ = crate::commands::errors::bounded_send(
+                &state.network_tx,
+                NetworkCommand::DropChannelTransfers {
                     channel_id: id,
                     member: None,
-                });
+                },
+            )
+            .await;
             // Tell the room now, on the mesh, rather than leaving everyone to
             // notice we stopped beating. The DHT tombstone below is the copy
             // that reaches members who are offline at this moment; this is the
@@ -1534,6 +1579,17 @@ pub async fn delete_owned_channel(
     // instead of signing a fresh record for the room straight after it. Taken
     // after the registry call, which can wait seconds on the network.
     let _snapshot = moderation_lock().lock().await;
+    // Best effort on the mesh, ahead of the purge that takes the key it is
+    // sealed with. The DHT notice the tombstone leaves owed is the one that
+    // is retried until it lands.
+    if owned.row.in_room_now() {
+        let _ = state
+            .network_tx
+            .try_send(NetworkCommand::AnnounceChannelPresence {
+                channel_id: owned.channel_id,
+                departed: true,
+            });
+    }
     let db = state.db.clone();
     let id = channel_id.clone();
     tokio::task::spawn_blocking(move || db.tombstone_channel(&id))
@@ -1542,12 +1598,14 @@ pub async fn delete_owned_channel(
         .map_err(|e| coded_ctx("channels_delete_failed", "Failed to delete the room", e))?;
     if let Ok(bytes) = hex::decode(&channel_id) {
         if let Ok(id) = <[u8; 16]>::try_from(bytes.as_slice()) {
-            let _ = state
-                .network_tx
-                .try_send(NetworkCommand::DropChannelTransfers {
+            let _ = crate::commands::errors::bounded_send(
+                &state.network_tx,
+                NetworkCommand::DropChannelTransfers {
                     channel_id: id,
                     member: None,
-                });
+                },
+            )
+            .await;
         }
     }
     Ok(())
@@ -1700,6 +1758,7 @@ pub async fn set_channel_focus(
     state: tauri::State<'_, AppState>,
     channel_id: Option<String>,
 ) -> Result<(), String> {
+    require_ember(&state).await?;
     let parsed = match channel_id {
         Some(id) => Some(channel_id_bytes(&parse_channel_id(&id)?)?),
         None => None,
@@ -1747,7 +1806,10 @@ pub async fn search_channel_messages(
 ) -> Result<Vec<ChannelMessageInfo>, String> {
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
-    let needle = crate::security::sanitize_chat_text(&query);
+    // A query past the line cap cannot match any line, which is held to it.
+    let Some(needle) = crate::security::sanitize_outgoing_message_text(&query) else {
+        return Ok(Vec::new());
+    };
     if needle.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -1786,7 +1848,7 @@ pub async fn edit_channel_message(
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
     let channel_id_bytes = channel_id_bytes(&channel_id)?;
-    let sanitized = crate::security::sanitize_chat_text(&message);
+    let sanitized = crate::security::sanitize_outgoing_message_text(&message).ok_or_else(message_too_long)?;
     // The reply reference is re-attached below from the stored line, never taken
     // from what was typed.
     let cleaned = channel::strip_reply_trailers(&sanitized).to_string();
@@ -2192,6 +2254,7 @@ pub async fn send_channel_typing(
     channel_id: String,
     typing: bool,
 ) -> Result<(), String> {
+    require_ember(&state).await?;
     let channel_id = channel_id_bytes(&parse_channel_id(&channel_id)?)?;
     let _ = state
         .network_tx
@@ -2311,7 +2374,9 @@ pub async fn send_channel_message(
             "Chat history is locked; restore the key file to send",
         ));
     }
-    let sanitized = crate::security::sanitize_chat_text(&message);
+    // Refused rather than cut: a line past the cap used to be truncated to its
+    // first 4096 characters and sent as though that were what was typed.
+    let sanitized = crate::security::sanitize_outgoing_message_text(&message).ok_or_else(message_too_long)?;
     // A trailer pasted in with copied text would otherwise make this a reply to
     // whatever the copied line answered.
     let cleaned = channel::strip_reply_trailers(&sanitized).to_string();
@@ -4163,12 +4228,14 @@ async fn apply_local_mod_ban(
     // its own frame — so without this the moderator who evicted somebody was the
     // one member still uploading to them.
     if banned {
-        let _ = state
-            .network_tx
-            .try_send(NetworkCommand::DropChannelTransfers {
+        let _ = crate::commands::errors::bounded_send(
+            &state.network_tx,
+            NetworkCommand::DropChannelTransfers {
                 channel_id: channel_id_bytes,
                 member: Some(target),
-            });
+            },
+        )
+        .await;
     }
     Ok(())
 }
@@ -4226,7 +4293,7 @@ pub async fn rename_channel(
     }
     let channel_id = parse_channel_id(&channel_id)?;
     let name = sanitize_channel_name(&name)?;
-    let _snapshot = moderation_lock().lock().await;
+    let snapshot = moderation_lock().lock().await;
     let owned = load_owned_channel(&state, &channel_id).await?;
     if !owned.row.successor_id.is_empty() {
         return Err(coded(
@@ -4296,6 +4363,10 @@ pub async fn rename_channel(
     let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
     let url = rendezvous_url(&state).await;
     let seed = owned.ident.signing_key.to_bytes();
+    // Released across the registry round trip, as the ownership claim does:
+    // the lock serialises owner edits in every room, and this call can take
+    // seconds. Everything decided so far is re-read once it is retaken.
+    drop(snapshot);
     // A claim for a different name is refused by the registry, so only an
     // actual rename goes through the rename operation. A re-casing is still
     // a claim, which also keeps it working against a server without renames.
@@ -4322,6 +4393,23 @@ pub async fn rename_channel(
     };
     granted.map_err(|e| registry_fail(e, "channels_name_taken"))?;
 
+    // Retaken for the write and the commit, read afresh: other owner edits may
+    // have landed while the registry was being asked, and the snapshot below
+    // must carry them along with the new name.
+    let _snapshot = moderation_lock().lock().await;
+    let fresh = load_owned_channel(&state, &channel_id).await?;
+    let owned = OwnedChannel {
+        row: StoredChannel {
+            name: name.clone(),
+            renamed_at: stamp,
+            ..fresh.row.clone()
+        },
+        ..fresh
+    };
+    let bans = load_banned_pubkeys(&state, &channel_id).await?;
+    let mods = load_moderator_pubkeys(&state, &channel_id).await?;
+    let topic = owned.row.topic.clone();
+    let welcome = owned.row.welcome.clone();
     {
         let db = state.db.clone();
         let id = channel_id.clone();
@@ -4388,7 +4476,7 @@ pub async fn ban_channel_member(
             "You cannot ban yourself",
         ));
     }
-    let _snapshot = moderation_lock().lock().await;
+    let snapshot = moderation_lock().lock().await;
     let (row, is_owner, is_mod) = moderation_power(&state, &channel_id).await?;
     if !is_owner && !is_mod {
         return Err(coded(
@@ -4477,9 +4565,6 @@ pub async fn ban_channel_member(
         // matters twice over, because the snapshot carries the new epoch number
         // and that is how the remaining members learn to fetch it.
         rotate_and_commit(&state, &owned, &bans, &mods).await?;
-        if withdraws_nominee {
-            register_nominee_with_registry(&state, &owned, None, 0).await;
-        }
         // An offer still waiting on them would otherwise complete the moment
         // their ready reply arrived, handing the room to the person just
         // evicted from it.
@@ -4507,12 +4592,21 @@ pub async fn ban_channel_member(
             .map_err(|_| ())
             .and_then(|b| <[u8; 16]>::try_from(b).map_err(|_| ()))
         {
-            let _ = state
-                .network_tx
-                .try_send(NetworkCommand::DropChannelTransfers {
+            let _ = crate::commands::errors::bounded_send(
+                &state.network_tx,
+                NetworkCommand::DropChannelTransfers {
                     channel_id: id,
                     member: Some(pk),
-                });
+                },
+            )
+            .await;
+        }
+        // Outside the moderation lock, which every room shares: the withdrawal
+        // is already signed into the snapshot, and the owner loop re-sends
+        // the registry's copy if this round trip is lost.
+        if withdraws_nominee {
+            drop(snapshot);
+            register_nominee_with_registry(&state, &owned, None, 0).await;
         }
     } else {
         // The same ceiling the owner path enforces, reported the same way. A
@@ -4547,6 +4641,7 @@ pub async fn ban_channel_member(
         // Public rooms are exempt: their key is derived from a pubkey anyone
         // who found the room already has, so a ban there never claimed to take
         // reading rights away in the first place.
+        refuse_protected_ban_target(&state, &channel_id, &pk).await?;
         if row.visibility == CHANNEL_KIND_PRIVATE && !owner_is_present(&state, &row).await {
             return Err(coded(
                 "channels_ban_owner_offline",
@@ -4602,7 +4697,32 @@ pub async fn unban_channel_member(
         // member still holds a signed record saying is banned.
         reseal_current_epoch_to_member(&state, &owned, pk).await?;
     } else {
+        refuse_protected_ban_target(&state, &channel_id, &pk).await?;
         apply_local_mod_ban(&state, &row, pk, false).await?;
+    }
+    Ok(())
+}
+
+/// Refuse a moderator's ban or unban that only the owner may make: one naming
+/// the owner or another moderator, or one lifting a ban the owner signed. See
+/// [`Database::channel_ban_target_protected`]. A failed read refuses.
+async fn refuse_protected_ban_target(
+    state: &AppState,
+    channel_id: &str,
+    target: &[u8; 32],
+) -> Result<(), String> {
+    let db = state.db.clone();
+    let id = channel_id.to_string();
+    let target_hex = hex::encode(target);
+    let protected = tokio::task::spawn_blocking(move || db.channel_ban_target_protected(&id, &target_hex))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_moderation_failed", "Failed to load channel", e))?;
+    if protected {
+        return Err(coded(
+            "channels_ban_protected",
+            "Only the room's owner can change the ban on the owner, a moderator, or someone the owner banned",
+        ));
     }
     Ok(())
 }
@@ -4733,7 +4853,7 @@ pub async fn set_channel_successor_nominee(
             .unwrap_or(channel::CLAIM_AFTER_DAYS_DEFAULT)
             .clamp(channel::CLAIM_AFTER_DAYS_MIN, channel::CLAIM_AFTER_DAYS_MAX)
     };
-    let _snapshot = moderation_lock().lock().await;
+    let snapshot = moderation_lock().lock().await;
     let owned = load_owned_channel(&state, &channel_id).await?;
     if nominee.is_some() {
         // Nominating somebody who is not in the room, or is banned from it,
@@ -4788,7 +4908,10 @@ pub async fn set_channel_successor_nominee(
     )
     .await?;
     // Only once the commit has landed: a registry told first would hold a
-    // nominee the room never had whenever the commit then refused.
+    // nominee the room never had whenever the commit then refused. Outside the
+    // moderation lock, which serialises every room and has nothing left to
+    // guard here; the owner loop re-sends the nominee if this one is lost.
+    drop(snapshot);
     register_nominee_with_registry(&state, &owned, nominee.as_ref(), u32::from(days)).await;
     channel_info_from_id(&state, &channel_id).await
 }
@@ -5436,7 +5559,23 @@ pub async fn gather_channels(
     if !deleted.is_empty() {
         let db = state.db.clone();
         let ids: Vec<String> = deleted.iter().cloned().collect();
-        let _ = tokio::task::spawn_blocking(move || db.walk_out_deleted_channels(&ids)).await;
+        let walked = tokio::task::spawn_blocking(move || db.walk_out_deleted_channels(&ids))
+            .await
+            .ok()
+            .and_then(|walked| walked.ok())
+            .unwrap_or_default();
+        // As leaving does: transfers in a room we just walked out of would keep
+        // serving, and offers from it stay acceptable, while every frame that
+        // could settle them is now dropped.
+        for id in walked {
+            if let Ok(channel_id) = <[u8; 16]>::try_from(hex::decode(&id).unwrap_or_default().as_slice()) {
+                let _ = crate::commands::errors::bounded_send(
+                    &state.network_tx,
+                    NetworkCommand::DropChannelTransfers { channel_id, member: None },
+                )
+                .await;
+            }
+        }
     }
 
     let mut walks: futures::stream::FuturesUnordered<_> = channel::all_index_keys()

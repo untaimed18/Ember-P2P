@@ -2,7 +2,7 @@ use tauri::Emitter;
 use tokio::sync::oneshot;
 
 use crate::app_state::AppState;
-use crate::commands::errors::{bounded_send, coded, coded_ctx};
+use crate::commands::errors::{await_reply, bounded_send, coded, coded_ctx};
 use crate::network::ed2k::hash;
 use crate::network::kad::publish::md4_bytes_to_kad_id;
 use crate::network::{NetworkCommand, SearchMethod};
@@ -858,6 +858,22 @@ pub async fn publish_note(
         // treat a slow KAD publish as a hard failure.
         Err(_) => Ok("search_note_publish_queued".to_string()),
     }
+}
+
+/// Continue the latest search, once it has finished, on the networks that can
+/// give more: the eD2K servers it did not reach, and the connected server's
+/// next pages when it said it had them. New results stream into the same
+/// `request_id`, and `search-complete` fires for it again when they are in.
+/// `started` is false when there is nothing left to ask, or the search is no
+/// longer the latest one.
+#[tauri::command]
+pub async fn search_more(
+    state: tauri::State<'_, AppState>,
+    request_id: u64,
+) -> Result<crate::network::SearchMoreOutcome, String> {
+    let (tx, rx) = oneshot::channel();
+    bounded_send(&state.network_tx, NetworkCommand::SearchMore { request_id, tx }).await?;
+    await_reply(rx, "search_more_failed", "Could not search for more results").await
 }
 
 #[tauri::command]

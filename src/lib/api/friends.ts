@@ -175,6 +175,8 @@ export interface IncomingFileOffer {
 
 /** Where a chat attachment is. See `network/chat_attach.rs` for who moves it. */
 export type ChatAttachmentStatus =
+  /** Sent while the friend could not be reached; offered once they can be. */
+  | 'queued'
   | 'offered'
   | 'awaiting'
   | 'accepted'
@@ -188,7 +190,9 @@ export type ChatAttachmentStatus =
   | 'unreachable'
   | 'source_gone'
   | 'failed'
-  | 'expired';
+  | 'expired'
+  /** Queued, but the friend was not reachable before it lapsed. */
+  | 'undelivered';
 
 /** One file sent in chat, in either direction. Also the `ember:attach-update`
  *  payload, so an event and a listed row can be merged by `xfer_id`. */
@@ -223,6 +227,7 @@ export const CHAT_ATTACHMENT_TERMINAL: ReadonlySet<ChatAttachmentStatus> = new S
   'source_gone',
   'failed',
   'expired',
+  'undelivered',
 ]);
 
 /**
@@ -292,9 +297,9 @@ export function parseChatAttachment(raw: unknown): ChatAttachment | null {
   if (!xfer_id || !user_hash) return null;
   if (r.direction !== 'sent' && r.direction !== 'received') return null;
   const statuses: ChatAttachmentStatus[] = [
-    'offered', 'awaiting', 'accepted', 'active', 'complete', 'declined',
+    'queued', 'offered', 'awaiting', 'accepted', 'active', 'complete', 'declined',
     'too_large', 'busy', 'not_allowed', 'cancelled', 'unreachable', 'source_gone', 'failed',
-    'expired',
+    'expired', 'undelivered',
   ];
   const status = statuses.find((s) => s === r.status);
   if (!status) return null;

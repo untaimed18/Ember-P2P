@@ -2138,7 +2138,7 @@ impl SearchManager {
         routing_table: &RoutingTable,
         cap: usize,
     ) -> Option<u32> {
-        let initial = routing_table.find_closest_prefer_verified(&target, K_BUCKET_SIZE);
+        let initial = routing_table.find_lookup_seeds(&target, K_BUCKET_SIZE);
         let id = self.alloc_id(cap)?;
         let search = IterativeSearch::new(id, SearchType::FindNode, target, vec![], initial);
         trace!("Starting FIND_NODE search {} for target {}", id, target);
@@ -2185,7 +2185,7 @@ impl SearchManager {
         routing_table: &RoutingTable,
         cap: usize,
     ) -> Option<u32> {
-        let initial = routing_table.find_closest_prefer_verified(&primary_key, K_BUCKET_SIZE);
+        let initial = routing_table.find_lookup_seeds(&primary_key, K_BUCKET_SIZE);
         let id = self.alloc_id(cap)?;
         let search = IterativeSearch::new(
             id,

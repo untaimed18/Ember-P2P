@@ -660,8 +660,11 @@
       ? crypto.randomUUID()
       : `${instanceId}-${Date.now()}-${myGen}`;
     const myRequestId = expectedRequestId;
+    // Generations restart at zero on every close, so only the request id says
+    // whether this is still the request on screen once the call returns.
     try {
       await browseFriend(hash, myRequestId);
+      if (expectedRequestId !== myRequestId) return;
       browseTimeout = setTimeout(() => {
         if (
           currentBrowseGen === myGen &&
@@ -673,11 +676,14 @@
             console.error('Failed to cancel friend browse:', e),
           );
           currentBrowseGen = 0;
+          // Already cancelled: closing the dialog must not cancel it again.
+          expectedRequestId = '';
         }
       }, 30_000);
     } catch (e: unknown) {
+      if (expectedRequestId !== myRequestId) return;
       failBrowse(translateError(e, m.browse_failed_to_browse()));
-      if (currentBrowseGen === myGen) currentBrowseGen = 0;
+      currentBrowseGen = 0;
     }
   }
 

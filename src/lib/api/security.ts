@@ -83,6 +83,24 @@ export async function downloadAndLoadIpfilter(): Promise<IpFilterApplyResult> {
   return invoke('download_and_load_ipfilter');
 }
 
+/** Where the installed IP filter came from and when. `fromDefault` is false
+ *  for a list installed from a file or another URL, which the automatic
+ *  updates leave alone. `updatedAt` is unix seconds, 0 when unknown. */
+export interface IpFilterUpdateInfo {
+  autoUpdate: boolean;
+  fromDefault: boolean;
+  updatedAt: number;
+}
+
+export async function getIpFilterUpdateInfo(): Promise<IpFilterUpdateInfo> {
+  return invoke('get_ip_filter_update_info');
+}
+
+/** The Auto-update switch: refresh the default list once it is a day old. */
+export async function setIpFilterAutoUpdate(enabled: boolean): Promise<void> {
+  return invoke('set_ip_filter_auto_update', { enabled });
+}
+
 /**
  * Download and load an ipfilter from a user-supplied URL.
  *

@@ -1093,7 +1093,7 @@
 
     <div class="download-box">
       <img src="icon.png" alt="" width="80" height="80">
-      <h3>Get Ember 1.7.2</h3>
+      <h3>Get Ember 1.7.3</h3>
       <p>The latest release is available on GitHub for Windows 10 and Windows 11, and for x86-64 Linux as a <code>.deb</code> or an AppImage.</p>
       <span class="download-meta">Windows installer &middot; Linux <code>.deb</code> / AppImage &middot; no extra runtimes</span>
       <div class="btn-group">
@@ -1865,6 +1865,83 @@ npm run tauri build -- --config '{"bundle":{"createUpdaterArtifacts":false}}'</c
   <section id="releases">
     <h2>Release History</h2>
     <p>Every Ember release, newest first. These are the same notes we publish on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
+
+    <article class="release" id="release-1-7-3">
+      <div class="release-header">
+        <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.7.3" target="_blank" rel="noopener">Ember v1.7.3</a></h3>
+        <time class="release-date" datetime="2026-10-10">October 10, 2026</time>
+      </div>
+      <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.7.3" target="_blank" rel="noopener"><code>v1.7.3</code></a></p>
+      <div class="release-notes">
+        <p>Your files get tidier: each category can have a folder of its own that finished downloads land in, Library files can be renamed in place, and cancelling a finished download deletes its file. Search can carry on past where a search stopped, files sent to a friend who is offline wait until they are back, and VPN and seedbox users can now join the Ember DHT. Full audits of Friends and Channels fixed idle friend connections that dropped every few minutes, room members who missed most of what was said while they were away, and moderators who could ban each other.</p>
+
+        <h4>Before you upgrade</h4>
+
+        <ul>
+          <li><strong>The Ember DHT wire version is unchanged at version 4,</strong> so 1.7.3, 1.7.2, 1.7.1, 1.7.0 and every 1.6 release see each other on the overlay normally</li>
+          <li><strong>Friends on 1.7.0 to 1.7.2 won&rsquo;t see your friends-only files</strong> when they browse you, until they update. Their builds keep the marking but cannot say so, and builds before 1.7.0 would share those files openly, so 1.7.3 lists them only to friends who say they understand it</li>
+          <li><strong>Idle connections to a friend on an older build can still drop.</strong> Once both of you run 1.7.3 they hold</li>
+          <li><strong>The Ember DHT no longer applies the IP filter.</strong> The default list blocks whole hosting and VPN networks, which kept their users out of Ember entirely. The filter still covers eD2K, Kad, transfers and room traffic</li>
+          <li><strong>The IP filter now updates itself</strong> once the bundled list is a day old. A list you installed from a file or another address is left alone, and ranges you added or removed are kept. It can be turned off under Security</li>
+          <li><strong>If you may go back to 1.7.1,</strong> set Max uploads to a number first: 1.7.1 reads Auto as one slot</li>
+        </ul>
+
+        <h4>What&rsquo;s New</h4>
+
+        <h5>Downloads and Library</h5>
+        <ul>
+          <li><strong>A category can have its own folder</strong> under Downloads, and downloads in it finish there. Changing a finished download&rsquo;s category moves its file, and the Library can move files into a category from the right-click menu. The categories dialog is redesigned</li>
+          <li><strong>Rename files in the Library</strong> from the right-click menu, <kbd>F2</kbd> or the file panel, without ever replacing another file. A finished download&rsquo;s Transfers entry follows it</li>
+          <li><strong>Cancel on a finished download deletes its file,</strong> from the row menu, the bulk bar or <kbd>Shift</kbd>+<kbd>Delete</kbd>. A new setting deletes files permanently instead of to the Recycle Bin</li>
+          <li><strong>The File Details window is redesigned,</strong> with chunk map, progress and availability cards, and Copy eD2K Link, Open Location and Rename beside Close</li>
+          <li><strong>A download&rsquo;s box is ticked only from the box,</strong> right-click acts on the ticked rows or the row you clicked, and a click away or <kbd>Esc</kbd> lets go of the highlighted download</li>
+          <li><strong>The Library</strong> gains a menu on sidebar folders and Unshare and Delete in the file panel</li>
+        </ul>
+
+        <h5>Search</h5>
+        <ul>
+          <li><strong>Search More</strong> carries on a finished search: it asks the eD2K servers the search never reached, and the connected server for its next pages, adding new results to the same tab</li>
+          <li><strong>Menu submenus open on hover</strong> in Search and Transfers, and results no longer flash on returning to the page</li>
+        </ul>
+
+        <h5>Friends</h5>
+        <ul>
+          <li><strong>Files sent to a friend who is offline wait for them.</strong> They are offered when the friend is back, with the usual prompt or auto-accept, survive restarts, can be cancelled, and are marked undelivered after 7 days</li>
+        </ul>
+
+        <h5>Ember network</h5>
+        <ul>
+          <li><strong>VPN and seedbox users can join the Ember DHT,</strong> which settles faster on a small network and publishes to the nodes that accept a record on a large one</li>
+          <li><strong>The Ember page shows Ember relaying:</strong> how many firewalled users you relay for, or whether you are using or looking for a relay. New counters show where peers are turned away</li>
+          <li><strong>Max uploads Auto is a switch,</strong> and opens more slots while your upload has room to spare</li>
+        </ul>
+
+        <h5>Rooms</h5>
+        <ul>
+          <li><strong>A member who was away catches up on the whole backlog,</strong> not just the newest lines</li>
+          <li><strong>Moderators cannot ban each other</strong> or lift the owner&rsquo;s bans</li>
+          <li><strong>Slow mode says when you can send again</strong></li>
+        </ul>
+
+        <h4>What&rsquo;s Fixed</h4>
+
+        <ul>
+          <li><strong>Idle friend connections dropped every few minutes,</strong> and closing Browse disconnected the friend. Both now hold</li>
+          <li><strong>An unverified friend request could act like a friend:</strong> show as online, or count as acceptance when you added them. A friend could also claim another user&rsquo;s eD2K user hash as their own. Friend requests and file offers are now rate limited</li>
+          <li><strong>A friend downloading your friends-only files</strong> could be banned as a hash prober</li>
+          <li><strong>Room messages could be dropped or replayed:</strong> a forged copy could get a genuine message thrown away, old messages and moderator actions were relayed again, and reaction floods were not limited</li>
+          <li><strong>A room file changed after it was offered</strong> could still be sent. It now fails as &ldquo;source gone&rdquo;</li>
+          <li><strong>Leaving Settings asks once about restarting,</strong> instead of on every port change, and the Max uploads box no longer flashes while it saves</li>
+          <li><strong>Search and Library fixes:</strong> Search Again dropping a tab, filters and selection lost on return, hashing Stop and Resume, keyboard shortcuts firing through menus, and bulk delete</li>
+          <li><strong>Ember DHT searches</strong> no longer wait on peers that never answer</li>
+        </ul>
+
+        <p class="full-changelog">
+          <strong>Full Changelog</strong>
+          <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.7.2...v1.7.3" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.7.2...v1.7.3</a>
+        </p>
+      </div>
+    </article>
 
     <article class="release" id="release-1-7-2">
       <div class="release-header">

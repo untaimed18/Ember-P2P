@@ -59,23 +59,36 @@ pub(super) async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkSt
         } = query;
         // The shortlist is not the routing table, and its contents arrive
         // straight out of a peer's `FOUND_NODE`. The table refuses an address
-        // the user blocked, but a search dialled its own shortlist directly, so
-        // a peer could name any IPv4 address it liked — a blocked range,
-        // special-use space, or a third party — and have us open unsolicited
-        // Noise handshakes to it. Getting into the top of the shortlist is
-        // cheap, since the node id is the attacker's to choose. Every other
-        // Ember dial path already consults this gate.
+        // its IP policy blocks, but a search dialled its own shortlist
+        // directly, so a peer could name any IPv4 address it liked —
+        // special-use space, a LAN under `block_private_ips`, or a banned
+        // host — and have us open unsolicited Noise handshakes to it. Getting
+        // into the top of the shortlist is cheap, since the node id is the
+        // attacker's to choose. Every other Ember dial path already consults
+        // this gate.
         //
-        // `definitely_blocked`, not `!admits_addr`: the latter is fail-*closed*
-        // while `ipfilter.dat` is still parsing, and Ember addresses are never
-        // Kad seeds, so during that window it refuses every peer — which would
-        // have made a search on any node with the filter enabled retire its
-        // whole shortlist without dialling anyone. "Known bad" is the right
-        // question for whether to dial; the routing table draws the same
-        // distinction for admission versus eviction.
-        if state.ember_dht.routing().definitely_blocked(&contact.addr)
-            || ember_addr_banned(state, contact.addr)
-        {
+        // A session peer is judged as every other session dial is, by
+        // `ember_addr_ip_verdict`: a LAN address an eD2K session introduced is
+        // allowed under `block_private_ips`, and bans still apply. The table's
+        // gate refuses it outright — which is the reason the peer is held as a
+        // session contact and pinned onto value searches in the first place —
+        // so judging the pin by that gate meant it was never asked.
+        let session_peer = match contact.addr.ip() {
+            IpAddr::V4(v4) => state
+                .ember_session_dht_contacts
+                .contains_key(&(v4, contact.addr.port())),
+            IpAddr::V6(_) => false,
+        };
+        let refused = if session_peer {
+            matches!(
+                ember_addr_ip_verdict(state, contact.addr),
+                EmberIpVerdict::Blocked | EmberIpVerdict::Banned
+            )
+        } else {
+            state.ember_dht.routing().definitely_blocked(&contact.addr)
+                || ember_addr_banned(state, contact.addr)
+        };
+        if refused {
             debug!(
                 "Ember search {search_id}: refusing to query {} — the IP policy blocks it",
                 contact.addr
@@ -281,6 +294,7 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
             // so a walk that reached nobody leaves the key queued rather than
             // pinning an empty target set for the whole TTL.
             if let Some(key) = state.ember_publish_target_lookups.remove(&search_id) {
+                note_ember_target_lookup_ended(state, key);
                 if contacts.is_empty() {
                     debug!(
                         "Ember DHT: target lookup for {} found nobody; keeping the table's answer",
@@ -302,12 +316,22 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
                         }
                     }
                     let now = chrono::Utc::now().timestamp();
-                    // IDs only — see `NetworkState::ember_publish_targets` for why
-                    // the addresses are deliberately not kept.
-                    let ids: Vec<ember::dht::EmberNodeId> =
-                        contacts.iter().map(|c| c.node_id).collect();
-                    let learned = ids.len();
-                    state.ember_publish_targets.insert(key, (ids, now));
+                    // Each answered this walk over a Noise session to the
+                    // address and key the shortlist holds, so that is what is
+                    // kept, stamped as heard from — the shortlist's copy of a
+                    // contact learned from `FOUND_NODE` never reads as verified.
+                    // See `NetworkState::ember_publish_targets` for how long an
+                    // address the table did not keep is trusted.
+                    let found: Vec<ember::dht::EmberContact> = contacts
+                        .into_iter()
+                        .map(|mut c| {
+                            c.last_seen = now;
+                            c.failed_queries = 0;
+                            c
+                        })
+                        .collect();
+                    let learned = found.len();
+                    state.ember_publish_targets.insert(key, (found, now));
                     debug!(
                         "Ember DHT: {learned} publish targets learned for {}",
                         hex::encode(key)

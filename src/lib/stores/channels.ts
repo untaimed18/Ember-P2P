@@ -737,20 +737,49 @@ let unreadRevision = 0;
  *  database. A global revision used to keep *every* room's local count when
  *  any one of them moved during a refresh — so a bump in room A left room B
  *  holding a stale badge (or hiding a new one) until the next clean fetch. */
-const unreadDirty = new Map<string, number>();
+const unreadDirty = new Map<string, UnreadChange>();
+
+/** The latest local unread change to a room, and whether a clear is among the
+ *  changes not yet taken from the database. */
+export interface UnreadChange {
+  rev: number;
+  cleared: boolean;
+}
 /** Bumped at the start of every `refreshChannels`. A later start invalidates
  *  an earlier snapshot so two overlapping fetches cannot apply out of order:
  *  the older one would see a dirty flag the newer one already consumed and
  *  write a stale unread back over a live bump. */
 let refreshGen = 0;
 
-function touchUnread(channelId: string): void {
+function touchUnread(channelId: string, cleared: boolean): void {
   unreadRevision++;
-  unreadDirty.set(channelId, unreadRevision);
+  unreadDirty.set(channelId, {
+    rev: unreadRevision,
+    cleared: cleared || (unreadDirty.get(channelId)?.cleared ?? false),
+  });
 }
 
-/** Apply a `list_channels` snapshot, keeping live unread only on rooms that
- *  were mutated locally while (or just before) that snapshot was in flight. */
+/**
+ * Rooms whose local unread should outlast a snapshot that started at
+ * `startRev`.
+ *
+ * A bump mirrors a row the database wrote before announcing it, so a snapshot
+ * begun after the bump already counts that line, and keeping the local count
+ * on top of it counted the line twice. A clear runs ahead of the mark-read it
+ * stands for, so a snapshot can still predate the write and has to give way
+ * to it either way.
+ */
+export function unreadIdsToPreserve(
+  dirty: ReadonlyMap<string, UnreadChange>,
+  startRev: number,
+): string[] {
+  return [...dirty]
+    .filter(([, change]) => change.rev > startRev || change.cleared)
+    .map(([id]) => id);
+}
+
+/** Apply a `list_channels` snapshot, keeping live unread only on the rooms
+ *  named in `dirtyIds`. */
 export function mergeChannelUnreadFromSnapshot(
   snapshot: ChannelInfo[],
   current: ChannelInfo[],
@@ -881,17 +910,29 @@ function toastXferConsent(channelId: string): void {
   );
 }
 
-/** Snapshot of transfers already in flight. Live rows win so an offer that
- *  arrived while this call was outstanding is not wiped. */
+/** Fold a `list_channel_transfers` snapshot into the live rows. A live row's
+ *  fields win, so an update that arrived while the call was outstanding is not
+ *  wound back, but a field only the snapshot carries — `risky` on an offer
+ *  announced without it — is kept rather than dropped with the rest. */
+export function mergeTransferSnapshot(
+  current: Readonly<Record<string, ChannelTransferInfo>>,
+  snapshot: readonly ChannelTransferInfo[],
+): Record<string, ChannelTransferInfo> {
+  const next: Record<string, ChannelTransferInfo> = { ...current };
+  for (const row of snapshot) {
+    const live = current[row.xfer_id];
+    next[row.xfer_id] = live ? { ...row, ...live } : row;
+  }
+  return next;
+}
+
+/** Snapshot of transfers already in flight; see `mergeTransferSnapshot`. */
 export async function mergeChannelTransfers(): Promise<void> {
   const epoch = storeEpoch;
   try {
     const list = await listChannelTransfers();
     if (epoch !== storeEpoch) return;
-    channelTransfers.update((cur) => ({
-      ...Object.fromEntries(list.map((t) => [t.xfer_id, t])),
-      ...cur,
-    }));
+    channelTransfers.update((cur) => mergeTransferSnapshot(cur, list));
   } catch (e) {
     console.warn('Channels: could not list transfers already in flight', e);
   }
@@ -1004,9 +1045,11 @@ async function refreshChannelsOnce(): Promise<void> {
   // then rolled it back. Keep the live count only on rooms that actually
   // moved; every other room takes the snapshot so a bump in one room cannot
   // freeze badges everywhere else.
-  channels.update((cur) => mergeChannelUnreadFromSnapshot(list, cur, unreadDirty.keys()));
-  for (const [id, rev] of [...unreadDirty]) {
-    if (rev <= startRev) unreadDirty.delete(id);
+  channels.update((cur) =>
+    mergeChannelUnreadFromSnapshot(list, cur, unreadIdsToPreserve(unreadDirty, startRev)),
+  );
+  for (const [id, change] of [...unreadDirty]) {
+    if (change.rev <= startRev) unreadDirty.delete(id);
   }
   carryPrefsToSuccessors(list);
   const keep = new Set(list.filter((channel) => !channel.deleted).map((channel) => channel.channel_id));
@@ -1041,12 +1084,18 @@ async function refreshChannelsOnce(): Promise<void> {
   }
 }
 
+/** Swap in a row a command handed back. The row was read at some point during
+ *  the command, which gives no revision to compare against, so local unread is
+ *  kept on any room still waiting to be reconciled. `member_count` stays the
+ *  roster's: commands that return a row change settings, not who is here. */
 export function replaceChannel(updated: ChannelInfo): void {
-  channels.update((list) =>
-    list.map((channel) =>
-      channel.channel_id === updated.channel_id ? updated : channel,
-    ),
-  );
+  channels.update((list) => {
+    const current = list.find((channel) => channel.channel_id === updated.channel_id);
+    if (!current) return list;
+    const [merged] = mergeChannelUnreadFromSnapshot([updated], [current], unreadDirty.keys());
+    const row = { ...merged, member_count: current.member_count };
+    return list.map((channel) => (channel.channel_id === updated.channel_id ? row : channel));
+  });
 }
 
 /** Insert or replace so join can open the room before `list_channels` returns. */
@@ -1088,6 +1137,10 @@ export function clearChannelUnread(channelId: string): void {
   if (get(channelUnreadMentions).includes(channelId)) {
     channelUnreadMentions.update((ids) => ids.filter((id) => id !== channelId));
   }
+  // Recorded even when the count is already 0: a refresh that started before
+  // the mark-read was saved can still land with the old count, and the clear
+  // has to outlast it. A plain map, so this feeds no effect.
+  touchUnread(channelId, true);
   channels.update((list) => {
     // Hand back the same array when there is nothing to clear. Allocating a
     // fresh one regardless re-invalidated every `$channels` reader, and
@@ -1097,7 +1150,6 @@ export function clearChannelUnread(channelId: string): void {
     if (!list.some((channel) => channel.channel_id === channelId && channel.unread !== 0)) {
       return list;
     }
-    touchUnread(channelId);
     return list.map((channel) =>
       channel.channel_id === channelId ? { ...channel, unread: 0 } : channel,
     );
@@ -1144,7 +1196,7 @@ export function bumpChannelUnread(channelId: string, mentionsMe = false): void {
       return list;
     }
     bumped = true;
-    touchUnread(channelId);
+    touchUnread(channelId, false);
     return list.map((channel) =>
       channel.channel_id === channelId
         ? { ...channel, unread: channel.unread + 1 }
@@ -1397,25 +1449,30 @@ export async function initChannelsStore() {
         peer_pubkey: string;
         name: string;
         size: number;
+        risky?: boolean;
       }>('ember:xfer-offer', (event) => {
         if (myEpoch !== storeEpoch) return;
         const p = event.payload;
         const channelId = validChannelId(p?.channel_id);
         const xferId = typeof p?.xfer_id === 'string' ? p.xfer_id : '';
         if (!channelId || !xferId) return;
-        channelTransfers.update((cur) => ({
-          ...cur,
-          [xferId]: {
-            xfer_id: xferId,
-            channel_id: channelId,
-            peer_pubkey: p.peer_pubkey,
-            direction: 'receive',
-            name: p.name,
-            size: p.size,
-            transferred: 0,
-            status: 'awaiting',
-          },
-        }));
+        const row: ChannelTransferInfo = {
+          xfer_id: xferId,
+          channel_id: channelId,
+          peer_pubkey: p.peer_pubkey,
+          direction: 'receive',
+          name: p.name,
+          size: p.size,
+          transferred: 0,
+          status: 'awaiting',
+        };
+        // Set only when sent: an absent key lets the snapshot's verdict through
+        // `mergeTransferSnapshot`, where an explicit undefined would hide it.
+        if (typeof p.risky === 'boolean') row.risky = p.risky;
+        channelTransfers.update((cur) => ({ ...cur, [xferId]: row }));
+        // Builds that announce offers without `risky` leave the warning to the
+        // snapshot, which always carries it.
+        if (row.risky === undefined) void mergeChannelTransfers();
         toastXferOffer(channelId, p.peer_pubkey);
       }),
     );

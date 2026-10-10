@@ -176,6 +176,10 @@ pub(super) fn reset_ed2k_server_session(state: &mut NetworkState, app_handle: &t
     // the next plan will not count on a co-share request either.
     state.server_followup_search = None;
     state.server_followup_due_at = None;
+    // A new session has no memory of the search that left pages unread.
+    if let Some(finished) = state.finished_search.as_mut() {
+        finished.server_has_more = false;
+    }
     state.low_id = false;
     state.server_client_id = 0;
     // A new connection (even to the same server) is a fresh session that

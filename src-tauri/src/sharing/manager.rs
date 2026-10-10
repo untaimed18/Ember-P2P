@@ -992,6 +992,7 @@ impl TransferManager {
             self.active.insert(id, transfer);
             return true;
         }
+        crate::storage::category_folders::note_category(&id, &transfer.category);
         // Keep Insufficient in `active` (eMule ResumeFileInsufficient) so
         // Resume finds the row, the orphan `.part` sweep knows the UUID,
         // and we never rewrite the status to Searching/Queued.
@@ -1173,10 +1174,23 @@ impl TransferManager {
     }
 
     /// Record the actual on-disk destination of a finished download so the
-    /// Open/Reveal commands can target it directly. Call this while the row is
-    /// still in `active`/`queue` (before [`complete`](Self::complete) moves it).
+    /// Open/Reveal commands can target it directly. At completion, call this
+    /// while the row is still in `active`/`queue` (before
+    /// [`complete`](Self::complete) moves it); a finished row takes it too, when
+    /// a category change has moved its file.
     pub fn set_completed_path(&mut self, id: &str, path: String) {
         if let Some(t) = self.get_transfer_mut(id) {
+            t.completed_path = Some(path);
+        }
+    }
+
+    /// A finished download's file was renamed in the Library: the row takes the
+    /// new name and place, so the Transfers page keeps pointing at the file.
+    /// ([`set_file_name`](Self::set_file_name) refuses finished rows, whose file
+    /// a rename of the *row* would desync; this is the rename of the file.)
+    pub fn follow_renamed_file(&mut self, id: &str, name: &str, path: String) {
+        if let Some(t) = self.get_transfer_mut(id) {
+            t.file_name = name.to_string();
             t.completed_path = Some(path);
         }
     }
@@ -1236,6 +1250,9 @@ impl TransferManager {
             }
             self.speed_history.remove(id);
             self.source_details.remove(id);
+            // Its file is already where it finished; a later category change
+            // must not reach a completion that is over.
+            crate::storage::category_folders::forget(id);
             return Some(self.promote_next());
         }
         None
@@ -2146,6 +2163,7 @@ impl TransferManager {
         self.controls.remove(id);
         self.speed_history.remove(id);
         self.source_details.remove(id);
+        crate::storage::category_folders::forget(id);
         if was_active {
             self.promote_next()
         } else {
@@ -2167,10 +2185,14 @@ impl TransferManager {
     }
 
     pub fn set_category(&mut self, id: &str, category: &str) {
+        // A download still to finish lands in the category's folder when it
+        // does; a finished one's file is moved by the command that called this.
         if let Some(transfer) = self.active.get_mut(id) {
             transfer.category = category.to_string();
+            crate::storage::category_folders::note_category(id, category);
         } else if let Some(transfer) = self.queued_mut(id) {
             transfer.category = category.to_string();
+            crate::storage::category_folders::note_category(id, category);
         } else if let Some(transfer) = self.completed.iter_mut().find(|t| t.id == id) {
             transfer.category = category.to_string();
         }

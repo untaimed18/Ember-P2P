@@ -62,6 +62,47 @@ const MAX_ACTIVE_FETCHES_PER_FRIEND: usize = 2;
 /// offering without the user answering gets "busy" rather than a growing list.
 const MAX_PENDING_PER_FRIEND: usize = 8;
 
+/// New offers one friend may make per [`NEW_OFFER_WINDOW_SECS`]. The pending
+/// cap alone does not bound them: a sender that cancels its own waiting offer
+/// frees the slot at once, and each offer leaves a row and a notification.
+/// Generous enough for a batch of photos.
+const MAX_NEW_OFFERS_PER_WINDOW: u32 = 40;
+const NEW_OFFER_WINDOW_SECS: i64 = 600;
+
+/// Per friend: the start of its current window and the offers in it. Only
+/// friends reach `on_offer`, so this holds at most one entry per friend.
+static NEW_OFFER_RATE: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<[u8; 16], (i64, u32)>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+fn admit_new_offer(friend: &[u8; 16], now: i64) -> bool {
+    let mut rate = NEW_OFFER_RATE.lock();
+    let (window_start, count) = rate.entry(*friend).or_insert((now, 0));
+    if now - *window_start >= NEW_OFFER_WINDOW_SECS {
+        *window_start = now;
+        *count = 0;
+    }
+    if *count >= MAX_NEW_OFFERS_PER_WINDOW {
+        return false;
+    }
+    *count += 1;
+    true
+}
+
+/// How long a file sent to a friend we cannot reach stays queued for them
+/// before it is given up as undelivered.
+const ATTACH_QUEUE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// Files one friend may have queued at once. The queue holds a readable path
+/// per file until it goes, so it is kept to what someone would plausibly
+/// line up for a friend who is away.
+const MAX_QUEUED_PER_FRIEND: usize = 20;
+
+/// Queued files offered to a friend at a time once they are back. The rest
+/// wait for answers: the friend's side refuses more than
+/// [`MAX_PENDING_PER_FRIEND`] unanswered offers as busy.
+const MAX_QUEUED_OFFERS_OUTSTANDING: usize = 4;
+
 /// How often a moving transfer tells the UI where it is.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -147,7 +188,7 @@ impl ChatAttachmentInfo {
 }
 
 /// Ended sends our user may offer again under the same transfer id.
-const RETRYABLE_SENT: &[&str] = &["failed", "unreachable", "busy", "expired"];
+const RETRYABLE_SENT: &[&str] = &["failed", "unreachable", "busy", "expired", "undelivered"];
 /// Ended receives our user may ask the sender to offer again. Only ones that
 /// broke after being accepted: the sender honours nothing else (see
 /// [`FRIEND_RETRYABLE_SENT`]), and anything else was refused or lapsed.
@@ -214,6 +255,7 @@ fn is_terminal(status: &str) -> bool {
             | "source_gone"
             | "failed"
             | "expired"
+            | "undelivered"
     )
 }
 
@@ -330,40 +372,69 @@ fn relayed() -> String {
     )
 }
 
+/// Whether a file can be offered to a friend right now.
+pub(super) enum OfferPath {
+    /// Yes, naming this QUIC port.
+    Now(u16),
+    /// Not yet, for this reason; it can wait in the queue until they can be
+    /// reached directly.
+    Later(String),
+}
+
 /// Everything that has to hold before a file can be offered, and our public
 /// QUIC port when it does. Asked once before the picker opens, so the user is
 /// not made to choose and hash a file that cannot go anywhere, and again with
 /// the offer itself, since the session can change in between.
 ///
-/// A relayed session is refused rather than tried. The recipient dials the
-/// address the session came from, and a relay leaves none — or only the one
-/// the session already failed to reach directly — so the offer would sit
-/// through every retry and end as a failure nobody could explain.
-pub(super) async fn offer_preflight(
+/// An error is something waiting cannot fix (chat with them is off); a friend
+/// we cannot reach directly yet is [`OfferPath::Later`].
+///
+/// A relayed session counts as not yet rather than being tried. The
+/// recipient dials the address the session came from, and a relay leaves
+/// none — or only the one the session already failed to reach directly — so
+/// the offer would sit through every retry and end as a failure nobody could
+/// explain.
+pub(super) async fn offer_path(
     state: &NetworkState,
     settings: &AppSettings,
     friend: &[u8; 16],
-) -> Result<u16, String> {
+) -> Result<OfferPath, String> {
     if !settings.chat_allowed_with(friend) {
         return Err(chat_off_error(settings));
     }
     if quic_endpoint(state).is_none() {
-        return Err(unavailable());
+        return Ok(OfferPath::Later(unavailable()));
     }
     let sessions = state.ember_sessions.read().await;
     let Some(session) = sessions
         .get(friend)
         .filter(|h| h.is_fresh() && h.is_secure_v2())
     else {
-        return Err(coded(
+        return Ok(OfferPath::Later(coded(
             "peers_attach_offline",
             "Your friend is offline. Files can only be sent while you are both connected.",
-        ));
+        )));
     };
     if session.is_relayed() {
-        return Err(relayed());
+        return Ok(OfferPath::Later(relayed()));
     }
-    quic_port_for(state, session.peer_addr()).ok_or_else(unavailable)
+    Ok(match quic_port_for(state, session.peer_addr()) {
+        Some(port) => OfferPath::Now(port),
+        None => OfferPath::Later(unavailable()),
+    })
+}
+
+/// [`offer_path`] for the paths that need to offer now and have no queue to
+/// fall back on.
+pub(super) async fn offer_preflight(
+    state: &NetworkState,
+    settings: &AppSettings,
+    friend: &[u8; 16],
+) -> Result<u16, String> {
+    match offer_path(state, settings, friend).await? {
+        OfferPath::Now(port) => Ok(port),
+        OfferPath::Later(why) => Err(why),
+    }
 }
 
 /// Why a file cannot go to a friend chat with whom is off: the global switch,
@@ -457,7 +528,9 @@ fn not_found() -> String {
 
 // --- Sending -----------------------------------------------------------------
 
-/// Record the grant for a file we are offering, then send the offer.
+/// Record the grant for a file we are offering, then send the offer — or, if
+/// the friend cannot be reached directly right now, queue it for when they
+/// can (see [`send_queued`]).
 ///
 /// The grant is written first on purpose. A recipient under its auto-accept
 /// ceiling answers and dials within milliseconds of the offer landing, and the
@@ -475,12 +548,15 @@ pub(super) async fn send_offer(
     size: u64,
     root: [u8; 32],
 ) -> Result<ChatAttachmentInfo, String> {
-    let quic_port = offer_preflight(state, settings, &friend).await?;
+    let path_now = offer_path(state, settings, &friend).await?;
     let offer = AttachOffer {
         xfer_id,
         size,
         root,
-        quic_port,
+        quic_port: match path_now {
+            OfferPath::Now(port) => port,
+            OfferPath::Later(_) => 0,
+        },
         name: name.clone(),
     };
     let body = attach::encode_attach_offer(&offer).ok_or_else(|| {
@@ -494,6 +570,9 @@ pub(super) async fn send_offer(
     let xfer_hex = hex::encode(xfer_id);
     let now = chrono::Utc::now().timestamp();
     let path_str = path.to_string_lossy().into_owned();
+    if let OfferPath::Later(why) = path_now {
+        return queue_offer(db, app, friend, &xfer_hex, &name, size, root, &path_str, now, &why);
+    }
     db.upsert_chat_attachment(
         &xfer_hex,
         &hex::encode(friend),
@@ -522,6 +601,129 @@ pub(super) async fn send_offer(
         crate::security::short_hash(&friend),
     );
     Ok(ChatAttachmentInfo::from_row(&row))
+}
+
+fn queue_full() -> String {
+    coded(
+        "peers_attach_queue_full",
+        "Too many files are already waiting for this friend to come online",
+    )
+}
+
+/// Record a file for a friend we cannot reach directly yet. Not a grant:
+/// `queued` is not on [`Database::chat_attachment_grant`]'s list, so nothing
+/// can read the path until [`send_queued`] turns it into a real offer.
+#[allow(clippy::too_many_arguments)]
+fn queue_offer(
+    db: &Arc<Database>,
+    app: &tauri::AppHandle,
+    friend: [u8; 16],
+    xfer_hex: &str,
+    name: &str,
+    size: u64,
+    root: [u8; 32],
+    path: &str,
+    now: i64,
+    why: &str,
+) -> Result<ChatAttachmentInfo, String> {
+    let friend_hex = hex::encode(friend);
+    let queued = db
+        .count_sent_chat_attachments(&friend_hex, "queued", now)
+        .map_err(|e| coded_ctx("peers_attach_failed", "Could not send that file", e))?;
+    if queued >= MAX_QUEUED_PER_FRIEND {
+        return Err(queue_full());
+    }
+    db.upsert_chat_attachment(
+        xfer_hex,
+        &friend_hex,
+        "sent",
+        name,
+        size,
+        &hex::encode(root),
+        Some(path),
+        "queued",
+        now,
+        now + ATTACH_QUEUE_TTL_SECS,
+    )
+    .map_err(|e| coded_ctx("peers_attach_failed", "Could not send that file", e))?;
+    let row = db.chat_attachment(xfer_hex).ok_or_else(not_found)?;
+    emit_row(app, &row);
+    info!(
+        "Chat attachment: queued {xfer_hex} ({size} bytes) for {} until they can be reached ({why})",
+        crate::security::short_hash(&friend),
+    );
+    Ok(ChatAttachmentInfo::from_row(&row))
+}
+
+/// Offer what is queued for `friend`, oldest first, if they can be reached
+/// directly now. A few at a time: the rest go as earlier ones are answered,
+/// since this runs again on every answer.
+///
+/// Run when a session with them comes up, on each answer to an offer, and
+/// periodically, so a session that only later becomes direct is noticed too.
+pub(super) async fn send_queued(
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app: &tauri::AppHandle,
+    settings: &AppSettings,
+    friend: [u8; 16],
+) {
+    let friend_hex = hex::encode(friend);
+    let now = chrono::Utc::now().timestamp();
+    let outstanding = db
+        .count_sent_chat_attachments(&friend_hex, "offered", now)
+        .unwrap_or(usize::MAX);
+    let room = MAX_QUEUED_OFFERS_OUTSTANDING.saturating_sub(outstanding);
+    if room == 0 {
+        return;
+    }
+    let Ok(queued) = db.queued_chat_attachments(&friend_hex, room) else {
+        return;
+    };
+    if queued.is_empty() || !matches!(offer_path(state, settings, &friend).await, Ok(OfferPath::Now(_))) {
+        return;
+    }
+    for xfer_hex in queued {
+        let Some(row) = db.chat_attachment(&xfer_hex) else {
+            continue;
+        };
+        let queue_expiry = db.chat_attachment_expiry(&xfer_hex);
+        let body = match offer_again_body(state, db, settings, &friend, &xfer_hex, &row).await {
+            Ok(body) => body,
+            Err(OfferAgainError::SourceGone(_)) => {
+                if db
+                    .reopen_chat_attachment(&xfer_hex, &["queued"], "source_gone", None)
+                    .unwrap_or(false)
+                {
+                    emit_by_id(app, db, &xfer_hex);
+                }
+                continue;
+            }
+            // The session changed under us: what is left waits for the next try.
+            Err(OfferAgainError::Other(_)) => return,
+        };
+        let offered = db
+            .reopen_chat_attachment(&xfer_hex, &["queued"], "offered", Some(now + ATTACH_OFFER_TTL_SECS))
+            .unwrap_or(false);
+        if !offered {
+            continue;
+        }
+        if send_ext(state, &friend, EMBER_EXT_ATTACH_OFFER, &body).await.is_err() {
+            // Back in the queue, with the time it had left.
+            let _ = db.set_chat_attachment_status(&xfer_hex, "queued", None, None);
+            if let Some(expiry) = queue_expiry {
+                let _ = db.set_chat_attachment_expiry(&xfer_hex, expiry);
+            }
+            emit_by_id(app, db, &xfer_hex);
+            return;
+        }
+        emit_by_id(app, db, &xfer_hex);
+        info!(
+            "Chat attachment: offered queued {xfer_hex} ({} bytes) to {}",
+            row.file_size,
+            crate::security::short_hash(&friend),
+        );
+    }
 }
 
 enum OfferAgainError {
@@ -654,6 +856,27 @@ pub(super) async fn retry(
     }
     let now = chrono::Utc::now().timestamp();
     if row.direction == "sent" {
+        if let OfferPath::Later(why) = offer_path(state, settings, &friend).await? {
+            // They cannot be reached right now: it waits for them like a
+            // first send would, rather than failing again.
+            if db.count_sent_chat_attachments(&row.friend_hash, "queued", now).unwrap_or(0)
+                >= MAX_QUEUED_PER_FRIEND
+            {
+                return Err(queue_full());
+            }
+            let queued = db
+                .reopen_chat_attachment(&xfer_hex, RETRYABLE_SENT, "queued", Some(now + ATTACH_QUEUE_TTL_SECS))
+                .map_err(|e| coded_ctx("peers_attach_failed", "Could not send that file", e))?;
+            if !queued {
+                return Err(not_found());
+            }
+            emit_by_id(app, db, &xfer_hex);
+            info!(
+                "Chat attachment: queued {xfer_hex} again for {} ({why})",
+                crate::security::short_hash(&friend),
+            );
+            return Ok(());
+        }
         return reoffer(
             state,
             db,
@@ -1090,6 +1313,17 @@ pub(super) async fn on_offer(
         on_reoffer(state, db, app, settings, friend, offer, peer_addr, row).await;
         return;
     }
+    // Ahead of the unreachable branch below, which also leaves a row and an
+    // event per offer.
+    let pending = state
+        .attach_inbound
+        .values()
+        .filter(|a| a.friend == friend)
+        .count();
+    if pending >= MAX_PENDING_PER_FRIEND || !admit_new_offer(&friend, now) {
+        let _ = send_ext(state, &friend, EMBER_EXT_ATTACH_REPLY, &refuse(AttachReply::Busy)).await;
+        return;
+    }
     // Only a race gets here — the sender refuses to offer over a relayed
     // session — but an offer with no address behind it can never be fetched,
     // so it is settled now rather than left for an Accept that cannot work.
@@ -1119,15 +1353,6 @@ pub(super) async fn on_offer(
             &attach::encode_attach_cancel(&xfer_id, AttachCancel::Unreachable),
         )
         .await;
-        return;
-    }
-    let pending = state
-        .attach_inbound
-        .values()
-        .filter(|a| a.friend == friend)
-        .count();
-    if pending >= MAX_PENDING_PER_FRIEND {
-        let _ = send_ext(state, &friend, EMBER_EXT_ATTACH_REPLY, &refuse(AttachReply::Busy)).await;
         return;
     }
     let Some(peer_pubkey) = session_pubkey(state, &friend).await else {
@@ -1972,7 +2197,9 @@ pub(super) async fn cancel(
     // without it has to be stoppable too.
     stop_local(state, settings, &xfer_id);
     let mut friend = [0u8; 16];
-    if cancelled && hex::decode_to_slice(&row.friend_hash, &mut friend).is_ok() {
+    // A queued file was never offered, so there is nothing to tell them.
+    let told = row.status != "queued";
+    if cancelled && told && hex::decode_to_slice(&row.friend_hash, &mut friend).is_ok() {
         // Best effort: an offline friend finds out when their side lapses.
         let _ = send_ext(
             state,
@@ -2045,6 +2272,7 @@ pub(super) fn forget_friend(state: &mut NetworkState, settings: &AppSettings, fr
         stop_local(state, settings, &xfer_id);
     }
     state.attach_auto_log.remove(friend);
+    NEW_OFFER_RATE.lock().remove(friend);
 }
 
 fn transfers_with(
@@ -2095,6 +2323,18 @@ pub(super) fn sweep_interrupted(db: &Database, download_folders: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_friend_can_only_make_so_many_new_offers_per_window() {
+        let friend = [0xA7u8; 16];
+        let now = 1_800_000_000;
+        for _ in 0..MAX_NEW_OFFERS_PER_WINDOW {
+            assert!(admit_new_offer(&friend, now));
+        }
+        assert!(!admit_new_offer(&friend, now + 1));
+        assert!(admit_new_offer(&[0xA8u8; 16], now), "another friend has its own budget");
+        assert!(admit_new_offer(&friend, now + NEW_OFFER_WINDOW_SECS), "and it comes back");
+    }
 
     #[test]
     fn only_addresses_that_can_be_a_peer_are_dialled() {

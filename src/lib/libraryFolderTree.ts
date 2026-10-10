@@ -20,6 +20,13 @@ export type LibraryFolderRow = {
   depth: number;
 };
 
+/** `path` without Windows' extended-length prefix (`\\?\C:\…`, `\\?\UNC\…`),
+ *  which a finished download is recorded with: split as it stood, its `?`
+ *  counted as a folder and pushed every folder under the share down a level. */
+function withoutVerbatimPrefix(path: string): string {
+  return path.replace(/^[\\/]{2}\?[\\/]UNC[\\/]/i, '\\\\').replace(/^[\\/]{2}\?[\\/]/, '');
+}
+
 function lastSegment(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).pop() || path;
 }
@@ -66,6 +73,10 @@ export function buildLibraryFolderTree(
   shares: string[],
   files: { path: string; size: number }[],
   normalize: (path: string) => string,
+  /** Folders to show even with nothing in them yet, such as download category
+   *  folders set up before anything finished there. Only those inside a
+   *  share appear, as any folder does. */
+  emptyFolders: string[] = [],
 ): LibraryFolderNode[] {
   const shareNodes: MutableNode[] = shares.map((path) => ({
     path,
@@ -96,9 +107,9 @@ export function buildLibraryFolderTree(
     node.count += 1;
     node.size += file.size;
 
-    const fileDirs = file.path.split(/[\\/]/).filter(Boolean);
+    const fileDirs = withoutVerbatimPrefix(file.path).split(/[\\/]/).filter(Boolean);
     fileDirs.pop();
-    const shareDirs = node.path.split(/[\\/]/).filter(Boolean);
+    const shareDirs = withoutVerbatimPrefix(node.path).split(/[\\/]/).filter(Boolean);
     if (fileDirs.length <= shareDirs.length) continue;
     const segments = fileDirs.slice(shareDirs.length);
 
@@ -121,6 +132,36 @@ export function buildLibraryFolderTree(
       }
       child.count += 1;
       child.size += file.size;
+      cursor = child;
+    }
+  }
+
+  for (const folder of emptyFolders) {
+    const folderNorm = normalize(folder);
+    const match = normalizedShares.find(
+      ({ norm }) => folderNorm === norm || folderNorm.startsWith(`${norm}/`),
+    );
+    if (!match) continue;
+    const { node } = match;
+    const folderDirs = withoutVerbatimPrefix(folder).split(/[\\/]/).filter(Boolean);
+    const shareDirs = withoutVerbatimPrefix(node.path).split(/[\\/]/).filter(Boolean);
+    let cursor = node;
+    let cursorPath = node.path;
+    for (const segment of folderDirs.slice(shareDirs.length)) {
+      cursorPath = joinUnder(cursorPath, segment);
+      const key = childKey(segment, caseInsensitive);
+      let child = cursor.children.get(key);
+      if (!child) {
+        child = {
+          path: cursorPath,
+          name: segment,
+          count: 0,
+          size: 0,
+          isShare: false,
+          children: new Map(),
+        };
+        cursor.children.set(key, child);
+      }
       cursor = child;
     }
   }

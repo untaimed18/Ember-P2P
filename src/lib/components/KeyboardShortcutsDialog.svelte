@@ -132,6 +132,7 @@
         { keys: [modifierKey, 'D'], label: () => m.shortcuts_library_clear_selection() },
         { keys: [modifierKey, 'C'], label: () => m.shortcuts_library_copy_links() },
         { keys: ['Enter'], label: () => m.shortcuts_library_open() },
+        { keys: ['F2'], label: () => m.shortcuts_library_rename() },
         { keys: ['Delete'], label: () => m.shortcuts_library_delete() },
         { keys: ['Space'], label: () => m.shortcuts_library_toggle_check() },
         { keys: ['↑ / ↓'], label: () => m.shortcuts_library_navigate() },
@@ -167,13 +168,13 @@
       title: () => m.shortcuts_section_transfers(),
       shortcuts: [
         { keys: ['↑ / ↓'], label: () => m.shortcuts_transfers_navigate() },
-        { keys: ['Shift', '↑ / ↓'], label: () => m.shortcuts_transfers_extend() },
         { keys: ['Home / End'], label: () => m.shortcuts_transfers_jump_ends() },
         { keys: [modifierKey, 'A'], label: () => m.shortcuts_transfers_select_all() },
         { keys: ['Space'], label: () => m.shortcuts_transfers_pause_resume() },
         { keys: [modifierKey, 'V'], label: () => m.shortcuts_transfers_paste_links() },
         { keys: ['F2'], label: () => m.shortcuts_transfers_rename() },
         { keys: ['Delete'], label: () => m.shortcuts_transfers_delete() },
+        { keys: ['Shift', 'Delete'], label: () => m.shortcuts_transfers_delete_files() },
       ],
     },
     {

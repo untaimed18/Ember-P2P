@@ -751,6 +751,27 @@ fn normalize_download_categories(names: &[String]) -> Vec<String> {
     kept
 }
 
+/// The category folders kept: one per category that exists — a built-in other
+/// than `None`, or one of `categories` — each folder cleaned by
+/// `category_folders::normalize_folder`, and none whose folder cleans to
+/// nothing. Removing a category therefore drops its folder with it.
+fn normalize_download_category_folders(
+    folders: &std::collections::BTreeMap<String, String>,
+    categories: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    folders
+        .iter()
+        .filter(|(category, _)| {
+            (BUILTIN_DOWNLOAD_CATEGORIES.contains(&category.as_str()) && category.as_str() != "None")
+                || categories.iter().any(|name| name == *category)
+        })
+        .filter_map(|(category, folder)| {
+            crate::storage::category_folders::normalize_folder(folder)
+                .map(|folder| (category.clone(), folder))
+        })
+        .collect()
+}
+
 fn clamp_assign<T: Ord + Copy>(value: &mut T, min: T, max: T) -> bool {
     let clamped = (*value).clamp(min, max);
     if clamped != *value {
@@ -910,6 +931,14 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
     let categories = normalize_download_categories(&settings.download_categories);
     if categories != settings.download_categories {
         settings.download_categories = categories;
+        changed = true;
+    }
+    let category_folders = normalize_download_category_folders(
+        &settings.download_category_folders,
+        &settings.download_categories,
+    );
+    if category_folders != settings.download_category_folders {
+        settings.download_category_folders = category_folders;
         changed = true;
     }
 
@@ -1497,6 +1526,10 @@ pub async fn update_settings(
     }
     settings.web_services = kept_services;
     settings.download_categories = normalize_download_categories(&settings.download_categories);
+    settings.download_category_folders = normalize_download_category_folders(
+        &settings.download_category_folders,
+        &settings.download_categories,
+    );
     // Not exposed in Settings UI — always keep friend sessions encrypted.
     settings.friend_session_encryption = true;
     // Ember overlay is always on. The Settings / Ember-page switches stay
@@ -1642,6 +1675,18 @@ pub async fn update_settings(
             added_web_services.len()
         );
     }
+    // Deleting for good instead of to the Recycle Bin is asked for natively,
+    // for the same reason web services are: the Recycle Bin is what keeps a
+    // compromised webview from wiping shared folders for good with a loop of
+    // Delete calls, so the renderer must not be able to switch it off alone.
+    // Declining keeps the bin and the rest of the save.
+    if settings.delete_permanently
+        && !old_settings.delete_permanently
+        && !confirm_permanent_delete(&app).await
+    {
+        settings.delete_permanently = false;
+        info!("Permanent delete was not turned on: the native confirmation was declined");
+    }
     let (removed_shared_folders, added_shared_folders) =
         shared_folder_changes(&old_settings.shared_folders, &settings.shared_folders);
     // Per-folder defaults, pending file intents, and page cursors have no
@@ -1680,15 +1725,30 @@ pub async fn update_settings(
             != normalized_path_components(std::path::Path::new(&old_settings.download_folder));
     if download_folder_changed {
         // Unfinished downloads stay where they are, so the folder they are in
-        // has to stay listed, and approved, until they are done.
+        // has to stay listed, and approved, until they are done. So does one
+        // holding a finished download the transfer list still shows, or its
+        // Open, Reveal and Cancel would lose the folder under it.
         let old_current = old_settings.download_folder.clone();
         let old_previous = old_settings.previous_download_folders.clone();
         let new_current = settings.download_folder.clone();
+        let finished_files: Vec<String> = {
+            let manager = state.transfer_manager.read().await;
+            manager
+                .completed
+                .iter()
+                .filter(|t| {
+                    t.direction == crate::types::TransferDirection::Download
+                        && t.status == crate::types::TransferStatus::Completed
+                })
+                .filter_map(|t| t.completed_path.clone())
+                .collect()
+        };
         settings.previous_download_folders = tokio::task::spawn_blocking(move || {
-            crate::storage::part_folders::previous_after_change(
+            crate::storage::part_folders::previous_after_change_keeping(
                 &old_current,
                 &old_previous,
                 &new_current,
+                &finished_files,
             )
         })
         .await
@@ -2228,6 +2288,7 @@ pub async fn download_ipfilter(
     }
 
     let byte_count = extracted.len();
+    crate::commands::security::note_ipfilter_installed(&data_dir, true).await;
 
     // Match the Security-page download: first-run wizard should leave the
     // filter enabled, not just drop a dormant file on disk.
@@ -3053,6 +3114,30 @@ async fn confirm_external_url(app: &tauri::AppHandle, validated: &str) -> bool {
             .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
                 "Open link".to_string(),
                 "Cancel".to_string(),
+            ))
+            .blocking_show()
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Ask, natively, before deleting files outright instead of to the Recycle
+/// Bin; see the gate in `update_settings`. False for a dismissed or closed
+/// dialog, so anything other than an explicit yes keeps the bin.
+async fn confirm_permanent_delete(app: &tauri::AppHandle) -> bool {
+    let prompt = "Files you delete from the Library, and finished downloads you cancel, will be deleted permanently instead of going to the Recycle Bin.\n\nThey cannot be recovered afterwards.".to_string();
+    let confirm_app = app.clone();
+    // `blocking_show` waits on the main thread to pump the dialog, so it
+    // cannot run on the command's own task; see `pick_download_folder`.
+    tokio::task::spawn_blocking(move || {
+        confirm_app
+            .dialog()
+            .message(prompt)
+            .title("Delete files permanently?")
+            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                "Delete permanently".to_string(),
+                "Keep using the Recycle Bin".to_string(),
             ))
             .blocking_show()
     })
@@ -4044,6 +4129,43 @@ mod tests {
 
         let many: Vec<String> = (0..MAX_DOWNLOAD_CATEGORIES + 3).map(|i| format!("Cat {i}")).collect();
         assert_eq!(normalize_download_categories(&many).len(), MAX_DOWNLOAD_CATEGORIES);
+    }
+
+    /// A folder belongs to a category that exists, built in or the user's,
+    /// and is cleaned like a file name. Removing a category takes its folder.
+    #[test]
+    fn category_folders_follow_the_categories_and_are_cleaned() {
+        let mut settings = AppSettings {
+            download_categories: vec!["TV Series".into()],
+            ..AppSettings::default()
+        };
+        for (category, folder) in [
+            ("TV Series", " TV: Series "),
+            ("Video", "Video/Films"),
+            ("None", "Elsewhere"),
+            ("Gone", "Gone"),
+            ("Audio", " .. "),
+        ] {
+            settings
+                .download_category_folders
+                .insert(category.into(), folder.into());
+        }
+        assert!(soft_repair_settings(&mut settings));
+        let kept: Vec<(&str, &str)> = settings
+            .download_category_folders
+            .iter()
+            .map(|(c, f)| (c.as_str(), f.as_str()))
+            .collect();
+        assert_eq!(kept, vec![("TV Series", "TV_ Series"), ("Video", "Video/Films")]);
+        assert!(!soft_repair_settings(&mut settings), "a clean map is left alone");
+
+        settings.download_categories.clear();
+        assert!(soft_repair_settings(&mut settings));
+        assert_eq!(
+            settings.download_category_folders.keys().collect::<Vec<_>>(),
+            vec!["Video"],
+            "the removed category's folder goes with it"
+        );
     }
 
     #[test]

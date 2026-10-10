@@ -74,6 +74,9 @@ pub(crate) struct EmberPublishPassStats {
     pub(crate) due: usize,
     /// How many of those the per-tick budget took.
     pub(crate) selected: usize,
+    /// Selected files held back for a target lookup; see
+    /// `ember_publish_awaits_lookup`.
+    pub(crate) awaiting_lookup: usize,
     pub(crate) flush: EmberFlushStats,
 }
 

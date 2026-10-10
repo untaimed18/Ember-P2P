@@ -56,7 +56,13 @@ gets in through, in rough order of who arrives first:
    pass of up to `EMBER_BRIDGE_FAST_MAX_PINGS` every
    `EMBER_BRIDGE_FAST_INTERVAL` off the 1 Hz search timer while the table is
    starved, and quiet above `EMBER_KAD_BRIDGE_UNTIL_CONTACTS`. Candidates the
-   IP filter or ban list refuses are skipped.
+   ban list or the private-IP setting refuses are skipped. The IP filter
+   (`ipfilter.dat`) is not consulted anywhere in the DHT: the default list
+   blocks whole hosting and VPN networks, and applying it kept those users out
+   of the overlay while hiding nothing, since every reachable node is listed
+   under the public rendezvous key. Room frames and EPX, which share the
+   transport, are still filtered after decryption, as are eD2K, KAD and
+   transfers.
 3. **eD2K client-to-client sessions.** Peers that advertise the Ember
    capability bit over a normal eD2K transfer are cached with their UDP
    port and bridged too, via Noise_XX when no static key is known. This is
@@ -311,7 +317,8 @@ unexercised end to end:
   The chain to walk, with the counter that shows each hop:
   `BUDDY_ENDORSE_REQ` → endorsement absorbed → `PROXY_STORE` sent
   (`ember_dht_buddy_publishes`) → accepted and fanned out by the buddy
-  (`ember_dht_buddy_forwards`, on the buddy) → `PROXY_STORE_ACK` → overlay
+  (`ember_dht_buddy_forwards`, on the buddy, whose `ember_dht_relaying_for`
+  then counts the publisher for `CALLBACK_CLIENT_TTL`) → `PROXY_STORE_ACK` → overlay
   `STORE` → searcher
   finds the record → `CALLBACK_REQ` (`ember_dht_callback_sent`) → buddy bounces
   `CALLBACK` (`ember_dht_callback_forwards`) → publisher connects back

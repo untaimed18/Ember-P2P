@@ -25,6 +25,7 @@
   } from '$lib/types';
   import { copyToClipboard, formatDurationSecs, formatNumber } from '$lib/utils';
   import { getLocale, translateError } from '$lib/i18n';
+  import { plural } from '$lib/plural';
   import { EMBER_DIAG_FAILURE_THRESHOLD } from '$lib/emberJoin';
   import { emberJoinTimedOut } from '$lib/stores/emberJoin';
   import { checkForUpdates, installUpdate, restartToUpdate, updater } from '$lib/stores/updater';
@@ -304,6 +305,33 @@
           : m.ember_dht_udp_unreachable_hint(),
   );
 
+  // The Network Status card's relay tile, in place of KAD's buddy. Reachable:
+  // the firewalled Ember users we are relaying for now. Firewalled: whether
+  // someone relays for us. Follows the reachability verdict, so the two agree.
+  let relayingFor = $derived(diag?.ember_dht_relaying_for ?? 0);
+  let emberRelayValue = $derived(
+    !diag
+      ? m.common_unknown()
+      : reachability === 'checking'
+        ? m.kad_checking()
+        : reachability === 'waiting_buddy'
+          ? m.ember_relay_looking()
+          : reachability === 'relayed'
+            ? m.ember_relay_using()
+            : relayingFor > 0
+              ? plural(relayingFor, {
+                  one: m.ember_relay_relaying_for_one,
+                  few: () => m.ember_relay_relaying_for_few({ count: formatNumber(relayingFor) }),
+                  other: () => m.ember_relay_relaying_for_other({ count: formatNumber(relayingFor) }),
+                })
+              : m.ember_relay_none(),
+  );
+  let emberRelayTitle = $derived(
+    reachability === 'waiting_buddy' || reachability === 'relayed'
+      ? m.ember_relay_firewalled_title()
+      : m.ember_relay_open_title(),
+  );
+
   // What a relayed user can do about it. Forwarding on the router does nothing
   // while traffic leaves through a VPN (the backend has stood UPnP down for
   // exactly that), and is no advice at all once UPnP has already forwarded
@@ -490,6 +518,12 @@
     { id: 'recall-ember-only', k: m.ember_stat_recall_ember_only(), v: formatNumber(diag?.ember_dht_recall_ember_only ?? 0) },
     { id: 'rate-limited', k: m.ember_stat_rate_limited(), v: formatNumber(diag?.ember_dht_rate_limited ?? 0) },
     { id: 'store-addr-ceiling', k: m.ember_stat_store_addr_ceiling(), v: formatNumber(diag?.ember_dht_store_addr_ceiling ?? 0) },
+    { id: 'udp-dropped-banned', k: m.ember_stat_udp_dropped_banned(), v: formatNumber(diag?.ember_udp_dropped_banned ?? 0) },
+    { id: 'udp-dropped-rate', k: m.ember_stat_udp_dropped_rate_limited(), v: formatNumber(diag?.ember_udp_dropped_rate_limited ?? 0) },
+    { id: 'udp-dropped-filtered', k: m.ember_stat_udp_dropped_filtered(), v: formatNumber(diag?.ember_udp_dropped_filtered ?? 0) },
+    { id: 'refused-ip-policy', k: m.ember_stat_refused_ip_policy(), v: formatNumber(diag?.ember_dht_refused_ip_policy ?? 0) },
+    { id: 'refused-subnet', k: m.ember_stat_refused_subnet(), v: formatNumber(diag?.ember_dht_refused_subnet ?? 0) },
+    { id: 'refused-per-ip', k: m.ember_stat_refused_per_ip(), v: formatNumber(diag?.ember_dht_refused_per_ip ?? 0) },
     ];
   });
 
@@ -716,7 +750,14 @@
   -->
   <section class="card">
     <h2>{m.kad_network_status()}</h2>
-    <NetworkStatusTiles />
+    <NetworkStatusTiles
+      relayTile={{
+        label: m.ember_relay_label(),
+        help: m.ember_relay_help(),
+        value: emberRelayValue,
+        title: emberRelayTitle,
+      }}
+    />
   </section>
 
   <!--

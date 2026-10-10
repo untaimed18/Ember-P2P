@@ -24,7 +24,9 @@
     friendLabel,
     friendNames,
     acceptIncomingFileOffer,
+    acceptingOffer,
     clearFileOffer,
+    offerKey,
   } from '$lib/stores/friends';
   import { appSettings } from '$lib/stores/settings';
   import { chatAllowedWith } from '$lib/friendSettings';
@@ -158,7 +160,6 @@
 
   let panelEl: HTMLDivElement | undefined = $state();
   let returnFocusEl: HTMLElement | null = null;
-  let acceptingOffer: string | null = $state(null);
   /** Chat is off with everyone: globally with no friend switched back on, or
    *  for every friend there is. One friend's own setting only takes them out
    *  of the list. */
@@ -547,20 +548,16 @@
   }
 
   async function acceptDockOffer(offer: (typeof pendingOffers)[number]) {
-    const key = `${offer.user_hash}:${offer.file_hash}`;
-    if (acceptingOffer) return;
-    acceptingOffer = key;
     try {
       const res = await acceptIncomingFileOffer(offer);
+      if (!res) return;
       toastSuccess(
-        res?.already_queued
+        res.already_queued
           ? m.search_already_queued_name({ name: offer.file_name })
           : m.friends_offer_accepted({ name: offer.file_name }),
       );
     } catch (e) {
       toastError(translateError(e));
-    } finally {
-      acceptingOffer = null;
     }
   }
 </script>
@@ -883,7 +880,7 @@
                 <button
                   type="button"
                   class="dock-offer-accept"
-                  disabled={acceptingOffer !== null}
+                  disabled={$acceptingOffer !== null}
                   onclick={() => void acceptDockOffer(offer)}
                 >{m.friends_offer_download()}</button>
                 <!-- Only the row being accepted is held: dismissing a
@@ -891,7 +888,7 @@
                 <button
                   type="button"
                   class="dock-offer-dismiss"
-                  disabled={acceptingOffer === `${offer.user_hash}:${offer.file_hash}`}
+                  disabled={$acceptingOffer === offerKey(offer.user_hash, offer.file_hash)}
                   onclick={() => clearFileOffer(offer.user_hash, offer.file_hash)}
                 >{m.common_dismiss()}</button>
               </div>

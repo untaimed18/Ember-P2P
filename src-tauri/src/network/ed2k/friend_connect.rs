@@ -493,6 +493,19 @@ pub async fn run_friend_session_over_transport(
     let mut session_shutdown = ember_session_handle.subscribe_shutdown();
     {
         let mut sessions = ember_sessions.write().await;
+        // Removal revokes only sessions it can find, and this one is not in
+        // the map yet; re-checked under the lock it is about to be inserted
+        // with, so a removal since the check above cannot be missed.
+        if !friend_hashes.read().await.contains(&peer_ember_hash) {
+            ember_session_handle.close();
+            drop(sessions);
+            drop(reader);
+            drop(writer);
+            anyhow::bail!(
+                "{} was removed while dialling",
+                crate::security::short_hash(&peer_ember_hash)
+            );
+        }
         // The user may have gone offline while this dial was in flight.
         // `KadDisconnect` closes and clears every session and reports every
         // friend offline, so inserting here afterwards would put a live one
@@ -570,8 +583,11 @@ pub async fn run_friend_session_over_transport(
     } else {
         addr.port()
     };
+    // A relayed session only exists because a direct dial to `addr` failed,
+    // so it says nothing about where the friend can be reached: reporting it
+    // would persist a dead address and reseed downloads there.
     let peer_v4 = match addr.ip() {
-        std::net::IpAddr::V4(v4) => v4,
+        std::net::IpAddr::V4(v4) if !relayed => v4,
         _ => std::net::Ipv4Addr::UNSPECIFIED,
     };
     // Tell the network task this friend is reachable now, not just once
@@ -638,8 +654,16 @@ pub async fn run_friend_session_over_transport(
         // window in steady state.
         const STALL_TIMEOUT: std::time::Duration =
             std::time::Duration::from_secs(KEEPALIVE_INTERVAL.as_secs() * 3);
-        let mut last_activity = tokio::time::Instant::now();
+        const SESSION_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+        // Keepalives are paced off our own writes only. Neither side answers a
+        // keepalive, so if inbound traffic also pushed ours back, the side that
+        // fired first would be the only sender on an idle link and its reader
+        // would starve into the peer's record timeout.
+        let mut last_outbound = tokio::time::Instant::now();
         let mut last_inbound = tokio::time::Instant::now();
+        // Set once the friend sends `EMBER_EXT_BROWSE_SCOPE_AWARE`; until then
+        // our browse answers to it leave friends-only files out.
+        let mut peer_scope_aware = false;
 
         // Dedicated reader task: reading an ed2k packet requires multiple
         // sequential awaits (protocol byte, length, opcode, payload). If the
@@ -647,8 +671,10 @@ pub async fn run_friend_session_over_transport(
         // stream. Spawning a reader task keeps the framing state private and
         // only surfaces whole packets (or errors) through a channel, which is
         // cancel-safe at the select! site.
+        // Shallow: each slot can hold a frame of up to 5 MB, and a friend
+        // sending faster than we handle them only needs backpressure.
         let (pkt_tx, mut pkt_rx) =
-            tokio::sync::mpsc::channel::<std::io::Result<(u8, u8, Vec<u8>)>>(8);
+            tokio::sync::mpsc::channel::<std::io::Result<(u8, u8, Vec<u8>)>>(2);
         let reader_task = tokio::spawn(async move {
             loop {
                 let res = read_packet_inner(&mut reader).await;
@@ -663,7 +689,7 @@ pub async fn run_friend_session_over_transport(
         });
 
         loop {
-            let keepalive = tokio::time::sleep_until(last_activity + KEEPALIVE_INTERVAL);
+            let keepalive = tokio::time::sleep_until(last_outbound + KEEPALIVE_INTERVAL);
             tokio::select! {
                 changed = session_shutdown.changed() => {
                     if changed.is_err() || *session_shutdown.borrow() {
@@ -685,14 +711,12 @@ pub async fn run_friend_session_over_transport(
                     };
                     match result {
                         Ok((proto, opcode, payload)) => {
-                            let now = tokio::time::Instant::now();
-                            last_activity = now;
                             // Even an OP_EMBER_KEEPALIVE (which we
                             // otherwise drop in the match below)
                             // counts as inbound liveness — that's
                             // exactly what the peer is signalling
                             // by sending it.
-                            last_inbound = now;
+                            last_inbound = tokio::time::Instant::now();
                             // Mirror the same liveness signal into the
                             // shared `ember_sessions` map so lookups from
                             // other tasks (command handlers, the
@@ -752,6 +776,7 @@ pub async fn run_friend_session_over_transport(
                                                 super::multi_source::browse_request_supports_v1(
                                                     &payload,
                                                 ),
+                                            supports_scope: peer_scope_aware,
                                         },
                                     }).await;
                                 }
@@ -1036,6 +1061,9 @@ pub async fn run_friend_session_over_transport(
                                                 },
                                             }).await;
                                         }
+                                        Some((super::messages::EMBER_EXT_BROWSE_SCOPE_AWARE, _)) => {
+                                            peer_scope_aware = true;
+                                        }
                                         // A sub-type this build predates. Ignoring
                                         // it is the whole point of the envelope.
                                         Some((other, _)) => debug!(
@@ -1066,13 +1094,16 @@ pub async fn run_friend_session_over_transport(
                     }
                 }
                 Some(outbound_data) = outbound_rx.recv() => {
-                    last_activity = tokio::time::Instant::now();
-                    if writer.write_all(&outbound_data).await.is_err() {
-                        warn!("Friend session write error to {addr}");
-                        break;
-                    }
-                    if writer.flush().await.is_err() {
-                        warn!("Friend session flush error to {addr}");
+                    last_outbound = tokio::time::Instant::now();
+                    // Bounded so a peer that stops reading cannot park this
+                    // loop, where shutdown and removal would go unnoticed.
+                    let wrote = tokio::time::timeout(SESSION_WRITE_TIMEOUT, async {
+                        writer.write_all(&outbound_data).await?;
+                        writer.flush().await
+                    })
+                    .await;
+                    if !matches!(wrote, Ok(Ok(()))) {
+                        warn!("Friend session write to {addr} failed or stalled");
                         break;
                     }
                 }
@@ -1099,11 +1130,16 @@ pub async fn run_friend_session_over_transport(
                         );
                         break;
                     }
-                    if write_packet(&mut writer, OP_EMULEPROT, OP_EMBER_KEEPALIVE, &[]).await.is_err() {
-                        warn!("Friend session keepalive to {addr} failed");
+                    let sent = tokio::time::timeout(
+                        SESSION_WRITE_TIMEOUT,
+                        write_packet(&mut writer, OP_EMULEPROT, OP_EMBER_KEEPALIVE, &[]),
+                    )
+                    .await;
+                    if !matches!(sent, Ok(Ok(_))) {
+                        warn!("Friend session keepalive to {addr} failed or stalled");
                         break;
                     }
-                    last_activity = tokio::time::Instant::now();
+                    last_outbound = tokio::time::Instant::now();
                 }
             }
         }
@@ -1242,6 +1278,14 @@ pub async fn connect_friend_with_fallback(
     // fallback below is a punch registration plus a relay ticket — minutes of
     // rendezvous round-trips whose only possible outcome is that same refusal.
     if user_offline.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(tcp_err);
+    }
+    // Failures no transport can fix. Removal mid-dial would otherwise also
+    // publish our address in a punch registration to someone we dropped.
+    if ed25519_pubkey.is_none()
+        || ed25519_secret_key.is_none()
+        || !friend_hashes.read().await.contains(&expected_ember_hash)
+    {
         return Err(tcp_err);
     }
     info!(
@@ -2050,16 +2094,10 @@ async fn try_complete_friend_punch(
     )
     .await
     {
+        // The streams are up, so the ack is housekeeping: a slow or failed one
+        // must not throw away a punch that worked.
         Ok((send, recv)) => {
-            crate::network::ember::relay::ack_punch(
-                rendezvous_url,
-                &our_ember_hash,
-                &info.punch_id,
-                &info.capability,
-                info.epoch,
-                secret_key,
-            )
-            .await?;
+            ack_observed_punch(rendezvous_url, &our_ember_hash, &info, secret_key).await;
             Ok((send, recv, peer_addr))
         }
         Err(error) => {

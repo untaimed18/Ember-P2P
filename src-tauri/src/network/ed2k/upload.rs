@@ -420,7 +420,11 @@ fn note_upload_refusal(path: &std::path::Path, allowed_roots: &[String], error: 
 /// harmless. Private content is the opposite: honouring a one-sided add there
 /// would let anyone who learns our Ember hash add us and read our friends-only
 /// library. So this additionally requires that the peer added us back.
+///
+/// Membership of both sets is required: removal clears the two separately, so
+/// a grant racing a removal can leave a stale mutual entry behind.
 async fn mutual_friend_access(
+    friend_hashes: &Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     mutual_friend_hashes: &Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     peer_ember_hash: Option<[u8; 16]>,
     secure_v2_authenticated: bool,
@@ -429,7 +433,11 @@ async fn mutual_friend_access(
         return false;
     }
     match peer_ember_hash {
-        Some(hash) => mutual_friend_hashes.read().await.contains(&hash),
+        Some(hash) => {
+            // Separate statements, so neither guard is held while taking the other.
+            let mutual = mutual_friend_hashes.read().await.contains(&hash);
+            mutual && friend_hashes.read().await.contains(&hash)
+        }
         None => false,
     }
 }
@@ -1371,6 +1379,11 @@ const CLIENT_TIMEOUT_SECS: u64 = 120;
 /// 150 queued peers where aMule reached ~400 on the same share and server
 /// (issue #111).
 const QUEUED_SOCKET_IDLE_SECS: u64 = 40;
+
+/// How often we send `OP_EMBER_KEEPALIVE` on an Ember friend session we own,
+/// counted from our previous keepalive. Matches the dialling side's interval in
+/// `friend_connect`, and is no more than half the secure stream's record timeout.
+const FRIEND_SESSION_KEEPALIVE_SECS: u64 = 90;
 /// One wall-clock budget covers transport discrimination, optional
 /// obfuscation/secure-stream negotiation, and receipt of the first complete
 /// eD2K frame.
@@ -2650,6 +2663,9 @@ pub enum UploadEventKind {
         session_id: u64,
         reply_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
         supports_ebr1: bool,
+        /// The session has sent `EMBER_EXT_BROWSE_SCOPE_AWARE`, so it will
+        /// honour friends-only markings. Without it, none are listed.
+        supports_scope: bool,
     },
     /// Incoming Ember browse response from a friend (outbound session).
     /// Each entry is `(ed2k_hash_hex, size, name, optional_aich_hash_hex, optional_ember_hex)`.
@@ -3303,6 +3319,83 @@ fn target_client_data_rate(open_slots: usize, min_datarate: bool) -> u64 {
     } else {
         full
     }
+}
+
+/// eMule's `AcceptNewClient` slot arithmetic, plus the part eMule lacks.
+///
+/// `observed_rate` is the smoothed upload speed and `configured_rate` the
+/// effective upload cap (0 = unlimited), both in bytes/s. `slot_rates` is each
+/// open slot's smoothed rate, sorted ascending. `max_slots` is the user's fixed
+/// maximum, or [`MAX_UP_CLIENTS_ALLOWED`] for Auto.
+///
+/// eMule bounds the slot count by two terms and refuses at whichever binds
+/// first (`UploadQueue.cpp:388`):
+///
+/// ```text
+/// observed throughput / GetTargetClientDataRate(true)   [target * 3/4]
+/// configured cap      / GetTargetClientDataRate(false)  [target]
+/// ```
+///
+/// The first divisor is three quarters of the target (`UploadQueue.cpp:408`);
+/// the second is waived for an unlimited cap (`UploadQueue.cpp:391`).
+///
+/// The observed term is self-reinforcing: slow peers mean low throughput, which
+/// computes few slots, which keeps throughput low. With a cap set, that left
+/// the uplink mostly idle at the four-slot floor. So while the uplink has
+/// headroom (under three quarters of the cap) and every open slot is already
+/// moving data, one more slot is allowed at a time, up to the cap term. Waiting
+/// for every slot to report a rate keeps a burst of arrivals from overshooting
+/// before the throughput average has caught up.
+///
+/// Slots that are slow because the uplink is full should not be diluted
+/// further, so the "median slot is starved" brake only applies when there is no
+/// headroom (or no cap to measure headroom against). Slow peers on an idle
+/// uplink are a reason to open more slots, not fewer.
+fn dynamic_slot_target(
+    active: usize,
+    max_slots: usize,
+    observed_rate: u64,
+    configured_rate: u64,
+    slot_rates: &[u64],
+) -> usize {
+    let effective_rate = if observed_rate > 0 || active > 0 {
+        observed_rate
+    } else {
+        configured_rate
+    };
+    if effective_rate == 0 {
+        return ADMISSION_FLOOR_SLOTS.min(max_slots);
+    }
+
+    let target_per_slot = target_client_data_rate(active, false);
+    let min_target = target_client_data_rate(active, true).max(1);
+    let from_observed = effective_rate / min_target;
+    let from_configured = if configured_rate > 0 {
+        configured_rate / target_per_slot
+    } else {
+        u64::MAX
+    };
+    let mut computed = from_observed
+        .min(from_configured)
+        .max(ADMISSION_FLOOR_SLOTS as u64);
+
+    let has_headroom = configured_rate > 0 && observed_rate < configured_rate / 4 * 3;
+    if has_headroom && slot_rates.len() >= active {
+        computed = computed.max((active as u64 + 1).min(from_configured));
+    }
+
+    let computed = (computed.min(usize::MAX as u64) as usize)
+        .min(MAX_UP_CLIENTS_ALLOWED)
+        .min(max_slots);
+
+    if active >= 2 && slot_rates.len() >= 2 && !has_headroom {
+        let median = slot_rates[slot_rates.len() / 2];
+        if median < target_per_slot / 2 && computed > active {
+            return active;
+        }
+    }
+
+    computed
 }
 
 /// eMule's `(minFragSize, doubleSendSize)` pair for a given uplink rate
@@ -5262,9 +5355,33 @@ impl UploadHandler {
     /// Nothing is charged while the friends-only catalog is still loading:
     /// every indexed file is refused to strangers alike until it lands, so
     /// those misses say nothing about the asker.
-    async fn note_unservable_file_request(&self, peer_ip: std::net::IpAddr, file_hash: [u8; 16]) {
+    ///
+    /// Nor for anything asked under the user hash of a mutual friend. A
+    /// friend's downloader dials plain eD2K first and only then escalates to
+    /// the secure transfer, so queueing a dozen friends-only files from Browse
+    /// would otherwise ban the friend's IP for two hours. The hash is only
+    /// claimed, but sparing the counter grants nothing: the answer stays
+    /// `OP_FILEREQANSNOFIL`. It has to cover every miss, not just restricted
+    /// ones, or whether a ban follows would tell restricted from absent.
+    async fn note_unservable_file_request(
+        &self,
+        peer_ip: std::net::IpAddr,
+        peer_user_hash: [u8; 16],
+        file_hash: [u8; 16],
+    ) {
         if !friends_only_snapshot_ready(&self.friends_only_hashes) {
             return;
+        }
+        let claimed_friend = self
+            .credit_manager
+            .read()
+            .await
+            .get_record(&peer_user_hash)
+            .and_then(|record| record.ember_hash);
+        if let Some(friend) = claimed_friend {
+            if self.mutual_friend_hashes.read().await.contains(&friend) {
+                return;
+            }
         }
         let banned = self
             .abuse_tracker
@@ -5323,6 +5440,7 @@ impl UploadHandler {
                 // the lock.
                 if self.hash_is_friends_only(file_hash).await
                     && !mutual_friend_access(
+                        &self.friend_hashes,
                         &self.mutual_friend_hashes,
                         peer.ember_hash,
                         peer.secure_v2_authenticated,
@@ -5400,6 +5518,7 @@ impl UploadHandler {
         if (self.hash_is_friends_only(file_hash).await
             || self.partial_restricted_by_friend(file_hash).await)
             && !mutual_friend_access(
+                &self.friend_hashes,
                 &self.mutual_friend_hashes,
                 peer.ember_hash,
                 peer.secure_v2_authenticated,
@@ -5482,6 +5601,7 @@ impl UploadHandler {
         };
         if self.hash_is_friends_only(file_hash).await {
             return mutual_friend_access(
+                &self.friend_hashes,
                 &self.mutual_friend_hashes,
                 peer.ember_hash,
                 peer.secure_v2_authenticated,
@@ -5509,6 +5629,7 @@ impl UploadHandler {
         match live_download {
             Some(true) => {
                 mutual_friend_access(
+                    &self.friend_hashes,
                     &self.mutual_friend_hashes,
                     peer.ember_hash,
                     peer.secure_v2_authenticated,
@@ -5841,87 +5962,27 @@ impl UploadHandler {
         self.slot_holders.lock().clone()
     }
 
-    /// eMule ForceNewClient/AcceptNewClient dynamic slot computation.
-    /// Uses observed (smoothed) upload bandwidth to decide how many concurrent
-    /// upload slots the server should maintain, scaling per-slot target rate
-    /// as the number of active slots grows.
-    ///
-    /// When per-slot rate data is available from `slot_rates`, the median
-    /// per-slot rate is compared against the target: if existing slots are
-    /// already starved (median < target * 0.5), we avoid opening more even
-    /// if the formula would allow it.
+    /// How many upload slots may be open right now. The arithmetic lives in
+    /// [`dynamic_slot_target`]; this gathers its inputs. A configured max of 0
+    /// is Auto: the bandwidth terms decide alone, up to eMule's slot ceiling.
     fn compute_dynamic_slot_count(&self) -> usize {
         let active = self.active_count.load(std::sync::atomic::Ordering::Relaxed);
-        // 0 is Auto: the bandwidth terms below decide alone, as in eMule.
-        let max_configured = match self
+        let max_slots = match self
             .max_concurrent_uploads
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             0 => MAX_UP_CLIENTS_ALLOWED,
             n => n,
         };
-
-        let observed_rate = self.bandwidth_limiter.smoothed_upload_speed();
-        let effective_rate = if observed_rate > 0 || active > 0 {
-            observed_rate
-        } else {
-            self.bandwidth_limiter.effective_upload_rate()
-        };
-
-        if effective_rate == 0 {
-            return ADMISSION_FLOOR_SLOTS.min(max_configured);
-        }
-
-        let target_per_slot = target_client_data_rate(active, false);
-
-        // eMule bounds the slot count by two terms and refuses at whichever binds
-        // first (`AcceptNewClient`, `UploadQueue.cpp:388`):
-        //
-        //   observed throughput / GetTargetClientDataRate(true)   [target * 3/4]
-        //   configured cap      / GetTargetClientDataRate(false)  [target]
-        //
-        // The first divisor is three quarters of the target
-        // (`UploadQueue.cpp:408`). Dividing the observed term by the *full*
-        // target made every ceiling about 25% lower than eMule's for identical
-        // measurements, and slot count is the main lever on total upload
-        // throughput because individual eD2K peers are slow. It is also
-        // self-reinforcing: fewer slots means less observed throughput, which
-        // computes fewer slots again.
-        //
-        // Ignoring the configured term whenever a slot was active was the other
-        // half of the problem — a limited uplink serving slow peers could never
-        // open enough slots to reach the cap the user actually set.
-        let min_target = target_client_data_rate(active, true).max(1);
-        let from_observed = effective_rate / min_target;
-        let configured_rate = self.bandwidth_limiter.effective_upload_rate();
-        let from_configured = if configured_rate > 0 {
-            configured_rate / target_per_slot
-        } else {
-            // Unlimited: eMule likewise stops applying this bound
-            // (`UploadQueue.cpp:391`, `MaxSpeed != UNLIMITED`).
-            u64::MAX
-        };
-        let computed = from_observed
-            .min(from_configured)
-            .max(ADMISSION_FLOOR_SLOTS as u64);
-        let computed = (computed as usize)
-            .min(MAX_UP_CLIENTS_ALLOWED)
-            .min(max_configured);
-
-        if active >= 2 {
-            let rates = self.slot_rates.lock();
-            if rates.len() >= 2 {
-                let mut sorted: Vec<u64> = rates.values().copied().collect();
-                sorted.sort_unstable();
-                let median = sorted[sorted.len() / 2];
-                drop(rates);
-                if median < target_per_slot / 2 && computed > active {
-                    return active;
-                }
-            }
-        }
-
-        computed
+        let mut slot_rates: Vec<u64> = self.slot_rates.lock().values().copied().collect();
+        slot_rates.sort_unstable();
+        dynamic_slot_target(
+            active,
+            max_slots,
+            self.bandwidth_limiter.smoothed_upload_speed(),
+            self.bandwidth_limiter.effective_upload_rate(),
+            &slot_rates,
+        )
     }
 
     async fn hello_options(&self) -> HelloOptions {
@@ -8179,6 +8240,9 @@ impl UploadHandler {
         // sessions send immediately below; classic Ember file sockets
         // send after HELLO (or when the user adds the peer mid-session).
         let mut friend_request_sent = false;
+        // Set once the friend sends `EMBER_EXT_BROWSE_SCOPE_AWARE`; until then
+        // our browse answers on this session leave friends-only files out.
+        let mut peer_scope_aware = false;
         let mut identity_emitted = false;
         if is_friend && !hello_caps.is_ember {
             info!("Peer {peer_addr} is a friend but is_ember=false, skipping friend request");
@@ -8911,7 +8975,13 @@ impl UploadHandler {
                 let wait_secs = if queued_identity.is_some() {
                     1
                 } else if owns_ember_slot {
-                    90
+                    // Due when our own last keepalive is, not 90s after the
+                    // last inbound packet: the friend's keepalives would
+                    // otherwise keep pushing ours back, and as neither side
+                    // answers one, the friend's reader would starve.
+                    FRIEND_SESSION_KEEPALIVE_SECS
+                        .saturating_sub(last_friend_keepalive.elapsed().as_secs())
+                        .max(1)
                 } else if slot_guard.is_active() {
                     SLOT_IDLE_TIMEOUT_SECS
                 } else {
@@ -8965,6 +9035,22 @@ impl UploadHandler {
                 match read_result {
                     Ok(Some(Ok(p))) => {
                         last_inbound = std::time::Instant::now();
+                        // Also due here, not only on the read timeout: inbound
+                        // packets less than the wait apart would postpone it
+                        // for as long as they kept coming.
+                        if owns_ember_slot
+                            && last_friend_keepalive.elapsed().as_secs()
+                                >= FRIEND_SESSION_KEEPALIVE_SECS
+                        {
+                            last_friend_keepalive = std::time::Instant::now();
+                            if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_KEEPALIVE, &[])
+                                .await
+                                .is_err()
+                            {
+                                debug!("Friend keepalive failed, closing session");
+                                break;
+                            }
+                        }
                         p
                     }
                     Ok(Some(Err(e))) => {
@@ -9252,9 +9338,12 @@ impl UploadHandler {
                             continue;
                         }
                         if owns_ember_slot {
-                            if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_KEEPALIVE, &[]).await.is_err() {
-                                debug!("Friend keepalive failed, closing session");
-                                break;
+                            if last_friend_keepalive.elapsed().as_secs() >= FRIEND_SESSION_KEEPALIVE_SECS {
+                                last_friend_keepalive = std::time::Instant::now();
+                                if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_KEEPALIVE, &[]).await.is_err() {
+                                    debug!("Friend keepalive failed, closing session");
+                                    break;
+                                }
                             }
                             continue;
                         }
@@ -9641,7 +9730,7 @@ impl UploadHandler {
                                 &hash,
                             )
                             .await?;
-                            self.note_unservable_file_request(peer_addr.ip(), hash).await;
+                            self.note_unservable_file_request(peer_addr.ip(), peer_user_hash, hash).await;
                             current_file_hash = None;
                             total_size = 0;
                         }
@@ -9704,7 +9793,7 @@ impl UploadHandler {
                                 &hash,
                             )
                             .await?;
-                            self.note_unservable_file_request(peer_addr.ip(), hash).await;
+                            self.note_unservable_file_request(peer_addr.ip(), peer_user_hash, hash).await;
                             if !slot_guard.is_active() {
                                 current_file_hash = None;
                                 total_size = 0;
@@ -9755,7 +9844,7 @@ impl UploadHandler {
                             &h,
                         )
                         .await?;
-                        self.note_unservable_file_request(peer_addr.ip(), h).await;
+                        self.note_unservable_file_request(peer_addr.ip(), peer_user_hash, h).await;
                         if !slot_guard.is_active() {
                             current_file_hash = None;
                             total_size = 0;
@@ -13603,6 +13692,7 @@ impl UploadHandler {
                                     reply_tx: outbound_tx.clone(),
                                     supports_ebr1:
                                         super::multi_source::browse_request_supports_v1(&payload),
+                                    supports_scope: peer_scope_aware,
                                 },
                             }).await;
                         }
@@ -13867,6 +13957,9 @@ impl UploadHandler {
                                         })
                                         .await;
                                 }
+                            }
+                            Some((super::messages::EMBER_EXT_BROWSE_SCOPE_AWARE, _)) => {
+                                peer_scope_aware = true;
                             }
                             // A sub-type this build predates. Ignoring it is
                             // the whole point of the envelope.
@@ -17053,5 +17146,73 @@ mod abuse_and_seniority_tests {
             remember_sent_block(&mut sent, i, i + 1);
         }
         assert!(sent.len() <= MAX_SENT_BLOCKS);
+    }
+}
+
+#[cfg(test)]
+mod dynamic_slot_tests {
+    //! `dynamic_slot_target`: eMule's slot arithmetic plus headroom probing.
+    use super::*;
+
+    const KIB: u64 = 1024;
+
+    #[test]
+    fn nothing_flowing_stays_at_the_floor() {
+        assert_eq!(dynamic_slot_target(3, MAX_UP_CLIENTS_ALLOWED, 0, 100 * KIB, &[]), ADMISSION_FLOOR_SLOTS);
+        assert_eq!(dynamic_slot_target(2, 2, 0, 100 * KIB, &[]), 2);
+    }
+
+    #[test]
+    fn a_fixed_maximum_is_never_exceeded() {
+        let rates = vec![30 * KIB; 8];
+        assert!(dynamic_slot_target(8, 6, 240 * KIB, 0, &rates) <= 6);
+    }
+
+    #[test]
+    fn auto_grows_one_slot_at_a_time_while_the_uplink_has_headroom() {
+        // 100 KiB/s cap, four slow peers (2 KiB/s each) using 8% of it.
+        let rates = vec![2 * KIB; 4];
+        assert_eq!(dynamic_slot_target(4, MAX_UP_CLIENTS_ALLOWED, 8 * KIB, 100 * KIB, &rates), 5);
+    }
+
+    #[test]
+    fn auto_waits_for_a_new_slot_to_report_before_opening_another() {
+        // Five slots open but only four have moved data yet.
+        let rates = vec![2 * KIB; 4];
+        assert_eq!(dynamic_slot_target(5, MAX_UP_CLIENTS_ALLOWED, 8 * KIB, 100 * KIB, &rates), ADMISSION_FLOOR_SLOTS);
+    }
+
+    #[test]
+    fn auto_stops_at_what_the_cap_can_feed() {
+        // 100 KiB/s cap at 10 slots: target is 10 KiB/s each, so 10 is the limit.
+        let rates = vec![2 * KIB; 10];
+        assert_eq!(dynamic_slot_target(10, MAX_UP_CLIENTS_ALLOWED, 20 * KIB, 100 * KIB, &rates), 10);
+    }
+
+    #[test]
+    fn auto_stops_opening_once_the_uplink_is_busy() {
+        // 76% of the cap in use and slots starved: no probing, the brake holds.
+        let rates = vec![KIB; 6];
+        assert_eq!(dynamic_slot_target(6, MAX_UP_CLIENTS_ALLOWED, 76 * KIB, 100 * KIB, &rates), 6);
+    }
+
+    #[test]
+    fn slow_peers_on_an_idle_uplink_do_not_trip_the_starvation_brake() {
+        // 25% of the cap in use by slots well under target: more slots, not fewer.
+        let rates = vec![KIB; 6];
+        assert_eq!(dynamic_slot_target(6, MAX_UP_CLIENTS_ALLOWED, 25 * KIB, 100 * KIB, &rates), 7);
+    }
+
+    #[test]
+    fn a_fast_unlimited_uplink_is_fed_by_its_throughput() {
+        let rates = vec![40 * KIB; 4];
+        let slots = dynamic_slot_target(4, MAX_UP_CLIENTS_ALLOWED, 160 * KIB, 0, &rates);
+        assert!(slots > 4, "{slots}");
+    }
+
+    #[test]
+    fn unlimited_never_probes_blindly() {
+        let rates = vec![KIB; 4];
+        assert_eq!(dynamic_slot_target(4, MAX_UP_CLIENTS_ALLOWED, 4 * KIB, 0, &rates), 4);
     }
 }

@@ -75,8 +75,13 @@ impl RootListing {
         LISTED_ROOTS.lock().push(root.to_path_buf());
         Self {
             parts: crate::storage::part_folders::part_names(root),
+            // Category folders too: a completion copy is made beside where the
+            // file is published.
             copies: if copies {
-                ed2k::transfer::earlier_completion_copies(&root.join("Downloads"))
+                crate::storage::category_folders::finished_download_dirs(root)
+                    .iter()
+                    .flat_map(|dir| ed2k::transfer::earlier_completion_copies(dir))
+                    .collect()
             } else {
                 Vec::new()
             },
@@ -513,6 +518,9 @@ pub(in crate::network) async fn resume_incomplete_downloads(
             collect_friends_only_hashes(&index, known_files)
         };
         for mut transfer in incomplete {
+            // Before any branch below can finish it: several insert straight
+            // into the transfer list rather than through `enqueue`.
+            crate::storage::category_folders::note_category(&transfer.id, &transfer.category);
             // Hash-failed downloads are restored only to keep their Temp
             // `.part` owned (orphan sweep). Do not auto-start them.
             if transfer.status == TransferStatus::Failed {
@@ -657,10 +665,18 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                     // not answering it is a long one: off the network task, and
                     // given up on rather than waited out.
                     let downloads = PathBuf::from(&dl_folder).join("Downloads");
+                    // Its category's folder first, where completion put it,
+                    // then Downloads itself, where it went before it had one
+                    // or when that folder could not be made.
+                    let subdir = crate::storage::category_folders::completion_subdir(&transfer.id);
+                    let category_dir = (!subdir.is_empty())
+                        .then(|| subdir.iter().fold(downloads.clone(), |dir, s| dir.join(s)));
                     let name = safe_name.clone();
                     let listing = tokio::task::spawn_blocking(move || {
-                        ed2k::transfer::published_names(&downloads, &name)
-                            .into_iter()
+                        category_dir
+                            .iter()
+                            .chain(std::iter::once(&downloads))
+                            .flat_map(|dir| ed2k::transfer::published_names(dir, &name))
                             .filter(|path| path.exists())
                             .collect::<Vec<_>>()
                     });

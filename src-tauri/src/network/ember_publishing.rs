@@ -230,7 +230,13 @@ pub(super) fn untrack_ember_record_pending(
     let Some(unplaced) = schedule.unplaced.get_mut(&slot) else {
         return false;
     };
-    unplaced.remove(&reference.key);
+    // A key dropped before it reached anyone is as unplaced as one every
+    // storer refused. Without the partial mark a sibling that did land closed
+    // the round as complete, and the dropped word stayed unsearchable for the
+    // whole interval instead of coming back on the partial retry.
+    if unplaced.remove(&reference.key) {
+        schedule.partial.insert(slot);
+    }
     if !unplaced.is_empty() {
         return false;
     }
@@ -1002,7 +1008,7 @@ pub(super) async fn flush_ember_batch_publish(socket: &UdpSocket, state: &mut Ne
             .ember_batch_publish
             .queued_count
             .saturating_sub(queued.len());
-        // A ban or filter change can land between queueing and this flush.
+        // A ban or policy change can land between queueing and this flush.
         if ember_addr_ip_verdict(state, contact.addr).refuses() {
             let (dropped, rearmed) = release_ember_queued_records(state, queued);
             stats.records_dropped += dropped;
@@ -1492,6 +1498,14 @@ pub(super) const EMBER_MAINT_MIN_TARGET_LOOKUPS: usize = 2;
 /// background share of the search pool.
 pub(super) const EMBER_MAINT_MAX_TARGET_LOOKUPS: usize = 8;
 
+/// Most target lookups started per maintenance cycle while publishes wait on
+/// them. A quarter of the background search pool, each walk lasting well
+/// under its minute.
+pub(super) const EMBER_MAINT_MAX_AWAITED_TARGET_LOOKUPS: usize = 16;
+
+/// Cycles a queue of awaited lookups is drained over.
+pub(super) const EMBER_AWAITED_TARGET_LOOKUP_CYCLES: usize = 4;
+
 /// Target lookups to start this cycle with `queued` keys waiting.
 ///
 /// Enough to drain the queue within a quarter of a target set's lifetime. A
@@ -1500,12 +1514,41 @@ pub(super) const EMBER_MAINT_MAX_TARGET_LOOKUPS: usize = 8;
 /// fewer fresh target sets than it had keys, a full queue took longer to drain
 /// than a set lived, and most records went to our own table's closest, which
 /// on a large overlay refuse on proximity.
-pub(super) fn ember_target_lookups_this_cycle(queued: usize) -> usize {
+///
+/// `awaited` is whether publishes are waiting on these lookups (see
+/// [`ember_publish_awaits_lookup`]). Then the queue is drained within a few
+/// minutes, since every key in it is a file not yet published; otherwise a
+/// lookup only improves a republish hours away, and an hour is soon enough.
+pub(super) fn ember_target_lookups_this_cycle(queued: usize, awaited: bool) -> usize {
+    if awaited {
+        return queued
+            .div_ceil(EMBER_AWAITED_TARGET_LOOKUP_CYCLES)
+            .clamp(EMBER_MAINT_MIN_TARGET_LOOKUPS, EMBER_MAINT_MAX_AWAITED_TARGET_LOOKUPS);
+    }
     let cycles = (EMBER_PUBLISH_TARGETS_TTL_SECS as u64 / 4 / EMBER_MAINT_INTERVAL.as_secs()).max(1) as usize;
     queued
         .div_ceil(cycles)
         .clamp(EMBER_MAINT_MIN_TARGET_LOOKUPS, EMBER_MAINT_MAX_TARGET_LOOKUPS)
 }
+
+/// How long after a lookup a node it found is used even though the routing
+/// table did not keep it. See [`NetworkState::ember_publish_targets`].
+///
+/// Long enough to cover the wait between the lookup landing and the publish
+/// tick that uses it; short enough that the node answered us minutes ago, not
+/// hours, which is what the table's own liveness checks would otherwise vouch
+/// for.
+pub(super) const EMBER_PUBLISH_TARGETS_DETACHED_SECS: i64 = 30 * 60;
+
+/// Longest a publish waits on its target lookup before going to our own
+/// table's closest anyway. The lookup may never run — the search pool full,
+/// the queue full, every send failing — and a file must not sit unpublished
+/// on its account.
+pub(super) const EMBER_PUBLISH_LOOKUP_WAIT_SECS: i64 = 10 * 60;
+
+/// Publishes that may be waiting on lookups at once. Past it, new keys
+/// publish from the table as they did before waits existed.
+pub(super) const EMBER_PUBLISH_TARGET_WAITS_MAX: usize = 4096;
 
 /// Keys that may be waiting for a target lookup at once.
 pub(super) const EMBER_PUBLISH_TARGET_QUEUE_MAX: usize = 512;
@@ -1523,7 +1566,7 @@ pub(super) const EMBER_PUBLISH_TARGETS_MAX: usize = 2048;
 /// The key is queued only while the queue holds fewer than `queue_limit` keys
 /// (capped at [`EMBER_PUBLISH_TARGET_QUEUE_MAX`]).
 pub(super) fn ember_publish_targets_for(
-    cache: &HashMap<[u8; 16], (Vec<ember::dht::EmberNodeId>, i64)>,
+    cache: &HashMap<[u8; 16], (Vec<ember::dht::EmberContact>, i64)>,
     queue: &mut std::collections::VecDeque<[u8; 16]>,
     queue_limit: usize,
     routing: &ember::dht::routing::RoutingTable,
@@ -1532,23 +1575,33 @@ pub(super) fn ember_publish_targets_for(
 ) -> Vec<ember::dht::EmberContact> {
     let target = ember::dht::EmberNodeId(key);
     let fresh = match cache.get(&key) {
-        Some((ids, learned_at))
-            if !ids.is_empty()
+        Some((found, learned_at))
+            if !found.is_empty()
                 && now.saturating_sub(*learned_at) < EMBER_PUBLISH_TARGETS_TTL_SECS =>
         {
-            Some(ids)
+            Some((found, *learned_at))
         }
         _ => None,
     };
 
-    // Resolve the remembered IDs against the table as it is now. Anyone since
-    // evicted, faulted or filtered out simply drops away, and whoever remains is
-    // addressed where the table says they are rather than where the lookup found
-    // them.
+    // Resolve the remembered nodes against the table as it is now. Anyone it
+    // still holds is addressed where the table says; anyone since evicted,
+    // faulted or filtered out drops away — except, for a short while after the
+    // lookup, a node the table never kept, whose address the lookup reached it
+    // at minutes ago. See `NetworkState::ember_publish_targets`.
     let mut out: Vec<ember::dht::EmberContact> = fresh
-        .map(|ids| {
-            ids.iter()
-                .filter_map(|id| routing.get_contact(id).cloned())
+        .map(|(found, learned_at)| {
+            let detached_ok =
+                now.saturating_sub(learned_at) < EMBER_PUBLISH_TARGETS_DETACHED_SECS;
+            found
+                .iter()
+                .filter_map(|cached| match routing.get_contact(&cached.node_id) {
+                    Some(held) => Some(held.clone()),
+                    None if detached_ok && !routing.definitely_blocked(&cached.addr) => {
+                        Some(cached.clone())
+                    }
+                    None => None,
+                })
                 .filter(|c| c.is_verified())
                 .collect()
         })
@@ -1607,6 +1660,96 @@ pub(super) fn ember_publish_targets_for(
         queue.push_back(key);
     }
     out
+}
+
+/// Whether our own publish under `key` should wait for a target lookup rather
+/// than go to our own table's closest now. Queues the lookup when it starts a
+/// wait. The caller skips the file this tick; it stays due, so the next tick
+/// publishes it against the set the lookup found.
+///
+/// Below k answered contacts we are among the k closest to every key, and so is
+/// everyone we know: our table is the network's answer, and nothing waits.
+/// Past that, a storer refuses a key it is not among the closest to
+/// (`store_proximity_ok`), and for a distant key our table's closest are not —
+/// a bucket holds twenty nodes drawn from half the keyspace. Publishing first
+/// and looking up afterwards therefore sent every new key, and every keyword at
+/// each twelve-hour republish (its four-hour target set long gone), to nodes
+/// that refused it, and the lookup's answer only served a republish that found
+/// it already expired.
+///
+/// A key waits at most once per target-set lifetime and at most
+/// [`EMBER_PUBLISH_LOOKUP_WAIT_SECS`]: a lookup that finds nobody, never runs or
+/// times out ends the wait, and the file then publishes from the table as before.
+pub(super) fn ember_publish_awaits_lookup(state: &mut NetworkState, key: [u8; 16]) -> bool {
+    let verified = state.ember_dht.routing().verified_len();
+    let in_flight = state.ember_publish_target_lookups.values().any(|k| *k == key);
+    ember_publish_awaits_lookup_in(
+        verified,
+        &state.ember_publish_targets,
+        &mut state.ember_publish_target_waits,
+        &mut state.ember_publish_target_queue,
+        in_flight,
+        key,
+        chrono::Utc::now().timestamp(),
+    )
+}
+
+/// [`ember_publish_awaits_lookup`] over its inputs alone, so the rule can be
+/// tested without standing up a whole `NetworkState`.
+pub(super) fn ember_publish_awaits_lookup_in(
+    verified: usize,
+    cache: &HashMap<[u8; 16], (Vec<ember::dht::EmberContact>, i64)>,
+    waits: &mut HashMap<[u8; 16], (i64, bool)>,
+    queue: &mut std::collections::VecDeque<[u8; 16]>,
+    in_flight: bool,
+    key: [u8; 16],
+    now: i64,
+) -> bool {
+    if verified < ember::dht::K_BUCKET_SIZE {
+        return false;
+    }
+    let fresh = cache.get(&key).is_some_and(|(found, at)| {
+        !found.is_empty() && now.saturating_sub(*at) < EMBER_PUBLISH_TARGETS_TTL_SECS
+    });
+    if fresh {
+        return false;
+    }
+    if let Some(&(since, ended)) = waits.get(&key) {
+        return !ended && now.saturating_sub(since) < EMBER_PUBLISH_LOOKUP_WAIT_SECS;
+    }
+    if waits.len() >= EMBER_PUBLISH_TARGET_WAITS_MAX {
+        return false;
+    }
+    if !in_flight && !queue.contains(&key) {
+        if queue.len() >= EMBER_PUBLISH_TARGET_QUEUE_MAX {
+            return false;
+        }
+        queue.push_back(key);
+    }
+    waits.insert(key, (now, false));
+    true
+}
+
+/// A target lookup for `key` has ended, found anything or not, so a publish
+/// waiting on it stops waiting.
+pub(super) fn note_ember_target_lookup_ended(state: &mut NetworkState, key: [u8; 16]) {
+    if let Some(wait) = state.ember_publish_target_waits.get_mut(&key) {
+        wait.1 = true;
+    }
+}
+
+/// Whether any publish is waiting on a target lookup that has not ended.
+pub(super) fn ember_publish_lookups_awaited(state: &NetworkState) -> bool {
+    state.ember_publish_target_waits.values().any(|(_, ended)| !ended)
+}
+
+/// Forget waits older than a target set's lifetime, so a key can wait again
+/// for the lookup its next republish needs.
+pub(super) fn prune_ember_publish_target_waits(state: &mut NetworkState) {
+    let now = chrono::Utc::now().timestamp();
+    state
+        .ember_publish_target_waits
+        .retain(|_, (since, _)| now.saturating_sub(*since) < EMBER_PUBLISH_TARGETS_TTL_SECS);
 }
 
 /// How long a stranger's PING keeps proving our UDP port is open.
@@ -1996,8 +2139,8 @@ pub(super) async fn maybe_publish_ember_sources(
     // port, and it must not be reachable only on the paths that get that far:
     // three of the returns below (empty publishable table, no external IPv4,
     // IPv6-only mapping) sat above it, and the first of those is exactly what a
-    // node hits when `evict_filtered_contacts` momentarily empties the table on
-    // an ipfilter reload.
+    // node hits when turning on `block_private_ips` momentarily empties the
+    // table.
     //
     // This is the only periodic sweep of `ember_pending_proxy_overlay`, and
     // `ember_publish_staleness` returns `None` for any file with an `unplaced`
@@ -2250,6 +2393,13 @@ pub(super) async fn maybe_publish_ember_sources(
             kind: EmberPublishKind::Source,
             key: record.keyword_hash,
         };
+
+        // Nothing is tracked or stamped for a file skipped here, so it stays
+        // due and goes out on a later tick against the nodes its lookup finds.
+        if ember_publish_awaits_lookup(state, record.keyword_hash) {
+            state.ember_publish_pass.awaiting_lookup += 1;
+            continue;
+        }
 
         // Overlay STORE names the buddy in the trailer. Hold it until that
         // buddy ACKs PROXY_STORE so FIND_VALUE cannot succeed while
@@ -2674,6 +2824,10 @@ pub(super) async fn maybe_publish_ember_keywords(
             ember::dht::publish::SignedRecord,
             Vec<ember::dht::EmberContact>,
         )> = Vec::new();
+        // Every keyword is asked, so each one that needs a lookup queues it in
+        // this pass rather than one per tick; the file then waits for all of
+        // them, for the same all-or-nothing reason as below.
+        let mut awaiting_lookup = false;
         for keyword in keywords {
             let record = state.ember_dht.build_keyword_record_with_media(
                 &keyword,
@@ -2684,6 +2838,10 @@ pub(super) async fn maybe_publish_ember_keywords(
                 media.as_ref(),
             );
             state.ember_dht.store_own_record(&record);
+            if ember_publish_awaits_lookup(state, record.keyword_hash) {
+                awaiting_lookup = true;
+                continue;
+            }
             let targets = ember_overlay_publish_targets(state, record.keyword_hash);
             let reference = EmberRecordRef {
                 file_hash,
@@ -2691,6 +2849,10 @@ pub(super) async fn maybe_publish_ember_keywords(
                 key: record.keyword_hash,
             };
             planned.push((reference, record, targets));
+        }
+        if awaiting_lookup {
+            state.ember_publish_pass.awaiting_lookup += 1;
+            continue;
         }
         // All-or-nothing: tracking only the keywords that fit the queue let
         // the ones that landed stamp the file, locking the skipped terms out

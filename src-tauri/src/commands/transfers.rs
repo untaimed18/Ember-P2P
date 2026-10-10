@@ -1318,6 +1318,24 @@ pub async fn start_download(
         control.pause();
     }
 
+    // Decided here, before the row is saved, rather than only once the
+    // network task gets `StartDownload`: a quit in between would bring the
+    // download back public, and a publish tick could advertise it meanwhile.
+    // The network task still applies its fuller check (known.met included)
+    // and can only add the restriction, never lift it.
+    let from_restricting_friend = match (
+        friend_ember_hash,
+        hex::decode(file_hash.trim()).ok().and_then(|b| <[u8; 16]>::try_from(b).ok()),
+    ) {
+        (Some(friend), Some(hash)) if crate::network::friend_marked_friends_only(friend, &hash) => {
+            let index = state.local_index.read().await;
+            !index
+                .get_by_hash(&hex::encode(hash))
+                .is_some_and(|file| !file.friends_only)
+        }
+        _ => false,
+    };
+
     let transfer = Transfer {
         id: transfer_id.clone(),
         file_name: file_name.clone(),
@@ -1376,7 +1394,7 @@ pub async fn start_download(
         up_part_count: None,
         up_peer_part_status: None,
         ember_verified: false,
-        friends_only: false,
+        friends_only: from_restricting_friend,
     };
 
     let active_now = {
@@ -2018,7 +2036,12 @@ fn resolve_transfer_reveal_path(
     let part_path = folders.part_path_for(&transfer.id);
 
     let verified = if final_path.is_file() {
-        crate::security::filesystem::verify_recorded_file(&final_path, &folders.roots(), "Downloads")
+        crate::security::filesystem::verify_recorded_file_nested(
+            &final_path,
+            &folders.roots(),
+            "Downloads",
+            crate::storage::category_folders::MAX_DEPTH,
+        )
     } else if part_path.is_file() {
         crate::security::filesystem::verify_existing_path(&part_path, &folders.roots())
     } else {
@@ -2147,10 +2170,12 @@ pub async fn open_file(
                 "Download has not finished yet",
             ));
         }
-        let canonical = crate::security::filesystem::verify_recorded_file(
+        // A category's folder inside Downloads is where Ember wrote it too.
+        let canonical = crate::security::filesystem::verify_recorded_file_nested(
             &file_path,
             &dl_folders.roots(),
             "Downloads",
+            crate::storage::category_folders::MAX_DEPTH,
         )
         .map_err(|e| {
             coded_ctx(
@@ -2251,6 +2276,148 @@ pub async fn resume_transfer(
     }
     start_queued_discovery(&state, &rediscover).await;
     Ok(())
+}
+
+/// What [`delete_finished_downloads`] did.
+#[derive(serde::Serialize)]
+pub struct FinishedDeleteReport {
+    /// Downloads taken off the list: their file deleted, or already gone.
+    removed: Vec<String>,
+    /// One coded error per download whose file was kept, and whose row stays.
+    failed: Vec<String>,
+}
+
+/// Cancel finished downloads: delete each one's file — to the Recycle Bin, or
+/// outright when the user chose that in Settings — and take it off the list. A
+/// file the Library holds goes through the Library's own delete, so it also
+/// leaves the index and every network it was published on.
+///
+/// Only the file the download wrote is touched: the recorded path must still
+/// resolve inside a `Downloads` folder, hold the download's size, and, where
+/// the Library has hashed it, its hash. A file already gone just takes the row
+/// with it. When the user keeps a file the Recycle Bin would not take, the
+/// rest are left alone too, as the Library's bulk delete does.
+#[tauri::command]
+pub async fn delete_finished_downloads(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    transfer_ids: Vec<String>,
+) -> Result<FinishedDeleteReport, String> {
+    check_batch_size(&transfer_ids)?;
+    let (rows, dl_folders, permanently) = {
+        let (mgr, cfg) = tokio::join!(state.transfer_manager.read(), state.config.read());
+        let rows: Vec<Option<Transfer>> = transfer_ids
+            .iter()
+            .map(|id| mgr.get_transfer(id).cloned())
+            .collect();
+        (rows, cfg.settings.download_folders(), cfg.settings.delete_permanently)
+    };
+    let roots = dl_folders.roots();
+    let mut report = FinishedDeleteReport { removed: Vec::new(), failed: Vec::new() };
+    for (transfer_id, row) in transfer_ids.into_iter().zip(rows) {
+        let Some(transfer) = row else {
+            report.failed.push(coded_ctx("transfers_transfer_not_found", "Transfer not found", &transfer_id));
+            continue;
+        };
+        if transfer.direction != TransferDirection::Download || transfer.status != TransferStatus::Completed {
+            report.failed.push(coded_ctx(
+                "transfers_delete_not_finished",
+                "Only a finished download's file can be deleted",
+                &transfer.file_name,
+            ));
+            continue;
+        }
+        let recorded = match transfer.completed_path.as_deref() {
+            Some(p) if !p.is_empty() => PathBuf::from(p),
+            _ => dl_folders
+                .current
+                .join("Downloads")
+                .join(crate::security::sanitize_filename(&transfer.file_name)),
+        };
+        let resolved = tokio::task::spawn_blocking({
+            let recorded = recorded.clone();
+            let roots = roots.clone();
+            let expected_size = transfer.total_size;
+            move || -> Result<Option<(PathBuf, crate::security::filesystem::ObjectIdentity)>, String> {
+                if std::fs::symlink_metadata(&recorded).is_err() {
+                    return Ok(None);
+                }
+                let canonical = crate::security::filesystem::verify_recorded_file_nested(
+                    &recorded,
+                    &roots,
+                    "Downloads",
+                    crate::storage::category_folders::MAX_DEPTH,
+                )
+                .map_err(|e| coded_ctx("transfers_invalid_path", "Invalid or changed download path", e))?;
+                let (_, opened) =
+                    crate::security::filesystem::open_existing_approved(&canonical, &roots, false)
+                        .map_err(|e| coded_ctx("transfers_invalid_path", "Invalid or changed download path", e))?;
+                let size = opened
+                    .metadata()
+                    .map_err(|e| coded_ctx("transfers_invalid_path", "Invalid or changed download path", e))?
+                    .len();
+                if size != expected_size {
+                    return Err(coded("transfers_delete_file_changed", "The file there is no longer this download"));
+                }
+                let identity = crate::security::filesystem::opened_file_identity(&opened)
+                    .map_err(|e| coded_ctx("transfers_invalid_path", "Invalid or changed download path", e))?;
+                Ok(Some((canonical, identity)))
+            }
+        })
+        .await
+        .map_err(|e| coded_ctx("transfers_delete_task_failed", "Delete task failed", e))?;
+
+        let deleted = match resolved {
+            Err(e) => Err(e),
+            Ok(None) => Ok(()),
+            Ok(Some((canonical, identity))) => {
+                let canonical_str = canonical.to_string_lossy().into_owned();
+                let indexed = match crate::commands::sharing::indexed_library_entry(&state, &canonical_str).await {
+                    Some(entry) => Some(entry),
+                    None => {
+                        crate::commands::sharing::indexed_library_entry(&state, &recorded.to_string_lossy()).await
+                    }
+                };
+                match indexed {
+                    Some((_, hash)) if !hash.is_empty() && !hash.eq_ignore_ascii_case(&transfer.file_hash) => {
+                        Err(coded("transfers_delete_file_changed", "The file there is no longer this download"))
+                    }
+                    Some((indexed_path, _)) => {
+                        crate::commands::sharing::delete_indexed_library_file(&app, &state, &indexed_path)
+                            .await
+                            .map(|_| ())
+                    }
+                    None => {
+                        crate::commands::sharing::recycle_library_file(&app, &canonical, &roots, &identity, permanently)
+                            .await
+                    }
+                }
+            }
+        };
+        match deleted {
+            Ok(()) => {
+                if let Err(e) = remove_transfer(state.clone(), transfer_id.clone()).await {
+                    tracing::warn!("The file of {transfer_id} was deleted but its row could not be removed: {e}");
+                }
+                report.removed.push(transfer_id);
+            }
+            Err(e) => {
+                // "Keep file" at the delete-permanently question: the rest are
+                // very likely in the same place, so stop rather than ask again.
+                let declined = e.contains("\"sharing_delete_declined\"");
+                report.failed.push(e);
+                if declined {
+                    break;
+                }
+            }
+        }
+    }
+    tracing::info!(
+        "Deleted the files of {} finished download(s){}",
+        report.removed.len(),
+        if report.failed.is_empty() { String::new() } else { format!(", {} kept", report.failed.len()) }
+    );
+    Ok(report)
 }
 
 #[tauri::command]
@@ -2537,12 +2704,48 @@ pub async fn move_transfers_in_queue(
     Ok(u32::try_from(moved).unwrap_or(u32::MAX))
 }
 
+/// What changing downloads' category did. A finished download's file moves to
+/// the new category's folder; one still downloading lands there when it
+/// finishes.
+#[derive(serde::Serialize, Default)]
+pub struct CategoryChanges {
+    /// The downloads whose category was changed, in the order asked.
+    changed: Vec<String>,
+    /// Why the rest were not, when saving the category failed; the change
+    /// stops there.
+    error: Option<String>,
+    /// Finished downloads whose file was moved.
+    moved: u32,
+    /// One coded error per finished download whose file stayed where it was.
+    /// Its category is changed regardless.
+    move_failed: Vec<String>,
+}
+
+/// A finished download to file under its new category.
+struct FinishedToMove {
+    id: String,
+    from: String,
+    file_name: String,
+    file_hash: String,
+    size: u64,
+    /// The hash of the Library row at `from`, if one is there.
+    indexed_hash: Option<String>,
+}
+
+/// Change the category of downloads, in one call for a whole selection: each
+/// finished one has its file moved, and the Library and known.met follow the
+/// moves once at the end rather than once per file. `move_finished: false`
+/// relabels finished downloads and leaves their files, as removing a category
+/// does.
 #[tauri::command]
-pub async fn set_transfer_category(
+pub async fn set_transfers_category(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    transfer_id: String,
+    transfer_ids: Vec<String>,
     category: String,
-) -> Result<(), String> {
+    move_finished: Option<bool>,
+) -> Result<CategoryChanges, String> {
+    check_batch_size(&transfer_ids)?;
     if category.len() > 256 {
         return Err(coded(
             "transfers_category_too_long",
@@ -2550,29 +2753,264 @@ pub async fn set_transfer_category(
         ));
     }
     let db = state.db.clone();
-    let tid = transfer_id.clone();
+    let ids = transfer_ids.clone();
     let cat = category.clone();
-    tokio::task::spawn_blocking(move || db.update_transfer_category(&tid, &cat))
-        .await
-        .map_err(|e| {
-            coded_ctx(
-                "transfers_category_task_failed",
-                "Category update failed",
-                e,
-            )
-        })?
-        .map_err(|e| {
-            coded_ctx(
-                "transfers_category_persist_failed",
-                "Category update failed",
-                e,
-            )
-        })?;
+    let (saved, error) = tokio::task::spawn_blocking(move || {
+        let mut saved = Vec::new();
+        for id in ids {
+            if let Err(e) = db.update_transfer_category(&id, &cat) {
+                return (
+                    saved,
+                    Some(coded_ctx("transfers_category_persist_failed", "Category update failed", e)),
+                );
+            }
+            saved.push(id);
+        }
+        (saved, None)
+    })
+    .await
+    .map_err(|e| coded_ctx("transfers_category_task_failed", "Category update failed", e))?;
+
+    let mut finished = Vec::new();
     {
         let mut manager = state.transfer_manager.write().await;
-        manager.set_category(&transfer_id, &category);
+        for id in &saved {
+            manager.set_category(id, &category);
+            if !move_finished.unwrap_or(true) {
+                continue;
+            }
+            let Some(t) = manager.get_transfer(id).filter(|t| {
+                t.direction == TransferDirection::Download
+                    && t.status == crate::types::TransferStatus::Completed
+            }) else {
+                continue;
+            };
+            let Some(from) = t.completed_path.clone().filter(|p| !p.is_empty()) else {
+                continue;
+            };
+            finished.push(FinishedToMove {
+                id: id.clone(),
+                from,
+                file_name: t.file_name.clone(),
+                file_hash: t.file_hash.clone(),
+                size: t.total_size,
+                indexed_hash: None,
+            });
+        }
     }
-    Ok(())
+    let mut changes = CategoryChanges { changed: saved, error, ..Default::default() };
+    if finished.is_empty() {
+        return Ok(changes);
+    }
+    {
+        let index = state.local_index.read().await;
+        for item in &mut finished {
+            item.indexed_hash = index
+                .get_by_path(&item.from)
+                .map(|row| row.hash.clone())
+                .filter(|hash| !hash.is_empty());
+        }
+    }
+
+    // From the saved settings rather than the folders the network loop holds:
+    // those follow a settings change only once the loop reaches it, and a
+    // category made with its folder and assigned straight after is the
+    // common case, not a race to lose.
+    let (roots, subdir) = {
+        let config = state.config.read().await;
+        let subdir = config
+            .settings
+            .download_category_folders
+            .get(&category)
+            .map(|folder| crate::storage::category_folders::folder_segments(folder))
+            .unwrap_or_default();
+        (config.settings.download_folders().roots(), subdir)
+    };
+    let outcome = tokio::task::spawn_blocking(move || {
+        finished
+            .into_iter()
+            .map(|item| {
+                let result = move_if_still_the_download(&item, &roots, &subdir);
+                (item, result)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| coded_ctx("transfers_category_task_failed", "Category update failed", e))?;
+
+    let mut moves = Vec::new();
+    {
+        let mut manager = state.transfer_manager.write().await;
+        for (item, result) in outcome {
+            match result {
+                Ok(Some(to)) => {
+                    manager.set_completed_path(&item.id, to.to_string_lossy().into_owned());
+                    tracing::info!("Moved finished download {} to {}", item.id, to.display());
+                    moves.push(crate::commands::sharing::FileMove {
+                        from: item.from,
+                        to,
+                        hash: item.file_hash,
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "Could not move finished download {} into its category's folder: {e}",
+                        item.id
+                    );
+                    changes.move_failed.push(e);
+                }
+            }
+        }
+    }
+    changes.moved = u32::try_from(moves.len()).unwrap_or(u32::MAX);
+    crate::commands::sharing::relocate_library_files(&app, &state, &moves).await;
+    Ok(changes)
+}
+
+/// Move a finished download's file to `subdir`, after checking that the file
+/// at its recorded place is still the one it downloaded: by the Library's hash
+/// for it when there is one, by size otherwise. Something else written there
+/// since — the user moved the download away and another of the same name
+/// finished — must not be filed under this download's category. Blocking.
+fn move_if_still_the_download(
+    item: &FinishedToMove,
+    roots: &[String],
+    subdir: &[String],
+) -> Result<Option<std::path::PathBuf>, String> {
+    let not_this_file = || {
+        coded_ctx(
+            "transfers_category_not_the_download",
+            "The file at the download's place is no longer the one it downloaded",
+            &item.file_name,
+        )
+    };
+    match &item.indexed_hash {
+        Some(hash) if !hash.eq_ignore_ascii_case(&item.file_hash) => return Err(not_this_file()),
+        Some(_) => {}
+        None => match std::fs::metadata(&item.from) {
+            Ok(meta) if meta.len() == item.size => {}
+            Ok(_) => return Err(not_this_file()),
+            Err(e) => {
+                return Err(coded_ctx(
+                    "transfers_category_move_failed",
+                    "The file could not be moved to the category's folder",
+                    format!("{}: {e}", item.file_name),
+                ))
+            }
+        },
+    }
+    crate::network::ed2k::transfer::move_finished_download(
+        std::path::Path::new(&item.from),
+        roots,
+        subdir,
+        &item.file_name,
+    )
+    .map_err(|e| {
+        coded_ctx(
+            "transfers_category_move_failed",
+            "The file could not be moved to the category's folder",
+            format!("{}: {e:#}", item.file_name),
+        )
+    })
+}
+
+/// Library files the Library moved into `category`'s folder: a finished
+/// download in the transfer list that wrote one of them takes the category and
+/// the file's new place, so the two pages agree on both. Matched on the hash
+/// as well as the path, as [`relocate_library_files`] is. Best effort.
+///
+/// A file that stayed where it was is passed with `to` equal to `from`: its
+/// download takes the category all the same. Returns how many downloads did.
+///
+/// [`relocate_library_files`]: crate::commands::sharing::relocate_library_files
+pub(crate) async fn follow_moved_finished_downloads(
+    state: &AppState,
+    moves: &[crate::commands::sharing::FileMove],
+    category: &str,
+) -> usize {
+    let moved: HashMap<String, (&str, String)> = moves
+        .iter()
+        .map(|mv| {
+            (
+                crate::search::index::normalize_path_key(&mv.from),
+                (mv.hash.as_str(), mv.to.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+    let followed: Vec<String> = {
+        let mut manager = state.transfer_manager.write().await;
+        let hits: Vec<(String, String, bool)> = manager
+            .completed
+            .iter()
+            .filter(|t| t.direction == TransferDirection::Download)
+            .filter_map(|t| {
+                let recorded = t.completed_path.as_deref()?;
+                let (hash, to) = moved.get(&crate::search::index::normalize_path_key(recorded))?;
+                t.file_hash
+                    .eq_ignore_ascii_case(hash)
+                    .then(|| (t.id.clone(), to.clone(), t.category != category))
+            })
+            .collect();
+        for (id, to, _) in &hits {
+            manager.set_category(id, category);
+            manager.set_completed_path(id, to.clone());
+        }
+        // Only the downloads whose category this actually changed.
+        hits.into_iter().filter(|(_, _, changed)| *changed).map(|(id, _, _)| id).collect()
+    };
+    let count = followed.len();
+    for id in followed {
+        let db = state.db.clone();
+        let cat = category.to_string();
+        let persisted = tokio::task::spawn_blocking(move || db.update_transfer_category(&id, &cat)).await;
+        if !matches!(persisted, Ok(Ok(_))) {
+            tracing::warn!("Could not save the category of a finished download moved from the Library");
+        }
+    }
+    count
+}
+
+/// A Library file was renamed: a finished download in the transfer list that
+/// wrote it takes the new name and path, so the two pages agree. Matched on the
+/// hash as well as the path, as [`follow_moved_finished_downloads`] is. Best
+/// effort.
+pub(crate) async fn follow_renamed_finished_download(
+    state: &AppState,
+    renamed: &crate::commands::sharing::FileMove,
+) {
+    let Some(name) = renamed.to.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let to = renamed.to.to_string_lossy().into_owned();
+    let from_key = crate::search::index::normalize_path_key(&renamed.from);
+    let followed: Vec<String> = {
+        let mut manager = state.transfer_manager.write().await;
+        let ids: Vec<String> = manager
+            .completed
+            .iter()
+            .filter(|t| t.direction == TransferDirection::Download)
+            .filter(|t| {
+                t.completed_path
+                    .as_deref()
+                    .is_some_and(|p| crate::search::index::normalize_path_key(p) == from_key)
+                    && t.file_hash.eq_ignore_ascii_case(&renamed.hash)
+            })
+            .map(|t| t.id.clone())
+            .collect();
+        for id in &ids {
+            manager.follow_renamed_file(id, &name, to.clone());
+        }
+        ids
+    };
+    for id in followed {
+        let db = state.db.clone();
+        let name = name.clone();
+        let persisted = tokio::task::spawn_blocking(move || db.update_transfer_file_name(&id, &name)).await;
+        if !matches!(persisted, Ok(Ok(_))) {
+            tracing::warn!("Could not save the new name of a finished download renamed in the Library");
+        }
+    }
 }
 
 #[tauri::command]
@@ -3792,6 +4230,39 @@ mod ipc_lifecycle_tests {
         let climbed_out = old.join("Chat Files").join("..").join("Documents").join("photo.jpg");
         assert!(verify(&climbed_out, "Chat Files").is_err());
         assert!(verify(&old.join("Chat Files").join("missing.jpg"), "Chat Files").is_err());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A download filed under a category finishes in a folder inside
+    /// Downloads, and must still open once its download folder is an old one —
+    /// but no deeper than a category folder can be, and never by climbing out.
+    #[test]
+    fn a_recorded_download_may_sit_in_a_category_folder_inside_downloads() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (root, base) = approved_download_folder("category-landing");
+        let roots = [root.to_string_lossy().into_owned()];
+        let downloads = base.join("old").join("Downloads");
+        let filed = downloads.join("Video").join("TV Series").join("episode.mkv");
+        let too_deep = downloads.join("a").join("b").join("c").join("d").join("episode.mkv");
+        let beside = base.join("old").join("Documents").join("episode.mkv");
+        for file in [&filed, &too_deep, &beside] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, b"mkv").unwrap();
+        }
+        let max = crate::storage::category_folders::MAX_DEPTH;
+        let verify = |path: &std::path::Path| {
+            crate::security::filesystem::verify_recorded_file_nested(path, &roots, "Downloads", max)
+        };
+
+        assert_eq!(verify(&filed).unwrap(), filed.canonicalize().unwrap());
+        assert!(verify(&too_deep).is_err(), "deeper than a category folder can be");
+        assert!(verify(&beside).is_err());
+        let climbed_out = downloads.join("Video").join("..").join("..").join("Documents").join("episode.mkv");
+        assert!(verify(&climbed_out).is_err());
+        assert!(
+            crate::security::filesystem::verify_recorded_file(&filed, &roots, "Downloads").is_err(),
+            "the plain check still wants the file directly in Downloads"
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 

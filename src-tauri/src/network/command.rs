@@ -247,6 +247,8 @@ async fn handle_command_inner(
                 cancel_search_request(state, app_handle, prior_id);
             }
             state.active_search_request = None;
+            // Only the latest search can be continued with Search More.
+            state.finished_search = None;
             // Any second server request still queued belongs to that prior
             // search, which is now gone; this one queues its own below.
             state.server_followup_search = None;
@@ -292,6 +294,8 @@ async fn handle_command_inner(
                 // streamed packet of this search scores them as files we hold
                 // rather than as rows in whatever result set they arrived in.
                 batch_spam: crate::search::spam::BatchSpamContext::for_owned_hashes(owned_hashes),
+                udp_search_expr: Vec::new(),
+                server_has_more: false,
             };
 
             // eMule's native "Search Related Files": the connected server is
@@ -374,7 +378,7 @@ async fn handle_command_inner(
                 if let Some(tx) = tx.take() {
                     let _ = tx.send(local_results.take().unwrap_or_default());
                 }
-                let _ = app_handle.emit("search-complete", SearchCompleteEvent { request_id });
+                let _ = app_handle.emit("search-complete", SearchCompleteEvent::done(request_id));
                 return;
             }
             active_request.keywords = keywords.clone();
@@ -489,6 +493,7 @@ async fn handle_command_inner(
 
             // --- UDP global search ---
             if legs.udp {
+                active_request.udp_search_expr = search_expr.clone();
                 let uses_64bit_search = kad::messages::search_expression_uses_64bit(&search_expr);
                 let connected_addr = state.server_addr;
                 let servers = state.server_list.servers().to_vec();
@@ -747,12 +752,16 @@ async fn handle_command_inner(
                     && !active_request.udp_pending
                     && !active_request.ember_pending
                 {
-                    let _ = app_handle.emit("search-complete", SearchCompleteEvent { request_id });
+                    let _ = app_handle.emit("search-complete", SearchCompleteEvent::done(request_id));
                     return;
                 }
             }
 
             state.active_search_request = Some(active_request);
+        }
+
+        NetworkCommand::SearchMore { request_id, tx } => {
+            let _ = tx.send(start_search_more(state, request_id));
         }
 
         NetworkCommand::CancelSearch { request_id } => {
@@ -2352,6 +2361,10 @@ async fn handle_command_inner(
             let (ember_contacts, ember_verified) = ember_dht_ui_contact_counts(state);
             diag.ember_dht_contacts = ember_contacts;
             diag.ember_dht_verified_contacts = ember_verified;
+            diag.ember_dht_relaying_for = u32::try_from(
+                state.ember_dht.relaying_for_count(std::time::Instant::now()),
+            )
+            .unwrap_or(u32::MAX);
             // The headline count is buckets + cache + session extras, and those
             // three behave nothing alike — only the first is liveness-pinged.
             // Splitting them is what tells "we hold twelve peers" apart from
@@ -2372,10 +2385,8 @@ async fn handle_command_inner(
                 .estimated_network_size()
                 .unwrap_or(0)
                 .min(u32::MAX as u64) as u32;
-            diag.ember_dht_republish_backlog = state
-                .ember_dht
-                .republish_backlog(std::time::Duration::from_secs(EMBER_RECORD_REPUBLISH_SECS))
-                as u32;
+            diag.ember_dht_republish_backlog =
+                ember_republish_backlog(state).min(u32::MAX as usize) as u32;
             diag.ember_dht_seconds_since_inbound = state.ember_last_inbound.map(|at| {
                 chrono::Utc::now()
                     .timestamp()
@@ -3141,7 +3152,7 @@ async fn handle_command_inner(
                 return;
             }
             if let Some(gossip) = ember::channel::ChannelGossip::decode(&body) {
-                let _ = remember_channel_gossip(state, gossip.msg_id);
+                remember_originated_gossip(state, &gossip);
             }
             fanout_channel_gossip_body(socket, state, db, body, None).await;
         }
@@ -3273,8 +3284,26 @@ async fn handle_command_inner(
             // the file's name and size. A recipient on v1.6.x cannot read it
             // either, so unless this one is known to, the plain offer is kept
             // and the user is asked about it if the recipient stays silent.
+            // The file as it stands now, which the block path checks before it
+            // serves a byte. Off this task: an open can stall on a scanner.
+            let stamp_path = path.clone();
+            let stamp = match tokio::task::spawn_blocking(move || {
+                ember::xfer::SourceStamp::of_path(&stamp_path)
+            })
+            .await
+            {
+                Ok(Ok(stamp)) if stamp.size() == size => stamp,
+                _ => {
+                    let _ = tx.send(Err(coded(
+                        "channels_xfer_source_changed",
+                        "The file changed or was moved before it could be offered",
+                    )));
+                    return;
+                }
+            };
             let mut send =
-                ember::xfer::SendState::new(channel_id, peer, key, name.clone(), size, path.clone());
+                ember::xfer::SendState::new(channel_id, peer, key, name.clone(), size, path.clone())
+                    .with_source_stamp(stamp);
             if ember::xfer::holds_plain_offer(size, member_reads_sealed_offers(state, db, &peer)) {
                 send.hold_plain_offer(
                     ember::channel::encode_xfer_offer(&key, &offer),
@@ -3357,6 +3386,30 @@ async fn handle_command_inner(
                     )));
                     return;
                 }
+                // No longer in the room it came from — left, deleted, or walked
+                // out when the directory listed it gone. Its frames are dropped
+                // from here on, so the transfer could never finish.
+                if !cached_channel_view(state, db, offer.channel_id)
+                    .is_some_and(|view| view.row.in_room_now())
+                {
+                    state.xfer_pending.remove(&xfer_id);
+                    emit_xfer_update(
+                        app_handle,
+                        &xfer_id,
+                        &offer.channel_id,
+                        &offer.peer,
+                        "receive",
+                        &offer.name,
+                        offer.size,
+                        0,
+                        "not_allowed",
+                    );
+                    let _ = tx.send(Err(coded(
+                        "channels_xfer_no_member",
+                        "That member is not in this room",
+                    )));
+                    return;
+                }
                 // Banned since the prompt appeared. The offer path refuses a
                 // banned sender outright, and nothing re-read that decision
                 // afterwards — so a member evicted while their dialog sat on
@@ -3401,7 +3454,16 @@ async fn handle_command_inner(
                 .await
                 .ok()
                 .flatten();
-                if free.is_some_and(|free| free < offer.size.saturating_add(XFER_DISK_HEADROOM)) {
+                // Receives already running grow their part files as data
+                // arrives, so what they still owe is spoken for too.
+                let owed: u64 = state
+                    .xfer_recv
+                    .values()
+                    .map(|recv| recv.size.saturating_sub(recv.bytes_received()))
+                    .fold(0, u64::saturating_add);
+                if free.is_some_and(|free| {
+                    free < offer.size.saturating_add(XFER_DISK_HEADROOM).saturating_add(owed)
+                }) {
                     let _ = tx.send(Err(coded(
                         "channels_xfer_no_space",
                         "Not enough free disk space for this file",
@@ -4176,12 +4238,21 @@ async fn handle_command_inner(
                         return Err("Failed to parse IP filter".into());
                     }
                 };
+                // The user's own additions and removals outlive the list they
+                // were made on (`storage::ipfilter_edits`).
+                let edits = crate::storage::ipfilter_edits::load(
+                    load_path.parent().unwrap_or(std::path::Path::new(".")),
+                );
+                if !edits.is_empty() {
+                    edits.apply(&mut fresh);
+                }
                 if let (Some(staged), Some(bytes)) = (staged_path, staged_bytes) {
                     // `ipfilter.dat` is always loaded as text on startup.
                     // Preserve `.p2p` text verbatim, but convert `.p2b`
                     // binary input into canonical eMule text before it
-                    // replaces that stable path.
-                    let persisted_bytes = if imported_p2b {
+                    // replaces that stable path. With edits re-applied the
+                    // list on disk has to carry them too.
+                    let persisted_bytes = if imported_p2b || !edits.is_empty() {
                         fresh.canonical_dat_bytes()
                     } else {
                         bytes
@@ -4194,6 +4265,15 @@ async fn handle_command_inner(
                         return Err(format!("Failed to persist imported IP filter: {error}"));
                     }
                     info!("Persisted imported IP filter to {:?}", load_path);
+                } else if !edits.is_empty() {
+                    // A downloaded list was written to ipfilter.dat before
+                    // this reload; rewrite it with the edits in, or the next
+                    // start would load the list without them.
+                    if let Err(error) =
+                        write_ipfilter_dat_superseding(&load_path, &fresh.canonical_dat_bytes())
+                    {
+                        warn!("Could not save the IP filter with your edits re-applied: {error}");
+                    }
                 }
                 info!("ReloadIpFilter: parsed {range_count} ranges from {path:?}");
                 Ok(fresh)
@@ -4207,8 +4287,6 @@ async fn handle_command_inner(
                         .ip_filter
                         .update_shared_snapshot(&state.shared_ip_filter);
                     state.routing_table.evict_filtered_contacts();
-                    purge_ember_ip_blocked_peers(state);
-                    state.ember_dht.evict_filtered_contacts();
                     info!(
                         "Reloaded IP filter: {} ranges",
                         state.ip_filter.range_count(),
@@ -4258,13 +4336,18 @@ async fn handle_command_inner(
             if let (Ok(start), Ok(end)) = (start_ip.parse::<Ipv4Addr>(), end_ip.parse::<Ipv4Addr>())
             {
                 ensure_ipfilter_loaded(state).await;
+                {
+                    let data_dir = state.data_dir.clone();
+                    let (s, e, d) = (u32::from(start), u32::from(end), description.clone());
+                    tokio::task::spawn_blocking(move || {
+                        crate::storage::ipfilter_edits::update(&data_dir, |edits| edits.record_add(s, e, d))
+                    });
+                }
                 state.ip_filter.add_range(start, end, description);
                 state
                     .ip_filter
                     .update_shared_snapshot(&state.shared_ip_filter);
                 state.routing_table.evict_filtered_contacts();
-                purge_ember_ip_blocked_peers(state);
-                state.ember_dht.evict_filtered_contacts();
                 spawn_save_ipfilter_dat(&state.ip_filter, state.data_dir.join("ipfilter.dat"));
                 info!(
                     "Added IP filter range {start_ip} - {end_ip}, total ranges: {}",
@@ -4288,6 +4371,13 @@ async fn handle_command_inner(
             ensure_ipfilter_loaded(state).await;
             let removed = state.ip_filter.remove_range(&start_ip, &end_ip);
             if removed {
+                if let (Ok(start), Ok(end)) = (start_ip.parse::<Ipv4Addr>(), end_ip.parse::<Ipv4Addr>()) {
+                    let data_dir = state.data_dir.clone();
+                    let (s, e) = (u32::from(start), u32::from(end));
+                    tokio::task::spawn_blocking(move || {
+                        crate::storage::ipfilter_edits::update(&data_dir, |edits| edits.record_remove(s, e))
+                    });
+                }
                 state
                     .ip_filter
                     .update_shared_snapshot(&state.shared_ip_filter);
@@ -4378,8 +4468,6 @@ async fn handle_command_inner(
                 .update_shared_snapshot(&state.shared_ip_filter);
             if enabled {
                 state.routing_table.evict_filtered_contacts();
-                purge_ember_ip_blocked_peers(state);
-                state.ember_dht.evict_filtered_contacts();
                 apply_server_ip_filter(
                     state,
                     shared_server_addr,
@@ -5187,8 +5275,9 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::ChatAttachmentPreflight { ember_hash: friend_eh, tx } => {
+            // A friend we cannot reach yet still gets the file: it queues.
             let result = if friend_hashes.read().await.contains(&friend_eh) {
-                super::chat_attach::offer_preflight(state, settings, &friend_eh)
+                super::chat_attach::offer_path(state, settings, &friend_eh)
                     .await
                     .map(|_| ())
             } else {
@@ -6481,26 +6570,7 @@ async fn handle_command_inner(
             ember_hash: friend_eh,
             request_id,
         } => {
-            if let Some((retired_session_id, invalidated)) =
-                cancel_browse_request(&mut state.pending_browse_requests, friend_eh, &request_id)
-            {
-                if let Some(session_id) = retired_session_id.filter(|id| *id != 0) {
-                    // A browse response cannot be cancelled on the ED2K wire.
-                    // Retire this canonical session so its late response is
-                    // never attributed to a later local request.
-                    let _ =
-                        retire_ember_session(&state.ember_sessions, friend_eh, session_id).await;
-                    for invalidated_id in invalidated {
-                        let _ = app_handle.emit(
-                            "ember:browse-error",
-                            serde_json::json!({
-                                "user_hash": hex::encode(friend_eh),
-                                "request_id": invalidated_id,
-                                "reason": "Browse session was reset after cancellation",
-                            }),
-                        );
-                    }
-                }
+            if cancel_browse_request(&mut state.pending_browse_requests, friend_eh, &request_id) {
                 dispatch_browse_head(state, app_handle, friend_eh).await;
             }
         }
@@ -6696,7 +6766,7 @@ async fn handle_command_inner(
                                     db_for_clear.clear_friend_address(&hash_hex_clear)
                                 })
                                 .await;
-                                let _ = cancel_browse_request(
+                                let _ = remove_browse_request(
                                     &mut state.pending_browse_requests,
                                     friend_eh,
                                     &request_id,
@@ -6829,51 +6899,15 @@ async fn handle_command_inner(
             ember_hash: removed_hash,
             tx,
         } => {
-            upload_server::revoke_all_secure_sessions(removed_hash);
-            state.online_friends.remove(&removed_hash);
-            let _ = retire_current_ember_session(&state.ember_sessions, removed_hash).await;
-            // Also drop any pending outbound-search slot so a remove
-            // immediately followed by re-add isn't blocked for up to
-            // 10 minutes by a stale entry.
-            state.outbound_session_tasks.remove(&removed_hash);
-            state.friend_reconnect_last.remove(&removed_hash);
-            state.recent_ember_chat.remove(&removed_hash);
-            super::browse::forget_friend_scope(removed_hash);
-            super::chat_attach::forget_friend(state, settings, &removed_hash);
-
-            if let Some(pending) = state.pending_browse_requests.remove(&removed_hash) {
-                for request in pending {
-                    let _ = app_handle.emit(
-                        "ember:browse-error",
-                        serde_json::json!({
-                            "user_hash": hex::encode(removed_hash),
-                            "request_id": request.request_id,
-                            "reason": "Friend was removed",
-                        }),
-                    );
-                }
-            }
-
-            // Queue entries outlive their originating TCP connection for
-            // eMule seniority.  Strip only the friend-priority bit; standard
-            // queue/file-transfer behavior and verified Ember accounting stay
-            // intact.
-            {
-                let mut queue = upload_queue.lock().await;
-                for entry in queue.iter_mut() {
-                    let matches_removed = entry.ember_pubkey.is_some_and(|pk| {
-                        crate::network::ember::crypto::verifying_key_from_bytes(&pk).is_some_and(
-                            |vk| {
-                                crate::network::ember::crypto::node_id_from_public_key(&vk)
-                                    == removed_hash
-                            },
-                        )
-                    });
-                    if matches_removed {
-                        entry.is_friend_slot = false;
-                    }
-                }
-            }
+            super::friends::forget_friend_network_state(
+                state,
+                settings,
+                app_handle,
+                upload_queue,
+                removed_hash,
+                "Friend was removed",
+            )
+            .await;
             let _ = tx.send(());
         }
 
