@@ -971,9 +971,13 @@ pub(super) fn maybe_start_ember_rendezvous_lookup(
     if !kad_has_fresh_contact(state) {
         return false;
     }
-    // Gated on the same table size the bridge uses, so this stops once we are
-    // self-sufficient and gossip takes over.
-    if state.ember_dht.routing().verified_len() >= EMBER_KAD_BRIDGE_UNTIL_CONTACTS {
+    // Past the table size the bridge treats as a working set, gossip does most
+    // of the finding, so this slows to an hourly look rather than stopping:
+    // the rendezvous key is where Ember peers that joined since are listed,
+    // and a node that stopped asking never heard of them.
+    if state.ember_dht.routing().verified_len() >= EMBER_KAD_BRIDGE_UNTIL_CONTACTS
+        && now.saturating_sub(state.ember_rendezvous_looked_up_at) < EMBER_RENDEZVOUS_SETTLED_SECS
+    {
         return false;
     }
     let key = kad::publish::ember_rendezvous_key();
@@ -998,6 +1002,8 @@ pub(super) fn maybe_start_ember_rendezvous_lookup(
     let verified = state.ember_dht.routing().verified_len();
     if verified == 0 {
         info!("Ember rendezvous: looking up {key} to seed an empty DHT table");
+    } else if verified >= EMBER_KAD_BRIDGE_UNTIL_CONTACTS {
+        debug!("Ember rendezvous: looking up {key} for Ember peers that joined since ({verified} verified)");
     } else {
         info!(
             "Ember rendezvous: looking up {key} to grow a thin DHT table \
@@ -1006,6 +1012,21 @@ pub(super) fn maybe_start_ember_rendezvous_lookup(
     }
     true
 }
+
+/// How often a table past [`EMBER_KAD_BRIDGE_UNTIL_CONTACTS`] verified contacts
+/// still looks up the rendezvous key, for Ember peers that have joined since.
+pub(super) const EMBER_RENDEZVOUS_SETTLED_SECS: i64 = 3600;
+
+/// KAD-bridge pings per maintenance cycle once the table is past
+/// [`EMBER_KAD_BRIDGE_UNTIL_CONTACTS`] verified contacts.
+///
+/// Not zero: the peers KAD keeps naming are Ember users we have not met, and a
+/// node that stopped dialling them at twenty never met the rest. A few a minute
+/// under the ordinary retry backoff works through the cache without the
+/// handshake bursts the cold-start budget exists to bound, and a peer that
+/// answers is admitted like any other — into a bucket, or the replacement cache
+/// behind a full one — and from there into `nodes_ember.dat`.
+pub(super) const EMBER_KAD_BRIDGE_SETTLED_MAX_PINGS: usize = 4;
 
 /// Max KAD-bridge `PING`s per maintenance cycle, so even a large KAD-learned
 /// peer cache can't burst the DHT with handshakes in one tick.
@@ -1040,10 +1061,16 @@ pub(super) const EMBER_KAD_BRIDGE_MAX_PINGS: usize = EMBER_MAINT_MAX_PINGS_STARV
 pub(super) const EMBER_BRIDGE_FAST_MAX_PINGS: usize = 4;
 pub(super) const EMBER_BRIDGE_FAST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How many contacts `nodes_ember.dat` keeps. Matching KAD's 200: enough to
-/// rejoin from cold even if most have churned, without persisting the whole
-/// table (which also meant persisting gossip we had never reached).
-pub(super) const EMBER_PERSIST_MAX_CONTACTS: usize = 200;
+/// How many contacts `nodes_ember.dat` keeps.
+///
+/// Room for every peer a node is likely to meet, not just a rejoin's worth:
+/// on an overlay this young a remembered address is often the only way back
+/// to its owner, and at about 100 bytes an entry the whole book is ~100 KB.
+/// The cache ranks proven peers ahead of gossip, so a book that does fill
+/// sheds hearsay first. Builds that wrote 200 read the first 200 of a larger
+/// file, which are the best-ranked ones, so the file still loads after a
+/// downgrade.
+pub(super) const EMBER_PERSIST_MAX_CONTACTS: usize = 1000;
 
 /// Remembered peers handed to the routing table at once, at launch and on each
 /// top-up.
@@ -1086,6 +1113,12 @@ pub(super) const EMBER_SELF_LOOKUP_WARM_VERIFIED: usize = ember::dht::K_BUCKET_S
 /// How often the self-lookup repeats, to recover the close-to-home buckets
 /// after churn.
 pub(super) const EMBER_SELF_LOOKUP_REPEAT_SECS: i64 = 4 * 3600;
+/// Spacing between join-time self-lookups that had no proven peer to ask.
+///
+/// Such a lookup can only walk unanswered seeds, so it does not count as the
+/// join's self-lookup; this keeps the retries to one every couple of minutes
+/// until a peer has answered.
+pub(super) const EMBER_SELF_LOOKUP_RETRY_SECS: i64 = 120;
 /// Silence after which the DHT is treated as disconnected and re-bootstraps.
 pub(super) const EMBER_DISCONNECT_SECS: i64 = 20 * 60;
 /// Floor on how often emptying the overlay may re-arm bootstrap. The re-arm
@@ -1201,8 +1234,11 @@ pub(super) fn ember_stale_purge_hold(
 /// and whether it ever gets a slot depends entirely on this probe. If the
 /// incumbent answers it keeps its slot (proven-live contacts win, and the
 /// newcomer ages out of the cache); if it stays silent past
-/// `EMBER_MAINT_PING_TIMEOUT` the 1-second sweep faults and evicts it,
-/// promoting the newcomer. Registering the probe in the same
+/// `EMBER_MAINT_PING_TIMEOUT` the 1-second sweep charges it a strike, and the
+/// third in a row evicts it and promotes the newcomer — the same
+/// `MAX_FAILED_QUERIES` every contact gets, so one lost datagram cannot cost a
+/// proven peer its slot. A struck incumbent counts as in doubt, so the next
+/// newcomer to that bucket probes it again straight away. Registering the probe in the same
 /// `ember_dht_maint_pings` map the liveness sweep drains is what makes that
 /// fault/evict/promote path fire for free.
 ///
@@ -1315,9 +1351,9 @@ pub(super) async fn probe_bucket_oldest(
 /// never be DHT-pinged and `FIND_VALUE` would never ask it; those go over
 /// Noise_XX. Returns how many pings went out.
 ///
-/// The IK pass self-disables once the table is bootstrapped so steady-state KAD
-/// traffic does not spray DHT pings. `force` (the dev-panel button) bypasses
-/// that size gate.
+/// Once the table is bootstrapped the budget drops to
+/// [`EMBER_KAD_BRIDGE_SETTLED_MAX_PINGS`] so steady-state KAD traffic does not
+/// spray DHT pings. `force` (the dev-panel button) bypasses that size gate.
 ///
 /// Split out of [`run_ember_maintenance`] so the 1 Hz search timer can drive it
 /// during a cold join. Owned by the 60-second maintenance tick alone, it was
@@ -1341,9 +1377,17 @@ pub(super) async fn run_ember_kad_bridge(
     // A thin table that has settled still bridges, at the ordinary backoff:
     // on a small overlay that is how a peer appearing later is found, and a
     // node short of a working set must not shut the one door KAD gives it.
+    //
+    // A working set keeps dialling too, a few a cycle; see
+    // `EMBER_KAD_BRIDGE_SETTLED_MAX_PINGS`.
     let thin = state.ember_dht.routing().verified_len() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS;
     let starved = ember_dht_starved(state);
-    if !(force || thin) {
+    let max_pings = if force || thin {
+        max_pings
+    } else {
+        max_pings.min(EMBER_KAD_BRIDGE_SETTLED_MAX_PINGS)
+    };
+    if max_pings == 0 {
         return 0;
     }
     // Never a peer that is already a working contact. A signed frame clears an
@@ -1511,6 +1555,8 @@ pub(super) async fn run_ember_maintenance(
         {
             rearmed = true;
             info!("Ember DHT: overlay emptied, re-arming bootstrap");
+            // A fresh join, so the buckets near home need refilling too.
+            state.ember_self_lookup_done = false;
             state.ember_kad_bridge_attempted.clear();
             state.ember_bridge_fast_at = None;
             state.ember_rendezvous_looked_up_at = 0;
@@ -1793,18 +1839,28 @@ pub(super) async fn run_ember_maintenance(
     //     store responsibility meaningful, so it is worth an explicit lookup
     //     rather than waiting for generic refresh to wander there.
     let verified = state.ember_dht.routing().verified_len();
+    // Someone who has answered us: a verified table contact or session peer.
+    // Unproven seeds do not count — a lookup over them alone usually walks
+    // addresses that never reply.
+    let proven = ember_publishable_peer_count(state);
     let since_start = now_secs.saturating_sub(state.ember_started_at);
+    let retry_spaced = state.ember_last_self_lookup == 0
+        || now_secs.saturating_sub(state.ember_last_self_lookup) >= EMBER_SELF_LOOKUP_RETRY_SECS;
     let first_due = !state.ember_self_lookup_done
+        && retry_spaced
         && (since_start >= EMBER_SELF_LOOKUP_FIRST_DELAY_SECS
-            || ((verified >= EMBER_SELF_LOOKUP_WARM_VERIFIED
-                || ember_overlay_contact_count(state) > 0)
+            || ((verified >= EMBER_SELF_LOOKUP_WARM_VERIFIED || proven > 0)
                 && since_start >= EMBER_SELF_LOOKUP_WARM_DELAY_SECS));
     let repeat_due = state.ember_self_lookup_done
         && now_secs.saturating_sub(state.ember_last_self_lookup) >= EMBER_SELF_LOOKUP_REPEAT_SECS;
     if ember_overlay_contact_count(state) > 0 && (force || first_due || repeat_due) {
         let self_target = state.ember_dht.local_id();
         if let Some(search_id) = start_ember_background_find_node(state, self_target) {
-            state.ember_self_lookup_done = true;
+            // Only a lookup with a proven peer to ask fills the buckets near
+            // home. Marking one over dead seeds done held the next attempt
+            // off for the four-hour repeat, so peers the KAD bridge found a
+            // minute later never got one.
+            state.ember_self_lookup_done = proven > 0;
             state.ember_last_self_lookup = now_secs;
             result.buckets_refreshed += 1;
             debug!("Ember DHT: self-lookup for {self_target} to fill close-to-home buckets");

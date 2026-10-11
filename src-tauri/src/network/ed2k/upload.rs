@@ -2657,6 +2657,12 @@ pub enum UploadEventKind {
         ember_hash: [u8; 16],
         body_hash: [u8; 16],
     },
+    /// Friend's disappearing-message timer for something they just sent us.
+    EmberChatExpire {
+        ember_hash: [u8; 16],
+        target: crate::network::ember::crypto::ChatExpireTarget,
+        ttl_secs: u32,
+    },
     /// Incoming Ember browse request from a friend.
     EmberBrowseRequest {
         ember_hash: [u8; 16],
@@ -13837,6 +13843,29 @@ impl UploadHandler {
                                                 kind: UploadEventKind::EmberChatRead {
                                                     ember_hash: eh,
                                                     body_hash,
+                                                },
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
+                            Some((super::messages::EMBER_EXT_CHAT_EXPIRE, body)) => {
+                                if let Some(pk) = hello_caps.ember_pubkey {
+                                    if let Some((target, ttl_secs)) =
+                                        crate::network::ember::crypto::decrypt_chat_expire(
+                                            &self.ed25519_secret_key,
+                                            &pk,
+                                            body,
+                                        )
+                                    {
+                                        let _ = self
+                                            .upload_event_tx
+                                            .send(UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: UploadEventKind::EmberChatExpire {
+                                                    ember_hash: eh,
+                                                    target,
+                                                    ttl_secs,
                                                 },
                                             })
                                             .await;

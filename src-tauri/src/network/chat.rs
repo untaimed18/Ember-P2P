@@ -69,19 +69,29 @@ pub(super) async fn flush_pending_chat(
                 Vec::new()
             }
         };
-        (
-            expired,
-            db_read.pending_chat_messages(&hash_for_read, MAX_FLUSH_PER_SESSION),
-        )
+        let pending = db_read.pending_chat_messages(&hash_for_read, MAX_FLUSH_PER_SESSION);
+        // Each one's disappearing timer, to follow it out. A failed lookup
+        // sends them without one rather than not at all.
+        let ttls = pending
+            .as_ref()
+            .ok()
+            .map(|rows| {
+                let ids: Vec<i64> = rows.iter().map(|(id, _, _)| *id).collect();
+                db_read.chat_ttls(&hash_for_read, &ids).unwrap_or_default()
+            })
+            .unwrap_or_default();
+        (expired, pending, ttls)
     })
     .await
     .ok()
-    .map(|(expired, pending)| {
+    .map(|(expired, pending, ttls)| {
         emit_chat_delivery_failed(app_handle, &expired);
-        pending
+        pending.map(|rows| (rows, ttls))
     })
-    .and_then(|r| r.ok())
-    .unwrap_or_default();
+    .and_then(|r| r.ok());
+    let Some((pending, ttls)) = pending else {
+        return;
+    };
 
     if pending.is_empty() {
         return;
@@ -95,7 +105,7 @@ pub(super) async fn flush_pending_chat(
     {
         let sessions = ember_sessions.read().await;
         for (id, message, _stored_at) in pending {
-            let Some((session_tx, envelope)) = sessions
+            let Some((session_tx, envelope, peer_pubkey)) = sessions
                 .get(&friend)
                 .filter(|h| h.is_fresh() && h.is_secure_v2())
                 .and_then(|sender| {
@@ -105,7 +115,7 @@ pub(super) async fn flush_pending_chat(
                         &peer_pubkey,
                         message.as_bytes(),
                     )
-                    .map(|envelope| (sender.tx.clone(), envelope))
+                    .map(|envelope| (sender.tx.clone(), envelope, peer_pubkey))
                 })
             else {
                 // No usable session. Everything from here stays queued.
@@ -120,6 +130,16 @@ pub(super) async fn flush_pending_chat(
                 break;
             }
             sent.push(id);
+            if let Some(&ttl) = ttls.get(&id) {
+                let target = crate::network::ember::crypto::ChatExpireTarget::Message(
+                    crate::network::ember::crypto::chat_body_hash(&message),
+                );
+                let followed = chat_expire_frame(ed25519_secret_key, &peer_pubkey, target, ttl)
+                    .is_some_and(|frame| session_tx.try_send(frame).is_ok());
+                if !followed {
+                    debug!("Queued chat {id} to {hash_hex} went out without its disappearing timer");
+                }
+            }
         }
     }
     if sent.is_empty() {
@@ -131,15 +151,23 @@ pub(super) async fn flush_pending_chat(
     // task that called this, up to 200 times over.
     let db_mark = db.clone();
     let ids = sent.clone();
+    let hash_for_mark = hash_hex.clone();
     let marked = tokio::task::spawn_blocking(move || {
-        db_mark.set_chat_delivery_many(&ids, crate::storage::database::CHAT_DELIVERED)
+        let matched =
+            db_mark.set_chat_delivery_many(&ids, crate::storage::database::CHAT_DELIVERED)?;
+        let expiries: std::collections::HashMap<i64, i64> = db_mark
+            .chat_expiries(&hash_for_mark, &ids)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        Ok::<_, anyhow::Error>((matched, expiries))
     })
     .await;
     // A mark that silently failed left the row queued, so the next session
     // with this friend sent the same message again and they saw it twice.
     // We cannot un-send it, so log loudly rather than discarding the result.
-    let matched = match marked {
-        Ok(Ok(matched)) => matched,
+    let (matched, expiries) = match marked {
+        Ok(Ok(marked)) => marked,
         Ok(Err(e)) => {
             tracing::warn!(
                 "{} chat message(s) to {hash_hex} were sent but could not be marked \
@@ -171,6 +199,7 @@ pub(super) async fn flush_pending_chat(
                 "user_hash": hash_hex,
                 "id": id,
                 "delivery": "delivered",
+                "expires_at": expiries.get(&id),
             }),
         );
     }
@@ -226,6 +255,160 @@ pub(super) async fn send_encrypted_chat_ext(
         .is_ok()
 }
 
+/// The frame that follows something we sent a friend with our disappearing
+/// timer for it. `None` only if the peer's key cannot produce an envelope.
+pub(super) fn chat_expire_frame(
+    ed25519_secret_key: &[u8; 32],
+    peer_pubkey: &[u8; 32],
+    target: crate::network::ember::crypto::ChatExpireTarget,
+    ttl_secs: u32,
+) -> Option<Vec<u8>> {
+    let envelope = crate::network::ember::crypto::encrypt_chat_expire(
+        ed25519_secret_key,
+        peer_pubkey,
+        target,
+        ttl_secs,
+    )?;
+    Some(ed2k::messages::build_ember_ext_frame(
+        ed2k::messages::EMBER_EXT_CHAT_EXPIRE,
+        &envelope,
+    ))
+}
+
+/// Hand [`chat_expire_frame`] to the friend's live session. Whether it went.
+///
+/// Best-effort, like the read receipt: the message or offer it follows has
+/// already gone, so a timer that cannot follow leaves the friend's copy
+/// without one — exactly what a friend on a build that predates timers has —
+/// rather than holding anything back.
+pub(super) async fn send_chat_expire(
+    ember_sessions: &ed2k::upload::EmberSessionMap,
+    ed25519_secret_key: &[u8; 32],
+    friend: [u8; 16],
+    target: crate::network::ember::crypto::ChatExpireTarget,
+    ttl_secs: u32,
+) -> bool {
+    if ttl_secs == 0 {
+        return false;
+    }
+    let sessions = ember_sessions.read().await;
+    let Some(sender) = sessions
+        .get(&friend)
+        .filter(|h| h.is_fresh() && h.is_secure_v2())
+    else {
+        return false;
+    };
+    let Some(frame) =
+        chat_expire_frame(ed25519_secret_key, &sender.peer_ember_pubkey(), target, ttl_secs)
+    else {
+        return false;
+    };
+    sender.tx.try_send(frame).is_ok()
+}
+
+/// How long a timer that arrived ahead of its message is held for it.
+pub(super) const CHAT_EXPIRE_HOLD_SECS: i64 = 120;
+
+/// Timers held at once, across friends. A friend cannot grow it past this by
+/// naming messages that never come.
+pub(super) const MAX_HELD_CHAT_EXPIRES: usize = 256;
+
+/// Apply the disappearing timer `friend` named for something they sent us,
+/// or hold it until that arrives.
+///
+/// Held rather than dropped because the timer can overtake its message on the
+/// way to the database, and a dropped one leaves our copy without the expiry
+/// the sender asked for. Clamped to [`crate::types::CHAT_DISAPPEAR_PEER_MAX_SECS`]:
+/// a longer timer still deletes, just sooner than a sender on a future build
+/// might have asked, which never keeps anything longer than it wanted.
+pub(super) async fn apply_peer_chat_expire(
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    friend: [u8; 16],
+    target: crate::network::ember::crypto::ChatExpireTarget,
+    ttl_secs: u32,
+) {
+    let ttl_secs = ttl_secs.min(crate::types::CHAT_DISAPPEAR_PEER_MAX_SECS);
+    let friend_hex = hex::encode(friend);
+    let db_apply = db.clone();
+    let hash_for_db = friend_hex.clone();
+    let applied = tokio::task::spawn_blocking(move || match target {
+        crate::network::ember::crypto::ChatExpireTarget::Message(body_hash) => db_apply
+            .apply_peer_chat_ttl(&hash_for_db, &hex::encode(body_hash), ttl_secs)
+            .map(|row| row.map(|(id, at)| at.map(|at| (id, at)))),
+        crate::network::ember::crypto::ChatExpireTarget::Attachment(xfer_id) => db_apply
+            .set_received_chat_attachment_ttl(&hash_for_db, &hex::encode(xfer_id), ttl_secs)
+            .map(|matched| matched.then_some(None)),
+    })
+    .await;
+    match applied {
+        Ok(Ok(Some(started))) => {
+            if let Some(item) = started {
+                emit_chat_expiry(app_handle, &friend_hex, &[item]);
+            }
+        }
+        Ok(Ok(None)) => {
+            let now = chrono::Utc::now().timestamp();
+            state
+                .held_chat_expires
+                .retain(|_, (_, at)| now.saturating_sub(*at) < CHAT_EXPIRE_HOLD_SECS);
+            if state.held_chat_expires.len() < MAX_HELD_CHAT_EXPIRES {
+                state.held_chat_expires.insert((friend, target), (ttl_secs, now));
+            }
+        }
+        Ok(Err(e)) => warn!("Failed to apply a disappearing timer from {friend_hex}: {e}"),
+        Err(e) => warn!("Disappearing-timer task failed for {friend_hex}: {e}"),
+    }
+}
+
+/// The timer held for `target` from `friend`, if one arrived ahead of it.
+pub(super) fn take_held_chat_expire(
+    state: &mut NetworkState,
+    friend: [u8; 16],
+    target: crate::network::ember::crypto::ChatExpireTarget,
+) -> Option<u32> {
+    let (ttl, at) = state.held_chat_expires.remove(&(friend, target))?;
+    (chrono::Utc::now().timestamp().saturating_sub(at) < CHAT_EXPIRE_HOLD_SECS).then_some(ttl)
+}
+
+/// Tell an open conversation when these messages now disappear.
+pub(super) fn emit_chat_expiry(app_handle: &tauri::AppHandle, friend_hash: &str, items: &[(i64, i64)]) {
+    if items.is_empty() {
+        return;
+    }
+    let _ = app_handle.emit(
+        "ember:chat-expiry",
+        serde_json::json!({
+            "user_hash": friend_hash,
+            "items": items
+                .iter()
+                .map(|(id, at)| serde_json::json!({ "id": id, "expires_at": at }))
+                .collect::<Vec<_>>(),
+        }),
+    );
+}
+
+/// Tell open conversations what just disappeared or was deleted.
+pub(super) fn emit_chat_removed(
+    app_handle: &tauri::AppHandle,
+    friend_hash: &str,
+    ids: &[i64],
+    xfer_ids: &[String],
+) {
+    if ids.is_empty() && xfer_ids.is_empty() {
+        return;
+    }
+    let _ = app_handle.emit(
+        "ember:chat-removed",
+        serde_json::json!({
+            "user_hash": friend_hash,
+            "ids": ids,
+            "xfer_ids": xfer_ids,
+        }),
+    );
+}
+
 pub(super) async fn flush_pending_read_receipt(
     db: &Arc<Database>,
     ember_sessions: &ed2k::upload::EmberSessionMap,
@@ -266,8 +449,17 @@ pub(super) async fn persist_chat_history_message(
     user_hash: String,
     direction: &'static str,
     message: String,
+    ttl_secs: u32,
 ) -> Result<i64, String> {
-    tokio::task::spawn_blocking(move || db.insert_chat_message(&user_hash, direction, &message))
+    tokio::task::spawn_blocking(move || {
+        db.insert_chat_message_ttl(
+            &user_hash,
+            direction,
+            &message,
+            crate::storage::database::CHAT_DELIVERED,
+            ttl_secs,
+        )
+    })
         .await
         .map_err(|error| format!("Chat history persistence task failed: {error}"))?
         .map_err(|error| format!("Failed to persist chat history: {error}"))
@@ -302,18 +494,37 @@ pub(super) async fn queue_outbound_chat_message(
     db: Arc<Database>,
     user_hash: String,
     message: String,
+    ttl_secs: u32,
 ) -> Result<i64, String> {
-    tokio::task::spawn_blocking(move || db.insert_pending_chat_message(&user_hash, &message))
+    tokio::task::spawn_blocking(move || {
+        db.insert_chat_message_ttl(
+            &user_hash,
+            "sent",
+            &message,
+            crate::storage::database::CHAT_QUEUED,
+            ttl_secs,
+        )
+    })
         .await
         .map_err(|error| format!("Chat outbox persistence task failed: {error}"))?
         .map_err(|error| format!("Failed to persist chat outbox row: {error}"))
 }
 
 /// Mark an outbox row delivered only after its packet was accepted by the
-/// current live session's writer queue.
-pub(super) async fn mark_outbound_chat_delivered(db: Arc<Database>, message_id: i64) -> Result<(), String> {
+/// current live session's writer queue. Returns when it disappears, if it
+/// carries a timer — delivery is what starts it.
+pub(super) async fn mark_outbound_chat_delivered(
+    db: Arc<Database>,
+    friend_hash: String,
+    message_id: i64,
+) -> Result<Option<i64>, String> {
     let write = tokio::task::spawn_blocking(move || {
-        db.set_chat_delivery(message_id, crate::storage::database::CHAT_DELIVERED)
+        db.set_chat_delivery(message_id, crate::storage::database::CHAT_DELIVERED)?;
+        Ok::<_, anyhow::Error>(
+            db.chat_expiries(&friend_hash, &[message_id])?
+                .first()
+                .map(|(_, at)| *at),
+        )
     });
     // Same reasoning as `CHAT_OUTBOX_WRITE_TIMEOUT`. A timeout here leaves the
     // row pending, which the caller surfaces as "already queued" — the message
@@ -323,7 +534,6 @@ pub(super) async fn mark_outbound_chat_delivered(db: Arc<Database>, message_id: 
         .await
         .map_err(|_| "Chat delivery write did not complete in time".to_string())?
         .map_err(|error| format!("Chat delivery persistence task failed: {error}"))?
-        .map(|_| ())
         .map_err(|error| format!("Failed to mark chat delivered: {error}"))
 }
 

@@ -578,6 +578,88 @@ pub fn decrypt_chat_read(
     plain.try_into().ok()
 }
 
+/// What an `EMBER_EXT_CHAT_EXPIRE` timer is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChatExpireTarget {
+    /// A chat message, named by its [`chat_body_hash`].
+    Message([u8; CHAT_BODY_HASH_LEN]),
+    /// A chat attachment, named by its 16-byte transfer id.
+    Attachment([u8; 16]),
+}
+
+/// Marks the plaintext as a timer, so the envelope cannot be taken for any
+/// other chat signal under the same key.
+const CHAT_EXPIRE_MAGIC: &[u8; 4] = b"EXP1";
+const CHAT_EXPIRE_KIND_MESSAGE: u8 = 1;
+const CHAT_EXPIRE_KIND_ATTACHMENT: u8 = 2;
+/// `magic(4) || kind(1) || id(16) || ttl_secs(4, LE)`.
+const CHAT_EXPIRE_PLAIN_LEN: usize = 4 + 1 + 16 + 4;
+/// Largest timer envelope decrypted. Room past today's plaintext so a later
+/// build can append fields, which this one reads past.
+pub const MAX_CHAT_EXPIRE_WIRE_LEN: usize = CHAT_ENVELOPE_OVERHEAD + 64;
+
+/// The plaintext of a disappearing-message timer.
+pub fn encode_chat_expire(target: ChatExpireTarget, ttl_secs: u32) -> Vec<u8> {
+    let (kind, id) = match target {
+        ChatExpireTarget::Message(hash) => (CHAT_EXPIRE_KIND_MESSAGE, hash),
+        ChatExpireTarget::Attachment(xfer) => (CHAT_EXPIRE_KIND_ATTACHMENT, xfer),
+    };
+    let mut out = Vec::with_capacity(CHAT_EXPIRE_PLAIN_LEN);
+    out.extend_from_slice(CHAT_EXPIRE_MAGIC);
+    out.push(kind);
+    out.extend_from_slice(&id);
+    out.extend_from_slice(&ttl_secs.to_le_bytes());
+    out
+}
+
+/// The target and timer in a disappearing-message plaintext, or `None` for
+/// one that is short, unmarked, of a kind this build does not know, or names
+/// no timer at all.
+pub fn decode_chat_expire(plain: &[u8]) -> Option<(ChatExpireTarget, u32)> {
+    if plain.len() < CHAT_EXPIRE_PLAIN_LEN || &plain[..4] != CHAT_EXPIRE_MAGIC {
+        return None;
+    }
+    let id: [u8; 16] = plain[5..21].try_into().ok()?;
+    let ttl_secs = u32::from_le_bytes(plain[21..25].try_into().ok()?);
+    if ttl_secs == 0 {
+        return None;
+    }
+    let target = match plain[4] {
+        CHAT_EXPIRE_KIND_MESSAGE => ChatExpireTarget::Message(id),
+        CHAT_EXPIRE_KIND_ATTACHMENT => ChatExpireTarget::Attachment(id),
+        _ => return None,
+    };
+    Some((target, ttl_secs))
+}
+
+/// Encrypt a disappearing-message timer for a live friend session.
+pub fn encrypt_chat_expire(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    target: ChatExpireTarget,
+    ttl_secs: u32,
+) -> Option<Vec<u8>> {
+    encrypt_chat_for_peer(
+        our_ed25519_seed,
+        peer_ed25519_pubkey,
+        &encode_chat_expire(target, ttl_secs),
+    )
+}
+
+/// Decrypt a disappearing-message timer. `None` if the envelope is too large,
+/// not ours, or does not hold a timer.
+pub fn decrypt_chat_expire(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    envelope: &[u8],
+) -> Option<(ChatExpireTarget, u32)> {
+    if envelope.len() > MAX_CHAT_EXPIRE_WIRE_LEN {
+        return None;
+    }
+    let plain = decrypt_chat_from_peer(our_ed25519_seed, peer_ed25519_pubkey, envelope)?;
+    decode_chat_expire(&plain)
+}
+
 /// Decode an inbound `OP_EMBER_CHAT_MSG` payload for display.
 ///
 /// Returns `None` if the payload fails to decrypt or the plaintext isn't
@@ -616,6 +698,51 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
+
+    #[test]
+    fn a_disappearing_timer_round_trips_and_nothing_else_reads_as_one() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let bob = SigningKey::generate(&mut OsRng);
+        let hash = chat_body_hash("see you at eight");
+        let target = ChatExpireTarget::Message(hash);
+        let envelope = encrypt_chat_expire(
+            &alice.to_bytes(),
+            &bob.verifying_key().to_bytes(),
+            target,
+            86_400,
+        )
+        .unwrap();
+        assert_eq!(
+            decrypt_chat_expire(&bob.to_bytes(), &alice.verifying_key().to_bytes(), &envelope),
+            Some((target, 86_400))
+        );
+
+        let xfer = ChatExpireTarget::Attachment([7; 16]);
+        assert_eq!(decode_chat_expire(&encode_chat_expire(xfer, 300)), Some((xfer, 300)));
+        // A later build may append fields; this one reads what it knows.
+        let mut longer = encode_chat_expire(xfer, 300);
+        longer.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(decode_chat_expire(&longer), Some((xfer, 300)));
+
+        // No timer, an unknown kind, no marker, or a read receipt's bytes.
+        assert_eq!(decode_chat_expire(&encode_chat_expire(target, 0)), None);
+        let mut unknown = encode_chat_expire(target, 60);
+        unknown[4] = 9;
+        assert_eq!(decode_chat_expire(&unknown), None);
+        assert_eq!(decode_chat_expire(&hash), None);
+        let receipt =
+            encrypt_chat_read(&alice.to_bytes(), &bob.verifying_key().to_bytes(), &hash).unwrap();
+        assert_eq!(
+            decrypt_chat_expire(&bob.to_bytes(), &alice.verifying_key().to_bytes(), &receipt),
+            None
+        );
+        // Someone else's key opens nothing.
+        let eve = SigningKey::generate(&mut OsRng);
+        assert_eq!(
+            decrypt_chat_expire(&eve.to_bytes(), &alice.verifying_key().to_bytes(), &envelope),
+            None
+        );
+    }
 
     #[test]
     fn node_id_deterministic() {

@@ -1114,6 +1114,12 @@ pub(super) struct NetworkState {
     /// can reach this map; the short window suppresses accidental same-session
     /// application retries without accepting generic transfer-path chat.
     pub(super) recent_ember_chat: HashMap<[u8; 16], (String, i64)>,
+    /// Disappearing-message timers a friend named for something we have no
+    /// row for yet, by friend and target, with when each arrived. The timer
+    /// follows its message, but the message can still be on its way to the
+    /// database, so it is held for `CHAT_EXPIRE_HOLD_SECS` and applied when the
+    /// row lands. Bounded by `MAX_HELD_CHAT_EXPIRES` (both in `chat.rs`).
+    pub(super) held_chat_expires: HashMap<([u8; 16], ember::crypto::ChatExpireTarget), (u32, i64)>,
     /// Shared Ember session map for sending outbound packets to friend connections
     pub(super) ember_sessions: upload_server::EmberSessionMap,
     /// Shared flag: set while the app is shutting down, so the upload listener

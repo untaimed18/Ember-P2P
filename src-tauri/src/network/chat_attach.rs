@@ -338,6 +338,55 @@ pub(crate) struct InboundAttach {
     requested: bool,
 }
 
+/// Our disappearing timer for a file we offer `friend`: recorded on our own
+/// card, and sent after the offer so their card goes with it.
+async fn follow_offer_with_ttl(
+    state: &NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+    friend: [u8; 16],
+    xfer_id: [u8; 16],
+    announce: bool,
+) {
+    let ttl = settings.chat_disappear_secs_for(&friend);
+    if ttl == 0 {
+        return;
+    }
+    let _ = db.set_chat_attachment_ttl(&hex::encode(friend), &hex::encode(xfer_id), ttl);
+    if announce {
+        let _ = super::chat::send_chat_expire(
+            &state.ember_sessions,
+            &state.local_ed25519_seed,
+            friend,
+            crate::network::ember::crypto::ChatExpireTarget::Attachment(xfer_id),
+            ttl,
+        )
+        .await;
+    }
+}
+
+/// The timers for a file `friend` just offered us: ours, and theirs if it
+/// arrived ahead of the offer. Whichever is shorter applies.
+fn note_received_ttl(
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+    friend: [u8; 16],
+    xfer_id: [u8; 16],
+) {
+    let friend_hex = hex::encode(friend);
+    let xfer_hex = hex::encode(xfer_id);
+    let _ = db.set_chat_attachment_ttl(&friend_hex, &xfer_hex, settings.chat_disappear_secs_for(&friend));
+    let held = super::chat::take_held_chat_expire(
+        state,
+        friend,
+        crate::network::ember::crypto::ChatExpireTarget::Attachment(xfer_id),
+    );
+    if let Some(ttl) = held {
+        let _ = db.set_received_chat_attachment_ttl(&friend_hex, &xfer_hex, ttl);
+    }
+}
+
 async fn send_ext(
     state: &NetworkState,
     friend: &[u8; 16],
@@ -571,7 +620,10 @@ pub(super) async fn send_offer(
     let now = chrono::Utc::now().timestamp();
     let path_str = path.to_string_lossy().into_owned();
     if let OfferPath::Later(why) = path_now {
-        return queue_offer(db, app, friend, &xfer_hex, &name, size, root, &path_str, now, &why);
+        let queued = queue_offer(db, app, friend, &xfer_hex, &name, size, root, &path_str, now, &why)?;
+        // On our card now; it goes to the friend with the offer, when it can.
+        follow_offer_with_ttl(state, db, settings, friend, xfer_id, false).await;
+        return Ok(queued);
     }
     db.upsert_chat_attachment(
         &xfer_hex,
@@ -594,6 +646,7 @@ pub(super) async fn send_offer(
         emit_by_id(app, db, &xfer_hex);
         return Err(e);
     }
+    follow_offer_with_ttl(state, db, settings, friend, xfer_id, true).await;
     let row = db.chat_attachment(&xfer_hex).ok_or_else(not_found)?;
     emit_row(app, &row);
     info!(
@@ -717,6 +770,10 @@ pub(super) async fn send_queued(
             emit_by_id(app, db, &xfer_hex);
             return;
         }
+        let mut xfer_id = [0u8; 16];
+        if hex::decode_to_slice(&xfer_hex, &mut xfer_id).is_ok() {
+            follow_offer_with_ttl(state, db, settings, friend, xfer_id, true).await;
+        }
         emit_by_id(app, db, &xfer_hex);
         info!(
             "Chat attachment: offered queued {xfer_hex} ({} bytes) to {}",
@@ -824,6 +881,7 @@ async fn reoffer(
         emit_by_id(app, db, &xfer_hex);
         return Err(e);
     }
+    follow_offer_with_ttl(state, db, settings, friend, xfer_id, true).await;
     emit_by_id(app, db, &xfer_hex);
     info!(
         "Chat attachment: offered {xfer_hex} again ({} bytes) to {}",
@@ -965,6 +1023,7 @@ pub(super) async fn on_reply(
             match offer_again_body(state, db, settings, &friend, &xfer_hex, &row).await {
                 Ok(body) => {
                     if send_ext(state, &friend, EMBER_EXT_ATTACH_OFFER, &body).await.is_ok() {
+                        follow_offer_with_ttl(state, db, settings, friend, xfer_id, true).await;
                         state.attach_reoffered.insert(xfer_id, now);
                         info!(
                             "Chat attachment: offered {xfer_hex} again to {}, who lost it",
@@ -1344,6 +1403,7 @@ pub(super) async fn on_offer(
             )
             .is_ok()
         {
+            note_received_ttl(state, db, settings, friend, xfer_id);
             emit_by_id(app, db, &xfer_hex);
         }
         let _ = send_ext(
@@ -1376,6 +1436,7 @@ pub(super) async fn on_offer(
         warn!("Chat attachment: could not record an offer: {e}");
         return;
     }
+    note_received_ttl(state, db, settings, friend, xfer_id);
     let size = offer.size;
     // A program, script or shortcut, or one named to pass for a document, is
     // never fetched unasked whatever its size: the bubble's warning is only

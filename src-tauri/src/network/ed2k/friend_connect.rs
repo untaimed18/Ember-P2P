@@ -976,6 +976,24 @@ pub async fn run_friend_session_over_transport(
                                                 }).await;
                                             }
                                         }
+                                        Some((super::messages::EMBER_EXT_CHAT_EXPIRE, body)) => {
+                                            if let Some((target, ttl_secs)) =
+                                                crate::network::ember::crypto::decrypt_chat_expire(
+                                                    &session_our_ed25519_secret,
+                                                    &session_peer_ember_pubkey,
+                                                    body,
+                                                )
+                                            {
+                                                let _ = session_ul_event_tx.send(UploadEvent {
+                                                    transfer_id: String::new(),
+                                                    kind: UploadEventKind::EmberChatExpire {
+                                                        ember_hash: peer_ember_hash,
+                                                        target,
+                                                        ttl_secs,
+                                                    },
+                                                }).await;
+                                            }
+                                        }
                                         Some((super::messages::EMBER_EXT_DHT_CONTACT_REQ, body)) => {
                                             let _ = session_ul_event_tx.send(UploadEvent {
                                                 transfer_id: String::new(),

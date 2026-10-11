@@ -2468,6 +2468,8 @@ pub fn run() {
             commands::peers::reset_friend_code,
             commands::peers::send_chat_message,
             commands::peers::discard_failed_chat_message,
+            commands::peers::delete_chat_history,
+            commands::peers::delete_chat_message,
             commands::peers::get_chat_messages,
             commands::peers::is_chat_locked,
             commands::peers::mark_messages_read,

@@ -15,6 +15,7 @@
   import { plural } from '$lib/plural';
   import { appSettings, setAppSettings } from '$lib/stores/settings';
   import { onlineFriends } from '$lib/stores/friends';
+  import { CHAT_DISAPPEAR_CHOICES, disappearLabel } from '$lib/chatDisappear';
   import { setFriendOverrides } from '$lib/api/settings';
   import {
     compactOverrides,
@@ -75,6 +76,10 @@
       ? initial.auto_accept_mb
       : Math.max(1, $appSettings?.chat_attachment_auto_accept_mb ?? 25),
   );
+  /** `'default'`, or a timer in seconds as the select holds it (`'0'` is off). */
+  let disappear = $state<string>(
+    initial.disappear_secs === undefined ? 'default' : String(initial.disappear_secs),
+  );
 
   // What each default currently is, so "Use default" says what it means.
   let chatDefault = $derived($appSettings?.friend_chat_disabled !== true);
@@ -87,6 +92,8 @@
   let notifyMessagesDefault = $derived($appSettings?.notify_friend_message === true);
   let notificationsOff = $derived($appSettings?.notifications_enabled === false);
   let autoDefaultMb = $derived($appSettings?.chat_attachment_auto_accept_mb ?? 0);
+  let disappearDefault = $derived($appSettings?.chat_disappear_secs ?? 0);
+  let disappearOn = $derived((disappear === 'default' ? disappearDefault : Number(disappear)) > 0);
 
   let online = $derived($onlineFriends.has(hash));
   let displayName = $derived(name.trim() || opened.nickname || shortId);
@@ -123,6 +130,7 @@
             : autoMb,
       browse: fromTri(browse),
       read_receipts: chatOn ? fromTri(readReceipts) : undefined,
+      disappear_secs: chatOn && disappear !== 'default' ? Number(disappear) : undefined,
       notify_online: fromTri(notifyOnline),
       notify_messages: fromTri(notifyMessages),
     });
@@ -131,6 +139,7 @@
   function reset() {
     chat = files = browse = readReceipts = notifyOnline = notifyMessages = 'default';
     autoChoice = 'default';
+    disappear = 'default';
   }
 
   async function save() {
@@ -329,6 +338,25 @@
               {/if}
             {/if}
             {@render triSelect(`fs-receipts-${instanceId}`, m.friend_settings_read_receipts(), readReceipts, (v) => (readReceipts = v), receiptsDefault, !chatOn)}
+            <div class="fs-row" class:is-custom={disappear !== 'default'} class:is-disabled={!chatOn}>
+              <label for="fs-disappear-{instanceId}">{m.friend_settings_disappear()}</label>
+              <select
+                id="fs-disappear-{instanceId}"
+                value={disappear}
+                disabled={!chatOn}
+                aria-describedby={chatOn && disappearOn ? `fs-disappear-hint-${instanceId}` : undefined}
+                onchange={(e) => (disappear = e.currentTarget.value)}
+              >
+                <option value="default">{m.friend_settings_default_value({ value: disappearLabel(disappearDefault) })}</option>
+                <option value="0">{m.chat_disappear_off()}</option>
+                {#each CHAT_DISAPPEAR_CHOICES as secs (secs)}
+                  <option value={String(secs)}>{disappearLabel(secs)}</option>
+                {/each}
+              </select>
+            </div>
+            {#if chatOn && disappearOn}
+              <p id="fs-disappear-hint-{instanceId}" class="fs-note">{m.friend_settings_disappear_hint({ name: displayName })}</p>
+            {/if}
             <p class="fs-note">{chatOn ? m.friend_settings_risky_note() : m.friend_settings_needs_chat()}</p>
           </fieldset>
         </section>

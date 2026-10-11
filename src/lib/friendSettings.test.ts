@@ -5,6 +5,7 @@ import {
   browseAllowedFor,
   chatAllowedWith,
   compactOverrides,
+  disappearSecsFor,
   filesAllowedFrom,
   friendNotifies,
   friendOverrides,
@@ -31,6 +32,16 @@ function settingsWith(
     ...patch,
   } as AppSettings;
 }
+
+describe('disappearing messages', () => {
+  it('follows the default unless a friend has their own timer, off included', () => {
+    expect(disappearSecsFor(settingsWith(), ANA)).toBe(0);
+    const s = settingsWith({ chat_disappear_secs: 86_400 }, { [ANA]: { disappear_secs: 0 }, [BEN]: { disappear_secs: 3_600 } });
+    expect(disappearSecsFor(s, ANA)).toBe(0);
+    expect(disappearSecsFor(s, BEN)).toBe(3_600);
+    expect(disappearSecsFor(s, 'aa'.repeat(16))).toBe(86_400);
+  });
+});
 
 describe('friend settings', () => {
   it('follows the global settings for a friend with no overrides', () => {

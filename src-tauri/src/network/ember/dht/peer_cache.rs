@@ -123,7 +123,32 @@ impl BootstrapCache {
     /// what [`Self::trim_to`] compares against — but deliberately
     /// *not* carried into the routing table; see [`Self::seed_batch`].
     pub fn load(&mut self, mut entries: Vec<CachedContact>) {
-        for entry in &mut entries {
+        self.prepare_loaded(&mut entries);
+        for entry in entries {
+            self.entries.insert(entry.contact.node_id, entry);
+        }
+    }
+
+    /// [`Self::load`] for a file read after the session has started learning
+    /// peers — the launch read failed (on Windows, typically a sharing
+    /// violation from antivirus or backup software) and a later save retried
+    /// it. Nothing the session has heard is overwritten unless the file knows
+    /// of a more recent answer.
+    pub fn merge_late_load(&mut self, mut entries: Vec<CachedContact>) {
+        self.prepare_loaded(&mut entries);
+        for entry in entries {
+            match self.entries.get_mut(&entry.contact.node_id) {
+                Some(existing) if existing.contact.last_seen >= entry.contact.last_seen => {}
+                Some(existing) => *existing = entry,
+                None => {
+                    self.entries.insert(entry.contact.node_id, entry);
+                }
+            }
+        }
+    }
+
+    fn prepare_loaded(&mut self, entries: &mut [CachedContact]) {
+        for entry in entries {
             // Force every restored timestamp strictly before this session.
             //
             // `reached_someone` asks whether any entry was heard from at or
@@ -143,9 +168,6 @@ impl BootstrapCache {
                 .min(self.session_started_at.saturating_sub(1))
                 .max(0);
             self.loaded.insert(entry.contact.node_id);
-        }
-        for entry in entries {
-            self.entries.insert(entry.contact.node_id, entry);
         }
     }
 
@@ -317,13 +339,14 @@ impl BootstrapCache {
 
     /// The entries to write, best first, capped at `max`.
     ///
-    /// Ordered by how much we trust the address: peers that have never missed a
-    /// session, then ones we have actually heard from, then — as the original
-    /// table export did, and for the same reason KAD does — by XOR distance, so
-    /// the buckets closest to home are the ones a restart can refill first.
+    /// Ordered by how much we trust the address: peers we have actually heard
+    /// from, then fewest missed sessions, then most recently heard from, then —
+    /// as the original table export did, and for the same reason KAD does — by
+    /// XOR distance, so the buckets closest to home are the ones a restart can
+    /// refill first. See [`Self::rank`].
     pub fn snapshot(&self, local_id: &EmberNodeId, max: usize) -> Vec<CachedContact> {
         let mut out: Vec<&CachedContact> = self.entries.values().collect();
-        out.sort_by_key(|entry| Self::rank(local_id, entry));
+        out.sort_by_key(|entry| self.rank(local_id, entry));
         out.into_iter().take(max).cloned().collect()
     }
 
@@ -339,13 +362,28 @@ impl BootstrapCache {
     /// twenty invented contacts, repeated, injects unlimited zero-miss entries
     /// and flushes the whole book.
     ///
-    /// Within each tier, fewer missed sessions first, then XOR distance, so a
-    /// proven address that has stopped answering still sinks — just never below
-    /// something we have only been told about.
-    fn rank(local_id: &EmberNodeId, entry: &CachedContact) -> (bool, u8, [u8; 16]) {
+    /// Within each tier, fewer missed sessions first, so a proven address that
+    /// has stopped answering still sinks — just never below something we have
+    /// only been told about.
+    ///
+    /// Then how many days ago we last heard from it. Misses are only charged
+    /// to addresses a session dialled, and a settled node dials none of its
+    /// book, so a peer last heard from months ago keeps a clean record for
+    /// good. On distance alone it outranked one that answered today, and once
+    /// the book was full the trim deleted the live peer to keep it. Whole days
+    /// rather than seconds, so peers heard from the same day still order by
+    /// XOR distance, which is what lets a restart refill the buckets closest
+    /// to home first.
+    fn rank(&self, local_id: &EmberNodeId, entry: &CachedContact) -> (bool, u8, u32, [u8; 16]) {
+        let days_since_seen = self
+            .session_started_at
+            .saturating_sub(entry.contact.last_seen)
+            .max(0)
+            / 86_400;
         (
             !entry.contact.is_verified(),
             entry.misses,
+            u32::try_from(days_since_seen).unwrap_or(u32::MAX),
             local_id.distance(&entry.contact.node_id).0,
         )
     }
@@ -395,7 +433,7 @@ impl BootstrapCache {
                     && !held.contains(&entry.contact.node_id)
             })
             .collect();
-        ranked.sort_by_key(|entry| Self::rank(local_id, entry));
+        ranked.sort_by_key(|entry| self.rank(local_id, entry));
 
         let batch: Vec<EmberContact> = ranked
             .into_iter()
@@ -445,6 +483,46 @@ mod tests {
         let mut cache = cache_started_at(1_000);
         cache.load(entries.to_vec());
         cache
+    }
+
+    /// Neither has missed a session — a settled node dials none of its book, so
+    /// the long-gone peer never gets the chance — and XOR distance favours the
+    /// old one. A full book must still keep the peer that answered today.
+    #[test]
+    fn a_full_book_keeps_the_peer_heard_today_over_one_from_months_ago() {
+        const DAY: i64 = 86_400;
+        let started = 400 * DAY;
+        let old = contact(1, started - 200 * DAY);
+        let today = contact(2, started - 3_600);
+        // Our own id is the old peer's, so on distance alone it would win.
+        let local = old.node_id;
+        let mut cache = cache_started_at(started);
+        cache.load(vec![CachedContact::new(old.clone()), CachedContact::new(today.clone())]);
+
+        assert_eq!(cache.trim_to(&local, 1), 1);
+        let kept = cache.snapshot(&local, 1);
+        assert_eq!(kept[0].contact.node_id, today.node_id);
+    }
+
+    /// The launch read failed and a later save read the file after all: it
+    /// fills in what this session has not met, and leaves what it has alone.
+    #[test]
+    fn a_late_read_adds_to_the_book_without_undoing_this_session() {
+        let local = EmberNodeId([0; 16]);
+        let mut cache = cache_started_at(1_000);
+        let live = contact(1, 1_200);
+        cache.observe(std::iter::once(&live));
+
+        cache.merge_late_load(vec![
+            CachedContact { contact: contact(1, 900), misses: 3 },
+            CachedContact::new(contact(2, 900)),
+        ]);
+
+        let book = cache.snapshot(&local, EMBER_TEST_CAP);
+        assert_eq!(book.len(), 2, "the peer only the file knew is remembered");
+        let kept = book.iter().find(|e| e.contact.node_id == live.node_id).unwrap();
+        assert_eq!(kept.contact.last_seen, 1_200, "this session's answer stands");
+        assert_eq!(kept.misses, 0);
     }
 
     /// The bug this type exists for: the table is culled a few minutes into a

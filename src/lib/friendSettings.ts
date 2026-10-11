@@ -55,6 +55,16 @@ export function readReceiptsWith(settings: Settings, friendHash: string): boolea
   );
 }
 
+/** The disappearing-message timers offered, in seconds: five minutes, one hour,
+ *  one day, one week and four weeks. Mirrors `CHAT_DISAPPEAR_CHOICES`. */
+export const CHAT_DISAPPEAR_CHOICES = [300, 3_600, 86_400, 604_800, 2_419_200] as const;
+
+/** The disappearing-message timer with this friend, in seconds; 0 is off. */
+export function disappearSecsFor(settings: Settings, friendHash: string): number {
+  const secs = friendOverrides(settings, friendHash).disappear_secs ?? settings?.chat_disappear_secs ?? 0;
+  return Number.isFinite(secs) && secs > 0 ? secs : 0;
+}
+
 /** Whether this friend's online, message and file notifications are wanted,
  *  before the master switch and the focus rule `shouldNotify` also applies. */
 export function friendNotifies(

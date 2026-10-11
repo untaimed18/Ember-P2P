@@ -69,6 +69,10 @@ pub struct FriendChatRow {
     pub delivery: i64,
     /// The friend has opened our sent message. Received rows stay false.
     pub seen: bool,
+    /// When a disappearing message is deleted, in Unix seconds. `None` for
+    /// one without a timer, and for one whose timer has not started: a sent
+    /// message counts from delivery, a received one from when it is read.
+    pub expires_at: Option<i64>,
 }
 
 /// One chat attachment, as either side of it needs to see it.
@@ -3277,7 +3281,6 @@ impl Database {
             set_version(&tx, 62)?;
             tx.commit()?;
         }
-
         // Finish a v23 encryption pass that was deferred because chat was
         // locked at the time. The version is already 23 or later, so the
         // migration itself will never run again — without this the history
@@ -7111,31 +7114,38 @@ impl Database {
 
     /// Delivery state of an outbound chat message. Received messages are
     /// always [`ChatDelivery::Delivered`].
+    #[cfg(test)]
     pub fn insert_chat_message(
         &self,
         friend_hash: &str,
         direction: &str,
         message: &str,
     ) -> anyhow::Result<i64> {
-        self.insert_chat_message_with_delivery(friend_hash, direction, message, CHAT_DELIVERED)
+        self.insert_chat_message_ttl(friend_hash, direction, message, CHAT_DELIVERED, 0)
     }
 
     /// Store an outbound message that could not be handed to a live session,
     /// so it can be flushed the next time the friend is reachable.
+    #[cfg(test)]
     pub fn insert_pending_chat_message(
         &self,
         friend_hash: &str,
         message: &str,
     ) -> anyhow::Result<i64> {
-        self.insert_chat_message_with_delivery(friend_hash, "sent", message, CHAT_QUEUED)
+        self.insert_chat_message_ttl(friend_hash, "sent", message, CHAT_QUEUED, 0)
     }
 
-    pub fn insert_chat_message_with_delivery(
+    /// Store a chat row carrying a disappearing-message timer, in seconds (0
+    /// for none). The timer starts at once only for a sent message stored as
+    /// delivered; a queued one starts when it is delivered, and a received one
+    /// when it is read — see [`FriendChatRow::expires_at`].
+    pub fn insert_chat_message_ttl(
         &self,
         friend_hash: &str,
         direction: &str,
         message: &str,
         delivery: i64,
+        ttl_secs: u32,
     ) -> anyhow::Result<i64> {
         // Cap stored message length. Incoming chat text comes straight off
         // the wire from a peer, so bound it here (on a char boundary, so we
@@ -7169,6 +7179,16 @@ impl Database {
             params![friend_hash, direction, CHAT_CIPHERTEXT_PREFIX, now, if direction == "sent" { 1 } else { 0 }, delivery, body_hash],
         )?;
         let new_id = tx.last_insert_rowid();
+        if ttl_secs > 0 {
+            Self::ensure_chat_timers_locked(&tx)?;
+            let expires_at = (direction == "sent" && delivery == CHAT_DELIVERED)
+                .then(|| now.saturating_add(i64::from(ttl_secs)));
+            tx.execute(
+                "INSERT OR REPLACE INTO chat_message_timers (message_id, friend_hash, ttl_secs, expires_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![new_id, friend_hash, ttl_secs, expires_at],
+            )?;
+        }
         let encrypted = Self::encrypt_chat_body(
             self.require_chat_key()?,
             new_id,
@@ -7276,13 +7296,79 @@ impl Database {
         )? > 0)
     }
 
-    /// Move a stored outbound message between delivery states.
+    /// Move a stored outbound message between delivery states. Delivery starts
+    /// a disappearing message's timer, once.
     pub fn set_chat_delivery(&self, id: i64, delivery: i64) -> anyhow::Result<usize> {
         let conn = self.conn.lock();
-        Ok(conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        let updated = tx.execute(
             "UPDATE chat_messages SET delivery = ?1 WHERE id = ?2",
             params![delivery, id],
-        )?)
+        )?;
+        if updated > 0 && delivery == CHAT_DELIVERED {
+            Self::start_sent_timer_locked(&tx, id, chrono::Utc::now().timestamp())?;
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Start a delivered message's disappearing timer, if it has one that has
+    /// not started.
+    fn start_sent_timer_locked(conn: &Connection, id: i64, now: i64) -> anyhow::Result<()> {
+        Self::ensure_chat_timers_locked(conn)?;
+        conn.execute(
+            "UPDATE chat_message_timers SET expires_at = ?2 + ttl_secs \
+             WHERE message_id = ?1 AND expires_at IS NULL \
+               AND EXISTS (SELECT 1 FROM chat_messages WHERE id = ?1 AND direction = 'sent')",
+            params![id, now],
+        )?;
+        Ok(())
+    }
+
+    /// The timers of these rows of `friend_hash`, by id; rows without one are
+    /// left out.
+    pub fn chat_ttls(
+        &self,
+        friend_hash: &str,
+        ids: &[i64],
+    ) -> anyhow::Result<std::collections::HashMap<i64, u32>> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_timers_locked(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT ttl_secs FROM chat_message_timers \
+             WHERE message_id = ?1 AND friend_hash = ?2 AND ttl_secs > 0",
+        )?;
+        let mut out = std::collections::HashMap::new();
+        for id in ids {
+            if let Some(ttl) = stmt
+                .query_row(params![id, friend_hash], |row| row.get::<_, u32>(0))
+                .optional()?
+            {
+                out.insert(*id, ttl);
+            }
+        }
+        Ok(out)
+    }
+
+    /// When these rows of `friend_hash` disappear, for the ones whose timer has
+    /// started. For telling an open conversation after the timer moved.
+    pub fn chat_expiries(&self, friend_hash: &str, ids: &[i64]) -> anyhow::Result<Vec<(i64, i64)>> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_timers_locked(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT expires_at FROM chat_message_timers \
+             WHERE message_id = ?1 AND friend_hash = ?2 AND expires_at IS NOT NULL",
+        )?;
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(at) = stmt
+                .query_row(params![id, friend_hash], |row| row.get::<_, i64>(0))
+                .optional()?
+            {
+                out.push((*id, at));
+            }
+        }
+        Ok(out)
     }
 
     /// [`Self::set_chat_delivery`] for many rows in one transaction. Returns,
@@ -7294,10 +7380,18 @@ impl Database {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let mut matched = Vec::with_capacity(ids.len());
+        let now = chrono::Utc::now().timestamp();
         {
             let mut stmt = tx.prepare("UPDATE chat_messages SET delivery = ?1 WHERE id = ?2")?;
             for id in ids {
                 matched.push(stmt.execute(params![delivery, id])? > 0);
+            }
+        }
+        if delivery == CHAT_DELIVERED {
+            for (id, hit) in ids.iter().zip(&matched) {
+                if *hit {
+                    Self::start_sent_timer_locked(&tx, *id, now)?;
+                }
             }
         }
         tx.commit()?;
@@ -7390,102 +7484,301 @@ impl Database {
         before_id: Option<i64>,
     ) -> anyhow::Result<Vec<FriendChatRow>> {
         let conn = self.conn.lock();
-        let rows: Vec<(i64, String, String, i64, bool, i64, bool)> = if let Some(bid) = before_id {
+        Self::ensure_chat_timers_locked(&conn)?;
+        type Raw = (i64, String, String, i64, bool, i64, bool, Option<i64>);
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Raw> {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get::<_, i64>(4)? != 0,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)? != 0,
+                row.get(7)?,
+            ))
+        };
+        let rows: Vec<Raw> = if let Some(bid) = before_id {
             let mut stmt = conn.prepare(
-                "SELECT id, direction, message, timestamp, read, delivery, seen \
-                 FROM chat_messages WHERE friend_hash = ?1 AND id < ?2 ORDER BY id DESC LIMIT ?3"
+                "SELECT m.id, m.direction, m.message, m.timestamp, m.read, m.delivery, m.seen, t.expires_at \
+                 FROM chat_messages m LEFT JOIN chat_message_timers t ON t.message_id = m.id \
+                 WHERE m.friend_hash = ?1 AND m.id < ?2 ORDER BY m.id DESC LIMIT ?3"
             )?;
-            let mapped = stmt.query_map(params![friend_hash, bid, limit], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get::<_, i64>(4)? != 0,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)? != 0,
-                ))
-            })?;
+            let mapped = stmt.query_map(params![friend_hash, bid, limit], map_row)?;
             mapped.collect::<Result<Vec<_>, _>>()?
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, direction, message, timestamp, read, delivery, seen \
-                 FROM chat_messages WHERE friend_hash = ?1 ORDER BY id DESC LIMIT ?2"
+                "SELECT m.id, m.direction, m.message, m.timestamp, m.read, m.delivery, m.seen, t.expires_at \
+                 FROM chat_messages m LEFT JOIN chat_message_timers t ON t.message_id = m.id \
+                 WHERE m.friend_hash = ?1 ORDER BY m.id DESC LIMIT ?2"
             )?;
-            let mapped = stmt.query_map(params![friend_hash, limit], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get::<_, i64>(4)? != 0,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)? != 0,
-                ))
-            })?;
+            let mapped = stmt.query_map(params![friend_hash, limit], map_row)?;
             mapped.collect::<Result<Vec<_>, _>>()?
         };
-        let to_row = |id, direction, message, timestamp, read, delivery, seen| FriendChatRow {
-            id,
-            direction,
-            message,
-            timestamp,
-            read,
-            delivery,
-            seen,
-        };
+        drop(conn);
         // Locked: every row is sealed, so report them all as unavailable in one
         // go rather than warning once per row for a condition that is a property
         // of the database, not of any individual message.
-        let Some(chat_key) = self.chat_key.as_deref() else {
-            return Ok(rows
-                .into_iter()
-                .map(|(id, direction, _stored, timestamp, read, delivery, seen)| {
-                    to_row(
-                        id,
-                        direction,
-                        CHAT_UNAVAILABLE_TEXT.to_string(),
-                        timestamp,
-                        read,
-                        delivery,
-                        seen,
-                    )
-                })
-                .collect());
-        };
+        let chat_key = self.chat_key.as_deref();
         let mut messages = Vec::with_capacity(rows.len());
-        for (id, direction, stored, timestamp, read, delivery, seen) in rows {
-            match Self::decrypt_chat_body(chat_key, id, friend_hash, &direction, timestamp, &stored)
-            {
-                Ok(message) => {
-                    messages.push(to_row(id, direction, message, timestamp, read, delivery, seen))
+        for (id, direction, stored, timestamp, read, delivery, seen, expires_at) in rows {
+            let message = match chat_key {
+                None => CHAT_UNAVAILABLE_TEXT.to_string(),
+                Some(key) => {
+                    match Self::decrypt_chat_body(key, id, friend_hash, &direction, timestamp, &stored) {
+                        Ok(message) => message,
+                        Err(error) => {
+                            tracing::warn!(
+                                "Chat row {id} for friend {friend_hash} is unavailable; preserving its ciphertext for later recovery: {error}"
+                            );
+                            CHAT_UNAVAILABLE_TEXT.to_string()
+                        }
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        "Chat row {id} for friend {friend_hash} is unavailable; preserving its ciphertext for later recovery: {error}"
-                    );
-                    messages.push(to_row(
-                        id,
-                        direction,
-                        CHAT_UNAVAILABLE_TEXT.to_string(),
-                        timestamp,
-                        read,
-                        delivery,
-                        seen,
-                    ));
-                }
-            }
+            };
+            messages.push(FriendChatRow {
+                id,
+                direction,
+                message,
+                timestamp,
+                read,
+                delivery,
+                seen,
+                expires_at,
+            });
         }
         Ok(messages)
     }
 
-    pub fn mark_messages_read(&self, friend_hash: &str) -> anyhow::Result<()> {
+    /// Mark everything received from `friend_hash` read, which also starts the
+    /// timer on each disappearing message among it. Returns `(id, expires_at)`
+    /// for every timer this started, so an open conversation can show it.
+    pub fn mark_messages_read(&self, friend_hash: &str) -> anyhow::Result<Vec<(i64, i64)>> {
         let conn = self.conn.lock();
-        conn.execute(
+        Self::ensure_chat_timers_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let now = chrono::Utc::now().timestamp();
+        let started: Vec<(i64, i64)> = tx
+            .prepare(
+                "UPDATE chat_message_timers SET read_at = ?2, expires_at = ?2 + ttl_secs \
+                 WHERE friend_hash = ?1 AND ttl_secs > 0 AND expires_at IS NULL \
+                   AND message_id IN (SELECT id FROM chat_messages \
+                       WHERE friend_hash = ?1 AND read = 0 AND direction = 'received') \
+                 RETURNING message_id, expires_at",
+            )?
+            .query_map(params![friend_hash, now], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        tx.execute(
             "UPDATE chat_messages SET read = 1 WHERE friend_hash = ?1 AND read = 0",
             params![friend_hash],
         )?;
-        Ok(())
+        tx.commit()?;
+        Ok(started)
+    }
+
+    /// A friend's disappearing timer for a message they sent us, named by its
+    /// body hash: the newest received row with that body takes it, or keeps
+    /// its own if that is shorter — the sender decides how long their words
+    /// live, and our own setting can only make that sooner. Counted from when
+    /// we read it; a message already read when its timer arrives — the timer
+    /// follows it within moments — counts from now. Returns the row and its
+    /// expiry if it has started, or `None` when no row matches yet.
+    pub fn apply_peer_chat_ttl(
+        &self,
+        friend_hash: &str,
+        body_hash: &str,
+        ttl_secs: u32,
+    ) -> anyhow::Result<Option<(i64, Option<i64>)>> {
+        if body_hash.is_empty() || ttl_secs == 0 {
+            return Ok(None);
+        }
+        let conn = self.conn.lock();
+        Self::ensure_chat_timers_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let Some((id, read)) = tx
+            .query_row(
+                "SELECT id, read FROM chat_messages \
+                 WHERE friend_hash = ?1 AND direction = 'received' AND body_hash = ?2 \
+                 ORDER BY id DESC LIMIT 1",
+                params![friend_hash, body_hash],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0)),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let existing: Option<(u32, Option<i64>)> = tx
+            .query_row(
+                "SELECT ttl_secs, read_at FROM chat_message_timers WHERE message_id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let ttl = match existing {
+            Some((own, _)) if own > 0 => own.min(ttl_secs),
+            _ => ttl_secs,
+        };
+        let now = chrono::Utc::now().timestamp();
+        let started_at = existing
+            .and_then(|(_, read_at)| read_at)
+            .or_else(|| read.then_some(now));
+        let expires_at = started_at.map(|at| at.saturating_add(i64::from(ttl)));
+        tx.execute(
+            "INSERT OR REPLACE INTO chat_message_timers \
+                 (message_id, friend_hash, ttl_secs, read_at, expires_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, friend_hash, ttl, started_at, expires_at],
+        )?;
+        tx.commit()?;
+        Ok(Some((id, expires_at)))
+    }
+
+    /// Give a chat attachment a disappearing timer, keeping a shorter one it
+    /// already has: our own setting, when the card is created, on either side.
+    /// Whether a row matched.
+    pub fn set_chat_attachment_ttl(
+        &self,
+        friend_hash: &str,
+        xfer_id: &str,
+        ttl_secs: u32,
+    ) -> anyhow::Result<bool> {
+        self.set_chat_attachment_ttl_where(friend_hash, xfer_id, ttl_secs, false)
+    }
+
+    /// [`Self::set_chat_attachment_ttl`] for the timer a friend names, which
+    /// only ever reaches a file they sent: a transfer id is no secret from the
+    /// friend it was offered to, and without this they could put a timer on
+    /// the card for a file we sent them.
+    pub fn set_received_chat_attachment_ttl(
+        &self,
+        friend_hash: &str,
+        xfer_id: &str,
+        ttl_secs: u32,
+    ) -> anyhow::Result<bool> {
+        self.set_chat_attachment_ttl_where(friend_hash, xfer_id, ttl_secs, true)
+    }
+
+    fn set_chat_attachment_ttl_where(
+        &self,
+        friend_hash: &str,
+        xfer_id: &str,
+        ttl_secs: u32,
+        received_only: bool,
+    ) -> anyhow::Result<bool> {
+        if ttl_secs == 0 {
+            return Ok(false);
+        }
+        let conn = self.conn.lock();
+        Self::ensure_chat_timers_locked(&conn)?;
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chat_attachments \
+             WHERE xfer_id = ?1 AND friend_hash = ?2 AND (?3 = 0 OR direction = 'received'))",
+            params![xfer_id, friend_hash, received_only],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO chat_attachment_timers (xfer_id, friend_hash, ttl_secs) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(xfer_id) DO UPDATE SET ttl_secs = MIN(ttl_secs, excluded.ttl_secs)",
+            params![xfer_id, friend_hash, ttl_secs],
+        )?;
+        Ok(true)
+    }
+
+    /// Delete every disappearing message and attachment card whose time is up,
+    /// returning what went per friend as `(friend_hash, message ids, transfer
+    /// ids)` so open conversations can drop them.
+    ///
+    /// A message still waiting to be sent has no expiry yet and is never
+    /// touched. An attachment goes only once it is settled: a transfer still
+    /// running holds a read grant or a file being written, and cutting either
+    /// off is the friend's or the user's decision, not a timer's.
+    pub fn expire_disappearing_chat(
+        &self,
+        now: i64,
+    ) -> anyhow::Result<Vec<(String, Vec<i64>, Vec<String>)>> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_timers_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let messages: Vec<(String, i64)> = tx
+            .prepare(
+                "DELETE FROM chat_messages WHERE id IN (SELECT message_id FROM chat_message_timers \
+                     WHERE expires_at IS NOT NULL AND expires_at <= ?1) \
+                 RETURNING friend_hash, id",
+            )?
+            .query_map(params![now], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let attachments: Vec<(String, String)> = tx
+            .prepare(
+                "DELETE FROM chat_attachments WHERE xfer_id IN ( \
+                     SELECT a.xfer_id FROM chat_attachments a \
+                     JOIN chat_attachment_timers t ON t.xfer_id = a.xfer_id \
+                     WHERE a.created_at + t.ttl_secs <= ?1 \
+                       AND a.status NOT IN ('queued', 'offered', 'awaiting', 'accepted', 'active')) \
+                 RETURNING friend_hash, xfer_id",
+            )?
+            .query_map(params![now], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        // Timers whose message or card is gone — expired just now, deleted by
+        // the user or with the friend, or trimmed by the per-friend cap.
+        tx.execute(
+            "DELETE FROM chat_message_timers \
+             WHERE message_id NOT IN (SELECT id FROM chat_messages)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM chat_attachment_timers \
+             WHERE xfer_id NOT IN (SELECT xfer_id FROM chat_attachments)",
+            [],
+        )?;
+        tx.commit()?;
+        let mut by_friend: std::collections::BTreeMap<String, (Vec<i64>, Vec<String>)> =
+            std::collections::BTreeMap::new();
+        for (friend, id) in messages {
+            by_friend.entry(friend).or_default().0.push(id);
+        }
+        for (friend, xfer) in attachments {
+            by_friend.entry(friend).or_default().1.push(xfer);
+        }
+        Ok(by_friend
+            .into_iter()
+            .map(|(friend, (ids, xfers))| (friend, ids, xfers))
+            .collect())
+    }
+
+    /// Delete the conversation with `friend_hash` from this device: every
+    /// message, including ones still waiting to be sent, and every settled
+    /// attachment card. A file still transferring keeps its card until it
+    /// finishes, for the reason [`Self::expire_disappearing_chat`] gives.
+    /// Files already received stay where they were saved. Returns how many
+    /// messages went.
+    pub fn delete_chat_history(&self, friend_hash: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let deleted = tx.execute(
+            "DELETE FROM chat_messages WHERE friend_hash = ?1",
+            params![friend_hash],
+        )?;
+        tx.execute(
+            "DELETE FROM chat_attachments WHERE friend_hash = ?1 \
+               AND status NOT IN ('queued', 'offered', 'awaiting', 'accepted', 'active')",
+            params![friend_hash],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    /// Delete one message of the conversation with `friend_hash` from this
+    /// device. A message still queued is withdrawn with it, so it is never
+    /// sent. Whether a row matched.
+    pub fn delete_chat_message(&self, friend_hash: &str, id: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Ok(conn.execute(
+            "DELETE FROM chat_messages WHERE id = ?1 AND friend_hash = ?2",
+            params![id, friend_hash],
+        )? > 0)
     }
 
     /// Body hash of the newest received message this device has already read,
@@ -10668,6 +10961,37 @@ impl Database {
     /// beside `transfers` rather than as a column of it for the same reason as
     /// [`Self::ensure_sealed_offer_readers_locked`]: a numbered migration would
     /// stop 1.7.0 from opening the database after a downgrade.
+    /// Disappearing-message timers, in tables of their own for the reason
+    /// [`Self::ensure_transfer_part_folders_locked`] gives: columns on
+    /// `chat_messages` would raise the schema version 1.7.0 checks.
+    ///
+    /// `ttl_secs` is the timer a row was written with or told about;
+    /// `expires_at` is when it goes, set once the timer starts — at delivery
+    /// for a sent message, when it is read for a received one — and `read_at`
+    /// is kept so a timer the sender names after it was opened still counts
+    /// from then. A row whose message is gone is an orphan the sweep clears.
+    /// Attachments carry a timer counted from when the card was created, only
+    /// ever acted on once the transfer is settled.
+    fn ensure_chat_timers_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS chat_message_timers (
+                message_id INTEGER PRIMARY KEY,
+                friend_hash TEXT NOT NULL,
+                ttl_secs INTEGER NOT NULL,
+                read_at INTEGER,
+                expires_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_message_timers_expires
+                ON chat_message_timers(expires_at) WHERE expires_at IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS chat_attachment_timers (
+                xfer_id TEXT PRIMARY KEY,
+                friend_hash TEXT NOT NULL,
+                ttl_secs INTEGER NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
     fn ensure_transfer_part_folders_locked(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS transfer_part_folders (
@@ -22474,6 +22798,109 @@ mod tests {
 
     /// Queued outbound chat has to survive a restart, otherwise the queue is
     /// no better than the in-memory send it replaced.
+    #[test]
+    fn disappearing_chat_counts_from_delivery_and_reading_and_then_goes() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-chat-disappear-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let friend = "ab".repeat(16);
+        let other = "cd".repeat(16);
+        let hour = 3_600u32;
+
+        // Sent: queued has no expiry, delivery starts it.
+        let queued = db
+            .insert_chat_message_ttl(&friend, "sent", "later", CHAT_QUEUED, hour)
+            .unwrap();
+        assert!(db.chat_expiries(&friend, &[queued]).unwrap().is_empty());
+        db.set_chat_delivery(queued, CHAT_DELIVERED).unwrap();
+        let sent_at = db.chat_expiries(&friend, &[queued]).unwrap()[0].1;
+
+        // Received: nothing counts until it is read.
+        let received = db
+            .insert_chat_message_ttl(&friend, "received", "hello", CHAT_DELIVERED, 0)
+            .unwrap();
+        let hash = Database::friend_chat_body_hash_hex("hello");
+        let (row, started) = db.apply_peer_chat_ttl(&friend, &hash, hour).unwrap().unwrap();
+        assert_eq!(row, received);
+        assert_eq!(started, None, "an unread message's timer has not started");
+        let read = db.mark_messages_read(&friend).unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].0, received);
+
+        // A longer timer from the sender cannot outlast ours; a shorter one wins.
+        let (_, longer) = db.apply_peer_chat_ttl(&friend, &hash, hour * 24).unwrap().unwrap();
+        assert_eq!(longer, Some(read[0].1));
+        let (_, shorter) = db.apply_peer_chat_ttl(&friend, &hash, 300).unwrap().unwrap();
+        assert!(shorter.unwrap() < read[0].1);
+
+        // A message without a timer, and another friend's, are left alone.
+        let keep = db.insert_chat_message_ttl(&friend, "sent", "stays", CHAT_DELIVERED, 0).unwrap();
+        let theirs = db.insert_chat_message_ttl(&other, "sent", "theirs", CHAT_DELIVERED, 0).unwrap();
+        let gone = db.expire_disappearing_chat(sent_at + 1).unwrap();
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].0, friend);
+        let mut ids = gone[0].1.clone();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![queued, received]);
+        let left: Vec<i64> = db.get_chat_messages(&friend, 50, None).unwrap().iter().map(|r| r.id).collect();
+        assert_eq!(left, vec![keep]);
+        assert_eq!(db.get_chat_messages(&other, 50, None).unwrap()[0].id, theirs);
+
+        // Deleting the chat takes the rest, queued sends included, and only
+        // that friend's.
+        db.insert_chat_message_ttl(&friend, "sent", "never sent", CHAT_QUEUED, 0).unwrap();
+        assert_eq!(db.delete_chat_history(&friend).unwrap(), 2);
+        assert!(db.get_chat_messages(&friend, 50, None).unwrap().is_empty());
+        assert!(db.delete_chat_message(&other, theirs).unwrap());
+        assert!(!db.delete_chat_message(&other, theirs).unwrap());
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_friend_times_only_files_they_sent_and_only_settled_cards_disappear() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-attach-disappear-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).expect("open db");
+        let friend = "ab".repeat(16);
+        let root = "00".repeat(32);
+        let (sent, received, running) = ("11".repeat(16), "22".repeat(16), "33".repeat(16));
+        let card = |xfer: &str, direction: &str, status: &str| {
+            db.upsert_chat_attachment(xfer, &friend, direction, "f.txt", 1, &root, None, status, 100, 200)
+                .expect("card");
+        };
+        card(&sent, "sent", "complete");
+        card(&received, "received", "complete");
+        card(&running, "received", "active");
+
+        assert!(
+            !db.set_received_chat_attachment_ttl(&friend, &sent, 60).unwrap(),
+            "a friend's timer never reaches a file we sent them"
+        );
+        assert!(db.set_received_chat_attachment_ttl(&friend, &received, 60).unwrap());
+        assert!(db.set_chat_attachment_ttl(&friend, &running, 60).unwrap());
+
+        let gone = db.expire_disappearing_chat(100 + 61).unwrap();
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].2, vec![received.clone()], "the running one waits until it settles");
+        assert!(db.chat_attachment(&running).is_some());
+        assert!(db.chat_attachment(&sent).is_some());
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn queued_chat_survives_restart_and_flush_marks_it_delivered() {
         let path = std::env::temp_dir().join(format!(

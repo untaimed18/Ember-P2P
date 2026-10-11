@@ -575,6 +575,7 @@ pub(in crate::network) async fn on_upload_event(
             UploadEventKind::EmberChatMessage { ember_hash, .. }
             | UploadEventKind::EmberChatTyping { ember_hash, .. }
             | UploadEventKind::EmberChatRead { ember_hash, .. }
+            | UploadEventKind::EmberChatExpire { ember_hash, .. }
             | UploadEventKind::EmberBrowseRequest { ember_hash, .. }
             | UploadEventKind::EmberBrowseResponse { ember_hash, .. }
             // An unverified request is only a claimed hash. Counting it would
@@ -952,11 +953,14 @@ pub(in crate::network) async fn on_upload_event(
                         && now.saturating_sub(*last_at) <= EMBER_CHAT_DEDUP_WINDOW_SECS
                 });
             if !is_dup {
+                // Our own timer for this chat, which the sender's — when it
+                // follows — can only shorten.
                 match persist_chat_history_message(
                     db.clone(),
                     hash_hex.clone(),
                     "received",
                     cleaned.clone(),
+                    settings.chat_disappear_secs_for(&chat_eh),
                 )
                 .await
                 {
@@ -964,6 +968,12 @@ pub(in crate::network) async fn on_upload_event(
                         state
                             .recent_ember_chat
                             .insert(chat_eh, (cleaned.clone(), now));
+                        let target = crate::network::ember::crypto::ChatExpireTarget::Message(
+                            crate::network::ember::crypto::chat_body_hash(&cleaned),
+                        );
+                        if let Some(ttl) = take_held_chat_expire(state, chat_eh, target) {
+                            apply_peer_chat_expire(state, db, app_handle, chat_eh, target, ttl).await;
+                        }
                         let _ = app_handle.emit("ember:chat-message", serde_json::json!({
                             "user_hash": hash_hex,
                             "id": id,
@@ -1028,6 +1038,17 @@ pub(in crate::network) async fn on_upload_event(
             Ok(Ok(None)) => {}
             Ok(Err(e)) => warn!("Failed to apply chat read receipt from {hash_hex}: {e}"),
             Err(e) => warn!("Chat read-receipt task failed for {hash_hex}: {e}"),
+        }
+    }
+
+    if let UploadEventKind::EmberChatExpire { ember_hash: expire_eh, target, ttl_secs } = event.kind {
+        // The same gates as the message it follows: a timer for a chat we
+        // refuse, or from someone who is no longer a friend, names nothing.
+        if settings.chat_allowed_with(&expire_eh)
+            && friend_hashes.read().await.contains(&expire_eh)
+            && !db.chat_locked()
+        {
+            apply_peer_chat_expire(state, db, app_handle, expire_eh, target, ttl_secs).await;
         }
     }
 

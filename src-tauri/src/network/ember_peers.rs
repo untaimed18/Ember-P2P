@@ -884,18 +884,22 @@ pub(super) fn release_ember_queued_records(
     (released.dropped, released.rearm.len())
 }
 
-/// Verified routing-table (and cache) contacts plus firsthand session peers
-/// the table refused (typically LAN while `block_private_ips` is on).
+/// Routing-table (and cache) contacts plus firsthand session peers the table
+/// refused (typically LAN while `block_private_ips` is on), and how many of
+/// those are connected.
 ///
-/// Session extras only count toward the verified figure when they have
-/// answered us — LAN PEER_LIST copies arrive with `last_seen == 0` and must
-/// not inflate the high-water mark.
+/// The connected figure is what the Ember page shows as contacts connected,
+/// so it leaves out cached peers that have gone quiet; see
+/// [`ember::dht::routing::RoutingTable::verified_connected`]. Session extras
+/// only count when they have answered us — LAN PEER_LIST copies arrive with
+/// `last_seen == 0` and must not inflate the high-water mark.
 pub(super) fn ember_dht_ui_contact_counts(state: &NetworkState) -> (u32, u32) {
     let extra = ember_session_overlay_extras(state, false);
     let verified_extra = ember_session_overlay_extras(state, true);
+    let now = chrono::Utc::now().timestamp();
     (
         (state.ember_dht.routing().held_len() + extra) as u32,
-        (state.ember_dht.routing().verified_held() + verified_extra) as u32,
+        (state.ember_dht.routing().verified_connected(now) + verified_extra) as u32,
     )
 }
 

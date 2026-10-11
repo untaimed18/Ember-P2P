@@ -1156,6 +1156,7 @@ pub(super) async fn handle_upload_event(
         | UploadEventKind::EmberChatMessage { .. }
         | UploadEventKind::EmberChatTyping { .. }
         | UploadEventKind::EmberChatRead { .. }
+        | UploadEventKind::EmberChatExpire { .. }
         | UploadEventKind::EmberBrowseRequest { .. }
         | UploadEventKind::EmberBrowseResponse { .. }
         | UploadEventKind::EmberBrowseScope { .. }

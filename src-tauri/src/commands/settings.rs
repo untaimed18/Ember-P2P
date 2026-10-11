@@ -829,6 +829,12 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
+    let disappear = crate::types::normalize_chat_disappear_secs(settings.chat_disappear_secs);
+    if disappear != settings.chat_disappear_secs {
+        settings.chat_disappear_secs = disappear;
+        changed = true;
+    }
+
     // A hand-edited or damaged entry is repaired or dropped, not a reason to
     // reset every other setting.
     let overrides = normalize_friend_overrides(settings.friend_overrides.clone());
@@ -1481,6 +1487,7 @@ pub async fn update_settings(
     settings.spam_filter_profile = settings.spam_filter_profile.trim().to_ascii_lowercase();
     settings.close_to_tray_behavior = settings.close_to_tray_behavior.trim().to_ascii_lowercase();
     settings.channel_file_offers = settings.channel_file_offers.trim().to_ascii_lowercase();
+    settings.chat_disappear_secs = crate::types::normalize_chat_disappear_secs(settings.chat_disappear_secs);
     // Web services are URL templates the user curates, so they are normalised
     // here rather than trusted: each is checked for a http/https scheme, a host
     // and no embedded credentials, duplicates by URL are dropped, and the list

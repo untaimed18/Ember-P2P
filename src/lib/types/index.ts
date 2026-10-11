@@ -847,6 +847,9 @@ export interface FriendOverrides {
   notify_online?: boolean;
   /** Messages and files from this friend. */
   notify_messages?: boolean;
+  /** Disappearing messages with this friend, in seconds; 0 is off whatever
+   *  the default says. */
+  disappear_secs?: number;
 }
 
 export interface AppSettings {
@@ -950,6 +953,9 @@ export interface AppSettings {
   friend_chat_disabled: boolean;
   /** Send and display friend-chat read receipts. Off both ways. */
   friend_chat_read_receipts: boolean;
+  /** Disappearing messages by default, in seconds; 0 is off. A friend's own
+   *  `disappear_secs` wins. See `CHAT_DISAPPEAR_CHOICES`. */
+  chat_disappear_secs: number;
   /** Disable browse-shares responses to friends */
   friend_browse_disabled: boolean;
   /** Decline files friends send (chat attachments and file offers). A friend's

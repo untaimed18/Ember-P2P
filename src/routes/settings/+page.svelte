@@ -68,6 +68,7 @@
   } from '$lib/api/backup';
   import { collectBackupPrefs } from '$lib/backupPrefs';
   import { lastBackupAt, noteBackupMade } from '$lib/backupReminder';
+  import { CHAT_DISAPPEAR_CHOICES, disappearLabel } from '$lib/chatDisappear';
   import {
     clampInputUtf8Bytes,
     formatDateTime,
@@ -4198,6 +4199,21 @@
                 disabled={!friendChatOn}
                 ariaLabel={m.settings_friend_chat_read_receipts()}
               />
+            </div>
+            <div class="field nested" class:is-disabled={!friendChatOn}>
+              <label for="chat-disappear">{m.settings_chat_disappear_label()}</label>
+              <select
+                id="chat-disappear"
+                bind:value={settings.chat_disappear_secs}
+                disabled={!friendChatOn}
+                aria-describedby="chat-disappear-hint"
+              >
+                <option value={0}>{m.chat_disappear_off()}</option>
+                {#each CHAT_DISAPPEAR_CHOICES as secs (secs)}
+                  <option value={secs}>{disappearLabel(secs)}</option>
+                {/each}
+              </select>
+              <span id="chat-disappear-hint" class="hint">{m.settings_chat_disappear_hint()}</span>
             </div>
           </div>
 

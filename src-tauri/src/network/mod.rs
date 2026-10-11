@@ -1057,6 +1057,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         online_friends: HashMap::new(),
         pending_browse_requests: HashMap::new(),
         recent_ember_chat: HashMap::new(),
+        held_chat_expires: HashMap::new(),
         ember_sessions: Arc::new(RwLock::new(HashMap::new())),
         // Mirror the `stats.status` initialization above. The upload listener
         // binds and starts accepting TCP connections immediately (see

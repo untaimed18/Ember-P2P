@@ -16,6 +16,7 @@ use crate::network::{
 use crate::network::{EmberMaintenanceResult, EmberPublishResult};
 use crate::types::EmberDiagnostics;
 use crate::types::*;
+use tauri::Emitter;
 
 /// Result returned by the `ember_ping_peer` harness command — either
 /// the round-trip time of the matching `Pong` or the reason the
@@ -806,6 +807,62 @@ pub struct ChatMessageInfo {
     pub delivery: String,
     /// The friend has opened this outbound message. Received rows are false.
     pub seen: bool,
+    /// When this disappearing message is deleted, in Unix seconds, once its
+    /// timer has started; `None` otherwise.
+    pub expires_at: Option<i64>,
+}
+
+/// A disappearing message whose timer just started.
+#[derive(serde::Serialize)]
+pub struct ChatExpiryInfo {
+    pub id: i64,
+    pub expires_at: i64,
+}
+
+/// Delete the whole conversation with a friend from this device. Their copy is
+/// theirs; the confirmation in the UI says so.
+#[tauri::command]
+pub async fn delete_chat_history(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    user_hash_hex: String,
+) -> Result<(), String> {
+    let canonical = user_hash_hex.to_lowercase();
+    parse_user_hash(&canonical)?;
+    let db = state.db.clone();
+    let friend = canonical.clone();
+    tokio::task::spawn_blocking(move || db.delete_chat_history(&friend))
+        .await
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("peers_failed_delete_chat", "Failed to delete the conversation", e))?;
+    // Every view of it — the dock and the Friends page can both have it open —
+    // and the unread badge, which would otherwise count what is gone.
+    let _ = app.emit("ember:chat-cleared", serde_json::json!({ "user_hash": canonical }));
+    Ok(())
+}
+
+/// Delete one message of a conversation from this device. A message still
+/// waiting to be sent is withdrawn, so it never goes.
+#[tauri::command]
+pub async fn delete_chat_message(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    user_hash_hex: String,
+    id: i64,
+) -> Result<(), String> {
+    let canonical = user_hash_hex.to_lowercase();
+    parse_user_hash(&canonical)?;
+    let db = state.db.clone();
+    let friend = canonical.clone();
+    tokio::task::spawn_blocking(move || db.delete_chat_message(&friend, id))
+        .await
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("peers_failed_delete_message", "Failed to delete the message", e))?;
+    let _ = app.emit(
+        "ember:chat-removed",
+        serde_json::json!({ "user_hash": canonical, "ids": [id], "xfer_ids": [] }),
+    );
+    Ok(())
 }
 
 /// Map the stored `chat_messages.delivery` integer to the string the UI uses.
@@ -911,8 +968,15 @@ pub async fn send_chat_message(
             // task means one place covers all of those paths.
             let db = state.db.clone();
             let friend_hex = canonical.clone();
+            let ttl_secs = state.config.read().await.settings.chat_disappear_secs_for(&hash);
             let queued_id = tokio::task::spawn_blocking(move || {
-                db.insert_pending_chat_message(&friend_hex, &cleaned)
+                db.insert_chat_message_ttl(
+                    &friend_hex,
+                    "sent",
+                    &cleaned,
+                    crate::storage::database::CHAT_QUEUED,
+                    ttl_secs,
+                )
             })
             .await
             .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
@@ -1046,6 +1110,7 @@ pub async fn get_chat_messages(
             read: row.read,
             delivery: delivery_label(row.delivery),
             seen: row.seen,
+            expires_at: row.expires_at,
         })
         .collect())
 }
@@ -1084,7 +1149,7 @@ pub async fn offer_file_to_friend(
 pub async fn mark_messages_read(
     state: tauri::State<'_, AppState>,
     friend_hash: String,
-) -> Result<(), String> {
+) -> Result<Vec<ChatExpiryInfo>, String> {
     let friend_hash = friend_hash.to_lowercase();
     let eh = parse_user_hash(&friend_hash)?;
     if !state.friend_hashes.read().await.contains(&eh) {
@@ -1092,7 +1157,9 @@ pub async fn mark_messages_read(
     }
     let db = state.db.clone();
     let marked_hash = friend_hash.clone();
-    tokio::task::spawn_blocking(move || db.mark_messages_read(&marked_hash))
+    // Reading is what starts a received message's disappearing timer, so the
+    // timers this started go back to the view that read them.
+    let started = tokio::task::spawn_blocking(move || db.mark_messages_read(&marked_hash))
         .await
         .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
         .map_err(|e| {
@@ -1127,7 +1194,10 @@ pub async fn mark_messages_read(
             }
         }
     }
-    Ok(())
+    Ok(started
+        .into_iter()
+        .map(|(id, expires_at)| ChatExpiryInfo { id, expires_at })
+        .collect())
 }
 
 /// Tell a friend we are (or have stopped) composing. Live only; ignored if

@@ -29,7 +29,10 @@
     offerKey,
   } from '$lib/stores/friends';
   import { appSettings } from '$lib/stores/settings';
-  import { chatAllowedWith } from '$lib/friendSettings';
+  import { chatAllowedWith, disappearSecsFor } from '$lib/friendSettings';
+  import { disappearLabel } from '$lib/chatDisappear';
+  import { deleteChatHistory } from '$lib/api/friends';
+  import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { toastError, toastSuccess } from '$lib/stores/toast';
   import { formatBytes } from '$lib/utils';
   import { translateError } from '$lib/i18n';
@@ -278,6 +281,35 @@
   let activeTabLabel = $derived(
     activeTab ? friendLabel(activeTab.hash, activeTab.name, $friendNames) : '',
   );
+  /** The disappearing timer on the conversation on screen, 0 for none. */
+  let activeDisappearSecs = $derived(activeTab ? disappearSecsFor($appSettings, activeTab.hash) : 0);
+
+  let confirmDeleteOpen = $state(false);
+  let deletingChat = $state(false);
+  /** Who the open confirmation is about, fixed when it opened so a switch of
+   *  conversation underneath it cannot change what gets deleted. */
+  let deleteTarget = $state<{ hash: string; name: string } | null>(null);
+  $effect(() => {
+    if (confirmDeleteOpen && !deleteTarget && activeTab) {
+      deleteTarget = { hash: activeTab.hash, name: activeTabLabel };
+    } else if (!confirmDeleteOpen) {
+      deleteTarget = null;
+    }
+  });
+
+  async function deleteActiveChat() {
+    const target = deleteTarget;
+    if (!target || deletingChat) return;
+    deletingChat = true;
+    try {
+      await deleteChatHistory(target.hash);
+      toastSuccess(m.chat_delete_chat_done({ name: target.name }));
+    } catch (e) {
+      toastError(translateError(e));
+    } finally {
+      deletingChat = false;
+    }
+  }
 
   /**
    * Unread in conversations that are open but not on screen.
@@ -680,6 +712,16 @@
             <path d="M5.5 7V5.5a2.5 2.5 0 0 1 5 0V7"/>
           </svg>
         </span>
+        {#if activeDisappearSecs > 0}
+          {@const label = m.chat_disappear_badge_title({ time: disappearLabel(activeDisappearSecs) })}
+          <span class="dock-disappear" role="img" title={label} aria-label={label}>
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="8" cy="9" r="5.5"/>
+              <path d="M8 6.2V9l1.8 1.2M6.5 1.8h3"/>
+            </svg>
+            <span>{disappearLabel(activeDisappearSecs)}</span>
+          </span>
+        {/if}
       {/if}
 
       {#if unreadElsewhere > 0}
@@ -696,6 +738,20 @@
         </button>
       {/if}
 
+      {#if activeTab}
+        <button
+          type="button"
+          class="dock-new dock-delete"
+          title={m.chat_delete_chat()}
+          aria-label={m.chat_delete_chat()}
+          disabled={deletingChat}
+          onclick={() => (confirmDeleteOpen = true)}
+        >
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M2.5 4.5h11M6.5 4.5V3a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1.5M4 4.5l.7 8.6a1 1 0 0 0 1 .9h4.6a1 1 0 0 0 1-.9l.7-8.6"/>
+          </svg>
+        </button>
+      {/if}
       <button
         type="button"
         class="dock-new"
@@ -921,6 +977,15 @@
   </div>
 {/if}
 
+<ConfirmDialog
+  bind:open={confirmDeleteOpen}
+  title={m.chat_delete_chat_title()}
+  message={m.chat_delete_chat_message({ name: deleteTarget?.name ?? activeTabLabel })}
+  confirmLabel={m.chat_delete_chat()}
+  danger={true}
+  onconfirm={() => void deleteActiveChat()}
+/>
+
 <style>
   .chat-dock {
     position: fixed;
@@ -1072,6 +1137,29 @@
   .dock-encrypted svg {
     width: 12px;
     height: 12px;
+  }
+
+  .dock-disappear {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    flex-shrink: 0;
+    padding: 2px 7px 2px 5px;
+    border-radius: var(--radius-pill);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    color: var(--accent);
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  .dock-disappear svg {
+    width: 11px;
+    height: 11px;
+  }
+
+  .dock-delete:hover:not(:disabled) {
+    color: var(--danger);
   }
 
   .dock-elsewhere {

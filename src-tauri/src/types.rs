@@ -1666,6 +1666,14 @@ pub struct AppSettings {
     /// ours.
     #[serde(default = "default_true")]
     pub friend_chat_read_receipts: bool,
+    /// Disappearing messages, in seconds; 0 is off. A message we send carries
+    /// this timer and is deleted on both sides once it runs out — counted from
+    /// delivery here and from when the friend reads it there. Received
+    /// messages are also deleted from this device after it, or after the
+    /// sender's own timer if that is shorter. Applies to messages from when it
+    /// is set onward. See [`CHAT_DISAPPEAR_CHOICES`].
+    #[serde(default)]
+    pub chat_disappear_secs: u32,
     /// Refuse inbound friend-browse listings. Outbound browse is unaffected.
     #[serde(default)]
     pub friend_browse_disabled: bool,
@@ -2297,6 +2305,28 @@ fn default_chat_attachment_auto_accept_mb() -> u64 {
 pub const CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB: u64 =
     crate::network::ember::attach::ATTACH_MAX_BYTES / (1024 * 1024);
 
+/// The disappearing-message timers the app offers, in seconds: five minutes,
+/// one hour, one day, one week and four weeks. Off is 0.
+pub const CHAT_DISAPPEAR_CHOICES: [u32; 5] = [300, 3_600, 86_400, 604_800, 2_419_200];
+
+/// Longest timer accepted from a friend. Their build may offer choices this
+/// one does not, so anything up to a year is honoured as asked.
+pub const CHAT_DISAPPEAR_PEER_MAX_SECS: u32 = 365 * 86_400;
+
+/// A stored timer held to the offered choices: 0 stays off, anything else
+/// becomes the nearest choice, so a hand-edited value still means one of
+/// the timers the UI can show.
+pub fn normalize_chat_disappear_secs(secs: u32) -> u32 {
+    if secs == 0 {
+        return 0;
+    }
+    CHAT_DISAPPEAR_CHOICES
+        .iter()
+        .copied()
+        .min_by_key(|choice| choice.abs_diff(secs))
+        .unwrap_or(0)
+}
+
 /// Friends with overrides kept at most: past the friends list's own ceiling
 /// of 500, so a real list always fits and a hand-edited file cannot grow the
 /// config without bound.
@@ -2331,6 +2361,10 @@ pub struct FriendOverrides {
     /// Tell us about this friend's messages and files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify_messages: Option<bool>,
+    /// Disappearing messages with this friend, in seconds; `Some(0)` is off
+    /// whatever the default says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disappear_secs: Option<u32>,
 }
 
 impl FriendOverrides {
@@ -2345,6 +2379,7 @@ impl FriendOverrides {
         self.auto_accept_mb = self
             .auto_accept_mb
             .map(|mb| mb.min(CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB));
+        self.disappear_secs = self.disappear_secs.map(normalize_chat_disappear_secs);
         self
     }
 }
@@ -2417,6 +2452,16 @@ impl AppSettings {
                 .overrides_for(friend)
                 .and_then(|o| o.read_receipts)
                 .unwrap_or(self.friend_chat_read_receipts)
+    }
+
+    /// The disappearing-message timer for chat with `friend`, in seconds; 0
+    /// is off.
+    pub fn chat_disappear_secs_for(&self, friend: &[u8; 16]) -> u32 {
+        normalize_chat_disappear_secs(
+            self.overrides_for(friend)
+                .and_then(|o| o.disappear_secs)
+                .unwrap_or(self.chat_disappear_secs),
+        )
     }
 }
 
@@ -2617,6 +2662,7 @@ impl Default for AppSettings {
             friend_require_approval: true,
             friend_chat_disabled: false,
             friend_chat_read_receipts: true,
+            chat_disappear_secs: 0,
             friend_browse_disabled: false,
             friend_files_disabled: false,
             friend_session_encryption: true,
@@ -2794,6 +2840,33 @@ mod tests {
         );
         assert!(settings.chat_allowed_with(&ana));
         assert!(!settings.files_allowed_from(&ana));
+    }
+
+    #[test]
+    fn the_disappearing_timer_follows_the_default_unless_a_friend_has_their_own() {
+        let ana = [0xA1; 16];
+        let ben = [0xB2; 16];
+        let mut settings = AppSettings {
+            chat_disappear_secs: 86_400,
+            ..AppSettings::default()
+        };
+        assert_eq!(AppSettings::default().chat_disappear_secs, 0, "off by default");
+        assert_eq!(settings.chat_disappear_secs_for(&ana), 86_400);
+
+        settings.friend_overrides.insert(
+            hex::encode(ana),
+            FriendOverrides { disappear_secs: Some(0), ..FriendOverrides::default() },
+        );
+        assert_eq!(settings.chat_disappear_secs_for(&ana), 0, "off for them alone");
+        assert_eq!(settings.chat_disappear_secs_for(&ben), 86_400);
+
+        // A hand-edited value becomes the nearest timer the app offers.
+        assert_eq!(normalize_chat_disappear_secs(0), 0);
+        assert_eq!(normalize_chat_disappear_secs(1), 300);
+        assert_eq!(normalize_chat_disappear_secs(90_000), 86_400);
+        assert_eq!(normalize_chat_disappear_secs(u32::MAX), 2_419_200);
+        let odd = FriendOverrides { disappear_secs: Some(4_000), ..FriendOverrides::default() };
+        assert_eq!(odd.normalized().disappear_secs, Some(3_600));
     }
 
     #[test]

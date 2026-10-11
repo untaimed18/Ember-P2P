@@ -341,6 +341,18 @@ pub const EMBER_EXT_DHT_MEET: u8 = 0x0D;
 /// session that has sent this.
 pub const EMBER_EXT_BROWSE_SCOPE_AWARE: u8 = 0x0E;
 
+/// [`OP_EMBER_EXT`] sub-type: the sender's disappearing-message timer for
+/// something they just sent — a chat message, named by its body hash, or an
+/// attachment, named by its transfer id. Body is the chat AEAD envelope over
+/// [`crate::network::ember::crypto::encode_chat_expire`].
+///
+/// A frame of its own, following the message, rather than a field of
+/// [`OP_EMBER_CHAT_MSG`]: that payload is the text and nothing else, so a
+/// timer inside it would show as part of the message on every peer that
+/// predates this. As it is, such a peer shows the message exactly as before
+/// and ignores the timer — it keeps its copy, which the sender's UI says.
+pub const EMBER_EXT_CHAT_EXPIRE: u8 = 0x0F;
+
 const DHT_MEET_FLAG_ANSWER: u8 = 0x01;
 
 /// [`EMBER_EXT_DHT_MEET`] body: `udp_port(2, LE) || flags(1)`.

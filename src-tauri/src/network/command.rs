@@ -6194,10 +6194,12 @@ async fn handle_command_inner(
                                 return;
                             }
                             let hash_hex = hex::encode(friend_eh);
+                            let ttl_secs = settings.chat_disappear_secs_for(&friend_eh);
                             let pending_id = match queue_outbound_chat_message(
                                 db.clone(),
-                                hash_hex,
+                                hash_hex.clone(),
                                 message.clone(),
+                                ttl_secs,
                             )
                             .await
                             {
@@ -6212,9 +6214,24 @@ async fn handle_command_inner(
                             };
                             match sender.tx.try_send(packet) {
                                 Ok(()) => {
-                                    match mark_outbound_chat_delivered(db.clone(), pending_id).await
+                                    if ttl_secs > 0 {
+                                        let target = crate::network::ember::crypto::ChatExpireTarget::Message(
+                                            crate::network::ember::crypto::chat_body_hash(&message),
+                                        );
+                                        let followed = chat_expire_frame(
+                                            &ed25519_secret_key,
+                                            &peer_pubkey,
+                                            target,
+                                            ttl_secs,
+                                        )
+                                        .is_some_and(|frame| sender.tx.try_send(frame).is_ok());
+                                        if !followed {
+                                            debug!("Chat {pending_id} went out without its disappearing timer");
+                                        }
+                                    }
+                                    match mark_outbound_chat_delivered(db.clone(), hash_hex.clone(), pending_id).await
                                     {
-                                        Ok(()) => {
+                                        Ok(expires_at) => {
                                             let _ = app_handle.emit(
                                                 "ember:chat-message",
                                                 serde_json::json!({
@@ -6223,6 +6240,7 @@ async fn handle_command_inner(
                                                     "message": message,
                                                     "direction": "sent",
                                                     "timestamp": chrono::Utc::now().timestamp(),
+                                                    "expires_at": expires_at,
                                                 }),
                                             );
                                             let _ = tx.send(Ok(()));
@@ -6256,6 +6274,7 @@ async fn handle_command_inner(
                         db.clone(),
                         queued_hash,
                         message.clone(),
+                        settings.chat_disappear_secs_for(&friend_eh),
                     )
                     .await
                     {
