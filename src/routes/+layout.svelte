@@ -58,8 +58,10 @@
     getSecurityPolicyState,
   } from '$lib/api/security';
   import {
-    addToast, clearAllToasts, onPendingUndoChange, toastError, toastSuccess, toastWarning,
+    addActionToast, addToast, clearAllToasts, onPendingUndoChange, toastError, toastSuccess, toastWarning,
   } from '$lib/stores/toast';
+  import { backupReminderDue, noteBackupReminderShown } from '$lib/backupReminder';
+  import { goto } from '$app/navigation';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { confirmDroppedFolders, dismissDroppedFolders } from '$lib/api/sharing';
   import { takePendingDownloadOverflowNotice } from '$lib/api/transfers';
@@ -177,6 +179,31 @@
     });
     return () => cancelAnimationFrame(frame);
   });
+
+  const BACKUP_REMINDER_DELAY_MS = 2 * 60 * 1000;
+
+  /** See `$lib/backupReminder` for when this is due. */
+  function showBackupReminderIfDue() {
+    let due = false;
+    try {
+      due = backupReminderDue(localStorage, Date.now());
+      if (due) noteBackupReminderShown(localStorage, Date.now());
+    } catch {
+      // Without storage there is no way to keep it from repeating every launch.
+      return;
+    }
+    if (!due) return;
+    addActionToast(
+      'info',
+      m.backup_reminder_message(),
+      {
+        label: m.backup_reminder_action(),
+        run: () => void goto('/settings?section=backup').catch((e) => console.warn('Failed to open Backup:', e)),
+      },
+      () => {},
+      20_000,
+    );
+  }
 
   async function onWizardComplete(updated: AppSettings) {
     setAppSettings(updated);
@@ -306,6 +333,7 @@
     let revealTimer: number | undefined;
     let hideTimer: number | undefined;
     let handoffCheckTimer: number | undefined;
+    let backupReminderTimer: number | undefined;
     let unlistenUpdateCheck: UnlistenFn | null = null;
     let unlistenUpdateResume: UnlistenFn | null = null;
     let unlistenSettingsChanged: UnlistenFn | null = null;
@@ -425,7 +453,7 @@
 
     // An eMule import staged before this launch was applied during startup.
     // Marked seen as it is read, so the notice shows once; the full report
-    // stays in Settings → Import.
+    // stays in Settings → Backup & import.
     getEmuleImportReport(true)
       .then((report) => {
         if (!mounted || !report || report.seen) return;
@@ -526,10 +554,10 @@
       .then((fn) => { if (mounted) unlistenScanFailed = fn; else fn(); })
       .catch((e) => console.error('Failed to register shared-folder-scan-failed listener:', e));
 
-    // Automatic update checks run in the backend on the user's
-    // hourly/daily/weekly/monthly cadence, at launch and for as long as Ember stays
-    // open (release builds only). Their results are applied exactly as a
-    // silent check's would be, and surface non-blockingly via <UpdateNotice />.
+    // Automatic update checks run in the backend at every launch and hourly
+    // for as long as Ember stays open (release builds only); they have no
+    // setting. Their results are applied exactly as a silent check's would
+    // be, and surface non-blockingly via <UpdateNotice />.
     listen<SecureUpdateCheckResult>('ember:updater-check-result', (event) => {
       if (mounted) void applyBackgroundCheckResult(event.payload);
     })
@@ -735,6 +763,10 @@
             if (!settings.setup_complete) {
               wizardSettings = settings;
               showWizard = true;
+            } else {
+              // A couple of minutes in, once startup notices have had their
+              // turn: a reminder competing with them is one more thing to close.
+              backupReminderTimer = window.setTimeout(showBackupReminderIfDue, BACKUP_REMINDER_DELAY_MS);
             }
           } else {
             console.error('Persistent settings fetch failure; blocking main app entry', settingsError);
@@ -760,9 +792,8 @@
           // Did the last install actually happen? A
           // hand-off to the installer ends this process, so if the installer
           // never ran there was nobody left to say so and the user just saw
-          // Ember close. This is the first opportunity to tell them. Runs
-          // regardless of the auto-check preference and of the cadence — it
-          // reports on something they already asked for — and it resolves to
+          // Ember close. This is the first opportunity to tell them. It
+          // reports on something they already asked for, and it resolves to
           // nothing in the normal case where the update landed. Two things in
           // the store stop the backend's first automatic check from
           // overwriting the result, because ordering the two cannot: an
@@ -798,6 +829,7 @@
       if (revealTimer !== undefined) window.clearTimeout(revealTimer);
       if (hideTimer !== undefined) window.clearTimeout(hideTimer);
       if (handoffCheckTimer !== undefined) window.clearTimeout(handoffCheckTimer);
+      if (backupReminderTimer !== undefined) window.clearTimeout(backupReminderTimer);
       if (unlistenUpdateCheck) unlistenUpdateCheck();
       if (unlistenUpdateResume) unlistenUpdateResume();
       if (unlistenSettingsChanged) unlistenSettingsChanged();

@@ -396,10 +396,9 @@ pub(in crate::network) async fn on_upload_event(
             let _ = reply_tx.try_send(framed);
         } else if friend_hashes.read().await.contains(&offer_eh) {
             let status = if !settings.files_allowed_from(&offer_eh) {
-                // Reuse the chat switch as the "no unsolicited
-                // contact from friends" control rather than adding
-                // a second one that could disagree with it; a
-                // friend's own files setting narrows it.
+                // Chat off refuses files too; with chat on, the
+                // global files switch decides unless the friend has
+                // a files setting of their own.
                 ed2k::messages::OFFER_STATUS_DECLINED
             } else {
                 ed2k::messages::OFFER_STATUS_ACCEPTED

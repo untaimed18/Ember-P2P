@@ -13,12 +13,14 @@ import {
   checkUpdateHandoff,
   installUpdate,
   loadLastBackgroundCheckResult,
+  dismissNotice,
   updater,
   type SecureUpdateCheckResult,
 } from './updater';
 
 const invokeMock = vi.mocked(invoke);
 const storage = new Map<string, string>();
+const session = new Map<string, string>();
 
 const IDLE = get(updater);
 
@@ -45,10 +47,16 @@ function holdNextInvoke(): (value: unknown) => void {
 
 beforeEach(() => {
   storage.clear();
+  session.clear();
   vi.stubGlobal('localStorage', {
     getItem: (k: string) => storage.get(k) ?? null,
     setItem: (k: string, v: string) => void storage.set(k, v),
     removeItem: (k: string) => void storage.delete(k),
+  });
+  vi.stubGlobal('sessionStorage', {
+    getItem: (k: string) => session.get(k) ?? null,
+    setItem: (k: string, v: string) => void session.set(k, v),
+    removeItem: (k: string) => void session.delete(k),
   });
   updater.set({ ...IDLE });
   invokeMock.mockReset();
@@ -56,6 +64,31 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+describe('dismissing an update', () => {
+  it('keeps it hidden through the hourly checks of the same run', async () => {
+    await applyBackgroundCheckResult(found('9.9.9'));
+    dismissNotice();
+    await applyBackgroundCheckResult(found('9.9.9'));
+    expect(get(updater).dismissed).toBe(true);
+  });
+
+  it('does not hide a newer release', async () => {
+    await applyBackgroundCheckResult(found('9.9.9'));
+    dismissNotice();
+    await applyBackgroundCheckResult(found('9.9.10'));
+    expect(get(updater).dismissed).toBe(false);
+  });
+
+  it('is forgotten when Ember starts again', async () => {
+    await applyBackgroundCheckResult(found('9.9.9'));
+    dismissNotice();
+    session.clear();
+    await applyBackgroundCheckResult(found('9.9.9'));
+    expect(get(updater).dismissed).toBe(false);
+    expect(storage.size).toBe(0);
+  });
 });
 
 describe('applyBackgroundCheckResult', () => {

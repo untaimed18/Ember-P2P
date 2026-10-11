@@ -9,6 +9,7 @@
     getKadSearches,
     kadCancelSearch,
   } from '$lib/api/kad';
+  import { downloadNodesDat } from '$lib/api/settings';
   import { goto } from '$app/navigation';
   import { networkError, networkStats, serverStatus } from '$lib/stores/network';
   import { toastSuccess, toastError, toast as toastInfo } from '$lib/stores/toast';
@@ -20,7 +21,7 @@
   import { translateError, degradedReasonText } from '$lib/i18n';
   import { kadNodesLoadedText } from '$lib/commandReplies';
   import { inertBackground } from '$lib/a11y';
-  import { copyToClipboard, formatDateTime, formatNumber } from '$lib/utils';
+  import { copyToClipboard, formatDateTime, formatNumber, formatSize } from '$lib/utils';
   import IconX from '$lib/components/IconX.svelte';
   import NetworkStatusTiles from '$lib/components/NetworkStatusTiles.svelte';
 
@@ -286,6 +287,35 @@
     } catch (e: unknown) {
       // Show the concrete backend error so the user knows whether the
       // URL 404'd, the parse failed, the IP was unreachable, etc.
+      toastError(toErrMsg(e, m.kad_bootstrap_failed()));
+    } finally {
+      bootstrapPending = false;
+    }
+  }
+
+  /** The URL tab's shortcut: the backend's pinned default nodes.dat, so a
+   *  first bootstrap needs no address. A deferred outcome still lands — the
+   *  contact list polls every few seconds. */
+  async function handleDefaultNodes() {
+    if (bootstrapPending) return;
+    bootstrapPending = true;
+    try {
+      const result = await downloadNodesDat();
+      toastSuccess(
+        result.outcome === 'applied' && result.appliedCount !== undefined
+          ? m.kad_nodes_downloaded_applied({
+              parsed: result.parsedCount,
+              applied: result.appliedCount,
+              bytes: formatSize(result.byteCount),
+            })
+          : m.kad_nodes_downloaded_deferred({
+              parsed: result.parsedCount,
+              bytes: formatSize(result.byteCount),
+            }),
+      );
+      closeBootstrap();
+      void refresh();
+    } catch (e: unknown) {
       toastError(toErrMsg(e, m.kad_bootstrap_failed()));
     } finally {
       bootstrapPending = false;
@@ -1267,6 +1297,12 @@
                   onkeydown={(e) => { if (e.key === 'Enter' && !bootstrapPending && bootstrapUrl.trim()) { e.preventDefault(); void handleBootstrap(); } }}
                 />
               </div>
+              <div class="bootstrap-default">
+                <p class="bootstrap-hint">{m.kad_bootstrap_default_list_hint()}</p>
+                <button type="button" class="ghost" onclick={handleDefaultNodes} disabled={bootstrapPending}>
+                  {m.kad_bootstrap_default_list()}
+                </button>
+              </div>
             {:else}
               <p class="bootstrap-hint">{m.kad_bootstrap_hint_clients()}</p>
             {/if}
@@ -1649,6 +1685,21 @@
     color: var(--text-muted);
     margin: 0 0 12px 0;
     line-height: 1.5;
+  }
+  .bootstrap-default {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+  }
+  .bootstrap-default .bootstrap-hint {
+    margin: 0;
+  }
+  .bootstrap-default button {
+    flex-shrink: 0;
   }
   .bootstrap-hint code {
     font-family: var(--font-mono);

@@ -717,9 +717,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // unmodified pre-haystack factory file is migrated in place).
     // Wrapped in a `parking_lot::RwLock` so the upload server can
     // hot-read on every handshake while the settings UI hot-swaps the
-    // pattern list. The filter is disabled by default — users have to
-    // opt in via Settings — to avoid surprising regressions for anyone
-    // who didn't ask for it. The defaults are conservative regardless.
+    // pattern list. New profiles start with it on; the built-in patterns
+    // are conservative, naming only clients that take without giving back.
     let shared_antileech: crate::security::antileech::SharedAntiLeechFilter = {
         let initial = crate::security::antileech::load_or_seed_defaults(
             &data_dir,

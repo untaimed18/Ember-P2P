@@ -206,9 +206,12 @@ export async function takePendingKnownMetNotice(): Promise<{ reset: boolean } | 
   return invoke('take_pending_known_met_notice');
 }
 
-/** Open the official Ember website in the default browser. */
-export async function openEmberWebsite(): Promise<void> {
-  return invoke('open_ember_website');
+/** The project's own pages. Named rather than passed as URLs: the addresses
+ *  are fixed in the backend, so this renderer cannot point them elsewhere. */
+export type EmberLink = 'website' | 'github' | 'reddit';
+
+export async function openEmberLink(target: EmberLink): Promise<void> {
+  return invoke('open_ember_link', { target });
 }
 
 /** Open the project's Buy Me a Coffee page. The address is fixed in the backend. */

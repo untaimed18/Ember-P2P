@@ -73,7 +73,6 @@ const KNOWN_UNTRANSLATED = new Set([
   "settings_folder_priority_path_too_long",
   "settings_invalid_update",
   "settings_too_many_folder_priorities",
-  "settings_update_check_frequency_invalid",
   "sharing_batch_bytes_too_large",
   "sharing_cannot_share_data_dir",
   "sharing_config_transaction_error",

@@ -30,7 +30,10 @@ export function chatAllowedWith(settings: Settings, friendHash: string): boolean
 
 /** Files from this friend. Never while chat with them is off. */
 export function filesAllowedFrom(settings: Settings, friendHash: string): boolean {
-  return chatAllowedWith(settings, friendHash) && (friendOverrides(settings, friendHash).files ?? true);
+  return (
+    chatAllowedWith(settings, friendHash) &&
+    (friendOverrides(settings, friendHash).files ?? settings?.friend_files_disabled !== true)
+  );
 }
 
 /** The ceiling under which this friend's files download without asking, in MB. */

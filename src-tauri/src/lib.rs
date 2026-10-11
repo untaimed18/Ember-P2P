@@ -2571,7 +2571,7 @@ pub fn run() {
             commands::settings::take_pending_restore_expired_notice,
             commands::settings::take_pending_restore_download_folder_notice,
             commands::settings::take_pending_known_met_notice,
-            commands::settings::open_ember_website,
+            commands::settings::open_ember_link,
             commands::settings::open_support_page,
             commands::settings::get_ember_website_url,
             commands::settings::open_ember_share,

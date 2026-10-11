@@ -142,6 +142,19 @@
   let speedTestRunning = $state(false);
   let speedTestResult = $state('');
   let speedTestFailed = $state(false);
+
+  // Unlimited upload fills most home connections and slows everything else on
+  // them, so the Bandwidth step measures once on its first visit and suggests
+  // limits — unless some are already set, by eMule's settings or by hand.
+  const BANDWIDTH_STEP = 6;
+  let speedTestAutoStarted = false;
+  $effect(() => {
+    if (step !== BANDWIDTH_STEP || speedTestAutoStarted) return;
+    speedTestAutoStarted = true;
+    untrack(() => {
+      if (maxUploadSpeed === 0 && maxDownloadSpeed === 0 && !speedTestRunning) void runSpeedTest(true);
+    });
+  });
   let saving = $state(false);
   let saveError = $state('');
   let relaunching = $state(false);
@@ -270,17 +283,19 @@
     }
   }
 
-  async function runSpeedTest() {
+  /** `auto` is the run the Bandwidth step starts by itself; its result fills
+   *  in only limits still at Unlimited, so a number typed while it ran stays. */
+  async function runSpeedTest(auto = false) {
     speedTestRunning = true;
     speedTestResult = '';
     speedTestFailed = false;
     try {
       const result: { recommended_upload_limit: number; recommended_download_limit: number } = await invoke('run_speed_test');
-      maxUploadSpeed = result.recommended_upload_limit;
-      maxDownloadSpeed = result.recommended_download_limit;
+      if (!auto || maxUploadSpeed === 0) maxUploadSpeed = result.recommended_upload_limit;
+      if (!auto || maxDownloadSpeed === 0) maxDownloadSpeed = result.recommended_download_limit;
       speedTestResult = m.wizard_speed_test_recommended({
-        up: fmtSpeedShort(maxUploadSpeed),
-        down: fmtSpeedShort(maxDownloadSpeed),
+        up: fmtSpeedShort(result.recommended_upload_limit),
+        down: fmtSpeedShort(result.recommended_download_limit),
       });
     } catch {
       speedTestResult = m.wizard_speed_test_failed();
@@ -647,7 +662,7 @@
           <p class="step-hint">{m.wizard_ports_hint()}</p>
         </div>
 
-      {:else if step === 6}
+      {:else if step === BANDWIDTH_STEP}
         <div class="step-content">
           <h2 class="step-title">{m.wizard_bandwidth_title()}</h2>
           <p class="step-desc">{m.wizard_bandwidth_desc()}</p>
@@ -662,7 +677,7 @@
           {#if speedsFromEmule}
             <p class="step-hint from-emule">{m.wizard_from_emule()}</p>
           {/if}
-          <button type="button" class="speed-test-btn" onclick={runSpeedTest} disabled={speedTestRunning}>
+          <button type="button" class="speed-test-btn" onclick={() => void runSpeedTest()} disabled={speedTestRunning}>
             {speedTestRunning ? m.wizard_speed_test_running() : m.wizard_speed_test_run()}
           </button>
           {#if speedTestResult}

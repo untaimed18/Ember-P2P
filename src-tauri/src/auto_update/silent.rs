@@ -439,10 +439,7 @@ impl Driver {
             return;
         }
         self.refresh_tray_labels(app);
-        let enabled = {
-            let config = state.config.read().await;
-            config.settings.silent_update_enabled && config.settings.auto_check_updates
-        };
+        let enabled = state.config.read().await.settings.silent_update_enabled;
         let support = support();
         let now = Instant::now();
         let now_ms = chrono::Utc::now().timestamp_millis();

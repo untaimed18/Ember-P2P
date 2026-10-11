@@ -883,8 +883,9 @@ export interface AppSettings {
    *  separate Ember-only friend browse feature. */
   allow_shared_files_browse: boolean;
   /** eMule-style web services: sites openable for one file from its context
-   *  menu, with the file's facts substituted into a URL template. Empty by
-   *  default — opening one tells a third party which file you are after. */
+   *  menu, with the file's facts substituted into a URL template. A new
+   *  profile gets one example; opening any of them tells a third party which
+   *  file you are after, and asks first. */
   web_services: WebService[];
   /** Download categories the user made, offered beside the built-in ones. */
   download_categories?: string[];
@@ -951,6 +952,9 @@ export interface AppSettings {
   friend_chat_read_receipts: boolean;
   /** Disable browse-shares responses to friends */
   friend_browse_disabled: boolean;
+  /** Decline files friends send (chat attachments and file offers). A friend's
+   *  own `files` override wins; chat off refuses files regardless. */
+  friend_files_disabled: boolean;
   /** Encrypt friend sessions with RC4 obfuscation */
   friend_session_encryption: boolean;
   /** Who may offer you a file in a channel. Gates the prompt only — accepting
@@ -1003,16 +1007,9 @@ export interface AppSettings {
    *  window is created at its configured size), so a change only affects
    *  the next launch. Off by default. */
   launch_maximized: boolean;
-  /** Automatically check for updates shortly after launch, subject to
-   *  `update_check_frequency`. The "Check for updates" button in Settings →
-   *  About always works manually regardless of this setting. Defaults to
-   *  true (Ember's original always-check-on-launch behavior). */
-  auto_check_updates: boolean;
-  /** How often the automatic background update check may run. */
-  update_check_frequency: 'hourly' | 'daily' | 'weekly' | 'monthly';
   /** Install updates without asking, once nothing is transferring and the user
-   *  is away, after a one-minute warning. Only on together with
-   *  `auto_check_updates`. */
+   *  is away, after a one-minute warning. Update checks themselves always run
+   *  (at launch and hourly) and have no setting. */
   silent_update_enabled: boolean;
 
   /** Master switch for desktop notifications. Off silences every category

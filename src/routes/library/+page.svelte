@@ -317,6 +317,17 @@
   let creatingCollection = $state(false);
   let newCollFormat: 'binary' | 'text' = $state('binary');
   let copyingCollectionLinks = $state(false);
+  /** Total size of the files a new collection would list, each hash once. */
+  let selectedCollectionBytes = $derived.by(() => {
+    const seen = new Set<string>();
+    let bytes = 0;
+    for (const f of hashedLibraryFiles) {
+      if (!selectedFileHashes.has(f.hash) || seen.has(f.hash)) continue;
+      seen.add(f.hash);
+      bytes += f.size;
+    }
+    return bytes;
+  });
 
   async function handleOpenCollection() {
     collectionLoading = true;
@@ -3925,85 +3936,129 @@
       }
     }
   }}>
-    <div class="modal-content create-coll-modal" bind:this={createCollectionModal}>
+    <div class="modal-content coll-modal" bind:this={createCollectionModal}>
       <div class="modal-header">
         <span id="create-coll-title" class="modal-title">{m.library_create_collection()}</span>
         <button type="button" class="icon-close" onclick={closeCreateDialog} disabled={creatingCollection} aria-label={m.common_close()}><IconX size={15} /></button>
       </div>
       <div class="modal-body">
-        <div class="form-row">
-          <label class="form-label" for="coll-name">{m.library_coll_name()}</label>
-          <input
-            id="coll-name"
-            type="text"
-            class="form-input"
-            bind:value={newCollName}
-            placeholder={m.library_coll_name_placeholder()}
-            onkeydown={(e) => {
-              if (e.key === 'Enter' && !!newCollName.trim() && selectedFileHashes.size > 0 && !creatingCollection) {
-                e.preventDefault();
-                void handleCreateCollection();
-              }
-            }}
-          />
-        </div>
-        <div class="form-row">
-          <label class="form-label" for="coll-author">{m.library_coll_author()}</label>
-          <input id="coll-author" type="text" class="form-input" bind:value={newCollAuthor} placeholder={m.library_coll_optional()} />
-        </div>
-        <div class="form-row">
-          <span class="form-label">{m.library_coll_format()}</span>
-          <div class="format-toggle">
-            <label class="format-option">
-              <input type="radio" name="coll-format" value="binary" bind:group={newCollFormat} />
-              <span class="format-label">
-                <span class="format-name">{m.library_coll_format_binary_name()}</span>
-                <span class="format-desc">{m.library_coll_format_binary_desc()}</span>
+        <!-- The collection leads, as the file does in File Details: what it
+             will be called, how much it holds, and the format it is written
+             in — all of it updating as the form below is filled in. -->
+        <div class="coll-hero">
+          <span class="coll-hero-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3 3 7.5l9 4.5 9-4.5L12 3z" />
+              <path d="m3 12 9 4.5 9-4.5" />
+              <path d="m3 16.5 9 4.5 9-4.5" />
+            </svg>
+          </span>
+          <div class="coll-hero-text">
+            <bdi class="coll-hero-name" class:is-placeholder={!newCollName.trim()} dir="auto">
+              {newCollName.trim() || m.library_coll_untitled()}
+            </bdi>
+            <div class="coll-hero-meta">
+              <span class="coll-pill" class:is-empty={selectedFileHashes.size === 0}>
+                {selectedFileHashes.size === 0
+                  ? m.library_coll_summary_none()
+                  : plural(selectedFileHashes.size, {
+                      one: () => m.library_coll_summary_one({ size: formatSize(selectedCollectionBytes) }),
+                      few: () => m.library_coll_summary_few({ count: formatNumber(selectedFileHashes.size), size: formatSize(selectedCollectionBytes) }),
+                      other: () => m.library_coll_summary_other({ count: formatNumber(selectedFileHashes.size), size: formatSize(selectedCollectionBytes) }),
+                    })}
               </span>
-            </label>
-            <label class="format-option">
-              <input type="radio" name="coll-format" value="text" bind:group={newCollFormat} />
-              <span class="format-label">
-                <span class="format-name">{m.library_coll_format_text_name()}</span>
-                <span class="format-desc">{m.library_coll_format_text_desc()}</span>
-              </span>
-            </label>
+              <code class="coll-ext">{newCollFormat === 'binary' ? '.emulecollection' : '.txt'}</code>
+              {#if newCollAuthor.trim()}
+                <bdi class="coll-hero-sub" dir="auto">{m.library_coll_by_author({ author: newCollAuthor.trim() })}</bdi>
+              {/if}
+            </div>
           </div>
         </div>
-        <div class="form-row">
-          <span class="form-label">{m.library_coll_select_files({ selected: formatNumber(selectedFileHashes.size), total: formatNumber(hashedUniqueCount) })}</span>
-          <button class="ghost select-all-btn" onclick={toggleAllFileSelection}>
-            {allHashedFilesSelected ? m.common_deselect_all() : m.common_select_all()}
-          </button>
-        </div>
-        <div class="coll-search-row">
-          <input
-            type="text"
-            class="form-input coll-search-input"
-            placeholder={m.library_coll_search_placeholder()}
-            aria-label={m.library_coll_search_placeholder()}
-            bind:value={collectionSearch}
-          />
-        </div>
-        <div class="coll-file-picker">
-          {#each displayedCollectionFiles as f (f.path)}
-            <label class="coll-pick-row">
-              <input type="checkbox" checked={selectedFileHashes.has(f.hash)} onchange={() => toggleFileSelection(f.hash)} />
-              <span class="coll-pick-name" title={f.name}>{f.name}</span>
-              <span class="coll-pick-size">{formatSize(f.size)}</span>
+
+        <section class="coll-card" aria-labelledby="coll-sec-details">
+          <h4 id="coll-sec-details" class="coll-card-title">{m.library_coll_section_details()}</h4>
+          <div class="coll-fields">
+            <label class="coll-field">
+              <span class="coll-field-label">{m.library_coll_name()}</span>
+              <input
+                id="coll-name"
+                type="text"
+                class="form-input"
+                bind:value={newCollName}
+                placeholder={m.library_coll_name_placeholder()}
+                onkeydown={(e) => {
+                  if (e.key === 'Enter' && !!newCollName.trim() && selectedFileHashes.size > 0 && !creatingCollection) {
+                    e.preventDefault();
+                    void handleCreateCollection();
+                  }
+                }}
+              />
             </label>
-          {/each}
-          {#if collectionFilteredFiles.length > displayedCollectionFiles.length}
-            <div class="coll-pick-empty">
-              {m.library_status_showing({ shown: formatNumber(displayedCollectionFiles.length), total: formatNumber(collectionFilteredFiles.length) })}
-            </div>
-          {/if}
-          {#if collectionFilteredFiles.length === 0 && hashedLibraryFiles.length > 0}
-            <div class="coll-pick-empty">{m.library_coll_no_matches({ query: collectionQuery })}</div>
-          {:else if hashedLibraryFiles.length === 0}
-            <div class="coll-pick-empty">{m.library_coll_no_hashed_files()}</div>
-          {/if}
-        </div>
+            <label class="coll-field">
+              <span class="coll-field-label">{m.library_coll_author()}</span>
+              <input id="coll-author" type="text" class="form-input" bind:value={newCollAuthor} placeholder={m.library_coll_optional()} />
+            </label>
+          </div>
+        </section>
+
+        <section class="coll-card" aria-labelledby="coll-sec-format">
+          <h4 id="coll-sec-format" class="coll-card-title">{m.library_coll_format()}</h4>
+          <div class="coll-formats" role="radiogroup" aria-labelledby="coll-sec-format">
+            <label class="coll-format">
+              <input type="radio" name="coll-format" value="binary" bind:group={newCollFormat} />
+              <span class="coll-format-name">{m.library_coll_format_binary_name()}</span>
+              <span class="coll-format-desc">{m.library_coll_format_binary_desc()}</span>
+            </label>
+            <label class="coll-format">
+              <input type="radio" name="coll-format" value="text" bind:group={newCollFormat} />
+              <span class="coll-format-name">{m.library_coll_format_text_name()}</span>
+              <span class="coll-format-desc">{m.library_coll_format_text_desc()}</span>
+            </label>
+          </div>
+        </section>
+
+        <section class="coll-card" aria-labelledby="coll-sec-files">
+          <div class="coll-card-head">
+            <h4 id="coll-sec-files" class="coll-card-title">{m.library_coll_section_files()}</h4>
+            <span class="coll-count">{m.library_coll_selected_count({ selected: formatNumber(selectedFileHashes.size), total: formatNumber(hashedUniqueCount) })}</span>
+            <button type="button" class="ghost coll-select-all" onclick={toggleAllFileSelection} disabled={hashedLibraryFiles.length === 0}>
+              {allHashedFilesSelected ? m.common_deselect_all() : m.common_select_all()}
+            </button>
+          </div>
+          <div class="coll-search">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+              <circle cx="7" cy="7" r="4.5" />
+              <path d="m10.5 10.5 3 3" />
+            </svg>
+            <input
+              type="search"
+              class="form-input"
+              placeholder={m.library_coll_search_placeholder()}
+              aria-label={m.library_coll_search_placeholder()}
+              bind:value={collectionSearch}
+            />
+          </div>
+          <div class="coll-file-picker">
+            {#each displayedCollectionFiles as f (f.path)}
+              <label class="coll-pick-row" class:is-checked={selectedFileHashes.has(f.hash)}>
+                <input type="checkbox" checked={selectedFileHashes.has(f.hash)} onchange={() => toggleFileSelection(f.hash)} />
+                <FileTypeIcon kind={fileTypeKey(extensionFromPath(f.name))} size={18} />
+                <span class="coll-pick-name" title={f.name}>{f.name}</span>
+                <span class="coll-pick-size">{formatSize(f.size)}</span>
+              </label>
+            {/each}
+            {#if collectionFilteredFiles.length > displayedCollectionFiles.length}
+              <div class="coll-pick-empty">
+                {m.library_status_showing({ shown: formatNumber(displayedCollectionFiles.length), total: formatNumber(collectionFilteredFiles.length) })}
+              </div>
+            {/if}
+            {#if collectionFilteredFiles.length === 0 && hashedLibraryFiles.length > 0}
+              <div class="coll-pick-empty">{m.library_coll_no_matches({ query: collectionQuery })}</div>
+            {:else if hashedLibraryFiles.length === 0}
+              <div class="coll-pick-empty">{m.library_coll_no_hashed_files()}</div>
+            {/if}
+          </div>
+        </section>
       </div>
       <div class="modal-footer">
         <button class="ghost" onclick={closeCreateDialog} disabled={creatingCollection}>{m.common_cancel()}</button>
@@ -6948,9 +7003,189 @@
       animation: none;
     }
   }
-  .create-coll-modal {
-    width: min(520px, calc(100vw - 2rem));
+  /* Create Collection, laid out like the File Details window: the collection
+     up front, then details, format and files each on their own card. */
+  .coll-modal {
+    width: min(560px, calc(100vw - 2rem));
     max-width: calc(100vw - 2rem);
+    max-height: min(720px, calc(100vh - 48px));
+  }
+  .coll-modal .modal-body {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .coll-hero {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+  }
+  .coll-hero-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 44px;
+    height: 44px;
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    color: var(--accent);
+  }
+  .coll-hero-icon svg { width: 24px; height: 24px; }
+  .coll-hero-text {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+    flex: 1;
+  }
+  .coll-hero-name {
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+  }
+  .coll-hero-name.is-placeholder { color: var(--text-muted); }
+  .coll-hero-meta {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .coll-pill {
+    padding: 1px 8px;
+    border-radius: var(--radius-pill);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    color: var(--badge-accent-text);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    font-variant-numeric: tabular-nums;
+  }
+  .coll-pill.is-empty {
+    color: var(--text-secondary);
+    background: color-mix(in srgb, var(--text-muted) 16%, transparent);
+  }
+  .coll-ext {
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+  }
+  .coll-hero-sub {
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+  }
+  .coll-card {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-primary);
+    min-width: 0;
+  }
+  .coll-card-title {
+    margin: 0;
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-secondary);
+  }
+  .coll-card-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .coll-count {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .coll-select-all {
+    margin-left: auto;
+    padding: 2px 8px;
+    font-size: var(--font-size-xs);
+  }
+  .coll-fields {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px 12px;
+  }
+  .coll-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+  .coll-field-label {
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+  }
+  .coll-field .form-input {
+    width: 100%;
+    box-sizing: border-box;
+  }
+  .coll-formats {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  /* Radio cards: the choice is the card, and the selected one is filled. */
+  .coll-format {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 10px 12px 10px 34px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-surface);
+    cursor: pointer;
+    transition: background var(--transition-fast), border-color var(--transition-fast);
+  }
+  .coll-format:hover { background: var(--bg-hover); }
+  .coll-format input[type="radio"] {
+    position: absolute;
+    top: 11px;
+    left: 12px;
+    margin: 0;
+    cursor: pointer;
+  }
+  .coll-format:has(input[type="radio"]:checked) {
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+    background: var(--accent-fill);
+  }
+  .coll-format:has(input[type="radio"]:focus-visible) {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .coll-format-name { font-size: var(--font-size-sm); font-weight: 600; color: var(--text-primary); }
+  .coll-format-desc { font-size: var(--font-size-xs); line-height: 1.4; color: var(--text-muted); }
+  .coll-search {
+    position: relative;
+    display: flex;
+  }
+  .coll-search svg {
+    position: absolute;
+    top: 50%;
+    left: 9px;
+    width: 14px;
+    height: 14px;
+    transform: translateY(-50%);
+    color: var(--text-muted);
+    pointer-events: none;
+  }
+  .coll-search .form-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding-left: 28px;
+  }
+  @media (max-width: 560px) {
+    .coll-fields,
+    .coll-formats {
+      grid-template-columns: 1fr;
+    }
   }
   .ctx-label.ctx-note {
     max-width: 260px;
@@ -7021,62 +7256,26 @@
   }
   .form-input:focus { border-color: var(--accent); }
 
-  .format-toggle {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    flex: 1;
-  }
-  .format-option {
-    display: flex;
-    align-items: flex-start;
-    gap: 8px;
-    padding: 6px 8px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-    transition: background var(--transition-fast), border-color var(--transition-fast);
-  }
-  .format-option:hover { background: var(--bg-hover); }
-  .format-option input[type="radio"] { margin-top: 2px; flex-shrink: 0; cursor: pointer; }
-  .format-option:has(input[type="radio"]:checked) {
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
-    background: var(--accent-fill);
-  }
-  .format-label {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    line-height: 1.3;
-  }
-  .format-name { font-size: var(--font-size-sm); font-weight: 600; color: var(--text-primary); }
-  .format-desc { font-size: var(--font-size-xs); color: var(--text-muted); }
-
-  .select-all-btn { font-size: var(--font-size-xs); margin-left: auto; padding: 2px 8px; }
-  .coll-search-row {
-    margin-bottom: 6px;
-  }
-  .coll-search-input {
-    width: 100%;
-    font-size: var(--font-size-sm);
-  }
   .coll-file-picker {
-    max-height: 260px;
+    max-height: 240px;
     overflow-y: auto;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    background: var(--bg-secondary);
+    background: var(--bg-surface);
   }
   .coll-pick-row {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 4px 10px;
+    padding: 5px 10px;
     font-size: var(--font-size-sm);
     cursor: pointer;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
     transition: background var(--transition-fast);
   }
+  .coll-pick-row:last-child { border-bottom: none; }
   .coll-pick-row:hover { background: var(--bg-hover); }
+  .coll-pick-row.is-checked { background: var(--accent-fill); }
   .coll-pick-name {
     flex: 1;
     overflow: hidden;

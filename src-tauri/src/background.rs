@@ -288,14 +288,10 @@ async fn run(app: tauri::AppHandle) {
 /// the app's own health model has already called `Stalled` — that is precisely
 /// its judgement that nothing is happening.
 ///
-/// An `Active` upload is judged on throughput instead, because neither of those
-/// two signals can speak for it. `compute_health_state` returns early for
-/// anything that is not a download, so an upload row's health is permanently
-/// `Healthy`, and uploads are unconditionally `Active` while they hold a slot.
-/// So a peer that takes an upload slot and then stops requesting blocks read as
-/// work forever — the same indefinite pin the `Stalled` exclusion exists to
-/// prevent, on the side it cannot see. `refresh_health` already decays `speed`
-/// to zero for exactly this case, so that is the signal to use.
+/// Uploads do not count at all. A client with shared files is serving someone
+/// nearly all the time, so counting them kept a laptop awake for as long as
+/// Ember was open — for strangers' downloads, not the user's. The tray tooltip
+/// still shows upload speed, which it reads from the limiter, not from here.
 async fn count_working_transfers(state: &AppState) -> usize {
     let manager = state.transfer_manager.read().await;
     manager
@@ -307,10 +303,10 @@ async fn count_working_transfers(state: &AppState) -> usize {
             TransferStatus::Verifying
             | TransferStatus::Completing
             | TransferStatus::Hashing => true,
-            TransferStatus::Active => match transfer.direction {
-                TransferDirection::Upload => transfer.speed > 0,
-                TransferDirection::Download => transfer.health != TransferHealth::Stalled,
-            },
+            TransferStatus::Active => {
+                transfer.direction == TransferDirection::Download
+                    && transfer.health != TransferHealth::Stalled
+            }
             _ => false,
         })
         .count()

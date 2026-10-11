@@ -22,6 +22,7 @@ function settingsWith(
   return {
     friend_chat_disabled: false,
     friend_browse_disabled: false,
+    friend_files_disabled: false,
     friend_chat_read_receipts: true,
     chat_attachment_auto_accept_mb: 25,
     notify_friend_online: false,
@@ -68,6 +69,13 @@ describe('friend settings', () => {
     expect(chatAllowedWith(s, ANA)).toBe(true);
     expect(filesAllowedFrom(s, ANA)).toBe(false);
     expect(filesAllowedFrom(s, BEN)).toBe(true);
+  });
+
+  it('follows the global files switch unless a friend has their own', () => {
+    const s = settingsWith({ friend_files_disabled: true }, { [ANA]: { files: true } });
+    expect(chatAllowedWith(s, BEN)).toBe(true);
+    expect(filesAllowedFrom(s, BEN)).toBe(false);
+    expect(filesAllowedFrom(s, ANA)).toBe(true);
   });
 
   it('reads an auto-accept of 0 as always ask, and caps it like the global one', () => {

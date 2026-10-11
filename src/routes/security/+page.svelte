@@ -664,12 +664,12 @@
       <div class="controls-left">
         <ToggleSwitch
           bind:checked={stats.enabled}
-          label={m.security_ipfilter_label()}
+          label={m.settings_ip_filter_label()}
           onchange={(v) => { void persistIpFilterEnabled(v); }}
         />
         <ToggleSwitch
           bind:checked={stats.block_private}
-          label={m.security_block_private_label()}
+          label={m.settings_block_private_label()}
           onchange={(v) => { void persistBlockPrivate(v); }}
         />
         <!-- Refreshes the bundled default list once it is a day old: on a
@@ -679,7 +679,7 @@
           <ToggleSwitch
             bind:checked={autoUpdate}
             disabled={autoUpdateSaving}
-            label={m.security_auto_update_label()}
+            label={m.settings_ip_filter_auto_update_label()}
             onchange={(v) => { void persistAutoUpdate(v); }}
           />
         </span>

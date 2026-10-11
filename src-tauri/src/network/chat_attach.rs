@@ -897,7 +897,7 @@ pub(super) async fn retry(
     if settings.chat_allowed_with(&friend) && !settings.files_allowed_from(&friend) {
         return Err(coded(
             "peers_attach_files_disabled_friend",
-            "Files from this friend are turned off in your settings for them",
+            "Files from this friend are turned off in your settings",
         ));
     }
     let session_port = offer_preflight(state, settings, &friend).await?;
@@ -1292,10 +1292,10 @@ pub(super) async fn on_offer(
     let refuse = |reply: AttachReply| attach::encode_attach_reply(&xfer_id, reply, None);
 
     if !settings.files_allowed_from(&friend) {
-        // The chat switch doubles as "no unsolicited contact from friends",
-        // exactly as it does for file offers, and a friend's own files setting
-        // narrows it further. Read as they are now, so a re-offer after the
-        // user switched this off is refused like a first one.
+        // Chat off refuses files too, as it does for file offers; otherwise
+        // the global files switch or the friend's own files setting decides.
+        // Read as they are now, so a re-offer after the user switched this
+        // off is refused like a first one.
         let _ = send_ext(state, &friend, EMBER_EXT_ATTACH_REPLY, &refuse(AttachReply::NotAllowed)).await;
         return;
     }

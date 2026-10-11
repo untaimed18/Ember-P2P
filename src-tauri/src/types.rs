@@ -1590,16 +1590,17 @@ pub struct AppSettings {
     /// back to empty is always allowed, because that is the safe default.
     #[serde(default)]
     pub preview_player: String,
-    /// Skip compressing video files during upload (eMule: dontcompressavi)
-    #[serde(default)]
+    /// Skip compressing video files during upload (eMule: dontcompressavi).
+    /// On by default: video is already compressed, so zlib only spends CPU.
+    #[serde(default = "default_true")]
     pub skip_compress_video: bool,
     /// Enable the AntiLeech client-software filter. Pattern list lives in
     /// `<data_dir>/antileech.dat` and is loaded at startup; toggling this
     /// at runtime is supported via the `set_antileech_enabled` Tauri
-    /// command. Off by default — opt-in to avoid surprising regressions
-    /// for users who didn't ask to filter peers. Matching uses the
-    /// rendered software label plus the peer's mod tag.
-    #[serde(default)]
+    /// command. On by default: the built-in patterns name only clients that
+    /// take without giving back. Matching uses the rendered software label
+    /// plus the peer's mod tag.
+    #[serde(default = "default_true")]
     pub antileech_enabled: bool,
     /// Upload Speed Sense: dynamically adjust upload limit based on network latency
     #[serde(default)]
@@ -1668,6 +1669,10 @@ pub struct AppSettings {
     /// Refuse inbound friend-browse listings. Outbound browse is unaffected.
     #[serde(default)]
     pub friend_browse_disabled: bool,
+    /// Decline files friends send: chat attachments and file offers. Chat
+    /// itself is unaffected, and a friend's own `files` override wins.
+    #[serde(default)]
+    pub friend_files_disabled: bool,
     /// Maximum number of friends allowed (1–500, default 200)
     #[serde(default = "default_max_friends")]
     pub max_friends: u32,
@@ -1822,26 +1827,12 @@ pub struct AppSettings {
     /// larger than the in-memory scan budget are eventually indexed in full.
     #[serde(default)]
     pub shared_folder_scan_cursors: std::collections::HashMap<String, String>,
-    /// Automatically check for Ember updates in the background, at launch and
-    /// while Ember keeps running (subject to `update_check_frequency`). This
-    /// only gates the *automatic* check — the "Check for Updates" button in
-    /// Settings → About always works regardless of this setting. Defaults
-    /// to `true` to preserve Ember's original always-check-on-launch
-    /// behavior for existing users upgrading into this setting.
-    #[serde(default = "default_true")]
-    pub auto_check_updates: bool,
-    /// How often the automatic background check gated by `auto_check_updates`
-    /// may run: `"hourly"`, `"daily"`, `"weekly"`, or `"monthly"`. This is only the
-    /// user's preference — the "was it long enough ago?" bookkeeping lives in
-    /// `silent-update-state.json` (`auto_update::record`), where the backend
-    /// scheduler reads it.
-    #[serde(default = "default_update_check_frequency")]
-    pub update_check_frequency: String,
     /// Install updates without asking: wait until nothing is transferring and
     /// the user is away, warn for a minute, then update and reopen the way the
-    /// session was left (`auto_update::silent`). Off by default, and only ever
-    /// on together with `auto_check_updates`, since it acts on what those checks
-    /// find.
+    /// session was left (`auto_update::silent`). Off by default. Update
+    /// *checks* have no setting: they always run, at launch and hourly
+    /// (`auto_update::scheduler`). Configs from before that still carry
+    /// `auto_check_updates` and `update_check_frequency`; serde ignores them.
     #[serde(default)]
     pub silent_update_enabled: bool,
 
@@ -2320,8 +2311,8 @@ pub struct FriendOverrides {
     /// global chat switch does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat: Option<bool>,
-    /// Files this friend sends: in chat, and file offers. Has no default of
-    /// its own — unset follows chat.
+    /// Files this friend sends: in chat, and file offers. Unset follows
+    /// `friend_files_disabled`, and nothing gets through while chat is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<bool>,
     /// Their files at or under this many megabytes are fetched without asking;
@@ -2397,7 +2388,10 @@ impl AppSettings {
     /// with them is off, whatever the files setting says.
     pub fn files_allowed_from(&self, friend: &[u8; 16]) -> bool {
         self.chat_allowed_with(friend)
-            && self.overrides_for(friend).and_then(|o| o.files).unwrap_or(true)
+            && self
+                .overrides_for(friend)
+                .and_then(|o| o.files)
+                .unwrap_or(!self.friend_files_disabled)
     }
 
     /// The auto-accept ceiling for `friend`'s files, in megabytes.
@@ -2494,10 +2488,6 @@ fn default_max_relay_sessions() -> u32 {
 
 fn default_close_to_tray_behavior() -> String {
     "ask".to_string()
-}
-
-fn default_update_check_frequency() -> String {
-    "daily".to_string()
 }
 
 /// Fresh-install download root: `Downloads/Ember` under the user's known
@@ -2609,8 +2599,8 @@ impl Default for AppSettings {
             remove_finished_downloads: false,
             preview_priority_all: false,
             preview_player: String::new(),
-            skip_compress_video: false,
-            antileech_enabled: false,
+            skip_compress_video: true,
+            antileech_enabled: true,
             uss_enabled: false,
             filename_cleanups: default_filename_cleanups(),
             spam_filter_enabled: true,
@@ -2628,6 +2618,7 @@ impl Default for AppSettings {
             friend_chat_disabled: false,
             friend_chat_read_receipts: true,
             friend_browse_disabled: false,
+            friend_files_disabled: false,
             friend_session_encryption: true,
             channel_file_offers: default_channel_file_offers(),
             chat_attachment_auto_accept_mb: default_chat_attachment_auto_accept_mb(),
@@ -2643,8 +2634,6 @@ impl Default for AppSettings {
             quic_shares_udp_port: true,
             close_to_tray_behavior: default_close_to_tray_behavior(),
             launch_maximized: false,
-            auto_check_updates: true,
-            update_check_frequency: default_update_check_frequency(),
             silent_update_enabled: false,
             notifications_enabled: true,
             notifications_only_when_unfocused: true,
@@ -2805,6 +2794,28 @@ mod tests {
         );
         assert!(settings.chat_allowed_with(&ana));
         assert!(!settings.files_allowed_from(&ana));
+    }
+
+    #[test]
+    fn the_global_files_switch_applies_unless_a_friend_overrides_it() {
+        let ana = [0xA1; 16];
+        let ben = [0xB2; 16];
+        let mut settings = AppSettings {
+            friend_files_disabled: true,
+            ..AppSettings::default()
+        };
+        assert!(settings.chat_allowed_with(&ana));
+        assert!(!settings.files_allowed_from(&ana));
+
+        settings.friend_overrides.insert(
+            hex::encode(ana),
+            FriendOverrides {
+                files: Some(true),
+                ..FriendOverrides::default()
+            },
+        );
+        assert!(settings.files_allowed_from(&ana));
+        assert!(!settings.files_allowed_from(&ben));
     }
 
     #[test]
