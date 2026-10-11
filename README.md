@@ -6,6 +6,15 @@ It also runs a network of its own: the [**Ember Network**](#ember-network) is an
 
 No spyware. No ads. No nonsense.
 
+<a href="docs/screenshots/ember-transfers-light.png">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/ember-transfers-dark.png">
+    <img alt="Ember's Transfers page: downloads with progress bars and categories, and uploads to eMule, aMule and Ember peers" src="docs/screenshots/ember-transfers-light.png">
+  </picture>
+</a>
+
+<sub>Full size: <a href="docs/screenshots/ember-transfers-light.png">light</a> · <a href="docs/screenshots/ember-transfers-dark.png">dark</a></sub>
+
 ## Join Our Reddit Community!
 
 https://www.reddit.com/r/EmberP2P/

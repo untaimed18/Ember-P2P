@@ -610,6 +610,27 @@
       padding: 5px 11px 5px 8px;
       border-radius: 999px;
     }
+    .hero-shot {
+      margin: 0 0 26px;
+    }
+    .hero-shot > a {
+      display: block;
+      cursor: zoom-in;
+    }
+    .hero-shot img {
+      display: block;
+      width: 100%;
+      height: auto;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow-lg);
+    }
+    .hero-shot figcaption {
+      margin-top: 10px;
+      font-size: 13px;
+      color: var(--text-muted);
+      text-align: center;
+    }
 
     /* ---- FAQ ---- */
     .faq-item {
@@ -1014,6 +1035,13 @@
         GPLv3 Licensed
       </div>
     </div>
+
+    <figure class="hero-shot">
+      <a href="screenshots/ember-transfers-light.png" target="_blank" rel="noopener" title="Open the full-size screenshot">
+        <img src="screenshots/ember-transfers-light.png" width="3200" height="1920" alt="Ember's Transfers page: downloads with progress bars and categories, and uploads to eMule, aMule and Ember peers">
+      </a>
+      <figcaption>The Transfers page. <a href="screenshots/ember-transfers-light.png" target="_blank" rel="noopener">View full size</a> &middot; <a href="screenshots/ember-transfers-dark.png" target="_blank" rel="noopener">dark mode</a></figcaption>
+    </figure>
 
     <p>Ember is not a fork or reskin of eMule. It is a complete reimplementation of the eMule protocol stack in safe Rust, paired with a lightweight Tauri + Svelte shell. It speaks the same KAD wire protocol as eMule 0.50a and compatible clients (aMule, eMule Xtreme, etc.), participates in the same network, finds the same sources, and respects the same credit system. KAD is joined automatically at startup; ED2K servers are yours to choose, and on first launch Ember can seed a community <code>server.met</code> from emule-security.org.</p>
     <p>Ember also runs a network of its own. The <a href="#ember">Ember Network</a> is an encrypted overlay with no servers and no central directory: Ember nodes find each other directly, publish the files they share, and look up sources for a download over their own DHT. It is on by default and runs <em>alongside</em> KAD and eD2K, so you keep the whole eMule network as well.</p>
