@@ -689,7 +689,7 @@ done; each was its own commit.
    `failed_version`.
 7. **Release.** Settings copy in all locales (shipped with step 5, since the
    locale tests require every key everywhere), the Updates text, feature list
-   and FAQ in `docs/index.html`, and `docs/release-checklist-1.7.1.md`. Ships
+   and FAQ in `docs/guide.html`, and `docs/release-checklist-1.7.1.md`. Ships
    with the switch off by default.
 
 ## Testing

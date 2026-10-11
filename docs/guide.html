@@ -1,0 +1,963 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ember Guide — Documentation for Ember P2P</title>
+  <meta name="description" content="Ember is a free, open-source P2P file sharing client for the eMule network, with its own encrypted, server-less Ember Network. No ads, no spyware.">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0b1220" media="(prefers-color-scheme: dark)">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Ember Guide — Documentation for Ember P2P">
+  <meta property="og:description" content="Ember is a free, open-source P2P file sharing client for the eMule network, with its own encrypted, server-less Ember Network. No ads, no spyware.">
+  <meta property="og:image" content="https://untaimed18.github.io/Ember-P2P/icon.png">
+  <meta name="twitter:card" content="summary">
+  <link rel="icon" type="image/png" href="favicon.png">
+  <link rel="stylesheet" href="site.css">
+</head>
+<body>
+<a href="#main" class="skip-link">Skip to content</a>
+
+<header class="site-header">
+  <div class="header-inner wide">
+    <button class="mobile-toggle" type="button" onclick="toggleSidebar()" aria-label="Open menu" aria-expanded="false" aria-controls="sidebar">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 7h18M3 12h18M3 17h18"/></svg>
+    </button>
+    <a href="index.html" class="brand"><img src="favicon.png" alt=""><span>EMBER</span></a>
+    <nav class="header-nav" aria-label="Primary">
+      <a href="index.html#features" class="nav-opt">Features</a>
+      <a href="guide.html" aria-current="page">Guide</a>
+      <a href="index.html#releases" class="nav-opt">Releases</a>
+      <a href="guide.html#faq" class="nav-opt">FAQ</a>
+      <a href="https://github.com/untaimed18/Ember-P2P" target="_blank" rel="noopener" class="icon-link nav-opt" aria-label="Ember on GitHub"><svg width="20" height="20" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a>
+      <a href="index.html#download" class="nav-cta">Download</a>
+    </nav>
+  </div>
+</header>
+
+<div class="overlay" id="overlay" onclick="toggleSidebar()"></div>
+
+<aside class="sidebar" id="sidebar" aria-label="On this page">
+  <nav class="sidebar-nav">
+
+    <div class="toc-section">
+      <span class="toc-heading">Basics</span>
+      <a href="#overview" class="toc-link">About Ember</a>
+      <a href="#installation" class="toc-link">Installation &amp; updates</a>
+      <a href="#getting-started" class="toc-link">Getting started</a>
+      <a href="#features" class="toc-link">Features</a>
+    </div>
+
+    <div class="toc-section">
+      <span class="toc-heading">Ember Network</span>
+      <a href="#ember" class="toc-link">What it is</a>
+      <a href="#ember-join" class="toc-link toc-child">How a node joins</a>
+      <a href="#ember-search" class="toc-link toc-child">Search &amp; publishing</a>
+      <a href="#ember-crypto" class="toc-link toc-child">Encryption &amp; identity</a>
+      <a href="#ember-status" class="toc-link toc-child">Status page</a>
+      <a href="#ember-limits" class="toc-link toc-child">Current limits</a>
+    </div>
+
+    <div class="toc-section">
+      <span class="toc-heading">EPX protocol</span>
+      <a href="#epx" class="toc-link">What it is</a>
+      <a href="#epx-wire" class="toc-link toc-child">Wire protocol</a>
+      <a href="#epx-limits" class="toc-link toc-child">Safety limits</a>
+      <a href="#epx-compat" class="toc-link toc-child">Backward compatibility</a>
+    </div>
+
+    <div class="toc-section">
+      <span class="toc-heading">Friends</span>
+      <a href="#friends" class="toc-link">Ember Friends</a>
+      <a href="#friends-features" class="toc-link toc-child">Features</a>
+      <a href="#friends-encryption" class="toc-link toc-child">E2E encryption</a>
+      <a href="#friends-privacy" class="toc-link toc-child">Privacy</a>
+    </div>
+
+    <div class="toc-section">
+      <span class="toc-heading">Channels</span>
+      <a href="#channels" class="toc-link">Rooms on Ember</a>
+      <a href="#channels-start" class="toc-link toc-child">Getting started</a>
+      <a href="#channels-public" class="toc-link toc-child">Public vs private</a>
+      <a href="#channels-owner" class="toc-link toc-child">Running a room</a>
+      <a href="#channels-messages" class="toc-link toc-child">Messages</a>
+      <a href="#channels-files" class="toc-link toc-child">Sending files</a>
+      <a href="#channels-limits" class="toc-link toc-child">What to expect</a>
+    </div>
+
+    <div class="toc-section">
+      <span class="toc-heading">Network</span>
+      <a href="#network" class="toc-link">Network compatibility</a>
+      <a href="#ports" class="toc-link">Port forwarding</a>
+      <a href="#highid" class="toc-link">High ID vs Low ID</a>
+    </div>
+
+    <div class="toc-section">
+      <span class="toc-heading">Technical</span>
+      <a href="#tech-stack" class="toc-link">Tech stack</a>
+      <a href="#developers" class="toc-link">For developers</a>
+    </div>
+
+    <div class="toc-section">
+      <span class="toc-heading">Help</span>
+      <a href="#faq" class="toc-link">FAQ</a>
+      <a href="#support" class="toc-link">Report an issue</a>
+      <a href="index.html#releases" class="toc-link">Release notes</a>
+    </div>
+
+  </nav>
+</aside>
+
+<div class="layout">
+<main class="main prose" id="main">
+
+  <div class="page-intro">
+    <h1 class="page-title">Ember Guide</h1>
+    <p class="page-lede">Install Ember, learn how its networks work, and find answers to common questions. New here? Start with <a href="#getting-started">Getting started</a>.</p>
+  </div>
+
+  <section id="overview">
+    <h2>About Ember</h2>
+    <p>Ember is not a fork or reskin of eMule. It is a complete reimplementation of the eMule protocol stack in safe Rust, paired with a lightweight Tauri + Svelte shell. It speaks the same KAD wire protocol as eMule 0.50a and compatible clients (aMule, eMule Xtreme, etc.), participates in the same network, finds the same sources, and respects the same credit system. KAD is joined automatically at startup; ED2K servers are yours to choose, and on first launch Ember can seed a community <code>server.met</code> from emule-security.org.</p>
+    <p>Ember also runs a network of its own. The <a href="#ember">Ember Network</a> is an encrypted overlay with no servers and no central directory: Ember nodes find each other directly, publish the files they share, and look up sources for a download over their own DHT. It is on by default and runs <em>alongside</em> KAD and eD2K, so you keep the whole eMule network as well.</p>
+    <p>On top of that, <a href="#epx">EPX (Ember Peer Exchange)</a> speeds up source discovery between Ember peers on the ordinary eMule wire, and an Ember-exclusive <a href="#friends">Friends</a> system adds <strong>end-to-end encrypted</strong> chat, Noise-secured sessions, and privacy-preserving Friend Codes &mdash; all invisible to non-Ember clients.</p>
+  </section>
+
+  <hr>
+
+  <section id="installation">
+    <h2>Installation &amp; updates</h2>
+
+    <h3>Supported Operating Systems</h3>
+    <p>Windows 10 and Windows 11. On Linux, x86-64 distributions with glibc 2.35 or newer (Ubuntu 22.04 and later, Debian 12 and later, and their derivatives), as a <code>.deb</code> or an AppImage. The AppImage needs FUSE 2 to start &mdash; <code>libfuse2</code> on Ubuntu 22.04, <code>libfuse2t64</code> on Ubuntu 24.04 and Debian 13 &mdash; so on those the <code>.deb</code> is the simpler choice.</p>
+
+    <h3>Requirements</h3>
+    <p>No external runtimes needed. No Java, no .NET, no browser engine download. Ember ships everything it needs in a single installer.</p>
+
+    <h3>Updates</h3>
+    <p>Ember updates itself. Every release is signed, and Ember checks the signature of both the release manifest and the package before installing anything. Each build updates with the format it was installed from, so a <code>.deb</code> install updates through <code>dpkg</code> and an AppImage replaces itself in place.</p>
+    <p>With <strong>Silent updates</strong> switched on in Settings &gt; About, Ember installs a new version by itself while nobody is using it, and reopens the way you left it. This works with the Windows installer and the AppImage. The <code>.deb</code> and MSI packages need your password or administrator approval to install an update, so there Ember tells you an update is ready and you install it with one click.</p>
+  </section>
+
+  <hr>
+
+  <section id="getting-started">
+    <h2>Getting Started</h2>
+
+    <ol class="steps-list">
+      <li>
+        <strong>Install</strong><br>
+        <span style="color: var(--text-secondary)">Download the latest release from the <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">Releases page</a> and run the installer. On Linux, install the <code>.deb</code> with your package manager, or mark the AppImage executable and run it.</span>
+      </li>
+      <li>
+        <strong>Setup Wizard</strong><br>
+        <span style="color: var(--text-secondary)">On first launch, the Setup Wizard walks you through essential settings &mdash; an optional import from an existing eMule install, nickname, download folder, ports, speed limits, and theme.</span>
+      </li>
+      <li>
+        <strong>Connect</strong><br>
+        <span style="color: var(--text-secondary)">KAD connects on its own at every launch, so there is nothing to press; you can still disconnect for the current session from the KAD Network page. The <a href="#ember">Ember Network</a> needs no connect step either &mdash; it is on by default and finds its first peers <em>through</em> KAD. ED2K servers stay opt-in: connect from the ED2K Servers page, or enable <strong>Auto-connect to server</strong> in Settings &gt; Network so Ember rejoins your last one on launch. A community <code>server.met</code> list can be downloaded from emule-security.org on first run.</span>
+      </li>
+      <li>
+        <strong>Share &amp; Download</strong><br>
+        <span style="color: var(--text-secondary)">Add folders to your library, search with the All networks / Server only / KAD only / Ember only methods, open <code>ed2k://</code> links, and start downloading. Right-click a result to look for related files or to look the file up on a web service. Ember handles multi-source transfers, queue management, and source discovery automatically.</span>
+      </li>
+      <li>
+        <strong>Add Friends (optional)</strong><br>
+        <span style="color: var(--text-secondary)">Open the Friends page, share your <strong>Friend Code</strong>, and add theirs. Adding somebody already gives them priority in your upload queue; once the two of you are mutual and online you also get end-to-end encrypted chat, remote file browsing, and friends-only shares. See <a href="#friends">Friends</a>.</span>
+      </li>
+      <li>
+        <strong>Join a Channel (optional)</strong><br>
+        <span style="color: var(--text-secondary)">Open the Channels page, pick a Channel username, then create a room or paste an invite. Discover lists public rooms other people have published. See <a href="#channels">Channels</a>.</span>
+      </li>
+    </ol>
+
+    <div class="callout">
+      <p><strong>Tip:</strong> For best performance (High ID), forward your TCP and UDP ports on your router, enable UPnP, or leave STUN port keep-alive on in Settings &gt; Network. See the <a href="#highid">High ID vs Low ID</a> section for details.</p>
+    </div>
+  </section>
+
+  <hr>
+
+  <section id="features">
+    <h2>Features</h2>
+
+    <h3>Networking</h3>
+    <ul>
+      <li><strong>Ember Network</strong> &mdash; Ember&rsquo;s own encrypted, server-less overlay for peer discovery, keyword search, publishing, and source lookup. Always on, joins automatically, and runs alongside KAD and eD2K. See the <a href="#ember">Ember Network section</a>.</li>
+      <li><strong>KAD Network</strong> &mdash; The decentralized KAD DHT for peer discovery, keyword search, publishing, firewall checks, and buddy relay. Bootstraps at startup with no setting to configure; the KAD Network page can disconnect it for the current session. If KAD will not connect, Settings &gt; Network can fetch fresh <code>nodes.dat</code> bootstrap contacts from emule-security.org.</li>
+      <li><strong>ED2K Servers &amp; Peer Exchange</strong> &mdash; Manage servers on the ED2K Servers page, download a community <code>server.met</code> from emule-security.org, and optionally turn on Auto-connect to server (last server, else eMule Sunrise). Once connected, peer exchange helps find sources.</li>
+      <li><strong>EPX Source Exchange</strong> &mdash; Ember peers share source lists with each other for faster downloads. Non-Ember clients are unaffected.</li>
+      <li><strong>NAT Traversal</strong> &mdash; UPnP automatic port mapping, firewall detection, KAD buddy relay for LowID peers, and EPX peer-relay (ERAT) for LowID&harr;LowID paths when attestations allow.</li>
+      <li><strong>STUN Port Keep-Alive</strong> &mdash; Periodic STUN plus a TCP hold from your listen port keeps NAT mappings alive and advertises the discovered public TCP/UDP ports for High ID. Designed for CGNAT and full-cone NAT when UPnP is unavailable; auto-suspends on symmetric or unstable remapping.</li>
+      <li><strong>Protocol Obfuscation</strong> &mdash; RC4-based TCP and UDP header encryption to help with ISP throttling.</li>
+      <li><strong>Deep Links</strong> &mdash; Opens <code>ed2k://</code> URIs and <code>.emulecollection</code> files from the OS (including while Ember is already running). Incoming links require <strong>confirm / review</strong> before opening, and pending links can be reviewed later.</li>
+    </ul>
+
+    <h3>Transfers</h3>
+    <ul>
+      <li><strong>Multi-Source Downloads</strong> &mdash; Download from multiple peers simultaneously with part-level hash verification, automatic source rotation, and queue management.</li>
+      <li><strong>Transfer Monitoring</strong> &mdash; Real-time progress bars, per-source detail drawers, upload tracking, health indicators, and archive recovery. The Sources column reads the way eMule&rsquo;s does, counting peers holding a place in a remote queue and showing how many are actually transferring in parentheses.</li>
+      <li><strong>Find More Sources</strong> &mdash; Ask every connected network for more sources for one download &mdash; KAD, the Ember DHT, the connected eD2K server over TCP, and the rest of the server list over UDP. Each leg answers on its own schedule and what it finds goes straight into the transfer; legs with nowhere to send the question are reported rather than waited on.</li>
+      <li><strong>Bulk Transfer Actions</strong> &mdash; Tick rows (or use the header checkbox) to pause, resume, stop or cancel many downloads at once, or use the Pause / Resume / Stop / Cancel All commands in the toolbar's More menu. Completed and failed rows can be selected the same way and removed from the list together; the files themselves are kept.</li>
+      <li><strong>Upload Speed Sense (USS)</strong> &mdash; Optionally adjusts upload speed from network latency to reduce congestion (requires an upload speed limit).</li>
+      <li><strong>AICH</strong> &mdash; Advanced Intelligent Corruption Handling for part-level hash verification and recovery.</li>
+    </ul>
+
+    <h3>Search &amp; Library</h3>
+    <ul>
+      <li><strong>Advanced Search</strong> &mdash; All networks, KAD only, Server only, and Ember only keyword search with multi-tab results plus type, size, source, and extension filters. All networks runs every network that is up, so Ember results arrive alongside KAD and server hits, de-duplicated into one list.</li>
+      <li><strong>Related Files</strong> &mdash; Right-click a search result, a transfer or a shared file to look for the rest of what it belongs to. eMule&rsquo;s version asks the connected server and is unavailable unless that server advertises support, which most do not; Ember keeps that request as one signal and also reads the season and episode marker, disc or part marker, year and title out of the file&rsquo;s own name, so the search runs on every network with no server support. The tab is named after what it went looking for.</li>
+      <li><strong>Web Services</strong> &mdash; eMule&rsquo;s right-click &gt; Web services: open a site with a file&rsquo;s details substituted in, most usefully one that reports how many complete sources the network has seen. All six eMule placeholders are supported and an existing <code>webservices.dat</code> can be imported. An availability lookup ships configured; nothing is contacted until you click one, adding a site asks for confirmation, and the list is editable in Settings &gt; Web services.</li>
+      <li><strong>Spam Detection</strong> &mdash; Built-in spam detection with Relaxed, Balanced (the default) and Aggressive profiles, each setting how high a score must be to count as spam, and automatic result hiding.</li>
+      <li><strong>Library Management</strong> &mdash; Virtual-scrolling tables that handle thousands of files. Sort, filter, bulk-edit priorities, scan for missing files, copy all eD2K links for the current view, and create collections.</li>
+      <li><strong>Copy eD2K Links from Search</strong> &mdash; Copy the link for one result, for every ticked result, or for the whole result list at once, from the context menu, the selection toolbar, or Ctrl+C.</li>
+      <li><strong>In-App Media Player</strong> &mdash; Play supported audio and video from the Library detail drawer, with Open Externally still available.</li>
+      <li><strong>Comments &amp; Ratings</strong> &mdash; Add metadata to your shared files for other peers to see.</li>
+    </ul>
+
+    <h3>Social</h3>
+    <ul>
+      <li><strong>Ember Friends</strong> &mdash; Ember-exclusive friend system powered by a rendezvous server. Share a <strong>Friend Code</strong>, exchange mutual requests, then enjoy real-time online status, remote file browsing, friends-only shares, file offers, priority upload slots, durable offline chat, and <strong>end-to-end encrypted</strong> messaging. See the <a href="#friends">Friends section</a> for details.</li>
+      <li><strong>E2E Friend Chat</strong> &mdash; Mutual-friend messages use static X25519 ECDH + AEAD end-to-end encryption after session setup. A lock icon in the chat window and on online mutual friends&rsquo; cards marks it; plaintext fallbacks are rejected. Conversation history is encrypted in the local database, and outbound messages queue until the friend is reachable again. Being a static exchange, it provides no forward secrecy and covers message bodies only &mdash; see <a href="#friends-encryption">E2E Encryption</a>.</li>
+      <li><strong>Noise-Secured Friend Sessions</strong> &mdash; Friend connections use <strong>Noise IK</strong> secure streams with Ed25519 proof-of-possession before chat, browse, offers, and verified friend privileges unlock. Friend file transfers can also run over the same secure path when ordinary HighID/callback routes are unavailable.</li>
+      <li><strong>Channels</strong> <span class="beta-badge">Beta</span> &mdash; Group rooms carried over the Ember Network itself. Create a public room anyone can find or a private one that needs an invite, moderate it with bans, moderators, owner-only invites and slow mode, edit and react to messages, and send a file to one member at a time &mdash; encrypted to that member, not to the room. Nobody publishes their IP address to the room. See the <a href="#channels">Channels section</a> for details.</li>
+      <li><strong>Credits &amp; SecIdent</strong> &mdash; RSA-based Secure Identification prevents credit theft. Upload priority follows the standard credit ratio formula.</li>
+    </ul>
+
+    <h3>Security</h3>
+    <ul>
+      <li><strong>Signed Anti-Rollback Updates</strong> &mdash; In-app updates are cryptographically signed and gated by security epochs, so installs only advance when the signed epoch allows it.</li>
+      <li><strong>Safer File Opens</strong> &mdash; Deep links require confirm / review; folders dropped on the Library are shared directly, while dropping files, your user folder or a large batch asks first, and sharing a whole parent folder or drive needs a native confirmation; media and upload paths pin approved handles to avoid path-swap races.</li>
+      <li><strong>Confirmed External Links</strong> &mdash; A link in a room or a message is opened only after a native system confirmation, showing the destination host, and only after the host is checked: anything that is or resolves to a loopback, private or link-local address is refused, so a link cannot reach your router&rsquo;s admin page or a cloud metadata endpoint. Web services collect the same confirmation once, when a site is added to the list.</li>
+      <li><strong>Security Page</strong> &mdash; A dedicated page for IP filter management: download the default list, import a file, fetch from an HTTPS URL, enable or disable filtering, add and remove custom ranges, and review how many times each range has actually blocked something.</li>
+      <li><strong>IP Filtering</strong> &mdash; Download the default ipfilter.zip with one click, import an ipfilter.dat / ipfilter.zip file, or fetch one from an HTTPS URL; the list is updated when you ask, not on a schedule. Incoming connection filtering is off by default because VPN IP ranges commonly appear in ipfilter.dat hosting blocks, silently blocking legitimate peers. Outbound filtering remains active regardless of this setting.</li>
+      <li><strong>Anti-Leech Filter</strong> &mdash; Reject incoming connections from known leech client patterns (customizable regex list in Settings).</li>
+      <li><strong>Private IP Blocking</strong> &mdash; Prevents connections to reserved IP ranges.</li>
+      <li><strong>Content Security Policy</strong> &mdash; Strict CSP headers in the Tauri webview.</li>
+      <li><strong>Path Traversal Protection</strong> &mdash; Sanitized file paths prevent directory escape attacks.</li>
+    </ul>
+
+    <h3>User Experience</h3>
+    <ul>
+      <li><strong>First-Time Setup Wizard</strong> &mdash; Guided configuration on first launch: an optional import from an existing eMule install, nickname, download folder, ports, speed limits, and theme, plus a summary of the networks Ember joins on its own.</li>
+      <li><strong>Clean UI</strong> &mdash; Modern, responsive interface with real-time transfer monitoring and inline search filtering.</li>
+      <li><strong>Close to System Tray</strong> &mdash; Choose what the title-bar close button does &mdash; ask each time, minimize to tray, or exit. The tray icon stays available either way, so you can reopen Ember from there. On a Linux desktop with nothing to show the icon, such as stock GNOME without the AppIndicator extension, closing to the tray minimizes the window instead.</li>
+      <li><strong>Keyboard Shortcuts</strong> &mdash; Press <strong>?</strong> for a shortcut cheat sheet, Alt+1&ndash;9 then Alt+0 to jump straight to the first ten sidebar pages, and Ctrl+, to open Settings.</li>
+      <li><strong>Backup &amp; Restore</strong> &mdash; Settings &gt; Backup saves your whole profile to a single passphrase-encrypted <code>.emberbackup</code> file: identity and SecIdent keys, upload credits, settings, shared-folder list, known files, friends, chat history, transfer list, server and Kad contacts, IP filter, and learned spam data. The files you share and part-finished downloads are <em>not</em> included, so a backup stays small. Encryption is mandatory because the archive contains your private keys, and a lost passphrase cannot be recovered. Your identity keys are unwrapped from this machine&rsquo;s at-rest protection (Windows DPAPI, or on Linux a key tied to the machine and your user) into the encrypted archive and re-wrapped for whichever account restores them, so a restore on a new machine keeps your user hash, credits and friendships instead of silently rotating them. Restores are prepared immediately and applied while Ember next starts (the files being replaced are in use while it runs); the replaced originals are kept in a <code>pre-restore-&lt;timestamp&gt;</code> folder beside them, and a pending restore can be discarded from the same screen before it is applied. A restore that has sat waiting for more than a month is dropped rather than applied on top of the profile you have been using since; the backup file is untouched, so you can simply import it again. After restoring onto a <em>different</em> machine, the restored shared and download folders are approved automatically, so put the files back at the same paths; and if the backup carried the database without <code>chat-history.key</code>, existing chat history stays sealed.</li>
+      <li><strong>Statistics</strong> &mdash; Session and cumulative transfer statistics, connection uptime, network health indicators, and a peer reputation snapshot.</li>
+      <li><strong>Automatic Updates</strong> &mdash; Ember checks for new versions on the schedule you choose (hourly, daily, weekly or monthly; daily by default), including while it stays open, and installs cryptographically signed, anti-rollback updates in-app with one click. You can also check manually under Settings &gt; About.</li>
+      <li><strong>Silent Updates</strong> &mdash; An optional switch in Settings &gt; About for anyone who leaves Ember running. A new version downloads and verifies in the background, then waits until nothing is transferring and nobody has touched Ember for ten minutes. A one-minute warning appears as a dialog, a desktop notification and a <em>Cancel update</em> entry on the tray icon, and <em>Not now</em> puts it off for a day. Ember then updates and comes back as you left it: hidden in the tray or where the window was, connected to the same eD2K server, on the same page, with your search tabs, and with the peers waiting in your upload queue still in line. If an update ever fails to install, Ember reopens on the version you had and never retries that version silently.</li>
+      <li><strong>Languages</strong> &mdash; Full UI localization for English, Spanish, French, Brazilian Portuguese, German, Simplified Chinese, Italian, Russian, and Traditional Chinese, with a Settings language picker and system-language detection.</li>
+      <li><strong>GeoIP</strong> &mdash; Country identification for connected peers via the bundled DB-IP Country Lite database (MMDB format).</li>
+    </ul>
+  </section>
+
+  <hr>
+
+  <section id="ember">
+    <h2>Ember Network</h2>
+
+    <p>The Ember Network is Ember&rsquo;s own peer-to-peer overlay: a second network that Ember nodes run between themselves, in parallel with KAD and eD2K. Nodes find each other directly, publish the files they share, and look up sources for a download over their own DHT. There is no directory server, no tracker, and no shipped seed list, and every frame between nodes travels inside an encrypted session.</p>
+
+    <p>It is <strong>always on</strong> and joins on its own &mdash; there is no Connect button and no switch to turn it off. Because it runs alongside the eMule networks rather than replacing them, taking part costs you nothing on KAD or eD2K.</p>
+
+    <div class="callout-info callout">
+      <p><strong>What it does not change:</strong> Ember finds the source; the file itself still transfers over eD2K client-to-client. An Ember search result downloads through the same multi-source engine, credits, and AICH verification as any other result.</p>
+    </div>
+
+    <h3 id="ember-join">How a node joins</h3>
+    <p>There is no bootstrap server to ask and no address list in the installer. A cold node gets in through whichever of these arrives first:</p>
+
+    <ol class="steps-list">
+      <li>
+        <strong>The KAD rendezvous key</strong><br>
+        <span style="color: var(--text-secondary)">Ember nodes advertise themselves under one fixed KAD key, as an ordinary source record carrying their Noise public key. A node with a near-empty routing table simply runs a source lookup there. Nodes re-advertise every 5 hours, while they are reachable enough to be a useful first contact. Sharing a library is not required &mdash; a node that can answer a DHT ping is worth listing whether or not it publishes anything &mdash; but a firewalled node that cannot be reached directly is left out.</span>
+      </li>
+      <li>
+        <strong>The KAD bridge</strong><br>
+        <span style="color: var(--text-secondary)">Ember peers noticed in ordinary KAD traffic get pinged on the Ember DHT; their signed reply folds them into the routing table. Rate-capped per maintenance cycle and quiet once the table is healthy.</span>
+      </li>
+      <li>
+        <strong>eD2K transfers</strong><br>
+        <span style="color: var(--text-secondary)">A peer that advertises Ember capability during a normal eD2K transfer is cached with its UDP port and bridged in. This is the way in for a client running with no KAD at all.</span>
+      </li>
+      <li>
+        <strong>Gossip and the saved contact file</strong><br>
+        <span style="color: var(--text-secondary)">Once a node has been online before, peers learned from other peers plus a persisted contact file (up to 200 entries) get it back in without help.</span>
+      </li>
+    </ol>
+
+    <p>The first three paths all assume either a live KAD connection or an eD2K transfer with an Ember-capable peer, and the fourth only helps a node that has been online before. That is deliberate: Ember rides eMule&rsquo;s bootstrap rather than standing up infrastructure of its own. The practical consequence is worth knowing &mdash; <strong>a first run with KAD off and no servers has no way in</strong>.</p>
+
+    <div class="callout">
+      <p><strong>The rendezvous server has no role here.</strong> The server behind <a href="#friends">Friends</a> is not involved in joining the Ember Network, and a server-hosted bootstrap pool is explicitly not planned: it would hand whoever runs the server an identity-to-IP roster of every participant. Hardcoded seed lists and DNS SRV seeds are ruled out for the same reason &mdash; joining stays the rendezvous key, the bridges, gossip, and your own saved contacts.</p>
+      <p style="margin-top: 10px;">A fresh node can legitimately sit at zero peers for a minute or two while its first maintenance cycle runs the bridge. The status page shows <strong>Connecting</strong> during that window rather than pretending something is wrong.</p>
+    </div>
+
+    <h3 id="ember-search">Search and publishing</h3>
+    <p>The files you share are published to the Ember DHT as keyword records (so people can find them by name) and source records (so people can fetch them). Publishing happens automatically once the node has peers, and republishes on a cycle to stay alive.</p>
+    <ul>
+      <li><strong>Searching</strong> &mdash; The Search page has an <strong>Ember only</strong> method, and <strong>All networks</strong> queries Ember alongside KAD and servers, merging everything into one de-duplicated result list. If KAD and eD2K are both offline, All networks quietly falls back to Ember alone.</li>
+      <li><strong>What a result carries</strong> &mdash; A keyword record holds the file&rsquo;s media details (duration, bitrate, codec, artist, album, title) alongside its name and size, so an Ember hit fills the same columns an eD2K server hit fills. Your library is probed once and the answer is persisted &mdash; including &ldquo;nothing to find&rdquo;, which is the answer for most of a library and has to be as durable as a positive one.</li>
+      <li><strong>Complete sources</strong> &mdash; Only complete public shares are keyword-published, so the count of distinct publishers who signed a record is a floor on the complete sources. That is a firmer number than a server or KAD swarm estimate, which is one peer&rsquo;s claim about a swarm it cannot see &mdash; and the Sources column says which of the two it is showing.</li>
+      <li><strong>Filters that cost the network nothing</strong> &mdash; Size, type and extension travel with the query as constraints the responder applies before it packs an answer, rather than as published keys. An indexed <code>.mp3</code> would be the hottest key on the network, with every mp3 anyone shares competing for one key&rsquo;s slots on the twenty nodes nearest it.</li>
+      <li><strong>Source lookup</strong> &mdash; Downloads ask the Ember DHT for sources in addition to KAD and servers, so a file can gain Ember sources even if you found it elsewhere. Find Sources on a transfer asks every network that is connected.</li>
+      <li><strong>Publish badge</strong> &mdash; The Library marks a shared file with an <strong>Ember</strong> badge once it has a source record placed on the network, which is the point at which other Ember users can actually fetch it.</li>
+      <li><strong>Publishing while firewalled</strong> &mdash; A node that cannot be reached directly publishes through a buddy relay instead, so sharing still works behind a restrictive router.</li>
+      <li><strong>BLAKE3 integrity</strong> &mdash; Ember records carry a BLAKE3 digest, and a download verifies against it whenever one is known (from a search hit, a DHT source record, or your own library). A match shows an Ember badge on the finished row; a mismatch fails the download instead of retrying parts that already matched. Links opened without a digest still download normally and are hashed for future sharing.</li>
+    </ul>
+
+    <div class="callout-warn callout">
+      <p><strong>Multi-keyword search is approximate.</strong> A query with several words uses a sparse DHT intersection plus a filename match on the results, not a strict worldwide AND of every keyword. Recall can differ from KAD on the same query.</p>
+    </div>
+
+    <h3 id="ember-crypto">Encryption and identity</h3>
+    <p>Ember DHT traffic shares the KAD UDP port (4672 by default) and is told apart by a two-byte marker, so forwarding that port covers both networks, and Ember&rsquo;s QUIC transfers, which share the same socket by default. Everything past the marker is encrypted.</p>
+
+    <table class="doc-table">
+      <thead>
+        <tr><th>Property</th><th>Detail</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Session encryption</strong></td>
+          <td>Noise with ChaCha20-Poly1305 and BLAKE2s. <code>Noise_IK</code> when the peer&rsquo;s static key is already known, <code>Noise_XX</code> for first contact.</td>
+        </tr>
+        <tr>
+          <td><strong>Node identity</strong></td>
+          <td>A 128-bit node ID derived from BLAKE3 of the node&rsquo;s Ed25519 public key. DHT frames are Ed25519-signed and bound to the encrypted session they arrive on, and a contact is only trusted once it has answered directly.</td>
+        </tr>
+        <tr>
+          <td><strong>Routing</strong></td>
+          <td>Kademlia with k = 20 and &alpha; = 5. A response carries up to 17 IPv4 contacts, so it fits one unfragmented datagram; decoders accept up to 20.</td>
+        </tr>
+        <tr>
+          <td><strong>Wire versioning</strong></td>
+          <td>Version 4. The decoder accepts a version range and refuses anything outside it at the version byte, so an incompatible peer is a clean rejection rather than a stream of malformed-packet counters that read like packet loss.</td>
+        </tr>
+        <tr>
+          <td><strong>Abuse resistance</strong></td>
+          <td>Per-IP and per-subnet admission caps that tighten as more contacts answer this node (gossiped leads do not count), return-routability checks before a node spends anything substantial on a request (so Ember cannot be used as a traffic reflector), retry cookies for unproven addresses, and per-publisher storage quotas so one peer cannot fill the space this node offers the network.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>The full wire format &mdash; every frame and its encoding, the signing and session rules, the version negotiation, and the storage and admission limits &mdash; is written up in the <a href="ember-dht-specification.html">EmberDHT Protocol Specification</a>, also available as a <a href="ember-dht-specification.pdf">PDF</a>. It is written against wire version 4, as implemented in this release, and marks each change since v3 as additive or breaking, which is the distinction another implementation needs.</p>
+
+    <h3 id="ember-status">The Ember Network page</h3>
+    <p>The page leads with the questions a user actually has &mdash; is it on, am I connected, can people reach me, are my shared files findable &mdash; and keeps the protocol detail behind a disclosure.</p>
+    <ul>
+      <li><strong>Status</strong> &mdash; Connecting, Connected, or No peers found. There is nothing to switch: the overlay reports what it is doing, it does not ask you to start it.</li>
+      <li><strong>Peers and Published files</strong> &mdash; How many nodes you are in touch with, and how many of your shared files are findable.</li>
+      <li><strong>Health checklist</strong> &mdash; Whether people can reach you <strong>directly</strong> or through a <strong>relay</strong> (or are still waiting for one), and whether your shares are published. Whether you are on the network is the status line above it.</li>
+      <li><strong>Technical details</strong> &mdash; Collapsed by default: your node ID and public keys, the protocol counters (search hits and misses, store acks and failures, truncated and withheld answers, average replication, buddy publishes and forwards, malformed frames, version mismatches, observed address votes, EPX exchange stats, storage rejections), plus live tables of contacts, in-flight searches, and the keys this node is serving to others.</li>
+    </ul>
+
+    <h3 id="ember-limits">Current limits</h3>
+    <p>The overlay is always on and in daily use, but these are the things it does not do yet:</p>
+    <ul>
+      <li><strong>Bootstrap depends on eMule</strong> &mdash; A first run with KAD off and no servers cannot join, as described above.</li>
+      <li><strong>A peer that needs to update cannot be told so</strong> &mdash; Incompatible peers refuse each other cleanly at the version byte. Your side is not in the dark about it: refusals are counted, split into peer-older and peer-newer, and the Ember page raises a banner while older peers are being turned away. The other half cannot be fixed from here, because the peer that needs to update is by definition the one that cannot decode anything we send. Builds now advertise which versions they can decode on <code>PING</code> and <code>PONG</code>, so a future change to an existing frame can be negotiated rather than partitioning the overlay on the day it ships &mdash; but that only helps between peers that both carry it.</li>
+      <li><strong>Multi-keyword recall is approximate</strong> &mdash; See the note above.</li>
+      <li><strong>A busy keyword is answered a page at a time</strong> &mdash; One packet still only carries a few records, but a searcher can ask the same peer for the next page, so recall under a common word is bounded by how many peers the search walks and how deep it pages rather than by one datagram. A peer is held to a quarter of a search&rsquo;s budget while the walk still has somewhere to go, and may serve the rest of it once there is nothing left to ask &mdash; so a single node holding an uncommon word can hand over its whole index instead of the first slice of it. Publishing has its own ceiling: a key holds 1000 records and any one publisher at most 150 of them, matching KAD&rsquo;s numbers, so if you share far more than 150 files under one common word not all of them are findable under it. The Ember page counts how often an answer was truncated or records were withheld.</li>
+      <li><strong>Gossip is unverified until it answers</strong> &mdash; A peer another node told us about is a lead, not a fact, until it replies directly. The Ember page, status bar, and Search readiness wait for a verified answer before calling the overlay connected, so a table full of gossip does not look like a successful join. Admission caps bound the damage, and a peer whose introductions almost never answer has its leads probed less often. It is still sampled, so it can recover, and no contact is refused on that basis alone.</li>
+      <li><strong>Library content still moves over eD2K</strong> &mdash; Ember finds the source; the bytes travel the eMule wire. The exceptions are a file sent to a friend in chat or to a member of a room, which goes directly between the two of you (accept-first, up to 2 GB). Putting ordinary downloads on the same footing is the largest remaining piece.</li>
+      <li><strong>Some paths are not yet exercised end to end</strong> &mdash; Notably publishing while firewalled through a buddy relay, and a cold join from an empty contact file with no KAD.</li>
+    </ul>
+  </section>
+
+  <hr>
+
+  <section id="epx">
+    <h2>EPX &mdash; Ember Peer Exchange</h2>
+
+    <p>EPX is an Ember-exclusive extension to the eMule protocol that accelerates source discovery between Ember peers. It makes downloads faster whenever multiple Ember clients are present on the network.</p>
+
+    <p>EPX and the <a href="#ember">Ember Network</a> are separate things that are easy to confuse. EPX is an extra opcode on the <em>eMule</em> wire, exchanged with Ember peers you are already transferring with. The Ember Network is a whole overlay of its own, with its own DHT and its own encrypted transport. Both work independently: EPX helps with any Ember peer you are transferring with, whether or not that peer is in your Ember DHT routing table. (The overlay itself is always on in this build; there is no switch to turn it off.)</p>
+
+    <h3>How it works</h3>
+    <p>When two Ember clients connect (during a download or upload), they exchange compact lists of the files they are currently downloading along with the sources they know about for each file. If the receiving peer is downloading one of those files, it immediately gains new sources it may not have found through KAD or ED2K peer exchange alone.</p>
+
+    <div class="callout-info callout">
+      <p><strong>Key point:</strong> EPX only activates between confirmed Ember peers. Detection uses the private <code>OP_EMBER_HELLO</code> / <code>OP_EMBER_HELLOANSWER</code> handshake. TCP EPX also requires the peer's advertised Ed25519 public key to BLAKE3-bind to its Ember hash &mdash; an offline check that a replayed key pair can pass, and so a deliberately lower bar than the proof of possession behind chat, browse and other friend privileges. UDP EPX requires an authenticated Noise_IK session. Legacy <code>ET_MOD_VERSION</code> / <code>CT_EMULE_MISCOPTIONS2</code> Ember bits are not used.</p>
+    </div>
+
+    <h3 id="epx-wire">Wire Protocol</h3>
+    <p>EPX uses opcode <code>0xF0</code> on the eMule extended protocol (<code>OP_EMULEPROT</code>). The current version is <strong>v4</strong>. The payload format:</p>
+    <pre><code>version       (1 byte, currently 0x04)
+file_count    (u16 LE)
+  for each file:
+    ed2k_hash   (16 bytes)
+    file_size   (u64 LE)
+    file_flags  (u8, bit 0 = has AICH root hash)
+    aich_root   (20 bytes, only present if bit 0 of file_flags is set)
+    source_count (u16 LE)
+      for each source:
+        ipv4      (4 bytes, network order)
+        tcp_port  (u16 LE)
+        udp_port  (u16 LE)
+        flags     (u8, bit 0 = firewalled, bit 1 = obfuscation, bit 2 = relay-capable)
+peer_count    (u16 LE)
+  for each peer:
+    ipv4      (4 bytes, network order)
+    tcp_port  (u16 LE)
+[optional ERAT trailer]</code></pre>
+    <p>v4 is layout-identical to v3 for the main body and adds the relay-capable flag bit plus an optional <code>ERAT</code> relay-attestation trailer. v3 parsers ignore unknown flag bits. v3 additions over v2: per-file AICH root hashes for corruption recovery, UDP port and capability flags per source, and a peer discovery section for Ember mesh building. v2 and v3 payloads are still accepted.</p>
+
+    <h3 id="epx-erat">ERAT relay attestations</h3>
+    <p>After the peer list, a v4 packet may append a trailer beginning with magic <code>ERAT</code>: version byte, attestation count (max 16), then fixed-size Ed25519-signed entries binding a relay IP/port to an expiry and capability bits. Only cryptographically valid, non-expired attestations (max TTL 30 minutes) become connection-broker relay candidates. The per-source <code>relay-capable</code> flag alone never admits a relay.</p>
+    <p>Peer-relay QUIC <code>RELAY_REQUEST</code> messages are version&nbsp;2 or 3 and require proof of possession: the requester includes their Ed25519 public key and Ember hash, a fresh nonce, and a signature over the session id, the relay's ERAT attestation hash, target address, and file hash. Legacy hash-only (bearer) requests are rejected. Relays also reject replayed nonces within a short TTL window.</p>
+    <p>The target port in the request is the port the relay dials over QUIC. For Ember DHT sources, that is the QUIC port the source advertises in its record. Version&nbsp;3 adds the target's Ember node id ahead of the signature, which is made under a separate domain, and the relay then refuses to bridge to any endpoint whose QUIC certificate does not prove that id. A relay advertises support with ERAT capability bit <code>0x02</code>. Requesters send version&nbsp;3 only to relays with that bit, because older relays accept no request length other than version&nbsp;2's. A relay also holds at most two sessions per requester, and it closes a bridge after two minutes in which neither direction moves a byte.</p>
+    <p>The relay answers only once it has reached the target. <code>RELAY_ACCEPT</code> means the bridge is up; <code>RELAY_REJECT</code> carries a reason byte for capacity, a target it will not dial, a requester that is not its friend or an attestation it does not know, a bad signature or replayed nonce, or a target it could not reach, and none of these counts against the relay. A requester asks one relay for no more sessions at once than it would hold, sends the next to another relay, and keeps the newest copy of a relay&rsquo;s attestation when an older one comes round again. A relay with no room left can only close the connection or refuse the handshake, and the requester then skips it for a minute; a refused handshake still counts against it, because anyone at that address could send one. Within a bridge, a side that finishes its stream has that passed on at once, and what the relay still holds for either side when the bridge ends is given up to ten seconds to arrive before the connections close.</p>
+
+    <h3 id="epx-limits">Safety Limits</h3>
+    <p>These caps prevent abuse from poisoned or malicious payloads. Private/reserved IPs and zero-port entries are silently dropped.</p>
+
+    <table class="doc-table">
+      <thead>
+        <tr><th>Limit</th><th>Value</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Max files per packet</td><td>200</td></tr>
+        <tr><td>Max sources per file</td><td>100</td></tr>
+        <tr><td>Max payload size</td><td>64 KB (TCP)</td></tr>
+        <tr><td>Max packets per TCP connection</td><td>3</td></tr>
+        <tr><td>Max total sources per event</td><td>2,000</td></tr>
+      </tbody>
+    </table>
+    <p>The 64 KB ceiling is the TCP path, which streams. UDP EPX has to fit inside a single Noise datagram, so it is packed to a much smaller budget &mdash; the same files and sources, just fewer of them per reply.</p>
+
+    <h3 id="epx-compat">Backward Compatibility</h3>
+    <p>Non-Ember eMule clients silently ignore the <code>0xF0</code> opcode &mdash; it causes no errors, disconnects, or side effects. EPX is only sent to peers confirmed as Ember through the private <code>OP_EMBER_HELLO</code> handshake, so a stock client never triggers it.</p>
+  </section>
+
+  <hr>
+
+  <section id="friends">
+    <h2>Friends &mdash; Ember-Exclusive Social</h2>
+
+    <p>Ember includes a built-in friend system that works exclusively between Ember users. It is powered by a separate cryptographic identity called the <strong>Ember Hash</strong> (also known as your <strong>Friend ID</strong>), which is distinct from the standard ed2k <code>user_hash</code> used for protocol operations and credits.</p>
+
+    <h3>How it works</h3>
+    <p>Each Ember client generates a unique 16-byte Ember Hash on first launch. Share a <strong>Friend Code</strong> (shown on the Friends page) with someone so they can find you on the network. A Friend Code (<code>ember3:</code>) carries your identity plus a random secret, so only someone you gave it to can look up where you are &mdash; a public key seen in a room roster is not enough. Friends &gt; Reset code makes a new secret; Ember still accepts older <code>ember2:</code> codes and bare Friend IDs.</p>
+    <p>Friend discovery is powered by a lightweight <strong>rendezvous server</strong>. When you connect, Ember registers presence using hashed capabilities (never your raw Friend ID in the clear). When you search for a friend, Ember queries the server and gets back an IP and port for a direct connection. Adding or accepting a friend forces a presence refresh so discovery does not wait on the normal heartbeat interval.</p>
+    <p>Once a friend is found, Ember opens a direct TCP connection and establishes a <strong>Noise IK</strong> secure stream with Ed25519 proof-of-possession. After both sides accept the friend request, chat, file browsing, file offers, friends-only shares, and priority uploads unlock on that secured session. When both friends are behind difficult NAT, Ember can still move friend file traffic over the secure session (and optional peer relay) without waiting for HighID.</p>
+
+    <div class="callout-info callout">
+      <p><strong>Ember-only:</strong> The friend system is completely invisible to non-Ember clients. It uses a separate identity hash, a dedicated rendezvous server, and dedicated protocol tags that other eMule clients silently ignore.</p>
+    </div>
+
+    <h3 id="friends-features">Features</h3>
+    <ul>
+      <li><strong>Friend Codes</strong> &mdash; Share a Friend Code from the Friends page instead of only a raw Friend ID. Codes support privacy-preserving pairwise presence so mutual chat and browse can unlock once both sides have added each other. Codes made by 1.7.0 and later start with <code>ember3:</code>, which 1.6.x cannot read.</li>
+      <li><strong>Mutual Friend Requests</strong> &mdash; The recipient sees an incoming request on the Friends page and can accept or reject it. Chat, file browsing, offers, and priority upload features only activate once both sides have accepted <strong>and</strong> a secure friend session is established.</li>
+      <li><strong>Real-Time Online Status</strong> &mdash; Ember detects when a friend comes online and shows a live online/offline indicator on their card. The Friends page also surfaces when you are not currently discoverable on the rendezvous network.</li>
+      <li><strong>End-to-End Encrypted Chat</strong> &mdash; Send and receive messages with mutual friends through a slide-out sidebar. After session setup, messages are encrypted end-to-end, marked by a lock icon in the chat window. Outbound messages queue locally and retry when the friend reconnects. The chat can also pop out into its own window. See <a href="#friends-encryption">E2E Encryption</a>.</li>
+      <li><strong>Send Files in Chat</strong> &mdash; Attach a file to a conversation and it goes directly to that friend, up to 2&nbsp;GB, over QUIC or, when the sender&rsquo;s UDP port is not reachable, an encrypted stream on their TCP upload port. Each piece is checked against the offered hash as it arrives. Received files are saved to a <strong>Chat Files</strong> folder, small ones can download automatically, and programs, scripts and disguised files carry a warning. Both of you need 1.7.0, and files are not sent through relays.</li>
+      <li><strong>Remote File Browsing</strong> &mdash; Browse a mutual friend&rsquo;s shared file library while they are online and start downloads directly from the browse results.</li>
+      <li><strong>Friends-Only Shares</strong> &mdash; Mark Library files as friends-only so they stay out of public search and only mutual friends can request them.</li>
+      <li><strong>Friend File Offers</strong> &mdash; Push a specific shared file to a mutual friend from the Friends page. Offers appear as actionable notifications the recipient can accept or decline.</li>
+      <li><strong>Friend Transfers Without HighID</strong> &mdash; Mutual-friend downloads can use the Noise-secured friend session (and optional Ember peer relay) when ordinary HighID or callback paths are unavailable&mdash;useful when both sides are behind difficult NAT.</li>
+      <li><strong>Priority Upload Slots</strong> &mdash; Anyone you have added as a friend gets priority in your upload queue on an authenticated Ember friend session, giving them faster access to your shared files. This one is deliberately one-sided: it costs you only queue position, so it does not wait on them adding you back. Friends-only shares and remote browse do.</li>
+      <li><strong>Friend Block List</strong> &mdash; Block a Friend ID so future requests, chat, browse, and offers from that identity are rejected. Existing mutual friendships with that identity are removed when you block.</li>
+      <li><strong>Optional Peer Relaying</strong> &mdash; <strong>Relay for other peers</strong> (Settings &gt; Network) lets peers who cannot reach each other directly route through you, which is what makes LowID&harr;LowID transfers work behind strict NATs when attestations allow. It spends your upload bandwidth on people you are not trading with, so you can turn it off.</li>
+      <li><strong>Discoverable Banner</strong> &mdash; The Friends page shows a confirmation banner when your identity is registered and discoverable, and warns when presence registration failed so friends may not find you.</li>
+    </ul>
+
+    <h3 id="friends-encryption">E2E Encryption</h3>
+    <p>Friend chat is designed so the rendezvous server and any on-path observer never see message plaintext after a secure session is up.</p>
+    <ul>
+      <li><strong>Noise IK sessions</strong> &mdash; Friend connections negotiate a Noise_IK secure stream authenticated with Ed25519 proof-of-possession before chat, browse, offer, and friends-only privileges unlock.</li>
+      <li><strong>End-to-end chat crypto</strong> &mdash; Message bodies are sealed with XChaCha20-Poly1305 under a key derived from a static X25519 exchange between the two friends&rsquo; identity keys. After session setup, plaintext chat fallbacks are rejected. Outbound messages that cannot be delivered stay queued and are retried on reconnect.</li>
+      <li><strong>Encrypted local history</strong> &mdash; Conversation history is encrypted at rest in the local database, under a key kept beside it. If that key cannot be recovered, history stays sealed and says so rather than failing quietly.</li>
+      <li><strong>Clear UI signals</strong> &mdash; A lock icon in the chat window and on online mutual friends&rsquo; cards marks encrypted chat (its tooltip says what is and is not protected), and reconnect-oriented errors when encryption or the friend session fails.</li>
+    </ul>
+    <div class="callout-warn callout">
+      <p><strong>What the encryption does not cover.</strong> The key comes from a <em>static</em> Diffie-Hellman between long-lived identity keys, not a ratchet, so there is <strong>no forward secrecy</strong>: someone who captures your traffic today and later obtains an identity private key could read those messages. Encryption also protects message <em>bodies</em> only &mdash; IP addresses, relationship capabilities, message size and timing stay observable to peers and to on-path services. The in-app chat says the same thing rather than implying more.</p>
+    </div>
+    <div class="callout">
+      <p><strong>Note:</strong> EPX source exchange and Ember mesh peer discovery can unlock earlier from HELLO hash&harr;pubkey binding between Ember peers. Friend privileges (chat, browse, offers, friends-only shares, verified requests) still require a secure friend session / proof-of-possession.</p>
+    </div>
+
+    <h3 id="friends-privacy">Privacy</h3>
+    <p>The rendezvous server stores presence as hashed capabilities derived from your Friend identity (never the raw Friend ID in the clear), paired with IP and port. Registration is pubkey-bound and signature-checked so entries cannot be spoofed with a stolen hash alone. Entries expire automatically after 5 minutes without a heartbeat. Between Ember peers, the Ember Hash is exchanged via the private <code>OP_EMBER_HELLO</code> / <code>OP_EMBER_HELLOANSWER</code> handshake (with Ed25519 proof-of-possession on TCP) &mdash; not via the legacy EmuleInfo path used for ordinary eMule metadata.</p>
+  </section>
+
+  <hr>
+
+  <section id="channels">
+    <h2>Channels <span class="beta-badge">Beta</span></h2>
+
+    <p>Channels are group chat rooms carried over the <a href="#ember">Ember Network</a> itself. No server hosts a room and no company runs one: messages travel encrypted between the members over the same overlay that carries search and source lookup. Room and user names are registered with the rendezvous server; messages never pass through it. Members never publish their IP address to the room.</p>
+
+    <p>Friends are for people you know one-to-one. Channels are for a group &mdash; a room you can hand an invite to, hand off to someone else, or leave running after you have gone.</p>
+
+    <div class="callout-warn callout">
+      <p><strong>Channels are in beta.</strong> The app marks them so too. The format is still settling, so expect rough edges, and read <a href="#channels-limits">What to expect</a> before you rely on a room for anything that matters.</p>
+    </div>
+
+    <h3 id="channels-start">Getting started</h3>
+    <ol class="steps-list">
+      <li>
+        <strong>Pick a Channel username</strong><br>
+        <span style="color: var(--text-secondary)">Two to twelve letters or numbers, and it has to be free &mdash; the name is claimed in Ember&rsquo;s rendezvous directory so two people in a room are never the same &ldquo;Ada&rdquo;. This is separate from your friend nickname, and you need one before you can create or join anything.</span>
+      </li>
+      <li>
+        <strong>Create a room, or join one</strong><br>
+        <span style="color: var(--text-secondary)">A room name is up to 32 characters and is claimed first come first served; the owner can rename the room later. To join someone else&rsquo;s, paste the <code>ember-channel:</code> invite they sent you.</span>
+      </li>
+      <li>
+        <strong>Or find one with Discover</strong><br>
+        <span style="color: var(--text-secondary)">Discover lists public rooms that other people have published. Private rooms never appear there.</span>
+      </li>
+    </ol>
+
+    <h3 id="channels-public">Public and private rooms</h3>
+    <p>The choice you make when you create a room is the one that matters most, and it cannot be changed afterwards.</p>
+    <ul>
+      <li><strong>Public</strong> &mdash; listed in Discover so anyone can find and join it. Anyone who finds it can also <em>read</em> it: the key that unlocks the conversation is derived from the address in its public listing. A public room is a public conversation.</li>
+      <li><strong>Private</strong> &mdash; never listed. Joining needs an invite link, which carries the key. If the conversation should stay with the people you invite, this is the one to use.</li>
+    </ul>
+    <p>A private room&rsquo;s owner can rotate its key, which cuts off anyone holding an older invite &mdash; the remedy when a link has been shared further than you meant.</p>
+
+    <h3 id="channels-owner">Running a room</h3>
+    <p>Whoever creates a room owns it. Owner tools open in a room settings window from the gear in the room header.</p>
+    <ul>
+      <li><strong>Rename</strong> &mdash; give the room a new name, up to 32 characters.</li>
+      <li><strong>Topic and welcome</strong> &mdash; a line at the top of the room and a greeting new members see.</li>
+      <li><strong>Language</strong> &mdash; mark the language the room is held in. It shows as a small flag beside the name in the room list, the header and Discover.</li>
+      <li><strong>Pins</strong> &mdash; pin up to 3 messages to the top of the room, from a message&rsquo;s own menu.</li>
+      <li><strong>Announcements only</strong> &mdash; only you and your moderators can post; members can still read and react. Each member&rsquo;s own app enforces it, so a member on an older build is not held to it.</li>
+      <li><strong>Moderators</strong> &mdash; up to 6 members who can ban and unban on your behalf. They cannot ban you, and they cannot delete the room.</li>
+      <li><strong>Bans</strong> &mdash; up to 12 at a time.</li>
+      <li><strong>Owner-only invites</strong> &mdash; stops a member re-sharing the room without thinking. Every member holds the key either way, so treat this as a guard against carelessness rather than against someone determined.</li>
+      <li><strong>Slow mode</strong> &mdash; sets how long members wait between messages, from 5 seconds to 5 minutes. Off unless you turn it on. You and your moderators are exempt, and everyone in the room can see it is on.</li>
+      <li><strong>Rotate the key</strong> &mdash; private rooms only, for when an invite has leaked.</li>
+      <li><strong>Hand the room over</strong> &mdash; transfer ownership to a member, or nominate a successor who can claim the room if you go quiet for a window you choose. Better than sharing your key.</li>
+      <li><strong>Delete</strong> &mdash; permanent. The room name is retired and cannot be claimed again.</li>
+    </ul>
+    <p>One device can own up to 10 rooms at once. Deleting a room gives the slot back. Joining rooms is not limited.</p>
+
+    <p>Every member, owner or not, can <strong>mute</strong> a room so it stops raising notifications, and <strong>ignore</strong> a member so their messages are hidden. Both are private to your device and are listed under Settings &gt; Channels, where you can undo them.</p>
+
+    <h3 id="channels-messages">Messages</h3>
+    <ul>
+      <li><strong>Edit your own message</strong> for 15 minutes after sending it. Every receiver checks the author&rsquo;s signature and both clocks itself, so &ldquo;only the author may edit&rdquo; is not something the sending client is trusted about. Members who were away are handed the corrected line rather than the original followed by a revision.</li>
+      <li><strong>Reply to a message</strong> and your line quotes the one it answers. A member on 1.6.x sees the reply as an ordinary line.</li>
+      <li><strong>React</strong> with one of 20 reactions. One reaction per person per message, and changing yours replaces it. The original thumb up, thumb down and heart work with 1.6.1 and newer; the others need 1.7.0.</li>
+      <li><strong>Format</strong> with <code>**bold**</code>, <code>*italic*</code>, <code>~~strike~~</code> and <code>`code`</code>. Formatting is only how the line is shown; an older Ember shows the marks as typed.</li>
+      <li><strong>See who is typing,</strong> on 1.7.0.</li>
+      <li><strong>Remove a message from this device.</strong> Local only &mdash; the protocol has no way to unsend, so every other member keeps their copy. What it does guarantee is that the line stays gone here, including when another member replays it later.</li>
+      <li><strong>Mention a member</strong> by typing <code>@</code>, which completes handles from the room&rsquo;s member list.</li>
+    </ul>
+    <p>Edits and reactions need both sides on 1.6.1 or newer. An older client does not recognise them and drops them rather than passing them on, so in a mixed room they reach only the members who have updated.</p>
+
+    <h3 id="channels-files">Sending files</h3>
+    <p>You can send a file to one member of a room at a time, up to <strong>2 GB</strong>, and only after they accept the offer. An offer that goes unanswered lapses after 5 minutes, and up to 4 transfers can run at once. Files go directly between the two of you, not to the whole room, and the payload is encrypted to that member rather than to the room. Transfers count against your upload speed limit like any other upload, and appear in a drawer under the member list with their speed and time left.</p>
+    <p>Between two members on 1.7.0 the file moves over a direct QUIC stream, or an encrypted stream on the sender&rsquo;s TCP upload port when their UDP port cannot be reached, and each piece is checked against the offer as it lands. If neither can be opened &mdash; a member on 1.6.x, or two firewalled members who can only meet through a relay &mdash; the transfer falls back to the older block protocol, which is much slower, keeps what was already verified, and is limited to 100&nbsp;MB for a 1.6.x member. Received files are saved to a <strong>Channel Files</strong> folder, which is not shared, and programs, scripts and disguised files carry a warning.</p>
+
+    <h3 id="channels-limits">What to expect</h3>
+    <div class="callout-warn callout">
+      <p><strong>Room chat has no forward secrecy.</strong> Everyone in a room shares one key. Someone who captures the traffic today and later obtains that key can read what was said. Rotating a private room&rsquo;s key protects future messages, not past ones. File transfers are the exception: each one is sealed to the member you sent it to with a key only the two of you can derive, so the rest of the room cannot read the bytes even though they can see the traffic.</p>
+    </div>
+    <ul>
+      <li><strong>Moderation is local.</strong> A ban stops honest clients from showing that member and stops them being served. It is not a network-level eviction, and someone running a modified client can ignore it.</li>
+      <li><strong>Public listings can be spammed.</strong> Discover shows what people published, and nobody vets it.</li>
+      <li><strong>A room holds up to 256 members</strong> and a message up to 4096 bytes.</li>
+      <li><strong>History is what your device kept.</strong> Rooms are not archived anywhere central. When you join, members near you share recent messages; older conversation you were not present for is gone.</li>
+      <li><strong>Search inside a room</strong> looks only through the history your device has.</li>
+    </ul>
+  </section>
+
+  <hr>
+
+  <section id="network">
+    <h2>Network Compatibility</h2>
+    <p>Ember is a first-class citizen of the eMule network. It implements the full protocol suite required to participate alongside every other eMule-family client.</p>
+
+    <table class="doc-table">
+      <thead>
+        <tr><th>Protocol</th><th>Details</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>KAD (Kademlia DHT)</strong></td>
+          <td>KAD v8/v9 for decentralized peer and file discovery, firewall checks, buddy relay for firewalled peers, keyword publishing, and note publishing.</td>
+        </tr>
+        <tr>
+          <td><strong>ED2K Servers &amp; Peer Exchange</strong></td>
+          <td>Connect from the ED2K Servers page or the optional Auto-connect to server setting (last server, else eMule Sunrise). Community <code>server.met</code> lists can be downloaded from emule-security.org. Once connected, servers provide High/Low ID and peer/source exchange.</td>
+        </tr>
+        <tr>
+          <td><strong>Credits &amp; SecIdent</strong></td>
+          <td>eMule credit system with RSA-based Secure Identification to prevent credit theft. Upload priority determined by the standard credit ratio formula.</td>
+        </tr>
+        <tr>
+          <td><strong>Obfuscation</strong></td>
+          <td>RC4-based TCP and UDP header encryption matching eMule&rsquo;s implementation, helping with ISP throttling.</td>
+        </tr>
+        <tr>
+          <td><strong>AICH</strong></td>
+          <td>Advanced Intelligent Corruption Handling for part-level hash verification and recovery.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="callout">
+      <p><strong>Beyond eMule:</strong> Ember additionally runs its own <a href="#ember">Ember Network</a> overlay and the <a href="#epx">EPX</a> source-exchange extension between Ember peers. Neither is visible to other eMule-family clients, and neither affects the compatibility above.</p>
+    </div>
+  </section>
+
+  <hr>
+
+  <section id="ports">
+    <h2>Port Forwarding</h2>
+    <p>Ember uses two port numbers for peer communication. Both are configurable in <strong>Settings &gt; Network</strong>.</p>
+
+    <table class="doc-table">
+      <thead>
+        <tr><th>Port</th><th>Protocol</th><th>Purpose</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>4662</td><td>TCP</td><td>Peer-to-peer file transfers</td></tr>
+        <tr><td>4672</td><td>UDP</td><td>KAD DHT, <a href="#ember">Ember Network</a> communication and Ember&rsquo;s QUIC transport (all share this socket)</td></tr>
+        <tr><td>4662</td><td>UDP</td><td>QUIC for relays that dial your TCP port number over UDP: 1.7.0 peers, and relays that know you only from KAD</td></tr>
+      </tbody>
+    </table>
+
+    <p>For best performance (High ID), forward 4662 TCP and 4672 UDP on your router, and 4662 UDP as well if you forward by hand (UPnP maps it for you), enable <strong>UPnP</strong> for automatic mapping, or use <strong>STUN port keep-alive</strong> when you are behind CGNAT or full-cone NAT without UPnP.</p>
+
+    <div class="callout">
+      <p><strong>UPnP:</strong> When enabled, Ember uses the IGD protocol to automatically request port mappings from your router. This works with most consumer routers and is the easiest path to High ID.</p>
+      <p style="margin-top: 10px;"><strong>STUN port keep-alive:</strong> On by default in Settings &gt; Network. Ember periodically refreshes your NAT mappings with STUN (and a TCP hold from the listen port) and advertises the public ports peers should connect to. It auto-suspends on Open / Symmetric NAT or unstable remapping and falls back to your Settings ports.</p>
+    </div>
+  </section>
+
+  <hr>
+
+  <section id="highid">
+    <h2>High ID vs Low ID</h2>
+
+    <p>An ID is a value calculated from the client's IP address and assigned by the ED2K server when Ember connects for peer exchange. It indicates whether proper bidirectional communication is possible.</p>
+
+    <h3>High ID</h3>
+    <p>A High ID means your connection port is open and freely accessible from the internet. Your client is fully reachable by others. This is the optimal state.</p>
+
+    <h3>Low ID</h3>
+    <p>A Low ID means your connection port is blocked or cannot be reached, typically caused by firewalls, routers, or NAT. Any ID value less than <strong>16,777,216</strong> is considered a Low ID.</p>
+
+    <h3>Disadvantages of a Low ID</h3>
+    <ul>
+      <li><strong>Peer Routing</strong> &mdash; Since your IP is not directly reachable, all requests must be routed through the server, increasing overhead.</li>
+      <li><strong>Reduced Sources</strong> &mdash; On the ordinary eD2K path, two Low ID clients cannot connect to each other, so you see fewer sources. Ember can route around some of those cases through a peer relay, and mutual friends can use a Noise session without either side holding a High ID, but neither is a substitute for opening the port.</li>
+      <li><strong>Lost Messages</strong> &mdash; On busy servers, messages can get lost, causing missed queue progression and slower downloads.</li>
+    </ul>
+
+    <div class="callout-info callout">
+      <p><strong>Note:</strong> The ID only affects control message exchange. Actual data transfer is still handled client-to-client. If your ID is High, there are no extra advantages to a higher numeric value.</p>
+    </div>
+
+    <h3>Troubleshooting Low ID</h3>
+    <p>If you're stuck with a Low ID despite correct settings:</p>
+    <ul>
+      <li>Verify that ports 4662 (TCP) and 4672 (UDP) are forwarded on your router.</li>
+      <li>Check that your OS firewall allows Ember through on both protocols.</li>
+      <li>Restart Ember to reconnect to the ED2K server.</li>
+      <li>Enable UPnP in Settings &gt; Network for automatic port mapping.</li>
+      <li>Leave STUN port keep-alive enabled (Settings &gt; Network) if you are behind CGNAT or full-cone NAT without UPnP &mdash; Ember will try to hold and advertise remapped public ports.</li>
+      <li>If behind symmetric NAT or a VPN that remaps ports unstably, STUN keep-alive suspends automatically; High ID may still require a VPN with a fixed forwarded port or another tunneling solution.</li>
+    </ul>
+  </section>
+
+  <hr>
+
+  <section id="tech-stack">
+    <h2>Tech Stack</h2>
+
+    <table class="doc-table">
+      <thead>
+        <tr><th>Layer</th><th>Technology</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Frontend</td><td>SvelteKit (Svelte 5) + TypeScript + Vite</td></tr>
+        <tr><td>App Shell</td><td>Tauri v2</td></tr>
+        <tr><td>Backend</td><td>Rust (2021 edition)</td></tr>
+        <tr><td>Database</td><td>SQLite via rusqlite</td></tr>
+        <tr><td>Networking</td><td>Tokio async runtime</td></tr>
+        <tr><td>Ember Overlay Transport</td><td>Noise IK / XX over UDP (ChaCha20-Poly1305 + BLAKE2s), plus QUIC (quinn + rustls) for relays, hole-punched transfers and attachments on the same UDP port</td></tr>
+        <tr><td>Ember DHT</td><td>Kademlia, 128-bit BLAKE3 node IDs, Ed25519-signed frames</td></tr>
+        <tr><td>Friend Discovery</td><td>Rendezvous server (Axum on Fly.io)</td></tr>
+        <tr><td>Friend Sessions</td><td>Noise IK + Ed25519 PoP</td></tr>
+        <tr><td>Friend Chat Crypto</td><td>X25519 ECDH + AEAD (E2E)</td></tr>
+        <tr><td>GeoIP</td><td>DB-IP Country Lite (MMDB, read with the maxminddb crate)</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <hr>
+
+  <section id="developers">
+    <h2>For Developers</h2>
+
+    <h3>Protocol documentation</h3>
+    <p>Ember&rsquo;s eMule-side behaviour follows the published eD2K and KAD protocols. Its own overlay is specified in the <a href="ember-dht-specification.html">EmberDHT Protocol Specification</a> (<a href="ember-dht-specification.pdf">PDF</a>) &mdash; wire version 4, as implemented in this release &mdash; which is enough to write an independent implementation that joins the same network.</p>
+
+    <h3>Prerequisites</h3>
+    <ul>
+      <li><a href="https://rustup.rs/" target="_blank" rel="noopener">Rust</a> (1.94+)</li>
+      <li><a href="https://nodejs.org/" target="_blank" rel="noopener">Node.js</a> (22.12+ or 24+)</li>
+      <li><strong>Windows:</strong> Visual Studio Build Tools with C++ workload</li>
+    </ul>
+
+    <h3>Development</h3>
+    <pre><code># Install dependencies
+npm install
+
+# Run in development mode
+npm run tauri dev
+
+# Build for production (updater artifacts need the release signing key)
+npm run tauri build -- --config '{"bundle":{"createUpdaterArtifacts":false}}'</code></pre>
+    <p>Without that override, or <code>TAURI_SIGNING_PRIVATE_KEY</code> set, the build stops at the updater-signing step. On Windows the production build produces NSIS and MSI installers in <code>src-tauri/target/release/bundle/</code>. A Linux build from the same tree produces the same <code>.deb</code> and AppImage the official release publishes, unsigned.</p>
+
+    <h3>Project Structure</h3>
+    <table class="doc-table">
+      <thead>
+        <tr><th>Directory</th><th>Description</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>src/</code></td><td>SvelteKit frontend (routes, components, stores)</td></tr>
+        <tr><td><code>src-tauri/src/</code></td><td>Rust backend (protocol stack, networking, storage)</td></tr>
+        <tr><td><code>src-tauri/Cargo.toml</code></td><td>Rust dependencies</td></tr>
+        <tr><td><code>docs/</code></td><td>This documentation site</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Contributing</h3>
+    <p>Ember is licensed under the GPLv3 and welcomes contributions. Visit the <a href="https://github.com/untaimed18/Ember-P2P" target="_blank" rel="noopener">GitHub repository</a> to open issues, submit pull requests, or review the codebase.</p>
+  </section>
+
+  <hr>
+
+  <section id="faq">
+    <h2>FAQ</h2>
+    <p class="section-lead">Answers to the questions people ask most. Click a question to expand it.</p>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        Is Ember compatible with regular eMule clients?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Yes. Ember speaks the same KAD wire protocol as eMule 0.50a and compatible clients (aMule, eMule Xtreme, etc.). It participates in the same network, finds the same sources, and respects the same credit system. KAD is joined automatically at startup, and you can add an ED2K server from the app. Ember&rsquo;s own additions &mdash; the <a href="#ember">Ember Network</a> overlay and the <a href="#epx">EPX</a> extension &mdash; only involve other Ember clients and are silently ignored by everything else.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        How do I move Ember to a new PC without losing my credits?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Use Settings &gt; Backup. Choose a passphrase, create the backup, copy the single <code>.emberbackup</code> file across, then restore it on the new machine from the same screen and restart when prompted. Your user hash, SecIdent keys, upload credits, friends, known files and settings all come across, which is what keeps your standing on the network. The files you share are not in the backup, so copy those separately. Put them at the same paths and Ember picks the folders up again after the restore; otherwise re-add them on the Library page. Keep the backup somewhere safe: it contains your private keys, and a lost passphrase cannot be recovered.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        What is the Ember Network, and do I need to set it up?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">It is Ember&rsquo;s own encrypted peer-to-peer overlay, with its own DHT and no directory server. Ember nodes find each other directly, publish the files they share, and look up download sources over it. You do not set anything up: it is on by default and joins on its own, with no Connect button. It runs alongside KAD and eD2K, so you keep access to the whole eMule network as well. See the <a href="#ember">Ember Network section</a>.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        If the Ember Network is decentralized, why do I still need KAD or a server?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Because there is no bootstrap server to ask. Ember deliberately ships no seed list and hosts no bootstrap pool &mdash; one would hand its operator a list of every participant&rsquo;s identity and IP. Instead a new node finds its first Ember peers through KAD (via a fixed rendezvous key and Ember peers spotted in ordinary KAD traffic) or through an eD2K transfer with an Ember-capable client. Once it has been online, it remembers up to 200 contacts and can rejoin on its own. So on a fresh install, keep KAD and/or a server available; after that the overlay stands on its own feet.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        My Ember Network page says &ldquo;Connecting&rdquo; or &ldquo;No peers found&rdquo; &mdash; is it broken?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Probably not. There is no central pool to fetch peers from, so a fresh node fills its routing table on a maintenance cycle and the first connection can take a minute or two. If it stays empty, check that KAD is connected or that you have an ED2K server available &mdash; those are how Ember finds its first peers. Ember keeps looking for as long as it is switched on.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        What is EPX and do I need it?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">EPX (Ember Peer Exchange) is an Ember-exclusive extension that lets Ember peers share source lists with each other, speeding up source discovery. It activates automatically when two Ember clients connect &mdash; no configuration needed. It has zero impact on non-Ember clients. It is not the same thing as the <a href="#ember">Ember Network</a>: EPX is an extra opcode on the eMule wire, while the Ember Network is a separate overlay with its own DHT. Both work independently of each other.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        Is ED2K Low ID the same as KAD Firewalled?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">No. ED2K High/Low ID is assigned when Ember connects to an ED2K server and reflects TCP reachability. KAD Open/Firewalled is KAD's own firewall check, and it also measures whether your TCP port accepts inbound connections, so a server High ID clears KAD's Firewalled flag. UDP reachability is a separate check, shown on its own: with TCP open and UDP blocked you can be Open on KAD and still be UDP-firewalled.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        How do I get High ID?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Forward ports 4662 (TCP) and 4672 (UDP) on your router, enable UPnP, or leave STUN port keep-alive on in Settings &gt; Network. Make sure your OS firewall also allows Ember through. On CGNAT or full-cone NAT without UPnP, STUN keep-alive can hold remapped public ports and advertise them for High ID. Symmetric or unstable VPN remapping still often needs a VPN with a fixed forwarded port.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        How do Friends work? Can I add non-Ember users?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Friends are an Ember-exclusive feature. Share a <strong>Friend Code</strong> from the Friends page with another Ember user. Ember finds them through its rendezvous server and sends a friend request. Once both sides accept and a secure Noise session is established, mutual friends unlock online status, <strong>end-to-end encrypted</strong> chat, remote file browsing, friends-only shares, file offers, priority uploads, and transfers that can work without HighID. You can also block a Friend ID to reject future contact. Non-Ember clients do not have a Friend ID / Friend Code and cannot participate.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        Is friend chat end-to-end encrypted?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Yes. Mutual-friend sessions use Noise IK secure streams with Ed25519 proof-of-possession. Chat messages then use static X25519 ECDH + AEAD end-to-end encryption; plaintext chat fallbacks are rejected after session setup. A lock icon in the chat window and on online mutual friends&rsquo; cards marks encrypted chat. Outbound messages queue until the friend is reachable again, and conversation history is encrypted in the local database. The rendezvous server only helps with discovery &mdash; it never sees message plaintext.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        What are credits and how do they work?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Credits reward users who upload. The transferred amount of data determines the credit you are given with a particular client. They are not global &mdash; they only apply on the client who granted them. Credits are a major modifier when calculating how fast you advance through other users' upload queues. Ember uses RSA-based Secure Identification (SecIdent) to prevent credit theft.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        Does Ember work on macOS or Linux?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Linux, yes: every release ships for x86-64 Linux as a <code>.deb</code> and an AppImage, and both update themselves from inside Ember. macOS has no official build. The stack (Tauri + Rust) is cross-platform, so one may follow.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        How does Ember update itself?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Ember checks for a newer version automatically whenever your chosen hourly, daily, weekly or monthly check is due, including while it stays open, and shows a non-blocking notification when one is available. You can install it in-app with one click &mdash; no need to download installers manually &mdash; and Ember restarts into the new version, back on the page and server you were using. You can also check anytime under Settings &gt; About. If you would rather not be asked, turn on <strong>Silent updates</strong> there (not available for the MSI installer or the <code>.deb</code> package, which need administrator approval or your password to install): Ember then installs updates by itself once nothing is transferring and you are away, after a one-minute warning you can cancel. Every release is cryptographically signed, and Ember verifies the signature before installing, including a downloaded update that waited on disk for a quiet moment. Updates are also gated by signed <strong>security epochs</strong> (anti-rollback), so installs only advance when the signed epoch allows it.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        Is Ember open source?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Yes. Ember is released under the GNU General Public License v3 (GPLv3). The full source code is available on <a href="https://github.com/untaimed18/Ember-P2P" target="_blank" rel="noopener">GitHub</a>. This means anyone can use, modify, and distribute it, but derivative works must also be released under the same license.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        Is Ember a fork of eMule?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">No. Ember is a complete ground-up rewrite of the eMule protocol stack in Rust, not a fork or modification of the original C++ codebase. It implements the same protocols from scratch to ensure compatibility while using modern, memory-safe code.</div>
+    </div>
+  </section>
+
+  <hr>
+
+  <section id="support">
+    <h2>Support</h2>
+
+    <h3>Report an Issue</h3>
+    <p>To report a bug or suggest an improvement, please use the <a href="https://github.com/untaimed18/Ember-P2P/issues" target="_blank" rel="noopener">GitHub Issues</a> page.</p>
+
+    <h4>What to include in a good report</h4>
+    <ul>
+      <li>The exact Ember version (shown in the About dialog).</li>
+          <li>Your operating system and version (Windows build or Linux distribution), and how you installed Ember (installer, MSI, <code>.deb</code> or AppImage).</li>
+      <li>Clear step-by-step instructions that reproduce the problem.</li>
+      <li>What you expected to happen and what actually happened instead.</li>
+      <li>Relevant screenshots or log excerpts if applicable.</li>
+    </ul>
+
+    <h3>Community &amp; Source Code</h3>
+    <p>Visit the <a href="https://github.com/untaimed18/Ember-P2P" target="_blank" rel="noopener">Ember GitHub repository</a> to browse source code, review open issues, or contribute. Ember is GPLv3-licensed and contributions are welcome.</p>
+  </section>
+
+</main>
+</div>
+
+<footer class="site-footer guide-footer">
+  <div class="footer-inner">
+    <div>&copy; 2025&ndash;2026 Ember. Released under the GPLv3 License.</div>
+    <nav class="footer-links" aria-label="Footer">
+      <a href="guide.html">Guide</a>
+      <a href="index.html#releases">Release notes</a>
+      <a href="https://github.com/untaimed18/Ember-P2P" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/untaimed18/Ember-P2P/issues" target="_blank" rel="noopener">Report an issue</a>
+    </nav>
+  </div>
+</footer>
+
+<button class="back-to-top" id="backToTop" type="button" onclick="window.scrollTo({top:0})" aria-label="Back to top">
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><polyline points="18 15 12 9 6 15"/></svg>
+</button>
+
+<script>
+(function() {
+  var sidebar = document.getElementById('sidebar');
+  var overlay = document.getElementById('overlay');
+  var menuBtn = document.querySelector('.mobile-toggle');
+
+  function setSidebar(open) {
+    sidebar.classList.toggle('open', open);
+    overlay.classList.toggle('open', open);
+    menuBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    menuBtn.setAttribute('aria-label', open ? 'Close menu' : 'Open menu');
+  }
+  window.toggleSidebar = function() { setSidebar(!sidebar.classList.contains('open')); };
+  window.toggleFaq = function(btn) {
+    var item = btn.parentElement;
+    var open = !item.classList.contains('open');
+    item.classList.toggle('open', open);
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  };
+  document.addEventListener('keydown', function(e) { if (e.key === 'Escape') setSidebar(false); });
+
+  var tocLinks = Array.prototype.slice.call(document.querySelectorAll('.toc-link[href^="#"]'));
+  tocLinks.forEach(function(link) { link.addEventListener('click', function() { setSidebar(false); }); });
+  var targets = tocLinks.map(function(link) {
+    return { el: document.getElementById(link.getAttribute('href').slice(1)), link: link };
+  }).filter(function(t) { return t.el; });
+
+  var lastActive = null;
+  function updateActive() {
+    var active = null;
+    for (var i = targets.length - 1; i >= 0; i--) {
+      if (targets[i].el.getBoundingClientRect().top <= 120) { active = targets[i].link; break; }
+    }
+    if (active === lastActive) return;
+    lastActive = active;
+    tocLinks.forEach(function(l) { l.classList.remove('active'); });
+    if (active) {
+      active.classList.add('active');
+      if (typeof active.scrollIntoView === 'function') active.scrollIntoView({ block: 'nearest' });
+    }
+  }
+  window.addEventListener('scroll', updateActive, { passive: true });
+  updateActive();
+
+  var header = document.querySelector('.site-header');
+  var btt = document.getElementById('backToTop');
+  function updateChrome() {
+    header.classList.toggle('scrolled', window.scrollY > 8);
+    if (btt) btt.classList.toggle('visible', window.scrollY > 600);
+  }
+  window.addEventListener('scroll', updateChrome, { passive: true });
+  updateChrome();
+})();
+</script>
+
+</body>
+</html>
