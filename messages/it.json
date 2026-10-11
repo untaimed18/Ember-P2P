@@ -4126,5 +4126,7 @@
   "settings_low_disk_hint": "Controllato su ogni unità su cui vengono scritti download in corso.",
   "settings_low_disk_off": "Non avvisare mai",
   "settings_watch_clipboard_label": "Proponi di aggiungere i link eD2K copiati",
-  "settings_watch_clipboard_hint": "Quando passi a Ember con link eD2K negli appunti, propone di aggiungerli. Gli appunti vengono letti solo in quel momento."
+  "settings_watch_clipboard_hint": "Quando passi a Ember con link eD2K negli appunti, propone di aggiungerli. Gli appunti vengono letti solo in quel momento.",
+  "settings_web_sources_label": "Usa le fonti web dei link eD2K",
+  "settings_web_sources_hint": "Scarica dai mirror HTTP e HTTPS indicati da un link (le sue parti s=) insieme agli altri utenti. Ogni parte viene verificata come quella di un peer, ma il mirror vede l’indirizzo di questo computer, come qualsiasi sito."
 }

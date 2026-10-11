@@ -4126,5 +4126,7 @@
   "settings_low_disk_hint": "Geprüft werden alle Laufwerke, auf die gerade Downloads geschrieben werden.",
   "settings_low_disk_off": "Nie warnen",
   "settings_watch_clipboard_label": "Kopierte eD2K-Links zum Hinzufügen anbieten",
-  "settings_watch_clipboard_hint": "Wenn Sie mit eD2K-Links in der Zwischenablage zu Ember wechseln, bietet Ember an, sie hinzuzufügen. Die Zwischenablage wird nur in diesem Moment gelesen."
+  "settings_watch_clipboard_hint": "Wenn Sie mit eD2K-Links in der Zwischenablage zu Ember wechseln, bietet Ember an, sie hinzuzufügen. Die Zwischenablage wird nur in diesem Moment gelesen.",
+  "settings_web_sources_label": "Webquellen aus eD2K-Links verwenden",
+  "settings_web_sources_hint": "Lädt neben anderen Nutzern auch von den HTTP- und HTTPS-Spiegeln, die ein Link nennt (seine s=-Teile). Jeder Teil wird wie der eines Peers geprüft, doch der Spiegel sieht die Adresse dieses Computers, wie jede Website."
 }

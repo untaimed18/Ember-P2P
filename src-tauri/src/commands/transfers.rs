@@ -1222,6 +1222,9 @@ pub async fn start_download(
     // waiting for a Hello handshake to bind it — see the field doc on
     // `NetworkCommand::StartDownload::friend_ember_hash`.
     friend_ember_hash: Option<String>,
+    // The `s=` HTTP/HTTPS mirrors of the ed2k link this came from. Validated
+    // and capped by `web_sources::register`; anything unusable is dropped.
+    web_sources: Option<Vec<String>>,
 ) -> Result<StartDownloadResponse, String> {
     let _download_admission = state.download_admission.lock().await;
     let file_name = crate::security::sanitize_filename(&file_name);
@@ -1302,6 +1305,34 @@ pub async fn start_download(
                 gib(file_size),
                 gib(cap_bytes)
             )));
+        }
+    }
+
+    // Kept per file before the duplicate check below, so pasting a link with
+    // mirrors for a file already in the list gives that download the mirrors.
+    let web_sources = web_sources.unwrap_or_default();
+    if !web_sources.is_empty() {
+        if let Some(hash) = hex::decode(&file_hash)
+            .ok()
+            .and_then(|b| <[u8; 16]>::try_from(b).ok())
+        {
+            let added = crate::network::ed2k::web_sources::register(
+                hash,
+                web_sources
+                    .into_iter()
+                    .take(crate::network::ed2k::web_sources::MAX_WEB_SOURCES_PER_FILE * 2),
+            );
+            if !added.is_empty() {
+                tracing::info!("Download of {file_hash} has {} web source(s) from its link", added.len());
+                let db = state.db.clone();
+                let fh = file_hash.clone();
+                db_blocking(move || {
+                    if let Err(e) = db.add_transfer_web_sources(&fh, &added) {
+                        tracing::warn!("Failed to save the web sources of {fh}: {e}");
+                    }
+                })
+                .await;
+            }
         }
     }
 

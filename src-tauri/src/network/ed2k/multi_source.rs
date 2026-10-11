@@ -32,6 +32,8 @@ use super::transfer::{
     take_completed_outstanding_range, DownloadEvent, OutstandingRange, PacketStreamDesynced,
 };
 
+mod web_worker;
+
 /// Shared registry of active download trackers so the shutdown path can
 /// persist `.part.met` files even when download tasks are aborted.
 pub type SharedTrackerRegistry = Arc<parking_lot::Mutex<HashMap<String, Arc<RwLock<PartTracker>>>>>;
@@ -3131,6 +3133,86 @@ impl MultiSourceDownload {
             handles.push(handle);
         }
 
+        // Web sources (`s=` links), one worker each under one dispatcher task
+        // (which also picks up mirrors added while this runs), beside every
+        // phase below rather than inside the first one. In `handles` they held
+        // up the retry rounds: a slow mirror on a large file, or one resting
+        // after a failure, kept the peers that dropped out from being asked
+        // again until it finished. They are waited for once the retry rounds
+        // are over instead, so a file whose only source is a mirror still runs
+        // until the mirror is done, and they report progress through their own
+        // aggregator because the first phase's is awaited before those rounds.
+        // `source_aborts` stops them on every early exit.
+        let web_urls = super::web_sources::ready(&self.file_hash);
+        let mut web_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let (web_progress_tx, mut web_progress_rx) = mpsc::channel::<(usize, i64)>(1024);
+        let web_agg = {
+            let tracker = tracker.clone();
+            let event_tx = event_tx.clone();
+            let transfer_id = self.transfer_id.clone();
+            let file_size = self.file_size;
+            tokio::spawn(async move {
+                const EMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+                let mut pending = false;
+                loop {
+                    tokio::select! {
+                        sig = web_progress_rx.recv() => match sig {
+                            Some(_) => pending = true,
+                            None => break,
+                        },
+                        _ = tokio::time::sleep(EMIT_INTERVAL), if pending => {
+                            let (downloaded, wire) = {
+                                let t = tracker.read().await;
+                                (t.progress_bytes().min(file_size), t.transferred())
+                            };
+                            let _ = event_tx
+                                .send(DownloadEvent::Progress {
+                                    transfer_id: transfer_id.clone(),
+                                    downloaded,
+                                    transferred: Some(wire),
+                                    total: file_size,
+                                })
+                                .await;
+                            pending = false;
+                        }
+                    }
+                }
+            })
+        };
+        source_aborts.track(&web_agg);
+        if !web_urls.is_empty() {
+            info!(
+                "Download {} has {} web source(s)",
+                self.transfer_id,
+                web_urls.len()
+            );
+        }
+        // Always, even with none ready now: one may be added while this runs.
+        {
+            let template = web_worker::WebWorker {
+                url: String::new(),
+                worker: WEB_WORKER_INDEX_BASE,
+                transfer_id: self.transfer_id.clone(),
+                file_hash: self.file_hash,
+                file_size: self.file_size,
+                tracker: tracker.clone(),
+                output: shared_part_file.clone(),
+                part_hashes: part_hashes.clone(),
+                bandwidth: self.bandwidth_limiter.clone(),
+                control: self.control.clone(),
+                progress_tx: web_progress_tx.clone(),
+                event_tx: event_tx.clone(),
+                drop_tx: drop_tx.clone(),
+                active_count: active_count.clone(),
+                disk_full: disk_full.clone(),
+            };
+            let handle = tokio::spawn(web_worker::dispatch(template, total_sources.clone()));
+            source_aborts.track(&handle);
+            web_handles.push(handle);
+        }
+        // Held only by the workers from here, so the aggregator ends with them.
+        drop(web_progress_tx);
+
         // Wait for all initial sources and accept new sources as they arrive
         let mut next_src_idx = self.sources.len();
         let mut injected_sources: Vec<DownloadSource> = Vec::new();
@@ -4923,6 +5005,15 @@ impl MultiSourceDownload {
             let _ = h.await;
         }
         let _ = adopt_agg.await;
+        // Mirrors outlast the peers' retry rounds: a file only a mirror has is
+        // still downloading here. Waited for like the adopted callbacks above,
+        // and before the sweep and the final verification, which must not race
+        // a writer.
+        wait_for_sources_unless_settled(&tracker, &web_handles).await;
+        for h in web_handles.drain(..) {
+            let _ = h.await;
+        }
+        let _ = web_agg.await;
         if disk_full_hit(&disk_full) {
             return Err(disk_full_error());
         }
@@ -5251,6 +5342,23 @@ impl MultiSourceDownload {
                 .await;
                 match recovery {
                     FinalVerifyRecovery::Reopen(parts_to_reopen) => {
+                        // With no part hashes nothing checked a mirror's parts
+                        // on the way in, so a bad file cannot be traced to a
+                        // source — and a mirror serving bad bytes would serve
+                        // them again on every retry, forever. Its mirrors are
+                        // the likeliest cause and the only ones that would
+                        // repeat it, so they sit out the rest of the session;
+                        // peers, checked part by part once a hashset arrives,
+                        // carry on.
+                        if part_hashes.read().await.is_empty() {
+                            for url in super::web_sources::urls(&self.file_hash) {
+                                warn!(
+                                    "Retiring web source {url} for {}: the file failed verification with nothing to tell which source sent the bad data",
+                                    self.file_name
+                                );
+                                super::web_sources::note_failure(&self.file_hash, &url, true);
+                            }
+                        }
                         let (corrected_bytes, corrected_wire, snap) = {
                             let mut t = tracker.write().await;
                             for &i in &parts_to_reopen {
@@ -5383,6 +5491,11 @@ async fn install_verified_part_hashes(
         tracker.set_part_hashes(installed);
     }
 }
+
+/// Worker indices for web sources start here, clear of every peer index (a
+/// download never has a million peers), so their claims and log lines can
+/// never be mistaken for a peer's.
+const WEB_WORKER_INDEX_BASE: usize = 1_000_000;
 
 /// How often a transfer runs [`rehash_unverified_parts`].
 const UNVERIFIED_PART_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);

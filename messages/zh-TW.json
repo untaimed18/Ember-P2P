@@ -4126,5 +4126,7 @@
   "settings_low_disk_hint": "在有下載進行時，檢查每個正在寫入下載的磁碟。",
   "settings_low_disk_off": "永不警告",
   "settings_watch_clipboard_label": "提示新增複製的 eD2K 連結",
-  "settings_watch_clipboard_hint": "剪貼簿中有 eD2K 連結時切換到 Ember，會提示新增這些連結。只在那一刻讀取剪貼簿。"
+  "settings_watch_clipboard_hint": "剪貼簿中有 eD2K 連結時切換到 Ember，會提示新增這些連結。只在那一刻讀取剪貼簿。",
+  "settings_web_sources_label": "使用 eD2K 連結中的網路來源",
+  "settings_web_sources_hint": "除其他使用者外，也會從連結指定的 HTTP 與 HTTPS 鏡像（其 s= 部分）下載。每個部分都會像來自其他使用者的一樣被驗證，但鏡像會看到這台電腦的位址，與任何網站相同。"
 }

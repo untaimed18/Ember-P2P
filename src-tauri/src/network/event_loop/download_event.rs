@@ -1807,6 +1807,18 @@ pub(in crate::network) async fn on_download_event(
     if let Some(ref file_hash) = completed_file_hash {
         let mut sf = spam_filter.write().await;
         sf.auto_mark_not_spam(file_hash);
+        drop(sf);
+        // Its mirrors have nothing left to give.
+        if let Some(hash) = parse_ed2k_hash16(file_hash) {
+            ed2k::web_sources::forget(&hash);
+        }
+        let db_web = db.clone();
+        let fh = file_hash.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = db_web.delete_transfer_web_sources(&fh) {
+                debug!("Could not forget the web sources of {fh}: {e}");
+            }
+        });
     }
     for t in promoted {
         // The transfer just moved from the queue into the active set

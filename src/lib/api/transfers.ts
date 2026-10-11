@@ -55,6 +55,8 @@ export async function startDownload(
    * friend again.
    */
   friendEmberHash?: string,
+  /** The `s=` HTTP/HTTPS mirrors of the ed2k link this came from. */
+  webSources?: string[],
 ): Promise<StartDownloadResponse> {
   // A source address identifies a peer, not the file. Never let a source-bearing
   // result bypass the mandatory content hash used to identify and verify it.
@@ -72,6 +74,7 @@ export async function startDownload(
     emberFileHash: emberFileHash?.trim() ? emberFileHash.trim() : null,
     expectedAich: validatedExpectedAich(expectedAich),
     friendEmberHash: friendEmberHash ?? null,
+    webSources: webSources?.length ? webSources : null,
   });
 }
 

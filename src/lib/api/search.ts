@@ -154,6 +154,8 @@ export type Ed2kLinkInfo = {
   hash: string;
   aich?: string;
   ember?: string;
+  /** The link's `s=` HTTP/HTTPS mirrors that can be used, if any. */
+  web_sources?: string[];
 };
 
 export async function parseEd2kLink(link: string): Promise<Ed2kLinkInfo> {

@@ -992,6 +992,25 @@ pub struct Ed2kLinkInfo {
     pub aich: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ember: Option<String>,
+    /// The link's `s=` HTTP/HTTPS mirrors that could be used, normalized.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub web_sources: Vec<String>,
+}
+
+/// The usable web sources of `link`, normalized and capped.
+fn link_web_sources(link: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in hash::ed2k_link_web_sources(link) {
+        if out.len() >= crate::network::ed2k::web_sources::MAX_WEB_SOURCES_PER_FILE {
+            break;
+        }
+        if let Some(url) = crate::network::ed2k::web_sources::normalize_web_source_url(&raw) {
+            if !out.contains(&url) {
+                out.push(url);
+            }
+        }
+    }
+    out
 }
 
 #[tauri::command]
@@ -1010,6 +1029,7 @@ pub fn parse_ed2k_link(link: String) -> Result<Ed2kLinkInfo, String> {
             hash,
             aich,
             ember,
+            web_sources: link_web_sources(&link),
         })
         .map_err(|error| {
             coded_ctx(
@@ -1075,6 +1095,7 @@ pub fn parse_ed2k_links(text: String) -> Result<Ed2kLinkBatch, String> {
                 hash,
                 aich,
                 ember,
+                web_sources: link_web_sources(line),
             }),
             Err(_) => invalid += 1,
         }

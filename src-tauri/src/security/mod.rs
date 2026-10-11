@@ -670,7 +670,18 @@ pub const MAX_FETCH_URL_LEN: usize = 2048;
 /// (the pin only proves *which* host you reached, not that the bytes
 /// weren't modified in flight). Users who paste a custom http:// URL
 /// into the IP filter import field get a clear "https only" error.
+#[cfg(test)]
 fn parse_fetch_url(url: &str) -> Result<(String, String, u16), String> {
+    parse_fetch_url_with(url, false)
+}
+
+/// [`parse_fetch_url`], also accepting `http://` when `allow_http` is set.
+///
+/// For ed2k web sources only: eMule's `s=` links are commonly plain HTTP, and
+/// what comes back is checked against the file's MD4 part hashes and AICH tree
+/// before it is used or shared, so a tampered byte is caught and re-fetched
+/// rather than trusted. Every other caller keeps HTTPS-only.
+pub fn parse_fetch_url_with(url: &str, allow_http: bool) -> Result<(String, String, u16), String> {
     let url = url.trim();
     if url.is_empty() {
         return Err("URL is empty".into());
@@ -696,8 +707,13 @@ fn parse_fetch_url(url: &str) -> Result<(String, String, u16), String> {
         return Err("URLs with userinfo (user:pass@host) are not allowed".into());
     }
     let parsed = reqwest::Url::parse(url).map_err(|error| format!("Invalid URL: {error}"))?;
-    if parsed.scheme() != "https" {
-        return Err("Only https:// URLs are allowed".into());
+    let scheme_ok = parsed.scheme() == "https" || (allow_http && parsed.scheme() == "http");
+    if !scheme_ok {
+        return Err(if allow_http {
+            "Only http:// and https:// URLs are allowed".into()
+        } else {
+            "Only https:// URLs are allowed".into()
+        });
     }
     // Belt and braces against any encoding the raw scan above does not model.
     if !parsed.username().is_empty() || parsed.password().is_some() {
@@ -722,11 +738,19 @@ fn parse_fetch_url(url: &str) -> Result<(String, String, u16), String> {
 pub async fn validate_fetch_url(
     url: &str,
 ) -> Result<(String, String, Vec<std::net::SocketAddr>), String> {
+    validate_fetch_url_with(url, false).await
+}
+
+/// [`validate_fetch_url`] with [`parse_fetch_url_with`]'s scheme rule.
+pub async fn validate_fetch_url_with(
+    url: &str,
+    allow_http: bool,
+) -> Result<(String, String, Vec<std::net::SocketAddr>), String> {
     // Parse once through `Url` so the normalized/punycode host is the exact
     // value used for DNS lookup, reqwest's resolver pin, and the final request.
     // Raw Unicode hostnames otherwise validate one key and connect under a
     // different IDNA key, bypassing DNS pinning.
-    let (normalized_url, host, url_port) = parse_fetch_url(url)?;
+    let (normalized_url, host, url_port) = parse_fetch_url_with(url, allow_http)?;
     if host == "localhost" {
         return Err("URLs pointing to private/loopback addresses are blocked".into());
     }
@@ -812,6 +836,30 @@ pub fn build_pinned_client(
         // and fast; anything over a minute is already failing.
         .timeout(std::time::Duration::from_secs(60))
         .connect_timeout(std::time::Duration::from_secs(15));
+    for addr in addrs {
+        builder = builder.resolve(host, *addr);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))
+}
+
+/// [`build_pinned_client`] for an ed2k web source: plain HTTP allowed (see
+/// [`parse_fetch_url_with`]), and no ceiling on the whole request — a range of
+/// a large file can take as long as the link is slow — but a read that stalls
+/// for `idle` ends it.
+pub fn build_pinned_web_source_client(
+    host: &str,
+    addrs: &[std::net::SocketAddr],
+    user_agent: &str,
+    idle: std::time::Duration,
+) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(idle)
+        .user_agent(user_agent);
     for addr in addrs {
         builder = builder.resolve(host, *addr);
     }

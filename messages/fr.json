@@ -4126,5 +4126,7 @@
   "settings_low_disk_hint": "Vérifié sur chaque disque où des téléchargements sont en cours d’écriture.",
   "settings_low_disk_off": "Ne jamais avertir",
   "settings_watch_clipboard_label": "Proposer d’ajouter les liens eD2K copiés",
-  "settings_watch_clipboard_hint": "Quand vous revenez sur Ember avec des liens eD2K dans le presse-papiers, Ember propose de les ajouter. Le presse-papiers n’est lu qu’à ce moment-là."
+  "settings_watch_clipboard_hint": "Quand vous revenez sur Ember avec des liens eD2K dans le presse-papiers, Ember propose de les ajouter. Le presse-papiers n’est lu qu’à ce moment-là.",
+  "settings_web_sources_label": "Utiliser les sources web des liens eD2K",
+  "settings_web_sources_hint": "Télécharge depuis les miroirs HTTP et HTTPS indiqués par un lien (ses parties s=) en plus des autres utilisateurs. Chaque partie est vérifiée comme celle d’un pair, mais le miroir voit l’adresse de cet ordinateur, comme tout site web."
 }

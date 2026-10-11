@@ -128,6 +128,7 @@ pub(super) fn apply_network_settings(
         new_settings.max_connections_per_five_secs as usize,
     );
     ed2k::multi_source::set_global_conn_limit(new_settings.max_connections as usize);
+    ed2k::web_sources::set_enabled(new_settings.web_sources_enabled);
     crate::sharing::manager::set_global_preview_priority(new_settings.preview_priority_all);
     state.max_sources_per_file = ed2k::sources::max_sources_per_file(new_settings.max_sources_per_file);
     for pfs in state.per_file_sources.values_mut() {

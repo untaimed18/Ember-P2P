@@ -10961,6 +10961,70 @@ impl Database {
     /// beside `transfers` rather than as a column of it for the same reason as
     /// [`Self::ensure_sealed_offer_readers_locked`]: a numbered migration would
     /// stop 1.7.0 from opening the database after a downgrade.
+    /// Web sources (`s=` URLs) of downloads, by file hash, in a table of its
+    /// own for the reason [`Self::ensure_transfer_part_folders_locked`] gives.
+    fn ensure_transfer_web_sources_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS transfer_web_sources (
+                file_hash TEXT NOT NULL,
+                url TEXT NOT NULL,
+                added_at INTEGER NOT NULL,
+                PRIMARY KEY (file_hash, url)
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Remember web sources for the download of `file_hash`.
+    pub fn add_transfer_web_sources(&self, file_hash: &str, urls: &[String]) -> anyhow::Result<()> {
+        if urls.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        Self::ensure_transfer_web_sources_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let now = chrono::Utc::now().timestamp();
+        for url in urls {
+            tx.execute(
+                "INSERT OR IGNORE INTO transfer_web_sources (file_hash, url, added_at) VALUES (?1, ?2, ?3)",
+                params![file_hash.to_ascii_lowercase(), url, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every remembered web source, as `(file_hash, url)`, oldest first per
+    /// file. Rows for a file no download names any more are deleted first:
+    /// they belonged to one that was removed while the app was closed.
+    pub fn load_transfer_web_sources(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock();
+        Self::ensure_transfer_web_sources_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM transfer_web_sources WHERE file_hash NOT IN \
+             (SELECT lower(file_hash) FROM transfers WHERE direction = 'download')",
+            [],
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT file_hash, url FROM transfer_web_sources ORDER BY file_hash, added_at, rowid",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Forget the web sources of `file_hash`: its download finished or went.
+    pub fn delete_transfer_web_sources(&self, file_hash: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_transfer_web_sources_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM transfer_web_sources WHERE file_hash = ?1",
+            params![file_hash.to_ascii_lowercase()],
+        )?;
+        Ok(())
+    }
+
     /// Disappearing-message timers, in tables of their own for the reason
     /// [`Self::ensure_transfer_part_folders_locked`] gives: columns on
     /// `chat_messages` would raise the schema version 1.7.0 checks.
@@ -22860,6 +22924,45 @@ mod tests {
         assert!(db.get_chat_messages(&friend, 50, None).unwrap().is_empty());
         assert!(db.delete_chat_message(&other, theirs).unwrap());
         assert!(!db.delete_chat_message(&other, theirs).unwrap());
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn web_sources_are_kept_per_file_and_pruned_with_their_download() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-web-sources-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).expect("open db");
+        let kept = "AB".repeat(16);
+        let gone = "cd".repeat(16);
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO transfers (id, file_name, file_hash, peer_id, direction, status) \
+                 VALUES ('t1', 'a.bin', ?1, '', 'download', 'downloading')",
+                params![kept.to_ascii_lowercase()],
+            )
+            .expect("transfer row");
+        let urls = vec!["https://a.example/f".to_string(), "http://b.example/f".to_string()];
+        db.add_transfer_web_sources(&kept, &urls).unwrap();
+        db.add_transfer_web_sources(&kept, &urls[..1]).unwrap();
+        db.add_transfer_web_sources(&gone, &urls[..1]).unwrap();
+
+        let loaded = db.load_transfer_web_sources().unwrap();
+        assert_eq!(
+            loaded,
+            vec![
+                (kept.to_ascii_lowercase(), urls[0].clone()),
+                (kept.to_ascii_lowercase(), urls[1].clone()),
+            ],
+            "deduplicated, and a file with no download is pruned"
+        );
+        db.delete_transfer_web_sources(&kept).unwrap();
+        assert!(db.load_transfer_web_sources().unwrap().is_empty());
 
         drop(db);
         let _ = std::fs::remove_file(&path);

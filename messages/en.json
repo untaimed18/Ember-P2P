@@ -4126,5 +4126,7 @@
   "settings_low_disk_hint": "Checked on every drive downloads are being written to, while they run.",
   "settings_low_disk_off": "Never warn",
   "settings_watch_clipboard_label": "Offer to add copied eD2K links",
-  "settings_watch_clipboard_hint": "When you switch to Ember with eD2K links on the clipboard, offer to add them. The clipboard is read only at that moment."
+  "settings_watch_clipboard_hint": "When you switch to Ember with eD2K links on the clipboard, offer to add them. The clipboard is read only at that moment.",
+  "settings_web_sources_label": "Use web sources from eD2K links",
+  "settings_web_sources_hint": "Download from the HTTP and HTTPS mirrors a link names (its s= parts) alongside other users. Every part is checked like one from a peer, but the mirror sees this computer’s address, as any website does."
 }

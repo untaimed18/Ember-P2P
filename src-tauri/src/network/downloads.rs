@@ -846,7 +846,10 @@ async fn start_pending_download_worker(
         .collect();
 
     if live_sources.is_empty() && !callback_stream_in_hand {
-        if !pending_download_has_parked_ember_sources(state, transfer_id) {
+        // A mirror from the link is a source too, and needs no peer to start.
+        if !pending_download_has_parked_ember_sources(state, transfer_id)
+            && !ed2k::web_sources::has_ready(&hash_bytes)
+        {
             state
                 .pending_downloads
                 .insert(transfer_id.to_string(), pending);

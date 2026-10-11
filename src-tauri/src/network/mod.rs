@@ -1237,6 +1237,30 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let folders = settings.download_roots();
         let _ = tokio::task::spawn_blocking(move || chat_attach::sweep_interrupted(&db, &folders)).await;
     }
+    // Web sources downloads were added with, before any of them can start.
+    ed2k::web_sources::set_enabled(settings.web_sources_enabled);
+    {
+        let db = db.clone();
+        match tokio::task::spawn_blocking(move || db.load_transfer_web_sources()).await {
+            Ok(Ok(rows)) => {
+                let mut by_file: HashMap<[u8; 16], Vec<String>> = HashMap::new();
+                for (file_hash, url) in rows {
+                    if let Some(hash) = parse_ed2k_hash16(&file_hash) {
+                        by_file.entry(hash).or_default().push(url);
+                    }
+                }
+                let files = by_file.len();
+                for (hash, urls) in by_file {
+                    ed2k::web_sources::register(hash, urls);
+                }
+                if files > 0 {
+                    info!("Loaded web sources for {files} download(s)");
+                }
+            }
+            Ok(Err(e)) => warn!("Failed to load download web sources: {e}"),
+            Err(e) => warn!("Web source load task failed: {e}"),
+        }
+    }
     // In the background, one folder each, so an offline one holds up nothing;
     // only copies older than this run are touched, never one a completion
     // starting meanwhile is writing. An unfinished download's copies are

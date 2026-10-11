@@ -3231,6 +3231,13 @@
               </div>
               <ToggleSwitch bind:checked={settings.watch_clipboard_links} ariaLabel={m.settings_watch_clipboard_label()} />
             </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_web_sources_label()}</span>
+                <span class="hint">{m.settings_web_sources_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.web_sources_enabled} ariaLabel={m.settings_web_sources_label()} />
+            </div>
           </div>
 
           <!-- Shared folders are chosen in the Library, so this only points

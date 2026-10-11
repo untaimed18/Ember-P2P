@@ -831,6 +831,25 @@ pub fn parse_ed2k_link_strict(link: &str) -> Result<ParsedEd2kLink, &'static str
     Ok((name, size, hash, aich, ember))
 }
 
+/// The `s=<url>` web sources of an ed2k file link — eMule's HTTP sources —
+/// in the order they appear, as written. Empty for anything that is not an
+/// ed2k file link. Whether a URL is usable is
+/// [`super::web_sources::normalize_web_source_url`]'s call.
+pub fn ed2k_link_web_sources(link: &str) -> Vec<String> {
+    let normalized = normalize_ed2k_uri(link);
+    let Some(inner) = strip_prefix_ignore_ascii_case(&normalized, "ed2k://|file|") else {
+        return Vec::new();
+    };
+    // Name, size and hash come first; a web source can only be a later field.
+    inner
+        .split('|')
+        .skip(3)
+        .filter_map(|seg| seg.strip_prefix("s="))
+        .filter(|url| !url.trim().is_empty())
+        .map(|url| url.trim().to_string())
+        .collect()
+}
+
 /// Compatibility parser for collection imports. Invalid links (including
 /// malformed AICH-bearing links) are skipped rather than partially accepted.
 pub fn parse_ed2k_link(link: &str) -> Option<ParsedEd2kLink> {
@@ -922,6 +941,21 @@ mod link_tests {
         assert_eq!(hash, HASH);
         assert!(aich.is_none());
         assert!(ember.is_none());
+    }
+
+    #[test]
+    fn web_sources_are_read_from_s_segments_only() {
+        let link = format!(
+            "ed2k://|file|a.bin|9|{HASH}|s=https://mirror.example/a.bin|sources,1.2.3.4:1|s=http://other.example/a.bin|/"
+        );
+        assert_eq!(
+            ed2k_link_web_sources(&link),
+            vec!["https://mirror.example/a.bin", "http://other.example/a.bin"]
+        );
+        // A file named like a source is still the name.
+        let named = format!("ed2k://|file|s=trick|9|{HASH}|/");
+        assert!(ed2k_link_web_sources(&named).is_empty());
+        assert!(ed2k_link_web_sources("ed2k://|server|1.2.3.4|4661|/").is_empty());
     }
 
     #[test]

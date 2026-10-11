@@ -4126,5 +4126,7 @@
   "settings_low_disk_hint": "Verificado em cada unidade onde há downloads sendo gravados enquanto estão em andamento.",
   "settings_low_disk_off": "Nunca avisar",
   "settings_watch_clipboard_label": "Oferecer para adicionar links eD2K copiados",
-  "settings_watch_clipboard_hint": "Ao voltar para o Ember com links eD2K na área de transferência, ele oferece adicioná-los. A área de transferência só é lida nesse momento."
+  "settings_watch_clipboard_hint": "Ao voltar para o Ember com links eD2K na área de transferência, ele oferece adicioná-los. A área de transferência só é lida nesse momento.",
+  "settings_web_sources_label": "Usar fontes web dos links eD2K",
+  "settings_web_sources_hint": "Baixa dos espelhos HTTP e HTTPS que um link indica (suas partes s=) junto com outros usuários. Cada parte é verificada como a de um par, mas o espelho vê o endereço deste computador, como qualquer site."
 }

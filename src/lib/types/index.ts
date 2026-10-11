@@ -914,6 +914,9 @@ export interface AppSettings {
   remove_finished_downloads: boolean;
   /** Globally prioritize first/last part of every download for faster preview. */
   preview_priority_all: boolean;
+  /** Download from the HTTP/HTTPS mirrors (`s=`) an ed2k link names. On by
+   *  default. */
+  web_sources_enabled: boolean;
   /** External media player for Preview; empty uses the system default handler.
    *  Only settable via `pickPreviewPlayer()` — see that function. */
   preview_player: string;

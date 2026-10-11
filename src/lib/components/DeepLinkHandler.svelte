@@ -156,6 +156,8 @@
           undefined,
           undefined,
           info.aich,
+          undefined,
+          info.web_sources,
         );
         if (!destroyed) {
           // Use the previewed name, not the re-parsed raw one: `preview.name`

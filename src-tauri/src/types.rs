@@ -1578,6 +1578,12 @@ pub struct AppSettings {
     /// per-file flag. Off by default (rarest-first is best for swarm health).
     #[serde(default)]
     pub preview_priority_all: bool,
+    /// Download from the web sources (`s=` HTTP/HTTPS mirrors) an ed2k link
+    /// names, alongside eD2K/KAD/Ember peers. On by default, as in eMule. What
+    /// a mirror sends is verified like a peer's; the mirror does learn this
+    /// computer's address, as any web server does.
+    #[serde(default = "default_true")]
+    pub web_sources_enabled: bool,
     /// Absolute path to an external media player for Preview, or empty to
     /// hand the file to the system's default handler (eMule's "Video Player"
     /// preference).
@@ -2643,6 +2649,7 @@ impl Default for AppSettings {
             add_downloads_paused: false,
             remove_finished_downloads: false,
             preview_priority_all: false,
+            web_sources_enabled: true,
             preview_player: String::new(),
             skip_compress_video: true,
             antileech_enabled: true,

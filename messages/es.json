@@ -4126,5 +4126,7 @@
   "settings_low_disk_hint": "Se comprueba cada unidad en la que se están escribiendo descargas mientras hay descargas en curso.",
   "settings_low_disk_off": "No avisar nunca",
   "settings_watch_clipboard_label": "Ofrecer añadir enlaces eD2K copiados",
-  "settings_watch_clipboard_hint": "Al cambiar a Ember con enlaces eD2K en el portapapeles, ofrece añadirlos. El portapapeles solo se lee en ese momento."
+  "settings_watch_clipboard_hint": "Al cambiar a Ember con enlaces eD2K en el portapapeles, ofrece añadirlos. El portapapeles solo se lee en ese momento.",
+  "settings_web_sources_label": "Usar fuentes web de los enlaces eD2K",
+  "settings_web_sources_hint": "Descarga de los espejos HTTP y HTTPS que indica un enlace (sus partes s=) además de otros usuarios. Cada parte se comprueba como la de un par, pero el espejo ve la dirección de este ordenador, como cualquier sitio web."
 }

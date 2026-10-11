@@ -460,6 +460,63 @@ pub(in crate::network) async fn on_source_retry_tick(
         }
     }
 
+    // A pending download whose link named a mirror can start on that alone,
+    // and a mirror needs neither KAD nor a server — so this runs ahead of the
+    // network gate below. A newly added link or one restored at launch starts
+    // within a tick, and one whose mirror is resting after a failure starts
+    // again once the rest is over. A download already running is left alone.
+    {
+        let web_candidates: Vec<String> = state
+            .pending_downloads
+            .iter()
+            .filter(|(_, pd)| !pd.control.is_cancelled() && !pd.control.is_paused())
+            .filter(|(tid, _)| {
+                !state
+                    .download_handles
+                    .get(*tid)
+                    .is_some_and(|h| !h.is_finished())
+            })
+            .filter(|(_, pd)| {
+                parse_ed2k_hash16(&pd.file_hash).is_some_and(|h| ed2k::web_sources::has_ready(&h))
+            })
+            .map(|(tid, _)| tid.clone())
+            .collect();
+        let startable: Vec<String> = if web_candidates.is_empty() {
+            Vec::new()
+        } else {
+            let mgr = transfer_manager.read().await;
+            web_candidates
+                .into_iter()
+                .filter(|tid| may_start_download_worker(&mgr, tid))
+                .collect()
+        };
+        for tid in startable {
+            let _ = try_start_pending_download_from_known_sources(
+                state,
+                &tid,
+                transfer_manager,
+                source_manager,
+                credit_manager,
+                bandwidth_limiter,
+                dl_event_tx,
+                app_handle,
+                settings,
+                shared_ember_payload,
+                ember_payload_generation,
+                shared_banned_ips,
+                geoip,
+                friend_hashes,
+                ember_hash,
+                ed25519_pubkey,
+                ed25519_secret_key,
+                &stats_manager.sx_counters,
+                &stats_manager.file_req_counters,
+                &stats_manager.epx_counters,
+            )
+            .await;
+        }
+    }
+
     // Skip source searches and warm-start dials until KAD is
     // Connected or an eD2k server session exists. `Connecting`
     // (nodes.dat bootstrap) must not count — otherwise restored
