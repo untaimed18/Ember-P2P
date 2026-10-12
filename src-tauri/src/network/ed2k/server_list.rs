@@ -1,4 +1,4 @@
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Write};
 use std::net::Ipv4Addr;
 use std::path::Path;
 
@@ -59,6 +59,8 @@ pub struct ServerMergeStats {
     pub updated: usize,
     pub filtered: usize,
     pub at_capacity: usize,
+    /// The file ended, or held something unreadable, before its last server.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,16 +105,23 @@ pub struct ServerEntry {
     /// directions (send key uses CLIENTSERVER magic, recv key uses
     /// SERVERCLIENT magic; see `server_obfuscation.rs`).
     pub server_udp_key: u32,
-    /// Public IPv4 the UDP obfuscation key was issued for (ST_UDPKEYIP).
-    /// eMule binds server UDP keys to the current public IP; a key learned
-    /// before an IP change must be discarded instead of reused.
+    /// Public IPv4 the UDP obfuscation key was issued for (ST_UDPKEYIP), in
+    /// eMule's byte order (see `met_ip_u32`). eMule binds server UDP keys to
+    /// the current public IP; a key learned before an IP change must be
+    /// discarded instead of reused.
     pub server_udp_key_ip: u32,
-    /// Number of UDP source-discovery queries (`OP_GLOBGETSOURCES` /
-    /// `OP_GLOBGETSOURCES2`) we've sent to this server since the last
-    /// time it sent us *any* UDP reply. Reset to 0 on any inbound UDP
-    /// packet from this server (status response or found-sources).
-    /// Used by `is_eligible_udp_server` to stop wasting bandwidth on
-    /// servers that no longer respond to UDP — distinct from
+    /// A key not in use until our public address is known to be the one it
+    /// was issued for: read from disk, or set aside while the address is
+    /// unknown. Runtime-only; saved in `server_udp_key`'s place.
+    pub parked_udp_key: u32,
+    /// The last status ping went out obfuscated and has not been answered.
+    /// The next one goes plain, 20 s later, as in eMule: a server that lost
+    /// our key would otherwise never answer again. Runtime-only.
+    pub crypt_ping_pending: bool,
+    /// Plain status pings sent to this server since it last answered any UDP
+    /// request of ours (`record_udp_ping_sent`, cleared by
+    /// `record_udp_reply`). Used by `is_eligible_udp_server` to stop wasting
+    /// bandwidth on servers that no longer respond to UDP — distinct from
     /// `fail_count` which only tracks **TCP** connect failures.
     ///
     /// Background: a non-trivial portion of the public ed2k server
@@ -139,18 +148,12 @@ pub struct ServerEntry {
     /// alive but doesn't have what we want".
     pub last_udp_source_reply_at: i64,
     /// Last time (Unix timestamp, seconds) we SENT this server a UDP source
-    /// query. Runtime-only (not persisted). Collapses the burst of
-    /// per-download source queries fired at one server within a single search
-    /// round into a single "unanswered round" for failure accounting, so a
-    /// session with many active downloads doesn't excise a healthy-but-silent
-    /// server after only a few seconds. (eMule servers stay silent when they
-    /// don't index a given hash, so the per-packet `udp_consecutive_failures`
-    /// counter otherwise raced past the exclusion threshold under load.)
+    /// query. Runtime-only (not persisted), diagnostic.
     pub last_udp_query_at: i64,
-    /// Last time (Unix timestamp, seconds) we sent this server a UDP status
-    /// ping. Runtime-only, like eMule's `CServer::GetLastPingedTime` minus
-    /// the persistence: it is the per-server gate for the 4.5 h status
-    /// cadence, so it has to live as long as the entry does.
+    /// When we last sent this server a UDP status ping, on
+    /// `network::monotonic_secs`, like eMule's `CServer::GetLastPingedTime`:
+    /// the per-server gate for the 4.5 h status cadence. Saved as wall-clock
+    /// time (`ST_LASTPING`) so it outlasts a restart.
     pub last_udp_ping_at: i64,
 }
 
@@ -214,6 +217,8 @@ impl ServerEntry {
             udp_flags: 0,
             server_udp_key: 0,
             server_udp_key_ip: 0,
+            parked_udp_key: 0,
+            crypt_ping_pending: false,
             udp_consecutive_failures: 0,
             last_udp_reply_at: 0,
             last_udp_source_reply_at: 0,
@@ -263,6 +268,230 @@ fn apply_server_int_tag(entry: &mut ServerEntry, name_id: u8, v: u32) {
         0xF7 => entry.last_udp_source_reply_at = v as i64,
         _ => {}
     }
+}
+
+/// When a status ping was last sent (eMule's `ST_LASTPING`), as Unix seconds.
+/// Saved so a restart does not ping every server again before the 4.5 h
+/// interval is up.
+const ST_LASTPING: u8 = 0x90;
+
+/// A saved ping time on the clock `last_udp_ping_at` runs on, or 0 ("never")
+/// when the interval it gated has already run out or the time lies ahead.
+fn ping_time_from_wall(wall: i64) -> i64 {
+    let age = chrono::Utc::now().timestamp() - wall;
+    if wall <= 0 || !(0..super::server_udp::STAT_REASK_INTERVAL_SECS).contains(&age) {
+        return 0;
+    }
+    (crate::network::monotonic_secs() - age).max(0)
+}
+
+/// `last_udp_ping_at` as Unix seconds, for saving.
+fn ping_time_to_wall(at: i64) -> i64 {
+    chrono::Utc::now().timestamp() - (crate::network::monotonic_secs() - at)
+}
+
+/// An address as eMule stores one in server.met (`ST_UDPKEYIP`): the octets in
+/// network order, read as a little-endian `u32`, the same as the server IPs.
+fn met_ip_u32(ip: Ipv4Addr) -> u32 {
+    u32::from_le_bytes(ip.octets())
+}
+
+/// Where a server.met came from, which decides how far its tags are trusted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MetSource {
+    /// Ember's own file.
+    Own,
+    /// A downloaded list, or eMule's: Ember's private tags in it mean nothing
+    /// Ember wrote, so they are not taken (one would make a server static).
+    Foreign,
+}
+
+/// Ember's own tags: the static flag and the UDP bookkeeping.
+fn is_ember_private_tag(id: u8) -> bool {
+    id == 0x8A || id >= 0xF0
+}
+
+/// What a tag holds, as far as a server entry cares.
+enum MetTagValue {
+    Str(String),
+    Int(u32),
+    /// A type whose payload was stepped over.
+    Other,
+}
+
+struct MetTag {
+    /// The one-byte id, or 0 for a tag with a longer name.
+    id: u8,
+    /// The longer name, lowercased: eMule names the user and file counts in
+    /// full ("users", "files").
+    name: Option<String>,
+    value: MetTagValue,
+}
+
+fn met_invalid(msg: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+/// The next `len` bytes, without copying them or allocating for a length the
+/// file only claims to have.
+fn met_take<'a>(cursor: &mut Cursor<&'a [u8]>, len: usize) -> io::Result<&'a [u8]> {
+    let data: &'a [u8] = cursor.get_ref();
+    let start = cursor.position() as usize;
+    let end = start
+        .checked_add(len)
+        .filter(|&end| end <= data.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "server.met ends inside a tag"))?;
+    cursor.set_position(end as u64);
+    Ok(&data[start..end])
+}
+
+/// Cut `text` to at most `max` bytes, on a character boundary.
+fn truncate_to_bytes(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut cut = max;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &text[..cut]
+}
+
+/// A string as eMule writes it: UTF-8 behind a byte-order mark when it is not
+/// plain ASCII, or else the writer's local code page, read here as Latin-1.
+/// Capped in bytes, which is what the reader checks: a cap in characters let a
+/// name of replacement characters reach three times the size, and the file
+/// written with it would not load.
+fn decode_met_string(raw: &[u8]) -> String {
+    let raw = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(raw);
+    let text = match std::str::from_utf8(raw) {
+        Ok(text) => text.to_string(),
+        Err(_) => raw.iter().map(|&b| char::from(b)).collect(),
+    };
+    let clean = crate::security::sanitize_remote_text(&text, MAX_SERVER_TAG_STR_LEN);
+    truncate_to_bytes(&clean, MAX_SERVER_TAG_STR_LEN).to_string()
+}
+
+/// Read one tag. Every type eMule defines has a known size and is stepped over
+/// when it is nothing a server entry stores; only a type with no known size
+/// stops the read, since nothing after it can be found.
+fn read_met_tag(cursor: &mut Cursor<&[u8]>) -> io::Result<MetTag> {
+    let raw_type = cursor.read_u8()?;
+    // Files use the long form; the compact one (type | 0x80, then an id byte)
+    // is accepted too, as eMule's reader does.
+    let (tag_type, id, name) = if raw_type & 0x80 != 0 {
+        (raw_type & 0x7F, cursor.read_u8()?, None)
+    } else {
+        let name_len = usize::from(cursor.read_u16::<LittleEndian>()?);
+        if name_len > MAX_SERVER_TAG_NAME_LEN {
+            return Err(met_invalid(format!("server.met tag name of {name_len} bytes")));
+        }
+        let raw = met_take(cursor, name_len)?;
+        match raw {
+            [id] => (raw_type, *id, None),
+            _ => (raw_type, 0, Some(String::from_utf8_lossy(raw).to_ascii_lowercase())),
+        }
+    };
+    let value = match tag_type {
+        0x02 => {
+            let len = usize::from(cursor.read_u16::<LittleEndian>()?);
+            MetTagValue::Str(decode_met_string(met_take(cursor, len)?))
+        }
+        // TAGTYPE_STR1..STR16: the length is in the type.
+        0x11..=0x20 => {
+            MetTagValue::Str(decode_met_string(met_take(cursor, usize::from(tag_type - 0x10))?))
+        }
+        0x03 => MetTagValue::Int(cursor.read_u32::<LittleEndian>()?),
+        0x08 => MetTagValue::Int(u32::from(cursor.read_u16::<LittleEndian>()?)),
+        0x09 => MetTagValue::Int(u32::from(cursor.read_u8()?)),
+        0x0B => {
+            let v = cursor.read_u64::<LittleEndian>()?;
+            MetTagValue::Int(u32::try_from(v).unwrap_or(u32::MAX))
+        }
+        0x01 => {
+            met_take(cursor, 16)?;
+            MetTagValue::Other
+        }
+        0x04 => {
+            met_take(cursor, 4)?;
+            MetTagValue::Other
+        }
+        0x05 => {
+            met_take(cursor, 1)?;
+            MetTagValue::Other
+        }
+        0x06 => {
+            let bits = usize::from(cursor.read_u16::<LittleEndian>()?);
+            met_take(cursor, bits.div_ceil(8))?;
+            MetTagValue::Other
+        }
+        0x07 => {
+            let len = cursor.read_u32::<LittleEndian>()? as usize;
+            met_take(cursor, len)?;
+            MetTagValue::Other
+        }
+        0x0A => {
+            let len = usize::from(cursor.read_u8()?);
+            met_take(cursor, len)?;
+            MetTagValue::Other
+        }
+        other => return Err(met_invalid(format!("server.met tag of unknown type 0x{other:02X}"))),
+    };
+    Ok(MetTag { id, name, value })
+}
+
+/// Read one `<ip><port><tag_count><tags>` entry.
+fn read_met_entry(cursor: &mut Cursor<&[u8]>, source: MetSource) -> io::Result<ServerEntry> {
+    let ip = Ipv4Addr::from(cursor.read_u32::<LittleEndian>()?.to_le_bytes());
+    let port = cursor.read_u16::<LittleEndian>()?;
+    let tag_count = cursor.read_u32::<LittleEndian>()?;
+    if tag_count > 50 {
+        return Err(met_invalid(format!(
+            "server.met entry for {ip}:{port} declares {tag_count} tags, exceeding cap of 50"
+        )));
+    }
+    let mut entry = ServerEntry::new(ip.to_string(), port);
+    for _ in 0..tag_count {
+        let tag = read_met_tag(cursor)?;
+        match tag.value {
+            // The first copy wins, as in eMule's `CServer::AddTagFromFile`.
+            MetTagValue::Str(text) => match tag.id {
+                0x01 if entry.name.is_empty() => entry.name = text,
+                0x0B if entry.description.is_empty() => entry.description = text,
+                _ => {}
+            },
+            MetTagValue::Int(v) => match (tag.id, tag.name.as_deref()) {
+                (0, Some("users")) => entry.user_count = v,
+                (0, Some("files")) => entry.file_count = v,
+                (0, _) => {}
+                // Another client's pings are no reason for ours to wait.
+                (ST_LASTPING, _) if source == MetSource::Own => {
+                    entry.last_udp_ping_at = ping_time_from_wall(i64::from(v));
+                }
+                (ST_LASTPING, _) => {}
+                (id, _) if source == MetSource::Foreign && is_ember_private_tag(id) => {}
+                (id, _) => apply_server_int_tag(&mut entry, id, v),
+            },
+            MetTagValue::Other => {}
+        }
+    }
+    // Not usable until our public address is known and matches.
+    entry.parked_udp_key = std::mem::take(&mut entry.server_udp_key);
+    Ok(entry)
+}
+
+/// A blank name, a bare address, or `address:port`: a placeholder rather than
+/// a label anybody chose, and so free to be replaced by what the server calls
+/// itself.
+fn is_placeholder_server_name(name: &str, entry_ip: &str) -> bool {
+    let name = name.trim();
+    let host = name.rsplit_once(':').map_or(name, |(host, port)| {
+        if port.parse::<u16>().is_ok() { host } else { name }
+    });
+    name.is_empty()
+        || name.parse::<Ipv4Addr>().is_ok()
+        || host.parse::<Ipv4Addr>().is_ok()
+        || name.eq_ignore_ascii_case(entry_ip)
 }
 
 pub struct ServerList {
@@ -458,76 +687,72 @@ impl ServerList {
     /// eMule MAX_SERVERFAILCOUNT = 10
     const MAX_FAIL_COUNT: u32 = 10;
 
-    pub fn record_failure(&mut self, ip: &str, port: u16) {
-        if let Some(entry) = self
-            .servers
-            .iter_mut()
-            .find(|s| s.ip == ip && s.port == port)
-        {
-            entry.fail_count += 1;
-            entry.last_failed_at = chrono::Utc::now().timestamp();
-        }
-        // eMule: remove non-static servers that exceed MAX_SERVERFAILCOUNT
-        self.servers.retain(|s| {
-            if s.is_static {
-                return true;
-            }
-            if s.fail_count >= Self::MAX_FAIL_COUNT {
-                info!(
-                    "Removing server {}:{} after {} consecutive failures",
-                    s.ip, s.port, s.fail_count
-                );
-                return false;
-            }
-            true
-        });
-    }
-
-    /// Record that we sent a UDP source-discovery query
-    /// (`OP_GLOBGETSOURCES` / `OP_GLOBGETSOURCES2`) to this server.
-    /// Records that we sent this server a UDP source query and, at most once
-    /// per cooldown window, bumps `udp_consecutive_failures`. The next inbound
-    /// UDP packet from the same server resets the counter via
-    /// `record_udp_reply`. Saturating arithmetic so a long-running session
-    /// against a dead server can't overflow.
+    /// Count a failed connect to `ip:port`, and remove it once it has failed
+    /// MAX_SERVERFAILCOUNT times unless it is static (eMule) or `keep`.
     ///
-    /// The cooldown collapses the burst of per-download source queries sent to
-    /// one server within a single search round into a single unanswered-round
-    /// increment. Without it, `K` active downloads bumped the counter `K`
-    /// times per ~5s round, racing past `MAX_UDP_CONSECUTIVE_FAILURES` within
-    /// seconds and excluding healthy-but-silent servers under multi-download
-    /// load.
-    pub fn record_udp_query_sent(&mut self, ip: &str, port: u16) {
-        const UDP_FAILURE_COOLDOWN_SECS: i64 = 30;
-        if let Some(entry) = self
+    /// `keep` is for the server auto-reconnect is still trying to reach:
+    /// removing it would leave Ember dialing a server the list no longer shows.
+    /// Only the server that failed is judged; a count read from an imported
+    /// file is not a failure of ours, and is left until that server fails.
+    pub fn record_failure(&mut self, ip: &str, port: u16, keep: bool) {
+        let Some(pos) = self
             .servers
-            .iter_mut()
-            .find(|s| s.ip == ip && s.port == port)
-        {
-            let now = chrono::Utc::now().timestamp();
-            // Only count (and advance the anchor) once per cooldown window. The
-            // anchor must NOT be refreshed on suppressed calls — otherwise the
-            // ~5s retry loop keeps pushing it forward so the 30s gap is never
-            // reached, the counter sticks at 1, and a genuinely dead server is
-            // never excluded. Advancing the anchor only on a real bump means a
-            // silent server accrues ~1 failure per 30s and is pruned after
-            // MAX_UDP_CONSECUTIVE_FAILURES windows, while a multi-download burst
-            // within a single window still counts once. A reply resets the
-            // counter to 0 via `record_udp_reply`.
-            if now.saturating_sub(entry.last_udp_query_at) >= UDP_FAILURE_COOLDOWN_SECS {
-                entry.udp_consecutive_failures = entry.udp_consecutive_failures.saturating_add(1);
-                entry.last_udp_query_at = now;
-            }
+            .iter()
+            .position(|s| s.ip == ip && s.port == port)
+        else {
+            return;
+        };
+        let entry = &mut self.servers[pos];
+        entry.fail_count = entry.fail_count.saturating_add(1);
+        entry.last_failed_at = chrono::Utc::now().timestamp();
+        if !keep && !entry.is_static && entry.fail_count >= Self::MAX_FAIL_COUNT {
+            info!(
+                "Removing server {}:{} after {} consecutive failures",
+                entry.ip, entry.port, entry.fail_count
+            );
+            self.servers.remove(pos);
         }
     }
 
-    pub fn record_udp_ping_sent(&mut self, ip: &str, port: u16, at: i64) {
+    /// Record that we sent this server a UDP source query (`OP_GLOBGETSOURCES`
+    /// / `OP_GLOBGETSOURCES2`).
+    ///
+    /// Not a failure when nothing comes back: a server with no sources for a
+    /// file says nothing at all, so counting the silence shut healthy servers
+    /// out of source discovery after a few rare downloads. Whether a server is
+    /// alive is judged on its status pings instead (`record_udp_ping_sent`).
+    pub fn record_udp_query_sent(&mut self, ip: &str, port: u16) {
         if let Some(entry) = self
             .servers
             .iter_mut()
             .find(|s| s.ip == ip && s.port == port)
         {
-            entry.last_udp_ping_at = at;
+            entry.last_udp_query_at = chrono::Utc::now().timestamp();
+        }
+    }
+
+    /// Record a status ping sent at `at`, as eMule's `ServerStats` does. A
+    /// plain ping counts as unanswered until a reply clears it
+    /// (`record_udp_reply`). An obfuscated one is not counted: the server may
+    /// simply not take it, so a plain ping follows 20 s later if no answer
+    /// came.
+    pub fn record_udp_ping_sent(&mut self, ip: &str, port: u16, at: i64, obfuscated: bool) {
+        const CRYPT_PING_REPLY_WINDOW_SECS: i64 = 20;
+        if let Some(entry) = self
+            .servers
+            .iter_mut()
+            .find(|s| s.ip == ip && s.port == port)
+        {
+            if obfuscated {
+                entry.crypt_ping_pending = true;
+                entry.last_udp_ping_at = at
+                    - super::server_udp::STAT_REASK_INTERVAL_SECS
+                    + CRYPT_PING_REPLY_WINDOW_SECS;
+            } else {
+                entry.crypt_ping_pending = false;
+                entry.last_udp_ping_at = at;
+                entry.udp_consecutive_failures = entry.udp_consecutive_failures.saturating_add(1);
+            }
         }
     }
 
@@ -546,6 +771,7 @@ impl ServerList {
         {
             entry.udp_consecutive_failures = 0;
             entry.fail_count = 0;
+            entry.crypt_ping_pending = false;
             entry.last_udp_reply_at = chrono::Utc::now().timestamp();
         }
     }
@@ -638,11 +864,19 @@ impl ServerList {
             .find(|s| s.name.eq_ignore_ascii_case(EMULE_SUNRISE_NAME))
     }
 
-    /// Resolve auto-connect target: last successful server, else eMule Sunrise
-    /// from the current list.
+    /// Resolve auto-connect target: the last successful server; else the best
+    /// High-priority server; else eMule Sunrise from the current list.
+    ///
+    /// Priority means what it does in eMule, which picks the server to connect
+    /// to by it: High is tried first and Low never chosen for you. It does not
+    /// make Ember leave a server it is already trying to reach.
     pub fn resolve_auto_connect_target(data_dir: &Path, list: &Self) -> Option<(String, u16)> {
         let last_path = data_dir.join("last_ed2k_server.json");
-        if let Some(last) = LastEd2kServer::load(&last_path) {
+        // Only while it is still in the list: one the user removed, or that
+        // was pruned, is not somewhere to go back to.
+        if let Some(last) = LastEd2kServer::load(&last_path)
+            .filter(|last| list.find_by_addr(&last.ip, last.port).is_some())
+        {
             info!(
                 "Auto-connect target from last server: {}:{} ({})",
                 last.ip,
@@ -655,14 +889,30 @@ impl ServerList {
             );
             return Some((last.ip, last.port));
         }
-        if let Some(sunrise) = list.find_emule_sunrise() {
+        // The one most likely to answer: fewest failures, then most users.
+        let high = list
+            .servers
+            .iter()
+            .filter(|s| s.priority == ServerPriority::High)
+            .min_by_key(|s| (s.fail_count, std::cmp::Reverse(s.user_count)));
+        if let Some(server) = high {
+            info!(
+                "Auto-connect target from High priority: {} {}:{}",
+                server.name, server.ip, server.port
+            );
+            return Some((server.ip.clone(), server.port));
+        }
+        if let Some(sunrise) = list
+            .find_emule_sunrise()
+            .filter(|s| s.priority != ServerPriority::Low)
+        {
             info!(
                 "Auto-connect target fallback: {} {}:{}",
                 sunrise.name, sunrise.ip, sunrise.port
             );
             return Some((sunrise.ip.clone(), sunrise.port));
         }
-        warn!("No last eD2K server and eMule Sunrise not found in server list");
+        warn!("No last eD2K server, no High-priority server, and eMule Sunrise not usable");
         None
     }
 
@@ -684,10 +934,17 @@ impl ServerList {
             ));
         }
         let data = std::fs::read(path)?;
+        let list = Self::parse_server_met(&data)?;
+        info!("Loaded {} servers from server.met", list.len());
+        Ok(list)
+    }
+
+    /// Ember's own server.met, already read.
+    fn parse_server_met(data: &[u8]) -> io::Result<Self> {
         if data.len() < 5 {
             return Ok(Self::new());
         }
-        let mut cursor = Cursor::new(&data);
+        let mut cursor = Cursor::new(data);
         let version = cursor.read_u8()?;
         if version != 0x0E && version != 0xE0 {
             return Err(io::Error::new(
@@ -716,110 +973,25 @@ impl ServerList {
         let mut list = Self::new();
 
         for _ in 0..count {
-            let ip_raw = cursor.read_u32::<LittleEndian>()?;
-            let ip = std::net::Ipv4Addr::from(ip_raw.to_le_bytes());
-            let port = cursor.read_u16::<LittleEndian>()?;
-            let tag_count = cursor.read_u32::<LittleEndian>()? as usize;
-            if tag_count > 50 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "server.met entry for {ip}:{port} declares {tag_count} tags, exceeding cap of 50",
-                    ),
-                ));
-            }
-
-            let mut entry = ServerEntry::new(ip.to_string(), port);
-
-            for _ in 0..tag_count {
-                let tag_type = cursor.read_u8()?;
-                let name_len = cursor.read_u16::<LittleEndian>()? as usize;
-                // Cap before allocating: each `vec![0u8; len]` is sized from an
-                // unchecked u16 and allocated before the read can fail, so a
-                // crafted/hostile server.met could force multi-MB allocations.
-                if name_len > MAX_SERVER_TAG_NAME_LEN {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "server.met entry for {ip}:{port} tag name_len {name_len} exceeds cap"
-                        ),
-                    ));
-                }
-                let mut name = vec![0u8; name_len];
-                cursor.read_exact(&mut name)?;
-                let name_id = if name_len == 1 { name[0] } else { 0 };
-
-                match tag_type {
-                    0x02 => {
-                        let slen = cursor.read_u16::<LittleEndian>()? as usize;
-                        if slen > MAX_SERVER_TAG_STR_LEN {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("server.met entry for {ip}:{port} string tag len {slen} exceeds cap"),
-                            ));
-                        }
-                        let mut sbuf = vec![0u8; slen];
-                        cursor.read_exact(&mut sbuf)?;
-                        match name_id {
-                            0x01 => {
-                                entry.name = crate::security::sanitize_remote_text(
-                                    &String::from_utf8_lossy(&sbuf),
-                                    MAX_SERVER_TAG_STR_LEN,
-                                )
-                            }
-                            0x0B => {
-                                entry.description = crate::security::sanitize_remote_text(
-                                    &String::from_utf8_lossy(&sbuf),
-                                    MAX_SERVER_TAG_STR_LEN,
-                                )
-                            }
-                            _ => {}
-                        }
-                    }
-                    0x03 => {
-                        let v = cursor.read_u32::<LittleEndian>()?;
-                        apply_server_int_tag(&mut entry, name_id, v);
-                    }
-                    0x08 => {
-                        let v = cursor.read_u16::<LittleEndian>()?;
-                        apply_server_int_tag(&mut entry, name_id, v as u32);
-                    }
-                    0x09 => {
-                        let v = cursor.read_u8()?;
-                        apply_server_int_tag(&mut entry, name_id, v as u32);
-                    }
-                    // Unknown tag type: bail the whole load. The
-                    // tag's payload size depends on its type so we
-                    // can't safely skip past it — `break`-ing would
-                    // desync the cursor and parse the rest of the
-                    // file as nonsense entries (the previous bug).
-                    // Failing here keeps the on-disk file intact;
-                    // the caller falls back to the seed list.
-                    other => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "server.met entry for {ip}:{port} has unknown tag type 0x{other:02X}; refusing to continue (would desync parser)",
-                            ),
-                        ));
-                    }
-                }
-            }
-
+            // Structural damage fails the whole load: the caller keeps the
+            // file rather than saving a partial list over it.
+            let entry = read_met_entry(&mut cursor, MetSource::Own)?;
             list.add(entry);
         }
-
-        info!("Loaded {} servers from server.met", list.len());
         Ok(list)
     }
 
     /// Merge servers from raw server.met bytes without clearing existing list.
     /// If filter_by_ip is true and ip_filter is Some, servers are checked against the IP filter.
+    ///
+    /// `keep_file_priorities` is for the user's own eMule list; a downloaded
+    /// one's priorities are dropped, as eMule does.
     pub fn merge_from_bytes_filtered(
         &mut self,
         data: &[u8],
         filter_by_ip: bool,
         mut ip_filter: Option<&mut crate::network::kad::ip_filter::IpFilter>,
+        keep_file_priorities: bool,
     ) -> anyhow::Result<ServerMergeStats> {
         if data.len() < 5 {
             return Ok(ServerMergeStats::default());
@@ -843,151 +1015,29 @@ impl ServerList {
         let mut stats = ServerMergeStats::default();
 
         for _ in 0..count {
-            let ip_raw = match cursor.read_u32::<LittleEndian>() {
-                Ok(v) => v,
-                Err(_) => break,
-            };
-            let ip = Ipv4Addr::from(ip_raw.to_le_bytes());
-            let port = match cursor.read_u16::<LittleEndian>() {
-                Ok(v) => v,
-                Err(_) => break,
-            };
-            let tag_count = match cursor.read_u32::<LittleEndian>() {
-                Ok(v) => v as usize,
-                Err(_) => break,
-            };
-            if tag_count > 50 {
-                debug!(
-                    "server.met merge: entry {ip}:{port} declares {tag_count} tags (>50); aborting merge to avoid wasting memory or running into a hostile file",
-                );
-                break;
-            }
-
-            let mut entry = ServerEntry::new(ip.to_string(), port);
-
-            // `unknown_tag` flag: when set, we abort the merge of the
-            // *whole* file (not just this entry) because tag payload
-            // sizes are type-specific and we'd desync the cursor by
-            // continuing — the previous bug parsed every following
-            // record from the wrong offset.
-            // `unknown_tag` is also set on any short read — a
-            // truncated or hostile fragment otherwise leaves the
-            // cursor at an arbitrary position and subsequent reads
-            // interpret unrelated bytes as structure (silent
-            // corruption of merged entries). Mirrors the strict
-            // behavior of `load_server_met`.
-            let mut unknown_tag = false;
-            for _ in 0..tag_count {
-                let tag_type = match cursor.read_u8() {
-                    Ok(v) => v,
-                    Err(_) => {
-                        unknown_tag = true;
-                        break;
-                    }
-                };
-                let name_len = match cursor.read_u16::<LittleEndian>() {
-                    Ok(v) => v as usize,
-                    Err(_) => {
-                        unknown_tag = true;
-                        break;
-                    }
-                };
-                // Cap before allocating (see load_server_met): abort the merge
-                // rather than letting an unchecked u16 drive a huge allocation.
-                if name_len > MAX_SERVER_TAG_NAME_LEN {
-                    unknown_tag = true;
+            // A tag of a type with no known size, or a file that ends early,
+            // leaves nothing after it that can be found. Keep what was read
+            // and say the file was cut short.
+            let mut entry = match read_met_entry(&mut cursor, MetSource::Foreign) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    debug!("server.met merge stopped early: {e}");
+                    stats.truncated = true;
                     break;
                 }
-                let mut name = vec![0u8; name_len];
-                if cursor.read_exact(&mut name).is_err() {
-                    unknown_tag = true;
-                    break;
-                }
-                let name_id = if name_len == 1 { name[0] } else { 0 };
-
-                match tag_type {
-                    0x02 => {
-                        let slen = match cursor.read_u16::<LittleEndian>() {
-                            Ok(v) => v as usize,
-                            Err(_) => {
-                                unknown_tag = true;
-                                break;
-                            }
-                        };
-                        if slen > MAX_SERVER_TAG_STR_LEN {
-                            unknown_tag = true;
-                            break;
-                        }
-                        let mut sbuf = vec![0u8; slen];
-                        if cursor.read_exact(&mut sbuf).is_err() {
-                            unknown_tag = true;
-                            break;
-                        }
-                        match name_id {
-                            0x01 => {
-                                entry.name = crate::security::sanitize_remote_text(
-                                    &String::from_utf8_lossy(&sbuf),
-                                    MAX_SERVER_TAG_STR_LEN,
-                                )
-                            }
-                            0x0B => {
-                                entry.description = crate::security::sanitize_remote_text(
-                                    &String::from_utf8_lossy(&sbuf),
-                                    MAX_SERVER_TAG_STR_LEN,
-                                )
-                            }
-                            _ => {}
-                        }
-                    }
-                    0x03 => {
-                        let v = match cursor.read_u32::<LittleEndian>() {
-                            Ok(v) => v,
-                            Err(_) => {
-                                unknown_tag = true;
-                                break;
-                            }
-                        };
-                        apply_server_int_tag(&mut entry, name_id, v);
-                    }
-                    0x08 => {
-                        let v = match cursor.read_u16::<LittleEndian>() {
-                            Ok(v) => v,
-                            Err(_) => {
-                                unknown_tag = true;
-                                break;
-                            }
-                        };
-                        apply_server_int_tag(&mut entry, name_id, v as u32);
-                    }
-                    0x09 => {
-                        let v = match cursor.read_u8() {
-                            Ok(v) => v,
-                            Err(_) => {
-                                unknown_tag = true;
-                                break;
-                            }
-                        };
-                        apply_server_int_tag(&mut entry, name_id, v as u32);
-                    }
-                    other => {
-                        debug!(
-                            "server.met merge: unknown tag type 0x{other:02X} in entry {ip}:{port}; aborting merge to avoid cursor desync",
-                        );
-                        unknown_tag = true;
-                        break;
-                    }
-                }
-            }
-            if unknown_tag {
-                break;
-            }
+            };
 
             if let Some(existing) = self
                 .servers
                 .iter_mut()
                 .find(|s| s.ip == entry.ip && s.port == entry.port)
             {
-                if !entry.name.is_empty() {
+                // eMule takes the list's name for a server it already has. Not
+                // over a name the user gave a server of their own, though.
+                if !entry.name.is_empty()
+                    && (!existing.is_static
+                        || is_placeholder_server_name(&existing.name, &existing.ip))
+                {
                     existing.name = entry.name;
                 }
                 if !entry.description.is_empty() {
@@ -1011,28 +1061,43 @@ impl ServerList {
                 if entry.obfuscation_port_tcp > 0 {
                     existing.obfuscation_port_tcp = entry.obfuscation_port_tcp;
                 }
-                // Merge UDP-obfuscation state too: a fresh import (from
-                // another saved server.met or our own) can carry
-                // updated material we'd otherwise lose by ignoring
-                // these fields. We never overwrite a non-zero key with
-                // 0 (so importing an old eMule-format file doesn't
-                // wipe what we already learned).
+                // Merge UDP-obfuscation state too: a fresh import can carry
+                // material we'd otherwise lose by ignoring these fields. Not
+                // the key: one from another client's file was issued to that
+                // client, and ours comes with the next status reply.
                 if entry.obfuscation_port_udp > 0 {
                     existing.obfuscation_port_udp = entry.obfuscation_port_udp;
-                }
-                if entry.server_udp_key != 0 {
-                    existing.server_udp_key = entry.server_udp_key;
-                }
-                if entry.server_udp_key_ip != 0 {
-                    existing.server_udp_key_ip = entry.server_udp_key_ip;
                 }
                 if entry.udp_flags != 0 {
                     existing.udp_flags = entry.udp_flags;
                 }
-                if entry.priority != ServerPriority::Normal {
+                // The priority on an existing server is the user's. An import
+                // of their own eMule list may fill in one they never set.
+                if keep_file_priorities
+                    && existing.priority == ServerPriority::Normal
+                    && entry.priority != ServerPriority::Normal
+                {
                     existing.priority = entry.priority;
                 }
                 stats.updated += 1;
+                continue;
+            }
+
+            // eMule drops the priority a downloaded list sets: providers have
+            // shipped dead servers marked High.
+            if !keep_file_priorities {
+                entry.priority = ServerPriority::Normal;
+            }
+
+            // Nothing Ember will dial: connecting refuses these addresses, so
+            // the row could only sit in the list and be pinged over the LAN.
+            let unroutable = entry.port == 0
+                || entry
+                    .ip
+                    .parse::<Ipv4Addr>()
+                    .map_or(true, crate::security::is_special_use_v4);
+            if unroutable {
+                stats.filtered += 1;
                 continue;
             }
 
@@ -1155,39 +1220,63 @@ impl ServerList {
             .iter_mut()
             .find(|s| s.ip == ip && s.port == port)
         {
-            if let Some(public_ip) = public_ip {
-                let public_ip_u32 = u32::from(public_ip);
-                if entry.server_udp_key_ip != 0 && entry.server_udp_key_ip != public_ip_u32 {
-                    entry.server_udp_key = 0;
-                    tracing::info!(
-                        "Discarded stale UDP obfuscation key for server {ip}:{port} after public IP changed",
-                    );
-                }
-                entry.server_udp_key_ip = public_ip_u32;
-            }
+            let current = public_ip.map(met_ip_u32).unwrap_or(0);
             if obfuscation_port_udp != 0 {
                 entry.obfuscation_port_udp = obfuscation_port_udp;
             }
-            if server_udp_key != 0 && entry.server_udp_key != server_udp_key {
-                tracing::info!(
-                    "Learned UDP obfuscation key for server {ip}:{port} (key={server_udp_key:#x}, obf_port={obfuscation_port_udp})",
-                );
-                entry.server_udp_key = server_udp_key;
-                if let Some(public_ip) = public_ip {
-                    entry.server_udp_key_ip = u32::from(public_ip);
+            if server_udp_key != 0 {
+                if entry.server_udp_key != server_udp_key {
+                    tracing::info!(
+                        "Learned UDP obfuscation key for server {ip}:{port} (key={server_udp_key:#x}, obf_port={obfuscation_port_udp})",
+                    );
                 }
+                // Issued for the address the server saw us at, which is our
+                // current one. Unknown yet, it is stamped once it is known.
+                entry.server_udp_key = server_udp_key;
+                entry.parked_udp_key = 0;
+                entry.server_udp_key_ip = current;
+            } else if current != 0
+                && entry.server_udp_key != 0
+                && entry.server_udp_key_ip != 0
+                && entry.server_udp_key_ip != current
+            {
+                entry.server_udp_key = 0;
+                tracing::info!(
+                    "Discarded stale UDP obfuscation key for server {ip}:{port} after public IP changed",
+                );
             }
         }
     }
 
+    /// Our public address is now `public_ip`. A key is bound to the address it
+    /// was issued for (eMule's `GetServerKeyUDP`): one for another address is
+    /// dropped, and while ours is unknown none is used, but kept for when it
+    /// is known again. Keys read from disk wait here for that check.
     pub fn invalidate_udp_keys_for_public_ip(&mut self, public_ip: Option<Ipv4Addr>) {
         let Some(public_ip) = public_ip else {
+            for entry in &mut self.servers {
+                if entry.server_udp_key != 0 {
+                    entry.parked_udp_key = entry.server_udp_key;
+                    entry.server_udp_key = 0;
+                }
+            }
             return;
         };
-        let public_ip_u32 = u32::from(public_ip);
+        let current = met_ip_u32(public_ip);
         for entry in &mut self.servers {
-            if entry.server_udp_key != 0 && entry.server_udp_key_ip != public_ip_u32 {
-                entry.server_udp_key = 0;
+            if entry.parked_udp_key != 0 {
+                if entry.server_udp_key_ip == current {
+                    entry.server_udp_key = entry.parked_udp_key;
+                }
+                entry.parked_udp_key = 0;
+            }
+            if entry.server_udp_key != 0 {
+                if entry.server_udp_key_ip == 0 {
+                    // Learned this session while the address was unknown.
+                    entry.server_udp_key_ip = current;
+                } else if entry.server_udp_key_ip != current {
+                    entry.server_udp_key = 0;
+                }
             }
         }
     }
@@ -1246,17 +1335,20 @@ impl ServerList {
             .iter_mut()
             .find(|s| s.ip == ip && s.port == port)
         {
-            let existing = entry.name.trim();
-            let existing_is_ip_like =
-                existing.parse::<Ipv4Addr>().is_ok() || existing.eq_ignore_ascii_case(&entry.ip);
-            if existing.is_empty() || existing_is_ip_like {
-                if existing != trimmed {
-                    entry.name = trimmed.to_string();
-                    return true;
-                }
+            if is_placeholder_server_name(&entry.name, &entry.ip) && entry.name.trim() != trimmed
+            {
+                entry.name = trimmed.to_string();
+                return true;
             }
         }
         false
+    }
+
+    /// Whether this server still goes by a placeholder (blank, or its own
+    /// address) and so would take a name if it told us one.
+    pub fn has_placeholder_name(&self, ip: &str, port: u16) -> bool {
+        self.find_by_addr(ip, port)
+            .is_some_and(|s| is_placeholder_server_name(&s.name, &s.ip))
     }
 
     /// Serialize the server list to server.met bytes (no disk I/O).
@@ -1297,21 +1389,20 @@ impl ServerList {
                 tag_count += 1;
             }
 
-            // CT_FAILCOUNT (0x0D / 0x85) - uint32
+            // ST_FAIL (0x0D) - uint32. Older Ember files used 0x85, which is
+            // eMule's ST_DYNIP; the reader still accepts an integer there.
             if entry.fail_count > 0 {
-                write_met_uint32_tag(&mut tag_buf, 0x85, entry.fail_count);
+                write_met_uint32_tag(&mut tag_buf, 0x0D, entry.fail_count);
                 tag_count += 1;
             }
 
-            // CT_USERS (0x83) - uint32
+            // "users" and "files" - uint32, named in full as eMule writes them.
             if entry.user_count > 0 {
-                write_met_uint32_tag(&mut tag_buf, 0x83, entry.user_count);
+                write_met_named_uint32_tag(&mut tag_buf, "users", entry.user_count);
                 tag_count += 1;
             }
-
-            // CT_FILES (0x84) - uint32
             if entry.file_count > 0 {
-                write_met_uint32_tag(&mut tag_buf, 0x84, entry.file_count);
+                write_met_named_uint32_tag(&mut tag_buf, "files", entry.file_count);
                 tag_count += 1;
             }
 
@@ -1369,12 +1460,27 @@ impl ServerList {
                 tag_count += 1;
             }
 
-            // ST_UDPKEY (0x95) and ST_UDPKEYIP (0x96) - uint32
-            if entry.server_udp_key != 0 {
-                write_met_uint32_tag(&mut tag_buf, ST_UDPKEY, entry.server_udp_key);
+            // ST_UDPKEY (0x95) and ST_UDPKEYIP (0x96) - uint32. A parked key
+            // is still the server's, and is written so it is not lost.
+            let udp_key = if entry.server_udp_key != 0 {
+                entry.server_udp_key
+            } else {
+                entry.parked_udp_key
+            };
+            if udp_key != 0 {
+                write_met_uint32_tag(&mut tag_buf, ST_UDPKEY, udp_key);
                 tag_count += 1;
                 if entry.server_udp_key_ip != 0 {
                     write_met_uint32_tag(&mut tag_buf, ST_UDPKEYIP, entry.server_udp_key_ip);
+                    tag_count += 1;
+                }
+            }
+
+            // ST_LASTPING (0x90) - uint32 Unix time, as eMule writes it.
+            if entry.last_udp_ping_at > 0 {
+                let wall = ping_time_to_wall(entry.last_udp_ping_at);
+                if let Ok(wall) = u32::try_from(wall) {
+                    write_met_uint32_tag(&mut tag_buf, ST_LASTPING, wall);
                     tag_count += 1;
                 }
             }
@@ -1426,14 +1532,26 @@ impl ServerList {
     }
 }
 
+/// A string tag the reader takes back unchanged: within its byte cap, and
+/// marked as UTF-8 when it is not plain ASCII, so eMule reads it as UTF-8 too
+/// rather than in its local code page.
 fn write_met_string_tag(buf: &mut Vec<u8>, tag_id: u8, value: &str) {
+    const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
     buf.push(0x02); // TAGTYPE_STRING
     buf.extend_from_slice(&1u16.to_le_bytes()); // name length = 1
     buf.push(tag_id);
-    let bytes = value.as_bytes();
-    let clamped = &bytes[..bytes.len().min(u16::MAX as usize)];
-    buf.extend_from_slice(&(clamped.len() as u16).to_le_bytes());
-    buf.extend_from_slice(clamped);
+    let text = truncate_to_bytes(value, MAX_SERVER_TAG_STR_LEN - BOM.len());
+    let bom: &[u8] = if text.is_ascii() { &[] } else { &BOM };
+    buf.extend_from_slice(&((bom.len() + text.len()) as u16).to_le_bytes());
+    buf.extend_from_slice(bom);
+    buf.extend_from_slice(text.as_bytes());
+}
+
+fn write_met_named_uint32_tag(buf: &mut Vec<u8>, name: &str, value: u32) {
+    buf.push(0x03); // TAGTYPE_UINT32
+    buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    buf.extend_from_slice(name.as_bytes());
+    buf.extend_from_slice(&value.to_le_bytes());
 }
 
 fn write_met_uint32_tag(buf: &mut Vec<u8>, tag_id: u8, value: u32) {
@@ -1477,6 +1595,41 @@ mod tests {
     }
 
     #[test]
+    fn a_server_named_by_its_ip_takes_the_name_it_announces() {
+        let mut list = ServerList::new();
+        for (ip, port, name) in [
+            ("3.3.3.3", 4661, "3.3.3.3"),
+            ("4.4.4.4", 4661, "4.4.4.4:4661"),
+            ("5.5.5.5", 4661, ""),
+        ] {
+            list.add(ServerEntry {
+                ip: ip.to_string(),
+                port,
+                name: name.to_string(),
+                ..ServerEntry::new(String::new(), 0)
+            });
+            assert!(
+                list.update_server_name_from_ident(ip, port, "Real Server"),
+                "{name:?} is a placeholder"
+            );
+            assert_eq!(list.find_by_addr(ip, port).unwrap().name, "Real Server");
+        }
+    }
+
+    #[test]
+    fn a_name_somebody_chose_is_not_overwritten_by_the_ident() {
+        let mut list = ServerList::new();
+        list.add(ServerEntry {
+            ip: "6.6.6.6".to_string(),
+            port: 4661,
+            name: "My Server".to_string(),
+            ..ServerEntry::new(String::new(), 0)
+        });
+        assert!(!list.update_server_name_from_ident("6.6.6.6", 4661, "Announced"));
+        assert_eq!(list.find_by_addr("6.6.6.6", 4661).unwrap().name, "My Server");
+    }
+
+    #[test]
     fn find_emule_sunrise_prefers_known_addr_then_name() {
         let mut list = ServerList::new();
         list.add(ServerEntry {
@@ -1507,7 +1660,7 @@ mod tests {
                 .expect("fixture has the High server")
                 .last_failed_at
         };
-        list.record_failure("1.1.1.1", 1000);
+        list.record_failure("1.1.1.1", 1000, false);
         assert!(failed_at(&list) > 0, "a failed login starts the cooldown");
 
         list.clear_connect_cooldowns();
@@ -1576,5 +1729,306 @@ mod tests {
         let outcome =
             list.add_filtered(ServerEntry::new("192.168.1.10".into(), 4661), true, &mut filter);
         assert!(matches!(outcome, AddServerOutcome::Added));
+    }
+
+    /// A server.met with `entries`, each `(ip octets, port, tag count, tags)`.
+    fn met_file(entries: &[([u8; 4], u16, u32, Vec<u8>)]) -> Vec<u8> {
+        let mut buf = vec![0xE0];
+        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (octets, port, tag_count, tags) in entries {
+            buf.extend_from_slice(octets);
+            buf.extend_from_slice(&port.to_le_bytes());
+            buf.extend_from_slice(&tag_count.to_le_bytes());
+            buf.extend_from_slice(tags);
+        }
+        buf
+    }
+
+    fn string_tag(id: u8, value: &[u8]) -> Vec<u8> {
+        let mut tag = vec![0x02, 1, 0, id];
+        tag.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        tag.extend_from_slice(value);
+        tag
+    }
+
+    fn int_tag(id: u8, value: u32) -> Vec<u8> {
+        let mut tag = vec![0x03, 1, 0, id];
+        tag.extend_from_slice(&value.to_le_bytes());
+        tag
+    }
+
+    /// The reader capped strings at 4096 bytes and the writer did not, so a
+    /// long description saved once made the next launch refuse the file.
+    #[test]
+    fn ember_reads_back_every_server_met_it_writes() {
+        let mut list = ServerList::new();
+        let mut entry = ServerEntry::new("8.8.4.4".into(), 4661);
+        entry.name = "Ünïcode Server".into();
+        entry.description = "é".repeat(MAX_SERVER_TAG_STR_LEN);
+        entry.user_count = 5;
+        entry.file_count = 6;
+        entry.fail_count = 2;
+        entry.priority = ServerPriority::Low;
+        entry.is_static = true;
+        list.add(entry);
+
+        let bytes = list.to_server_met_bytes().unwrap();
+        let back = ServerList::parse_server_met(&bytes).expect("Ember reads what it writes");
+        let entry = back.find_by_addr("8.8.4.4", 4661).unwrap();
+        assert_eq!(entry.name, "Ünïcode Server");
+        assert!(entry.description.len() <= MAX_SERVER_TAG_STR_LEN);
+        assert!(!entry.description.is_empty() && entry.description.chars().all(|c| c == 'é'));
+        assert_eq!((entry.user_count, entry.file_count, entry.fail_count), (5, 6, 2));
+        assert_eq!(entry.priority, ServerPriority::Low);
+        assert!(entry.is_static);
+    }
+
+    /// A description of bytes that are not UTF-8 grew past the cap once
+    /// decoded. Whatever a merged file holds, the next save still loads.
+    #[test]
+    fn a_merged_list_of_odd_bytes_still_saves_a_loadable_file() {
+        // Latin-1 'é' bytes: each one doubles once decoded.
+        let file = met_file(&[([8, 8, 8, 8], 4661, 1, string_tag(0x0B, &[0xE9; 4096]))]);
+        let mut list = ServerList::new();
+        list.merge_from_bytes_filtered(&file, false, None, false).unwrap();
+        let bytes = list.to_server_met_bytes().unwrap();
+        assert!(ServerList::parse_server_met(&bytes).is_ok());
+    }
+
+    /// The tags eMule writes: names with a byte-order mark, strings in its
+    /// local code page, the counts named in full, and types Ember stores
+    /// nothing from.
+    #[test]
+    fn an_emule_server_met_is_read_as_emule_writes_it() {
+        let mut tags = Vec::new();
+        tags.extend(string_tag(0x01, b"\xEF\xBB\xBFCaf\xC3\xA9"));
+        tags.extend(string_tag(0x0B, b"Caf\xE9"));
+        for (name, value) in [("users", 1000u32), ("files", 2000)] {
+            tags.extend_from_slice(&[0x03, name.len() as u8, 0]);
+            tags.extend_from_slice(name.as_bytes());
+            tags.extend_from_slice(&value.to_le_bytes());
+        }
+        tags.extend_from_slice(&[0x04, 1, 0, 0x99, 0, 0, 0x80, 0x3F]); // a float
+        tags.extend_from_slice(&[0x07, 1, 0, 0x9A, 3, 0, 0, 0, 1, 2, 3]); // a blob
+        tags.extend(int_tag(0x8A, 1)); // Ember's static flag, from no Ember
+        tags.extend(int_tag(0x0E, 1)); // High
+        let file = met_file(&[
+            ([8, 8, 8, 8], 4661, 8, tags),
+            ([192, 168, 1, 1], 4661, 0, Vec::new()),
+        ]);
+
+        let mut list = ServerList::new();
+        let stats = list.merge_from_bytes_filtered(&file, false, None, false).unwrap();
+        assert_eq!((stats.added, stats.filtered, stats.truncated), (1, 1, false));
+        let entry = list.find_by_addr("8.8.8.8", 4661).unwrap();
+        assert_eq!(entry.name, "Café");
+        assert_eq!(entry.description, "Café");
+        assert_eq!((entry.user_count, entry.file_count), (1000, 2000));
+        assert!(!entry.is_static, "a downloaded list cannot make a server static");
+        assert_eq!(entry.priority, ServerPriority::Normal, "a downloaded list's priority is dropped");
+        assert!(list.find_by_addr("192.168.1.1", 4661).is_none(), "a LAN address is not merged");
+    }
+
+    #[test]
+    fn a_merge_keeps_what_the_user_set() {
+        let mut list = ServerList::new();
+        list.add(ServerEntry {
+            ip: "1.1.1.1".into(),
+            port: 4661,
+            name: "Home".into(),
+            priority: ServerPriority::Low,
+            is_static: true,
+            ..ServerEntry::new(String::new(), 0)
+        });
+        list.add(ServerEntry {
+            ip: "2.2.2.2".into(),
+            port: 4661,
+            name: "Old".into(),
+            priority: ServerPriority::High,
+            ..ServerEntry::new(String::new(), 0)
+        });
+        let mut theirs = string_tag(0x01, b"Theirs");
+        theirs.extend(int_tag(0x0E, 1));
+        let mut renamed = string_tag(0x01, b"New");
+        renamed.extend(int_tag(0x0E, 2));
+        let file = met_file(&[([1, 1, 1, 1], 4661, 2, theirs), ([2, 2, 2, 2], 4661, 2, renamed)]);
+
+        list.merge_from_bytes_filtered(&file, false, None, false).unwrap();
+        let home = list.find_by_addr("1.1.1.1", 4661).unwrap();
+        assert_eq!((home.name.as_str(), home.priority), ("Home", ServerPriority::Low));
+        let other = list.find_by_addr("2.2.2.2", 4661).unwrap();
+        assert_eq!(other.name, "New", "a server from a list takes the list's name, as in eMule");
+        assert_eq!(other.priority, ServerPriority::High);
+    }
+
+    #[test]
+    fn a_merge_that_runs_into_damage_says_so() {
+        let file = met_file(&[
+            ([8, 8, 8, 8], 4661, 0, Vec::new()),
+            ([9, 9, 9, 9], 4661, 1, vec![0x55, 1, 0, 0x01]),
+        ]);
+        let mut list = ServerList::new();
+        let stats = list.merge_from_bytes_filtered(&file, false, None, false).unwrap();
+        assert_eq!((stats.added, stats.truncated), (1, true));
+    }
+
+    /// Only the server that failed is judged, and not the one auto-reconnect
+    /// is still trying to reach.
+    #[test]
+    fn a_failure_removes_only_the_server_that_failed() {
+        let mut list = ServerList::new();
+        for (ip, fails) in [("1.1.1.1", 15), ("2.2.2.2", 9), ("3.3.3.3", 9)] {
+            list.add(ServerEntry {
+                ip: ip.into(),
+                port: 4661,
+                fail_count: fails,
+                ..ServerEntry::new(String::new(), 0)
+            });
+        }
+        list.record_failure("2.2.2.2", 4661, false);
+        assert!(list.find_by_addr("2.2.2.2", 4661).is_none());
+        assert!(list.find_by_addr("1.1.1.1", 4661).is_some(), "an imported count is not ours");
+        list.record_failure("3.3.3.3", 4661, true);
+        assert_eq!(list.find_by_addr("3.3.3.3", 4661).unwrap().fail_count, 10);
+    }
+
+    /// eMule's `GetServerKeyUDP`: a key is used only on the address it was
+    /// issued for.
+    #[test]
+    fn a_saved_udp_key_waits_for_our_address_to_match() {
+        let ours = Ipv4Addr::new(1, 2, 3, 4);
+        let mut list = ServerList::new();
+        list.add(ServerEntry {
+            ip: "8.8.8.8".into(),
+            port: 4661,
+            server_udp_key: 0xABCD,
+            server_udp_key_ip: met_ip_u32(ours),
+            ..ServerEntry::new(String::new(), 0)
+        });
+        let key = |list: &ServerList| list.find_by_addr("8.8.8.8", 4661).unwrap().server_udp_key;
+
+        let mut loaded = ServerList::parse_server_met(&list.to_server_met_bytes().unwrap()).unwrap();
+        assert_eq!(key(&loaded), 0, "not used before our address is known");
+        loaded.invalidate_udp_keys_for_public_ip(Some(ours));
+        assert_eq!(key(&loaded), 0xABCD);
+        loaded.invalidate_udp_keys_for_public_ip(None);
+        assert_eq!(key(&loaded), 0, "not used while our address is unknown");
+        loaded.invalidate_udp_keys_for_public_ip(Some(ours));
+        assert_eq!(key(&loaded), 0xABCD, "and back once it is known again");
+
+        let mut moved = ServerList::parse_server_met(&list.to_server_met_bytes().unwrap()).unwrap();
+        moved.invalidate_udp_keys_for_public_ip(Some(Ipv4Addr::new(5, 6, 7, 8)));
+        assert_eq!(key(&moved), 0, "a key for another address is dropped");
+    }
+
+    /// An unanswered obfuscated ping is followed by a plain one 20 s later
+    /// and not counted; plain pings count until a reply.
+    #[test]
+    fn status_pings_are_counted_as_emule_counts_them() {
+        let mut list = ServerList::new();
+        list.add(ServerEntry::new("8.8.8.8".into(), 4661));
+        let entry = |list: &ServerList| list.find_by_addr("8.8.8.8", 4661).unwrap().clone();
+        let now = 1_000_000;
+
+        list.record_udp_ping_sent("8.8.8.8", 4661, now, true);
+        let e = entry(&list);
+        assert!(e.crypt_ping_pending);
+        assert_eq!(e.udp_consecutive_failures, 0);
+        assert!(!super::super::server_udp::status_ping_due(&e, now + 19));
+        assert!(super::super::server_udp::status_ping_due(&e, now + 20));
+
+        list.record_udp_ping_sent("8.8.8.8", 4661, now + 20, false);
+        let e = entry(&list);
+        assert!(!e.crypt_ping_pending);
+        assert_eq!(e.udp_consecutive_failures, 1);
+
+        list.record_udp_reply("8.8.8.8", 4661);
+        assert_eq!(entry(&list).udp_consecutive_failures, 0);
+    }
+
+    /// A last server the user removed, or that was pruned, is not dialed at
+    /// the next launch.
+    #[test]
+    fn auto_connect_skips_a_last_server_no_longer_in_the_list() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-last-server-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        LastEd2kServer { ip: "9.9.9.9".into(), port: 4661, name: String::new() }
+            .save(&dir.join("last_ed2k_server.json"))
+            .unwrap();
+
+        let mut list = ServerList::new();
+        assert_eq!(ServerList::resolve_auto_connect_target(&dir, &list), None);
+        list.add(ServerEntry::new("9.9.9.9".into(), 4661));
+        assert_eq!(
+            ServerList::resolve_auto_connect_target(&dir, &list),
+            Some(("9.9.9.9".to_string(), 4661))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With no last server, High is tried first and Low never chosen.
+    #[test]
+    fn auto_connect_picks_by_priority_without_a_last_server() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-no-last-server-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let target = |list: &ServerList| ServerList::resolve_auto_connect_target(&dir, list);
+        let server = |ip: &str, port: u16, priority, fail_count, user_count| ServerEntry {
+            ip: ip.into(),
+            port,
+            priority,
+            fail_count,
+            user_count,
+            ..ServerEntry::new(String::new(), 0)
+        };
+
+        let mut list = ServerList::new();
+        list.add(server(EMULE_SUNRISE_IP, EMULE_SUNRISE_PORT, ServerPriority::Normal, 0, 0));
+        assert_eq!(target(&list), Some((EMULE_SUNRISE_IP.to_string(), EMULE_SUNRISE_PORT)));
+
+        list.add(server("1.1.1.1", 4661, ServerPriority::High, 3, 900));
+        list.add(server("2.2.2.2", 4661, ServerPriority::High, 0, 100));
+        list.add(server("3.3.3.3", 4661, ServerPriority::High, 0, 500));
+        assert_eq!(target(&list), Some(("3.3.3.3".to_string(), 4661)));
+
+        let mut low_only = ServerList::new();
+        low_only.add(server(EMULE_SUNRISE_IP, EMULE_SUNRISE_PORT, ServerPriority::Low, 0, 0));
+        assert_eq!(target(&low_only), None, "Low is never picked for the user");
+    }
+
+    /// A restart does not re-ping a server whose 4.5 h interval is still
+    /// running, and a time from another client's file does not hold ours.
+    #[test]
+    fn ping_times_survive_a_restart_of_ember_only() {
+        let now = crate::network::monotonic_secs();
+        let mut list = ServerList::new();
+        list.add(ServerEntry {
+            ip: "8.8.8.8".into(),
+            port: 4661,
+            last_udp_ping_at: now - 100,
+            ..ServerEntry::new(String::new(), 0)
+        });
+        list.add(ServerEntry {
+            ip: "9.9.9.9".into(),
+            port: 4661,
+            last_udp_ping_at: now - super::super::server_udp::STAT_REASK_INTERVAL_SECS - 10,
+            ..ServerEntry::new(String::new(), 0)
+        });
+        let bytes = list.to_server_met_bytes().unwrap();
+
+        let back = ServerList::parse_server_met(&bytes).unwrap();
+        let recent = back.find_by_addr("8.8.8.8", 4661).unwrap().last_udp_ping_at;
+        assert!((recent - (now - 100)).abs() <= 2, "kept: {recent} vs {}", now - 100);
+        assert_eq!(back.find_by_addr("9.9.9.9", 4661).unwrap().last_udp_ping_at, 0, "already due");
+
+        let mut merged = ServerList::new();
+        merged.merge_from_bytes_filtered(&bytes, false, None, false).unwrap();
+        assert_eq!(merged.find_by_addr("8.8.8.8", 4661).unwrap().last_udp_ping_at, 0);
     }
 }

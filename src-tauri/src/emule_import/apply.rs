@@ -364,7 +364,8 @@ fn apply_server_met(data_dir: &Path, pending: &Path) -> anyhow::Result<u64> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => ServerList::new(),
         Err(e) => anyhow::bail!("Ember's server.met could not be read, so it was left as it is: {e}"),
     };
-    let stats = list.merge_from_bytes_filtered(&std::fs::read(pending.join("server.met"))?, false, None)?;
+    // The user's own list, so the priorities they set in eMule come along.
+    let stats = list.merge_from_bytes_filtered(&std::fs::read(pending.join("server.met"))?, false, None, true)?;
     if stats.added + stats.updated + stats.filtered + stats.at_capacity == 0 {
         anyhow::bail!("eMule's server.met has no servers Ember can read");
     }

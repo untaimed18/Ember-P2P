@@ -805,16 +805,12 @@ fn advertised_tcp_port_prefers_the_stun_remap_once_the_server_says_lowid() {
 }
 
 #[test]
-fn login_tcp_port_is_captured_before_session_reset_clears_low_id() {
-    let mut low_id = true;
-    let port = capture_advertised_tcp_port_then_reset_low_id(
-        Some(4662),
-        Some(51234),
-        4662,
-        &mut low_id,
-    );
-    assert_eq!(port, 51234);
-    assert!(!low_id);
+fn login_tcp_port_remembers_a_lowid_past_session_reset() {
+    // The session that ended was LowID; teardown has cleared `low_id`.
+    assert_eq!(login_tcp_port_from(Some(4662), Some(51234), 4662, false, true), 51234);
+    assert_eq!(login_tcp_port_from(Some(4662), Some(51234), 4662, true, false), 51234);
+    // A HighID session proved the forward works.
+    assert_eq!(login_tcp_port_from(Some(4662), Some(51234), 4662, false, false), 4662);
 }
 
 #[test]

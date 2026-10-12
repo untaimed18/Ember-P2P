@@ -6219,6 +6219,12 @@
     overflow-y: auto;
   }
 
+  /* The shared `textarea:focus` rule draws a ring around the field, which
+     inside the pill reads as a square box. The composer shows focus. */
+  .conv-input:focus {
+    box-shadow: none;
+  }
+
   /* Rooms have no attach button, so the text needs its own inset. */
   .conv-composer > .conv-input:first-child {
     padding-inline-start: 12px;

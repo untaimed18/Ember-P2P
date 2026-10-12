@@ -743,10 +743,20 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         met_path
                     );
                 } else {
-                    warn!(
-                        "Failed to load persisted server.met from {:?}: {} — will download community list after event loop starts if empty",
-                        met_path, e
-                    );
+                    // The bootstrap below saves the community list over this
+                    // path. Set the user's file aside first, so a list that
+                    // will not load is kept rather than replaced.
+                    let kept = data_dir.join("server.met.bad");
+                    match std::fs::rename(&met_path, &kept) {
+                        Ok(()) => warn!(
+                            "Failed to load persisted server.met from {:?}: {} — kept it as {:?}; will download community list after event loop starts",
+                            met_path, e, kept
+                        ),
+                        Err(rename_err) => warn!(
+                            "Failed to load persisted server.met from {:?}: {} — and could not set it aside ({}); will download community list after event loop starts",
+                            met_path, e, rename_err
+                        ),
+                    }
                 }
                 ServerList::new()
             }
@@ -961,6 +971,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         server_auto_reconnect: false,
         server_reconnect_failures: 0,
         server_reconnect_network_down: false,
+        server_last_attempt_failed: false,
+        last_server_session_low_id: false,
         preferred_ed2k_server: None,
         server_last_connect_attempt: None,
         pending_uss_pings: HashMap::new(),
@@ -2804,7 +2816,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             } else {
                 match target {
                     Some((server_ip, server_port)) => {
-                        initiate_server_connect(
+                        let target = format!("{server_ip}:{server_port}");
+                        let started = initiate_server_connect(
                             &mut state,
                             &settings,
                             &app_handle,
@@ -2813,6 +2826,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             server_port,
                         )
                         .await;
+                        if !started {
+                            emit_server_auto_connect_failed(
+                                &app_handle,
+                                &format!("{target} can no longer be connected to"),
+                            );
+                        }
                     }
                     None => {
                         emit_server_auto_connect_failed(
@@ -2948,6 +2967,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             &data,
                             settings.filter_servers_by_ip,
                             Some(&mut state.ip_filter),
+                            false,
                         ) {
                             Ok(stats) => {
                                 info!(

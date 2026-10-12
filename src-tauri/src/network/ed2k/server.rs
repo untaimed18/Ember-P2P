@@ -130,6 +130,19 @@ pub fn related_search_supported() -> bool {
     RELATED_SEARCH_SUPPORTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether we are logged in to a server, for the upload side, which shares the
+/// server's address before login so it can recognise the server's port test.
+/// Our Hello names the server we are on, and until login that is none.
+static SERVER_SESSION_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_server_session_up(up: bool) {
+    SERVER_SESSION_UP.store(up, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn server_session_up() -> bool {
+    SERVER_SESSION_UP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A file to offer to the ed2k server via OP_OFFERFILES.
 pub struct OfferFile {
     pub hash: [u8; 16],
@@ -439,7 +452,15 @@ impl Ed2kServerConnection {
                     }
                 }
                 OP_IDCHANGE => {
-                    if payload.len() >= 4 {
+                    // No client ID, no session: taken as one, it read as a
+                    // HighID of 0 and offered our files under it.
+                    if payload.len() < 4 {
+                        return Err(anyhow::anyhow!(
+                            "server sent an ID change without an ID ({} bytes)",
+                            payload.len()
+                        ));
+                    }
+                    {
                         session.client_id =
                             u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
                         if session.client_id == 0 {
@@ -1224,7 +1245,17 @@ fn parse_server_ident_name(payload: &[u8]) -> Option<String> {
     }
     let tag_count =
         u32::from_le_bytes([payload[22], payload[23], payload[24], payload[25]]) as usize;
-    let mut offset = 26;
+    server_name_from_tags(payload, 26, tag_count)
+}
+
+/// The `ST_SERVERNAME` string out of `tag_count` tags starting at `offset`.
+/// Shared by the TCP `OP_SERVERIDENT` and the UDP `OP_SERVER_DESC_RES`, which
+/// carry the same tag list behind different headers.
+pub(super) fn server_name_from_tags(
+    payload: &[u8],
+    mut offset: usize,
+    tag_count: usize,
+) -> Option<String> {
     for _ in 0..tag_count.min(32) {
         if offset >= payload.len() {
             break;

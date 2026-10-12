@@ -878,17 +878,16 @@ pub(super) async fn send_kad_callback_req(
 
 pub(super) const MAX_FAIL_COUNT_FOR_UDP: u32 = 3;
 
-/// Maximum number of UDP source-discovery queries we'll send to a
-/// single server with no inbound UDP reply before treating it as
-/// dead-for-UDP and skipping it. Distinct from [`MAX_FAIL_COUNT_FOR_UDP`]
-/// (which counts TCP connect failures); a server can be perfectly
-/// healthy on TCP and still completely silent on UDP because its
-/// admin firewalled the UDP port, it doesn't index our specific file
-/// hashes, or it requires UDP obfuscation we never negotiated.
+/// Unanswered status pings in a row before a server is treated as
+/// dead-for-UDP and left out of source queries. Distinct from
+/// [`MAX_FAIL_COUNT_FOR_UDP`] (which counts TCP connect failures); a server
+/// can be perfectly healthy on TCP and still completely silent on UDP because
+/// its admin firewalled the UDP port.
 ///
-/// Re-eligible the moment any inbound UDP reply arrives — the recv
-/// path resets the per-server counter via `record_udp_reply`.
-pub(super) const MAX_UDP_CONSECUTIVE_FAILURES: u32 = 5;
+/// Pings keep going out while it is excluded, and the first verified reply
+/// makes it eligible again (`record_udp_reply`). eMule excludes a server
+/// after one unanswered ping; two lets a single lost datagram pass.
+pub(super) const MAX_UDP_CONSECUTIVE_FAILURES: u32 = 2;
 pub(super) const SERVER_UDP_SOURCE_REASK_SECS: i64 = 30 * 60;
 pub(super) const SERVER_UDP_SOURCE_REPLY_TTL_SECS: i64 = 120;
 

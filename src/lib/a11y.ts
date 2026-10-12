@@ -102,6 +102,32 @@ export function menuKeydown(e: KeyboardEvent, container: HTMLElement | null | un
 }
 
 /**
+ * Swallow the native `contextmenu` that follows a Menu key or Shift+F10 the
+ * page has already answered with its own menu. Call from that `keydown`
+ * handler.
+ *
+ * Windows raises it as the key comes back up, and cancelling the keydown does
+ * not stop it. By then focus is in the menu just opened, so the event lands
+ * there: WebView2 drew its own menu over ours, or a row's handler reopened
+ * ours and lost the row focus was to go back to. Where the keydown did cancel
+ * it, the listener simply lapses.
+ */
+export function swallowKeyboardContextMenu(timeoutMs = 1000): void {
+  if (typeof window === 'undefined') return;
+  const swallow = (e: Event) => {
+    e.preventDefault();
+    e.stopPropagation();
+    stop();
+  };
+  const timer = setTimeout(() => stop(), timeoutMs);
+  function stop() {
+    clearTimeout(timer);
+    window.removeEventListener('contextmenu', swallow, { capture: true });
+  }
+  window.addEventListener('contextmenu', swallow, { capture: true });
+}
+
+/**
  * Standard modal Tab focus-trap. Call from a `keydown` handler; wraps focus
  * between the first and last focusable descendant of `container` so Tab /
  * Shift+Tab cycle within the dialog instead of escaping to the background.

@@ -19,6 +19,13 @@ pub const OP_GLOBGETSOURCES2: u8 = 0x94;
 pub const OP_GLOBFOUNDSOURCES: u8 = 0x9B;
 pub const OP_GLOBSERVSTATREQ: u8 = 0x96;
 pub const OP_GLOBSERVSTATRES: u8 = 0x97;
+/// Ask a server what it calls itself (eMule `OP_SERVER_DESC_REQ`).
+pub const OP_SERVER_DESC_REQ: u8 = 0xA2;
+pub const OP_SERVER_DESC_RES: u8 = 0xA3;
+/// The low 16 bits of a description-request challenge. Read as a string
+/// length it is impossible, which is how a reply that echoes a challenge is
+/// told apart from the older `<name_len><name><desc_len><desc>` reply.
+const INV_SERV_DESC_LEN: u16 = 0xF0FF;
 
 // Server UDP capability flags (from eMule Opcodes.h)
 pub const SRV_UDPFLG_EXT_GETSOURCES: u32 = 0x0001;
@@ -86,6 +93,9 @@ pub struct ServerUdpSocket {
     /// Challenge and send time of each status ping awaiting its reply,
     /// keyed by canonical server addr (eMule: anti-spoof).
     pending_challenges: std::collections::HashMap<SocketAddr, (u32, i64)>,
+    /// The same for description requests. A name is only taken from a server
+    /// we just asked, so a stray datagram cannot rename one.
+    pending_desc_challenges: std::collections::HashMap<SocketAddr, (u32, i64)>,
 }
 
 /// Whether `server` is due a status ping at `now`, judged by the
@@ -106,6 +116,7 @@ impl ServerUdpSocket {
         Self {
             socket: Arc::new(socket),
             pending_challenges: std::collections::HashMap::new(),
+            pending_desc_challenges: std::collections::HashMap::new(),
         }
     }
 
@@ -114,17 +125,55 @@ impl ServerUdpSocket {
         self.socket.clone()
     }
 
-    /// Remove and return a pending challenge for the given address (for verification).
-    pub fn take_challenge(&mut self, addr: &SocketAddr) -> Option<u32> {
-        self.pending_challenges
-            .remove(addr)
-            .map(|(challenge, _)| challenge)
+    /// Whether a status reply from `addr` carrying `challenge` answers our
+    /// ping, consuming the ping if so (eMule: anti-spoof). A wrong challenge
+    /// leaves the ping waiting, so a stray or forged reply cannot cancel the
+    /// real one, and one older than the reply window is no longer ours.
+    pub fn accept_status_reply(&mut self, addr: &SocketAddr, challenge: u32, now: i64) -> bool {
+        let Some(&(expected, sent)) = self.pending_challenges.get(addr) else {
+            return false;
+        };
+        if now - sent >= CHALLENGE_REPLY_WINDOW_SECS {
+            self.pending_challenges.remove(addr);
+            return false;
+        }
+        if challenge != expected {
+            return false;
+        }
+        self.pending_challenges.remove(addr);
+        true
     }
 
     fn remember_challenge(&mut self, addr: SocketAddr, challenge: u32, now: i64) {
         self.pending_challenges
             .retain(|_, (_, sent)| now - *sent < CHALLENGE_REPLY_WINDOW_SECS);
         self.pending_challenges.insert(addr, (challenge, now));
+    }
+
+    /// Whether a description reply from `addr` answers the request we sent it,
+    /// consuming that request if so. `echoed` is the challenge the reply
+    /// carries; the older reply layout has none and is taken on our having
+    /// asked recently. A reply with the wrong challenge leaves the request
+    /// waiting, as eMule does, so a forged one cannot cancel the real answer.
+    pub fn accept_desc_reply(&mut self, addr: &SocketAddr, echoed: Option<u32>, now: i64) -> bool {
+        let Some(&(challenge, sent)) = self.pending_desc_challenges.get(addr) else {
+            return false;
+        };
+        if now - sent >= CHALLENGE_REPLY_WINDOW_SECS {
+            self.pending_desc_challenges.remove(addr);
+            return false;
+        }
+        if echoed.is_some_and(|c| c != challenge) {
+            return false;
+        }
+        self.pending_desc_challenges.remove(addr);
+        true
+    }
+
+    fn remember_desc_challenge(&mut self, addr: SocketAddr, challenge: u32, now: i64) {
+        self.pending_desc_challenges
+            .retain(|_, (_, sent)| now - *sent < CHALLENGE_REPLY_WINDOW_SECS);
+        self.pending_desc_challenges.insert(addr, (challenge, now));
     }
 
     /// Build a single-file get-sources packet. Returns (packet, addr).
@@ -311,14 +360,15 @@ impl ServerUdpSocket {
     }
 
     /// Ping `server` if [`status_ping_due`], returning the bytes sent (0 when
-    /// not due). The caller records `now` on the entry after a send.
+    /// not due) and whether the ping went out obfuscated. The caller records
+    /// both on the entry after a send (`record_udp_ping_sent`).
     pub async fn send_status_ping(
         &mut self,
         server: &ServerEntry,
         now: i64,
-    ) -> anyhow::Result<usize> {
+    ) -> anyhow::Result<(usize, bool)> {
         if !status_ping_due(server, now) {
-            return Ok(0);
+            return Ok((0, false));
         }
         let udp_port = server.port.checked_add(4).ok_or_else(|| {
             anyhow::anyhow!("Server port {} too high for UDP offset", server.port)
@@ -342,9 +392,10 @@ impl ServerUdpSocket {
         // `UDPSocket.cpp` uses the same gate
         // (`pServer->GetServerKeyUDP() != 0 && pServer->SupportsObfuscationUDP()`).
         // First ping always goes plain (key not yet known); subsequent
-        // pings obfuscate.
-        let use_obf =
-            server.server_udp_key != 0 && server.udp_flags & SRV_UDPFLG_UDPOBFUSCATION != 0;
+        // pings obfuscate, unless the last obfuscated one went unanswered.
+        let use_obf = server.server_udp_key != 0
+            && server.udp_flags & SRV_UDPFLG_UDPOBFUSCATION != 0
+            && !server.crypt_ping_pending;
         let mut wire_addr = plain_addr;
         if use_obf && server.obfuscation_port_udp != 0 {
             wire_addr.set_port(server.obfuscation_port_udp);
@@ -367,7 +418,38 @@ impl ServerUdpSocket {
         let sent = self.socket.send_to(&wire_packet, wire_addr).await?;
         self.remember_challenge(plain_addr, challenge, now);
         debug!(
-            "Sent status ping to {}:{} (challenge=0x{challenge:08X})",
+            "Sent status ping to {}:{} (challenge=0x{challenge:08X}, obfuscated={use_obf})",
+            server.ip, server.port
+        );
+        Ok((sent, use_obf))
+    }
+
+    /// Ask `server` for its name and description (eMule sends this right after
+    /// a status reply). Returns the bytes sent. Goes out the way the status ping
+    /// does, obfuscated when the server's key is known.
+    pub async fn send_desc_request(
+        &mut self,
+        server: &ServerEntry,
+        now: i64,
+    ) -> anyhow::Result<usize> {
+        let udp_port = server.port.checked_add(4).ok_or_else(|| {
+            anyhow::anyhow!("Server port {} too high for UDP offset", server.port)
+        })?;
+        // Keyed by the canonical (TCP + 4) address, like the status challenge,
+        // so a reply from the obfuscation port still finds it.
+        let plain_addr: SocketAddr = format!("{}:{}", server.ip, udp_port)
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid server address: {e}"))?;
+        let challenge = desc_request_challenge(rand::RngCore::next_u32(&mut rand::rngs::OsRng));
+        let mut packet = Vec::with_capacity(6);
+        packet.push(OP_EDONKEYPROT);
+        packet.push(OP_SERVER_DESC_REQ);
+        packet.extend_from_slice(&challenge.to_le_bytes());
+        let (wire_packet, wire_addr) = maybe_obfuscate_packet(packet, plain_addr, server);
+        let sent = self.socket.send_to(&wire_packet, wire_addr).await?;
+        self.remember_desc_challenge(plain_addr, challenge, now);
+        debug!(
+            "Sent description request to {}:{} (challenge=0x{challenge:08X})",
             server.ip, server.port
         );
         Ok(sent)
@@ -538,6 +620,14 @@ pub enum ServerUdpResponse {
         addr: SocketAddr,
         results: Vec<ServerSearchResult>,
     },
+    /// The answer to `OP_SERVER_DESC_REQ`: what the server calls itself.
+    DescResponse {
+        addr: SocketAddr,
+        /// The challenge the reply echoes, or `None` for the older reply
+        /// layout, which has none.
+        challenge: Option<u32>,
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -632,6 +722,42 @@ fn parse_found_sources_blocks(buf: &[u8]) -> Vec<FoundSourcesBlock> {
     blocks
 }
 
+/// The challenge a description request carries: random in the high half, and
+/// `INV_SERV_DESC_LEN` in the low half so the reply can be told from the old
+/// format (eMule `((uint32)GetRandomUInt16() << 16) + INV_SERV_DESC_LEN`).
+fn desc_request_challenge(random: u32) -> u32 {
+    (random & 0xFFFF_0000) | u32::from(INV_SERV_DESC_LEN)
+}
+
+/// An `OP_SERVER_DESC_RES` payload (the bytes after the opcode).
+///
+/// Two layouts share the opcode. A server that understands the challenge
+/// echoes it and sends a tag list, `<challenge 4><tag_count 4><tags>`. An
+/// older one sends `<name_len 2><name><desc_len 2><desc>`. The echoed
+/// challenge always starts with `INV_SERV_DESC_LEN`, which is not a length a
+/// name can have, so the first two bytes say which one this is.
+fn parse_server_desc_response(payload: &[u8], addr: SocketAddr) -> Option<ServerUdpResponse> {
+    if payload.len() >= 8 && u16::from_le_bytes([payload[0], payload[1]]) == INV_SERV_DESC_LEN {
+        let challenge = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let tag_count = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+        let name = super::server::server_name_from_tags(payload, 8, tag_count as usize);
+        return Some(ServerUdpResponse::DescResponse {
+            addr,
+            challenge: Some(challenge),
+            name,
+        });
+    }
+    let name_len = usize::from(u16::from_le_bytes([*payload.first()?, *payload.get(1)?]));
+    let raw = payload.get(2..2 + name_len)?;
+    let name = crate::security::sanitize_remote_text(&String::from_utf8_lossy(raw), 256);
+    let name = name.trim();
+    Some(ServerUdpResponse::DescResponse {
+        addr,
+        challenge: None,
+        name: (!name.is_empty()).then(|| name.to_string()),
+    })
+}
+
 fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpResponse> {
     if data.is_empty() {
         return None;
@@ -656,10 +782,16 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
             let mut max_users: u32 = 0;
             let mut soft_files: u32 = 0;
             let mut hard_files: u32 = 0;
-            let udp_flags = if payload.len() >= 28 {
+            // Each field as soon as the reply is long enough for it, as eMule
+            // reads them: a 16- or 24-byte reply still carries the limits.
+            if payload.len() >= 16 {
                 max_users = cursor.read_u32::<LittleEndian>().unwrap_or(0); // max_users (offset 12)
+            }
+            if payload.len() >= 24 {
                 soft_files = cursor.read_u32::<LittleEndian>().unwrap_or(0); // soft_files (offset 16)
                 hard_files = cursor.read_u32::<LittleEndian>().unwrap_or(0); // hard_files (offset 20)
+            }
+            let udp_flags = if payload.len() >= 28 {
                 cursor.read_u32::<LittleEndian>().unwrap_or(0) // udp_flags (offset 24)
             } else {
                 0
@@ -699,6 +831,11 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
             if tcp_obf_port == 0 && (udp_flags & SRV_UDPFLG_TCPOBFUSCATION) != 0 {
                 tcp_obf_port = addr.port().saturating_sub(4);
             }
+            // And for UDP, TCP port + 12. Left at 0, obfuscated packets went to
+            // TCP + 4 and the replies, from TCP + 12, matched no server.
+            if udp_obf_port == 0 && (udp_flags & SRV_UDPFLG_UDPOBFUSCATION) != 0 {
+                udp_obf_port = addr.port().saturating_sub(4).checked_add(12).unwrap_or(0);
+            }
 
             Some(ServerUdpResponse::StatusResponse {
                 addr,
@@ -714,6 +851,7 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
                 server_udp_key,
             })
         }
+        OP_SERVER_DESC_RES => parse_server_desc_response(payload, addr),
         OP_GLOBFOUNDSOURCES => {
             // A server answering an OP_GLOBGETSOURCES2 for several files packs
             // one `<hash><count><sources>` block per file into the datagram.
@@ -1608,12 +1746,29 @@ mod tests {
         for i in 0..2_000 {
             server_udp.remember_challenge(addr_of(i), i + 1, now);
         }
-        assert_eq!(server_udp.take_challenge(&addr_of(0)), Some(1));
-        assert_eq!(server_udp.take_challenge(&addr_of(1_999)), Some(2_000));
+        assert!(server_udp.accept_status_reply(&addr_of(0), 1, now));
+        assert!(server_udp.accept_status_reply(&addr_of(1_999), 2_000, now));
 
         server_udp.remember_challenge(addr_of(5_000), 7, now + CHALLENGE_REPLY_WINDOW_SECS);
-        assert_eq!(server_udp.take_challenge(&addr_of(1)), None, "stale challenge kept");
+        assert!(
+            !server_udp.accept_status_reply(&addr_of(1), 2, now + CHALLENGE_REPLY_WINDOW_SECS),
+            "stale challenge kept"
+        );
         assert_eq!(server_udp.pending_challenges.len(), 1);
+    }
+
+    /// A stray reply with the wrong challenge leaves the ping waiting, so the
+    /// server's own answer is still taken.
+    #[tokio::test]
+    async fn a_mismatched_status_reply_leaves_the_ping_waiting() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut server_udp = ServerUdpSocket::from_socket(socket);
+        let now = 1_000_000;
+        let addr: SocketAddr = "10.0.0.4:4665".parse().unwrap();
+        server_udp.remember_challenge(addr, 42, now);
+        assert!(!server_udp.accept_status_reply(&addr, 7, now + 1));
+        assert!(server_udp.accept_status_reply(&addr, 42, now + 2));
+        assert!(!server_udp.accept_status_reply(&addr, 42, now + 3), "used once");
     }
 
     /// One unusable datagram, or a Windows `ConnectionReset` left by an ICMP
@@ -1761,5 +1916,171 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    fn desc_reply_name(payload: &[u8]) -> (Option<u32>, Option<String>) {
+        let addr: SocketAddr = "10.0.0.1:4665".parse().unwrap();
+        match parse_server_udp_response(payload, addr) {
+            Some(ServerUdpResponse::DescResponse { challenge, name, .. }) => (challenge, name),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// What a request carries decides how the reply is read: the low half of
+    /// the challenge must never be a plausible name length, or an old-format
+    /// reply and a new one could not be told apart.
+    #[test]
+    fn a_description_challenge_cannot_be_mistaken_for_a_name_length() {
+        for random in [0, 1, 0xFFFF_FFFF, 0x1234_5678] {
+            let challenge = desc_request_challenge(random);
+            assert_eq!(challenge as u16, INV_SERV_DESC_LEN);
+            assert_eq!(challenge >> 16, random >> 16, "the random half is kept");
+            // On the wire, little-endian: the first two bytes read back as it.
+            let bytes = challenge.to_le_bytes();
+            assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), INV_SERV_DESC_LEN);
+        }
+    }
+
+    #[test]
+    fn a_description_reply_with_tags_yields_the_server_name() {
+        let challenge = desc_request_challenge(0xABCD_0000);
+        let mut payload = vec![OP_SERVER_DESC_RES];
+        payload.extend_from_slice(&challenge.to_le_bytes());
+        payload.extend_from_slice(&2u32.to_le_bytes()); // two tags
+        // ST_SERVERNAME as a compact string tag: type | 0x80, name id, len, text.
+        payload.push(0x02 | 0x80);
+        payload.push(0x01);
+        payload.extend_from_slice(&11u16.to_le_bytes());
+        payload.extend_from_slice(b"Real Server");
+        // ST_DESCRIPTION, which the name reader steps over.
+        payload.push(0x02 | 0x80);
+        payload.push(0x0B);
+        payload.extend_from_slice(&4u16.to_le_bytes());
+        payload.extend_from_slice(b"Fast");
+
+        assert_eq!(
+            desc_reply_name(&payload),
+            (Some(challenge), Some("Real Server".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_description_reply_with_a_name_after_another_tag_still_yields_it() {
+        let challenge = desc_request_challenge(0x0001_0000);
+        let mut payload = vec![OP_SERVER_DESC_RES];
+        payload.extend_from_slice(&challenge.to_le_bytes());
+        payload.extend_from_slice(&2u32.to_le_bytes());
+        // ST_VERSION as a u32 comes first, in the long-name form.
+        payload.push(0x03);
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.push(0x91);
+        payload.extend_from_slice(&0x0011_0002u32.to_le_bytes());
+        payload.push(0x02);
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.push(0x01);
+        payload.extend_from_slice(&3u16.to_le_bytes());
+        payload.extend_from_slice(b"Abc");
+
+        assert_eq!(desc_reply_name(&payload).1.as_deref(), Some("Abc"));
+    }
+
+    /// Older servers answer `<name_len><name><desc_len><desc>`, with no
+    /// challenge to echo.
+    #[test]
+    fn an_old_style_description_reply_yields_the_server_name() {
+        let mut payload = vec![OP_SERVER_DESC_RES];
+        payload.extend_from_slice(&7u16.to_le_bytes());
+        payload.extend_from_slice(b"Old One");
+        payload.extend_from_slice(&4u16.to_le_bytes());
+        payload.extend_from_slice(b"Fast");
+
+        let (challenge, name) = desc_reply_name(&payload);
+        assert_eq!(challenge, None);
+        assert_eq!(name.as_deref(), Some("Old One"));
+    }
+
+    #[test]
+    fn a_truncated_or_blank_description_reply_names_nothing() {
+        let addr: SocketAddr = "10.0.0.1:4665".parse().unwrap();
+        // A name length that runs past the datagram.
+        let mut payload = vec![OP_SERVER_DESC_RES];
+        payload.extend_from_slice(&50u16.to_le_bytes());
+        payload.extend_from_slice(b"short");
+        assert!(parse_server_udp_response(&payload, addr).is_none());
+        // An empty name is a reply, but one that gives nothing to apply.
+        let mut blank = vec![OP_SERVER_DESC_RES];
+        blank.extend_from_slice(&0u16.to_le_bytes());
+        blank.extend_from_slice(&0u16.to_le_bytes());
+        assert_eq!(desc_reply_name(&blank), (None, None));
+    }
+
+    /// A name is only taken from a server that was asked, and only while the
+    /// request is fresh.
+    #[tokio::test]
+    async fn a_description_reply_needs_a_recent_request() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut server_udp = ServerUdpSocket::from_socket(socket);
+        let now = 1_000_000;
+        let addr: SocketAddr = "10.0.0.2:4665".parse().unwrap();
+        assert!(!server_udp.accept_desc_reply(&addr, None, now), "never asked");
+
+        server_udp.remember_desc_challenge(addr, 42, now);
+        assert!(server_udp.accept_desc_reply(&addr, Some(42), now + 1));
+        assert!(!server_udp.accept_desc_reply(&addr, Some(42), now + 1), "used once");
+
+        // The older reply has no challenge to echo.
+        server_udp.remember_desc_challenge(addr, 44, now);
+        assert!(server_udp.accept_desc_reply(&addr, None, now + 1));
+
+        server_udp.remember_desc_challenge(addr, 43, now);
+        assert!(
+            !server_udp.accept_desc_reply(&addr, Some(43), now + CHALLENGE_REPLY_WINDOW_SECS),
+            "stale request"
+        );
+    }
+
+    /// A reply carrying the wrong challenge is ignored without using up the
+    /// request, so the server's own answer is still taken when it lands.
+    #[tokio::test]
+    async fn a_mismatched_description_reply_leaves_the_request_waiting() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut server_udp = ServerUdpSocket::from_socket(socket);
+        let now = 1_000_000;
+        let addr: SocketAddr = "10.0.0.3:4665".parse().unwrap();
+        server_udp.remember_desc_challenge(addr, 42, now);
+        assert!(!server_udp.accept_desc_reply(&addr, Some(7), now + 1));
+        assert!(server_udp.accept_desc_reply(&addr, Some(42), now + 2));
+    }
+
+    /// The request goes out as `OP_SERVER_DESC_REQ` with a challenge that is
+    /// then waiting for the reply.
+    #[tokio::test]
+    async fn a_description_request_is_sent_and_remembered() {
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_port = server_socket.local_addr().unwrap().port();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut server_udp = ServerUdpSocket::from_socket(client);
+        // The request goes to TCP port + 4.
+        let server = ServerEntry::new("127.0.0.1".into(), server_port - 4);
+        let now = 1_000_000;
+
+        let sent = server_udp.send_desc_request(&server, now).await.unwrap();
+        assert_eq!(sent, 6);
+
+        let mut buf = [0u8; 16];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server_socket.recv_from(&mut buf),
+        )
+        .await
+        .expect("request arrives")
+        .unwrap();
+        assert_eq!(&buf[..2], &[OP_EDONKEYPROT, OP_SERVER_DESC_REQ]);
+        assert_eq!(len, 6);
+        let challenge = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]);
+        assert_eq!(challenge as u16, INV_SERV_DESC_LEN);
+
+        let addr: SocketAddr = format!("127.0.0.1:{server_port}").parse().unwrap();
+        assert!(server_udp.accept_desc_reply(&addr, Some(challenge), now));
     }
 }

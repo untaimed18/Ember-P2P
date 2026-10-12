@@ -40,10 +40,10 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
         let server = state.server_list.servers()[idx].clone();
         let now = crate::network::monotonic_secs();
         match server_udp.send_status_ping(&server, now).await {
-            Ok(bytes) if bytes > 0 => {
+            Ok((bytes, obfuscated)) if bytes > 0 => {
                 state
                     .server_list
-                    .record_udp_ping_sent(&server.ip, server.port, now);
+                    .record_udp_ping_sent(&server.ip, server.port, now, obfuscated);
                 stats_manager.add_overhead(
                     crate::storage::statistics::OverheadCategory::Server,
                     crate::storage::statistics::OverheadDirection::Upload,
@@ -94,6 +94,7 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
             // Status pings and global search results are
             // server-control traffic, not source-discovery.
             ServerUdpResponse::StatusResponse { .. }
+            | ServerUdpResponse::DescResponse { .. }
             | ServerUdpResponse::SearchResult { .. } =>
                 crate::storage::statistics::OverheadCategory::Server,
         };
@@ -102,37 +103,20 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
             crate::storage::statistics::OverheadDirection::Download,
             recv_bytes,
         );
-        // Reset the per-server UDP-failure counter on
-        // any inbound reply (status, sources, or search).
-        // The address is already canonicalised to the
-        // standard TCP+4 port by `try_recv_with`, so the
-        // server-list lookup uses `addr.port() - 4` for
-        // the matching TCP port.
-        {
-            let resp_addr = match &resp {
-                ServerUdpResponse::StatusResponse { addr, .. } => Some(*addr),
-                // FoundSources is recorded only after endpoint +
-                // recent-query correlation in its handler below.
-                ServerUdpResponse::FoundSources { .. } => None,
-                // Search replies are recorded only after the
-                // sent-IP allowlist check below (eMule
-                // ProcessUDPSearchAnswer).
-                ServerUdpResponse::SearchResult { .. } => None,
-            };
-            if let Some(a) = resp_addr {
-                let ip_str = a.ip().to_string();
-                let tcp_port = a.port().saturating_sub(4);
-                state.server_list.record_udp_reply(&ip_str, tcp_port);
-            }
-        }
+        // A reply clears the server's failure counters (`record_udp_reply`)
+        // only once it is known to answer something we sent: each arm below
+        // records it after its own check. The address is already
+        // canonicalised to the standard TCP+4 port by `try_recv_with`, so the
+        // list lookup uses `addr.port() - 4` for the TCP port.
         match resp {
             ServerUdpResponse::StatusResponse { addr, challenge, user_count, file_count, max_users, soft_files, hard_files, obfuscation_port_tcp, obfuscation_port_udp, udp_flags, server_udp_key } => {
                 // eMule: verify challenge to prevent spoofed status responses
-                let expected = server_udp.take_challenge(&addr);
-                if expected != Some(challenge) {
+                let now = crate::network::monotonic_secs();
+                if !server_udp.accept_status_reply(&addr, challenge, now) {
                     debug!("Ignoring UDP status from {addr}: challenge mismatch or unexpected");
                 } else {
                     let tcp_port = addr.port().saturating_sub(4);
+                    state.server_list.record_udp_reply(&addr.ip().to_string(), tcp_port);
                     state.server_list.update_server_stats(
                         &addr.ip().to_string(), tcp_port, user_count, file_count, obfuscation_port_tcp,
                     );
@@ -160,6 +144,51 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
                         &addr.ip().to_string(), tcp_port,
                         obfuscation_port_udp, server_udp_key, state.external_ip,
                     );
+                    // A server learned from another server's list push has
+                    // only its address for a name. Ask it, as eMule does
+                    // after a status reply, but only while it needs one:
+                    // the status reply recurs every few hours.
+                    let ip_str = addr.ip().to_string();
+                    if state.server_list.has_placeholder_name(&ip_str, tcp_port) {
+                        if let Some(entry) =
+                            state.server_list.find_by_addr(&ip_str, tcp_port).cloned()
+                        {
+                            let now = crate::network::monotonic_secs();
+                            match server_udp.send_desc_request(&entry, now).await {
+                                Ok(bytes) if bytes > 0 => stats_manager.add_overhead(
+                                    crate::storage::statistics::OverheadCategory::Server,
+                                    crate::storage::statistics::OverheadDirection::Upload,
+                                    bytes as u64,
+                                ),
+                                Ok(_) => {}
+                                Err(e) => debug!(
+                                    "Server description request to {ip_str}:{tcp_port} failed: {e}"
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+            ServerUdpResponse::DescResponse { addr, challenge, name } => {
+                let now = crate::network::monotonic_secs();
+                if !server_udp.accept_desc_reply(&addr, challenge, now) {
+                    debug!("Ignoring unsolicited or mismatched server description from {addr}");
+                    continue;
+                }
+                let ip_str = addr.ip().to_string();
+                let tcp_port = addr.port().saturating_sub(4);
+                state.server_list.record_udp_reply(&ip_str, tcp_port);
+                if let Some(name) = name {
+                    if state.server_list.update_server_name_from_ident(&ip_str, tcp_port, &name) {
+                        debug!("Learned name of server {ip_str}:{tcp_port} over UDP: {name}");
+                        let met_path = state.data_dir.join("server.met");
+                        spawn_save_server_met(
+                            &state.server_list,
+                            met_path,
+                            &state.server_met_save_generation,
+                            &state.server_met_save_lock,
+                        );
+                    }
                 }
             }
             ServerUdpResponse::FoundSources { addr, files } => {

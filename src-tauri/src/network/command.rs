@@ -4882,6 +4882,8 @@ async fn handle_command_inner(
                     &state.server_met_save_generation,
                     &state.server_met_save_lock,
                 );
+                forget_removed_server_as_target(state, app_handle, shared_server_addr, &ip, port)
+                    .await;
                 Ok(format!("Removed server {ip}:{port}"))
             } else {
                 Err(format!("Server {ip}:{port} not found in the list"))
@@ -5989,6 +5991,7 @@ async fn handle_command_inner(
                 &data,
                 settings.filter_servers_by_ip,
                 Some(&mut state.ip_filter),
+                false,
             );
             if result.is_ok() {
                 let met_path = state.data_dir.join("server.met");

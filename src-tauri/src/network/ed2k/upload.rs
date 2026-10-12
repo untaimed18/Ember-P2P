@@ -5992,7 +5992,13 @@ impl UploadHandler {
     }
 
     async fn hello_options(&self) -> HelloOptions {
-        let server = *self.shared_server_addr.read().await;
+        // Set while connecting too, for the port test; only a logged-in
+        // server is one a peer can reach us through.
+        let server = if super::server::server_session_up() {
+            *self.shared_server_addr.read().await
+        } else {
+            None
+        };
         let server_ip = server
             .and_then(|addr| match addr.ip() {
                 IpAddr::V4(v4) => Some(u32::from_le_bytes(v4.octets())),

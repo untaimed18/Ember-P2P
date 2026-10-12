@@ -723,6 +723,14 @@ pub(super) struct NetworkState {
     pub(super) server_reconnect_failures: u32,
     /// The last connect attempt failed because our own network was down.
     pub(super) server_reconnect_network_down: bool,
+    /// The last attempt failed to log in at all, with the network up. Only
+    /// then is a fast retry worth making plain: a session that logged in and
+    /// was later dropped proved the encrypted path works.
+    pub(super) server_last_attempt_failed: bool,
+    /// Whether the last server session to end was LowID. `low_id` is cleared
+    /// with the session, but the reconnect still has to log in on a port other
+    /// than the one that earned it.
+    pub(super) last_server_session_low_id: bool,
     /// Only server auto-reconnect / auto-connect may dial. Set on connect and
     /// persisted as last successful server on login.
     pub(super) preferred_ed2k_server: Option<(String, u16)>,

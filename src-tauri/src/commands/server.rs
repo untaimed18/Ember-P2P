@@ -262,7 +262,15 @@ pub async fn remove_server(
         return Err(coded("server_ip_required", "Server IP is required"));
     }
 
-    let resolved_ip = resolve_server_host(&ip, port).await?;
+    // Removal is an exact match against the list and reaches nobody, so an
+    // address is taken as it is. `resolve_server_host` refuses private and
+    // special-use addresses, which an imported server.met can still put in
+    // the list, and those rows could then never be removed.
+    let resolved_ip = if ip.parse::<std::net::Ipv4Addr>().is_ok() {
+        ip
+    } else {
+        resolve_server_host(&ip, port).await?
+    };
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -430,8 +438,12 @@ pub async fn download_server_met(
         .map_err(|e| coded_ctx("server_met_parse_failed", "Failed to parse server.met", e))?;
 
     let msg = format!(
-        "Downloaded server.met: {} added, {} updated, {} filtered, {} dropped at capacity",
-        stats.added, stats.updated, stats.filtered, stats.at_capacity
+        "Downloaded server.met: {} added, {} updated, {} filtered, {} dropped at capacity{}",
+        stats.added,
+        stats.updated,
+        stats.filtered,
+        stats.at_capacity,
+        if stats.truncated { " (the file was cut short)" } else { "" }
     );
     info!("{msg}");
     Ok(msg)

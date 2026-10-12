@@ -72,20 +72,18 @@ pub(in crate::network) async fn on_server_tick(
                         }
                     }
                     ed2k::server::ServerEvent::StatusUpdate { users, files } => {
-                        if let Some(addr) = state.server_addr {
-                            state.server_list.update_server_stats(
-                                &addr.ip().to_string(), addr.port(), users, files, 0,
-                            );
+                        if let Some((ip, port)) = connected_server_list_key(state) {
+                            state.server_list.update_server_stats(&ip, port, users, files, 0);
                         }
                         conn.session.user_count = users;
                         conn.session.file_count = files;
                     }
                     ed2k::server::ServerEvent::ServerIdent { name } => {
                         conn.session.server_name = name.clone();
-                        if let Some(addr) = state.server_addr {
+                        if let Some((ip, port)) = connected_server_list_key(state) {
                             if state.server_list.update_server_name_from_ident(
-                                &addr.ip().to_string(),
-                                addr.port(),
+                                &ip,
+                                port,
                                 &name,
                             ) {
                                 let met_path = state.data_dir.join("server.met");
@@ -1128,12 +1126,19 @@ pub(in crate::network) async fn on_server_tick(
         && state.server_connection.is_none()
         && state.preferred_ed2k_server.is_some()
     {
-        if server_auto_reconnect_gives_up(state.server_reconnect_failures, settings) {
-            let (ip, port) = state.preferred_ed2k_server.clone().unwrap_or_default();
+        let (preferred_ip, preferred_port) = state.preferred_ed2k_server.clone().unwrap_or_default();
+        let refusal = server_dial_refusal(state, settings, &preferred_ip, preferred_port);
+        if let Some(reason) = refusal {
             abandon_server_auto_reconnect(
                 state,
                 app_handle,
-                &format!("could not reach preferred server {ip}:{port}"),
+                &format!("preferred server {preferred_ip}:{preferred_port}: {reason}"),
+            );
+        } else if server_auto_reconnect_gives_up(state.server_reconnect_failures, settings) {
+            abandon_server_auto_reconnect(
+                state,
+                app_handle,
+                &format!("could not reach preferred server {preferred_ip}:{preferred_port}"),
             );
         } else {
         let backoff_secs = server_reconnect_wait_secs(
@@ -1157,11 +1162,15 @@ pub(in crate::network) async fn on_server_tick(
             let addr_str = format!("{ip}:{port}");
             let user_hash = state.user_hash;
             let nickname = settings.nickname.clone();
-            let tcp_port = advertised_tcp_port(state);
+            let tcp_port = login_tcp_port(state);
             // A slow retry after an outage starts over with obfuscation, so an
-            // obfuscation-only server does not end up reconnected plain.
-            let force_plain =
-                (2..AUTO_CONNECT_MAX_FAILURES).contains(&state.server_reconnect_failures);
+            // obfuscation-only server does not end up reconnected plain. Nor
+            // after a session that logged in and was dropped, or while our own
+            // network is down: neither says anything against obfuscation, and
+            // the plain session that succeeds would stay plain.
+            let force_plain = state.server_last_attempt_failed
+                && !state.server_reconnect_network_down
+                && (2..AUTO_CONNECT_MAX_FAILURES).contains(&state.server_reconnect_failures);
             let obfuscation_enabled = state.obfuscation_enabled;
             state.server_last_connect_attempt = Some(std::time::Instant::now());
             // Pre-set server addr so upload handler can detect HighID port test callbacks

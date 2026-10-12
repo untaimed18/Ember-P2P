@@ -35,6 +35,14 @@ describe('serverMetDownloadedText', () => {
   it('falls back to a count-free message when the reply changes shape', () => {
     expect(serverMetDownloadedText('Server list refreshed')).toBe(m.servers_met_updated());
   });
+
+  it('says when the file was cut short', () => {
+    const reply =
+      'Downloaded server.met: 1 added, 0 updated, 0 filtered, 0 dropped at capacity (the file was cut short)';
+    expect(serverMetDownloadedText(reply)).toBe(
+      `${m.servers_met_downloaded({ added: '1', updated: '0', filtered: '0', dropped: '0' })} ${m.servers_met_cut_short()}`,
+    );
+  });
 });
 
 describe('kadNodesLoadedText', () => {

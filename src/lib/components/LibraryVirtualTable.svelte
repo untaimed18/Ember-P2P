@@ -4,6 +4,7 @@
   import { extensionFromPath, fileTypeKey } from '$lib/fileTypes';
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { ctxMenuPosition } from '$lib/actions/ctxMenu';
+  import { swallowKeyboardContextMenu } from '$lib/a11y';
   import { formatSize, formatNumber, formatDateTime, formatDateWithYear as formatDate } from '$lib/utils';
   import { onMount, onDestroy, tick, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
@@ -541,6 +542,7 @@
     if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) {
       event.preventDefault();
       event.stopPropagation();
+      swallowKeyboardContextMenu();
       // Beside the row the menu is for; the focused row when that one is
       // scrolled out of the rendered window.
       const focusedRow = event.currentTarget;

@@ -29,8 +29,9 @@
     withTimeout,
   } from '$lib/utils';
   import { ctxMenuPosition } from '$lib/actions/ctxMenu';
-  import { menuKeydown } from '$lib/a11y';
+  import { menuKeydown, swallowKeyboardContextMenu } from '$lib/a11y';
   import { toastError } from '$lib/stores/toast';
+  import { serverStatus } from '$lib/stores/network';
   import { serverLog, appendServerLog, clearServerLog } from '$lib/stores/serverLog';
   import IconX from '$lib/components/IconX.svelte';
   import { TableWindow } from '$lib/tableWindow.svelte';
@@ -120,7 +121,12 @@
   /** The row a keyboard-opened menu came from, so Escape can hand focus back. */
   let ctxReturnFocus: HTMLElement | null = null;
 
+  /** The connect request is on its way to the backend. That call returns as
+   *  soon as the attempt is queued, so it says nothing about the handshake. */
   let connecting = $state(false);
+  /** A connection is being set up: ours, or the backend's own auto-connect and
+   *  reconnects. What the page shows, and what Cancel stops. */
+  let showConnecting = $derived(!connectedServer && (connecting || $serverStatus === 'connecting'));
   // Monotonic id bumped whenever the user cancels/disconnects. A connect
   // attempt captures the current value and, if it has changed by the time the
   // (non-abortable) `connectToServer` IPC resolves, treats itself as cancelled
@@ -246,7 +252,8 @@
       // remove failures also live in `error`, and the 5 s poll would
       // otherwise wipe them before they were read.
       if (hadFailure) {
-        error = m.servers_refresh_failed();
+        // Not over an error the user has yet to read; this one recurs.
+        if (!error) error = m.servers_refresh_failed();
       } else if (error === m.servers_refresh_failed()) {
         error = null;
       }
@@ -312,7 +319,12 @@
         // connection, and disconnecting here would kill the one it's
         // establishing.
         if (!connecting) {
-          try { await disconnectServer(); } catch { /* best-effort cleanup */ }
+          try {
+            await disconnectServer();
+          } catch (e: unknown) {
+            // Left alone, the attempt the user cancelled would finish anyway.
+            error = toErrorMsg(e);
+          }
         }
         return;
       }
@@ -336,7 +348,7 @@
     const prev = connectedServer;
     try {
       await disconnectServer();
-      const msg = m.servers_disconnected();
+      const msg = prev ? m.servers_disconnected() : m.servers_connect_cancelled();
       log(msg);
       flash(msg);
       await refresh();
@@ -377,7 +389,8 @@
     if (addingServer) return;
     const ip = newIp.trim();
     const portStr = newPort.trim();
-    const portNum = portStr ? parseInt(portStr, 10) : 4661;
+    // Digits only: `parseInt` alone reads "80abc" as 80 and "4661.9" as 4661.
+    const portNum = !portStr ? 4661 : /^\d{1,5}$/.test(portStr) ? Number(portStr) : NaN;
     const name = newName.trim();
 
     if (!ip) {
@@ -647,6 +660,7 @@
     } else if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
       e.preventDefault();
       e.stopPropagation();
+      swallowKeyboardContextMenu();
       const row = e.currentTarget as HTMLElement;
       const rect = row.getBoundingClientRect();
       handleContextMenu(
@@ -984,22 +998,23 @@
 
   async function handleManualRefresh() {
     await refresh();
-    if (error !== m.servers_refresh_failed()) flash(m.servers_list_refreshed());
+    // `flash` clears the error banner, which may be holding something else.
+    if (!error) flash(m.servers_list_refreshed());
   }
 
   $effect(() => {
-    const validKeys = new Set(servers.map(serverKey));
     // The multi-selection is trimmed to the rows on screen, as on the Search
     // page: bulk actions and Remove act on the selection, and one that kept
-    // rows the filter hid changed servers the user could no longer see.
+    // rows the filter hid changed servers the user could no longer see. The
+    // Connect target follows it, for the same reason.
     const visibleKeys = new Set(filteredServers.map(serverKey));
     untrack(() => {
       const next = new Set([...selectedServers].filter((key) => visibleKeys.has(key)));
       if (next.size !== selectedServers.size) {
         selectedServers = next;
       }
-      if (selectedServer && !validKeys.has(serverKey(selectedServer))) {
-        selectedServer = null;
+      if (selectedServer && !visibleKeys.has(serverKey(selectedServer))) {
+        selectedServer = filteredServers.find((s) => next.has(serverKey(s))) ?? null;
       }
       if (lastClickedKey && !visibleKeys.has(lastClickedKey)) {
         lastClickedKey = null;
@@ -1033,8 +1048,8 @@
     {#if selectionCount > 1}
       <button class="danger" onclick={handleRemoveSelected}>{m.servers_remove_selected_count({ count: selectionCount })}</button>
     {/if}
-    {#if connectedServer || connecting}
-      <button class="danger" onclick={handleDisconnect}>{connecting && !connectedServer ? m.common_cancel() : m.servers_disconnect()}</button>
+    {#if connectedServer || showConnecting}
+      <button class="danger" onclick={handleDisconnect}>{showConnecting ? m.common_cancel() : m.servers_disconnect()}</button>
     {:else if selectedServer}
       <button onclick={() => handleConnect()}>{m.servers_connect()}</button>
     {:else}
@@ -1065,7 +1080,7 @@
     </div>
     <div class="stat-card">
       <div class="label">{m.servers_stat_connected()}</div>
-      <div class="value">{connectedServer ? m.common_yes() : connecting ? m.servers_status_connecting() : m.common_no()}</div>
+      <div class="value">{connectedServer ? m.common_yes() : showConnecting ? m.servers_status_connecting() : m.common_no()}</div>
       {#if connectedServer}
         <div class="sub">{connectedServer.name || `${connectedServer.ip}:${connectedServer.port}`}</div>
       {/if}
@@ -1236,7 +1251,7 @@
                        else. -->
                   <td>{server.is_static ? m.common_yes() : m.common_no()}</td>
                   <td>
-                    <button type="button" class="server-remove" tabindex={rowKey === tabStopKey ? 0 : -1} onclick={(e: MouseEvent) => { e.stopPropagation(); handleRemoveServer(server); }} title={m.common_remove()} aria-label={m.servers_remove_aria({ name: server.name || `${server.ip}:${server.port}` })}><IconX size={12} /></button>
+                    <button type="button" class="server-remove" tabindex={rowKey === tabStopKey ? 0 : -1} onclick={(e: MouseEvent) => { e.stopPropagation(); handleRemoveServer(server); }} ondblclick={(e: MouseEvent) => e.stopPropagation()} title={m.common_remove()} aria-label={m.servers_remove_aria({ name: server.name || `${server.ip}:${server.port}` })}><IconX size={12} /></button>
                   </td>
                 </tr>
               {/each}
@@ -1370,7 +1385,7 @@
                 </span>
               </div>
             {/if}
-          {:else if connecting}
+          {:else if showConnecting}
             <div class="info-row">
               <span class="info-label">{m.servers_info_status()}</span>
               <span class="badge connecting"><span class="spinner xs current"></span> {m.servers_status_connecting()}</span>
