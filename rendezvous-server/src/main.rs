@@ -5945,10 +5945,17 @@ async fn stats_handler(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> axum::response::Response {
+    // Aggregate counts only, so any page may read them. Without this a browser
+    // refuses the body to a dashboard opened from disk or hosted elsewhere,
+    // and the refusal has to cover a 429 too or it reads as the server being down.
+    let cors = [(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    )];
     let client_ip = extract_client_ip(&headers, addr);
     if !check_rate_limit(&state, client_ip).await {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
+        return (cors, StatusCode::TOO_MANY_REQUESTS).into_response();
     }
     let relay_count =
         state.relay_sessions.read().await.len() + state.bridged_relays.read().await.len();
@@ -5958,15 +5965,19 @@ async fn stats_handler(
     let uptime_secs = state.started_at.elapsed().as_secs();
     let channels_registry_read_only = state.channels_registry.read().await.is_read_only();
 
-    Ok(Json(serde_json::json!({
-        "active_relay_sessions": relay_count,
-        "active_punch_requests": punch_count,
-        "relay_ip_count": relay_ip_count,
-        "registered_peers": presence_count,
-        "uptime_seconds": uptime_secs,
-        "max_global_relays": MAX_GLOBAL_RELAY_SESSIONS,
-        "channels_registry_read_only": channels_registry_read_only,
-    })))
+    (
+        cors,
+        Json(serde_json::json!({
+            "active_relay_sessions": relay_count,
+            "active_punch_requests": punch_count,
+            "relay_ip_count": relay_ip_count,
+            "registered_peers": presence_count,
+            "uptime_seconds": uptime_secs,
+            "max_global_relays": MAX_GLOBAL_RELAY_SESSIONS,
+            "channels_registry_read_only": channels_registry_read_only,
+        })),
+    )
+        .into_response()
 }
 
 async fn health() -> &'static str {
@@ -9111,6 +9122,47 @@ mod relay_ticket_tests {
         }
         drop(full);
         assert!(limiter.counts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stats_are_readable_from_any_origin_even_when_rate_limited() {
+        use tower::ServiceExt;
+
+        let state = test_state();
+        let app = build_router(state.clone());
+        let get_stats = |addr: SocketAddr| {
+            let request = axum::http::Request::builder()
+                .uri("/stats")
+                .header("Origin", "null")
+                .extension(ConnectInfo(addr))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let app = app.clone();
+            async move { app.oneshot(request).await.unwrap() }
+        };
+        let allowed_origin = |response: &axum::response::Response| {
+            response
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+
+        let addr: SocketAddr = "198.51.100.20:4000".parse().unwrap();
+        let ok = get_stats(addr).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(allowed_origin(&ok).as_deref(), Some("*"));
+
+        for _ in 0..MAX_REQUESTS_PER_MINUTE {
+            check_rate_limit(&state, addr.ip()).await;
+        }
+        let limited = get_stats(addr).await;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            allowed_origin(&limited).as_deref(),
+            Some("*"),
+            "a page must be able to tell a 429 from the server being unreachable"
+        );
     }
 
     #[tokio::test]
