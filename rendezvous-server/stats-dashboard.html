@@ -1,0 +1,711 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ember Network · Live stats</title>
+<style>
+  :root {
+    --bg: #f6f8fb;
+    --panel: #ffffff;
+    --muted: #eceff5;
+    --text: #0f172a;
+    --text-2: #475569;
+    --text-3: #64748b;
+    --border: #e2e8f0;
+    --accent: #2563eb;
+    --accent-soft: #eff4ff;
+    --flame-1: #f97316;
+    --flame-2: #facc15;
+    --success: #15803d;
+    --success-soft: #dcfce7;
+    --warn: #b45309;
+    --warn-soft: #fef3c7;
+    --danger: #b91c1c;
+    --danger-soft: #fee2e2;
+    --shadow: 0 6px 20px rgba(15, 23, 42, 0.07);
+    --radius: 14px;
+    --font: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b1220;
+      --panel: #101a2e;
+      --muted: #17233b;
+      --text: #e8edf7;
+      --text-2: #b6c1d6;
+      --text-3: #8795af;
+      --border: #202d46;
+      --accent: #5b9dff;
+      --accent-soft: rgba(91, 157, 255, 0.12);
+      --success: #4ade80;
+      --success-soft: rgba(74, 222, 128, 0.12);
+      --warn: #fbbf24;
+      --warn-soft: rgba(251, 191, 36, 0.12);
+      --danger: #f87171;
+      --danger-soft: rgba(248, 113, 113, 0.12);
+      --shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+      color-scheme: dark;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 15px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 32px 20px 48px; }
+
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand svg { width: 40px; height: 40px; flex: none; }
+  .brand h1 { margin: 0; font-size: 22px; letter-spacing: -0.01em; }
+  .brand p { margin: 0; color: var(--text-3); font-size: 13px; }
+  .brand code { font-family: var(--mono); font-size: 12px; }
+
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    font-size: 13px;
+    font-weight: 600;
+    background: var(--muted);
+    color: var(--text-2);
+    white-space: nowrap;
+  }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .pill.live { background: var(--success-soft); color: var(--success); }
+  .pill.live .dot { animation: pulse 2s ease-in-out infinite; }
+  .pill.warn { background: var(--warn-soft); color: var(--warn); }
+  .pill.error { background: var(--danger-soft); color: var(--danger); }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+
+  button {
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 7px 14px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button:focus-visible, input:focus-visible, textarea:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px var(--accent-soft), 0 0 0 1px var(--accent);
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { filter: brightness(1.08); color: #fff; }
+  a { color: var(--accent); }
+  label.toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-2); cursor: pointer; }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 20px;
+  }
+  .label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-3);
+  }
+  .hint { color: var(--text-3); font-size: 13px; margin: 6px 0 0; }
+
+  .hero {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 28px;
+    align-items: center;
+    margin-bottom: 16px;
+    position: relative;
+    overflow: hidden;
+  }
+  .hero::after {
+    content: "";
+    position: absolute;
+    inset: auto -60px -80px auto;
+    width: 260px;
+    height: 260px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(249, 115, 22, 0.16), transparent 70%);
+    pointer-events: none;
+  }
+  .hero .big {
+    font-size: 76px;
+    font-weight: 800;
+    line-height: 1;
+    letter-spacing: -0.03em;
+    background: linear-gradient(135deg, var(--flame-1), var(--flame-2));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    font-variant-numeric: tabular-nums;
+  }
+  .hero h2 { margin: 4px 0 0; font-size: 18px; }
+  .hero .meta { display: flex; flex-wrap: wrap; gap: 18px; margin-top: 12px; font-size: 13px; color: var(--text-2); }
+  .hero .meta strong { color: var(--text); font-variant-numeric: tabular-nums; }
+
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 16px; }
+  .stat .value { font-size: 28px; font-weight: 700; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .stat .value small { font-size: 14px; font-weight: 600; color: var(--text-3); }
+  .bar { height: 6px; border-radius: 999px; background: var(--muted); margin-top: 10px; overflow: hidden; }
+  .bar span { display: block; height: 100%; width: 0; background: var(--accent); border-radius: inherit; transition: width 0.4s ease; }
+  .badge {
+    display: inline-block;
+    margin-top: 8px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .badge.ok { background: var(--success-soft); color: var(--success); }
+  .badge.bad { background: var(--danger-soft); color: var(--danger); }
+
+  .history-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+  .history-head h3 { margin: 0; font-size: 16px; }
+  .summary { display: flex; flex-wrap: wrap; gap: 18px; font-size: 13px; color: var(--text-2); }
+  .summary strong { color: var(--text); font-variant-numeric: tabular-nums; }
+  .chart { position: relative; height: 220px; }
+  .chart svg { width: 100%; height: 100%; display: block; overflow: visible; }
+  .chart .empty {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    color: var(--text-3);
+    font-size: 14px;
+    text-align: center;
+    padding: 0 20px;
+  }
+  .tip {
+    position: absolute;
+    pointer-events: none;
+    background: var(--text);
+    color: var(--bg);
+    font-size: 12px;
+    padding: 6px 9px;
+    border-radius: 8px;
+    white-space: nowrap;
+    transform: translate(-50%, calc(-100% - 10px));
+    opacity: 0;
+    transition: opacity 0.1s;
+  }
+  .ranges { display: inline-flex; gap: 4px; background: var(--muted); padding: 3px; border-radius: 10px; }
+  .ranges button { border: 0; background: transparent; padding: 4px 10px; color: var(--text-2); }
+  .ranges button[aria-pressed="true"] { background: var(--panel); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,0.12); }
+
+  .fallback { margin-bottom: 16px; border-color: var(--warn); }
+  .fallback h3 { margin: 0 0 6px; font-size: 16px; }
+  .fallback p { margin: 0 0 12px; color: var(--text-2); font-size: 14px; }
+  .fallback ol { margin: 0 0 12px; padding-left: 20px; color: var(--text-2); font-size: 14px; }
+  .fallback textarea {
+    width: 100%;
+    min-height: 86px;
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 10px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    resize: vertical;
+  }
+  .fallback .row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; align-items: center; }
+  .fallback .err { color: var(--danger); font-size: 13px; }
+
+  footer { margin-top: 20px; color: var(--text-3); font-size: 12.5px; }
+  footer dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 0 0 12px; }
+  footer dt { font-weight: 600; color: var(--text-2); }
+  footer dd { margin: 0; }
+  footer code { font-family: var(--mono); }
+
+  [hidden] { display: none !important; }
+
+  @media (max-width: 860px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 520px) {
+    .grid { grid-template-columns: 1fr; }
+    .hero { grid-template-columns: 1fr; gap: 12px; }
+    .hero .big { font-size: 60px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <svg viewBox="0 0 40 40" aria-hidden="true">
+        <defs>
+          <linearGradient id="flame" x1="0" y1="1" x2="0.4" y2="0">
+            <stop offset="0" stop-color="#f97316"/>
+            <stop offset="1" stop-color="#facc15"/>
+          </linearGradient>
+        </defs>
+        <rect width="40" height="40" rx="10" fill="#0b1220"/>
+        <path d="M20 7c1.2 4.6 6.9 7.5 6.9 14.1A6.9 6.9 0 0 1 20 28a6.9 6.9 0 0 1-6.9-6.9c0-3 1.5-4.9 2.9-6.4.2 1.8 1.2 3.2 2.6 3.7C18 14.3 18.6 10.4 20 7Z" fill="url(#flame)"/>
+        <path d="M20 33.5c-2.6 0-4.4-1.6-4.4-3.6h8.8c0 2-1.8 3.6-4.4 3.6Z" fill="#f97316" opacity="0.55"/>
+      </svg>
+      <div>
+        <h1>Ember Network</h1>
+        <p>Live stats from <code id="server-label"></code></p>
+      </div>
+    </div>
+    <div class="controls">
+      <span class="pill" id="status"><span class="dot"></span><span id="status-text">Connecting…</span></span>
+      <label class="toggle"><input type="checkbox" id="auto" checked> Auto-refresh (30 s)</label>
+      <button id="refresh" class="primary" type="button">Refresh</button>
+    </div>
+  </header>
+
+  <section class="card fallback" id="fallback" hidden>
+    <h3>Your browser won't let this page read the stats directly</h3>
+    <p>The rendezvous server doesn't allow other sites, or files opened from your computer, to read its answers, so the browser blocks the request. You can still view the numbers here:</p>
+    <ol>
+      <li><a id="open-stats" target="_blank" rel="noopener">Open the stats page</a> in a new tab.</li>
+      <li>Select everything (Ctrl+A or Cmd+A) and copy it.</li>
+      <li>Paste it below. Each paste is added to the history chart.</li>
+    </ol>
+    <textarea id="paste" placeholder='{"registered_peers": 13, "uptime_seconds": 177345, …}' spellcheck="false"></textarea>
+    <div class="row">
+      <button id="paste-apply" class="primary" type="button">Show these stats</button>
+      <span class="err" id="paste-error" role="alert"></span>
+    </div>
+  </section>
+
+  <section class="card hero" aria-live="polite">
+    <div class="big" id="online">–</div>
+    <div>
+      <div class="label">Online now</div>
+      <h2>Ember clients connected to the rendezvous server</h2>
+      <p class="hint">Clients check in every 2 minutes and drop off 5 minutes after their last check-in.</p>
+      <div class="meta">
+        <span>Peak seen <strong id="peak">–</strong></span>
+        <span>Server up <strong id="uptime-short">–</strong></span>
+        <span>Updated <strong id="updated">–</strong></span>
+      </div>
+    </div>
+  </section>
+
+  <section class="grid">
+    <div class="card stat">
+      <div class="label">Relay sessions</div>
+      <div class="value"><span id="relays">–</span> <small>/ <span id="relay-max">–</span></small></div>
+      <div class="bar"><span id="relay-bar"></span></div>
+      <p class="hint">Connections the server is relaying between peers that can't reach each other directly.</p>
+    </div>
+    <div class="card stat">
+      <div class="label">Relay networks</div>
+      <div class="value" id="relay-ips">–</div>
+      <p class="hint">Distinct client networks holding relay slots right now.</p>
+    </div>
+    <div class="card stat">
+      <div class="label">Hole-punch requests</div>
+      <div class="value" id="punches">–</div>
+      <p class="hint">Pending direct-connection attempts. Each one lasts about 30 seconds.</p>
+    </div>
+    <div class="card stat">
+      <div class="label">Server</div>
+      <div class="value" id="uptime">–</div>
+      <span class="badge" id="registry" hidden></span>
+      <p class="hint">Uptime since the last restart, and whether room names can be claimed.</p>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="history-head">
+      <h3>Online over time</h3>
+      <div class="ranges" role="group" aria-label="Time range">
+        <button type="button" data-range="3600000">1 h</button>
+        <button type="button" data-range="86400000" aria-pressed="true">24 h</button>
+        <button type="button" data-range="604800000">7 d</button>
+        <button type="button" data-range="0">All</button>
+      </div>
+    </div>
+    <div class="summary">
+      <span>Peak <strong id="h-peak">–</strong></span>
+      <span>Low <strong id="h-low">–</strong></span>
+      <span>Average <strong id="h-avg">–</strong></span>
+      <span>Samples <strong id="h-count">0</strong></span>
+    </div>
+    <div class="chart" id="chart">
+      <svg id="chart-svg" role="img" aria-label="Online clients over time"></svg>
+      <div class="empty" id="chart-empty">No history yet. Samples are saved in this browser each time the stats load, so the chart fills in while this page is open.</div>
+      <div class="tip" id="tip"></div>
+    </div>
+    <p class="hint">History is kept only in this browser, up to 30 days. <button type="button" id="clear" style="padding:2px 8px;margin-left:4px">Clear history</button></p>
+  </section>
+
+  <footer>
+    <dl>
+      <dt>Online now</dt><dd><code>registered_peers</code>: clients registered with the rendezvous server. It misses clients still working out their public IP, and anyone who changed the server address in settings. It drops to zero after a server restart and refills within about 2 minutes.</dd>
+      <dt>Source</dt><dd>The public <code>/stats</code> endpoint, which returns counts only. To use a different server, add <code>?server=https://your-server</code> to this page's address.</dd>
+    </dl>
+  </footer>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const DEFAULT_SERVER = "https://ember-rendezvous.fly.dev";
+  const REFRESH_MS = 30000;
+  const KEEP_MS = 30 * 24 * 3600 * 1000;
+  const MAX_SAMPLES = 20000;
+
+  const server = (() => {
+    const fromQuery = new URLSearchParams(location.search).get("server");
+    try {
+      const url = new URL(fromQuery || DEFAULT_SERVER);
+      if (url.protocol === "https:" || url.protocol === "http:") return url.origin;
+    } catch (_) { /* fall through to the default */ }
+    return DEFAULT_SERVER;
+  })();
+  const statsUrl = server + "/stats";
+  const storageKey = "ember-stats-history:" + server;
+
+  const $ = (id) => document.getElementById(id);
+  $("server-label").textContent = server.replace(/^https?:\/\//, "");
+  $("open-stats").href = statsUrl;
+
+  let history = loadHistory();
+  let range = 86400000;
+  let timer = null;
+  let liveWorks = null;
+
+  function loadHistory() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(storageKey) || "[]");
+      return Array.isArray(raw)
+        ? raw.filter((s) => Number.isFinite(s.t) && Number.isFinite(s.v))
+        : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function saveHistory() {
+    const cutoff = Date.now() - KEEP_MS;
+    history = history.filter((s) => s.t >= cutoff).slice(-MAX_SAMPLES);
+    try { localStorage.setItem(storageKey, JSON.stringify(history)); } catch (_) { /* storage full or disabled */ }
+  }
+
+  function num(value) {
+    const n = Number(value);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+  }
+
+  function fmtInt(n) {
+    return n === null ? "–" : Math.round(n).toLocaleString();
+  }
+
+  function fmtUptime(seconds, short) {
+    if (seconds === null) return "–";
+    const d = Math.floor(seconds / 86400);
+    const h = Math.floor((seconds % 86400) / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    if (short) return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
+    if (d) return `${d}d ${h}h ${m}m`;
+    if (h) return `${h}h ${m}m`;
+    return `${m}m ${Math.floor(seconds % 60)}s`;
+  }
+
+  function fmtTime(t, withDate) {
+    const date = new Date(t);
+    const opts = withDate
+      ? { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }
+      : { hour: "2-digit", minute: "2-digit" };
+    return date.toLocaleString(undefined, opts);
+  }
+
+  function setStatus(kind, text) {
+    const pill = $("status");
+    pill.className = "pill" + (kind ? " " + kind : "");
+    $("status-text").textContent = text;
+  }
+
+  function render(stats, at) {
+    const online = num(stats.registered_peers);
+    const relays = num(stats.active_relay_sessions);
+    const relayMax = num(stats.max_global_relays);
+    const uptime = num(stats.uptime_seconds);
+
+    $("online").textContent = fmtInt(online);
+    $("relays").textContent = fmtInt(relays);
+    $("relay-max").textContent = fmtInt(relayMax);
+    $("relay-bar").style.width =
+      relays !== null && relayMax ? Math.min(100, (relays / relayMax) * 100) + "%" : "0";
+    $("relay-ips").textContent = fmtInt(num(stats.relay_ip_count));
+    $("punches").textContent = fmtInt(num(stats.active_punch_requests));
+    $("uptime").textContent = fmtUptime(uptime, false);
+    $("uptime-short").textContent = fmtUptime(uptime, true);
+    $("updated").textContent = fmtTime(at, false);
+
+    const registry = $("registry");
+    if (typeof stats.channels_registry_read_only === "boolean") {
+      registry.hidden = false;
+      registry.className = "badge " + (stats.channels_registry_read_only ? "bad" : "ok");
+      registry.textContent = stats.channels_registry_read_only
+        ? "Room names read-only"
+        : "Room names writable";
+    }
+
+    if (online !== null) {
+      history.push({ t: at, v: online, u: uptime });
+      saveHistory();
+    }
+    drawChart();
+  }
+
+  function parseStats(text) {
+    const data = JSON.parse(text);
+    if (!data || typeof data !== "object" || num(data.registered_peers) === null) {
+      throw new Error("That doesn't look like the stats page: there's no registered_peers number in it.");
+    }
+    return data;
+  }
+
+  async function refresh() {
+    setStatus("", "Loading…");
+    let response;
+    try {
+      response = await fetch(statsUrl, { cache: "no-store" });
+    } catch (_) {
+      // A blocked cross-origin read and an unreachable server look the same
+      // from here; once a live read has worked, assume the server went away.
+      if (liveWorks) {
+        setStatus("error", "Server unreachable");
+      } else {
+        liveWorks = false;
+        setStatus("warn", "Live reading blocked");
+        $("fallback").hidden = false;
+        stopTimer();
+      }
+      return;
+    }
+    if (response.status === 429) {
+      setStatus("warn", "Rate limited, retrying");
+      return;
+    }
+    if (!response.ok) {
+      setStatus("error", `Server error ${response.status}`);
+      return;
+    }
+    try {
+      const stats = parseStats(await response.text());
+      liveWorks = true;
+      $("fallback").hidden = true;
+      render(stats, Date.now());
+      setStatus("live", "Live");
+    } catch (err) {
+      setStatus("error", "Unexpected answer");
+    }
+  }
+
+  function startTimer() {
+    stopTimer();
+    if ($("auto").checked && liveWorks !== false) timer = setInterval(refresh, REFRESH_MS);
+  }
+  function stopTimer() {
+    if (timer) clearInterval(timer);
+    timer = null;
+  }
+
+  function drawChart() {
+    const svg = $("chart-svg");
+    const now = Date.now();
+    const samples = range ? history.filter((s) => s.t >= now - range) : history.slice();
+    const values = samples.map((s) => s.v);
+
+    const allTimePeak = history.length ? Math.max(...history.map((s) => s.v)) : null;
+    $("peak").textContent = fmtInt(allTimePeak);
+    $("h-count").textContent = samples.length.toLocaleString();
+    $("h-peak").textContent = values.length ? fmtInt(Math.max(...values)) : "–";
+    $("h-low").textContent = values.length ? fmtInt(Math.min(...values)) : "–";
+    $("h-avg").textContent = values.length
+      ? (values.reduce((a, b) => a + b, 0) / values.length).toFixed(1)
+      : "–";
+
+    $("chart-empty").hidden = samples.length > 0;
+    svg.innerHTML = "";
+    svg.onmousemove = null;
+    svg.onmouseleave = null;
+    if (!samples.length) return;
+
+    const box = svg.getBoundingClientRect();
+    const W = Math.max(box.width, 200);
+    const H = Math.max(box.height, 120);
+    const pad = { l: 36, r: 12, t: 12, b: 26 };
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+
+    const t0 = samples[0].t;
+    const t1 = samples.length > 1 ? samples[samples.length - 1].t : t0 + 1;
+    const step = Math.max(1, Math.ceil((Math.max(...values) * 1.15) / 4));
+    const vMax = step * 4;
+    const x = (t) => pad.l + ((t - t0) / (t1 - t0 || 1)) * (W - pad.l - pad.r);
+    const y = (v) => pad.t + (1 - v / vMax) * (H - pad.t - pad.b);
+
+    const css = getComputedStyle(document.documentElement);
+    const border = css.getPropertyValue("--border").trim();
+    const text3 = css.getPropertyValue("--text-3").trim();
+    const accent = css.getPropertyValue("--flame-1").trim();
+    const NS = "http://www.w3.org/2000/svg";
+    const el = (name, attrs) => {
+      const node = document.createElementNS(NS, name);
+      for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+      svg.appendChild(node);
+      return node;
+    };
+
+    const defs = el("defs", {});
+    const grad = document.createElementNS(NS, "linearGradient");
+    grad.id = "area";
+    grad.setAttribute("x1", "0"); grad.setAttribute("y1", "0");
+    grad.setAttribute("x2", "0"); grad.setAttribute("y2", "1");
+    for (const [offset, opacity] of [["0", "0.35"], ["1", "0"]]) {
+      const stop = document.createElementNS(NS, "stop");
+      stop.setAttribute("offset", offset);
+      stop.setAttribute("stop-color", accent);
+      stop.setAttribute("stop-opacity", opacity);
+      grad.appendChild(stop);
+    }
+    defs.appendChild(grad);
+
+    for (let i = 0; i <= 4; i++) {
+      const v = step * i;
+      el("line", { x1: pad.l, x2: W - pad.r, y1: y(v), y2: y(v), stroke: border, "stroke-width": 1 });
+      const label = el("text", { x: pad.l - 8, y: y(v) + 4, "text-anchor": "end", "font-size": 11, fill: text3 });
+      label.textContent = v;
+    }
+
+    const spansDays = t1 - t0 > 20 * 3600 * 1000;
+    const ticks = samples.length > 1 ? 4 : 0;
+    for (let i = 0; i <= ticks; i++) {
+      const t = t0 + ((t1 - t0) / (ticks || 1)) * i;
+      const anchor = i === 0 ? "start" : i === ticks ? "end" : "middle";
+      const label = el("text", { x: x(t), y: H - 6, "text-anchor": anchor, "font-size": 11, fill: text3 });
+      label.textContent = fmtTime(t, spansDays);
+    }
+
+    const pts = samples.map((s) => [x(s.t), y(s.v)]);
+    const line = pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + "," + p[1].toFixed(1)).join("");
+    if (pts.length > 1) {
+      el("path", {
+        d: `${line}L${pts[pts.length - 1][0].toFixed(1)},${y(0)}L${pts[0][0].toFixed(1)},${y(0)}Z`,
+        fill: "url(#area)",
+      });
+      el("path", { d: line, fill: "none", stroke: accent, "stroke-width": 2, "stroke-linejoin": "round" });
+    }
+
+    for (let i = 1; i < samples.length; i++) {
+      const prev = samples[i - 1].u;
+      const cur = samples[i].u;
+      if (Number.isFinite(prev) && Number.isFinite(cur) && cur < prev) {
+        el("line", {
+          x1: pts[i][0], x2: pts[i][0], y1: pad.t, y2: H - pad.b,
+          stroke: text3, "stroke-dasharray": "3 4", "stroke-width": 1,
+        }).appendChild(document.createElementNS(NS, "title")).textContent = "Server restarted";
+      }
+    }
+
+    const last = pts[pts.length - 1];
+    el("circle", { cx: last[0], cy: last[1], r: 4, fill: accent });
+    const marker = el("circle", {
+      cx: last[0], cy: last[1], r: 5, fill: "none", stroke: accent, "stroke-width": 2, visibility: "hidden",
+    });
+
+    const tip = $("tip");
+    svg.onmousemove = (event) => {
+      const rect = svg.getBoundingClientRect();
+      const mx = ((event.clientX - rect.left) / rect.width) * W;
+      let best = 0;
+      for (let i = 1; i < pts.length; i++) {
+        if (Math.abs(pts[i][0] - mx) < Math.abs(pts[best][0] - mx)) best = i;
+      }
+      const [px, py] = pts[best];
+      marker.setAttribute("cx", px);
+      marker.setAttribute("cy", py);
+      marker.setAttribute("visibility", "visible");
+      tip.textContent = `${samples[best].v} online · ${fmtTime(samples[best].t, true)}`;
+      tip.style.left = (px / W) * rect.width + "px";
+      tip.style.top = (py / H) * rect.height + "px";
+      tip.style.opacity = "1";
+    };
+    svg.onmouseleave = () => {
+      tip.style.opacity = "0";
+      marker.setAttribute("visibility", "hidden");
+    };
+  }
+
+  $("refresh").addEventListener("click", () => { refresh(); startTimer(); });
+  $("auto").addEventListener("change", startTimer);
+  $("clear").addEventListener("click", () => {
+    if (!confirm("Clear the saved history for this server?")) return;
+    history = [];
+    saveHistory();
+    drawChart();
+  });
+  for (const button of document.querySelectorAll(".ranges button")) {
+    button.addEventListener("click", () => {
+      range = Number(button.dataset.range);
+      for (const b of document.querySelectorAll(".ranges button")) {
+        b.setAttribute("aria-pressed", String(b === button));
+      }
+      drawChart();
+    });
+  }
+  function applyPasted(text) {
+    const error = $("paste-error");
+    error.textContent = "";
+    try {
+      render(parseStats(text.trim()), Date.now());
+      $("paste").value = "";
+      setStatus("warn", "Showing pasted stats");
+    } catch (err) {
+      error.textContent = err instanceof SyntaxError
+        ? "That isn't valid JSON. Copy the whole stats page, including the braces."
+        : err.message;
+    }
+  }
+  $("paste-apply").addEventListener("click", () => applyPasted($("paste").value));
+  document.addEventListener("paste", (event) => {
+    if ($("fallback").hidden || event.target === $("paste")) return;
+    const text = event.clipboardData && event.clipboardData.getData("text");
+    if (text) {
+      event.preventDefault();
+      applyPasted(text);
+    }
+  });
+  let resizeTimer = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(drawChart, 120);
+  });
+
+  drawChart();
+  refresh().then(startTimer);
+})();
+</script>
+</body>
+</html>
