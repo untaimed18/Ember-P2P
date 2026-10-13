@@ -690,6 +690,11 @@ pub const CHAT_FAILED: i64 = 2;
 /// to someone who never returns is retried on every reconnect forever and
 /// counted as unsent for the life of the database.
 const CHAT_QUEUE_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60;
+/// How long a received mailbox id is remembered. Past this a copy cannot
+/// still be waiting on the server, which holds entries for a week, in any box
+/// the recipient still reads (the last week and a day of clock skew), or in
+/// the sender's queue, which gives up after a week.
+const CHAT_MAILBOX_SEEN_RETAIN_SECS: i64 = 10 * 24 * 60 * 60;
 /// How long a settled `chat_attachments` row (finished, refused, expired,
 /// failed) stays in the transcript before it is deleted.
 const CHAT_ATTACHMENT_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
@@ -7147,6 +7152,24 @@ impl Database {
         delivery: i64,
         ttl_secs: u32,
     ) -> anyhow::Result<i64> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let new_id = self.insert_chat_row(&tx, friend_hash, direction, message, delivery, ttl_secs)?;
+        tx.commit()?;
+        Ok(new_id)
+    }
+
+    /// The body of [`Self::insert_chat_message_ttl`], inside the caller's
+    /// transaction.
+    fn insert_chat_row(
+        &self,
+        tx: &Connection,
+        friend_hash: &str,
+        direction: &str,
+        message: &str,
+        delivery: i64,
+        ttl_secs: u32,
+    ) -> anyhow::Result<i64> {
         // Cap stored message length. Incoming chat text comes straight off
         // the wire from a peer, so bound it here (on a char boundary, so we
         // never split a multi-byte sequence) to stop a hostile friend from
@@ -7169,8 +7192,6 @@ impl Database {
         // covers months-to-years of normal conversation; beyond that we
         // age out the oldest entries on insert so the DB stays compact.
         const MAX_MESSAGES_PER_FRIEND: i64 = 5_000;
-        let conn = self.conn.lock();
-        let tx = conn.unchecked_transaction()?;
         let now = chrono::Utc::now().timestamp();
         let body_hash = Self::friend_chat_body_hash_hex(message);
         tx.execute(
@@ -7180,7 +7201,7 @@ impl Database {
         )?;
         let new_id = tx.last_insert_rowid();
         if ttl_secs > 0 {
-            Self::ensure_chat_timers_locked(&tx)?;
+            Self::ensure_chat_timers_locked(tx)?;
             let expires_at = (direction == "sent" && delivery == CHAT_DELIVERED)
                 .then(|| now.saturating_add(i64::from(ttl_secs)));
             tx.execute(
@@ -7214,8 +7235,326 @@ impl Database {
              )",
             params![friend_hash, MAX_MESSAGES_PER_FRIEND],
         )?;
-        tx.commit()?;
         Ok(new_id)
+    }
+
+    /// Store a message `friend_hash` sent under mailbox id `msg_id`, unless a
+    /// copy of it already was. The id is noted as shown, the row stored, and
+    /// the sender's timer applied together, so a crash between them cannot
+    /// leave the id marked shown with no message behind it (the friend would
+    /// then be told it arrived). `None` when it was already shown; otherwise
+    /// the new row, and its expiry if the sender's timer started it.
+    pub fn insert_received_chat_once(
+        &self,
+        friend_hash: &str,
+        message: &str,
+        own_ttl: u32,
+        msg_id: &[u8; 16],
+        now: i64,
+        peer_ttl: Option<u32>,
+    ) -> anyhow::Result<Option<(i64, Option<(i64, i64)>)>> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        Self::ensure_chat_timers_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let fresh = tx.execute(
+            "INSERT OR IGNORE INTO chat_mailbox_seen (friend_hash, msg_id, seen_at) VALUES (?1, ?2, ?3)",
+            params![friend_hash, hex::encode(msg_id), now],
+        )? > 0;
+        if !fresh {
+            return Ok(None);
+        }
+        let id = self.insert_chat_row(&tx, friend_hash, "received", message, CHAT_DELIVERED, own_ttl)?;
+        let expiry = match peer_ttl.filter(|ttl| *ttl > 0) {
+            Some(ttl) => {
+                let body_hash = Self::friend_chat_body_hash_hex(message);
+                Self::apply_peer_chat_ttl_in(&tx, friend_hash, &body_hash, ttl)?
+                    .and_then(|(row, at)| at.map(|at| (row, at)))
+            }
+            None => None,
+        };
+        tx.commit()?;
+        Ok(Some((id, expiry)))
+    }
+
+    /// Chat-mailbox bookkeeping, in tables of their own for the reason
+    /// [`Self::ensure_chat_timers_locked`] gives.
+    ///
+    /// `friend_chat_caps` records the friends who said they collect from the
+    /// mailbox. `chat_mailbox_sent` holds the mailbox id given to each message
+    /// for such a friend, and where the server keeps its copy once one is
+    /// left: the row stays queued until the friend's receipt names that id,
+    /// and a direct send of it carries the id. `chat_mailbox_seen` is the
+    /// receiving side's record of ids already shown, so the mailbox copy and
+    /// the direct one are not both stored.
+    fn ensure_chat_mailbox_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS friend_chat_caps (
+                friend_hash TEXT PRIMARY KEY,
+                mailbox INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS chat_mailbox_sent (
+                message_id INTEGER PRIMARY KEY,
+                friend_hash TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                deposited_at INTEGER NOT NULL,
+                box_id TEXT NOT NULL DEFAULT '',
+                item_id TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_mailbox_sent_msg
+                ON chat_mailbox_sent(friend_hash, msg_id);
+            CREATE TABLE IF NOT EXISTS chat_mailbox_seen (
+                friend_hash TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                seen_at INTEGER NOT NULL,
+                PRIMARY KEY (friend_hash, msg_id)
+            );",
+        )?;
+        Self::add_column_if_missing(conn, "chat_mailbox_sent", "box_id", "TEXT NOT NULL DEFAULT ''")?;
+        Self::add_column_if_missing(conn, "chat_mailbox_sent", "item_id", "TEXT NOT NULL DEFAULT ''")?;
+        Ok(())
+    }
+
+    /// Record that `friend_hash` collects chat left in the mailbox.
+    pub fn set_friend_chat_mailbox(&self, friend_hash: &str, collects: bool) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        conn.execute(
+            "INSERT INTO friend_chat_caps (friend_hash, mailbox) VALUES (?1, ?2) \
+             ON CONFLICT(friend_hash) DO UPDATE SET mailbox = excluded.mailbox",
+            params![friend_hash, i64::from(collects)],
+        )?;
+        Ok(())
+    }
+
+    /// The friends known to collect chat left in the mailbox.
+    pub fn chat_mailbox_friends(&self) -> anyhow::Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        let mut stmt = conn.prepare("SELECT friend_hash FROM friend_chat_caps WHERE mailbox = 1")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// The mailbox ids assigned to these rows of `friend_hash`, and whether
+    /// the server has taken each.
+    pub fn chat_mailbox_ids(
+        &self,
+        friend_hash: &str,
+        ids: &[i64],
+    ) -> anyhow::Result<std::collections::HashMap<i64, ([u8; 16], bool)>> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT msg_id, deposited_at FROM chat_mailbox_sent \
+             WHERE message_id = ?1 AND friend_hash = ?2",
+        )?;
+        let mut out = std::collections::HashMap::new();
+        for id in ids {
+            let Some((hex_id, deposited_at)) = stmt
+                .query_row(params![id, friend_hash], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .optional()?
+            else {
+                continue;
+            };
+            let mut msg_id = [0u8; 16];
+            if hex::decode_to_slice(&hex_id, &mut msg_id).is_ok() {
+                out.insert(*id, (msg_id, deposited_at > 0));
+            }
+        }
+        Ok(out)
+    }
+
+    /// [`Self::chat_mailbox_ids`], first giving an id to each of these queued
+    /// rows that lacks one when `friend_hash` collects from the mailbox. A
+    /// direct send carries the id, so a copy a round leaves meanwhile is
+    /// shown once whichever arrives first.
+    pub fn assign_chat_mailbox_ids(
+        &self,
+        friend_hash: &str,
+        ids: &[i64],
+    ) -> anyhow::Result<std::collections::HashMap<i64, ([u8; 16], bool)>> {
+        {
+            let conn = self.conn.lock();
+            Self::ensure_chat_mailbox_locked(&conn)?;
+            let collects: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM friend_chat_caps WHERE friend_hash = ?1 AND mailbox = 1)",
+                params![friend_hash],
+                |row| row.get(0),
+            )?;
+            if collects && !ids.is_empty() {
+                let tx = conn.unchecked_transaction()?;
+                {
+                    let mut stmt = tx.prepare(
+                        "INSERT OR IGNORE INTO chat_mailbox_sent (message_id, friend_hash, msg_id, deposited_at) \
+                         VALUES (?1, ?2, ?3, 0)",
+                    )?;
+                    for id in ids {
+                        let mut msg_id = [0u8; 16];
+                        OsRng.fill_bytes(&mut msg_id);
+                        stmt.execute(params![id, friend_hash, hex::encode(msg_id)])?;
+                    }
+                }
+                tx.commit()?;
+            }
+        }
+        self.chat_mailbox_ids(friend_hash, ids)
+    }
+
+    /// Give a queued message its mailbox id, before it is sent. Recorded
+    /// first so a deposit cut short is retried under the same id, which the
+    /// friend recognises if both copies reach them. A row that already has
+    /// one (a direct send gave it) keeps it; the id it has is returned.
+    pub fn record_chat_mailbox_sent(
+        &self,
+        message_id: i64,
+        friend_hash: &str,
+        msg_id: &[u8; 16],
+    ) -> anyhow::Result<[u8; 16]> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO chat_mailbox_sent (message_id, friend_hash, msg_id, deposited_at) \
+             VALUES (?1, ?2, ?3, 0)",
+            params![message_id, friend_hash, hex::encode(msg_id)],
+        )?;
+        let stored: String = conn.query_row(
+            "SELECT msg_id FROM chat_mailbox_sent WHERE message_id = ?1",
+            params![message_id],
+            |row| row.get(0),
+        )?;
+        let mut out = [0u8; 16];
+        hex::decode_to_slice(&stored, &mut out)
+            .map_err(|e| anyhow::anyhow!("Corrupt chat mailbox id for message {message_id}: {e}"))?;
+        Ok(out)
+    }
+
+    /// The server took the message's mailbox copy as `item_id` in `box_id`,
+    /// which is what withdrawing it again takes.
+    pub fn mark_chat_mailbox_deposited(
+        &self,
+        message_id: i64,
+        now: i64,
+        box_id: &[u8; 32],
+        item_id: &[u8; 16],
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        conn.execute(
+            "UPDATE chat_mailbox_sent SET deposited_at = ?2, box_id = ?3, item_id = ?4 \
+             WHERE message_id = ?1",
+            params![message_id, now.max(1), hex::encode(box_id), hex::encode(item_id)],
+        )?;
+        Ok(())
+    }
+
+    /// Mailbox copies of messages delivered, or deleted by the user or with
+    /// the friend. The round takes each back, so a deleted message is not
+    /// collected after all and a delivered one does not sit on the server for
+    /// the rest of the week. A message given up on as failed keeps its copy:
+    /// the friend may yet collect it, and their receipt then marks it
+    /// delivered.
+    pub fn chat_mailbox_stale_deposits(&self) -> anyhow::Result<Vec<(i64, [u8; 32], [u8; 16])>> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT message_id, box_id, item_id FROM chat_mailbox_sent \
+             WHERE deposited_at > 0 AND message_id NOT IN \
+                 (SELECT id FROM chat_messages WHERE delivery IN (?1, ?2) AND direction = 'sent')",
+        )?;
+        let rows: Vec<(i64, String, String)> = stmt
+            .query_map(params![CHAT_QUEUED, CHAT_FAILED], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut out = Vec::new();
+        for (message_id, box_hex, item_hex) in rows {
+            let mut box_id = [0u8; 32];
+            let mut item_id = [0u8; 16];
+            if hex::decode_to_slice(&box_hex, &mut box_id).is_ok()
+                && hex::decode_to_slice(&item_hex, &mut item_id).is_ok()
+            {
+                out.push((message_id, box_id, item_id));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The server no longer holds these messages' mailbox copies.
+    pub fn forget_chat_mailbox_sent(&self, message_ids: &[i64]) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        let mut stmt = conn.prepare("DELETE FROM chat_mailbox_sent WHERE message_id = ?1")?;
+        for id in message_ids {
+            stmt.execute(params![id])?;
+        }
+        Ok(())
+    }
+
+    /// Whether `message_id` is still a queued outbound message.
+    pub fn chat_message_still_queued(&self, message_id: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chat_messages \
+             WHERE id = ?1 AND delivery = ?2 AND direction = 'sent')",
+            params![message_id, CHAT_QUEUED],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The messages to `friend_hash` that these mailbox ids name, which their
+    /// receipt has just confirmed: queued ones, and ones given up on as
+    /// failed while their copy still waited to be collected.
+    pub fn chat_mailbox_receipted(
+        &self,
+        friend_hash: &str,
+        msg_ids: &[[u8; 16]],
+    ) -> anyhow::Result<Vec<i64>> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT s.message_id FROM chat_mailbox_sent s \
+             JOIN chat_messages m ON m.id = s.message_id \
+             WHERE s.friend_hash = ?1 AND s.msg_id = ?2 \
+               AND m.delivery IN (?3, ?4) AND m.direction = 'sent'",
+        )?;
+        let mut out = Vec::new();
+        for msg_id in msg_ids {
+            if let Some(id) = stmt
+                .query_row(params![friend_hash, hex::encode(msg_id), CHAT_QUEUED, CHAT_FAILED], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()?
+            {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Forget mailbox bookkeeping nothing can need any more: ids seen longer
+    /// ago than an entry can wait on the server, and ids of messages that are
+    /// gone or no longer queued.
+    pub fn prune_chat_mailbox(&self, now: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM chat_mailbox_seen WHERE seen_at < ?1",
+            params![now - CHAT_MAILBOX_SEEN_RETAIN_SECS],
+        )?;
+        // Never deposited, or deposited longer ago than the server keeps
+        // anything: there is no copy to take back.
+        conn.execute(
+            "DELETE FROM chat_mailbox_sent WHERE message_id NOT IN \
+                 (SELECT id FROM chat_messages WHERE delivery = ?1 AND direction = 'sent') \
+               AND (deposited_at = 0 OR deposited_at < ?2)",
+            params![CHAT_QUEUED, now - CHAT_MAILBOX_SEEN_RETAIN_SECS],
+        )?;
+        Ok(())
     }
 
     /// Outbound messages still waiting on a session, oldest first, so a flush
@@ -7597,6 +7936,19 @@ impl Database {
         let conn = self.conn.lock();
         Self::ensure_chat_timers_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
+        let applied = Self::apply_peer_chat_ttl_in(&tx, friend_hash, body_hash, ttl_secs)?;
+        tx.commit()?;
+        Ok(applied)
+    }
+
+    /// The body of [`Self::apply_peer_chat_ttl`], inside the caller's
+    /// transaction.
+    fn apply_peer_chat_ttl_in(
+        tx: &Connection,
+        friend_hash: &str,
+        body_hash: &str,
+        ttl_secs: u32,
+    ) -> anyhow::Result<Option<(i64, Option<i64>)>> {
         let now = chrono::Utc::now().timestamp();
         let Some((id, read)) = tx
             .query_row(
@@ -7636,7 +7988,6 @@ impl Database {
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id, friend_hash, ttl, started_at, expires_at],
         )?;
-        tx.commit()?;
         Ok(Some((id, expires_at)))
     }
 
@@ -23083,6 +23434,142 @@ mod tests {
         assert!(db.expire_disappearing_chat(now + 120).unwrap().is_empty(), "just settled");
         let gone = db.expire_disappearing_chat(now + 181).unwrap();
         assert_eq!(gone[0].2, vec![running.clone()]);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn chat_mailbox_bookkeeping_tracks_deposits_receipts_and_seen_ids() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-chat-mailbox-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).expect("open db");
+        let friend = "ab".repeat(16);
+        let other = "cd".repeat(16);
+        let now = chrono::Utc::now().timestamp();
+
+        assert!(db.chat_mailbox_friends().unwrap().is_empty());
+        db.set_friend_chat_mailbox(&friend, true).unwrap();
+        db.set_friend_chat_mailbox(&other, false).unwrap();
+        assert_eq!(
+            db.chat_mailbox_friends().unwrap(),
+            std::collections::HashSet::from([friend.clone()])
+        );
+
+        let queued = db
+            .insert_chat_message_ttl(&friend, "sent", "while you were out", CHAT_QUEUED, 0)
+            .unwrap();
+        let plain = db
+            .insert_chat_message_ttl(&friend, "sent", "not left anywhere", CHAT_QUEUED, 0)
+            .unwrap();
+        db.record_chat_mailbox_sent(queued, &friend, &[1; 16]).unwrap();
+        let ids = db.chat_mailbox_ids(&friend, &[queued, plain]).unwrap();
+        assert_eq!(ids.get(&queued), Some(&([1; 16], false)), "assigned, not yet taken");
+        assert!(!ids.contains_key(&plain));
+        assert_eq!(
+            db.record_chat_mailbox_sent(queued, &friend, &[9; 16]).unwrap(),
+            [1; 16],
+            "the id already given is the one used"
+        );
+        db.mark_chat_mailbox_deposited(queued, now, &[7; 32], &[8; 16]).unwrap();
+        assert_eq!(
+            db.chat_mailbox_ids(&friend, &[queued]).unwrap().get(&queued),
+            Some(&([1; 16], true)),
+            "a retry keeps the first id"
+        );
+        assert!(db.chat_message_still_queued(queued).unwrap());
+        assert!(db.chat_mailbox_stale_deposits().unwrap().is_empty(), "still queued");
+
+        assert!(db.chat_mailbox_receipted(&other, &[[1; 16]]).unwrap().is_empty(), "another friend's receipt");
+        assert_eq!(db.chat_mailbox_receipted(&friend, &[[1; 16], [2; 16]]).unwrap(), vec![queued]);
+        db.set_chat_delivery_many(&[queued], CHAT_DELIVERED).unwrap();
+        assert!(
+            db.chat_mailbox_receipted(&friend, &[[1; 16]]).unwrap().is_empty(),
+            "a delivered row is not delivered twice"
+        );
+        db.prune_chat_mailbox(now).unwrap();
+        assert_eq!(
+            db.chat_mailbox_stale_deposits().unwrap(),
+            vec![(queued, [7; 32], [8; 16])],
+            "kept until its server copy is taken back"
+        );
+        db.forget_chat_mailbox_sent(&[queued]).unwrap();
+        assert!(db.chat_mailbox_ids(&friend, &[queued]).unwrap().is_empty());
+
+        // A deposited message the user deletes is taken back too.
+        let withdrawn = db
+            .insert_chat_message_ttl(&friend, "sent", "never mind", CHAT_QUEUED, 0)
+            .unwrap();
+        db.record_chat_mailbox_sent(withdrawn, &friend, &[3; 16]).unwrap();
+        db.mark_chat_mailbox_deposited(withdrawn, now, &[7; 32], &[4; 16]).unwrap();
+        db.delete_chat_message(&friend, withdrawn).unwrap();
+        assert_eq!(db.chat_mailbox_stale_deposits().unwrap(), vec![(withdrawn, [7; 32], [4; 16])]);
+        // One never taken by the server has nothing to take back.
+        db.record_chat_mailbox_sent(plain, &friend, &[6; 16]).unwrap();
+        db.delete_chat_message(&friend, plain).unwrap();
+        db.prune_chat_mailbox(now).unwrap();
+        assert!(db.chat_mailbox_ids(&friend, &[plain]).unwrap().is_empty());
+        assert_eq!(db.chat_mailbox_stale_deposits().unwrap().len(), 1);
+
+        // A row given up on is still rescued by a receipt that comes late.
+        let late = db
+            .insert_chat_message_ttl(&friend, "sent", "slow friend", CHAT_QUEUED, 0)
+            .unwrap();
+        db.record_chat_mailbox_sent(late, &friend, &[10; 16]).unwrap();
+        db.mark_chat_mailbox_deposited(late, now, &[7; 32], &[13; 16]).unwrap();
+        db.set_chat_delivery_many(&[late], CHAT_FAILED).unwrap();
+        assert!(
+            !db.chat_mailbox_stale_deposits().unwrap().iter().any(|(id, _, _)| *id == late),
+            "its copy is left for the friend to collect"
+        );
+        db.prune_chat_mailbox(now).unwrap();
+        assert_eq!(db.chat_mailbox_receipted(&friend, &[[10; 16]]).unwrap(), vec![late]);
+
+        // A direct send gives ids only for a friend who collects.
+        let direct = db
+            .insert_chat_message_ttl(&friend, "sent", "live", CHAT_QUEUED, 0)
+            .unwrap();
+        let other_direct = db
+            .insert_chat_message_ttl(&other, "sent", "live", CHAT_QUEUED, 0)
+            .unwrap();
+        let given = db.assign_chat_mailbox_ids(&friend, &[direct]).unwrap();
+        let (direct_id, taken) = given[&direct];
+        assert!(!taken);
+        assert_eq!(
+            db.assign_chat_mailbox_ids(&friend, &[direct]).unwrap()[&direct].0,
+            direct_id,
+            "stable once given"
+        );
+        assert_eq!(db.record_chat_mailbox_sent(direct, &friend, &[11; 16]).unwrap(), direct_id);
+        assert!(db.assign_chat_mailbox_ids(&other, &[other_direct]).unwrap().is_empty());
+
+        let received = |hash: &str| {
+            db.get_chat_messages(hash, 100, None)
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.direction == "received")
+                .count()
+        };
+        assert!(db.insert_received_chat_once(&friend, "hi", 0, &[5; 16], now, None).unwrap().is_some());
+        assert!(
+            db.insert_received_chat_once(&friend, "hi", 0, &[5; 16], now, None).unwrap().is_none(),
+            "the second copy"
+        );
+        assert_eq!(received(&friend), 1);
+        assert!(db.insert_received_chat_once(&other, "hi", 0, &[5; 16], now, None).unwrap().is_some(), "per friend");
+        let (_, expiry) = db
+            .insert_received_chat_once(&friend, "timed", 0, &[12; 16], now, Some(600))
+            .unwrap()
+            .unwrap();
+        assert_eq!(expiry, None, "the sender's timer waits for it to be read");
+        db.prune_chat_mailbox(now + CHAT_MAILBOX_SEEN_RETAIN_SECS + 1).unwrap();
+        assert!(
+            db.insert_received_chat_once(&friend, "hi", 0, &[5; 16], now, None).unwrap().is_some(),
+            "forgotten after the retention"
+        );
 
         drop(db);
         let _ = std::fs::remove_file(&path);

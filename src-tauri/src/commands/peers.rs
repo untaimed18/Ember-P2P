@@ -835,6 +835,9 @@ pub async fn delete_chat_history(
         .await
         .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("peers_failed_delete_chat", "Failed to delete the conversation", e))?;
+    // Take back anything left for them in the chat mailbox before they
+    // collect it. Best effort here; every round does it anyway.
+    let _ = state.network_tx.try_send(NetworkCommand::ChatMailboxRound);
     // Every view of it — the dock and the Friends page can both have it open —
     // and the unread badge, which would otherwise count what is gone.
     let _ = app.emit("ember:chat-cleared", serde_json::json!({ "user_hash": canonical }));
@@ -858,6 +861,7 @@ pub async fn delete_chat_message(
         .await
         .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("peers_failed_delete_message", "Failed to delete the message", e))?;
+    let _ = state.network_tx.try_send(NetworkCommand::ChatMailboxRound);
     let _ = app.emit(
         "ember:chat-removed",
         serde_json::json!({ "user_hash": canonical, "ids": [id], "xfer_ids": [] }),

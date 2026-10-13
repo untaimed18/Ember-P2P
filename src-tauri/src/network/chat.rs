@@ -72,24 +72,27 @@ pub(super) async fn flush_pending_chat(
         let pending = db_read.pending_chat_messages(&hash_for_read, MAX_FLUSH_PER_SESSION);
         // Each one's disappearing timer, to follow it out. A failed lookup
         // sends them without one rather than not at all.
-        let ttls = pending
+        let ids: Vec<i64> = pending
             .as_ref()
-            .ok()
-            .map(|rows| {
-                let ids: Vec<i64> = rows.iter().map(|(id, _, _)| *id).collect();
-                db_read.chat_ttls(&hash_for_read, &ids).unwrap_or_default()
-            })
+            .map(|rows| rows.iter().map(|(id, _, _)| *id).collect())
             .unwrap_or_default();
-        (expired, pending, ttls)
+        let ttls = db_read.chat_ttls(&hash_for_read, &ids).unwrap_or_default();
+        // Mailbox ids for a friend who collects, sent ahead of each message
+        // so the friend shows it once even if a round leaves a copy too. A
+        // failed lookup sends them without, which can only show one twice.
+        let mailbox_ids = db_read
+            .assign_chat_mailbox_ids(&hash_for_read, &ids)
+            .unwrap_or_default();
+        (expired, pending, ttls, mailbox_ids)
     })
     .await
     .ok()
-    .map(|(expired, pending, ttls)| {
+    .map(|(expired, pending, ttls, mailbox_ids)| {
         emit_chat_delivery_failed(app_handle, &expired);
-        pending.map(|rows| (rows, ttls))
+        pending.map(|rows| (rows, ttls, mailbox_ids))
     })
     .and_then(|r| r.ok());
-    let Some((pending, ttls)) = pending else {
+    let Some((pending, ttls, mailbox_ids)) = pending else {
         return;
     };
 
@@ -126,7 +129,19 @@ pub(super) async fn flush_pending_chat(
             framed.extend_from_slice(&((1 + envelope.len()) as u32).to_le_bytes());
             framed.push(ed2k::messages::OP_EMBER_CHAT_MSG);
             framed.extend_from_slice(&envelope);
-            let mut frames = vec![framed];
+            let mut frames = Vec::with_capacity(3);
+            if let Some((msg_id, _)) = mailbox_ids.get(&id) {
+                let Some(sealed) =
+                    crate::network::ember::crypto::encrypt_chat_id(ed25519_secret_key, &peer_pubkey, msg_id)
+                else {
+                    break;
+                };
+                frames.push(ed2k::messages::build_ember_ext_frame(
+                    ed2k::messages::EMBER_EXT_CHAT_ID,
+                    &sealed,
+                ));
+            }
+            frames.push(framed);
             if let Some(&ttl) = ttls.get(&id) {
                 let target = crate::network::ember::crypto::ChatExpireTarget::Message(
                     crate::network::ember::crypto::chat_body_hash(&message),

@@ -1128,6 +1128,13 @@ pub(super) struct NetworkState {
     /// database, so it is held for `CHAT_EXPIRE_HOLD_SECS` and applied when the
     /// row lands. Bounded by `MAX_HELD_CHAT_EXPIRES` (both in `chat.rs`).
     pub(super) held_chat_expires: HashMap<([u8; 16], ember::crypto::ChatExpireTarget), (u32, i64)>,
+    /// The chat mailbox round in progress, if any (`chat_mailbox.rs`).
+    pub(super) chat_mailbox_round: Option<tokio::task::JoinHandle<()>>,
+    /// When the last round started, which spaces out rounds asked for early.
+    pub(super) chat_mailbox_last_round: Option<std::time::Instant>,
+    /// A round was asked for early while one ran or too soon after: the tick
+    /// starts it once it may.
+    pub(super) chat_mailbox_rerun: bool,
     /// Shared Ember session map for sending outbound packets to friend connections
     pub(super) ember_sessions: upload_server::EmberSessionMap,
     /// Shared flag: set while the app is shutting down, so the upload listener

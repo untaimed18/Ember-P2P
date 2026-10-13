@@ -660,6 +660,195 @@ pub fn decrypt_chat_expire(
     decode_chat_expire(&plain)
 }
 
+/// Chat-mailbox boxes rotate daily: a box is one sender's channel to one
+/// recipient for one UTC day.
+pub const CHAT_MAILBOX_DAY_SECS: i64 = 86_400;
+/// The only sealed sizes the rendezvous mailbox stores. A blob is padded to
+/// the smallest that fits, so its length shows only as one of these.
+pub const CHAT_MAILBOX_BLOB_SIZES: [usize; 4] = [512, 1024, 2048, 4608];
+/// Ids named by one receipt.
+pub const MAX_MAILBOX_RECEIPT_IDS: usize = 200;
+/// Longest chat text a mailbox message carries, the same cap a live one has.
+pub const MAX_MAILBOX_TEXT_LEN: usize = 4096;
+/// A chat message's mailbox id, also sent ahead of its direct copy.
+pub const CHAT_MESSAGE_ID_LEN: usize = 16;
+
+const CHAT_MAILBOX_PURPOSE: &[u8] = b"chat-mailbox-v1\0";
+const CHAT_MAILBOX_MAGIC: &[u8; 4] = b"MBX1";
+const CHAT_MAILBOX_KIND_MESSAGE: u8 = 1;
+const CHAT_MAILBOX_KIND_RECEIPT: u8 = 2;
+/// `magic(4) || box(32) || kind(1) || body_len(2)`, before the body.
+const CHAT_MAILBOX_HEADER_LEN: usize = 4 + 32 + 1 + 2;
+const CHAT_ID_MAGIC: &[u8; 4] = b"CID1";
+/// Largest chat-id envelope decrypted.
+pub const MAX_CHAT_ID_WIRE_LEN: usize = CHAT_ENVELOPE_OVERHEAD + 4 + CHAT_MESSAGE_ID_LEN;
+
+/// The mailbox day `unix_seconds` falls in.
+pub fn chat_mailbox_day(unix_seconds: i64) -> i64 {
+    unix_seconds.div_euclid(CHAT_MAILBOX_DAY_SECS)
+}
+
+/// The box where `recipient_ed25519_pubkey` collects what its friend left on
+/// `day`. Both friends compute the same box for one direction and a different
+/// one for the other; nobody else can compute either.
+pub fn derive_chat_mailbox_box(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    recipient_ed25519_pubkey: &[u8; 32],
+    day: i64,
+) -> Option<[u8; 32]> {
+    let mut purpose = Vec::with_capacity(CHAT_MAILBOX_PURPOSE.len() + 32);
+    purpose.extend_from_slice(CHAT_MAILBOX_PURPOSE);
+    purpose.extend_from_slice(recipient_ed25519_pubkey);
+    derive_pairwise_capability(our_ed25519_seed, peer_ed25519_pubkey, &purpose, day)
+}
+
+/// What a sealed mailbox entry carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MailboxPayload {
+    /// A chat message, with the sender's disappearing timer (0 for none).
+    Message {
+        msg_id: [u8; CHAT_MESSAGE_ID_LEN],
+        ttl_secs: u32,
+        text: String,
+    },
+    /// The messages the sender of this receipt has collected.
+    Receipt {
+        msg_ids: Vec<[u8; CHAT_MESSAGE_ID_LEN]>,
+    },
+}
+
+/// Seal `payload` for the friend at `peer_ed25519_pubkey`, bound to `mailbox`
+/// and padded to a [`CHAT_MAILBOX_BLOB_SIZES`] size.
+///
+/// The chat key is the same in both directions, so the box goes inside the
+/// seal: a server moving a blob into the other direction's box, where its own
+/// author would collect it, gets it refused rather than read as the friend's.
+pub fn seal_mailbox_payload(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    mailbox: &[u8; 32],
+    payload: &MailboxPayload,
+) -> Option<Vec<u8>> {
+    let (kind, body) = match payload {
+        MailboxPayload::Message {
+            msg_id,
+            ttl_secs,
+            text,
+        } => {
+            if text.len() > MAX_MAILBOX_TEXT_LEN {
+                return None;
+            }
+            let mut body = Vec::with_capacity(CHAT_MESSAGE_ID_LEN + 4 + text.len());
+            body.extend_from_slice(msg_id);
+            body.extend_from_slice(&ttl_secs.to_le_bytes());
+            body.extend_from_slice(text.as_bytes());
+            (CHAT_MAILBOX_KIND_MESSAGE, body)
+        }
+        MailboxPayload::Receipt { msg_ids } => {
+            if msg_ids.is_empty() || msg_ids.len() > MAX_MAILBOX_RECEIPT_IDS {
+                return None;
+            }
+            (CHAT_MAILBOX_KIND_RECEIPT, msg_ids.concat())
+        }
+    };
+    let plain_len = CHAT_MAILBOX_HEADER_LEN + body.len();
+    let sealed_len = *CHAT_MAILBOX_BLOB_SIZES
+        .iter()
+        .find(|&&size| size >= plain_len + CHAT_ENVELOPE_OVERHEAD)?;
+    let mut plain = Vec::with_capacity(sealed_len - CHAT_ENVELOPE_OVERHEAD);
+    plain.extend_from_slice(CHAT_MAILBOX_MAGIC);
+    plain.extend_from_slice(mailbox);
+    plain.push(kind);
+    plain.extend_from_slice(&u16::try_from(body.len()).ok()?.to_le_bytes());
+    plain.extend_from_slice(&body);
+    plain.resize(sealed_len - CHAT_ENVELOPE_OVERHEAD, 0);
+    encrypt_chat_for_peer(our_ed25519_seed, peer_ed25519_pubkey, &plain)
+}
+
+/// Open a blob collected from `mailbox`. `None` for one of another size, not
+/// sealed by this friend, addressed to another box, or not well formed.
+pub fn open_mailbox_payload(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    mailbox: &[u8; 32],
+    blob: &[u8],
+) -> Option<MailboxPayload> {
+    if !CHAT_MAILBOX_BLOB_SIZES.contains(&blob.len()) {
+        return None;
+    }
+    let plain = decrypt_chat_from_peer(our_ed25519_seed, peer_ed25519_pubkey, blob)?;
+    if plain.len() < CHAT_MAILBOX_HEADER_LEN
+        || &plain[..4] != CHAT_MAILBOX_MAGIC
+        || plain[4..36] != mailbox[..]
+    {
+        return None;
+    }
+    let kind = plain[36];
+    let body_len = usize::from(u16::from_le_bytes([plain[37], plain[38]]));
+    let body = plain.get(CHAT_MAILBOX_HEADER_LEN..CHAT_MAILBOX_HEADER_LEN + body_len)?;
+    match kind {
+        CHAT_MAILBOX_KIND_MESSAGE => {
+            if body.len() < CHAT_MESSAGE_ID_LEN + 4 {
+                return None;
+            }
+            let msg_id: [u8; CHAT_MESSAGE_ID_LEN] = body[..CHAT_MESSAGE_ID_LEN].try_into().ok()?;
+            let ttl_secs = u32::from_le_bytes(body[16..20].try_into().ok()?);
+            let text = std::str::from_utf8(&body[20..]).ok()?;
+            if text.len() > MAX_MAILBOX_TEXT_LEN {
+                return None;
+            }
+            Some(MailboxPayload::Message {
+                msg_id,
+                ttl_secs,
+                text: text.to_string(),
+            })
+        }
+        CHAT_MAILBOX_KIND_RECEIPT => {
+            if body.is_empty()
+                || body.len() % CHAT_MESSAGE_ID_LEN != 0
+                || body.len() / CHAT_MESSAGE_ID_LEN > MAX_MAILBOX_RECEIPT_IDS
+            {
+                return None;
+            }
+            let msg_ids = body
+                .chunks_exact(CHAT_MESSAGE_ID_LEN)
+                .map(|chunk| chunk.try_into().expect("chunks_exact yields full chunks"))
+                .collect();
+            Some(MailboxPayload::Receipt { msg_ids })
+        }
+        _ => None,
+    }
+}
+
+/// Seal the mailbox id that goes ahead of a chat message's direct copy, so a
+/// friend who already collected it from the mailbox shows it once.
+pub fn encrypt_chat_id(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    msg_id: &[u8; CHAT_MESSAGE_ID_LEN],
+) -> Option<Vec<u8>> {
+    let mut plain = Vec::with_capacity(4 + CHAT_MESSAGE_ID_LEN);
+    plain.extend_from_slice(CHAT_ID_MAGIC);
+    plain.extend_from_slice(msg_id);
+    encrypt_chat_for_peer(our_ed25519_seed, peer_ed25519_pubkey, &plain)
+}
+
+pub fn decrypt_chat_id(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    envelope: &[u8],
+) -> Option<[u8; CHAT_MESSAGE_ID_LEN]> {
+    if envelope.len() > MAX_CHAT_ID_WIRE_LEN {
+        return None;
+    }
+    let plain = decrypt_chat_from_peer(our_ed25519_seed, peer_ed25519_pubkey, envelope)?;
+    if plain.len() != 4 + CHAT_MESSAGE_ID_LEN || &plain[..4] != CHAT_ID_MAGIC {
+        return None;
+    }
+    plain[4..].try_into().ok()
+}
+
 /// Decode an inbound `OP_EMBER_CHAT_MSG` payload for display.
 ///
 /// Returns `None` if the payload fails to decrypt or the plaintext isn't
@@ -1264,5 +1453,116 @@ mod tests {
         let envelope = encrypt_chat_read(&alice_seed, &bob_pub, &hash).unwrap();
         assert_eq!(decrypt_chat_read(&bob_seed, &alice_pub, &envelope), Some(hash));
         assert_ne!(chat_body_hash("hello there"), chat_body_hash("hello there!"));
+    }
+
+    fn mailbox_pair() -> ([u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
+        let alice_seed = gen_seed();
+        let bob_seed = gen_seed();
+        let alice_pub = signing_key_from_bytes(&alice_seed).verifying_key().to_bytes();
+        let bob_pub = signing_key_from_bytes(&bob_seed).verifying_key().to_bytes();
+        (alice_seed, alice_pub, bob_seed, bob_pub)
+    }
+
+    #[test]
+    fn both_friends_derive_each_direction_s_box_and_nobody_else_does() {
+        let (alice_seed, alice_pub, bob_seed, bob_pub) = mailbox_pair();
+        let day = chat_mailbox_day(1_790_000_000);
+        let to_bob = derive_chat_mailbox_box(&alice_seed, &bob_pub, &bob_pub, day).unwrap();
+        assert_eq!(
+            derive_chat_mailbox_box(&bob_seed, &alice_pub, &bob_pub, day),
+            Some(to_bob),
+            "the recipient finds the box its friend writes to"
+        );
+        let to_alice = derive_chat_mailbox_box(&bob_seed, &alice_pub, &alice_pub, day).unwrap();
+        assert_ne!(to_bob, to_alice, "each direction has its own box");
+        assert_ne!(
+            derive_chat_mailbox_box(&alice_seed, &bob_pub, &bob_pub, day + 1),
+            Some(to_bob),
+            "boxes rotate daily"
+        );
+        let (eve_seed, _, _, _) = mailbox_pair();
+        assert_ne!(
+            derive_chat_mailbox_box(&eve_seed, &bob_pub, &bob_pub, day),
+            Some(to_bob),
+            "a third identity cannot compute it"
+        );
+    }
+
+    #[test]
+    fn a_mailbox_message_and_receipt_round_trip_padded() {
+        let (alice_seed, alice_pub, bob_seed, bob_pub) = mailbox_pair();
+        let mailbox = derive_chat_mailbox_box(&alice_seed, &bob_pub, &bob_pub, 7).unwrap();
+        let message = MailboxPayload::Message {
+            msg_id: [3; CHAT_MESSAGE_ID_LEN],
+            ttl_secs: 3600,
+            text: "see you tomorrow".to_string(),
+        };
+        let sealed = seal_mailbox_payload(&alice_seed, &bob_pub, &mailbox, &message).unwrap();
+        assert_eq!(sealed.len(), 512, "padded to the smallest bucket");
+        assert_eq!(
+            open_mailbox_payload(&bob_seed, &alice_pub, &mailbox, &sealed),
+            Some(message)
+        );
+
+        let long = MailboxPayload::Message {
+            msg_id: [4; CHAT_MESSAGE_ID_LEN],
+            ttl_secs: 0,
+            text: "x".repeat(MAX_MAILBOX_TEXT_LEN),
+        };
+        let sealed = seal_mailbox_payload(&alice_seed, &bob_pub, &mailbox, &long).unwrap();
+        assert_eq!(sealed.len(), 4608, "the longest message fits the largest bucket");
+        assert_eq!(open_mailbox_payload(&bob_seed, &alice_pub, &mailbox, &sealed), Some(long));
+        let too_long = MailboxPayload::Message {
+            msg_id: [5; CHAT_MESSAGE_ID_LEN],
+            ttl_secs: 0,
+            text: "x".repeat(MAX_MAILBOX_TEXT_LEN + 1),
+        };
+        assert!(seal_mailbox_payload(&alice_seed, &bob_pub, &mailbox, &too_long).is_none());
+
+        let receipt = MailboxPayload::Receipt {
+            msg_ids: vec![[9; CHAT_MESSAGE_ID_LEN]; MAX_MAILBOX_RECEIPT_IDS],
+        };
+        let sealed = seal_mailbox_payload(&bob_seed, &alice_pub, &mailbox, &receipt).unwrap();
+        assert!(CHAT_MAILBOX_BLOB_SIZES.contains(&sealed.len()));
+        assert_eq!(
+            open_mailbox_payload(&alice_seed, &bob_pub, &mailbox, &sealed),
+            Some(receipt)
+        );
+    }
+
+    /// The chat key is the same both ways, so the box inside the seal is what
+    /// stops a server handing a blob back to its own author as the friend's.
+    #[test]
+    fn a_blob_moved_to_another_box_is_refused() {
+        let (alice_seed, alice_pub, bob_seed, bob_pub) = mailbox_pair();
+        let to_bob = derive_chat_mailbox_box(&alice_seed, &bob_pub, &bob_pub, 7).unwrap();
+        let to_alice = derive_chat_mailbox_box(&alice_seed, &bob_pub, &alice_pub, 7).unwrap();
+        let sealed = seal_mailbox_payload(
+            &alice_seed,
+            &bob_pub,
+            &to_bob,
+            &MailboxPayload::Message {
+                msg_id: [1; CHAT_MESSAGE_ID_LEN],
+                ttl_secs: 0,
+                text: "hi".into(),
+            },
+        )
+        .unwrap();
+        assert!(open_mailbox_payload(&alice_seed, &bob_pub, &to_alice, &sealed).is_none());
+        assert!(open_mailbox_payload(&bob_seed, &alice_pub, &to_alice, &sealed).is_none());
+        let mut tampered = sealed.clone();
+        tampered[100] ^= 1;
+        assert!(open_mailbox_payload(&bob_seed, &alice_pub, &to_bob, &tampered).is_none());
+        assert!(open_mailbox_payload(&bob_seed, &alice_pub, &to_bob, &sealed[..511]).is_none());
+    }
+
+    #[test]
+    fn a_chat_id_round_trips_and_is_not_another_signal() {
+        let (alice_seed, alice_pub, bob_seed, bob_pub) = mailbox_pair();
+        let id = [8; CHAT_MESSAGE_ID_LEN];
+        let envelope = encrypt_chat_id(&alice_seed, &bob_pub, &id).unwrap();
+        assert_eq!(decrypt_chat_id(&bob_seed, &alice_pub, &envelope), Some(id));
+        let read = encrypt_chat_read(&alice_seed, &bob_pub, &[8; CHAT_BODY_HASH_LEN]).unwrap();
+        assert!(decrypt_chat_id(&bob_seed, &alice_pub, &read).is_none());
     }
 }

@@ -4207,6 +4207,17 @@
                 ariaLabel={m.settings_friend_chat_read_receipts()}
               />
             </div>
+            <div class="field toggle-row nested" class:is-disabled={!friendChatOn}>
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_chat_mailbox_label()}</span>
+                <span class="hint">{m.settings_chat_mailbox_hint()}</span>
+              </div>
+              <ToggleSwitch
+                bind:checked={settings.chat_mailbox_enabled}
+                disabled={!friendChatOn}
+                ariaLabel={m.settings_chat_mailbox_label()}
+              />
+            </div>
             <div class="field nested" class:is-disabled={!friendChatOn}>
               <label for="chat-disappear">{m.settings_chat_disappear_label()}</label>
               <select

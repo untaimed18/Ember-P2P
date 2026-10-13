@@ -1154,6 +1154,7 @@ pub(super) async fn handle_upload_event(
         | UploadEventKind::EmberPeerDiscovered { .. }
         | UploadEventKind::FriendSeen { .. }
         | UploadEventKind::EmberChatMessage { .. }
+        | UploadEventKind::EmberChatMailboxAware { .. }
         | UploadEventKind::EmberChatTyping { .. }
         | UploadEventKind::EmberChatRead { .. }
         | UploadEventKind::EmberChatExpire { .. }

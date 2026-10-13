@@ -218,8 +218,20 @@ pub(super) async fn apply_settings_update(
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
 ) {
     let old_channel_username = settings.channel_username.clone();
+    let session_friends: Vec<[u8; 16]> = state.ember_sessions.read().await.keys().copied().collect();
+    let collected_before: Vec<bool> = session_friends
+        .iter()
+        .map(|friend| collects_chat_mail_from(settings, friend))
+        .collect();
     if apply_network_settings(state, settings, new_settings, app_handle) {
         load_ipfilter_on_enable(state).await;
+    }
+    // Friends online now hear the change at once, rather than leaving us mail
+    // we no longer collect until their next session.
+    for (friend, before) in session_friends.into_iter().zip(collected_before) {
+        if collects_chat_mail_from(settings, &friend) != before {
+            on_friend_session_for_mailbox(state, settings, friend).await;
+        }
     }
     publish_presence_under_new_username(
         udp_socket,

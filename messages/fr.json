@@ -3018,6 +3018,8 @@
   "settings_friend_browse_hint": "Vos amis peuvent voir la liste des fichiers que vous partagez. Désactivé, vous pouvez toujours parcourir les leurs s’ils l’autorisent.",
   "settings_friend_chat_read_receipts": "Accusés de lecture",
   "settings_friend_chat_read_receipts_hint": "Vos amis voient quand vous avez lu leurs messages. Si c’est désactivé, vous ne verrez pas les leurs non plus.",
+  "settings_chat_mailbox_label": "Remettre les messages quand vos amis sont hors ligne",
+  "settings_chat_mailbox_hint": "Les messages destinés à un ami hors ligne l'attendent jusqu'à une semaine sur le serveur Rendezvous, chiffrés de bout en bout, et ceux qu'il vous envoie pendant votre absence vous attendent. Le serveur ne peut pas les lire, et rien dans ces messages ne vous identifie, ni vous ni votre ami. Fonctionne avec les amis sous Ember 1.7.4 ou plus récent.",
   "settings_chat_disappear_label": "Messages éphémères",
   "settings_chat_disappear_hint": "S’applique aux nouveaux messages avec tous les amis sans minuteur propre. Les messages que vous envoyez disparaissent des deux ordinateurs ; un ami sous une ancienne version d’Ember garde ses copies. Les fichiers reçus restent dans votre dossier de téléchargements.",
   "settings_max_friends": "Nombre maximal d’amis",

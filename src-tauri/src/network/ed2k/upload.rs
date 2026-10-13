@@ -2646,6 +2646,14 @@ pub enum UploadEventKind {
     EmberChatMessage {
         ember_hash: [u8; 16],
         message: String,
+        /// The mailbox id an `EMBER_EXT_CHAT_ID` frame gave it, when the
+        /// friend also left it in the chat mailbox.
+        msg_id: Option<[u8; 16]>,
+    },
+    /// Whether the friend collects chat left in the rendezvous chat mailbox.
+    EmberChatMailboxAware {
+        ember_hash: [u8; 16],
+        collects: bool,
     },
     /// Friend is composing (or just stopped) in our 1:1 chat. Live only.
     EmberChatTyping {
@@ -8255,6 +8263,8 @@ impl UploadHandler {
         // Set once the friend sends `EMBER_EXT_BROWSE_SCOPE_AWARE`; until then
         // our browse answers on this session leave friends-only files out.
         let mut peer_scope_aware = false;
+        // From an `EMBER_EXT_CHAT_ID`, for the chat message that follows it.
+        let mut pending_chat_id: Option<[u8; 16]> = None;
         let mut identity_emitted = false;
         if is_friend && !hello_caps.is_ember {
             info!("Peer {peer_addr} is a friend but is_ember=false, skipping friend request");
@@ -13649,6 +13659,9 @@ impl UploadHandler {
                 (OP_EMULEPROT, OP_EMBER_CHAT_MSG)
                     if friend_privileges_allowed(secure_v2_authenticated, is_ember_friend) =>
                 {
+                    // Spent on this message even if it is dropped, so it
+                    // cannot attach to the next.
+                    let msg_id = pending_chat_id.take();
                     if let Some(eh) = peer_ember_hash {
                         if !self.friend_hashes.read().await.contains(&eh) {
                             debug!("Ignoring chat from removed friend {}", hex::encode(eh));
@@ -13673,6 +13686,7 @@ impl UploadHandler {
                                         kind: UploadEventKind::EmberChatMessage {
                                             ember_hash: eh,
                                             message: msg,
+                                            msg_id,
                                         },
                                     })
                                     .await;
@@ -13995,6 +14009,27 @@ impl UploadHandler {
                             }
                             Some((super::messages::EMBER_EXT_BROWSE_SCOPE_AWARE, _)) => {
                                 peer_scope_aware = true;
+                            }
+                            Some((super::messages::EMBER_EXT_CHAT_ID, body)) => {
+                                pending_chat_id = hello_caps.ember_pubkey.and_then(|pk| {
+                                    crate::network::ember::crypto::decrypt_chat_id(
+                                        &self.ed25519_secret_key,
+                                        &pk,
+                                        body,
+                                    )
+                                });
+                            }
+                            Some((super::messages::EMBER_EXT_MAILBOX_AWARE, body)) => {
+                                let _ = self
+                                    .upload_event_tx
+                                    .send(UploadEvent {
+                                        transfer_id: String::new(),
+                                        kind: UploadEventKind::EmberChatMailboxAware {
+                                            ember_hash: eh,
+                                            collects: body.first() == Some(&1),
+                                        },
+                                    })
+                                    .await;
                             }
                             // A sub-type this build predates. Ignoring it is
                             // the whole point of the envelope.

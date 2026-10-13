@@ -4824,6 +4824,18 @@ async fn handle_command_inner(
             // to allow updating the owned `settings` variable.
         }
 
+        NetworkCommand::ChatMailboxRound => {
+            start_chat_mailbox_round(
+                state,
+                db,
+                app_handle,
+                settings,
+                ed25519_secret_key,
+                ed25519_pubkey,
+                true,
+            );
+        }
+
         NetworkCommand::ConnectToServer { ip, port, tx } => {
             let target = format!("{ip}:{port}");
             let result =
@@ -6242,7 +6254,32 @@ async fn handle_command_inner(
                                     return;
                                 }
                             };
-                            let mut frames = vec![packet];
+                            let db_ids = db.clone();
+                            let hex_ids = hash_hex.clone();
+                            let mailbox_id = tokio::task::spawn_blocking(move || {
+                                db_ids.assign_chat_mailbox_ids(&hex_ids, &[pending_id])
+                            })
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .and_then(|ids| ids.get(&pending_id).map(|(msg_id, _)| *msg_id));
+                            let mut frames = Vec::with_capacity(3);
+                            // A round that started while the friend was away
+                            // may be leaving this row in the mailbox: with its
+                            // id ahead of it, the friend shows it once.
+                            if let Some(sealed) = mailbox_id.and_then(|msg_id| {
+                                crate::network::ember::crypto::encrypt_chat_id(
+                                    &ed25519_secret_key,
+                                    &peer_pubkey,
+                                    &msg_id,
+                                )
+                            }) {
+                                frames.push(ed2k::messages::build_ember_ext_frame(
+                                    ed2k::messages::EMBER_EXT_CHAT_ID,
+                                    &sealed,
+                                ));
+                            }
+                            frames.push(packet);
                             if ttl_secs > 0 {
                                 let target = crate::network::ember::crypto::ChatExpireTarget::Message(
                                     crate::network::ember::crypto::chat_body_hash(&message),
@@ -6325,6 +6362,17 @@ async fn handle_command_inner(
                         }
                     };
                     let _ = tx.send(Err(format!("ChatAlreadyQueued:{queued_id}")));
+                    // Left in the chat mailbox now if they collect from it,
+                    // rather than at the next round.
+                    start_chat_mailbox_round(
+                        state,
+                        db,
+                        app_handle,
+                        settings,
+                        ed25519_secret_key,
+                        ed25519_pubkey,
+                        true,
+                    );
                     if state.outbound_session_tasks.contains_key(&friend_eh) {
                         debug!("Chat remains queued while an existing friend connection attempt finishes");
                     } else {

@@ -3018,6 +3018,8 @@
   "settings_friend_browse_hint": "好友可以看到你共享的文件列表。关闭后，若对方允许，你仍可浏览他们的共享。",
   "settings_friend_chat_read_receipts": "已读回执",
   "settings_friend_chat_read_receipts_hint": "好友能看到你已阅读他们的消息。关闭后，你也看不到对方的已读状态。",
+  "settings_chat_mailbox_label": "好友离线时也能送达消息",
+  "settings_chat_mailbox_hint": "发给离线好友的消息会经端到端加密后在 Rendezvous 服务器上等待对方，最长一周；你不在时好友发来的消息也会在那里等你。服务器无法读取消息，消息中也没有任何能识别你或好友身份的信息。适用于使用 Ember 1.7.4 或更高版本的好友。",
   "settings_chat_disappear_label": "消息定时消失",
   "settings_chat_disappear_hint": "适用于所有未单独设置计时的好友的新消息。你发送的消息会从两台电脑删除；使用旧版 Ember 的好友会保留副本。收到的文件会留在你的下载文件夹中。",
   "settings_max_friends": "好友上限",

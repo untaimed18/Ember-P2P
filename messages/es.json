@@ -3018,6 +3018,8 @@
   "settings_friend_browse_hint": "Tus amigos pueden ver la lista de archivos que compartes. Si lo desactivas, aún puedes explorar los suyos si ellos lo permiten.",
   "settings_friend_chat_read_receipts": "Confirmaciones de lectura",
   "settings_friend_chat_read_receipts_hint": "Tus amigos verán cuando hayas leído sus mensajes. Si lo desactivas, tú tampoco verás las suyas.",
+  "settings_chat_mailbox_label": "Entregar mensajes mientras tus amigos están desconectados",
+  "settings_chat_mailbox_hint": "Los mensajes para un amigo desconectado le esperan en el servidor Rendezvous hasta una semana, cifrados de extremo a extremo, y los que te envíe mientras no estés te esperan a ti. El servidor no puede leerlos, y no llevan nada que te identifique a ti ni a tu amigo. Funciona con amigos que usen Ember 1.7.4 o posterior.",
   "settings_chat_disappear_label": "Mensajes temporales",
   "settings_chat_disappear_hint": "Se aplica a los mensajes nuevos con todos los amigos sin temporizador propio. Los mensajes que envías desaparecen de ambos ordenadores; un amigo con una versión antigua de Ember conserva sus copias. Los archivos que recibes se quedan en tu carpeta de descargas.",
   "settings_max_friends": "Máximo de amigos",

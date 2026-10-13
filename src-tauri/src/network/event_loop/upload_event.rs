@@ -573,6 +573,7 @@ pub(in crate::network) async fn on_upload_event(
     {
         let activity_eh = match &event.kind {
             UploadEventKind::EmberChatMessage { ember_hash, .. }
+            | UploadEventKind::EmberChatMailboxAware { ember_hash, .. }
             | UploadEventKind::EmberChatTyping { ember_hash, .. }
             | UploadEventKind::EmberChatRead { ember_hash, .. }
             | UploadEventKind::EmberChatExpire { ember_hash, .. }
@@ -625,6 +626,11 @@ pub(in crate::network) async fn on_upload_event(
                     );
                 }
             }
+            // Ahead of the flush below, which can fill the session's
+            // queue and leave no room for it.
+            if still_friend {
+                on_friend_session_for_mailbox(state, settings, *ember_hash).await;
+            }
             // The session is live, so anything the user typed
             // while this friend was unreachable can go out now —
             // unless chat with them was turned off since, which
@@ -649,6 +655,13 @@ pub(in crate::network) async fn on_upload_event(
                 }
                 // Files queued while they were away, the same way.
                 chat_attach::send_queued(state, db, app_handle, settings, *ember_hash).await;
+            }
+            if still_friend {
+                // Their receipts for what was left them, and anything they
+                // left us, without waiting out the interval.
+                start_chat_mailbox_round(
+                    state, db, app_handle, settings, ed25519_secret_key, ed25519_pubkey, true,
+                );
             }
             if still_friend && !ip.is_unspecified() && *port > 0 {
                 let hash_hex = hex::encode(ember_hash);
@@ -776,6 +789,9 @@ pub(in crate::network) async fn on_upload_event(
                 // the outbound dial path), so without flushing
                 // here queued chat would sit unsent while the UI
                 // showed the friend online and new sends worked.
+                // Whether we collect goes first, for the reason the
+                // outbound arm gives.
+                on_friend_session_for_mailbox(state, settings, *ember_hash).await;
                 if settings.chat_allowed_with(ember_hash) {
                     flush_pending_chat(
                         db,
@@ -796,7 +812,15 @@ pub(in crate::network) async fn on_upload_event(
                     )
                     .await;
                 }
+                start_chat_mailbox_round(
+                    state, db, app_handle, settings, ed25519_secret_key, ed25519_pubkey, true,
+                );
             }
+        UploadEventKind::EmberChatMailboxAware { ember_hash, collects }
+            if friend_hashes.read().await.contains(ember_hash) =>
+        {
+            on_friend_mailbox_aware(db, *ember_hash, *collects).await;
+        }
         _ => {}
     }
 
@@ -909,7 +933,7 @@ pub(in crate::network) async fn on_upload_event(
         }
     }
 
-    if let UploadEventKind::EmberChatMessage { ember_hash: chat_eh, ref message } = event.kind {
+    if let UploadEventKind::EmberChatMessage { ember_hash: chat_eh, ref message, msg_id } = event.kind {
         if !friend_hashes.read().await.contains(&chat_eh) {
             debug!("Dropping secure chat event after friend removal");
             return;
@@ -945,25 +969,53 @@ pub(in crate::network) async fn on_upload_event(
             // deliberately doesn't participate in that ownership
             // check, so this shared map is what catches it.
             let now = chrono::Utc::now().timestamp();
-            let is_dup = state
-                .recent_ember_chat
-                .get(&chat_eh)
-                .is_some_and(|(last_msg, last_at)| {
-                    *last_msg == cleaned
-                        && now.saturating_sub(*last_at) <= EMBER_CHAT_DEDUP_WINDOW_SECS
-                });
-            if !is_dup {
-                // Our own timer for this chat, which the sender's — when it
-                // follows — can only shorten.
-                match persist_chat_history_message(
-                    db.clone(),
-                    hash_hex.clone(),
-                    "received",
-                    cleaned.clone(),
-                    settings.chat_disappear_secs_for(&chat_eh),
-                )
-                .await
-                {
+            // A message with a mailbox id is told apart by that id alone: two
+            // identical texts sent in a row are two messages, and dropping
+            // the second here would leave its mailbox copy to show later.
+            let is_dup = msg_id.is_none()
+                && state
+                    .recent_ember_chat
+                    .get(&chat_eh)
+                    .is_some_and(|(last_msg, last_at)| {
+                        *last_msg == cleaned
+                            && now.saturating_sub(*last_at) <= EMBER_CHAT_DEDUP_WINDOW_SECS
+                    });
+            // Our own timer for this chat, which the sender's — when it
+            // follows — can only shorten.
+            let own_ttl = settings.chat_disappear_secs_for(&chat_eh);
+            let stored = match msg_id {
+                _ if is_dup => None,
+                // The direct copy of a message the friend may also have left
+                // in the chat mailbox: shown once, whichever copy arrives
+                // first, with the id noted in the same transaction as the row.
+                Some(id) => {
+                    let db_once = db.clone();
+                    let hex_once = hash_hex.clone();
+                    let message = cleaned.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        db_once.insert_received_chat_once(&hex_once, &message, own_ttl, &id, now, None)
+                    })
+                    .await
+                    {
+                        Ok(Ok(Some((row, _)))) => Some(Ok(row)),
+                        Ok(Ok(None)) => None,
+                        Ok(Err(e)) => Some(Err(format!("Failed to persist chat history: {e}"))),
+                        Err(e) => Some(Err(format!("Chat history persistence task failed: {e}"))),
+                    }
+                }
+                None => Some(
+                    persist_chat_history_message(
+                        db.clone(),
+                        hash_hex.clone(),
+                        "received",
+                        cleaned.clone(),
+                        own_ttl,
+                    )
+                    .await,
+                ),
+            };
+            if let Some(stored) = stored {
+                match stored {
                     Ok(id) => {
                         state
                             .recent_ember_chat

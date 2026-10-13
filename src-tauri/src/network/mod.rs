@@ -7,6 +7,7 @@ mod channel_relay;
 mod channel_xfer;
 mod chat;
 pub(crate) mod chat_attach;
+mod chat_mailbox;
 mod command;
 mod downloads;
 pub mod ed2k;
@@ -137,6 +138,7 @@ use self::channel_membership::*;
 use self::channel_relay::*;
 use self::channel_xfer::*;
 use self::chat::*;
+use self::chat_mailbox::*;
 use self::downloads::*;
 use self::ember_dht::*;
 use self::ember_peers::*;
@@ -1070,6 +1072,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         pending_browse_requests: HashMap::new(),
         recent_ember_chat: HashMap::new(),
         held_chat_expires: HashMap::new(),
+        chat_mailbox_round: None,
+        chat_mailbox_last_round: None,
+        chat_mailbox_rerun: false,
         ember_sessions: Arc::new(RwLock::new(HashMap::new())),
         // Mirror the `stats.status` initialization above. The upload listener
         // binds and starts accepting TCP connections immediately (see
@@ -3718,6 +3723,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'small_timer' panicked: {}", describe_panic(&*__p));
                 }
+                // Here rather than an arm of its own: the loop is at
+                // `select!`'s branch limit. It keeps its own cadence.
+                on_chat_mailbox_tick(&mut state, &db, &app_handle, &settings, ed25519_secret_key, ed25519_pubkey);
             }
 
             // Buddy system: find a relay buddy if firewalled (always-on, like eMule)

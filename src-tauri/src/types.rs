@@ -1680,6 +1680,13 @@ pub struct AppSettings {
     /// is set onward. See [`CHAT_DISAPPEAR_CHOICES`].
     #[serde(default)]
     pub chat_disappear_secs: u32,
+    /// Leave chat for a friend who is offline in the rendezvous chat mailbox,
+    /// and collect what friends left for us there. Messages are sealed end to
+    /// end and the server keeps them at most a week; the message also stays
+    /// queued here until the friend confirms it, so nothing depends on the
+    /// server keeping it.
+    #[serde(default = "default_true")]
+    pub chat_mailbox_enabled: bool,
     /// Refuse inbound friend-browse listings. Outbound browse is unaffected.
     #[serde(default)]
     pub friend_browse_disabled: bool,
@@ -2680,6 +2687,7 @@ impl Default for AppSettings {
             friend_chat_disabled: false,
             friend_chat_read_receipts: true,
             chat_disappear_secs: 0,
+            chat_mailbox_enabled: true,
             friend_browse_disabled: false,
             friend_files_disabled: false,
             friend_session_encryption: true,

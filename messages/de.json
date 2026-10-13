@@ -3021,6 +3021,8 @@
   "settings_friend_browse_hint": "Freunde sehen die Liste Ihrer freigegebenen Dateien. Ist dies aus, können Sie deren Freigaben trotzdem durchsuchen, wenn sie es zulassen.",
   "settings_friend_chat_read_receipts": "Lesebestätigungen",
   "settings_friend_chat_read_receipts_hint": "Freunde sehen, wenn Sie ihre Nachrichten gelesen haben. Ist dies aus, sehen Sie ihre Lesebestätigungen auch nicht.",
+  "settings_chat_mailbox_label": "Nachrichten zustellen, während Freunde offline sind",
+  "settings_chat_mailbox_hint": "Nachrichten an einen Freund, der offline ist, warten bis zu eine Woche Ende-zu-Ende-verschlüsselt auf dem Rendezvous-Server, und Nachrichten, die er Ihnen schickt, während Sie weg sind, warten auf Sie. Der Server kann sie nicht lesen, und nichts darin identifiziert Sie oder Ihren Freund. Funktioniert mit Freunden ab Ember 1.7.4.",
   "settings_chat_disappear_label": "Verschwindende Nachrichten",
   "settings_chat_disappear_hint": "Gilt für neue Nachrichten mit allen Freunden ohne eigenen Timer. Ihre gesendeten Nachrichten verschwinden von beiden Computern; ein Freund mit einer älteren Ember-Version behält seine Kopien. Empfangene Dateien bleiben in Ihrem Download-Ordner.",
   "settings_max_friends": "Maximale Freunde",

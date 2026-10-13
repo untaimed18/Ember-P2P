@@ -3021,6 +3021,8 @@
   "settings_friend_browse_hint": "Friends can see the list of files you share. When off, you can still browse theirs if they allow it.",
   "settings_friend_chat_read_receipts": "Read receipts",
   "settings_friend_chat_read_receipts_hint": "Let friends see when you've read their messages. If this is off, you won't see theirs either.",
+  "settings_chat_mailbox_label": "Deliver messages while friends are offline",
+  "settings_chat_mailbox_hint": "Messages to a friend who is offline wait for them on the Rendezvous server for up to a week, end-to-end encrypted, and messages they send you while you are away wait for you. The server cannot read them, and nothing in them identifies you or your friend. Works with friends on Ember 1.7.4 or later.",
   "settings_chat_disappear_label": "Disappearing messages",
   "settings_chat_disappear_hint": "Applies to new messages with every friend who has no timer of their own. Messages you send disappear from both computers; a friend on an older version of Ember keeps their copies. Files you receive stay in your downloads folder.",
   "settings_max_friends": "Maximum friends",

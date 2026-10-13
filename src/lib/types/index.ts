@@ -959,6 +959,9 @@ export interface AppSettings {
   /** Disappearing messages by default, in seconds; 0 is off. A friend's own
    *  `disappear_secs` wins. See `CHAT_DISAPPEAR_CHOICES`. */
   chat_disappear_secs: number;
+  /** Leave chat for offline friends in the rendezvous chat mailbox, and
+   *  collect what they left us there. */
+  chat_mailbox_enabled: boolean;
   /** Disable browse-shares responses to friends */
   friend_browse_disabled: boolean;
   /** Decline files friends send (chat attachments and file offers). A friend's

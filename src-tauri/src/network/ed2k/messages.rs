@@ -353,6 +353,20 @@ pub const EMBER_EXT_BROWSE_SCOPE_AWARE: u8 = 0x0E;
 /// and ignores the timer — it keeps its copy, which the sender's UI says.
 pub const EMBER_EXT_CHAT_EXPIRE: u8 = 0x0F;
 
+/// [`OP_EMBER_EXT`] sub-type: whether this side collects chat left for it in
+/// the rendezvous chat mailbox, as one byte (1 yes, 0 no). Sent whenever a
+/// secure session comes up. A friend leaves messages there only for someone
+/// whose last word was yes; a build that predates this says nothing and is
+/// never left any.
+pub const EMBER_EXT_MAILBOX_AWARE: u8 = 0x10;
+
+/// [`OP_EMBER_EXT`] sub-type: the mailbox id of the [`OP_EMBER_CHAT_MSG`] that
+/// immediately follows, sealed under the chat key
+/// ([`crate::network::ember::crypto::encrypt_chat_id`]). Sent only ahead of a
+/// message that was also left in the mailbox, so a friend who already
+/// collected it there shows it once.
+pub const EMBER_EXT_CHAT_ID: u8 = 0x11;
+
 const DHT_MEET_FLAG_ANSWER: u8 = 0x01;
 
 /// [`EMBER_EXT_DHT_MEET`] body: `udp_port(2, LE) || flags(1)`.

@@ -664,6 +664,8 @@ pub async fn run_friend_session_over_transport(
         // Set once the friend sends `EMBER_EXT_BROWSE_SCOPE_AWARE`; until then
         // our browse answers to it leave friends-only files out.
         let mut peer_scope_aware = false;
+        // From an `EMBER_EXT_CHAT_ID`, for the chat message that follows it.
+        let mut pending_chat_id: Option<[u8; 16]> = None;
 
         // Dedicated reader task: reading an ed2k packet requires multiple
         // sequential awaits (protocol byte, length, opcode, payload). If the
@@ -733,6 +735,9 @@ pub async fn run_friend_session_over_transport(
                             }
                             match (proto, opcode) {
                                 (OP_EMULEPROT, OP_EMBER_CHAT_MSG) => {
+                                    // Spent on this message even if it is
+                                    // dropped, so it cannot attach to the next.
+                                    let msg_id = pending_chat_id.take();
                                     if payload.len() > MAX_CHAT_WIRE_LEN {
                                         warn!(
                                             "Friend {} chat payload oversized ({} bytes); dropping without decrypt",
@@ -750,6 +755,7 @@ pub async fn run_friend_session_over_transport(
                                                 kind: UploadEventKind::EmberChatMessage {
                                                     ember_hash: peer_ember_hash,
                                                     message: msg,
+                                                    msg_id,
                                                 },
                                             })
                                             .await;
@@ -1081,6 +1087,22 @@ pub async fn run_friend_session_over_transport(
                                         }
                                         Some((super::messages::EMBER_EXT_BROWSE_SCOPE_AWARE, _)) => {
                                             peer_scope_aware = true;
+                                        }
+                                        Some((super::messages::EMBER_EXT_CHAT_ID, body)) => {
+                                            pending_chat_id = crate::network::ember::crypto::decrypt_chat_id(
+                                                &session_our_ed25519_secret,
+                                                &session_peer_ember_pubkey,
+                                                body,
+                                            );
+                                        }
+                                        Some((super::messages::EMBER_EXT_MAILBOX_AWARE, body)) => {
+                                            let _ = session_ul_event_tx.send(UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: UploadEventKind::EmberChatMailboxAware {
+                                                    ember_hash: peer_ember_hash,
+                                                    collects: body.first() == Some(&1),
+                                                },
+                                            }).await;
                                         }
                                         // A sub-type this build predates. Ignoring
                                         // it is the whole point of the envelope.
