@@ -311,9 +311,11 @@ pub enum NetworkCommand {
         priority: u8,
         tx: oneshot::Sender<Result<(), String>>,
     },
+    /// Answers once the attempt has started, or with why it was refused.
     ConnectToServer {
         ip: String,
         port: u16,
+        tx: oneshot::Sender<Result<(), String>>,
     },
     DisconnectServer,
     AddServer {

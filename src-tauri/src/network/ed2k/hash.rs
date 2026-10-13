@@ -841,9 +841,13 @@ pub fn ed2k_link_web_sources(link: &str) -> Vec<String> {
         return Vec::new();
     };
     // Name, size and hash come first; a web source can only be a later field.
+    // The link ends at its `|/`, or at a line break when it has none: text
+    // holding several links must not lend this one the mirrors of the next.
+    let inner = inner.split(['\n', '\r']).next().unwrap_or_default();
     inner
         .split('|')
         .skip(3)
+        .take_while(|seg| !seg.starts_with('/'))
         .filter_map(|seg| seg.strip_prefix("s="))
         .filter(|url| !url.trim().is_empty())
         .map(|url| url.trim().to_string())
@@ -956,6 +960,19 @@ mod link_tests {
         let named = format!("ed2k://|file|s=trick|9|{HASH}|/");
         assert!(ed2k_link_web_sources(&named).is_empty());
         assert!(ed2k_link_web_sources("ed2k://|server|1.2.3.4|4661|/").is_empty());
+    }
+
+    #[test]
+    fn web_sources_stop_at_the_end_of_their_link() {
+        let two = format!(
+            "ed2k://|file|a.bin|9|{HASH}|s=https://a.example/a.bin|/\n\
+             ed2k://|file|b.bin|9|{HASH}|s=https://b.example/b.bin|/"
+        );
+        assert_eq!(ed2k_link_web_sources(&two), vec!["https://a.example/a.bin"]);
+        let unterminated = format!(
+            "ed2k://|file|a.bin|9|{HASH}|s=https://a.example/a.bin\nmore|s=https://b.example/b.bin|/"
+        );
+        assert_eq!(ed2k_link_web_sources(&unterminated), vec!["https://a.example/a.bin"]);
     }
 
     #[test]

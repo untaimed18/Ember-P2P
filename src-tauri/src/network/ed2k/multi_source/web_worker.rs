@@ -34,7 +34,10 @@ const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 const DISPATCH_RECHECK: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Run a worker for each web source of the download as it becomes ready,
-/// until the file is complete or none is running and none is ready.
+/// until the file is complete or the download stops. It does not end when no
+/// source is ready: one may be added, finish resting, or be switched back on
+/// while the download runs. The download aborts it once the peers are done
+/// and no worker is fetching (`WebWorker::working`).
 ///
 /// One task owns them all so the download waits on one handle, and holds each
 /// worker in an [`super::super::transfer::AbortOnDrop`] so that aborting it —
@@ -63,13 +66,13 @@ pub(super) async fn dispatch(template: WebWorker, total_sources: Arc<AtomicU32>)
             worker.url = url.clone();
             worker.worker = template.worker + next_worker;
             next_worker += 1;
+            // Counted before the spawn, so the download never sees a gap
+            // between a source being ready and its worker starting.
+            let working = Working::new(&template.working);
             let handle = tokio::spawn(async move {
-                let _ = worker.run().await;
+                let _ = worker.run(working).await;
             });
             running.insert(url, super::super::transfer::AbortOnDrop(handle));
-        }
-        if running.is_empty() {
-            return;
         }
         tokio::select! {
             _ = tokio::time::sleep(DISPATCH_RECHECK) => {}
@@ -97,6 +100,43 @@ pub(super) struct WebWorker {
     pub drop_tx: DropReleaseTx,
     pub active_count: Arc<AtomicU32>,
     pub disk_full: Arc<AtomicBool>,
+    /// Workers fetching or ready to, shared by all of them: one resting out
+    /// its backoff is not counted, so the download does not wait on it.
+    pub working: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Counts its worker in `WebWorker::working` while held.
+struct Working {
+    count: Arc<std::sync::atomic::AtomicUsize>,
+    held: bool,
+}
+
+impl Working {
+    fn new(count: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        let mut working = Self { count: count.clone(), held: false };
+        working.hold();
+        working
+    }
+
+    fn hold(&mut self) {
+        if !self.held {
+            self.count.fetch_add(1, Ordering::Relaxed);
+            self.held = true;
+        }
+    }
+
+    fn release(&mut self) {
+        if self.held {
+            self.count.fetch_sub(1, Ordering::Relaxed);
+            self.held = false;
+        }
+    }
+}
+
+impl Drop for Working {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// How a request ended, which decides what the source is told.
@@ -128,7 +168,7 @@ impl WebWorker {
         let (host, port) = self.host_and_port();
         // The protocol as the client name — the same in every language — with
         // the URL beside it as the name, which is what tells mirrors apart.
-        let label = if self.url.starts_with("https:") { "HTTPS" } else { "HTTP" };
+        let label = web_sources::source_label(&self.url);
         let _ = self
             .event_tx
             .send(DownloadEvent::SourceDetail {
@@ -151,13 +191,13 @@ impl WebWorker {
 
     /// Run until the file is complete, the download stops, or this source has
     /// nothing more to give. Returns the shape every source task returns.
-    pub async fn run(self) -> (usize, Vec<usize>, anyhow::Result<()>) {
+    async fn run(self, working: Working) -> (usize, Vec<usize>, anyhow::Result<()>) {
         let worker = self.worker;
-        let result = self.run_inner().await;
+        let result = self.run_inner(working).await;
         (worker, Vec::new(), result)
     }
 
-    async fn run_inner(self) -> anyhow::Result<()> {
+    async fn run_inner(self, mut working: Working) -> anyhow::Result<()> {
         self.adopt_single_part_hash().await;
         self.report("connecting", 0, 0, None).await;
         let mut guard = InProgressGuard::with_release_tx(
@@ -167,7 +207,6 @@ impl WebWorker {
         );
         let mut transferred: u64 = 0;
         let mut bad_parts: u32 = 0;
-        let mut skip_rehash = HashSet::new();
         // The address the last redirect landed on, reused until it fails so a
         // mirror behind a redirector is not re-resolved for every range.
         let mut effective_url = self.url.clone();
@@ -207,6 +246,7 @@ impl WebWorker {
                 continue;
             }
 
+            let transferred_before = transferred;
             let mut outcome: Result<(), FetchError> = Ok(());
             for (gs, ge) in gaps {
                 match self.fetch_range(&mut effective_url, gs, ge, &mut transferred).await {
@@ -217,10 +257,39 @@ impl WebWorker {
                     }
                 }
             }
-            {
-                let mut t = self.tracker.write().await;
-                guard.release_locked(part, &mut t);
-            }
+            // Check what this source just filled now, while the claim still
+            // keeps the sweep and every peer off it, so the verdict is about
+            // this mirror and a bad one is found out after one part.
+            let to_check = if outcome.is_ok() {
+                let t = self.tracker.read().await;
+                (t.is_part_complete(part) && !t.is_part_verified(part))
+                    .then(|| (t.part_range(part), t.part_content_generation(part)))
+            } else {
+                None
+            };
+            let hashes = self.part_hashes.read().await.clone();
+            let checked = match to_check {
+                Some((range, generation)) if hashes.len() > part => Some((
+                    range,
+                    hash_claimed_part(
+                        &self.tracker,
+                        &hashes,
+                        &self.output,
+                        &mut guard,
+                        part,
+                        range,
+                        generation,
+                        &self.file_hash,
+                        &self.event_tx,
+                    )
+                    .await,
+                )),
+                _ => {
+                    let mut t = self.tracker.write().await;
+                    guard.release_locked(part, &mut t);
+                    None
+                }
+            };
 
             match outcome {
                 Ok(()) => web_sources::note_success(&self.file_hash, &self.url),
@@ -233,36 +302,32 @@ impl WebWorker {
                 }
                 Err(FetchError::Transient(why)) => {
                     debug!("Web source {} failed for {}: {why}", self.url, self.transfer_id);
+                    // A connection that dropped after delivering data is one
+                    // failure, not one more in a run: a mirror that keeps
+                    // making progress is rested, never retired for it.
+                    if transferred > transferred_before {
+                        web_sources::note_success(&self.file_hash, &self.url);
+                    }
                     web_sources::note_failure(&self.file_hash, &self.url, false);
                     self.report("failed", 0, transferred, Some(SourceFailureKind::Transient)).await;
                     // Rest as long as the backoff says, then carry on; a source
                     // that keeps failing is retired by it and this ends.
                     effective_url = self.url.clone();
+                    working.release();
                     if !self.wait_until_ready().await {
                         return Ok(());
                     }
+                    working.hold();
                     self.report("connecting", 0, transferred, None).await;
                     continue;
                 }
             }
 
-            // Check what this source just filled now rather than at the next
-            // sweep, so a bad mirror is found out after one part, not thirty
-            // seconds of them.
-            let was_complete = self.tracker.read().await.is_part_complete(part);
-            if was_complete {
-                rehash_unverified_parts(
-                    &self.tracker,
-                    &self.part_hashes,
-                    &self.output,
-                    &mut guard,
-                    &mut skip_rehash,
-                    &self.file_hash,
-                    &self.event_tx,
-                )
-                .await;
-                let reopened = !self.tracker.read().await.is_part_complete(part);
-                if reopened {
+            // Held against the mirror only when it supplied most of the part:
+            // one a peer had mostly filled says little about the mirror.
+            if let Some(((ps, pe), ClaimedPartCheck::Corrupt)) = checked {
+                let supplied = transferred - transferred_before;
+                if supplied.saturating_mul(2) >= pe - ps {
                     bad_parts += 1;
                     warn!(
                         "Part {part} from web source {} failed verification ({bad_parts} so far)",
@@ -486,6 +551,11 @@ impl WebWorker {
         let mut reported_transferring = false;
         let mut got_any = false;
         loop {
+            if !web_sources::enabled() {
+                // Switched off mid-request. What was written stays; the worker
+                // ends at the top of its loop rather than after a whole part.
+                return Ok(());
+            }
             let chunk = tokio::select! {
                 c = response.chunk() => c.map_err(|e| FetchError::Transient(format!("read failed: {e}")))?,
                 _ = self.control.wait_cancel_or_pause() => {

@@ -46,6 +46,20 @@ fn registry() -> &'static parking_lot::RwLock<HashMap<[u8; 16], Vec<WebSource>>>
     REGISTRY.get_or_init(|| parking_lot::RwLock::new(HashMap::new()))
 }
 
+/// The client name a web source's rows carry in the source list: its protocol.
+pub fn source_label(url: &str) -> &'static str {
+    if url.starts_with("https:") {
+        "HTTPS"
+    } else {
+        "HTTP"
+    }
+}
+
+/// Whether a source row's client name is a web source's ([`source_label`]).
+pub fn is_web_source_label(client_software: &str) -> bool {
+    matches!(client_software, "HTTP" | "HTTPS")
+}
+
 pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }

@@ -338,31 +338,59 @@ pub(crate) struct InboundAttach {
     requested: bool,
 }
 
-/// Our disappearing timer for a file we offer `friend`: recorded on our own
-/// card, and sent after the offer so their card goes with it.
-async fn follow_offer_with_ttl(
-    state: &NetworkState,
-    db: &Arc<Database>,
-    settings: &AppSettings,
-    friend: [u8; 16],
-    xfer_id: [u8; 16],
-    announce: bool,
-) {
+/// Our disappearing timer for a file we offer `friend`, recorded on our own
+/// card. [`send_offer_frames`] carries it to theirs.
+fn record_offer_ttl(db: &Arc<Database>, settings: &AppSettings, friend: [u8; 16], xfer_id: [u8; 16]) {
     let ttl = settings.chat_disappear_secs_for(&friend);
     if ttl == 0 {
         return;
     }
     let _ = db.set_chat_attachment_ttl(&hex::encode(friend), &hex::encode(xfer_id), ttl);
-    if announce {
-        let _ = super::chat::send_chat_expire(
-            &state.ember_sessions,
+}
+
+/// Send an offer with our disappearing timer for it right behind, both or
+/// neither: an offer whose timer did not fit would leave the friend's card
+/// in place for good while ours goes.
+async fn send_offer_frames(
+    state: &NetworkState,
+    settings: &AppSettings,
+    friend: &[u8; 16],
+    xfer_id: [u8; 16],
+    body: &[u8],
+) -> Result<(), String> {
+    let sessions = state.ember_sessions.read().await;
+    let Some(session) = sessions
+        .get(friend)
+        .filter(|h| h.is_fresh() && h.is_secure_v2())
+    else {
+        return Err(friend_offline());
+    };
+    let mut frames = vec![build_ember_ext_frame(EMBER_EXT_ATTACH_OFFER, body)];
+    let ttl = settings.chat_disappear_secs_for(friend);
+    if ttl > 0 {
+        let timer = super::chat::chat_expire_frame(
             &state.local_ed25519_seed,
-            friend,
+            &session.peer_ember_pubkey(),
             crate::network::ember::crypto::ChatExpireTarget::Attachment(xfer_id),
             ttl,
         )
-        .await;
+        .ok_or_else(|| {
+            coded_ctx(
+                "peers_attach_failed",
+                "Could not send that file",
+                "its disappearing timer could not be sealed",
+            )
+        })?;
+        frames.push(timer);
     }
+    super::chat::try_send_frames_together(&session.tx, frames).map_err(|_| friend_offline())
+}
+
+fn friend_offline() -> String {
+    coded(
+        "peers_attach_offline",
+        "Your friend is offline. Files can only be sent while you are both connected.",
+    )
 }
 
 /// The timers for a file `friend` just offered us: ours, and theirs if it
@@ -398,20 +426,12 @@ async fn send_ext(
         .get(friend)
         .filter(|h| h.is_fresh() && h.is_secure_v2())
     else {
-        return Err(coded(
-            "peers_attach_offline",
-            "Your friend is offline. Files can only be sent while you are both connected.",
-        ));
+        return Err(friend_offline());
     };
     session
         .tx
         .try_send(build_ember_ext_frame(sub_type, body))
-        .map_err(|_| {
-            coded(
-                "peers_attach_offline",
-                "Your friend is offline. Files can only be sent while you are both connected.",
-            )
-        })
+        .map_err(|_| friend_offline())
 }
 
 fn relayed() -> String {
@@ -622,7 +642,7 @@ pub(super) async fn send_offer(
     if let OfferPath::Later(why) = path_now {
         let queued = queue_offer(db, app, friend, &xfer_hex, &name, size, root, &path_str, now, &why)?;
         // On our card now; it goes to the friend with the offer, when it can.
-        follow_offer_with_ttl(state, db, settings, friend, xfer_id, false).await;
+        record_offer_ttl(db, settings, friend, xfer_id);
         return Ok(queued);
     }
     db.upsert_chat_attachment(
@@ -639,14 +659,14 @@ pub(super) async fn send_offer(
     )
     .map_err(|e| coded_ctx("peers_attach_failed", "Could not send that file", e))?;
 
-    if let Err(e) = send_ext(state, &friend, EMBER_EXT_ATTACH_OFFER, &body).await {
+    if let Err(e) = send_offer_frames(state, settings, &friend, xfer_id, &body).await {
         // The session dropped between the check above and the send. Retire the
         // grant rather than leave a readable path nobody was told about.
         let _ = db.set_chat_attachment_status(&xfer_hex, "failed", None, None);
         emit_by_id(app, db, &xfer_hex);
         return Err(e);
     }
-    follow_offer_with_ttl(state, db, settings, friend, xfer_id, true).await;
+    record_offer_ttl(db, settings, friend, xfer_id);
     let row = db.chat_attachment(&xfer_hex).ok_or_else(not_found)?;
     emit_row(app, &row);
     info!(
@@ -761,7 +781,10 @@ pub(super) async fn send_queued(
         if !offered {
             continue;
         }
-        if send_ext(state, &friend, EMBER_EXT_ATTACH_OFFER, &body).await.is_err() {
+        let mut xfer_id = [0u8; 16];
+        if hex::decode_to_slice(&xfer_hex, &mut xfer_id).is_err()
+            || send_offer_frames(state, settings, &friend, xfer_id, &body).await.is_err()
+        {
             // Back in the queue, with the time it had left.
             let _ = db.set_chat_attachment_status(&xfer_hex, "queued", None, None);
             if let Some(expiry) = queue_expiry {
@@ -770,10 +793,7 @@ pub(super) async fn send_queued(
             emit_by_id(app, db, &xfer_hex);
             return;
         }
-        let mut xfer_id = [0u8; 16];
-        if hex::decode_to_slice(&xfer_hex, &mut xfer_id).is_ok() {
-            follow_offer_with_ttl(state, db, settings, friend, xfer_id, true).await;
-        }
+        record_offer_ttl(db, settings, friend, xfer_id);
         emit_by_id(app, db, &xfer_hex);
         info!(
             "Chat attachment: offered queued {xfer_hex} ({} bytes) to {}",
@@ -876,12 +896,12 @@ async fn reoffer(
     if !reopened {
         return Err(not_found());
     }
-    if let Err(e) = send_ext(state, &friend, EMBER_EXT_ATTACH_OFFER, &body).await {
+    if let Err(e) = send_offer_frames(state, settings, &friend, xfer_id, &body).await {
         let _ = db.set_chat_attachment_status(&xfer_hex, &row.status, None, None);
         emit_by_id(app, db, &xfer_hex);
         return Err(e);
     }
-    follow_offer_with_ttl(state, db, settings, friend, xfer_id, true).await;
+    record_offer_ttl(db, settings, friend, xfer_id);
     emit_by_id(app, db, &xfer_hex);
     info!(
         "Chat attachment: offered {xfer_hex} again ({} bytes) to {}",
@@ -1022,8 +1042,8 @@ pub(super) async fn on_reply(
             // stays as it is.
             match offer_again_body(state, db, settings, &friend, &xfer_hex, &row).await {
                 Ok(body) => {
-                    if send_ext(state, &friend, EMBER_EXT_ATTACH_OFFER, &body).await.is_ok() {
-                        follow_offer_with_ttl(state, db, settings, friend, xfer_id, true).await;
+                    if send_offer_frames(state, settings, &friend, xfer_id, &body).await.is_ok() {
+                        record_offer_ttl(db, settings, friend, xfer_id);
                         state.attach_reoffered.insert(xfer_id, now);
                         info!(
                             "Chat attachment: offered {xfer_hex} again to {}, who lost it",

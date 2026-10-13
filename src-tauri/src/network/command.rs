@@ -943,6 +943,19 @@ async fn handle_command_inner(
                         if let Ok(mut map) = state.aich_recovery_pending.write() {
                             map.retain(|(file_hash, _), _| *file_hash != fh_arr);
                         }
+                        // Its mirrors go with it, so adding the file again
+                        // later starts from its new link, not from mirrors
+                        // this session already gave up on.
+                        if deleting {
+                            ed2k::web_sources::forget(&fh_arr);
+                            let db_web = db.clone();
+                            let fh_web = fh.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(e) = db_web.delete_transfer_web_sources(&fh_web) {
+                                    debug!("Could not forget the web sources of {fh_web}: {e}");
+                                }
+                            });
+                        }
                     }
                 }
             }
@@ -4811,9 +4824,23 @@ async fn handle_command_inner(
             // to allow updating the owned `settings` variable.
         }
 
-        NetworkCommand::ConnectToServer { ip, port } => {
-            initiate_server_connect(state, settings, app_handle, shared_server_addr, ip, port)
-                .await;
+        NetworkCommand::ConnectToServer { ip, port, tx } => {
+            let target = format!("{ip}:{port}");
+            let result =
+                initiate_server_connect(state, settings, app_handle, shared_server_addr, ip, port)
+                    .await
+                    .map_err(|reason| match reason {
+                        ServerDialRefusal::NotInList => coded(
+                            "server_not_in_list",
+                            "That server is not in your server list. Add it first.",
+                        ),
+                        ServerDialRefusal::BlockedByIpFilter => crate::commands::errors::coded_ctx(
+                            "server_blocked_by_ip_filter",
+                            "That server is blocked by your IP filter",
+                            target,
+                        ),
+                    });
+            let _ = tx.send(result);
         }
 
         NetworkCommand::DisconnectServer => {
@@ -6215,23 +6242,30 @@ async fn handle_command_inner(
                                     return;
                                 }
                             };
-                            match sender.tx.try_send(packet) {
-                                Ok(()) => {
-                                    if ttl_secs > 0 {
-                                        let target = crate::network::ember::crypto::ChatExpireTarget::Message(
-                                            crate::network::ember::crypto::chat_body_hash(&message),
-                                        );
-                                        let followed = chat_expire_frame(
-                                            &ed25519_secret_key,
-                                            &peer_pubkey,
-                                            target,
-                                            ttl_secs,
-                                        )
-                                        .is_some_and(|frame| sender.tx.try_send(frame).is_ok());
-                                        if !followed {
-                                            debug!("Chat {pending_id} went out without its disappearing timer");
-                                        }
+                            let mut frames = vec![packet];
+                            if ttl_secs > 0 {
+                                let target = crate::network::ember::crypto::ChatExpireTarget::Message(
+                                    crate::network::ember::crypto::chat_body_hash(&message),
+                                );
+                                // Sent with its timer or not yet: bare, it would
+                                // expire here and stay with the friend. The
+                                // queued row goes out with the next flush.
+                                match chat_expire_frame(
+                                    &ed25519_secret_key,
+                                    &peer_pubkey,
+                                    target,
+                                    ttl_secs,
+                                ) {
+                                    Some(frame) => frames.push(frame),
+                                    None => {
+                                        debug!("Chat {pending_id} stays queued: its disappearing timer could not be sealed");
+                                        let _ = tx.send(Err(format!("ChatAlreadyQueued:{pending_id}")));
+                                        return;
                                     }
+                                }
+                            }
+                            match try_send_frames_together(&sender.tx, frames) {
+                                Ok(()) => {
                                     match mark_outbound_chat_delivered(db.clone(), hash_hex.clone(), pending_id).await
                                     {
                                         Ok(expires_at) => {

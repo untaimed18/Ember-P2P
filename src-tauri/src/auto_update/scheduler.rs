@@ -52,29 +52,35 @@ pub fn spawn(app: AppHandle) {
         return;
     }
     tauri::async_runtime::spawn(async move {
+        let mut launch = true;
         loop {
-            let result = std::panic::AssertUnwindSafe(run(app.clone()))
+            let result = std::panic::AssertUnwindSafe(run(app.clone(), launch))
                 .catch_unwind()
                 .await;
             if result.is_ok() {
                 return;
             }
+            launch = false;
             tracing::error!("Update scheduler panicked; restarting it");
             tokio::time::sleep(RESTART_DELAY).await;
         }
     });
 }
 
-async fn run(app: AppHandle) {
+async fn run(app: AppHandle, launch: bool) {
     tokio::time::sleep(FIRST_CHECK_DELAY).await;
     // Every launch checks, even a minute after the last: someone reopening
-    // Ember is the moment they are most likely to act on what it finds.
-    check(&app).await;
+    // Ember is the moment they are most likely to act on what it finds. A
+    // restart after a panic is not a launch, and keeps to the schedule, or a
+    // panic on every pass would check every minute.
+    if launch || check_due() {
+        check(&app).await;
+    }
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     // A machine waking from a week of sleep should check once, not replay a
     // week of missed polls.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // `interval` fires at once; the launch check above has just run.
+    // `interval` fires at once; the check above has just been decided.
     ticker.tick().await;
     loop {
         ticker.tick().await;

@@ -1192,6 +1192,38 @@ async fn sweep_orphan_part_files_in(
     failed == 0
 }
 
+/// Give the download of `file_hash` the `s=` mirrors its link named: kept for
+/// this session (`web_sources::register`, which validates and caps them) and
+/// saved, so it keeps them across restarts and re-queues.
+async fn attach_link_web_sources(state: &AppState, file_hash: &str, urls: Vec<String>) {
+    if urls.is_empty() {
+        return;
+    }
+    let Some(hash) = hex::decode(file_hash)
+        .ok()
+        .and_then(|b| <[u8; 16]>::try_from(b).ok())
+    else {
+        return;
+    };
+    let added = crate::network::ed2k::web_sources::register(
+        hash,
+        urls.into_iter()
+            .take(crate::network::ed2k::web_sources::MAX_WEB_SOURCES_PER_FILE * 2),
+    );
+    if added.is_empty() {
+        return;
+    }
+    tracing::info!("Download of {file_hash} has {} web source(s) from its link", added.len());
+    let db = state.db.clone();
+    let fh = file_hash.to_string();
+    db_blocking(move || {
+        if let Err(e) = db.add_transfer_web_sources(&fh, &added) {
+            tracing::warn!("Failed to save the web sources of {fh}: {e}");
+        }
+    })
+    .await;
+}
+
 #[tauri::command]
 pub async fn start_download(
     app: tauri::AppHandle,
@@ -1308,33 +1340,10 @@ pub async fn start_download(
         }
     }
 
-    // Kept per file before the duplicate check below, so pasting a link with
-    // mirrors for a file already in the list gives that download the mirrors.
+    // Attached once the download is known to stand (below): to the one already
+    // in the list, so pasting a link with mirrors again gives it the mirrors,
+    // or to this one once it is saved. An add that is refused leaves none.
     let web_sources = web_sources.unwrap_or_default();
-    if !web_sources.is_empty() {
-        if let Some(hash) = hex::decode(&file_hash)
-            .ok()
-            .and_then(|b| <[u8; 16]>::try_from(b).ok())
-        {
-            let added = crate::network::ed2k::web_sources::register(
-                hash,
-                web_sources
-                    .into_iter()
-                    .take(crate::network::ed2k::web_sources::MAX_WEB_SOURCES_PER_FILE * 2),
-            );
-            if !added.is_empty() {
-                tracing::info!("Download of {file_hash} has {} web source(s) from its link", added.len());
-                let db = state.db.clone();
-                let fh = file_hash.clone();
-                db_blocking(move || {
-                    if let Err(e) = db.add_transfer_web_sources(&fh, &added) {
-                        tracing::warn!("Failed to save the web sources of {fh}: {e}");
-                    }
-                })
-                .await;
-            }
-        }
-    }
 
     let transfer_id = uuid::Uuid::new_v4().to_string();
 
@@ -1428,7 +1437,7 @@ pub async fn start_download(
         friends_only: from_restricting_friend,
     };
 
-    let active_now = {
+    let (active_now, existing_id) = {
         let mut manager = state.transfer_manager.write().await;
         if let Some(existing_id) = manager.pending_transfer_id_for_hash(&file_hash) {
             if let Some(expected) = expected_aich.as_deref() {
@@ -1453,16 +1462,21 @@ pub async fn start_download(
                     ));
                 }
             }
-            return Ok(StartDownloadResponse {
-                transfer_id: existing_id,
-                already_queued: true,
-            });
+            (false, Some(existing_id))
+        } else {
+            ensure_pending_download_budget(&manager, &[file_size])?;
+            let active_now = manager.enqueue(transfer.clone());
+            manager.register_control(&transfer_id, control.clone());
+            (active_now, None)
         }
-        ensure_pending_download_budget(&manager, &[file_size])?;
-        let active_now = manager.enqueue(transfer.clone());
-        manager.register_control(&transfer_id, control.clone());
-        active_now
     };
+    if let Some(existing_id) = existing_id {
+        attach_link_web_sources(&state, &file_hash, web_sources).await;
+        return Ok(StartDownloadResponse {
+            transfer_id: existing_id,
+            already_queued: true,
+        });
+    }
 
     let persisted_transfer = {
         let manager = state.transfer_manager.read().await;
@@ -1479,6 +1493,8 @@ pub async fn start_download(
             error,
         ));
     }
+    // Before the network task is told, so the download's first run has them.
+    attach_link_web_sources(&state, &file_hash, web_sources).await;
 
     let _ = app.emit("transfer-started", &persisted_transfer);
 

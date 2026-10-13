@@ -1433,9 +1433,14 @@ pub(in crate::network) async fn on_download_event(
     // eMule-style: only mark per-source connections dead for
     // permanent failures (FNF, hash mismatch).  Transient TCP
     // errors are expected in P2P and should not block the source.
-    if let DownloadEvent::SourceDetail { ref transfer_id, ref ip, port, ref status, ref queue_rank, ref failure_kind, .. } = event {
-        // Update persistent per-file source state
-        if let Ok(v4) = ip.parse::<Ipv4Addr>() {
+    if let DownloadEvent::SourceDetail { ref transfer_id, ref ip, port, ref status, ref queue_rank, ref failure_kind, ref client_software, .. } = event {
+        // Update persistent per-file source state. Not for a web source: its
+        // address is a mirror's host, which as a dotted quad would otherwise
+        // be taken for a peer on port 80 or 443.
+        let peer_v4 = (!ed2k::web_sources::is_web_source_label(client_software))
+            .then(|| ip.parse::<Ipv4Addr>().ok())
+            .flatten();
+        if let Some(v4) = peer_v4 {
             if let Some(pfs) = state.per_file_sources.get_mut(transfer_id) {
                 match status.as_str() {
                     // `v4` at this call site always comes from an active

@@ -7581,8 +7581,10 @@ impl Database {
     /// its own if that is shorter — the sender decides how long their words
     /// live, and our own setting can only make that sooner. Counted from when
     /// we read it; a message already read when its timer arrives — the timer
-    /// follows it within moments — counts from now. Returns the row and its
-    /// expiry if it has started, or `None` when no row matches yet.
+    /// follows it within moments — counts from now. Only a row that reached
+    /// us within [`crate::types::CHAT_DISAPPEAR_PEER_WINDOW_SECS`] takes it, so
+    /// a friend cannot time out what they sent long ago. Returns the row and
+    /// its expiry if it has started, or `None` when no row matches yet.
     pub fn apply_peer_chat_ttl(
         &self,
         friend_hash: &str,
@@ -7595,12 +7597,18 @@ impl Database {
         let conn = self.conn.lock();
         Self::ensure_chat_timers_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
+        let now = chrono::Utc::now().timestamp();
         let Some((id, read)) = tx
             .query_row(
                 "SELECT id, read FROM chat_messages \
                  WHERE friend_hash = ?1 AND direction = 'received' AND body_hash = ?2 \
+                   AND timestamp >= ?3 \
                  ORDER BY id DESC LIMIT 1",
-                params![friend_hash, body_hash],
+                params![
+                    friend_hash,
+                    body_hash,
+                    now - crate::types::CHAT_DISAPPEAR_PEER_WINDOW_SECS
+                ],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0)),
             )
             .optional()?
@@ -7618,7 +7626,6 @@ impl Database {
             Some((own, _)) if own > 0 => own.min(ttl_secs),
             _ => ttl_secs,
         };
-        let now = chrono::Utc::now().timestamp();
         let started_at = existing
             .and_then(|(_, read_at)| read_at)
             .or_else(|| read.then_some(now));
@@ -7648,7 +7655,9 @@ impl Database {
     /// [`Self::set_chat_attachment_ttl`] for the timer a friend names, which
     /// only ever reaches a file they sent: a transfer id is no secret from the
     /// friend it was offered to, and without this they could put a timer on
-    /// the card for a file we sent them.
+    /// the card for a file we sent them. Only a card offered within
+    /// [`crate::types::CHAT_DISAPPEAR_PEER_WINDOW_SECS`] takes it, as with
+    /// messages.
     pub fn set_received_chat_attachment_ttl(
         &self,
         friend_hash: &str,
@@ -7670,10 +7679,16 @@ impl Database {
         }
         let conn = self.conn.lock();
         Self::ensure_chat_timers_locked(&conn)?;
+        let offered_since = if received_only {
+            chrono::Utc::now().timestamp() - crate::types::CHAT_DISAPPEAR_PEER_WINDOW_SECS
+        } else {
+            i64::MIN
+        };
         let exists: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM chat_attachments \
-             WHERE xfer_id = ?1 AND friend_hash = ?2 AND (?3 = 0 OR direction = 'received'))",
-            params![xfer_id, friend_hash, received_only],
+             WHERE xfer_id = ?1 AND friend_hash = ?2 \
+               AND (?3 = 0 OR (direction = 'received' AND created_at >= ?4)))",
+            params![xfer_id, friend_hash, received_only, offered_since],
             |row| row.get(0),
         )?;
         if !exists {
@@ -7710,12 +7725,28 @@ impl Database {
             )?
             .query_map(params![now], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
+        // A card's timer runs from when its transfer settled: started here,
+        // and started over if the transfer is tried again.
+        tx.execute(
+            "DELETE FROM chat_attachment_timer_starts WHERE xfer_id IN ( \
+                 SELECT xfer_id FROM chat_attachments \
+                 WHERE status IN ('queued', 'offered', 'awaiting', 'accepted', 'active'))",
+            [],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO chat_attachment_timer_starts (xfer_id, started_at) \
+             SELECT t.xfer_id, ?1 FROM chat_attachment_timers t \
+             JOIN chat_attachments a ON a.xfer_id = t.xfer_id \
+             WHERE a.status NOT IN ('queued', 'offered', 'awaiting', 'accepted', 'active')",
+            params![now],
+        )?;
         let attachments: Vec<(String, String)> = tx
             .prepare(
                 "DELETE FROM chat_attachments WHERE xfer_id IN ( \
                      SELECT a.xfer_id FROM chat_attachments a \
                      JOIN chat_attachment_timers t ON t.xfer_id = a.xfer_id \
-                     WHERE a.created_at + t.ttl_secs <= ?1 \
+                     JOIN chat_attachment_timer_starts s ON s.xfer_id = a.xfer_id \
+                     WHERE s.started_at + t.ttl_secs <= ?1 \
                        AND a.status NOT IN ('queued', 'offered', 'awaiting', 'accepted', 'active')) \
                  RETURNING friend_hash, xfer_id",
             )?
@@ -7731,6 +7762,11 @@ impl Database {
         tx.execute(
             "DELETE FROM chat_attachment_timers \
              WHERE xfer_id NOT IN (SELECT xfer_id FROM chat_attachments)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM chat_attachment_timer_starts \
+             WHERE xfer_id NOT IN (SELECT xfer_id FROM chat_attachment_timers)",
             [],
         )?;
         tx.commit()?;
@@ -7750,12 +7786,15 @@ impl Database {
 
     /// Delete the conversation with `friend_hash` from this device: every
     /// message, including ones still waiting to be sent, and every settled
-    /// attachment card. A file still transferring keeps its card until it
-    /// finishes, for the reason [`Self::expire_disappearing_chat`] gives.
-    /// Files already received stay where they were saved. Returns how many
-    /// messages went.
+    /// attachment card. A file offer not yet sent is withdrawn, and an offer
+    /// of theirs we never answered goes; neither has anything running. A file
+    /// still transferring keeps its card until it finishes, for the reason
+    /// [`Self::expire_disappearing_chat`] gives, and goes at the first sweep
+    /// after that. Files already received stay where they were saved. Returns
+    /// how many messages went.
     pub fn delete_chat_history(&self, friend_hash: &str) -> anyhow::Result<usize> {
         let conn = self.conn.lock();
+        Self::ensure_chat_timers_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
         let deleted = tx.execute(
             "DELETE FROM chat_messages WHERE friend_hash = ?1",
@@ -7763,7 +7802,15 @@ impl Database {
         )?;
         tx.execute(
             "DELETE FROM chat_attachments WHERE friend_hash = ?1 \
-               AND status NOT IN ('queued', 'offered', 'awaiting', 'accepted', 'active')",
+               AND (status NOT IN ('queued', 'offered', 'awaiting', 'accepted', 'active') \
+                    OR (direction = 'sent' AND status = 'queued') \
+                    OR (direction = 'received' AND status = 'awaiting'))",
+            params![friend_hash],
+        )?;
+        tx.execute(
+            "INSERT INTO chat_attachment_timers (xfer_id, friend_hash, ttl_secs) \
+             SELECT xfer_id, friend_hash, 0 FROM chat_attachments WHERE friend_hash = ?1 \
+             ON CONFLICT(xfer_id) DO UPDATE SET ttl_secs = 0",
             params![friend_hash],
         )?;
         tx.commit()?;
@@ -11034,8 +11081,11 @@ impl Database {
     /// for a sent message, when it is read for a received one — and `read_at`
     /// is kept so a timer the sender names after it was opened still counts
     /// from then. A row whose message is gone is an orphan the sweep clears.
-    /// Attachments carry a timer counted from when the card was created, only
-    /// ever acted on once the transfer is settled.
+    /// Attachments carry a timer counted from when the transfer settled, which
+    /// the sweep notes in `chat_attachment_timer_starts` (and forgets if it is
+    /// tried again); counted from the offer, a slow or late-accepted file lost
+    /// its card the moment it finished. A timer of 0 deletes the card as soon
+    /// as it settles: what deleting the chat asks of a transfer still running.
     fn ensure_chat_timers_locked(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chat_message_timers (
@@ -11051,6 +11101,10 @@ impl Database {
                 xfer_id TEXT PRIMARY KEY,
                 friend_hash TEXT NOT NULL,
                 ttl_secs INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS chat_attachment_timer_starts (
+                xfer_id TEXT PRIMARY KEY,
+                started_at INTEGER NOT NULL
             );",
         )?;
         Ok(())
@@ -22904,6 +22958,21 @@ mod tests {
         let (_, shorter) = db.apply_peer_chat_ttl(&friend, &hash, 300).unwrap().unwrap();
         assert!(shorter.unwrap() < read[0].1);
 
+        // A timer for something that reached us long ago does not apply.
+        let old = db
+            .insert_chat_message_ttl(&friend, "received", "long ago", CHAT_DELIVERED, 0)
+            .unwrap();
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE chat_messages SET timestamp = timestamp - 86400 WHERE id = ?1",
+                params![old],
+            )
+            .unwrap();
+        let old_hash = Database::friend_chat_body_hash_hex("long ago");
+        assert!(db.apply_peer_chat_ttl(&friend, &old_hash, 300).unwrap().is_none());
+        db.delete_chat_message(&friend, old).unwrap();
+
         // A message without a timer, and another friend's, are left alone.
         let keep = db.insert_chat_message_ttl(&friend, "sent", "stays", CHAT_DELIVERED, 0).unwrap();
         let theirs = db.insert_chat_message_ttl(&other, "sent", "theirs", CHAT_DELIVERED, 0).unwrap();
@@ -22978,27 +23047,78 @@ mod tests {
         let db = Database::open_at(&path).expect("open db");
         let friend = "ab".repeat(16);
         let root = "00".repeat(32);
-        let (sent, received, running) = ("11".repeat(16), "22".repeat(16), "33".repeat(16));
-        let card = |xfer: &str, direction: &str, status: &str| {
-            db.upsert_chat_attachment(xfer, &friend, direction, "f.txt", 1, &root, None, status, 100, 200)
+        let (sent, received, running, old) =
+            ("11".repeat(16), "22".repeat(16), "33".repeat(16), "44".repeat(16));
+        let now = chrono::Utc::now().timestamp();
+        let card = |xfer: &str, direction: &str, status: &str, at: i64| {
+            db.upsert_chat_attachment(xfer, &friend, direction, "f.txt", 1, &root, None, status, at, at + 100)
                 .expect("card");
         };
-        card(&sent, "sent", "complete");
-        card(&received, "received", "complete");
-        card(&running, "received", "active");
+        card(&sent, "sent", "complete", now);
+        card(&received, "received", "complete", now);
+        card(&running, "received", "active", now);
+        card(&old, "received", "complete", now - 86_400);
 
         assert!(
             !db.set_received_chat_attachment_ttl(&friend, &sent, 60).unwrap(),
             "a friend's timer never reaches a file we sent them"
         );
+        assert!(
+            !db.set_received_chat_attachment_ttl(&friend, &old, 60).unwrap(),
+            "nor a card offered long ago"
+        );
         assert!(db.set_received_chat_attachment_ttl(&friend, &received, 60).unwrap());
         assert!(db.set_chat_attachment_ttl(&friend, &running, 60).unwrap());
 
-        let gone = db.expire_disappearing_chat(100 + 61).unwrap();
+        // The first sweep starts the settled card's timer; it goes a minute on.
+        assert!(db.expire_disappearing_chat(now).unwrap().is_empty());
+        let gone = db.expire_disappearing_chat(now + 61).unwrap();
         assert_eq!(gone.len(), 1);
         assert_eq!(gone[0].2, vec![received.clone()], "the running one waits until it settles");
         assert!(db.chat_attachment(&running).is_some());
         assert!(db.chat_attachment(&sent).is_some());
+
+        // Its timer counts from when it settled, not from the offer.
+        db.set_chat_attachment_status(&running, "complete", None, None).unwrap();
+        assert!(db.expire_disappearing_chat(now + 120).unwrap().is_empty(), "just settled");
+        let gone = db.expire_disappearing_chat(now + 181).unwrap();
+        assert_eq!(gone[0].2, vec![running.clone()]);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deleting_a_chat_withdraws_unsent_offers_and_clears_live_cards_once_settled() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-delete-chat-cards-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).expect("open db");
+        let friend = "ab".repeat(16);
+        let root = "00".repeat(32);
+        let now = chrono::Utc::now().timestamp();
+        let card = |xfer: &str, direction: &str, status: &str| {
+            db.upsert_chat_attachment(xfer, &friend, direction, "f.txt", 1, &root, None, status, now, now + 100)
+                .expect("card");
+            xfer.to_string()
+        };
+        let queued = card(&"11".repeat(16), "sent", "queued");
+        let awaiting = card(&"22".repeat(16), "received", "awaiting");
+        let active = card(&"33".repeat(16), "sent", "active");
+        let done = card(&"44".repeat(16), "received", "complete");
+
+        db.delete_chat_history(&friend).unwrap();
+        assert!(db.chat_attachment(&queued).is_none(), "never sent, so never will be");
+        assert!(db.chat_attachment(&awaiting).is_none());
+        assert!(db.chat_attachment(&done).is_none());
+        assert!(db.chat_attachment(&active).is_some(), "still transferring");
+
+        assert!(db.expire_disappearing_chat(now).unwrap().is_empty());
+        db.set_chat_attachment_status(&active, "complete", None, None).unwrap();
+        let gone = db.expire_disappearing_chat(now + 1).unwrap();
+        assert_eq!(gone[0].2, vec![active.clone()], "goes once it settles");
 
         drop(db);
         let _ = std::fs::remove_file(&path);

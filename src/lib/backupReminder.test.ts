@@ -49,4 +49,13 @@ describe('backup reminder', () => {
     expect(backupReminderDue(storage, START)).toBe(false);
     expect(backupReminderDue(storage, START + FIRST_REMINDER_AFTER_MS)).toBe(true);
   });
+
+  it('counts a backup stamped ahead of the clock as one made now', () => {
+    backupReminderDue(storage, START);
+    const now = START + FIRST_REMINDER_AFTER_MS;
+    noteBackupMade(storage, now + 365 * DAY);
+    expect(backupReminderDue(storage, now)).toBe(false);
+    expect(backupReminderDue(storage, now + REMIND_AGAIN_AFTER_MS - DAY)).toBe(false);
+    expect(backupReminderDue(storage, now + REMIND_AGAIN_AFTER_MS)).toBe(true);
+  });
 });

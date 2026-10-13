@@ -2319,6 +2319,16 @@ pub const CHAT_DISAPPEAR_CHOICES: [u32; 5] = [300, 3_600, 86_400, 604_800, 2_419
 /// one does not, so anything up to a year is honoured as asked.
 pub const CHAT_DISAPPEAR_PEER_MAX_SECS: u32 = 365 * 86_400;
 
+/// Shortest timer accepted from a friend: the shortest one offered. Anything
+/// less would remove a message before it could be read.
+pub const CHAT_DISAPPEAR_PEER_MIN_SECS: u32 = CHAT_DISAPPEAR_CHOICES[0];
+
+/// How recently a message or file card must have reached us for a friend's
+/// timer to apply to it. The timer follows what it names within moments;
+/// without a limit a friend could put one on anything they ever sent us and
+/// have it gone at once.
+pub const CHAT_DISAPPEAR_PEER_WINDOW_SECS: i64 = 120;
+
 /// A stored timer held to the offered choices: 0 stays off, anything else
 /// becomes the nearest choice, so a hand-edited value still means one of
 /// the timers the UI can show.

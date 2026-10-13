@@ -126,20 +126,24 @@ pub(super) async fn flush_pending_chat(
             framed.extend_from_slice(&((1 + envelope.len()) as u32).to_le_bytes());
             framed.push(ed2k::messages::OP_EMBER_CHAT_MSG);
             framed.extend_from_slice(&envelope);
-            if session_tx.try_send(framed).is_err() {
-                break;
-            }
-            sent.push(id);
+            let mut frames = vec![framed];
             if let Some(&ttl) = ttls.get(&id) {
                 let target = crate::network::ember::crypto::ChatExpireTarget::Message(
                     crate::network::ember::crypto::chat_body_hash(&message),
                 );
-                let followed = chat_expire_frame(ed25519_secret_key, &peer_pubkey, target, ttl)
-                    .is_some_and(|frame| session_tx.try_send(frame).is_ok());
-                if !followed {
-                    debug!("Queued chat {id} to {hash_hex} went out without its disappearing timer");
-                }
+                // Without its timer the message stays queued: sent bare, it
+                // would expire here and stay with the friend.
+                let Some(frame) = chat_expire_frame(ed25519_secret_key, &peer_pubkey, target, ttl)
+                else {
+                    debug!("Queued chat {id} to {hash_hex} stays queued: its disappearing timer could not be sealed");
+                    break;
+                };
+                frames.push(frame);
             }
+            if try_send_frames_together(&session_tx, frames).is_err() {
+                break;
+            }
+            sent.push(id);
         }
     }
     if sent.is_empty() {
@@ -187,9 +191,11 @@ pub(super) async fn flush_pending_chat(
     };
     for (id, matched) in sent.into_iter().zip(matched) {
         if !matched {
+            // Only a deleted row misses: the user withdrew it in the moment
+            // it was going out. It reached them, and is gone here.
             tracing::warn!(
-                "Chat message {id} to {hash_hex} was sent but matched no row to mark \
-                 delivered; it may be re-sent on the next session"
+                "Chat message {id} to {hash_hex} was deleted while it was being sent; \
+                 the friend has it"
             );
             continue;
         }
@@ -275,35 +281,18 @@ pub(super) fn chat_expire_frame(
     ))
 }
 
-/// Hand [`chat_expire_frame`] to the friend's live session. Whether it went.
-///
-/// Best-effort, like the read receipt: the message or offer it follows has
-/// already gone, so a timer that cannot follow leaves the friend's copy
-/// without one — exactly what a friend on a build that predates timers has —
-/// rather than holding anything back.
-pub(super) async fn send_chat_expire(
-    ember_sessions: &ed2k::upload::EmberSessionMap,
-    ed25519_secret_key: &[u8; 32],
-    friend: [u8; 16],
-    target: crate::network::ember::crypto::ChatExpireTarget,
-    ttl_secs: u32,
-) -> bool {
-    if ttl_secs == 0 {
-        return false;
+/// Queue `frames` on a friend's session all together or not at all. A chat
+/// message whose timer frame did not fit would expire on our side and stay on
+/// theirs.
+pub(super) fn try_send_frames_together(
+    tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    frames: Vec<Vec<u8>>,
+) -> Result<(), tokio::sync::mpsc::error::TrySendError<()>> {
+    let permits = tx.try_reserve_many(frames.len())?;
+    for (permit, frame) in permits.zip(frames) {
+        permit.send(frame);
     }
-    let sessions = ember_sessions.read().await;
-    let Some(sender) = sessions
-        .get(&friend)
-        .filter(|h| h.is_fresh() && h.is_secure_v2())
-    else {
-        return false;
-    };
-    let Some(frame) =
-        chat_expire_frame(ed25519_secret_key, &sender.peer_ember_pubkey(), target, ttl_secs)
-    else {
-        return false;
-    };
-    sender.tx.try_send(frame).is_ok()
+    Ok(())
 }
 
 /// How long a timer that arrived ahead of its message is held for it.
@@ -313,6 +302,10 @@ pub(super) const CHAT_EXPIRE_HOLD_SECS: i64 = 120;
 /// naming messages that never come.
 pub(super) const MAX_HELD_CHAT_EXPIRES: usize = 256;
 
+/// Timers held at once for one friend, so one naming messages that never come
+/// cannot crowd out everyone else's.
+pub(super) const MAX_HELD_CHAT_EXPIRES_PER_FRIEND: usize = 32;
+
 /// Apply the disappearing timer `friend` named for something they sent us,
 /// or hold it until that arrives.
 ///
@@ -320,7 +313,9 @@ pub(super) const MAX_HELD_CHAT_EXPIRES: usize = 256;
 /// way to the database, and a dropped one leaves our copy without the expiry
 /// the sender asked for. Clamped to [`crate::types::CHAT_DISAPPEAR_PEER_MAX_SECS`]:
 /// a longer timer still deletes, just sooner than a sender on a future build
-/// might have asked, which never keeps anything longer than it wanted.
+/// might have asked, which never keeps anything longer than it wanted. And
+/// raised to [`crate::types::CHAT_DISAPPEAR_PEER_MIN_SECS`], so what it names
+/// can still be read.
 pub(super) async fn apply_peer_chat_expire(
     state: &mut NetworkState,
     db: &Arc<Database>,
@@ -329,7 +324,13 @@ pub(super) async fn apply_peer_chat_expire(
     target: crate::network::ember::crypto::ChatExpireTarget,
     ttl_secs: u32,
 ) {
-    let ttl_secs = ttl_secs.min(crate::types::CHAT_DISAPPEAR_PEER_MAX_SECS);
+    if ttl_secs == 0 {
+        return;
+    }
+    let ttl_secs = ttl_secs.clamp(
+        crate::types::CHAT_DISAPPEAR_PEER_MIN_SECS,
+        crate::types::CHAT_DISAPPEAR_PEER_MAX_SECS,
+    );
     let friend_hex = hex::encode(friend);
     let db_apply = db.clone();
     let hash_for_db = friend_hex.clone();
@@ -353,7 +354,14 @@ pub(super) async fn apply_peer_chat_expire(
             state
                 .held_chat_expires
                 .retain(|_, (_, at)| now.saturating_sub(*at) < CHAT_EXPIRE_HOLD_SECS);
-            if state.held_chat_expires.len() < MAX_HELD_CHAT_EXPIRES {
+            let from_friend = state
+                .held_chat_expires
+                .keys()
+                .filter(|(held_from, _)| *held_from == friend)
+                .count();
+            if state.held_chat_expires.len() < MAX_HELD_CHAT_EXPIRES
+                && from_friend < MAX_HELD_CHAT_EXPIRES_PER_FRIEND
+            {
                 state.held_chat_expires.insert((friend, target), (ttl_secs, now));
             }
         }

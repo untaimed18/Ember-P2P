@@ -3188,6 +3188,7 @@ impl MultiSourceDownload {
             );
         }
         // Always, even with none ready now: one may be added while this runs.
+        let web_working = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         {
             let template = web_worker::WebWorker {
                 url: String::new(),
@@ -3205,6 +3206,7 @@ impl MultiSourceDownload {
                 drop_tx: drop_tx.clone(),
                 active_count: active_count.clone(),
                 disk_full: disk_full.clone(),
+                working: web_working.clone(),
             };
             let handle = tokio::spawn(web_worker::dispatch(template, total_sources.clone()));
             source_aborts.track(&handle);
@@ -4991,6 +4993,65 @@ impl MultiSourceDownload {
             last_round_end = Some(std::time::Instant::now());
         }
 
+        // Mirrors outlast the peers' retry rounds: a file only a mirror has is
+        // still downloading here. Waited for only while one is fetching, not
+        // while all of them rest out a backoff, and with the peers' channels
+        // still read: a callback stream is adopted as in the rounds, and a new
+        // peer ends the wait, so the download is re-queued and its next run
+        // dials it, rather than leaving it unread behind a mirror.
+        loop {
+            if web_working.load(Ordering::Relaxed) == 0
+                || web_handles.iter().all(|h| h.is_finished())
+                || tracker.read().await.all_complete_and_settled()
+            {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                new_est = async {
+                    match post_phase_new_established_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match new_est {
+                        Some(es) => {
+                            pending_established.push(es);
+                            adopt_pending_callbacks!(retry_round);
+                        }
+                        None => post_phase_new_established_rx = None,
+                    }
+                }
+                new_src = async {
+                    match post_phase_new_source_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match new_src {
+                        Some(source) => {
+                            info!(
+                                "Download {}: a new peer {}:{} arrived while mirrors were fetching; ending this run so the re-queued download uses it",
+                                self.transfer_id, source.peer_ip, source.peer_port
+                            );
+                            break;
+                        }
+                        None => post_phase_new_source_rx = None,
+                    }
+                }
+            }
+        }
+        // The dispatcher does not end by itself while the download runs.
+        // Stopped before the sweep and the final verification, which must not
+        // race a writer.
+        for h in &web_handles {
+            h.abort();
+        }
+        for h in web_handles.drain(..) {
+            let _ = h.await;
+        }
+        let _ = web_agg.await;
+
         // Retry budget exhausted: let any in-flight adopted callback downloads
         // finish (they may be actively transferring), then shut down the
         // adoption aggregator. Any callback stream still merely buffered can't
@@ -5005,15 +5066,6 @@ impl MultiSourceDownload {
             let _ = h.await;
         }
         let _ = adopt_agg.await;
-        // Mirrors outlast the peers' retry rounds: a file only a mirror has is
-        // still downloading here. Waited for like the adopted callbacks above,
-        // and before the sweep and the final verification, which must not race
-        // a writer.
-        wait_for_sources_unless_settled(&tracker, &web_handles).await;
-        for h in web_handles.drain(..) {
-            let _ = h.await;
-        }
-        let _ = web_agg.await;
         if disk_full_hit(&disk_full) {
             return Err(disk_full_error());
         }
@@ -5546,63 +5598,112 @@ async fn rehash_unverified_parts(
                 (p, t.part_range(p), t.part_content_generation(p))
             })
         };
-        let Some((part_idx, (ps, pe), hashed_generation)) = picked else {
+        let Some((part_idx, range, hashed_generation)) = picked else {
             return;
         };
-        let checked = match output.hash_part_md4(ps, (pe - ps) as usize).await {
-            Ok((_, actual)) if actual == hashes[part_idx] => {
-                // Durability before persisting the verified bit, as for a
-                // part a worker verifies.
-                output.sync_data().await.map(|()| true)
-            }
-            Ok(_) => Ok(false),
-            Err(e) => Err(e),
-        };
-        let verified = match checked {
-            Ok(verified) => verified,
-            Err(e) => {
-                debug!("Re-hash of unverified part {part_idx} failed: {e}");
-                skip.insert(part_idx);
-                let mut t = tracker.write().await;
-                guard.release_locked(part_idx, &mut t);
-                continue;
-            }
-        };
-        let snap = {
+        let checked = hash_claimed_part(
+            tracker,
+            &hashes,
+            output,
+            guard,
+            part_idx,
+            range,
+            hashed_generation,
+            file_hash,
+            event_tx,
+        )
+        .await;
+        if checked == ClaimedPartCheck::Unreadable {
+            skip.insert(part_idx);
+        }
+    }
+}
+
+/// How [`hash_claimed_part`] found a part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimedPartCheck {
+    Verified,
+    /// MD4 mismatch: the part was reopened.
+    Corrupt,
+    /// The read or fsync failed; the part is left as it was.
+    Unreadable,
+    /// Rewritten while it was hashed, so the verdict was not applied.
+    Superseded,
+}
+
+/// Hash a complete part `guard` holds the claim on against `hashes`, apply the
+/// verdict, and release the claim. Holding the claim throughout keeps the
+/// sweep and every other worker off the part until the verdict is in, so the
+/// source that filled it is the one the verdict is about.
+#[allow(clippy::too_many_arguments)]
+async fn hash_claimed_part(
+    tracker: &Arc<RwLock<PartTracker>>,
+    hashes: &[[u8; 16]],
+    output: &super::write_coordinator::PartFileWriter,
+    guard: &mut InProgressGuard,
+    part_idx: usize,
+    (ps, pe): (u64, u64),
+    hashed_generation: u64,
+    file_hash: &[u8; 16],
+    event_tx: &mpsc::Sender<DownloadEvent>,
+) -> ClaimedPartCheck {
+    let checked = match output.hash_part_md4(ps, (pe - ps) as usize).await {
+        Ok((_, actual)) if hashes.get(part_idx) == Some(&actual) => {
+            // Durability before persisting the verified bit, as for a
+            // part a worker verifies.
+            output.sync_data().await.map(|()| true)
+        }
+        Ok(_) => Ok(false),
+        Err(e) => Err(e),
+    };
+    let verified = match checked {
+        Ok(verified) => verified,
+        Err(e) => {
+            debug!("Re-hash of unverified part {part_idx} failed: {e}");
             let mut t = tracker.write().await;
-            let superseded = t.part_verdict_superseded(part_idx, hashed_generation);
-            if !superseded {
-                if verified {
-                    t.set_part_verified(part_idx);
-                } else {
-                    t.mark_incomplete(part_idx);
-                }
-            }
             guard.release_locked(part_idx, &mut t);
-            (!superseded).then(|| t.snapshot_for_save())
-        };
-        let Some(snap) = snap else {
-            continue;
-        };
-        save_snapshot_now(snap, "re-hashed part").await;
-        let event = if verified {
-            info!("Re-hashed part {part_idx}: verified");
-            DownloadEvent::PartVerified {
-                file_hash: *file_hash,
-                part_start: ps,
-                part_end: pe,
-                sender_user_hash: None,
+            return ClaimedPartCheck::Unreadable;
+        }
+    };
+    let snap = {
+        let mut t = tracker.write().await;
+        let superseded = t.part_verdict_superseded(part_idx, hashed_generation);
+        if !superseded {
+            if verified {
+                t.set_part_verified(part_idx);
+            } else {
+                t.mark_incomplete(part_idx);
             }
-        } else {
-            warn!("Re-hashed part {part_idx}: MD4 mismatch, reopening it");
-            DownloadEvent::PartCorrupted {
-                file_hash: *file_hash,
-                part_start: ps,
-                part_end: pe,
-                sender_user_hash: None,
-            }
-        };
-        let _ = event_tx.send(event).await;
+        }
+        guard.release_locked(part_idx, &mut t);
+        (!superseded).then(|| t.snapshot_for_save())
+    };
+    let Some(snap) = snap else {
+        return ClaimedPartCheck::Superseded;
+    };
+    save_snapshot_now(snap, "re-hashed part").await;
+    let event = if verified {
+        info!("Re-hashed part {part_idx}: verified");
+        DownloadEvent::PartVerified {
+            file_hash: *file_hash,
+            part_start: ps,
+            part_end: pe,
+            sender_user_hash: None,
+        }
+    } else {
+        warn!("Re-hashed part {part_idx}: MD4 mismatch, reopening it");
+        DownloadEvent::PartCorrupted {
+            file_hash: *file_hash,
+            part_start: ps,
+            part_end: pe,
+            sender_user_hash: None,
+        }
+    };
+    let _ = event_tx.send(event).await;
+    if verified {
+        ClaimedPartCheck::Verified
+    } else {
+        ClaimedPartCheck::Corrupt
     }
 }
 

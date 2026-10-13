@@ -173,13 +173,18 @@ pub async fn connect_to_server(
         ));
     }
 
+    let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
         .try_send(NetworkCommand::ConnectToServer {
             ip: resolved_ip.clone(),
             port,
+            tx,
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    // Refused before dialing (blocked by the IP filter, or gone from the list
+    // since the check above): said here, or the page waited on nothing.
+    await_reply(rx, "network_unavailable", "Network unavailable").await??;
 
     Ok(format!("Connecting to ed2k server {resolved_ip}:{port}..."))
 }

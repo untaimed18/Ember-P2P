@@ -763,6 +763,10 @@ impl ServerList {
     /// last TCP attempt ran into, and without this a few failed logins — or
     /// our own network being down — excluded it from UDP use and eventually
     /// deleted it. Also timestamps the reply for the periodic UDP-health log.
+    ///
+    /// An answer while an obfuscated ping waits ends the wait: the ping time
+    /// was set back for a plain retry 20 s on (`record_udp_ping_sent`), and
+    /// left there it made every obfuscating server due again 20 s later.
     pub fn record_udp_reply(&mut self, ip: &str, port: u16) {
         if let Some(entry) = self
             .servers
@@ -771,7 +775,10 @@ impl ServerList {
         {
             entry.udp_consecutive_failures = 0;
             entry.fail_count = 0;
-            entry.crypt_ping_pending = false;
+            if entry.crypt_ping_pending {
+                entry.crypt_ping_pending = false;
+                entry.last_udp_ping_at = crate::network::monotonic_secs();
+            }
             entry.last_udp_reply_at = chrono::Utc::now().timestamp();
         }
     }
@@ -1944,6 +1951,24 @@ mod tests {
 
         list.record_udp_reply("8.8.8.8", 4661);
         assert_eq!(entry(&list).udp_consecutive_failures, 0);
+    }
+
+    /// An answered obfuscated ping waits the full interval for the next one,
+    /// not the 20 s left for a plain retry.
+    #[test]
+    fn an_answered_obfuscated_ping_waits_the_full_interval() {
+        use super::super::server_udp::{status_ping_due, STAT_REASK_INTERVAL_SECS};
+        let mut list = ServerList::new();
+        list.add(ServerEntry::new("8.8.8.8".into(), 4661));
+        let now = crate::network::monotonic_secs();
+
+        list.record_udp_ping_sent("8.8.8.8", 4661, now, true);
+        list.record_udp_reply("8.8.8.8", 4661);
+        let e = list.find_by_addr("8.8.8.8", 4661).unwrap().clone();
+        assert!(!e.crypt_ping_pending);
+        assert!(!status_ping_due(&e, now + 20), "re-pinged on the retry timer");
+        assert!(!status_ping_due(&e, now + STAT_REASK_INTERVAL_SECS - 10));
+        assert!(status_ping_due(&e, e.last_udp_ping_at + STAT_REASK_INTERVAL_SECS));
     }
 
     /// A last server the user removed, or that was pruned, is not dialed at

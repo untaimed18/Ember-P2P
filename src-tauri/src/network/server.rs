@@ -574,13 +574,13 @@ pub(super) async fn initiate_server_connect(
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
     ip: String,
     port: u16,
-) -> bool {
+) -> Result<(), ServerDialRefusal> {
     // Checked before anything is torn down: a refused server leaves the
     // current session as it was.
     if let Some(reason) = server_dial_refusal(state, settings, &ip, port) {
         warn!("Not connecting to {ip}:{port}: {reason}");
         emit_server_log(app_handle, &format!("Not connecting to {ip}:{port}: {reason}."));
-        return false;
+        return Err(reason);
     }
     state.server_auto_reconnect = true;
     state.server_reconnect_failures = 0;
@@ -707,7 +707,24 @@ pub(super) async fn initiate_server_connect(
             result: result.map(|(conn, session, _)| (conn, session)),
         }
     }));
-    true
+    Ok(())
+}
+
+/// Why a server is not dialed (`server_dial_refusal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerDialRefusal {
+    /// Removed, or pruned after failing.
+    NotInList,
+    BlockedByIpFilter,
+}
+
+impl std::fmt::Display for ServerDialRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotInList => "it is no longer in the server list",
+            Self::BlockedByIpFilter => "it is blocked by the IP filter",
+        })
+    }
 }
 
 /// Why `ip:port` must not be dialed, if it must not: it has left the server
@@ -719,9 +736,9 @@ pub(super) fn server_dial_refusal(
     settings: &AppSettings,
     ip: &str,
     port: u16,
-) -> Option<String> {
+) -> Option<ServerDialRefusal> {
     if state.server_list.find_by_addr(ip, port).is_none() {
-        return Some("it is no longer in the server list".to_string());
+        return Some(ServerDialRefusal::NotInList);
     }
     if settings.filter_servers_by_ip {
         // While the filter is still loading it blocks nothing yet, as in the
@@ -729,7 +746,7 @@ pub(super) fn server_dial_refusal(
         let loading = state.ip_filter.is_enabled() && !state.ip_filter.ranges_ready();
         if let Ok(v4) = ip.parse::<Ipv4Addr>() {
             if !loading && state.ip_filter.is_blocked_readonly(v4) {
-                return Some("it is blocked by the IP filter".to_string());
+                return Some(ServerDialRefusal::BlockedByIpFilter);
             }
         }
     }

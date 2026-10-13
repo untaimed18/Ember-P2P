@@ -2817,7 +2817,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 match target {
                     Some((server_ip, server_port)) => {
                         let target = format!("{server_ip}:{server_port}");
-                        let started = initiate_server_connect(
+                        if let Err(reason) = initiate_server_connect(
                             &mut state,
                             &settings,
                             &app_handle,
@@ -2825,11 +2825,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             server_ip,
                             server_port,
                         )
-                        .await;
-                        if !started {
+                        .await
+                        {
                             emit_server_auto_connect_failed(
                                 &app_handle,
-                                &format!("{target} can no longer be connected to"),
+                                &format!("{target} can no longer be connected to: {reason}"),
                             );
                         }
                     }

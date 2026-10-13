@@ -48,7 +48,13 @@ export function backupReminderDue(storage: StorageLike, now: number): boolean {
   const quietUntil = readTime(storage, QUIET_UNTIL_KEY);
   if (quietUntil !== null && quietUntil > now) return false;
   const lastBackup = readTime(storage, LAST_BACKUP_KEY);
-  if (lastBackup !== null && lastBackup <= now) {
+  if (lastBackup !== null && lastBackup > now) {
+    // Made while the clock ran ahead. It is still a backup: count it from now
+    // rather than as none.
+    writeTime(storage, LAST_BACKUP_KEY, now);
+    return false;
+  }
+  if (lastBackup !== null) {
     return now - lastBackup >= REMIND_AGAIN_AFTER_MS;
   }
   return now - firstSeen >= FIRST_REMINDER_AFTER_MS;
