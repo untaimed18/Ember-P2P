@@ -161,6 +161,9 @@
   let members: ChannelMemberInfo[] = $state([]);
   let membersLoading = $state(false);
   let membersError: string | null = $state(null);
+  /** The room `members` was read for. An empty list only means "just you"
+   *  once it is this room's; until then the pane is still loading. */
+  let membersFor: string | null = $state(null);
   let loading = $state(true);
   /** Set by the first `list_channels` that succeeds, not the first attempt.
    *  Discover fills the same list from the cache within milliseconds, so
@@ -1430,6 +1433,19 @@
     void pushChannelFocus(selectedId);
   });
 
+  /** Read the roster of whatever room is on screen without one. Opening a room
+   *  fetches it, but a room can also come back on screen without being opened
+   *  (restored on the way back to this page) and then waited on the room list
+   *  loading first, which may be slow or fail; the pane said "just you" all the
+   *  while. A failed read stays failed, with its Retry, rather than looping. */
+  $effect(() => {
+    const id = selected?.channel_id;
+    if (!id) return;
+    untrack(() => {
+      if (membersFor !== id && !membersLoading && !membersError) void refreshMembers(id);
+    });
+  });
+
   $effect(() => {
     if (emberOff) {
       goto('/ember').catch(() => {});
@@ -1446,6 +1462,7 @@
     untrack(() => {
       activeChannelId.set(null);
       members = [];
+      membersFor = null;
       membersLoading = false;
       membersError = null;
       const next = new URL($page.url);
@@ -1472,6 +1489,7 @@
       if (current && !$channelsStore.some((c) => c.channel_id === current && c.in_room)) {
         activeChannelId.set(null);
         members = [];
+        membersFor = null;
         membersLoading = false;
         membersError = null;
       } else if (current) {
@@ -1523,6 +1541,7 @@
       const mems = await listChannelMembers(id);
       if (gen === membersGen && id === selectedId) {
         members = mems;
+        membersFor = id;
         membersLoading = false;
         membersError = null;
       }
@@ -1582,6 +1601,7 @@
     }
     activeChannelId.set(id);
     members = [];
+    membersFor = null;
     membersLoading = true;
     membersError = null;
     editTopic = ch.topic ?? '';
@@ -1646,6 +1666,7 @@
   function clearSelection() {
     activeChannelId.set(null);
     members = [];
+    membersFor = null;
     membersLoading = false;
     membersError = null;
     roomInfoOpen = false;
@@ -1737,6 +1758,7 @@
     if (wasOpen) {
       activeChannelId.set(null);
       members = [];
+      membersFor = null;
       membersLoading = false;
       membersError = null;
       resetSearch();
@@ -1932,6 +1954,7 @@
       roomInfoOpen = false;
       activeChannelId.set(null);
       members = [];
+      membersFor = null;
       membersLoading = false;
       membersError = null;
       discovered = discovered.filter((item) => item.channel_id !== id);
@@ -3642,6 +3665,8 @@
                   {m.common_retry()}
                 </button>
               </div>
+            {:else if members.length === 0 && membersFor !== selectedId}
+              <p class="muted list-empty">{m.common_loading()}</p>
             {:else if members.length === 0}
               <p class="muted list-empty">{m.channels_members_empty()}</p>
             {:else}
