@@ -280,7 +280,9 @@ fn apply_credits(pending: &Path, db: &Database) -> anyhow::Result<u64> {
                 row.1 = row.1.max(credit.uploaded);
                 row.2 = row.2.max(credit.downloaded);
                 row.3 = row.3.max(credit.last_seen);
-                if row.4.is_empty() && has_key {
+                // A key on an unanchored row was never proven here and is
+                // dropped when credits load, so eMule's key replaces it.
+                if has_key && (row.4.is_empty() || !row.8) {
                     row.4 = credit.public_key.clone();
                     row.6 = needed;
                     row.8 = true;

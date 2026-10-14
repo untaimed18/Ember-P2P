@@ -75,6 +75,22 @@ fn note_requeue(transfer_id: &str, prev_pending: Option<u32>, completed_now: u64
     count
 }
 
+/// The source a [`DownloadEvent::FriendTransferOnly`] names, `None` for any
+/// other event. `Some(None)` is one whose address is not a dotted quad, which
+/// is consumed all the same.
+fn friend_transfer_only_source(
+    event: &DownloadEvent,
+) -> Option<Option<(&str, Ipv4Addr, u16, [u8; 16])>> {
+    let DownloadEvent::FriendTransferOnly { transfer_id, ip, port, friend } = event else {
+        return None;
+    };
+    Some(
+        ip.parse::<Ipv4Addr>()
+            .ok()
+            .map(|v4| (transfer_id.as_str(), v4, *port, *friend)),
+    )
+}
+
 fn forget_requeue_history(transfer_id: &str) {
     if let Ok(mut history) = requeue_history().lock() {
         history.remove(transfer_id);
@@ -1487,6 +1503,27 @@ pub(in crate::network) async fn on_download_event(
         return;
     }
 
+    // Kept clear of the `"failed"` handling below on purpose: nothing was
+    // asked of the friend, so no fail count, dead-source entry or reputation
+    // event may follow.
+    if let Some(source) = friend_transfer_only_source(&event) {
+        if let Some((transfer_id, v4, port, friend)) = source {
+            route_friend_transfer_only_source(
+                state,
+                transfer_manager,
+                friend_hashes,
+                pending_kad_callbacks,
+                app_handle,
+                transfer_id,
+                v4,
+                port,
+                friend,
+            )
+            .await;
+        }
+        return;
+    }
+
     // eMule-style: only mark per-source connections dead for
     // permanent failures (FNF, hash mismatch).  Transient TCP
     // errors are expected in P2P and should not block the source.
@@ -2190,5 +2227,94 @@ mod requeue_tests {
         record_source_failure(&mut dead, other, peer, 4662, false);
         assert!(dead.is_dead_source_for_file(&other, u32::from(peer), 4662));
         assert!(!dead.is_dead_source(0, u32::from(peer), 4662));
+    }
+}
+
+#[cfg(test)]
+mod friend_transfer_only_tests {
+    use super::*;
+
+    const FRIEND: [u8; 16] = [0xAA; 16];
+    const PEER: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 7);
+
+    fn friend_transfer_only(ip: &str) -> DownloadEvent {
+        DownloadEvent::FriendTransferOnly {
+            transfer_id: "dl".to_string(),
+            ip: ip.to_string(),
+            port: 4662,
+            friend: FRIEND,
+        }
+    }
+
+    #[test]
+    fn the_event_names_the_source_to_route() {
+        assert_eq!(
+            friend_transfer_only_source(&friend_transfer_only("203.0.113.7")),
+            Some(Some(("dl", PEER, 4662, FRIEND)))
+        );
+    }
+
+    /// Claimed even when nothing can be routed, so it can never fall through
+    /// to the `"failed"` handling and its fail count or dead-source entry.
+    #[test]
+    fn an_unroutable_address_is_still_claimed() {
+        for ip in ["", "not-an-ip", "2001:db8::7", "203.0.113.7:4662"] {
+            assert_eq!(friend_transfer_only_source(&friend_transfer_only(ip)), Some(None), "{ip:?}");
+        }
+    }
+
+    #[test]
+    fn other_events_are_left_to_the_rest_of_the_handler() {
+        let failed = DownloadEvent::Failed {
+            transfer_id: "dl".to_string(),
+            error: "connection reset by peer".to_string(),
+            failure_kind: ed2k::transfer::SourceFailureKind::Transient,
+            generation: None,
+        };
+        assert_eq!(friend_transfer_only_source(&failed), None);
+    }
+
+    /// The source is parked whatever the friend's answer, and its fail count
+    /// stands; only an answer of "already asking" leaves it waiting on the
+    /// friend.
+    #[test]
+    fn a_routed_source_is_parked_without_any_failure() {
+        for (outcome, unreachable) in [
+            (FriendXferRequestOutcome::Sent, false),
+            (FriendXferRequestOutcome::Outstanding, false),
+            (
+                FriendXferRequestOutcome::NoTransport(NoTransportReason::SymmetricNat),
+                true,
+            ),
+            (FriendXferRequestOutcome::Refused, true),
+        ] {
+            let mut pfs = ed2k::sources::PerFileSourceList::new([1; 16], 100);
+            pfs.add_source_full(PEER, 4662, 0);
+            pfs.set_failed_with_penalty(PEER, 4662, 2, None);
+            let mut waiting = HashMap::new();
+
+            let event = friend_transfer_only("203.0.113.7");
+            let Some(Some((tid, ip, port, friend))) = friend_transfer_only_source(&event) else {
+                panic!("the event is routed");
+            };
+            let parked_unreachable =
+                friend_transfer_only_parking(&mut waiting, outcome, friend, tid);
+            park_in_source_list(&mut pfs, ip, port, parked_unreachable);
+
+            assert_eq!(parked_unreachable, unreachable, "{outcome:?}");
+            let source = &pfs.sources[0];
+            assert_eq!(source.fail_count, 2, "{outcome:?}");
+            let parked_as_expected = if unreachable {
+                matches!(source.state, ed2k::sources::DownloadSourceState::Unreachable)
+            } else {
+                matches!(source.state, ed2k::sources::DownloadSourceState::FriendConnect)
+            };
+            assert!(parked_as_expected, "{outcome:?}: {:?}", source.state);
+            assert_eq!(
+                waiting.contains_key(&FRIEND),
+                outcome == FriendXferRequestOutcome::Outstanding,
+                "{outcome:?}"
+            );
+        }
     }
 }

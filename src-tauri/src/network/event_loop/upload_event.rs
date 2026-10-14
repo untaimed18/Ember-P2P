@@ -746,44 +746,50 @@ pub(in crate::network) async fn on_upload_event(
                 // reconnect backoff so a later disconnect can re-dial
                 // promptly instead of waiting out the cooldown.
                 state.friend_reconnect_last.remove(ember_hash);
-                let ip_str = match ip {
-                    std::net::IpAddr::V4(v4) => v4.to_string(),
-                    std::net::IpAddr::V6(v6) => v6.to_string(),
-                };
-                let db2 = db.clone();
-                let h2 = hash_hex.clone();
-                let ip2 = ip_str.clone();
-                let port = *port;
-                tokio::task::spawn_blocking(move || {
-                    if let Err(e) = db2.update_friend_address(&h2, &ip2, port) {
-                        warn!("Failed to persist friend {h2} address {ip2}:{port}: {e}");
+                // A relayed session reports no address: it is online, but
+                // nothing about where to reach it is known.
+                if let Some(ip) = ip {
+                    let ip_str = ip.to_string();
+                    let db2 = db.clone();
+                    let h2 = hash_hex.clone();
+                    let ip2 = ip_str.clone();
+                    let port = *port;
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = db2.update_friend_address(&h2, &ip2, port) {
+                            warn!("Failed to persist friend {h2} address {ip2}:{port}: {e}");
+                        }
+                    });
+                    // `FriendSeen` now carries the peer's Hello listen
+                    // port (see the emission sites in upload.rs), so
+                    // it's safe to reseed download sources from it too.
+                    if let std::net::IpAddr::V4(v4) = ip {
+                        reseed_friend_endpoint(
+                            state,
+                            source_manager,
+                            credit_manager,
+                            transfer_manager,
+                            friend_hashes,
+                            *ember_hash,
+                            None,
+                            *v4,
+                            port,
+                        )
+                        .await;
                     }
-                });
-                // `FriendSeen` now carries the peer's Hello listen
-                // port (see the emission sites in upload.rs), so
-                // it's safe to reseed download sources from it too.
-                if let std::net::IpAddr::V4(v4) = ip {
-                    reseed_friend_endpoint(
-                        state,
-                        source_manager,
-                        credit_manager,
-                        transfer_manager,
-                        friend_hashes,
-                        *ember_hash,
-                        None,
-                        *v4,
-                        port,
-                    )
-                    .await;
+                    let _ = app_handle.emit(
+                        "ember:friend-online",
+                        serde_json::json!({
+                            "user_hash": hash_hex,
+                            "ip": ip_str,
+                            "port": port,
+                        }),
+                    );
+                } else {
+                    let _ = app_handle.emit(
+                        "ember:friend-online",
+                        serde_json::json!({ "user_hash": hash_hex }),
+                    );
                 }
-                let _ = app_handle.emit(
-                    "ember:friend-online",
-                    serde_json::json!({
-                        "user_hash": hash_hex,
-                        "ip": ip_str,
-                        "port": port,
-                    }),
-                );
                 // A friend who dials *us* never produces
                 // `EmberFriendConnected` (that is emitted only by
                 // the outbound dial path), so without flushing

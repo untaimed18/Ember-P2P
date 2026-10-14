@@ -1183,6 +1183,9 @@ async fn handle_command_inner(
                     .await
                     .get_transfer(&transfer_id)
                     .is_some_and(|t| t.friends_only);
+            if transfer_friends_only {
+                control.mark_friends_only();
+            }
             // Seed expected BLAKE3 from search/UI so verify does not depend
             // solely on having processed an Ember keyword hit this session.
             // Non-search starts (deep link, friend browse, collections) often
@@ -1234,7 +1237,7 @@ async fn handle_command_inner(
                 }
             }
 
-            let has_source = !peer_ip.is_empty() && peer_ip != "0.0.0.0" && peer_port > 0;
+            let has_source = !crate::security::names_no_peer_address(&peer_ip) && peer_port > 0;
             // Best-effort: a friend-browse download almost always implies an
             // active friend session, so this binding is usually already
             // known this session (see `EmberFriendConnected` /
@@ -2202,6 +2205,55 @@ async fn handle_command_inner(
                         ips_to_ban.push(ip);
                     }
                 }
+                // eMule drops a banned client from the waiting list
+                // (`CUpDownClient::Ban` → `RemoveFromWaitingQueue`). Left in
+                // place, the row kept answering its UDP reasks with a rank,
+                // and the peer kept its place in a queue it can never be
+                // served from. Its addresses are the ones the live-session
+                // capture would have banned had it been connected.
+                //
+                // The hash is published before the purge: a re-ask landing
+                // between the two would otherwise queue the peer again.
+                if let Ok(mut set) = shared_banned_hashes.write() {
+                    set.insert(kad_id.0);
+                }
+                if kad_id.0 != [0u8; 16] {
+                    // Keeps a row restored from the last session, if that
+                    // merge is still pending, from bringing the peer back.
+                    ed2k::upload_queue_store::note_asked(&ed2k::upload::QueueIdentity::UserHash(
+                        kad_id.0,
+                    ));
+                    let queued_ips: Vec<std::net::IpAddr> = upload_queue
+                        .lock()
+                        .await
+                        .iter()
+                        .filter(|entry| entry.user_hash == kad_id.0)
+                        .flat_map(|entry| entry.current_addr.map(|a| a.ip()).into_iter().chain(entry.last_ip))
+                        .collect();
+                    for ip in queued_ips {
+                        let v4 = match ip {
+                            std::net::IpAddr::V4(v4) => Some(v4),
+                            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+                        };
+                        // `0.0.0.0/8` is the stand-in a relayed session is
+                        // queued under (`relayed_session_addr`), not an
+                        // address anyone can be banned at.
+                        if let Some(v4) =
+                            v4.filter(|v4| v4.octets()[0] != 0 && !ips_to_ban.contains(v4))
+                        {
+                            ips_to_ban.push(v4);
+                        }
+                    }
+                    let purged =
+                        ed2k::upload::purge_queue_rows_for_banned_hash(upload_queue, &kad_id.0).await;
+                    if purged > 0 {
+                        info!("Removed {purged} upload-queue row(s) of banned peer {peer_id_hex}");
+                    }
+                }
+                // `0.0.0.0/8` names nobody: identity-only source rows and
+                // older stored addresses use `0.0.0.0` as a placeholder, and
+                // relayed sessions are recorded in the rest of the block.
+                ips_to_ban.retain(|ip| ip.octets()[0] != 0);
                 for ip in &ips_to_ban {
                     state.banned_ips.insert(*ip);
                 }
@@ -2214,9 +2266,6 @@ async fn handle_command_inner(
                 // admitted. Nothing in the write depends on the sets.
                 if let Ok(mut shared) = shared_banned_ips.write() {
                     *shared = state.banned_ips.clone();
-                }
-                if let Ok(mut set) = shared_banned_hashes.write() {
-                    set.insert(kad_id.0);
                 }
                 // Keep ReputationManager in sync so Trust badges and
                 // reputation-gated connect paths see the manual ban

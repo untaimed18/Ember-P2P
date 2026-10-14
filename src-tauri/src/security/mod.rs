@@ -586,6 +586,23 @@ fn is_this_network_v4(v4: std::net::Ipv4Addr) -> bool {
     v4.octets()[0] == 0
 }
 
+/// Whether `ip`, a stored or caller-supplied peer address, names no host:
+/// empty, or anywhere in `0.0.0.0/8`. Not just `0.0.0.0`: the rest of that
+/// block is where relayed upload sessions are recorded, and an address taken
+/// from one of those names nobody.
+pub(crate) fn names_no_peer_address(ip: &str) -> bool {
+    if ip.is_empty() {
+        return true;
+    }
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => is_this_network_v4(v4),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            v6.is_unspecified() || v6.to_ipv4_mapped().is_some_and(is_this_network_v4)
+        }
+        Err(_) => false,
+    }
+}
+
 /// Reserved for future use / class E (240.0.0.0/4, includes 255.255.255.255)
 fn is_reserved_future_v4(v4: std::net::Ipv4Addr) -> bool {
     v4.octets()[0] >= 240
@@ -2045,6 +2062,16 @@ fn filter_message_text(text: &str, keep_joiners: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relayed_stand_ins_name_no_peer_address() {
+        for none in ["", "0.0.0.0", "0.0.0.7", "0.255.255.255", "::", "::ffff:0.0.0.7"] {
+            assert!(names_no_peer_address(none), "{none:?}");
+        }
+        for some in ["81.2.69.7", "10.0.0.1", "1.0.0.0", "2001:db8::1", "::ffff:81.2.69.7"] {
+            assert!(!names_no_peer_address(some), "{some:?}");
+        }
+    }
 
     #[test]
     fn path_within_dir_treats_a_drive_root_as_a_directory() {

@@ -2028,6 +2028,13 @@ pub(in crate::network) async fn on_source_retry_tick(
                 )
                 .await;
             }
+            // Timed-out records stay in the map below the attempt ceiling, so
+            // this runs every sweep: only once nothing to this friend is still
+            // in flight are the downloads waiting behind it released.
+            if !friend_has_live_request(&state.friend_xfer_attempts, key.0, now) {
+                release_sources_waiting_on_friend(state, transfer_manager, app_handle, key.0)
+                    .await;
+            }
             // Past the retry ceiling the entry is useless: drop it
             // so a much later attempt (after the friend has been
             // offline and come back) starts from a clean slate

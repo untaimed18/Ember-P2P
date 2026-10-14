@@ -6679,7 +6679,9 @@ impl Database {
             ))
         });
         match result {
-            Ok((ip, port)) if !ip.is_empty() && port > 0 => Ok(Some((ip, port))),
+            Ok((ip, port)) if !crate::security::names_no_peer_address(&ip) && port > 0 => {
+                Ok(Some((ip, port)))
+            }
             Ok(_) => Ok(None),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),

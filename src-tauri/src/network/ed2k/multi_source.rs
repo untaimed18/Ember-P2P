@@ -1481,6 +1481,11 @@ pub struct EstablishedStream {
     /// `stage:file_status_wait (round 0) unexpected end of file` we saw for
     /// every adopted callback source.
     pub peer_caps: crate::network::ed2k::messages::PeerCapabilities,
+    /// The friend whose connect-back for a friend transfer this is, over the
+    /// secure session that transfer exists for. `None` for every plain
+    /// callback (server, KAD buddy, Ember DHT), which is held to the same
+    /// friends-only rule as a stream we dialed.
+    pub friend_connect_back: Option<[u8; 16]>,
 }
 
 /// Pairing of an established peer stream with the synthesised
@@ -6060,6 +6065,65 @@ impl SharedAichPin {
     }
 }
 
+/// How long a source of a download that some friend may refuse over plain
+/// eD2K has, after the handshake, to name its Ember identity before it is
+/// asked for the file. An Ember uploader sends `OP_EMBER_HELLO` as its first
+/// packet, so this only runs out on a peer that is not Ember at all.
+const EMBER_IDENTITY_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The friend, among the Ember identities a source is known by, that refuses
+/// this download's file over plain eD2K — see
+/// [`crate::network::friend_transfer::friend_refuses_plain_ed2k`]. It is also
+/// the friend the source is then routed to, so the two cannot disagree.
+async fn friend_refusing_plain_ed2k(
+    identities: &[Option<[u8; 16]>],
+    friend_hashes: &Option<Arc<RwLock<std::collections::HashSet<[u8; 16]>>>>,
+    file_hash: &[u8; 16],
+    control: &TransferControl,
+) -> Option<[u8; 16]> {
+    let friends = friend_hashes.as_ref()?.read().await;
+    identities.iter().flatten().copied().find(|&peer| {
+        crate::network::friend_transfer::friend_refuses_plain_ed2k(
+            Some(peer),
+            &friends,
+            file_hash,
+            control.is_friends_only(),
+        )
+    })
+}
+
+/// The Ember identity `clients.met` binds to `user_hash`, if any.
+async fn stored_ember_identity(
+    credit_mgr: &Option<Arc<RwLock<CreditManager>>>,
+    user_hash: Option<[u8; 16]>,
+) -> Option<[u8; 16]> {
+    let (Some(cm), Some(uh)) = (credit_mgr, user_hash) else {
+        return None;
+    };
+    cm.read().await.find_ember_by_user_hash(&uh)
+}
+
+/// Hand a source [`friend_refusing_plain_ed2k`] named to the network task, to
+/// be asked for by friend transfer instead.
+async fn report_friend_transfer_only(
+    event_tx: &Option<mpsc::Sender<DownloadEvent>>,
+    transfer_id: &str,
+    ip: &str,
+    port: u16,
+    friend: [u8; 16],
+) {
+    if let Some(etx) = event_tx {
+        let _ = etx
+            .send(DownloadEvent::FriendTransferOnly {
+                transfer_id: transfer_id.to_string(),
+                ip: ip.to_string(),
+                port,
+                friend,
+            })
+            .await;
+    }
+}
+
 async fn download_parts_from_source(
     _src_idx: usize,
     source: &DownloadSource,
@@ -6279,6 +6343,7 @@ async fn download_parts_from_source(
     // `None` for adopted inbound streams, which open no outbound connection.
     let mut _global_conn_permit: Option<GlobalConnPermit> = None;
     let mut peer_session: Option<peer_sessions::PeerSession> = None;
+    let friend_connect_back = pre_established.as_ref().and_then(|es| es.friend_connect_back);
 
     if let Some(es) = pre_established {
         emit_source!("connecting", None, 0u64);
@@ -6404,6 +6469,19 @@ async fn download_parts_from_source(
         let std::net::IpAddr::V4(dial_v4) = addr.ip() else {
             return Ok(());
         };
+        let stored_ember = stored_ember_identity(&credit_mgr, source.peer_user_hash).await;
+        if let Some(friend) =
+            friend_refusing_plain_ed2k(&[stored_ember], &friend_hashes, file_hash, &control).await
+        {
+            debug!(
+                "Source {} ({}) skip dial: friend {} serves this file only by friend transfer",
+                _src_idx,
+                addr,
+                hex::encode(friend),
+            );
+            report_friend_transfer_only(&event_tx, &transfer_id, &src_ip, src_port, friend).await;
+            return Ok(());
+        }
         // Every dial ends in `OP_STARTUPLOADREQ`, and one inside eMule's
         // `MIN_REQUESTTIME` of the last is a strike toward a ban however we
         // got here: a restarted or resumed download, another retry path, or a
@@ -6988,6 +7066,22 @@ async fn download_parts_from_source(
     // OP_REQUESTFILENAME) while keeping the original "drain everything"
     // semantics intact for the slower / chattier peers.
     let mut read_timeout_ms: u64 = 500;
+    // A source of a download some friend may refuse over plain eD2K must name
+    // its Ember identity before the file request, or the check below would
+    // run blind and the request go out to a friend it is charged against.
+    let ember_identity_deadline = {
+        let possible = match (&friend_hashes, friend_connect_back, peer_ember_hash) {
+            (Some(fh), None, None) => {
+                crate::network::friend_transfer::friend_transfer_only_possible(
+                    &*fh.read().await,
+                    file_hash,
+                    control.is_friends_only(),
+                )
+            }
+            _ => false,
+        };
+        possible.then(|| std::time::Instant::now() + EMBER_IDENTITY_WAIT)
+    };
     for _ in 0..12 {
         let (proto, opcode, payload) = if let Some(pkt) = deferred_packet.take() {
             pkt
@@ -7013,6 +7107,16 @@ async fn download_parts_from_source(
                 Err(e) if e.get_ref().is_some_and(|i| i.is::<PacketStreamDesynced>()) => {
                     return Err(anyhow::Error::from(e).context("stage:emule_info_wait"));
                 }
+                Ok(None) => match ember_identity_deadline
+                    .filter(|_| peer_ember_hash.is_none())
+                    .and_then(|d| d.checked_duration_since(std::time::Instant::now()))
+                {
+                    Some(left) if !left.is_zero() => {
+                        read_timeout_ms = left.as_millis().max(1) as u64;
+                        continue;
+                    }
+                    _ => break,
+                },
                 _ => break,
             }
         };
@@ -7563,6 +7667,33 @@ async fn download_parts_from_source(
                     mesh_discovered_emitted = true;
                 }
             }
+        }
+    }
+
+    // The pre-dial check knows only identities `clients.met` had bound for
+    // the listed source; the handshake names the rest, adopted callback
+    // streams included. Nothing is charged until a file request, so stopping
+    // here still costs the friend nothing. Only a friend's connect-back is
+    // left alone: it is the friend transfer itself.
+    if friend_connect_back.is_none() {
+        let stored_ember = stored_ember_identity(&credit_mgr, Some(peer_user_hash)).await;
+        if let Some(friend) = friend_refusing_plain_ed2k(
+            &[peer_ember_hash, stored_ember],
+            &friend_hashes,
+            file_hash,
+            &control,
+        )
+        .await
+        {
+            info!(
+                "Source {} ({}): friend {} serves this file only by friend transfer; \
+                 not asking over plain eD2K",
+                _src_idx,
+                addr,
+                hex::encode(friend),
+            );
+            report_friend_transfer_only(&event_tx, &transfer_id, &src_ip, src_port, friend).await;
+            return Ok(());
         }
     }
 
@@ -11747,7 +11878,7 @@ async fn download_parts_from_source(
                                 let mut cm = cm.write().await;
                                 cm.add_downloaded(
                                     peer_user_hash,
-                                    super::credits::credit_ip(addr),
+                                    CreditManager::ident_ip_of(addr),
                                     verified_bytes,
                                 );
                                 // Name the row these bytes just created.
@@ -13053,6 +13184,48 @@ mod tests {
     use super::*;
 
     use super::super::messages::PARTSIZE;
+
+    /// A plain callback stream arrives with nothing but the Hello's user hash,
+    /// so the friend it belongs to is found through `clients.met`, and the
+    /// friend found is the one the source is routed to.
+    #[tokio::test]
+    async fn a_source_is_refused_for_and_routed_to_the_friend_its_identities_name() {
+        let friend = [0xD1u8; 16];
+        let stranger = [0xD2u8; 16];
+        let friend_user_hash = [0xD3u8; 16];
+        let file = [0xD4u8; 16];
+        let friends: Option<Arc<RwLock<HashSet<[u8; 16]>>>> =
+            Some(Arc::new(RwLock::new([friend].into_iter().collect())));
+        let mut cm = CreditManager::new();
+        cm.set_ember_hash(friend_user_hash, friend);
+        let cm = Some(Arc::new(RwLock::new(cm)));
+        let control = TransferControl::new();
+
+        let stored = stored_ember_identity(&cm, Some(friend_user_hash)).await;
+        assert_eq!(stored, Some(friend));
+        assert_eq!(
+            friend_refusing_plain_ed2k(&[None, stored], &friends, &file, &control).await,
+            None,
+            "a public file is asked for over plain eD2K"
+        );
+        control.mark_friends_only();
+        assert_eq!(
+            friend_refusing_plain_ed2k(&[None, stored], &friends, &file, &control).await,
+            Some(friend),
+            "an adopted callback with no Ember Hello yet is still recognised"
+        );
+        assert_eq!(
+            friend_refusing_plain_ed2k(&[Some(stranger), stored], &friends, &file, &control)
+                .await,
+            Some(friend),
+            "a non-friend identity does not hide the friend one"
+        );
+        assert_eq!(
+            friend_refusing_plain_ed2k(&[Some(stranger), None], &friends, &file, &control).await,
+            None
+        );
+        assert_eq!(stored_ember_identity(&cm, Some([0xD5u8; 16])).await, None);
+    }
 
     /// The listener's share of the shared budget has to be real capacity and
     /// has to leave downloads a usable majority. It is the thing standing

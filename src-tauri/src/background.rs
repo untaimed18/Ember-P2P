@@ -154,7 +154,7 @@ async fn run(app: tauri::AppHandle) {
                 // notices. So the line reports the new source rather than
                 // claiming a cause it cannot know.
                 tracing::info!(
-                    "Effective bandwidth limits now up {} (was {}), down {} (was {}); source: {}",
+                    "Effective bandwidth limits now up {} (was {}), down {} (was {}); source: {}{}",
                     target.0,
                     previous.0,
                     target.1,
@@ -168,6 +168,10 @@ async fn run(app: tauri::AppHandle) {
                             .map(|rule| format!("schedule rule {}", rule.id))
                             .unwrap_or_else(|| "manual limits".to_string())
                     },
+                    resolved
+                        .download_ratio_cap
+                        .map(|cap| format!(", download held to {}x upload", cap.ratio))
+                        .unwrap_or_default(),
                 );
             }
             applied_limits = Some(target);
@@ -249,6 +253,7 @@ async fn run(app: tauri::AppHandle) {
             effective_download_speed: target.1,
             schedule: resolved.active,
             alt_speed,
+            download_ratio_cap: resolved.download_ratio_cap,
             sleep_inhibit_supported,
             // What the OS accepted, not what was asked for: a refused
             // `SetThreadExecutionState` is backed off rather than retried every
@@ -664,6 +669,7 @@ pub fn apply_effective_limits(
         published.effective_download_speed = resolved.max_download_speed;
         published.schedule = resolved.active;
         published.alt_speed = settings.alt_speed_enabled;
+        published.download_ratio_cap = resolved.download_ratio_cap;
         published.clone()
     };
     if let Err(error) = app.emit("ember:runtime-status", &status) {
@@ -707,6 +713,7 @@ fn resolved_status(settings: &crate::types::AppSettings) -> RuntimeStatus {
         effective_download_speed: resolved.max_download_speed,
         schedule: resolved.active,
         alt_speed: settings.alt_speed_enabled,
+        download_ratio_cap: resolved.download_ratio_cap,
         sleep_inhibit_supported: crate::power::supported(),
         sleep_inhibit_held: false,
     }

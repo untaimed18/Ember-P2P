@@ -784,9 +784,16 @@ pub async fn start_token_refill(
     let mut last_uploaded = limiter.total_uploaded();
     let mut last_downloaded = limiter.total_downloaded();
     let mut speed_tick_count: u64 = 0;
+    // Refill by elapsed time, since Skip drops the ticks a stall swallowed and
+    // a per-tick tenth then lost that time's allowance for good. Capped at a
+    // second; the bucket's own 2x cap bounds the burst either way.
+    let mut last_refill = std::time::Instant::now();
 
     loop {
         interval.tick().await;
+        let now = std::time::Instant::now();
+        let elapsed_ms = now.duration_since(last_refill).as_millis().min(1_000) as u64;
+        last_refill = now;
         // Refill before the teardown check, because `bw_shutdown` means "flush
         // state now", not "this process is about to die". The updater raises it
         // before handing the bundle to the installer, and an install that fails
@@ -797,7 +804,7 @@ pub async fn start_token_refill(
         // `drain_tokens` warns about, and invisible unless someone reads the
         // log. Downloads escaped it only when left unlimited, since
         // `acquire_download` returns early at rate 0.
-        limiter.refill_tokens_incremental(1, TICKS_PER_SECOND);
+        limiter.refill_tokens_incremental(elapsed_ms, 1_000);
         if shutdown.load(Ordering::Relaxed) {
             // Stand USS down once, and hand back any throttle it was holding:
             // `set_configured_limits` treats a still-`uss_active` limiter as
@@ -816,7 +823,15 @@ pub async fn start_token_refill(
         // Drain real KAD RTT samples from the network loop. Cap drain size so a
         // stuck lock elsewhere cannot leave an ever-growing queue.
         let uss_state_before_drain = uss.state();
-        if let Ok(mut queue) = uss_rtt_queue.try_lock() {
+        // A poisoned queue is still a queue: the producer in `udp.rs` already
+        // recovers it, and treating it as locked would starve USS of samples
+        // for the rest of the session.
+        let queue = match uss_rtt_queue.try_lock() {
+            Ok(queue) => Some(queue),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some(mut queue) = queue {
             let mut drained = 0;
             while drained < 64 {
                 let Some(sample) = queue.pop_front() else {
@@ -849,7 +864,10 @@ pub async fn start_token_refill(
             }
         }
 
-        // Sync USS enabled state from user settings
+        // Sync USS enabled state from user settings. USS needs a ceiling to
+        // throttle down from and ramp back to, so it stands down while upload
+        // is unlimited. eMule substitutes the configured line capacity
+        // (`GetMaxGraphUploadRate`) there; Ember has no capacity setting yet.
         let want_enabled =
             uss_enabled_flag.load(Ordering::Relaxed) && limiter.configured_upload_rate() > 0;
         if want_enabled && !uss.is_enabled() {
@@ -1307,6 +1325,71 @@ mod tests {
             .await
             .expect("uploads must keep flowing after a shutdown the process survived");
 
+        task.abort();
+    }
+
+    /// `MissedTickBehavior::Skip` drops the ticks a stalled runtime swallowed.
+    /// Refilling a fixed tenth per tick lost that time's allowance with them.
+    #[tokio::test]
+    async fn a_runtime_stall_does_not_lose_upload_allowance() {
+        let bw = Arc::new(BandwidthLimiter::new(10_000, 0));
+        let task = tokio::spawn(super::start_token_refill(
+            bw.clone(),
+            Arc::new(AtomicBool::new(false)),
+            crate::bandwidth::new_uss_rtt_queue(),
+            crate::bandwidth::new_uss_enabled_flag(false),
+        ));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        bw.try_take_upload(u64::MAX);
+
+        // Blocks the (current-thread) runtime, refill task included.
+        std::thread::sleep(Duration::from_millis(600));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let refilled = bw.available_upload_tokens();
+        assert!(
+            (5_000..=20_000).contains(&refilled),
+            "600 ms of a 10 kB/s cap should come back, got {refilled}"
+        );
+        task.abort();
+    }
+
+    /// The network loop recovers a poisoned RTT queue when it pushes; the
+    /// limiter has to as well, or USS never sees another sample.
+    #[tokio::test]
+    async fn a_poisoned_rtt_queue_is_still_drained() {
+        let queue = crate::bandwidth::new_uss_rtt_queue();
+        {
+            let queue = queue.clone();
+            let _ = std::thread::spawn(move || {
+                let _guard = queue.lock().unwrap();
+                panic!("poison the USS RTT queue");
+            })
+            .join();
+        }
+        assert!(queue.is_poisoned());
+        queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(crate::bandwidth::UssRttSample {
+                host: "192.0.2.1:4672".parse().unwrap(),
+                rtt_ms: 40.0,
+            });
+
+        let bw = Arc::new(BandwidthLimiter::new(1_000_000, 0));
+        let task = tokio::spawn(super::start_token_refill(
+            bw.clone(),
+            Arc::new(AtomicBool::new(false)),
+            queue.clone(),
+            crate::bandwidth::new_uss_enabled_flag(true),
+        ));
+        assert!(
+            wait_for(|| queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty())
+            .await,
+            "samples behind a poisoned lock must still reach USS"
+        );
         task.abort();
     }
 

@@ -368,11 +368,12 @@ pub(super) async fn upload_queue_snapshot(
             .unwrap_or((0, 0));
 
         let file_hash_hex = hex::encode(entry.file_hash);
+        // Empty when unresolved; the UI renders its own translated label.
         let file_name = idx
             .get_by_hash(&file_hash_hex)
             .map(|f| f.name.clone())
             .or_else(|| downloading_names.get(&file_hash_hex).cloned())
-            .unwrap_or_else(|| String::from("(unknown file)"));
+            .unwrap_or_default();
 
         // Resolved from the full address, not a v4-mapped copy of it, so a
         // v6-only peer gets a flag too.

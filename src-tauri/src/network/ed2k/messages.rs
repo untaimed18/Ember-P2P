@@ -1967,24 +1967,11 @@ pub fn build_reask_file_ping(
     completed_parts: Option<&[bool]>,
 ) -> Option<Vec<u8>> {
     let part_count = ed2k_wire_part_count_u16(file_size)?;
-    let bitmap_bytes = ((part_count as usize) + 7) / 8;
+    let bitmap_bytes = bitmap_len_for_part_count(part_count as usize);
     let mut buf = Vec::with_capacity(16 + 2 + bitmap_bytes + 2);
     buf.extend_from_slice(file_hash);
     buf.extend_from_slice(&part_count.to_le_bytes());
-    for byte_idx in 0..bitmap_bytes {
-        let mut byte = 0u8;
-        if let Some(parts) = completed_parts {
-            for bit in 0..8 {
-                let idx = byte_idx * 8 + bit;
-                if idx < part_count as usize {
-                    if parts.get(idx).copied().unwrap_or(false) {
-                        byte |= 1 << bit;
-                    }
-                }
-            }
-        }
-        buf.push(byte);
-    }
+    encode_part_bitmap(file_size, completed_parts, &mut buf);
     buf.extend_from_slice(&complete_source_count.to_le_bytes());
     Some(buf)
 }
@@ -2027,14 +2014,19 @@ fn decode_part_bitmap(part_count: usize, data: &[u8]) -> io::Result<Vec<bool>> {
     Ok(parts)
 }
 
-fn encode_part_bitmap(part_count: usize, parts: Option<&[bool]>, out: &mut Vec<u8>) {
-    let bitmap_bytes = bitmap_len_for_part_count(part_count);
+/// Write the `ed2k_wire_part_count(file_size)` bitmap. An exact multiple of
+/// `PARTSIZE` has a phantom last wire part with no data behind it, and eMule's
+/// `WritePartStatus` never sets its bit (`uPart < GetPartCount()`), so only
+/// the real parts can be marked here whatever `parts` says.
+fn encode_part_bitmap(file_size: u64, parts: Option<&[bool]>, out: &mut Vec<u8>) {
+    let bitmap_bytes = bitmap_len_for_part_count(ed2k_wire_part_count(file_size));
+    let real_parts = ed2k_part_count_for_size(file_size);
     for byte_idx in 0..bitmap_bytes {
         let mut byte = 0u8;
         if let Some(parts) = parts {
             for bit in 0..8 {
                 let idx = byte_idx * 8 + bit;
-                if idx < part_count && parts.get(idx).copied().unwrap_or(false) {
+                if idx < real_parts && parts.get(idx).copied().unwrap_or(false) {
                     byte |= 1 << bit;
                 }
             }
@@ -2045,8 +2037,12 @@ fn encode_part_bitmap(part_count: usize, parts: Option<&[bool]>, out: &mut Vec<u
 
 /// Parse OP_REASKFILEPING UDP payload.
 ///
-/// Legacy peers send only the 16-byte file hash. eMule udp_ver > 3 appends
-/// part_count + completed-part bitmap + complete-source count.
+/// eMule picks the layout from the sender's UDP version
+/// (`UDPReaskForDownload`): v1/v2 send the 16-byte file hash, v3 appends the
+/// u16 complete-source count, v4+ put the part status (part count + bitmap)
+/// between the two. A v4+ payload is never shorter than 20 bytes, so 18 is
+/// always v3 and gets `completed_parts: None` — answered rank-only, as eMule
+/// answers a v3 sender.
 pub fn parse_reask_file_ping(payload: &[u8]) -> io::Result<ReaskFilePing> {
     if payload.len() < 16 {
         return Err(io::Error::new(
@@ -2063,10 +2059,17 @@ pub fn parse_reask_file_ping(payload: &[u8]) -> io::Result<ReaskFilePing> {
             complete_sources: None,
         });
     }
-    if payload.len() < 18 {
+    if payload.len() == 18 {
+        return Ok(ReaskFilePing {
+            file_hash,
+            completed_parts: None,
+            complete_sources: Some(u16::from_le_bytes([payload[16], payload[17]])),
+        });
+    }
+    if payload.len() < 20 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
-            "OP_REASKFILEPING payload has truncated part count",
+            "OP_REASKFILEPING payload has truncated part status",
         ));
     }
     let part_count = u16::from_le_bytes([payload[16], payload[17]]) as usize;
@@ -2096,8 +2099,13 @@ pub fn parse_reask_file_ping(payload: &[u8]) -> io::Result<ReaskFilePing> {
     })
 }
 
-/// Build OP_REASKACK payload. Enhanced ACKs mirror OP_FILESTATUS layout
-/// (part_count + bitmap) followed by queue rank.
+/// Build OP_REASKACK payload. Enhanced ACKs (to UDP v4+ senders) mirror
+/// OP_FILESTATUS layout (part_count + bitmap) followed by queue rank.
+///
+/// `available_parts`: `None` writes no part status (UDP v3 and older), an
+/// empty slice writes eMule's u16 `0` part count for a complete file
+/// (`ClientUDPSocket.cpp`: `IsPartFile() ? WritePartStatus : WriteUInt16(0)`),
+/// anything else writes the wire bitmap.
 pub fn build_reask_ack(
     file_size: u64,
     rank: Option<u16>,
@@ -2105,9 +2113,13 @@ pub fn build_reask_ack(
 ) -> Option<Vec<u8>> {
     let part_count = ed2k_wire_part_count_u16(file_size)?;
     let mut buf = Vec::new();
-    if let Some(parts) = available_parts {
-        buf.extend_from_slice(&part_count.to_le_bytes());
-        encode_part_bitmap(part_count as usize, Some(parts), &mut buf);
+    match available_parts {
+        None => {}
+        Some([]) => buf.extend_from_slice(&0u16.to_le_bytes()),
+        Some(parts) => {
+            buf.extend_from_slice(&part_count.to_le_bytes());
+            encode_part_bitmap(file_size, Some(parts), &mut buf);
+        }
     }
     if let Some(rank) = rank {
         buf.extend_from_slice(&rank.to_le_bytes());
@@ -3999,6 +4011,79 @@ mod tests {
         assert_eq!(ed2k_wire_part_count(PARTSIZE + 1), 2);
         assert_eq!(ed2k_wire_part_count(PARTSIZE * 2), 3);
         assert_eq!(ed2k_wire_part_count(PARTSIZE * 2 + 1), 3);
+    }
+
+    #[test]
+    fn reask_ping_hash_only_layout_is_udp_v1_v2() {
+        let hash = [0x11u8; 16];
+        let reask = parse_reask_file_ping(&hash).unwrap();
+        assert_eq!(reask.file_hash, hash);
+        assert_eq!(reask.completed_parts, None);
+        assert_eq!(reask.complete_sources, None);
+    }
+
+    /// `UDPReaskForDownload` for UDP v3: hash + complete-source count and no
+    /// part status. Read as a part count, the count demanded a bitmap and
+    /// trailing u16 that are not there and every v3 reask was dropped.
+    #[test]
+    fn reask_ping_hash_and_complete_count_layout_is_udp_v3() {
+        let hash = [0x22u8; 16];
+        let mut payload = hash.to_vec();
+        payload.extend_from_slice(&7u16.to_le_bytes());
+        let reask = parse_reask_file_ping(&payload).unwrap();
+        assert_eq!(reask.file_hash, hash);
+        assert_eq!(reask.completed_parts, None, "a v3 sender gets a rank-only ack");
+        assert_eq!(reask.complete_sources, Some(7));
+    }
+
+    #[test]
+    fn reask_ping_part_status_layout_is_udp_v4() {
+        let hash = [0x33u8; 16];
+        let size = PARTSIZE * 2 + 1;
+        let payload = build_reask_file_ping(&hash, size, 9, Some(&[true, false, true])).unwrap();
+        assert_eq!(payload.len(), 16 + 2 + 1 + 2);
+        let reask = parse_reask_file_ping(&payload).unwrap();
+        assert_eq!(reask.file_hash, hash);
+        assert_eq!(reask.completed_parts, Some(vec![true, false, true]));
+        assert_eq!(reask.complete_sources, Some(9));
+
+        // A complete file's sender writes a zero part count and no bitmap.
+        let mut zero = hash.to_vec();
+        zero.extend_from_slice(&0u16.to_le_bytes());
+        zero.extend_from_slice(&4u16.to_le_bytes());
+        let reask = parse_reask_file_ping(&zero).unwrap();
+        assert_eq!(reask.completed_parts, Some(vec![]));
+        assert_eq!(reask.complete_sources, Some(4));
+
+        let mut truncated = hash.to_vec();
+        truncated.extend_from_slice(&[0, 0, 0]);
+        assert!(parse_reask_file_ping(&truncated).is_err());
+    }
+
+    #[test]
+    fn reask_ack_for_a_complete_file_writes_a_zero_part_count() {
+        let ack = build_reask_ack(PARTSIZE * 3, Some(12), Some(&[])).unwrap();
+        assert_eq!(ack, vec![0, 0, 12, 0]);
+        let parsed = parse_reask_ack(&ack).unwrap();
+        assert_eq!(parsed.rank, Some(12));
+        assert_eq!(parsed.available_parts, Some(vec![]));
+
+        assert_eq!(build_reask_ack(PARTSIZE * 3, Some(12), None).unwrap(), vec![12, 0]);
+    }
+
+    #[test]
+    fn reask_bitmaps_never_set_the_phantom_part_of_an_exact_multiple() {
+        let size = PARTSIZE * 8;
+        assert_eq!(ed2k_wire_part_count(size), 9);
+        let all = vec![true; 9];
+
+        let ack = build_reask_ack(size, Some(1), Some(&all)).unwrap();
+        assert_eq!(ack, vec![9, 0, 0xFF, 0x00, 1, 0]);
+        let parsed = parse_reask_ack(&ack).unwrap();
+        assert_eq!(parsed.available_parts.unwrap().iter().filter(|p| **p).count(), 8);
+
+        let ping = build_reask_file_ping(&[0u8; 16], size, 0, Some(&all)).unwrap();
+        assert_eq!(&ping[16..20], &[9, 0, 0xFF, 0x00]);
     }
 
     /// The opcodes a stock eMule actually browses with. Getting any of these

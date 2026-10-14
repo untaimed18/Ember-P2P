@@ -802,6 +802,16 @@ pub enum SourceFailureKind {
 
 #[derive(Debug, Clone)]
 pub enum DownloadEvent {
+    /// A source worker stopped short of asking `friend` for this file over
+    /// plain eD2K, which that friend refuses — and counts toward banning the
+    /// asker. Not a source failure: nothing was asked. The network task asks
+    /// the friend for a friend transfer instead.
+    FriendTransferOnly {
+        transfer_id: String,
+        ip: String,
+        port: u16,
+        friend: [u8; 16],
+    },
     Progress {
         transfer_id: String,
         /// Bytes present on disk, from the gap list — eMule's `m_completedsize`
@@ -4306,13 +4316,7 @@ pub(crate) async fn maybe_send_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
     let Some(cm) = credit_manager else {
         return Ok(None);
     };
-    let peer_ip_u32 = match peer_addr.ip() {
-        std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-        std::net::IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(|v4| u32::from_be_bytes(v4.octets()))
-            .unwrap_or(0),
-    };
+    let peer_ip_u32 = CreditManager::ident_ip_of(peer_addr);
     // Read the request state under a short-lived guard and drop it before the
     // socket write. Holding the `CreditManager` read guard across
     // `write_packet_async().await` would block every `credit_manager.write()`
@@ -4346,15 +4350,10 @@ pub(crate) async fn maybe_send_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
 /// A peer's IPv4 as SecIdent v2 signs it: eMule's in-memory network-order
 /// `dwIP`, which `PokeUInt32` writes back out as the octets in order
 /// (`ClientCredits.cpp:440, :481-495`) — the same form as a HighID client ID,
-/// not the big-endian value credit bookkeeping keys on.
+/// not the big-endian value credit bookkeeping keys on. 0 wherever
+/// [`CreditManager::ident_ip_of`] is, a relayed session's stand-in included.
 fn secident_wire_ip(peer_addr: SocketAddr) -> u32 {
-    match peer_addr.ip() {
-        std::net::IpAddr::V4(v4) => u32::from_le_bytes(v4.octets()),
-        std::net::IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(|v4| u32::from_le_bytes(v4.octets()))
-            .unwrap_or(0),
-    }
+    CreditManager::ident_ip_of(peer_addr).swap_bytes()
 }
 
 pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Sized>(
@@ -4438,6 +4437,9 @@ pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
     Ok(())
 }
 
+/// Check a peer's `OP_SIGNATURE` against our outstanding challenge and record
+/// the outcome. Returns whether it verified: that this session, not merely
+/// some session under this user hash, proved it.
 pub(crate) async fn handle_secident_signature(
     credit_manager: Option<&Arc<tokio::sync::RwLock<CreditManager>>>,
     peer_user_hash: [u8; 16],
@@ -4446,9 +4448,9 @@ pub(crate) async fn handle_secident_signature(
     peer_secident_level: u8,
     payload: &[u8],
     our_client_id: u32,
-) {
+) -> bool {
     let Some(cm) = credit_manager else {
-        return;
+        return false;
     };
     let peer = crate::security::short_hash(&peer_user_hash);
     let sig_len = payload[0] as usize;
@@ -4458,19 +4460,13 @@ pub(crate) async fn handle_secident_signature(
              {} bytes, declared signature length {sig_len}",
             payload.len()
         );
-        return;
+        return false;
     }
     let Some(challenge) = pending_secident_challenge.take() else {
         debug!("SecIdent: ignored OP_SIGNATURE from {peer_addr} ({peer}) with no challenge of ours outstanding");
-        return;
+        return false;
     };
-    let peer_ip_u32 = match peer_addr.ip() {
-        std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-        std::net::IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(|v4| u32::from_be_bytes(v4.octets()))
-            .unwrap_or(0),
-    };
+    let peer_ip_u32 = CreditManager::ident_ip_of(peer_addr);
     let sig_bytes = &payload[1..1 + sig_len];
     let challenge_kind = if payload.len() == 1 + sig_len {
         None
@@ -4482,25 +4478,26 @@ pub(crate) async fn handle_secident_signature(
              {sig_len}-byte signature does not fit peer level {peer_secident_level}",
             payload.len()
         );
-        return;
+        return false;
     };
-    let verified = {
-        let cm = cm.read().await;
-        let local_ip = if our_client_id >= 0x0100_0000 {
-            our_client_id
-        } else {
-            0
-        };
-        cm.verify_signature(
-            &peer_user_hash,
-            challenge,
-            challenge_kind,
-            secident_wire_ip(peer_addr),
-            local_ip,
-            sig_bytes,
-        )
-    };
+    // Checked and recorded under one write lock. An unproven key can be
+    // replaced, and a failed check clears it, so a gap between the two let
+    // another connection swap the key in between: the signature passed
+    // against one key and a different one was marked proven.
     let mut cm = cm.write().await;
+    let local_ip = if our_client_id >= 0x0100_0000 {
+        our_client_id
+    } else {
+        0
+    };
+    let verified = cm.verify_signature(
+        &peer_user_hash,
+        challenge,
+        challenge_kind,
+        secident_wire_ip(peer_addr),
+        local_ip,
+        sig_bytes,
+    );
     if verified {
         debug!("SecIdent: verified {peer_addr} ({peer}), v{}", if challenge_kind.is_some() { 2 } else { 1 });
         cm.set_ident_state(peer_user_hash, IdentState::Verified);
@@ -4524,6 +4521,7 @@ pub(crate) async fn handle_secident_signature(
             cm.get_record(&peer_user_hash).map(|record| record.ident_state)
         );
     }
+    verified
 }
 
 /// Carried inside the `io::Error` of a packet read that was abandoned after

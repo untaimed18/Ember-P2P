@@ -1801,6 +1801,10 @@
     });
     return sorted;
   });
+  /** The backend sends an empty name when it cannot resolve the file. */
+  function queueFileName(c: UploadQueueClient): string {
+    return c.file_name || m.transfers_queue_unknown_file();
+  }
   /** Matches the peer's name, user hash or IP, its client software, the file
    *  it waits for, or its country code. */
   let queueFilter = $state('');
@@ -1808,7 +1812,7 @@
     const q = queueFilter.trim().toLowerCase();
     if (!q) return sortedUploadQueueClients;
     return sortedUploadQueueClients.filter((c) =>
-      c.file_name.toLowerCase().includes(q)
+      queueFileName(c).toLowerCase().includes(q)
       || (c.peer_name || '').toLowerCase().includes(q)
       || (c.user_hash || '').toLowerCase().includes(q)
       || (c.peer_ip || '').toLowerCase().includes(q)
@@ -6349,7 +6353,7 @@
                   {:else if column.key === 'client_software'}
                     <td class="client-cell" title={q.client_software}>{q.client_software || '\u2014'}</td>
                   {:else if column.key === 'file_name'}
-                    <td class="name-cell" title={q.file_name}><bdi dir="auto">{q.file_name}</bdi></td>
+                    <td class="name-cell" title={queueFileName(q)}><bdi dir="auto">{queueFileName(q)}</bdi></td>
                   {:else if column.key === 'wait_time'}
                     <td class="num-cell">{q.wait_seconds > 0 ? formatDurationSecs(q.wait_seconds) : '\u2014'}</td>
                   {:else if column.key === 'queue_rank'}

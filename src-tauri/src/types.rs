@@ -1978,7 +1978,7 @@ fn default_alt_max_download_speed() -> u64 {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct RuntimeStatus {
     /// Caps actually in force, whatever their source. Equal to the manual
-    /// settings unless `schedule` is set.
+    /// settings unless `schedule`, `alt_speed` or `download_ratio_cap` is set.
     pub effective_upload_speed: u64,
     pub effective_download_speed: u64,
     /// The schedule rule in force, or `None` when the manual limits are.
@@ -1986,6 +1986,9 @@ pub struct RuntimeStatus {
     pub schedule: Option<crate::bandwidth::schedule::ActiveScheduleRule>,
     /// The alternative limits are in force, overriding manual and schedule.
     pub alt_speed: bool,
+    /// eMule's upload ratio is what holds `effective_download_speed` down.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_ratio_cap: Option<crate::bandwidth::ratio::DownloadRatioCap>,
     /// Whether this platform can hold a sleep inhibitor at all.
     pub sleep_inhibit_supported: bool,
     /// Whether one is held right now.

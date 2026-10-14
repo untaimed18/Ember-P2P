@@ -710,6 +710,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         Arc::new(std::sync::RwLock::new(banned_ips.clone()));
     let shared_banned_hashes: ed2k::upload::SharedBannedHashes =
         Arc::new(std::sync::RwLock::new(banned_hashes));
+    ed2k::upload::register_udp_banned_hashes(&shared_banned_hashes);
     let shared_friends_only_hashes: ed2k::upload::SharedFriendsOnlyHashes =
         Arc::new(std::sync::RwLock::new(Default::default()));
 
@@ -945,6 +946,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         active_source_overflow: HashMap::new(),
         transfer_friend_hint: HashMap::new(),
         friend_xfer_attempts: HashMap::new(),
+        friend_xfer_waiting: HashMap::new(),
         friend_xfer_inbound_last: HashMap::new(),
         friend_xfer_stats: FriendXferStats::default(),
         friend_xfer_punch_serve: HashMap::new(),
@@ -981,6 +983,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         uss_host: None,
         uss_prev_host: None,
         uss_missed_pongs: 0,
+        uss_last_ping_at: None,
         uss_host_selected_at: 0,
         uss_rtt_queue,
         uss_enabled_flag,
@@ -1656,8 +1659,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             {
                 // Built here and adopted by `insert_loaded_credit` rather
                 // than via `get_or_create`, which would bump `last_seen` to
-                // "now" and index it there, so cap eviction and the 90-day
-                // prune would both misjudge the record's real age.
+                // "now" and index it there, so cap eviction and the
+                // `CREDIT_EXPIRY_DAYS` prune would both misjudge the
+                // record's real age.
                 let mut record = ed2k::credits::CreditRecord::new(hash);
                 record.uploaded = uploaded;
                 record.downloaded = downloaded;
@@ -1746,7 +1750,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 Err(e) => debug!("Could not load clients.met: {e}"),
             }
         }
-        // Prune anything older than the 90-day cutoff right now instead
+        // Prune anything past `CREDIT_EXPIRY_DAYS` right now instead
         // of waiting for the first `credit_save_timer` tick (60 s in).
         // Without this, the Known Clients tab would render with stale
         // rows for the first minute of every session — annoying when
@@ -1754,7 +1758,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         // periodic prune at `credit_save_timer` still runs, but this
         // makes the steady state correct from second one.
         let pruned_before = cm.all_records().len();
-        cm.cleanup_stale(90);
+        cm.cleanup_stale(ed2k::credits::CREDIT_EXPIRY_DAYS);
         let pruned_after = cm.all_records().len();
         let any_pruned = pruned_before != pruned_after;
         if any_pruned {

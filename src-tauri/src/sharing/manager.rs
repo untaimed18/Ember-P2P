@@ -99,6 +99,10 @@ pub struct TransferControl {
     /// mirrored from [`Transfer::priority`] so the multi-source download worker
     /// can bias global connection-slot acquisition without a manager round-trip.
     download_priority: AtomicU8,
+    /// Mirrored from [`Transfer::friends_only`] for the download worker, which
+    /// must not ask a friend for this file over plain eD2K (see
+    /// `friend_refuses_plain_ed2k`). Only ever set, like the flag it mirrors.
+    friends_only: AtomicBool,
     /// Display name applied by Rename while a download is running. Completion
     /// and the `.part.met` sidecar both read this so a rename sticks even on
     /// the callback path, whose tracker is not in the shared registry.
@@ -135,6 +139,7 @@ impl TransferControl {
             preview_priority: AtomicBool::new(false),
             preview_ready: AtomicBool::new(false),
             download_priority: AtomicU8::new(2),
+            friends_only: AtomicBool::new(false),
             pending_rename: std::sync::Mutex::new(PendingRename::default()),
         })
     }
@@ -292,6 +297,14 @@ impl TransferControl {
 
     pub fn download_priority_ordinal(&self) -> u8 {
         self.download_priority.load(Ordering::Acquire)
+    }
+
+    pub fn mark_friends_only(&self) {
+        self.friends_only.store(true, Ordering::Release);
+    }
+
+    pub fn is_friends_only(&self) -> bool {
+        self.friends_only.load(Ordering::Acquire)
     }
 
     /// False once completion has read the name: the file is about to be (or
@@ -737,12 +750,13 @@ impl TransferManager {
         self.install_control(id, control, seed);
     }
 
-    /// The per-row settings a fresh control must carry: priority ordinal and
-    /// the per-file preview flag.
-    fn control_seed(transfer: &Transfer) -> (u8, bool) {
+    /// The per-row settings a fresh control must carry: priority ordinal, the
+    /// per-file preview flag, and the friends-only flag.
+    fn control_seed(transfer: &Transfer) -> (u8, bool, bool) {
         (
             Self::priority_ordinal(&transfer.priority),
             transfer.preview_priority,
+            transfer.friends_only,
         )
     }
 
@@ -750,11 +764,14 @@ impl TransferManager {
         &mut self,
         id: &str,
         control: Arc<TransferControl>,
-        seed: Option<(u8, bool)>,
+        seed: Option<(u8, bool, bool)>,
     ) {
-        if let Some((ord, preview_priority)) = seed {
+        if let Some((ord, preview_priority, friends_only)) = seed {
             control.set_download_priority_ordinal(ord);
             control.set_preview_priority(preview_priority);
+            if friends_only {
+                control.mark_friends_only();
+            }
         }
         let download = self
             .active

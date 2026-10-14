@@ -89,7 +89,7 @@ pub(super) async fn flush_credit_state(
     let ownership = save_ownership.clone().lock_owned().await;
     if cleanup_stale {
         let mut cm_w = credit_manager.write().await;
-        cm_w.cleanup_stale(90);
+        cm_w.cleanup_stale(ed2k::credits::CREDIT_EXPIRY_DAYS);
     }
 
     // Skip the whole sequence when nothing has changed since the last
@@ -114,7 +114,7 @@ pub(super) async fn flush_credit_state(
             r.uploaded,
             r.downloaded,
             r.last_seen,
-            r.public_key.clone(),
+            r.persisted_public_key().to_vec(),
             r.ident_ip,
             r.ident_state.to_u8(),
             r.ember_hash,

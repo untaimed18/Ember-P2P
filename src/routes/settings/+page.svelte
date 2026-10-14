@@ -3553,6 +3553,19 @@
           </div>
         </div>
         <div class="card-body">
+          <!-- Rendered under the alternative download limit while those limits
+               are on, under the manual one otherwise. -->
+          {#snippet downloadRatioCapNote()}
+            {#if runtimeStatus?.download_ratio_cap}
+              <span class="hint download-ratio-cap" role="status">
+                {m.settings_download_ratio_cap_note({
+                  limit: formatSpeed(runtimeStatus.download_ratio_cap.limit),
+                  ratio: runtimeStatus.download_ratio_cap.ratio,
+                  upload: formatSpeed(runtimeStatus.download_ratio_cap.upload_below),
+                })}
+              </span>
+            {/if}
+          {/snippet}
           {#if runtimeStatus?.schedule}
             <!-- Without this, a user whose overnight rule is open sees the
                  manual number in the field and a different speed everywhere
@@ -3614,6 +3627,9 @@
                 {@render applyButton(['max_download_speed'], m.settings_max_download_speed())}
               </div>
               <span class="hint">{m.settings_max_download_speed_hint()}</span>
+              {#if !runtimeStatus?.alt_speed}
+                {@render downloadRatioCapNote()}
+              {/if}
             </div>
             <div class="field toggle-row" class:is-disabled={savedSettings?.max_upload_speed === 0}>
               <div class="toggle-info">
@@ -3652,6 +3668,9 @@
                 </div>
                 {@render applyButton(['alt_max_download_speed'], m.settings_alt_max_download_speed())}
               </div>
+              {#if runtimeStatus?.alt_speed}
+                {@render downloadRatioCapNote()}
+              {/if}
             </div>
           </div>
 

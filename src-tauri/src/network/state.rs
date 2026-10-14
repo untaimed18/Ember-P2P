@@ -631,6 +631,10 @@ pub(super) struct NetworkState {
     /// Bounds retries and lets an `OP_EMBER_XFER_ACK` be matched to the
     /// request it answers.
     pub(super) friend_xfer_attempts: HashMap<([u8; 16], [u8; 16]), FriendXferAttempt>,
+    /// Downloads with a source parked behind another file's request to the
+    /// same friend, which is released when that request is over. See
+    /// `friend_transfer::route_friend_transfer_only_source`.
+    pub(super) friend_xfer_waiting: HashMap<[u8; 16], HashSet<String>>,
     /// When we last accepted an inbound `OP_EMBER_XFER_REQ` from each friend.
     /// A friend session is authenticated, so this is not an anti-spoofing
     /// measure — it just stops a buggy or malicious *friend* from using us as
@@ -743,8 +747,10 @@ pub(super) struct NetworkState {
     /// Last USS host — excluded on the next selection so rotation cannot
     /// immediately re-pick the same unresponsive contact.
     pub(super) uss_prev_host: Option<SocketAddr>,
-    /// Consecutive *timed-out* USS pings (rotate host after 3)
+    /// Consecutive timed-out USS pings, for the log.
     pub(super) uss_missed_pongs: u32,
+    /// When the last USS ping went out, to any host in the pool.
+    pub(super) uss_last_ping_at: Option<std::time::Instant>,
     /// When the current USS host was selected
     pub(super) uss_host_selected_at: i64,
     /// Shared RTT queue for feeding latency samples to the limiter loop

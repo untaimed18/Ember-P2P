@@ -191,7 +191,10 @@ pub(super) fn apply_reputation_ban_ips(
 }
 
 /// Upload `Failed` endings that are session/queue mechanics rather than
-/// evidence the peer sent bad data — must not feed `FailedChunk`.
+/// evidence the peer sent bad data — must not feed `FailedChunk`. That
+/// includes a session `upload.rs` found to have ended without fault (our
+/// side failing, or a peer that stopped reading, which eMule does not
+/// penalise either) and a slot we ended for a file we could not serve.
 pub(super) fn is_neutral_upload_failure(error: &str) -> bool {
     let lower = error.to_lowercase();
     lower.contains("before any data")
@@ -200,4 +203,25 @@ pub(super) fn is_neutral_upload_failure(error: &str) -> bool {
         || lower.contains("network disconnected")
         || lower.contains("cancelled")
         || lower.contains("auto-banned")
+        || lower.contains("without fault")
+        || lower.contains("cannot be served")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn our_own_session_endings_are_no_strike_against_the_peer() {
+        for neutral in [
+            "Session ended without fault: bandwidth limiter stopped",
+            "Peer asked for a file it cannot be served",
+            "Slot rotated before any data was sent",
+            "Peer disconnected before any data transferred",
+        ] {
+            assert!(is_neutral_upload_failure(neutral), "{neutral}");
+        }
+        assert!(!is_neutral_upload_failure("Session ended: RequestParts too short"));
+        assert!(!is_neutral_upload_failure("Session ended: connection reset by peer"));
+    }
 }

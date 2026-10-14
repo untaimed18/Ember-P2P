@@ -347,6 +347,27 @@ pub(super) async fn handle_udp_packet(
     }
 }
 
+/// `packet` as it goes back to the eD2K client that asked: obfuscated for
+/// `encrypt_for`, the asker's user hash, as eMule's `SendPacket(...,
+/// bEncrypt, GetUserHash())` does, or plain when there is none.
+///
+/// The receiver keys on the datagram's source address, so this needs our
+/// public IP; eMule likewise sends plain while it has none
+/// (`theApp.GetPublicIP() > 0`).
+fn client_udp_reply(
+    packet: Vec<u8>,
+    encrypt_for: Option<[u8; 16]>,
+    our_ip: Option<Ipv4Addr>,
+    obfuscation_enabled: bool,
+) -> Vec<u8> {
+    match (encrypt_for, our_ip) {
+        (Some(user_hash), Some(our_ip)) if obfuscation_enabled => {
+            kad::obfuscation::encrypt_client_ed2k_packet(&packet, &user_hash, our_ip.octets())
+        }
+        _ => packet,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_udp_packet_inner(
     socket: &UdpSocket,
@@ -450,8 +471,9 @@ pub(super) async fn handle_udp_packet_inner(
     let decrypted_client_packet =
         kad::obfuscation::try_decrypt_client_ed2k_packet(data, &state.user_hash, from_ipv4.octets())
             .filter(|plain| plain[0] == OP_EDONKEYHEADER || plain[0] == OP_EMULEPROT);
+    let request_obfuscated = decrypted_client_packet.is_some();
     let data: &[u8] = decrypted_client_packet.as_deref().unwrap_or(data);
-    if decrypted_client_packet.is_some() && state.ip_filter.is_blocked_readonly(from_ipv4) {
+    if request_obfuscated && state.ip_filter.is_blocked_readonly(from_ipv4) {
         debug!("Dropping obfuscated eD2K UDP packet from blocked IP {from}");
         return;
     }
@@ -536,20 +558,15 @@ pub(super) async fn handle_udp_packet_inner(
                     // only ever answer for public files. Index presence alone
                     // used to be enough, which confirmed possession of both
                     // unshared and friends-only files to any prober.
+                    // A complete file's part status is eMule's u16 `0`
+                    // (`IsPartFile() ? WritePartStatus : WriteUInt16(0)`),
+                    // which `build_reask_ack` writes for an empty bitmap.
                     if restricted {
                         None
                     } else {
                         idx.get_by_hash(&hash_hex)
                             .filter(|file| file.is_public_listable())
-                            .map(|file| {
-                                (
-                                    file.size,
-                                    vec![
-                                        true;
-                                        ed2k::messages::ed2k_wire_part_count(file.size)
-                                    ],
-                                )
-                            })
+                            .map(|file| (file.size, Vec::new()))
                     }
                 };
                 let partial_candidate = if local_file.is_none()
@@ -650,7 +667,23 @@ pub(super) async fn handle_udp_packet_inner(
                     // as a rank in either direction: `GetWaitingPosition`
                     // returns 0 for an absent client and `SendRankingInfo`
                     // refuses to transmit a zero rank.
-                    let Some(rank) = queue_rank else {
+                    let (rank, row_user_hash) = match queue_rank {
+                        ed2k::upload::UdpReasker::Queued { rank, user_hash } => {
+                            (Some(rank), user_hash)
+                        }
+                        // A banned peer is not on the queue, and gets less than
+                        // one that is merely absent: not even `OP_QUEUEFULL`.
+                        ed2k::upload::UdpReasker::Banned => {
+                            debug!("UDP reask from {from} for {hash_hex}: user hash banned; row dropped");
+                            return;
+                        }
+                        ed2k::upload::UdpReasker::NotQueued => (None, None),
+                    };
+                    // eMule obfuscates its answer to a client it knows wants
+                    // that (`ShouldReceiveCryptUDPPackets`), keyed on the
+                    // client's user hash; one that obfuscated its ask does.
+                    let encrypt_for = row_user_hash.filter(|_| request_obfuscated);
+                    let Some(rank) = rank else {
                         // The one thing eMule does say, and only when its queue
                         // is nearly full, so the peer learns not to keep asking.
                         if upload_queue.lock().await.len() + ed2k::upload::QUEUE_FULL_HEADROOM
@@ -674,12 +707,24 @@ pub(super) async fn handle_udp_packet_inner(
                         enhanced.then_some(available_parts.as_slice()),
                     ) else {
                         let resp = vec![OP_EMULEPROT, ed2k::messages::OP_FILENOTFOUND_UDP];
+                        let resp = client_udp_reply(
+                            resp,
+                            encrypt_for,
+                            state.external_ip,
+                            state.obfuscation_enabled,
+                        );
                         let _ = socket.send_to(&resp, from).await;
                         debug!("Refused UDP reask from {from} for oversized {hash_hex}");
                         return;
                     };
                     let mut resp = vec![OP_EMULEPROT, ed2k::messages::OP_REASKACK];
                     resp.extend_from_slice(&ack_payload);
+                    let resp = client_udp_reply(
+                        resp,
+                        encrypt_for,
+                        state.external_ip,
+                        state.obfuscation_enabled,
+                    );
                     let _ = socket.send_to(&resp, from).await;
                     debug!(
                         "Answered UDP reask from {from} for {hash_hex}: file available, rank={rank}"
@@ -3485,6 +3530,37 @@ mod udp_reask_cache_tests {
             assert!(std::time::Instant::now() < deadline, "in-flight marker never cleared");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod reask_reply_tests {
+    use super::*;
+
+    #[test]
+    fn a_reask_reply_is_obfuscated_for_the_askers_hash_only_when_it_can_be() {
+        let peer_hash = [0x42u8; 16];
+        let our_ip = Ipv4Addr::new(81, 2, 69, 7);
+        let plain = vec![OP_EMULEPROT, ed2k::messages::OP_REASKACK, 1, 0];
+
+        let wire = client_udp_reply(plain.clone(), Some(peer_hash), Some(our_ip), true);
+        assert_ne!(wire, plain);
+        assert_eq!(
+            kad::obfuscation::try_decrypt_client_ed2k_packet(&wire, &peer_hash, our_ip.octets()),
+            Some(plain.clone()),
+            "the asker decrypts it keyed on its own hash and our address"
+        );
+
+        assert_eq!(client_udp_reply(plain.clone(), None, Some(our_ip), true), plain);
+        assert_eq!(client_udp_reply(plain.clone(), Some(peer_hash), None, true), plain);
+        assert_eq!(client_udp_reply(plain.clone(), Some(peer_hash), Some(our_ip), false), plain);
+    }
+
+    #[test]
+    fn a_complete_files_reask_ack_carries_a_zero_part_count() {
+        let ack = ed2k::messages::build_reask_ack(3 * ed2k::messages::PARTSIZE, Some(5), Some(&[]))
+            .unwrap();
+        assert_eq!(ack, [0, 0, 5, 0]);
     }
 }
 

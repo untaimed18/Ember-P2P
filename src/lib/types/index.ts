@@ -1108,6 +1108,17 @@ export interface ActiveScheduleRule {
   end_minute: number;
 }
 
+/** eMule's upload ratio holding the download limit down: below 4 KB/s of
+ *  upload, downloads get 3× it; below 10 KB/s, 4×. */
+export interface DownloadRatioCap {
+  /** The download limit in force, bytes/sec. */
+  limit: number;
+  /** The multiple of the upload limit that `limit` is. */
+  ratio: number;
+  /** The threshold the upload limit is below, bytes/sec. */
+  upload_below: number;
+}
+
 /** State that changes without anybody pressing anything: which bandwidth
  *  window is open and whether sleep is being deferred.
  *
@@ -1115,13 +1126,16 @@ export interface ActiveScheduleRule {
  *  event, which the backend emits only on change. */
 export interface RuntimeStatus {
   /** Caps actually in force, whatever their source. Equal to the manual
-   *  settings unless {@link schedule} is set. */
+   *  settings unless {@link schedule}, {@link alt_speed} or
+   *  {@link download_ratio_cap} is set. */
   effective_upload_speed: number;
   effective_download_speed: number;
   /** Absent when the manual limits are in force. */
   schedule?: ActiveScheduleRule;
   /** The alternative limits are in force, overriding manual and schedule. */
   alt_speed: boolean;
+  /** Absent unless the upload ratio is what lowered the download limit. */
+  download_ratio_cap?: DownloadRatioCap;
   /** Whether this platform can hold a sleep inhibitor at all. False means the
    *  `prevent_sleep_while_active` toggle would do nothing, so the UI disables
    *  it rather than offering a dead switch. */

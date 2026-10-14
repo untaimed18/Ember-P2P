@@ -990,9 +990,11 @@ pub fn run() {
 
             let local_index = Arc::new(RwLock::new(LocalIndex::new()));
 
+            let (initial_upload_limit, initial_download_limit) =
+                background::effective_limits_now(&settings);
             let bandwidth_limiter = Arc::new(BandwidthLimiter::new(
-                settings.max_upload_speed,
-                settings.max_download_speed,
+                initial_upload_limit,
+                initial_download_limit,
             ));
             let uss_rtt_queue = bandwidth::new_uss_rtt_queue();
             let uss_enabled_flag = bandwidth::new_uss_enabled_flag(settings.uss_enabled);

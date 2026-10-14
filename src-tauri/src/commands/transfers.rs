@@ -1609,7 +1609,7 @@ pub async fn start_download(
 
     let transfer_id = uuid::Uuid::new_v4().to_string();
 
-    let has_source = !peer_ip.is_empty() && peer_ip != "0.0.0.0" && peer_port > 0;
+    let has_source = !crate::security::names_no_peer_address(&peer_ip) && peer_port > 0;
 
     let add_paused = {
         let config = state.config.read().await;

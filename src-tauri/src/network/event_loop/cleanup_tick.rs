@@ -536,7 +536,7 @@ pub(in crate::network) async fn on_cleanup_tick(
         sm.cleanup_expired();
     }
 
-    // Request a stale-credit prune/flush (older than 90 days).
+    // Request a stale-credit prune/flush (past `CREDIT_EXPIRY_DAYS`).
     // L6: previously this only mutated
     // the in-memory map; the next `credit_save_timer` tick
     // (up to 60 s away) was the only thing that wrote the
