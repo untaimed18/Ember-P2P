@@ -1405,7 +1405,7 @@
     min-width: 140px;
     max-width: 260px;
     padding: 6px 12px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-pill);
     background: var(--bg-primary);
     color: var(--text-primary);

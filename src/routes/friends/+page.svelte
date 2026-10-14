@@ -50,6 +50,7 @@
   import { networkStats } from '$lib/stores/network';
   import { menuKeydown } from '$lib/a11y';
   import IconX from '$lib/components/IconX.svelte';
+  import IconGear from '$lib/components/IconGear.svelte';
   import FriendSettingsDialog from '$lib/components/FriendSettingsDialog.svelte';
   import { chatAllowedWith, friendNameTooLong, friendOverrides, FRIEND_NAME_MAX_BYTES } from '$lib/friendSettings';
 
@@ -1498,10 +1499,7 @@
               ? m.friend_settings_open_custom({ name: shortName })
               : m.friend_settings_open({ name: shortName })}
           >
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <circle cx="8" cy="8" r="2.1"/>
-              <path d="M8 1.6v1.6M8 12.8v1.6M1.6 8h1.6M12.8 8h1.6M3.5 3.5l1.1 1.1M11.4 11.4l1.1 1.1M3.5 12.5l1.1-1.1M11.4 4.6l1.1-1.1"/>
-            </svg>
+            <IconGear size={15} weight={1.3} />
           </button>
 
           <details class="card-more">
@@ -1945,7 +1943,7 @@
 
   .add-form-inner input {
     padding: 7px 10px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-md);
     background: var(--bg-input);
     color: var(--text-primary);
@@ -1996,7 +1994,7 @@
   .search-input {
     width: 100%;
     padding: 5px 26px 5px 30px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-pill);
     background: var(--bg-input);
     color: var(--text-primary);
@@ -2275,11 +2273,6 @@
   .card-settings-btn:hover {
     background: var(--bg-hover);
     color: var(--text-primary);
-  }
-
-  .card-settings-btn svg {
-    width: 15px;
-    height: 15px;
   }
 
   /* This friend has settings of their own: the gear reads as switched on. */

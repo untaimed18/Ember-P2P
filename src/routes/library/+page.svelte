@@ -6467,7 +6467,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-pill);
     padding: 0 10px;
     background: var(--bg-input);
@@ -6523,7 +6523,7 @@
   .filter-type {
     padding: 7px 28px 7px 10px;
     font-size: var(--font-size-sm);
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-sm);
     background-color: var(--bg-primary);
     color: inherit;
@@ -6777,7 +6777,7 @@
     padding: 3px 8px;
     font-size: var(--font-size-sm);
     font-weight: 600;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-sm);
     background: var(--bg-secondary);
     color: var(--text-primary);
@@ -7071,7 +7071,7 @@
     padding: 6px 8px;
     font-size: var(--font-size-sm);
     font-family: inherit;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-md);
     background: var(--bg-primary);
     color: inherit;
@@ -7508,7 +7508,7 @@
     flex: 1;
     padding: 5px 8px;
     font-size: var(--font-size-sm);
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-sm);
     background: var(--bg-input);
     color: inherit;

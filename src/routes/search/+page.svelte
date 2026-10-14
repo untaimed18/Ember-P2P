@@ -5283,7 +5283,7 @@
     padding: 7px 28px 7px 10px;
     font-size: var(--font-size-sm);
     font-weight: 600;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-md);
     background-color: var(--bg-surface);
     color: var(--text-secondary);

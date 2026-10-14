@@ -1510,7 +1510,7 @@
   .browse-filter-input {
     width: 100%;
     padding: 8px 32px 8px 32px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-pill);
     background: var(--bg-input);
     color: var(--text-primary);

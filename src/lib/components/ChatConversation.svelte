@@ -5381,7 +5381,7 @@
   .bubble-edit-input {
     width: 100%;
     padding: 5px 7px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-sm);
     background: var(--bg-primary);
     color: var(--text-primary);

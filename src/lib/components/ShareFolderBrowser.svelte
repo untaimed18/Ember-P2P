@@ -1300,7 +1300,7 @@
   .name-filter, .type-filter {
     height: 28px;
     flex-shrink: 0;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-sm);
     background: var(--bg-secondary);
     color: var(--text-primary);

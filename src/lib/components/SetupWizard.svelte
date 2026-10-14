@@ -1192,7 +1192,7 @@
   .text-input {
     width: 100%;
     padding: 9px 12px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-sm);
     background: var(--bg-input);
     color: var(--text-primary);

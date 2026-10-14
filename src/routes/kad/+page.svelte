@@ -1557,7 +1557,7 @@
     font-size: var(--font-size-sm);
     background: var(--bg-secondary);
     color: var(--text-primary);
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-pill);
   }
   .filter-input:focus {
@@ -1574,7 +1574,7 @@
     font-size: var(--font-size-sm);
     background-color: var(--bg-secondary);
     color: var(--text-primary);
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-pill);
   }
   .filter-select:disabled {
@@ -1644,7 +1644,7 @@
     flex: 1;
     padding: 7px 10px;
     font-size: var(--font-size-sm);
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-md);
     background: var(--bg-input);
     color: inherit;

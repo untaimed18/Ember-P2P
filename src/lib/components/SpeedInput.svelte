@@ -213,7 +213,7 @@
   .speed-input {
     display: flex;
     align-items: stretch;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-md);
     overflow: hidden;
     background: var(--bg-input);

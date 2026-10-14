@@ -922,7 +922,7 @@
     min-width: 0;
     padding: 6px 10px;
     border-radius: var(--radius-sm);
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     background: var(--bg-primary);
     color: var(--text-primary);
     font-family: inherit;
@@ -1053,7 +1053,7 @@
     gap: 8px;
     flex: 1;
     max-width: 400px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-pill);
     padding: 0 8px;
     background: var(--bg-input);

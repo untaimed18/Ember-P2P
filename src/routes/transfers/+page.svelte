@@ -7840,7 +7840,7 @@
     width: 100%;
     box-sizing: border-box;
     padding: 8px 10px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-sm);
     background: var(--bg-primary);
     color: var(--text-primary);

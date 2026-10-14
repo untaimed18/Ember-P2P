@@ -891,7 +891,7 @@
   .folder-input {
     display: flex;
     align-items: stretch;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-sm);
     overflow: hidden;
     background: var(--bg-input);
