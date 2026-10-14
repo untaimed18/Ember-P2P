@@ -1787,7 +1787,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     }
 
     let a4af_shared: Arc<RwLock<A4AFManager>> = Arc::new(RwLock::new(A4AFManager::new()));
-    let pending_dl_hashes: Arc<RwLock<Vec<[u8; 16]>>> = Arc::new(RwLock::new(Vec::new()));
     let active_port_tests: Arc<tokio::sync::Mutex<HashMap<std::net::IpAddr, mpsc::Sender<()>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let shared_server_addr: Arc<RwLock<Option<SocketAddr>>> = Arc::new(RwLock::new(None));
@@ -1855,8 +1854,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let ul_sm = source_manager.clone();
         let ul_comments = state.comment_manager.clone();
         let ul_cm = credit_manager.clone();
-        let ul_a4af = a4af_shared.clone();
-        let ul_pdh = pending_dl_hashes.clone();
         let ul_apt = active_port_tests.clone();
         let ul_buddy_hashes = pending_buddy_hashes.clone();
         let ul_buddy_tx = buddy_conn_tx.clone();
@@ -1921,8 +1918,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 ul_sm,
                 ul_comments,
                 ul_cm,
-                ul_a4af,
-                ul_pdh,
                 ul_apt,
                 ul_buddy_hashes,
                 ul_buddy_tx,
@@ -3895,7 +3890,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &transfer_manager,
                     &source_manager,
                     &a4af_shared,
-                    &pending_dl_hashes,
                 ))
                 .catch_unwind()
                 .await;

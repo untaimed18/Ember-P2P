@@ -8,7 +8,7 @@
   import { addLinksRequested, MAX_LINKS_TEXT_BYTES } from '$lib/clipboardWatch';
   import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
   import { categoryDestinationLabel, categorySubdir, normalizeCategoryFolder } from '$lib/categoryFolders';
-  import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, holdDownloadRemoved, setLocalCategory, IDLE_STATUSES, effectiveUploadSpeed } from '$lib/stores/transfers';
+  import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, holdDownloadRemoved, setLocalCategory, IDLE_STATUSES, effectiveUploadSpeed, resumableFailedDownloads } from '$lib/stores/transfers';
   import { addActionToast, removeToast, setToastMessage, toastError, toastSuccess } from '$lib/stores/toast';
   import { holdPendingCancel, releasePendingCancel } from '$lib/stores/pendingCancels';
   import { finishAction, setFinishAction, type FinishAction } from '$lib/stores/finishAction';
@@ -1949,7 +1949,9 @@
     return asc ? ' \u25B2' : ' \u25BC';
   }
 
-  const priorityOrder: Record<string, number> = { release: 0, auto: 1, high: 2, normal: 3, low: 4, verylow: 5 };
+  // The backend's scheduling order (`TransferManager::priority_ordinal`):
+  // Auto ranks below High.
+  const priorityOrder: Record<string, number> = { release: 0, high: 1, auto: 2, normal: 3, low: 4, verylow: 5 };
   const statusOrder: Record<string, number> = { active: 0, verifying: 1, completing: 2, searching: 3, queued: 4, paused: 5, stopped: 6, hashing: 7, noneneeded: 8, insufficient: 9, failed: 10, completed: 11 };
 
   // Client-side EWMA speed tracker: computes speed from transferred-byte
@@ -2143,7 +2145,7 @@
       case 'speed': cmp = displaySpeed(a) - displaySpeed(b); break;
       case 'progress': cmp = a.progress - b.progress; break;
       case 'sources': cmp = a.sources - b.sources; break;
-      case 'priority': cmp = (priorityOrder[a.priority] ?? 2) - (priorityOrder[b.priority] ?? 2); break;
+      case 'priority': cmp = (priorityOrder[a.priority] ?? priorityOrder.normal) - (priorityOrder[b.priority] ?? priorityOrder.normal); break;
       case 'status': cmp = (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9); break;
       case 'remaining': {
         const ea = etaSeconds(a), eb = etaSeconds(b);
@@ -2155,7 +2157,11 @@
       case 'category': cmp = sortCollator.compare(a.category || '', b.category || ''); break;
       case 'started_at': cmp = a.started_at - b.started_at; break;
     }
-    return dlSortAsc ? cmp : -cmp;
+    if (cmp !== 0) return dlSortAsc ? cmp : -cmp;
+    // Fixed-direction tie-break, as the upload sort has: the list is re-sorted
+    // on every store update, and equal keys otherwise kept whatever order the
+    // backend last emitted, so rows sharing a priority or status reshuffled.
+    return sortCollator.compare(a.file_name, b.file_name) || a.id.localeCompare(b.id);
   }
 
   let sortedActiveDownloads = $derived.by(() => {
@@ -2818,8 +2824,14 @@
     );
   }
 
+  /** A failed download whose progress is still on disk: Resume continues it
+   *  as the same row. */
+  function isResumableFailed(t: Transfer): boolean {
+    return t.direction === 'download' && t.status === 'failed' && $resumableFailedDownloads.has(t.id);
+  }
+
   function canResume(t: Transfer): boolean {
-    return isPausedState(t) || isHeldForDrive(t);
+    return isPausedState(t) || isHeldForDrive(t) || isResumableFailed(t);
   }
 
   /** Rows that may be waiting in the download queue. The backend has the last
@@ -4024,16 +4036,18 @@
     let cancel = cancelIds;
     let remove = removeIds;
     // A row that could not be paused (verifying, moving into Downloads), or
-    // that "Resume all" in the tray restarted, may have finished while the
+    // that "Resume all" in the tray restarted, may have completed while the
     // toast was up, and cancelling a finished download records it in the
-    // history as cancelled. Finished rows are removed from the list instead,
-    // as the confirm dialogs already do.
+    // history as cancelled. Completed rows are removed from the list instead,
+    // as the confirm dialogs already do. One that failed meanwhile is still
+    // cancelled: Remove would keep its progress in Downloads as `name.part`,
+    // and the user asked for it to be deleted.
     if (cancelIds.length > 0) {
       const pending = new Set(cancelIds);
       try {
         const finished = new Set(
           (await getTransfers())
-            .filter((t) => pending.has(t.id) && (t.status === 'completed' || t.status === 'failed'))
+            .filter((t) => pending.has(t.id) && t.status === 'completed')
             .map((t) => t.id),
         );
         if (finished.size > 0) {
@@ -7035,6 +7049,10 @@
       {/if}
       <button class="ctx-item ctx-danger" role="menuitem" disabled={!ctxTargets.some((x) => !isFinished(x) || x.status === 'completed')} onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
     {:else if ctxMenu.section !== 'upload' && ctxMulti}
+      {#if ctxTargets.some(canResume)}
+        <button class="ctx-item" role="menuitem" title={m.transfers_ctx_resume_failed_title()} onclick={() => ctxAction('resume')}>{m.common_resume()}</button>
+        <div class="ctx-sep" role="separator"></div>
+      {/if}
       {@render categorySubmenu(ctxTransfer, sharedValue(ctxTargets, (x) => x.category || 'None') ?? null)}
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_copy_links_btn()}</button>
@@ -7139,6 +7157,10 @@
         partial file on disk. If the file is truly missing, the backend
         `open_file` command returns an error that surfaces via transferError.
       -->
+      {#if canResume(ctxTransfer)}
+        <button class="ctx-item" role="menuitem" title={m.transfers_ctx_resume_failed_title()} onclick={() => ctxAction('resume')}>{m.common_resume()}</button>
+        <div class="ctx-sep" role="separator"></div>
+      {/if}
       {#if ctxTransfer.status === 'completed' || ctxTransfer.status === 'failed'}
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open')}>{m.transfers_ctx_open_file()}</button>
       {/if}

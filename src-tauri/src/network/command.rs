@@ -846,6 +846,9 @@ async fn handle_command_inner(
             // would hit `Closed` on dispatch and waste a round.
             state.active_established_senders.remove(&transfer_id);
             state.active_source_overflow.remove(&transfer_id);
+            // eMule's `StopFile` zeroes both `m_LastSearchTimeKad` and
+            // `m_TotalSearchesKad`, so a stopped file searches afresh when it
+            // is resumed. (A worker that ends and is re-queued keeps it.)
             state.active_kad_search_state.remove(&transfer_id);
             // `deleting` was captured at the top of this arm, *before*
             // `cleanup_ack.take()` below. The ack is moved into the join task
@@ -1076,7 +1079,23 @@ async fn handle_command_inner(
             // dispatch to a dead established channel.
             state.active_established_senders.remove(&transfer_id);
             state.active_source_overflow.remove(&transfer_id);
-            state.active_kad_search_state.remove(&transfer_id);
+            // eMule's `PauseFile` keeps the KAD search clock, except that it
+            // stops a search still running and zeroes its time, so the resumed
+            // file may search again (the count stands). Here the search runs on
+            // to report what it finds, and the next may follow once it ends.
+            if state
+                .download_source_searches
+                .values()
+                .any(|(tid, _)| tid == &transfer_id)
+            {
+                if let Some(clock) = state.active_kad_search_state.get_mut(&transfer_id) {
+                    if let Some(due) = std::time::Instant::now()
+                        .checked_sub(kad_source_search_interval(clock.1))
+                    {
+                        clock.0 = due;
+                    }
+                }
+            }
             if let Some(pfs) = state.per_file_sources.get_mut(&transfer_id) {
                 pfs.reset_active_states();
             }
@@ -1358,7 +1377,9 @@ async fn handle_command_inner(
                             .map(|t| priority_str_to_u32(&t.priority))
                             .unwrap_or(1)
                     };
-                    let kad_available = kad_ready_for_sources(state);
+                    let kad_now = std::time::Instant::now();
+                    let kad_available = kad_ready_for_sources(state)
+                        && kad_source_search_may_start(state, &transfer_id, kad_now);
                     let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
                     let mut closest = state
                         .routing_table
@@ -1376,6 +1397,7 @@ async fn handle_command_inner(
                             state
                                 .download_source_searches
                                 .insert(sid, (transfer_id.clone(), hash_bytes));
+                            note_kad_source_search(state, &transfer_id, kad_now);
                             info!(
                                 "Started KAD source search {} for queued/paused download {}",
                                 sid.0, transfer_id
@@ -1562,7 +1584,10 @@ async fn handle_command_inner(
                             .map(|t| priority_str_to_u32(&t.priority))
                             .unwrap_or(1)
                     };
-                    {
+                    // As for a worker below: a start overtaken by a Pause
+                    // must not set the row searching, nor displace the
+                    // control a later Resume made.
+                    if !control.is_cancelled() {
                         let mut mgr = transfer_manager.write().await;
                         mgr.update_status(&transfer_id, TransferStatus::Searching);
                         mgr.register_control(&transfer_id, control.clone());
@@ -1756,9 +1781,9 @@ async fn handle_command_inner(
                 // (the common path: user clicks Download on a search
                 // result, frontend passes the first `source_addresses`
                 // entry) would only see that one peer until the next
-                // periodic sweep — the source_retry_timer for KAD (15s+
-                // on `active_download_kad_interval(0)`) and the 4-minute
-                // TCP `OP_GETSOURCES` batch. A search result reporting
+                // periodic sweep — the KAD source search clock
+                // (`kad_source_search_interval`) and the 4-minute TCP
+                // `OP_GETSOURCES` batch. A search result reporting
                 // "27 sources" then looked like it had exactly one in the
                 // transfer view, and a single failed connection left the
                 // file stuck. Match the `has_source = false` branch's
@@ -1775,15 +1800,12 @@ async fn handle_command_inner(
                 )
                 .await;
 
-                // Seed both sweeps so they schedule their next lookup on the
-                // normal cadence (~30s for KAD when count==1) instead of
-                // re-firing immediately. A leg with nowhere to send this ask
+                // Seed the Ember sweep so it schedules its next lookup on the
+                // normal cadence instead of re-firing immediately (the KAD leg
+                // keeps its own clock). A leg with nowhere to send this ask
                 // records (now, 0), which lets its sweep retry as soon as that
                 // network is available again.
                 let asked_at = std::time::Instant::now();
-                state
-                    .active_kad_search_state
-                    .insert(transfer_id.clone(), (asked_at, u32::from(ask.kad)));
                 state
                     .ember_source_search_state
                     .insert(transfer_id.clone(), (asked_at, u32::from(ask.ember)));
@@ -1907,11 +1929,7 @@ async fn handle_command_inner(
                 // Seed the Ember sweep so it re-asks on the normal backoff
                 // rather than immediately. A leg with nowhere to send this ask
                 // records (now, 0), which lets the sweep try again as soon as
-                // Ember is available. `active_kad_search_state` is deliberately
-                // left alone: this download has no sources yet, so its KAD
-                // retries are the pending-download timer's business below, and
-                // an entry here would look to the active sweep like a turn
-                // already taken once the download starts moving.
+                // Ember is available. The KAD leg stamped the file's own clock.
                 state
                     .ember_source_search_state
                     .insert(transfer_id.clone(), (std::time::Instant::now(), u32::from(ask.ember)));
@@ -4067,14 +4085,13 @@ async fn handle_command_inner(
             )
             .await;
             let asked_at = std::time::Instant::now();
-            // Stamp both sweeps so the ask the user just made counts as this
-            // round's ask: without it the periodic sweep sees a file it has not
-            // asked about recently and immediately asks again, which on a
-            // repeatedly clicked button is how one file talks over every other
-            // download's turn.
-            state
-                .active_kad_search_state
-                .insert(transfer_id.clone(), (asked_at, u32::from(outcome.kad)));
+            // Stamp the Ember sweep so the ask the user just made counts as
+            // this round's ask: without it the periodic sweep sees a file it
+            // has not asked about recently and immediately asks again, which
+            // on a repeatedly clicked button is how one file talks over every
+            // other download's turn. The KAD leg stamped its own clock, and
+            // asks KAD only when that clock allows, as eMule has no button
+            // that skips it.
             state
                 .ember_source_search_state
                 .insert(transfer_id.clone(), (asked_at, u32::from(outcome.ember)));

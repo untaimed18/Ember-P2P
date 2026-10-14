@@ -34,10 +34,14 @@ pub(in crate::network) async fn on_server_tcp_source_tick(
             server_tcp_srcreq_asks,
             SERVER_TCP_SRCREQ_MAX_PER_FRAME,
             |tid, fh| {
-                (pending_downloads.contains_key(tid)
-                    || active_source_senders.contains_key(tid)
-                    || download_handles.contains_key(tid))
-                    && server_tcp_srcreq_file_due(server_tcp_srcreq_file_at, fh, srcreq_now)
+                let live = match pending_downloads.get(tid) {
+                    Some(pd) => !pd.control.is_cancelled() && !pd.control.is_paused(),
+                    None => {
+                        active_source_senders.contains_key(tid)
+                            || download_handles.contains_key(tid)
+                    }
+                };
+                live && server_tcp_srcreq_file_due(server_tcp_srcreq_file_at, fh, srcreq_now)
             },
         )
     };
@@ -55,7 +59,8 @@ pub(in crate::network) async fn on_server_tcp_source_tick(
         let udp_cap = {
             let sm = source_manager.read().await;
             for (tid, pd) in &state.pending_downloads {
-                if pd.control.is_cancelled() { continue; }
+                // eMule asks servers only for files that are neither paused nor stopped.
+                if pd.control.is_cancelled() || pd.control.is_paused() { continue; }
                 if let Ok(raw) = hex::decode(&pd.file_hash) {
                     if raw.len() == 16 {
                         let mut fh = [0u8; 16];

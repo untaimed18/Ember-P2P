@@ -134,6 +134,9 @@ export interface TransferDelta {
   removed: string[];
   /** The downloads the last session left unfinished are back in the list. */
   restored: boolean;
+  /** Every Failed download whose progress is kept, so Resume can continue it.
+   *  Complete on every answer, delta or not. */
+  resumable_failed?: string[];
 }
 
 /** Rows changed since `since` of `epoch`. Pass `null`/`0` for a full snapshot. */

@@ -16,6 +16,27 @@ fn tick_due(at: std::time::Instant, now: std::time::Instant, interval: std::time
     now.saturating_duration_since(at) + TICK_SLACK >= interval
 }
 
+/// Count a running search on its file's clock when whoever started it did not.
+/// The opening ask for a sourceless download and the post-bootstrap burst only
+/// count theirs on `PendingDownload::search_count`, which paces the other legs;
+/// unadopted, the search after theirs would follow it by one tick.
+fn adopt_running_kad_source_searches(
+    clocks: &mut HashMap<String, (std::time::Instant, u32)>,
+    searches: &HashMap<SearchId, (String, [u8; 16])>,
+    now: std::time::Instant,
+) {
+    for (tid, _) in searches.values() {
+        clocks
+            .entry(tid.clone())
+            .and_modify(|e| {
+                if e.1 == 0 {
+                    *e = (now, 1);
+                }
+            })
+            .or_insert((now, 1));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn on_source_retry_tick(
     udp_socket: &Arc<UdpSocket>,
@@ -92,9 +113,8 @@ pub(in crate::network) async fn on_source_retry_tick(
     // Without this sweep the UI accumulates "forever-
     // Connecting" rows and the user rightly wonders why
     // nothing ever transitions. The next KAD source search
-    // for this transfer (~30-60s cadence) will re-insert the
-    // row if the peer is still in results, producing a
-    // visible "still trying" rhythm instead of stale rows.
+    // for this transfer will re-insert the row if the peer is
+    // still in results.
     {
         let expired_keys: Vec<(String, String, u16)> = state
             .callback_row_pending_since
@@ -524,6 +544,21 @@ pub(in crate::network) async fn on_source_retry_tick(
     // before either network is usable.
     if !network_ready_for_sources(state) {
         return;
+    }
+
+    adopt_running_kad_source_searches(
+        &mut state.active_kad_search_state,
+        &state.download_source_searches,
+        tick_now,
+    );
+    // The clocks outlive a re-queue on purpose; drop only those whose transfer
+    // has left the list.
+    {
+        let mgr = transfer_manager.read().await;
+        let queued: HashSet<&str> = mgr.queue.iter().map(|t| t.id.as_str()).collect();
+        state
+            .active_kad_search_state
+            .retain(|tid, _| mgr.active.contains_key(tid) || queued.contains(tid.as_str()));
     }
 
     let mut to_retry: Vec<(String, u32)> = Vec::new();
@@ -1216,10 +1251,10 @@ pub(in crate::network) async fn on_source_retry_tick(
                     .collect()
             };
             for (tid, fh, file_size) in &targets {
-                // Immediate KAD source search. Seed
-                // `active_kad_search_state` so the active-download
-                // KAD loop later in this tick doesn't double-fire.
-                if kad_available {
+                // KAD source search, if the file's clock allows one: the first
+                // start of a download searches at once, a restart after a
+                // re-queue waits out the interval its last search earned.
+                if kad_available && kad_source_search_may_start(state, tid, tick_now) {
                     let kad_hash = md4_bytes_to_kad_id(fh);
                     let closest = state
                         .routing_table
@@ -1236,12 +1271,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                             state
                                 .download_source_searches
                                 .insert(sid, (tid.clone(), *fh));
-                            let started = tick_now;
-                            state
-                                .active_kad_search_state
-                                .entry(tid.clone())
-                                .and_modify(|e| *e = (started, e.1 + 1))
-                                .or_insert((started, 1));
+                            note_kad_source_search(state, tid, tick_now);
                             debug!(
                                 "Warm-start: kicked off initial KAD source search for resumed download {}",
                                 tid
@@ -1320,10 +1350,8 @@ pub(in crate::network) async fn on_source_retry_tick(
 
     // UDP reask pass: for sources with known UDP ports, send enhanced
     // OP_REASKFILEPING with part status bitmap + complete source count
-    // (eMule udp_ver > 3 format). Sources whose SX is due are skipped
-    // so the normal TCP reask path can carry OP_REQUESTSOURCES.
+    // (eMule udp_ver > 3 format).
     {
-        let reask_interval = ed2k::dead_sources::FILEREASKTIME_SECS;
         // Plan every UDP reask packet while holding the SourceManager
         // lock (no `.await` in this scope), then drop the lock and do
         // the actual `send_to` calls. Holding `source_manager.write()`
@@ -1396,70 +1424,26 @@ pub(in crate::network) async fn on_source_retry_tick(
                 continue;
             };
 
-            let total_udp = sm.get_udp_sources(&fh).len();
-            let udp_sources = sm.get_udp_sources_due_for_reask(&fh, reask_interval);
-            // Track which (ip, tcp_port) pairs we sent to in this
-            // tick so the persistent-list pass below doesn't
-            // double-fire to the same peer. This set is the only
-            // dedup between the two passes: the SourceManager
-            // cooldown is bumped by `mark_asked` below, but the
-            // persistent pass keys on its own `last_udp_reask`.
-            let mut sent_this_tick: HashSet<(Ipv4Addr, u16)> =
-                HashSet::with_capacity(udp_sources.len());
-            let mut sent = 0usize;
-            for (ip, tcp_port, udp_port) in &udp_sources {
-                if state.dead_sources.is_dead_source_for_file(&fh, u32::from(*ip), *tcp_port) {
-                    continue;
-                }
-                // Deliberately NOT gated on the source-exchange
-                // cooldown. eMule drives `OP_REASKFILEPING` purely
-                // off the reask timer and the source's queue state
-                // (`CPartFile::Process` → `UDPReaskForDownload`);
-                // `OP_REQUESTSOURCES` piggybacks on a *TCP* reask
-                // when its own interval allows, but never suppresses
-                // the UDP ping. Gating on it here did two harmful
-                // things: `can_request_sources_for` returns true when
-                // `last_sx_sent` is `None`, so a source we had never
-                // source-exchanged with — every row loaded from
-                // `sources.met` — was never reasked at all; and for
-                // the rest the ping stopped once the 40-minute SX
-                // window lapsed, because `last_sx_sent` only advances
-                // on a live TCP connection. The population that
-                // depends on this ping is precisely the detached
-                // `OnQueue` sources of *active* downloads, and the
-                // TCP reask path only runs for pending ones, so the
-                // deep queue positions the detach model is built to
-                // accumulate were being dropped.
-                let now_ts = std::time::Instant::now();
-                if crate::network::state::udp_reask_awaits_other_file(
-                    &state.pending_udp_reasks,
-                    (*ip, *udp_port),
-                    &fh,
-                    now_ts,
-                ) {
-                    continue;
-                }
-                let addr = SocketAddr::new((*ip).into(), *udp_port);
-                let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
-                pkt.extend_from_slice(&reask_payload);
-                // Mark optimistically under the lock; the send happens
-                // after the lock is released below.
-                sm.mark_asked(&fh, *ip, *tcp_port);
-                state
-                    .pending_udp_reasks
-                    .insert((*ip, *udp_port), (fh, now_ts));
-                to_send.push((addr, pkt));
-                sent_this_tick.insert((*ip, *tcp_port));
-                sent += 1;
-            }
-            if sent > 0 {
-                debug!(
-                    "Sent UDP reask to {}/{} UDP sources for pending download {}",
-                    sent, total_udp, tid
-                );
-            }
-
-            // Also check persistent per-file source list for UDP reask candidates.
+            // The per-file source list is what decides who is due: it knows
+            // each source's queue state, as eMule's `CPartFile::Process` does
+            // when it calls `UDPReaskForDownload`. The SourceManager once ran
+            // a pass of its own on a separate clock, which could ping the same
+            // peer twice inside one FILEREASKTIME. Each reask is still
+            // recorded there, since that keeps the rows we wait on alive.
+            //
+            // Deliberately NOT gated on the source-exchange cooldown. eMule
+            // drives `OP_REASKFILEPING` purely off the reask timer and the
+            // source's queue state; `OP_REQUESTSOURCES` piggybacks on a *TCP*
+            // reask when its own interval allows, but never suppresses the
+            // UDP ping. Gating on it meant a source we had never
+            // source-exchanged with (every row loaded from `sources.met`) was
+            // never reasked, and for the rest the ping stopped once the
+            // 40-minute SX window lapsed — dropping exactly the deep queue
+            // positions of an active download's detached sources.
+            //
+            // Pairs pinged this tick, so a row and its remapped dial target
+            // are not both sent one.
+            let mut sent_this_tick: HashSet<(Ipv4Addr, u16)> = HashSet::new();
             if let Some(pfs) = state.per_file_sources.get_mut(tid) {
                 let udp_due = pfs.sources_needing_udp_reask();
                 let mut pfs_sent = 0usize;
@@ -1487,7 +1471,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                         continue;
                     }
                     if sent_this_tick.contains(&(ip, tcp_port)) {
-                        // Already pinged via SourceManager this tick.
+                        // Already pinged this tick through another row.
                         pfs.mark_udp_reask_sent(*orig_ip, *orig_tcp);
                         continue;
                     }
@@ -1504,15 +1488,12 @@ pub(in crate::network) async fn on_source_retry_tick(
                     ) {
                         continue;
                     }
-                    // Not gated on the source-exchange cooldown —
-                    // see the SourceManager pass above. This pass
-                    // is the one that maintains queue position for
-                    // an active download's detached sources, so the
-                    // gate hit it hardest.
+                    // Not gated on the source-exchange cooldown — see
+                    // the note above this pass.
                     let addr = SocketAddr::new(ip.into(), udp_port);
                     let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
                     pkt.extend_from_slice(&reask_payload);
-                    // Bump last_asked so this entry isn't "due" again
+                    // Bump last_udp_reask so this entry isn't "due" again
                     // until the next full FILEREASKTIME window — without
                     // this the 5s timer pings the same peer every tick
                     // forever. Marked optimistically under the lock; the
@@ -1521,6 +1502,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                     if (ip, tcp_port) != (*orig_ip, *orig_tcp) {
                         pfs.mark_udp_reask_sent(ip, tcp_port);
                     }
+                    sm.mark_asked(&pfs.file_hash, ip, tcp_port);
                     state
                         .pending_udp_reasks
                         .insert((ip, udp_port), (pfs.file_hash, now_ts));
@@ -1569,7 +1551,10 @@ pub(in crate::network) async fn on_source_retry_tick(
         let mut fh = [0u8; 16];
         fh.copy_from_slice(&hash_bytes);
 
-        if kad_available && kad_searches_started < MAX_KAD_SEARCHES_PER_TICK {
+        if kad_available
+            && kad_searches_started < MAX_KAD_SEARCHES_PER_TICK
+            && kad_source_search_may_start(state, &tid, tick_now)
+        {
             let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
             let closest = state.routing_table.find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
             if !closest.is_empty() {
@@ -1582,6 +1567,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                 );
                 if sid != SearchId(0) {
                     state.download_source_searches.insert(sid, (tid.clone(), fh));
+                    note_kad_source_search(state, &tid, tick_now);
                     kad_searches_started += 1;
                     did_search = true;
                 } else {
@@ -1745,14 +1731,7 @@ pub(in crate::network) async fn on_source_retry_tick(
             let sm = source_manager.read().await;
             for tid in state.active_source_senders.keys() {
                 if state.pending_downloads.contains_key(tid) { continue; }
-                let (last_at, count) = match state.active_kad_search_state.get(tid) {
-                    Some(&(at, count)) => (Some(at), count),
-                    None => (None, 0),
-                };
-                let interval = std::time::Duration::from_secs(
-                    active_download_kad_interval(count).max(0) as u64,
-                );
-                if last_at.is_some_and(|at| !tick_due(at, tick_now, interval)) { continue; }
+                if !kad_source_search_may_start(state, tid, tick_now) { continue; }
                 if let Some(transfer) = mgr.get_transfer(tid) {
                     if let Ok(raw) = hex::decode(&transfer.file_hash) {
                         if raw.len() == 16 {
@@ -1781,13 +1760,8 @@ pub(in crate::network) async fn on_source_retry_tick(
                     state.download_source_searches.insert(sid, (tid.clone(), fh));
                     kad_searches_started += 1;
                     active_kad_started += 1;
-                    let started = tick_now;
-                    let entry = state
-                        .active_kad_search_state
-                        .entry(tid.clone())
-                        .and_modify(|e| *e = (started, e.1 + 1))
-                        .or_insert((started, 1));
-                    debug!("Started KAD source search for active download {} (attempt {})", tid, entry.1);
+                    let count = note_kad_source_search(state, &tid, tick_now);
+                    debug!("Started KAD source search for active download {} (attempt {})", tid, count);
                 } else {
                     warn!(
                         "Active FindSource for {} deferred: active search cap reached",
@@ -1939,9 +1913,11 @@ pub(in crate::network) async fn on_source_retry_tick(
             for (tid, fh, file_size) in &starved {
                 // Stop at the first refusal: the writer queue is full or
                 // the session is broken, and the rest would fare the same.
+                // Only a file that was asked starts its starved clock.
                 match send_server_get_sources(state, fh, *file_size, pace_now) {
                     Ok(bytes) => {
                         if bytes > 0 {
+                            state.starved_server_reask_at.insert(tid.clone(), pace_now);
                             stats_manager.add_overhead(
                                 crate::storage::statistics::OverheadCategory::SourceExchange,
                                 crate::storage::statistics::OverheadDirection::Upload,
@@ -1961,9 +1937,6 @@ pub(in crate::network) async fn on_source_retry_tick(
                         break;
                     }
                 }
-            }
-            for (tid, _, _) in &starved {
-                state.starved_server_reask_at.insert(tid.clone(), pace_now);
             }
             // Bound the cooldown map: drop entries for downloads no
             // longer active so a long session can't accumulate them.
@@ -2078,8 +2051,33 @@ pub(in crate::network) async fn on_source_retry_tick(
 
 #[cfg(test)]
 mod tests {
-    use super::tick_due;
+    use super::{adopt_running_kad_source_searches, tick_due, SearchId};
+    use std::collections::HashMap;
     use std::time::{Duration, Instant};
+
+    /// A search another path started counts on its file's clock, so the
+    /// retry sweep does not start a second one as soon as it ends.
+    #[test]
+    fn a_running_search_nobody_counted_is_adopted() {
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(30);
+        let mut clocks: HashMap<String, (Instant, u32)> = HashMap::new();
+        clocks.insert("counted".into(), (t0, 3));
+        clocks.insert("unreached".into(), (t0, 0));
+        let searches: HashMap<SearchId, (String, [u8; 16])> = [
+            (SearchId(1), ("counted".to_string(), [1; 16])),
+            (SearchId(2), ("unreached".to_string(), [2; 16])),
+            (SearchId(3), ("opening".to_string(), [3; 16])),
+        ]
+        .into_iter()
+        .collect();
+
+        adopt_running_kad_source_searches(&mut clocks, &searches, later);
+
+        assert_eq!(clocks["counted"], (t0, 3), "a counted search is left alone");
+        assert_eq!(clocks["unreached"], (later, 1));
+        assert_eq!(clocks["opening"], (later, 1));
+    }
 
     #[test]
     fn a_tick_a_few_milliseconds_early_still_counts_as_due() {

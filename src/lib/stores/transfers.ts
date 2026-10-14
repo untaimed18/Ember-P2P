@@ -298,6 +298,15 @@ export const transfersLoaded = writable(false);
  *  `AppSettings.max_upload_speed` while a schedule rule or USS is in charge. */
 export const effectiveUploadSpeed = writable<number | null>(null);
 
+/** Failed downloads whose progress the backend still holds: the ones Resume
+ *  can continue (`TransferDelta.resumable_failed`). */
+export const resumableFailedDownloads = writable<ReadonlySet<string>>(new Set());
+
+/** When a Failed download was taken back into the list by `transfer-started`.
+ *  A snapshot already in flight then still says `failed`, and must not put
+ *  the row back; one fetched afterwards is believed either way. */
+const revivedAt = new Map<string, number>();
+
 function publishedUploadSpeed(status: Partial<RuntimeStatus> | null | undefined): number | null {
   const speed = status?.effective_upload_speed;
   return typeof speed === 'number' && Number.isFinite(speed) ? speed : null;
@@ -708,6 +717,18 @@ export async function initTransferStore() {
         commitTransfers([...list, t]);
         return;
       }
+      // A Failed download resumed: the one way a row leaves Failed, so the
+      // backend's row replaces it outright rather than being merged into it.
+      if (t.direction !== 'upload' && !isTerminal(t.status)) {
+        const existing = list.find((x) => x.id === t.id);
+        if (existing?.status === 'failed') {
+          revivedAt.set(t.id, Date.now());
+          // Failing again is news again.
+          announcedTerminal.delete(t.id);
+          commitTransfers(applyRowPatches(list, [[t.id, () => ({ ...t })]]));
+          return;
+        }
+      }
       commitTransfers(
         applyRowPatches(list, [[t.id, (existing: Transfer) => ({
           ...existing,
@@ -1005,6 +1026,7 @@ async function runSync(pollStartedAt: number): Promise<void> {
   if (epoch !== storeEpoch) return;
   const changed = applySnapshotDelta(backendSnapshot, delta);
   if (changed === undefined) return;
+  publishResumableFailed(delta.resumable_failed ?? []);
   flushPendingTransfers();
   const now = Date.now();
   pruneRemovedUploads(now);
@@ -1034,6 +1056,12 @@ async function runSync(pollStartedAt: number): Promise<void> {
   }
   commitTransfers(next);
   if (delta.restored) transfersLoaded.set(true);
+}
+
+function publishResumableFailed(ids: string[]): void {
+  const current = get(resumableFailedDownloads);
+  if (ids.length === current.size && ids.every((id) => current.has(id))) return;
+  resumableFailedDownloads.set(new Set(ids));
 }
 
 /**
@@ -1066,9 +1094,16 @@ function mergePolledRow(
     apiItem.status === 'insufficient';
   const snapshotPredatesReversibleLeave =
     leftReversibleAt != null && leftReversibleAt > pollStartedAt && apiStillReversible;
+  // A resumed Failed download: a snapshot fetched before the resume still
+  // says `failed`, and would otherwise win over the listed `searching` row.
+  const revived = revivedAt.get(apiItem.id);
+  const snapshotPredatesRevive =
+    revived != null && revived > pollStartedAt && apiItem.status === 'failed';
+  if (revived != null && !snapshotPredatesRevive) revivedAt.delete(apiItem.id);
   const preferEvent =
     snapshotPredatesReversibleEntry ||
     snapshotPredatesReversibleLeave ||
+    snapshotPredatesRevive ||
     isMoreAdvancedStatus(eventItem.status, apiItem.status);
   const status = preferEvent ? eventItem.status : apiItem.status;
   const apiActive = apiItem.active_sources ?? 0;
@@ -1173,6 +1208,7 @@ export function forgetTransfer(id: string) {
   lastApiCompleted.delete(id);
   progressRewindHold.delete(id);
   announcedTerminal.delete(id);
+  revivedAt.delete(id);
 }
 
 export function cleanupTransferStore() {
@@ -1201,6 +1237,8 @@ export function cleanupTransferStore() {
   lastApiCompleted.clear();
   progressRewindHold.clear();
   announcedTerminal.clear();
+  revivedAt.clear();
+  resumableFailedDownloads.set(new Set());
   effectiveUploadSpeed.set(null);
   // Cancel any flush queued for the next frame/tick so it can't run against a
   // store we've just reset (or a subsequently re-initialised one).

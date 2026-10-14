@@ -81,6 +81,27 @@ fn forget_requeue_history(transfer_id: &str) {
     }
 }
 
+/// Block a failed source for this file only.
+///
+/// Every `Permanent` source failure is about the file: the peer answered
+/// `OP_FILEREQANSNOFIL`, or what it holds failed a hash check. eMule files
+/// those on the part file's own dead list (`CPartFile::m_DeadSourceList`) and
+/// keeps the global list for peers it could not reach at all, so the same
+/// peer is still asked for every other file it shares.
+fn record_source_failure(
+    dead_sources: &mut ed2k::dead_sources::DeadSourceList,
+    file_hash: [u8; 16],
+    ip: Ipv4Addr,
+    port: u16,
+    permanent: bool,
+) {
+    if permanent {
+        dead_sources.add_dead_source_for_file(file_hash, u32::from(ip), port);
+    } else {
+        dead_sources.add_transient_dead_source_for_file(file_hash, u32::from(ip), port);
+    }
+}
+
 /// Failed moves of a verified download into `Downloads` before it is left
 /// Failed instead of re-queued.
 const COMPLETION_MOVE_ATTEMPTS: u32 = 2;
@@ -119,8 +140,9 @@ fn completed_download_friends_only(
 }
 
 /// Give a restored download whose finished copy was not its file back the
-/// paused or stopped `status` it had, where a normal restore puts such a row,
-/// unless the user changed it while the copy was checked. `true` when it was.
+/// paused, stopped or insufficient `status` it had, where a normal restore
+/// puts such a row, unless the user changed it while the copy was checked.
+/// `true` when it was.
 fn restore_status_after_copy_check(
     mgr: &mut TransferManager,
     transfer_id: &str,
@@ -167,7 +189,7 @@ fn drop_superseded_terminal_event(event: &DownloadEvent, mgr: &mut TransferManag
         .zip(mgr.get_control(transfer_id))
         .is_some_and(|(sender, registered)| sender != registered.generation());
     if superseded {
-        mgr.finish_restore_verification(transfer_id, generation);
+        mgr.finish_restore_verification(transfer_id, generation, true);
         debug!("Ignoring {transfer_id}'s result from a worker that has since been replaced");
     }
     superseded
@@ -270,7 +292,10 @@ pub(in crate::network) async fn on_download_event(
         ..
     } = event
     {
-        transfer_manager.write().await.finish_restore_verification(transfer_id, generation);
+        transfer_manager
+            .write()
+            .await
+            .finish_restore_verification(transfer_id, generation, false);
         {
             let mgr_snap = transfer_manager.read().await;
             if let Some(t) = mgr_snap.get_transfer(transfer_id) {
@@ -801,7 +826,7 @@ pub(in crate::network) async fn on_download_event(
     if let DownloadEvent::Failed { ref transfer_id, ref error, ref failure_kind, generation } = event {
         let superseded = {
             let mut mgr = transfer_manager.write().await;
-            let restore_check = mgr.finish_restore_verification(transfer_id, generation);
+            let restore_check = mgr.finish_restore_verification(transfer_id, generation, true);
             !restore_check
                 && cancel_failure_is_superseded(error, mgr.get_control(transfer_id).as_deref())
         };
@@ -812,7 +837,8 @@ pub(in crate::network) async fn on_download_event(
         state.active_source_senders.remove(transfer_id);
         state.active_established_senders.remove(transfer_id);
         state.active_source_overflow.remove(transfer_id);
-        state.active_kad_search_state.remove(transfer_id);
+        // `active_kad_search_state` stays: it is the file's KAD search clock,
+        // and a re-queue below must not reset it to "search now".
         state.download_handles.remove(transfer_id);
         if let Some(pfs) = state.per_file_sources.get_mut(transfer_id) {
             pfs.reset_active_states();
@@ -907,15 +933,21 @@ pub(in crate::network) async fn on_download_event(
         // source's failures arrive as SourceDetail events with its address.
 
         // A restored download whose finished copy was not its file resumes
-        // as it was left, and one the user had paused or stopped stays so.
-        if let Some(status @ (TransferStatus::Paused | TransferStatus::Stopped)) = copy_check {
+        // as it was left, and one the user had paused or stopped, or that
+        // was waiting for disk space, stays so.
+        if let Some(
+            status @ (TransferStatus::Paused
+            | TransferStatus::Stopped
+            | TransferStatus::Insufficient),
+        ) = copy_check
+        {
             let restored = restore_status_after_copy_check(
                 &mut *transfer_manager.write().await,
                 transfer_id,
                 status.clone(),
             );
             if restored {
-                let key = if status == TransferStatus::Paused { "paused" } else { "stopped" };
+                let key = crate::commands::transfers::transfer_status_key(&status);
                 spawn_transfer_status_write(
                     transfer_status_writes,
                     db.clone(),
@@ -1152,18 +1184,28 @@ pub(in crate::network) async fn on_download_event(
                             active_t.status = TransferStatus::Searching;
                             active_t.speed = 0;
                         }
-                        mgr.set_failure_context(
-                            transfer_id,
-                            Some(failure_code),
-                            Some(failure_kind_name.clone()),
-                            Some(failure_stage.clone()),
-                        );
-                        let update = mgr.set_retrying_after(transfer_id, failure_code);
+                        // A finished copy that is not the file says nothing
+                        // about the download, which goes on as it was left.
+                        let update = if copy_check.is_some() {
+                            mgr.clear_retry_context(transfer_id)
+                        } else {
+                            mgr.set_failure_context(
+                                transfer_id,
+                                Some(failure_code),
+                                Some(failure_kind_name.clone()),
+                                Some(failure_stage.clone()),
+                            );
+                            mgr.set_retrying_after(transfer_id, failure_code)
+                        };
                         mgr.register_control(transfer_id, control.clone());
-                        Some(update)
+                        let status = mgr
+                            .get_transfer(transfer_id)
+                            .map(|row| row.status.clone())
+                            .unwrap_or(TransferStatus::Searching);
+                        Some((update, status))
                     }
                 };
-                let Some(health_update) = health_update else {
+                let Some((health_update, requeued_status)) = health_update else {
                     return;
                 };
                 {
@@ -1186,6 +1228,21 @@ pub(in crate::network) async fn on_download_event(
                     last_search_at: requeue_last_search_at(search_count, std::time::Instant::now()),
                     priority: priority_str_to_u32(&t.priority),
                 });
+                if copy_check.is_some() {
+                    info!("Restored download {transfer_id} resumes as it was left: {error}");
+                    spawn_transfer_status_write(
+                        transfer_status_writes,
+                        db.clone(),
+                        transfer_id.clone(),
+                        crate::commands::transfers::transfer_status_key(&requeued_status),
+                    );
+                    crate::commands::transfers::emit_transfer_status(
+                        app_handle,
+                        transfer_id,
+                        &requeued_status,
+                    );
+                    return;
+                }
                 info!("Re-queued failed download {} for source retry: {}", transfer_id, error);
                 spawn_transfer_status_write(
                     transfer_status_writes,
@@ -1525,40 +1582,17 @@ pub(in crate::network) async fn on_download_event(
             };
             if let (false, Ok(v4)) = (friend_escalated, ip.parse::<Ipv4Addr>()) {
                 let is_permanent = matches!(failure_kind, Some(SourceFailureKind::Permanent));
-                if is_permanent {
-                    let src_fw = state
-                        .per_file_sources
-                        .get(transfer_id)
-                        .is_some_and(|pfs| pfs.source_is_firewalled(v4, port, None));
-                    state.dead_sources.add_dead_source(0, u32::from(v4), port, src_fw);
-                    let mut retire: Option<[u8; 16]> = None;
-                    let mgr = transfer_manager.read().await;
-                    if let Some(t) = mgr.get_transfer(transfer_id) {
-                        if let Ok(fh_bytes) = hex::decode(&t.file_hash) {
-                            if fh_bytes.len() == 16 {
-                                let mut fh = [0u8; 16];
-                                fh.copy_from_slice(&fh_bytes);
-                                state.dead_sources.add_dead_source_for_file(fh, u32::from(v4), port);
-                                retire = Some(fh);
-                            }
-                        }
-                    }
-                    drop(mgr);
-                    if let Some(fh) = retire {
+                let file_hash = transfer_manager
+                    .read()
+                    .await
+                    .get_transfer(transfer_id)
+                    .and_then(|t| parse_ed2k_hash16(&t.file_hash));
+                if let Some(fh) = file_hash {
+                    record_source_failure(&mut state.dead_sources, fh, v4, port, is_permanent);
+                    if is_permanent {
                         retire_dead_source_from_registry(source_manager, &fh, v4, port)
                             .await;
-                    }
-                    debug!("Marked source {}:{} as dead (permanent failure)", ip, port);
-                } else {
-                    let mgr = transfer_manager.read().await;
-                    if let Some(t) = mgr.get_transfer(transfer_id) {
-                        if let Ok(fh_bytes) = hex::decode(&t.file_hash) {
-                            if fh_bytes.len() == 16 {
-                                let mut fh = [0u8; 16];
-                                fh.copy_from_slice(&fh_bytes);
-                                state.dead_sources.add_transient_dead_source_for_file(fh, u32::from(v4), port);
-                            }
-                        }
+                        debug!("Marked source {}:{} as dead for {} (permanent failure)", ip, port, hex::encode(fh));
                     }
                 }
             }
@@ -2112,5 +2146,49 @@ mod requeue_tests {
         );
         assert_eq!(mgr.get_transfer("resumed").unwrap().status, TransferStatus::Searching);
         assert!(!restore_status_after_copy_check(&mut mgr, "gone", TransferStatus::Paused));
+
+        mgr.active.insert("no-space".into(), checking("no-space"));
+        assert!(restore_status_after_copy_check(&mut mgr, "no-space", TransferStatus::Insufficient));
+        assert_eq!(
+            mgr.active.get("no-space").map(|t| &t.status),
+            Some(&TransferStatus::Insufficient),
+            "back in `active` waiting for disk space, not searching"
+        );
+    }
+
+    /// A copy check that fails on a row that was running leaves no failure or
+    /// "retrying after" health on it: the copy was never the download's.
+    #[test]
+    fn a_running_download_whose_copy_fails_its_check_carries_no_failure() {
+        let mut mgr = TransferManager::new(3);
+        mgr.active.insert("running".into(), checking("running"));
+        mgr.set_failure_context(
+            "running",
+            Some(ed2k::transfer::TransferFailureCode::HashMismatch),
+            None,
+            None,
+        );
+        let update = mgr.clear_retry_context("running").expect("something was cleared");
+        assert!(update.failure_code.is_none() && update.health_reason.is_none());
+        let row = mgr.get_transfer("running").unwrap();
+        assert!(row.failure_code.is_none() && row.failure_reason.is_none());
+        assert_eq!(row.health, crate::types::TransferHealth::Healthy);
+        assert!(mgr.clear_retry_context("running").is_none(), "nothing left to clear");
+    }
+
+    /// A peer without one file is still asked for the others it shares.
+    #[test]
+    fn a_permanent_source_failure_blocks_only_that_file() {
+        let mut dead = ed2k::dead_sources::DeadSourceList::new();
+        let peer = Ipv4Addr::new(203, 0, 113, 7);
+        let (missing, other) = ([1u8; 16], [2u8; 16]);
+        record_source_failure(&mut dead, missing, peer, 4662, true);
+        assert!(dead.is_dead_source_for_file(&missing, u32::from(peer), 4662));
+        assert!(!dead.is_dead_source_for_file(&other, u32::from(peer), 4662));
+        assert!(!dead.is_dead_source(0, u32::from(peer), 4662));
+
+        record_source_failure(&mut dead, other, peer, 4662, false);
+        assert!(dead.is_dead_source_for_file(&other, u32::from(peer), 4662));
+        assert!(!dead.is_dead_source(0, u32::from(peer), 4662));
     }
 }

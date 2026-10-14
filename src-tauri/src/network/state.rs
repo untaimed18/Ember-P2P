@@ -581,9 +581,9 @@ pub(super) struct NetworkState {
     pub(super) per_file_sources: HashMap<String, ed2k::sources::PerFileSourceList>,
     /// Cap for each list in `per_file_sources`, from Max sources per file.
     pub(super) max_sources_per_file: usize,
-    /// KAD search state for active downloads not in pending_downloads.
-    /// Tracks (last_kad_search_at, search_count) so we periodically search
-    /// for additional sources via KAD even while the download is running.
+    /// Each download's KAD source search clock, eMule's `m_LastSearchTimeKad`
+    /// and `m_TotalSearchesKad`: the file's whether it is pending or running
+    /// (see `kad_source_search_may_start`).
     /// `(last search, searches so far)`. Monotonic, as is
     /// `ember_source_search_state`: on the wall clock a step back held each
     /// download's next search for the length of the step.

@@ -28,6 +28,21 @@ pub fn ed2k_known_met_part_hash_count(file_size: u64) -> usize {
     }
 }
 
+/// `part_hashes` in the form eMule stores and expects back
+/// (`CFileIdentifier::HasExpectedMD4HashCount`): one MD4 per part, plus the
+/// `MD4("")` of the empty last part when the size is an exact multiple of
+/// PARTSIZE. A set with any other length is returned unchanged.
+pub fn ed2k_known_met_hashset(part_hashes: &[[u8; 16]], file_size: u64) -> Vec<[u8; 16]> {
+    let mut hashes = part_hashes.to_vec();
+    if file_size >= PARTSIZE
+        && file_size.is_multiple_of(PARTSIZE)
+        && hashes.len() as u64 == file_size / PARTSIZE
+    {
+        hashes.push(Md4::digest([]).into());
+    }
+    hashes
+}
+
 /// Hash an already-opened file. Callers that enforce filesystem policy use
 /// this to bind verification to the same object identity later finalized.
 pub fn ed2k_hash_open_file(file: &mut std::fs::File) -> anyhow::Result<String> {

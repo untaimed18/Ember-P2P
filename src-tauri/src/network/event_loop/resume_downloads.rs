@@ -438,6 +438,26 @@ fn recover_restored_copies(
     })
 }
 
+/// Put a restored download into `active` for its re-verification, which runs
+/// whatever the concurrent-download cap: a check that finishes it is only
+/// local work. With `rejoin`, a check that does not finish it hands the row a
+/// download slot only if one is free (`rejoin_queue_after_restore_check`).
+async fn admit_for_restore_check(
+    transfer_manager: &Arc<RwLock<TransferManager>>,
+    transfer: Transfer,
+    control: Arc<TransferControl>,
+    rejoin: bool,
+) {
+    let id = transfer.id.clone();
+    let mut mgr = transfer_manager.write().await;
+    mgr.active.insert(id.clone(), transfer);
+    mgr.begin_restore_verification(&id, &control);
+    if rejoin {
+        mgr.rejoin_queue_after_restore_check(&id);
+    }
+    mgr.register_control(&id, control);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn resume_incomplete_downloads(
     state: &mut NetworkState,
@@ -521,15 +541,13 @@ pub(in crate::network) async fn resume_incomplete_downloads(
             // Before any branch below can finish it: several insert straight
             // into the transfer list rather than through `enqueue`.
             crate::storage::category_folders::note_category(&transfer.id, &transfer.category);
-            // Hash-failed downloads are restored only to keep their Temp
-            // `.part` owned (orphan sweep). Do not auto-start them.
+            // Failed downloads are restored to keep their Temp `.part` owned
+            // (orphan sweep) and resumable by hand. Do not auto-start them.
             if transfer.status == TransferStatus::Failed {
+                let id = transfer.id.clone();
                 let mut mgr = transfer_manager.write().await;
-                mgr.completed.push(transfer);
-                if mgr.completed.len() > 1000 {
-                    let keep_from = mgr.completed.len() - 1000;
-                    mgr.completed.drain(..keep_from);
-                }
+                mgr.push_finished(transfer);
+                mgr.note_failed_partial(&id, progress_map.contains_key(&id));
                 continue;
             }
 
@@ -593,16 +611,18 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 let download_root = dl_folder.clone();
                 let part_files_in = found_parts.get(&tid).map(PathBuf::from);
                 let generation = Some(control.generation());
+                // One the user had paused or stopped, or that waited for disk
+                // space, goes back to that state when the copy is not its
+                // file, in `active` where it waits.
+                let rejoin = !matches!(
+                    transfer.status,
+                    TransferStatus::Paused | TransferStatus::Stopped | TransferStatus::Insufficient
+                );
                 note_copy_check(&tid, transfer.status.clone());
                 transfer.status = TransferStatus::Verifying;
                 transfer.speed = 0;
                 restore_db_writes.push(transfer.clone());
-                {
-                    let mut mgr = transfer_manager.write().await;
-                    mgr.active.insert(tid.clone(), transfer);
-                    mgr.begin_restore_verification(&tid, &control);
-                    mgr.register_control(&tid, control);
-                }
+                admit_for_restore_check(transfer_manager, transfer, control, rejoin).await;
                 let handle_id = tid.clone();
                 let handle = spawn_restore_check(
                     tx,
@@ -653,10 +673,20 @@ pub(in crate::network) async fn resume_incomplete_downloads(
 
             // If the app crashed during Verifying/Completing, handle locally
             // instead of waiting for source discovery.
-            if matches!(
+            let interrupted_finish = matches!(
                 transfer.status,
                 TransferStatus::Verifying | TransferStatus::Completing
-            ) {
+            );
+            // A download with progress whose part files are nowhere may have
+            // finished without the database hearing of it: the move into
+            // Downloads cannot be stopped, and a quit can come before the
+            // loop handles its `Verifying` or `Completed`. Restarted from
+            // nothing, it downloaded the whole file again as "name (1)".
+            let unrecorded_finish = !interrupted_finish
+                && transfer.total_size > 0
+                && (transfer.completed_size > 0 || transfer.progress > 0.0)
+                && !found_parts.contains_key(&transfer.id);
+            if interrupted_finish || unrecorded_finish {
                 let safe_name = crate::security::sanitize_filename(&transfer.file_name);
                 let published: Vec<PathBuf> = if part_path.exists() {
                     Vec::new()
@@ -718,15 +748,27 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                     let tid_handle = tid.clone();
                     let tx = dl_event_tx.clone();
                     let generation = Some(control.generation());
+                    // As for a completion copy: a file that is not this one
+                    // is no evidence against a source, and the download goes
+                    // on as it was left.
+                    let rejoin = !matches!(
+                        transfer.status,
+                        TransferStatus::Paused
+                            | TransferStatus::Stopped
+                            | TransferStatus::Insufficient
+                    );
+                    if unrecorded_finish {
+                        info!(
+                            "Restored download {} has no part files but a published file of its name — \
+                             checking it before resuming",
+                            transfer.id
+                        );
+                        note_copy_check(&tid, transfer.status.clone());
+                    }
                     transfer.status = TransferStatus::Verifying;
                     transfer.speed = 0;
                     restore_db_writes.push(transfer.clone());
-                    {
-                        let mut mgr = transfer_manager.write().await;
-                        mgr.active.insert(tid.clone(), transfer);
-                        mgr.begin_restore_verification(&tid, &control);
-                        mgr.register_control(&tid, control);
-                    }
+                    admit_for_restore_check(transfer_manager, transfer, control, rejoin).await;
                     let handle = spawn_restore_check(
                         tx,
                         tid.clone(),
@@ -741,13 +783,18 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                                 expected_aich.as_deref(),
                                 expected_ember.as_deref(),
                             ) {
-                                Ok(final_path) => DownloadEvent::Completed {
-                                    transfer_id: tid,
-                                    final_path: Some(final_path.to_string_lossy().into_owned()),
-                                    part_hashes: Vec::new(),
-                                    ember_verified: ember_pinned,
-                                    generation,
-                                },
+                                Ok(final_path) => {
+                                    take_copy_check(&tid);
+                                    DownloadEvent::Completed {
+                                        transfer_id: tid,
+                                        final_path: Some(
+                                            final_path.to_string_lossy().into_owned(),
+                                        ),
+                                        part_hashes: Vec::new(),
+                                        ember_verified: ember_pinned,
+                                        generation,
+                                    }
+                                }
                                 Err(error) => {
                                     warn!(
                                         "Restored download {tid} failed re-verification: {error}"
@@ -767,8 +814,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                     continue;
                 }
 
-
-                if part_path.exists() && transfer.total_size > 0 {
+                if interrupted_finish && part_path.exists() && transfer.total_size > 0 {
                     let all_complete = restored.is_some_and(|part| part.all_complete);
                     if all_complete {
                         info!(
@@ -793,12 +839,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                         restore_db_writes.push(transfer.clone());
                         let verify_control = control.clone();
                         let generation = Some(control.generation());
-                        {
-                            let mut mgr = transfer_manager.write().await;
-                            mgr.active.insert(tid.clone(), transfer);
-                            mgr.begin_restore_verification(&tid, &control);
-                            mgr.register_control(&tid, control);
-                        }
+                        admit_for_restore_check(transfer_manager, transfer, control, true).await;
 
                         if let Some(old_handle) = state.download_handles.remove(&dl_tid2) {
                             old_handle.abort();
@@ -858,7 +899,9 @@ pub(in crate::network) async fn resume_incomplete_downloads(
 
                 // .part exists but not all complete, or .part is missing and
                 // no final file — fall through to normal restore as Searching
-                transfer.status = TransferStatus::Searching;
+                if interrupted_finish {
+                    transfer.status = TransferStatus::Searching;
+                }
             }
 
             TransferManager::normalize_restored_incomplete_download(&mut transfer);

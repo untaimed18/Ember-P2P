@@ -139,6 +139,59 @@ impl Drop for Working {
     }
 }
 
+/// Counts a request in the download's active sources while its body streams.
+/// A guard rather than a pair of calls: the worker is aborted mid-await on
+/// every early exit of the download, which would skip the decrement.
+struct ActiveRequest(Arc<AtomicU32>);
+
+impl ActiveRequest {
+    fn new(count: &Arc<AtomicU32>) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self(count.clone())
+    }
+}
+
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// What this source has written into each part since the part's last verdict,
+/// across however many passes it took. A mirror is judged on the bytes it
+/// put in the part, not on what one pass happened to carry: a pass can be
+/// mostly duplicates, and a mirror that drops every connection fills a part
+/// over several.
+#[derive(Default)]
+struct PartShares(HashMap<usize, PartShare>);
+
+#[derive(Default)]
+struct PartShare {
+    written: u64,
+    /// What the part still lacked when this source last left it. More missing
+    /// now means it was reopened since, and what was written before is gone.
+    missing_after: u64,
+}
+
+impl PartShares {
+    fn begin_pass(&mut self, part: usize, missing: u64) {
+        if self.0.get(&part).is_some_and(|s| missing > s.missing_after) {
+            self.0.remove(&part);
+        }
+    }
+
+    fn end_pass(&mut self, part: usize, written: u64, missing: u64) {
+        let share = self.0.entry(part).or_default();
+        share.written = share.written.saturating_add(written);
+        share.missing_after = missing;
+    }
+
+    /// The bytes to judge a verdict on `part` by; the count starts over.
+    fn take(&mut self, part: usize) -> u64 {
+        self.0.remove(&part).map_or(0, |s| s.written)
+    }
+}
+
 /// How a request ended, which decides what the source is told.
 enum FetchError {
     /// The server will never serve this file in parts: missing, refused, or
@@ -206,6 +259,7 @@ impl WebWorker {
             self.drop_tx.clone(),
         );
         let mut transferred: u64 = 0;
+        let mut shares = PartShares::default();
         let mut bad_parts: u32 = 0;
         // The address the last redirect landed on, reused until it fails so a
         // mirror behind a redirector is not re-resolved for every range.
@@ -246,10 +300,19 @@ impl WebWorker {
                 continue;
             }
 
-            let transferred_before = transferred;
+            shares.begin_pass(part, gaps.iter().map(|&(gs, ge)| ge - gs).sum());
+            // So a peer worker piling onto this part in the endgame asks for
+            // these ranges last, as it does for another peer's requests.
+            let in_flight: Vec<OutstandingRange> =
+                gaps.iter().map(|&(gs, ge)| OutstandingRange::new(gs, ge)).collect();
+            guard.publish_in_flight(&in_flight, None).await;
+            let mut written: u64 = 0;
             let mut outcome: Result<(), FetchError> = Ok(());
             for (gs, ge) in gaps {
-                match self.fetch_range(&mut effective_url, gs, ge, &mut transferred).await {
+                match self
+                    .fetch_range(&mut effective_url, gs, ge, &mut transferred, &mut written)
+                    .await
+                {
                     Ok(()) => {}
                     Err(e) => {
                         outcome = Err(e);
@@ -257,15 +320,17 @@ impl WebWorker {
                     }
                 }
             }
+            guard.publish_in_flight(&[], None).await;
             // Check what this source just filled now, while the claim still
             // keeps the sweep and every peer off it, so the verdict is about
             // this mirror and a bad one is found out after one part.
-            let to_check = if outcome.is_ok() {
+            let to_check = {
                 let t = self.tracker.read().await;
-                (t.is_part_complete(part) && !t.is_part_verified(part))
-                    .then(|| (t.part_range(part), t.part_content_generation(part)))
-            } else {
-                None
+                let (ps, pe) = t.part_range(part);
+                let missing = t.fillable_subranges(ps, pe).iter().map(|&(gs, ge)| ge - gs).sum();
+                shares.end_pass(part, written, missing);
+                (outcome.is_ok() && t.is_part_complete(part) && !t.is_part_verified(part))
+                    .then(|| ((ps, pe), t.part_content_generation(part)))
             };
             let hashes = self.part_hashes.read().await.clone();
             let checked = match to_check {
@@ -305,7 +370,7 @@ impl WebWorker {
                     // A connection that dropped after delivering data is one
                     // failure, not one more in a run: a mirror that keeps
                     // making progress is rested, never retired for it.
-                    if transferred > transferred_before {
+                    if written > 0 {
                         web_sources::note_success(&self.file_hash, &self.url);
                     }
                     web_sources::note_failure(&self.file_hash, &self.url, false);
@@ -325,8 +390,11 @@ impl WebWorker {
 
             // Held against the mirror only when it supplied most of the part:
             // one a peer had mostly filled says little about the mirror.
+            let supplied = match &checked {
+                Some((_, ClaimedPartCheck::Unreadable)) | None => 0,
+                Some(_) => shares.take(part),
+            };
             if let Some(((ps, pe), ClaimedPartCheck::Corrupt)) = checked {
-                let supplied = transferred - transferred_before;
                 if supplied.saturating_mul(2) >= pe - ps {
                     bad_parts += 1;
                     warn!(
@@ -391,13 +459,16 @@ impl WebWorker {
         }
     }
 
-    /// Fetch `[start, end)` and write what is still missing of it.
+    /// Fetch `[start, end)` and write what is still missing of it. Adds the
+    /// bytes off the wire to `transferred` and those that filled a gap to
+    /// `written`.
     async fn fetch_range(
         &self,
         effective_url: &mut String,
         start: u64,
         end: u64,
         transferred: &mut u64,
+        written: &mut u64,
     ) -> Result<(), FetchError> {
         let response = match self.send_range(effective_url, start, end).await {
             Ok(r) => r,
@@ -417,8 +488,20 @@ impl WebWorker {
             Err(e) => return Err(e),
         };
 
+        let status = response.status().as_u16();
+        // We ask for `identity`; a range of an encoded body is a range of the
+        // encoding, and writing it would only cost a failed part hash. Error
+        // pages are often compressed, so only a body we would write counts.
+        if matches!(status, 200 | 206)
+            && is_encoded(response.headers().get(reqwest::header::CONTENT_ENCODING))
+        {
+            return Err(FetchError::Permanent(
+                "the server sends the file encoded".to_string(),
+            ));
+        }
+
         // Where the body starts, which a server ignoring `Range` puts at 0.
-        let body_start = match response.status().as_u16() {
+        let body_start = match status {
             206 => {
                 let header = response
                     .headers()
@@ -469,12 +552,9 @@ impl WebWorker {
             }
         };
 
-        self.active_count.fetch_add(1, Ordering::Relaxed);
-        let result = self
-            .stream_body(response, body_start, end, transferred)
-            .await;
-        self.active_count.fetch_sub(1, Ordering::Relaxed);
-        result
+        let _active = ActiveRequest::new(&self.active_count);
+        self.stream_body(response, body_start, end, transferred, written)
+            .await
     }
 
     /// GET `url` for bytes `[start, end)`, following redirects by hand so each
@@ -517,7 +597,10 @@ impl WebWorker {
                     return Err(FetchError::Stopped(anyhow::anyhow!("cancelled by user")));
                 }
             };
-            if response.status().is_redirection() {
+            // Only the codes that name a new location for the same resource:
+            // 300 is a choice to make and 304 a cache answer to a conditional
+            // request we never send.
+            if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
                 let location = response
                     .headers()
                     .get(reqwest::header::LOCATION)
@@ -542,6 +625,7 @@ impl WebWorker {
         body_start: u64,
         end: u64,
         transferred: &mut u64,
+        written: &mut u64,
     ) -> Result<(), FetchError> {
         let wire = self.tracker.read().await.transferred_counter();
         let mut pos = body_start;
@@ -595,6 +679,7 @@ impl WebWorker {
                 if !outcome.write_ok {
                     return Err(FetchError::Stopped(anyhow::anyhow!("disk write failed")));
                 }
+                *written = written.saturating_add(outcome.newly_written);
                 if outcome.newly_written > 0 {
                     let _ = self
                         .progress_tx
@@ -644,6 +729,13 @@ fn fetch_error_text(e: &FetchError) -> &str {
     }
 }
 
+fn is_encoded(content_encoding: Option<&reqwest::header::HeaderValue>) -> bool {
+    content_encoding.is_some_and(|v| {
+        let v = v.as_bytes().trim_ascii();
+        !v.is_empty() && !v.eq_ignore_ascii_case(b"identity") && !v.eq_ignore_ascii_case(b"none")
+    })
+}
+
 /// `bytes first-last/total` → `(first, last, total)`; `total` is `None` for
 /// `*`. Anything else, or a range that runs backwards, is `None`.
 fn parse_content_range(header: &str) -> Option<(u64, u64, Option<u64>)> {
@@ -664,7 +756,40 @@ fn parse_content_range(header: &str) -> Option<(u64, u64, Option<u64>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_content_range;
+    use super::{is_encoded, parse_content_range, PartShares};
+    use reqwest::header::HeaderValue;
+
+    #[test]
+    fn only_a_real_content_encoding_counts() {
+        assert!(!is_encoded(None));
+        for plain in ["identity", " Identity ", "NONE", "none", ""] {
+            assert!(!is_encoded(Some(&HeaderValue::from_static(plain))), "{plain:?}");
+        }
+        for encoded in ["gzip", "br", "deflate", " GZIP "] {
+            assert!(is_encoded(Some(&HeaderValue::from_static(encoded))), "{encoded:?}");
+        }
+    }
+
+    #[test]
+    fn a_mirror_is_judged_on_what_it_wrote_across_passes() {
+        let mut shares = PartShares::default();
+        // Two passes that each dropped early, then one that finished.
+        shares.begin_pass(0, 100);
+        shares.end_pass(0, 30, 70);
+        shares.begin_pass(0, 70);
+        shares.end_pass(0, 30, 40);
+        shares.begin_pass(0, 40);
+        shares.end_pass(0, 0, 0);
+        assert_eq!(shares.take(0), 60, "duplicates add nothing, earlier passes count");
+        assert_eq!(shares.take(0), 0, "a verdict starts the count over");
+
+        // Reopened since this source last left it: what it wrote is gone.
+        shares.begin_pass(1, 100);
+        shares.end_pass(1, 80, 20);
+        shares.begin_pass(1, 100);
+        shares.end_pass(1, 10, 0);
+        assert_eq!(shares.take(1), 10);
+    }
 
     #[test]
     fn content_range_is_read_strictly() {

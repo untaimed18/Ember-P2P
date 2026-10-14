@@ -15,7 +15,6 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use crate::bandwidth::limiter::BandwidthLimiter;
-use crate::network::ed2k::a4af::A4AFManager;
 use crate::network::ed2k::comments::CommentManager;
 use crate::network::ed2k::credits::CreditManager;
 use crate::network::ed2k::sources::SourceManager;
@@ -2943,9 +2942,6 @@ struct UploadHandler {
     source_manager: Arc<RwLock<SourceManager>>,
     comment_manager: Arc<RwLock<CommentManager>>,
     credit_manager: Arc<RwLock<CreditManager>>,
-    a4af_manager: Arc<RwLock<A4AFManager>>,
-    /// File hashes we're currently downloading (for A4AF registration)
-    pending_download_hashes: Arc<RwLock<Vec<[u8; 16]>>>,
     /// Active port test waiters (IP -> Sender)
     active_port_tests: Arc<tokio::sync::Mutex<HashMap<IpAddr, tokio::sync::mpsc::Sender<()>>>>,
     /// User hashes expected as incoming buddy connections
@@ -4454,8 +4450,6 @@ pub async fn start_upload_server(
     source_manager: Arc<RwLock<SourceManager>>,
     comment_manager: Arc<RwLock<CommentManager>>,
     credit_manager: Arc<RwLock<CreditManager>>,
-    a4af_manager: Arc<RwLock<A4AFManager>>,
-    pending_download_hashes: Arc<RwLock<Vec<[u8; 16]>>>,
     active_port_tests: Arc<
         tokio::sync::Mutex<HashMap<std::net::IpAddr, tokio::sync::mpsc::Sender<()>>>,
     >,
@@ -4577,8 +4571,6 @@ pub async fn start_upload_server(
         source_manager,
         comment_manager,
         credit_manager,
-        a4af_manager,
-        pending_download_hashes,
         active_port_tests,
         pending_buddy_hashes,
         buddy_conn_tx,
@@ -9412,8 +9404,10 @@ impl UploadHandler {
 
             match (proto, opcode) {
                 (OP_EMULEPROT, OP_PUBLICKEY) if payload.len() >= 2 => {
-                    let key_len = payload[0] as usize;
-                    if key_len > 0 && payload.len() > key_len {
+                    // eMule's framing or nothing: a key once bound to a user
+                    // hash is never replaced, so taking a misframed one would
+                    // lock that hash out of its real key for good.
+                    if let Some(key) = super::multi_source::public_key_from_packet(&payload) {
                         let mut cm = self.credit_manager.write().await;
                         // Only move the identity forward if the key was
                         // actually bound. A refused key must not reset a
@@ -9426,8 +9420,7 @@ impl UploadHandler {
                         let was_verified = cm
                             .get_record(&peer_user_hash)
                             .is_some_and(|r| r.ident_state == super::credits::IdentState::Verified);
-                        let key_bound = cm
-                            .set_public_key(peer_user_hash, payload[1..1 + key_len].to_vec());
+                        let key_bound = cm.set_public_key(peer_user_hash, key.to_vec());
                         if key_bound && !was_verified {
                             cm.set_ident_state(peer_user_hash, super::credits::IdentState::Needed);
                         }
@@ -9727,23 +9720,6 @@ impl UploadHandler {
                             let _ = self.send_comment_info(&mut writer, &hash).await;
 
                             total_size = file.size;
-
-                            // Register this peer as potential A4AF source for our pending downloads
-                            let download_hashes = self.pending_download_hashes.read().await;
-                            if !download_hashes.is_empty() {
-                                let mut a4af = self.a4af_manager.write().await;
-                                for &dl_hash in download_hashes.iter() {
-                                    if dl_hash != hash {
-                                        // A peer asking us for `hash` says nothing
-                                        // about whether it still has parts we need
-                                        // of it, so claim nothing: `true` leaves
-                                        // the swap decision to priority and source
-                                        // counts instead of firing the
-                                        // "has run dry" fast path.
-                                        a4af.add_a4af_source(dl_hash, peer_addr, hash, true);
-                                    }
-                                }
-                            }
                         } else {
                             write_packet_async(
                                 &mut writer,

@@ -47,6 +47,7 @@ function row(id: string): Transfer {
 const backend = {
   rows: [row('a')],
   restored: true,
+  resumable: [] as string[],
   hold: null as Promise<void> | null,
 };
 
@@ -59,6 +60,7 @@ vi.mock('$lib/api/transfers', () => ({
       transfers: backend.rows.map((t) => ({ ...t })),
       removed: [],
       restored: backend.restored,
+      resumable_failed: [...backend.resumable],
     };
     if (backend.hold) await backend.hold;
     return answer;
@@ -157,6 +159,7 @@ describe('the transfers poll', () => {
     vi.stubGlobal('cancelAnimationFrame', () => {});
     backend.rows = [row('a')];
     backend.restored = true;
+    backend.resumable = [];
     backend.hold = null;
     vi.useFakeTimers();
   });
@@ -197,6 +200,38 @@ describe('the transfers poll', () => {
     backend.rows = [{ ...row('a'), category: 'Audio' }];
     await vi.advanceTimersByTimeAsync(3_000);
     expect(category()).toBe('Audio');
+    stop();
+  });
+
+  it('takes a resumed failed download out of Failed, whatever a poll in flight says', async () => {
+    const status = () => get(store.transfers).find((t) => t.id === 'a')?.status;
+    backend.rows = [{ ...row('a'), status: 'failed', failure_code: 'local_read_failed' }];
+    backend.resumable = ['a'];
+    await store.initTransferStore();
+    expect(status()).toBe('failed');
+    expect(get(store.resumableFailedDownloads).has('a')).toBe(true);
+
+    let release = () => {};
+    backend.hold = new Promise<void>((resolve) => (release = resolve));
+    const stop = store.startTransferPoll();
+    vi.setSystemTime(Date.now() + 1);
+    handlers.get('transfer-started')?.({ payload: { ...row('a'), status: 'searching' } });
+    expect(status()).toBe('searching');
+
+    backend.hold = null;
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(status()).toBe('searching');
+
+    backend.rows = [{ ...row('a'), status: 'searching' }];
+    backend.resumable = [];
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(status()).toBe('searching');
+    expect(get(store.resumableFailedDownloads).size).toBe(0);
+
+    backend.rows = [{ ...row('a'), status: 'failed' }];
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(status(), 'failing again later is not held off').toBe('failed');
     stop();
   });
 });

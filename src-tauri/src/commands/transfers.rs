@@ -90,7 +90,7 @@ fn parse_peer_port(peer_id: &str) -> u16 {
         .unwrap_or(0)
 }
 
-fn transfer_status_key(status: &TransferStatus) -> &'static str {
+pub(crate) fn transfer_status_key(status: &TransferStatus) -> &'static str {
     match status {
         TransferStatus::Searching => "searching",
         TransferStatus::Queued => "queued",
@@ -516,6 +516,148 @@ pub(crate) async fn start_promoted_downloads(state: &AppState, promoted: &[Trans
     }
 }
 
+/// The link a Failed download is revived by when it is added again, carrying
+/// what a new download of it would have started with.
+struct ReviveLink {
+    peer_ip: String,
+    peer_port: u16,
+    extra_sources: Vec<(String, u16)>,
+    friend_ember_hash: Option<[u8; 16]>,
+    add_paused: bool,
+}
+
+/// Queue a Failed download again from the `.part` it kept, as a Resume does a
+/// stopped one: out of the finished list, into a free slot or the queue, the
+/// status saved, and a worker or source discovery started. The UI is sent the
+/// row on `transfer-started`, the one event that takes a row out of Failed.
+/// `None` when `transfer_id` is not a Failed download Resume may continue
+/// (any more).
+async fn revive_failed_download(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    transfer_id: &str,
+    link: Option<ReviveLink>,
+) -> Result<Option<Transfer>, String> {
+    let paused = link.as_ref().is_some_and(|link| link.add_paused);
+    let revived = {
+        let mut manager = state.transfer_manager.write().await;
+        if !manager.is_failed_resumable(transfer_id) {
+            return Ok(None);
+        }
+        let Some(remaining) = manager
+            .get_transfer(transfer_id)
+            .map(|t| t.total_size.saturating_sub(t.completed_size))
+        else {
+            return Ok(None);
+        };
+        ensure_pending_download_budget(&manager, &[remaining])?;
+        manager.revive_failed(transfer_id, paused).and_then(|active_now| {
+            Some((
+                manager.get_transfer(transfer_id)?.clone(),
+                active_now,
+                manager.get_control(transfer_id)?,
+            ))
+        })
+    };
+    let Some((row, active_now, control)) = revived else {
+        return Ok(None);
+    };
+    tracing::info!(
+        "Resuming failed download {} from its kept progress",
+        transfer_id_short(transfer_id)
+    );
+    persist_transfer_status(state, transfer_id, &row.status).await;
+    let _ = app.emit("transfer-started", &row);
+    let Some(link) = link else {
+        if active_now {
+            start_promoted_downloads(state, std::slice::from_ref(&row)).await;
+        } else {
+            start_queued_discovery(state, std::slice::from_ref(&row.id)).await;
+        }
+        return Ok(Some(row));
+    };
+    if let Err(e) = bounded_send(
+        &state.network_tx,
+        NetworkCommand::StartDownload {
+            file_hash: row.file_hash.clone(),
+            file_name: row.file_name.clone(),
+            file_size: row.total_size,
+            peer_ip: link.peer_ip,
+            peer_port: link.peer_port,
+            extra_sources: link.extra_sources,
+            ember_file_hash: row.ember_file_hash.clone().unwrap_or_default(),
+            expected_aich: row.expected_aich.clone(),
+            transfer_id: row.id.clone(),
+            control,
+            friend_ember_hash: link.friend_ember_hash,
+            discovery_only: !active_now || paused,
+        },
+    )
+    .await
+    {
+        tracing::warn!("Failed to start revived download {}: {e}", row.id);
+        let mut manager = state.transfer_manager.write().await;
+        let _ = manager.fail(
+            &row.id,
+            TransferFailureCode::NetworkChannelUnavailable,
+            Some("permanent".to_string()),
+            None,
+        );
+    }
+    Ok(Some(row))
+}
+
+/// [`revive_failed_download`] for a Resume of `transfer_id`, once its `.part`
+/// is known to be there still: a row without one has nothing to resume, and
+/// starting it would download the file again from nothing under the old row.
+/// `Ok(false)` when `transfer_id` is no Failed download, for the ordinary
+/// resume to handle.
+async fn resume_failed_download(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    transfer_id: &str,
+) -> Result<bool, String> {
+    let (failed, resumable) = {
+        let manager = state.transfer_manager.read().await;
+        let failed = manager.get_transfer(transfer_id).is_some_and(|t| {
+            t.status == TransferStatus::Failed && t.direction == TransferDirection::Download
+        });
+        (failed, manager.is_failed_resumable(transfer_id))
+    };
+    if !failed {
+        return Ok(false);
+    }
+    if !resumable {
+        return Err(coded(
+            "transfers_failed_not_resumable",
+            "This download can't be resumed: its progress can't be trusted to finish it. Cancel it and add its link again.",
+        ));
+    }
+    let roots = state.config.read().await.settings.download_roots();
+    match check_failed_partial(roots, transfer_id.to_string()).await {
+        Some(true) => {}
+        Some(false) => {
+            state
+                .transfer_manager
+                .write()
+                .await
+                .note_failed_partial(transfer_id, false);
+            return Err(coded(
+                "transfers_failed_partial_missing",
+                "This download's progress is no longer on disk, so it can't be resumed. Add its link again to start it over.",
+            ));
+        }
+        None => {
+            return Err(coded(
+                "transfers_failed_partial_unreachable",
+                "The folder that holds this download's progress can't be reached. Connect it, then try again.",
+            ));
+        }
+    }
+    revive_failed_download(app, state, transfer_id, None).await?;
+    Ok(true)
+}
+
 /// Try to delete a file, retrying with a delay if it fails (e.g. because
 /// the download task still holds the handle on Windows).
 async fn delete_with_retry(
@@ -688,6 +830,75 @@ async fn cleanup_partial_files(db: &Arc<Database>, download_roots: &[String], tr
     }
 }
 
+/// [`cleanup_partial_files`] for many downloads at once: each folder is asked
+/// whether it can be reached once, and cleaned for all of them within one
+/// [`PARTIAL_CLEANUP_FOLDER_BUDGET`].
+async fn cleanup_partial_files_many(
+    db: &Arc<Database>,
+    download_roots: &[String],
+    transfer_ids: &[String],
+) {
+    let ids: Vec<&str> = transfer_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let ids = &ids;
+    let left = futures::future::join_all(download_roots.iter().map(|root| async move {
+        let temp_dir = std::path::PathBuf::from(root).join("Temp");
+        let paths = |id: &str| {
+            [
+                temp_dir.join(format!("{id}.part")),
+                temp_dir.join(format!("{id}.part.met")),
+            ]
+        };
+        for id in ids {
+            crate::network::ed2k::part_tracker::suppress_met_saves(&paths(id)[1]);
+        }
+        let allowed = vec![root.clone()];
+        let cleanup = async {
+            let folder = std::path::PathBuf::from(root);
+            let reachable = tokio::task::spawn_blocking(move || {
+                crate::storage::part_folders::folder_reachable(&folder)
+            })
+            .await
+            .unwrap_or(false);
+            if reachable {
+                for id in ids {
+                    let [part_path, met_path] = paths(id);
+                    tokio::join!(
+                        cleanup_one_partial(&part_path, &allowed, 6, 500),
+                        cleanup_one_partial(&met_path, &allowed, 6, 500),
+                    );
+                }
+            }
+            reachable
+        };
+        let cleaned = tokio::time::timeout(PARTIAL_CLEANUP_FOLDER_BUDGET, cleanup)
+            .await
+            .unwrap_or(false);
+        if cleaned {
+            return Vec::new();
+        }
+        ids.iter()
+            .filter(|id| crate::storage::part_folders::may_hold_parts(id, Path::new(root)))
+            .flat_map(|id| {
+                tracing::warn!("Removing {id}'s part files from {root} once it answers");
+                paths(id).map(|path| (path.to_string_lossy().into_owned(), root.clone()))
+            })
+            .collect::<Vec<_>>()
+    }))
+    .await;
+    let left: Vec<(String, String)> = left.into_iter().flatten().collect();
+    if !left.is_empty() {
+        let db = db.clone();
+        db_blocking(move || crate::storage::deferred_removals::record(&db, &left)).await;
+    }
+}
+
 fn spawn_deferred_partial_cleanup(
     db: Arc<Database>,
     download_roots: Vec<String>,
@@ -697,6 +908,57 @@ fn spawn_deferred_partial_cleanup(
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         cleanup_partial_files(&db, &download_roots, &transfer_id).await;
     });
+}
+
+/// How long the check for a failed download's `.part` may take. A drive that
+/// does not answer by then is taken not to hold it.
+pub(crate) const FAILED_PARTIAL_CHECK_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// Whether a failed download's `.part` is on disk, in the folder its part
+/// files were last in, or in any of `download_roots` when there is none.
+/// `None` when that cannot be known: a folder that may hold it cannot be
+/// reached. Blocking.
+pub(crate) fn failed_partial_on_disk(
+    download_roots: &[String],
+    transfer_id: &str,
+) -> Option<bool> {
+    if uuid::Uuid::parse_str(transfer_id).is_err() {
+        return Some(false);
+    }
+    let folders: Vec<PathBuf> = match crate::storage::part_folders::located_folder(transfer_id) {
+        Some(folder) => vec![folder],
+        None => download_roots.iter().map(PathBuf::from).collect(),
+    };
+    let mut unknown = false;
+    for folder in folders {
+        if !crate::storage::part_folders::folder_reachable(&folder) {
+            unknown = true;
+            continue;
+        }
+        let part = folder.join("Temp").join(format!("{transfer_id}.part"));
+        match std::fs::symlink_metadata(&part) {
+            Ok(meta) if meta.is_file() => return Some(true),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => unknown = true,
+        }
+    }
+    (!unknown).then_some(false)
+}
+
+/// [`failed_partial_on_disk`] off the async runtime, within
+/// [`FAILED_PARTIAL_CHECK_BUDGET`].
+pub(crate) async fn check_failed_partial(
+    download_roots: Vec<String>,
+    transfer_id: String,
+) -> Option<bool> {
+    let check =
+        tokio::task::spawn_blocking(move || failed_partial_on_disk(&download_roots, &transfer_id));
+    match tokio::time::timeout(FAILED_PARTIAL_CHECK_BUDGET, check).await {
+        Ok(Ok(found)) => found,
+        _ => None,
+    }
 }
 
 /// Relocate a failed download's `.part` into `Downloads/` so "Remove from List"
@@ -1437,6 +1699,60 @@ pub async fn start_download(
         friends_only: from_restricting_friend,
     };
 
+    // A Failed download of this file whose progress is kept is resumed rather
+    // than started over beside it under a new id. Not one pinned to another
+    // AICH root or Ember digest than this link names: the link's pin is the
+    // one asked for, and that row's final check would still use its own.
+    // Which failed rows may be resumed at all is the manager's to say.
+    let failed_id = {
+        let manager = state.transfer_manager.read().await;
+        if manager.has_pending_for_hash(&file_hash) {
+            None
+        } else {
+            manager.resumable_failed_id_for_hash(&file_hash).filter(|id| {
+                manager.is_failed_resumable(id)
+                    && manager.get_transfer(id).is_some_and(|row| {
+                        expected_aich
+                            .as_deref()
+                            .is_none_or(|pin| row.expected_aich.as_deref() == Some(pin))
+                            && ember_file_hash
+                                .as_deref()
+                                .is_none_or(|pin| row.ember_file_hash.as_deref() == Some(pin))
+                    })
+            })
+        }
+    };
+    if let Some(failed_id) = failed_id {
+        let roots = state.config.read().await.settings.download_roots();
+        match check_failed_partial(roots, failed_id.clone()).await {
+            Some(true) => {
+                attach_link_web_sources(&state, &file_hash, web_sources.clone()).await;
+                let link = ReviveLink {
+                    peer_ip: peer_ip.clone(),
+                    peer_port,
+                    extra_sources: parsed_extras.clone(),
+                    friend_ember_hash,
+                    add_paused,
+                };
+                if revive_failed_download(&app, &state, &failed_id, Some(link))
+                    .await?
+                    .is_some()
+                {
+                    return Ok(StartDownloadResponse {
+                        transfer_id: failed_id,
+                        already_queued: false,
+                    });
+                }
+            }
+            Some(false) => state
+                .transfer_manager
+                .write()
+                .await
+                .note_failed_partial(&failed_id, false),
+            None => {}
+        }
+    }
+
     let (active_now, existing_id) = {
         let mut manager = state.transfer_manager.write().await;
         if let Some(existing_id) = manager.pending_transfer_id_for_hash(&file_hash) {
@@ -1777,15 +2093,31 @@ pub async fn resume_transfers_batch(
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
     check_batch_size(&transfer_ids)?;
-    // `restart_ids` holds `active` rows resumed from `Insufficient` as well as
-    // `Paused`, as in `resume_transfer` and `resume_all_transfers`. `resume`
-    // clears that state in place and returns no promotions (the row never
-    // left `active`), so without it `start_promoted_downloads` is never
-    // called and no `PendingDownload` is re-inserted —
-    // `mark_download_insufficient` dropped it. The row then reads `Searching`,
-    // which `active_download_count` *does* count, so the cap is oversubscribed
-    // and the transfer never dials again: the retry timer only walks
-    // `pending_downloads`.
+    let failed_ids: Vec<String> = {
+        let manager = state.transfer_manager.read().await;
+        transfer_ids
+            .iter()
+            .filter(|id| {
+                manager.get_transfer(id).is_some_and(|t| {
+                    t.status == TransferStatus::Failed
+                        && t.direction == TransferDirection::Download
+                })
+            })
+            .cloned()
+            .collect()
+    };
+    // Each is checked for its `.part` and revived on its own; the first that
+    // could not be is reported once the rest of the batch has gone through.
+    let mut failed_resume_error = None;
+    for id in &failed_ids {
+        if let Err(e) = resume_failed_download(&app, &state, id).await {
+            failed_resume_error.get_or_insert(e);
+        }
+    }
+    let transfer_ids: Vec<String> = transfer_ids
+        .into_iter()
+        .filter(|id| !failed_ids.contains(id))
+        .collect();
     let held_over = start_held_over(&state, &transfer_ids).await;
     let (outcome, rediscover) = {
         let mut manager = state.transfer_manager.write().await;
@@ -1805,6 +2137,15 @@ pub async fn resume_transfers_batch(
     let mut to_start: Vec<Transfer> = outcome.promoted;
     {
         let manager = state.transfer_manager.read().await;
+        // `restart_ids` holds `active` rows resumed from `Insufficient` as
+        // well as `Paused`, as in `resume_transfer` and `resume_all_transfers`.
+        // `resume` clears that state in place and returns no promotions (the
+        // row never left `active`), so without it `start_promoted_downloads`
+        // is never called and no `PendingDownload` is re-inserted —
+        // `mark_download_insufficient` dropped it. The row then reads
+        // `Searching`, which `active_download_count` *does* count, so the cap
+        // is oversubscribed and the transfer never dials again: the retry
+        // timer only walks `pending_downloads`.
         for id in outcome.restart_ids {
             if let Some(t) = manager.get_transfer(&id) {
                 to_start.push(t.clone());
@@ -1820,7 +2161,10 @@ pub async fn resume_transfers_batch(
     }
     start_promoted_downloads(&state, &to_start).await;
     start_queued_discovery(&state, &rediscover).await;
-    Ok(())
+    match failed_resume_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 #[tauri::command]
@@ -1832,17 +2176,20 @@ pub async fn stop_transfers_batch(
     let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
     let mut send_error = None;
     for transfer_id in transfer_ids {
-        let promoted = {
+        let (stopped, promoted) = {
             let mut manager = state.transfer_manager.write().await;
             if let Some(control) = manager.get_control(&transfer_id) {
                 control.cancel();
             }
-            manager.stop(&transfer_id)
+            (manager.is_pending(&transfer_id), manager.stop(&transfer_id))
         };
         for p in promoted {
             promoted_by_id.entry(p.id.clone()).or_insert(p);
         }
-        persist_transfer_status(&state, &transfer_id, &TransferStatus::Stopped).await;
+        // See `stop_transfer`.
+        if stopped {
+            persist_transfer_status(&state, &transfer_id, &TransferStatus::Stopped).await;
+        }
         // Bounded, and the first failure ends the batch — see the note in
         // `pause_transfers_batch` for why carrying on is worse than stopping.
         if let Err(e) = bounded_send(
@@ -2032,17 +2379,25 @@ pub async fn stop_transfer(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
-    let promoted = {
+    let (stopped, promoted) = {
         let mut manager = state.transfer_manager.write().await;
         if let Some(control) = manager.get_control(&transfer_id) {
             control.cancel();
         }
-        manager.stop(&transfer_id)
+        (manager.is_pending(&transfer_id), manager.stop(&transfer_id))
     };
-    persist_transfer_status(&state, &transfer_id, &TransferStatus::Stopped).await;
-    // Reflect the Stop in the UI immediately (eMule CPartFile::StopFile updates
-    // synchronously); otherwise the row lingers as Active until the next poll.
-    emit_transfer_status(&app, &transfer_id, &TransferStatus::Stopped);
+    // Only a row Stop acted on. One that completed (or failed) first is left
+    // as it is: writing "stopped" over "completed" brought a finished download
+    // back at the next launch, to fetch the whole file again as "name (1)".
+    // Decided under the manager lock `complete()` also takes, so the two
+    // cannot both believe they ended the row.
+    if stopped {
+        persist_transfer_status(&state, &transfer_id, &TransferStatus::Stopped).await;
+        // Reflect the Stop in the UI immediately (eMule CPartFile::StopFile
+        // updates synchronously); otherwise the row lingers as Active until
+        // the next poll.
+        emit_transfer_status(&app, &transfer_id, &TransferStatus::Stopped);
+    }
     // As in `pause_transfer`: the control is already cancelled, so this is the
     // hard-abort backstop and its failure is worth a line rather than nothing.
     if let Err(e) = bounded_send(
@@ -2266,6 +2621,9 @@ pub async fn resume_transfer(
             "transfers_still_verifying",
             "This download is still being checked after restart. Resume it when the check finishes.",
         ));
+    }
+    if resume_failed_download(&app, &state, &transfer_id).await? {
+        return Ok(());
     }
     let held_over = !start_held_over(&state, std::slice::from_ref(&transfer_id))
         .await
@@ -3393,9 +3751,14 @@ pub async fn clear_completed(
         })
         .await;
     }
-    for id in &ids {
-        cleanup_partial_files(&state.db, &dl_roots, id).await;
-    }
+    // Off the command, and each folder looked at once for the whole list
+    // under one budget: a finished download seldom left part files, and one
+    // folder at a time per row, a share that does not answer held the list
+    // for minutes and a blocking thread for every row.
+    let db = state.db.clone();
+    tauri::async_runtime::spawn(async move {
+        cleanup_partial_files_many(&db, &dl_roots, &ids).await;
+    });
     Ok(count)
 }
 
@@ -3729,6 +4092,59 @@ mod ipc_lifecycle_tests {
 
         assert!(!part.exists());
         assert!(!part.with_extension("part.met").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Clear Completed cleans every listed download from each folder in one
+    /// pass, leaving other downloads' part files alone.
+    #[tokio::test]
+    async fn clearing_many_finished_rows_cleans_each_folder_once_for_all() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (folders, base) = approved_old_and_new_folders("clear");
+        let (a, b, kept) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let in_old = |id: &str| folders.previous[0].join("Temp").join(format!("{id}.part"));
+        let in_new = |id: &str| folders.current.join("Temp").join(format!("{id}.part.met"));
+        for path in [in_old(&a), in_new(&b), in_old(&kept)] {
+            std::fs::write(path, b"x").unwrap();
+        }
+
+        let db = test_db(&base);
+        let ids = [a.clone(), b.clone(), "not-a-uuid".to_string()];
+        super::cleanup_partial_files_many(&db, &folders.roots(), &ids).await;
+
+        assert!(!in_old(&a).exists());
+        assert!(!in_new(&b).exists());
+        assert!(in_old(&kept).exists(), "a download not cleared keeps its part files");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Resume is offered on a failed row only while its `.part` is there, in
+    /// whichever download folder holds it.
+    #[test]
+    fn a_failed_partial_is_found_in_any_download_folder() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (folders, base) = approved_old_and_new_folders("failed-partial");
+        let roots = folders.roots();
+        let (old, gone) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let old_part = folders.previous[0].join("Temp").join(format!("{old}.part"));
+        std::fs::write(old_part, b"x").unwrap();
+        let gone_met = folders.current.join("Temp").join(format!("{gone}.part.met"));
+        std::fs::write(gone_met, b"x").unwrap();
+
+        assert_eq!(failed_partial_on_disk(&roots, &old), Some(true));
+        assert_eq!(
+            failed_partial_on_disk(&roots, &gone),
+            Some(false),
+            "a `.part.met` alone has no bytes to resume"
+        );
+        assert_eq!(failed_partial_on_disk(&roots, "not-a-uuid"), Some(false));
         let _ = std::fs::remove_dir_all(base);
     }
 

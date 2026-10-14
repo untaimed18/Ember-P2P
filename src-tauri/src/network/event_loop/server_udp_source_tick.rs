@@ -10,8 +10,9 @@ pub(in crate::network) async fn on_server_udp_source_tick(
     if !network_ready_for_sources(state) {
         return;
     }
+    // eMule asks servers only for files that are neither paused nor stopped.
     let mut all_for_udp: Vec<([u8; 16], u64)> = state.pending_downloads.values()
-        .filter(|pd| !pd.control.is_cancelled())
+        .filter(|pd| !pd.control.is_cancelled() && !pd.control.is_paused())
         .filter_map(|pd| {
             let hash_bytes = hex::decode(&pd.file_hash).ok()?;
             if hash_bytes.len() != 16 {

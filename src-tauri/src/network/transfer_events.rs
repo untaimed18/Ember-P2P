@@ -5,6 +5,29 @@
 
 use super::*;
 
+/// [`spawn_transfer_status_write`] of "failed", ordered on the same clock,
+/// with the failure stored beside it: a restart reads it back to tell
+/// whether Resume may continue the row.
+fn spawn_failed_status_write(
+    clock: &Arc<TransferStatusWriteClock>,
+    db: Arc<Database>,
+    transfer_id: String,
+    failure_code: &'static str,
+) {
+    let seq = clock.next_seq();
+    let clock = Arc::clone(clock);
+    tokio::task::spawn_blocking(move || {
+        let mut last = clock.last.lock().unwrap_or_else(|e| e.into_inner());
+        if transfer_status_write_is_stale(last.get(&transfer_id).copied(), seq) {
+            return;
+        }
+        last.insert(transfer_id.clone(), seq);
+        if let Err(e) = db.mark_transfer_failed(&transfer_id, failure_code) {
+            warn!("DB mark_transfer_failed failed for {transfer_id}: {e}");
+        }
+    });
+}
+
 #[cfg(test)]
 pub(super) async fn take_fresh_part_hashes(
     fresh_part_hashes: &Arc<RwLock<HashMap<[u8; 16], Vec<[u8; 16]>>>>,
@@ -826,14 +849,27 @@ pub(super) async fn handle_download_event(
                     );
                 }
                 promoted_out.extend(promoted);
+                // Resume is offered on a failed row only while its progress
+                // is there to continue from.
+                let manager = transfer_manager.clone();
+                let roots = download_roots.to_vec();
+                let id = transfer_id.clone();
+                tokio::spawn(async move {
+                    let present =
+                        crate::commands::transfers::check_failed_partial(roots, id.clone()).await;
+                    manager
+                        .write()
+                        .await
+                        .note_failed_partial(&id, present == Some(true));
+                });
             } else {
                 warn!("Failed event for transfer {transfer_id} not found in active set");
             }
-            spawn_transfer_status_write(
+            spawn_failed_status_write(
                 status_writes,
                 db.clone(),
                 transfer_id.clone(),
-                "failed",
+                failure_code.as_code(),
             );
             let _ = app_handle.emit(
                 "transfer-failed",

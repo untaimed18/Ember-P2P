@@ -42,7 +42,7 @@ pub struct A4AFEntry {
 
 /// Candidates are keyed by peer address rather than held in a `Vec`, because
 /// every mutating operation here is "find this one peer": the duplicate check
-/// in [`A4AFManager::add_a4af_source`], the per-file probe in
+/// on insert, the per-file probe in
 /// [`A4AFManager::update_source_state`], and the removal in
 /// [`A4AFManager::remove_source`]. As a `Vec` each of those was a linear scan
 /// over up to [`MAX_A4AF_ENTRIES_PER_FILE`] entries, which the periodic NNP
@@ -84,6 +84,14 @@ impl A4AFManager {
     /// rather than a default because only the caller knows — the NNP sweep adds
     /// sources precisely *because* they have run dry, while a peer that merely
     /// asked us for a different file has not.
+    ///
+    /// Only tests insert one at a time; production fills the lists through
+    /// [`Self::offer_dry_sources`]. The upload path used to call this with
+    /// every peer that asked us for a file, at the ephemeral port of its
+    /// inbound connection and for every download we had: none of those were
+    /// known sources of the file, so each swap dialled an address that could
+    /// not answer and inflated the target's source count.
+    #[cfg(test)]
     pub fn add_a4af_source(
         &mut self,
         file_hash: [u8; 16],
@@ -113,8 +121,8 @@ impl A4AFManager {
     /// than the one that source is already assigned to.
     ///
     /// This is the periodic NNP sweep, and it is the only caller that runs at
-    /// (targets × sources) scale, so it is a method rather than a loop over
-    /// [`A4AFManager::add_a4af_source`] at the call site: the target's map is
+    /// (targets × sources) scale, so it is a method rather than a loop of
+    /// single inserts at the call site: the target's map is
     /// resolved once per target instead of once per pair, a target already at
     /// [`MAX_A4AF_ENTRIES_PER_FILE`] is abandoned rather than probed for every
     /// remaining source, and the clock is read once for the whole pass instead

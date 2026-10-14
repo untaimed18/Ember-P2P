@@ -128,7 +128,31 @@ const OLD_PART_MET_MAGIC: u32 = 0x504D4554; // "PMET" - legacy format
 
 /// eMule version bytes for .part.met files
 const PARTFILE_VERSION: u8 = 0xE0;
+/// eMule's `PARTFILE_SPLITTEDVERSION`: eDonkey's split format, which eMule
+/// only ever reads, and only to convert it.
+const PARTFILE_SPLITTED_VERSION: u8 = 0xE1;
 const PARTFILE_VERSION_LARGEFILE: u8 = 0xE2;
+
+/// Offset of the file hash in an eMule-family `.part.met` (the date is the four
+/// bytes before it), and whether the hashset follows the hash.
+///
+/// Mirrors `CPartFile::LoadPartFile`. eDonkey's "new old" style (`PMT_NEWOLD`,
+/// recognised by `00 00 02 01` at byte 24 and a non-zero word at byte 1) puts
+/// the date at byte 2 and has no hashset, and read the standard way its date
+/// bytes became half the file hash. The split format keeps its data in
+/// numbered files rather than one `.part`, so there is nothing to resume, and
+/// it is refused rather than parsed as though it were the standard layout.
+fn part_met_hash_layout(data: &[u8], version: u8) -> anyhow::Result<(u64, bool)> {
+    if version == PARTFILE_SPLITTED_VERSION {
+        anyhow::bail!(
+            "eDonkey split-format part.met (version 0xE1) keeps its data outside the .part file"
+        );
+    }
+    let edonkey_new_old = version == PARTFILE_VERSION
+        && data.get(24..28) == Some(&[0, 0, 2, 1][..])
+        && data.get(1..5).is_some_and(|word| word != [0; 4]);
+    Ok(if edonkey_new_old { (6, false) } else { (5, true) })
+}
 
 /// eMule tag IDs for .part.met
 const FT_FILENAME: u8 = 0x01;
@@ -739,8 +763,9 @@ impl PartTracker {
 
     /// Mark a byte range as not received (e.g. AICH-identified bad 180 KiB blocks inside a part).
     pub fn invalidate_range(&mut self, start: u64, end: u64) {
+        let end = end.min(self.file_size);
         self.add_gap(start, end);
-        if start < end && end <= self.file_size && !self.part_verified.is_empty() {
+        if start < end && !self.part_verified.is_empty() {
             let first = (start / PARTSIZE) as usize;
             let last = ((end - 1) / PARTSIZE) as usize;
             let mut cleared = Vec::new();
@@ -836,6 +861,7 @@ impl PartTracker {
         // and re-invalidate it to merge its neighbours. Repeat until back
         // under the cap. The coalesced bytes will be re-requested and any
         // affected parts lose their `verified` flag, which is correct.
+        let mut reopened: u64 = 0;
         while self.gaps.len() > MAX_GAP_ENTRIES {
             let Some(merge_idx) = self.find_smallest_coalesce_candidate() else {
                 break;
@@ -846,8 +872,11 @@ impl PartTracker {
                 break;
             }
             self.invalidate_range(filled_start, filled_end);
+            reopened += filled_end - filled_start;
         }
-        newly_filled
+        // Net of what coalescing just took back, so callers that credit this
+        // to progress do not count bytes that are missing again.
+        newly_filled.saturating_sub(reopened)
     }
 
     /// Find the index `i` such that the filled span between `gaps[i]` and
@@ -871,7 +900,11 @@ impl PartTracker {
     }
 
     /// Add a gap (mark bytes in [start, end) as missing). Merges with adjacent gaps.
+    ///
+    /// Clamped to the file: bytes past EOF can never be received, so a gap
+    /// there would keep the file incomplete forever.
     fn add_gap(&mut self, start: u64, end: u64) {
+        let end = end.min(self.file_size);
         if start >= end {
             return;
         }
@@ -1164,7 +1197,12 @@ impl PartTracker {
             cur.write_u32::<LittleEndian>(date)?;
 
             cur.write_all(&self.file_hash)?;
-            let part_hash_count = self.part_hashes.len();
+            // eMule's count, not the in-memory one: for an exact multiple of
+            // PARTSIZE eMule expects the trailing `MD4("")` and discards a set
+            // without it. The loader accepts both and drops it again.
+            let part_hashes =
+                super::hash::ed2k_known_met_hashset(&self.part_hashes, self.file_size);
+            let part_hash_count = part_hashes.len();
             if part_hash_count > u16::MAX as usize {
                 anyhow::bail!(
                     "part.met: {} part hashes exceeds u16::MAX — refusing to write a mismatched count (file too large for classic part.met)",
@@ -1172,11 +1210,11 @@ impl PartTracker {
                 );
             }
             cur.write_u16::<LittleEndian>(part_hash_count as u16)?;
-            for ph in &self.part_hashes {
+            for ph in &part_hashes {
                 cur.write_all(ph)?;
             }
 
-            let tag_count_pos = 5 + 16 + 2 + self.part_hashes.len() * 16;
+            let tag_count_pos = 5 + 16 + 2 + part_hashes.len() * 16;
             cur.write_u32::<LittleEndian>(0)?;
 
             let mut tag_count: u32 = 0;
@@ -1315,7 +1353,10 @@ impl PartTracker {
         }
 
         let version = data[0];
-        if version == PARTFILE_VERSION || version == PARTFILE_VERSION_LARGEFILE || version == 0xE1 {
+        if version == PARTFILE_VERSION
+            || version == PARTFILE_VERSION_LARGEFILE
+            || version == PARTFILE_SPLITTED_VERSION
+        {
             return self.load_emule_format(&data, version);
         }
 
@@ -1372,8 +1413,9 @@ impl PartTracker {
 
     /// Load eMule-format .part.met: version + date + hash + tags (with gap list).
     fn load_emule_format(&mut self, data: &[u8], version: u8) -> anyhow::Result<()> {
+        let (hash_at, has_hashset) = part_met_hash_layout(data, version)?;
         let mut cursor = Cursor::new(data);
-        cursor.set_position(1); // skip version byte
+        cursor.set_position(hash_at - 4);
 
         let _date = cursor.read_u32::<LittleEndian>()?;
 
@@ -1396,7 +1438,11 @@ impl PartTracker {
             return Ok(());
         }
 
-        let part_hash_count = cursor.read_u16::<LittleEndian>()? as usize;
+        let part_hash_count = if has_hashset {
+            cursor.read_u16::<LittleEndian>()? as usize
+        } else {
+            0
+        };
         // A hashset that disagrees with the part count implied by the file size
         // cannot be indexed by part, so every part beyond the stored range
         // would silently stay unverifiable. Both counts are legitimate on
@@ -1902,7 +1948,10 @@ impl SaveSnapshot {
             cur.write_u32::<LittleEndian>(date)?;
 
             cur.write_all(&self.file_hash)?;
-            let part_hash_count = self.part_hashes.len();
+            // eMule's count; see `save_emule_format`.
+            let part_hashes =
+                super::hash::ed2k_known_met_hashset(&self.part_hashes, self.file_size);
+            let part_hash_count = part_hashes.len();
             if part_hash_count > u16::MAX as usize {
                 anyhow::bail!(
                     "part.met: {} part hashes exceeds u16::MAX — refusing to write a mismatched count (file too large for classic part.met)",
@@ -1910,11 +1959,11 @@ impl SaveSnapshot {
                 );
             }
             cur.write_u16::<LittleEndian>(part_hash_count as u16)?;
-            for ph in &self.part_hashes {
+            for ph in &part_hashes {
                 cur.write_all(ph)?;
             }
 
-            let tag_count_pos = 5 + 16 + 2 + self.part_hashes.len() * 16;
+            let tag_count_pos = 5 + 16 + 2 + part_hashes.len() * 16;
             cur.write_u32::<LittleEndian>(0)?;
 
             let mut tag_count: u32 = 0;
@@ -2023,15 +2072,19 @@ pub struct PartMetSummary {
 /// Read the header and identity tags of an eMule-format `.part.met`.
 pub fn summarize_part_met(data: &[u8]) -> anyhow::Result<PartMetSummary> {
     let version = *data.first().ok_or_else(|| anyhow::anyhow!("empty part.met"))?;
-    if !(version == PARTFILE_VERSION || version == PARTFILE_VERSION_LARGEFILE || version == 0xE1) {
+    if !(version == PARTFILE_VERSION || version == PARTFILE_VERSION_LARGEFILE) {
         anyhow::bail!("not an eMule part.met (version 0x{version:02X})");
     }
+    let (hash_at, has_hashset) = part_met_hash_layout(data, version)?;
     let mut cursor = Cursor::new(data);
-    cursor.set_position(1);
-    let _date = cursor.read_u32::<LittleEndian>()?;
+    cursor.set_position(hash_at);
     let mut file_hash = [0u8; 16];
     cursor.read_exact(&mut file_hash)?;
-    let part_hash_count = cursor.read_u16::<LittleEndian>()? as u64;
+    let part_hash_count = if has_hashset {
+        cursor.read_u16::<LittleEndian>()? as u64
+    } else {
+        0
+    };
     let skip = cursor.position() + part_hash_count * 16;
     if skip > data.len() as u64 {
         anyhow::bail!("truncated part hashes in part.met");
@@ -3167,6 +3220,172 @@ mod tests {
         assert_eq!(reloaded.part_hashes(), &[[0x11; 16], [0x22; 16]]);
 
         let _ = std::fs::remove_file(part_path.with_extension("part.met"));
+    }
+
+    /// The hashset count and hashes as written, from the standard header.
+    fn stored_hashset(met: &[u8]) -> Vec<[u8; 16]> {
+        let count = u16::from_le_bytes([met[21], met[22]]) as usize;
+        (0..count)
+            .map(|i| met[23 + i * 16..39 + i * 16].try_into().unwrap())
+            .collect()
+    }
+
+    /// eMule stores `GetED2KPartHashCount` hashes — for an exact multiple of
+    /// PARTSIZE, one per part plus `MD4("")` — and discards a `.part.met` set
+    /// of any other length. Ember wrote one per part, so eMule resuming one of
+    /// its files threw the hashset away. Both writers emit eMule's count, and
+    /// the in-memory set Ember reloads stays one per part.
+    #[test]
+    fn part_met_hashset_round_trips_in_emule_count() {
+        use digest::Digest;
+        let empty: [u8; 16] = md4::Md4::digest([]).into();
+        for (label, file_size, parts, written) in [
+            ("one-exact", PARTSIZE, 1usize, 2usize),
+            ("two-exact", PARTSIZE * 2, 2, 3),
+            ("not-multiple", PARTSIZE * 2 + 5, 3, 3),
+        ] {
+            let hashes: Vec<[u8; 16]> = (0..parts).map(|i| [i as u8 + 1; 16]).collect();
+            let mut expected_on_disk = hashes.clone();
+            if written > parts {
+                expected_on_disk.push(empty);
+            }
+            let part_path = temp_part_path(label);
+            let met_path = part_path.with_extension("part.met");
+            let mut tracker = PartTracker::new(file_size, &part_path);
+            tracker.set_file_hash([0x5A; 16]);
+            tracker.set_part_hashes(hashes.clone());
+            tracker.fill_range(0, 100);
+
+            let on_disk = || stored_hashset(&std::fs::read(&met_path).unwrap());
+            tracker.save();
+            assert_eq!(on_disk(), expected_on_disk, "{label}");
+            tracker.snapshot_for_save().write_to_disk().unwrap();
+            assert_eq!(on_disk(), expected_on_disk, "{label}");
+
+            let reloaded = PartTracker::new_with_identity(file_size, &part_path, [0x5A; 16]);
+            assert_eq!(reloaded.part_hashes(), hashes.as_slice(), "{label}");
+            assert_eq!(reloaded.gap_list(), &[(100, file_size)], "{label}");
+            let _ = std::fs::remove_file(&met_path);
+        }
+    }
+
+    /// Files older builds wrote carry one hash per part even for an exact
+    /// multiple of PARTSIZE, and must keep loading.
+    #[test]
+    fn part_met_written_with_one_hash_per_part_still_loads() {
+        let part_path = temp_part_path("legacy-count");
+        let met_path = part_path.with_extension("part.met");
+        let file_size = PARTSIZE * 2;
+        let mut tracker = PartTracker::new(file_size, &part_path);
+        tracker.set_file_hash([0x6B; 16]);
+        tracker.set_part_hashes(vec![[0x11; 16], [0x22; 16]]);
+        tracker.fill_range(0, PARTSIZE);
+        tracker.save();
+
+        let current = std::fs::read(&met_path).unwrap();
+        assert_eq!(u16::from_le_bytes([current[21], current[22]]), 3);
+        let mut legacy = current[..21].to_vec();
+        legacy.extend_from_slice(&2u16.to_le_bytes());
+        legacy.extend_from_slice(&current[23..23 + 32]);
+        legacy.extend_from_slice(&current[23 + 48..]);
+        std::fs::write(&met_path, &legacy).unwrap();
+
+        let reloaded = PartTracker::new_with_identity(file_size, &part_path, [0x6B; 16]);
+        assert_eq!(reloaded.part_hashes(), &[[0x11; 16], [0x22; 16]]);
+        assert_eq!(reloaded.gap_list(), &[(PARTSIZE, file_size)]);
+        let _ = std::fs::remove_file(&met_path);
+    }
+
+    /// eDonkey's "new old" `.part.met`, which eMule recognises by `00 00 02 01`
+    /// at byte 24: the date sits at byte 2, the hash at 6, and no hashset
+    /// follows. Read with the standard layout, its date became half the hash.
+    #[test]
+    fn edonkey_new_old_part_met_is_read_with_its_own_layout() {
+        let file_size = PARTSIZE + 1000;
+        let hash = [0x7C; 16];
+        let mut met = vec![PARTFILE_VERSION, 0x00];
+        met.extend_from_slice(&0x6512_3456u32.to_le_bytes()); // date
+        met.extend_from_slice(&hash);
+        met.extend_from_slice(&4u32.to_le_bytes());
+        write_string_tag(&mut met, FT_FILENAME, "old.avi").unwrap();
+        write_uint32_tag(&mut met, FT_FILESIZE, file_size as u32).unwrap();
+        write_gap_tag(&mut met, FT_GAPSTART, 0, 500, false).unwrap();
+        write_gap_tag(&mut met, FT_GAPEND, 0, file_size as u32 as u64, false).unwrap();
+        assert_eq!(&met[24..28], &[0, 0, 2, 1], "fixture must carry eMule's marker");
+
+        let summary = summarize_part_met(&met).unwrap();
+        assert_eq!(summary.file_hash, hash);
+        assert_eq!(summary.file_name, "old.avi");
+
+        let part_path = temp_part_path("edonkey-new-old");
+        let met_path = part_path.with_extension("part.met");
+        std::fs::write(&met_path, &met).unwrap();
+        let tracker = PartTracker::new_with_identity(file_size, &part_path, hash);
+        assert_eq!(tracker.gap_list(), &[(500, file_size)]);
+        assert!(tracker.part_hashes().is_empty());
+        let _ = std::fs::remove_file(&met_path);
+    }
+
+    /// The eDonkey split format keeps its data in numbered files, so the single
+    /// `.part` holds nothing it describes. Its header used to be parsed as the
+    /// standard layout; it is refused instead.
+    #[test]
+    fn split_format_part_met_is_refused() {
+        let file_size = PARTSIZE * 2;
+        let part_path = temp_part_path("split-format");
+        let met_path = part_path.with_extension("part.met");
+        let mut tracker = PartTracker::new(file_size, &part_path);
+        tracker.set_file_hash([0x8D; 16]);
+        tracker.set_file_name("split.avi");
+        tracker.fill_range(0, PARTSIZE);
+        tracker.save();
+        let mut met = std::fs::read(&met_path).unwrap();
+        met[0] = PARTFILE_SPLITTED_VERSION;
+        std::fs::write(&met_path, &met).unwrap();
+
+        assert!(summarize_part_met(&met).is_err());
+        let reloaded = PartTracker::new_with_identity(file_size, &part_path, [0x8D; 16]);
+        assert_eq!(reloaded.gap_list(), &[(0, file_size)]);
+        let _ = std::fs::remove_file(&met_path);
+    }
+
+    /// Bytes past EOF can never arrive, so a gap there would hold the file
+    /// incomplete forever; and the range check that clears verified flags used
+    /// to skip a range ending past EOF entirely.
+    #[test]
+    fn invalidating_past_eof_is_clamped_to_the_file() {
+        let file_size = PARTSIZE + 100;
+        let mut tracker = PartTracker::new_empty(file_size, &temp_part_path("clamp"));
+        tracker.fill_range(0, file_size);
+        tracker.mark_file_hash_verified();
+
+        tracker.invalidate_range(PARTSIZE - 10, file_size + 1000);
+        assert_eq!(tracker.gap_list(), &[(PARTSIZE - 10, file_size)]);
+        assert_eq!(tracker.verified_parts(), vec![false, false]);
+
+        tracker.fill_range(PARTSIZE - 10, file_size);
+        assert!(tracker.all_complete());
+        tracker.mark_incomplete(5);
+        assert!(tracker.all_complete(), "a part past EOF opens no gap");
+    }
+
+    /// Past `MAX_GAP_ENTRIES`, `fill_range` re-opens filled runs to merge gaps.
+    /// Its return value is credited to progress, so it has to be net of that.
+    #[test]
+    fn fill_range_credit_is_net_of_gap_coalescing() {
+        let file_size = 4 * MAX_GAP_ENTRIES as u64;
+        let mut tracker = PartTracker::new_empty(file_size, &temp_part_path("coalesce"));
+        let tail = 2 * MAX_GAP_ENTRIES as u64;
+        tracker.gaps = (0..MAX_GAP_ENTRIES as u64 - 1)
+            .map(|i| (2 * i, 2 * i + 1))
+            .chain(std::iter::once((tail, file_size)))
+            .collect();
+        let before = tracker.remaining_gap_bytes();
+
+        let credited = tracker.fill_range(tail + 10, tail + 11);
+        assert!(tracker.gaps.len() <= MAX_GAP_ENTRIES);
+        assert_eq!(credited, before - tracker.remaining_gap_bytes());
+        assert_eq!(credited, 0, "the one byte filled was paid for by one reopened");
     }
 
     /// Cancel deletes `.part.met` while a `spawn_blocking` save may still be

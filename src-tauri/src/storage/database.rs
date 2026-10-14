@@ -34,6 +34,44 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// paths refuse instead. Bump this when introducing a new migration.
 pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 62;
 
+/// A status write keeps the stored failure code only while the row stays
+/// Failed: any other status means it was taken up again.
+const UPDATE_TRANSFER_STATUS_SQL: &str = "UPDATE transfers
+     SET status = ?1, failure_code = CASE WHEN ?1 = 'failed' THEN failure_code END
+     WHERE id = ?2";
+
+/// The failure a stored `failure_code` names, `None` for one this build does
+/// not know.
+fn persisted_failure_code(code: &str) -> Option<TransferFailureCode> {
+    use TransferFailureCode as F;
+    [
+        F::Cancelled,
+        F::RemoteMissingFile,
+        F::EmberContentHashMismatch,
+        F::AichHashMismatch,
+        F::HashMismatch,
+        F::DownloadTimedOut,
+        F::InsufficientDisk,
+        F::ConnectionFailed,
+        F::PeerHandshakeFailed,
+        F::QueueWaitInterrupted,
+        F::HashsetRequestFailed,
+        F::ConnectionLost,
+        F::PermanentFailure,
+        F::TransientFailure,
+        F::NetworkChannelUnavailable,
+        F::DownloadFolderUnavailable,
+        F::PartFolderOffline,
+        F::EmberPinCorrupt,
+        F::AichPinCorrupt,
+        F::FinalVerifyInconclusive,
+        F::LocalReadFailed,
+        F::CompletionMoveFailed,
+    ]
+    .into_iter()
+    .find(|f| f.as_code() == code)
+}
+
 /// Longest room name kept from a moderation snapshot. Keep in step with
 /// `MAX_CHANNEL_NAME_CHARS` in `commands/channels.rs`, the cap an owner names
 /// a room under.
@@ -3286,6 +3324,11 @@ impl Database {
             set_version(&tx, 62)?;
             tx.commit()?;
         }
+        // Why a download failed, kept for Failed rows so a failure Resume must
+        // not continue is still known after a restart. Outside the numbered
+        // chain: 1.7.0 has to open this database, and it names every
+        // `transfers` column it reads or writes, so one more is invisible to it.
+        Self::add_column_if_missing(&conn, "transfers", "failure_code", "TEXT")?;
         // Finish a v23 encryption pass that was deferred because chat was
         // locked at the time. The version is already 23 or later, so the
         // migration itself will never run again — without this the history
@@ -4336,9 +4379,14 @@ impl Database {
             TransferStatus::Insufficient => "insufficient",
             TransferStatus::NoneNeeded => "noneneeded",
         };
+        let failure_code = if transfer.status == TransferStatus::Failed {
+            transfer.failure_code.as_deref()
+        } else {
+            None
+        };
         conn.execute(
-            "INSERT INTO transfers (id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich, ember_file_hash, friends_only)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            "INSERT INTO transfers (id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich, ember_file_hash, friends_only, failure_code)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
              ON CONFLICT(id) DO UPDATE SET
                file_name = excluded.file_name,
                file_hash = excluded.file_hash,
@@ -4355,7 +4403,8 @@ impl Database {
                category = excluded.category,
                expected_aich = excluded.expected_aich,
                ember_file_hash = excluded.ember_file_hash,
-               friends_only = MAX(friends_only, excluded.friends_only)",
+               friends_only = MAX(friends_only, excluded.friends_only),
+               failure_code = excluded.failure_code",
             params![
                 transfer.id,
                 transfer.file_name,
@@ -4381,6 +4430,7 @@ impl Database {
                 transfer.expected_aich,
                 transfer.ember_file_hash,
                 transfer.friends_only,
+                failure_code,
             ],
         )?;
         Ok(())
@@ -4413,7 +4463,7 @@ impl Database {
         // still owned by a known transfer id and survive orphan sweep. They are
         // restored into the manager as Failed (not auto-started).
         let mut stmt = conn.prepare(
-            "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich, ember_file_hash, friends_only
+            "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich, ember_file_hash, friends_only, failure_code
              FROM transfers
              WHERE status NOT IN ('completed', 'noneneeded')
                AND status NOT LIKE 'queue_overflow%'
@@ -4486,6 +4536,15 @@ impl Database {
                     if pin_corrupt {
                         status = TransferStatus::Failed;
                     }
+                    let stored_failure = if status == TransferStatus::Failed {
+                        row.get::<_, Option<String>>(17)
+                            .ok()
+                            .flatten()
+                            .and_then(|code| persisted_failure_code(&code))
+                    } else {
+                        None
+                    };
+                    let failure = pin_failure.or(stored_failure);
                     Ok(Transfer {
                         id: row.get(0)?,
                         // Defense-in-depth: re-sanitize the persisted name on
@@ -4514,8 +4573,8 @@ impl Database {
                         transferred: transferred_val,
                         completed_size: transferred_val,
                         started_at: row.get(11)?,
-                        failure_reason: pin_failure.map(|f| f.message().to_string()),
-                        failure_code: pin_failure.map(|f| f.as_code().to_string()),
+                        failure_reason: failure.map(|f| f.message().to_string()),
+                        failure_code: failure.map(|f| f.as_code().to_string()),
                         failure_kind: pin_corrupt.then(|| "permanent".to_string()),
                         failure_stage: None,
                         priority: row
@@ -4768,9 +4827,17 @@ impl Database {
 
     pub fn update_transfer_status(&self, transfer_id: &str, status: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
+        conn.execute(UPDATE_TRANSFER_STATUS_SQL, params![status, transfer_id])?;
+        Ok(())
+    }
+
+    /// Mark a download Failed together with why, which a restart reads back
+    /// to know whether Resume may continue it.
+    pub fn mark_transfer_failed(&self, transfer_id: &str, failure_code: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
         conn.execute(
-            "UPDATE transfers SET status = ?1 WHERE id = ?2",
-            params![status, transfer_id],
+            "UPDATE transfers SET status = 'failed', failure_code = ?1 WHERE id = ?2",
+            params![failure_code, transfer_id],
         )?;
         Ok(())
     }
@@ -4787,7 +4854,7 @@ impl Database {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         {
-            let mut stmt = tx.prepare("UPDATE transfers SET status = ?1 WHERE id = ?2")?;
+            let mut stmt = tx.prepare(UPDATE_TRANSFER_STATUS_SQL)?;
             for (transfer_id, status) in updates {
                 stmt.execute(params![status, transfer_id])?;
             }
@@ -16197,6 +16264,75 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("AICH")));
         }
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// Why a Failed download failed is read back after a restart, so a
+    /// failure Resume must not continue stays one; any other status drops it.
+    #[test]
+    fn a_failed_downloads_failure_code_survives_a_restart() {
+        for code in TransferFailureCode::ALL {
+            assert_eq!(persisted_failure_code(code.as_code()), Some(*code), "{code:?}");
+        }
+        assert_eq!(persisted_failure_code("from_a_newer_build"), None);
+
+        let path = std::env::temp_dir().join(format!(
+            "ember-failure-code-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).unwrap();
+        let insert = |id: &str, status: &str| {
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO transfers (
+                        id, file_name, file_hash, peer_id, peer_name, direction, status,
+                        progress, speed, total_size, transferred, started_at, priority, category
+                     ) VALUES (?1, 'file.bin', ?2, '', '', 'download', ?3, 0, 0, 4, 0, 1, 'normal', '')",
+                    params![id, "11".repeat(16), status],
+                )
+                .unwrap();
+        };
+        insert("mismatch", "searching");
+        insert("legacy", "failed");
+        insert("resumed", "searching");
+        db.mark_transfer_failed("mismatch", TransferFailureCode::AichHashMismatch.as_code())
+            .unwrap();
+        db.update_transfer_status("mismatch", "failed").unwrap();
+        db.mark_transfer_failed("resumed", TransferFailureCode::HashMismatch.as_code())
+            .unwrap();
+        db.update_transfer_status("resumed", "paused").unwrap();
+        db.update_transfer_status("resumed", "failed").unwrap();
+
+        let mut saved = db.get_incomplete_downloads().unwrap();
+        saved.sort_by(|a, b| a.id.cmp(&b.id));
+        let code_of = |rows: &[Transfer], id: &str| {
+            rows.iter().find(|t| t.id == id).unwrap().failure_code.clone()
+        };
+        assert_eq!(
+            code_of(&saved, "mismatch").as_deref(),
+            Some(TransferFailureCode::AichHashMismatch.as_code())
+        );
+        assert_eq!(code_of(&saved, "legacy"), None, "an older row behaves as before");
+        assert_eq!(code_of(&saved, "resumed"), None, "resuming it dropped the old failure");
+
+        let mut row = saved.into_iter().find(|t| t.id == "legacy").unwrap();
+        row.failure_code = Some(TransferFailureCode::EmberContentHashMismatch.as_code().into());
+        db.save_transfer(&row).unwrap();
+        let reloaded = db.get_incomplete_downloads().unwrap();
+        assert_eq!(
+            code_of(&reloaded, "legacy").as_deref(),
+            Some(TransferFailureCode::EmberContentHashMismatch.as_code())
+        );
+        row.status = TransferStatus::Queued;
+        db.save_transfer(&row).unwrap();
+        db.update_transfer_status("legacy", "failed").unwrap();
+        assert_eq!(code_of(&db.get_incomplete_downloads().unwrap(), "legacy"), None);
+
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));

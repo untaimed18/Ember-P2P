@@ -394,11 +394,16 @@ impl CompressedPartAccumulator {
 pub(super) const OUTSTANDING_RANGE_TTL: std::time::Duration =
     std::time::Duration::from_secs(30);
 
+static OUTSTANDING_RANGE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct OutstandingRange {
     pub start: u64,
     pub end: u64,
     expires_at: std::time::Instant,
+    /// Order the range was requested in. Uploaders serve in request order,
+    /// which is not offset order once blocks are held back and sent later.
+    seq: u64,
 }
 
 impl OutstandingRange {
@@ -407,6 +412,7 @@ impl OutstandingRange {
             start,
             end,
             expires_at: std::time::Instant::now() + OUTSTANDING_RANGE_TTL,
+            seq: OUTSTANDING_RANGE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -446,23 +452,25 @@ pub(super) fn expire_outstanding_ranges(outstanding: &mut Vec<OutstandingRange>)
 }
 
 pub(super) fn refresh_outstanding_range(outstanding: &mut [OutstandingRange], pkt_start: u64) {
-    if let Some(start) = outstanding
+    if let Some(seq) = outstanding
         .iter()
         .find(|r| pkt_start >= r.start && pkt_start < r.end)
-        .map(|r| r.start)
+        .map(|r| r.seq)
     {
-        touch_queued_from(outstanding, start);
+        touch_queued_from(outstanding, seq);
     }
 }
 
-/// Refresh every range from `start` on. Uploaders serve requests in order and
-/// ours ascend through the part, so the ranges after the one being sent are
-/// waiting their turn, not dropped. Timed from the request alone, the second
-/// of two blocks at 4 KB/s expired before its first byte (~45 s in), and each
-/// expiry re-requested more than the peer could ever deliver. Ranges before
-/// `start` the peer has skipped, and keep their own deadline.
-fn touch_queued_from(outstanding: &mut [OutstandingRange], start: u64) {
-    for r in outstanding.iter_mut().filter(|r| r.start >= start) {
+/// Refresh every range requested at or after `seq`. Uploaders serve requests
+/// in the order they were asked for, so the ranges after the one being sent
+/// are waiting their turn, not dropped. Timed from the request alone, the
+/// second of two blocks at 4 KB/s expired before its first byte (~45 s in),
+/// and each expiry re-requested more than the peer could ever deliver. Ranges
+/// requested earlier the peer has skipped, and keep their own deadline.
+/// Keyed on request order rather than offset: a held-back block goes out
+/// after higher offsets and waits behind them.
+fn touch_queued_from(outstanding: &mut [OutstandingRange], seq: u64) {
+    for r in outstanding.iter_mut().filter(|r| r.seq >= seq) {
         r.touch();
     }
 }
@@ -483,8 +491,8 @@ pub(super) fn take_completed_outstanding_range(
         .iter()
         .position(|r| pkt_start >= r.start && pkt_start < r.end && pkt_end == r.end)
     {
-        outstanding.swap_remove(i);
-        touch_queued_from(outstanding, pkt_end);
+        let done = outstanding.swap_remove(i);
+        touch_queued_from(outstanding, done.seq + 1);
         true
     } else {
         refresh_outstanding_range(outstanding, pkt_start);
@@ -2151,6 +2159,31 @@ mod tests {
         assert!(take_completed_outstanding_range(&mut outstanding, 100, 200));
         let now = std::time::Instant::now();
         assert!(outstanding.iter().find(|r| r.start == 200).unwrap().expires_at > now);
+    }
+
+    #[test]
+    fn a_held_back_lower_block_requested_later_stays_queued() {
+        let mut outstanding = Vec::new();
+        push_outstanding_batch(&mut outstanding, &[(100, 200), (200, 300)]);
+        // A block deferred earlier goes out in a later request.
+        push_outstanding_batch(&mut outstanding, &[(0, 100)]);
+        for r in &mut outstanding {
+            r.expires_at = std::time::Instant::now();
+        }
+        refresh_outstanding_range(&mut outstanding, 150);
+        let now = std::time::Instant::now();
+        let live = |o: &[OutstandingRange], start: u64| {
+            o.iter().find(|r| r.start == start).unwrap().expires_at > now
+        };
+        assert!(live(&outstanding, 0), "requested after the block being served");
+        assert!(live(&outstanding, 200));
+
+        for r in &mut outstanding {
+            r.expires_at = std::time::Instant::now();
+        }
+        assert!(take_completed_outstanding_range(&mut outstanding, 100, 200));
+        let now = std::time::Instant::now();
+        assert!(outstanding.iter().all(|r| r.expires_at > now));
     }
 
     #[test]
