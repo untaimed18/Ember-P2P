@@ -7063,6 +7063,94 @@ pub async fn batch_unshare(
     Ok(count)
 }
 
+/// Share Library rows again. Returns the count of files flipped to shared.
+///
+/// Only rows the index already holds are touched, so this re-offers what the
+/// user unshared and cannot reach a file that was never in a share. A row a
+/// partly shared folder withheld goes back on that folder's allowlist first:
+/// [`batch_share`] keeps a file the lists do not offer unshared, and the next
+/// scan would unshare it again.
+#[tauri::command]
+pub async fn share_library_files(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    file_paths: Vec<String>,
+) -> Result<u32, String> {
+    check_path_batch(&file_paths, MAX_BATCH_IDS)?;
+    let indexed: Vec<String> = {
+        let index = state.local_index.read().await;
+        file_paths
+            .iter()
+            .filter_map(|path| index.get_by_path(path).map(|file| file.path.clone()))
+            .collect()
+    };
+    if indexed.is_empty() {
+        return Ok(0);
+    }
+    let keys = indexed
+        .iter()
+        .map(|path| crate::search::index::normalize_path_key(path))
+        .collect::<Vec<_>>();
+    let mut readmitted = Vec::new();
+    edit_folder_lists(&state, |allowlists, withheld| {
+        readmitted = readmit_keys(allowlists, withheld, &keys);
+        !readmitted.is_empty()
+    })
+    .await?;
+    match batch_share(app, state.clone(), indexed).await {
+        Ok(count) => Ok(count),
+        Err(e) => {
+            if let Err(undo_error) = drop_from_allowlists(&state, &readmitted).await {
+                warn!("Could not withhold files again after a failed share: {undo_error}");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Put each of `keys` that a partly shared folder withheld back on that
+/// folder's allowlist: the innermost one holding it, which is the one that
+/// decides whether it is offered. Keys no list withheld are left alone; they
+/// are offered already or were never listed. Returns the keys added.
+fn readmit_keys(
+    allowlists: &mut std::collections::HashMap<String, Vec<String>>,
+    withheld: &std::collections::HashMap<String, Vec<String>>,
+    keys: &[String],
+) -> Vec<String> {
+    let mut permitted: std::collections::HashMap<String, HashSet<String>> =
+        std::collections::HashMap::new();
+    let mut added = Vec::new();
+    for key in keys {
+        let Some(folder) = allowlists
+            .keys()
+            .filter(|folder| crate::security::path_within_dir(key, folder))
+            .max_by_key(|folder| folder.len())
+            .cloned()
+        else {
+            continue;
+        };
+        let Some(list) = allowlists.get_mut(&folder) else {
+            continue;
+        };
+        let allowed = permitted
+            .entry(folder.clone())
+            .or_insert_with(|| list.iter().cloned().collect());
+        if allowlist_permits(allowed, key) {
+            continue;
+        }
+        let was_withheld = withheld
+            .get(&folder)
+            .is_some_and(|entries| entries.iter().any(|entry| path_key_covers(entry, key)));
+        if !was_withheld {
+            continue;
+        }
+        allowed.insert(key.clone());
+        list.push(key.clone());
+        added.push(key.clone());
+    }
+    added
+}
+
 #[tauri::command]
 pub async fn reload_shared_files(
     app: tauri::AppHandle,
@@ -9723,6 +9811,42 @@ mod tests {
         lists.clear();
         assert!(tidy_withheld(&lists, &mut withheld));
         assert!(withheld.is_empty());
+    }
+
+    #[test]
+    fn sharing_a_withheld_file_again_puts_it_back_on_its_list() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let folder = crate::search::index::normalize_path_key(&format!("C:{sep}music"));
+        let a = format!("{folder}{sep}a.mp3");
+        let b = format!("{folder}{sep}b.mp3");
+        let sub = format!("{folder}{sep}live");
+        let in_sub = format!("{sub}{sep}c.mp3");
+        let never = format!("{folder}{sep}never-listed.mp3");
+        let elsewhere = crate::search::index::normalize_path_key(&format!("D:{sep}films{sep}d.mkv"));
+        let mut lists = std::collections::HashMap::from([
+            (folder.clone(), vec![b.clone()]),
+            (sub.clone(), Vec::new()),
+        ]);
+        let mut withheld = std::collections::HashMap::from([
+            (folder.clone(), vec![a.clone()]),
+            (sub.clone(), vec![sub.clone()]),
+        ]);
+
+        let added = readmit_keys(
+            &mut lists,
+            &withheld,
+            &[a.clone(), b.clone(), in_sub.clone(), never.clone(), elsewhere],
+        );
+        assert_eq!(added, vec![a.clone(), in_sub.clone()]);
+        assert_eq!(lists[&folder], vec![b.clone(), a.clone()]);
+        assert_eq!(lists[&sub], vec![in_sub.clone()], "the innermost list decides");
+        let offers = crate::sharing::indexer::AllowlistOffers::new(&lists);
+        assert!(offers.offers(&a) && offers.offers(&in_sub));
+        assert!(!offers.offers(&never), "a file no list withheld is not let in");
+
+        assert!(tidy_withheld(&lists, &mut withheld));
+        assert!(!withheld.contains_key(&folder), "a file shared again is no longer withheld");
+        assert_eq!(withheld[&sub], vec![sub.clone()], "the rest of the folder stays withheld");
     }
 
     /// Unsharing a partly shared folder must leave it limited, to nothing: with

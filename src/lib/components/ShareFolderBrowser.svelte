@@ -1,8 +1,16 @@
 <script lang="ts">
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
-  import { untrack } from 'svelte';
+  import { tick, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
+  import {
+    FILE_TYPE_FILTERS,
+    extensionFromPath,
+    fileTypeFilterLabel,
+    fileTypeKey,
+    type FileTypeFilter,
+  } from '$lib/fileTypes';
+  import { isShortcutLetter } from '$lib/shortcutKey';
   import { translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
   import { inertBackground, trapTabKey } from '$lib/a11y';
@@ -36,12 +44,18 @@
   const IS_WINDOWS =
     typeof navigator !== 'undefined' &&
     (/Win/i.test(navigator.platform) || /Windows/i.test(navigator.userAgent));
+  const IS_MAC =
+    typeof navigator !== 'undefined' && /Mac|iPhone|iPad/i.test(navigator.platform);
+  const SHARE_SHORTCUT = IS_MAC ? '⌘↩' : 'Ctrl+Enter';
+  const LAST_PATH_KEY = 'share-browser-last-path';
 
   let overlayEl: HTMLDivElement | undefined = $state(undefined);
   let dialogEl: HTMLDivElement | undefined = $state(undefined);
   let pathInputEl: HTMLInputElement | undefined = $state(undefined);
   let listEl: HTMLDivElement | undefined = $state(undefined);
+  let selectAllEl: HTMLInputElement | undefined = $state(undefined);
   let treeRowEls: Record<number, HTMLDivElement | undefined> = {};
+  let listRowEls: Record<string, HTMLDivElement | undefined> = {};
   let returnFocusEl: HTMLElement | null = null;
 
   let sessionId: number | null = $state(null);
@@ -60,6 +74,16 @@
   let loadGen = 0;
   let sessionGen = 0;
   let rootEntry: ShareBrowserEntry | null = $state(null);
+  let typeFilter = $state<FileTypeFilter>('All');
+  let nameFilter = $state('');
+  let sortKey = $state<'name' | 'size'>('name');
+  let sortAsc = $state(true);
+  /** Where a Shift-click or Shift+Space range starts. */
+  let anchorPath: string | null = null;
+  /** The list row and tree row that take Tab, one each. */
+  let focusedPath = $state<string | null>(null);
+  let focusedTreeId = $state<number | null>(null);
+  let selectionNote = $state<string | null>(null);
 
   $effect(() => {
     if (!open || !overlayEl) return;
@@ -103,6 +127,12 @@
     children = [];
     truncated = false;
     pathDraft = '';
+    typeFilter = 'All';
+    nameFilter = '';
+    anchorPath = null;
+    focusedPath = null;
+    focusedTreeId = null;
+    selectionNote = null;
     try {
       const view = await openShareBrowser();
       if (gen !== sessionGen) {
@@ -112,12 +142,16 @@
       sessionId = view.session_id;
       applyView(view, { recordHistory: false });
       expanded = new Set([view.current.id]);
-      // This PC repeats the same places in both panes, and it cannot be
-      // shared. Land in Documents (then Downloads) so the list is files.
-      const start = view.children.find((entry) => entry.kind === 'documents')
-        ?? view.children.find((entry) => entry.kind === 'downloads');
-      if (start && gen === sessionGen) {
-        await showEntry(start.id, { recordHistory: true });
+      // Back where the user last browsed, which is usually where the next
+      // files to share are. A folder since removed falls through to the default.
+      const lastPath = readLastPath();
+      const reopened = !!lastPath && (await openPathQuietly(lastPath, gen));
+      if (!reopened && gen === sessionGen) {
+        // This PC repeats the same places in both panes, and it cannot be
+        // shared. Land in Documents (then Downloads) so the list is files.
+        const start = view.children.find((entry) => entry.kind === 'documents')
+          ?? view.children.find((entry) => entry.kind === 'downloads');
+        if (start) await showEntry(start.id, { recordHistory: true });
       }
       requestAnimationFrame(() => pathInputEl?.focus());
     } catch (e: unknown) {
@@ -127,12 +161,43 @@
     }
   }
 
+  function readLastPath(): string | null {
+    try { return localStorage.getItem(LAST_PATH_KEY); } catch { return null; }
+  }
+
+  function rememberLastPath(path: string) {
+    try { localStorage.setItem(LAST_PATH_KEY, path); } catch { /* storage unavailable */ }
+  }
+
+  /** Open `path` at session start, reporting nothing if it is gone. */
+  async function openPathQuietly(path: string, gen: number): Promise<boolean> {
+    if (sessionId == null) return false;
+    try {
+      const view = await navigateShareBrowser(sessionId, path);
+      if (gen !== sessionGen) return false;
+      applyView(view);
+      const next = new Set(expanded);
+      next.add(view.current.id);
+      if (view.current.parent_id != null) next.add(view.current.parent_id);
+      expanded = next;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   function applyView(view: ShareBrowserView, opts?: { recordHistory?: boolean }) {
     const movedFolder = currentEntry?.id !== view.current.id;
     if (opts?.recordHistory !== false && currentEntry && movedFolder) {
       history = [...history, currentEntry.id];
     }
-    if (movedFolder) includeSubfolders = true;
+    if (movedFolder) {
+      includeSubfolders = true;
+      nameFilter = '';
+      focusedPath = null;
+      anchorPath = null;
+    }
+    if (view.current.kind !== 'this_pc' && view.current.path) rememberLastPath(view.current.path);
     // A new folder starts at its first item. Keeping the old offset would
     // drop the user into the middle of a list they have not seen.
     if (movedFolder && listEl) listEl.scrollTop = 0;
@@ -167,9 +232,33 @@
     entryByPath = known;
   }
 
+  /** Whether keyboard focus is in the list. A navigation replaces its rows,
+   *  and the focused one going with them would drop focus out of the dialog. */
+  function listHasFocus(): boolean {
+    const active = typeof document !== 'undefined' ? document.activeElement : null;
+    return !!listEl && !!active && listEl.contains(active);
+  }
+
+  /** Focus `preferPath`'s row (the folder just left, after Up), else the first. */
+  async function refocusList(preferPath?: string | null) {
+    await tick();
+    const rows = visibleChildren;
+    const target = (preferPath ? rows.find((row) => row.path === preferPath) : undefined) ?? rows[0];
+    if (!target) {
+      listEl?.focus();
+      return;
+    }
+    focusedPath = target.path;
+    await tick();
+    listRowEls[target.path]?.focus();
+    listRowEls[target.path]?.scrollIntoView({ block: 'nearest' });
+  }
+
   async function showEntry(id: number, opts?: { recordHistory?: boolean }) {
     if (sessionId == null || sharing) return;
     const gen = ++loadGen;
+    const keepFocus = listHasFocus();
+    const leaving = currentEntry?.path ?? null;
     loading = true;
     error = null;
     try {
@@ -179,6 +268,7 @@
       const next = new Set(expanded);
       next.add(id);
       expanded = next;
+      if (keepFocus) void refocusList(leaving);
     } catch (e: unknown) {
       if (gen === loadGen) error = translateError(e);
     } finally {
@@ -256,13 +346,48 @@
     return entry.share_status === 'already' || entry.share_status === 'inherited';
   }
 
-  function toggleSelect(entry: ShareBrowserEntry, e?: Event) {
-    e?.stopPropagation();
+  /** Commit a selection, held to what one share may name. Paths already
+   *  selected keep their place; the newest beyond the cap are left off. */
+  function setSelection(next: Set<string>) {
+    if (next.size > MAX_SHARE_SELECTION && next.size > selectedPaths.size) {
+      next = new Set([...next].slice(0, MAX_SHARE_SELECTION));
+      selectionNote = m.library_explorer_selection_cap({ count: formatNumber(MAX_SHARE_SELECTION) });
+    } else {
+      selectionNote = null;
+    }
+    selectedPaths = next;
+  }
+
+  /** Tick or untick one entry. With Shift, every checkable entry between it
+   *  and the last one toggled takes the state this one takes. */
+  function toggleSelect(entry: ShareBrowserEntry, shiftKey = false) {
     if (!canCheck(entry) || !entry.path) return;
     const next = new Set(selectedPaths);
-    if (next.has(entry.path)) next.delete(entry.path);
-    else next.add(entry.path);
-    selectedPaths = next;
+    const on = !next.has(entry.path);
+    const rows = visibleChildren;
+    const from = shiftKey && anchorPath ? rows.findIndex((row) => row.path === anchorPath) : -1;
+    const to = from >= 0 ? rows.findIndex((row) => row.path === entry.path) : -1;
+    const range = to >= 0 ? rows.slice(Math.min(from, to), Math.max(from, to) + 1) : [entry];
+    for (const row of range) {
+      if (!canCheck(row) || !row.path) continue;
+      if (on) next.add(row.path);
+      else next.delete(row.path);
+    }
+    anchorPath = entry.path;
+    setSelection(next);
+  }
+
+  function toggleSelectAll() {
+    const next = new Set(selectedPaths);
+    if (allVisibleChecked) for (const entry of checkableVisible) next.delete(entry.path);
+    else for (const entry of checkableVisible) next.add(entry.path);
+    setSelection(next);
+  }
+
+  function clearSelection() {
+    selectedPaths = new Set();
+    selectionNote = null;
+    anchorPath = null;
   }
 
   let entryByPath = $state(new Map<string, ShareBrowserEntry>());
@@ -274,6 +399,57 @@
   let selectedFolderCount = $derived(selectedEntries.length - selectedFileCount);
   let currentShareable = $derived(currentEntry?.share_status === 'shareable');
   let currentPartial = $derived(currentEntry?.share_status === 'partial');
+
+  let filterActive = $derived(typeFilter !== 'All' || nameFilter.trim() !== '');
+  /** The open folder's entries as listed: filtered, then sorted. Folders stay
+   *  ahead of files, in name order, whatever the files are sorted by. */
+  let visibleChildren = $derived.by(() => {
+    const query = nameFilter.trim().toLowerCase();
+    let rows = children;
+    if (filterActive) {
+      rows = rows.filter((entry) => {
+        if (typeFilter !== 'All') {
+          if (entry.kind !== 'file' || fileTypeKey(extensionFromPath(entry.name)) !== typeFilter) return false;
+        }
+        return !query || entryLabel(entry).toLowerCase().includes(query);
+      });
+    }
+    if (sortKey === 'name' && sortAsc) return rows;
+    const folders = rows.filter((entry) => entry.kind !== 'file');
+    const files = rows.filter((entry) => entry.kind === 'file');
+    if (sortKey === 'name') {
+      folders.reverse();
+      files.reverse();
+    } else {
+      const dir = sortAsc ? 1 : -1;
+      files.sort((a, b) => dir * ((a.size ?? 0) - (b.size ?? 0)));
+    }
+    return [...folders, ...files];
+  });
+  let checkableVisible = $derived(visibleChildren.filter((entry) => canCheck(entry) && !!entry.path));
+  let allVisibleChecked = $derived(
+    checkableVisible.length > 0 && checkableVisible.every((entry) => selectedPaths.has(entry.path)),
+  );
+  let someVisibleChecked = $derived(checkableVisible.some((entry) => selectedPaths.has(entry.path)));
+  $effect(() => {
+    if (selectAllEl) selectAllEl.indeterminate = someVisibleChecked && !allVisibleChecked;
+  });
+  /** The list row that takes Tab: the one last focused, else the first. */
+  let tabbablePath = $derived(
+    focusedPath && visibleChildren.some((entry) => entry.path === focusedPath)
+      ? focusedPath
+      : visibleChildren[0]?.path ?? null,
+  );
+
+  function toggleSort(key: 'name' | 'size') {
+    if (sortKey === key) {
+      sortAsc = !sortAsc;
+    } else {
+      sortKey = key;
+      // Biggest first is what a size column is clicked for.
+      sortAsc = key === 'name';
+    }
+  }
 
   /**
    * Sharing the open folder takes its subfolders too, as every Ember share
@@ -293,7 +469,8 @@
       && currentSubfolders > 0
       && currentOwnFiles.length <= MAX_SHARE_SELECTION
       && !truncated
-      && !loading,
+      && !loading
+      && !filterActive,
   );
   let ownFilesOnly = $derived(offerSubfolderChoice && !includeSubfolders);
 
@@ -302,6 +479,9 @@
       return [...selectedPaths].map((path) => idByPath.get(path)).filter((id): id is number => id != null);
     }
     if (ownFilesOnly) return currentOwnFiles.map((entry) => entry.id);
+    // A filtered list reads as "these", so sharing the whole folder from it
+    // would offer far more than what is on screen.
+    if (filterActive) return [];
     return currentEntry && (currentShareable || currentPartial) ? [currentEntry.id] : [];
   });
   let shareDisabled = $derived(sharing || loading || shareIds.length === 0);
@@ -314,6 +494,7 @@
       });
     }
     if (selectedCount === 0) {
+      if (filterActive) return m.library_explorer_share();
       if (currentPartial) return m.library_explorer_share_rest();
       if (currentShareable) return m.library_explorer_share_folder();
       return m.library_explorer_share();
@@ -337,6 +518,7 @@
         : m.library_explorer_outcome_own_files({ count: currentOwnFiles.length });
     }
     if (selectedCount === 0) {
+      if (filterActive) return m.library_explorer_outcome_filtered();
       if (currentPartial) return m.library_explorer_outcome_rest();
       if (currentShareable) return m.library_explorer_outcome_folder();
       if (currentEntry?.share_status === 'inherited') return m.library_explorer_outcome_inherited();
@@ -517,6 +699,98 @@
     return rows;
   });
 
+  /** The tree row that takes Tab: the one last focused, else the open folder. */
+  let tabbableTreeId = $derived.by(() => {
+    const ids = treeRows.map((row) => row.entry.id);
+    if (focusedTreeId != null && ids.includes(focusedTreeId)) return focusedTreeId;
+    if (currentEntry && ids.includes(currentEntry.id)) return currentEntry.id;
+    return ids[0] ?? null;
+  });
+
+  function focusTreeRow(id: number) {
+    focusedTreeId = id;
+    treeRowEls[id]?.focus();
+  }
+
+  function onTreeKey(e: KeyboardEvent, row: TreeRow, index: number) {
+    // Leave the chevron button's own Enter/Space activation alone, and the
+    // dialog's Alt+arrow history keys.
+    if (e.target !== e.currentTarget || e.altKey || e.ctrlKey || e.metaKey) return;
+    const rows = treeRows;
+    const move = (to: number) => {
+      const target = rows[Math.max(0, Math.min(rows.length - 1, to))];
+      if (target) focusTreeRow(target.entry.id);
+    };
+    switch (e.key) {
+      case 'Enter':
+      case ' ':
+        e.preventDefault();
+        void showEntry(row.entry.id);
+        break;
+      case 'ArrowDown': e.preventDefault(); move(index + 1); break;
+      case 'ArrowUp': e.preventDefault(); move(index - 1); break;
+      case 'Home': e.preventDefault(); move(0); break;
+      case 'End': e.preventDefault(); move(rows.length - 1); break;
+      case 'ArrowRight':
+        e.preventDefault();
+        if (row.canExpand && !row.isExpanded) toggleExpand(row.entry, e);
+        else if (row.isExpanded && (rows[index + 1]?.depth ?? 0) > row.depth) move(index + 1);
+        break;
+      case 'ArrowLeft': {
+        e.preventDefault();
+        if (row.isExpanded) {
+          toggleExpand(row.entry, e);
+          break;
+        }
+        const parent = rows.findIndex((other) => other.entry.id === row.entry.parent_id);
+        if (parent >= 0) move(parent);
+        break;
+      }
+    }
+  }
+
+  function focusListRow(path: string) {
+    focusedPath = path;
+    listRowEls[path]?.focus();
+  }
+
+  /** A row's click or Enter: a file is ticked, a folder is opened. */
+  function activateRow(entry: ShareBrowserEntry, shiftKey: boolean) {
+    if (entry.kind === 'file') toggleSelect(entry, shiftKey);
+    else void showEntry(entry.id);
+  }
+
+  function onRowKey(e: KeyboardEvent, entry: ShareBrowserEntry, index: number) {
+    if (e.target !== e.currentTarget) return;
+    if ((e.ctrlKey || e.metaKey) && isShortcutLetter(e, 'a')) {
+      e.preventDefault();
+      if (!allVisibleChecked) toggleSelectAll();
+      return;
+    }
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+    const rows = visibleChildren;
+    const move = (to: number) => {
+      const target = rows[Math.max(0, Math.min(rows.length - 1, to))];
+      if (target) focusListRow(target.path);
+    };
+    switch (e.key) {
+      case 'ArrowDown': e.preventDefault(); move(index + 1); break;
+      case 'ArrowUp': e.preventDefault(); move(index - 1); break;
+      case 'PageDown': e.preventDefault(); move(index + 10); break;
+      case 'PageUp': e.preventDefault(); move(index - 10); break;
+      case 'Home': e.preventDefault(); move(0); break;
+      case 'End': e.preventDefault(); move(rows.length - 1); break;
+      case ' ':
+        e.preventDefault();
+        toggleSelect(entry, e.shiftKey);
+        break;
+      case 'Enter':
+        e.preventDefault();
+        activateRow(entry, e.shiftKey);
+        break;
+    }
+  }
+
   async function shareSelected() {
     if (sessionId == null || shareIds.length === 0 || sharing) return;
     sharing = true;
@@ -587,6 +861,7 @@
   }
 
   function statusLabel(entry: ShareBrowserEntry): string | null {
+    if (entry.library_unshared) return m.library_not_shared();
     switch (entry.share_status) {
       case 'already': return m.library_explorer_already();
       case 'partial': {
@@ -625,7 +900,11 @@
     aria-modal="true"
     aria-labelledby="share-explorer-title"
     tabindex="-1"
-    onclick={(e) => { if (e.target === e.currentTarget && !sharing) closeDialog(); }}
+    onclick={(e) => {
+      // A stray click outside must not throw away a selection gathered
+      // across folders; Cancel and Escape still close.
+      if (e.target === e.currentTarget && !sharing && selectedCount === 0) closeDialog();
+    }}
     onkeydown={onDialogKey}
     transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
   >
@@ -662,7 +941,31 @@
             placeholder={IS_WINDOWS ? m.library_explorer_this_pc() : m.library_explorer_computer()}
             disabled={sharing}
           />
+          {#if loading && children.length > 0}
+            <span class="spinner xs current path-spinner" aria-hidden="true"></span>
+          {/if}
         </form>
+        <input
+          class="name-filter"
+          type="search"
+          bind:value={nameFilter}
+          placeholder={m.library_explorer_filter_placeholder()}
+          aria-label={m.library_explorer_filter_aria()}
+          disabled={sharing}
+          onkeydown={(e) => {
+            // Escape empties the filter before it closes the dialog.
+            if (e.key === 'Escape' && nameFilter) {
+              e.preventDefault();
+              e.stopPropagation();
+              nameFilter = '';
+            }
+          }}
+        />
+        <select class="type-filter" bind:value={typeFilter} aria-label={m.library_type_filter_aria()} disabled={sharing}>
+          {#each FILE_TYPE_FILTERS as opt (opt)}
+            <option value={opt}>{fileTypeFilterLabel(opt)}</option>
+          {/each}
+        </select>
       </div>
 
       {#if error}
@@ -671,7 +974,7 @@
 
       <div class="panes">
         <div class="tree" role="tree" aria-label={m.library_explorer_tree_aria()}>
-          {#each treeRows as row (row.entry.id)}
+          {#each treeRows as row, index (row.entry.id)}
             <div
               class="tree-row"
               bind:this={treeRowEls[row.entry.id]}
@@ -682,28 +985,17 @@
               aria-level={row.depth + 1}
               aria-expanded={row.canExpand ? row.isExpanded : undefined}
               aria-selected={currentEntry?.id === row.entry.id}
-              tabindex="0"
+              tabindex={row.entry.id === tabbableTreeId ? 0 : -1}
+              onfocus={() => (focusedTreeId = row.entry.id)}
               onclick={() => void showEntry(row.entry.id, { recordHistory: true })}
-              onkeydown={(e) => {
-                // Leave the chevron button's own Enter/Space activation alone.
-                if (e.target !== e.currentTarget) return;
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault();
-                  void showEntry(row.entry.id);
-                } else if (e.key === 'ArrowRight' && row.canExpand && !row.isExpanded) {
-                  e.preventDefault();
-                  toggleExpand(row.entry, e);
-                } else if (e.key === 'ArrowLeft' && row.isExpanded) {
-                  e.preventDefault();
-                  toggleExpand(row.entry, e);
-                }
-              }}
+              onkeydown={(e) => onTreeKey(e, row, index)}
             >
               {#if row.canExpand}
                 <button
                   type="button"
                   class="chevron"
                   class:open={row.isExpanded}
+                  tabindex="-1"
                   onclick={(e) => toggleExpand(row.entry, e)}
                   aria-label={row.isExpanded ? m.library_folder_collapse() : m.library_folder_expand()}
                 >
@@ -726,62 +1018,120 @@
           {/each}
         </div>
 
-        <div class="list" bind:this={listEl} role="group" aria-label={m.library_explorer_list_aria()} aria-busy={loading}>
+        <div
+          class="list"
+          class:busy={loading && children.length > 0}
+          bind:this={listEl}
+          tabindex="-1"
+          aria-busy={loading}
+        >
           {#if loading && children.length === 0}
             <div class="empty">{m.library_loading_ellipsis()}</div>
           {:else if children.length === 0}
             <div class="empty">{m.library_explorer_empty()}</div>
           {:else}
             <div class="list-head">
+              <input
+                bind:this={selectAllEl}
+                type="checkbox"
+                checked={allVisibleChecked}
+                disabled={checkableVisible.length === 0 || sharing || loading}
+                onclick={(e) => {
+                  const box = e.currentTarget;
+                  toggleSelectAll();
+                  void tick().then(() => { box.checked = allVisibleChecked; });
+                }}
+                aria-label={m.library_explorer_select_all()}
+                title={m.library_explorer_select_all()}
+              />
+              <button
+                type="button"
+                class="sort-btn"
+                onclick={() => toggleSort('name')}
+              >
+                {m.browse_col_name()}
+                {#if sortKey === 'name'}<span class="sort-arrow" aria-hidden="true">{sortAsc ? '▲' : '▼'}</span>{/if}
+              </button>
               <span></span>
-              <span>{m.browse_col_name()}</span>
-              <span class="list-size">{m.library_col_size()}</span>
+              <button
+                type="button"
+                class="sort-btn sort-size"
+                onclick={() => toggleSort('size')}
+              >
+                {#if sortKey === 'size'}<span class="sort-arrow" aria-hidden="true">{sortAsc ? '▲' : '▼'}</span>{/if}
+                {m.library_col_size()}
+              </button>
             </div>
-            {#each children as entry (entry.id)}
-              {@const badge = statusLabel(entry)}
-              <div class="list-row" class:shared={isShared(entry)} class:file={entry.kind === 'file'}>
-                <input
-                  type="checkbox"
-                  checked={selectedPaths.has(entry.path) || isShared(entry)}
-                  disabled={!canCheck(entry) || sharing}
-                  onchange={() => toggleSelect(entry)}
-                  aria-label={entryLabel(entry)}
-                />
+            {#if visibleChildren.length === 0}
+              <div class="empty">
+                {m.library_explorer_no_matches()}
                 <button
                   type="button"
-                  class="list-open"
-                  onclick={() => {
-                    if (entry.kind === 'file') toggleSelect(entry);
-                    else void showEntry(entry.id);
-                  }}
-                  title={entry.path}
-                >
-                  <span class="glyph" aria-hidden="true">
-                    {#if entry.kind === 'file'}
-                      <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M4 2.5h5l3 3V13a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1z"/><path d="M9 2.5V6h3"/></svg>
-                    {:else}
-                      <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 4.5a1 1 0 0 1 1-1h3l1.5 1.5H13a1 1 0 0 1 1 1V12a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z"/></svg>
-                    {/if}
-                  </span>
-                  <span class="list-name">{entryLabel(entry)}</span>
-                </button>
-                {#if badge}
-                  <span
-                    class="badge sm row-badge {entry.share_status === 'overlap'
-                      || entry.share_status === 'contains_shared'
-                      || entry.share_status === 'blocked'
-                      ? 'tone-warning'
-                      : isShared(entry) && entry.share_status !== 'partial'
-                        ? 'tone-accent'
-                        : 'tone-muted'}"
-                  >{badge}</span>
-                {:else if entry.kind === 'file' && entry.size != null}
-                  <span class="list-size">{formatBytes(entry.size)}</span>
-                {:else}
-                  <span class="list-size"></span>
-                {/if}
+                  class="link-btn"
+                  onclick={() => { nameFilter = ''; typeFilter = 'All'; }}
+                >{m.common_clear_filters()}</button>
               </div>
-            {/each}
+            {/if}
+            <div role="listbox" aria-multiselectable="true" aria-label={m.library_explorer_list_aria()}>
+              {#each visibleChildren as entry, index (entry.id)}
+                {@const badge = statusLabel(entry)}
+                {@const checked = selectedPaths.has(entry.path) || isShared(entry)}
+                <div
+                  class="list-row"
+                  class:shared={isShared(entry)}
+                  class:file={entry.kind === 'file'}
+                  class:checked={selectedPaths.has(entry.path)}
+                  bind:this={listRowEls[entry.path]}
+                  role="option"
+                  aria-selected={checked}
+                  aria-disabled={entry.kind === 'file' && !canCheck(entry)}
+                  tabindex={entry.path === tabbablePath ? 0 : -1}
+                  title={entry.path}
+                  onfocus={() => (focusedPath = entry.path)}
+                  onclick={(e) => activateRow(entry, e.shiftKey)}
+                  onkeydown={(e) => onRowKey(e, entry, index)}
+                >
+                  <input
+                    type="checkbox"
+                    {checked}
+                    disabled={!canCheck(entry) || sharing}
+                    tabindex="-1"
+                    aria-hidden="true"
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      const box = e.currentTarget;
+                      toggleSelect(entry, e.shiftKey);
+                      // A path the selection cap left off must not stay ticked.
+                      void tick().then(() => { box.checked = selectedPaths.has(entry.path) || isShared(entry); });
+                    }}
+                  />
+                  <span class="list-open">
+                    <span class="glyph" aria-hidden="true">
+                      {#if entry.kind === 'file'}
+                        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M4 2.5h5l3 3V13a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1z"/><path d="M9 2.5V6h3"/></svg>
+                      {:else}
+                        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 4.5a1 1 0 0 1 1-1h3l1.5 1.5H13a1 1 0 0 1 1 1V12a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z"/></svg>
+                      {/if}
+                    </span>
+                    <span class="list-name">{entryLabel(entry)}</span>
+                  </span>
+                  {#if badge}
+                    <span
+                      class="badge sm row-badge {entry.share_status === 'overlap'
+                        || entry.share_status === 'contains_shared'
+                        || entry.share_status === 'blocked'
+                        ? 'tone-warning'
+                        : isShared(entry) && entry.share_status !== 'partial'
+                          ? 'tone-accent'
+                          : 'tone-muted'}"
+                    >{badge}</span>
+                  {:else}
+                    <span></span>
+                  {/if}
+                  <span class="list-size">{entry.kind === 'file' && entry.size != null ? formatBytes(entry.size) : ''}</span>
+                </div>
+              {/each}
+            </div>
             {#if truncated}
               <div class="empty">{m.library_explorer_truncated({ count: formatNumber(children.length) })}</div>
             {/if}
@@ -829,12 +1179,26 @@
               <span class="summary-hint">{summaryHint}</span>
             {/if}
           {/if}
+          {#if selectedCount > 0}
+            <button type="button" class="link-btn summary-clear" onclick={clearSelection} disabled={sharing}>
+              {m.library_explorer_clear_selection()}
+            </button>
+          {/if}
         </div>
-        <p class="selection-meta">{shareOutcome}</p>
+        <p class="selection-meta">
+          {#if selectionNote}<span class="selection-note">{selectionNote}</span>{/if}
+          {shareOutcome}
+        </p>
         <div class="footer-actions">
           <button type="button" class="ghost footer-fallback" onclick={useSystemDialog} disabled={sharing}>{m.library_explorer_system_dialog()}</button>
           <button type="button" class="ghost" onclick={closeDialog} disabled={sharing}>{m.common_cancel()}</button>
-          <button type="button" onclick={() => void shareSelected()} disabled={shareDisabled}>
+          <button
+            type="button"
+            onclick={() => void shareSelected()}
+            disabled={shareDisabled}
+            title={m.library_explorer_share_shortcut({ keys: SHARE_SHORTCUT })}
+            aria-keyshortcuts={IS_MAC ? 'Meta+Enter' : 'Control+Enter'}
+          >
             {shareLabel}
           </button>
         </div>
@@ -925,7 +1289,31 @@
     background: var(--bg-hover);
     transform: none;
   }
-  .path-form { flex: 1; min-width: 0; }
+  .path-form { flex: 1; min-width: 0; position: relative; }
+  .path-spinner {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    margin-top: -6px;
+    pointer-events: none;
+  }
+  .name-filter, .type-filter {
+    height: 28px;
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    font: inherit;
+    font-size: var(--font-size-sm);
+  }
+  .name-filter { width: 170px; padding: 0 8px; }
+  .type-filter { padding: 0 6px; }
+  .name-filter:focus, .type-filter:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-halo);
+  }
   .path-input {
     width: 100%;
     height: 28px;
@@ -1019,8 +1407,17 @@
   }
   .list-head, .list-row {
     display: grid;
-    grid-template-columns: 22px minmax(0, 1fr) max-content;
+    grid-template-columns: 22px minmax(0, 1fr) max-content 72px;
     column-gap: 8px;
+  }
+  .list:focus { outline: none; }
+  /* Dimmed only once a load has run long enough to notice, so a quick folder
+     change does not flash. */
+  .list [role='listbox'] { transition: opacity 120ms ease 0ms; }
+  .list.busy [role='listbox'] {
+    opacity: 0.5;
+    pointer-events: none;
+    transition-delay: 150ms;
   }
   .list-head {
     position: sticky;
@@ -1036,13 +1433,54 @@
     font-weight: 600;
     letter-spacing: 0.02em;
   }
-  .list-row { padding: 2px 8px; cursor: default; }
-  .list-row input {
+  .list-row { padding: 2px 8px; user-select: none; }
+  .list-row.checked { background: color-mix(in srgb, var(--accent) 9%, transparent); }
+  .list-row.checked:hover { background: color-mix(in srgb, var(--accent) 14%, var(--bg-hover)); }
+  .list-row:focus-visible, .tree-row:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  .list-row input, .list-head input {
     margin: 0;
     width: 14px;
     height: 14px;
     accent-color: var(--accent);
     justify-self: center;
+  }
+  button.sort-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0;
+    border: none;
+    background: none;
+    color: inherit;
+    font: inherit;
+    letter-spacing: inherit;
+    cursor: pointer;
+    transform: none;
+    justify-self: start;
+  }
+  button.sort-btn:not(:disabled):hover { color: var(--text-primary); background: none; transform: none; }
+  button.sort-btn.sort-size { justify-self: end; }
+  .sort-arrow { font-size: 0.7em; }
+  button.link-btn {
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--accent);
+    font: inherit;
+    font-size: var(--font-size-sm);
+    font-weight: 400;
+    cursor: pointer;
+    transform: none;
+  }
+  button.link-btn:not(:disabled):hover { background: none; text-decoration: underline; transform: none; }
+  .empty button.link-btn { margin-left: 6px; }
+  .summary-clear { margin-left: auto; }
+  .selection-note {
+    display: block;
+    color: var(--warning);
   }
   .list-size {
     justify-self: end;
@@ -1052,31 +1490,14 @@
     white-space: nowrap;
   }
   .list-row .badge { margin-left: 0; justify-self: end; }
-  /* Opens the folder. A real button so Tab and Enter work without a roving
-     tabindex, and so the checkbox beside it stays independently reachable. */
   .list-open {
     display: flex;
     align-items: center;
     gap: 6px;
-    flex: 1;
     min-width: 0;
     padding: 2px 4px;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: inherit;
-    font: inherit;
-    text-align: left;
-    cursor: pointer;
   }
-  .list-open:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
-  }
-  .row-badge {
-    margin-left: auto;
-    flex-shrink: 0;
-  }
+  .row-badge { flex-shrink: 0; }
   .empty {
     padding: 24px 12px;
     text-align: center;

@@ -21,6 +21,7 @@
     openSharedFolder as openSharedFolderCommand,
     batchSetPriority,
     batchUnshare,
+    shareLibraryFiles,
     setFilesFriendsOnly,
     republishFile,
     scanMissingFiles,
@@ -52,7 +53,7 @@
     incomingCollection,
     markIncomingCollectionPresented,
   } from '$lib/stores/collection';
-  import { toast as toastInfo, toastSuccess, toastError, toastWarning } from '$lib/stores/toast';
+  import { addActionToast, toast as toastInfo, toastSuccess, toastError, toastWarning } from '$lib/stores/toast';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
     formatSize,
@@ -610,8 +611,37 @@
   let typeFilter: TypeFilter = $state('All');
   let showDuplicatesOnly = $state(false);
   let showMissingOnly = $state(false);
-  type ShareScopeFilter = 'all' | 'friends_only' | 'unpublished' | 'hashing';
-  const VALID_SHARE_SCOPES = new Set<ShareScopeFilter>(['all', 'friends_only', 'unpublished', 'hashing']);
+  let showNeverRequestedOnly = $state(false);
+  const MB = 1024 * 1024;
+  const GB = 1024 * MB;
+  /** Size bands, as `[min, max)` in bytes. Keys are persisted, so never renamed. */
+  const SIZE_FILTERS = {
+    any: [0, Infinity],
+    lt10m: [0, 10 * MB],
+    '10m-100m': [10 * MB, 100 * MB],
+    '100m-1g': [100 * MB, GB],
+    '1g-4g': [GB, 4 * GB],
+    gt4g: [4 * GB, Infinity],
+  } as const;
+  type SizeFilter = keyof typeof SIZE_FILTERS;
+  const SIZE_FILTER_KEYS = Object.keys(SIZE_FILTERS) as SizeFilter[];
+  let sizeFilter = $state<SizeFilter>('any');
+  function sizeFilterLabel(key: SizeFilter): string {
+    switch (key) {
+      case 'any': return m.library_size_any();
+      case 'lt10m': return m.library_size_lt10m();
+      case '10m-100m': return m.library_size_10m_100m();
+      case '100m-1g': return m.library_size_100m_1g();
+      case '1g-4g': return m.library_size_1g_4g();
+      case 'gt4g': return m.library_size_gt4g();
+    }
+  }
+  /** Offered, and nobody has asked for it in all the time it has been. */
+  function neverRequested(f: FileInfo): boolean {
+    return f.shared && !!f.hash && f.requests === 0 && f.alltime_requests === 0;
+  }
+  type ShareScopeFilter = 'all' | 'not_shared' | 'friends_only' | 'unpublished' | 'hashing';
+  const VALID_SHARE_SCOPES = new Set<ShareScopeFilter>(['all', 'not_shared', 'friends_only', 'unpublished', 'hashing']);
   let shareScopeFilter = $state<ShareScopeFilter>('all');
   /** A saved sharing-state filter waiting for the library to load. */
   let pendingShareScope = $state<Exclude<ShareScopeFilter, 'all'> | null>(null);
@@ -620,11 +650,12 @@
    * The one sharing state a row is in, if any of the filterable ones.
    *
    * A friends-only file is never published by design, so it counts as
-   * friends-only rather than as waiting to be published.
+   * friends-only rather than as waiting to be published. An unshared file is
+   * not shared whether or not it has finished hashing.
    */
   function shareScopeOf(f: FileInfo): Exclude<ShareScopeFilter, 'all'> | null {
+    if (!f.shared) return 'not_shared';
     if (!f.hash) return 'hashing';
-    if (!f.shared) return null;
     if (f.friends_only) return 'friends_only';
     if (!f.shared_kad && !f.shared_ed2k && !f.shared_ember) return 'unpublished';
     return null;
@@ -1015,11 +1046,11 @@
       folders = newFolders;
       if (newUnapproved !== undefined) unapprovedFolders = newUnapproved;
       if (!stoppedByUser) scanning = isScanning;
-      // The library is the offer list. A file that is not offered stays on
-      // disk and stays out of this view; sharing it again is the folder window.
-      const offered = snapshot.files ? snapshot.files.filter((f) => f.shared) : null;
-      if (offered) {
-        files = offered.map(withMatchKeys);
+      // Unshared files stay listed, as Not shared, so they can be shared again
+      // from here.
+      const listed = snapshot.files;
+      if (listed) {
+        files = listed.map(withMatchKeys);
         treeFiles = files;
       }
       filesEtag = snapshot.etag;
@@ -1034,13 +1065,13 @@
         if (error === lastLoadError) error = null;
         lastLoadError = null;
       }
-      // Drop selection entries whose file is no longer offered (unshared,
-      // deleted, or removed with its folder). `offered` is the library, not
-      // the filtered view, so this only prunes files that left the list.
+      // Drop selection entries whose file left the library (deleted, or
+      // removed with its folder). `listed` is the library, not the filtered
+      // view, so this only prunes files that left the list.
       // Without this the
       // bulk-bar count and later bulk ops could reference ghost paths.
-      if (offered && (checkedPaths.size > 0 || selectedPath)) {
-        const present = new Set(offered.map((f) => f.path));
+      if (listed && (checkedPaths.size > 0 || selectedPath)) {
+        const present = new Set(listed.map((f) => f.path));
         if (checkedPaths.size > 0) {
           let removed = false;
           const nextChecked = new Set<string>();
@@ -1109,6 +1140,21 @@
       one: m.library_copied_link_one,
       other: () => m.library_copied_links_other({ count: formatNumber(count) }),
     });
+  }
+
+  /** Report a copy that worked. A link to an unshared file still names it,
+   *  but peers cannot fetch it from here, so that is a warning, not a success. */
+  function reportCopied(rows: readonly FileInfo[], success: string) {
+    let unshared = 0;
+    for (const f of rows) if (!f.shared) unshared++;
+    if (unshared === 0) {
+      toastSuccess(success);
+      return;
+    }
+    toastWarning(plural(unshared, {
+      one: m.library_copied_unshared_one,
+      other: () => m.library_copied_unshared_other({ count: formatNumber(unshared) }),
+    }));
   }
 
   function removedMissingText(count: number): string {
@@ -1388,7 +1434,7 @@
         toastError(m.library_copy_failed());
         return;
       }
-      toastSuccess(copiedLinksText(targets.length));
+      reportCopied(targets, copiedLinksText(targets.length));
     } catch (e: unknown) {
       toastError(toErr(e));
     } finally {
@@ -1696,7 +1742,10 @@
     const missOnly = showMissingOnly;
     const scope = shareScopeFilter;
     const hasScope = scope !== 'all';
-    if (!hasFolder && !hasQuery && !hasType && !dupOnly && !missOnly && !hasScope) return files;
+    const neverOnly = showNeverRequestedOnly;
+    const hasSize = sizeFilter !== 'any';
+    const [minSize, maxSize] = SIZE_FILTERS[sizeFilter];
+    if (!hasFolder && !hasQuery && !hasType && !dupOnly && !missOnly && !hasScope && !neverOnly && !hasSize) return files;
     // Normalized once per pass rather than once per row: `isPathInFolder`
     // re-derived it from `folder` on every call.
     const normalizedFolder = hasFolder ? normalizePathForMatch(folder!) : '';
@@ -1704,16 +1753,45 @@
       if (hasFolder && !rowInFolder(f, normalizedFolder)) return false;
       if (hasQuery && !f.matchName.includes(q)) return false;
       if (hasType && f.matchType !== typeFilter) return false;
+      if (hasSize && (f.size < minSize || f.size >= maxSize)) return false;
       if (dupOnly && (!f.hash || !duplicateHashes.has(f.hash))) return false;
       if (missOnly && !missingPathSet.has(f.path)) return false;
       if (hasScope && shareScopeOf(f) !== scope) return false;
+      if (neverOnly && !neverRequested(f)) return false;
       return true;
     });
   });
 
+  let libraryTotalSize = $derived.by(() => {
+    let bytes = 0;
+    for (const f of files) bytes += f.size;
+    return bytes;
+  });
+
+  function filesCountLabel(count: number): string {
+    return plural(count, {
+      one: m.library_stat_files_one,
+      few: () => m.library_stat_files_few({ count: formatNumber(count) }),
+      other: () => m.library_stat_files({ count: formatNumber(count) }),
+    });
+  }
+
+  /** The folder card's "N not shared": the files behind that count. */
+  function showNotSharedIn(folder: string | null) {
+    filterFolder = folder;
+    pendingShareScope = null;
+    shareScopeFilter = 'not_shared';
+  }
+
+  let neverRequestedCount = $derived.by(() => {
+    let n = 0;
+    for (const f of files) if (neverRequested(f)) n++;
+    return n;
+  });
+
   /** Counts per sharing state, for the labels in the sharing-state filter. */
   let shareScopeCounts = $derived.by(() => {
-    const counts: Record<Exclude<ShareScopeFilter, 'all'>, number> = { friends_only: 0, unpublished: 0, hashing: 0 };
+    const counts: Record<Exclude<ShareScopeFilter, 'all'>, number> = { not_shared: 0, friends_only: 0, unpublished: 0, hashing: 0 };
     for (const f of files) {
       const scope = shareScopeOf(f);
       if (scope) counts[scope]++;
@@ -1731,7 +1809,7 @@
     });
   });
 
-  let hasActiveLibraryFilters = $derived(!!filterFolder || !!searchQuery.trim() || typeFilter !== 'All' || showDuplicatesOnly || showMissingOnly || shareScopeFilter !== 'all');
+  let hasActiveLibraryFilters = $derived(!!filterFolder || !!searchQuery.trim() || typeFilter !== 'All' || sizeFilter !== 'any' || showDuplicatesOnly || showMissingOnly || showNeverRequestedOnly || shareScopeFilter !== 'all');
   let libraryHashedCount = $derived.by(() => {
     let hashed = 0;
     for (const f of files) if (f.hash) hashed++;
@@ -1747,8 +1825,10 @@
     filterFolder = null;
     searchQuery = '';
     typeFilter = 'All';
+    sizeFilter = 'any';
     showDuplicatesOnly = false;
     showMissingOnly = false;
+    showNeverRequestedOnly = false;
     shareScopeFilter = 'all';
     pendingShareScope = null;
   }
@@ -1789,6 +1869,11 @@
   let checkedUnshareCount = $derived.by(() => {
     let n = 0;
     for (const f of files) if (checkedPaths.has(f.path) && f.hash && f.shared) n++;
+    return n;
+  });
+  let checkedShareCount = $derived.by(() => {
+    let n = 0;
+    for (const f of files) if (checkedPaths.has(f.path) && f.hash && !f.shared) n++;
     return n;
   });
   // Selections persist across filter changes and bulk actions operate on the
@@ -1925,9 +2010,64 @@
       return;
     }
     bulkBusy = true;
+    const copies = sharedCopiesOf(targets);
     try {
       const count = await runBulkBatches(targets, batchUnshare);
-      toastSuccess(unsharedText(count));
+      offerUnshareUndo(unsharedText(count), copies);
+    } catch (e: unknown) { error = toErr(e); }
+    finally {
+      await refresh();
+      bulkBusy = false;
+    }
+  }
+
+  /** The shared rows an unshare of `targets` takes down. Sharing follows the
+   *  content, so that is every shared copy of it, not only the rows named. */
+  function sharedCopiesOf(targets: FileInfo[]): FileInfo[] {
+    const hashes = new Set(targets.map((f) => f.hash).filter(Boolean));
+    return files.filter((f) => f.shared && hashes.has(f.hash));
+  }
+
+  /** Report an unshare, with Undo sharing `copies` again. Unsharing no longer
+   *  takes anything out of the Library, so it is undone instead of confirmed. */
+  function offerUnshareUndo(message: string, copies: FileInfo[]) {
+    if (copies.length === 0) {
+      toastSuccess(message);
+      return;
+    }
+    addActionToast(
+      'success',
+      message,
+      {
+        label: m.common_undo(),
+        undo: true,
+        run: () => {
+          void runBulkBatches(copies, shareLibraryFiles)
+            .catch((e: unknown) => toastError(toErr(e)))
+            .finally(() => refresh());
+        },
+      },
+      () => {},
+    );
+  }
+
+  async function bulkShare() {
+    if (bulkBusy) return;
+    const checked = getCheckedFiles();
+    const targets = checked.filter(f => !!f.hash && !f.shared);
+    if (targets.length === 0) {
+      if (checked.some(f => !f.hash)) toastWarning(m.library_selection_still_hashing());
+      else if (checked.length > 0) toastWarning(m.library_selection_none_unshared());
+      else toastWarning(m.library_no_hashed_in_selection());
+      return;
+    }
+    bulkBusy = true;
+    try {
+      const count = await runBulkBatches(targets, shareLibraryFiles);
+      toastSuccess(plural(count, {
+        one: m.library_shared_one,
+        other: () => m.library_shared_other({ count: formatNumber(count) }),
+      }));
     } catch (e: unknown) { error = toErr(e); }
     finally {
       await refresh();
@@ -2062,7 +2202,7 @@
         toastError(m.library_copy_failed());
         return;
       }
-      toastSuccess(copiedLinksText(files.length));
+      reportCopied(targets, copiedLinksText(files.length));
     } catch (e: unknown) { error = toErr(e); }
   }
 
@@ -2672,7 +2812,7 @@
           toastError(m.library_copy_failed());
           return;
         }
-        toastSuccess(copiedLinksText(files.length));
+        reportCopied(targets, copiedLinksText(files.length));
       } catch (e: unknown) { error = toErr(e); }
       return;
     }
@@ -2692,7 +2832,7 @@
         toastError(m.library_copy_failed());
         return;
       }
-      toastSuccess(m.library_copied_link_one());
+      reportCopied([selectedFile], m.library_copied_link_one());
     } catch (e: unknown) { error = toErr(e); }
   }
 
@@ -2961,6 +3101,9 @@
         case 'unshare':
           await unshareOneFile(f);
           break;
+        case 'share':
+          await shareOneFile(f);
+          break;
         case 'send_to_friend': {
           if (!extra) break;
           const { offerFileToFriend } = await import('$lib/api/friends');
@@ -2989,14 +3132,16 @@
   // drawer alike. They throw; each caller reports the error its own way.
 
   async function unshareOneFile(f: FileInfo) {
-    const confirmed = await askConfirm(
-      m.library_confirm_unshare_file({ name: f.name }),
-      m.library_unshare_file_title(),
-    );
-    if (!confirmed) return;
+    const copies = sharedCopiesOf([f]);
     await unshareFile(f.path, f.hash || undefined);
     await refresh();
-    toastSuccess(m.library_unshared_named({ name: f.name }));
+    offerUnshareUndo(m.library_unshared_named({ name: f.name }), copies);
+  }
+
+  async function shareOneFile(f: FileInfo) {
+    await shareLibraryFiles([f.path]);
+    await refresh();
+    toastSuccess(m.library_shared_named({ name: f.name }));
   }
 
   /** Files a delete is confirming or running for. A second Delete press while
@@ -3060,13 +3205,14 @@
       toastError(m.library_copy_failed());
       return false;
     }
-    if (variant === 'aich') {
-      toastSuccess(m.library_copied_ed2k_link_aich());
-    } else if (variant === 'sources') {
-      toastSuccess(m.library_copied_ed2k_link_sources());
-    } else {
-      toastSuccess(m.library_copied_ed2k_link());
-    }
+    reportCopied(
+      [f],
+      variant === 'aich'
+        ? m.library_copied_ed2k_link_aich()
+        : variant === 'sources'
+          ? m.library_copied_ed2k_link_sources()
+          : m.library_copied_ed2k_link(),
+    );
     return true;
   }
 
@@ -3213,6 +3359,12 @@
         if (typeof parsed.showDuplicatesOnly === 'boolean') {
           showDuplicatesOnly = parsed.showDuplicatesOnly;
         }
+        if (typeof parsed.showNeverRequestedOnly === 'boolean') {
+          showNeverRequestedOnly = parsed.showNeverRequestedOnly;
+        }
+        if (typeof parsed.sizeFilter === 'string' && (SIZE_FILTER_KEYS as string[]).includes(parsed.sizeFilter)) {
+          sizeFilter = parsed.sizeFilter as SizeFilter;
+        }
         // Deferred like "missing only" below: put back once the library is
         // loaded, and only if it still matches something. "Still hashing"
         // restored after the hashing finished would open on an empty list.
@@ -3268,6 +3420,8 @@
         sortField,
         sortAsc,
         showDuplicatesOnly,
+        showNeverRequestedOnly,
+        sizeFilter,
         // Still waiting on the first missing-file scan: keep what was saved.
         showMissingOnly: showMissingOnly || pendingRestoreMissingOnly,
         shareScopeFilter: pendingShareScope ?? shareScopeFilter,
@@ -3283,6 +3437,7 @@
     if (!filtersRestored) return;
     // Track dependencies explicitly so this effect re-runs when any filter/sort changes.
     void typeFilter; void filterFolder; void searchQuery; void sortField; void sortAsc; void showDuplicatesOnly; void showMissingOnly; void shareScopeFilter; void pendingShareScope;
+    void showNeverRequestedOnly; void sizeFilter;
     void topPanelOpen; void topPanelMetric; void topPanelScope; void expandedFolders;
     persistFilters();
   });
@@ -3735,8 +3890,14 @@
         <option value={opt}>{fileTypeFilterLabel(opt)}</option>
       {/each}
     </select>
+    <select class="filter-type" bind:value={sizeFilter} aria-label={m.library_size_filter_aria()}>
+      {#each SIZE_FILTER_KEYS as key (key)}
+        <option value={key}>{sizeFilterLabel(key)}</option>
+      {/each}
+    </select>
     <select class="filter-type" bind:value={shareScopeFilter} onchange={() => (pendingShareScope = null)} aria-label={m.library_scope_filter_aria()}>
       <option value="all">{m.library_scope_all()}</option>
+      <option value="not_shared">{m.library_scope_not_shared()} ({formatNumber(shareScopeCounts.not_shared)})</option>
       <option value="friends_only">{m.library_scope_friends_only()} ({formatNumber(shareScopeCounts.friends_only)})</option>
       <option value="unpublished">{m.library_scope_unpublished()} ({formatNumber(shareScopeCounts.unpublished)})</option>
       <option value="hashing">{m.library_scope_hashing()} ({formatNumber(shareScopeCounts.hashing)})</option>
@@ -3780,6 +3941,16 @@
       {:else}
         {m.library_missing()}{missingTotalCount > 0 ? ` (${formatNumber(missingTotalCount)})` : ''}
       {/if}
+    </button>
+    <button
+      class="dupes-toggle"
+      class:active={showNeverRequestedOnly}
+      disabled={neverRequestedCount === 0 && !showNeverRequestedOnly}
+      aria-pressed={showNeverRequestedOnly}
+      onclick={() => (showNeverRequestedOnly = !showNeverRequestedOnly)}
+      title={m.library_never_requested_title()}
+    >
+      {m.library_never_requested()}{neverRequestedCount > 0 ? ` (${formatNumber(neverRequestedCount)})` : ''}
     </button>
     {#if showMissingOnly && missingPathSet.size > 0}
       <button
@@ -4167,6 +4338,35 @@
   </button>
 {/snippet}
 
+{#snippet globeIcon(off: boolean)}
+  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <!-- Same 12-unit span as the folder and trash glyphs beside it. The "off"
+         outline opens at the bottom right, where the X sits. -->
+    {#if off}
+      <path d="M9.55 13.8A6 6 0 1 1 13.8 9.55"/>
+    {:else}
+      <circle cx="8" cy="8" r="6"/>
+    {/if}
+    <path d="M2 8h12"/>
+    <path d="M8 2c-1.75 1.75-2.6 3.8-2.6 6s.85 4.25 2.6 6c1.75-1.75 2.6-3.8 2.6-6S9.75 3.75 8 2z"/>
+    {#if off}
+      <path d="M11.6 11.6l3.4 3.4M15 11.6l-3.4 3.4"/>
+    {/if}
+  </svg>
+{/snippet}
+
+{#snippet notSharedLink(folder: string | null, count: number)}
+  <button
+    type="button"
+    class="tree-unshared"
+    onclick={(e) => { e.stopPropagation(); showNotSharedIn(folder); }}
+    title={m.library_folder_not_shared_title({ count: formatNumber(count) })}
+  >
+    <span class="tree-unshared-dot" aria-hidden="true"></span>
+    {m.library_folder_not_shared({ count: formatNumber(count) })}
+  </button>
+{/snippet}
+
 <div class="shared-layout" class:dragging={sidebarDragging}>
   <!-- Sidebar: folder filter tree -->
   <div class="sidebar" style="width: {sidebarWidth}px; min-width: {sidebarWidth}px;">
@@ -4200,7 +4400,12 @@
           <span class="tree-folder-name">{m.library_all_files()}</span>
         </span>
         <div class="tree-meta">
-          <span class="tree-count">{formatNumber(files.length)}</span>
+          <span class="tree-stats">
+            <span class="tree-count">{filesCountLabel(files.length)} &middot; {formatSize(libraryTotalSize)}</span>
+            {#if shareScopeCounts.not_shared > 0}
+              {@render notSharedLink(null, shareScopeCounts.not_shared)}
+            {/if}
+          </span>
         </div>
       </div>
       {#each folderRows as row (row.path)}
@@ -4277,9 +4482,46 @@
                 <span class="sr-only">{m.library_folder_category_title({ names })}</span>
               </span>
             {/if}
+            {#if row.isShare}
+              <!-- Quiet until pointed at: they act on the whole share, and three
+                   coloured buttons on every card drowned out the folder name. -->
+              <span class="tree-actions">
+                {@render openFolderButton(folder)}
+                <button
+                  type="button"
+                  class="tree-btn tree-unshare"
+                  onclick={(e) => { e.stopPropagation(); handleUnshareFolder(folder); }}
+                  title={m.library_unshare_folder_title()}
+                  aria-label={m.library_unshare_folder_title()}
+                >
+                  {@render globeIcon(true)}
+                </button>
+                <button
+                  type="button"
+                  class="tree-btn tree-remove"
+                  onclick={(e) => { e.stopPropagation(); handleRemoveFolder(folder); }}
+                  title={m.library_remove_folder_btn_title()}
+                  aria-label={m.library_remove_folder_btn_title()}
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <polyline points="3 6 5 6 21 6" />
+                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                    <line x1="10" y1="11" x2="10" y2="17" />
+                    <line x1="14" y1="11" x2="14" y2="17" />
+                  </svg>
+                </button>
+              </span>
+            {/if}
           </span>
           <div class="tree-meta">
-            <span class="tree-count">{formatNumber(row.count)} &middot; {formatSize(row.size)}</span>
+            <span class="tree-stats">
+              <span class="tree-count">
+                {row.isShare ? filesCountLabel(row.count) : formatNumber(row.count)} &middot; {formatSize(row.size)}
+              </span>
+              {#if row.unshared > 0}
+                {@render notSharedLink(folder, row.unshared)}
+              {/if}
+            </span>
             {#if !row.isShare && row.count > 0}
               <span class="tree-actions">{@render openFolderButton(folder)}</span>
             {/if}
@@ -4294,51 +4536,25 @@
                 {m.library_folder_reapprove()}
               </button>
             {/if}
-            <select
-              class="tree-prio"
-              class:tree-prio-set={!!folderPriorities[folder]}
-              title={m.library_folder_priority_title()}
-              aria-label={m.library_folder_priority_title()}
-              value={folderPriorities[folder] ?? ''}
-              onclick={(e) => e.stopPropagation()}
-              onchange={(e) => { e.stopPropagation(); handleSetFolderPriority(folder, e.currentTarget.value, e.currentTarget); }}
-            >
-              <option value="">{m.library_folder_priority_default()}</option>
-              <option value="verylow">{m.library_priority_verylow()}</option>
-              <option value="low">{m.library_priority_low()}</option>
-              <option value="normal">{m.library_priority_normal()}</option>
-              <option value="high">{m.library_priority_high()}</option>
-              <option value="release">{m.library_priority_release()}</option>
-              <option value="auto">{m.library_priority_auto()}</option>
-            </select>
-            <span class="tree-actions">
-              {@render openFolderButton(folder)}
-              <button
-                type="button"
-                class="tree-btn tree-remove"
-                onclick={(e) => { e.stopPropagation(); handleRemoveFolder(folder); }}
-                title={m.library_remove_folder_btn_title()}
-                aria-label={m.library_remove_folder_btn_title()}
+            <span class="tree-prio-wrap">
+              <span class="tree-prio-label" aria-hidden="true">{m.library_col_priority()}</span>
+              <select
+                class="tree-prio"
+                class:tree-prio-set={!!folderPriorities[folder]}
+                title={m.library_folder_priority_title()}
+                aria-label={m.library_folder_priority_title()}
+                value={folderPriorities[folder] ?? ''}
+                onclick={(e) => e.stopPropagation()}
+                onchange={(e) => { e.stopPropagation(); handleSetFolderPriority(folder, e.currentTarget.value, e.currentTarget); }}
               >
-                <span class="tree-btn-idle" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
-                    <polyline points="3 6 5 6 21 6" />
-                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-                    <line x1="10" y1="11" x2="10" y2="17" />
-                    <line x1="14" y1="11" x2="14" y2="17" />
-                  </svg>
-                </span>
-                <span class="tree-btn-confirm" aria-hidden="true"><IconX size={12} /></span>
-              </button>
-              <button
-                type="button"
-                class="tree-unshare-btn"
-                onclick={(e) => { e.stopPropagation(); handleUnshareFolder(folder); }}
-                title={m.library_unshare_folder_title()}
-                aria-label={m.library_unshare_folder_title()}
-              >
-                {m.library_bulk_unshare()}
-              </button>
+                <option value="">{m.library_folder_priority_default()}</option>
+                <option value="verylow">{m.library_priority_verylow()}</option>
+                <option value="low">{m.library_priority_low()}</option>
+                <option value="normal">{m.library_priority_normal()}</option>
+                <option value="high">{m.library_priority_high()}</option>
+                <option value="release">{m.library_priority_release()}</option>
+                <option value="auto">{m.library_priority_auto()}</option>
+              </select>
             </span>
             {/if}
           </div>
@@ -4616,7 +4832,12 @@
           </div>
         </div>
         <span class="bulk-sep" aria-hidden="true"></span>
-        <button class="tb-btn" disabled={bulkBusy || checkedUnshareCount === 0} onclick={bulkUnshare} title={checkedUnshareCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_unshare_title()}>{m.library_bulk_unshare()}</button>
+        {#if checkedShareCount > 0}
+          <button class="tb-btn" disabled={bulkBusy} onclick={bulkShare} title={m.library_bulk_share_title()}>{m.library_bulk_share()}</button>
+        {/if}
+        {#if checkedShareCount === 0 || checkedUnshareCount > 0}
+          <button class="tb-btn" disabled={bulkBusy || checkedUnshareCount === 0} onclick={bulkUnshare} title={checkedUnshareCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_unshare_title()}>{m.library_bulk_unshare()}</button>
+        {/if}
         {#if checkedUnrestrictCount > 0 && checkedRestrictCount === 0}
           <button class="tb-btn" disabled={bulkBusy} onclick={() => bulkFriendsOnly(false)} title={m.library_bulk_friends_only_off_title()}>{m.library_bulk_friends_only_off()}</button>
         {:else}
@@ -4663,8 +4884,9 @@
             <span>{fileType(selectedFile.extension) || (selectedFile.extension ? selectedFile.extension.toUpperCase() : '—')}</span>
             <span class="drawer-sub-sep" aria-hidden="true">·</span>
             <span>{formatSize(selectedFile.size)}</span>
-            <!-- The Library lists what is offered, so this is who it is offered to. -->
-            {#if selectedFile.friends_only}
+            {#if !selectedFile.shared}
+              <span class="drawer-status drawer-status-unshared">{m.library_not_shared()}</span>
+            {:else if selectedFile.friends_only}
               <span class="drawer-status drawer-status-friends" title={m.library_friends_only_badge_title()}>{m.library_friends_only_badge()}</span>
             {:else}
               <span class="drawer-status">{m.library_shared()}</span>
@@ -4740,12 +4962,17 @@
               aria-label={m.library_unshare_file_title()}
               onclick={() => { const f = selectedFile; if (f) void drawerChange(() => unshareOneFile(f)); }}
             >
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M3 10.5v2a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-2"/>
-                <path d="M8 9.5V3"/>
-                <path d="M5.5 5.5 8 3l2.5 2.5"/>
-                <path d="M2 2l12 12"/>
-              </svg>
+              {@render globeIcon(true)}
+            </button>
+          {:else if selectedFile.hash}
+            <button
+              class="drawer-icon-btn drawer-action-share"
+              disabled={drawerBusy}
+              title={m.library_share_file_title()}
+              aria-label={m.library_share_file_title()}
+              onclick={() => { const f = selectedFile; if (f) void drawerChange(() => shareOneFile(f)); }}
+            >
+              {@render globeIcon(false)}
             </button>
           {/if}
           <button
@@ -4818,7 +5045,9 @@
           <div class="details-meta-grid">
             <span class="meta-label">{m.library_col_published()}</span>
             <span class="meta-value meta-shared-row">
-              {#if selectedFile.hash}
+              {#if !selectedFile.shared}
+                <span class="shared-status">{m.library_not_shared()}</span>
+              {:else if selectedFile.hash}
                 <span class="meta-badges">
                   {#if selectedFile.shared_kad}<span class="meta-badge meta-badge-kad" title={m.library_published_kad()}>KAD</span>{/if}
                   {#if selectedFile.shared_ed2k}<span class="meta-badge meta-badge-ed2k" title={m.library_published_ed2k()}>eD2K</span>{/if}
@@ -4872,7 +5101,7 @@
                 {#key `${selectedFile.path}:${selectedFile.friends_only}:${drawerSettled}`}
                   <ToggleSwitch
                     checked={selectedFile.friends_only}
-                    disabled={!selectedFile.hash}
+                    disabled={!selectedFile.hash || !selectedFile.shared}
                     ariaLabel={m.library_friends_only_toggle()}
                     onchange={(restrict) => {
                       const f = selectedFile;
@@ -5320,6 +5549,8 @@
           title={m.library_friends_only_hint()}
         >{m.library_friends_only_toggle()}</button>
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unshare')}>{m.library_bulk_unshare()}</button>
+      {:else}
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('share')}>{m.library_bulk_share()}</button>
       {/if}
     {:else}
       <button class="ctx-item ctx-disabled" role="menuitem" disabled>{m.library_hashing_in_progress()}</button>
@@ -5710,6 +5941,9 @@
     margin-left: auto;
     flex-wrap: nowrap;
   }
+  .tree-item.child { flex-wrap: wrap; }
+  .tree-item.child .tree-stats { flex-wrap: nowrap; }
+  .tree-item.child .tree-unshared { font-size: var(--font-size-2xs); }
   .tree-item.child .tree-icon {
     width: 18px;
     height: 18px;
@@ -5735,18 +5969,27 @@
     min-width: 0;
     flex: 0 0 auto;
   }
-  /* Second row: count/size badge, priority dropdown and action buttons stacked
-     under the folder name so a long name gets the full width of the row. The
-     left padding lines the meta row up with the folder name (icon chip 24px +
-     8px gap). It wraps when the sidebar is narrow rather than squeezing the
-     name. */
+  /* A card's first line: icon, name, then the share's actions pushed right. */
+  .tree-item:not(.child) .tree-main { display: flex; }
+  .tree-item:not(.child) .tree-folder-name { flex: 1 1 auto; }
+  /* Second line: what the folder holds, then its upload priority, lined up
+     with the folder name (icon chip 24px + 8px gap). It wraps when the
+     sidebar is narrow rather than squeezing the name. */
   .tree-meta {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 5px;
+    gap: 4px 8px;
     padding-left: 32px;
     min-width: 0;
+  }
+  .tree-stats {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 2px 10px;
+    min-width: 0;
+    flex: 1 1 auto;
   }
   /* Folder icon sits in a rounded tinted chip. When the folder has children
      the chip is the expander: a closed folder folds them away, an open one
@@ -5787,39 +6030,78 @@
     color: var(--text-primary);
   }
   .tree-count {
-    display: inline-flex;
-    align-items: center;
-    height: 22px;
     font-size: var(--font-size-xs);
     font-weight: 500;
     font-variant-numeric: tabular-nums;
     color: var(--text-secondary);
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-pill);
-    padding: 0 8px;
-    flex-shrink: 0;
-    line-height: 1;
+    white-space: nowrap;
+    line-height: 22px;
   }
-  .tree-item.active .tree-count {
-    color: var(--badge-accent-text);
-    border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
-    background: color-mix(in srgb, var(--accent) 10%, var(--bg-secondary));
+  .tree-item.active .tree-count { color: var(--text-primary); }
+  /* Takes you to the files behind the count, so it reads as a link. */
+  button.tree-unshared {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 22px;
+    padding: 0;
+    border: none;
+    background: none;
+    font-size: var(--font-size-xs);
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    color: var(--badge-warning-text);
+    white-space: nowrap;
+    cursor: pointer;
+    transform: none;
+  }
+  button.tree-unshared:hover,
+  button.tree-unshared:focus-visible {
+    background: none;
+    color: var(--badge-warning-text);
+    text-decoration: underline;
+    transform: none;
+  }
+  button.tree-unshared:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+    border-radius: var(--radius-sm);
+  }
+  .tree-unshared-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--warning);
+    flex-shrink: 0;
   }
   .tree-actions {
     display: inline-flex;
-    gap: 4px;
+    gap: 2px;
     flex-shrink: 0;
+  }
+  .tree-actions button.tree-btn { color: var(--text-secondary); }
+  .tree-prio-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+    flex-shrink: 0;
+  }
+  .tree-prio-label {
+    font-size: var(--font-size-2xs);
+    font-weight: 500;
+    color: var(--text-muted);
+    white-space: nowrap;
   }
   /* The global `button` rule paints these accent-blue with white icons and
      7px 14px of padding. Name the element so color, fill, and padding win,
      otherwise both chips collapse to the same empty grey square. */
   button.tree-btn {
-    width: 22px;
-    height: 22px;
+    width: 24px;
+    height: 24px;
     border-radius: var(--radius-sm);
     border: 1px solid transparent;
-    background: var(--bg-secondary);
+    background: transparent;
     color: var(--text-muted);
     display: inline-flex;
     align-items: center;
@@ -5847,47 +6129,12 @@
   button.tree-btn:active:not(:disabled) {
     transform: none;
   }
-  /* Rest: tinted chips with distinct glyphs (share-off vs trash). Hover/focus
-     fills the chip and swaps to an X so the two actions stay readable
-     before you point at them, then match as confirm-style controls. */
-  button.tree-btn .tree-btn-idle,
-  button.tree-btn .tree-btn-confirm {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-  }
-  button.tree-btn .tree-btn-confirm { display: none; }
-  button.tree-btn:hover .tree-btn-idle,
-  button.tree-btn:focus-visible .tree-btn-idle { display: none; }
-  button.tree-btn:hover .tree-btn-confirm,
-  button.tree-btn:focus-visible .tree-btn-confirm { display: inline-flex; }
-  button.tree-unshare-btn {
-    flex-shrink: 0;
-    height: 22px;
-    padding: 0 8px;
-    font-size: var(--font-size-xs);
-    font-weight: 600;
-    line-height: 20px;
-    white-space: nowrap;
-    border-radius: var(--radius-sm);
-    color: color-mix(in srgb, var(--warning) 70%, var(--text-primary));
-    border: 1px solid color-mix(in srgb, var(--warning) 65%, var(--border));
-    background: color-mix(in srgb, var(--warning) 20%, var(--bg-secondary));
-    transform: none;
-    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
-  }
-  button.tree-unshare-btn:hover,
-  button.tree-unshare-btn:focus-visible {
-    color: var(--on-warning);
-    border-color: var(--warning);
-    background: var(--warning);
-  }
-  button.tree-unshare-btn:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
-  }
-  button.tree-unshare-btn:active:not(:disabled) {
-    transform: none;
+  /* Each takes the colour of what it does only when pointed at. */
+  button.tree-btn.tree-unshare:hover,
+  button.tree-btn.tree-unshare:focus-visible {
+    color: color-mix(in srgb, var(--warning) 80%, var(--text-primary));
+    border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+    background: color-mix(in srgb, var(--warning) 16%, transparent);
   }
   button.tree-unapproved {
     flex-shrink: 0;
@@ -5911,15 +6158,11 @@
   button.tree-unapproved:active:not(:disabled) {
     transform: none;
   }
-  button.tree-btn.tree-open {
-    color: var(--text-secondary);
-    border-color: var(--border);
-  }
   button.tree-btn.tree-open:hover,
   button.tree-btn.tree-open:focus-visible {
     color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
-    background: color-mix(in srgb, var(--accent) 14%, var(--bg-secondary));
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
   }
   /* Marks a download category's folder: the same tag as the Transfers page's
      categories, so the two read as one feature. */
@@ -5941,17 +6184,12 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  button.tree-btn.tree-remove,
+  button.tree-btn.tree-remove:hover,
+  button.tree-btn.tree-remove:focus-visible,
   button.tree-btn.tree-remove:active:not(:disabled) {
     color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 55%, var(--border));
-    background: color-mix(in srgb, var(--danger) 16%, var(--bg-secondary));
-  }
-  button.tree-btn.tree-remove:hover,
-  button.tree-btn.tree-remove:focus-visible {
-    color: var(--on-danger);
-    border-color: var(--danger);
-    background: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+    background: color-mix(in srgb, var(--danger) 14%, transparent);
   }
   /* Per-folder default upload priority. Always visible; highlighted when a
      non-default priority is set. */
@@ -5965,12 +6203,18 @@
     font-weight: 500;
     line-height: 20px;
     border-radius: var(--radius-sm);
-    border: 1px solid var(--border);
-    background-color: var(--bg-secondary);
+    border: 1px solid transparent;
+    background-color: transparent;
     background-position: right 4px center;
     background-size: 10px;
     color: var(--text-secondary);
     cursor: pointer;
+    transition: border-color var(--transition-fast), background-color var(--transition-fast);
+  }
+  .tree-item:hover .tree-prio,
+  .tree-prio:focus {
+    border-color: var(--border);
+    background-color: var(--bg-secondary);
   }
   .tree-prio:focus {
     box-shadow: 0 0 0 2px var(--accent-halo);
@@ -6073,6 +6317,11 @@
     background: color-mix(in srgb, var(--warning) 15%, transparent);
     border-color: color-mix(in srgb, var(--warning) 32%, transparent);
     color: var(--warning);
+  }
+  .drawer-status.drawer-status-unshared {
+    background: transparent;
+    border-color: var(--border);
+    color: var(--text-muted);
   }
   .drawer-close {
     margin-top: 1px;
@@ -6689,6 +6938,17 @@
     color: var(--on-warning);
     background: var(--warning);
     border-color: var(--warning);
+  }
+  button.drawer-icon-btn.drawer-action-share {
+    color: var(--badge-success-text);
+    border-color: color-mix(in srgb, var(--success) 45%, var(--border));
+    background: color-mix(in srgb, var(--success) 8%, var(--bg-surface));
+  }
+  button.drawer-icon-btn.drawer-action-share:hover:not(:disabled),
+  button.drawer-icon-btn.drawer-action-share:focus-visible {
+    color: var(--on-success);
+    background: var(--success);
+    border-color: var(--success);
   }
   button.drawer-icon-btn.drawer-action-danger {
     color: var(--danger);

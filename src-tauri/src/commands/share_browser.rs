@@ -110,6 +110,10 @@ pub struct ShareBrowserEntry {
     /// How many files a partial share currently offers. Set only for [`ShareBrowserStatus::Partial`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_count: Option<u32>,
+    /// A file the Library holds, unshared. Shareable like any other, but the
+    /// user took it off the network, which a never-shared file was not.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub library_unshared: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -507,6 +511,7 @@ fn entry_from_stored(
             share_status: ShareBrowserStatus::Blocked,
             size: None,
             shared_count: None,
+            library_unshared: false,
         },
         Location::Path(path) => {
             let share_status = if stored.kind == ShareBrowserKind::File {
@@ -538,16 +543,21 @@ fn entry_from_stored(
             } else {
                 None
             };
+            let path = display_fs_path(path);
+            let library_unshared = stored.kind == ShareBrowserKind::File
+                && share_status == ShareBrowserStatus::Shareable
+                && session.unshared.contains(&normalize_path_key(&path));
             ShareBrowserEntry {
                 id,
                 name: stored.name.clone(),
-                path: display_fs_path(path),
+                path,
                 kind: stored.kind,
                 letter: stored.letter.clone(),
                 parent_id: stored.parent_id,
                 size: stored.size,
                 share_status,
                 shared_count,
+                library_unshared,
             }
         }
     }

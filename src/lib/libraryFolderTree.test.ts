@@ -34,6 +34,24 @@ describe('buildLibraryFolderTree', () => {
     expect(tree[0].children[0].children[0].count).toBe(1);
   });
 
+  it('counts the unshared files under each folder', () => {
+    const tree = buildLibraryFolderTree(
+      ['C:\\Music'],
+      [
+        { path: 'C:\\Music\\a.mp3', size: 10, shared: false },
+        { path: 'C:\\Music\\Albums\\one.mp3', size: 20, shared: true },
+        { path: 'C:\\Music\\Albums\\Live\\two.mp3', size: 40, shared: false },
+        { path: 'C:\\Music\\Albums\\Live\\three.mp3', size: 5 },
+      ],
+      win,
+    );
+    expect(tree[0].unshared).toBe(2);
+    expect(tree[0].children[0].unshared).toBe(1);
+    expect(tree[0].children[0].children[0].unshared).toBe(1);
+    const rows = flattenLibraryFolderTree(tree, new Set(['C:\\Music']));
+    expect(rows.map((r) => r.unshared)).toEqual([2, 1]);
+  });
+
   it('files a finished download recorded in the extended form under its plain share', () => {
     const plain = (path: string) =>
       win(path).replace(/^\/\/\?\/unc\//, '//').replace(/^\/\/\?\//, '');

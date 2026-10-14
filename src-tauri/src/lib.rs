@@ -2431,6 +2431,7 @@ pub fn run() {
             commands::sharing::set_file_priority,
             commands::sharing::batch_set_priority,
             commands::sharing::batch_unshare,
+            commands::sharing::share_library_files,
             commands::sharing::set_files_friends_only,
             commands::sharing::reload_shared_files,
             commands::sharing::unshare_file,

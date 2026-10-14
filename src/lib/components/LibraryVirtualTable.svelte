@@ -732,11 +732,12 @@
               {:else if col.key === 'sources'}
                 <td class="cell-num">{file.complete_sources ? formatNumber(file.complete_sources) : '\u2014'}</td>
               {:else if col.key === 'shared'}
-                <!-- Every row in the Library is a file peers can download, so
-                     a "yes" tick on all of them said nothing. What varies is
-                     where the file has actually reached. -->
+                <!-- What varies among shared files is where each has actually
+                     reached, so that is what a shared row shows. -->
                 <td class="cell-shared">
-                  {#if !file.hash}
+                  {#if !file.shared}
+                    <span class="not-shared" title={m.library_not_shared_title()}>{m.library_not_shared()}</span>
+                  {:else if !file.hash}
                     <span class="hashing-label">{m.common_pending()}</span>
                   {:else if file.friends_only || file.shared_kad || file.shared_ed2k || file.shared_ember}
                     <span class="shared-badges">
@@ -988,6 +989,10 @@
   }
   .not-published {
     color: var(--text-muted);
+  }
+  .not-shared {
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
   }
   .shared-badges {
     display: inline-flex;
