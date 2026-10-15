@@ -3838,7 +3838,7 @@
                 </button>
               </div>
               {#if speedResult}
-                <div class="stat-grid">
+                <div class="stat-grid speed-result-grid">
                   <div class="stat"><span>{m.settings_speed_download()}</span><strong>{formatSpeed(speedResult.download_speed)}</strong></div>
                   <div class="stat"><span>{m.settings_speed_upload()}</span><strong>{formatSpeed(speedResult.upload_speed)}</strong></div>
                   <div class="stat"><span>{m.settings_speed_recommended_upload()}</span><strong>{formatSpeed(speedResult.recommended_upload_limit)}</strong></div>
@@ -6706,6 +6706,19 @@
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
     gap: 8px;
+  }
+
+  /* The two recommended-limit cards carry the longest labels, so they take a
+     larger share than Download and Upload; "Recommended download limit" no
+     longer wraps onto a second line. Narrow windows go back to two columns. */
+  .stat-grid.speed-result-grid {
+    grid-template-columns: 1fr 1fr 1.25fr 1.5fr;
+  }
+
+  @media (max-width: 760px) {
+    .stat-grid.speed-result-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
   }
 
   .stat {

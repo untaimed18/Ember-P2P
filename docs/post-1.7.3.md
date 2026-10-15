@@ -22,6 +22,20 @@ priority within each section.
   allowance and a per-neighbor frontier, moderators cannot act on each other,
   room transfers serve only the file as offered.
 
+1.7.4 has done these so far:
+
+- Friends-only files are offered only to a friend whose session has shown it
+  honours the marking (`EMBER_EXT_BROWSE_SCOPE_AWARE` or
+  `EMBER_EXT_MAILBOX_AWARE`); anyone else is refused with
+  `peers_offer_needs_newer_ember`.
+- Unknown gossip and relay envelope versions are counted per room and raise the
+  "needs a newer Ember" notice (item 3, first half).
+- `docs/channels-format.md` exists (item 4) and
+  `docs/release-checklist-1.7.4.md` has the cross-machine Channels run
+  (item 5, still to be run).
+- Smaller Friends follow-ups: the friend-session frame limit, the search-failed
+  slot release, and `reseed_friend_endpoint`'s lock.
+
 ## Channels: before the BETA badge comes off
 
 Items 1 to 6 are carried from the 1.7.2 plan; none was started in 1.7.3. Item
@@ -82,13 +96,22 @@ relay envelope (`CHANNEL_RELAY_ENVELOPE_VERSION`) still drop a version they
 do not know without a word. If either changes, members on older builds would
 see a room go quiet.
 
-**To do:** count unknown envelope versions per room, as `channel_newer_frames`
-does for message kinds, and show the existing banner. Relay an unknown outer
-version unopened, as extension frames are.
+**Done in 1.7.4:** unknown versions are counted per room in
+`channel_newer_frames` (sources `envelope` and `relay`) and show the existing
+banner, from hops on the room's roster only (`note_unread_channel_envelope`).
+Every future version must keep the version at byte 0 and the room id at bytes
+1 to 17, which is what the count reads.
+
+**Still open:** relaying an unknown outer version unopened. Members forward
+only frames that open (`handle_inbound_channel_relay`), which is what stops a
+hop using them to spread junk; an unknown version cannot open, so carrying it
+reopens that. Decide at the freeze whether a version bump is announced first
+(for example in a signed governance field) so members know to carry it.
 
 ### 4. A short format spec
 
-**To do:** `docs/channels-format.md`, covering every gossip frame number
+**Done in 1.7.4:** `docs/channels-format.md`. Keep it current with every format
+change. It covers every gossip frame number
 (`*_PLAIN_VERSION`, in use and retired, never reused), every DHT channel
 record kind with its storer rule (`channel_store_ok`) and TTL (`record_ttl`),
 the extension-frame layout and display flag, the envelope-version rule (a
@@ -98,8 +121,8 @@ friend sessions, and what is frozen at the end of the beta.
 
 ### 5. Test across real machines
 
-**To do:** add a Channels section to the release checklist
-(`docs/release-checklist-1.7.0.md` is the model) and run it on three or more
+**Written, not yet run:** `docs/release-checklist-1.7.4.md`, section 1. Run it
+on three or more
 machines, at least one behind a firewall that is not reachable: create public
 and private rooms, chat, edit, react, pin, send a file; ban a member; rotate a
 private room's key with a member offline; name a successor and let them take
@@ -225,6 +248,24 @@ Carried from the 1.7.2 plan.
   ceiling. To do: keep an inbound offer waiting until the user answers,
   decide how long the sender's grant holds for one (the 24-hour grant is the
   piece to build on), and what happens when the file moves first.
+
+  Looked at in 1.7.4 and not started, because three things need deciding
+  first:
+  - **How long.** The receiver holds a pending offer only in memory
+    (`state.attach_inbound`), so today a restart lapses it. Either keep it
+    for the session only, or persist the offer (it needs `AttachOffer`'s
+    fields, not just the `awaiting` row) and restore it at start. A day,
+    matching `ATTACH_GRANT_TTL_SECS`, is the natural ceiling either way.
+  - **Telling old builds apart.** A 1.7.3 receiver still drops the offer at
+    `ATTACH_OFFER_TTL_SECS`, so a sender that held its grant for a day would
+    show "waiting" for a day to someone who will never answer. If this ships
+    in the same release as `EMBER_EXT_MAILBOX_AWARE`, a session that sent it
+    is proof the receiver waits too (`honours_friends_only` shows the same
+    pattern); otherwise it needs a signal of its own.
+  - **The file moving first.** The grant is a path; an accept after the file
+    changed already ends as `source_gone` on the stream, which is the right
+    answer, but the card should say so when the accept is pressed rather
+    than after a dial.
 - **An Away status.** An "Away" or "Not at PC" state, set by hand and by idle
   time, sent as a new friend-session extension frame (older builds ignore
   unknown ones), shown in the friends list and the chat header.
@@ -241,11 +282,11 @@ Carried from the 1.7.2 plan.
   that tells them from 1.6.x, which would republish the files. Kept that way
   on purpose for 1.7.3, since a leak cannot be taken back and the gap closes
   as friends update. Say so in the release notes.
-- **File offers still tell older builds a file is friends-only by a flag they
-  may drop.** `OfferFileToFriend` sends a friends-only file to any mutual
-  friend; a build that predates the flag files the copy as public. Refuse to
-  offer a friends-only file to a friend whose session has not shown it reads
-  the marking, as Browse now does.
+- **Done in 1.7.4: friends-only offers to older builds.** `OfferFileToFriend`
+  now refuses a friends-only file unless the session has shown it honours the
+  marking (`EmberSessionHandle::honours_friends_only`). A 1.7.3 friend counts
+  only once they have browsed us in that session, since 1.7.3 sends the scope
+  frame only then; say so in the release notes.
 - **The hash-probe exemption trusts a claimed user hash.** A request under a
   mutual friend's eD2K user hash is not counted toward the probe ban, so
   someone spoofing that hash can probe without being banned (the answers are
@@ -263,14 +304,8 @@ Carried from the 1.7.2 plan.
 - Derive the Friends page's firewall state from `$networkStats` instead of
   its own fetch and listener, and reuse `friendsList` in the layout instead of
   a second `getFriends`.
-- `reseed_friend_endpoint` holds the transfer-manager read lock across an
-  await on the source manager.
 - Inbound friend nicknames are capped at 64 characters, local edits at 64
   bytes; accepting a request can store one the edit box then refuses.
-- The friend session reader accepts 5 MB frames where the inbound path
-  accepts 512 KiB; align them.
-- The trailing `EmberFriendSearchFailed` that releases an outbound session
-  slot carries no attempt id, so it can release a newer attempt's reservation.
 - Duplicate accept acks for a punch transfer each start a fresh punch
   registration.
 - `process_inbound_friend_request` and `ask_unmatched_friend_through_rooms`

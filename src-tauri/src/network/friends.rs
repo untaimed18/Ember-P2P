@@ -181,11 +181,21 @@ pub(super) async fn reseed_friend_endpoint(
             .remove_for_file(file_hash, u32::from(ip), port);
     }
 
-    let mgr = transfer_manager.read().await;
+    // The transfer manager is only needed to find the downloads; it is let go
+    // before the source manager is awaited below, so this never holds one of
+    // them while waiting on the other.
+    let targets: Vec<([u8; 16], Vec<String>)> = {
+        let mgr = transfer_manager.read().await;
+        file_hashes
+            .into_iter()
+            .map(|file_hash| {
+                let ids = matching_active_transfer_ids_for_hash(state, &mgr, &hex::encode(file_hash));
+                (file_hash, ids)
+            })
+            .collect()
+    };
     let mut total_injected = 0usize;
-    for file_hash in file_hashes {
-        let hash_hex = hex::encode(file_hash);
-        let matching_ids = matching_active_transfer_ids_for_hash(state, &mgr, &hash_hex);
+    for (file_hash, matching_ids) in targets {
         for tid in &matching_ids {
             if let Some(pfs) = state.per_file_sources.get_mut(tid) {
                 let _ = pfs.relocate_user_hash(user_hash, ip, port);
@@ -1199,6 +1209,9 @@ pub(super) fn spawn_rendezvous_friend_lookup(
     // contents) here is cheap and lets `connect_friend_with_fallback`
     // re-read the live values later instead of this snapshot going stale.
     let nat_ctx_fc = state.friend_nat_context.clone();
+    // Every caller reserves the slot just before calling this; the release
+    // below names that reservation so it cannot free a later one.
+    let reserved_at = state.outbound_session_tasks.get(&target_hash).copied();
 
     tokio::spawn(async move {
         match rendezvous::lookup(
@@ -1439,6 +1452,7 @@ pub(super) fn spawn_rendezvous_friend_lookup(
                 transfer_id: String::new(),
                 kind: upload_server::UploadEventKind::EmberFriendSearchFailed {
                     ember_hash: target_hash,
+                    reserved_at,
                 },
             })
             .await

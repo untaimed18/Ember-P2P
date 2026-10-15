@@ -70,11 +70,28 @@ pub struct EmberSessionHandle {
     /// attachment which of our QUIC ports to name: a friend on our own network
     /// cannot reach the public one the NAT maps.
     peer_addr: Option<std::net::SocketAddr>,
+    /// The friend has shown, on this session, a build that keeps a file
+    /// friends-only when told to: it sent `EMBER_EXT_BROWSE_SCOPE_AWARE` or
+    /// `EMBER_EXT_MAILBOX_AWARE`, both newer than the offer's friends-only
+    /// flag. Shared by every clone, so the reader's mark reaches the map's copy,
+    /// and spread to the friend's other live secure sessions (see
+    /// [`SecureSessionEntry`]).
+    honours_friends_only: Arc<std::sync::atomic::AtomicBool>,
 }
 
 static NEXT_EMBER_SESSION_ID: AtomicU64 = AtomicU64::new(1);
-type SecureRevocationIndex =
-    std::sync::Mutex<HashMap<[u8; 16], HashMap<u64, tokio::sync::watch::Sender<bool>>>>;
+
+/// One live secure session in [`SECURE_REVOCATION_INDEX`].
+struct SecureSessionEntry {
+    shutdown: tokio::sync::watch::Sender<bool>,
+    /// The session's [`EmberSessionHandle::honours_friends_only`] flag. Every
+    /// live session of a friend is the same running build, so a mark on one
+    /// is set on all of them: a frame the friend sent down a duplicate
+    /// connection still counts on the one our session map holds.
+    honours_friends_only: Arc<std::sync::atomic::AtomicBool>,
+}
+
+type SecureRevocationIndex = std::sync::Mutex<HashMap<[u8; 16], HashMap<u64, SecureSessionEntry>>>;
 static SECURE_REVOCATION_INDEX: std::sync::OnceLock<SecureRevocationIndex> =
     std::sync::OnceLock::new();
 
@@ -113,7 +130,7 @@ pub fn revoke_all_secure_sessions(ember_hash: [u8; 16]) -> usize {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         index
             .get(&ember_hash)
-            .map(|sessions| sessions.values().cloned().collect())
+            .map(|sessions| sessions.values().map(|entry| entry.shutdown.clone()).collect())
             .unwrap_or_default()
     };
     for sender in &senders {
@@ -149,7 +166,29 @@ impl EmberSessionHandle {
             secure_registration: None,
             relayed: false,
             peer_addr: None,
+            honours_friends_only: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Record that the friend's build honours friends-only markings, on this
+    /// session and on every other live secure session of the same friend.
+    pub fn mark_honours_friends_only(&self) {
+        self.honours_friends_only.store(true, Ordering::Relaxed);
+        let (Some(registration), Some(index)) =
+            (self.secure_registration.as_ref(), SECURE_REVOCATION_INDEX.get())
+        else {
+            return;
+        };
+        let index = index.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for entry in index.get(&registration.ember_hash).into_iter().flat_map(|s| s.values()) {
+            entry.honours_friends_only.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a friends-only file may be offered on this session: an older
+    /// build would drop the flag and republish the file as public.
+    pub fn honours_friends_only(&self) -> bool {
+        self.honours_friends_only.load(Ordering::Relaxed)
     }
 
     pub fn via_relay(mut self, relayed: bool) -> Self {
@@ -178,12 +217,24 @@ impl EmberSessionHandle {
     ) -> Self {
         let mut handle = Self::new(tx, peer_ember_pubkey);
         let index = SECURE_REVOCATION_INDEX.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-        index
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(ember_hash)
-            .or_default()
-            .insert(handle.session_id, handle.shutdown.clone());
+        let mut index = index.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sessions = index.entry(ember_hash).or_default();
+        // A second connection while the first is still up is the same build:
+        // it starts with what that one already showed.
+        if sessions
+            .values()
+            .any(|entry| entry.honours_friends_only.load(Ordering::Relaxed))
+        {
+            handle.honours_friends_only.store(true, Ordering::Relaxed);
+        }
+        sessions.insert(
+            handle.session_id,
+            SecureSessionEntry {
+                shutdown: handle.shutdown.clone(),
+                honours_friends_only: handle.honours_friends_only.clone(),
+            },
+        );
+        drop(index);
         handle.secure_registration = Some(Arc::new(SecureSessionRegistration {
             ember_hash,
             session_id: handle.session_id,
@@ -3367,6 +3418,10 @@ pub enum UploadEventKind {
     /// state-mutation only and never reaches the UI.
     EmberFriendSearchFailed {
         ember_hash: [u8; 16],
+        /// The `outbound_session_tasks` reservation this attempt was spawned
+        /// under. A slower attempt finishing after a newer one reserved the
+        /// slot must not release that one; `None` releases unconditionally.
+        reserved_at: Option<std::time::Instant>,
     },
     /// The punch registration for a friend transfer they accepted could not
     /// be published, so the punch can never happen. Sent from the spawned
@@ -15040,6 +15095,9 @@ impl UploadHandler {
                             }
                             Some((super::messages::EMBER_EXT_BROWSE_SCOPE_AWARE, _)) => {
                                 peer_scope_aware = true;
+                                if let Some(session) = ember_session_handle.as_ref() {
+                                    session.mark_honours_friends_only();
+                                }
                             }
                             Some((super::messages::EMBER_EXT_CHAT_ID, body)) => {
                                 pending_chat_id = hello_caps.ember_pubkey.and_then(|pk| {
@@ -15051,6 +15109,9 @@ impl UploadHandler {
                                 });
                             }
                             Some((super::messages::EMBER_EXT_MAILBOX_AWARE, body)) => {
+                                if let Some(session) = ember_session_handle.as_ref() {
+                                    session.mark_honours_friends_only();
+                                }
                                 let _ = self
                                     .upload_event_tx
                                     .send(UploadEvent {
@@ -17083,6 +17144,36 @@ mod ember_session_handle_tests {
         shutdown_b.changed().await.unwrap();
         assert!(*shutdown_a.borrow());
         assert!(*shutdown_b.borrow());
+    }
+
+    /// A friend's frame down one connection counts on the other one our map
+    /// holds, and a connection opened while one is marked starts marked; a
+    /// different friend, and a session once every earlier one is gone, do not.
+    #[test]
+    fn a_friends_only_mark_reaches_every_live_session_of_that_friend() {
+        let hash = [0xE3; 16];
+        let other = [0xE4; 16];
+        let channel = || tokio::sync::mpsc::channel::<Vec<u8>>(1).0;
+        let a = EmberSessionHandle::new_secure(channel(), [2; 32], hash);
+        let b = EmberSessionHandle::new_secure(channel(), [2; 32], hash);
+        let stranger = EmberSessionHandle::new_secure(channel(), [3; 32], other);
+        assert!(!a.honours_friends_only() && !b.honours_friends_only());
+
+        a.mark_honours_friends_only();
+        assert!(b.clone().honours_friends_only(), "the duplicate is marked too");
+        assert!(!stranger.honours_friends_only());
+
+        let later = EmberSessionHandle::new_secure(channel(), [2; 32], hash);
+        assert!(later.honours_friends_only(), "opened while one was marked");
+
+        drop((a, b, later));
+        let fresh = EmberSessionHandle::new_secure(channel(), [2; 32], hash);
+        assert!(!fresh.honours_friends_only(), "nothing live to learn it from");
+
+        // A pre-v2 handle has no registration; marking it stays local.
+        let legacy = EmberSessionHandle::new(channel(), [2; 32]);
+        legacy.mark_honours_friends_only();
+        assert!(legacy.honours_friends_only());
     }
 
     /// The guard owns both halves of an admission — the unit of the

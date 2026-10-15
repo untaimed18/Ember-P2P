@@ -1404,7 +1404,8 @@ pub(in crate::network) async fn on_download_event(
             && !state.outbound_session_tasks.contains_key(&friend_eh)
         {
             if let std::net::IpAddr::V4(v4) = ip {
-                state.outbound_session_tasks.insert(friend_eh, std::time::Instant::now());
+                let reserved_at = std::time::Instant::now();
+                state.outbound_session_tasks.insert(friend_eh, reserved_at);
                 let our_uh = state.user_hash;
                 let our_eh = ember_hash;
                 let nick = settings.nickname.clone();
@@ -1437,7 +1438,10 @@ pub(in crate::network) async fn on_download_event(
                     // the slot only gated this connect attempt.
                     let _ = ultx2.send(upload_server::UploadEvent {
                         transfer_id: String::new(),
-                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed {
+                            ember_hash: friend_eh,
+                            reserved_at: Some(reserved_at),
+                        },
                     }).await;
                 });
             }

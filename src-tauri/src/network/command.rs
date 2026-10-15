@@ -192,6 +192,35 @@ pub(crate) async fn handle_command(
     }
 }
 
+/// Why a file may not be offered to a friend whose session has not shown it
+/// honours friends-only markings, or `None` when it may.
+///
+/// The offer's friends-only flag rides a trailing byte older builds never
+/// read; one of those would file the copy as public and republish it, which
+/// cannot be taken back. A file not marked here is held back too while the
+/// catalog that would say so is not trusted (`known.met` still loading, or
+/// only read in part), with its own reason, since it may well be public.
+fn friends_only_offer_refusal(
+    restricted: bool,
+    catalog_trusted: bool,
+    session_honours_friends_only: bool,
+) -> Option<String> {
+    if session_honours_friends_only || (!restricted && catalog_trusted) {
+        return None;
+    }
+    Some(if restricted {
+        coded(
+            "peers_offer_needs_newer_ember",
+            "Your friend's Ember is too old to keep friends-only files private",
+        )
+    } else {
+        coded(
+            "peers_offer_library_unconfirmed",
+            "Ember cannot yet confirm this file is not friends-only",
+        )
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_command_inner(
     socket: &UdpSocket,
@@ -5345,14 +5374,15 @@ async fn handle_command_inner(
                 let _ = tx.send(Err("File is restricted to mutual friends".into()));
                 return;
             }
+            // Until known.met is absorbed a restricted row can read public,
+            // and the recipient would republish it.
+            let friends_only = restricted || !known_files.is_authoritative();
             let payload = ed2k::messages::build_ember_file_offer(&ed2k::messages::EmberFileOffer {
                 file_hash,
                 file_size,
                 file_name,
                 ember_file_hash,
-                // Until known.met is absorbed a restricted row can read
-                // public, and the recipient would republish it.
-                friends_only: restricted || !known_files.is_authoritative(),
+                friends_only,
             });
             let sessions = state.ember_sessions.read().await;
             let Some(session) = sessions
@@ -5363,6 +5393,17 @@ async fn handle_command_inner(
                 let _ = tx.send(Err("Friend is offline".into()));
                 return;
             };
+            // Browse holds friends-only files back from an older session for
+            // the reason `friends_only_offer_refusal` gives.
+            if let Some(error) = friends_only_offer_refusal(
+                restricted,
+                known_files.is_authoritative(),
+                session.honours_friends_only(),
+            ) {
+                drop(sessions);
+                let _ = tx.send(Err(error));
+                return;
+            }
             let mut framed = Vec::with_capacity(6 + payload.len());
             framed.push(OP_EMULEPROT);
             framed.extend_from_slice(&((1 + payload.len()) as u32).to_le_bytes());
@@ -6453,9 +6494,10 @@ async fn handle_command_inner(
                         if let Some((ip_str, port)) = addr_opt {
                             if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
                                 let addr = SocketAddr::new(ip.into(), port);
+                                let reserved_at = std::time::Instant::now();
                                 state
                                     .outbound_session_tasks
-                                    .insert(friend_eh, std::time::Instant::now());
+                                    .insert(friend_eh, reserved_at);
                                 let our_user_hash = state.user_hash;
                                 let our_ember_hash = ember_hash;
                                 let nickname = settings.nickname.clone();
@@ -6511,7 +6553,7 @@ async fn handle_command_inner(
                                                 );
                                                 let _ = ul_tx2.send(upload_server::UploadEvent {
                                                     transfer_id: String::new(),
-                                                    kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                                    kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh, reserved_at: Some(reserved_at) },
                                                 }).await;
                                                 return;
                                             }
@@ -6564,7 +6606,7 @@ async fn handle_command_inner(
                                     // slot only gated this connect attempt.
                                     let _ = ul_tx2.send(upload_server::UploadEvent {
                                         transfer_id: String::new(),
-                                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh, reserved_at: Some(reserved_at) },
                                     }).await;
                                 });
                             } else {
@@ -6600,9 +6642,10 @@ async fn handle_command_inner(
                             let fh = friend_hashes.clone();
                             let ultx2 = ul_event_tx.clone();
                             let nat_ctx = state.friend_nat_context.clone();
+                            let reserved_at = std::time::Instant::now();
                             state
                                 .outbound_session_tasks
-                                .insert(friend_eh, std::time::Instant::now());
+                                .insert(friend_eh, reserved_at);
                             debug!(
                                 "No stored address for {}, trying rendezvous for chat",
                                 hex::encode(friend_eh)
@@ -6647,7 +6690,7 @@ async fn handle_command_inner(
                                                     );
                                                     let _ = ultx2.send(upload_server::UploadEvent {
                                                         transfer_id: String::new(),
-                                                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh, reserved_at: Some(reserved_at) },
                                                     }).await;
                                                     return;
                                                 }
@@ -6691,7 +6734,7 @@ async fn handle_command_inner(
                                 // misleading offline UI events.
                                 let _ = ultx2.send(upload_server::UploadEvent {
                                     transfer_id: String::new(),
-                                    kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                    kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh, reserved_at: Some(reserved_at) },
                                 }).await;
                             });
                         }
@@ -6825,9 +6868,10 @@ async fn handle_command_inner(
                         if let Some((ip_str, port)) = addr_opt {
                             if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
                                 let addr = SocketAddr::new(ip.into(), port);
+                                let reserved_at = std::time::Instant::now();
                                 state
                                     .outbound_session_tasks
-                                    .insert(friend_eh, std::time::Instant::now());
+                                    .insert(friend_eh, reserved_at);
                                 let our_user_hash = state.user_hash;
                                 let our_ember_hash = ember_hash;
                                 let nickname = settings.nickname.clone();
@@ -6922,7 +6966,7 @@ async fn handle_command_inner(
                                     // slot only gated this connect attempt.
                                     let _ = ul_tx2.send(upload_server::UploadEvent {
                                         transfer_id: String::new(),
-                                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh, reserved_at: Some(reserved_at) },
                                     }).await;
                                 });
                             } else {
@@ -6963,9 +7007,10 @@ async fn handle_command_inner(
                             let browse_event_tx = ul_event_tx.clone();
                             let ultx2 = ul_event_tx.clone();
                             let nat_ctx = state.friend_nat_context.clone();
+                            let reserved_at = std::time::Instant::now();
                             state
                                 .outbound_session_tasks
-                                .insert(friend_eh, std::time::Instant::now());
+                                .insert(friend_eh, reserved_at);
                             info!(
                                 "No stored address for {}, trying rendezvous for browse",
                                 hex::encode(friend_eh)
@@ -7056,7 +7101,7 @@ async fn handle_command_inner(
                                 // not EmberFriendDisconnected — see chat path.
                                 let _ = ultx2.send(upload_server::UploadEvent {
                                     transfer_id: String::new(),
-                                    kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                    kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh, reserved_at: Some(reserved_at) },
                                 }).await;
                             });
                         }
@@ -7373,6 +7418,42 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::Shutdown { .. } => {}
+    }
+}
+
+#[cfg(test)]
+mod friends_only_offer_tests {
+    use super::friends_only_offer_refusal;
+
+    fn code(error: Option<String>) -> Option<String> {
+        error.map(|e| {
+            let envelope: serde_json::Value = serde_json::from_str(&e).expect("a coded error");
+            envelope["code"].as_str().expect("with a code").to_string()
+        })
+    }
+
+    #[test]
+    fn a_friend_who_honours_the_marking_gets_any_file() {
+        for (restricted, trusted) in [(true, true), (true, false), (false, false), (false, true)] {
+            assert_eq!(friends_only_offer_refusal(restricted, trusted, true), None);
+        }
+    }
+
+    #[test]
+    fn an_older_friend_gets_only_a_file_known_to_be_public() {
+        assert_eq!(friends_only_offer_refusal(false, true, false), None);
+        assert_eq!(
+            code(friends_only_offer_refusal(true, true, false)).as_deref(),
+            Some("peers_offer_needs_newer_ember")
+        );
+        assert_eq!(
+            code(friends_only_offer_refusal(true, false, false)).as_deref(),
+            Some("peers_offer_needs_newer_ember")
+        );
+        assert_eq!(
+            code(friends_only_offer_refusal(false, false, false)).as_deref(),
+            Some("peers_offer_library_unconfirmed")
+        );
     }
 }
 

@@ -164,6 +164,90 @@
     });
   });
 
+  // The log pane's height, dragged from the bar above it and remembered across
+  // launches. `null` until the user drags: the pane then keeps its default
+  // sizing (fits its content, up to 30% of the layout).
+  const LOG_HEIGHT_KEY = 'servers-log-height';
+  const LOG_MIN_HEIGHT = 100;
+  const LOG_MAX_HEIGHT = 520;
+  /** The server list above always keeps at least this much. */
+  const LIST_MIN_HEIGHT = 200;
+  const LOG_KEY_STEP = 24;
+
+  function loadLogHeight(): number | null {
+    try {
+      const n = Number(localStorage.getItem(LOG_HEIGHT_KEY));
+      return Number.isFinite(n) && n >= LOG_MIN_HEIGHT ? n : null;
+    } catch {
+      return null;
+    }
+  }
+
+  let layoutHeight = $state(0);
+  let logHeight: number | null = $state(loadLogHeight());
+  let logResizing = $state(false);
+
+  /** Largest height the pane may take right now, so a shrunken window can
+   *  never leave the server list with no room. Before the layout has been
+   *  measured (0) only the fixed ceiling applies, so a saved height does not
+   *  flash at the minimum on the first frame. */
+  let logMaxHeight = $derived(
+    layoutHeight > 0
+      ? Math.max(LOG_MIN_HEIGHT, Math.min(LOG_MAX_HEIGHT, layoutHeight - LIST_MIN_HEIGHT))
+      : LOG_MAX_HEIGHT,
+  );
+  let shownLogHeight = $derived(
+    logHeight === null ? null : Math.min(Math.max(logHeight, LOG_MIN_HEIGHT), logMaxHeight),
+  );
+
+  function saveLogHeight() {
+    if (logHeight === null) return;
+    try { localStorage.setItem(LOG_HEIGHT_KEY, String(Math.round(logHeight))); } catch { /* quota — non-fatal */ }
+  }
+
+  function clampLogHeight(h: number): number {
+    return Math.min(Math.max(h, LOG_MIN_HEIGHT), logMaxHeight);
+  }
+
+  let logLowerEl: HTMLDivElement | undefined = $state(undefined);
+
+  function startLogResize(e: PointerEvent) {
+    if (e.button !== 0 || !logLowerEl) return;
+    e.preventDefault();
+    const handle = e.currentTarget as HTMLElement;
+    const startY = e.clientY;
+    const startHeight = logLowerEl.getBoundingClientRect().height;
+    logResizing = true;
+    handle.setPointerCapture(e.pointerId);
+    const onMove = (ev: PointerEvent) => {
+      // Dragging up grows the pane, since it hangs from the bottom edge.
+      logHeight = clampLogHeight(startHeight + (startY - ev.clientY));
+    };
+    const onEnd = () => {
+      handle.removeEventListener('pointermove', onMove);
+      handle.removeEventListener('pointerup', onEnd);
+      handle.removeEventListener('pointercancel', onEnd);
+      logResizing = false;
+      saveLogHeight();
+    };
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', onEnd);
+    handle.addEventListener('pointercancel', onEnd);
+  }
+
+  function logResizeKey(e: KeyboardEvent) {
+    const current = logHeight ?? logLowerEl?.getBoundingClientRect().height ?? LOG_MIN_HEIGHT;
+    let next: number | null = null;
+    if (e.key === 'ArrowUp') next = current + LOG_KEY_STEP;
+    else if (e.key === 'ArrowDown') next = current - LOG_KEY_STEP;
+    else if (e.key === 'Home') next = LOG_MIN_HEIGHT;
+    else if (e.key === 'End') next = logMaxHeight;
+    if (next === null) return;
+    e.preventDefault();
+    logHeight = clampLogHeight(next);
+    saveLogHeight();
+  }
+
   /// Clears the view and the backend's replay buffer. Without the second half,
   /// the next reload would hand the cleared lines straight back.
   function clearLog() {
@@ -1095,7 +1179,7 @@
     </div>
   </div>
 
-  <div class="server-layout">
+  <div class="server-layout" bind:clientHeight={layoutHeight}>
   <!-- Main area: server list (left) + side panel (right) -->
   <div class="server-upper">
     <div class="server-list-area">
@@ -1408,7 +1492,31 @@
   </div>
 
   <!-- Bottom: Server log messages -->
-  <div class="server-lower">
+  <!-- A focusable separator is a window splitter (ARIA): interactive by role. -->
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_no_noninteractive_tabindex -->
+  <div
+    class="log-resize"
+    class:dragging={logResizing}
+    role="separator"
+    aria-orientation="horizontal"
+    aria-label={m.servers_log_title()}
+    aria-valuemin={LOG_MIN_HEIGHT}
+    aria-valuemax={logMaxHeight}
+    aria-valuenow={Math.round(shownLogHeight ?? logLowerEl?.clientHeight ?? LOG_MIN_HEIGHT)}
+    tabindex="0"
+    onpointerdown={startLogResize}
+    onkeydown={logResizeKey}
+    ondblclick={() => {
+      logHeight = null;
+      try { localStorage.removeItem(LOG_HEIGHT_KEY); } catch { /* ignore */ }
+    }}
+  ></div>
+  <div
+    class="server-lower"
+    class:sized={shownLogHeight !== null}
+    style:height={shownLogHeight !== null ? `${shownLogHeight}px` : undefined}
+    bind:this={logLowerEl}
+  >
     <div class="log-toolbar">
       <span class="toolbar-label">{m.servers_log_title()}</span>
       <button class="ghost btn-sm" onclick={clearLog}>{m.common_clear()}</button>
@@ -1512,7 +1620,7 @@
   .server-upper {
     display: flex;
     flex: 1;
-    min-height: 0;
+    min-height: 200px;
     border-bottom: 1px solid var(--border);
   }
 
@@ -1908,6 +2016,35 @@
     min-height: 100px;
     display: flex;
     flex-direction: column;
+  }
+
+  /* Once the user has dragged it, the height is theirs: no 30% cap. */
+  .server-lower.sized {
+    flex: 0 0 auto;
+    max-height: none;
+  }
+
+  /* The grip between the server list and the log. Straddles the list's bottom
+     border, so the target is where the edge looks like it is. */
+  .log-resize {
+    flex-shrink: 0;
+    height: 7px;
+    margin: -4px 0 -3px;
+    position: relative;
+    z-index: 1;
+    cursor: row-resize;
+    touch-action: none;
+    background: transparent;
+    transition: background var(--transition-fast);
+  }
+  .log-resize:hover,
+  .log-resize.dragging,
+  .log-resize:focus-visible {
+    background: color-mix(in srgb, var(--accent) 55%, transparent);
+    outline: none;
+  }
+  .log-resize.dragging {
+    background: var(--accent);
   }
 
   .log-toolbar {

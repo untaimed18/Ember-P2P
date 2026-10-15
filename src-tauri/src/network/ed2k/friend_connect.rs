@@ -673,7 +673,7 @@ pub async fn run_friend_session_over_transport(
         // stream. Spawning a reader task keeps the framing state private and
         // only surfaces whole packets (or errors) through a channel, which is
         // cancel-safe at the select! site.
-        // Shallow: each slot can hold a frame of up to 5 MB, and a friend
+        // Shallow: each slot can hold a frame of up to 512 KiB, and a friend
         // sending faster than we handle them only needs backpressure.
         let (pkt_tx, mut pkt_rx) =
             tokio::sync::mpsc::channel::<std::io::Result<(u8, u8, Vec<u8>)>>(2);
@@ -1087,6 +1087,7 @@ pub async fn run_friend_session_over_transport(
                                         }
                                         Some((super::messages::EMBER_EXT_BROWSE_SCOPE_AWARE, _)) => {
                                             peer_scope_aware = true;
+                                            session_ember_session_handle.mark_honours_friends_only();
                                         }
                                         Some((super::messages::EMBER_EXT_CHAT_ID, body)) => {
                                             pending_chat_id = crate::network::ember::crypto::decrypt_chat_id(
@@ -1096,6 +1097,7 @@ pub async fn run_friend_session_over_transport(
                                             );
                                         }
                                         Some((super::messages::EMBER_EXT_MAILBOX_AWARE, body)) => {
+                                            session_ember_session_handle.mark_honours_friends_only();
                                             let _ = session_ul_event_tx.send(UploadEvent {
                                                 transfer_id: String::new(),
                                                 kind: UploadEventKind::EmberChatMailboxAware {
@@ -2254,12 +2256,18 @@ async fn write_packet<W: AsyncWriteExt + Unpin + ?Sized>(
     Ok(())
 }
 
+/// The same ceiling the inbound side of a friend session reads with
+/// (`read_packet_after_protocol` in upload.rs). Every sender already sizes
+/// for it, browse answers included, since a frame over it ends an inbound
+/// session; anything larger here is not a frame a friend has reason to send.
+const FRIEND_SESSION_MAX_PACKET: usize = 512 * 1024;
+
 async fn read_packet_inner<R: AsyncReadExt + Unpin + ?Sized>(
     reader: &mut R,
 ) -> std::io::Result<(u8, u8, Vec<u8>)> {
     let protocol = reader.read_u8().await?;
     let len = reader.read_u32_le().await?;
-    if len == 0 || len > 5_000_000 {
+    if len == 0 || len as usize > FRIEND_SESSION_MAX_PACKET {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid packet length",
@@ -2268,7 +2276,7 @@ async fn read_packet_inner<R: AsyncReadExt + Unpin + ?Sized>(
     let opcode = reader.read_u8().await?;
     let payload_len = (len - 1) as usize;
     // Grow the buffer as bytes actually arrive rather than allocating the full
-    // declared length (up to ~5 MiB) before reading. A peer that announces a
+    // declared length before reading. A peer that announces a
     // large packet then stalls would otherwise pin that allocation per
     // friend-connect session (mirrors `read_packet_body_ms` in multi_source.rs).
     let mut payload = Vec::new();

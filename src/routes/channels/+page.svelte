@@ -723,6 +723,7 @@
       language: item.language ?? '',
       newer_lines: 0,
       newer_key: false,
+      newer_envelope: false,
     };
   }
   let leaveTargetName = $derived(
@@ -3495,9 +3496,12 @@
                 <span>{m.channels_key_behind_body()}</span>
               </div>
             {/if}
-            {#if selected.newer_lines > 0}
+            {#if selected.newer_lines > 0 || selected.newer_envelope}
               <div class="successor-banner" role="status">
-                <span>{newerLinesLabel}</span>
+                <span>
+                  {#if selected.newer_lines > 0}{newerLinesLabel}{/if}
+                  {#if selected.newer_envelope}{m.channels_newer_envelope()}{/if}
+                </span>
                 <span class="newer-actions">
                   <!-- One update button per room: the key banner above has it. -->
                   {#if !selected.newer_key}

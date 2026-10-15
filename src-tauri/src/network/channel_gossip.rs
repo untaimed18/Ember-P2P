@@ -671,6 +671,76 @@ pub(super) async fn overlay_send_channel_gossip(
     sent && via_members
 }
 
+/// Room, envelope source and version already noted this session, so a member
+/// still sending them costs a set lookup rather than a database write. It
+/// also keeps a dismissed notice put away until Ember restarts, rather than
+/// raising it again with the member's next frame.
+static NOTED_NEWER_ENVELOPES: std::sync::Mutex<Option<HashSet<([u8; 16], &'static str, u8)>>> =
+    std::sync::Mutex::new(None);
+
+/// A frame for a room we hold came in an envelope version this build cannot
+/// read, so whatever it carried never reaches the room here. Say so with the
+/// room's "needs a newer Ember" banner, as for a line of an unknown kind.
+///
+/// The version byte is outside any seal, so only a hop on the room's roster
+/// counts: anyone else could raise the banner in every room whose id they
+/// have seen in a gossip header. A relay hop that is not a member goes
+/// unreported, which costs a banner, never a message.
+async fn note_unread_channel_envelope(
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    from_id: ember::dht::EmberNodeId,
+    source: &'static str,
+    version: u8,
+    channel_id: [u8; 16],
+) {
+    if !cached_channel_view(state, db, channel_id).is_some_and(|view| view.row.in_room_now()) {
+        return;
+    }
+    let from_member = channel_member_pubkeys_cached(state, db, channel_id)
+        .iter()
+        .any(|pk| ember::dht::EmberNodeId(ember::channel::channel_id_from_pubkey(pk)) == from_id);
+    if !from_member {
+        return;
+    }
+    let first_this_session = NOTED_NEWER_ENVELOPES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashSet::new)
+        .insert((channel_id, source, version));
+    if !first_this_session {
+        return;
+    }
+    let channel_id_hex = hex::encode(channel_id);
+    let (db, channel, seen_at) = (db.clone(), channel_id_hex.clone(), chrono::Utc::now().timestamp());
+    let noted = tokio::task::spawn_blocking(move || {
+        db.note_channel_newer_envelope(&channel, source, version, seen_at)
+    })
+    .await;
+    if !matches!(noted, Ok(Ok(_))) {
+        // Not written, so the next frame may try again.
+        if let Some(set) = NOTED_NEWER_ENVELOPES.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            set.remove(&(channel_id, source, version));
+        }
+    }
+    match noted {
+        Ok(Ok(true)) => {
+            info!(
+                "Ember channel {channel_id_hex}: a member sent a {source} envelope of version \
+                 {version}, which needs a newer Ember"
+            );
+            let _ = app_handle.emit(
+                "ember:channel-newer",
+                serde_json::json!({ "channel_id": channel_id_hex }),
+            );
+        }
+        Ok(Ok(false)) => {}
+        Ok(Err(e)) => debug!("Ember channel: could not note a newer envelope: {e}"),
+        Err(e) => debug!("Ember channel: newer-envelope task failed: {e}"),
+    }
+}
+
 pub(super) async fn handle_inbound_channel_relay(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -679,14 +749,29 @@ pub(super) async fn handle_inbound_channel_relay(
     body: Vec<u8>,
     from_id: ember::dht::EmberNodeId,
 ) {
-    let Some((channel_id, target_id, inner)) = ember::channel::decode_channel_relay_envelope(&body)
-    else {
+    let decoded = ember::channel::decode_channel_relay_envelope(&body);
+    // Charged before anything is looked up: noting an unread version reads the
+    // room, and a miss is a database query nobody caches.
+    if decoded.is_none()
+        && ember::channel::unread_envelope_room(&body, ember::channel::relay_envelope_version_supported)
+            .is_none()
+    {
         return;
-    };
+    }
     if !channel_gossip_inbound_ok(state, &from_id, XferAttribution::Relayed) {
         debug!("Ember channel relay: shed a frame from {from_id} over the per-hop budget");
         return;
     }
+    let Some((channel_id, target_id, inner)) = decoded else {
+        if let Some((version, channel_id)) = ember::channel::unread_envelope_room(
+            &body,
+            ember::channel::relay_envelope_version_supported,
+        ) {
+            note_unread_channel_envelope(state, db, app_handle, from_id, "relay", version, channel_id)
+                .await;
+        }
+        return;
+    };
     let local = state.ember_dht.local_id();
     if target_id == local.0 {
         handle_inbound_channel_gossip(
@@ -789,18 +874,50 @@ pub(super) async fn handle_inbound_channel_gossip(
     from_id: ember::dht::EmberNodeId,
     metering: HopMetering,
 ) {
-    let Some(gossip) = ember::channel::ChannelGossip::decode(&body) else {
-        return;
+    let decoded = ember::channel::ChannelGossip::decode(&body);
+    let unread_outer = match decoded {
+        Some(_) => None,
+        None => match ember::channel::unread_envelope_room(
+            &body,
+            ember::channel::gossip_envelope_version_supported,
+        ) {
+            Some(unread) => Some(unread),
+            None => return,
+        },
     };
     // Every caller that charges here is talking to the hop directly — a UDP
     // `CHANNEL_MSG`, or a WebSocket relay outbox already keyed by the peer —
     // so the transfer allowance is attributed to that hop. Frames arriving
     // inside a relay envelope were charged by the relay handler instead.
+    // Ahead of the unread-version note too, which reads the room.
     if metering == HopMetering::Charge
         && !channel_gossip_inbound_ok(state, &from_id, XferAttribution::Hop)
     {
         debug!("Ember channel gossip: shed a frame from {from_id} over the per-hop budget");
         return;
+    }
+    let Some(gossip) = decoded else {
+        if let Some((version, channel_id)) = unread_outer {
+            note_unread_channel_envelope(state, db, app_handle, from_id, "envelope", version, channel_id)
+                .await;
+        }
+        return;
+    };
+    // A header this build reads around a sealed body it does not: the body's
+    // own version byte comes first, outside the seal.
+    if let Some(&version) = gossip.ciphertext.first() {
+        if !ember::channel::gossip_envelope_version_supported(version) {
+            note_unread_channel_envelope(
+                state,
+                db,
+                app_handle,
+                from_id,
+                "envelope",
+                version,
+                gossip.channel_id,
+            )
+            .await;
+        }
     }
     let body_key = ember::channel::gossip_body_key(&gossip);
     let admission = ember::channel::admit_gossip(

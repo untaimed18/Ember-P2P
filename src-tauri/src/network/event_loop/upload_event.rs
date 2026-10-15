@@ -130,6 +130,22 @@ fn note_no_known_record(index: &LocalIndex, hash_hex: &str, what: &str) {
     }
 }
 
+/// Free a friend's outbound-dial slot when the attempt that reserved it ends.
+/// An attempt that outlived its reservation (pruned at ten minutes, or
+/// replaced by a newer dial) finds a different instant there and leaves it.
+fn release_outbound_session_slot(
+    slots: &mut HashMap<[u8; 16], std::time::Instant>,
+    friend: [u8; 16],
+    reserved_at: Option<std::time::Instant>,
+) {
+    match reserved_at {
+        Some(at) if slots.get(&friend) != Some(&at) => {}
+        _ => {
+            slots.remove(&friend);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn on_upload_event(
     event: UploadEvent,
@@ -1724,7 +1740,7 @@ pub(in crate::network) async fn on_upload_event(
         .await;
     }
 
-    if let UploadEventKind::EmberFriendSearchFailed { ember_hash: failed_eh } = event.kind {
+    if let UploadEventKind::EmberFriendSearchFailed { ember_hash: failed_eh, reserved_at } = event.kind {
         // Pure cleanup signal from the rendezvous /
         // chat-auto-connect / browse-auto-connect spawns.
         // Distinct from `EmberFriendDisconnected` so we
@@ -1737,7 +1753,7 @@ pub(in crate::network) async fn on_upload_event(
         // `ember:friend-search-failed` event with a
         // structured reason is emitted from inside the
         // spawn itself; here we only mutate state.
-        state.outbound_session_tasks.remove(&failed_eh);
+        release_outbound_session_slot(&mut state.outbound_session_tasks, failed_eh, reserved_at);
     }
 
     // Reputation: record upload-side events
@@ -1954,5 +1970,33 @@ pub(in crate::network) async fn on_upload_event(
             upload_queue_handle,
             transfer_status_writes,
         ).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_finished_attempt_frees_only_its_own_reservation() {
+        let friend = [7u8; 16];
+        let old = std::time::Instant::now();
+        let newer = old + std::time::Duration::from_secs(1);
+        let mut slots = HashMap::from([(friend, newer)]);
+
+        // The older attempt ends after a newer one reserved the slot.
+        release_outbound_session_slot(&mut slots, friend, Some(old));
+        assert_eq!(slots.get(&friend), Some(&newer));
+
+        release_outbound_session_slot(&mut slots, friend, Some(newer));
+        assert!(!slots.contains_key(&friend));
+    }
+
+    #[test]
+    fn an_attempt_without_a_reservation_still_frees_the_slot() {
+        let friend = [9u8; 16];
+        let mut slots = HashMap::from([(friend, std::time::Instant::now())]);
+        release_outbound_session_slot(&mut slots, friend, None);
+        assert!(slots.is_empty());
     }
 }

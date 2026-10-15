@@ -211,18 +211,24 @@ pub struct ChannelNewerStatus {
     pub lines: i64,
     /// The room's key came sealed in a version this build cannot open.
     pub key: bool,
+    /// Members sent this room's frames in a gossip or relay envelope version
+    /// this build cannot read, so what they say does not reach it at all.
+    pub envelope: bool,
 }
 
 impl ChannelNewerStatus {
     fn note(&mut self, source: &str, kind: i64) {
+        use crate::network::ember::channel as ch;
         let Ok(kind) = u8::try_from(kind) else {
             return;
         };
         match source {
-            "line" if !crate::network::ember::channel::ext_kind_understood(kind) => self.lines += 1,
-            "key" if !crate::network::ember::channel::epoch_envelope_version_supported(kind) => {
+            "line" if !ch::ext_kind_understood(kind) => self.lines += 1,
+            "key" if !ch::epoch_envelope_version_supported(kind) => {
                 self.key = true;
             }
+            "envelope" if !ch::gossip_envelope_version_supported(kind) => self.envelope = true,
+            "relay" if !ch::relay_envelope_version_supported(kind) => self.envelope = true,
             _ => {}
         }
     }
@@ -9240,12 +9246,41 @@ impl Database {
         Ok(added)
     }
 
+    /// Note that a member sent this room's frames in an envelope version this
+    /// build cannot read. `source` is `envelope` for the gossip envelope and
+    /// `relay` for the overlay relay one; one row per version, so a room
+    /// flooded with them still holds a handful. Returns whether it was news.
+    pub fn note_channel_newer_envelope(
+        &self,
+        channel_id: &str,
+        source: &str,
+        version: u8,
+        seen_at: i64,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            matches!(source, "envelope" | "relay"),
+            "not an envelope source: {source}"
+        );
+        let conn = self.conn.lock();
+        Self::ensure_channel_newer_frames_locked(&conn)?;
+        Ok(conn.execute(
+            "INSERT OR IGNORE INTO channel_newer_frames
+                (channel_id, source, ref, kind, seen_at)
+             VALUES (?1, ?2, ?3, ?3, ?4)",
+            params![channel_id, source, i64::from(version), seen_at],
+        )? > 0)
+    }
+
     /// The user has seen that some of a room's lines need a newer Ember.
+    /// Clears the envelope notes with them: both are one banner the user put
+    /// away. A member still sending such envelopes is noted again after Ember
+    /// restarts (`NOTED_NEWER_ENVELOPES` in `channel_gossip.rs`).
     pub fn dismiss_channel_newer_lines(&self, channel_id: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         Self::ensure_channel_newer_frames_locked(&conn)?;
         Ok(conn.execute(
-            "DELETE FROM channel_newer_frames WHERE channel_id = ?1 AND source = 'line'",
+            "DELETE FROM channel_newer_frames
+             WHERE channel_id = ?1 AND source IN ('line', 'envelope', 'relay')",
             params![channel_id],
         )? > 0)
     }
@@ -20962,6 +20997,43 @@ mod tests {
         db.insert_channel_message(&channel_id, &me, "sent", "newer", "s2", 7_000, "", true)
             .unwrap();
         assert_eq!(db.last_sent_channel_message_at(&channel_id).unwrap(), 7_000);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// An envelope version this build cannot read raises the room's notice
+    /// once per version, a version it can read never does, and dismissing the
+    /// lines notice puts it away too.
+    #[test]
+    fn a_room_notes_envelopes_only_a_newer_ember_reads() {
+        use crate::network::ember::channel::CHANNEL_MSG_VERSION;
+        let path = std::env::temp_dir().join(format!(
+            "ember-newer-envelope-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "6c".repeat(16);
+        db.insert_channel(&channel_id, &"5b".repeat(32), "Room", "public", false, None, None)
+            .expect("insert channel");
+
+        assert!(db.note_channel_newer_envelope(&channel_id, "envelope", 2, 100).unwrap());
+        assert!(!db.note_channel_newer_envelope(&channel_id, "envelope", 2, 101).unwrap());
+        assert!(db.channel_newer_status(&channel_id).unwrap().envelope);
+        assert!(db.note_channel_newer_envelope(&channel_id, "relay", 3, 102).unwrap());
+        assert!(db.note_channel_newer_envelope(&channel_id, "bogus", 3, 102).is_err());
+
+        assert!(db.dismiss_channel_newer_lines(&channel_id).unwrap());
+        assert!(!db.channel_newer_status(&channel_id).unwrap().envelope);
+
+        // A version this build reads, noted by one that did not, says nothing.
+        db.note_channel_newer_envelope(&channel_id, "envelope", CHANNEL_MSG_VERSION, 200)
+            .unwrap();
+        assert!(!db.channel_newer_status(&channel_id).unwrap().envelope);
 
         drop(db);
         let _ = std::fs::remove_file(&path);
