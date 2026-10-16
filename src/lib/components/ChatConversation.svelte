@@ -3568,6 +3568,10 @@
           aria-label={m.channels_pinned_next_count({ index: shownPinIndex + 1, total: pinEntries.length })}
         >
           {m.channels_pinned_count({ index: shownPinIndex + 1, total: pinEntries.length })}
+          <!-- Says it moves on; the count alone read as a label. -->
+          <svg class="conv-pin-next" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M6 3.5L10.5 8 6 12.5"/>
+          </svg>
         </button>
       {/if}
       {#if canPin}
@@ -3579,7 +3583,12 @@
           title={m.channels_unpin_message()}
           aria-label={m.channels_unpin_message()}
         >
-          <IconX size={11} />
+          <!-- The pin struck through, not the ✕ that cancels a reply: this one
+               takes the pin down for everyone in the room. -->
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="11" height="11" aria-hidden="true">
+            <path d="M6 2.5h4M7 2.5v4L4.5 9h7L9 6.5v-4M8 9v4.5"/>
+            <path d="M2.5 2.5l11 11"/>
+          </svg>
         </button>
       {/if}
     </div>
@@ -3859,6 +3868,7 @@
               {/if}
               {#if isChannel && row.msg.id > 0 && canEdit(row.msg) && editingId !== row.msg.id}
                 <button
+                  type="button"
                   class="bubble-edit-btn"
                   onclick={() => startEdit(row.msg)}
                   title={m.channels_edit_message()}
@@ -3872,13 +3882,19 @@
               {#if row.msg.id > 0}
                 {@const removeLabel = isChannel ? m.channels_remove_local() : m.chat_delete_message()}
                 <button
+                  type="button"
                   class="bubble-remove"
                   disabled={removingMessage === row.msg.id}
                   onclick={() => handleRemoveMessage(row.msg.id)}
                   title={removeLabel}
                   aria-label={removeLabel}
                 >
-                  <IconX size={11} />
+                  <!-- A bin, not the ✕ that cancels a reply or closes a bar. -->
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="11" height="11" aria-hidden="true">
+                    <path d="M2.5 4.5h11"/>
+                    <path d="M6.5 4.5V3a1 1 0 011-1h1a1 1 0 011 1v1.5"/>
+                    <path d="M4 4.5l.7 8.1a1 1 0 001 .9h4.6a1 1 0 001-.9l.7-8.1"/>
+                  </svg>
                 </button>
               {/if}
             </div>
@@ -3966,7 +3982,9 @@
         {#if isChannel && (slowSend || failed)}
           <div class="bubble-status">
             {#if slowSend}
-              <span title={m.channels_delivery_sending_title()}>{m.chat_delivery_queued()}</span>
+              <!-- Not "Queued": in a friend chat that means held for later,
+                   while here the line is still on its way into the room. -->
+              <span title={m.channels_delivery_sending_title()}>{m.channels_delivery_sending()}</span>
             {:else}
               <span class="failed" title={m.channels_delivery_failed_title()}>{m.chat_delivery_failed()}</span>
               <button
@@ -4998,8 +5016,12 @@
     gap: 3px;
   }
 
+  /* In the cluster rather than floating; relative, not static, so its
+     enlarged hit area (below) has something to hang from. */
   .conversation.channel .bubble-remove {
-    position: static;
+    position: relative;
+    top: auto;
+    inset-inline-end: auto;
   }
 
   .conversation.channel .bubble-edit-btn,
@@ -5083,6 +5105,27 @@
   .bubble-reply-btn:hover {
     background: var(--bg-hover);
     color: var(--text-primary);
+  }
+
+  /* Drawn at 18 px so the cluster stays small on the bubble's edge, but hit
+     at 24, the smallest target that is comfortable to press: an invisible
+     margin around each. Neighbours' margins overlap in the gap between them,
+     where either is a fair reading of the click. */
+  .bubble-copy-btn,
+  .bubble-reply-btn,
+  .bubble-pin-btn,
+  .bubble-edit-btn {
+    position: relative;
+  }
+
+  .bubble-copy-btn::after,
+  .bubble-reply-btn::after,
+  .bubble-pin-btn::after,
+  .bubble-edit-btn::after,
+  .bubble-remove::after {
+    content: '';
+    position: absolute;
+    inset: -3px;
   }
 
   /* The line a reply answers, above its text. Tinted from `currentColor` like
@@ -5317,7 +5360,10 @@
 
   .conv-pin-cycle {
     flex-shrink: 0;
-    padding: 1px 6px;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 1px 4px 1px 6px;
     border: 1px solid var(--border);
     border-radius: var(--radius-pill);
     background: transparent;
@@ -5331,6 +5377,12 @@
   .conv-pin-cycle:hover {
     background: var(--bg-hover);
     color: var(--text-primary);
+  }
+
+  .conv-pin-next {
+    width: 10px;
+    height: 10px;
+    flex-shrink: 0;
   }
 
   .bubble-pin-btn {

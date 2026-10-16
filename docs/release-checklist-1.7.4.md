@@ -88,5 +88,10 @@ New strings this release, in all eight non-English locales:
 - [ ] `error_peers_offer_library_unconfirmed` (the same refusal while the
       library is still loading or was only read in part).
 - [ ] `channels_newer_envelope` (members on a newer Ember).
+- [ ] Channels UX pass: `channels_ban_confirm*` (the Ban confirmation),
+      `channels_offers_waiting_*` and `channels_offers_review` (the file
+      waiting banner), `channels_hide_listing_aria`, `channels_delivery_sending`,
+      `channels_search_unavailable`, `channels_send_file_member_banned`,
+      `channels_send_file_busy`.
 
 List everything else that changed with `git diff v1.7.3 -- messages/en.json`.

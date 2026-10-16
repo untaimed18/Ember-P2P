@@ -224,6 +224,12 @@
   const CLAIM_WINDOWS = [7, 14, 30, 90, 180, 365];
   let transferTarget = $state<ChannelMemberInfo | null>(null);
   let transferOpen = $state(false);
+  /** The member a Ban is waiting on confirmation for, and whether banning
+   *  them rotates the room's key (an owner, in a private room), read when the
+   *  menu item was pressed so the dialog's wording cannot change under it. */
+  let banTarget = $state<ChannelMemberInfo | null>(null);
+  let banRotates = $state(false);
+  let banOpen = $state(false);
   let composeMode = $state<'create' | 'join' | null>(null);
   let membersOpen = $state(true);
   /** The directory stays up alongside an open room; the header toggle hands the
@@ -379,12 +385,28 @@
     return inertBackground(roomSettingsOverlayEl);
   });
 
+  /** Where the window should open to, for a prompt that is about one part of
+   *  it: the successor banner opens it at Succession, near the bottom. */
+  let roomSettingsSection = $state<'succession' | null>(null);
+  let successionEl = $state<HTMLDivElement>();
+
+  function openRoomSettings(section: 'succession' | null = null) {
+    roomSettingsSection = section;
+    roomInfoOpen = true;
+  }
+
   // Focus moves into the window so Tab starts inside it and a screen reader
   // hears its title, and goes back to whatever opened it — the gear — after.
   $effect(() => {
     if (!roomSettingsShown) return;
     const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    void tick().then(() => roomSettingsEl?.focus());
+    void tick().then(() => {
+      roomSettingsEl?.focus();
+      if (untrack(() => roomSettingsSection) === 'succession') {
+        successionEl?.scrollIntoView({ block: 'start' });
+      }
+      roomSettingsSection = null;
+    });
     return () => {
       if (opener?.isConnected) opener.focus();
     };
@@ -726,6 +748,8 @@
       newer_envelope: false,
     };
   }
+  /** Only the owner may hand out invites here, and we are not the owner. */
+  let invitesClosed = $derived(!!selected && selected.invites_owner_only && !selected.is_owner);
   let leaveTargetName = $derived(
     directoryList.find((c) => c.channel_id === leaveTargetId)?.name
       ?? channelList.find((c) => c.channel_id === leaveTargetId)?.name
@@ -2031,6 +2055,18 @@
     }
   }
 
+  function requestBan(member: ChannelMemberInfo) {
+    banTarget = member;
+    banRotates = !!selected?.is_owner && selected.visibility === 'private';
+    banOpen = true;
+  }
+
+  // The target stays set while the dialog animates closed, so its title does
+  // not lose the name; the next request replaces it.
+  function confirmBan() {
+    if (banTarget) void handleBan(banTarget.member_pubkey);
+  }
+
   async function handleBan(memberPubkey: string) {
     const id = selectedId;
     if (!id || moderationBusy) return;
@@ -2616,6 +2652,18 @@
       membersOpen = true;
     }
   }
+  /** The banner's way to the offers: unlike an arriving offer, the user asked,
+   *  so the pane opens even where it covers the conversation. */
+  function reviewRoomOffers() {
+    xferCollapsed = false;
+    membersOpen = true;
+  }
+  let roomOffersLabel = $derived(
+    plural(roomOffersWaiting, {
+      one: m.channels_offers_waiting_one,
+      other: () => m.channels_offers_waiting_other({ count: roomOffersWaiting }),
+    }),
+  );
   const offersSeen = new Set<string>();
   $effect(() => {
     const fresh = roomTransfers.filter((t) => t.status === 'awaiting' && !offersSeen.has(t.xfer_id));
@@ -2707,7 +2755,7 @@
       disabled={emberOff || (needsUsername && composeMode !== 'join')}
       title={needsUsername && composeMode !== 'join' ? m.channels_username_required() : undefined}
     >
-      {composeMode === 'join' ? m.common_cancel() : m.channels_join()}
+      {composeMode === 'join' ? m.common_cancel() : m.channels_join_title()}
     </button>
     <button
       class="add-btn primary"
@@ -2995,9 +3043,8 @@
 
         {#snippet roomRow(ch: ChannelInfo)}
                 {@const memberCount = directoryMemberCount(ch)}
-                <!-- A room whose ownership moved is dimmed rather than
-                     labelled: the card carries no prose now, and opening it
-                     shows the successor banner that actually explains it. -->
+                <!-- A room whose ownership moved is dimmed and badged; opening
+                     it shows the successor banner that explains it. -->
                 <div
                   class="chan-row"
                   role="listitem"
@@ -3063,6 +3110,11 @@
                           alt={m.channels_language_flag_title({ language: languageName })}
                           title={m.channels_language_flag_title({ language: languageName })}
                         />
+                      {/if}
+                      <!-- Said, not only dimmed: a faded row with its reason in a
+                           tooltip read as broken to anyone not hovering it. -->
+                      {#if ch.successor_id}
+                        <span class="badge sm tone-muted chan-moved-badge">{m.channels_transferred_badge()}</span>
                       {/if}
                     </span>
                     {#if ch.in_room && favouriteSet.has(ch.channel_id)}
@@ -3175,8 +3227,10 @@
                         <button
                           type="button"
                           class="chan-forget"
-                          title={m.channels_forget()}
-                          aria-label={m.channels_forget_aria({ name: ch.name })}
+                          title={storedChannelIds.has(ch.channel_id) ? m.channels_forget() : m.channels_hide_listing()}
+                          aria-label={storedChannelIds.has(ch.channel_id)
+                            ? m.channels_forget_aria({ name: ch.name })
+                            : m.channels_hide_listing_aria({ name: ch.name })}
                           disabled={forgettingIds.includes(ch.channel_id)
                             || joiningIds.includes(ch.channel_id)}
                           onclick={() => requestForget(ch.channel_id)}
@@ -3326,6 +3380,31 @@
                       title={m.channels_language_flag_title({ language: languageName })}
                     />
                   {/if}
+                  <!-- Facts about the room, beside its name: kept apart from the
+                       buttons on the right so nothing here reads as pressable.
+                       Shown to everyone: an owner or moderator still needs to
+                       know that nobody else can answer here. -->
+                  <span class="conv-status">
+                    {#if selected.announce_only}
+                      <span
+                        class="enc-lock"
+                        role="img"
+                        title={m.channels_announce_badge_title()}
+                        aria-label={m.channels_announce_badge_title()}
+                      >
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <path d="M2.5 6.5v3h2l4.5 3V3.5l-4.5 3z"/>
+                          <path d="M11.5 5.5a3.5 3.5 0 0 1 0 5"/>
+                        </svg>
+                      </span>
+                    {/if}
+                    <span class="enc-lock" role="img" title={selectedEncTitle} aria-label={selectedEncTitle}>
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/>
+                        <path d="M5.5 7V5.5a2.5 2.5 0 0 1 5 0V7"/>
+                      </svg>
+                    </span>
+                  </span>
                 </div>
                 {#if selected.topic.trim()}
                   <p class="topic has-topic" title={selected.topic}>
@@ -3337,28 +3416,6 @@
                 {/if}
               </div>
               <div class="conv-actions">
-                <!-- Beside the padlock, as another fact about the room itself.
-                     Shown to everyone: an owner or moderator still needs to
-                     know that nobody else can answer here. -->
-                {#if selected.announce_only}
-                  <span
-                    class="enc-lock"
-                    role="img"
-                    title={m.channels_announce_badge_title()}
-                    aria-label={m.channels_announce_badge_title()}
-                  >
-                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                      <path d="M2.5 6.5v3h2l4.5 3V3.5l-4.5 3z"/>
-                      <path d="M11.5 5.5a3.5 3.5 0 0 1 0 5"/>
-                    </svg>
-                  </span>
-                {/if}
-                <span class="enc-lock" role="img" title={selectedEncTitle} aria-label={selectedEncTitle}>
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/>
-                    <path d="M5.5 7V5.5a2.5 2.5 0 0 1 5 0V7"/>
-                  </svg>
-                </span>
                 {#if selected.is_owner}
                   <button
                     class="icon-btn"
@@ -3399,10 +3456,11 @@
                     title={m.channels_welcome_show()}
                     aria-label={m.channels_welcome_show()}
                   >
+                    <!-- A note rather than a megaphone: the megaphone beside the
+                         room's name says the room is announcement-only. -->
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                      <path d="M2.5 6.5v3h2l4.5 3v-9l-4.5 3z"/>
-                      <path d="M11.2 5.6a3.4 3.4 0 010 4.8"/>
-                      <path d="M12.9 4a5.6 5.6 0 010 8"/>
+                      <path d="M2.5 3.5h11v7.5H7l-3 2.5V11H2.5z"/>
+                      <path d="M5 6.2h6M5 8.6h4"/>
                     </svg>
                   </button>
                 {/if}
@@ -3448,11 +3506,18 @@
                 <!-- Splits the four view toggles from the two actions that
                      actually change something. -->
                 <span class="conv-actions-sep" aria-hidden="true"></span>
-                <button class="ghost conv-action" disabled={copyingInvite} onclick={handleCopyInvite}>{copyingInvite ? m.channels_copying_invite() : m.channels_invite()}</button>
+                <!-- Disabled with the reason rather than failing after the
+                     click: the backend refuses non-owners here. -->
+                <button
+                  class="ghost conv-action"
+                  disabled={copyingInvite || invitesClosed}
+                  title={invitesClosed ? m.error_channels_invites_owner_only() : undefined}
+                  onclick={handleCopyInvite}
+                >{copyingInvite ? m.channels_copying_invite() : m.channels_invite()}</button>
                 <!-- Delete room used to sit here, identical red text one gap
                      away from Leave. Only one of the two can be undone, so it
                      moved in beside the owner's other room settings. -->
-                <span class="conv-actions-sep" aria-hidden="true"></span>
+                <span class="conv-actions-sep before-leave" aria-hidden="true"></span>
                 <button class="conv-action conv-leave" onclick={() => requestLeave(selected.channel_id)}>{m.channels_leave()}</button>
               </div>
             </header>
@@ -3516,11 +3581,20 @@
                 </span>
               </div>
             {/if}
+            <!-- Accept and Deny live in the members pane's transfer drawer. An
+                 arriving offer opens it on wide windows; where it stays shut
+                 (narrow, or closed by the user) this says a file is waiting. -->
+            {#if roomOffersWaiting > 0 && !membersOpen}
+              <div class="offers-banner" role="status">
+                <span>{roomOffersLabel}</span>
+                <button type="button" class="ghost" onclick={reviewRoomOffers}>{m.channels_offers_review()}</button>
+              </div>
+            {/if}
             {#if successorPromptShown}
               <div class="successor-banner successor-prompt" role="status">
                 <span>{m.channels_successor_prompt()}</span>
                 <span class="newer-actions">
-                  <button type="button" class="ghost" onclick={() => (roomInfoOpen = true)}>
+                  <button type="button" class="ghost" onclick={() => openRoomSettings('succession')}>
                     {m.channels_successor_prompt_choose()}
                   </button>
                   <button type="button" class="ghost" onclick={() => dismissSuccessorPrompt(selected.channel_id)}>
@@ -3621,7 +3695,7 @@
                 mentionName={$appSettings?.channel_username || $appSettings?.nickname || ''}
                 mentionCandidates={mentionCandidates}
                 focusRequest={transcriptFocus}
-                onfocusmissing={() => toast(m.channels_search_too_far())}
+                onfocusmissing={() => toast(m.channels_search_unavailable())}
                 historyStartNote={selectedHistoryNote}
               />
             </div>
@@ -3734,6 +3808,13 @@
                             role="menuitem"
                             tabindex="-1"
                             disabled={sendingTo.includes(mem.member_pubkey) || mem.banned || selectedBanned}
+                            title={selectedBanned
+                              ? m.channels_you_are_banned()
+                              : mem.banned
+                                ? m.channels_send_file_member_banned()
+                                : sendingTo.includes(mem.member_pubkey)
+                                  ? m.channels_send_file_busy()
+                                  : undefined}
                             onclick={(e) => { closeCardMenu(e.currentTarget); handleSendFile(mem); }}
                           >{m.channels_send_file()}</button>
                           <button
@@ -3794,7 +3875,7 @@
                                 tabindex="-1"
                                 class="menu-item-danger"
                                 disabled={moderationBusy}
-                                onclick={(e) => { closeCardMenu(e.currentTarget); handleBan(mem.member_pubkey); }}
+                                onclick={(e) => { closeCardMenu(e.currentTarget); requestBan(mem); }}
                               >{m.channels_ban()}</button>
                             {/if}
                           {/if}
@@ -4178,7 +4259,7 @@
             </button>
           </div>
         {/if}
-        <div class="succession-form">
+        <div class="succession-form" bind:this={successionEl}>
           <p class="succession-title">{m.channels_succession()}</p>
           <p class="succession-hint">{m.channels_succession_hint()}</p>
           <label class="succession-field">
@@ -4263,6 +4344,15 @@
   confirmLabel={m.channels_transfer_ownership()}
   danger
   onconfirm={handleTransfer}
+/>
+
+<ConfirmDialog
+  bind:open={banOpen}
+  title={m.channels_ban_confirm({ name: banTarget ? roomMemberLabel(banTarget) : '' })}
+  message={banRotates ? m.channels_ban_confirm_body_rotates() : m.channels_ban_confirm_body()}
+  confirmLabel={m.channels_ban()}
+  danger
+  onconfirm={confirmBan}
 />
 
 <ConfirmDialog
@@ -5099,6 +5189,11 @@
 
   .chan-row.moved .chan-flag { opacity: 0.55; }
 
+  .chan-moved-badge {
+    margin-inline-start: 6px;
+    vertical-align: 1px;
+  }
+
   /* A silenced room still counts its unread, it just stops shouting about it. */
   .unread.silenced {
     background: var(--bg-tertiary);
@@ -5224,19 +5319,27 @@
     margin-left: auto;
   }
 
-  /* A status light, not a control. The tinted box made it read as a pressed
-     toggle sitting at the head of four real ones. */
+  /* Status lights, not controls: by the room's name, at the name's size, and
+     with no hover or pointer, so they cannot be mistaken for the buttons. */
+  .conv-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    flex-shrink: 0;
+  }
+
   .enc-lock {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 22px;
-    height: 32px;
-    color: var(--accent);
+    width: 18px;
+    height: 18px;
+    color: var(--text-muted);
+    cursor: default;
     flex-shrink: 0;
   }
 
-  .enc-lock svg { width: 14px; height: 14px; }
+  .enc-lock svg { width: 15px; height: 15px; }
 
   .conv-actions-sep {
     width: 1px;
@@ -5425,6 +5528,20 @@
     border-bottom-color: color-mix(in srgb, var(--accent) 35%, var(--border));
     background: color-mix(in srgb, var(--accent) 9%, transparent);
     color: var(--text-primary);
+  }
+
+  /* News, not a warning: the accent wash the successor suggestion uses. */
+  .offers-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 14px;
+    border-bottom: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+    background: color-mix(in srgb, var(--accent) 9%, transparent);
+    font-size: var(--font-size-md);
+    color: var(--text-primary);
+    flex-shrink: 0;
   }
 
   .key-behind-banner {
@@ -6386,7 +6503,9 @@
     .workspace.list-collapsed > .conversation-pane { margin-left: 0; }
     .workspace.has-members:not(.members-open) > .conversation-pane { margin-right: 0; }
     .list-toggle { display: none; }
-    .conv-actions-sep { display: none; }
+    /* The one before Leave stays: without it Leave sits flush against Copy
+       invite, the action people reach for most. */
+    .conv-actions-sep:not(.before-leave) { display: none; }
 
     .back-btn {
       display: inline-flex;
