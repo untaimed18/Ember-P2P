@@ -4,7 +4,8 @@ import type { SearchResult } from '$lib/types';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { SearchMethod, SearchFilters, RelationKind } from '$lib/api/search';
 import { cancelSearch, rescoreSearchResults } from '$lib/api/search';
-import { rememberShed, shedWeakestRows } from '$lib/searchOverflow';
+import { planIdleTrim, rememberShed, shedWeakestRows } from '$lib/searchOverflow';
+import { SEARCH_NOTICES } from '$lib/searchNotices';
 import {
   PERSIST_RETRY_LIMITS,
   SEARCH_STORAGE_KEY,
@@ -61,7 +62,25 @@ export type SearchTab = {
    *  again: one that comes back is shown and no longer dropped, and one
    *  dropped twice is counted once. Bounded by `MAX_REMEMBERED_SHED`. */
   shedKeys?: Set<string>;
+  /** Results dropped to save memory rather than because the search overflowed
+   *  the tab: while the open tabs together held too many rows (see
+   *  `MAX_TOTAL_RESULTS`), or because a reload stored fewer than the tab had.
+   *  Counted apart from `shed` because it calls for a different explanation —
+   *  nothing about the query was too broad. */
+  memoryShed?: number;
+  /** Networks this search could not ask or that never answered, as the
+   *  codes in `SEARCH_NOTICES`. */
+  notices?: string[];
+  /** Why the search ended before every network finished, when it had rows to
+   *  show anyway (a timeout, a failure): `error` is only for a tab left with
+   *  nothing. */
+  interruption?: string;
 };
+
+function withNotice(tab: SearchTab, notice: string): SearchTab {
+  if (!SEARCH_NOTICES.has(notice) || tab.notices?.includes(notice)) return tab;
+  return { ...tab, notices: [...(tab.notices ?? []), notice] };
+}
 
 /**
  * Restore the tabs a reload would otherwise have thrown away. The rules live in
@@ -249,7 +268,7 @@ function newTabId(): string {
  * (availability, filename, address cap) and are deliberately not in the fixture.
  */
 function resultKey(result: SearchResult): string {
-  if (result.file.hash) return result.file.hash;
+  if (result.file.hash) return result.size_variant ? `${result.file.hash}:${result.file.size}` : result.file.hash;
   if (result.file.id?.startsWith('pending:')) return `nohash-id:${result.file.id}`;
   if (result.file.path) return `nohash-path:${result.file.path}`;
   return `nohash:${result.file.name}:${result.file.size}`;
@@ -541,9 +560,22 @@ function mergeIntoTab(tab: SearchTab, incoming: SearchResult[]): SearchTab {
   }
   let shed = tab.shed ?? 0;
   let shedKeys = tab.shedKeys;
-  for (const result of incoming) {
-    const key = resultKey(result);
-    const at = index.get(key);
+  for (const row of incoming) {
+    let result = row;
+    let key = resultKey(result);
+    let at = index.get(key);
+    // A hash is public, so a reply can pair a real one with any size it likes;
+    // folded in, it would put that size on the file's row, and on the download
+    // started from it. A size of 0 claims nothing and merges as before.
+    if (at !== undefined && result.file.hash && !result.size_variant) {
+      const have = results[at].file.size;
+      const claimed = result.file.size;
+      if (have && claimed && have !== claimed) {
+        result = { ...result, size_variant: true };
+        key = resultKey(result);
+        at = index.get(key);
+      }
+    }
     if (at === undefined) {
       if (shedKeys?.delete(key)) shed -= 1;
       index.set(key, results.length);
@@ -593,10 +625,10 @@ export function patchSearchTabByRequestId(requestId: number, fn: (tab: SearchTab
 export function appendSearchResults(requestId: number, incoming: SearchResult[]) {
   if (!Array.isArray(incoming) || incoming.length === 0) return;
   const activeId = get(activeSearchTabId);
-  // The invoke reply can land after `search-complete` already trimmed an idle
-  // background tab; the trim applies to what it brings too.
+  // The invoke reply can land after `search-complete` already settled an idle
+  // background tab, and can take the open tabs past their total.
   searchTabs.update((tabs) =>
-    updateTabByRequestId(tabs, requestId, (t) => trimIdleTab(mergeIntoTab(t, incoming), activeId)),
+    settleIdleTabs(updateTabByRequestId(tabs, requestId, (t) => mergeIntoTab(t, incoming)), activeId),
   );
 }
 
@@ -734,31 +766,62 @@ function sameReasons(a: string[] | undefined, b: string[] | undefined): boolean 
 const MAX_SEARCH_TABS = 20;
 
 /**
- * Rows a finished tab keeps once the user has moved off it.
+ * Rows all open tabs may hold together before idle ones give some up.
  *
  * `MAX_TAB_RESULTS` bounds one tab; nothing bounded the set, so twenty finished
- * broad searches could sit on 300k rows no one was looking at. The tab being
- * viewed and the one still streaming keep their full cap.
+ * broad searches could sit on 300k rows no one was looking at. Six full tabs'
+ * worth, so ordinary use never reaches it.
  */
-const IDLE_TAB_RESULTS = 3_000;
+const MAX_TOTAL_RESULTS = 90_000;
+/**
+ * The fewest rows an idle tab is trimmed to when the total is over
+ * `MAX_TOTAL_RESULTS`. Low enough that the tab on screen and the one streaming,
+ * at `MAX_TAB_RESULTS` each, plus every other tab at this floor still fit under
+ * the cap, so the trim always gets there.
+ */
+const IDLE_TAB_FLOOR = 3_000;
 
-function trimIdleTab(tab: SearchTab, activeId: string | null): SearchTab {
-  if (tab.id === activeId || tab.isSearching || tab.results.length <= IDLE_TAB_RESULTS) return tab;
-  const results = tab.results.slice();
-  shedWeakestRows(results, IDLE_TAB_RESULTS);
-  const resultIndex = new Map<string, number>();
-  for (let i = 0; i < results.length; i++) resultIndex.set(resultKey(results[i]), i);
-  const shed = (tab.shed ?? 0) + (tab.results.length - results.length);
-  // Finished, so nothing will come back to be told apart.
-  return { ...tab, results, resultIndex, shed, shedKeys: undefined };
-}
-
-function trimIdleTabs(tabs: SearchTab[], activeId: string | null): SearchTab[] {
+/**
+ * Settle the tabs the user is not looking at and nothing is streaming into.
+ *
+ * Their rows stay: coming back to a finished tab shows what it found. What goes
+ * is what can be rebuilt — the key index, which `mergeIntoTab` rebuilds and
+ * `resultIndexOfHash` scans without, and the dropped-key memory, unless Search
+ * More can still bring those rows back. Rows are dropped only once the tabs
+ * together pass `MAX_TOTAL_RESULTS`, from the oldest idle tabs first, and are
+ * counted in `memoryShed` so the tab says why.
+ */
+function settleIdleTabs(tabs: SearchTab[], activeId: string | null): SearchTab[] {
+  const isIdle = (t: SearchTab) => t.id !== activeId && !t.isSearching;
+  const plan = planIdleTrim(
+    tabs.map((t) => ({ rows: t.results.length, idle: isIdle(t) })),
+    MAX_TOTAL_RESULTS,
+    IDLE_TAB_FLOOR,
+  );
   let changed = false;
-  const next = tabs.map((tab) => {
-    const trimmed = trimIdleTab(tab, activeId);
-    if (trimmed !== tab) changed = true;
-    return trimmed;
+  const next = tabs.map((tab, i) => {
+    if (!isIdle(tab)) return tab;
+    let settled = tab;
+    const keep = plan?.[i];
+    if (keep !== undefined && keep < tab.results.length) {
+      const results = tab.results.slice();
+      shedWeakestRows(results, keep);
+      settled = {
+        ...settled,
+        results,
+        memoryShed: (tab.memoryShed ?? 0) + tab.results.length - results.length,
+      };
+    }
+    const dropShedKeys = !!settled.shedKeys && !settled.canSearchMore;
+    if (settled.resultIndex || dropShedKeys) {
+      settled = {
+        ...settled,
+        resultIndex: undefined,
+        shedKeys: dropShedKeys ? undefined : settled.shedKeys,
+      };
+    }
+    if (settled !== tab) changed = true;
+    return settled;
   });
   return changed ? next : tabs;
 }
@@ -832,7 +895,7 @@ export function openSearchTab(query: string, method: SearchMethod, fileType?: st
       pendingByRequest.delete(rid);
       void cancelSearchWithRetry(rid);
     }
-    return trimIdleTabs(next, id);
+    return settleIdleTabs(next, id);
   });
   activeSearchTabId.set(id);
   return { tabId: id, requestId, stoppedOthers };
@@ -843,8 +906,8 @@ export function setActiveSearchTab(tabId: string | null) {
   // Checked before writing: an object store notifies on every `set`, even of
   // the same array, and the search page re-derives its whole list from it.
   const tabs = get(searchTabs);
-  const trimmed = trimIdleTabs(tabs, tabId);
-  if (trimmed !== tabs) searchTabs.set(trimmed);
+  const settled = settleIdleTabs(tabs, tabId);
+  if (settled !== tabs) searchTabs.set(settled);
 }
 
 export async function closeSearchTab(tabId: string): Promise<void> {
@@ -889,8 +952,9 @@ export function flushPendingSearchResults(requestId: number) {
   const incoming = pendingByRequest.get(requestId);
   pendingByRequest.delete(requestId);
   if (!incoming || incoming.length === 0) return;
+  const activeId = get(activeSearchTabId);
   searchTabs.update((tabs) =>
-    updateTabByRequestId(tabs, requestId, (t) => mergeIntoTab(t, incoming)),
+    settleIdleTabs(updateTabByRequestId(tabs, requestId, (t) => mergeIntoTab(t, incoming)), activeId),
   );
 }
 
@@ -922,12 +986,14 @@ function flushSearchResults() {
   // `flushProgress` already uses in `stores/transfers.ts`.
   const batch = new Map(pendingByRequest);
   pendingByRequest.clear();
+  const activeId = get(activeSearchTabId);
   searchTabs.update((tabs) => {
     let next = tabs;
     for (const [requestId, incoming] of batch) {
       next = updateTabByRequestId(next, requestId, (t) => mergeIntoTab(t, incoming));
     }
-    return next;
+    // A streaming tab growing is what takes the set past its total.
+    return settleIdleTabs(next, activeId);
   });
 }
 
@@ -1180,8 +1246,9 @@ export async function initSearchStore() {
       }
       const activeId = get(activeSearchTabId);
       searchTabs.update((tabs) =>
-        updateTabByRequestId(tabs, requestId, (t) =>
-          trimIdleTab({ ...t, isSearching: false, progress: null, canSearchMore }, activeId),
+        settleIdleTabs(
+          updateTabByRequestId(tabs, requestId, (t) => ({ ...t, isSearching: false, progress: null, canSearchMore })),
+          activeId,
         ),
       );
     }));
@@ -1193,18 +1260,27 @@ export async function initSearchStore() {
         searchTabs.update((tabs) =>
           updateTabByRequestId(tabs, requestId, (t) => {
             if (!t.isSearching) return t;
-            return {
+            const phase = typeof event.payload?.phase === 'string' ? event.payload.phase : '';
+            return withNotice({
               ...t,
               progress: {
                 nodes_contacted: validCount(event.payload?.nodes_contacted),
                 results_so_far: validCount(event.payload?.results_so_far),
-                phase: typeof event.payload?.phase === 'string' ? event.payload.phase : '',
+                phase,
               },
-            };
+            }, phase);
           }),
         );
       },
     ));
+    registered.push(await listen<{ request_id: number; notice: string }>('search-notice', (event) => {
+      const requestId = validRequestId(event.payload?.request_id);
+      const notice = event.payload?.notice;
+      if (requestId === null || typeof notice !== 'string') return;
+      // Not gated on `isSearching`: a server that never answered is only
+      // known to have not answered as its leg ends, which can be the end.
+      searchTabs.update((tabs) => updateTabByRequestId(tabs, requestId, (t) => withNotice(t, notice)));
+    }));
   } catch (e) {
     for (const u of registered) u();
     initialized = false;

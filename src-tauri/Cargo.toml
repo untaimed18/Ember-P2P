@@ -43,6 +43,10 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs", "signal"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 blake3 = "1"
+# NFKC for Ember DHT keyword keys and for search spam-filter name matching.
+# The copy `url`/`idna` already link; only `compiled_data` is enabled, which is
+# the feature set they lock.
+icu_normalizer = { version = "2.3", default-features = false, features = ["compiled_data"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "6"
@@ -130,7 +134,6 @@ rustls = { version = "0.23", features = ["ring"] }
 # ASN.1/DER parser walks the actual certificate structure and cannot
 # be fooled that way.
 x509-cert = { version = "0.3", default-features = false }
-strsim = "0.11"
 zip = "8"
 fs2 = "0.4"
 maxminddb = "0.32"
@@ -161,6 +164,11 @@ argon2 = "0.5"
 # Library deletes go to the Recycle Bin / Trash, so a delete is recoverable and
 # a compromised webview cannot wipe shared folders for good.
 trash = "5"
+
+[dev-dependencies]
+# Reference edit distance the spam filter's bounded Levenshtein is tested
+# against.
+strsim = "0.11"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

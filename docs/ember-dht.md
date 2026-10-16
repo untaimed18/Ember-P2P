@@ -551,9 +551,25 @@ a certainty, which is not the same as gone.
 
 ## Known limits (document for users / release notes)
 
-- Multi-keyword search uses sparse DHT intersection (missing secondary
-  keys are skipped) plus a filename match at emit time — not a strict
-  worldwide AND of every keyword key.
+- Multi-keyword AND is by word, not substring, for this build's searches: a
+  responder serves every record under the primary key but leads with those whose
+  signed name carries every other keyword as a word, and the searcher keeps only
+  those. `server` does not match `servers`. A searcher predating this still gets
+  every record (subject to the per-node budget) and filters by substring, as it
+  always did.
+- Keywords are normalised (NFKC, lowercase, final sigma folded) for Ember keys
+  only. A name whose normalised words hash differently from its words as typed
+  is published under both; a search walks the normalised key and, when the query
+  as typed hashes elsewhere, that key too. ASCII is unaffected.
+- A storer predating normalisation counts every record filed under a
+  normalised key that differs from the typed one in
+  `ember_dht_keyword_key_off_name`, since it cannot derive that key from the
+  name. Read that counter on such storers with this in mind; nothing is refused
+  on it.
+- A name too long for its record is shortened before signing. Releases before
+  1.7.4 derived keywords from the full name, so a record of theirs may sit under
+  a word its signed name no longer has; the searcher accepts such a record
+  without that word, provided the rest of the query is in what is left.
 - A peer serves only a few records per keyword *datagram* — five for a bare
   record, four for one carrying media, two in the worst case — but a searcher can
   now page a node until its key is exhausted, bounded by the per-node result

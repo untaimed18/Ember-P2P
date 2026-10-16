@@ -298,7 +298,7 @@ fn keyword_entry_has_min_content(tags: &[KadTag]) -> bool {
             && matches!(&t.value, TagValue::String(s) if !s.is_empty())
     });
     let has_filesize = tags.iter().any(|t| {
-        matches!(&t.name, TagName::Id(TAG_FILESIZE)) && t.as_uint().is_some_and(|v| v > 0)
+        matches!(&t.name, TagName::Id(TAG_FILESIZE)) && t.as_file_size().is_some_and(|v| v > 0)
     });
     has_filename && has_filesize
 }
@@ -1699,6 +1699,34 @@ mod keyword_store_tests {
         let sender = KadId([0x66; 16]);
         store.store_keyword_entries(&target, vec![entry(1)], &sender, None);
         assert_eq!(store.search_keywords(&target).len(), 1);
+    }
+
+    /// eMule publishes a file over 4 GiB with its size as an 8-byte `BSOB`,
+    /// and answers searches with the stored tag as it came in.
+    #[test]
+    fn accepts_and_returns_an_emule_bsob_size_over_4_gib() {
+        let mut store = DhtStore::new();
+        let target = KadId([0x55; 16]);
+        let sender = KadId([0x66; 16]);
+        let size: u64 = 6 * 1024 * 1024 * 1024;
+        let mut large = entry(1);
+        large.tags[1].value = TagValue::Bsob(size.to_le_bytes().to_vec());
+        let mut malformed = entry(2);
+        malformed.tags[1].value = TagValue::Bsob(vec![0xFF; 4]);
+        store.store_keyword_entries(&target, vec![large, malformed], &sender, None);
+
+        let results = store.search_keywords(&target);
+        assert_eq!(
+            results.len(),
+            1,
+            "a BSOB size that isn't 8 bytes is no size"
+        );
+        let stored_size = results[0]
+            .tags
+            .iter()
+            .find(|t| matches!(t.name, TagName::Id(TAG_FILESIZE)))
+            .and_then(KadTag::as_file_size);
+        assert_eq!(stored_size, Some(size));
     }
 
     #[test]

@@ -221,6 +221,48 @@ fn friends_only_offer_refusal(
     })
 }
 
+/// Whether a search with no positive keyword still searches on its filters
+/// alone: only when the box is genuinely empty and it is not a related search.
+fn is_filter_only_search(query: &str, has_usable_filters: bool, related_hashes: &[String]) -> bool {
+    has_usable_filters && query.trim().is_empty() && related_hashes.is_empty()
+}
+
+/// eMule's "Search Related Files" request: the `related::<hash>` term alone.
+///
+/// Never given the panel's constraints: a server ANDs them into a filename
+/// search, which then answers with every file that passes the filters.
+fn related_search_expression(co_share_term: &str) -> Vec<u8> {
+    kad::messages::build_search_expression_with_node(
+        Some(crate::search::query::QueryExpr::Term(co_share_term.to_string()).to_wire_bytes()),
+        &kad::messages::SearchConstraints::default(),
+    )
+}
+
+/// The words every row of the connected server's answer to this search should
+/// share at least one of. A row sharing none answers some other request, and
+/// is dropped (`SearchTicket::match_terms`).
+///
+/// Lenient on purpose, since servers match substrings: any one positive term
+/// is enough. Empty — accept everything — wherever a correct row need not
+/// contain a typed word at all: a related search, a server directive, a
+/// filter-only search, and a non-ASCII term a server may fold differently.
+fn server_reply_match_terms(
+    query_expr: Option<&crate::search::query::QueryExpr>,
+    related: bool,
+) -> Vec<String> {
+    let Some(expr) = query_expr.filter(|_| !related) else {
+        return Vec::new();
+    };
+    if expr.contains_server_directive() {
+        return Vec::new();
+    }
+    let terms = expr.positive_terms();
+    if terms.iter().any(|term| !term.is_ascii()) {
+        return Vec::new();
+    }
+    terms
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_command_inner(
     socket: &UdpSocket,
@@ -317,7 +359,7 @@ async fn handle_command_inner(
                 keywords: Vec::new(),
                 server_ip: state.server_addr.map(|a| a.ip().to_string()),
                 server_result_count: 0,
-                streamed_hashes: std::collections::HashSet::new(),
+                streamed_hashes: std::collections::HashMap::new(),
                 exclude_hashes: exclude_hashes.iter().cloned().collect(),
                 // Seeded with the library hashes the caller resolved, so every
                 // streamed packet of this search scores them as files we hold
@@ -398,7 +440,14 @@ async fn handle_command_inner(
             // whole search. Every keyword leg is gated on this rather than on
             // its own reading of `keywords` so none of them can put an empty
             // expression on the wire.
-            let has_keyword_query = !keywords.is_empty() || has_usable_filters;
+            //
+            // Filters alone only make a search when nothing was typed and no
+            // file was named: a related search's panel filters narrow its rows
+            // here instead, and a query whose words were all too short is not
+            // a request for everything that passes the filters.
+            let filter_only = keywords.is_empty()
+                && is_filter_only_search(&query, has_usable_filters, &related_hashes);
+            let has_keyword_query = !keywords.is_empty() || filter_only;
             // A co-share request needs no keywords: the hashes *are* the query.
             // Without this a related search on a file whose name yields no
             // searchable token (all words under the eD2k 3-byte minimum) would
@@ -448,7 +497,7 @@ async fn handle_command_inner(
             let server_directive_query = query_expr
                 .as_ref()
                 .is_some_and(|expr| expr.contains_server_directive());
-            let legs = search_legs(
+            let mut legs = search_legs(
                 method,
                 has_keyword_query,
                 !keywords.is_empty() && !server_directive_query,
@@ -456,30 +505,42 @@ async fn handle_command_inner(
                     .user_offline
                     .load(std::sync::atomic::Ordering::Relaxed),
             );
+            // A filter-only expression matches every file that passes it; the
+            // connected server caps its answer, but the global sweep would ask
+            // it of every server in the list.
+            if filter_only {
+                legs.udp = false;
+            }
 
             // --- TCP server search ---
+            let mut server_asked = false;
             if legs.server && state.server_connected {
                 if let Some(conn) = state.server_connection.as_mut() {
-                    // The co-share term must be wrapped as a `QueryExpr::Term`
-                    // by hand rather than parsed: `:` is an eD2k keyword
-                    // separator, so parsing `related::<hash>` would send the
-                    // server a keyword search for "related".
-                    let co_share_expr = co_share_term.as_deref().map(|term| {
-                        kad::messages::build_search_expression_with_node(
-                            Some(
-                                crate::search::query::QueryExpr::Term(term.to_string())
-                                    .to_wire_bytes(),
-                            ),
-                            &search_constraints,
-                        )
-                    });
+                    // The panel filters narrow the co-share answer's rows
+                    // (`active_request.min_size` and friends) rather than
+                    // riding on the request.
+                    let co_share_expr = co_share_term
+                        .as_deref()
+                        .map(related_search_expression);
                     // Both questions are sent under the same `request_id`, so
                     // both answers land in the same tab; the co-share request
                     // goes out from the poll loop once the first has delivered.
                     let (first_expr, followup_expr) =
                         server_search_phases(&search_expr, co_share_expr, has_keyword_query);
-                    match conn.send_search_expr_bytes(&first_expr) {
-                        Ok(()) => {
+                    let ticket = crate::network::ed2k::server::SearchTicket {
+                        request_id,
+                        match_terms: if has_keyword_query {
+                            server_reply_match_terms(
+                                query_expr.as_ref(),
+                                !related_hashes.is_empty(),
+                            )
+                        } else {
+                            Vec::new()
+                        },
+                    };
+                    match conn.send_search_expr_bytes(ticket, &first_expr) {
+                        Ok(_) => {
+                            server_asked = true;
                             active_request.server_pending = true;
                             state.server_search_more_due_at = None;
                             state.server_search_more_requests = 0;
@@ -550,6 +611,7 @@ async fn handle_command_inner(
                     );
                 }
                 if !state.udp_search_queue.is_empty() {
+                    server_asked = true;
                     active_request.udp_pending = true;
                     state.server_udp_search_age = 0;
                     // One second per queued packet safely exceeds the real
@@ -565,6 +627,10 @@ async fn handle_command_inner(
                         state.udp_search_queue.len()
                     );
                 }
+            }
+
+            if (legs.server || legs.udp) && !server_asked {
+                emit_search_notice(app_handle, request_id, "ServerUnavailable");
             }
 
             // --- KAD search ---
@@ -770,6 +836,8 @@ async fn handle_command_inner(
                         active_request.ember_ran = true;
                         drive_ember_search(socket, state, search_id).await;
                     }
+                } else {
+                    emit_search_notice(app_handle, request_id, "EmberNoKeyword");
                 }
             }
 
@@ -7418,6 +7486,58 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::Shutdown { .. } => {}
+    }
+}
+
+#[cfg(test)]
+mod search_request_tests {
+    use super::{
+        is_filter_only_search, related_search_expression, server_reply_match_terms,
+    };
+    use crate::search::query::parse;
+
+    const HASH: &str = "AABBCCDDEEFF00112233445566778899";
+
+    #[test]
+    fn the_related_request_is_the_bare_term_whatever_the_filters() {
+        let term = format!("related::{HASH}");
+        let wire = related_search_expression(&term);
+        let mut expected = vec![0x01];
+        expected.extend_from_slice(&(term.len() as u16).to_le_bytes());
+        expected.extend_from_slice(term.as_bytes());
+        assert_eq!(wire, expected, "no AND node, no constraint leaf");
+    }
+
+    #[test]
+    fn filters_alone_search_only_with_an_empty_box_and_no_seed() {
+        let none: Vec<String> = Vec::new();
+        let seed = vec![HASH.to_lowercase()];
+        assert!(is_filter_only_search("", true, &none));
+        assert!(is_filter_only_search("   ", true, &none));
+        assert!(!is_filter_only_search("", false, &none));
+        // Every word under the 3-byte minimum is not an empty box.
+        assert!(!is_filter_only_search("a b", true, &none));
+        assert!(!is_filter_only_search("", true, &seed), "a related search's filters narrow its rows");
+    }
+
+    #[test]
+    fn server_reply_terms_are_the_positive_words_of_a_plain_search() {
+        let expr = parse("matrix reloaded -cam").unwrap();
+        assert_eq!(
+            server_reply_match_terms(Some(&expr), false),
+            vec!["matrix".to_string(), "reloaded".to_string()]
+        );
+    }
+
+    #[test]
+    fn server_reply_terms_accept_everything_where_a_row_need_not_share_a_word() {
+        let plain = parse("matrix").unwrap();
+        assert!(server_reply_match_terms(Some(&plain), true).is_empty(), "related");
+        assert!(server_reply_match_terms(None, false).is_empty(), "filter-only");
+        let directive = parse(&format!("related::{HASH} video")).unwrap();
+        assert!(server_reply_match_terms(Some(&directive), false).is_empty());
+        let accented = parse("café").unwrap();
+        assert!(server_reply_match_terms(Some(&accented), false).is_empty());
     }
 }
 

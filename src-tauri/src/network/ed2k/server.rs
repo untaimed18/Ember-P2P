@@ -616,8 +616,97 @@ pub struct ServerLink {
     /// obfuscated connection, an RC4 send keystream the server no longer
     /// agrees with, so nothing written afterwards can be parsed.
     write_failure: Arc<OnceLock<String>>,
+    search_replies: SearchReplies,
     reader: tokio::task::JoinHandle<()>,
     writer: tokio::task::JoinHandle<()>,
+}
+
+/// The search a server reply is credited to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchTicket {
+    pub request_id: u64,
+    /// A reply row whose name contains none of these was not an answer to
+    /// this search. Empty accepts every row.
+    pub match_terms: Vec<String>,
+}
+
+/// What became of a search handed to [`ServerLink::send_search_expr_bytes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchSend {
+    Sent,
+    /// Held until the server answers the request ahead of it, or that answer
+    /// is given up on; [`ServerLink::take_deferred_search`] hands it back.
+    Deferred,
+}
+
+/// Pairs `OP_SEARCHRESULT` replies with the requests that asked for them.
+///
+/// The reply names no request; a server answers `OP_SEARCHREQUEST` and
+/// `OP_QUERY_MORE_RESULT` in the order they arrive, so a reply belongs to the
+/// oldest request still owed one. Keeping at most one owed at a time is what
+/// makes that unambiguous: a search started while an answer is owed waits for
+/// it (or for the wait to be given up on), and the late answer is then
+/// credited to the search that asked, not the one that replaced it.
+#[derive(Debug, Default)]
+struct SearchReplies {
+    awaiting: Option<(SearchTicket, std::time::Instant)>,
+    deferred: Option<(SearchTicket, Vec<u8>)>,
+    /// What `OP_QUERY_MORE_RESULT` continues: the server pages the last
+    /// search it answered.
+    last_answered: Option<SearchTicket>,
+}
+
+impl SearchReplies {
+    fn owed(&self) -> bool {
+        self.awaiting.is_some()
+    }
+
+    fn defer(&mut self, ticket: SearchTicket, expr: &[u8]) {
+        if let Some((replaced, _)) = &self.deferred {
+            debug!(
+                "Server search {} superseded by {} before it was sent",
+                replaced.request_id, ticket.request_id
+            );
+        }
+        self.deferred = Some((ticket, expr.to_vec()));
+    }
+
+    fn sent(&mut self, ticket: SearchTicket, now: std::time::Instant) {
+        self.awaiting = Some((ticket, now));
+    }
+
+    fn more_ticket(&self, request_id: u64) -> SearchTicket {
+        self.last_answered
+            .as_ref()
+            .filter(|t| t.request_id == request_id)
+            .cloned()
+            .unwrap_or(SearchTicket {
+                request_id,
+                match_terms: Vec::new(),
+            })
+    }
+
+    fn answered(&mut self) -> Option<SearchTicket> {
+        let (ticket, _) = self.awaiting.take()?;
+        self.last_answered = Some(ticket.clone());
+        Some(ticket)
+    }
+
+    fn expire(&mut self, wait: std::time::Duration, now: std::time::Instant) -> Option<u64> {
+        let (_, sent_at) = self.awaiting.as_ref()?;
+        if now.saturating_duration_since(*sent_at) < wait {
+            return None;
+        }
+        let (ticket, _) = self.awaiting.take()?;
+        Some(ticket.request_id)
+    }
+
+    fn take_deferred(&mut self) -> Option<(SearchTicket, Vec<u8>)> {
+        if self.owed() {
+            return None;
+        }
+        self.deferred.take()
+    }
 }
 
 impl Drop for ServerLink {
@@ -711,6 +800,7 @@ impl ServerLink {
             outbound,
             inbound,
             write_failure,
+            search_replies: SearchReplies::default(),
             reader,
             writer,
         }
@@ -779,8 +869,15 @@ impl ServerLink {
     /// `OP_SEARCHREQUEST`. Multi-word queries MUST use the AND-tree wire
     /// format for reliable results across all eD2K servers.
     ///
-    /// The result arrives later as `ServerEvent::SearchResult`.
-    pub fn send_search_expr_bytes(&mut self, expr: &[u8]) -> anyhow::Result<()> {
+    /// The result arrives later as `ServerEvent::SearchResult`, and
+    /// [`Self::take_search_reply`] says which search it answers. While an
+    /// earlier request is still owed its answer this one is held back rather
+    /// than sent (see [`SearchReplies`]); a later search replaces it there.
+    pub fn send_search_expr_bytes(
+        &mut self,
+        ticket: SearchTicket,
+        expr: &[u8],
+    ) -> anyhow::Result<SearchSend> {
         // A server without large-file support cannot parse a 64-bit size
         // leaf; the UDP sweep leaves such servers out for the same reason.
         if self.session.server_flags & SRV_TCPFLG_LARGEFILES == 0
@@ -788,12 +885,48 @@ impl ServerLink {
         {
             anyhow::bail!("server lacks large-file support for a size limit past 4 GiB");
         }
+        if self.search_replies.owed() {
+            info!(
+                "Holding OP_SEARCHREQUEST for search {} until the server answers search {}",
+                ticket.request_id,
+                self.search_replies
+                    .awaiting
+                    .as_ref()
+                    .map_or(0, |(t, _)| t.request_id),
+            );
+            self.search_replies.defer(ticket, expr);
+            return Ok(SearchSend::Deferred);
+        }
         info!(
             "Queuing OP_SEARCHREQUEST expression ({} bytes payload)",
             expr.len(),
         );
         self.queue(OP_SEARCHREQUEST, expr)?;
-        Ok(())
+        self.search_replies.sent(ticket, std::time::Instant::now());
+        Ok(SearchSend::Sent)
+    }
+
+    /// Which search the `OP_SEARCHRESULT` just received answers, or `None`
+    /// when no request was owed one (an answer already given up on).
+    pub fn take_search_reply(&mut self) -> Option<SearchTicket> {
+        self.search_replies.answered()
+    }
+
+    /// Stop waiting on a request the server has left unanswered for `wait`,
+    /// returning its search id, so the search held behind it can go out.
+    pub fn expire_search_reply(&mut self, wait: std::time::Duration) -> Option<u64> {
+        self.search_replies.expire(wait, std::time::Instant::now())
+    }
+
+    /// The search held back by [`Self::send_search_expr_bytes`], once nothing
+    /// is owed ahead of it. The caller decides whether it is still wanted.
+    pub fn take_deferred_search(&mut self) -> Option<(SearchTicket, Vec<u8>)> {
+        self.search_replies.take_deferred()
+    }
+
+    /// Whether a search reply is owed or a search is held back waiting.
+    pub fn search_reply_outstanding(&self) -> bool {
+        self.search_replies.owed() || self.search_replies.deferred.is_some()
     }
 
     /// Send a source request to the server (eMule DownloadQueue.cpp format).
@@ -876,9 +1009,16 @@ impl ServerLink {
         Ok(())
     }
 
-    /// Ask for the next page of the current search (eMule `SearchMore`).
-    pub fn request_more_results(&mut self) -> anyhow::Result<()> {
+    /// Ask for the next page of the last search the server answered (eMule
+    /// `SearchMore`), crediting it to `request_id`. Refused while a reply is
+    /// owed or a search is held back: the page would answer the wrong one.
+    pub fn request_more_results(&mut self, request_id: u64) -> anyhow::Result<()> {
+        if self.search_reply_outstanding() {
+            anyhow::bail!("a server search reply is still outstanding");
+        }
         self.queue(OP_QUERY_MORE_RESULT, &[])?;
+        let ticket = self.search_replies.more_ticket(request_id);
+        self.search_replies.sent(ticket, std::time::Instant::now());
         debug!("Queued OP_QUERY_MORE_RESULT to server");
         Ok(())
     }
@@ -1186,7 +1326,13 @@ fn parse_server_event(opcode: u8, payload: &[u8]) -> Vec<ServerEvent> {
                 events.push(ServerEvent::SearchResult { results, more });
             }
             Err(e) => {
+                // Still the answer to the request it replies to; dropping it
+                // would leave that request owed and credit the next reply to it.
                 debug!("Failed to parse search result: {e}");
+                events.push(ServerEvent::SearchResult {
+                    results: Vec::new(),
+                    more: false,
+                });
             }
         },
         OP_FOUNDSOURCES | OP_FOUNDSOURCES_OBFU => {
@@ -1558,7 +1704,7 @@ mod tests {
         let mut refused = None;
         for _ in 0..4096 {
             let started = std::time::Instant::now();
-            let result = link.send_search_expr_bytes(&payload);
+            let result = link.queue(OP_SEARCHREQUEST, &payload);
             spent += started.elapsed();
             if let Err(e) = result {
                 refused = Some(e);
@@ -1568,10 +1714,7 @@ mod tests {
         }
 
         let err = refused.expect("the queue never filled against a server that does not read");
-        assert_eq!(
-            err.downcast_ref::<io::Error>().map(io::Error::kind),
-            Some(io::ErrorKind::WouldBlock)
-        );
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         assert!(link.write_failure().is_none());
         assert!(spent < std::time::Duration::from_secs(1), "sends took {spent:?}");
     }
@@ -1613,10 +1756,14 @@ mod tests {
             Some(io::ErrorKind::BrokenPipe)
         );
         assert!(link.request_callback(0x00AB_CDEF).is_err());
-        assert!(link.request_more_results().is_err());
+        assert!(link.request_more_results(1).is_err());
         assert!(link.send_get_sources(&[7u8; 16], 1024).is_err());
         assert!(link.offer_files_chunk(&[offer("movie.avi")], 4662).is_err());
-        assert!(link.send_search_expr_bytes(b"x").is_err());
+        assert!(link.send_search_expr_bytes(ticket(1, &[]), b"x").is_err());
+        assert!(
+            !link.search_reply_outstanding(),
+            "a request that never reached the queue is owed nothing"
+        );
         // A later failure does not overwrite the first, root-cause reason.
         assert_eq!(link.write_failure(), Some("server write timed out"));
 
@@ -1627,6 +1774,89 @@ mod tests {
             .expect("peer read timed out")
             .unwrap();
         assert_eq!(n, 0, "a broken connection must not put further frames on the wire");
+    }
+
+    fn ticket(request_id: u64, terms: &[&str]) -> SearchTicket {
+        SearchTicket {
+            request_id,
+            match_terms: terms.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    /// Search B started before the server answered search A: the answer that
+    /// arrives next is A's, and B goes out only after it.
+    #[tokio::test]
+    async fn a_search_started_while_one_is_owed_waits_for_its_answer() {
+        let (mut link, mut peer) = loopback_link(SERVER_WRITE_QUEUE).await;
+
+        assert_eq!(
+            link.send_search_expr_bytes(ticket(1, &["alpha"]), b"A").unwrap(),
+            SearchSend::Sent
+        );
+        assert_eq!(
+            link.send_search_expr_bytes(ticket(2, &["bravo"]), b"B").unwrap(),
+            SearchSend::Deferred
+        );
+        assert_eq!(
+            link.send_search_expr_bytes(ticket(3, &["charlie"]), b"C").unwrap(),
+            SearchSend::Deferred,
+            "a newer search replaces the one held back"
+        );
+        assert!(link.request_more_results(1).is_err());
+        assert!(link.take_deferred_search().is_none(), "search 1 is still owed");
+
+        let mut wire = vec![0u8; 7];
+        tokio::time::timeout(std::time::Duration::from_secs(5), peer.read_exact(&mut wire))
+            .await
+            .expect("search 1 never reached the server")
+            .unwrap();
+        assert_eq!(wire, server_wire_packet(OP_EDONKEYHEADER, OP_SEARCHREQUEST, b"A").unwrap());
+
+        assert_eq!(link.take_search_reply(), Some(ticket(1, &["alpha"])));
+        assert_eq!(link.take_search_reply(), None, "nothing else is owed");
+        let (held, expr) = link.take_deferred_search().expect("search 3 was held");
+        assert_eq!(held, ticket(3, &["charlie"]));
+        assert_eq!(expr, b"C");
+        assert!(!link.search_reply_outstanding());
+    }
+
+    #[test]
+    fn more_results_are_credited_to_the_search_they_continue() {
+        let mut replies = SearchReplies::default();
+        let now = std::time::Instant::now();
+        replies.sent(ticket(7, &["alpha"]), now);
+        assert_eq!(replies.answered(), Some(ticket(7, &["alpha"])));
+        assert_eq!(replies.more_ticket(7), ticket(7, &["alpha"]));
+        // Search More for a search the server did not answer last keeps no
+        // terms rather than borrowing another search's.
+        assert_eq!(replies.more_ticket(8), ticket(8, &[]));
+    }
+
+    /// A server that never answers cannot hold the next search back forever.
+    #[test]
+    fn an_unanswered_request_is_given_up_on_after_the_wait() {
+        let mut replies = SearchReplies::default();
+        let sent_at = std::time::Instant::now();
+        let wait = std::time::Duration::from_secs(28);
+        replies.sent(ticket(1, &[]), sent_at);
+        replies.defer(ticket(2, &[]), b"B");
+
+        assert_eq!(replies.expire(wait, sent_at + wait / 2), None);
+        assert!(replies.take_deferred().is_none());
+
+        assert_eq!(replies.expire(wait, sent_at + wait), Some(1));
+        assert_eq!(replies.answered(), None, "a late answer is credited to nobody");
+        let (held, _) = replies.take_deferred().expect("search 2 is released");
+        assert_eq!(held.request_id, 2);
+    }
+
+    #[test]
+    fn an_unparsable_search_result_still_answers_its_request() {
+        let events = parse_server_event(OP_SEARCHRESULT, &[0x01, 0x00]);
+        assert!(matches!(
+            events.as_slice(),
+            [ServerEvent::SearchResult { results, more: false }] if results.is_empty()
+        ));
     }
 
     #[tokio::test]

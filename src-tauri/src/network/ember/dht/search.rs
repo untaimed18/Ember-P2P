@@ -409,6 +409,27 @@ pub struct QueryTarget {
     /// For a page follow-up, the records the last page ended on. Empty for a
     /// first query.
     pub resume_after: ResumeAnchors,
+    /// Send a `FIND_NODE` for the search's target, whatever kind the search is:
+    /// a value walk asking a node that answered with records for the contacts
+    /// it did not send. See [`IterativeSearch::referral_queue`].
+    pub find_node: bool,
+}
+
+/// The other walk of a keyword search whose query hashes to two keys — the
+/// normalised one and the spelling as typed (see [`legacy_keyword_hashes`]).
+/// Each key lives at its own place in the DHT, so each needs a walk of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Companion {
+    /// Nobody has asked yet whether this search needs one.
+    #[default]
+    Unconsidered,
+    /// It does not, or its companion has finished.
+    None,
+    /// The companion walk still running, which this search waits for before it
+    /// reports its results.
+    Running(u32),
+    /// This search is the companion: its records go to the search named here.
+    FeedsInto(u32),
 }
 
 /// The anchors for the page after one that was asked to begin at `asked_start`
@@ -458,6 +479,9 @@ struct PendingQuery {
     /// For a page, whether the answer that earned it delivered anything. See
     /// [`OwedPage::backed`].
     backed: bool,
+    /// A `FIND_NODE` to a node that already answered this value walk — see
+    /// [`IterativeSearch::referral_queue`].
+    referral: bool,
 }
 
 /// A page follow-up waiting to be sent, or parked until it may be.
@@ -481,6 +505,12 @@ impl PendingQuery {
     /// Whether this query was a page follow-up rather than a node's first.
     fn is_page(&self) -> bool {
         self.start_position > 0
+    }
+
+    /// Whether this query went to a node that has already answered the search,
+    /// as a page or a referral, rather than being that node's first.
+    fn is_follow_up(&self) -> bool {
+        self.is_page() || self.referral
     }
 }
 
@@ -653,6 +683,25 @@ pub struct IterativeSearch {
     /// file hash of a keyword record, or the blob digest of anything else. See
     /// that constant for why this is not simply a count of blobs.
     budget_spent: HashSet<[u8; 16]>,
+    /// Nodes that answered a `FIND_VALUE` with records, owed a `FIND_NODE` for
+    /// the contacts that answer could not carry.
+    ///
+    /// A responder holding even one record under the key answers with records
+    /// alone, and `FOUND_VALUE` has no room for contacts. The shortlist only
+    /// grows from `FOUND_NODE`, so a walk whose nearest hops all hold something
+    /// never learned of the replicas closer still — which are where most of a
+    /// key's records sit. Asking each such node for contacts as well restores
+    /// the descent without anything a responder of any version has to parse
+    /// differently. Only nodes among the k closest the walk can still reach are
+    /// asked, once each: a farther one has k better places to send us already.
+    referral_queue: VecDeque<EmberNodeId>,
+    /// Nodes ever queued for a referral, so none is asked twice.
+    referred: HashSet<EmberNodeId>,
+    /// The other walk of a two-key keyword search, if any — see [`Companion`].
+    pub companion: Companion,
+    /// How many of `results` came from a companion through
+    /// [`Self::absorb_results`].
+    absorbed_count: usize,
 }
 
 /// What one result blob buys against [`MAX_SEARCH_RESULTS`].
@@ -744,12 +793,36 @@ impl IterativeSearch {
             seeded_count: 0,
             budget_spent: HashSet::new(),
             value_constraints: super::messages::ValueConstraints::default(),
+            referral_queue: VecDeque::new(),
+            referred: HashSet::new(),
+            companion: Companion::Unconsidered,
+            absorbed_count: 0,
         }
     }
 
     /// Records held that came from the network rather than our own store.
+    ///
+    /// A companion's records are not counted: they were bought from its own
+    /// budget, and charging them again here would end this walk short.
     fn remote_blobs(&self) -> usize {
-        self.results.len().saturating_sub(self.seeded_count)
+        self.results
+            .len()
+            .saturating_sub(self.seeded_count)
+            .saturating_sub(self.absorbed_count)
+    }
+
+    /// Take the records a finished companion walk gathered (see [`Companion`]),
+    /// skipping any blob this search already holds.
+    pub fn absorb_results(&mut self, records: Vec<SearchResultRecord>) {
+        for record in records {
+            let blob_digest = *blake3::hash(&record.data).as_bytes();
+            if !self.seen_results.insert(blob_digest) {
+                continue;
+            }
+            self.result_slots.insert(blob_digest, self.results.len());
+            self.results.push(record);
+            self.absorbed_count = self.absorbed_count.saturating_add(1);
+        }
     }
 
     /// Note that `node` handed this search an authentic record.
@@ -889,12 +962,16 @@ impl IterativeSearch {
     /// it can add entries. Both have to count, or a search whose last α queries
     /// are in flight would look finished while the closer nodes it was reaching
     /// for are exactly what has not answered yet.
+    ///
+    /// A referral owed or outstanding is descent too: its answer is contacts.
     fn can_still_descend(&self) -> bool {
-        self.shortlist.iter().any(|entry| {
-            entry.state == NodeState::InFlight
-                || (entry.state == NodeState::Pending
-                    && !self.queried.contains(&entry.contact.node_id))
-        })
+        !self.referral_queue.is_empty()
+            || self.referrals_in_flight() > 0
+            || self.shortlist.iter().any(|entry| {
+                entry.state == NodeState::InFlight
+                    || (entry.state == NodeState::Pending
+                        && !self.queried.contains(&entry.contact.node_id))
+            })
     }
 
     /// Whether some *other* node is still owed a page follow-up.
@@ -1049,6 +1126,32 @@ impl IterativeSearch {
             .count()
     }
 
+    /// Referral `FIND_NODE`s currently awaiting an answer.
+    fn referrals_in_flight(&self) -> usize {
+        self.pending_requests
+            .values()
+            .filter(|p| p.referral)
+            .count()
+    }
+
+    /// Queue a referral to `node` if it answered with records and sits among
+    /// the k closest entries that can still answer. See [`Self::referral_queue`].
+    fn maybe_queue_referral(&mut self, node: &EmberNodeId) {
+        if self.search_type != SearchType::FindValue || self.referred.contains(node) {
+            return;
+        }
+        let near = self
+            .shortlist
+            .iter()
+            .filter(|entry| entry.state != NodeState::Failed)
+            .take(K_BUCKET_SIZE)
+            .any(|entry| entry.contact.node_id == *node);
+        if near {
+            self.referred.insert(*node);
+            self.referral_queue.push_back(*node);
+        }
+    }
+
     /// Get the next batch of queries to send (up to ALPHA outstanding).
     ///
     /// Two kinds of work share the budget: nodes on the shortlist that have not
@@ -1065,7 +1168,8 @@ impl IterativeSearch {
             .iter()
             .filter(|e| e.state == NodeState::InFlight)
             .count()
-            + self.pages_in_flight();
+            + self.pages_in_flight()
+            + self.referrals_in_flight();
 
         let can_send = ALPHA.saturating_sub(in_flight);
         if can_send == 0 {
@@ -1082,10 +1186,11 @@ impl IterativeSearch {
         // a hot key would otherwise page one node for the whole search while the
         // frontier stood still, which is how a walk misses the closer nodes that
         // hold the rest of the index.
-        let has_descent = self
-            .shortlist
-            .iter()
-            .any(|e| e.state == NodeState::Pending && !self.queried.contains(&e.contact.node_id));
+        let has_descent = !self.referral_queue.is_empty()
+            || self
+                .shortlist
+                .iter()
+                .any(|e| e.state == NodeState::Pending && !self.queried.contains(&e.contact.node_id));
         // Half, rounded *down*, so the descent always gets the odd slot. The
         // floor of one this used to carry handed the last free slot to a page
         // whenever only one was free — which is the steady state of a walk at
@@ -1135,6 +1240,7 @@ impl IterativeSearch {
                     start_position: start,
                     resume_after: owed.resume_after,
                     backed: owed.backed,
+                    referral: false,
                 },
             );
             batch.push(QueryTarget {
@@ -1142,6 +1248,7 @@ impl IterativeSearch {
                 request_id: req_id,
                 start_position: start,
                 resume_after: owed.resume_after,
+                find_node: false,
             });
         }
         for item in skipped_pages {
@@ -1155,6 +1262,41 @@ impl IterativeSearch {
             return batch;
         }
         let page_waiting = !self.page_queue.is_empty();
+        // Referrals ahead of unasked entries: the node has answered, so it is
+        // alive, and it is among the closest the walk knows of, so the contacts
+        // it names are the likeliest of anything to be closer still. One whose
+        // entry the trim has since dropped is no longer near enough to ask.
+        while batch.len() < can_send {
+            let Some(node_id) = self.referral_queue.pop_front() else {
+                break;
+            };
+            let Some(contact) = self
+                .shortlist
+                .iter()
+                .find(|e| e.contact.node_id == node_id && e.state == NodeState::Responded)
+                .map(|e| e.contact.clone())
+            else {
+                continue;
+            };
+            let req_id = self.take_request_id();
+            self.pending_requests.insert(
+                req_id,
+                PendingQuery {
+                    node: node_id,
+                    start_position: 0,
+                    resume_after: ResumeAnchors::default(),
+                    backed: false,
+                    referral: true,
+                },
+            );
+            batch.push(QueryTarget {
+                contact,
+                request_id: req_id,
+                start_position: 0,
+                resume_after: ResumeAnchors::default(),
+                find_node: true,
+            });
+        }
         // The class preference — pinned session peers, then verified contacts,
         // then mute leads — applies to the *opening* batch only, and exists so
         // the first round does not lead with a lead the routing table happened
@@ -1211,6 +1353,7 @@ impl IterativeSearch {
                             start_position: 0,
                             resume_after: ResumeAnchors::default(),
                             backed: false,
+                            referral: false,
                         },
                     );
                     batch.push(QueryTarget {
@@ -1218,6 +1361,7 @@ impl IterativeSearch {
                         request_id: req_id,
                         start_position: 0,
                         resume_after: ResumeAnchors::default(),
+                        find_node: false,
                     });
                 }
             }
@@ -1332,8 +1476,8 @@ impl IterativeSearch {
             }
             return ResponseOutcome::REFUSED;
         }
-        let (asked_start, asked_resume) = expected
-            .map(|p| (p.start_position, p.resume_after))
+        let (asked_start, asked_resume, asked_referral, asked_first) = expected
+            .map(|p| (p.start_position, p.resume_after, p.referral, !p.is_follow_up()))
             .unwrap_or_default();
 
         for entry in &mut self.shortlist {
@@ -1362,7 +1506,9 @@ impl IterativeSearch {
         // concurrency for repeat queries to itself, which cannot even make
         // progress: the driver builds a plain `FIND_NODE` for a page follow-up
         // and ignores `start_position`.
-        let value_answer_expected = self.search_type == SearchType::FindValue;
+        //
+        // A referral asked for contacts too, so the same holds for its answer.
+        let value_answer_expected = self.search_type == SearchType::FindValue && !asked_referral;
         if !value_answer_expected {
             if !value_records.is_empty() {
                 debug!(
@@ -1552,6 +1698,9 @@ impl IterativeSearch {
                 cut_short,
                 delivered_now > 0,
             );
+        }
+        if asked_first && carried > 0 && closer_nodes.is_empty() {
+            self.maybe_queue_referral(from_id);
         }
 
         // Merge closer nodes into shortlist
@@ -1877,8 +2026,12 @@ impl IterativeSearch {
         // window rather than one, since the retry above can miss as well. A
         // genuinely dead peer is still caught, by the liveness ping that exists
         // for exactly that and answers to nothing a searcher chose to ask.
-        let fault_worthy = !pending.is_page();
-        if !pending.is_page() {
+        //
+        // A referral is neither retried nor reported, for the same reason as a
+        // page: the node has answered this search, and the records it gave are
+        // held whether or not its contacts ever arrive.
+        let fault_worthy = !pending.is_follow_up();
+        if fault_worthy {
             let spent = self
                 .attempts
                 .get(&node_id)
@@ -1904,7 +2057,7 @@ impl IterativeSearch {
                 // kept, so this can only happen `MAX_QUERY_ATTEMPTS` times.
                 self.queried.remove(&node_id);
             }
-        } else if failure != QueryFailure::NotSent {
+        } else if pending.is_page() && failure != QueryFailure::NotSent {
             // A page goes to a node that has already answered this search, so a
             // handshake that stalled here is a dropped session, not a phantom.
             let start = pending.start_position;
@@ -1931,13 +2084,28 @@ impl IterativeSearch {
         fault_worthy.then_some(node_id)
     }
 
-    /// The node a query is outstanding to, and whether it is a page follow-up,
-    /// so a caller about to report its failure can tell what a retry would be
-    /// sent to — see [`QueryFailure::HandshakeNeverCompleted`].
+    /// The node a query is outstanding to, and whether it is a follow-up (a page
+    /// or a referral) to a node that has already answered, so a caller about to
+    /// report its failure can tell what a retry would be sent to — see
+    /// [`QueryFailure::HandshakeNeverCompleted`].
     pub fn pending_query(&self, request_id: u32) -> Option<(EmberNodeId, bool)> {
         self.pending_requests
             .get(&request_id)
-            .map(|p| (p.node, p.is_page()))
+            .map(|p| (p.node, p.is_follow_up()))
+    }
+
+    /// The contact an outstanding first query went to, as the shortlist holds
+    /// it: the address and key that were actually dialled. `None` for a
+    /// follow-up, whose failure says nothing about the contact.
+    pub fn queried_contact(&self, request_id: u32) -> Option<EmberContact> {
+        let pending = self.pending_requests.get(&request_id)?;
+        if pending.is_follow_up() {
+            return None;
+        }
+        self.shortlist
+            .iter()
+            .find(|e| e.contact.node_id == pending.node)
+            .map(|e| e.contact.clone())
     }
 
     /// Re-evaluate and return the completion state. Unlike the internal
@@ -1976,8 +2144,9 @@ impl IterativeSearch {
             .iter()
             .any(|e| e.state == NodeState::InFlight);
         let has_pages = !self.page_queue.is_empty() || self.pages_in_flight() > 0;
+        let has_referrals = !self.referral_queue.is_empty() || self.referrals_in_flight() > 0;
 
-        if !has_pending && !has_in_flight && !has_pages {
+        if !has_pending && !has_in_flight && !has_pages && !has_referrals {
             self.take_sole_contributors_held();
             self.complete = true;
             return;
@@ -2433,6 +2602,11 @@ impl SearchManager {
 }
 
 /// Compute the BLAKE3-based keyword hash used as a DHT key.
+///
+/// Hashes the text as given, lowercased. Every key published so far was made
+/// this way from a tokenizer's words, so it stays exactly as it is; the
+/// normalised keys come from running [`normalize_keyword_text`] *before* the
+/// tokenizer, whose output this then leaves unchanged.
 pub fn keyword_hash(keyword: &str) -> [u8; 16] {
     let normalized = keyword.to_lowercase();
     let hash = blake3::hash(normalized.as_bytes());
@@ -2441,24 +2615,129 @@ pub fn keyword_hash(keyword: &str) -> [u8; 16] {
     key
 }
 
+/// Ember's keyword normal form: NFKC, then a char-by-char lowercase with the
+/// final sigma `ς` folded to `σ`.
+///
+/// Without it, text that reads the same hashes apart: a decomposed `Café`
+/// against the composed one, full-width `ＵＢＵＮＴＵ` against `ubuntu`, `οδος`
+/// against `ΟΔΟΣ` (which lowercases 1:1 to `οδοσ`). ASCII comes out exactly as
+/// `to_ascii_lowercase`, so an ASCII keyword keeps the key it always had.
+///
+/// Ember only. A KAD keyword hash has to match eMule's byte for byte, so the
+/// KAD tokenizer in `kad::publish` is never handed normalised text.
+pub fn normalize_keyword_text(text: &str) -> String {
+    if text.is_ascii() {
+        return text.to_ascii_lowercase();
+    }
+    let nfkc = icu_normalizer::ComposingNormalizerBorrowed::new_nfkc();
+    let lower = |s: &str| -> String {
+        s.chars()
+            .flat_map(char::to_lowercase)
+            .map(|c| if c == 'ς' { 'σ' } else { c })
+            .collect()
+    };
+    // Twice: NFKC can produce capitals (`㎆` is `MB`), and lowercasing can
+    // produce a sequence NFKC would rewrite.
+    let once = lower(&nfkc.normalize(text));
+    lower(&nfkc.normalize(&once))
+}
+
+/// The words the Ember publish loop files a keyword record for `file_name`
+/// under: the KAD tokenizer's words, which is what releases from 1.6.5 on have
+/// published under, then the words of the normalised name that hash anywhere
+/// else. `file_name` is the name as the record will sign it
+/// (`publish::keyword_record_signed_name`).
+///
+/// Both, so a searcher of either generation finds the record: an older one
+/// walks the key of the spelling it was typed in, a newer one the normalised
+/// key and that spelling's key as well (see [`legacy_keyword_hashes`]). For an
+/// ASCII name the two sets are the same words.
+pub fn ember_publish_keywords(file_name: &str) -> Vec<String> {
+    let mut words = crate::network::kad::publish::extract_keywords(file_name);
+    let mut keys: HashSet<[u8; 16]> = words.iter().map(|w| keyword_hash(w)).collect();
+    for word in crate::network::kad::publish::extract_keywords(&normalize_keyword_text(file_name)) {
+        if keys.insert(keyword_hash(&word)) {
+            words.push(word);
+        }
+    }
+    words
+}
+
 /// Whether any keyword the publish loop would derive from `file_name` hashes to
 /// `key` — that is, whether a keyword record filed under `key` could have been
 /// aimed there by the name it carries.
 ///
-/// Both sides of the index are here on purpose: [`extract_keywords`] is the same
-/// tokenizer the publisher ran over the name, and [`keyword_hash`] is the same
-/// hash it filed the result under, so this asks the publisher's own question
-/// rather than an approximation of it. A name with no words at all — nothing at
-/// least three characters long once the extension is stripped — answers false
-/// for every key, because there is no word under which it could be found.
+/// Both sides of the index are here on purpose: [`ember_publish_keywords`] is
+/// the same derivation the publisher ran over the name, and [`keyword_hash`] is
+/// the same hash it filed the result under, so this asks the publisher's own
+/// question rather than an approximation of it. The derivation 1.6.0 to 1.6.4
+/// used ([`v16_keywords`]) is asked too, since those releases speak the same
+/// wire version and their records are still live. A name with no words at all
+/// — nothing at least three characters long once the extension is stripped —
+/// answers false for every key, because there is no word under which it could
+/// be found.
 ///
-/// Deliberately a question and not a rule. See its one caller: making a record's
-/// validity depend on this tokenizer would refuse tomorrow's publisher from
-/// every storer still running today's.
+/// A store-side question, not a rule: making a record's validity depend on this
+/// tokenizer would refuse tomorrow's publisher from every storer still running
+/// today's. A searcher can afford to ask it, since dropping a row costs recall
+/// rather than interoperability.
 pub fn name_hashes_to_key(file_name: &str, key: &[u8; 16]) -> bool {
-    crate::network::kad::publish::extract_keywords(file_name)
+    ember_publish_keywords(file_name)
         .iter()
+        .chain(v16_keywords(file_name, true).iter())
         .any(|word| keyword_hash(word) == *key)
+}
+
+/// The tokenizer 1.6.0 to 1.6.4 published with: split on the KAD separators and
+/// on any whitespace, keep words of three bytes or more, lowercase in full, keep
+/// a repeat where it first appeared, and — with `strip_trailing_extension` —
+/// drop the last *new* word as an extension when it is three characters and
+/// three bytes and more than one word survived.
+fn v16_keywords(text: &str, strip_trailing_extension: bool) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut last = (0usize, 0usize);
+    for word in text.split(|c: char| crate::network::kad::publish::is_kad_keyword_separator(c) || c.is_whitespace()) {
+        if word.len() < 3 {
+            continue;
+        }
+        let lower = word.to_lowercase();
+        if !words.contains(&lower) {
+            last = (word.chars().count(), word.len());
+            words.push(lower);
+        }
+    }
+    if strip_trailing_extension && words.len() > 1 && last == (3, 3) {
+        words.pop();
+    }
+    words
+}
+
+/// Every key a word of `file_name` hashes to, in either spelling, the trailing
+/// three-letter token the publisher drops as an extension included.
+///
+/// What a multi-keyword search tests its secondary words against. Looser than
+/// [`name_hashes_to_key`] by that one token, so `ubuntu iso` still finds
+/// `ubuntu.iso`, whose publisher filed it under `ubuntu` alone.
+///
+/// A name holding whitespace other than the space is also cut on it, as 1.6.0
+/// to 1.6.4 cut it, so `alpha<TAB>beta` carries `alpha` and `beta`.
+pub fn name_word_keys(file_name: &str) -> HashSet<[u8; 16]> {
+    use crate::network::kad::publish::extract_query_keywords;
+    let mut keys: HashSet<[u8; 16]> = extract_query_keywords(file_name)
+        .iter()
+        .map(|w| keyword_hash(w))
+        .collect();
+    if !file_name.is_ascii() {
+        keys.extend(
+            extract_query_keywords(&normalize_keyword_text(file_name))
+                .iter()
+                .map(|w| keyword_hash(w)),
+        );
+    }
+    if file_name.chars().any(|c| c.is_whitespace() && c != ' ') {
+        keys.extend(v16_keywords(file_name, false).iter().map(|w| keyword_hash(w)));
+    }
+    keys
 }
 
 /// Compute keyword hashes for a multi-word query. Returns `(hash, text)` pairs
@@ -2472,15 +2751,26 @@ pub fn name_hashes_to_key(file_name: &str, key: &[u8; 16]) -> bool {
 /// whitespace alone would hash `blade-runner` whole while the publisher stored
 /// `blade` and `runner`.
 ///
-/// In practice the live callers pass terms [`crate::search::query`] has already
-/// tokenized with the same rules, so this is belt-and-braces rather than a
-/// behaviour change — but it is what keeps the two ends from drifting apart if
-/// a caller ever hands over a raw query.
+/// The query is normalised first ([`normalize_keyword_text`]), so these are the
+/// normalised keys. Where the query as typed hashes elsewhere, publishers older
+/// than normalisation filed under that other key, which
+/// [`legacy_keyword_hashes`] gives; an ASCII query has one set of keys.
 pub fn compute_keyword_hashes(query: &str) -> Vec<([u8; 16], String)> {
+    hash_query_words(crate::network::kad::publish::extract_query_keywords(
+        &normalize_keyword_text(query),
+    ))
+}
+
+/// [`compute_keyword_hashes`] without the normalisation: the keys a release
+/// that predates it walks for `query`, and publishes the same spelling under.
+pub fn legacy_keyword_hashes(query: &str) -> Vec<([u8; 16], String)> {
+    hash_query_words(crate::network::kad::publish::extract_query_keywords(query))
+}
+
+fn hash_query_words(mut keywords: Vec<String>) -> Vec<([u8; 16], String)> {
     // Already lowercased and deduplicated (case-insensitively) by the
     // tokenizer; this only imposes the most-selective-first ordering the
     // primary/secondary split depends on.
-    let mut keywords = crate::network::kad::publish::extract_query_keywords(query);
     keywords.sort_by_key(|kw| std::cmp::Reverse(kw.len()));
 
     keywords
@@ -3168,7 +3458,7 @@ mod tests {
         let mut asked: Vec<u16> = Vec::new();
         let mut served = 0u16;
         loop {
-            let batch = search.next_to_query();
+            let batch = next_value_queries(search);
             if batch.is_empty() {
                 break;
             }
@@ -3239,7 +3529,7 @@ mod tests {
             !search.poll_complete(),
             "a queued page must keep the search alive"
         );
-        let follow_up = search.next_to_query();
+        let follow_up = next_value_queries(search);
         assert_eq!(follow_up.len(), 1);
         assert_eq!(follow_up[0].start_position, 1);
     }
@@ -3273,7 +3563,7 @@ mod tests {
             }),
         );
 
-        let page = search.next_to_query();
+        let page = next_value_queries(search);
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].start_position, 4);
 
@@ -3572,7 +3862,7 @@ mod tests {
 
         let mut blobs_on_the_wire = 0usize;
         for (expected_start, served, next_position) in script {
-            let batch = search.next_to_query();
+            let batch = next_value_queries(search);
             assert_eq!(batch.len(), 1, "only one node is known");
             let query = &batch[0];
             assert_eq!(query.start_position, expected_start);
@@ -3605,7 +3895,7 @@ mod tests {
             "the allowance is charged per distinct record, not per blob received"
         );
         assert!(
-            search.next_to_query().is_empty(),
+            next_value_queries(search).is_empty(),
             "the key is exhausted, so there is nothing left to page"
         );
         assert!(search.poll_complete());
@@ -3641,7 +3931,7 @@ mod tests {
         );
 
         assert!(
-            search.next_to_query().is_empty(),
+            next_value_queries(search).is_empty(),
             "a page that does not advance must not be followed"
         );
         assert!(search.poll_complete());
@@ -3678,7 +3968,7 @@ mod tests {
             }),
         );
 
-        let page = search.next_to_query();
+        let page = next_value_queries(search);
         assert_eq!(page[0].start_position, 1);
         assert_eq!(search.mark_failed(page[0].request_id), None);
 
@@ -3686,7 +3976,7 @@ mod tests {
         // nothing ever asks this node for its first page again.
         let mut rounds = 0;
         loop {
-            let batch = search.next_to_query();
+            let batch = next_value_queries(search);
             if batch.is_empty() {
                 break;
             }
@@ -3980,6 +4270,297 @@ mod tests {
         let hashes = compute_keyword_hashes("iso abc iso");
         assert_eq!(hashes.len(), 2, "the repeated keyword is counted once");
         assert_eq!(hashes.iter().filter(|(_, k)| k == "iso").count(), 1);
+    }
+
+    /// An id one bit from `target`: closer than anything a table seeded from
+    /// `make_contact` holds.
+    fn next_to(target: EmberNodeId) -> EmberContact {
+        let mut contact = make_lead(0x01);
+        let mut id = target.0;
+        id[15] ^= 1;
+        contact.node_id = EmberNodeId(id);
+        contact
+    }
+
+    /// A node holding records under the key answers with records alone, so a
+    /// walk whose nearest hops all hold something never heard of the replicas
+    /// closer still. Such a node is asked for contacts as well, once, and the
+    /// contacts it names are walked.
+    #[test]
+    fn a_value_responder_is_asked_for_the_contacts_its_answer_had_no_room_for() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let holder = make_contact(0xF0);
+        rt.add_contact(holder.clone());
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        let first = search.next_to_query();
+        assert_eq!(first.len(), 1);
+        assert!(!first[0].find_node);
+        search.process_unpaged(
+            first[0].request_id,
+            &holder.node_id,
+            vec![],
+            vec![signed_value_blob("ubuntu", 1)],
+        );
+        assert!(!search.poll_complete(), "the referral is still owed");
+
+        let referral = search.next_to_query();
+        assert_eq!(referral.len(), 1);
+        assert!(referral[0].find_node, "a FIND_NODE, which every version answers");
+        assert_eq!(referral[0].contact.node_id, holder.node_id);
+        let closer = next_to(target);
+        search.process_unpaged(referral[0].request_id, &holder.node_id, vec![closer.clone()], vec![]);
+
+        let next = search.next_to_query();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].contact.node_id, closer.node_id);
+        assert!(!next[0].find_node);
+        search.process_unpaged(
+            next[0].request_id,
+            &closer.node_id,
+            vec![],
+            vec![signed_value_blob("ubuntu", 2)],
+        );
+        let last = next_value_queries(search);
+        assert!(last.is_empty(), "each value responder is asked for contacts once");
+        assert!(search.poll_complete());
+        assert_eq!(search.results.len(), 2, "the closer replica's record was reached");
+    }
+
+    /// A referral goes to a node that has just answered, so losing it says
+    /// nothing about the node: it is neither retried nor reported, and the
+    /// walk ends with the records that node already gave.
+    #[test]
+    fn a_lost_referral_is_not_charged_or_retried() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let holder = make_contact(0xF0);
+        rt.add_contact(holder.clone());
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        let first = search.next_to_query();
+        search.process_unpaged(
+            first[0].request_id,
+            &holder.node_id,
+            vec![],
+            vec![signed_value_blob("ubuntu", 1)],
+        );
+        let referral = search.next_to_query();
+        assert!(referral[0].find_node);
+        assert_eq!(search.pending_query(referral[0].request_id), Some((holder.node_id, true)));
+        assert!(search.queried_contact(referral[0].request_id).is_none());
+        assert_eq!(search.mark_failed(referral[0].request_id), None);
+        assert!(search.next_to_query().is_empty());
+        assert!(search.poll_complete());
+        assert_eq!(search.results.len(), 1);
+    }
+
+    /// A referral asked for contacts, so records riding its answer were not
+    /// asked for and are not taken; and a node whose answer already carried
+    /// contacts needs no referral, whatever else it carried.
+    #[test]
+    fn a_referral_takes_contacts_only_and_contacts_need_no_referral() {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let holder = make_contact(0xF0);
+        let pointer = make_contact(0xE0);
+        rt.add_contact(holder.clone());
+        rt.add_contact(pointer.clone());
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        let lead = next_to(target);
+        let batch = search.next_to_query();
+        assert_eq!(batch.len(), 2);
+        for query in &batch {
+            if query.contact.node_id == holder.node_id {
+                search.process_unpaged(
+                    query.request_id,
+                    &holder.node_id,
+                    vec![],
+                    vec![signed_value_blob("ubuntu", 1)],
+                );
+            } else {
+                search.process_unpaged(
+                    query.request_id,
+                    &pointer.node_id,
+                    vec![lead.clone()],
+                    vec![signed_value_blob("ubuntu", 3)],
+                );
+            }
+        }
+        let next = search.next_to_query();
+        let referrals: Vec<_> = next.iter().filter(|q| q.find_node).collect();
+        assert_eq!(referrals.len(), 1, "only the responder that sent no contacts is asked");
+        assert_eq!(referrals[0].contact.node_id, holder.node_id);
+        for query in &next {
+            if query.find_node {
+                search.process_unpaged(
+                    query.request_id,
+                    &holder.node_id,
+                    vec![],
+                    vec![signed_value_blob("ubuntu", 2)],
+                );
+            } else {
+                assert_eq!(query.contact.node_id, lead.node_id);
+                search.process_unpaged(query.request_id, &lead.node_id, vec![], vec![]);
+            }
+        }
+        assert_eq!(search.results.len(), 2, "records on a referral's answer are not taken");
+        assert!(next_value_queries(search).is_empty());
+        assert!(search.poll_complete());
+    }
+
+    /// The timeout sweep charges the routing table only for the address and
+    /// key it actually dialled, which is the shortlist's copy — possibly an
+    /// address some other peer's `FOUND_NODE` paired with a real node's id.
+    #[test]
+    fn queried_contact_is_what_the_shortlist_dialled() {
+        let target = make_id(0x01);
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        let referrer = make_contact(0xF0);
+        rt.add_contact(referrer.clone());
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_node(target, &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        let first = search.next_to_query();
+        assert_eq!(
+            search.queried_contact(first[0].request_id).map(|c| (c.node_id, c.addr)),
+            Some((referrer.node_id, referrer.addr))
+        );
+        let mut lie = make_contact(0x02);
+        lie.addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(81, 9, 9, 9)), 4662);
+        lie.last_seen = 0;
+        search.process_unpaged(first[0].request_id, &referrer.node_id, vec![lie.clone()], vec![]);
+        let next = search.next_to_query();
+        let dialled = search.queried_contact(next[0].request_id).expect("a first query");
+        assert_eq!(dialled.node_id, lie.node_id);
+        assert_eq!(dialled.addr, lie.addr);
+    }
+
+    /// A companion's records join the search once each, and are not charged to
+    /// this walk's own budget, which they were not bought from.
+    #[test]
+    fn a_companions_records_are_taken_once_without_spending_this_walk() {
+        let target = keyword_target("ubuntu");
+        let rt = table_with_contacts(make_id(0x00), 2);
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+        let records: Vec<SearchResultRecord> = (0..4)
+            .map(|i| SearchResultRecord {
+                data: signed_value_blob("ubuntu", i),
+                from_node: make_id(0x40),
+                confirmed_by: None,
+                from_subnet: Some(1),
+                confirmed_subnet: None,
+                from_local_store: false,
+            })
+            .collect();
+        search.absorb_results(records.clone());
+        search.absorb_results(records);
+        assert_eq!(search.results.len(), 4);
+        assert_eq!(search.remote_blobs(), 0);
+    }
+
+    /// The keys every release has used for an ASCII word, pinned to their bytes.
+    /// Normalisation must not move one of them, or a new searcher and an old
+    /// publisher stop meeting on every ordinary query.
+    #[test]
+    fn ascii_keywords_keep_the_keys_they_always_had() {
+        let legacy = |word: &str| {
+            let mut key = [0u8; 16];
+            key.copy_from_slice(&blake3::hash(word.to_lowercase().as_bytes()).as_bytes()[..16]);
+            key
+        };
+        for query in ["Ubuntu Server", "Blade.Runner.2049", "the big cat", "ABC-def_ghi"] {
+            assert_eq!(compute_keyword_hashes(query), legacy_keyword_hashes(query), "{query}");
+            for (key, word) in compute_keyword_hashes(query) {
+                assert_eq!(key, legacy(&word), "{word}");
+            }
+        }
+        assert_eq!(normalize_keyword_text("MiXeD 123 ~!"), "mixed 123 ~!");
+        let name = "Some.Movie.Title.2049.1080p.mkv";
+        assert_eq!(
+            ember_publish_keywords(name),
+            crate::network::kad::publish::extract_keywords(name),
+            "an ASCII name publishes exactly the words it always did"
+        );
+    }
+
+    /// Composed and decomposed accents, full-width letters and the two Greek
+    /// sigmas each read as one word, so each must land on one key.
+    #[test]
+    fn spellings_that_read_the_same_share_a_normalised_key() {
+        let key = |q: &str| compute_keyword_hashes(q)[0].0;
+        assert_eq!(key("Cafe\u{301}"), key("Café"));
+        assert_eq!(key("ＵＢＵＮＴＵ"), key("ubuntu"));
+        assert_eq!(key("οδος"), key("ΟΔΟΣ"));
+        assert_eq!(key("ΟΔΟΣ"), key("οδοσ"));
+
+        // The legacy derivation keeps them apart, which is why a search walks
+        // that key as well when the two differ.
+        let legacy = |q: &str| legacy_keyword_hashes(q)[0].0;
+        assert_ne!(legacy("Cafe\u{301}"), legacy("Café"));
+        assert_eq!(legacy("Cafe\u{301}"), legacy_keyword_hashes("cafe\u{301}")[0].0);
+        assert_ne!(key("Cafe\u{301}"), legacy("Cafe\u{301}"));
+        assert_eq!(key("Café"), legacy("Café"), "a composed name already had its normal key");
+    }
+
+    #[test]
+    fn normalisation_is_stable_under_a_second_pass() {
+        for text in ["Cafe\u{301}", "ＡＢＣ", "ΟΔΟΣ οδος", "İstanbul", "Straße", "㎆", "ﬁle"] {
+            let once = normalize_keyword_text(text);
+            assert_eq!(normalize_keyword_text(&once), once, "{text}");
+            assert_eq!(once.to_lowercase(), once, "keyword_hash must not change it again");
+        }
+    }
+
+    /// A name whose normalised words hash elsewhere is published under both, so
+    /// a searcher of either generation finds it, and the store-side check
+    /// accepts a record filed under either.
+    #[test]
+    fn a_name_is_published_under_its_legacy_and_its_normalised_keys() {
+        let name = "Cafe\u{301} del Mar.mp3";
+        let keys: Vec<[u8; 16]> = ember_publish_keywords(name)
+            .iter()
+            .map(|w| keyword_hash(w))
+            .collect();
+        let legacy = keyword_hash("cafe\u{301}");
+        let normalised = compute_keyword_hashes("café")[0].0;
+        assert!(keys.contains(&legacy));
+        assert!(keys.contains(&normalised));
+        assert_eq!(keys.len(), 4, "cafe in both spellings, del and mar once each");
+        assert!(name_hashes_to_key(name, &legacy));
+        assert!(name_hashes_to_key(name, &normalised));
+        assert!(!name_hashes_to_key(name, &keyword_hash("mp3")), "the extension is not a key");
+        assert!(name_word_keys(name).contains(&keyword_hash("mp3")));
+    }
+
+    /// 1.6.0 to 1.6.4 cut on any whitespace, lowercased in full and stripped the
+    /// last *new* word as an extension, and their records are still live on the
+    /// same wire version, so a name filed that way still vouches for its key.
+    #[test]
+    fn a_name_filed_by_the_1_6_tokenizer_still_derives_its_key() {
+        // A tab: one token to the current tokenizer, two to 1.6.
+        assert!(name_hashes_to_key("alpha\tbeta.mkv", &keyword_hash("beta")));
+        assert!(name_word_keys("alpha\tbeta.mkv").contains(&keyword_hash("alpha")));
+        // A word-final capital sigma: `ς` in full lowercasing.
+        assert!(name_hashes_to_key("ΟΔΟΣ ΤΟΥ.mp3", &keyword_hash("οδος")));
+        // A repeat stays where it first appeared, so the last *new* word is
+        // what 1.6 stripped: `song` here, never the repeated `abc`.
+        assert!(name_hashes_to_key("abc song abc", &keyword_hash("abc")));
+        assert_eq!(v16_keywords("abc song abc", true), vec!["abc", "song"]);
+        assert_eq!(v16_keywords("abc song mp3", true), vec!["abc", "song"]);
+        // And it is not a licence for unrelated names.
+        assert!(!name_hashes_to_key("alpha\tbeta.mkv", &keyword_hash("gamma")));
     }
 
     #[test]
@@ -4837,7 +5418,7 @@ mod tests {
         let total = MAX_RESULTS_PER_NODE as u16;
         let per_page = RECORDS_PER_UNFRAGMENTED_PAGE as u16;
         loop {
-            let batch = search.next_to_query();
+            let batch = next_value_queries(search);
             if batch.is_empty() {
                 break;
             }
@@ -4886,7 +5467,7 @@ mod tests {
         let total = MAX_SEARCH_RESULTS as u16;
         let per_page = RECORDS_PER_UNFRAGMENTED_PAGE as u16;
         loop {
-            let batch = search.next_to_query();
+            let batch = next_value_queries(search);
             if batch.is_empty() {
                 break;
             }
@@ -5112,8 +5693,28 @@ mod tests {
         );
     }
 
+    /// [`IterativeSearch::next_to_query`] with every referral in it answered at
+    /// once with no contacts, as by a node that knows nobody closer, for the
+    /// tests whose subject is the value queries.
+    fn next_value_queries(search: &mut IterativeSearch) -> Vec<QueryTarget> {
+        loop {
+            let (referrals, values): (Vec<_>, Vec<_>) =
+                search.next_to_query().into_iter().partition(|q| q.find_node);
+            if referrals.is_empty() {
+                return values;
+            }
+            for query in referrals {
+                search.process_unpaged(query.request_id, &query.contact.node_id, vec![], vec![]);
+            }
+            if !values.is_empty() {
+                return values;
+            }
+        }
+    }
+
     /// Answer every query `search` sends with `answer`, until it has nothing
-    /// left to send. Returns how many queries were answered.
+    /// left to send. Returns how many value queries were answered; a referral
+    /// is answered with no contacts, as by a node that knows nobody closer.
     fn drive_value_search(
         search: &mut IterativeSearch,
         mut answer: impl FnMut(&EmberNodeId, u16) -> (Vec<Vec<u8>>, Option<ValuePage>),
@@ -5125,6 +5726,10 @@ mod tests {
                 break;
             }
             for query in batch {
+                if query.find_node {
+                    search.process_unpaged(query.request_id, &query.contact.node_id, vec![], vec![]);
+                    continue;
+                }
                 answered += 1;
                 assert!(answered < 2_000, "the search must terminate");
                 let (records, page) = answer(&query.contact.node_id, query.start_position);

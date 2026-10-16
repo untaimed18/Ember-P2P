@@ -391,7 +391,13 @@ pub(super) fn fault_ember_contact(state: &mut NetworkState, node_id: &ember::dht
 /// only the search's own shortlist, so a dead gossip lead kept being chosen as
 /// a seed for every later lookup until the liveness sweep happened to reach it,
 /// which at eight pings a minute can be many minutes of five-second stalls.
-pub(super) fn fault_ember_search_contact(state: &mut NetworkState, node_id: &ember::dht::EmberNodeId) {
+///
+/// `queried` is the contact as the search dialled it. Only the table entry at
+/// that same address and key is charged: a shortlist contact may have come out
+/// of any peer's `FOUND_NODE`, which can pair a real node's id with an address
+/// that goes nowhere; silence there says nothing about the node the table
+/// holds under that id.
+pub(super) fn fault_ember_search_contact(state: &mut NetworkState, queried: &ember::dht::EmberContact) {
     // Unverified leads have no `last_seen` and are the only bootstrap we
     // hold on a cold join. Publish-target FIND_NODEs (two per tick) plus the
     // liveness ping all land on that one contact; each lookup timeout is 12s
@@ -400,12 +406,22 @@ pub(super) fn fault_ember_search_contact(state: &mut NetworkState, node_id: &emb
     // fault leads; a dead seed drops after three unanswered pings (~3 min).
     if !state
         .ember_dht
-        .contact_for(node_id)
-        .is_some_and(|c| c.is_verified())
+        .contact_for(&queried.node_id)
+        .is_some_and(|c| ember_search_fault_lands(c, queried))
     {
         return;
     }
-    evict_ember_contact_if_dead(state, node_id, "unresponsive in lookup");
+    evict_ember_contact_if_dead(state, &queried.node_id, "unresponsive in lookup");
+}
+
+/// Whether a lookup query that went unanswered may be charged to `held`, the
+/// routing table's contact for the id it was sent to. See
+/// [`fault_ember_search_contact`].
+pub(super) fn ember_search_fault_lands(
+    held: &ember::dht::EmberContact,
+    queried: &ember::dht::EmberContact,
+) -> bool {
+    held.is_verified() && held.addr == queried.addr && held.noise_pub == queried.noise_pub
 }
 
 /// Charge one failure against a contact and evict it once it has missed
@@ -546,11 +562,10 @@ pub(super) struct EmberKeywordSearch {
     /// is about to see. Re-deriving it per tick instead would mean verifying
     /// every gathered signature again once a second.
     pub(super) streamed_files: HashSet<String>,
-    /// `(file hash, publisher key)` of every record a streamed slice has
-    /// counted. A republished record is a new blob, so the blob dedup keeps
-    /// both versions and they can land in different slices; slice counts are
-    /// added up, and counting that publisher twice would stick, since the UI
-    /// merges counts by max. Bounded by the search's result-blob cap.
+    /// `(file hash, publisher key)` of every publisher the last streaming
+    /// rebuild counted. Each rebuild goes over everything gathered, so only the
+    /// rows whose counted set differs from this one carry anything new; the
+    /// rest are not sent again. Bounded by the search's result-blob cap.
     pub(super) streamed_publishers: HashSet<([u8; 16], [u8; 32])>,
 }
 

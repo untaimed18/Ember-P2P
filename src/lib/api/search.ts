@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { SearchResult, SpamExplanation, SpamStats, DownloadHistoryStats } from '$lib/types';
+import { clampFilterBytes, clampMinSources } from '$lib/searchQuery';
 
 export type SearchMethod = 'global' | 'server' | 'kad' | 'ember';
 
@@ -21,6 +22,29 @@ export interface RelatedSearchArgs {
   excludeHashes?: string[];
 }
 
+/** The least `search_files` waits for its reply, whatever the timeout setting:
+ *  a KAD keyword search's whole run plus slack (`search_reply_wait_secs` in
+ *  `commands/search.rs`). */
+const SEARCH_REPLY_MIN_SECS = 75;
+/** How much longer than the backend the page's watchdog waits, so the
+ *  backend's own reply, carrying KAD's last rows, lands first. */
+const SEARCH_WATCHDOG_SLACK_SECS = 5;
+
+/** Seconds before the page gives up on a search and cancels it. */
+export function searchWatchdogSecs(timeoutSecs: number): number {
+  return Math.max(timeoutSecs, SEARCH_REPLY_MIN_SECS) + SEARCH_WATCHDOG_SLACK_SECS;
+}
+
+/** The numeric filters as `search_files` can deserialize them. A value its
+ *  argument types refuse fails the whole search before it starts. */
+export function wireNumericFilters(filters: SearchFilters | undefined) {
+  return {
+    minSize: clampFilterBytes(filters?.minSize) ?? null,
+    maxSize: clampFilterBytes(filters?.maxSize) ?? null,
+    minAvailability: clampMinSources(filters?.minAvailability) ?? null,
+  };
+}
+
 export async function searchFiles(query: string, method: SearchMethod = 'global', requestId: number, fileType?: string, filters?: SearchFilters, related?: RelatedSearchArgs): Promise<SearchResult[]> {
   return invoke('search_files', {
     query,
@@ -28,9 +52,7 @@ export async function searchFiles(query: string, method: SearchMethod = 'global'
     requestId,
     fileType: fileType || filters?.fileType || null,
     fileExtension: filters?.fileExtension || null,
-    minSize: filters?.minSize ?? null,
-    maxSize: filters?.maxSize ?? null,
-    minAvailability: filters?.minAvailability ?? null,
+    ...wireNumericFilters(filters),
     relatedHashes: related?.relatedHashes?.length ? related.relatedHashes : null,
     excludeHashes: related?.excludeHashes?.length ? related.excludeHashes : null,
   });
@@ -231,6 +253,7 @@ export async function markSpam(
   sourceAddresses: string[],
   searchQuery: string,
   serverIp?: string | null,
+  resultOrigin?: string | null,
 ): Promise<void> {
   return invoke('mark_spam', {
     fileHash,
@@ -240,6 +263,7 @@ export async function markSpam(
     searchKeywords: [],
     serverIp: serverIp ?? null,
     searchQuery: searchQuery || null,
+    resultOrigin: resultOrigin ?? null,
   });
 }
 

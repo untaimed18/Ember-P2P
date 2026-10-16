@@ -84,6 +84,54 @@ export function queryHasNetworkKeyword(query: string): boolean {
 }
 
 /**
+ * Largest Min sources a search sends.
+ *
+ * `search_files` takes `min_availability` as `Option<u32>`, and serde rejects a
+ * larger number while deserializing the arguments — before the command body
+ * runs, so every search on every network fails with an argument error, and the
+ * box is saved and restored with the value in it. Held well below that, to the
+ * u16 eD2K carries a source count in: merged counts are capped there too
+ * (`MAX_PLAUSIBLE_SOURCES` in the search store), so no row could pass a higher
+ * minimum anyway.
+ */
+export const MAX_MIN_SOURCES = 65535;
+
+/**
+ * Min sources as a search sends it: a whole number from 1 to
+ * `MAX_MIN_SOURCES`, or `undefined` for no constraint — empty, zero, negative
+ * or not a number, which is what the backend makes of a zero too.
+ */
+export function clampMinSources(value: number | null | undefined): number | undefined {
+  if (value === null || value === undefined || !Number.isFinite(value)) return undefined;
+  const whole = Math.trunc(value);
+  if (whole < 1) return undefined;
+  return Math.min(whole, MAX_MIN_SOURCES);
+}
+
+/**
+ * A size filter as a search sends it: a whole, non-negative byte count, or
+ * `undefined` for no constraint.
+ *
+ * `min_size` / `max_size` are `Option<u64>`, and serde rejects a JSON float
+ * outright, so a fractional count fails every search the same way an
+ * out-of-range Min sources does. Held to `MAX_SAFE_INTEGER`: past that JS cannot
+ * represent the count exactly, and `JSON.stringify` starts emitting an exponent,
+ * which serde also reads as a float.
+ */
+export function clampFilterBytes(bytes: number | null | undefined): number | undefined {
+  if (bytes === null || bytes === undefined) return undefined;
+  const whole = Math.round(bytes);
+  if (!Number.isFinite(whole) || whole < 0) return undefined;
+  return Math.min(whole, Number.MAX_SAFE_INTEGER);
+}
+
+/** Whether a min and a max size, in bytes, leave no size that passes both.
+ *  Zero or absent is no constraint on either side. */
+export function sizeRangeInverted(minBytes: number | undefined, maxBytes: number | undefined): boolean {
+  return !!minBytes && !!maxBytes && minBytes > maxBytes;
+}
+
+/**
  * If the query is only a dotted three-letter extension (`.mp3`, `.mp4`,
  * `.mkv`), return that extension in lowercase; otherwise `null`.
  *

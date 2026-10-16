@@ -8,12 +8,21 @@ use crate::network::kad::publish::md4_bytes_to_kad_id;
 use crate::network::{NetworkCommand, SearchMethod};
 use crate::search::cleanup::{cleanup_filename, parse_cleanup_strings, strip_comment_urls};
 use crate::search::merge;
-use crate::search::spam::{BatchSpamContext, CommunityRating, SpamFilter, SpamFilterProfile};
+use crate::search::spam::{
+    BatchSpamContext, CommunityRating, SpamFilter, SpamFilterProfile, SpamKeywords,
+};
 use crate::types::SearchResult;
 use std::collections::HashMap;
 
 const SEARCH_TIMEOUT_MIN: u64 = 30;
 const SEARCH_TIMEOUT_MAX: u64 = 600;
+/// The longest a KAD keyword search runs before its last rows come back on the
+/// `search_files` reply: eMule's `SEARCHKEYWORD_LIFETIME` (45 s) plus the 15 s
+/// `PrepareToStop` grace, as `kad::search` runs it.
+const KAD_KEYWORD_SEARCH_MAX_SECS: u64 = 60;
+/// Slack past [`KAD_KEYWORD_SEARCH_MAX_SECS`] for the network task's poll tick
+/// to reap the finished search and send the reply.
+const KAD_REPLY_GRACE_SECS: u64 = 15;
 /// How long `find_sources` waits for the network task to send the asks. It
 /// does not wait for answers, so this only has to cover the task getting to
 /// the command and one TCP write to the server — long enough that a busy tick
@@ -41,6 +50,22 @@ const MAX_MARK_SPAM_KEYWORDS: usize = 32;
 const MAX_RELATED_SEEDS: usize = 16;
 /// Maximum keyword length in a `mark_spam` payload.
 const MAX_MARK_SPAM_KEYWORD_LEN: usize = 256;
+/// Maximum `result_origin` length in a spam payload. A combined origin label
+/// (`Ember · KAD · Local · Notes · Server · UDP`) is well under this.
+const MAX_SPAM_RESULT_ORIGIN: usize = 128;
+
+/// The origin label a spam payload's row is scored and learned with.
+///
+/// Absent means a caller that does not send one (empty, as before). A label
+/// longer than any the UI produces is not trusted to say the row is UDP, so
+/// it can neither stamp nor train a server's reputation.
+fn spam_payload_origin(result_origin: Option<String>) -> String {
+    match result_origin {
+        Some(origin) if origin.len() > MAX_SPAM_RESULT_ORIGIN => "?".to_string(),
+        Some(origin) => origin,
+        None => String::new(),
+    }
+}
 
 fn is_allowed_emule_file_type(file_type: &str) -> bool {
     matches!(
@@ -100,6 +125,57 @@ fn validate_spam_payload(
         }
     }
     Ok(())
+}
+
+/// How long `search_files` waits for its reply. Every leg but KAD streams its
+/// rows as events, and the reply only waits on KAD, so giving up before KAD's
+/// own lifetime ends throws away the rows it collected last.
+fn search_reply_wait_secs(timeout_secs: u64) -> u64 {
+    timeout_secs.max(KAD_KEYWORD_SEARCH_MAX_SECS + KAD_REPLY_GRACE_SECS)
+}
+
+/// Whether a filter would reach the wire: zero sizes and empty strings are
+/// dropped there and so constrain nothing.
+fn has_usable_search_filters(
+    min_size: Option<u64>,
+    max_size: Option<u64>,
+    file_type: Option<&str>,
+    file_extension: Option<&str>,
+    min_availability: Option<u32>,
+) -> bool {
+    min_size.is_some_and(|v| v > 0)
+        || max_size.is_some_and(|v| v > 0)
+        || file_type.is_some_and(|t| !t.is_empty())
+        || file_extension.is_some_and(|e| !e.trim_start_matches('.').is_empty())
+        || min_availability.is_some_and(|v| v > 0)
+}
+
+/// Refuse a search with no word to look for. Typed words that all fall under
+/// the keyword minimum (or are all operators, or all exclusions after a word
+/// too short to keep) would otherwise go out as "everything" plus whatever the
+/// filters say. A related search needs no word, its seed hashes are the query;
+/// and an empty box with filters is a deliberate filter-only search, which
+/// only the connected server is asked (`network::command`).
+fn check_search_has_keyword(
+    query: &str,
+    keywords: &[String],
+    has_related_hashes: bool,
+    has_usable_filters: bool,
+    method: SearchMethod,
+) -> Result<(), String> {
+    if !keywords.is_empty() || has_related_hashes {
+        return Ok(());
+    }
+    let filter_only = query.trim().is_empty()
+        && has_usable_filters
+        && matches!(method, SearchMethod::Global | SearchMethod::Server);
+    if filter_only {
+        return Ok(());
+    }
+    Err(coded(
+        "search_no_keyword",
+        "Type at least one word of 3 or more characters to search for.",
+    ))
 }
 
 fn keywords_for_spam(search_query: Option<&str>, search_keywords: &[String]) -> Vec<String> {
@@ -217,23 +293,28 @@ pub fn apply_search_enrichment_with_batch(
         analyzed = BatchSpamContext::default();
         &analyzed
     };
+    let keywords = SpamKeywords::new(search_keywords);
     for result in results.iter_mut() {
         // Record which server the hit came from, not just score against it.
         // Everything downstream of the emit re-derives from the row alone: the
         // explain tooltip re-scores it, and marking it spam is what trains that
         // server's reputation. Both read `origin_server_ip` (see
-        // `SpamFilter::explain_result` / `mark_spam`), so leaving it empty meant
-        // a tooltip that could not account for the score beside it, and a
-        // reputation that only ever decayed toward clean -- `record_server_clean_batch`
-        // has the batch's IP and redeems with it, while the user's own verdict
-        // arrived with nothing to attribute it to.
+        // `SpamFilter::explain_result` / `mark_spam`), and
+        // `record_server_clean_batch` redeems with the batch's IP, so the
+        // user's own verdict needs the same IP to attribute to.
         //
-        // Filled only when empty, and only from a batch that has an IP: a
-        // `rescore_search_results` pass re-enriches rows handed back by the UI
-        // with no server of its own, and must not strip what they already carry.
-        // First-seen-wins matches how both merge paths combine the field
-        // (`merge::merge_into`, `mergeResult` in `stores/search.ts`).
-        if result.origin_server_ip.is_none() {
+        // Only UDP rows take it: server reputation is about the UDP server
+        // that answered, and a TCP, KAD or Ember row stamped with some server
+        // would carry that server's reputation into every later re-score and
+        // into Mark spam. Filled only when empty, and only from a batch that
+        // has an IP: a `rescore_search_results` pass re-enriches rows handed
+        // back by the UI with no server of its own, and must not strip what
+        // they already carry. First-seen-wins matches how both merge paths
+        // combine the field (`merge::merge_into`, `mergeResult` in
+        // `stores/search.ts`).
+        if result.origin_server_ip.is_none()
+            && crate::search::spam::origin_has_udp_server(&result.result_origin)
+        {
             if let Some(ip) = server_ip {
                 result.origin_server_ip = Some(ip.to_string());
             }
@@ -243,8 +324,14 @@ pub fn apply_search_enrichment_with_batch(
                 .get(&result.file.hash)
                 .copied()
                 .unwrap_or_default();
-            let details =
-                spam.explain_result(result, search_keywords, server_ip, spam_profile, cr, batch);
+            let details = spam.explain_result_with_keywords(
+                result,
+                &keywords,
+                server_ip,
+                spam_profile,
+                cr,
+                batch,
+            );
             result.spam_rating = details.score;
             result.is_spam = details.is_spam;
             result.spam_reasons = details.reasons;
@@ -498,6 +585,21 @@ pub async fn search_files(
             "The server can no longer answer a related-files request",
         ));
     }
+    let method = method.unwrap_or(SearchMethod::Global);
+    let no_network_keyword = check_search_has_keyword(
+        &query,
+        &keywords,
+        !related_hashes.is_empty(),
+        has_usable_search_filters(
+            min_size,
+            max_size,
+            file_type.as_deref(),
+            file_extension.as_deref(),
+            min_availability,
+        ),
+        method,
+    )
+    .err();
 
     let ui_file_type = file_type.clone();
     let client_min_size = min_size;
@@ -578,11 +680,29 @@ pub async fn search_files(
         );
     }
 
+    // A word too short for any network (`U2`) can still name a file in the
+    // library; refuse only when there is not even that to show.
+    if let Some(refusal) = no_network_keyword {
+        if streamed_local.is_empty() {
+            return Err(refusal);
+        }
+        let _ = app.emit(
+            "search-notice",
+            serde_json::json!({ "request_id": request_id, "notice": "NetworkNoKeyword" }),
+        );
+        let _ = app.emit(
+            "search-complete",
+            serde_json::json!({ "request_id": request_id, "can_search_more": false }),
+        );
+        merge::sort_search_results(&mut streamed_local);
+        return Ok(streamed_local);
+    }
+
     state
         .network_tx
         .try_send(NetworkCommand::SearchFiles {
             query,
-            method: method.unwrap_or(SearchMethod::Global),
+            method,
             request_id,
             tx,
             search_filters: filters,
@@ -592,8 +712,9 @@ pub async fn search_files(
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
+    let wait_secs = search_reply_wait_secs(timeout_secs);
     let mut results =
-        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(wait_secs), rx).await {
             Ok(Ok(results)) => results,
             Ok(Err(e)) => return Err(coded_ctx("search_failed", "Search failed", e)),
             Err(_) => {
@@ -610,8 +731,8 @@ pub async fn search_files(
                 .await;
                 return Err(coded_ctx(
                     "search_timed_out",
-                    format!("Search timed out after {timeout_secs}s"),
-                    timeout_secs,
+                    format!("Search timed out after {wait_secs}s"),
+                    wait_secs,
                 ));
             }
         };
@@ -1217,6 +1338,7 @@ pub async fn mark_spam(
     search_keywords: Vec<String>,
     server_ip: Option<String>,
     search_query: Option<String>,
+    result_origin: Option<String>,
 ) -> Result<(), String> {
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
         return Err(coded("search_invalid_file_hash", "Invalid file hash"));
@@ -1265,7 +1387,7 @@ pub async fn mark_spam(
         spam_rating: 0,
         is_spam: false,
         clean_name: String::new(),
-        result_origin: String::new(),
+        result_origin: spam_payload_origin(result_origin),
         origin_server_ip: server_ip.clone(),
         spam_reasons: Vec::new(),
         spam_reason_details: Vec::new(),
@@ -1411,7 +1533,7 @@ pub async fn explain_spam_result(
         spam_rating: 0,
         is_spam: false,
         clean_name: String::new(),
-        result_origin: result_origin.unwrap_or_default(),
+        result_origin: spam_payload_origin(result_origin),
         origin_server_ip: server_ip.clone(),
         spam_reasons: Vec::new(),
         spam_reason_details: Vec::new(),
@@ -1754,6 +1876,68 @@ pub async fn remove_download_history_entry(
 }
 
 #[cfg(test)]
+mod search_request_gate_tests {
+    use super::*;
+
+    fn kw(query: &str) -> Vec<String> {
+        crate::search::query::parse(query.trim())
+            .map(|e| e.positive_terms())
+            .unwrap_or_default()
+    }
+
+    fn code(err: String) -> String {
+        serde_json::from_str::<serde_json::Value>(&err)
+            .ok()
+            .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_string))
+            .unwrap_or(err)
+    }
+
+    #[test]
+    fn a_query_with_no_searchable_word_is_refused() {
+        for query in ["a b", "OR", "-", "tv -sport", "  x  "] {
+            for filters in [false, true] {
+                let err = check_search_has_keyword(query, &kw(query), false, filters, SearchMethod::Global)
+                    .expect_err(query);
+                assert!(code(err).contains("search_no_keyword"), "{query:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_searchable_word_or_a_related_seed_passes() {
+        assert!(check_search_has_keyword("ubuntu", &kw("ubuntu"), false, false, SearchMethod::Global).is_ok());
+        assert!(check_search_has_keyword("", &[], true, false, SearchMethod::Server).is_ok());
+        assert!(check_search_has_keyword("a b", &[], true, true, SearchMethod::Server).is_ok());
+    }
+
+    /// An empty box with filters is a filter-only search, which only a server
+    /// can run; it is never a KAD or Ember walk.
+    #[test]
+    fn an_empty_box_with_filters_searches_only_where_a_server_answers() {
+        assert!(check_search_has_keyword("", &[], false, true, SearchMethod::Global).is_ok());
+        assert!(check_search_has_keyword("  ", &[], false, true, SearchMethod::Server).is_ok());
+        assert!(check_search_has_keyword("", &[], false, false, SearchMethod::Global).is_err());
+        assert!(check_search_has_keyword("", &[], false, true, SearchMethod::Kad).is_err());
+        assert!(check_search_has_keyword("", &[], false, true, SearchMethod::Ember).is_err());
+    }
+
+    #[test]
+    fn filters_that_never_reach_the_wire_do_not_count() {
+        assert!(!has_usable_search_filters(Some(0), Some(0), Some(""), Some("."), Some(0)));
+        assert!(!has_usable_search_filters(None, None, None, None, None));
+        assert!(has_usable_search_filters(Some(1), None, None, None, None));
+        assert!(has_usable_search_filters(None, None, Some("Video"), None, None));
+        assert!(has_usable_search_filters(None, None, None, Some("mkv"), None));
+    }
+
+    #[test]
+    fn the_reply_wait_outlasts_a_kad_keyword_search() {
+        assert!(search_reply_wait_secs(SEARCH_TIMEOUT_MIN) > KAD_KEYWORD_SEARCH_MAX_SECS);
+        assert_eq!(search_reply_wait_secs(SEARCH_TIMEOUT_MAX), SEARCH_TIMEOUT_MAX);
+    }
+}
+
+#[cfg(test)]
 mod ed2k_paste_tests {
     use super::*;
 
@@ -1913,14 +2097,37 @@ mod result_attribution_tests {
     }
 
     #[test]
-    fn a_server_batch_stamps_the_server_it_came_from() {
-        let mut results = vec![row(&"1".repeat(32), crate::search::merge::ORIGIN_SERVER_TCP)];
+    fn a_udp_batch_stamps_the_server_it_came_from() {
+        let mut results = vec![row(&"1".repeat(32), crate::search::merge::ORIGIN_SERVER_UDP)];
         enrich(&mut results, Some("93.184.216.34"));
         assert_eq!(
             results[0].origin_server_ip.as_deref(),
             Some("93.184.216.34"),
             "marking this hit spam has to be able to train the server that served it"
         );
+    }
+
+    /// Server reputation is about the UDP server that answered. A TCP, KAD or
+    /// Ember row handed a server IP — the connected server, or the UDP server
+    /// whose packet triggered a re-score of rows other packets sent — must not
+    /// be stamped with it, or Mark spam on it trains that server.
+    #[test]
+    fn only_udp_rows_are_stamped_with_a_server() {
+        let mut results = vec![
+            row(&"6".repeat(32), crate::search::merge::ORIGIN_SERVER_TCP),
+            row(&"7".repeat(32), crate::search::merge::ORIGIN_KAD),
+            row(&"8".repeat(32), crate::search::merge::ORIGIN_EMBER),
+        ];
+        enrich(&mut results, Some("93.184.216.34"));
+        assert!(results.iter().all(|r| r.origin_server_ip.is_none()));
+    }
+
+    #[test]
+    fn an_oversized_origin_label_is_not_trusted_as_udp() {
+        assert_eq!(spam_payload_origin(None), "");
+        assert_eq!(spam_payload_origin(Some("UDP".into())), "UDP");
+        let huge = format!("UDP{}", " ".repeat(MAX_SPAM_RESULT_ORIGIN));
+        assert!(!crate::search::spam::origin_has_udp_server(&spam_payload_origin(Some(huge))));
     }
 
     #[test]

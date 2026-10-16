@@ -236,6 +236,10 @@ export interface SearchResult {
   /** The same reasons, coded and parameterised. Preferred over `spam_reasons`
    *  because it renders in the active locale; see `spamReasonTexts`. */
   spam_reason_details?: SpamReason[];
+  /** Set by the search store, never by the backend: this row claims a size
+   *  other than the one the tab's row for the same hash has, so it is kept
+   *  as its own row (keyed by hash and size) rather than merged into it. */
+  size_variant?: boolean;
 }
 
 export interface StartDownloadResponse {

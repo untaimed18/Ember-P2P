@@ -66,6 +66,10 @@ const TIMEOUT_STORE_NOTES: i64 = 100; // SEARCHSTORENOTES_LIFETIME
 const TIMEOUT_FIND_BUDDY: i64 = 100; // SEARCHFINDBUDDY_LIFETIME
 /// Grace period after entering fetch phase for late results (eMule PrepareToStop gives 15s)
 const FETCH_TIMEOUT_SECS: i64 = 15;
+/// A responder splits one answer over many datagrams sent back to back. A
+/// lookup that reached its answer quota waits this long after the last one
+/// before it completes, so the rest of an answer already on the wire counts.
+const RESULT_QUOTA_SETTLE_SECS: i64 = 2;
 /// eMule deletes a "stopping" search ~15s after `PrepareToStop()` (Search.cpp
 /// back-dates `m_tCreated` to `now - LIFETIME + SEC(15)`) and runs the prune
 /// every second via `CSearchManager::JumpStart()`. We mirror that: once a
@@ -159,6 +163,11 @@ pub struct SearchState {
     /// Prevents new queries from being sent but keeps the search alive
     /// so that late responses from already-queried nodes are still accepted.
     stop_querying: bool,
+    /// When the raw result count first reached the search type's answer quota
+    /// (eMule `SEARCHKEYWORD_TOTAL` and friends).
+    result_quota_reached_at: Option<i64>,
+    /// When the last `SearchRes` datagram for this search arrived.
+    last_result_at: Option<i64>,
     /// Set when entering fetch phase; used for fetch-specific timeout.
     fetch_started_at: Option<i64>,
     /// Tracks how many lookup rounds returned no closer contacts.
@@ -265,6 +274,8 @@ impl SearchState {
             completed: false,
             completed_at: None,
             stop_querying: false,
+            result_quota_reached_at: None,
+            last_result_at: None,
             fetch_started_at: None,
             lookup_stale_rounds: 0,
             responded_during_lookup: HashSet::new(),
@@ -812,6 +823,7 @@ impl SearchState {
         self.pending_times.remove(from);
         self.store_pending.remove(from);
         self.store_pending_times.remove(from);
+        self.last_result_at = Some(chrono::Utc::now().timestamp());
 
         let count = entries.len();
         let before = self.results.len();
@@ -953,13 +965,9 @@ impl SearchState {
     /// the threshold is reached eMule calls PrepareToStop(): new queries stop
     /// but late responses from already-queried nodes keep flowing in.
     fn should_stop_querying(&self) -> bool {
-        let threshold_reached = match self.search_type {
-            SearchType::FindKeyword => self.results.len() >= KEYWORD_SEARCH_STOP_THRESHOLD,
-            SearchType::FindSource { .. } => self.results.len() >= SOURCE_SEARCH_STOP_THRESHOLD,
-            SearchType::FindNotes { .. } => self.results.len() >= NOTES_SEARCH_STOP_THRESHOLD,
-            SearchType::FindBuddy => self.find_buddy_sent.len() >= FIND_BUDDY_REQUEST_TOTAL,
-            _ => false,
-        };
+        let threshold_reached = self.result_quota_reached()
+            || (matches!(self.search_type, SearchType::FindBuddy)
+                && self.find_buddy_sent.len() >= FIND_BUDDY_REQUEST_TOTAL);
         // Stop early enough that a query we send can still be answered before
         // the search expires — and no earlier. The margin is one
         // `PENDING_TIMEOUT_SECS`, which is exactly how long a sent query is
@@ -978,6 +986,35 @@ impl SearchState {
             && now.saturating_sub(self.started_at)
                 >= self.lifetime_secs().saturating_sub(PENDING_TIMEOUT_SECS);
         threshold_reached || early_lifetime_stop
+    }
+
+    fn result_quota_reached(&self) -> bool {
+        match self.search_type {
+            SearchType::FindKeyword => self.results.len() >= KEYWORD_SEARCH_STOP_THRESHOLD,
+            SearchType::FindSource { .. } => self.results.len() >= SOURCE_SEARCH_STOP_THRESHOLD,
+            SearchType::FindNotes { .. } => self.results.len() >= NOTES_SEARCH_STOP_THRESHOLD,
+            _ => false,
+        }
+    }
+
+    /// eMule `PrepareToStop` at the answer quota: a lookup that reached it
+    /// sends nothing more, so it is done once the result requests it already
+    /// sent have answered, and at the latest one stop grace after the quota.
+    /// Routing requests still in flight can only bring contacts it will no
+    /// longer ask.
+    fn quota_lookup_settled(&self) -> bool {
+        let Some(reached_at) = self.result_quota_reached_at else {
+            return false;
+        };
+        let now = chrono::Utc::now().timestamp();
+        let within = |since: i64, secs: i64| (0..secs).contains(&(now - since));
+        if !within(reached_at, FETCH_TIMEOUT_SECS) {
+            return true;
+        }
+        self.store_pending.is_empty()
+            && !self
+                .last_result_at
+                .is_some_and(|t| within(t, RESULT_QUOTA_SETTLE_SECS))
     }
 
     pub fn find_buddy_requests_sent(&self) -> usize {
@@ -1020,7 +1057,7 @@ impl SearchState {
     }
 
     fn check_phase_transition(&mut self) {
-        if self.phase != SearchPhase::Lookup {
+        if self.phase != SearchPhase::Lookup || self.result_quota_reached_at.is_some() {
             return;
         }
         if matches!(
@@ -1126,13 +1163,25 @@ impl SearchState {
     fn check_completion(&mut self) {
         // eMule PrepareToStop: stop sending queries once we have enough raw
         // results, but keep the search alive to receive late responses.
+        if self.result_quota_reached_at.is_none() && self.result_quota_reached() {
+            self.result_quota_reached_at = Some(chrono::Utc::now().timestamp());
+        }
         if !self.stop_querying && self.should_stop_querying() {
             self.stop_querying = true;
         }
 
         match self.phase {
             SearchPhase::Lookup => {
-                if matches!(
+                if self.search_type.accepts_search_results() {
+                    if !self.completed && self.quota_lookup_settled() {
+                        info!(
+                            "Search {}: answer quota reached during lookup ({} raw results), ending",
+                            self.id.0,
+                            self.results.len()
+                        );
+                        self.mark_completed();
+                    }
+                } else if matches!(
                     self.search_type,
                     SearchType::FindNode | SearchType::FindBuddy
                 ) {
@@ -1523,14 +1572,18 @@ impl SearchManager {
             // eMule's total search lifetime is 45s for keyword searches. Force
             // transition to fetch late enough to allow slower lookups, while still
             // leaving room for fetch responses before overall expiry.
+            // A lookup that already reached its answer quota sends nothing in
+            // Fetch either; `check_completion` ends it from Lookup instead.
             let elapsed = chrono::Utc::now().timestamp() - state.started_at;
-            if should_force_fetch_after_lookup(
-                state.phase,
-                state.search_type,
-                elapsed,
-                state.queried.len(),
-                state.responded_during_lookup.len(),
-            ) {
+            if state.result_quota_reached_at.is_none()
+                && should_force_fetch_after_lookup(
+                    state.phase,
+                    state.search_type,
+                    elapsed,
+                    state.queried.len(),
+                    state.responded_during_lookup.len(),
+                )
+            {
                 info!(
                     "Search {}: forcing transition to fetch after {}s in lookup (queried={}, verified={})",
                     sid.0, elapsed, state.queried.len(), state.responded_during_lookup.len()
@@ -1538,6 +1591,9 @@ impl SearchManager {
                 state.phase = SearchPhase::Fetch;
                 state.settle_in_flight_routing_queries();
                 state.fetch_started_at = Some(chrono::Utc::now().timestamp());
+                state.check_completion();
+            } else if state.result_quota_reached_at.is_some() {
+                state.check_completion();
             }
 
             // eMule `JumpStart`: `m_mapPossible.empty()` -> `PrepareToStop()`
@@ -1789,6 +1845,125 @@ mod tests {
         assert_eq!(
             requested_start_position(&state, &peer),
             SEARCH_RESULT_PAGE_SIZE as u16
+        );
+    }
+
+    fn result_entries(count: usize) -> Vec<SearchResultEntry> {
+        (0..count)
+            .map(|i| SearchResultEntry {
+                id: KadId([(i % 251) as u8; KAD_ID_SIZE]),
+                tags: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// A popular keyword fills eMule's `SEARCHKEYWORD_TOTAL` from answers sent
+    /// during the walk; once those answers have landed there is nothing left
+    /// to wait for, routing replies still in flight or not.
+    #[test]
+    fn a_lookup_at_the_answer_quota_completes_once_its_answers_settle() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
+        let peer = contact(near_kad_id(1), 1);
+        let router = contact(near_kad_id(2), 2);
+        let now = chrono::Utc::now().timestamp();
+        state.closest = vec![peer.clone(), router.clone()];
+        state.responded_during_lookup.insert(peer.id);
+        state.pending.insert(router.id);
+        state.pending_times.insert(router.id, now);
+
+        state.handle_search_results(&peer.id, result_entries(KEYWORD_SEARCH_STOP_THRESHOLD));
+        assert!(state.stop_querying);
+        assert_eq!(state.phase, SearchPhase::Lookup);
+        assert!(
+            !state.completed,
+            "the rest of a fragmented answer may still be arriving"
+        );
+
+        state.last_result_at = Some(now - RESULT_QUOTA_SETTLE_SECS);
+        state.check_completion();
+        assert!(state.completed);
+        assert_eq!(state.phase, SearchPhase::Lookup);
+    }
+
+    #[test]
+    fn a_lookup_at_the_answer_quota_waits_for_sent_result_requests_up_to_the_stop_grace() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
+        let answered = kad_id(2);
+        let asked = kad_id(3);
+        let now = chrono::Utc::now().timestamp();
+        state.store_pending.insert(asked);
+        state.store_pending_times.insert(asked, now);
+
+        state.handle_search_results(&answered, result_entries(KEYWORD_SEARCH_STOP_THRESHOLD));
+        state.last_result_at = Some(now - RESULT_QUOTA_SETTLE_SECS);
+        state.check_completion();
+        assert!(!state.completed, "a sent SearchKeyReq has not answered yet");
+
+        state.result_quota_reached_at = Some(now - FETCH_TIMEOUT_SECS);
+        state.check_completion();
+        assert!(state.completed);
+    }
+
+    #[test]
+    fn a_lookup_short_of_the_answer_quota_keeps_its_lifetime() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
+        state.handle_search_results(
+            &kad_id(2),
+            result_entries(KEYWORD_SEARCH_STOP_THRESHOLD - 1),
+        );
+        state.last_result_at = Some(chrono::Utc::now().timestamp() - FETCH_TIMEOUT_SECS);
+        state.check_completion();
+        assert!(!state.stop_querying);
+        assert!(state.result_quota_reached_at.is_none());
+        assert!(!state.completed);
+    }
+
+    /// Nothing else calls back into a search whose requests have all
+    /// answered, so the poll tick has to be what ends it.
+    #[test]
+    fn the_poll_tick_ends_a_settled_quota_lookup() {
+        let mut manager = SearchManager::new();
+        let peer = contact(near_kad_id(1), 1);
+        let (sid, ..) =
+            manager.start_search(near_kad_id(0), SearchType::FindKeyword, vec![peer.clone()]);
+        let search = manager.get_mut(&sid).unwrap();
+        search.handle_search_results(&peer.id, result_entries(KEYWORD_SEARCH_STOP_THRESHOLD));
+
+        assert!(manager.poll_queries().is_empty());
+        assert!(!manager.get(&sid).unwrap().completed);
+
+        let search = manager.get_mut(&sid).unwrap();
+        search.last_result_at = Some(chrono::Utc::now().timestamp() - RESULT_QUOTA_SETTLE_SECS);
+        assert!(manager.poll_queries().is_empty());
+        let search = manager.get(&sid).unwrap();
+        assert!(search.completed);
+        assert_eq!(
+            search.phase,
+            SearchPhase::Lookup,
+            "no pointless switch to Fetch"
+        );
+    }
+
+    #[test]
+    fn a_forced_switch_to_fetch_with_nothing_left_completes_on_that_tick() {
+        let mut manager = SearchManager::new();
+        let peer = contact(near_kad_id(1), 1);
+        let (sid, ..) =
+            manager.start_search(near_kad_id(0), SearchType::FindKeyword, vec![peer.clone()]);
+        let search = manager.get_mut(&sid).unwrap();
+        search.started_at = chrono::Utc::now().timestamp() - LOOKUP_FORCE_FETCH_SECS;
+        search.queried.extend([peer.id, kad_id(0x51), kad_id(0x52)]);
+        search.responded_during_lookup.insert(peer.id);
+        search.store_sent.insert(peer.id);
+        search.handle_search_results(&peer.id, result_entries(20));
+        assert!(!search.completed);
+
+        manager.poll_queries();
+        let search = manager.get(&sid).unwrap();
+        assert_eq!(search.phase, SearchPhase::Fetch);
+        assert!(
+            search.completed,
+            "every fetch candidate already answered during lookup"
         );
     }
 

@@ -94,7 +94,21 @@ pub(in crate::network) async fn on_server_tick(
                     ed2k::server::ServerEvent::SearchResult { results, more } => {
                         let count = results.len();
                         info!("Server returned {count} search results via poll");
-                        let search_results: Vec<SearchResult> = results.iter().map(|sr| {
+                        let Some(ticket) = conn.take_search_reply().filter(|ticket| {
+                            state
+                                .pending_server_search
+                                .as_ref()
+                                .is_some_and(|pending| pending.request_id == ticket.request_id)
+                        }) else {
+                            info!("Discarding {count} server search result(s) answering a search that is no longer waiting");
+                            continue;
+                        };
+                        let search_results: Vec<SearchResult> = results.iter().filter(|sr| {
+                            crate::search::query::name_contains_any_term(
+                                &sr.file_name,
+                                &ticket.match_terms,
+                            )
+                        }).map(|sr| {
                             let hash_hex = hex::encode(sr.file_hash);
                             let extension = sr.file_name
                                 .rsplit_once('.')
@@ -161,6 +175,13 @@ pub(in crate::network) async fn on_server_tick(
                             spam_reason_details: Vec::new(),
                             }
                         }).collect();
+                        if search_results.len() < count {
+                            debug!(
+                                "Dropped {} server row(s) sharing no keyword with search {}",
+                                count - search_results.len(),
+                                ticket.request_id
+                            );
+                        }
 
                         if let Some(mut pending) = state.pending_server_search.take() {
                             let request_id = pending.request_id;
@@ -929,15 +950,37 @@ pub(in crate::network) async fn on_server_tick(
                     }
                 }
             }
-            if server_disconnect_reason.is_none()
-                && state.pending_server_search.is_some()
-                && state
-                    .server_search_more_due_at
-                    .is_some_and(|due| std::time::Instant::now() >= due)
-                && state.server_search_more_requests < MAX_SERVER_MORE_REQUESTS
-            {
+            if server_disconnect_reason.is_none() {
+                if let Some(silent) = conn
+                    .expire_search_reply(server_search_reply_wait(settings.search_timeout_secs))
+                {
+                    info!("Server never answered search {silent}; no longer waiting on it");
+                }
+                if let Some(request_id) = send_deferred_server_search(state, &mut conn) {
+                    drop_queued_server_followup(state, request_id);
+                    if let Some(active) = state.active_search_request.as_mut() {
+                        if active.request_id == request_id {
+                            active.server_pending = false;
+                        }
+                    }
+                    finished_search_requests.push(request_id);
+                }
+            }
+            let more_for = state
+                .pending_server_search
+                .as_ref()
+                .map(|pending| pending.request_id)
+                .filter(|_| {
+                    server_disconnect_reason.is_none()
+                        && !conn.search_reply_outstanding()
+                        && state
+                            .server_search_more_due_at
+                            .is_some_and(|due| std::time::Instant::now() >= due)
+                        && state.server_search_more_requests < MAX_SERVER_MORE_REQUESTS
+                });
+            if let Some(request_id) = more_for {
                 state.server_search_more_due_at = None;
-                match conn.request_more_results() {
+                match conn.request_more_results(request_id) {
                     Ok(()) => {
                         state.server_search_more_requests += 1;
                         // The wait for the next page starts now, not when
@@ -973,8 +1016,14 @@ pub(in crate::network) async fn on_server_tick(
             if followup_ready {
                 if let Some((followup_id, expr)) = state.server_followup_search.take() {
                     state.server_followup_due_at = None;
-                    match conn.send_search_expr_bytes(&expr) {
-                        Ok(()) => {
+                    // A co-share answer lists other files, which share no
+                    // word with anything the user typed.
+                    let ticket = ed2k::server::SearchTicket {
+                        request_id: followup_id,
+                        match_terms: Vec::new(),
+                    };
+                    match conn.send_search_expr_bytes(ticket, &expr) {
+                        Ok(_) => {
                             // Its own More budget: this is a second
                             // search, not another page of the first.
                             state.server_search_more_due_at = None;
@@ -1093,6 +1142,11 @@ pub(in crate::network) async fn on_server_tick(
             if let Some(mut pending) = state.pending_server_search.take() {
                 let request_id = pending.request_id;
                 info!("Server search timed out, returning {} local results", pending.results.len());
+                // A page of More going unanswered is not the server failing
+                // to answer the search: its first page is already on screen.
+                if state.server_search_more_requests == 0 {
+                    emit_search_notice(app_handle, request_id, "ServerNoAnswer");
+                }
                 if let Some(tx) = pending.tx.take() {
                     let _ = tx.send(pending.results);
                 }
@@ -1249,6 +1303,48 @@ pub(in crate::network) async fn on_server_tick(
         }
         } // elapsed_ok
         } // else: failures < MAX
+    }
+}
+
+/// How long the link waits on one unanswered server search request before
+/// letting a search held behind it go out. Kept under the pending search's own
+/// timeout (`server_search_age_limit` ticks plus the one that trips it), so a
+/// search released after a silent one still gets its full wait.
+fn server_search_reply_wait(search_timeout_secs: u64) -> std::time::Duration {
+    const TICK_SECS: u64 = 2;
+    std::time::Duration::from_secs(u64::from(server_search_age_limit(search_timeout_secs)) * TICK_SECS)
+}
+
+/// Send the search the link held back while an earlier one was owed its
+/// answer, if it is still the one waiting. Returns its id when the send
+/// failed and the leg has to be ended.
+fn send_deferred_server_search(state: &mut NetworkState, conn: &mut ServerLink) -> Option<u64> {
+    let (ticket, expr) = conn.take_deferred_search()?;
+    let request_id = ticket.request_id;
+    if !state
+        .pending_server_search
+        .as_ref()
+        .is_some_and(|pending| pending.request_id == request_id)
+    {
+        debug!("Dropping held server search {request_id}: it is no longer waiting");
+        return None;
+    }
+    match conn.send_search_expr_bytes(ticket, &expr) {
+        Ok(_) => {
+            // The wait for this search starts now, not when it was queued.
+            state.server_search_age = 0;
+            info!("TCP server search {request_id} sent after the previous answer");
+            None
+        }
+        Err(e) => {
+            debug!("Held TCP server search {request_id} failed to send: {e}");
+            if let Some(mut pending) = state.pending_server_search.take() {
+                if let Some(tx) = pending.tx.take() {
+                    let _ = tx.send(pending.results);
+                }
+            }
+            Some(request_id)
+        }
     }
 }
 

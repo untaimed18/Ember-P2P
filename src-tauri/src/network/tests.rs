@@ -1233,7 +1233,7 @@ fn sample_active_search_request(request_id: u64) -> ActiveSearchRequest {
         keywords: Vec::new(),
         server_ip: None,
         server_result_count: 0,
-        streamed_hashes: std::collections::HashSet::new(),
+        streamed_hashes: std::collections::HashMap::new(),
         exclude_hashes: std::collections::HashSet::new(),
         batch_spam: crate::search::spam::BatchSpamContext::default(),
         udp_search_expr: Vec::new(),
@@ -1897,11 +1897,35 @@ fn dedup_streamed_batch_is_noop_for_mismatched_or_missing_request() {
 /// should keep being filtered on every later sighting; only a brand
 /// new hash first seen after the cap goes untracked (accepted
 /// trade-off — see the constant's doc comment).
+/// The UI keeps a row claiming another size for a hash as a row of its own, so
+/// it has to arrive scored like any new row, not as an unscored re-sight.
+#[test]
+fn dedup_streamed_batch_treats_another_size_for_a_hash_as_a_new_row() {
+    let mut active = Some(sample_active_search_request(7));
+    mark_streamed_hashes(active.as_mut().unwrap(), &[sample_search_result("aa")]);
+
+    let mut other_size = sample_search_result("aa");
+    other_size.file.size = 9_999;
+    let mut unknown_size = sample_search_result("aa");
+    unknown_size.file.size = 0;
+    let mut batch = vec![sample_search_result("aa"), other_size, unknown_size];
+    let resights = dedup_streamed_batch(&mut active, 7, &mut batch);
+
+    assert_eq!(
+        batch.iter().map(|r| r.file.size).collect::<Vec<_>>(),
+        vec![9_999]
+    );
+    assert_eq!(
+        resights.iter().map(|r| r.file.size).collect::<Vec<_>>(),
+        vec![1234, 0]
+    );
+}
+
 #[test]
 fn dedup_streamed_batch_keeps_deduping_already_tracked_hashes_past_soft_cap() {
     let mut active = sample_active_search_request(7);
     for i in 0..MAX_STREAMED_HASHES_SOFT_CAP {
-        active.streamed_hashes.insert(format!("preexisting-{i}"));
+        active.streamed_hashes.insert(format!("preexisting-{i}"), 0);
     }
     let mut active = Some(active);
 
@@ -1927,7 +1951,7 @@ fn dedup_streamed_batch_keeps_deduping_already_tracked_hashes_past_soft_cap() {
         "set must not grow past the soft cap"
     );
     assert!(
-        !active_ref.streamed_hashes.contains("brand-new"),
+        !active_ref.streamed_hashes.contains_key("brand-new"),
         "new hashes seen past the cap are not tracked (documented trade-off)"
     );
 }

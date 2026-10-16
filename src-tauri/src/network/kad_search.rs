@@ -181,7 +181,7 @@ pub(super) fn convert_search_results(
                         }
                     }
                     TagName::Id(TAG_FILESIZE) => {
-                        if let Some(v) = tag.as_uint() {
+                        if let Some(v) = tag.as_file_size() {
                             size = v;
                         }
                     }
@@ -473,7 +473,7 @@ pub(super) fn convert_note_search_results(
                         }
                     }
                     TagName::Id(TAG_FILESIZE) => {
-                        if let Some(v) = tag.as_uint() {
+                        if let Some(v) = tag.as_file_size() {
                             size = v;
                         }
                     }
@@ -1263,10 +1263,7 @@ pub(super) fn search_entry_tag_u64(tag: &KadTag) -> Option<u64> {
     if !matches!(&tag.name, TagName::Id(TAG_FILESIZE)) {
         return None;
     }
-    tag.uint64_value()
-        .or_else(|| tag.uint32_value().map(|v| v as u64))
-        .or_else(|| tag.uint16_value().map(|v| v as u64))
-        .or_else(|| tag.uint8_value().map(|v| v as u64))
+    tag.as_file_size()
 }
 
 pub(super) fn matches_search_expr_impl(
@@ -1464,5 +1461,62 @@ mod convert_tests {
         assert_eq!(results[0].file.name, clean);
         assert_eq!(results[0].file.extension, "zip");
         assert_eq!(results[0].file_type, "Arc");
+    }
+
+    const OVER_4_GIB: u64 = 5 * 1024 * 1024 * 1024 + 123;
+
+    fn emule_large_size_tag() -> KadTag {
+        KadTag {
+            name: TagName::Id(TAG_FILESIZE),
+            value: TagValue::Bsob(OVER_4_GIB.to_le_bytes().to_vec()),
+        }
+    }
+
+    #[test]
+    fn a_keyword_result_over_4_gib_keeps_emules_bsob_size() {
+        let mut large = entry("Big Archive.iso");
+        large.tags[1] = emule_large_size_tag();
+        let results = convert_search_results(&[large], |_| true);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file.size, OVER_4_GIB);
+    }
+
+    #[test]
+    fn a_note_result_over_4_gib_keeps_emules_bsob_size() {
+        let mut note = entry("Big Archive.iso");
+        note.tags[1] = emule_large_size_tag();
+        note.tags.push(KadTag {
+            name: TagName::Id(TAG_DESCRIPTION),
+            value: TagValue::String("good copy".to_string()),
+        });
+        let results = convert_note_search_results(&[note], &KadId([0x42; 16]));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file.size, OVER_4_GIB);
+    }
+
+    #[test]
+    fn size_filters_and_exact_size_lookups_see_a_bsob_size() {
+        let mut tags = entry("Big Archive.iso").tags;
+        tags[1] = emule_large_size_tag();
+
+        let at_least = |value| KadSearchExpr::Numeric {
+            tag: SearchTagRef::Id(TAG_FILESIZE),
+            op: KadNumericOp::Ge,
+            value,
+        };
+        assert!(matches_search_expr_for_tags(
+            &at_least(u32::MAX as u64 + 1),
+            &tags
+        ));
+        assert!(!matches_search_expr_for_tags(
+            &at_least(OVER_4_GIB + 1),
+            &tags
+        ));
+
+        assert!(matches_requested_file_size_tags(&tags, OVER_4_GIB));
+        assert!(!matches_requested_file_size_tags(
+            &tags,
+            OVER_4_GIB & u32::MAX as u64
+        ));
     }
 }

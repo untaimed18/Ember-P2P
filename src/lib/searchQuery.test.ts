@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
+  MAX_MIN_SOURCES,
   MAX_SEARCH_QUERY_LEN,
+  clampFilterBytes,
+  clampMinSources,
   clampQueryBytes,
   extensionOnlyQueryToken,
   isServerDirectiveQuery,
   queryHasNetworkKeyword,
+  sizeRangeInverted,
 } from './searchQuery';
 
 const bytes = (s: string) => new TextEncoder().encode(s).length;
@@ -151,5 +155,57 @@ describe('extensionOnlyQueryToken', () => {
     expect(extensionOnlyQueryToken('.mp3 collection')).toBeNull();
     expect(extensionOnlyQueryToken('song.mp3')).toBeNull();
     expect(extensionOnlyQueryToken('')).toBeNull();
+  });
+});
+
+describe('clampMinSources', () => {
+  it('holds a huge count to what `min_availability` can take', () => {
+    // Past u32 the backend refused the arguments, so every search failed.
+    expect(clampMinSources(5_000_000_000)).toBe(MAX_MIN_SOURCES);
+    expect(clampMinSources(MAX_MIN_SOURCES + 1)).toBe(MAX_MIN_SOURCES);
+    expect(clampMinSources(MAX_MIN_SOURCES)).toBe(MAX_MIN_SOURCES);
+  });
+
+  it('sends a whole number', () => {
+    expect(clampMinSources(3.9)).toBe(3);
+    expect(clampMinSources(1)).toBe(1);
+  });
+
+  it('treats empty, zero, negative and non-numbers as no constraint', () => {
+    for (const value of [null, undefined, 0, 0.5, -4, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(clampMinSources(value)).toBeUndefined();
+    }
+  });
+});
+
+describe('clampFilterBytes', () => {
+  it('rounds to a whole byte count, which is all a u64 argument accepts', () => {
+    expect(clampFilterBytes(104_857.6)).toBe(104_858);
+    expect(clampFilterBytes(0)).toBe(0);
+  });
+
+  it('stays inside what JSON writes as an integer', () => {
+    expect(clampFilterBytes(1e30)).toBe(Number.MAX_SAFE_INTEGER);
+    expect(Number.isSafeInteger(clampFilterBytes(2 ** 60))).toBe(true);
+  });
+
+  it('treats empty, negative and non-numbers as no constraint', () => {
+    for (const value of [null, undefined, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(clampFilterBytes(value)).toBeUndefined();
+    }
+  });
+});
+
+describe('sizeRangeInverted', () => {
+  it('flags a minimum above the maximum', () => {
+    expect(sizeRangeInverted(2_000, 1_000)).toBe(true);
+  });
+
+  it('accepts an equal or open-ended range', () => {
+    expect(sizeRangeInverted(1_000, 1_000)).toBe(false);
+    expect(sizeRangeInverted(1_000, 2_000)).toBe(false);
+    expect(sizeRangeInverted(2_000, undefined)).toBe(false);
+    expect(sizeRangeInverted(undefined, 1_000)).toBe(false);
+    expect(sizeRangeInverted(2_000, 0)).toBe(false);
   });
 });

@@ -2810,9 +2810,12 @@ pub(super) async fn maybe_publish_ember_keywords(
         let media = known_files
             .media_for(&file_hash)
             .and_then(|(_, media)| media);
-        // Same tokenization as KAD keyword publishing/search so an Ember
-        // search hashes the identical keyword set.
-        let keywords = kad::publish::extract_keywords(&file_name);
+        // KAD's tokenization, which Ember has published under since 1.6.5,
+        // plus the normalised spellings newer searchers walk — of the name as
+        // the record signs it, so a word cut off to fit is not a key the
+        // record's own name cannot vouch for.
+        let signed_name = ember::dht::publish::keyword_record_signed_name(&file_name, media.as_ref());
+        let keywords = ember::dht::search::ember_publish_keywords(signed_name);
         if keywords.is_empty() {
             // Nothing to publish for this name, ever. Mark it done so it does
             // not get re-selected every tick and starve the rest of the

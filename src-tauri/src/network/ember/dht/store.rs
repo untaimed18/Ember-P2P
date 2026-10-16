@@ -412,6 +412,25 @@ pub struct DhtRecord {
     /// record as *just* republished — the exact opposite of due, and silently,
     /// on what is the common desktop case.
     pub republish_due: bool,
+    /// Every key a word of the record's name hashes to, worked out the first
+    /// time a multi-keyword `FIND_VALUE` asks and kept for the life of the
+    /// record. Never persisted: it is derived from `data` alone.
+    pub name_keys: std::sync::OnceLock<Box<[[u8; 16]]>>,
+}
+
+impl DhtRecord {
+    /// [`Self::name_keys`], computed on first use.
+    pub fn name_keys(&self) -> &[[u8; 16]] {
+        self.name_keys.get_or_init(|| {
+            super::publish::name_bytes_from_record_data(&self.data)
+                .map(|name| {
+                    super::search::name_word_keys(&String::from_utf8_lossy(name))
+                        .into_iter()
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
 }
 
 /// What one publisher currently occupies.
@@ -1165,6 +1184,7 @@ impl DhtStore {
             expires_at_unix,
             last_republished: now,
             republish_due: false,
+            name_keys: std::sync::OnceLock::new(),
         };
 
         let records = self.entries.entry(key).or_default();
@@ -4081,6 +4101,7 @@ mod tests {
             expires_at_unix: now_ts() - 1,
             last_republished: Instant::now(),
             republish_due: false,
+            name_keys: std::sync::OnceLock::new(),
         };
         store.entries.entry(key).or_default().push(record);
 

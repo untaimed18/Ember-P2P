@@ -781,7 +781,9 @@ pub(in crate::network) async fn on_search_poll_tick(
                     let mut resights = Vec::new();
                     network_results.retain(|r| {
                         if !r.file.hash.is_empty()
-                            && active.streamed_hashes.contains(&r.file.hash)
+                            && active.streamed_hashes.get(&r.file.hash).is_some_and(|&first| {
+                                first == 0 || r.file.size == 0 || first == r.file.size
+                            })
                         {
                             resights.push(r.clone());
                             false

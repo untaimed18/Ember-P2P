@@ -1,6 +1,6 @@
 <script lang="ts">
   import SearchBar from '$lib/components/SearchBar.svelte';
-  import { searchFiles, cancelSearch, searchMore, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, removeDownloadHistoryEntry, formatEd2kLink, formatEd2kLinks, type SearchMethod, type RelatedPlan } from '$lib/api/search';
+  import { searchFiles, searchWatchdogSecs, cancelSearch, searchMore, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, removeDownloadHistoryEntry, formatEd2kLink, formatEd2kLinks, type SearchMethod, type RelatedPlan } from '$lib/api/search';
   import {
     pendingRelatedSearch,
     relationKindLabel,
@@ -35,12 +35,17 @@
     type SearchTab,
   } from '$lib/stores/search';
   import {
+    MAX_MIN_SOURCES,
     MAX_SEARCH_QUERY_LEN,
+    clampFilterBytes,
+    clampMinSources,
     clampQueryBytes,
     extensionOnlyQueryToken,
     isServerDirectiveQuery,
     queryHasNetworkKeyword,
+    sizeRangeInverted,
   } from '$lib/searchQuery';
+  import { holdRowOrder, rowRanks } from '$lib/searchRowOrder';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import { onDestroy, onMount, tick, untrack } from 'svelte';
   import { get } from 'svelte/store';
@@ -49,7 +54,7 @@
   import { formatNumber, formatSize, formatLiveSpeed, copyToClipboard, sizeUnitLabel } from '$lib/utils';
   import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import { addToast } from '$lib/stores/toast';
-  import { inertBackground, menuKeydown, trapTabKey } from '$lib/a11y';
+  import { inertBackground, menuKeydown, swallowKeyboardContextMenu, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { hoverSubmenus } from '$lib/hoverSubmenus';
   import { passiveScroll } from '$lib/actions/passiveScroll';
@@ -154,6 +159,83 @@
         syncVisibleResults(searchResultsList, syncedTabId);
       }, RESULTS_SYNC_MIN_INTERVAL_MS - elapsed);
     }
+  });
+
+  /**
+   * What the polite live region says about the active tab's search: that it
+   * started, how many results it has found — at most every
+   * `SEARCH_ANNOUNCE_INTERVAL_MS` while they stream, which is still far more
+   * often than anyone wants a count read out — and how it ended.
+   *
+   * Switching to a tab announces nothing: that is the user's own action, and
+   * the tab strip already reads its count.
+   */
+  let searchAnnouncement = $state('');
+  const SEARCH_ANNOUNCE_INTERVAL_MS = 5_000;
+  let announceSeq = 0;
+  let announcedTabId: string | null = null;
+  let announcedSearching = false;
+  let announcedAt = 0;
+  let announcedCount = 0;
+
+  function announceSearch(text: string) {
+    // Emptied first so the same words twice in a row are read out twice.
+    const seq = ++announceSeq;
+    searchAnnouncement = '';
+    void tick().then(() => {
+      if (seq === announceSeq && !destroyed) searchAnnouncement = text;
+    });
+  }
+
+  let announceTabId = $derived(activeTab?.id ?? null);
+  let announceSearching = $derived(activeTab?.isSearching ?? false);
+
+  $effect(() => {
+    const tabId = announceTabId;
+    const searching = announceSearching;
+    const count = visibleResults.length;
+    untrack(() => {
+      const now = Date.now();
+      if (tabId !== announcedTabId) {
+        // A new search opens a new tab, already searching and still empty.
+        const started = searching && (activeTab?.results.length ?? 0) === 0;
+        announcedTabId = tabId;
+        announcedSearching = searching;
+        announcedAt = now;
+        announcedCount = count;
+        if (started) announceSearch(m.search_searching_indicator());
+        return;
+      }
+      if (searching && !announcedSearching) {
+        announcedSearching = true;
+        announcedAt = now;
+        announcedCount = count;
+        announceSearch(m.search_searching_indicator());
+        return;
+      }
+      if (!searching && announcedSearching) {
+        announcedSearching = false;
+        const tab = activeTab;
+        const found = tab?.results.length ?? 0;
+        announceSearch(
+          tab?.error
+            ? m.search_failed_with({ error: tab.error })
+            : plural(found, {
+                one: m.search_announce_complete_one,
+                other: () => m.search_announce_complete_other({ count: formatNumber(found) }),
+              }),
+        );
+        return;
+      }
+      if (searching && count !== announcedCount && now - announcedAt >= SEARCH_ANNOUNCE_INTERVAL_MS) {
+        announcedAt = now;
+        announcedCount = count;
+        announceSearch(plural(count, {
+          one: m.search_results_so_far_one,
+          other: () => m.search_results_so_far({ count: formatNumber(count) }),
+        }));
+      }
+    });
   });
 
   let downloadHistoryMap = $state<Record<string, string>>({});
@@ -999,10 +1081,10 @@
       if (typeof p.filterExtension === 'string' && p.filterExtension.length <= 16) {
         filterExtension = p.filterExtension;
       }
-      if (typeof p.filterMinSize === 'number' && Number.isFinite(p.filterMinSize)) {
+      if (typeof p.filterMinSize === 'number' && Number.isFinite(p.filterMinSize) && p.filterMinSize >= 0) {
         filterMinSize = p.filterMinSize;
       }
-      if (typeof p.filterMaxSize === 'number' && Number.isFinite(p.filterMaxSize)) {
+      if (typeof p.filterMaxSize === 'number' && Number.isFinite(p.filterMaxSize) && p.filterMaxSize >= 0) {
         filterMaxSize = p.filterMaxSize;
       }
       if (typeof p.filterMinUnit === 'number' && VALID_SIZE_UNITS.has(p.filterMinUnit)) {
@@ -1011,8 +1093,10 @@
       if (typeof p.filterMaxUnit === 'number' && VALID_SIZE_UNITS.has(p.filterMaxUnit)) {
         filterMaxUnit = p.filterMaxUnit;
       }
-      if (typeof p.filterMinSources === 'number' && Number.isFinite(p.filterMinSources)) {
-        filterMinSources = p.filterMinSources;
+      if (typeof p.filterMinSources === 'number') {
+        // Saved by a build that did not bound it, a value `search_files`
+        // refuses would fail every search from the first one after launch.
+        filterMinSources = clampMinSources(p.filterMinSources) ?? null;
       }
       if (typeof p.filterMinComplete === 'number' && Number.isFinite(p.filterMinComplete)) {
         filterMinComplete = p.filterMinComplete;
@@ -1098,7 +1182,7 @@
   }
 
   function resultKey(result: SearchResult): string {
-    if (result.file.hash) return result.file.hash;
+    if (result.file.hash) return result.size_variant ? `${result.file.hash}:${result.file.size}` : result.file.hash;
     if (result.file.id?.startsWith('pending:')) return `nohash-id:${result.file.id}`;
     if (result.file.path) return `nohash-path:${result.file.path}`;
     return `nohash:${result.file.name}:${result.file.size}`;
@@ -1224,6 +1308,26 @@
       default: return null;
     }
   }
+
+  function searchNoticeLabel(notice: string): string | null {
+    switch (notice) {
+      case 'KadNoContacts': return m.search_phase_kad_no_contacts();
+      case 'KadBusy': return m.search_phase_kad_busy();
+      case 'EmberBusy': return m.search_phase_ember_busy();
+      case 'EmberNoKeyword': return m.search_notice_ember_no_keyword();
+      case 'ServerUnavailable': return m.search_notice_server_unavailable();
+      case 'ServerNoAnswer': return m.search_notice_server_no_answer();
+      case 'NetworkNoKeyword': return m.search_notice_library_only();
+      default: return null;
+    }
+  }
+
+  /** The networks the active tab's search could not ask or that never
+   *  answered: shown with its results, so a partial answer does not pass for
+   *  a complete one. */
+  let tabNoticeText = $derived(
+    (activeTab?.notices ?? []).map(searchNoticeLabel).filter((s): s is string => !!s).join(' · '),
+  );
 
   function explainBatchFromTab(): { batchFileHashes: string[]; batchFileNames: string[] } {
     const tab = activeTab;
@@ -1620,6 +1724,17 @@
     selectedResult ? downloadsByHash.get(selectedResult.file.hash) : undefined
   );
 
+  /** The pointer is over the results table. While it is, or while a row's
+   *  context menu is open, rows already on screen keep their places instead
+   *  of re-sorting as results stream in: a double-click (which downloads) or a
+   *  menu could otherwise land on a different file than the one aimed at. The
+   *  re-sort waiting behind the hold applies when it ends. */
+  let pointerOverResults = $state(false);
+  let orderHeld = $derived(pointerOverResults || contextMenu !== null);
+  /** The order being held, for the sort and tab it was taken under. Written
+   *  only by `filterPass`, which it exists to carry between passes. */
+  let heldOrder: { sortKey: string; tabId: string | null; ranks: Map<string, number> } | null = null;
+
   // Filter, sort and the spam tally all in one walk of the list. `spamHidden`
   // used to be its own `.filter().length` over the same array, which meant a
   // second full pass riding the same invalidation as this one.
@@ -1640,8 +1755,7 @@
     // the boundary passing one filter and failing the other.
     const minBytes = sizeToBytes(filterMinSize, filterMinUnit) ?? 0;
     const maxBytes = sizeToBytes(filterMaxSize, filterMaxUnit) ?? 0;
-    const minSrcParsed = filterMinSources !== null ? Math.trunc(filterMinSources) : NaN;
-    const minSrc = Number.isFinite(minSrcParsed) && minSrcParsed > 0 ? minSrcParsed : 0;
+    const minSrc = clampMinSources(filterMinSources) ?? 0;
     const minCompleteParsed = filterMinComplete !== null ? Math.trunc(filterMinComplete) : NaN;
     const minComplete = Number.isFinite(minCompleteParsed) && minCompleteParsed > 0 ? minCompleteParsed : 0;
     const hasType = !!filterType;
@@ -1694,7 +1808,7 @@
       out.push(r);
     }
 
-    out.sort((a, b) => {
+    const compare = (a: SearchResult, b: SearchResult) => {
       let cmp = 0;
       switch (sortField) {
         case 'name':
@@ -1746,7 +1860,17 @@
           break;
       }
       return sortDir === 'asc' ? cmp : -cmp;
-    });
+    };
+    // A sort the user picks, or another tab, applies at once even mid-hold:
+    // only the stream's re-sorting waits.
+    const sortKey = `${sortField}:${sortDir}`;
+    const tabId = $activeSearchTabId;
+    if (orderHeld && heldOrder && heldOrder.sortKey === sortKey && heldOrder.tabId === tabId) {
+      holdRowOrder(out, heldOrder.ranks, resultKey, compare);
+    } else {
+      out.sort(compare);
+      heldOrder = orderHeld ? { sortKey, tabId, ranks: rowRanks(out, resultKey) } : null;
+    }
 
     return { rows: out, spamCount, ownedCount, bothCount };
   });
@@ -2170,16 +2294,18 @@
    * restored behind nothing stricter than `Number.isFinite`, it stayed broken
    * across restarts until someone thought to clear the field.
    *
-   * Rounded, then held to `MAX_SAFE_INTEGER`: past that JS cannot represent the
-   * count exactly anyway, and `JSON.stringify` starts emitting an exponent,
-   * which serde reads as a float and rejects for the same reason.
+   * `clampFilterBytes` rounds, then holds the count to `MAX_SAFE_INTEGER`.
    */
   function sizeToBytes(value: number | null, unit: number): number | undefined {
     if (value === null) return undefined;
-    const bytes = Math.round(value * unit);
-    if (!Number.isFinite(bytes) || bytes < 0) return undefined;
-    return Math.min(bytes, Number.MAX_SAFE_INTEGER);
+    return clampFilterBytes(value * unit);
   }
+
+  /** Min size above max size: no file passes both, so the table would show
+   *  nothing and a search could only come back empty. */
+  let sizeRangeInvalid = $derived(
+    sizeRangeInverted(sizeToBytes(filterMinSize, filterMinUnit), sizeToBytes(filterMaxSize, filterMaxUnit)),
+  );
 
   /** Split a byte count back into the number and unit the size boxes hold. */
   function sizeToInput(
@@ -2225,7 +2351,28 @@
     const max = sizeToInput(tab.filters?.maxSize, filterMaxUnit);
     filterMaxSize = max.value;
     filterMaxUnit = max.unit;
-    filterMinSources = tab.filters?.minAvailability ?? null;
+    filterMinSources = clampMinSources(tab.filters?.minAvailability) ?? null;
+  }
+
+  /** The panel controls a search reads, so a search started on another tab's
+   *  behalf can hand them back if it is refused. */
+  function snapshotSearchPanel(): () => void {
+    const s = {
+      barQuery, searchMethod, searchFileType, filterType, filterExtension,
+      filterMinSize, filterMinUnit, filterMaxSize, filterMaxUnit, filterMinSources,
+    };
+    return () => {
+      barQuery = s.barQuery;
+      searchMethod = s.searchMethod;
+      searchFileType = s.searchFileType;
+      filterType = s.filterType;
+      filterExtension = s.filterExtension;
+      filterMinSize = s.filterMinSize;
+      filterMinUnit = s.filterMinUnit;
+      filterMaxSize = s.filterMaxSize;
+      filterMaxUnit = s.filterMaxUnit;
+      filterMinSources = s.filterMinSources;
+    };
   }
 
   function selectSearchTab(tabId: string) {
@@ -2311,17 +2458,18 @@
   }
 
   /**
-   * Run a finished tab's search again, with its own network and type, in its
-   * place in the strip. The filter panel is shared by every tab, so the
-   * filters are whatever it holds now, as for any search.
+   * Run a finished tab's search again, with its own network, type and filters,
+   * in its place in the strip. The filter panel is shared by every tab and
+   * `handleSearch` reads it, so the tab's search goes into the panel first —
+   * where the new tab, selected once it opens, then finds it, as a tab switch
+   * would have left it.
    */
   function searchAgain(tab: SearchTab) {
     if (tab.isSearching || tab.related || !tab.query) return;
-    const panel = { barQuery, searchMethod, searchFileType };
+    const restorePanel = snapshotSearchPanel();
     const existing = new Set(get(searchTabs).map((t) => t.id));
     barQuery = tab.query;
-    searchMethod = tab.method;
-    searchFileType = tab.fileType ?? '';
+    restoreTabSearchParams(tab);
     // `handleSearch` opens the new tab before its first await, so it is in
     // the store by the time this returns, unless a gate refused the search.
     // Refused, the active tab is still one that was already there — often not
@@ -2330,9 +2478,7 @@
     void handleSearch(tab.query);
     const newId = get(activeSearchTabId);
     if (!newId || existing.has(newId)) {
-      barQuery = panel.barQuery;
-      searchMethod = panel.searchMethod;
-      searchFileType = panel.searchFileType;
+      restorePanel();
       return;
     }
     searchTabs.update((tabs) => {
@@ -2452,15 +2598,22 @@
     // the boxes mean when empty.
     const parsedMinSize = sizeToBytes(filterMinSize, filterMinUnit);
     const parsedMaxSize = sizeToBytes(filterMaxSize, filterMaxUnit);
-    const parsedMinAvail = filterMinSources !== null ? Math.trunc(filterMinSources) : undefined;
     const searchFilterSnapshot: import('$lib/api/search').SearchFilters = plan
       ? {}
       : {
           fileExtension: filterExtension.trim() || undefined,
           minSize: parsedMinSize,
           maxSize: parsedMaxSize,
-          minAvailability: parsedMinAvail !== undefined && Number.isFinite(parsedMinAvail) && parsedMinAvail >= 0 ? parsedMinAvail : undefined,
+          minAvailability: clampMinSources(filterMinSources),
         };
+    // Nothing can pass both, so the search could only come back empty and the
+    // table would hide whatever it found. The panel says why; open it so the
+    // message is on screen.
+    if (!plan && sizeRangeInverted(parsedMinSize, parsedMaxSize)) {
+      showAdvancedFilters = true;
+      addToast('warning', m.search_size_range_invalid());
+      return;
+    }
     // A related search whose seed filename yielded no searchable word is still
     // runnable when the server can answer the co-share request from the hashes
     // alone, so it is exempt from the "type something" and "needs a keyword"
@@ -2565,8 +2718,9 @@
     // therefore never race against) the search result path. If the search
     // settles first the watchdog is cleared by the success/error branch below
     // and the settings promise becomes a no-op.
-    const armTimeout = (secs: number) => {
+    const armTimeout = (timeoutSecs: number) => {
       clearSearchTimeoutForRequest(requestId);
+      const secs = searchWatchdogSecs(timeoutSecs);
       searchTimeouts.set(
         requestId,
         setTimeout(async () => {
@@ -2585,6 +2739,7 @@
               isSearching: false,
               progress: null,
               error: tab.results.length > 0 ? null : m.search_timeout_error({ secs }),
+              interruption: tab.results.length > 0 ? m.search_timeout_error({ secs }) : undefined,
             };
           });
           forgetSettledRequest(requestId);
@@ -2643,6 +2798,7 @@
         isSearching: false,
         progress: null,
         error: tab.results.length > 0 ? null : msg,
+        interruption: tab.results.length > 0 ? msg : undefined,
       }));
       forgetSettledRequest(requestId);
     }
@@ -3326,7 +3482,10 @@
         result.file.size,
         result.source_addresses,
         currentSearchQuery(),
-        result.origin_server_ip,
+        // Only a UDP reply names the server that chose to return this row;
+        // a TCP one carries the connected server whatever it sent.
+        (result.result_origin ?? '').includes('UDP') ? result.origin_server_ip : null,
+        result.result_origin,
       );
       // A newer mark/unmark superseded this request — leave its optimistic state.
       if (spamToggleGen.get(hash) !== gen) return;
@@ -3463,6 +3622,7 @@
               results: [],
               shed: undefined,
               shedKeys: undefined,
+              memoryShed: undefined,
               error: null,
               isSearching: false,
               // Its id is gone, so the network cannot continue it.
@@ -3540,6 +3700,76 @@
     });
   });
 
+  let resultsTableEl: HTMLTableElement | undefined = $state(undefined);
+  // The table is not mounted while the tab is empty or still on its first
+  // hits, and leaving that way fires no `pointerleave`, which would hold the
+  // order of the next list until the pointer happened to cross it.
+  $effect(() => {
+    if (!resultsTableEl) pointerOverResults = false;
+  });
+
+  /** A row's element id. Result keys can carry a path, so they are encoded:
+   *  an id must not contain whitespace. */
+  function resultRowId(key: string): string {
+    return `search-row-${encodeURIComponent(key)}`;
+  }
+
+  let cursorRowId = $derived(
+    cursorKey !== null && cursorIndex >= rowWindowStart && cursorIndex < rowWindowEnd
+      ? resultRowId(cursorKey)
+      : undefined,
+  );
+
+  /** The rows the last two presses landed on. A double-click downloads only
+   *  when both were on the row it fires for: a row that moved between them,
+   *  or a click that slipped to its neighbour, is not the file aimed at. */
+  let rowPressPrev: string | null = null;
+  let rowPressLast: string | null = null;
+  function noteRowPress(key: string) {
+    rowPressPrev = rowPressLast;
+    rowPressLast = key;
+  }
+  function pressesLandedOn(key: string): boolean {
+    return rowPressPrev === key && rowPressLast === key;
+  }
+
+  /**
+   * The Menu key or Shift+F10: the cursor row's context menu, placed at the
+   * row, as right-clicking it would. With no cursor yet, the first row's.
+   *
+   * Focus goes to the table first unless it is already on something in the
+   * table, so Escape hands it back there rather than to the page.
+   */
+  async function openRowContextMenuFromKeyboard(index: number) {
+    const result = filteredResults[index];
+    if (!result) return;
+    const key = resultKey(result);
+    cursorKey = key;
+    revealResultRow(index);
+    const focused = document.activeElement;
+    if (!(focused instanceof HTMLElement) || !resultsTableEl?.contains(focused)) {
+      resultsTableEl?.focus({ preventScroll: true });
+    }
+    let row = document.getElementById(resultRowId(key));
+    if (!row) {
+      // Scrolled out of the rendered window: `revealResultRow` has asked for
+      // the window that holds it on the next frame.
+      await new Promise<void>((r) => requestAnimationFrame(() => r()));
+      await tick();
+      if (destroyed) return;
+      row = document.getElementById(resultRowId(key));
+    }
+    const rect = (row ?? resultsTableEl)?.getBoundingClientRect();
+    showContextMenu(
+      new MouseEvent('contextmenu', {
+        cancelable: true,
+        clientX: rect ? rect.left + Math.min(24, rect.width / 2) : 0,
+        clientY: rect ? rect.top + Math.min(16, rect.height / 2) : 0,
+      }),
+      result,
+    );
+  }
+
   /** Scroll a row into view. The table is windowed, so the row may not be
    *  mounted; its position follows from the measured row height. */
   function revealResultRow(index: number) {
@@ -3583,6 +3813,17 @@
     const total = filteredResults.length;
     if (total === 0) return false;
     const current = cursorIndex;
+    if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
+      // From the table or from nowhere in particular; a toolbar control or
+      // the tab strip with focus is not asking about a row.
+      const target = e.target;
+      const fromResults = target === document.body
+        || (target instanceof Node && !!resultsTableEl?.contains(target));
+      if (!fromResults) return false;
+      swallowKeyboardContextMenu();
+      void openRowContextMenuFromKeyboard(current >= 0 ? current : 0);
+      return true;
+    }
     let nextIdx: number | null = null;
     if (e.key === 'ArrowDown') nextIdx = current < 0 ? 0 : Math.min(total - 1, current + 1);
     else if (e.key === 'ArrowUp') nextIdx = current <= 0 ? 0 : current - 1;
@@ -3608,9 +3849,11 @@
       // A control clicked earlier (a checkbox or button in a row or the
       // toolbar, a sort header, the syntax help's summary) keeps focus, and
       // would take the Space or Enter meant for the row the cursor is now on.
-      // Text fields never get here.
-      const focused = document.activeElement;
-      if (focused instanceof HTMLElement && focused !== document.body) focused.blur();
+      // Text fields never get here. The table takes it instead of the page, so
+      // its active descendant — the cursor row — is what a screen reader reads.
+      if (resultsTableEl && document.activeElement !== resultsTableEl) {
+        resultsTableEl.focus({ preventScroll: true });
+      }
       return true;
     }
     if (isActivationTarget(e.target)) return false;
@@ -4367,9 +4610,14 @@
           id="filter-sources"
           type="number"
           min="1"
+          max={MAX_MIN_SOURCES}
           step="1"
           placeholder="—"
-          bind:value={filterMinSources}
+          bind:value={
+            () => filterMinSources,
+            (v) => (filterMinSources = v !== null && v > MAX_MIN_SOURCES ? MAX_MIN_SOURCES : v)
+          }
+          onchange={() => (filterMinSources = clampMinSources(filterMinSources) ?? null)}
           class="sources-input"
         />
       </div>
@@ -4390,12 +4638,16 @@
         />
       </div>
     </div>
+    {#if sizeRangeInvalid}
+      <p class="filter-error" role="alert">{m.search_size_range_invalid()}</p>
+    {/if}
   {/if}
 
   <p class="filter-help">{m.search_filter_help_prefix()} <code>-</code> {m.search_filter_help_suffix()}</p>
 </div>
 
 <div class="page-content results-scroll" bind:this={resultsScrollEl} use:passiveScroll={onResultsScroll}>
+  <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{searchAnnouncement}</div>
   {#if emberDrivesThisSearch && emberReadinessUnknown}
     <div class="search-readiness-hint" role="status">
       {m.search_network_ember_diagnostics_hint()}
@@ -4492,6 +4744,9 @@
       {#if extensionOnlyHintExt}
         <p class="empty-sub">{m.search_extension_keyword_hint({ ext: extensionOnlyHintExt })}</p>
       {/if}
+      {#if tabNoticeText}
+        <p class="empty-sub">{tabNoticeText}</p>
+      {/if}
     </div>
   {:else}
     <div class="results-info">
@@ -4523,6 +4778,15 @@
                available first. Without saying so, a broad search looked as
                if it had lost hits. -->
           <p class="results-extension-hint">{m.search_results_shed({ count: formatNumber(activeTab?.shed ?? 0) })}</p>
+        {/if}
+        {#if (activeTab?.memoryShed ?? 0) > 0}
+          <p class="results-extension-hint">{m.search_results_shed_memory({ count: formatNumber(activeTab?.memoryShed ?? 0) })}</p>
+        {/if}
+        {#if activeTab?.interruption}
+          <p class="results-extension-hint">{m.search_interrupted({ reason: activeTab.interruption })}</p>
+        {/if}
+        {#if tabNoticeText}
+          <p class="results-extension-hint">{tabNoticeText}</p>
         {/if}
       </div>
       <div class="results-info-actions">
@@ -4583,7 +4847,21 @@
          with a per-row `aria-rowindex` is what the spec provides for a grid whose
          DOM holds only part of its rows. Both count the header row, which is why
          the data rows start at 2. -->
-    <table class="search-results-table" aria-rowcount={filteredResults.length + 1}>
+    <!-- Focus stays on the table while the arrow keys move the row cursor, and
+         `aria-activedescendant` names the cursor row, so a screen reader
+         follows it. Only while that row is mounted: the id of one outside the
+         window points at nothing. -->
+    <table
+      class="search-results-table"
+      role="grid"
+      tabindex="0"
+      aria-label={m.search_results_grid_aria()}
+      aria-rowcount={filteredResults.length + 1}
+      aria-activedescendant={cursorRowId}
+      bind:this={resultsTableEl}
+      onpointerenter={() => (pointerOverResults = true)}
+      onpointerleave={() => (pointerOverResults = false)}
+    >
       <thead oncontextmenu={openColumnMenuFromHeader}>
         <tr aria-rowindex="1">
           <th class="col-check">
@@ -4675,6 +4953,7 @@
           {@const originText = originLabel(result.result_origin || '')}
           {@const spamExplain = spamExplainFor(result)}
           <tr
+            id={resultRowId(rKey)}
             class="result-row {dlRowClass(dlTransfer)}"
             aria-rowindex={idx + 2}
             class:row-alt={(idx & 1) === 1}
@@ -4685,9 +4964,11 @@
             class:history-completed-row={!isInLibraryOnly(result) && downloadHistoryMap[result.file.hash] === 'completed'}
             class:history-cancelled-row={!isInLibraryOnly(result) && downloadHistoryMap[result.file.hash] === 'cancelled'}
             oncontextmenu={(e) => { cursorKey = rKey; showContextMenu(e, result); }}
+            onmousedown={() => noteRowPress(rKey)}
             onclick={() => (cursorKey = rKey)}
             ondblclick={(e) => {
               if ((e.target as HTMLElement).closest('input, button')) return;
+              if (!pressesLandedOn(rKey)) return;
               if (!blockingDl) download(result);
             }}
           >
@@ -5618,6 +5899,12 @@
     color: var(--text-muted);
   }
 
+  .filter-error {
+    margin: 6px 0 0;
+    font-size: var(--font-size-xs);
+    color: var(--danger);
+  }
+
   .filter-help code {
     font-family: var(--font-mono);
     font-size: var(--font-size-2xs);
@@ -5884,6 +6171,16 @@
   :global(tr.row-checked td) {
     background: var(--table-row-selected) !important;
   }
+  /* The cursor row is where keyboard focus is shown once there is one; the
+     ring is for reaching the table before any row is picked. */
+  .search-results-table:focus {
+    outline: none;
+  }
+  .search-results-table:focus-visible:not(:has(tr.row-cursor)) {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+
   /* The keyboard cursor: an outline, so it reads on ticked and unticked rows alike. */
   tr.row-cursor td {
     box-shadow: inset 0 1px 0 var(--accent), inset 0 -1px 0 var(--accent);

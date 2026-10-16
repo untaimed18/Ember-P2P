@@ -13,6 +13,9 @@
  * pure — the storage reads and writes stay in the store.
  */
 import { shedWeakestRows } from '$lib/searchOverflow';
+import { clampFilterBytes, clampMinSources } from '$lib/searchQuery';
+import type { SearchFilters } from '$lib/api/search';
+import { SEARCH_NOTICES } from '$lib/searchNotices';
 import type { SearchTab } from '$lib/stores/search';
 import type { SearchResult } from '$lib/types';
 
@@ -102,9 +105,32 @@ function rowsWorthStoring(raw: unknown, limit: number): { rows: SearchResult[]; 
   return { rows, shed: usable - rows.length };
 }
 
-/** A stored tab's `shed`, which nothing else checks before it is added to. */
+/** A stored tab's `shed` or `memoryShed`, which nothing else checks before it
+ *  is added to. */
 function storedShed(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+/**
+ * A stored tab's filters, held to what `search_files` accepts.
+ *
+ * Search again re-sends them and selecting the tab puts them back in the filter
+ * panel, so a value the backend's argument types refuse — from hand-edited
+ * storage, or a build that did not bound them — would fail every search the
+ * panel then made.
+ */
+function storedFilters(raw: unknown): SearchFilters | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const f = raw as Record<string, unknown>;
+  const text = (v: unknown) => (typeof v === 'string' && v ? v : undefined);
+  const num = (v: unknown) => (typeof v === 'number' ? v : undefined);
+  return {
+    fileType: text(f.fileType),
+    fileExtension: text(f.fileExtension),
+    minSize: clampFilterBytes(num(f.minSize)),
+    maxSize: clampFilterBytes(num(f.maxSize)),
+    minAvailability: clampMinSources(num(f.minAvailability)),
+  };
 }
 
 /** Strip a tab to what is worth storing, and to what survives being stored. */
@@ -113,8 +139,16 @@ export function forPersist(tab: SearchTab, limit = PERSIST_MAX_RESULTS): SearchT
   return {
     ...tab,
     results: rows,
-    // Rows storage leaves out are as gone after a restore as those the cap shed.
-    shed: storedShed(tab.shed) + shed,
+    shed: storedShed(tab.shed),
+    // Rows storage leaves out are as gone after a restore as those the cap
+    // shed, but they went to fit the storage quota, not because the search
+    // overflowed the tab.
+    memoryShed: storedShed(tab.memoryShed) + shed,
+    filters: storedFilters(tab.filters),
+    notices: Array.isArray(tab.notices)
+      ? tab.notices.filter((n) => typeof n === 'string' && SEARCH_NOTICES.has(n))
+      : undefined,
+    interruption: typeof tab.interruption === 'string' && tab.interruption ? tab.interruption : undefined,
     // A `Map` does not survive JSON, and `mergeIntoTab` rebuilds it from its
     // length check whenever it is missing.
     resultIndex: undefined,
@@ -171,7 +205,7 @@ export function trimPersistPayload(payload: PersistedSearch, limit: number): Per
       // this came from, and the attempt that failed may not be the last one.
       const results = tab.results.slice();
       shedWeakestRows(results, limit);
-      return { ...tab, results, shed: storedShed(tab.shed) + tab.results.length - results.length };
+      return { ...tab, results, memoryShed: storedShed(tab.memoryShed) + tab.results.length - results.length };
     }),
   };
 }

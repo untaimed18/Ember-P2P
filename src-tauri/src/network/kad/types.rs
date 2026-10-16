@@ -882,6 +882,20 @@ impl KadTag {
             _ => None,
         }
     }
+
+    /// A `TAG_FILESIZE` value as eMule reads it: any integer width, or the
+    /// 8-byte little-endian `BSOB` that eMule writes for files over 4 GiB
+    /// (`CEntry::WriteTagListInc`, the keyword publish in `Search.cpp`). eMule
+    /// only takes a `BSOB` of exactly 8 bytes as a size; any other length
+    /// gives `None` here.
+    pub fn as_file_size(&self) -> Option<u64> {
+        match &self.value {
+            TagValue::Bsob(b) => <[u8; 8]>::try_from(b.as_slice())
+                .ok()
+                .map(u64::from_le_bytes),
+            _ => self.as_uint(),
+        }
+    }
 }
 
 /// Maximum tags per tag list we *keep* (eMule typically sends < 10 tags per
@@ -1139,6 +1153,42 @@ mod kad_tag_wire_layout_tests {
         };
         assert_eq!(blob.blob_value(), Some(bytes.as_slice()));
         assert_eq!(bsob.blob_value(), Some(bytes.as_slice()));
+    }
+
+    /// eMule's `CKadTagBsob(TAG_FILESIZE, byFileSize, 8)` on the wire, for a
+    /// 5 GiB file.
+    #[test]
+    fn file_size_reads_emules_8_byte_bsob() {
+        let size: u64 = 5 * 1024 * 1024 * 1024;
+        let mut buf = vec![TAGTYPE_BSOB, 0x01, 0x00, TAG_FILESIZE, 8];
+        buf.extend_from_slice(&size.to_le_bytes());
+        let mut cursor = std::io::Cursor::new(&buf);
+        let tag = KadTag::read_from(&mut cursor).unwrap();
+        assert_eq!(tag.as_uint(), None);
+        assert_eq!(tag.as_file_size(), Some(size));
+    }
+
+    #[test]
+    fn file_size_accepts_every_integer_width_and_rejects_other_bsobs() {
+        let tag = |value| KadTag {
+            name: TagName::Id(TAG_FILESIZE),
+            value,
+        };
+        assert_eq!(tag(TagValue::Uint8(200)).as_file_size(), Some(200));
+        assert_eq!(tag(TagValue::Uint16(40_000)).as_file_size(), Some(40_000));
+        assert_eq!(
+            tag(TagValue::Uint32(u32::MAX)).as_file_size(),
+            Some(u32::MAX as u64)
+        );
+        assert_eq!(
+            tag(TagValue::Uint64(6_000_000_000)).as_file_size(),
+            Some(6_000_000_000)
+        );
+        assert_eq!(tag(TagValue::Bsob(vec![1, 2, 3, 4])).as_file_size(), None);
+        assert_eq!(tag(TagValue::Bsob(vec![0; 9])).as_file_size(), None);
+        assert_eq!(tag(TagValue::Bsob(Vec::new())).as_file_size(), None);
+        assert_eq!(tag(TagValue::Blob(vec![0; 8])).as_file_size(), None);
+        assert_eq!(tag(TagValue::String("123".into())).as_file_size(), None);
     }
 }
 

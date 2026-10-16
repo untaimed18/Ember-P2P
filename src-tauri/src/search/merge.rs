@@ -1,4 +1,4 @@
-//! Dedupe and merge search rows by ed2k hash (fallback: name + size) for multi-source results.
+//! Dedupe and merge search rows by ed2k hash and size (fallback: name + size) for multi-source results.
 
 use std::collections::HashMap;
 
@@ -356,14 +356,14 @@ fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {
             em.title = inc_media.title;
         }
     }
-    // The filename is *not* decided here: `merge_search_vecs` elects it by vote
-    // (see `NameVotes`). Keep the name we already have until that vote is
-    // counted.
+    // The filename is *not* decided here: `merge_search_vecs` takes the
+    // library's name when the user holds the file and otherwise elects one by
+    // vote (see `NameVotes`). Keep the name we already have until then.
     //
-    // That vote arbitrates the network row against the local-library row, not
-    // "every source that advertised this hash" as this used to say: its only
-    // caller receives results that `convert_search_results` has already
-    // collapsed to one row per hash, and eD2K server hits never reach it at all.
+    // That vote is between network rows only, not "every source that
+    // advertised this hash" as this used to say: its only caller receives
+    // results that `convert_search_results` has already collapsed to one row
+    // per hash, and eD2K server hits never reach it at all.
     // Across DHT publishers the name is still decided upstream by
     // `name_spam_penalty`, which a responder can steer by choosing a name that
     // scores lower than the honest one — better than the old "longest wins", but
@@ -440,17 +440,59 @@ pub fn complete_sources_known(origin: &str) -> bool {
     })
 }
 
-/// Merge two result lists; rows with the same hash are combined. Output is sorted for display.
+/// Whether a row came out of the user's own library.
+fn is_library_row(r: &SearchResult) -> bool {
+    r.result_origin
+        .split('·')
+        .any(|part| part.trim() == ORIGIN_LOCAL)
+}
+
+/// The identity rows are merged under: [`result_key`] plus, for a hashed row,
+/// its size. A hash is public, so a reply can pair a real one with any size
+/// it likes; folding that into the real file's row would put the wrong size on
+/// it (and on the download started from it). A row of size 0 says nothing
+/// about the size and joins the first sized row with its hash, if any.
+type MergeKey = (String, u64);
+
+fn merge_key(r: &SearchResult, first_size: &HashMap<String, u64>) -> MergeKey {
+    if r.file.hash.is_empty() {
+        return (result_key(r), 0);
+    }
+    let size = if r.file.size == 0 {
+        first_size.get(&r.file.hash).copied().unwrap_or(0)
+    } else {
+        r.file.size
+    };
+    (result_key(r), size)
+}
+
+/// Merge two result lists; rows with the same hash and size are combined.
+/// Output is sorted for display.
+///
+/// A file the user holds keeps the library's name: the library row was read
+/// off this disk, and the network's names for a hash are claims anyone can
+/// make.
 pub fn merge_search_vecs(
     primary: Vec<SearchResult>,
     secondary: Vec<SearchResult>,
 ) -> Vec<SearchResult> {
-    let mut map: HashMap<String, SearchResult> = HashMap::new();
+    let rows: Vec<SearchResult> = primary.into_iter().chain(secondary).collect();
+    let mut first_size: HashMap<String, u64> = HashMap::new();
+    for r in rows.iter().filter(|r| !r.file.hash.is_empty() && r.file.size != 0) {
+        first_size.entry(r.file.hash.clone()).or_insert(r.file.size);
+    }
+    let mut map: HashMap<MergeKey, SearchResult> = HashMap::new();
     // Ballots live here rather than on `SearchResult`: that type is serialized
     // straight to the frontend, so it must not grow a merge-only field.
-    let mut name_votes: HashMap<String, NameVotes> = HashMap::new();
-    for r in primary.into_iter().chain(secondary) {
-        let k = result_key(&r);
+    let mut name_votes: HashMap<MergeKey, NameVotes> = HashMap::new();
+    let mut library_names: HashMap<MergeKey, String> = HashMap::new();
+    for r in rows {
+        let k = merge_key(&r, &first_size);
+        if is_library_row(&r) && !r.file.name.is_empty() {
+            library_names
+                .entry(k.clone())
+                .or_insert_with(|| r.file.name.clone());
+        }
         vote_name(name_votes.entry(k.clone()).or_default(), &r.file.name);
         if let Some(mut e) = map.remove(&k) {
             merge_into(&mut e, r);
@@ -460,9 +502,16 @@ pub fn merge_search_vecs(
         }
     }
     for (key, result) in map.iter_mut() {
-        if let Some(elected) = name_votes.get(key).and_then(elected_name) {
-            if result.file.name != elected {
-                rename_result(result, elected.to_string());
+        if result.file.size == 0 {
+            result.file.size = key.1;
+        }
+        let chosen = library_names
+            .get(key)
+            .map(String::as_str)
+            .or_else(|| name_votes.get(key).and_then(elected_name));
+        if let Some(chosen) = chosen {
+            if result.file.name != chosen {
+                rename_result(result, chosen.to_string());
             }
         }
     }
@@ -812,6 +861,65 @@ mod tests {
             vec![named("ff", "clip.avi.HD.REPACK.scr", ORIGIN_KAD)],
         );
         assert_eq!(merged[0].file.name, "clip.avi");
+    }
+
+    fn sized(hash: &str, size: u64, name: &str, origin: &str) -> SearchResult {
+        let mut r = named(hash, name, origin);
+        r.file.size = size;
+        r
+    }
+
+    /// The hash is public; the size is the reply's own claim. One reply must
+    /// not fold a different size into the real file's row.
+    #[test]
+    fn rows_with_one_hash_and_different_sizes_stay_apart() {
+        let merged = merge_search_vecs(
+            vec![sized("aa", 700, "movie.avi", ORIGIN_SERVER_TCP)],
+            vec![
+                sized("aa", 9_999, "movie.avi", ORIGIN_KAD),
+                sized("aa", 700, "movie.avi", ORIGIN_SERVER_UDP),
+            ],
+        );
+        assert_eq!(merged.len(), 2);
+        let real = merged.iter().find(|r| r.file.size == 700).unwrap();
+        assert_eq!(real.availability, 2, "the two 700-byte replies merged");
+        let other = merged.iter().find(|r| r.file.size == 9_999).unwrap();
+        assert_eq!(other.result_origin, ORIGIN_KAD);
+    }
+
+    #[test]
+    fn a_row_of_unknown_size_joins_the_sized_row_with_its_hash() {
+        let merged = merge_search_vecs(
+            vec![sized("aa", 0, "movie.avi", ORIGIN_KAD)],
+            vec![sized("aa", 700, "movie.avi", ORIGIN_SERVER_TCP)],
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].file.size, 700);
+    }
+
+    /// A file the user holds is named the way the library names it, however
+    /// many network rows (or which one first) say otherwise.
+    #[test]
+    fn the_library_row_names_a_file_the_user_holds() {
+        let merged = merge_search_vecs(
+            vec![
+                sized("aa", 700, "Movie.REAL.PROPER.avi", ORIGIN_SERVER_TCP),
+                sized("aa", 700, "Movie.REAL.PROPER.avi", ORIGIN_KAD),
+            ],
+            vec![sized("aa", 700, "movie.avi", ORIGIN_LOCAL)],
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].file.name, "movie.avi");
+        assert_eq!(merged[0].file.size, 700);
+        assert!(merged[0].result_origin.contains(ORIGIN_LOCAL));
+
+        // A network row of another size is a different file, not a rename.
+        let merged = merge_search_vecs(
+            vec![sized("bb", 9_999, "bigger.avi", ORIGIN_SERVER_TCP)],
+            vec![sized("bb", 700, "mine.avi", ORIGIN_LOCAL)],
+        );
+        let mine = merged.iter().find(|r| r.result_origin == ORIGIN_LOCAL).unwrap();
+        assert_eq!((mine.file.name.as_str(), mine.file.size), ("mine.avi", 700));
     }
 
     #[test]

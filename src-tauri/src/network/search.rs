@@ -486,11 +486,17 @@ pub(super) fn mark_streamed_hashes(active: &mut ActiveSearchRequest, results: &[
             continue;
         }
         if active.streamed_hashes.len() >= MAX_STREAMED_HASHES_SOFT_CAP
-            && !active.streamed_hashes.contains(&r.file.hash)
+            && !active.streamed_hashes.contains_key(&r.file.hash)
         {
             continue;
         }
-        active.streamed_hashes.insert(r.file.hash.clone());
+        let first = active
+            .streamed_hashes
+            .entry(r.file.hash.clone())
+            .or_insert(r.file.size);
+        if *first == 0 {
+            *first = r.file.size;
+        }
     }
 }
 
@@ -513,28 +519,25 @@ pub(super) struct DhtNotedAvailability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DhtBatchKind {
     /// Records the leg has not handed over before — the cursor-advanced tail
-    /// slice both streaming paths send. Ember's publisher counts add to the
-    /// total; KAD's swarm estimates raise it to the larger.
+    /// slice KAD's streaming path sends. KAD's swarm estimates raise the total
+    /// to the larger.
     Incremental,
-    /// A rebuild over every record the walk gathered, which is what the closing
-    /// batch of either leg is. It *is* the total, so it replaces rather than
-    /// adds — folding it in as an increment would double every count at the
-    /// exact moment the search finished.
+    /// A rebuild over every record the walk has gathered: every Ember batch,
+    /// streamed or closing, and KAD's closing batch. It *is* the total, so it
+    /// replaces Ember's count and raises KAD's — folding it in as an increment
+    /// would double every count.
     Cumulative,
 }
 
 /// Fold a DHT batch into the request's running per-file totals for that leg,
 /// and put the total on each row.
 ///
-/// Both DHT legs convert only the records they have not converted before, so a
-/// batch's `availability` counts that slice and nothing else: a file thirty
-/// Ember publishers named arrives as a dozen small batches. The UI merges
-/// counts by max, so without a running total the row showed the largest single
-/// slice until the leg finished and pushed its rebuild over everything
-/// gathered — up to a minute late on a cold routing table. The server legs
-/// never had this because they have kept a running total all along; this is
-/// that, for Ember, and the running max for KAD (see the body for why KAD
-/// slices do not add).
+/// KAD converts only the records it has not converted before, so a KAD batch
+/// counts that slice alone; Ember rebuilds every batch over everything its
+/// walk has gathered, so an Ember batch is already the file's total. The UI
+/// merges counts by max, so these per-leg totals are what keep a row's count
+/// from being the largest single slice (see the body for why KAD slices do
+/// not add).
 pub(super) fn note_dht_availability(
     active: &mut ActiveSearchRequest,
     results: &mut [SearchResult],
@@ -564,8 +567,8 @@ pub(super) fn note_dht_availability(
         // slices counted them once per responder, and the UI's max-merge kept
         // the overshoot even after the closing rebuild got it right; within a
         // batch `convert_search_results` already takes the max for this reason.
-        // An Ember slice counts publishers the earlier slices did not (the
-        // streaming path drops the ones already counted), so those add up.
+        // An Ember batch is a rebuild over everything its walk gathered, so it
+        // replaces the running count, upwards or down.
         let (slot, additive) = match r.result_origin.as_str() {
             crate::search::merge::ORIGIN_KAD => (&mut noted.kad, false),
             crate::search::merge::ORIGIN_EMBER => (&mut noted.ember, true),
@@ -575,6 +578,7 @@ pub(super) fn note_dht_availability(
         };
         *slot = match kind {
             DhtBatchKind::Incremental if additive => slot.saturating_add(r.availability),
+            DhtBatchKind::Cumulative if additive => r.availability,
             DhtBatchKind::Incremental | DhtBatchKind::Cumulative => (*slot).max(r.availability),
         }
         .min(MAX_KAD_AVAILABILITY);
@@ -746,11 +750,11 @@ pub(super) struct ActiveSearchRequest {
     /// applied — those queries shouldn't reach the streaming paths anyway,
     /// since we early-return when `keywords.is_empty()` at request start).
     pub(super) keywords: Vec<String>,
-    /// Source IP of the connected eD2k server at request-start time, used
-    /// as an extra signal by the spam filter (`spam_server_ips` set). Only
-    /// meaningful for the TCP-server streaming path; the UDP-server and
-    /// KAD paths pass `None` because results from those origins don't
-    /// uniquely belong to one server / origin IP.
+    /// Source IP of the connected eD2k server at request-start time. Used to
+    /// tell whether Search More can still page the same server. The TCP leg
+    /// hands it to [`enrich_and_emit_search_results`], which does not score or
+    /// stamp TCP rows with it: server reputation only applies to UDP
+    /// global-search rows, keyed by the UDP server that answered.
     pub(super) server_ip: Option<String>,
     pub(super) server_result_count: usize,
     /// File hashes already forwarded to the UI for this request, across
@@ -771,7 +775,11 @@ pub(super) struct ActiveSearchRequest {
     /// KAD/TCP/UDP each cap their own result counts, but a hard cap keeps
     /// a pathological all-servers global search from growing this
     /// unboundedly for the lifetime of one search.
-    pub(super) streamed_hashes: std::collections::HashSet<String>,
+    ///
+    /// Each hash maps to the size it was first streamed with: a later row
+    /// claiming another size is a different file as far as the UI's merge is
+    /// concerned, so it is scored as a new row rather than passed as a re-sight.
+    pub(super) streamed_hashes: std::collections::HashMap<String, u64>,
     /// Hashes never to forward to the UI for this request. Set only by a
     /// related search, to the seed files it was started from: a co-share
     /// request and a title probe both return the seed itself, and listing the
@@ -988,6 +996,23 @@ pub(super) struct SearchProgressEvent {
     pub(super) phase: String,
 }
 
+/// A network a search could not ask, or that never answered, so the tab can
+/// say so after the search ends instead of looking like a complete answer.
+#[derive(Clone, serde::Serialize)]
+pub(super) struct SearchNoticeEvent {
+    pub(super) request_id: u64,
+    pub(super) notice: &'static str,
+}
+
+pub(super) fn emit_search_notice(
+    app_handle: &tauri::AppHandle,
+    request_id: u64,
+    notice: &'static str,
+) {
+    use tauri::Emitter;
+    let _ = app_handle.emit("search-notice", SearchNoticeEvent { request_id, notice });
+}
+
 #[derive(Clone, serde::Serialize)]
 pub(super) struct SearchCompleteEvent {
     pub(super) request_id: u64,
@@ -1144,14 +1169,43 @@ pub(super) fn dedup_streamed_batch(
         if active.exclude_hashes.contains(&r.file.hash) {
             continue;
         }
-        if !r.file.hash.is_empty() && active.streamed_hashes.contains(&r.file.hash) {
+        let resight = !r.file.hash.is_empty()
+            && active
+                .streamed_hashes
+                .get(&r.file.hash)
+                .is_some_and(|&first| first == 0 || r.file.size == 0 || first == r.file.size);
+        if resight {
             resights.push(r);
         } else {
             kept.push(r);
         }
     }
     *results = kept;
+    // The row is dropped, but the name it was re-advertised under is what
+    // "same file, many names" counts.
+    active.batch_spam.note_resighted(&resights);
     resights
+}
+
+/// Whether an enrichment pass has anything to do.
+///
+/// The re-sighted names [`dedup_streamed_batch`] queues only feed batch
+/// statistics, so with those off the queue is dropped here and a packet of
+/// nothing but re-sightings does no work. With them on such a packet still
+/// runs: folding its names in can complete a collision and upgrade a row on
+/// screen.
+pub(super) fn enrichment_has_work(
+    results_empty: bool,
+    batch: Option<&mut crate::search::spam::BatchSpamContext>,
+    batch_stats_wanted: bool,
+) -> bool {
+    let Some(batch) = batch else {
+        return !results_empty;
+    };
+    if !batch_stats_wanted {
+        batch.clear_pending_resights();
+    }
+    !results_empty || batch.has_pending_resights()
 }
 
 /// Whether the currently connected eD2k server can answer eMule's native
@@ -1279,15 +1333,29 @@ pub(super) async fn enrich_and_emit_search_results(
     server_ip: Option<&str>,
     accumulated_batch: Option<&mut crate::search::spam::BatchSpamContext>,
 ) -> Vec<SearchResult> {
-    if results.is_empty() {
-        return Vec::new();
-    }
+    let mut accumulated_batch = accumulated_batch;
     let spam_enabled = settings.spam_filter_enabled;
     let spam_profile =
         crate::search::spam::SpamFilterProfile::from_setting(&settings.spam_filter_profile);
+    let batch_stats_wanted =
+        spam_enabled && spam_profile != crate::search::spam::SpamFilterProfile::Relaxed;
+    if !enrichment_has_work(results.is_empty(), accumulated_batch.as_deref_mut(), batch_stats_wanted) {
+        return Vec::new();
+    }
     let cleanup_strings =
         crate::search::cleanup::parse_cleanup_strings(&settings.filename_cleanups);
 
+    // Server reputation is about the UDP server that answered a global search
+    // (eMule's `CSearchList` rule). The TCP leg passes the connected server;
+    // scoring or stamping its rows with it would make every TCP row carry that
+    // server's reputation, and Mark spam on any of them train it. Only a UDP
+    // batch keeps its server.
+    let server_ip = server_ip.filter(|_| {
+        !results.is_empty()
+            && results
+                .iter()
+                .all(|r| r.result_origin == crate::search::merge::ORIGIN_SERVER_UDP)
+    });
     if let Some(sip) = server_ip {
         for result in &mut results {
             if result.origin_server_ip.is_none() {
@@ -1310,8 +1378,6 @@ pub(super) async fn enrich_and_emit_search_results(
     // with whatever the context has absorbed since, not the whole search. The
     // settings change already triggers `rescoreOpenTabs`, which re-scores
     // without batch context at all, so this changes nothing a user sees.
-    let batch_stats_wanted =
-        spam_enabled && spam_profile != crate::search::spam::SpamFilterProfile::Relaxed;
     let batch_for_score: Option<&crate::search::spam::BatchSpamContext> =
         if let Some(acc) = accumulated_batch {
             if batch_stats_wanted {
@@ -1369,11 +1435,13 @@ pub(super) async fn enrich_and_emit_search_results(
             batch_for_score,
         );
         if !upgrades.is_empty() {
+            // Upgrades are rows earlier packets sent; each keeps the server it
+            // arrived with, never this packet's.
             crate::commands::search::apply_search_enrichment_with_batch(
                 &mut upgrades,
                 &spam,
                 keywords,
-                server_ip,
+                None,
                 spam_enabled,
                 spam_profile,
                 &cleanup_strings,
@@ -1387,17 +1455,13 @@ pub(super) async fn enrich_and_emit_search_results(
 
     // Auto-redemption: if a server's results came back mostly clean, decay its
     // learned spam reputation (escalation stays user-driven). Only relevant for
-    // server-sourced batches, so it's gated on a known server IP.
-    if spam_enabled {
+    // UDP server batches, so it's gated on a known server IP.
+    if spam_enabled && !results.is_empty() {
         if let Some(sip) = server_ip {
-            let total = results.len();
-            let clean = results.iter().filter(|r| !r.is_spam).count();
-            if clean > 0 {
-                spam_filter
-                    .write()
-                    .await
-                    .record_server_clean_batch(sip, clean, total);
-            }
+            spam_filter
+                .write()
+                .await
+                .record_server_clean_batch(sip, &results, spam_profile);
         }
     }
 
@@ -1825,6 +1889,19 @@ pub(super) fn split_peer_id(peer_id: &str) -> (String, u16) {
     }
 }
 
+/// End the walk under the typed spelling's key that `search_id` was waiting
+/// on, if one is still running: nothing reads its records once the search it
+/// feeds is gone.
+pub(super) fn drop_running_ember_companion(state: &mut NetworkState, search_id: u32) {
+    let companion = state.ember_search.get(search_id).map(|s| s.companion);
+    if let Some(ember::dht::search::Companion::Running(walk)) = companion {
+        state.ember_search.remove(walk);
+        state
+            .ember_dht_search_requests
+            .retain(|_, r| r.search_id != walk);
+    }
+}
+
 /// Release every piece of state keyed by an Ember `search_id` and settle
 /// whatever was waiting on it.
 ///
@@ -1880,6 +1957,7 @@ pub(super) fn release_ember_search_state(
     if let Some(key) = state.ember_publish_target_lookups.remove(&search_id) {
         note_ember_target_lookup_ended(state, key);
     }
+    drop_running_ember_companion(state, search_id);
     state.ember_search.remove(search_id);
     state
         .ember_dht_search_requests
@@ -1903,6 +1981,7 @@ pub(super) fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri
         .ember_pending_keyword_results
         .retain(|b| b.request_id != request_id);
     for sid in ember_sids {
+        drop_running_ember_companion(state, sid);
         state.ember_search.remove(sid);
         state
             .ember_dht_search_requests
@@ -1992,5 +2071,146 @@ pub(super) fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri
         .is_some_and(|finished| finished.request_id == request_id)
     {
         state.finished_search = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(hash: &str, name: &str) -> SearchResult {
+        SearchResult {
+            file: crate::types::FileInfo {
+                id: hash.to_string(),
+                name: name.to_string(),
+                path: String::new(),
+                size: 1000,
+                hash: hash.to_string(),
+                aich_hash: String::new(),
+                ember_file_hash: String::new(),
+                extension: "mkv".to_string(),
+                modified_at: 0,
+                priority: "normal".to_string(),
+                requests: 0,
+                accepted: 0,
+                bytes_transferred: 0,
+                alltime_requests: 0,
+                alltime_accepted: 0,
+                alltime_transferred: 0,
+                complete_sources: 0,
+                folder: String::new(),
+                shared: false,
+                friends_only: false,
+                shared_kad: false,
+                shared_ed2k: false,
+                shared_ember: false,
+            },
+            peer_id: String::new(),
+            peer_name: String::new(),
+            availability: 1,
+            file_type: String::new(),
+            source_addresses: Vec::new(),
+            rating: None,
+            comment: None,
+            media: None,
+            spam_rating: 0,
+            is_spam: false,
+            clean_name: String::new(),
+            result_origin: crate::search::merge::ORIGIN_SERVER_UDP.to_string(),
+            origin_server_ip: None,
+            spam_reasons: Vec::new(),
+            spam_reason_details: Vec::new(),
+        }
+    }
+
+    fn active(request_id: u64) -> ActiveSearchRequest {
+        ActiveSearchRequest {
+            request_id,
+            server_pending: false,
+            kad_pending: false,
+            udp_pending: true,
+            ember_pending: false,
+            kad_ran: false,
+            ember_ran: false,
+            udp_search_deadline: 0,
+            udp_search_sent_ips: HashSet::new(),
+            ed2k_found_sources: 0,
+            udp_found_sources: 0,
+            ed2k_noted_availability: HashMap::new(),
+            ed2k_noted_complete_sources: HashMap::new(),
+            dht_noted_availability: HashMap::new(),
+            file_type_filter: None,
+            min_size: None,
+            max_size: None,
+            file_extension: None,
+            min_availability: None,
+            keywords: Vec::new(),
+            server_ip: None,
+            server_result_count: 0,
+            streamed_hashes: HashMap::new(),
+            exclude_hashes: HashSet::new(),
+            batch_spam: crate::search::spam::BatchSpamContext::default(),
+            udp_search_expr: Vec::new(),
+            server_has_more: false,
+        }
+    }
+
+    /// The dropped re-sighting's name has to reach the batch context, or a
+    /// hash re-advertised under new names by other servers is never seen as
+    /// "same file, many names".
+    #[test]
+    fn dedup_hands_resighted_names_to_the_batch_context() {
+        let target = "1".repeat(32);
+        let mut request = Some(active(7));
+        let mut first: Vec<SearchResult> = std::iter::once(row(&target, "Original Name Alpha.mkv"))
+            .chain((2..10).map(|i| row(&format!("{i:032x}"), &format!("Unrelated Title {i}.mkv"))))
+            .collect();
+        assert!(dedup_streamed_batch(&mut request, 7, &mut first).is_empty());
+        let a = request.as_mut().unwrap();
+        a.batch_spam.absorb(&first);
+        mark_streamed_hashes(a, &first);
+
+        let mut second = vec![
+            row(&target, "Garden Planner Deluxe.mkv"),
+            row(&target, "Ocean Documentary Series.mkv"),
+            row(&target, "Jazz Piano Collection.mkv"),
+        ];
+        let resights = dedup_streamed_batch(&mut request, 7, &mut second);
+        assert_eq!(resights.len(), 3);
+        assert!(second.is_empty());
+
+        let batch = &mut request.as_mut().unwrap().batch_spam;
+        assert!(batch.has_pending_resights());
+        let prev = batch.colliding_hashes();
+        batch.absorb(&second);
+        let upgrades = batch.upgrade_rows(&prev, &HashSet::new());
+        assert_eq!(
+            upgrades.iter().map(|r| r.file.hash.as_str()).collect::<Vec<_>>(),
+            [target.as_str()]
+        );
+    }
+
+    #[test]
+    fn a_packet_of_only_resightings_runs_only_while_batch_stats_are_on() {
+        let resighted = |batch: &mut crate::search::spam::BatchSpamContext| {
+            batch.note_resighted(&[row(&"2".repeat(32), "Some Title.mkv")]);
+        };
+
+        let mut batch = crate::search::spam::BatchSpamContext::default();
+        assert!(!enrichment_has_work(true, Some(&mut batch), true), "nothing queued, nothing to do");
+        resighted(&mut batch);
+        assert!(enrichment_has_work(true, Some(&mut batch), true));
+        assert!(batch.has_pending_resights(), "kept for the absorb that follows");
+
+        // Filter off or relaxed: the queue is dropped, so it cannot keep an
+        // empty packet running or grow until it caps.
+        assert!(!enrichment_has_work(true, Some(&mut batch), false));
+        assert!(!batch.has_pending_resights());
+        resighted(&mut batch);
+        assert!(enrichment_has_work(false, Some(&mut batch), false), "real rows always run");
+        assert!(!batch.has_pending_resights());
+
+        assert!(!enrichment_has_work(true, None, true));
+        assert!(enrichment_has_work(false, None, false));
     }
 }
