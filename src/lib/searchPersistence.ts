@@ -14,9 +14,15 @@
  */
 import { shedWeakestRows } from '$lib/searchOverflow';
 import { clampFilterBytes, clampMinSources } from '$lib/searchQuery';
-import type { SearchFilters } from '$lib/api/search';
+import {
+  RELATION_KINDS,
+  SEARCH_METHODS,
+  type RelationKind,
+  type SearchFilters,
+  type SearchMethod,
+} from '$lib/api/search';
 import { SEARCH_NOTICES } from '$lib/searchNotices';
-import type { SearchTab } from '$lib/stores/search';
+import type { RelatedSearchInfo, SearchTab } from '$lib/stores/search';
 import type { SearchResult } from '$lib/types';
 
 /** `sessionStorage`, not `localStorage`: a search is something you are in the
@@ -133,11 +139,38 @@ function storedFilters(raw: unknown): SearchFilters | undefined {
   };
 }
 
+/** A stored tab's method. The tab strip and Search again branch on it, so an
+ *  unknown one falls back to the default a search would have used. */
+function storedMethod(raw: unknown): SearchMethod {
+  return SEARCH_METHODS.find((m) => m === raw) ?? 'global';
+}
+
+/**
+ * A stored tab's related-search label, or `undefined` when it is not one.
+ *
+ * The tab strip and its tooltip read every field of it, so a malformed entry
+ * would throw while rendering the strip. Kinds this build does not know are
+ * dropped rather than the whole entry: the labels still say what the tab is.
+ */
+function storedRelated(raw: unknown): RelatedSearchInfo | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.seedLabel !== 'string' || typeof r.queryLabel !== 'string') return undefined;
+  const kinds = Array.isArray(r.kinds)
+    ? r.kinds.filter((k): k is RelationKind => RELATION_KINDS.some((known) => known === k))
+    : [];
+  return { seedLabel: r.seedLabel, queryLabel: r.queryLabel, kinds };
+}
+
 /** Strip a tab to what is worth storing, and to what survives being stored. */
 export function forPersist(tab: SearchTab, limit = PERSIST_MAX_RESULTS): SearchTab {
   const { rows, shed } = rowsWorthStoring(tab.results, limit);
   return {
     ...tab,
+    method: storedMethod(tab.method),
+    fileType: typeof tab.fileType === 'string' && tab.fileType ? tab.fileType : undefined,
+    related: storedRelated(tab.related),
+    error: typeof tab.error === 'string' ? tab.error : null,
     results: rows,
     shed: storedShed(tab.shed),
     // Rows storage leaves out are as gone after a restore as those the cap
@@ -149,6 +182,7 @@ export function forPersist(tab: SearchTab, limit = PERSIST_MAX_RESULTS): SearchT
       ? tab.notices.filter((n) => typeof n === 'string' && SEARCH_NOTICES.has(n))
       : undefined,
     interruption: typeof tab.interruption === 'string' && tab.interruption ? tab.interruption : undefined,
+    startedAt: undefined,
     // A `Map` does not survive JSON, and `mergeIntoTab` rebuilds it from its
     // length check whenever it is missing.
     resultIndex: undefined,
@@ -227,6 +261,8 @@ export function parsePersistedSearch(raw: string | null): PersistedSearch {
   }
   if (!parsed || typeof parsed !== 'object') return { tabs: [], activeId: null };
   const obj = parsed as { tabs?: unknown; activeId?: unknown };
+  // The tab strip is a keyed `{#each}` over the ids, which throws on a repeat.
+  const seenIds = new Set<string>();
   const tabs = (Array.isArray(obj.tabs) ? obj.tabs : [])
     .filter(
       (t): t is SearchTab =>
@@ -236,6 +272,7 @@ export function parsePersistedSearch(raw: string | null): PersistedSearch {
         typeof (t as SearchTab).query === 'string' &&
         Array.isArray((t as SearchTab).results),
     )
+    .filter((t) => !seenIds.has(t.id) && !!seenIds.add(t.id))
     .map((t) => forPersist(t))
     .slice(-PERSIST_MAX_TABS);
   const activeRaw = typeof obj.activeId === 'string' ? obj.activeId : null;

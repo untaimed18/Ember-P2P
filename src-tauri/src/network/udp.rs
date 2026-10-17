@@ -2177,106 +2177,37 @@ pub(super) async fn handle_udp_packet_inner(
             // `Store*` share a target (e.g. FindSource + StoreFile on one file
             // hash): the `Store*` search never issues a SEARCH_*_REQ, so
             // delivering a SEARCH_RES to it would silently swallow results the
-            // real `Find*` search needs. We still never route to a search that
-            // did not query this sender (anti-poisoning, eMule's
+            // real `Find*` search needs. We never route to a search that did
+            // not send this sender a search request (anti-poisoning, eMule's
             // IsOnOutTrackList), and we deliver to every qualifying search so
             // duplicate UI searches on the same keyword don't starve.
-            let sender_ip_port: Option<(Ipv4Addr, u16)> = match from.ip() {
-                std::net::IpAddr::V4(v4) => Some((v4, from.port())),
-                _ => None,
-            };
-
-            // A completed search is still taken until the poll tick finalizes
-            // it. A node answers in several SEARCH_RES packets, and the first
-            // one from the last pending node is what completes the search: the
-            // rest of its answer arrives a few milliseconds later and used to
-            // be turned away here.
-            let mut search_ids: Vec<SearchId> = sender_ip_port
-                .map(|(ip, port)| {
-                    state
-                        .search_manager
-                        .active
-                        .iter()
-                        .filter(|(_, s)| {
-                            s.target == target
-                                && s.search_type.accepts_search_results()
-                                && s.tried.contains_key(&(ip, port))
-                        })
-                        .map(|(id, _)| *id)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-
-            if search_ids.is_empty() {
-                // NAT port-rewrite fallback: match by sender IP only. Same
-                // anti-poisoning and fetch-kind constraints as above.
-                search_ids = sender_ip_port
-                    .map(|(ip, _)| {
-                        state
-                            .search_manager
-                            .active
-                            .iter()
-                            .filter(|(_, s)| {
-                                s.target == target
-                                    && s.search_type.accepts_search_results()
-                                    && s.tried.keys().any(|(tip, _)| *tip == ip)
-                            })
-                            .map(|(id, _)| *id)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+            let recipients = state
+                .search_manager
+                .search_result_recipients(&target, from, &sender_id);
+            if recipients.is_empty() {
+                debug!("  No active search sent this sender a search request for this target");
             }
 
-            if search_ids.is_empty() {
-                debug!("  No active search queried this sender for this target");
-            }
-
-            for sid in search_ids {
-                let resolved_sender_id = sender_ip_port
-                    .and_then(|(ip, port)| {
-                        state.search_manager.active.get(&sid).and_then(|s| {
-                            // Exact (ip, port) first, then any contact from the
-                            // same IP we queried (NAT port rewrite).
-                            s.tried.get(&(ip, port)).copied().or_else(|| {
-                                s.tried
-                                    .iter()
-                                    .find(|((tip, _), _)| *tip == ip)
-                                    .map(|(_, id)| *id)
-                            })
-                        })
-                    })
-                    .or_else(|| {
-                        sender_ip_port.and_then(|(ip, port)| {
-                            state
-                                .routing_table
-                                .all_contacts()
-                                .find(|c| c.ip == ip && c.udp_port == port)
-                                .map(|c| c.id)
-                        })
-                    });
-
-                if let (Some(search), Some(resolved_sender_id)) =
-                    (state.search_manager.get_mut(&sid), resolved_sender_id)
-                {
-                    if sender_id != resolved_sender_id {
-                        debug!(
-                            "SearchRes sender_id mismatch from {from}: embedded={}, resolved={}",
-                            sender_id, resolved_sender_id
-                        );
-                    }
-                    search.handle_search_results(&resolved_sender_id, results.clone());
-                    let unique: std::collections::HashSet<&kad::types::KadId> =
-                        search.results.iter().map(|r| &r.id).collect();
+            for (sid, resolved_sender_id) in recipients {
+                let Some(search) = state.search_manager.get_mut(&sid) else {
+                    continue;
+                };
+                if sender_id != resolved_sender_id {
                     debug!(
-                        "  Search {} now has {} raw / {} unique results (phase={:?})",
-                        sid.0,
-                        search.results.len(),
-                        unique.len(),
-                        search.phase
+                        "SearchRes sender_id mismatch from {from}: embedded={}, resolved={}",
+                        sender_id, resolved_sender_id
                     );
-                } else {
-                    debug!("Ignoring SearchRes from {from}: sender could not be resolved from queried contacts");
                 }
+                search.handle_search_results(&resolved_sender_id, results.clone());
+                let unique: std::collections::HashSet<&kad::types::KadId> =
+                    search.results.iter().map(|r| &r.id).collect();
+                debug!(
+                    "  Search {} now has {} raw / {} unique results (phase={:?})",
+                    sid.0,
+                    search.results.len(),
+                    unique.len(),
+                    search.phase
+                );
             }
         }
 

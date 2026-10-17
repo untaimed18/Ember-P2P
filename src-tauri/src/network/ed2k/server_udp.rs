@@ -918,7 +918,7 @@ fn apply_udp_string_tag(
 ) {
     let value = crate::security::sanitize_remote_text(&value, 8192);
     if name_id == 0x01 {
-        *file_name = value;
+        *file_name = super::server::cap_result_name(value);
         return;
     }
     if value.is_empty() {
@@ -1052,16 +1052,17 @@ fn read_udp_search_tag(
         }
         0x02 => {
             // TAGTYPE_STRING
-            let slen = cursor.read_u16::<LittleEndian>().ok().unwrap_or(0) as usize;
+            let Ok(slen) = cursor.read_u16::<LittleEndian>() else {
+                return false;
+            };
             let start = cursor.position() as usize;
-            let end = start.saturating_add(slen);
+            let end = start.saturating_add(slen as usize);
             if end > payload.len() {
                 false
             } else {
                 let bytes = &payload[start..end];
                 cursor.set_position(end as u64);
-                let keep = &bytes[..bytes.len().min(8192)];
-                let value = String::from_utf8_lossy(keep).to_string();
+                let value = super::server::decode_wire_text(bytes);
                 apply_udp_string_tag(name_id, tag_name, value, file_name, comment, media);
                 true
             }
@@ -1207,7 +1208,7 @@ fn read_udp_search_tag(
             let slen = (t - 0x11 + 1) as usize;
             let mut sbuf = vec![0u8; slen];
             if std::io::Read::read_exact(cursor, &mut sbuf).is_ok() {
-                let value = String::from_utf8_lossy(&sbuf).to_string();
+                let value = super::server::decode_wire_text(&sbuf);
                 apply_udp_string_tag(name_id, tag_name, value, file_name, comment, media);
                 true
             } else {
@@ -1325,26 +1326,28 @@ fn parse_search_results(payload: &[u8], addr: SocketAddr) -> Option<ServerUdpRes
             }
         }
 
-        results.push(ServerSearchResult {
-            file_hash,
-            client_id,
-            client_port,
-            file_name,
-            file_size,
-            source_count,
-            complete_source_count,
-            rating,
-            comment,
-            media,
-        });
-
         // If a tag failed to decode, the cursor is no longer aligned to the
-        // next record. Stop here rather than decoding subsequent "results"
-        // from a mid-tag offset, which would emit garbage entries. The
-        // surplus-tag discard above keeps us aligned on success, so only a
-        // genuine desync forces the break.
+        // next record, and this one has lost whatever followed the bad tag.
+        // Stop here rather than decoding subsequent "results" from a mid-tag
+        // offset, which would emit garbage entries. The surplus-tag discard
+        // above keeps us aligned on success, so only a genuine desync forces
+        // the break.
         if !tags_in_sync {
             break;
+        }
+        if !file_name.is_empty() && file_size != 0 {
+            results.push(ServerSearchResult {
+                file_hash,
+                client_id,
+                client_port,
+                file_name,
+                file_size,
+                source_count,
+                complete_source_count,
+                rating,
+                comment,
+                media,
+            });
         }
 
         // eMule UDPSocket.cpp OP_GLOBSEARCHRES: multi-result datagrams may
@@ -1550,13 +1553,15 @@ mod tests {
 
         let mut packet = vec![OP_GLOBSEARCHRES];
 
-        // Record A: 300 tags (over the 256 cap), each a minimal 3-byte
-        // "short name" TAGTYPE_UINT8 tag (raw_type=0x80|0x09, name_id, value).
+        // Record A: a name and a size, then 300 more tags (over the 256 cap),
+        // each a minimal 3-byte "short name" TAGTYPE_UINT8 tag
+        // (raw_type=0x80|0x09, name_id, value).
         packet.extend_from_slice(&hash_a);
         packet.extend_from_slice(&1234u32.to_le_bytes()); // client_id
         packet.extend_from_slice(&4662u16.to_le_bytes()); // client_port
         const SURPLUS_TAG_COUNT: u32 = 300;
-        packet.extend_from_slice(&SURPLUS_TAG_COUNT.to_le_bytes());
+        packet.extend_from_slice(&(SURPLUS_TAG_COUNT + 2).to_le_bytes());
+        push_name_and_size(&mut packet, b"many tags.bin");
         for _ in 0..SURPLUS_TAG_COUNT {
             packet.push(0x80 | 0x09); // short-name TAGTYPE_UINT8
             packet.push(0xEE); // arbitrary unrecognized name_id
@@ -1569,12 +1574,8 @@ mod tests {
         packet.extend_from_slice(&hash_b);
         packet.extend_from_slice(&5678u32.to_le_bytes()); // client_id
         packet.extend_from_slice(&4663u16.to_le_bytes()); // client_port
-        packet.extend_from_slice(&1u32.to_le_bytes()); // tag_count
-        packet.push(0x80 | 0x02); // short-name TAGTYPE_STRING
-        packet.push(0x01); // name_id = FT_FILENAME
-        let name = b"test.txt";
-        packet.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        packet.extend_from_slice(name);
+        packet.extend_from_slice(&2u32.to_le_bytes()); // tag_count
+        push_name_and_size(&mut packet, b"test.txt");
 
         let parsed = parse_server_udp_response(&packet, addr).unwrap();
         match parsed {
@@ -1595,15 +1596,23 @@ mod tests {
         }
     }
 
-    fn push_minimal_search_record(packet: &mut Vec<u8>, hash: &[u8; 16], name: &[u8]) {
-        packet.extend_from_slice(hash);
-        packet.extend_from_slice(&1234u32.to_le_bytes());
-        packet.extend_from_slice(&4662u16.to_le_bytes());
-        packet.extend_from_slice(&1u32.to_le_bytes()); // tag_count
+    /// FT_FILENAME, then FT_FILESIZE (1000): the two tags every kept record has.
+    fn push_name_and_size(packet: &mut Vec<u8>, name: &[u8]) {
         packet.push(0x80 | 0x02); // short-name TAGTYPE_STRING
         packet.push(0x01); // FT_FILENAME
         packet.extend_from_slice(&(name.len() as u16).to_le_bytes());
         packet.extend_from_slice(name);
+        packet.push(0x80 | 0x03); // short-name TAGTYPE_UINT32
+        packet.push(0x02); // FT_FILESIZE
+        packet.extend_from_slice(&1000u32.to_le_bytes());
+    }
+
+    fn push_minimal_search_record(packet: &mut Vec<u8>, hash: &[u8; 16], name: &[u8]) {
+        packet.extend_from_slice(hash);
+        packet.extend_from_slice(&1234u32.to_le_bytes());
+        packet.extend_from_slice(&4662u16.to_le_bytes());
+        packet.extend_from_slice(&2u32.to_le_bytes()); // tag_count
+        push_name_and_size(packet, name);
     }
 
     #[test]
@@ -1644,13 +1653,8 @@ mod tests {
         packet.extend_from_slice(&hash);
         packet.extend_from_slice(&1u32.to_le_bytes());
         packet.extend_from_slice(&4662u16.to_le_bytes());
-        packet.extend_from_slice(&3u32.to_le_bytes()); // filename + sources + complete
-                                                       // FT_FILENAME
-        packet.push(0x80 | 0x02);
-        packet.push(0x01);
-        let name = b"movie.mkv";
-        packet.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        packet.extend_from_slice(name);
+        packet.extend_from_slice(&4u32.to_le_bytes()); // filename + size + sources + complete
+        push_name_and_size(&mut packet, b"movie.mkv");
         // FT_SOURCES = 0x15 as UINT32
         packet.push(0x80 | 0x03);
         packet.push(0x15);
@@ -1669,6 +1673,98 @@ mod tests {
                 assert_eq!(results[0].file_name, "movie.mkv");
             }
             other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    fn udp_result_header(tag_count: u32) -> Vec<u8> {
+        let mut packet = vec![OP_GLOBSEARCHRES];
+        packet.extend_from_slice(&[0xCDu8; 16]);
+        packet.extend_from_slice(&1u32.to_le_bytes());
+        packet.extend_from_slice(&4662u16.to_le_bytes());
+        packet.extend_from_slice(&tag_count.to_le_bytes());
+        packet
+    }
+
+    #[test]
+    fn a_string_tag_cut_off_before_its_length_fails_the_record() {
+        let addr: SocketAddr = "127.0.0.1:4665".parse().unwrap();
+        // FT_FILESIZE, then an FT_FILENAME whose u16 length is one byte short.
+        let mut packet = udp_result_header(2);
+        packet.push(0x80 | 0x03);
+        packet.push(0x02);
+        packet.extend_from_slice(&1234u32.to_le_bytes());
+        packet.push(0x80 | 0x02);
+        packet.push(0x01);
+        packet.push(0x05);
+
+        let tail = &packet[1 + 16 + 4 + 2 + 4..];
+        let mut cursor = Cursor::new(tail);
+        let (mut name, mut size, mut sources, mut complete) = (String::new(), 0u64, 0u32, 0u32);
+        let (mut rating, mut comment) = (None, None);
+        let mut media = crate::types::MediaMetadata::default();
+        let mut read = || {
+            read_udp_search_tag(
+                &mut cursor,
+                tail,
+                &mut name,
+                &mut size,
+                &mut sources,
+                &mut complete,
+                &mut rating,
+                &mut comment,
+                &mut media,
+            )
+        };
+        assert!(read(), "the size tag is whole");
+        assert!(!read(), "a missing string length is a failed read, not an empty name");
+
+        // The broken record is dropped, and the parser stops there rather
+        // than reading on from a mid-tag offset.
+        let mut chained = packet.clone();
+        chained.extend_from_slice(&udp_result_header(2)[1..]);
+        push_name_and_size(&mut chained, b"after.avi");
+        assert!(parse_server_udp_response(&chained, addr).is_none());
+
+        // A record read whole but naming no file, or no size, is dropped too;
+        // the ones after it are still read.
+        let mut packet = udp_result_header(1);
+        packet.extend_from_slice(&[0x80 | 0x03, 0x02]);
+        packet.extend_from_slice(&1234u32.to_le_bytes());
+        packet.extend_from_slice(&udp_result_header(1)[1..]);
+        packet.extend_from_slice(&[0x80 | 0x02, 0x01, 0x04, 0x00]);
+        packet.extend_from_slice(b"a.gz");
+        packet.extend_from_slice(&udp_result_header(2)[1..]);
+        push_name_and_size(&mut packet, b"whole.avi");
+        match parse_server_udp_response(&packet, addr) {
+            Some(ServerUdpResponse::SearchResult { results, .. }) => {
+                assert_eq!(
+                    results.iter().map(|r| r.file_name.as_str()).collect::<Vec<_>>(),
+                    ["whole.avi"]
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn udp_names_decode_and_cap_like_tcp_ones() {
+        let addr: SocketAddr = "127.0.0.1:4665".parse().unwrap();
+        let long = format!("{}.avi", "n".repeat(3000));
+        for (raw, expected) in [
+            (b"Fran\xE7ais.mp3".to_vec(), "Français.mp3".to_string()),
+            (
+                long.into_bytes(),
+                format!("{}.avi", "n".repeat(super::super::server::MAX_RESULT_NAME_CHARS - 4)),
+            ),
+        ] {
+            let mut packet = udp_result_header(2);
+            push_name_and_size(&mut packet, &raw);
+            match parse_server_udp_response(&packet, addr) {
+                Some(ServerUdpResponse::SearchResult { results, .. }) => {
+                    assert_eq!(results[0].file_name, expected);
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
         }
     }
 

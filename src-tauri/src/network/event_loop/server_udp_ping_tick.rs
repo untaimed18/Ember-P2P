@@ -542,7 +542,12 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
                     state.server_list.record_udp_reply(&ip_str, tcp_port);
 
                     debug!("UDP search returned {} results from {addr}", results.len());
-                    let search_results: Vec<SearchResult> = results.iter().map(|sr| {
+                    let search_results: Vec<SearchResult> = results.iter().filter(|sr| {
+                        state
+                            .active_search_request
+                            .as_ref()
+                            .is_none_or(|a| a.reply_row_matches(&sr.file_name))
+                    }).map(|sr| {
                         let hash_hex = hex::encode(sr.file_hash);
                         let extension = sr.file_name
                             .rsplit_once('.')
@@ -614,6 +619,12 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
                             spam_reason_details: Vec::new(),
                         }
                     }).collect();
+                    if search_results.len() < results.len() {
+                        debug!(
+                            "Dropped {} UDP row(s) from {addr} sharing no keyword with the search",
+                            results.len() - search_results.len()
+                        );
+                    }
                     // Extracted into owned values (rather than an `as_ref()`
                     // binding kept alive across the call below) so the
                     // `dedup_streamed_batch` call can take `active_search_request`
@@ -639,13 +650,37 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
                         kws,
                     )) = active_ctx
                     {
-                        state.server_udp_search_age = 0;
+                        // Rows answering another search are no reason to keep
+                        // waiting on this one's stragglers.
+                        if !search_results.is_empty() {
+                            state.server_udp_search_age = 0;
+                        }
                         let mut search_results = search_results;
                         let resights = dedup_streamed_batch(
                             &mut state.active_search_request,
                             request_id,
                             &mut search_results,
                         );
+                        let skip_hashes = {
+                            let idx = local_index.read().await;
+                            let mgr = transfer_manager.read().await;
+                            owned_or_downloading_search_hashes(
+                                search_results
+                                    .iter()
+                                    .chain(resights.iter())
+                                    .map(|r| r.file.hash.as_str()),
+                                &idx,
+                                &mgr,
+                                &state.pending_downloads,
+                            )
+                        };
+                        if let Some(active) = state
+                            .active_search_request
+                            .as_mut()
+                            .filter(|a| a.request_id == request_id)
+                        {
+                            note_ed2k_batch_availability(active, &mut search_results, &skip_hashes);
+                        }
                         let mut batch_spam = take_search_batch_spam(state, request_id);
                         let udp_server_ip = addr.ip().to_string();
                         let emitted = enrich_and_emit_search_results(
@@ -665,27 +700,9 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
                             Some(&mut batch_spam),
                         ).await;
                         store_search_batch_spam(state, request_id, batch_spam);
-                        let skip_hashes = {
-                            let idx = local_index.read().await;
-                            let mgr = transfer_manager.read().await;
-                            owned_or_downloading_search_hashes(
-                                emitted
-                                    .iter()
-                                    .chain(resights.iter())
-                                    .map(|r| r.file.hash.as_str()),
-                                &idx,
-                                &mgr,
-                                &state.pending_downloads,
-                            )
-                        };
                         if let Some(active) = state.active_search_request.as_mut() {
                             if active.request_id == request_id {
                                 mark_streamed_hashes(active, &emitted);
-                                let _ = note_ed2k_search_results(
-                                    active,
-                                    &emitted,
-                                    &skip_hashes,
-                                );
                                 emit_search_resight_updates(
                                     app_handle,
                                     request_id,

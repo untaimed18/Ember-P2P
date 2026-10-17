@@ -71,7 +71,7 @@ pub fn result_matches_client_filters(
         }
     }
     if let Some(ext) = file_extension {
-        let want = ext.trim_start_matches('.').to_lowercase();
+        let want = ext.trim().trim_start_matches('.').to_lowercase();
         if !want.is_empty() {
             let got = r.file.extension.trim_start_matches('.').to_lowercase();
             if got != want {
@@ -360,14 +360,13 @@ fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {
     // library's name when the user holds the file and otherwise elects one by
     // vote (see `NameVotes`). Keep the name we already have until then.
     //
-    // That vote is between network rows only, not "every source that
-    // advertised this hash" as this used to say: its only caller receives
-    // results that `convert_search_results` has already collapsed to one row
-    // per hash, and eD2K server hits never reach it at all.
-    // Across DHT publishers the name is still decided upstream by
-    // `name_spam_penalty`, which a responder can steer by choosing a name that
-    // scores lower than the honest one — better than the old "longest wins", but
-    // not a cross-source majority.
+    // That vote is between network rows only, not between every source that
+    // advertised the hash: its only caller receives results that
+    // `convert_search_results` has already collapsed to one row per hash, and
+    // eD2K server hits never reach it at all. Across DHT publishers the name
+    // is decided upstream by `name_spam_penalty`, which a responder can steer
+    // by choosing a name that scores lower than the honest one; it is not a
+    // cross-source majority.
     if existing.file.name.is_empty() && !incoming.file.name.is_empty() {
         existing.file.name = incoming.file.name;
     }
@@ -762,6 +761,12 @@ mod tests {
             None,
             None
         ));
+        for typed in [" bin", "bin ", ".BIN", " .bin "] {
+            assert!(
+                result_matches_client_filters(&r, None, None, None, Some(typed), None),
+                "{typed:?}"
+            );
+        }
     }
 
     /// A zero size bound is how every other layer spells "no bound", so this
@@ -968,7 +973,7 @@ mod tests {
     /// divergences stay out of it: the frontend takes `max` for both source
     /// counts where `merge_into` sums them across ed2k replies — the backend
     /// has already summed within a network, and emits the absolute running
-    /// total (`ed2k_noted_availability` / `ed2k_noted_complete_sources`), so a
+    /// total (`ActiveSearchRequest::ed2k_noted_sources`), so a
     /// second sum over the batches would double it — it keeps the first name
     /// where `merge_search_vecs` elects one by vote, and both sides cap
     /// `source_addresses` at `MAX_SOURCE_ADDRS`.

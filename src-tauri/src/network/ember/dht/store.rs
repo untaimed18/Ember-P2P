@@ -412,11 +412,21 @@ pub struct DhtRecord {
     /// record as *just* republished — the exact opposite of due, and silently,
     /// on what is the common desktop case.
     pub republish_due: bool,
-    /// Every key a word of the record's name hashes to, worked out the first
+    /// The keys the words of the record's name hash to, worked out the first
     /// time a multi-keyword `FIND_VALUE` asks and kept for the life of the
-    /// record. Never persisted: it is derived from `data` alone.
+    /// record, at most [`MAX_NAME_KEYS_PER_RECORD`] of them. Never persisted:
+    /// it is derived from `data` alone.
     pub name_keys: std::sync::OnceLock<Box<[[u8; 16]]>>,
 }
+
+/// Name keys a stored record keeps (see [`DhtRecord::name_keys`]).
+///
+/// The cache sits outside the byte accounting every other part of a record is
+/// charged to, and a name long enough to fill its record has a few hundred
+/// words, in up to three spellings. The earliest words are kept: a record whose
+/// name carries a query's other words past them is still served, after the
+/// records known to carry them.
+pub const MAX_NAME_KEYS_PER_RECORD: usize = 64;
 
 impl DhtRecord {
     /// [`Self::name_keys`], computed on first use.
@@ -424,9 +434,9 @@ impl DhtRecord {
         self.name_keys.get_or_init(|| {
             super::publish::name_bytes_from_record_data(&self.data)
                 .map(|name| {
-                    super::search::name_word_keys(&String::from_utf8_lossy(name))
-                        .into_iter()
-                        .collect()
+                    let mut keys = super::search::name_word_key_list(&String::from_utf8_lossy(name));
+                    keys.truncate(MAX_NAME_KEYS_PER_RECORD);
+                    keys.into_boxed_slice()
                 })
                 .unwrap_or_default()
         })
@@ -4278,5 +4288,38 @@ mod tests {
         assert!(removed >= 32);
         let batch = store.take_republish_batch(Duration::from_secs(0), 16, true);
         assert!(!batch.is_empty());
+    }
+
+    /// A record keeps the keys of its earliest words only, however long its
+    /// name.
+    #[test]
+    fn a_record_caches_a_bounded_number_of_name_keys() {
+        let sk = SigningKey::from_bytes(&[0x4E; 32]);
+        let words: String = (0..300).map(|i| format!("word{i:03} ")).collect();
+        let rec = super::super::publish::SignedRecord::keyword(
+            "word000",
+            [1; 16],
+            [0; 32],
+            1,
+            &format!("{words}tail.iso"),
+            &sk,
+        );
+        let record = DhtRecord {
+            data: rec.data.clone(),
+            signature: rec.signature,
+            publisher_key: sk.verifying_key().to_bytes(),
+            stored_at: Instant::now(),
+            created_at: now_ts(),
+            attributed_ip: None,
+            expires_at_unix: now_ts() + 3600,
+            last_republished: Instant::now(),
+            republish_due: false,
+            name_keys: std::sync::OnceLock::new(),
+        };
+        let keys = record.name_keys();
+        assert_eq!(keys.len(), MAX_NAME_KEYS_PER_RECORD);
+        assert!(keys.contains(&super::super::search::keyword_hash("word000")));
+        assert!(keys.contains(&super::super::search::keyword_hash("word063")));
+        assert!(!keys.contains(&super::super::search::keyword_hash("word064")));
     }
 }

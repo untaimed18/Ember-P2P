@@ -4,6 +4,7 @@ import {
   filterSwitcherRows,
   foldForSearch,
   searchNeedle,
+  splitFoldedHighlights,
   switcherMatch,
 } from './dockSearch';
 
@@ -16,6 +17,45 @@ describe('foldForSearch', () => {
   it('strips accents and case', () => {
     expect(foldForSearch('José')).toBe('jose');
     expect(foldForSearch('ÅNGSTRÖM')).toBe('angstrom');
+  });
+
+  it('keeps the marks that are part of a letter', () => {
+    // Dakuten: が is not か, nor ぱ は.
+    expect(foldForSearch('がぱ')).toBe('がぱ');
+    // Devanagari and Thai vowel signs.
+    expect(foldForSearch('हिंदी')).toBe('हिंदी');
+    expect(foldForSearch('ภาษาไทย')).toBe('ภาษาไทย');
+  });
+
+  it('gives back composed text', () => {
+    expect(foldForSearch('Cafe\u0301 が')).toBe('cafe が');
+    expect(foldForSearch('か\u3099')).toBe('が');
+  });
+});
+
+describe('splitFoldedHighlights', () => {
+  it('marks an accented name for an unaccented term, in the original letters', () => {
+    expect(splitFoldedHighlights('Ana José Ruiz', ['jose'])).toEqual([
+      { text: 'Ana ', mark: false },
+      { text: 'José', mark: true },
+      { text: ' Ruiz', mark: false },
+    ]);
+  });
+
+  it('marks an unaccented name for an accented term', () => {
+    expect(splitFoldedHighlights('jose.mp3', ['josé'])).toEqual([
+      { text: 'jose', mark: true },
+      { text: '.mp3', mark: false },
+    ]);
+  });
+
+  it('falls back to a plain match when folding changes the length', () => {
+    // Decomposed input: NFC shortens it, so folded positions would drift.
+    expect(splitFoldedHighlights('Jose\u0301 jose', ['jose'])).toEqual([
+      { text: 'Jose', mark: true },
+      { text: '\u0301 ', mark: false },
+      { text: 'jose', mark: true },
+    ]);
   });
 });
 

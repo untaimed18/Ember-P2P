@@ -9,6 +9,7 @@ import {
 } from '$lib/api/search';
 import { addToast } from '$lib/stores/toast';
 import { translateError } from '$lib/i18n';
+import { formatNumber } from '$lib/utils';
 import * as m from '$lib/paraglide/messages';
 
 /**
@@ -41,6 +42,10 @@ export type PendingRelatedSearch = {
  */
 export const RELATED_SEARCH_METHOD: SearchMethod = 'server';
 
+/** The most files one related search plans from: `MAX_RELATED_SEEDS` in
+ *  `commands/search.rs`, which refuses the whole plan past it. */
+export const MAX_RELATED_SEEDS = 16;
+
 /** Set by [`startRelatedSearch`], consumed once by the search page. */
 export const pendingRelatedSearch = writable<PendingRelatedSearch | null>(null);
 
@@ -65,7 +70,8 @@ export function relationKindLabel(kind: RelationKind): string {
  *
  * Returns `true` when a search was started. Failures are reported as a toast
  * (the caller is a context-menu click, which has nowhere else to put an error)
- * and return `false`.
+ * and return `false`. Past `MAX_RELATED_SEEDS` files, the first that many are
+ * used, and a toast says so.
  */
 export async function startRelatedSearch(seeds: RelatedSeed[]): Promise<boolean> {
   const usable = seeds.filter((s) => (s.hash ?? '').trim() !== '' || (s.name ?? '').trim() !== '');
@@ -76,11 +82,17 @@ export async function startRelatedSearch(seeds: RelatedSeed[]): Promise<boolean>
 
   let plan: RelatedPlan;
   try {
-    plan = await planRelatedSearch(usable);
+    plan = await planRelatedSearch(usable.slice(0, MAX_RELATED_SEEDS));
   } catch (e: unknown) {
     console.error('Failed to plan related search:', e);
     addToast('warning', translateError(e, m.search_related_nothing_to_search()));
     return false;
+  }
+  if (usable.length > MAX_RELATED_SEEDS) {
+    addToast('info', m.search_related_seed_limit({
+      max: formatNumber(MAX_RELATED_SEEDS),
+      count: formatNumber(usable.length),
+    }));
   }
 
   pendingRelatedSearch.set({ plan });

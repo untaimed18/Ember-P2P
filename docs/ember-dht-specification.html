@@ -1506,10 +1506,12 @@ footer.doc-end {
   whose name fills the budget to the derivation, nor to carrying its key’s own
   word.</li>
   <li><strong>Searching</strong> (<code>compute_keyword_hashes</code>) walks the
-  normalised key of the query’s primary word. When the query as typed hashes
-  its primary word elsewhere (<code>legacy_keyword_hashes</code>), the search
-  also runs a second walk to that key and reports the two together, so it still
-  finds publishers that predate normalisation and wrote the same spelling.</li>
+  normalised key of the query’s primary word. When that same word, as typed,
+  hashes elsewhere (<code>legacy_keyword_hashes</code>), the search also runs a
+  second walk to that key and reports the two together, so it still finds
+  publishers that predate normalisation and wrote the same spelling. The second
+  walk is on the word the first one walks, whichever word is longest as typed;
+  the other words of an <code>OR</code> are walked as branches (§8.2).</li>
   <li><strong>Matching a name</strong> (<code>name_hashes_to_key</code>,
   <code>name_word_keys</code>) accepts either form of each word.</li>
 </ul>
@@ -1716,6 +1718,10 @@ footer.doc-end {
   <li>A FOUND_VALUE carries no contacts, and a node holding even one record under the key answers with records alone, so a walk whose nearest hops all hold something would never learn of the replicas closer still. A node that answers a first FIND_VALUE with records, and is among the k closest entries that have not failed, is therefore also sent one <code>FIND_NODE</code> for the target — a <em>referral</em> — and the contacts it names join the shortlist as from any FOUND_NODE. Every version answers FIND_NODE, so this needs nothing of the responder. A referral is not retried, and losing one is not held against the node, which has just answered.</li>
   <li>A timed-out first query is charged to the routing table only when the table holds that node at the address and Noise key the search dialled. A FOUND_NODE may pair a real node’s id with an address that goes nowhere; charging the id alone let its sender evict honest contacts.</li>
   <li>FIND_NODE converges once the k closest entries that have not failed have all answered, α consecutive responses have brought nothing closer, and at least k/2 nodes have answered. FIND_VALUE does <em>not</em> use this rule: every extra node is another chance at a record the closer ones did not hold. The walk continues until the shortlist is exhausted, the 300-result budget is full, or 60 seconds elapse.</li>
+  <li>A user keyword search also ends once the k closest entries that have not failed have all answered, every pinned session peer has answered or failed, no page or referral is owed, and no new record has been taken for 5 seconds. Records live on the k nodes closest to their key, so what is left past that point is farther nodes — mostly verified seeds the trim keeps — that seldom hold anything, and walking them to exhaustion can take most of the 60 seconds, holding the search’s completion that long. Source, channel and other value lookups still exhaust their shortlist.</li>
+  <li>A FIND_VALUE carries the search’s extra keys (§8.2) and its constraints to every pinned session peer, and to every other node that is among the k closest entries that have not failed when it is first asked — which includes the whole opening round and every hop of the descent. A node outside them when first asked, typically a far seed the trim kept and asked once the neighbourhood is done, is sent the primary key alone, and its page follow-ups are too, since their offsets count records of that first query. The primary key is the walk’s target and goes to every hop either way; the rest of the query does not. A pinned peer is asked in full wherever it sorts, because it is asked for records of its own. Every version answers a one-key FIND_VALUE.</li>
+  <li>A user keyword search drops any record under its key that is not a keyword record as it arrives, before it is charged to the 300-result budget or earns a page. The other value lookups take every record type.</li>
+  <li>A walk left with unasked entries and nothing outstanding — its driver gives up after a run of batches it could not dial — is driven again on the next 1-second sweep, rather than idling until its timeout.</li>
 </ul>
 
 <table class="data">
@@ -1723,6 +1729,7 @@ footer.doc-end {
   <tbody>
     <tr><td>MAX_ACTIVE_SEARCHES</td><td>64</td></tr>
     <tr><td>SEARCH_TIMEOUT_SECS</td><td>60</td></tr>
+    <tr><td>KEYWORD_SETTLE_SECS</td><td>5</td></tr>
     <tr><td>MAX_SEARCH_RESULTS</td><td>300</td></tr>
     <tr><td>MAX_LOCAL_SEED_RESULTS</td><td>150 (half the budget)</td></tr>
     <tr><td>MAX_RESULTS_PER_NODE</td><td>75 (quarter of the budget)</td></tr>
@@ -1746,7 +1753,9 @@ footer.doc-end {
   three-letter token counted as a word. Secondary keys live near other ids, so
   the node closest to the primary rarely holds them; the name is what lets the
   match be made there. The words of each stored record’s name are worked out
-  once, on first use, and kept with the record.
+  once, on first use, and kept with the record — at most 64 keys, earliest words
+  first, so a record whose name carries the other words only past them is served
+  after the matches rather than among them.
 </p>
 <p>
   Ordering rather than filtering is for searchers that predate it. They filter
@@ -1771,6 +1780,29 @@ footer.doc-end {
   rules, so 1- and 2-byte tokens never become DHT keys.
 </p>
 <p>
+  A search walks a term every match contains. A query with none — the sides of
+  an <code>OR</code> share no term — walks its longest positive term, which
+  finds only the branches containing it, so each branch that does not is walked
+  as well, up to three branches in all. A branch’s other terms are in every file
+  it matches, so its walk sends them as extra keys; branches sharing a key share
+  one walk and send only the extra keys they have in common. A branch is also
+  walked once under its spelling as typed where that hashes elsewhere (§7.1).
+  No two walks of one search share a key, a search runs at most four walks
+  besides its own, and those walks leave the pool’s last four slots free for the
+  next search. Each hands its records to the search when it ends, as the second
+  walk of §7.1 does.
+</p>
+<p>
+  The records for one file are folded into one row per size, as every other
+  network’s rows are kept apart by size. The file’s digest votes, and with them
+  the publishers it counts, are taken across all its sizes, since one file has
+  one content digest; each size’s row counts the counted publishers giving that
+  size, one per publisher by its first record. A row’s name is the one most of
+  those publishers give, a tie going to the record that arrived first; the type
+  follows the name, and the media is that record’s, or else the first any of
+  them carries.
+</p>
+<p>
   The Search page exposes an <strong>Ember Only</strong> method. <strong>Global</strong>
   queries Ember alongside KAD and servers, merging into one de-duplicated
   list. With KAD and eD2K both offline, Global falls back to Ember alone.
@@ -1792,8 +1824,23 @@ footer.doc-end {
   is a total rather than an increment. A row counts the publishers that agree
   with its plurality digest, which no slice of the records can know, so slices
   counted separately and added up over-counted in a way the closing batch could
-  not take back. A search’s second walk (§7.1) streams with it: its records are
-  part of each rebuild while it runs, and join the search’s own when it ends.
+  not take back. A row is first streamed once two publishers give it, or at the
+  rebuild after the one that first built it, a sweep later at most: the page
+  keeps the name a row first arrives with, so a row sent off a lone first record
+  would keep whatever that record says. The closing batch carries every row.
+  Each rebuild reads only the records gathered since the last one and folds the
+  rows from what it read, so a record is parsed and matched once per search.
+  A search’s second walk (§7.1) and its <code>OR</code> branch
+  walks (§8.2) stream with it: their records are part of each rebuild while they
+  run, and join the search’s own when they end. The search reports complete only
+  once every one of them has.
+</p>
+<p>
+  The progress figure a running search shows counts the rows that reached the
+  page — accepted by the type, size, extension and availability filters, or
+  already shown by another network and found again — not the rows built. Its
+  count of nodes contacted is every node any of the search’s walks has asked,
+  and does not fall when a walk ends and hands its records over.
 </p>
 <p>
   Batches run through hash de-duplication against what KAD already streamed,

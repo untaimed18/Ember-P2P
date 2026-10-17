@@ -4501,7 +4501,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // `SpamFilter::save_gate` with IPC mark_spam saves so the two
                 // paths cannot overwrite each other out of order.
                 let needs_spam_save = if !spam_save_in_flight {
-                    spam_filter.read().await.is_dirty()
+                    spam_filter.read().await.has_unsaved_changes()
                 } else {
                     false
                 };

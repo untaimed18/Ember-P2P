@@ -373,10 +373,124 @@ pub(super) fn owned_or_downloading_search_hashes(
     owned
 }
 
-/// Record ed2k (TCP/UDP) result availability toward the global-search cap.
-/// UDP re-sights **sum** availability (cross-server); TCP/Server re-sights use
-/// **max** (OP_QUERY_MORE can re-list the same sources). Only the spam-capped
-/// contribution *delta* is added to `ed2k_found_sources`.
+/// Per-file state one search keeps, keyed by hash and size.
+///
+/// A hash is public, so a reply can pair a real one with any size it likes;
+/// here, as in the merge (`search::merge::merge_search_vecs`), each size is a
+/// file of its own, so a row with a made-up size neither borrows the real
+/// file's counts nor adds to them. A row of size 0 says nothing about the size
+/// and joins the first sized entry for its hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PerFile<V> {
+    entries: HashMap<(String, u64), V>,
+    first_size: HashMap<String, u64>,
+}
+
+impl<V> Default for PerFile<V> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            first_size: HashMap::new(),
+        }
+    }
+}
+
+impl<V: Default> PerFile<V> {
+    fn key(&self, hash: &str, size: u64) -> (String, u64) {
+        let size = match size {
+            0 => self.first_size.get(hash).copied().unwrap_or(0),
+            size => size,
+        };
+        (hash.to_string(), size)
+    }
+
+    pub(super) fn get(&self, hash: &str, size: u64) -> Option<&V> {
+        self.entries.get(&self.key(hash, size))
+    }
+
+    /// Files tracked.
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(super) fn values(&self) -> impl Iterator<Item = &V> {
+        self.entries.values()
+    }
+
+    /// The entry for a file and whether it was already there, created unless
+    /// `cap` files are already tracked.
+    fn tracked_mut(&mut self, hash: &str, size: u64, cap: usize) -> Option<(&mut V, bool)> {
+        if size != 0 && !self.first_size.contains_key(hash) {
+            // An entry kept for the hash before any size was known is this
+            // file's: the first sized row is the one an unknown size joins.
+            if let Some(unsized_entry) = self.entries.remove(&(hash.to_string(), 0)) {
+                self.entries.insert((hash.to_string(), size), unsized_entry);
+            }
+            if self.entries.len() < cap || self.entries.contains_key(&(hash.to_string(), size)) {
+                self.first_size.insert(hash.to_string(), size);
+            }
+        }
+        let key = self.key(hash, size);
+        let existed = self.entries.contains_key(&key);
+        if !existed && self.entries.len() >= cap {
+            return None;
+        }
+        Some((self.entries.entry(key).or_default(), existed))
+    }
+}
+
+/// One file's ed2k source count across the servers that reported it.
+///
+/// The UDP sweep asks each of the other servers once, so their counts add up.
+/// The connected server is one server, and its "More" pages re-list what it
+/// already said, so it counts with the largest figure it gave. The file's
+/// total is both together.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Ed2kSourceCount {
+    udp: u32,
+    tcp: u32,
+}
+
+impl Ed2kSourceCount {
+    fn note(&mut self, incoming: u32, from_udp: bool) {
+        let incoming = crate::search::merge::clamp_source_count(incoming);
+        if from_udp {
+            self.udp = crate::search::merge::clamp_source_count(self.udp.saturating_add(incoming));
+        } else {
+            self.tcp = self.tcp.max(incoming);
+        }
+    }
+
+    pub(super) fn total(self) -> u32 {
+        crate::search::merge::clamp_source_count(self.udp.saturating_add(self.tcp))
+    }
+}
+
+/// The running ed2k totals for one file: its sources and, on the same rule
+/// because eMule's `AddCompleteSources` is `AddSources` with a different tag,
+/// its complete sources.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Ed2kNotedSources {
+    pub(super) sources: Ed2kSourceCount,
+    pub(super) complete: Ed2kSourceCount,
+}
+
+fn is_udp_server_row(r: &SearchResult) -> bool {
+    crate::search::merge::is_ed2k_network_origin(&r.result_origin)
+        && r.result_origin
+            .split('·')
+            .any(|p| p.trim() == crate::search::merge::ORIGIN_SERVER_UDP)
+}
+
+/// Record ed2k (TCP/UDP) result availability toward the global-search cap
+/// (see [`Ed2kSourceCount`] for how the servers' counts combine). Only the
+/// spam-capped contribution *delta* is added to `ed2k_found_sources`.
 ///
 /// `skip_hashes` are shared/downloading files (eMule `AddResultCount`): their
 /// availability is still tracked for UI resights, but they do not advance the
@@ -387,10 +501,7 @@ pub(super) fn note_ed2k_search_results(
     skip_hashes: &HashSet<String>,
 ) -> bool {
     for r in results {
-        let from_udp = crate::search::merge::is_ed2k_network_origin(&r.result_origin)
-            && r.result_origin
-                .split('·')
-                .any(|p| p.trim() == crate::search::merge::ORIGIN_SERVER_UDP);
+        let from_udp = is_udp_server_row(r);
         if r.file.hash.is_empty() {
             let contribution = ed2k_result_source_contribution(r.availability);
             active.ed2k_found_sources = active.ed2k_found_sources.saturating_add(contribution);
@@ -402,49 +513,38 @@ pub(super) fn note_ed2k_search_results(
         let skip_count = skip_hashes.contains(&r.file.hash);
         // Bounded exactly as `streamed_hashes` and `dht_noted_availability`
         // are, and for the reason they are: a global sweep of every server in
-        // the list can answer with far more distinct hashes than any user will
-        // look at, and these two maps were the only per-hash state in a search
-        // with nothing above them. A file already being tracked keeps
-        // accumulating; a new one past the cap simply goes untracked and
-        // carries its own slice, which beats abandoning the totals outright.
+        // the list can answer with far more distinct files than any user will
+        // look at. A file already being tracked keeps accumulating; a new one
+        // past the cap simply goes untracked and carries its own slice, which
+        // beats abandoning the totals outright.
         //
-        // One gate for both maps: every row writes to each of them, so their
-        // key sets are the same and splitting the decision could only let them
-        // disagree about a hash.
-        let tracked = active.ed2k_noted_availability.len() < MAX_STREAMED_HASHES_SOFT_CAP
-            || active
-                .ed2k_noted_availability
-                .contains_key(&r.file.hash);
-        let prev = active.ed2k_noted_availability.get(&r.file.hash).copied();
-        // A UDP reply is a different server than the last one that reported this
-        // file, so its sources add; a TCP "More" re-list is the same server
-        // repeating itself, so its figure replaces.
-        let sum_incoming = from_udp;
-        let (new_avail, old_contrib) = match prev {
-            Some(p) => {
-                let merged = crate::search::merge::clamp_source_count(if sum_incoming {
-                    p.saturating_add(r.availability)
-                } else {
-                    p.max(r.availability)
-                });
-                (merged, ed2k_result_source_contribution(p))
-            }
-            None => (
-                crate::search::merge::clamp_source_count(r.availability),
-                0,
-            ),
+        // Untracked files must not advance the stop counters either. With no
+        // stored previous value, the old contribution is 0 on *every*
+        // sighting, so a past-the-cap file re-listed by each server in a
+        // global sweep would add its whole slice again each time instead of a
+        // delta, inflating `udp_found_sources` against `MAX_UDP_SEARCH_SOURCES`
+        // and ending the sweep early. Past 20,000 distinct files the sweep's
+        // other bounds govern, and erring toward running the full course
+        // loses nothing.
+        let Some((noted, existed)) = active.ed2k_noted_sources.tracked_mut(
+            &r.file.hash,
+            r.file.size,
+            MAX_STREAMED_HASHES_SOFT_CAP,
+        ) else {
+            continue;
         };
-        let new_contrib = ed2k_result_source_contribution(new_avail);
-        // Untracked hashes must not advance the stop counters either. With no
-        // stored previous value, `old_contrib` is 0 on *every* sighting, so a
-        // past-the-cap file re-listed by each server in a global sweep added its
-        // whole slice again each time instead of a delta. That inflates
-        // `udp_found_sources` against `MAX_UDP_SEARCH_SOURCES` and ends the
-        // sweep early — truncating the very results the sweep was asked for.
-        // A number that cannot be computed correctly is better left out than
-        // counted wrong: past 20,000 distinct files the sweep's other bounds
-        // govern, and erring toward running the full course loses nothing.
-        if !skip_count && tracked && new_contrib > old_contrib {
+        let old_contrib = if existed {
+            ed2k_result_source_contribution(noted.sources.total())
+        } else {
+            0
+        };
+        noted.sources.note(r.availability, from_udp);
+        // Complete sources deliberately do not feed `ed2k_found_sources`: the
+        // result cap counts sources, and a complete source has already been
+        // counted as one.
+        noted.complete.note(r.file.complete_sources, from_udp);
+        let new_contrib = ed2k_result_source_contribution(noted.sources.total());
+        if !skip_count && new_contrib > old_contrib {
             let delta = new_contrib - old_contrib;
             active.ed2k_found_sources = active.ed2k_found_sources.saturating_add(delta);
             // Only a UDP reply advances the sweep's own backstop.
@@ -452,31 +552,14 @@ pub(super) fn note_ed2k_search_results(
                 active.udp_found_sources = active.udp_found_sources.saturating_add(delta);
             }
         }
-        if tracked {
-            active
-                .ed2k_noted_availability
-                .insert(r.file.hash.clone(), new_avail);
-        }
-
-        // Complete sources ride along on the same rule, and deliberately do not
-        // feed `ed2k_found_sources`: the result cap counts sources, and a
-        // complete source has already been counted as one.
-        let new_complete = match active.ed2k_noted_complete_sources.get(&r.file.hash) {
-            Some(&p) => crate::search::merge::clamp_source_count(if sum_incoming {
-                p.saturating_add(r.file.complete_sources)
-            } else {
-                p.max(r.file.complete_sources)
-            }),
-            None => crate::search::merge::clamp_source_count(r.file.complete_sources),
-        };
-        if tracked {
-            active
-                .ed2k_noted_complete_sources
-                .insert(r.file.hash.clone(), new_complete);
-        }
     }
     active.udp_found_sources > MAX_UDP_SEARCH_SOURCES
 }
+
+/// Distinct sizes `streamed_hashes` keeps for one hash. A hash already shown
+/// under this many sizes is being claimed for files it is not; a row giving it
+/// yet another size is dropped (see [`dedup_streamed_batch`]).
+pub(super) const MAX_STREAMED_SIZES_PER_HASH: usize = 4;
 
 /// Mark hashes as streamed only after a row was actually accepted/emitted
 /// (so a type-filter miss does not permanently block later Kad sightings).
@@ -490,19 +573,16 @@ pub(super) fn mark_streamed_hashes(active: &mut ActiveSearchRequest, results: &[
         {
             continue;
         }
-        let first = active
-            .streamed_hashes
-            .entry(r.file.hash.clone())
-            .or_insert(r.file.size);
-        if *first == 0 {
-            *first = r.file.size;
+        let sizes = active.streamed_hashes.entry(r.file.hash.clone()).or_default();
+        if sizes.len() < MAX_STREAMED_SIZES_PER_HASH && !sizes.contains(&r.file.size) {
+            sizes.push(r.file.size);
         }
     }
 }
 
 /// Running per-file source totals for the DHT legs of one search.
 ///
-/// Kept apart from `ed2k_noted_availability`, and from each other, because the
+/// Kept apart from `ed2k_noted_sources`, and from each other, because the
 /// rule for combining counts is per-leg: inside a leg the answers add up (each
 /// KAD node and each Ember publisher is a separate claim on a separate file),
 /// while across legs the biggest wins — a file on both the server and KAD is
@@ -550,17 +630,13 @@ pub(super) fn note_dht_availability(
         // Bounded the way `streamed_hashes` is: at the cap, files already being
         // tracked keep accumulating and a new one simply goes untracked, which
         // beats abandoning the totals for the rest of the search.
-        let noted = if active.dht_noted_availability.len() >= MAX_STREAMED_HASHES_SOFT_CAP {
-            active.dht_noted_availability.get_mut(&r.file.hash)
-        } else {
-            Some(
-                active
-                    .dht_noted_availability
-                    .entry(r.file.hash.clone())
-                    .or_default(),
-            )
+        let Some((noted, _)) = active.dht_noted_availability.tracked_mut(
+            &r.file.hash,
+            r.file.size,
+            MAX_STREAMED_HASHES_SOFT_CAP,
+        ) else {
+            continue;
         };
-        let Some(noted) = noted else { continue };
         // A KAD count is a swarm estimate — the largest `TAG_SOURCES`, or the
         // publisher addresses seen — and every keyword entry sits on about ten
         // nodes, so the same publishers come back in slice after slice. Adding
@@ -606,11 +682,86 @@ pub(super) fn note_ed2k_resight_availability(
     for r in updates {
         if crate::search::merge::is_ed2k_network_origin(&r.result_origin) {
             let _ = note_ed2k_search_results(active, std::slice::from_ref(r), skip_hashes);
-            if let Some(&total) = active.ed2k_noted_availability.get(&r.file.hash) {
-                r.availability = total;
+            if let Some(noted) = active.ed2k_noted_sources.get(&r.file.hash, r.file.size) {
+                r.availability = noted.sources.total();
+                r.file.complete_sources = noted.complete.total();
             }
-            if let Some(&total) = active.ed2k_noted_complete_sources.get(&r.file.hash) {
-                r.file.complete_sources = total;
+        }
+    }
+}
+
+/// Fold a batch of new ed2k rows into the running per-file totals and put each
+/// file's total on its row, before [`enrich_and_emit_search_results`] filters
+/// them.
+///
+/// "Min sources" is a question about the file, not about one server's reply: a
+/// file two servers each report with 6 sources meets a minimum of 10. A row the
+/// filters will drop still has its sources remembered, but it does not advance
+/// the stop counters: it is not a result the user is shown. The counters
+/// follow [`note_ed2k_search_results`] otherwise, which still takes the rows
+/// that are already on screen.
+pub(super) fn note_ed2k_batch_availability(
+    active: &mut ActiveSearchRequest,
+    results: &mut [SearchResult],
+    skip_hashes: &HashSet<String>,
+) {
+    // Files this batch has charged to the counters. With the files already on
+    // screen they are the ones whose stored total was counted; any other
+    // stored total is sources held back from rows the filters dropped.
+    let mut charged: HashSet<(String, u64)> = HashSet::new();
+    for r in results.iter_mut() {
+        if !crate::search::merge::is_ed2k_network_origin(&r.result_origin) {
+            continue;
+        }
+        let from_udp = is_udp_server_row(r);
+        let (prev, tracked) = if r.file.hash.is_empty() {
+            (None, false)
+        } else {
+            match active.ed2k_noted_sources.tracked_mut(
+                &r.file.hash,
+                r.file.size,
+                MAX_STREAMED_HASHES_SOFT_CAP,
+            ) {
+                Some((noted, existed)) => {
+                    let prev = existed.then(|| noted.sources.total());
+                    noted.sources.note(r.availability, from_udp);
+                    noted.complete.note(r.file.complete_sources, from_udp);
+                    r.availability = noted.sources.total();
+                    r.file.complete_sources = noted.complete.total();
+                    (prev, true)
+                }
+                None => (None, false),
+            }
+        };
+        if !tracked {
+            r.availability = crate::search::merge::clamp_source_count(r.availability);
+            r.file.complete_sources =
+                crate::search::merge::clamp_source_count(r.file.complete_sources);
+        }
+        let accepted = crate::search::merge::result_matches_client_filters(
+            r,
+            active.file_type_filter.as_deref(),
+            active.min_size,
+            active.max_size,
+            active.file_extension.as_deref(),
+            active.min_availability,
+        );
+        let hash = r.file.hash.as_str();
+        if accepted && !skip_hashes.contains(hash) && (hash.is_empty() || tracked) {
+            let file = active.ed2k_noted_sources.key(hash, r.file.size);
+            let counted_before =
+                active.already_streamed(hash, r.file.size) || charged.contains(&file);
+            let old_contrib = match prev {
+                Some(p) if counted_before => ed2k_result_source_contribution(p),
+                _ => 0,
+            };
+            let delta = ed2k_result_source_contribution(r.availability).saturating_sub(old_contrib);
+            active.ed2k_found_sources = active.ed2k_found_sources.saturating_add(delta);
+            if from_udp {
+                active.udp_found_sources = active.udp_found_sources.saturating_add(delta);
+            }
+            if !hash.is_empty() {
+                charged.insert(file);
             }
         }
     }
@@ -670,6 +821,9 @@ pub(super) struct PendingKeywordSearch {
     pub(super) query_expr: crate::search::query::QueryExpr,
     pub(super) request_id: u64,
     pub(super) last_streamed_count: usize,
+    /// When rows last went out (or the search started), so a trickle that
+    /// never reaches a full batch is still flushed before the walk ends.
+    pub(super) last_streamed_at: std::time::Instant,
     pub(super) file_type_filter: Option<String>,
 }
 
@@ -677,6 +831,10 @@ pub(super) struct PendingServerSearch {
     pub(super) tx: Option<oneshot::Sender<Vec<SearchResult>>>,
     pub(super) results: Vec<SearchResult>,
     pub(super) request_id: u64,
+    /// The server has answered this search at least once, so a request still
+    /// waiting (a More page, the co-share half of a related search) going
+    /// unanswered is not the server failing to answer it.
+    pub(super) answered: bool,
 }
 
 #[derive(Clone)]
@@ -722,23 +880,18 @@ pub(super) struct ActiveSearchRequest {
     /// which is what that sweep's backstop ([`MAX_UDP_SEARCH_SOURCES`]) reads.
     /// Held separately so the connected server's TCP reply cannot spend it.
     pub(super) udp_found_sources: u32,
-    /// Per-hash summed availability already folded into `ed2k_found_sources`
-    /// (so a later UDP/TCP re-sight only adds the spam-capped contribution
-    /// delta after summing, matching eMule `UpdateResultCount`).
-    pub(super) ed2k_noted_availability: HashMap<String, u32>,
-    /// Per-hash running total of `FT_COMPLETE_SOURCES`, accumulated by the same
-    /// rule as `ed2k_noted_availability` because eMule accumulates it by the
-    /// same rule: `AddCompleteSources` is `AddSources` with a different tag.
+    /// Per-file running ed2k totals of sources and complete sources, so a later
+    /// UDP/TCP re-sight only adds the spam-capped contribution delta to
+    /// `ed2k_found_sources` (eMule `UpdateResultCount`).
     ///
-    /// Needed separately from the merge in `search::merge` because a streamed
+    /// Needed apart from the merge in `search::merge` because a streamed
     /// re-sight carries one server's slice and the row has to be emitted with
-    /// the file's absolute total — the frontend merges batches by max, so
-    /// without this the Complete column kept whichever single server answered
-    /// with the most instead of the sum across them.
-    pub(super) ed2k_noted_complete_sources: HashMap<String, u32>,
+    /// the file's absolute total: the frontend merges batches by max, so
+    /// without this a row kept whichever single server answered with the most.
+    pub(super) ed2k_noted_sources: PerFile<Ed2kNotedSources>,
     /// The same running per-file total for the DHT legs; see
     /// [`DhtNotedAvailability`] for why theirs is kept apart from the ed2k one.
-    pub(super) dht_noted_availability: HashMap<String, DhtNotedAvailability>,
+    pub(super) dht_noted_availability: PerFile<DhtNotedAvailability>,
     pub(super) file_type_filter: Option<String>,
     pub(super) min_size: Option<u64>,
     pub(super) max_size: Option<u64>,
@@ -746,10 +899,15 @@ pub(super) struct ActiveSearchRequest {
     pub(super) min_availability: Option<u32>,
     /// Keywords extracted from the original query, used by the spam-filter
     /// scorer when streamed results arrive from the network event loop.
-    /// Empty for queries where extraction yielded nothing (no spam scoring
-    /// applied — those queries shouldn't reach the streaming paths anyway,
-    /// since we early-return when `keywords.is_empty()` at request start).
+    /// Empty for a search with no positive keyword (filter-only, or a related
+    /// search's co-share request), whose streamed rows are scored without any.
     pub(super) keywords: Vec<String>,
+    /// The words every server reply row should share one of, as
+    /// `SearchTicket::match_terms` holds the TCP leg's replies to them. A UDP
+    /// reply is only matched to a search by the server it came from, so a
+    /// slow answer to the previous search from a server this one also asked
+    /// would otherwise land in this tab. Empty accepts every row.
+    pub(super) reply_match_terms: Vec<String>,
     /// Source IP of the connected eD2k server at request-start time. Used to
     /// tell whether Search More can still page the same server. The TCP leg
     /// hands it to [`enrich_and_emit_search_results`], which does not score or
@@ -776,10 +934,12 @@ pub(super) struct ActiveSearchRequest {
     /// a pathological all-servers global search from growing this
     /// unboundedly for the lifetime of one search.
     ///
-    /// Each hash maps to the size it was first streamed with: a later row
-    /// claiming another size is a different file as far as the UI's merge is
-    /// concerned, so it is scored as a new row rather than passed as a re-sight.
-    pub(super) streamed_hashes: std::collections::HashMap<String, u64>,
+    /// Each hash maps to the sizes it was streamed with, up to
+    /// [`MAX_STREAMED_SIZES_PER_HASH`]: a row claiming another size is a
+    /// different file as far as the UI's merge is concerned, so it is scored
+    /// as a new row rather than passed as a re-sight, and a later row of any
+    /// of those sizes is a re-sight of its own row.
+    pub(super) streamed_hashes: std::collections::HashMap<String, Vec<u64>>,
     /// Hashes never to forward to the UI for this request. Set only by a
     /// related search, to the seed files it was started from: a co-share
     /// request and a title probe both return the seed itself, and listing the
@@ -799,6 +959,70 @@ pub(super) struct ActiveSearchRequest {
     /// results — the page cap or the result cap stopped it, not the server —
     /// so Search More can ask it for further pages.
     pub(super) server_has_more: bool,
+}
+
+impl ActiveSearchRequest {
+    /// A request with no leg started, no filters and nothing seen yet.
+    pub(super) fn new(request_id: u64) -> Self {
+        Self {
+            request_id,
+            server_pending: false,
+            kad_pending: false,
+            udp_pending: false,
+            ember_pending: false,
+            kad_ran: false,
+            ember_ran: false,
+            udp_search_deadline: 0,
+            udp_search_sent_ips: HashSet::new(),
+            ed2k_found_sources: 0,
+            udp_found_sources: 0,
+            ed2k_noted_sources: PerFile::default(),
+            dht_noted_availability: PerFile::default(),
+            file_type_filter: None,
+            min_size: None,
+            max_size: None,
+            file_extension: None,
+            min_availability: None,
+            keywords: Vec::new(),
+            reply_match_terms: Vec::new(),
+            server_ip: None,
+            server_result_count: 0,
+            streamed_hashes: HashMap::new(),
+            exclude_hashes: HashSet::new(),
+            batch_spam: crate::search::spam::BatchSpamContext::default(),
+            udp_search_expr: Vec::new(),
+            server_has_more: false,
+        }
+    }
+
+    /// Whether a row for `hash` at `size` re-sights a row already on screen:
+    /// one streamed at that size, or any row of the hash when one of the two
+    /// sizes is unknown and the other is the only one there is (the merge
+    /// joins an unknown size to the first sized row).
+    pub(super) fn already_streamed(&self, hash: &str, size: u64) -> bool {
+        !hash.is_empty()
+            && self.streamed_hashes.get(hash).is_some_and(|sizes| {
+                size == 0 || sizes.contains(&size) || sizes.as_slice() == [0]
+            })
+    }
+
+    /// Whether a server reply row named `name` can answer this search (see
+    /// `reply_match_terms`).
+    pub(super) fn reply_row_matches(&self, name: &str) -> bool {
+        crate::search::query::name_contains_any_term(name, &self.reply_match_terms)
+    }
+
+    /// The file's running ed2k source total, if it has one.
+    #[cfg(test)]
+    pub(super) fn ed2k_noted_total(&self, hash: &str, size: u64) -> Option<u32> {
+        self.ed2k_noted_sources.get(hash, size).map(|n| n.sources.total())
+    }
+
+    /// The file's running ed2k complete-source total, if it has one.
+    #[cfg(test)]
+    pub(super) fn ed2k_noted_complete_total(&self, hash: &str, size: u64) -> Option<u32> {
+        self.ed2k_noted_sources.get(hash, size).map(|n| n.complete.total())
+    }
 }
 
 /// What Search More found to do for a finished search: how many servers it
@@ -910,6 +1134,7 @@ pub(super) fn start_search_more(
             tx: None,
             results: Vec::new(),
             request_id,
+            answered: true,
         });
         state.server_search_age = 0;
     }
@@ -1148,6 +1373,8 @@ pub(super) fn filter_results_by_type(
 ///   recorded in `streamed_hashes` only after a successful emit).
 /// - **Already-streamed** hashes are returned as lightweight availability /
 ///   origin updates (no spam re-score) — ed2k and Kad alike.
+/// - A hash already shown under [`MAX_STREAMED_SIZES_PER_HASH`] sizes that
+///   arrives with yet another is dropped.
 ///
 /// A no-op (passes everything through, returns empty updates) if there's no
 /// matching active search. Must run before spam enrichment so repeats never
@@ -1169,13 +1396,20 @@ pub(super) fn dedup_streamed_batch(
         if active.exclude_hashes.contains(&r.file.hash) {
             continue;
         }
-        let resight = !r.file.hash.is_empty()
-            && active
-                .streamed_hashes
-                .get(&r.file.hash)
-                .is_some_and(|&first| first == 0 || r.file.size == 0 || first == r.file.size);
-        if resight {
+        if active.already_streamed(&r.file.hash, r.file.size) {
+            // The row streamed without a size now has one.
+            if let Some(sizes) = active.streamed_hashes.get_mut(&r.file.hash) {
+                if r.file.size != 0 && sizes.as_slice() == [0] {
+                    sizes[0] = r.file.size;
+                }
+            }
             resights.push(r);
+        } else if active
+            .streamed_hashes
+            .get(&r.file.hash)
+            .is_some_and(|sizes| sizes.len() >= MAX_STREAMED_SIZES_PER_HASH)
+        {
+            continue;
         } else {
             kept.push(r);
         }
@@ -1458,10 +1692,12 @@ pub(super) async fn enrich_and_emit_search_results(
     // UDP server batches, so it's gated on a known server IP.
     if spam_enabled && !results.is_empty() {
         if let Some(sip) = server_ip {
-            spam_filter
-                .write()
-                .await
-                .record_server_clean_batch(sip, &results, spam_profile);
+            if spam_filter.read().await.has_server_reputation(sip) {
+                spam_filter
+                    .write()
+                    .await
+                    .record_server_clean_batch(sip, &results, spam_profile);
+            }
         }
     }
 
@@ -1674,9 +1910,11 @@ pub(super) fn finalize_removed_searches_with_keyword_results(
         {
             if let Some((_, entries)) = preserved_results.get(sid) {
                 if !entries.is_empty() {
-                    let mut network_results =
-                        convert_search_results(entries, |ip| is_search_source_safe(state, ip));
-                    network_results.retain(|r| query_expr.matches_name(&r.file.name));
+                    let mut network_results = convert_search_results_matching(
+                        entries,
+                        |ip| is_search_source_safe(state, ip),
+                        Some(&query_expr),
+                    );
                     if let Some(active) = state.active_search_request.as_mut() {
                         if active.request_id == request_id {
                             // Same rebuild as the completion path, reaching the
@@ -1889,12 +2127,11 @@ pub(super) fn split_peer_id(peer_id: &str) -> (String, u16) {
     }
 }
 
-/// End the walk under the typed spelling's key that `search_id` was waiting
-/// on, if one is still running: nothing reads its records once the search it
-/// feeds is gone.
+/// End the walks still feeding `search_id` — the older spelling of its word
+/// and its `OR` branches: nothing reads their records once the search they
+/// feed is gone.
 pub(super) fn drop_running_ember_companion(state: &mut NetworkState, search_id: u32) {
-    let companion = state.ember_search.get(search_id).map(|s| s.companion);
-    if let Some(ember::dht::search::Companion::Running(walk)) = companion {
+    for walk in ember_feeding_walks(&state.ember_search, search_id) {
         state.ember_search.remove(walk);
         state
             .ember_dht_search_requests
@@ -2125,33 +2362,8 @@ mod tests {
 
     fn active(request_id: u64) -> ActiveSearchRequest {
         ActiveSearchRequest {
-            request_id,
-            server_pending: false,
-            kad_pending: false,
             udp_pending: true,
-            ember_pending: false,
-            kad_ran: false,
-            ember_ran: false,
-            udp_search_deadline: 0,
-            udp_search_sent_ips: HashSet::new(),
-            ed2k_found_sources: 0,
-            udp_found_sources: 0,
-            ed2k_noted_availability: HashMap::new(),
-            ed2k_noted_complete_sources: HashMap::new(),
-            dht_noted_availability: HashMap::new(),
-            file_type_filter: None,
-            min_size: None,
-            max_size: None,
-            file_extension: None,
-            min_availability: None,
-            keywords: Vec::new(),
-            server_ip: None,
-            server_result_count: 0,
-            streamed_hashes: HashMap::new(),
-            exclude_hashes: HashSet::new(),
-            batch_spam: crate::search::spam::BatchSpamContext::default(),
-            udp_search_expr: Vec::new(),
-            server_has_more: false,
+            ..ActiveSearchRequest::new(request_id)
         }
     }
 
@@ -2212,5 +2424,253 @@ mod tests {
 
         assert!(!enrichment_has_work(true, None, true));
         assert!(enrichment_has_work(false, None, false));
+    }
+
+    fn sourced(hash: &str, origin: &str, availability: u32) -> SearchResult {
+        SearchResult {
+            availability,
+            result_origin: origin.to_string(),
+            ..row(hash, "Some Title.mkv")
+        }
+    }
+
+    fn passes(a: &ActiveSearchRequest, r: &SearchResult) -> bool {
+        crate::search::merge::result_matches_client_filters(
+            r,
+            a.file_type_filter.as_deref(),
+            a.min_size,
+            a.max_size,
+            a.file_extension.as_deref(),
+            a.min_availability,
+        )
+    }
+
+    #[test]
+    fn min_sources_judges_a_new_file_on_every_servers_sources() {
+        let hash = "3".repeat(32);
+        let none = HashSet::new();
+        let mut a = active(1);
+        a.min_availability = Some(10);
+
+        let mut first = vec![sourced(&hash, crate::search::merge::ORIGIN_SERVER_UDP, 6)];
+        note_ed2k_batch_availability(&mut a, &mut first, &none);
+        assert!(!passes(&a, &first[0]), "6 sources alone are under the minimum");
+        assert_eq!(a.ed2k_noted_total(&hash, 1000), Some(6), "but they are kept");
+        assert_eq!(a.udp_found_sources, 0, "a dropped row is not a found result");
+
+        let mut second = vec![sourced(&hash, crate::search::merge::ORIGIN_SERVER_UDP, 6)];
+        note_ed2k_batch_availability(&mut a, &mut second, &none);
+        assert_eq!(second[0].availability, 12);
+        assert!(passes(&a, &second[0]));
+        assert_eq!(
+            a.udp_found_sources,
+            ED2K_SEARCH_SOURCE_CAP,
+            "the file is charged in full once it is shown"
+        );
+        assert_eq!(a.ed2k_found_sources, ED2K_SEARCH_SOURCE_CAP);
+    }
+
+    /// The batch path charges the counters exactly as the per-row path did for
+    /// rows that pass, so a search without filters stops where it used to.
+    #[test]
+    fn the_batch_path_counts_like_the_per_row_path_without_filters() {
+        let none = HashSet::new();
+        let rows = || {
+            vec![
+                sourced(&"4".repeat(32), crate::search::merge::ORIGIN_SERVER_UDP, 2),
+                sourced(&"5".repeat(32), crate::search::merge::ORIGIN_SERVER_UDP, 9),
+                sourced(&"4".repeat(32), crate::search::merge::ORIGIN_SERVER_UDP, 1),
+                sourced("", crate::search::merge::ORIGIN_SERVER_UDP, 3),
+            ]
+        };
+        let mut by_row = active(1);
+        let _ = note_ed2k_search_results(&mut by_row, &rows(), &none);
+        let mut by_batch = active(1);
+        note_ed2k_batch_availability(&mut by_batch, &mut rows(), &none);
+        assert_eq!(by_batch.udp_found_sources, by_row.udp_found_sources);
+        assert_eq!(by_batch.ed2k_found_sources, by_row.ed2k_found_sources);
+        assert_eq!(by_batch.ed2k_noted_sources, by_row.ed2k_noted_sources);
+
+        // A TCP re-list repeats the same server, so the larger figure stands.
+        let hash = "6".repeat(32);
+        let mut tcp = active(1);
+        for n in [4, 3] {
+            let mut batch = vec![sourced(&hash, crate::search::merge::ORIGIN_SERVER_TCP, n)];
+            note_ed2k_batch_availability(&mut tcp, &mut batch, &none);
+            assert_eq!(batch[0].availability, 4);
+        }
+        assert_eq!(tcp.udp_found_sources, 0, "TCP never spends the UDP backstop");
+    }
+
+    #[test]
+    fn a_row_the_filters_drop_spends_nothing_of_the_udp_backstop() {
+        let none = HashSet::new();
+        let mut a = active(1);
+        a.file_extension = Some("flac".to_string());
+        let mut batch: Vec<SearchResult> = (0..50)
+            .map(|i| sourced(&format!("{i:032x}"), crate::search::merge::ORIGIN_SERVER_UDP, 20))
+            .collect();
+        note_ed2k_batch_availability(&mut a, &mut batch, &none);
+        assert_eq!(a.udp_found_sources, 0);
+        assert_eq!(a.ed2k_found_sources, 0);
+    }
+
+    fn sized(hash: &str, origin: &str, availability: u32, size: u64) -> SearchResult {
+        let mut r = sourced(hash, origin, availability);
+        r.file.size = size;
+        r
+    }
+
+    /// The connected server's count and the other servers' counts are
+    /// different servers' sources: a file with 6 over TCP and 6 over UDP has
+    /// 12, and the connected server repeating its 6 on a More page leaves it
+    /// at 12.
+    #[test]
+    fn the_connected_servers_count_adds_to_the_sweeps() {
+        use crate::search::merge::{ORIGIN_SERVER_TCP, ORIGIN_SERVER_UDP};
+        let hash = "7".repeat(32);
+        let none = HashSet::new();
+        let mut a = active(1);
+        a.min_availability = Some(10);
+        for (origin, n, total) in [
+            (ORIGIN_SERVER_TCP, 6, 6),
+            (ORIGIN_SERVER_UDP, 6, 12),
+            (ORIGIN_SERVER_TCP, 6, 12),
+            (ORIGIN_SERVER_TCP, 8, 14),
+            (ORIGIN_SERVER_UDP, 2, 16),
+        ] {
+            let mut batch = vec![sourced(&hash, origin, n)];
+            note_ed2k_batch_availability(&mut a, &mut batch, &none);
+            assert_eq!(batch[0].availability, total, "{origin} {n}");
+        }
+        assert_eq!(a.ed2k_noted_total(&hash, 1000), Some(16));
+
+        let mut b = active(2);
+        let _ = note_ed2k_search_results(&mut b, &[sourced(&hash, ORIGIN_SERVER_UDP, 6)], &none);
+        let _ = note_ed2k_search_results(&mut b, &[sourced(&hash, ORIGIN_SERVER_TCP, 6)], &none);
+        assert_eq!(b.ed2k_noted_total(&hash, 1000), Some(12), "the per-row path agrees");
+    }
+
+    /// A row pairing a real hash with another size is a file of its own: it
+    /// neither borrows the real file's count nor adds to it, and a row with no
+    /// size joins the first sized one, as the merge has it.
+    #[test]
+    fn each_size_of_a_hash_keeps_its_own_count() {
+        use crate::search::merge::ORIGIN_SERVER_UDP;
+        let hash = "8".repeat(32);
+        let none = HashSet::new();
+        let mut a = active(1);
+        a.min_availability = Some(10);
+
+        let mut real = vec![sized(&hash, ORIGIN_SERVER_UDP, 9, 1000)];
+        note_ed2k_batch_availability(&mut a, &mut real, &none);
+        let mut fake = vec![sized(&hash, ORIGIN_SERVER_UDP, 4, 777)];
+        note_ed2k_batch_availability(&mut a, &mut fake, &none);
+        assert_eq!(fake[0].availability, 4, "the fake size borrows nothing");
+        assert!(!passes(&a, &fake[0]));
+        let mut unknown = vec![sized(&hash, ORIGIN_SERVER_UDP, 2, 0)];
+        note_ed2k_batch_availability(&mut a, &mut unknown, &none);
+        assert_eq!(unknown[0].availability, 11, "an unknown size joins the first sized row");
+
+        assert_eq!(a.ed2k_noted_total(&hash, 1000), Some(11));
+        assert_eq!(a.ed2k_noted_total(&hash, 777), Some(4));
+        assert_eq!(a.ed2k_noted_total(&hash, 0), Some(11));
+        assert_eq!(a.ed2k_noted_sources.len(), 2);
+
+        let mut dht = active(2);
+        let kad_row = |size: u64, n: u32| SearchResult {
+            result_origin: crate::search::merge::ORIGIN_KAD.to_string(),
+            ..sized(&hash, ORIGIN_SERVER_UDP, n, size)
+        };
+        let mut rows = vec![kad_row(1000, 5), kad_row(777, 3)];
+        note_dht_availability(&mut dht, &mut rows, DhtBatchKind::Incremental);
+        assert_eq!((rows[0].availability, rows[1].availability), (5, 3));
+        assert_eq!(dht.dht_noted_availability.get(&hash, 777).map(|n| n.kad), Some(3));
+    }
+
+    /// Sources first reported without a size belong to the file once its
+    /// size turns up, rather than being left behind under an unknown size.
+    #[test]
+    fn an_unknown_size_entry_becomes_the_first_sized_one() {
+        use crate::search::merge::ORIGIN_SERVER_UDP;
+        let hash = "9".repeat(32);
+        let none = HashSet::new();
+        let mut a = active(1);
+        let _ = note_ed2k_search_results(&mut a, &[sized(&hash, ORIGIN_SERVER_UDP, 3, 0)], &none);
+        let _ = note_ed2k_search_results(&mut a, &[sized(&hash, ORIGIN_SERVER_UDP, 4, 1000)], &none);
+        assert_eq!(a.ed2k_noted_total(&hash, 1000), Some(7));
+        assert_eq!(a.ed2k_noted_sources.len(), 1);
+        assert_eq!(a.ed2k_found_sources, 5, "charged as one file, capped once");
+    }
+
+    /// Both sizes of a hash are on screen as rows of their own, so a later
+    /// row of either is a re-sight rather than another new row every batch;
+    /// past the per-hash bound a further size is dropped.
+    #[test]
+    fn a_re_sight_of_either_size_is_recognised() {
+        let hash = "a".repeat(32);
+        let mut request = Some(active(3));
+        let shown = vec![
+            sized(&hash, crate::search::merge::ORIGIN_SERVER_UDP, 1, 1000),
+            sized(&hash, crate::search::merge::ORIGIN_SERVER_UDP, 1, 777),
+        ];
+        mark_streamed_hashes(request.as_mut().unwrap(), &shown);
+
+        let mut batch = vec![
+            sized(&hash, crate::search::merge::ORIGIN_SERVER_UDP, 1, 777),
+            sized(&hash, crate::search::merge::ORIGIN_SERVER_UDP, 1, 1000),
+            sized(&hash, crate::search::merge::ORIGIN_SERVER_UDP, 1, 0),
+            sized(&hash, crate::search::merge::ORIGIN_SERVER_UDP, 1, 555),
+        ];
+        let resights = dedup_streamed_batch(&mut request, 3, &mut batch);
+        assert_eq!(resights.iter().map(|r| r.file.size).collect::<Vec<_>>(), [777, 1000, 0]);
+        assert_eq!(batch.iter().map(|r| r.file.size).collect::<Vec<_>>(), [555]);
+
+        let more: Vec<SearchResult> = [555, 444, 333]
+            .iter()
+            .map(|&size| sized(&hash, crate::search::merge::ORIGIN_SERVER_UDP, 1, size))
+            .collect();
+        mark_streamed_hashes(request.as_mut().unwrap(), &more);
+        assert_eq!(
+            request.as_ref().unwrap().streamed_hashes[&hash].len(),
+            MAX_STREAMED_SIZES_PER_HASH
+        );
+        let mut batch = vec![
+            sized(&hash, crate::search::merge::ORIGIN_SERVER_UDP, 1, 444),
+            sized(&hash, crate::search::merge::ORIGIN_SERVER_UDP, 1, 222),
+        ];
+        let resights = dedup_streamed_batch(&mut request, 3, &mut batch);
+        assert_eq!(resights[0].file.size, 444);
+        assert_eq!(resights.len(), 1);
+        assert!(batch.is_empty(), "a fifth size is dropped");
+    }
+
+    /// A UDP reply is matched to a search only by the server it came from, so
+    /// a slow answer to the previous search is held to this one's words, as
+    /// the connected server's replies are.
+    #[test]
+    fn a_udp_reply_row_must_share_a_word_with_the_search() {
+        let mut a = active(5);
+        assert!(a.reply_row_matches("anything.avi"), "no words: every row");
+        a.reply_match_terms = vec!["matrix".to_string(), "reloaded".to_string()];
+        assert!(a.reply_row_matches("The.MATRIX.1999.avi"));
+        assert!(!a.reply_row_matches("ubuntu-24.04.iso"));
+    }
+
+    /// A row streamed before its size was known stands for the first size
+    /// that turns up, and a second size after that is a file of its own.
+    #[test]
+    fn a_row_streamed_without_a_size_takes_the_first_one_seen() {
+        let hash = "b".repeat(32);
+        let mut request = Some(active(4));
+        mark_streamed_hashes(
+            request.as_mut().unwrap(),
+            &[sized(&hash, crate::search::merge::ORIGIN_SERVER_UDP, 1, 0)],
+        );
+        let mut first = vec![sized(&hash, crate::search::merge::ORIGIN_SERVER_UDP, 1, 1000)];
+        assert_eq!(dedup_streamed_batch(&mut request, 4, &mut first).len(), 1);
+        let mut second = vec![sized(&hash, crate::search::merge::ORIGIN_SERVER_UDP, 1, 777)];
+        assert!(dedup_streamed_batch(&mut request, 4, &mut second).is_empty());
+        assert_eq!(second.len(), 1);
     }
 }

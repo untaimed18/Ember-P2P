@@ -557,6 +557,19 @@ a certainty, which is not the same as gone.
   those. `server` does not match `servers`. A searcher predating this still gets
   every record (subject to the per-node budget) and filters by substring, as it
   always did.
+- An `OR` query whose sides share no term walks its longest term plus up to two
+  more branches that lack it, and at most four extra walks in all counting
+  second spellings, so a query of four or more such branches still misses the
+  files matching only through the rest.
+- A keyword walk ends once the k closest live contacts and every pinned session
+  peer have answered and no record has arrived for 5 seconds, rather than
+  exhausting its shortlist; a record held only by a farther node is missed.
+  Only those k closest and the pinned session peers hear the query's extra keys
+  and filters: any farther hop is asked for the primary key alone and its answer
+  is filtered locally.
+- A stored record keeps at most 64 keys of its name's words, earliest first, for ordering
+  multi-keyword answers, so a match whose other words come later in a long name
+  is served after the matches rather than among them.
 - Keywords are normalised (NFKC, lowercase, final sigma folded) for Ember keys
   only. A name whose normalised words hash differently from its words as typed
   is published under both; a search walks the normalised key and, when the query

@@ -178,6 +178,27 @@ fn check_search_has_keyword(
     ))
 }
 
+/// The extension filter in the one form every layer compares: no surrounding
+/// whitespace or leading dots, lower case, and `None` when nothing is left.
+/// The wire encoder trims and dot-strips it as well, and the client filters
+/// have to agree with what the network was asked or they drop its answers.
+fn normalize_search_extension(file_extension: Option<String>) -> Option<String> {
+    let ext = file_extension?;
+    let ext = ext.trim().trim_start_matches('.').trim();
+    (!ext.is_empty()).then(|| ext.to_lowercase())
+}
+
+/// Zero is "no limit" for either bound, as everywhere else.
+fn check_search_size_range(min_size: Option<u64>, max_size: Option<u64>) -> Result<(), String> {
+    match (min_size, max_size) {
+        (Some(min), Some(max)) if min > 0 && max > 0 && min > max => Err(coded(
+            "search_size_range_invalid",
+            "The minimum size is larger than the maximum size.",
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn keywords_for_spam(search_query: Option<&str>, search_keywords: &[String]) -> Vec<String> {
     if let Some(q) = search_query.map(str::trim).filter(|s| !s.is_empty()) {
         let parsed = crate::search::query::positive_terms_from_query(q);
@@ -557,6 +578,8 @@ pub async fn search_files(
             MAX_SEARCH_FILTER_LEN,
         ));
     }
+    let file_extension = normalize_search_extension(file_extension);
+    check_search_size_range(min_size, max_size)?;
     let related_hashes = normalize_hash_list(related_hashes, HashList::Related)?;
     let exclude_hashes = normalize_hash_list(exclude_hashes, HashList::Exclude)?;
 
@@ -670,15 +693,19 @@ pub async fn search_files(
         Some(&owned_ctx),
     )
     .await;
-    if !streamed_local.is_empty() {
-        let _ = app.emit(
-            "search-results",
-            serde_json::json!({
-                "request_id": request_id,
-                "results": streamed_local,
-            }),
-        );
-    }
+    // Emitted only once the search is certain to go ahead: a refused search
+    // must not leave rows behind under the request id it was refused for.
+    let emit_local_hits = |hits: &[SearchResult]| {
+        if !hits.is_empty() {
+            let _ = app.emit(
+                "search-results",
+                serde_json::json!({
+                    "request_id": request_id,
+                    "results": hits,
+                }),
+            );
+        }
+    };
 
     // A word too short for any network (`U2`) can still name a file in the
     // library; refuse only when there is not even that to show.
@@ -686,6 +713,7 @@ pub async fn search_files(
         if streamed_local.is_empty() {
             return Err(refusal);
         }
+        emit_local_hits(&streamed_local);
         let _ = app.emit(
             "search-notice",
             serde_json::json!({ "request_id": request_id, "notice": "NetworkNoKeyword" }),
@@ -711,6 +739,7 @@ pub async fn search_files(
             owned_hashes: local_hits.iter().map(|r| r.file.hash.clone()).collect(),
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    emit_local_hits(&streamed_local);
 
     let wait_secs = search_reply_wait_secs(timeout_secs);
     let mut results =
@@ -1484,6 +1513,7 @@ pub async fn explain_spam_result(
     result_origin: Option<String>,
     batch_file_hashes: Option<Vec<String>>,
     batch_file_names: Option<Vec<String>>,
+    spam_reason_details: Option<Vec<crate::search::spam::SpamReason>>,
 ) -> Result<SpamExplainResponse, String> {
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
         return Err(coded("search_invalid_file_hash", "Invalid file hash"));
@@ -1536,7 +1566,7 @@ pub async fn explain_spam_result(
         result_origin: spam_payload_origin(result_origin),
         origin_server_ip: server_ip.clone(),
         spam_reasons: Vec::new(),
-        spam_reason_details: Vec::new(),
+        spam_reason_details: spam_reason_details.unwrap_or_default().into_iter().take(32).collect(),
     };
 
     let cfg = state.config.read().await;
@@ -1631,6 +1661,7 @@ pub async fn explain_spam_result(
         _ => BatchSpamContext::default(),
     };
     batch.set_owned_hashes(owned_hashes);
+    batch.carry_batch_signals(std::slice::from_ref(&result));
     let details = spam.explain_result(
         &result,
         &keywords,
@@ -1919,6 +1950,33 @@ mod search_request_gate_tests {
         assert!(check_search_has_keyword("", &[], false, false, SearchMethod::Global).is_err());
         assert!(check_search_has_keyword("", &[], false, true, SearchMethod::Kad).is_err());
         assert!(check_search_has_keyword("", &[], false, true, SearchMethod::Ember).is_err());
+    }
+
+    #[test]
+    fn the_extension_filter_is_normalized_once_for_every_layer() {
+        for typed in ["mp3", "MP3", " mp3 ", ".mp3", "..Mp3", " .mp3"] {
+            assert_eq!(
+                normalize_search_extension(Some(typed.to_string())).as_deref(),
+                Some("mp3"),
+                "{typed:?}"
+            );
+        }
+        for empty in ["", "  ", ".", " .. "] {
+            assert_eq!(normalize_search_extension(Some(empty.to_string())), None, "{empty:?}");
+        }
+        assert_eq!(normalize_search_extension(None), None);
+    }
+
+    #[test]
+    fn a_minimum_size_above_the_maximum_is_refused() {
+        let err = check_search_size_range(Some(2_000), Some(1_000)).expect_err("inverted range");
+        assert_eq!(code(err), "search_size_range_invalid");
+        assert!(check_search_size_range(Some(1_000), Some(1_000)).is_ok());
+        assert!(check_search_size_range(Some(1_000), Some(2_000)).is_ok());
+        assert!(check_search_size_range(Some(2_000), Some(0)).is_ok(), "0 is no maximum");
+        assert!(check_search_size_range(Some(0), Some(1_000)).is_ok());
+        assert!(check_search_size_range(Some(2_000), None).is_ok());
+        assert!(check_search_size_range(None, Some(1)).is_ok());
     }
 
     #[test]

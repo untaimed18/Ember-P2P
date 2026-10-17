@@ -23,6 +23,13 @@ const MAX_ACTIVE_SEARCHES: usize = 64;
 /// somebody is actually waiting on is never the one turned away.
 const MAX_BACKGROUND_SEARCHES: usize = MAX_ACTIVE_SEARCHES * 3 / 4;
 
+/// How much of the pool the extra walks of keyword searches may occupy — a
+/// search's second spelling and its `OR` branches.
+///
+/// Those walks only widen a search that is already running, so they stop short
+/// of the last few slots, which stay for the next search the user starts.
+const MAX_FEEDING_SEARCHES: usize = MAX_ACTIVE_SEARCHES - 4;
+
 /// How long a search can run before being considered timed out.
 const SEARCH_TIMEOUT_SECS: u64 = 60;
 
@@ -273,6 +280,18 @@ const MAX_PAGES_PER_NODE_EXHAUSTED: u8 = (MAX_SEARCH_RESULTS / RECORDS_PER_UNFRA
 /// before its own stale-round rule may fire.
 const MIN_RESPONSES_TO_CONVERGE: usize = K_BUCKET_SIZE / 2;
 
+/// How long a keyword walk whose k closest live contacts have all answered may
+/// go without taking a new record before it ends.
+///
+/// A keyword record lives on the k nodes closest to its key, so once those have
+/// answered, and the session peers pinned for their own records have too, what
+/// is left on the shortlist is farther nodes — mostly verified seeds the trim
+/// keeps — that seldom hold anything, and walking them all to exhaustion can
+/// take most of `SEARCH_TIMEOUT_SECS`, holding the search's completion that
+/// long. One query timeout's worth of quiet: an answer still on its way from a
+/// near node lands inside it, and any record taken restarts it.
+const KEYWORD_SETTLE_SECS: u64 = 5;
+
 /// Diagnostic row for one in-flight Ember DHT search (slice 16).
 #[derive(Debug, Clone)]
 pub struct SearchSnapshot {
@@ -413,6 +432,14 @@ pub struct QueryTarget {
     /// a value walk asking a node that answered with records for the contacts
     /// it did not send. See [`IterativeSearch::referral_queue`].
     pub find_node: bool,
+    /// Send a `FIND_VALUE` the search's extra keys and constraints. False for
+    /// a node that was neither pinned nor among the k closest live entries when
+    /// it was first asked: a hop the walk only routes through is told the
+    /// primary key alone, and does not learn the rest of the query. A pinned
+    /// session peer is asked in full wherever it sorts, since it is asked for
+    /// records of its own. A page follow-up keeps what its node's first query
+    /// had, since its offsets count records of that same query.
+    pub narrow: bool,
 }
 
 /// The other walk of a keyword search whose query hashes to two keys — the
@@ -699,9 +726,37 @@ pub struct IterativeSearch {
     referred: HashSet<EmberNodeId>,
     /// The other walk of a two-key keyword search, if any — see [`Companion`].
     pub companion: Companion,
+    /// Walks for the other branches of an `OR` query, each
+    /// [`Companion::FeedsInto`] this search, which waits for them as it does
+    /// for its companion.
+    pub branch_walks: Vec<u32>,
     /// How many of `results` came from a companion through
     /// [`Self::absorb_results`].
     absorbed_count: usize,
+    /// A user keyword search, as [`Self::mark_keyword_lookup`] records.
+    keyword_lookup: bool,
+    /// When this walk last took a record, against [`KEYWORD_SETTLE_SECS`].
+    last_new_record: Instant,
+    /// Nodes whose first query carried the primary key alone — see
+    /// [`QueryTarget::narrow`].
+    broad_nodes: HashSet<EmberNodeId>,
+    /// Nodes the walks absorbed through [`Self::absorb_walk`] had asked.
+    absorbed_nodes: usize,
+    /// What the keyword search layer made of `results`, entry for entry from
+    /// the front — `None` for a record it does not show — so a streaming
+    /// rebuild reads only the records added since the last one. `results` is
+    /// only ever appended to while the search is held. Shorter than `results` until it has caught up; filled and read
+    /// by `network::ember_search`, and dropped with the search.
+    pub keyword_readings: Vec<Option<KeywordReading>>,
+}
+
+/// A keyword record a search shows, as the layer building its rows read it: the
+/// parsed record and the name it displays. See
+/// [`IterativeSearch::keyword_readings`].
+#[derive(Debug, Clone)]
+pub struct KeywordReading {
+    pub record: SignedRecord,
+    pub name: String,
 }
 
 /// What one result blob buys against [`MAX_SEARCH_RESULTS`].
@@ -796,8 +851,26 @@ impl IterativeSearch {
             referral_queue: VecDeque::new(),
             referred: HashSet::new(),
             companion: Companion::Unconsidered,
+            branch_walks: Vec::new(),
             absorbed_count: 0,
+            keyword_lookup: false,
+            last_new_record: Instant::now(),
+            broad_nodes: HashSet::new(),
+            absorbed_nodes: 0,
+            keyword_readings: Vec::new(),
         }
+    }
+
+    /// Mark this as a user keyword search.
+    ///
+    /// Only keyword records answer one, so any other type under its key is
+    /// dropped as it arrives rather than charged to the result budget, and the
+    /// walk may end once its neighbourhood has settled (see
+    /// [`KEYWORD_SETTLE_SECS`]). The other value lookups share this type and
+    /// keep exhausting their shortlist: a source or channel lookup is after
+    /// every copy there is of one key's records.
+    pub fn mark_keyword_lookup(&mut self) {
+        self.keyword_lookup = true;
     }
 
     /// Records held that came from the network rather than our own store.
@@ -1249,6 +1322,7 @@ impl IterativeSearch {
                 start_position: start,
                 resume_after: owed.resume_after,
                 find_node: false,
+                narrow: !self.broad_nodes.contains(&node_id),
             });
         }
         for item in skipped_pages {
@@ -1295,6 +1369,7 @@ impl IterativeSearch {
                 start_position: 0,
                 resume_after: ResumeAnchors::default(),
                 find_node: true,
+                narrow: false,
             });
         }
         // The class preference — pinned session peers, then verified contacts,
@@ -1321,6 +1396,18 @@ impl IterativeSearch {
         // walk XOR order like every later batch.
         let seed_round = !self.seed_round_done;
         let passes = if seed_round { 3 } else { 1 };
+        // Taken before anything below changes state; dispatching moves entries
+        // to `InFlight`, which leaves this set as it is.
+        let near: HashSet<EmberNodeId> = if self.search_type == SearchType::FindValue {
+            self.shortlist
+                .iter()
+                .filter(|entry| entry.state != NodeState::Failed)
+                .take(K_BUCKET_SIZE)
+                .map(|entry| entry.contact.node_id)
+                .collect()
+        } else {
+            HashSet::new()
+        };
         for prefer in 0..passes {
             for entry in &mut self.shortlist {
                 if batch.len() >= can_send {
@@ -1344,6 +1431,12 @@ impl IterativeSearch {
                     entry.state = NodeState::InFlight;
                     self.queried.insert(entry.contact.node_id);
                     *self.attempts.entry(entry.contact.node_id).or_insert(0) += 1;
+                    let narrow = entry.pinned || near.contains(&entry.contact.node_id);
+                    if narrow {
+                        self.broad_nodes.remove(&entry.contact.node_id);
+                    } else if self.search_type == SearchType::FindValue {
+                        self.broad_nodes.insert(entry.contact.node_id);
+                    }
                     let req_id = self.next_request_id;
                     self.next_request_id = self.next_request_id.wrapping_add(1);
                     self.pending_requests.insert(
@@ -1362,6 +1455,7 @@ impl IterativeSearch {
                         start_position: 0,
                         resume_after: ResumeAnchors::default(),
                         find_node: false,
+                        narrow,
                     });
                 }
             }
@@ -1553,6 +1647,16 @@ impl IterativeSearch {
                     );
                     continue;
                 }
+                // Treated like a record for another key: nothing that answers
+                // this search, so it neither buys a slot of the file budget nor
+                // earns a page.
+                if self.keyword_lookup && data[0] != super::publish::RECORD_TYPE_KEYWORD {
+                    debug!(
+                        "Search {}: dropping a FOUND_VALUE blob that is not a keyword record",
+                        self.id
+                    );
+                    continue;
+                }
             }
             carried += 1;
             // No single peer gets to fill the budget. See
@@ -1687,6 +1791,7 @@ impl IterativeSearch {
                     confirmed_subnet,
                     from_local_store: self.local_node == Some(from_node),
                 });
+                self.last_new_record = Instant::now();
             }
         }
 
@@ -2171,6 +2276,16 @@ impl IterativeSearch {
             return;
         }
 
+        if self.keyword_walk_settled() {
+            trace!(
+                "Search {}: its neighbourhood has answered and nothing new arrived for {KEYWORD_SETTLE_SECS}s",
+                self.id
+            );
+            self.take_sole_contributors_held();
+            self.complete = true;
+            return;
+        }
+
         // For FIND_VALUE, complete once the remote budget is spent — see
         // [`Self::value_budget_full`].
         if self.search_type == SearchType::FindValue && self.value_budget_full() {
@@ -2206,6 +2321,49 @@ impl IterativeSearch {
             .all(|entry| entry.state == NodeState::Responded)
     }
 
+    /// Whether a keyword walk may end before its shortlist is exhausted: see
+    /// [`KEYWORD_SETTLE_SECS`].
+    ///
+    /// Pages and referrals are records and descent still owed by nodes that
+    /// have answered, parked pages included, so any of them holds the walk
+    /// open. A pinned session peer has to have answered or failed wherever it
+    /// sorts, since it is on the shortlist for records the neighbourhood of the
+    /// key does not hold.
+    fn keyword_walk_settled(&self) -> bool {
+        self.keyword_lookup
+            && self.search_type == SearchType::FindValue
+            && self.page_queue.is_empty()
+            && self.parked_pages.is_empty()
+            && self.referral_queue.is_empty()
+            && !self
+                .pending_requests
+                .values()
+                .any(|p| p.is_follow_up())
+            && self
+                .shortlist
+                .iter()
+                .filter(|entry| entry.pinned)
+                .all(|entry| matches!(entry.state, NodeState::Responded | NodeState::Failed))
+            && self.closest_have_responded()
+            && self.last_new_record.elapsed().as_secs() >= KEYWORD_SETTLE_SECS
+    }
+
+    /// Whether this walk has queries it could send and none outstanding.
+    ///
+    /// Nothing re-drives a search but an answer or an expired query, and a
+    /// walk in this state has neither: [`Self::next_to_query`] has work for it,
+    /// but the driver that last ran gave up on a run of undialable contacts.
+    pub fn stalled(&self) -> bool {
+        !self.complete
+            && self.pending_requests.is_empty()
+            && (!self.page_queue.is_empty()
+                || !self.parked_pages.is_empty()
+                || !self.referral_queue.is_empty()
+                || self.shortlist.iter().any(|entry| {
+                    entry.state == NodeState::Pending && !self.queried.contains(&entry.contact.node_id)
+                }))
+    }
+
     /// Shortlist entries that have answered us.
     pub fn responded_count(&self) -> usize {
         self.shortlist
@@ -2234,11 +2392,19 @@ impl IterativeSearch {
     /// nodes that answered, matching the `nodes_contacted` KAD reports: a walk
     /// waiting on silent peers is still making progress the user can see.
     ///
-    /// A retry clears the node from `queried` so it can be picked again, so a
-    /// timed-out node briefly stops counting. The alternative — counting
-    /// attempts — would report more nodes than exist on a lossy path.
+    /// Distinct nodes ever asked, so the figure never goes back: not `queried`,
+    /// which a retry empties of the node it is about to ask again. The nodes a
+    /// walk that fed this one had asked are counted from when it hands over, as
+    /// they were counted beside this search's own while it ran.
     pub fn queried_count(&self) -> usize {
-        self.queried.len()
+        self.attempts.len() + self.absorbed_nodes
+    }
+
+    /// Take a finished walk's records (see [`Self::absorb_results`]) and the
+    /// count of nodes it asked.
+    pub fn absorb_walk(&mut self, walk: IterativeSearch) {
+        self.absorbed_nodes += walk.queried_count();
+        self.absorb_results(walk.results);
     }
 
     /// Get the closest responded nodes (useful for FIND_NODE results).
@@ -2329,6 +2495,17 @@ impl SearchManager {
             routing_table,
             MAX_ACTIVE_SEARCHES,
         )
+    }
+
+    /// [`Self::start_find_value`] for an extra walk of a running keyword
+    /// search, which leaves the last slots free. See [`MAX_FEEDING_SEARCHES`].
+    pub fn start_feeding_find_value(
+        &mut self,
+        primary_key: EmberNodeId,
+        keyword_hashes: Vec<[u8; 16]>,
+        routing_table: &RoutingTable,
+    ) -> Option<u32> {
+        self.start_find_value_within(primary_key, keyword_hashes, routing_table, MAX_FEEDING_SEARCHES)
     }
 
     /// [`Self::start_find_value`] for automatic work, which yields the reserve.
@@ -2722,20 +2899,30 @@ fn v16_keywords(text: &str, strip_trailing_extension: bool) -> Vec<String> {
 /// A name holding whitespace other than the space is also cut on it, as 1.6.0
 /// to 1.6.4 cut it, so `alpha<TAB>beta` carries `alpha` and `beta`.
 pub fn name_word_keys(file_name: &str) -> HashSet<[u8; 16]> {
+    name_word_key_list(file_name).into_iter().collect()
+}
+
+/// [`name_word_keys`] as a list without repeats: the name's words as typed in
+/// the order they appear, then the keys only their normalised spelling or the
+/// 1.6 split adds. A caller keeping a prefix keeps the earliest words.
+pub fn name_word_key_list(file_name: &str) -> Vec<[u8; 16]> {
     use crate::network::kad::publish::extract_query_keywords;
-    let mut keys: HashSet<[u8; 16]> = extract_query_keywords(file_name)
-        .iter()
-        .map(|w| keyword_hash(w))
-        .collect();
+    let mut seen: HashSet<[u8; 16]> = HashSet::new();
+    let mut keys = Vec::new();
+    let mut add = |word: &String| {
+        let key = keyword_hash(word);
+        if seen.insert(key) {
+            keys.push(key);
+        }
+    };
+    extract_query_keywords(file_name).iter().for_each(&mut add);
     if !file_name.is_ascii() {
-        keys.extend(
-            extract_query_keywords(&normalize_keyword_text(file_name))
-                .iter()
-                .map(|w| keyword_hash(w)),
-        );
+        extract_query_keywords(&normalize_keyword_text(file_name))
+            .iter()
+            .for_each(&mut add);
     }
     if file_name.chars().any(|c| c.is_whitespace() && c != ' ') {
-        keys.extend(v16_keywords(file_name, false).iter().map(|w| keyword_hash(w)));
+        v16_keywords(file_name, false).iter().for_each(&mut add);
     }
     keys
 }
@@ -5990,5 +6177,195 @@ mod tests {
             retry[0].0.node_id, close.node_id,
             "after the first dispatch, retries walk XOR order, not seed class"
         );
+    }
+
+    /// A signed source record filed under `key` — the record type a keyword
+    /// search never asked for, at the key it walks.
+    fn source_record_under(file_hash: [u8; 16], filler: u8) -> Vec<u8> {
+        let sk = SigningKey::from_bytes(&[filler; 32]);
+        let rec = SignedRecord::source(
+            file_hash,
+            [0u8; 32],
+            100,
+            "file.iso",
+            super::super::publish::SourceContact {
+                ip: Ipv4Addr::new(81, 2, 3, filler),
+                tcp_port: 4662,
+                ..Default::default()
+            },
+            &sk,
+        );
+        let mut blob = rec.data.clone();
+        blob.extend_from_slice(&rec.signature);
+        blob
+    }
+
+    /// Only keyword records answer a keyword search, so anything else under
+    /// its key buys none of its budget, and earns no page and no referral. The
+    /// other value lookups still take every record type.
+    #[test]
+    fn a_keyword_search_takes_no_other_record_type() {
+        let file_hash = [0x33u8; 16];
+        let target = EmberNodeId(super::super::publish::source_key(&file_hash));
+        let rt = table_with_contacts(make_id(0x00), 2);
+        let records: Vec<Vec<u8>> = (1..=10).map(|i| source_record_under(file_hash, i)).collect();
+        for keyword_lookup in [true, false] {
+            let mut sm = SearchManager::new();
+            let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+            let search = sm.get_mut(sid).unwrap();
+            if keyword_lookup {
+                search.mark_keyword_lookup();
+            }
+            let batch = search.query_pairs();
+            let (contact, req) = &batch[0];
+            let page = Some(ValuePage {
+                next_position: 10,
+                total_available: 40,
+            });
+            search.process_response(*req, &contact.node_id, vec![], records.clone(), page);
+            if keyword_lookup {
+                assert!(search.results.is_empty());
+                assert!(search.budget_spent.is_empty(), "nothing charged to the budget");
+                assert!(search.page_queue.is_empty() && search.parked_pages.is_empty(), "no page");
+                assert!(search.referral_queue.is_empty(), "no referral");
+            } else {
+                assert_eq!(search.results.len(), records.len());
+                assert_eq!(search.page_queue.len(), 1);
+                assert_eq!(search.referral_queue.len(), 1);
+            }
+        }
+    }
+
+    /// A contact `distance` (in its first byte) from `target`.
+    fn at_distance(target: EmberNodeId, distance: u8, verified: bool) -> EmberContact {
+        let mut contact = if verified {
+            make_contact(distance)
+        } else {
+            make_lead(distance)
+        };
+        contact.node_id = EmberNodeId(std::array::from_fn(|i| {
+            target.0[i] ^ if i == 0 { distance } else { 0 }
+        }));
+        contact
+    }
+
+    /// Answer a keyword-key walk until it ends, the first answer naming four
+    /// leads closer than every seed, which pushes four verified seeds past rank
+    /// k where the trim keeps them, and the `record_at`th answer carrying a new
+    /// record. Each answer is made with the quiet time reading `quiet_since`.
+    /// Returns how many queries were answered.
+    fn walk_past_the_neighbourhood(keyword_lookup: bool, quiet_since: Instant, record_at: Option<usize>) -> usize {
+        let target = keyword_target("ubuntu");
+        let mut rt = RoutingTable::new(make_id(0x00), false);
+        for distance in 0x40..0x40 + K_BUCKET_SIZE as u8 {
+            rt.add_contact(at_distance(target, distance, true));
+        }
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+        if keyword_lookup {
+            search.mark_keyword_lookup();
+        }
+        let mut leads: Vec<EmberContact> = (2..6).map(|d| at_distance(target, d, false)).collect();
+        let mut asked = 0usize;
+        while !search.complete {
+            let batch = search.query_pairs();
+            if batch.is_empty() {
+                break;
+            }
+            for (contact, req) in batch {
+                asked += 1;
+                search.last_new_record = quiet_since;
+                let records = if record_at == Some(asked) {
+                    vec![signed_value_blob("ubuntu", 1)]
+                } else {
+                    vec![]
+                };
+                search.process_unpaged(req, &contact.node_id, std::mem::take(&mut leads), records);
+            }
+        }
+        assert!(search.poll_complete());
+        asked
+    }
+
+    /// Records live on the k nodes closest to their key. Once those have
+    /// answered and nothing new has come in for a while, a keyword walk ends
+    /// instead of asking the farther seeds the trim keeps. A record taken
+    /// restarts the quiet time, as does any answer arriving while it is short;
+    /// other value lookups always exhaust.
+    #[test]
+    fn a_keyword_walk_ends_once_its_neighbourhood_has_answered_and_gone_quiet() {
+        let every_entry = K_BUCKET_SIZE + 4;
+        let quiet = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(KEYWORD_SETTLE_SECS + 1))
+            .expect("the clock reaches back that far");
+        let settled = walk_past_the_neighbourhood(true, quiet, None);
+        assert_eq!(settled, K_BUCKET_SIZE, "the k closest, and no farther");
+
+        // A record from the last of the k closest restarts the quiet time, so
+        // the walk goes on to the farther seeds rather than ending on it.
+        let restarted = walk_past_the_neighbourhood(true, quiet, Some(K_BUCKET_SIZE));
+        assert!(restarted > settled, "asked {restarted}");
+
+        assert_eq!(walk_past_the_neighbourhood(true, Instant::now(), None), every_entry);
+        assert_eq!(walk_past_the_neighbourhood(false, quiet, None), every_entry);
+    }
+
+    /// The nodes a search reports having asked never drop: not when a node is
+    /// put back to be asked again, nor when a walk feeding it hands over.
+    #[test]
+    fn nodes_asked_never_drops() {
+        let rt = table_with_contacts(make_id(0x00), 3);
+        let mut sm = SearchManager::new();
+        let main = sm.start_find_value(make_id(0x01), vec![], &rt).expect("slot");
+        let fed = sm.start_find_value(make_id(0x02), vec![], &rt).expect("slot");
+        let first = sm.get_mut(main).unwrap().query_pairs();
+        sm.get_mut(fed).unwrap().query_pairs();
+        assert_eq!(sm.get(main).unwrap().queried_count(), 3);
+
+        sm.get_mut(main).unwrap().mark_failed_with(first[0].1, QueryFailure::TimedOut);
+        assert_eq!(sm.get(main).unwrap().queried_count(), 3, "a node to be asked again");
+
+        let walk = sm.remove(fed).unwrap();
+        let before = sm.get(main).unwrap().queried_count() + walk.queried_count();
+        sm.get_mut(main).unwrap().absorb_walk(walk);
+        assert_eq!(sm.get(main).unwrap().queried_count(), before);
+    }
+
+    /// Extra walks of a running keyword search leave the last slots of the
+    /// pool for the next search the user starts.
+    #[test]
+    fn extra_walks_leave_the_last_slots_for_a_new_search() {
+        let rt = RoutingTable::new(make_id(0x00), false);
+        let mut sm = SearchManager::new();
+        for i in 0..MAX_FEEDING_SEARCHES {
+            let id = sm.start_find_value(make_id(i as u8), vec![], &rt);
+            assert!(id.is_some());
+        }
+        assert!(sm.start_feeding_find_value(make_id(0xF0), vec![], &rt).is_none());
+        assert!(sm.start_find_value(make_id(0xF1), vec![], &rt).is_some());
+    }
+
+    /// A walk whose driver gave up on a run of undialable contacts has nothing
+    /// outstanding, so nothing would drive it again; one still waiting on an
+    /// answer, or finished, is not stalled.
+    #[test]
+    fn a_walk_with_work_and_nothing_in_flight_is_stalled() {
+        let rt = table_with_contacts(make_id(0x00), K_BUCKET_SIZE as u8);
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_value(make_id(0x01), vec![], &rt).expect("slot");
+        let search = sm.get_mut(sid).unwrap();
+        assert!(search.stalled(), "never driven");
+
+        let batch = search.query_pairs();
+        assert!(!search.stalled(), "waiting on answers");
+        for (_, req) in batch {
+            search.mark_failed_with(req, QueryFailure::NotSent);
+        }
+        assert!(search.stalled(), "the rest of the shortlist was never tried");
+
+        walk_until_done(search);
+        assert!(search.complete);
+        assert!(!search.stalled());
     }
 }

@@ -524,10 +524,12 @@ fn is_episode_token(tok: &str) -> bool {
 /// `md4str` → `EncodeBase16`). The server special-cases the `related:` prefix
 /// instead of treating it as a filename substring.
 ///
-/// This must never go through [`crate::search::query::parse`]: `:` is an eD2k
-/// keyword separator, so the parser would shred the term into `related` plus
-/// hash fragments. Callers wrap the returned string in a
-/// [`crate::search::query::QueryExpr::Term`] directly.
+/// Callers wrap the returned string in a
+/// [`crate::search::query::QueryExpr::Term`] directly rather than handing it
+/// to [`crate::search::query::parse`]. The parser keeps a directive it
+/// recognizes whole, but `:` is an eD2k keyword separator, so a term it did
+/// not recognize would be split into `related` plus hash fragments; the term
+/// built here is already in the form eMule sends and needs no reading back.
 pub fn co_share_term(hashes: &[String]) -> Option<String> {
     let mut term = String::from("related");
     let mut used = 0usize;

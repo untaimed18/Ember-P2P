@@ -1,8 +1,9 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { SearchResult, SpamExplanation, SpamStats, DownloadHistoryStats } from '$lib/types';
+import type { SearchResult, SpamExplanation, SpamReason, SpamStats, DownloadHistoryStats } from '$lib/types';
 import { clampFilterBytes, clampMinSources } from '$lib/searchQuery';
 
-export type SearchMethod = 'global' | 'server' | 'kad' | 'ember';
+export const SEARCH_METHODS = ['global', 'server', 'kad', 'ember'] as const;
+export type SearchMethod = (typeof SEARCH_METHODS)[number];
 
 export interface SearchFilters {
   fileType?: string;
@@ -58,8 +59,9 @@ export async function searchFiles(query: string, method: SearchMethod = 'global'
   });
 }
 
+export const RELATION_KINDS = ['co_share', 'series', 'album', 'volume', 'title'] as const;
 /** Why a related search believes results are related to the seed file. */
-export type RelationKind = 'co_share' | 'series' | 'album' | 'volume' | 'title';
+export type RelationKind = (typeof RELATION_KINDS)[number];
 
 export interface RelatedProbe {
   kind: RelationKind;
@@ -287,6 +289,7 @@ export async function explainSpamResult(
     resultOrigin?: string | null;
     batchFileHashes?: string[];
     batchFileNames?: string[];
+    spamReasonDetails?: SpamReason[] | null;
   },
 ): Promise<SpamExplanation> {
   return invoke('explain_spam_result', {
@@ -301,6 +304,7 @@ export async function explainSpamResult(
     resultOrigin: opts?.resultOrigin ?? null,
     batchFileHashes: opts?.batchFileHashes ?? null,
     batchFileNames: opts?.batchFileNames ?? null,
+    spamReasonDetails: opts?.spamReasonDetails ?? null,
   });
 }
 

@@ -151,6 +151,68 @@ describe('forPersist', () => {
     });
   });
 
+  it('falls back to the default network for a method it does not know', () => {
+    const raw = JSON.stringify({
+      tabs: [
+        { id: 'a', query: 'q', results: [], method: 'carrier-pigeon' },
+        { id: 'b', query: 'q', results: [], method: 42 },
+        { id: 'c', query: 'q', results: [], method: 'kad' },
+      ],
+      activeId: 'a',
+    });
+    expect(parsePersistedSearch(raw).tabs.map((t) => t.method)).toEqual(['global', 'global', 'kad']);
+  });
+
+  it('drops a file type that is not text', () => {
+    const raw = JSON.stringify({
+      tabs: [
+        { id: 'a', query: 'q', results: [], fileType: { name: 'Video' } },
+        { id: 'b', query: 'q', results: [], fileType: 'Audio' },
+      ],
+      activeId: 'a',
+    });
+    expect(parsePersistedSearch(raw).tabs.map((t) => t.fileType)).toEqual([undefined, 'Audio']);
+  });
+
+  it('drops a related label without its text, and the kinds it does not know', () => {
+    // The tab strip reads every field of `related` while it renders.
+    const raw = JSON.stringify({
+      tabs: [
+        { id: 'a', query: 'q', results: [], related: { seedLabel: 'seed.mkv', queryLabel: 'seed', kinds: ['series', 'telepathy', 7] } },
+        { id: 'b', query: 'q', results: [], related: { seedLabel: 3, queryLabel: 'seed', kinds: [] } },
+        { id: 'c', query: 'q', results: [], related: 'yes' },
+        { id: 'd', query: 'q', results: [], related: { seedLabel: 's', queryLabel: '', kinds: 'series' } },
+      ],
+      activeId: 'a',
+    });
+    expect(parsePersistedSearch(raw).tabs.map((t) => t.related)).toEqual([
+      { seedLabel: 'seed.mkv', queryLabel: 'seed', kinds: ['series'] },
+      undefined,
+      undefined,
+      { seedLabel: 's', queryLabel: '', kinds: [] },
+    ]);
+  });
+
+  it('keeps the first of two tabs with one id', () => {
+    const raw = JSON.stringify({
+      tabs: [
+        { id: 'a', query: 'first', results: [] },
+        { id: 'b', query: 'other', results: [] },
+        { id: 'a', query: 'repeat', results: [] },
+      ],
+      activeId: 'a',
+    });
+    expect(parsePersistedSearch(raw).tabs.map((t) => t.query)).toEqual(['first', 'other']);
+  });
+
+  it('drops an error that is not text', () => {
+    const raw = JSON.stringify({
+      tabs: [{ id: 'a', query: 'q', results: [], error: { code: 'x' } }],
+      activeId: 'a',
+    });
+    expect(parsePersistedSearch(raw).tabs[0].error).toBeNull();
+  });
+
   it('keeps the best-sourced rows rather than the first ones stored', () => {
     // Arrival order is packet order. Keeping the head of the array threw away
     // the rows the user was most likely looking at.

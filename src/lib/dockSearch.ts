@@ -6,15 +6,41 @@
  * opens, and a rule that is wrong shows up as the wrong chat rather than as an
  * error.
  */
+import { splitHighlights, type HighlightPart } from '$lib/highlight';
 
 /** Below this a run of hex digits is far more likely to be part of a name —
  *  "de", "cafe", "bead" — than someone pasting an ID. */
 const ID_QUERY_MIN = 8;
 const ID_QUERY_RE = /^[0-9a-f]+$/;
 
-/** Lowercase with accents stripped, so "jose" finds "José". */
+/**
+ * Lowercase with accents stripped, so "jose" finds "José".
+ *
+ * Only the combining diacriticals block (U+0300–U+036F) goes: every other mark
+ * is part of the letter — Japanese dakuten, Indic and Thai vowel signs — and
+ * stripping it turns one word into another. NFC afterwards puts back what NFD
+ * took apart and nothing was stripped from.
+ */
 export function foldForSearch(text: string): string {
-  return text.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
+  return text.normalize('NFD').replace(/[\u0300-\u036f]/g, '').normalize('NFC').toLowerCase();
+}
+
+/**
+ * `splitHighlights` matched the way `foldForSearch` matches, so a filter of
+ * "jose" marks the "José" it found. Falls back to the plain case-insensitive
+ * split when folding changes the text's length, since the folded positions
+ * would then point at the wrong characters of the original.
+ */
+export function splitFoldedHighlights(text: string, terms: readonly string[]): HighlightPart[] {
+  const folded = foldForSearch(text);
+  if (folded.length !== text.length) return splitHighlights(text, terms);
+  const parts = splitHighlights(folded, terms.map(foldForSearch));
+  let at = 0;
+  return parts.map((part) => {
+    const original = text.slice(at, at + part.text.length);
+    at += part.text.length;
+    return { text: original, mark: part.mark };
+  });
 }
 
 /** The query as rows are compared against it. */

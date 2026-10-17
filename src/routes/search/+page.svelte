@@ -1,6 +1,6 @@
 <script lang="ts">
   import SearchBar from '$lib/components/SearchBar.svelte';
-  import { searchFiles, searchWatchdogSecs, cancelSearch, searchMore, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, removeDownloadHistoryEntry, formatEd2kLink, formatEd2kLinks, type SearchMethod, type RelatedPlan } from '$lib/api/search';
+  import { searchFiles, searchWatchdogSecs, cancelSearch, searchMore, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, removeDownloadHistoryEntry, formatEd2kLink, formatEd2kLinks, SEARCH_METHODS, type SearchMethod, type RelatedPlan } from '$lib/api/search';
   import {
     pendingRelatedSearch,
     relationKindLabel,
@@ -17,6 +17,7 @@
   import type { Transfer } from '$lib/types';
   import { appSettings } from '$lib/stores/settings';
   import {
+    MAX_SEARCH_TABS,
     activeSearchTabId,
     appendSearchResults,
     clearPendingSearchResults,
@@ -65,6 +66,8 @@
   import FileTypeIcon from '$lib/components/FileTypeIcon.svelte';
   import { extensionFromPath, fileTypeKey } from '$lib/fileTypes';
   import { highlightTerms, splitHighlights } from '$lib/highlight';
+  import { foldForSearch, splitFoldedHighlights } from '$lib/dockSearch';
+  import { getLocale } from '$lib/paraglide/runtime';
   import { highlightMatches } from '$lib/stores/highlight';
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
@@ -86,6 +89,10 @@
   const searchInvokeSettled = new Set<number>();
 
   let searchMethod = $state<SearchMethod>('global');
+  /** The method last picked in the dropdown. Selecting a tab shows its own
+   *  method there, but a related tab's is not one the user chose — it always
+   *  runs on the server — so selecting one puts this back instead. */
+  let chosenSearchMethod = $state<SearchMethod>('global');
   let searchFileType: string = $state('');
 
   let barQuery = $state('');
@@ -168,10 +175,13 @@
    * often than anyone wants a count read out — and how it ended.
    *
    * Switching to a tab announces nothing: that is the user's own action, and
-   * the tab strip already reads its count.
+   * the tab strip already reads its count. A tab is announced as started only
+   * within `SEARCH_ANNOUNCE_START_MS` of its search starting, which is when a
+   * new search selects it.
    */
   let searchAnnouncement = $state('');
   const SEARCH_ANNOUNCE_INTERVAL_MS = 5_000;
+  const SEARCH_ANNOUNCE_START_MS = 2_000;
   let announceSeq = 0;
   let announcedTabId: string | null = null;
   let announcedSearching = false;
@@ -197,8 +207,7 @@
     untrack(() => {
       const now = Date.now();
       if (tabId !== announcedTabId) {
-        // A new search opens a new tab, already searching and still empty.
-        const started = searching && (activeTab?.results.length ?? 0) === 0;
+        const started = searching && now - (activeTab?.startedAt ?? 0) < SEARCH_ANNOUNCE_START_MS;
         announcedTabId = tabId;
         announcedSearching = searching;
         announcedAt = now;
@@ -523,11 +532,11 @@
   let bulkMessageToken = 0;
   let checkedCount = $derived(checkedKeys.size);
   /** What the ticked results weigh, shown beside the count before a bulk
-   *  download. */
+   *  download. Over the throttled list, like every other whole-list pass. */
   let checkedTotalSize = $derived.by(() => {
     if (checkedKeys.size === 0) return 0;
     let bytes = 0;
-    for (const result of activeTab?.results ?? []) {
+    for (const result of visibleResults) {
       if (checkedKeys.has(resultKey(result))) bytes += result.file.size;
     }
     return bytes;
@@ -545,7 +554,7 @@
   }
   let selectedResult = $derived.by(() => {
     if (!selectedResultKey) return null;
-    return searchResultsList.find((r) => resultKey(r) === selectedResultKey) ?? null;
+    return visibleResults.find((r) => resultKey(r) === selectedResultKey) ?? null;
   });
   let notes: SearchResult[] = $state([]);
   let loadingNotes = $state(false);
@@ -598,6 +607,12 @@
   let filterMaxSize = $state<number | null>(null);
   let filterMaxUnit = $state(1024 * 1024 * 1024);
   let filterExtension = $state('');
+  /** An extension typed as the whole query, held for the next typed search
+   *  rather than put in the empty Extension box, which would also filter the
+   *  tab on screen. Shown as a chip by the query box while it is held, and
+   *  dropped by its ×, by typing in the Extension box, by picking a method or a
+   *  tab, and by clearing the query box. */
+  let stagedExtension = $state('');
   let filterMinSources = $state<number | null>(null);
   // Client-side "complete sources" minimum. Unlike Min Sources (sent to the
   // remote node as a FT_SOURCES constraint), there is no standard eD2k search
@@ -605,6 +620,16 @@
   // received (the count arrives on each hit as `file.complete_sources`).
   let filterMinComplete = $state<number | null>(null);
   let hideSpam = $state<boolean>(true);
+  /** The tab whose spam a Show spam button revealed. Not saved, and not the
+   *  Hide spam preference, for the reason `clearFilters` leaves that alone: a
+   *  look at one tab's junk is not a decision about every later search. */
+  let spamRevealedTabId = $state<string | null>(null);
+  let hidingSpam = $derived(
+    hideSpam && !(spamRevealedTabId !== null && spamRevealedTabId === $activeSearchTabId),
+  );
+  function revealSpamInTab() {
+    spamRevealedTabId = get(activeSearchTabId);
+  }
   let hideOwned = $state<boolean>(false);
 
   /**
@@ -658,8 +683,8 @@
     if (origin !== 'Ember') return m.search_sources_ember_mixed_hint();
     return plural(r.availability, {
       one: m.search_sources_ember_hint_one,
-      few: () => m.search_sources_ember_hint_few({ count: r.availability }),
-      other: () => m.search_sources_ember_hint_other({ count: r.availability }),
+      few: () => m.search_sources_ember_hint_few({ count: formatNumber(r.availability) }),
+      other: () => m.search_sources_ember_hint_other({ count: formatNumber(r.availability) }),
     });
   }
   let spamProfile = $derived(
@@ -951,24 +976,72 @@
     }
   }
 
+  /** A message as the text either side of one placeholder, so what goes in
+   *  it can be set in markup the message itself cannot carry. */
+  function aroundPlaceholder(render: (marker: string) => string): [string, string] {
+    const marker = '\u0000';
+    const [before, after = ''] = render(marker).split(marker);
+    return [before, after];
+  }
+  const filterHelpParts = aroundPlaceholder((minus) => m.search_filter_help({ minus }));
+
+  /** Lists in the app language: "a, b and c", and the bare "a, b, c" a status
+   *  line uses. Locale changes reload the page, so built once. */
+  const conjunctionList = new Intl.ListFormat(getLocale(), { type: 'conjunction' });
+  const unitList = new Intl.ListFormat(getLocale(), { type: 'unit', style: 'short' });
+
   // One reused collator instead of an implicit per-comparison one from
   // `String.prototype.localeCompare`, which allocates on every call during a
-  // sort over thousands of rows. Default options, so ordering is unchanged.
-  const sortCollator = new Intl.Collator();
+  // sort over thousands of rows. In the app language rather than the system's,
+  // and numeric, so "Episode 2" sorts before "Episode 10".
+  const sortCollator = new Intl.Collator(getLocale(), { numeric: true });
+
+  /** Code points that render as nothing. A name led by one sorted ahead of
+   *  every visible name, wherever its letters would put it. */
+  const DEFAULT_IGNORABLE_RE = /\p{Default_Ignorable_Code_Point}/gu;
+
+  /** What the name, Type and Origin columns show for a row, as it sorts.
+   *  Cached on the row object for one sort field, as `filterHaystack` is:
+   *  a sort compares each row about log n times. */
+  let sortLabelCache = new WeakMap<SearchResult, string>();
+  let sortLabelField: SortField | null = null;
+
+  function sortLabel(result: SearchResult, field: 'name' | 'type' | 'origin'): string {
+    if (sortLabelField !== field) {
+      sortLabelCache = new WeakMap();
+      sortLabelField = field;
+    }
+    const cached = sortLabelCache.get(result);
+    if (cached !== undefined) return cached;
+    const shown = field === 'name' ? displayName(result)
+      : field === 'type' ? resultTypeLabel(result) || result.file.extension || ''
+      : originLabel(result.result_origin || '');
+    const label = shown.replace(DEFAULT_IGNORABLE_RE, '');
+    sortLabelCache.set(result, label);
+    return label;
+  }
 
   // Parsed once per filter-text change rather than once per result row:
-  // `isFilteredByText` runs inside `filteredResults`, which re-derives on every
-  // streamed batch, so the split and its regex were being re-run per row.
+  // `isFilteredByText` runs for every row of the filter pass, which re-derives
+  // on every streamed batch.
   let filterTokens = $derived.by(() => {
     const t = filterText.trim();
     if (!t) return [] as string[];
     return t.split(/\s+/).filter((s) => s !== '' && s !== '-');
   });
+  /** The tokens as text terms, folded the way `filterHaystack` folds a row. */
+  let filterTerms = $derived(
+    filterTokens.map((token) => {
+      const isNot = token.startsWith('-');
+      return { isNot, term: foldForSearch(isNot ? token.slice(1) : token) };
+    }),
+  );
 
-  /** Lowercased searchable text for one row, under the active filter column.
+  /** Searchable text for one row under the active filter column, lowercased
+   *  and with accents stripped (`foldForSearch`), so "jose" finds "José".
    *
    *  `getColumnText` formats a size, resolves a type label and splits an
-   *  origin string, then joins the lot and lowercases it — all pure functions
+   *  origin string, then joins the lot and folds it — all pure functions
    *  of the row. It was doing that per row on every filter pass, and the
    *  filter re-derives on each streamed batch as well as each debounced
    *  keystroke, so typing into a large tab redid the whole thing several times
@@ -988,7 +1061,7 @@
     }
     const cached = haystackCache.get(result);
     if (cached !== undefined) return cached;
-    const text = getColumnText(result, column).toLowerCase();
+    const text = foldForSearch(getColumnText(result, column));
     haystackCache.set(result, text);
     return text;
   }
@@ -1022,11 +1095,8 @@
 
     const target = filterHaystack(result, filterColumn);
 
-    for (const token of tokens) {
-      const isNot = token.startsWith('-');
-      const term = (isNot ? token.slice(1) : token).toLowerCase();
+    for (const { isNot, term } of filterTerms) {
       if (!term) continue;
-
       const found = target.includes(term);
       if (isNot === found) return true;
     }
@@ -1044,7 +1114,6 @@
   // Stored under a versioned key so a future shape change can be migrated or
   // discarded safely by bumping the suffix.
   const PREFS_KEY = 'search-prefs-v1';
-  const VALID_SEARCH_METHODS = new Set<SearchMethod>(['global', 'kad', 'server', 'ember']);
   const VALID_FILTER_COLUMNS = new Set<FilterColumn>([
     'name', 'size', 'type', 'sources', 'origin', 'hash', 'all',
   ]);
@@ -1065,8 +1134,10 @@
       if (!raw) return;
       const p = JSON.parse(raw);
       if (!p || typeof p !== 'object') return;
-      if (typeof p.searchMethod === 'string' && VALID_SEARCH_METHODS.has(p.searchMethod as SearchMethod)) {
-        searchMethod = p.searchMethod as SearchMethod;
+      const savedMethod = SEARCH_METHODS.find((method) => method === p.searchMethod);
+      if (savedMethod) {
+        searchMethod = savedMethod;
+        chosenSearchMethod = searchMethod;
       }
       if (typeof p.searchFileType === 'string' && VALID_FILE_TYPES.has(p.searchFileType)) {
         searchFileType = p.searchFileType;
@@ -1130,7 +1201,7 @@
   function persistPrefs() {
     try {
       localStorage.setItem(PREFS_KEY, JSON.stringify({
-        searchMethod,
+        searchMethod: chosenSearchMethod,
         searchFileType,
         filterType,
         filterColumn,
@@ -1156,7 +1227,7 @@
     if (!prefsRestored) return;
     // Reactivity markers: touch every persisted field so the effect runs
     // whenever any of them changes.
-    void searchMethod; void searchFileType;
+    void chosenSearchMethod; void searchFileType;
     void filterType; void filterColumn; void filterExtension;
     void filterMinSize; void filterMaxSize; void filterMinUnit; void filterMaxUnit;
     void filterMinSources; void filterMinComplete; void columnVis;
@@ -1317,6 +1388,7 @@
       case 'EmberNoKeyword': return m.search_notice_ember_no_keyword();
       case 'ServerUnavailable': return m.search_notice_server_unavailable();
       case 'ServerNoAnswer': return m.search_notice_server_no_answer();
+      case 'ServerNoLargeFiles': return m.search_notice_server_no_large_files();
       case 'NetworkNoKeyword': return m.search_notice_library_only();
       default: return null;
     }
@@ -1340,14 +1412,6 @@
       // invent same-name/many-hashes collisions.
       batchFileNames: rows.map((r) => r.file.name),
     };
-  }
-
-  function spamProfileLabel(profile: string): string {
-    switch (profile) {
-      case 'aggressive': return m.settings_spam_profile_aggressive();
-      case 'relaxed': return m.settings_spam_profile_relaxed();
-      default: return m.settings_spam_profile_balanced();
-    }
   }
 
   let searchTimeoutSecs = $state(120);
@@ -1532,6 +1596,15 @@
     };
   });
   let spamThreshold = $derived(spamProfile === 'aggressive' ? 45 : spamProfile === 'relaxed' ? 80 : 60);
+  /** The spam help sentence, with its threshold and profile set in bold. */
+  let spamHelpParts = $derived.by(() => {
+    const threshold = formatNumber(spamThreshold);
+    const profile = spamProfileText(spamProfile);
+    return splitHighlights(
+      m.search_spam_help({ threshold, profile }),
+      [threshold, profile.toLowerCase()],
+    );
+  });
 
   function currentSearchQuery(): string {
     return activeTab?.query ?? '';
@@ -1573,6 +1646,7 @@
       serverIp: result.origin_server_ip ?? null,
       rating: result.rating ?? null,
       resultOrigin: result.result_origin ?? null,
+      spamReasonDetails: result.spam_reason_details ?? null,
     };
   }
 
@@ -1732,12 +1806,10 @@
   let pointerOverResults = $state(false);
   let orderHeld = $derived(pointerOverResults || contextMenu !== null);
   /** The order being held, for the sort and tab it was taken under. Written
-   *  only by `filterPass`, which it exists to carry between passes. */
+   *  only by `sortPass`, which it exists to carry between passes. */
   let heldOrder: { sortKey: string; tabId: string | null; ranks: Map<string, number> } | null = null;
 
-  // Filter, sort and the spam tally all in one walk of the list. `spamHidden`
-  // used to be its own `.filter().length` over the same array, which meant a
-  // second full pass riding the same invalidation as this one.
+  // Filter and the spam tally in one walk of the list; the sort is `sortPass`.
   let filterPass = $derived.by(() => {
     // Single-pass filter: the previous implementation chained up to 8
     // `.filter()` calls, each allocating a fresh array. On a busy search
@@ -1759,7 +1831,7 @@
     const minCompleteParsed = filterMinComplete !== null ? Math.trunc(filterMinComplete) : NaN;
     const minComplete = Number.isFinite(minCompleteParsed) && minCompleteParsed > 0 ? minCompleteParsed : 0;
     const hasType = !!filterType;
-    const spamHidden = hideSpam;
+    const spamHidden = hidingSpam;
     const ownedHidden = hideOwned;
 
     const out: SearchResult[] = [];
@@ -1808,17 +1880,52 @@
       out.push(r);
     }
 
+    return { rows: out, spamCount, ownedCount, bothCount };
+  });
+
+  /** The last order `sortPass` produced, and what it was produced from. */
+  let lastSort: {
+    input: SearchResult[];
+    sortKey: string;
+    tabId: string | null;
+    rows: SearchResult[];
+    /** A full sort rather than a held order. */
+    sorted: boolean;
+  } | null = null;
+
+  /**
+   * The filtered rows in table order. Apart from `filterPass` so the hold
+   * starting or ending — every time the pointer crosses the table — costs no
+   * filter, and no sort either unless rows came or went while it was held:
+   * the order on screen is already the one wanted.
+   */
+  let sortPass = $derived.by(() => {
+    const input = filterPass.rows;
+    // A sort the user picks, or another tab, applies at once even mid-hold:
+    // only the stream's re-sorting waits.
+    const sortKey = `${sortField}:${sortDir}`;
+    const tabId = $activeSearchTabId;
+    const held = orderHeld;
+    const same = lastSort && lastSort.input === input && lastSort.sortKey === sortKey && lastSort.tabId === tabId;
+    if (same && lastSort && (held || lastSort.sorted)) {
+      if (!held) heldOrder = null;
+      else if (!heldOrder || heldOrder.sortKey !== sortKey || heldOrder.tabId !== tabId) {
+        heldOrder = { sortKey, tabId, ranks: rowRanks(lastSort.rows, resultKey) };
+      }
+      return lastSort.rows;
+    }
+
     const compare = (a: SearchResult, b: SearchResult) => {
       let cmp = 0;
       switch (sortField) {
         case 'name':
-          cmp = sortCollator.compare(a.clean_name || a.file.name, b.clean_name || b.file.name);
+          cmp = sortCollator.compare(sortLabel(a, 'name'), sortLabel(b, 'name'));
           break;
         case 'size':
           cmp = a.file.size - b.file.size;
           break;
         case 'type':
-          cmp = sortCollator.compare(resultType(a), resultType(b));
+          cmp = sortCollator.compare(sortLabel(a, 'type'), sortLabel(b, 'type'));
           break;
         case 'sources':
           // Equal numbers are not equal evidence. Ember's count is confirmed
@@ -1831,7 +1938,7 @@
               (b.result_origin?.includes('Ember') ? 1 : 0);
           break;
         case 'origin':
-          cmp = sortCollator.compare(a.result_origin || '', b.result_origin || '');
+          cmp = sortCollator.compare(sortLabel(a, 'origin'), sortLabel(b, 'origin'));
           break;
         case 'length':
           cmp = (a.media?.duration ?? 0) - (b.media?.duration ?? 0);
@@ -1861,21 +1968,20 @@
       }
       return sortDir === 'asc' ? cmp : -cmp;
     };
-    // A sort the user picks, or another tab, applies at once even mid-hold:
-    // only the stream's re-sorting waits.
-    const sortKey = `${sortField}:${sortDir}`;
-    const tabId = $activeSearchTabId;
-    if (orderHeld && heldOrder && heldOrder.sortKey === sortKey && heldOrder.tabId === tabId) {
+    const out = input.slice();
+    let sorted = false;
+    if (held && heldOrder && heldOrder.sortKey === sortKey && heldOrder.tabId === tabId) {
       holdRowOrder(out, heldOrder.ranks, resultKey, compare);
     } else {
       out.sort(compare);
-      heldOrder = orderHeld ? { sortKey, tabId, ranks: rowRanks(out, resultKey) } : null;
+      sorted = true;
+      heldOrder = held ? { sortKey, tabId, ranks: rowRanks(out, resultKey) } : null;
     }
-
-    return { rows: out, spamCount, ownedCount, bothCount };
+    lastSort = { input, sortKey, tabId, rows: out, sorted };
+    return out;
   });
 
-  let filteredResults: SearchResult[] = $derived(filterPass.rows);
+  let filteredResults: SearchResult[] = $derived(sortPass);
   let spamHiddenCount = $derived(filterPass.spamCount);
   let ownedHiddenCount = $derived(filterPass.ownedCount);
   /** Rows hidden by both the spam and the owned filter: in neither count. */
@@ -2339,7 +2445,7 @@
    * on screen rather than part of the search that was sent.
    */
   function restoreTabSearchParams(tab: SearchTab) {
-    searchMethod = tab.method;
+    searchMethod = tab.related ? chosenSearchMethod : tab.method;
     searchFileType = tab.fileType ?? '';
     // Same rule as `handleSearch`: Program clears the local type filter so the
     // Arc/Iso hits a Pro-wire search brings back stay visible.
@@ -2380,6 +2486,7 @@
     // its ticks, selection and filter edits as one.
     if (tabId === get(activeSearchTabId)) return;
     setActiveSearchTab(tabId);
+    stagedExtension = '';
     // The scroller is shared by every tab; left where it was, a long tab
     // opened at the previous one's offset, thousands of rows in.
     if (resultsScrollEl) resultsScrollEl.scrollTop = 0;
@@ -2452,7 +2559,7 @@
    *  which is the only place that is discoverable. */
   function searchTabTitle(tab: SearchTab): string {
     if (!tab.related) return tab.query;
-    const signals = tab.related.kinds.map(relationKindLabel).join(', ');
+    const signals = conjunctionList.format(tab.related.kinds.map(relationKindLabel));
     const base = m.search_related_tab_title({ file: tab.related.seedLabel, signals });
     return tab.query ? `${base}\n${m.search_related_tab_query({ query: tab.query })}` : base;
   }
@@ -2467,29 +2574,20 @@
   function searchAgain(tab: SearchTab) {
     if (tab.isSearching || tab.related || !tab.query) return;
     const restorePanel = snapshotSearchPanel();
-    const existing = new Set(get(searchTabs).map((t) => t.id));
     barQuery = tab.query;
     restoreTabSearchParams(tab);
-    // `handleSearch` opens the new tab before its first await, so it is in
-    // the store by the time this returns, unless a gate refused the search.
-    // Refused, the active tab is still one that was already there — often not
-    // `tab` at all, since the button shows on background tabs too — and
-    // treating it as the new one moved it into `tab`'s slot and dropped `tab`.
-    void handleSearch(tab.query);
-    const newId = get(activeSearchTabId);
-    if (!newId || existing.has(newId)) {
+    // `handleSearch` refuses this one without a word, as it does for Enter,
+    // because the Search button is disabled for it and the readiness hint
+    // explains why; neither speaks for a tab the button may not be shown for.
+    if (searchSubmitBlocked) {
+      restorePanel();
+      addToast('warning', searchNetworkHint(tab.method));
+      return;
+    }
+    if (!handleSearch(tab.query, undefined, tab.id)) {
       restorePanel();
       return;
     }
-    searchTabs.update((tabs) => {
-      const oldIdx = tabs.findIndex((t) => t.id === tab.id);
-      const newIdx = tabs.findIndex((t) => t.id === newId);
-      if (oldIdx === -1 || newIdx === -1) return tabs;
-      const next = [...tabs];
-      const [fresh] = next.splice(newIdx, 1);
-      next.splice(next.findIndex((t) => t.id === tab.id), 1, fresh);
-      return next;
-    });
     clearSearchTimeoutForRequest(tab.requestId);
   }
 
@@ -2508,7 +2606,7 @@
       ? m.search_confirm_stop_message({ preview })
       : plural(tab.results.length, {
           one: () => m.search_confirm_close_message_one({ preview }),
-          other: () => m.search_confirm_close_message_other({ preview, count: tab.results.length }),
+          other: () => m.search_confirm_close_message_other({ preview, count: formatNumber(tab.results.length) }),
         });
     confirmOpen = true;
   }
@@ -2522,6 +2620,7 @@
     pruneHistoryToVisible();
     // A background tab closing leaves the one on screen as it was.
     if (!wasActive) return;
+    stagedExtension = '';
     selectedResultKey = null;
     notes = [];
     notesRequestId += 1;
@@ -2555,8 +2654,15 @@
    * they send (seed hashes alongside the query), how the tab is labelled, and
    * that they may legitimately have no keywords at all when the co-share request
    * is carrying the search.
+   *
+   * Returns whether the search started, which it does — tab open, request
+   * sent — before returning; the rest of it runs on without the caller.
+   *
+   * `replaceTabId` is Search again: the new tab takes that one's place, and an
+   * extension staged for the next typed search stays staged.
    */
-  async function handleSearch(query: string, plan?: RelatedPlan) {
+  function handleSearch(query: string, plan?: RelatedPlan, replaceTabId?: string): boolean {
+    const staged = plan || replaceTabId ? '' : stagedExtension;
     // A related search runs on the server whatever the dropdown says — see
     // `RELATED_SEARCH_METHOD` for why — so it also skips the gate below, which
     // reads that dropdown. Its readiness is the server session, and it is
@@ -2569,7 +2675,7 @@
     // of these states on screen, so refusing quietly is the consistent
     // behaviour rather than a silent dead end.
     if (!plan && searchSubmitBlocked) {
-      return;
+      return false;
     }
     // Clamp the query length before it reaches IPC: ed2k search keywords are
     // short, and an unbounded string is a needless payload/edge-case vector.
@@ -2601,7 +2707,7 @@
     const searchFilterSnapshot: import('$lib/api/search').SearchFilters = plan
       ? {}
       : {
-          fileExtension: filterExtension.trim() || undefined,
+          fileExtension: filterExtension.trim() || staged || undefined,
           minSize: parsedMinSize,
           maxSize: parsedMaxSize,
           minAvailability: clampMinSources(filterMinSources),
@@ -2612,7 +2718,7 @@
     if (!plan && sizeRangeInverted(parsedMinSize, parsedMaxSize)) {
       showAdvancedFilters = true;
       addToast('warning', m.search_size_range_invalid());
-      return;
+      return false;
     }
     // A related search whose seed filename yielded no searchable word is still
     // runnable when the server can answer the co-share request from the hashes
@@ -2625,30 +2731,39 @@
       // only disabled for a missing network, which the readiness hint explains
       // on screen; this state has nothing else saying it.
       addToast('warning', m.search_enter_query());
-      return;
+      return false;
     }
     // Checked before the keyword floor below, which a directive passes: its
     // text tokenizes into `ed2k` plus the hash, both comfortably over 3 bytes.
     if ((method === 'kad' || method === 'ember') && isServerDirectiveQuery(q)) {
       addToast('warning', m.search_directive_server_only());
-      return;
+      return false;
     }
     if ((method === 'kad' || method === 'ember') && !queryHasNetworkKeyword(q)) {
       addToast('warning', m.search_needs_keyword());
-      return;
+      return false;
     }
     // A bare `.mp3` names a token the publisher stripped before indexing, so on
     // a keyword DHT it walks a key nobody wrote. The extension is still a usable
-    // *filter* — Ember sends it to the responders — so move it into the box it
-    // belongs in and ask for the word the walk needs, rather than running a
-    // search that can only return the user's own library.
+    // *filter* — Ember sends it to the responders — so keep it for the next
+    // search and ask for the word the walk needs, rather than running a search
+    // that can only return the user's own library. Not into the Extension box:
+    // that also filters the tab on screen, which this query was not about.
     {
       const bare = method === 'kad' || method === 'ember' ? extensionOnlyQueryToken(q) : null;
       if (bare) {
-        filterExtension = bare;
-        addToast('info', m.search_extension_moved_to_filter({ ext: bare }));
+        if (filterExtension.trim()) {
+          // The box already filters the tab on screen; changing it is visible,
+          // where a staged value behind it would be overruled without a word.
+          filterExtension = bare;
+          stagedExtension = '';
+          addToast('info', m.search_extension_filter_set({ ext: bare }));
+        } else {
+          stagedExtension = bare;
+          addToast('info', m.search_extension_staged({ ext: bare }));
+        }
         searchBar?.focusInput();
-        return;
+        return false;
       }
     }
     // Gate by the selected search method — KAD-only needs KAD, server-only
@@ -2674,13 +2789,19 @@
       const emberIsTheOnlyCandidate =
         method === 'ember' || (method === 'global' && !kadUp && !serverUp);
       if (emberIsTheOnlyCandidate && (emberJoining || emberNoPeers)) {
-        return;
+        return false;
       }
       networkAlertMethod = method;
       networkAlertOpen = true;
-      return;
+      return false;
     }
     applyPanelFilters();
+    if (staged) {
+      // The search carries it, so the panel shows it as the new tab's filter,
+      // as selecting that tab later would.
+      if (!filterExtension.trim()) filterExtension = staged;
+      stagedExtension = '';
+    }
     const previousSearching = get(searchTabs).filter((t) => t.isSearching);
     for (const t of previousSearching) {
       searchInvokeSettled.add(t.requestId);
@@ -2700,9 +2821,12 @@
           kinds: plan.probes.map((p) => p.kind),
         }
       : undefined;
-    const { requestId, stoppedOthers } = openSearchTab(q, method, wireFileType, searchFilterSnapshot, relatedInfo);
+    const { requestId, stoppedOthers, evicted } = openSearchTab(q, method, wireFileType, searchFilterSnapshot, relatedInfo, replaceTabId);
     if (stoppedOthers) {
       addToast('info', m.search_previous_stopped());
+    }
+    for (const closed of evicted) {
+      addToast('info', m.search_tab_evicted({ label: searchTabLabel(closed), max: formatNumber(MAX_SEARCH_TABS) }));
     }
     selectedResultKey = null;
     notes = [];
@@ -2763,6 +2887,13 @@
         /* use cached timeout already set */
       });
 
+    void settleSearchInvoke(searchPromise, requestId, method);
+    return true;
+  }
+
+  /** The rest of `handleSearch`, once the search is under way: what its
+   *  invoke's reply or failure does to the tab. */
+  async function settleSearchInvoke(searchPromise: Promise<SearchResult[]>, requestId: number, method: SearchMethod) {
     try {
       const results = await searchPromise;
       // Search succeeded — cancel the long timeout watchdog so it doesn't
@@ -3221,12 +3352,10 @@
         selectedResult.file.name,
         selectedResult.file.size,
       );
-      const text =
-        raw === 'search_note_publish_queued'
-          ? m.search_note_publish_queued()
-          : raw === 'search_note_publish_started'
-            ? m.search_note_publish_started()
-            : raw;
+      // The reply is a code, not text to show; any but queued means it started.
+      const text = raw === 'search_note_publish_queued'
+        ? m.search_note_publish_queued()
+        : m.search_note_publish_started();
       if (!stillShown()) {
         addToast('success', text);
         return;
@@ -3456,12 +3585,24 @@
     spamExplainPending[key] = false;
   }
 
+  /**
+   * Why a row cannot be marked spam or not spam, or `undefined` when it can.
+   *
+   * The learned entry is keyed by hash and `mark_spam` rejects anything that
+   * is not one, so a hashless row has nothing to record. A size variant claims
+   * another size for a hash a row already lists: marking is by hash, here and
+   * in the backend, so it would mark that other row's file too.
+   */
+  function spamMarkBlockedReason(result: SearchResult): string | undefined {
+    if (!result.file.hash) return m.search_spam_requires_hash();
+    if (result.size_variant) return m.search_spam_size_variant();
+    return undefined;
+  }
+
   async function handleMarkSpam(result: SearchResult) {
     const hash = result.file.hash;
-    // The learned entry is keyed by hash and `mark_spam` rejects anything that
-    // is not one, so there is nothing to record for a hashless row. The menu
-    // item is disabled for those; this is the guard behind it.
-    if (!hash) return;
+    // The menu items are disabled for these; this is the guard behind them.
+    if (!hash || spamMarkBlockedReason(result)) return;
     const gen = nextSpamToggleGen(hash);
     // The tab the row belongs to, captured before the IPC: eMule re-rates
     // `pSpamFile->GetSearchID()`, not whatever search is on screen when the
@@ -3504,7 +3645,7 @@
 
   async function handleMarkNotSpam(result: SearchResult) {
     const hash = result.file.hash;
-    if (!hash) return;
+    if (!hash || spamMarkBlockedReason(result)) return;
     const gen = nextSpamToggleGen(hash);
     const markedTabId = activeTab?.id ?? null;
     contextMenu = null;
@@ -3557,7 +3698,7 @@
   function historyStatusLabel(status: string | undefined): string {
     if (status === 'completed') return m.search_history_downloaded();
     if (status === 'cancelled') return m.search_history_cancelled();
-    return status ?? '';
+    return m.common_unknown();
   }
 
   function requestClearResults() {
@@ -3567,8 +3708,8 @@
     confirmTitle = m.search_confirm_clear_title();
     confirmMessage = plural(tab.results.length, {
       one: m.search_confirm_clear_message_one,
-      few: () => m.search_confirm_clear_message_few({ count: tab.results.length }),
-      other: () => m.search_confirm_clear_message_other({ count: tab.results.length }),
+      few: () => m.search_confirm_clear_message_few({ count: formatNumber(tab.results.length) }),
+      other: () => m.search_confirm_clear_message_other({ count: formatNumber(tab.results.length) }),
     });
     confirmOpen = true;
   }
@@ -3991,7 +4132,7 @@
       }
       addToast('success', plural(targets.length, {
         one: m.search_copied_link_one,
-        other: () => m.search_copied_links_other({ count: targets.length }),
+        other: () => m.search_copied_links_other({ count: formatNumber(targets.length) }),
       }));
     } catch (e: unknown) {
       addToast('error', translateError(e, m.search_copy_failed()));
@@ -4103,11 +4244,16 @@
     }
 
     const parts: string[] = [];
-    if (queued > 0) parts.push(m.search_bulk_queued({ count: queued }));
-    if (alreadyQueued > 0) parts.push(m.search_bulk_already_queued({ count: alreadyQueued }));
-    if (skippedLocal > 0) parts.push(m.search_bulk_already_in_library({ count: skippedLocal }));
-    if (failed > 0) parts.push(m.search_bulk_failed({ count: failed }));
-    bulkDownloadMessage = parts.join(', ');
+    if (queued > 0) parts.push(m.search_bulk_queued({ count: formatNumber(queued) }));
+    if (alreadyQueued > 0) parts.push(m.search_bulk_already_queued({ count: formatNumber(alreadyQueued) }));
+    if (skippedLocal > 0) parts.push(m.search_bulk_already_in_library({ count: formatNumber(skippedLocal) }));
+    if (failed > 0) {
+      parts.push(plural(failed, {
+        one: m.search_bulk_failed_one,
+        other: () => m.search_bulk_failed_other({ count: formatNumber(failed) }),
+      }));
+    }
+    bulkDownloadMessage = unitList.format(parts);
     bulkDownloadHasFailures = failed > 0;
     const token = ++bulkMessageToken;
     safeTimeout(() => {
@@ -4117,23 +4263,38 @@
     }, 3000);
 
     if (queued > 0 && failed === 0) {
-      const base = plural(queued, {
-        one: m.search_bulk_queued_one,
-        other: () => m.search_bulk_queued_other({ count: queued }),
-      });
-      addToast('success', skippedLocal > 0 ? m.search_bulk_queued_with_local({ base, local: skippedLocal }) : base);
+      const count = formatNumber(queued);
+      const local = formatNumber(skippedLocal);
+      addToast('success', skippedLocal > 0
+        ? plural(queued, {
+            one: () => m.search_bulk_queued_with_local_one({ local }),
+            other: () => m.search_bulk_queued_with_local_other({ count, local }),
+          })
+        : plural(queued, {
+            one: m.search_bulk_queued_one,
+            other: () => m.search_bulk_queued_other({ count }),
+          }));
     } else if (queued === 0 && alreadyQueued > 0 && failed === 0) {
       addToast('info', m.search_already_in_queue());
     } else if (failed > 0) {
-      const head = failures.slice(0, 3).join(' · ');
-      const more = failures.length > 3 ? m.search_bulk_more({ count: failures.length - 3 }) : '';
-      addToast('error', m.search_bulk_failed_summary({
-        failed,
-        queued_part: queued > 0 ? m.search_bulk_failed_queued_suffix({ count: queued }) : '',
-        head: head ? `: ${head}${more}` : '',
-      }));
+      const shown = failures.slice(0, 3);
+      if (failures.length > shown.length) {
+        shown.push(m.search_bulk_more({ count: formatNumber(failures.length - shown.length) }));
+      }
+      const details = shown.join(' · ');
+      const queuedText = formatNumber(queued);
+      const failedText = formatNumber(failed);
+      addToast('error', queued > 0
+        ? plural(failed, {
+            one: () => m.search_bulk_failed_summary_queued_one({ queued: queuedText, details }),
+            other: () => m.search_bulk_failed_summary_queued_other({ failed: failedText, queued: queuedText, details }),
+          })
+        : plural(failed, {
+            one: () => m.search_bulk_failed_summary_one({ details }),
+            other: () => m.search_bulk_failed_summary_other({ failed: failedText, details }),
+          }));
     } else if (skippedLocal > 0) {
-      addToast('info', m.search_bulk_already_in_library({ count: skippedLocal }));
+      addToast('info', m.search_bulk_already_in_library({ count: formatNumber(skippedLocal) }));
     }
   }
 
@@ -4147,12 +4308,10 @@
     filterText !== ''
   );
 
-  // The visible result count and the raw search count can differ for a
-  // reason that isn't covered by `hasActiveFilters`: Hide spam. When they
-  // differ, the "(filtered from N)" suffix should show even if no explicit
-  // filter chip is set, so the user understands why the table isn't showing
-  // the headline number. Hide spam and Hide files I already have are the
-  // visibility rules that drop rows on their own.
+  // Rows the table leaves out, which picks "Showing X of Y" over "Showing X".
+  // Not only `hasActiveFilters`: Hide spam and Hide files I already have drop
+  // rows on their own, with no filter chip set, and the line has to say why
+  // the table is short of the tab's count.
   // Both sides come from `visibleResults`, not the live store list: mixing a
   // throttled count with an unthrottled one makes "showing X of Y" briefly
   // disagree with the rows actually on screen (and X - Y go negative).
@@ -4261,16 +4420,22 @@
     searchBar?.focusInput();
     return;
   }
-  // Ctrl+C copies the ticked results' links, or the whole filtered list when
-  // nothing is ticked. Skipped while text is selected or focus is in a field,
-  // so the normal copy still works in the query box.
+  // Ctrl+C copies the ticked results' links, or the cursor row's when nothing
+  // is ticked; Copy all links is the button. Skipped while text is selected or
+  // focus is in a field, so the normal copy still works in the query box.
   if ((e.ctrlKey || e.metaKey) && isShortcutLetter(e, 'c')) {
     if (isTextEntry(e.target)) return;
     if (confirmOpen || networkAlertOpen || selectedResult || !(window.getSelection()?.isCollapsed ?? true)) return;
     if (filteredResults.length === 0) return;
+    if (checkedCount > 0) {
+      e.preventDefault();
+      copyCheckedLinks();
+      return;
+    }
+    const cursorRow = cursorIndex >= 0 ? filteredResults[cursorIndex] : undefined;
+    if (!cursorRow) return;
     e.preventDefault();
-    if (checkedCount > 0) copyCheckedLinks();
-    else requestCopyAllLinks();
+    void copyResultLink(cursorRow);
     return;
   }
   // Already answered by the control that has focus (the tab strip, a sort
@@ -4298,11 +4463,32 @@
     bind:value={barQuery}
     placeholder={m.search_query_placeholder()}
     onsubmit={handleSearch}
+    onclear={() => (stagedExtension = '')}
     recentKey="search-recent-queries-v1"
     historyEnabled={$appSettings?.save_search_history ?? true}
     maxLength={MAX_SEARCH_QUERY_LEN}
   />
-  <select class="type-select" bind:value={searchMethod} title={m.search_method_title()} aria-label={m.search_method_title()}>
+  {#if stagedExtension}
+    <span class="staged-ext-chip">
+      {m.search_extension_staged_chip({ ext: stagedExtension })}
+      <button
+        type="button"
+        class="staged-ext-remove"
+        onclick={() => (stagedExtension = '')}
+        title={m.search_extension_staged_remove()}
+        aria-label={m.search_extension_staged_remove()}
+      ><IconX size={10} /></button>
+    </span>
+  {/if}
+  <select
+    class="type-select"
+    bind:value={() => searchMethod, (v) => {
+      searchMethod = chosenSearchMethod = v;
+      stagedExtension = '';
+    }}
+    title={m.search_method_title()}
+    aria-label={m.search_method_title()}
+  >
     <option value="global">{m.search_method_global()}</option>
     <option value="kad">{m.search_method_kad_only()}</option>
     <option value="server">{m.search_method_server_only()}</option>
@@ -4341,7 +4527,7 @@
       {m.common_stop()}
     </button>
   {:else}
-    <button onclick={() => handleSearch(barQuery)} disabled={searchSubmitBlocked} title={searchSubmitBlocked ? searchNetworkHint(searchMethod) : undefined}>{m.search_title()}</button>
+    <button onclick={() => searchBar?.submitQuery()} disabled={searchSubmitBlocked} title={searchSubmitBlocked ? searchNetworkHint(searchMethod) : undefined}>{m.search_title()}</button>
     {#if activeTab?.canSearchMore}
       <!-- Only offered when the finished search stopped on its own limits
            with somewhere left to ask; see `can_search_more`. -->
@@ -4391,7 +4577,7 @@
           tabindex={tab.id === $activeSearchTabId ? 0 : -1}
         >
           <span class="search-tab-label">{searchTabLabel(tab)}</span>
-          <span class="search-tab-meta" aria-label={tab.isSearching ? m.search_in_progress_aria() : plural(tab.results.length, { one: m.search_results_aria_one, other: () => m.search_results_aria({ count: tab.results.length }) })}>
+          <span class="search-tab-meta" aria-label={tab.isSearching ? m.search_in_progress_aria() : plural(tab.results.length, { one: m.search_results_aria_one, other: () => m.search_results_aria({ count: formatNumber(tab.results.length) }) })}>
             {#if tab.isSearching}
               {m.search_searching_label()}
             {:else}
@@ -4483,7 +4669,7 @@
     </div>
 
     <button class="ghost advanced-toggle" aria-expanded={showAdvancedFilters} aria-controls={showAdvancedFilters ? 'search-advanced-filters' : undefined} onclick={() => (showAdvancedFilters = !showAdvancedFilters)}>
-      {showAdvancedFilters ? m.search_hide_advanced() : (advancedFilterCount > 0 ? m.search_advanced_filters_count({ count: advancedFilterCount }) : m.search_advanced_filters())}
+      {showAdvancedFilters ? m.search_hide_advanced() : (advancedFilterCount > 0 ? m.search_advanced_filters_count({ count: formatNumber(advancedFilterCount) }) : m.search_advanced_filters())}
     </button>
 
     {#if hasActiveFilters}
@@ -4495,10 +4681,17 @@
     <div class="filter-advanced-row" id="search-advanced-filters">
       <div class="filter-toggles" role="group" aria-label={m.search_visibility_filters_aria()}>
         <label class="filter-toggle">
-          <input type="checkbox" bind:checked={hideSpam} />
+          <input
+            type="checkbox"
+            checked={hidingSpam}
+            onchange={(e) => {
+              hideSpam = e.currentTarget.checked;
+              spamRevealedTabId = null;
+            }}
+          />
           <span>{m.search_hide_spam()}</span>
           {#if spamHiddenCount > 0}
-            <span class="filter-count">({spamHiddenCount})</span>
+            <span class="filter-count">({formatNumber(spamHiddenCount)})</span>
           {/if}
           <span class="filter-help-wrap">
             <button
@@ -4519,17 +4712,16 @@
             </button>
             {#if showSpamHelp}
               <div class="filter-help-popover" role="tooltip">
-                {#if hideSpam && spamHiddenCount > 0}
+                {#if hidingSpam && spamHiddenCount > 0}
                   {plural(spamHiddenCount, {
                     one: m.search_spam_hidden_count_one,
-                    other: () => m.search_spam_hidden_count({ count: spamHiddenCount }),
+                    other: () => m.search_spam_hidden_count({ count: formatNumber(spamHiddenCount) }),
                   })}
                 {:else}
                   {m.search_spam_hidden_none()}
                 {/if}
                 <br />
-                {m.search_spam_help_prefix()}
-                <strong>{spamThreshold}</strong> {m.search_spam_help_in()} <strong>{spamProfileLabel(spamProfile)}</strong> {m.search_spam_help_suffix()}
+                {#each spamHelpParts as part, partIdx (partIdx)}{#if part.mark}<strong>{part.text}</strong>{:else}{part.text}{/if}{/each}
               </div>
             {/if}
           </span>
@@ -4538,7 +4730,7 @@
           <input type="checkbox" bind:checked={hideOwned} />
           <span>{m.search_hide_owned()}</span>
           {#if hideOwned && ownedHiddenCount > 0}
-            <span class="filter-count">({ownedHiddenCount})</span>
+            <span class="filter-count">({formatNumber(ownedHiddenCount)})</span>
           {/if}
         </label>
       </div>
@@ -4599,6 +4791,7 @@
           type="text"
           placeholder={m.search_ext_placeholder()}
           bind:value={filterExtension}
+          oninput={() => (stagedExtension = '')}
           maxlength="16"
           class="ext-input"
         />
@@ -4643,7 +4836,7 @@
     {/if}
   {/if}
 
-  <p class="filter-help">{m.search_filter_help_prefix()} <code>-</code> {m.search_filter_help_suffix()}</p>
+  <p class="filter-help">{filterHelpParts[0]}<code>-</code>{filterHelpParts[1]}</p>
 </div>
 
 <div class="page-content results-scroll" bind:this={resultsScrollEl} use:passiveScroll={onResultsScroll}>
@@ -4708,7 +4901,7 @@
         <p class="search-detail">
           {plural(nodes, {
             one: m.search_contacted_nodes_one,
-            other: () => m.search_contacted_nodes({ count: nodes }),
+            other: () => m.search_contacted_nodes({ count: formatNumber(nodes) }),
           })}
           {#if found > 0}
             &middot; {plural(found, {
@@ -4755,21 +4948,40 @@
           {#if activeTab?.isSearching}
             <span class="searching-indicator">{m.search_searching_indicator()}</span>
           {/if}
-          {#if filteredResults.length > 0}
-            {plural(filteredResults.length, { one: m.search_showing_one, other: () => m.search_showing_other({ count: formatNumber(filteredResults.length) }) })}{#if resultsHidden > 0} {m.search_filtered_from({ total: formatNumber(visibleResults.length) })}{/if}
+          {#if filteredResults.length > 0 && resultsHidden > 0}
+            {plural(filteredResults.length, {
+              one: () => m.search_showing_filtered_one({ total: formatNumber(visibleResults.length) }),
+              other: () => m.search_showing_filtered_other({
+                count: formatNumber(filteredResults.length),
+                total: formatNumber(visibleResults.length),
+              }),
+            })}
+          {:else if filteredResults.length > 0}
+            {plural(filteredResults.length, { one: m.search_showing_one, other: () => m.search_showing_other({ count: formatNumber(filteredResults.length) }) })}
           {:else if visibleResults.length > 0 && !hasActiveFilters}
-            {@const spamHides = hideSpam && spamHiddenCount + bothHiddenCount > 0}
+            {@const spamHides = hidingSpam && spamHiddenCount + bothHiddenCount > 0}
             {@const ownedHides = hideOwned && ownedHiddenCount + bothHiddenCount > 0}
             {spamHides && ownedHides ? m.search_no_results_filters() : spamHides ? allHiddenSpamLabel : allHiddenOwnedLabel}
           {:else if visibleResults.length > 0}
             {plural(visibleResults.length, {
-              one: () => m.search_zero_of_one({ what: m.search_filters_word() }),
-              other: () => m.search_zero_of_other({ count: formatNumber(visibleResults.length), what: m.search_filters_word() }),
+              one: m.search_zero_of_one,
+              other: () => m.search_zero_of_other({ count: formatNumber(visibleResults.length) }),
             })}
           {:else}
             {m.search_zero_results()}
           {/if}
         </span>
+        <!-- The all-hidden state above already says it; otherwise the count
+             is only in the Advanced panel, which is usually closed. -->
+        {#if hidingSpam && spamHiddenCount > 0 && (filteredResults.length > 0 || hasActiveFilters)}
+          <span class="results-spam-hidden">
+            {plural(spamHiddenCount, {
+              one: m.search_spam_hidden_inline_one,
+              other: () => m.search_spam_hidden_inline_other({ count: formatNumber(spamHiddenCount) }),
+            })}
+            <button type="button" class="ghost results-spam-show" onclick={revealSpamInTab}>{m.search_show_spam()}</button>
+          </span>
+        {/if}
         {#if extensionOnlyHintExt}
           <p class="results-extension-hint">{m.search_extension_keyword_hint({ ext: extensionOnlyHintExt })}</p>
         {/if}
@@ -4780,7 +4992,8 @@
           <p class="results-extension-hint">{m.search_results_shed({ count: formatNumber(activeTab?.shed ?? 0) })}</p>
         {/if}
         {#if (activeTab?.memoryShed ?? 0) > 0}
-          <p class="results-extension-hint">{m.search_results_shed_memory({ count: formatNumber(activeTab?.memoryShed ?? 0) })}</p>
+          <!-- Search again is offered for typed searches only. -->
+          <p class="results-extension-hint">{(activeTab?.related ? m.search_results_shed_memory_related : m.search_results_shed_memory)({ count: formatNumber(activeTab?.memoryShed ?? 0) })}</p>
         {/if}
         {#if activeTab?.interruption}
           <p class="results-extension-hint">{m.search_interrupted({ reason: activeTab.interruption })}</p>
@@ -4827,10 +5040,10 @@
       <div class="bulk-actions" role="toolbar" aria-label={m.search_bulk_actions_aria()}>
         <span class="bulk-count">{m.search_bulk_selected({ count: formatNumber(checkedCount) })}<span class="bulk-size"> · {formatSize(checkedTotalSize)}</span></span>
         <button class="bulk-download-btn" onclick={downloadChecked} disabled={bulkDownloadPending}>
-          {bulkDownloadPending ? m.search_downloading_ellipsis() : plural(checkedCount, { one: m.search_bulk_download_one, other: () => m.search_bulk_download_other({ count: checkedCount }) })}
+          {bulkDownloadPending ? m.search_downloading_ellipsis() : plural(checkedCount, { one: m.search_bulk_download_one, other: () => m.search_bulk_download_other({ count: formatNumber(checkedCount) }) })}
         </button>
         <button class="ghost bulk-copy-btn" onclick={copyCheckedLinks} disabled={copyingLinks} title={m.search_bulk_copy_links_title()}>
-          {plural(checkedCount, { one: m.search_bulk_copy_link_one, other: () => m.search_bulk_copy_links_other({ count: checkedCount }) })}
+          {plural(checkedCount, { one: m.search_bulk_copy_link_one, other: () => m.search_bulk_copy_links_other({ count: formatNumber(checkedCount) }) })}
         </button>
         <button class="ghost bulk-clear-btn" onclick={clearChecked} title={m.search_clear_selection_title()}>{m.search_clear_selection()}</button>
         {#if bulkDownloadMessage}
@@ -4998,7 +5211,7 @@
             <td class="col-name" title={displayName(result)}>
               <div class="name-cell-wrap">
                 <FileTypeIcon kind={resultTypeKey(result)} size={18} />
-                <button class="ghost link-btn" onclick={() => showFileDetails(result)}><bdi dir="auto">{#each splitHighlights(displayName(result), nameHighlightTerms) as part, partIdx (partIdx)}{#if part.mark}<mark class="name-match">{part.text}</mark>{:else}{part.text}{/if}{/each}</bdi></button>
+                <button class="ghost link-btn" onclick={() => showFileDetails(result)}><bdi dir="auto">{#each splitFoldedHighlights(displayName(result), nameHighlightTerms) as part, partIdx (partIdx)}{#if part.mark}<mark class="name-match">{part.text}</mark>{:else}{part.text}{/if}{/each}</bdi></button>
                 {#if dlTransfer}
                   <span class="badge sm {dlBadgeClass(dlTransfer)}" title="{dlBadgeLabel(dlTransfer)}: {dlTransfer.file_name}">
                     {dlBadgeLabel(dlTransfer)}
@@ -5059,7 +5272,7 @@
             </td>
             <td class="col-sources" title={sourceCountHint(result)}>
               <span class="source-count" class:high-sources={result.availability >= 10}>
-                {result.availability}
+                {formatNumber(result.availability)}
               </span>
             </td>
             {#if columnVis.complete}
@@ -5071,14 +5284,14 @@
               {:else if cs.kind === 'yes'}
                 <td class="col-complete" title={m.search_complete_single_part()}>{m.common_yes()}</td>
               {:else}
-                <td class="col-complete" title={m.search_complete_ratio_title({ complete: cs.complete, sources: cs.sources })}>{cs.percent}%</td>
+                <td class="col-complete" title={m.search_complete_ratio_title({ complete: formatNumber(cs.complete), sources: formatNumber(cs.sources) })}>{cs.percent}%</td>
               {/if}
             {/if}
             {#if columnVis.length}
               <td class="col-length">{result.media?.duration ? formatMediaLength(result.media.duration) : '\u2014'}</td>
             {/if}
             {#if columnVis.bitrate}
-              <td class="col-bitrate">{result.media?.bitrate ? m.search_bitrate_value({ kbps: result.media.bitrate }) : '\u2014'}</td>
+              <td class="col-bitrate">{result.media?.bitrate ? m.search_bitrate_value({ kbps: formatNumber(result.media.bitrate) }) : '\u2014'}</td>
             {/if}
             {#if columnVis.codec}
               <td class="col-codec" title={result.media?.codec || ''}>{result.media?.codec || '\u2014'}</td>
@@ -5185,13 +5398,13 @@
               <line x1="1" y1="1" x2="23" y2="23"/>
             </svg>
           </div>
-          {@const spamHides = hideSpam && spamHiddenCount + bothHiddenCount > 0}
+          {@const spamHides = hidingSpam && spamHiddenCount + bothHiddenCount > 0}
           {@const ownedHides = hideOwned && ownedHiddenCount + bothHiddenCount > 0}
           <p class="empty-title">
             {spamHides && ownedHides ? m.search_no_results_filters() : spamHides ? allHiddenSpamLabel : allHiddenOwnedLabel}
           </p>
           {#if spamHides}
-            <button type="button" class="ghost empty-action" onclick={() => (hideSpam = false)}>{m.search_show_spam()}</button>
+            <button type="button" class="ghost empty-action" onclick={revealSpamInTab}>{m.search_show_spam()}</button>
           {/if}
           {#if hideOwned && ownedHiddenCount > 0}
             <button type="button" class="ghost empty-action" onclick={() => (hideOwned = false)}>{m.search_show_owned()}</button>
@@ -5229,12 +5442,12 @@
           onclick={() => { if (contextMenu) download(contextMenu.result); closeContextMenu(); }}
         >{m.search_ctx_download()}</button>
         {#if checkedCount > 1}
-          <button class="ctx-item" role="menuitem" onclick={() => { downloadChecked(); closeContextMenu(); }}>{m.search_ctx_download_selected({ count: checkedCount })}</button>
+          <button class="ctx-item" role="menuitem" onclick={() => { downloadChecked(); closeContextMenu(); }}>{m.search_ctx_download_selected({ count: formatNumber(checkedCount) })}</button>
         {/if}
         <div class="ctx-sep" role="separator"></div>
         <button class="ctx-item" role="menuitem" onclick={() => { if (contextMenu) void copyResultLink(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_copy_link()}</button>
         {#if checkedCount > 1}
-          <button class="ctx-item" role="menuitem" onclick={() => { copyCheckedLinks(); closeContextMenu(); }}>{m.search_ctx_copy_selected_links({ count: checkedCount })}</button>
+          <button class="ctx-item" role="menuitem" onclick={() => { copyCheckedLinks(); closeContextMenu(); }}>{m.search_ctx_copy_selected_links({ count: formatNumber(checkedCount) })}</button>
         {/if}
         <!--
           Greyed out exactly where eMule greys it out — see
@@ -5256,7 +5469,7 @@
             disabled={!relatedSearchReady}
             onclick={() => void findRelatedChecked()}
             title={relatedSearchReady ? m.search_ctx_find_related_title() : m.search_ctx_find_related_unavailable()}
-          >{m.search_ctx_find_related_selected({ count: checkedCount })}</button>
+          >{m.search_ctx_find_related_selected({ count: formatNumber(checkedCount) })}</button>
         {/if}
         <!-- eMule's right-click → Web services. Shown even when nothing is
              configured, so the feature is discoverable from a result rather
@@ -5301,21 +5514,20 @@
         </div>
         <button class="ctx-item" role="menuitem" onclick={() => { if (contextMenu) showFileDetails(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_details()}</button>
         <div class="ctx-sep" role="separator"></div>
-        <!-- The learned entry is keyed by file hash, so a hashless row has
-             nothing to record and `mark_spam` rejects it. Greyed out rather
-             than left to fail with a toast. -->
+        <!-- Greyed out with the reason as the tooltip rather than left to
+             fail with a toast; see `spamMarkBlockedReason`. -->
         <button
           class="ctx-item"
           role="menuitem"
-          disabled={!contextMenu.result.file.hash}
-          title={contextMenu.result.file.hash ? undefined : m.search_spam_requires_hash()}
+          disabled={!!spamMarkBlockedReason(contextMenu.result)}
+          title={spamMarkBlockedReason(contextMenu.result)}
           onclick={() => { if (contextMenu) handleMarkSpam(contextMenu.result); }}
         >{m.search_mark_spam()}</button>
         <button
           class="ctx-item"
           role="menuitem"
-          disabled={!contextMenu.result.file.hash}
-          title={contextMenu.result.file.hash ? undefined : m.search_spam_requires_hash()}
+          disabled={!!spamMarkBlockedReason(contextMenu.result)}
+          title={spamMarkBlockedReason(contextMenu.result)}
           onclick={() => { if (contextMenu) handleMarkNotSpam(contextMenu.result); }}
         >{m.search_mark_not_spam()}</button>
         {#if downloadHistoryMap[contextMenu.result.file.hash]}
@@ -5379,7 +5591,7 @@
             <dt>{m.search_detail_hash()}</dt>
             <dd><code>{selectedResult.file.hash}</code></dd>
             <dt>{m.search_detail_sources()}</dt>
-            <dd>{selectedResult.availability}</dd>
+                <dd>{formatNumber(selectedResult.availability)}</dd>
             {#if selectedResult.result_origin}
               <dt>{m.search_hit_origin()}</dt>
               <dd>{originLabel(selectedResult.result_origin)}</dd>
@@ -5394,7 +5606,7 @@
               {/if}
               {#if selectedResult.media.bitrate}
                 <dt>{m.search_detail_bitrate()}</dt>
-                <dd>{m.search_bitrate_value({ kbps: selectedResult.media.bitrate })}</dd>
+                <dd>{m.search_bitrate_value({ kbps: formatNumber(selectedResult.media.bitrate) })}</dd>
               {/if}
               {#if selectedResult.media.codec}
                 <dt>{m.search_detail_codec()}</dt>
@@ -5464,7 +5676,7 @@
                 {/if}
                 {#if selectedDlTransfer.sources > 0}
                   <dt>{m.search_sources_label()}</dt>
-                  <dd>{m.search_sources_value({ active: selectedDlTransfer.active_sources || 0, total: selectedDlTransfer.sources })}</dd>
+                  <dd>{m.search_sources_value({ active: formatNumber(selectedDlTransfer.active_sources || 0), total: formatNumber(selectedDlTransfer.sources) })}</dd>
                 {/if}
                 {#if selectedDlTransfer.failure_reason || selectedDlTransfer.failure_code}
                   <dt>{m.search_error_label()}</dt>
@@ -5553,6 +5765,38 @@
     background: var(--bg-secondary);
     flex-wrap: wrap;
     border-bottom: 1px solid var(--border);
+  }
+
+  .staged-ext-chip {
+    display: inline-flex;
+    align-items: center;
+    align-self: center;
+    gap: 4px;
+    padding: 3px 4px 3px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-pill);
+    background: var(--accent-fill);
+    color: var(--text-accent);
+    font-size: var(--font-size-sm);
+    white-space: nowrap;
+  }
+
+  .staged-ext-remove {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+  }
+
+  .staged-ext-remove:hover {
+    background: var(--bg-hover);
   }
 
   .search-area :global(.search-bar-wrap) {
@@ -6022,6 +6266,17 @@
   .results-extension-hint {
     margin: 6px 0 0;
     line-height: 1.4;
+  }
+
+  .results-spam-hidden {
+    margin-left: 10px;
+    color: var(--text-muted);
+  }
+
+  .results-spam-show {
+    margin-left: 4px;
+    padding: 1px 8px;
+    font-size: var(--font-size-sm);
   }
 
   .clear-results-btn {

@@ -263,6 +263,47 @@ fn server_reply_match_terms(
     terms
 }
 
+/// The keyword request for the connected server, given whether it has
+/// large-file support.
+///
+/// A server without it refuses a 64-bit size leaf, but it cannot index a file
+/// past 4 GiB either, so a maximum above that excludes nothing it holds and
+/// goes as the largest 32-bit size. A minimum above it leaves such a server
+/// nothing to answer with: `None`.
+fn server_keyword_expression(
+    search_expr: &[u8],
+    query_expr: Option<&crate::search::query::QueryExpr>,
+    constraints: &kad::messages::SearchConstraints<'_>,
+    large_files: bool,
+) -> Option<Vec<u8>> {
+    const LARGEST_32BIT_SIZE: u64 = u32::MAX as u64;
+    if large_files || !kad::messages::search_expression_uses_64bit(search_expr) {
+        return Some(search_expr.to_vec());
+    }
+    if constraints.min_size.is_some_and(|min| min > LARGEST_32BIT_SIZE) {
+        return None;
+    }
+    let clamped = kad::messages::SearchConstraints {
+        max_size: constraints.max_size.map(|max| max.min(LARGEST_32BIT_SIZE)),
+        ..*constraints
+    };
+    Some(kad::messages::build_search_expression_with_node(
+        query_expr.map(|expr| expr.to_wire_bytes()),
+        &clamped,
+    ))
+}
+
+/// The term a KAD keyword search walks to: the longest, and the first of
+/// equally long ones. Measured in UTF-8 bytes, the unit the publisher's own
+/// keyword rule uses (a word is kept at 3 bytes or more); every term passed
+/// that rule, so a trailing extension-like word is never longer than the
+/// words before it and never wins over them.
+fn kad_lookup_keyword(terms: &[String]) -> Option<&String> {
+    terms
+        .iter()
+        .reduce(|best, term| if term.len() > best.len() { term } else { best })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_command_inner(
     socket: &UdpSocket,
@@ -335,20 +376,6 @@ async fn handle_command_inner(
                 crate::search::merge::wire_search_file_type(ui_file_type.as_deref())
                     .map(|s| s.to_string());
             let mut active_request = ActiveSearchRequest {
-                request_id,
-                server_pending: false,
-                kad_pending: false,
-                udp_pending: false,
-                ember_pending: false,
-                kad_ran: false,
-                ember_ran: false,
-                udp_search_deadline: 0,
-                udp_search_sent_ips: HashSet::new(),
-                ed2k_found_sources: 0,
-                udp_found_sources: 0,
-                ed2k_noted_availability: HashMap::new(),
-                ed2k_noted_complete_sources: HashMap::new(),
-                dht_noted_availability: HashMap::new(),
                 file_type_filter: file_type_filter.clone(),
                 min_size: search_filters.as_ref().and_then(|f| f.min_size),
                 max_size: search_filters.as_ref().and_then(|f| f.max_size),
@@ -356,17 +383,13 @@ async fn handle_command_inner(
                     .as_ref()
                     .and_then(|f| f.file_extension.clone()),
                 min_availability: search_filters.as_ref().and_then(|f| f.min_availability),
-                keywords: Vec::new(),
                 server_ip: state.server_addr.map(|a| a.ip().to_string()),
-                server_result_count: 0,
-                streamed_hashes: std::collections::HashMap::new(),
                 exclude_hashes: exclude_hashes.iter().cloned().collect(),
                 // Seeded with the library hashes the caller resolved, so every
                 // streamed packet of this search scores them as files we hold
                 // rather than as rows in whatever result set they arrived in.
                 batch_spam: crate::search::spam::BatchSpamContext::for_owned_hashes(owned_hashes),
-                udp_search_expr: Vec::new(),
-                server_has_more: false,
+                ..ActiveSearchRequest::new(request_id)
             };
 
             // eMule's native "Search Related Files": the connected server is
@@ -514,26 +537,49 @@ async fn handle_command_inner(
 
             // --- TCP server search ---
             let mut server_asked = false;
-            if legs.server && state.server_connected {
+            let server_large_files = state.server_connection.as_ref().is_some_and(|c| {
+                c.session.server_flags & ed2k::server::SRV_TCPFLG_LARGEFILES != 0
+            });
+            let server_keyword_expr = if has_keyword_query {
+                server_keyword_expression(
+                    &search_expr,
+                    query_expr.as_ref(),
+                    &search_constraints,
+                    server_large_files,
+                )
+            } else {
+                Some(search_expr.clone())
+            };
+            let server_has_keyword_query = has_keyword_query && server_keyword_expr.is_some();
+            // The panel filters narrow the co-share answer's rows
+            // (`active_request.min_size` and friends) rather than riding on
+            // the request. Both questions are sent under the same
+            // `request_id`, so both answers land in the same tab; the
+            // co-share request goes out from the poll loop once the first
+            // has delivered.
+            let (first_expr, followup_expr) = server_search_phases(
+                server_keyword_expr.as_deref().unwrap_or_default(),
+                co_share_term.as_deref().map(related_search_expression),
+                server_has_keyword_query,
+            );
+            let server_too_small_for_query =
+                legs.server && state.server_connected && server_keyword_expr.is_none();
+            if server_too_small_for_query {
+                info!("TCP server search skipped: the server cannot search for files over 4 GiB");
+                emit_search_notice(app_handle, request_id, "ServerNoLargeFiles");
+            }
+            let keyword_match_terms = if has_keyword_query {
+                server_reply_match_terms(query_expr.as_ref(), !related_hashes.is_empty())
+            } else {
+                Vec::new()
+            };
+            active_request.reply_match_terms = keyword_match_terms.clone();
+            if legs.server && state.server_connected && !first_expr.is_empty() {
                 if let Some(conn) = state.server_connection.as_mut() {
-                    // The panel filters narrow the co-share answer's rows
-                    // (`active_request.min_size` and friends) rather than
-                    // riding on the request.
-                    let co_share_expr = co_share_term
-                        .as_deref()
-                        .map(related_search_expression);
-                    // Both questions are sent under the same `request_id`, so
-                    // both answers land in the same tab; the co-share request
-                    // goes out from the poll loop once the first has delivered.
-                    let (first_expr, followup_expr) =
-                        server_search_phases(&search_expr, co_share_expr, has_keyword_query);
                     let ticket = crate::network::ed2k::server::SearchTicket {
                         request_id,
-                        match_terms: if has_keyword_query {
-                            server_reply_match_terms(
-                                query_expr.as_ref(),
-                                !related_hashes.is_empty(),
-                            )
+                        match_terms: if server_has_keyword_query {
+                            keyword_match_terms
                         } else {
                             Vec::new()
                         },
@@ -548,6 +594,7 @@ async fn handle_command_inner(
                                 tx: None,
                                 results: Vec::new(),
                                 request_id,
+                                answered: false,
                             });
                             state.server_search_age = 0;
                             // Queued only now that the first request is on the
@@ -629,7 +676,9 @@ async fn handle_command_inner(
                 }
             }
 
-            if (legs.server || legs.udp) && !server_asked {
+            // A server leg that `ServerNoLargeFiles` already explained is not
+            // also "unavailable".
+            if ((legs.server && !server_too_small_for_query) || legs.udp) && !server_asked {
                 emit_search_notice(app_handle, request_id, "ServerUnavailable");
             }
 
@@ -651,10 +700,8 @@ async fn handle_command_inner(
                 // holds all of them; only an OR with no shared term falls
                 // back to a key that can see just part of the answer.
                 let required = query_expr.required_terms();
-                let Some(primary_keyword) = required
-                    .iter()
-                    .max_by_key(|k| k.len())
-                    .or_else(|| keywords.iter().max_by_key(|k| k.len()))
+                let Some(primary_keyword) =
+                    kad_lookup_keyword(&required).or_else(|| kad_lookup_keyword(&keywords))
                 else {
                     kad_skip_phase = Some("KadBusy");
                     break 'kad false;
@@ -706,6 +753,7 @@ async fn handle_command_inner(
                 );
                 if let Some(search) = state.search_manager.get_mut(&sid) {
                     search.search_terms_data = kad_search_expr;
+                    search.answer_filter = Some(query_expr.clone());
                 }
                 // Claim the oneshot before marking the leg pending. The other
                 // order left `kad_pending` set on a leg that never started, and
@@ -726,6 +774,7 @@ async fn handle_command_inner(
                         query_expr,
                         request_id,
                         last_streamed_count: 0,
+                        last_streamed_at: std::time::Instant::now(),
                         file_type_filter,
                     },
                 );
@@ -747,12 +796,15 @@ async fn handle_command_inner(
             // --- Ember DHT keyword search (slice 10 + multi-keyword wire) ---
             // Streaming-only: it never touches the invoke oneshot (`tx`); its
             // hits arrive via `search-results` events and it gates
-            // `search-complete` through `ember_pending`. Uses the longest
-            // (most selective) keyword as the DHT walk key; remaining
-            // keyword hashes ride on FIND_VALUE for peer-side file_hash
-            // intersection on AND-only queries (OR skips extras — that
-            // intersection would drop the non-matching half). Filename
-            // filtering remains defense-in-depth via `query_expr`.
+            // `search-complete` through `ember_pending`. Walks a term every
+            // match contains when there is one (`ember_walk_query`), else the
+            // longest positive keyword; remaining keyword hashes ride on
+            // FIND_VALUE for peer-side file_hash intersection on AND-only
+            // queries (OR skips extras — that intersection would drop the
+            // non-matching half). Its first drive starts its extra walks — the
+            // walked word's older spelling and the OR branches that key misses
+            // (`ember_walk_plan`) — and it reports once they have all finished.
+            // Filename filtering remains defense-in-depth via `query_expr`.
             // Deliberately not gated on having contacts. With none the search
             // completes immediately from whatever the local store holds
             // rather than being skipped, which keeps a momentarily empty
@@ -7492,11 +7544,85 @@ async fn handle_command_inner(
 #[cfg(test)]
 mod search_request_tests {
     use super::{
-        is_filter_only_search, related_search_expression, server_reply_match_terms,
+        is_filter_only_search, kad_lookup_keyword, related_search_expression,
+        server_keyword_expression, server_reply_match_terms,
+    };
+    use crate::network::kad::messages::{
+        build_search_expression_with_node, search_expression_uses_64bit, SearchConstraints,
     };
     use crate::search::query::parse;
 
+    #[test]
+    fn a_server_without_large_files_gets_its_size_limit_in_32_bits() {
+        const GIB: u64 = 1 << 30;
+        let expr = parse("movie").unwrap();
+        let expr_for = |constraints: &SearchConstraints| {
+            build_search_expression_with_node(Some(expr.to_wire_bytes()), constraints)
+        };
+        let over = SearchConstraints {
+            min_size: Some(GIB),
+            max_size: Some(8 * GIB),
+            ..Default::default()
+        };
+        let full = expr_for(&over);
+        assert!(search_expression_uses_64bit(&full));
+        assert_eq!(
+            server_keyword_expression(&full, Some(&expr), &over, true).as_deref(),
+            Some(full.as_slice()),
+            "a large-file server is sent the search unchanged"
+        );
+        let clamped = server_keyword_expression(&full, Some(&expr), &over, false).unwrap();
+        assert!(!search_expression_uses_64bit(&clamped));
+        assert_eq!(
+            clamped,
+            expr_for(&SearchConstraints {
+                max_size: Some(u64::from(u32::MAX)),
+                ..over
+            })
+        );
+
+        // Nothing such a server indexes can meet a minimum past 4 GiB.
+        let big_min = SearchConstraints {
+            min_size: Some(5 * GIB),
+            ..Default::default()
+        };
+        let full = expr_for(&big_min);
+        assert_eq!(server_keyword_expression(&full, Some(&expr), &big_min, false), None);
+
+        // A search with no size past 4 GiB goes out as it is.
+        let small = SearchConstraints {
+            max_size: Some(GIB),
+            ..Default::default()
+        };
+        let full = expr_for(&small);
+        assert_eq!(
+            server_keyword_expression(&full, Some(&expr), &small, false).as_deref(),
+            Some(full.as_slice())
+        );
+    }
+
     const HASH: &str = "AABBCCDDEEFF00112233445566778899";
+
+    fn lookup(query: &str) -> Option<String> {
+        let terms = parse(query).unwrap().required_terms();
+        kad_lookup_keyword(&terms).cloned()
+    }
+
+    #[test]
+    fn the_kad_lookup_word_is_the_first_of_the_longest() {
+        assert_eq!(lookup("linux mint iso").as_deref(), Some("linux"));
+        assert_eq!(lookup("abcd wxyz").as_deref(), Some("abcd"));
+        assert_eq!(lookup("star wars").as_deref(), Some("star"));
+        // A trailing three-letter word ties at best, and a tie keeps the
+        // earlier word.
+        assert_eq!(lookup("foo bar mp3").as_deref(), Some("foo"));
+        assert_eq!(lookup("ubuntu iso").as_deref(), Some("ubuntu"));
+        assert_eq!(lookup("mp3").as_deref(), Some("mp3"));
+        assert_eq!(kad_lookup_keyword(&[]), None);
+        assert_eq!(lookup("big flac").as_deref(), Some("flac"));
+        // Bytes, as the publisher counts them: two CJK characters are six.
+        assert_eq!(lookup("abcd 東京").as_deref(), Some("東京"));
+    }
 
     #[test]
     fn the_related_request_is_the_bare_term_whatever_the_filters() {

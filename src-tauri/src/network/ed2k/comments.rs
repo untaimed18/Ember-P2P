@@ -319,18 +319,27 @@ impl CommentManager {
     /// Rows are one per wire identity, and a host can mint identities freely,
     /// so a voter is a network instead (see [`voter_key`]): rated rows from one
     /// IPv4 /24 or IPv6 /48 are one voter, and every rated row that names no
-    /// address is one voter between them. A voter counts as fake if any of its
-    /// rows says fake. Our own rating is a voter of its own.
+    /// address is one voter between them. A voter counts as fake when most of
+    /// its rated rows say fake (a tie is not fake), so one forged row cannot
+    /// turn a voter that otherwise rated the file well — least of all the
+    /// shared unaddressed one, which holds every notes-search row. Our own
+    /// rating is a voter of its own.
     pub fn fake_rating_stats(&self, file_hash: &str) -> (u32, u32) {
         let Some(info) = self.comments.get(file_hash) else {
             return (0, 0);
         };
-        let mut voters: HashMap<String, bool> = HashMap::new();
+        // voter -> (fake rows, rated rows)
+        let mut voters: HashMap<String, (u32, u32)> = HashMap::new();
         for comment in info.peer_comments.iter().filter(|c| c.rating > 0) {
-            *voters.entry(voter_key(comment)).or_insert(false) |= comment.rating == RATING_FAKE;
+            let rows = voters.entry(voter_key(comment)).or_default();
+            rows.0 += u32::from(comment.rating == RATING_FAKE);
+            rows.1 += 1;
         }
         let mut total = voters.len() as u32;
-        let mut fake = voters.values().filter(|fake| **fake).count() as u32;
+        let mut fake = voters
+            .values()
+            .filter(|(fake, rated)| fake * 2 > *rated)
+            .count() as u32;
         if info.our_rating > 0 {
             total += 1;
             if info.our_rating == RATING_FAKE {
@@ -628,6 +637,29 @@ mod tests {
 
         cm.add_kad_note("aa", Ipv4Addr::new(198, 51, 100, 1), "addressed".into(), RATING_FAKE, String::new());
         assert_eq!(cm.fake_rating_stats("aa"), (2, 2));
+    }
+
+    /// Ten honest notes and one forged "fake" from the notes search share the
+    /// unaddressed voter, which stays honest; with one addressed fake beside
+    /// it that is one fake voter of two, not two of two.
+    #[test]
+    fn one_forged_row_does_not_turn_a_voter_fake() {
+        let mut cm = CommentManager::new();
+        for i in 0..10 {
+            cm.add_peer_comment("aa", format!("{i:032x}"), RATING_GOOD, String::new(), 1);
+        }
+        cm.add_peer_comment("aa", format!("{:032x}", 99), RATING_FAKE, String::new(), 1);
+        assert_eq!(cm.fake_rating_stats("aa"), (0, 1));
+        cm.add_kad_note("aa", Ipv4Addr::new(198, 51, 100, 1), "addressed".into(), RATING_FAKE, String::new());
+        assert_eq!(cm.fake_rating_stats("aa"), (1, 2));
+
+        // A voter split evenly is not fake; a majority is.
+        let mut split = CommentManager::new();
+        split.add_peer_comment("bb", "93.184.216.34:4662".into(), RATING_FAKE, String::new(), 0);
+        split.add_peer_comment("bb", "93.184.216.35:4662".into(), RATING_GOOD, String::new(), 0);
+        assert_eq!(split.fake_rating_stats("bb"), (0, 1));
+        split.add_peer_comment("bb", "93.184.216.36:4662".into(), RATING_FAKE, String::new(), 0);
+        assert_eq!(split.fake_rating_stats("bb"), (1, 1));
     }
 
     #[test]

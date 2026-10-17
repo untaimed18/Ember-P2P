@@ -71,12 +71,23 @@ const MAX_HASH_NAME_SIGNATURES: usize = 64;
 /// that many-hashes-per-name is meaningful — "setup exe" and "01 intro mp3"
 /// are shared by countless unrelated files.
 const BATCH_MIN_NAME_LEN_FOR_COLLISION: usize = 8;
-/// A source IP referenced by at least this fraction of the batch is "hot"
-/// (likely an index-poisoning node).
+/// A source IP behind at least this fraction of the files that list a routable
+/// source is "hot" (likely an index-poisoning node). Files listing none (LowID
+/// and unsafe-source server replies, Kad publisher-only hits) are not in the
+/// share.
 const BATCH_SOURCE_HOT_SHARE: f64 = 0.5;
-/// Only treat a source IP as hot once the batch is at least this large, so a
-/// handful of legitimate results that happen to share a seeder don't trip it.
-const BATCH_SOURCE_MIN_HITS: usize = 4;
+/// Files a source IP must be behind before it can be hot, so a handful of
+/// legitimate results that happen to share a seeder don't trip it.
+const BATCH_SOURCE_MIN_HITS: usize = 6;
+/// Files that make a source IP hot below [`BATCH_SOURCE_HOT_SHARE`], so the
+/// signal does not fade as a large search keeps adding other sources' files.
+const BATCH_SOURCE_HOT_ROWS: usize = 50;
+/// The share [`BATCH_SOURCE_HOT_ROWS`] still needs, so an honest sharer of a
+/// whole discography in a broad search is not a flood.
+const BATCH_SOURCE_MIN_SHARE: f64 = 0.1;
+/// Hashes remembered so a re-sent row is not counted again. Past this, rows
+/// count as new, which is what every row did before.
+const MAX_BATCH_COUNTED_HASHES: usize = 16_384;
 /// Caps so a pathological all-servers search cannot grow these maps unboundedly.
 const MAX_BATCH_NAME_KEYS: usize = 4_096;
 const MAX_BATCH_HASH_KEYS: usize = 4_096;
@@ -207,10 +218,18 @@ pub struct BatchSpamContext {
     name_hashes: HashMap<String, HashSet<String>>,
     /// file hash -> the names it was advertised under
     hash_names: HashMap<String, HashNames>,
-    /// source IPs referenced by results (Kad publisher-only rows skipped)
+    /// source IP -> distinct files listing it (Kad publisher-only rows skipped)
     source_hits: HashMap<String, usize>,
+    /// Distinct files absorbed; see `counted_hashes`.
     result_count: usize,
-    /// source IPs referenced by a suspiciously large share of the batch
+    /// Distinct files that listed at least one routable source (Kad
+    /// publisher-only rows skipped): what the hot-source share is a share of.
+    addressed_rows: usize,
+    /// Hashes already counted above, so a row re-sent to [`Self::absorb`] (one
+    /// a client filter kept off screen is never marked streamed) counts once.
+    counted_hashes: HashSet<String>,
+    /// source IPs behind enough of the batch's files to read as a flood; see
+    /// [`BATCH_SOURCE_HOT_SHARE`] and [`BATCH_SOURCE_HOT_ROWS`]
     hot_source_ips: HashSet<String>,
     /// Last-seen row fields for hashes already absorbed, so a later packet that
     /// newly crosses a collision bar can upgrade earlier streamed rows.
@@ -471,7 +490,14 @@ impl BatchSpamContext {
             self.record_names(&names);
         }
         for r in results {
-            self.result_count = self.result_count.saturating_add(1);
+            let hash = normalize_hash(&r.file.hash);
+            let repeat = !hash.is_empty() && self.counted_hashes.contains(&hash);
+            if !repeat {
+                self.result_count = self.result_count.saturating_add(1);
+                if !hash.is_empty() && self.counted_hashes.len() < MAX_BATCH_COUNTED_HASHES {
+                    self.counted_hashes.insert(hash);
+                }
+            }
             if let Some(names) = RowNames::of(r) {
                 self.record_names(&names);
                 let hash = names.hash;
@@ -496,15 +522,17 @@ impl BatchSpamContext {
             }
             // Kad keyword hits often list the publishing node as the source.
             // Counting that IP as "hot" flags a whole contact's honest results.
-            if origin_is_kad_publisher_only(&r.result_origin) {
+            if repeat || origin_is_kad_publisher_only(&r.result_origin) {
                 continue;
             }
             let mut seen: HashSet<String> = HashSet::new();
+            let mut addressed = false;
             for addr in &r.source_addresses {
                 if let Some(ip) = extract_ip(addr) {
                     if !is_globally_routable_ip(&ip) {
                         continue;
                     }
+                    addressed = true;
                     if self.source_hits.contains_key(&ip)
                         || self.source_hits.len() < MAX_BATCH_SOURCE_KEYS
                     {
@@ -513,6 +541,9 @@ impl BatchSpamContext {
                         }
                     }
                 }
+            }
+            if addressed {
+                self.addressed_rows = self.addressed_rows.saturating_add(1);
             }
         }
         self.recompute();
@@ -564,8 +595,10 @@ impl BatchSpamContext {
             self.hot_source_ips.clear();
             return;
         }
-        let threshold = ((self.result_count as f64) * BATCH_SOURCE_HOT_SHARE).ceil() as usize;
-        let min_hits = threshold.max(BATCH_SOURCE_MIN_HITS);
+        let share_of = |fraction: f64| ((self.addressed_rows as f64) * fraction).ceil() as usize;
+        let min_hits = share_of(BATCH_SOURCE_HOT_SHARE)
+            .clamp(BATCH_SOURCE_MIN_HITS, BATCH_SOURCE_HOT_ROWS)
+            .max(share_of(BATCH_SOURCE_MIN_SHARE));
         self.hot_source_ips = self
             .source_hits
             .iter()
@@ -613,13 +646,22 @@ fn origin_is_kad_publisher_only(origin: &str) -> bool {
 
 /// Whether a UDP global search contributed this row. Server reputation is a
 /// signal about the UDP server that answered (eMule `CSearchList` applies it
-/// to UDP results only): the connected server's TCP replies carry no source
-/// addresses and come from the server the user chose, so scoring or stamping
-/// them with it would make one Mark spam a penalty on every result it returns.
+/// to UDP results only): the connected server's TCP replies come from the
+/// server the user chose, and name at most the one HighID client behind each
+/// hit, so scoring or stamping them with it would make one Mark spam a penalty
+/// on every result it returns.
 pub(crate) fn origin_has_udp_server(origin: &str) -> bool {
     origin
         .split('·')
         .any(|part| part.trim() == crate::search::merge::ORIGIN_SERVER_UDP)
+}
+
+/// Whether the user's own library contributed this row. Such a row may have
+/// no hash yet (still hashing), so the hash-keyed owned set cannot cover it.
+fn origin_has_local(origin: &str) -> bool {
+    origin
+        .split('·')
+        .any(|part| part.trim() == crate::search::merge::ORIGIN_LOCAL)
 }
 
 /// Reasons that come from learned server reputation.
@@ -731,19 +773,18 @@ impl FifoSet {
     /// `cap`. No-op if already present (does not refresh recency — FIFO, not
     /// LRU, matching the simple aging eMule uses for these caches).
     fn insert(&mut self, key: String, cap: usize) {
+        self.insert_evicting(key, cap);
+    }
+
+    /// [`Self::insert`], returning the entries it evicted.
+    fn insert_evicting(&mut self, key: String, cap: usize) -> Vec<String> {
         if cap == 0 || self.set.contains(&key) {
-            return;
+            return Vec::new();
         }
-        while self.set.len() >= cap {
-            match self.order.pop_front() {
-                Some(old) => {
-                    self.set.remove(&old);
-                }
-                None => break,
-            }
-        }
+        let evicted = self.truncate_oldest(cap - 1);
         self.set.insert(key.clone());
         self.order.push_back(key);
+        evicted
     }
 
     fn remove(&mut self, key: &str) -> bool {
@@ -757,17 +798,44 @@ impl FifoSet {
         }
     }
 
-    /// Drop oldest entries until at or below `cap` (used on load to enforce
-    /// caps against a hand-edited or migrated file).
-    fn truncate_oldest(&mut self, cap: usize) {
+    /// Keep only the entries `keep` accepts, in order. One pass, unlike a
+    /// [`Self::remove`] per entry.
+    fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        let set = &mut self.set;
+        self.order.retain(|key| {
+            let kept = keep(key);
+            if !kept {
+                set.remove(key);
+            }
+            kept
+        });
+    }
+
+    /// Replace every entry with `normalize(entry)`, dropping empty results and
+    /// later duplicates, order kept.
+    fn normalize_entries(&mut self, normalize: impl Fn(&str) -> String) {
+        let items: Vec<String> = self
+            .order
+            .iter()
+            .map(|key| normalize(key))
+            .filter(|key| !key.is_empty())
+            .collect();
+        *self = FifoSet::from(items);
+    }
+
+    /// Drop oldest entries until at or below `cap`, returning them.
+    fn truncate_oldest(&mut self, cap: usize) -> Vec<String> {
+        let mut dropped = Vec::new();
         while self.set.len() > cap {
             match self.order.pop_front() {
                 Some(old) => {
                     self.set.remove(&old);
+                    dropped.push(old);
                 }
                 None => break,
             }
         }
+        dropped
     }
 }
 
@@ -977,7 +1045,13 @@ pub struct SpamMarkEntry {
 #[serde(default)]
 pub struct SpamDatabase {
     pub spam_hashes: FifoSet,
+    /// Hashes the user marked not spam. Files written before
+    /// `auto_not_spam_hashes` existed hold completed downloads here too.
     pub not_spam_hashes: FifoSet,
+    /// Completed downloads whitelisted by [`SpamFilter::auto_mark_not_spam`],
+    /// kept apart so they cannot evict the user's own choices. A build that
+    /// predates this field ignores it on load and drops it on its next save.
+    pub auto_not_spam_hashes: FifoSet,
     pub spam_filenames: Vec<String>,
     pub spam_similar_names: Vec<String>,
     pub spam_sizes: VecDeque<u64>,
@@ -985,6 +1059,105 @@ pub struct SpamDatabase {
     pub spam_server_ips: FifoSet,
     pub udp_server_spam_ratios: HashMap<String, f32>,
     pub spam_marks: Vec<SpamMarkEntry>,
+}
+
+impl SpamDatabase {
+    fn is_not_spam(&self, hash: &str) -> bool {
+        self.not_spam_hashes.contains(hash) || self.auto_not_spam_hashes.contains(hash)
+    }
+
+    fn has_server_reputation(&self, sip: &str) -> bool {
+        self.spam_server_ips.contains(sip) || self.udp_server_spam_ratios.contains_key(sip)
+    }
+
+    fn drop_mark_collateral(&mut self, mark: &SpamMarkEntry) {
+        self.drop_marks_collateral(std::slice::from_ref(mark));
+    }
+
+    /// Drop the filenames / similar names / sizes / source IPs / server IPs
+    /// that `dropped` marks added, except what a mark still in `spam_marks`
+    /// references. Linear in the marks and learned lists, however many go.
+    fn drop_marks_collateral(&mut self, dropped: &[SpamMarkEntry]) {
+        if dropped.is_empty() {
+            return;
+        }
+        let mut names: HashSet<&str> = dropped.iter().map(|m| m.filename.as_str()).collect();
+        let mut similar: HashSet<&str> =
+            dropped.iter().map(|m| m.similar_name.as_str()).collect();
+        let mut sizes: HashSet<u64> = dropped.iter().map(|m| m.size).collect();
+        let mut ips: HashSet<&str> = dropped
+            .iter()
+            .flat_map(|m| m.source_ips.iter().map(String::as_str))
+            .collect();
+        let mut servers: HashSet<&str> =
+            dropped.iter().filter_map(|m| m.server_ip.as_deref()).collect();
+        for kept in &self.spam_marks {
+            names.remove(kept.filename.as_str());
+            similar.remove(kept.similar_name.as_str());
+            sizes.remove(&kept.size);
+            for ip in &kept.source_ips {
+                ips.remove(ip.as_str());
+            }
+            if let Some(sip) = &kept.server_ip {
+                servers.remove(sip.as_str());
+            }
+        }
+        names.remove("");
+        similar.remove("");
+        sizes.remove(&0);
+        if !names.is_empty() {
+            self.spam_filenames.retain(|n| !names.contains(n.as_str()));
+        }
+        if !similar.is_empty() {
+            self.spam_similar_names.retain(|n| !similar.contains(n.as_str()));
+        }
+        if !sizes.is_empty() {
+            self.spam_sizes.retain(|s| !sizes.contains(s));
+        }
+        if !ips.is_empty() {
+            self.spam_source_ips.retain(|ip| !ips.contains(ip));
+        }
+        if !servers.is_empty() {
+            self.udp_server_spam_ratios
+                .retain(|sip, _| !servers.contains(sip.as_str()));
+            self.spam_server_ips.retain(|sip| !servers.contains(sip));
+        }
+    }
+
+    /// Learn `sip` as a spam server: listed, and its ratio raised. The list and
+    /// the ratio map are bounded separately, so whichever evicts a server takes
+    /// it out of the other too; a listed server always has a ratio to redeem.
+    fn learn_spam_server(&mut self, sip: &str) {
+        for evicted in self
+            .spam_server_ips
+            .insert_evicting(sip.to_string(), MAX_SPAM_SERVER_IPS)
+        {
+            self.udp_server_spam_ratios.remove(&evicted);
+        }
+        let entry = self
+            .udp_server_spam_ratios
+            .entry(sip.to_string())
+            .or_insert(0.0);
+        *entry = (*entry * 0.9 + 0.1).min(1.0);
+        // A newly marked server starts near the lowest ratio, so the server
+        // being marked is never the one evicted.
+        if self.udp_server_spam_ratios.len() > MAX_SERVER_RATIOS {
+            if let Some(lowest_key) = self
+                .udp_server_spam_ratios
+                .iter()
+                .filter(|(k, _)| k.as_str() != sip)
+                .min_by(|a, b| {
+                    a.1.partial_cmp(b.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.cmp(b.0))
+                })
+                .map(|(k, _)| k.clone())
+            {
+                self.udp_server_spam_ratios.remove(&lowest_key);
+                self.spam_server_ips.remove(&lowest_key);
+            }
+        }
+    }
 }
 
 pub struct SpamFilter {
@@ -1077,9 +1250,9 @@ pub struct SpamStats {
 // so a hand-edited `search_spam.json` can't produce a runtime db larger than
 // the app would build on its own.
 const MAX_SPAM_HASHES: usize = 2_000;
-/// Unified cap for the not-spam whitelist, used by both the runtime insert path
-/// and the load path (previously 2000 at runtime vs 10000 on load).
+/// Cap for the explicit not-spam whitelist; only Mark not spam inserts into it.
 const NOT_SPAM_HASHES_CAP: usize = 10_000;
+const AUTO_NOT_SPAM_HASHES_CAP: usize = 10_000;
 const MAX_SPAM_FILENAMES: usize = 500;
 const MAX_SPAM_SIMILAR_NAMES: usize = 500;
 const MAX_SPAM_SIZES: usize = 1_000;
@@ -1186,8 +1359,13 @@ impl SpamFilter {
     fn sanitize_loaded(db: &mut SpamDatabase) {
         // Truncate to per-set caps so a corrupted or hand-edited file can't
         // produce a runtime db larger than `mark_spam` would ever produce.
+        // Hashes first take the form every lookup uses.
+        db.spam_hashes.normalize_entries(normalize_hash);
+        db.not_spam_hashes.normalize_entries(normalize_hash);
+        db.auto_not_spam_hashes.normalize_entries(normalize_hash);
         db.spam_hashes.truncate_oldest(MAX_SPAM_HASHES);
         db.not_spam_hashes.truncate_oldest(NOT_SPAM_HASHES_CAP);
+        db.auto_not_spam_hashes.truncate_oldest(AUTO_NOT_SPAM_HASHES_CAP);
         // Drop pathologically long entries before the count-based truncation
         // so a hand-edited file can't load megabyte-sized names that bog down
         // every search's similarity scan.
@@ -1210,6 +1388,7 @@ impl SpamFilter {
                 .filter(|n| is_learnable_signature(n)),
         );
         for mark in &mut db.spam_marks {
+            mark.hash = normalize_hash(&mark.hash);
             mark.filename = normalize_filename(&mark.filename);
             let signature = similar_name_signature(&mark.similar_name, &[]);
             mark.similar_name = if is_learnable_signature(&signature) {
@@ -1218,36 +1397,40 @@ impl SpamFilter {
                 String::new()
             };
         }
-        if db.spam_filenames.len() > MAX_SPAM_FILENAMES {
-            db.spam_filenames.truncate(MAX_SPAM_FILENAMES);
+        // Marks are oldest first, like every learned list: keep the newest, as
+        // runtime eviction does, and reverse what the dropped ones learned.
+        let (mut kept, mut dropped): (Vec<SpamMarkEntry>, Vec<SpamMarkEntry>) =
+            std::mem::take(&mut db.spam_marks)
+                .into_iter()
+                .partition(|m| !m.hash.is_empty() && db.spam_hashes.contains(&m.hash));
+        dropped.extend(kept.drain(..kept.len().saturating_sub(MAX_SPAM_HASHES)));
+        db.spam_marks = kept;
+        db.drop_marks_collateral(&dropped);
+        drop_oldest(&mut db.spam_filenames, MAX_SPAM_FILENAMES);
+        drop_oldest(&mut db.spam_similar_names, MAX_SPAM_SIMILAR_NAMES);
+        // A size of 0 sits within the size tolerance of every file under it.
+        db.spam_sizes.retain(|s| *s > 0);
+        let excess_sizes = db.spam_sizes.len().saturating_sub(MAX_SPAM_SIZES);
+        db.spam_sizes.drain(..excess_sizes);
+        for evicted in db.spam_server_ips.truncate_oldest(MAX_SPAM_SERVER_IPS) {
+            db.udp_server_spam_ratios.remove(&evicted);
         }
-        if db.spam_similar_names.len() > MAX_SPAM_SIMILAR_NAMES {
-            db.spam_similar_names.truncate(MAX_SPAM_SIMILAR_NAMES);
-        }
-        if db.spam_sizes.len() > MAX_SPAM_SIZES {
-            db.spam_sizes.truncate(MAX_SPAM_SIZES);
-        }
-        db.spam_server_ips.truncate_oldest(MAX_SPAM_SERVER_IPS);
         db.spam_source_ips.truncate_oldest(MAX_SPAM_SOURCE_IPS);
-        let known_hashes = db.spam_hashes.clone();
-        db.spam_marks.retain(|m| {
-            let hash = normalize_hash(&m.hash);
-            !hash.is_empty() && known_hashes.contains(&hash)
-        });
-        if db.spam_marks.len() > MAX_SPAM_HASHES {
-            db.spam_marks.truncate(MAX_SPAM_HASHES);
-        }
         if db.udp_server_spam_ratios.len() > MAX_SERVER_RATIOS {
             let mut ranked: Vec<(String, f32)> = db
                 .udp_server_spam_ratios
                 .iter()
                 .map(|(k, v)| (k.clone(), *v))
                 .collect();
-            ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            ranked.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
             let drop_n = ranked.len().saturating_sub(MAX_SERVER_RATIOS);
-            for (k, _) in ranked.into_iter().take(drop_n) {
-                db.udp_server_spam_ratios.remove(&k);
-            }
+            let dropped: HashSet<String> = ranked.into_iter().take(drop_n).map(|(k, _)| k).collect();
+            db.udp_server_spam_ratios.retain(|k, _| !dropped.contains(k));
+            db.spam_server_ips.retain(|k| !dropped.contains(k));
         }
     }
 
@@ -1324,7 +1507,14 @@ impl SpamFilter {
     /// Whether there are changes a save should write. False while saving is
     /// held back over an unreadable file (see `persist_blocked`).
     pub fn is_dirty(&self) -> bool {
-        self.dirty && !self.persist_blocked
+        self.has_unsaved_changes() && !self.persist_blocked
+    }
+
+    /// Whether this session holds changes not yet on disk, saveable or not.
+    /// A periodic flush keyed on this reaches [`Self::retry_blocked_load`]
+    /// while saving is held back.
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.dirty
     }
 
     /// Run before every deliberate change (Mark spam, Mark not spam, reset).
@@ -1354,7 +1544,7 @@ impl SpamFilter {
                     self.adopt_loaded(*db);
                     true
                 } else {
-                    set_aside_copy(&parked, "unreadable")
+                    self.set_aside_and_adopt(&parked)
                 }
             }
             LoadOutcome::Corrupt(reason) => match quarantine_corrupt(&self.data_path) {
@@ -1367,7 +1557,50 @@ impl SpamFilter {
                     false
                 }
             },
-            LoadOutcome::Unreadable(_) => set_aside_copy(&self.data_path, "unreadable"),
+            LoadOutcome::Unreadable(_) => self.set_aside_and_adopt(&self.data_path.clone()),
+        };
+        if resolved {
+            self.persist_blocked = false;
+            self.held_changes.clear();
+        }
+    }
+
+    /// Copy an unreadable `source` aside so a save may replace it, and adopt
+    /// the copy if it reads: a file held without read sharing can still copy.
+    /// Returns whether a copy now exists.
+    fn set_aside_and_adopt(&mut self, source: &Path) -> bool {
+        let Some(copy) = set_aside_copy(source, "unreadable") else {
+            return false;
+        };
+        if let LoadOutcome::Loaded(db) = Self::read_database(&copy) {
+            self.adopt_loaded(*db);
+        }
+        true
+    }
+
+    /// Retry the read that is holding saves back, without waiting for a
+    /// deliberate change. Only a file that now reads ends the hold here;
+    /// setting an unreadable one aside is left to [`Self::begin_user_change`].
+    pub fn retry_blocked_load(&mut self) {
+        if !self.persist_blocked {
+            return;
+        }
+        crate::security::recover_interrupted_replace(&self.data_path);
+        let parked = parked_replace_path(&self.data_path);
+        let resolved = match Self::read_database(&self.data_path) {
+            LoadOutcome::Loaded(db) => {
+                self.adopt_loaded(*db);
+                true
+            }
+            LoadOutcome::Missing if !parked.exists() => true,
+            LoadOutcome::Missing => match Self::read_database(&parked) {
+                LoadOutcome::Loaded(db) => {
+                    self.adopt_loaded(*db);
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
         };
         if resolved {
             self.persist_blocked = false;
@@ -1383,9 +1616,17 @@ impl SpamFilter {
         let session = std::mem::replace(&mut self.db, loaded);
         for hash in session.not_spam_hashes.iter() {
             if !self.db.spam_hashes.contains(hash) {
+                self.db.auto_not_spam_hashes.remove(hash);
                 self.db
                     .not_spam_hashes
                     .insert(hash.clone(), NOT_SPAM_HASHES_CAP);
+            }
+        }
+        for hash in session.auto_not_spam_hashes.iter() {
+            if !self.db.spam_hashes.contains(hash) && !self.db.not_spam_hashes.contains(hash) {
+                self.db
+                    .auto_not_spam_hashes
+                    .insert(hash.clone(), AUTO_NOT_SPAM_HASHES_CAP);
             }
         }
         self.rebuild_similar_name_features();
@@ -1427,6 +1668,7 @@ impl SpamFilter {
         loop {
             let Some((data, path, gen)) = ({
                 let mut spam = spam_filter.write().await;
+                spam.retry_blocked_load();
                 spam.take_save_data()
             }) else {
                 return Ok(());
@@ -1450,7 +1692,7 @@ impl SpamFilter {
     pub fn stats(&self) -> SpamStats {
         SpamStats {
             spam_hashes: self.db.spam_hashes.len(),
-            not_spam_hashes: self.db.not_spam_hashes.len(),
+            not_spam_hashes: self.db.not_spam_hashes.len() + self.db.auto_not_spam_hashes.len(),
             spam_filenames: self.db.spam_filenames.len(),
             spam_server_ips: self.db.spam_server_ips.len(),
             spam_source_ips: self.db.spam_source_ips.len(),
@@ -1535,7 +1777,7 @@ impl SpamFilter {
         // trust network-derived signals" dial rather than just a threshold.
         let network_signals = profile != SpamFilterProfile::Relaxed;
 
-        if self.db.not_spam_hashes.contains(&hash) {
+        if self.db.is_not_spam(&hash) {
             return Self::explanation(
                 0,
                 threshold,
@@ -1560,7 +1802,8 @@ impl SpamFilter {
         // An explicit Mark spam still wins, exactly as it does over
         // `auto_mark_not_spam`: if the user has judged this hash, that judgement
         // is the answer.
-        if batch.is_owned(&hash) && !self.db.spam_hashes.contains(&hash) {
+        let owned = batch.is_owned(&hash) || origin_has_local(&result.result_origin);
+        if owned && !self.db.spam_hashes.contains(&hash) {
             return Self::explanation(
                 0,
                 threshold,
@@ -1587,32 +1830,35 @@ impl SpamFilter {
 
         let canonical = canonical_lower(name);
         let name_norm = normalized_from_canonical(&canonical);
-        let mut exact_name_hit = false;
-        for spam_name in &self.db.spam_filenames {
-            if name_norm == *spam_name {
-                exact_name_hit = true;
-                let bump = if name.chars().count() < SMALL_FILENAME_LEN {
-                    SPAM_SMALLFULLNAME_HIT
-                } else {
-                    SPAM_FULLNAME_HIT
-                };
-                score += bump;
+        // A name with nothing distinctive in it ("installer exe", "sample
+        // avi") is shared by countless genuine files, so matching it exactly
+        // is weak evidence however long it is.
+        let exact_weight = self.db.spam_filenames.contains(&name_norm).then(|| {
+            if name.chars().count() < SMALL_FILENAME_LEN || !has_distinctive_token(&name_norm) {
+                SPAM_SMALLFULLNAME_HIT
+            } else {
+                SPAM_FULLNAME_HIT
+            }
+        });
+        // One name signal, the stronger: a genuine file sharing a learned name
+        // must not take both weights.
+        let similar = if exact_weight.is_some_and(|w| w >= SPAM_SIMILARNAME_HIT) {
+            None
+        } else {
+            self.best_similar_name(&signature_from_canonical(&canonical, &keywords.0))
+        };
+        match (exact_weight, similar) {
+            (Some(weight), hit) if hit.is_none_or(|hit| weight >= hit.weight) => {
+                score += weight;
                 reasons.push(SpamReason::new(
                     SpamReasonCode::ExactFilename,
-                    &[(SpamParam::Weight, bump)],
+                    &[(SpamParam::Weight, weight)],
                 ));
-                if bump >= SPAM_FULLNAME_HIT {
+                if weight >= SPAM_FULLNAME_HIT {
                     strong_local = true;
                 }
-                break;
             }
-        }
-
-        // An exact learned name already says everything a similar one would,
-        // and a genuine file sharing the name must not take both weights.
-        if !exact_name_hit {
-            let signature = signature_from_canonical(&canonical, &keywords.0);
-            if let Some(hit) = self.best_similar_name(&signature) {
+            (_, Some(hit)) => {
                 score += hit.weight;
                 reasons.push(SpamReason::new(
                     hit.code,
@@ -1622,12 +1868,14 @@ impl SpamFilter {
                     ],
                 ));
             }
+            _ => {}
         }
 
         for &spam_size in &self.db.spam_sizes {
             let diff = size.abs_diff(spam_size);
-            if diff < SIZE_TOLERANCE_BYTES
-                && (spam_size == 0 || (diff as f64 / spam_size as f64) < SIZE_TOLERANCE_PERCENT)
+            if spam_size > 0
+                && diff < SIZE_TOLERANCE_BYTES
+                && (diff as f64 / spam_size as f64) < SIZE_TOLERANCE_PERCENT
             {
                 score += SPAM_SIMILARSIZE_HIT;
                 reasons.push(SpamReason::new(
@@ -1918,12 +2166,13 @@ impl SpamFilter {
                 .spam_hashes
                 .insert(file_hash.clone(), MAX_SPAM_HASHES);
             self.db.not_spam_hashes.remove(&file_hash);
+            self.db.auto_not_spam_hashes.remove(&file_hash);
             // Reverse collateral for the previous mark of this hash (re-mark)
             // and for hashes FIFO-evicted by the insert above, *before* we
             // learn this row's filename/IPs so a shared name is not dropped.
             if let Some(pos) = self.db.spam_marks.iter().position(|m| m.hash == file_hash) {
                 let old = self.db.spam_marks.remove(pos);
-                self.drop_mark_collateral(&old);
+                self.db.drop_mark_collateral(&old);
             }
             self.drop_orphaned_marks();
         }
@@ -1994,23 +2243,7 @@ impl SpamFilter {
             None
         };
         if let Some(ref sip) = server_ip_owned {
-            self.db
-                .spam_server_ips
-                .insert(sip.clone(), MAX_SPAM_SERVER_IPS);
-
-            let entry = self.db.udp_server_spam_ratios.entry(sip.clone()).or_insert(0.0);
-            *entry = (*entry * 0.9 + 0.1).min(1.0);
-            if self.db.udp_server_spam_ratios.len() > MAX_SERVER_RATIOS {
-                if let Some(lowest_key) = self
-                    .db
-                    .udp_server_spam_ratios
-                    .iter()
-                    .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(k, _)| k.clone())
-                {
-                    self.db.udp_server_spam_ratios.remove(&lowest_key);
-                }
-            }
+            self.db.learn_spam_server(sip);
         }
 
         if !file_hash.is_empty() {
@@ -2024,7 +2257,7 @@ impl SpamFilter {
             });
             while self.db.spam_marks.len() > MAX_SPAM_HASHES {
                 let mark = self.db.spam_marks.remove(0);
-                self.drop_mark_collateral(&mark);
+                self.db.drop_mark_collateral(&mark);
             }
         }
 
@@ -2034,6 +2267,9 @@ impl SpamFilter {
     }
 
     pub fn mark_not_spam(&mut self, file_hash: &str) {
+        if normalize_hash(file_hash).is_empty() {
+            return;
+        }
         self.begin_user_change();
         if self.persist_blocked {
             self.hold(HeldUserChange::MarkNotSpam(file_hash.to_string()));
@@ -2043,64 +2279,21 @@ impl SpamFilter {
 
     fn apply_mark_not_spam(&mut self, file_hash: &str) {
         let file_hash = normalize_hash(file_hash);
+        if file_hash.is_empty() {
+            return;
+        }
         self.db
             .not_spam_hashes
             .insert(file_hash.clone(), NOT_SPAM_HASHES_CAP);
+        self.db.auto_not_spam_hashes.remove(&file_hash);
         self.db.spam_hashes.remove(&file_hash);
         if let Some(pos) = self.db.spam_marks.iter().position(|m| m.hash == file_hash) {
             let mark = self.db.spam_marks.remove(pos);
-            self.drop_mark_collateral(&mark);
+            self.db.drop_mark_collateral(&mark);
             self.rebuild_similar_name_features();
         }
         self.mark_dirty();
         info!("Marked as not spam: {file_hash}");
-    }
-
-    /// Drop filename / similar-name / size / source IPs / server IP that this
-    /// mark added, but only when no remaining mark still references them.
-    fn drop_mark_collateral(&mut self, mark: &SpamMarkEntry) {
-        if !mark.filename.is_empty()
-            && !self
-                .db
-                .spam_marks
-                .iter()
-                .any(|m| m.filename == mark.filename)
-        {
-            self.db.spam_filenames.retain(|n| n != &mark.filename);
-        }
-        if !mark.similar_name.is_empty()
-            && !self
-                .db
-                .spam_marks
-                .iter()
-                .any(|m| m.similar_name == mark.similar_name)
-        {
-            self.db.spam_similar_names.retain(|n| n != &mark.similar_name);
-        }
-        if mark.size > 0 && !self.db.spam_marks.iter().any(|m| m.size == mark.size) {
-            self.db.spam_sizes.retain(|s| *s != mark.size);
-        }
-        for ip in &mark.source_ips {
-            if !self
-                .db
-                .spam_marks
-                .iter()
-                .any(|m| m.source_ips.iter().any(|o| o == ip))
-            {
-                self.db.spam_source_ips.remove(ip);
-            }
-        }
-        if let Some(sip) = &mark.server_ip {
-            let still_used = self
-                .db
-                .spam_marks
-                .iter()
-                .any(|m| m.server_ip.as_deref() == Some(sip.as_str()));
-            if !still_used {
-                self.db.udp_server_spam_ratios.remove(sip);
-                self.db.spam_server_ips.remove(sip);
-            }
-        }
     }
 
     /// Reverse collateral for marks whose hash left `spam_hashes` (FIFO cap).
@@ -2113,7 +2306,7 @@ impl SpamFilter {
                 continue;
             }
             let mark = self.db.spam_marks.remove(i);
-            self.drop_mark_collateral(&mark);
+            self.db.drop_mark_collateral(&mark);
         }
     }
 
@@ -2124,14 +2317,14 @@ impl SpamFilter {
     pub fn auto_mark_not_spam(&mut self, file_hash: &str) {
         let file_hash = normalize_hash(file_hash);
         if file_hash.is_empty()
-            || self.db.not_spam_hashes.contains(&file_hash)
+            || self.db.is_not_spam(&file_hash)
             || self.db.spam_hashes.contains(&file_hash)
         {
             return;
         }
         self.db
-            .not_spam_hashes
-            .insert(file_hash.clone(), NOT_SPAM_HASHES_CAP);
+            .auto_not_spam_hashes
+            .insert(file_hash.clone(), AUTO_NOT_SPAM_HASHES_CAP);
         self.mark_dirty();
         debug!("Auto-marked completed download as not spam: {file_hash}");
     }
@@ -2158,6 +2351,9 @@ impl SpamFilter {
         if total == 0 {
             return;
         }
+        if !self.has_server_reputation(server_ip) {
+            return;
+        }
         let sip = match extract_ip(server_ip) {
             Some(s) => s,
             None => return,
@@ -2176,15 +2372,15 @@ impl SpamFilter {
             return;
         }
         let mut changed = false;
-        let mut redeem = false;
+        // A listed server with no ratio left has nothing to decay; a clean
+        // batch is all its redemption can wait for.
+        let mut redeem = true;
         if let Some(r) = self.db.udp_server_spam_ratios.get_mut(&sip) {
             if *r > 0.0 {
                 *r *= 0.8;
                 changed = true;
             }
-            if *r < 0.05 {
-                redeem = true;
-            }
+            redeem = *r < 0.05;
         }
         if redeem {
             self.db.udp_server_spam_ratios.remove(&sip);
@@ -2196,6 +2392,13 @@ impl SpamFilter {
         if changed {
             self.mark_dirty();
         }
+    }
+
+    /// Whether `server_ip` has any learned reputation for
+    /// [`Self::record_server_clean_batch`] to decay. Cheap, for checking under
+    /// a read lock before taking the write lock that call needs.
+    pub fn has_server_reputation(&self, server_ip: &str) -> bool {
+        extract_ip(server_ip).is_some_and(|sip| self.db.has_server_reputation(&sip))
     }
 
     pub fn is_spam(score: u32, profile: SpamFilterProfile) -> bool {
@@ -2353,6 +2556,11 @@ fn dedup_in_order(items: impl Iterator<Item = String>) -> Vec<String> {
     items.filter(|item| seen.insert(item.clone())).collect()
 }
 
+/// Drop the front (oldest) of `items` until at most `cap` remain.
+fn drop_oldest<T>(items: &mut Vec<T>, cap: usize) {
+    items.drain(..items.len().saturating_sub(cap));
+}
+
 /// Where an interrupted [`crate::security::atomic_write`] parks the previous
 /// file (`security::interrupted_replace_backup_path`).
 fn parked_replace_path(path: &Path) -> std::path::PathBuf {
@@ -2393,8 +2601,8 @@ fn identical_aside_copy(path: &Path, kind: &str, data: &[u8]) -> Option<std::pat
 }
 
 /// Copy `path` aside as `<file name>.<stamp>.<kind>`, so a save may replace
-/// it. Returns whether a copy now exists.
-fn set_aside_copy(path: &Path, kind: &str) -> bool {
+/// it. Returns the copy, if one now exists.
+fn set_aside_copy(path: &Path, kind: &str) -> Option<std::path::PathBuf> {
     let destination = aside_path(path, kind);
     match std::fs::copy(path, &destination) {
         Ok(_) => {
@@ -2403,11 +2611,11 @@ fn set_aside_copy(path: &Path, kind: &str) -> bool {
                 path.display(),
                 destination.display()
             );
-            true
+            Some(destination)
         }
         Err(e) => {
             warn!("{} could not be read or copied ({e}); not saving over it", path.display());
-            false
+            None
         }
     }
 }
@@ -2719,31 +2927,36 @@ fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
     }
 }
 
+/// The address in `ip`, `ip:port` or `[v6]:port`, IPv4-mapped IPv6 as the
+/// IPv4 it is (as `CommentManager`'s voter key reads it).
 fn extract_ip(addr: &str) -> Option<String> {
+    parse_ip(addr).map(|ip| ip.to_canonical().to_string())
+}
+
+fn parse_ip(addr: &str) -> Option<std::net::IpAddr> {
     if addr.is_empty() {
         return None;
     }
 
     if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
-        return Some(ip.to_string());
+        return Some(ip);
     }
     if let Ok(sock) = addr.parse::<std::net::SocketAddr>() {
-        return Some(sock.ip().to_string());
+        return Some(sock.ip());
     }
 
     if let Some(rest) = addr.strip_prefix('[') {
         if let Some(end) = rest.find(']') {
-            let ip = &rest[..end];
-            if ip.parse::<std::net::IpAddr>().is_ok() {
-                return Some(ip.to_string());
+            if let Ok(ip) = rest[..end].parse::<std::net::IpAddr>() {
+                return Some(ip);
             }
         }
     }
 
     if addr.matches(':').count() == 1 {
         if let Some((ip, _port)) = addr.split_once(':') {
-            if ip.parse::<std::net::IpAddr>().is_ok() {
-                return Some(ip.to_string());
+            if let Ok(ip) = ip.parse::<std::net::IpAddr>() {
+                return Some(ip);
             }
         }
     }
@@ -2755,7 +2968,7 @@ fn is_globally_routable_ip(ip: &str) -> bool {
     let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
         return false;
     };
-    match addr {
+    match addr.to_canonical() {
         std::net::IpAddr::V4(v) => {
             !v.is_unspecified()
                 && !v.is_loopback()
@@ -3400,7 +3613,7 @@ mod tests {
         filter.mark_spam(&sample_result(&hash, "fake.bin"), &[], None);
         filter.auto_mark_not_spam(&hash);
         assert!(filter.db.spam_hashes.contains(&hash));
-        assert!(!filter.db.not_spam_hashes.contains(&hash));
+        assert!(!filter.db.is_not_spam(&hash));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3630,7 +3843,7 @@ mod tests {
     fn a_rescore_keeps_the_batch_signals_rows_were_flagged_with() {
         let dir = temp_dir("carry-batch");
         let mut filter = SpamFilter::load(&dir);
-        // Five hashes, each advertised under the same four unrelated titles
+        // Eight hashes, each advertised under the same four unrelated titles
         // from one flooding IP: both collision bars and the source bar, which
         // together convict under `balanced` while no single row signal does.
         let names = [
@@ -3639,7 +3852,7 @@ mod tests {
             "Ocean Documentary Series.mkv",
             "Jazz Piano Collection.mkv",
         ];
-        let hashes: Vec<String> = (0..5).map(|i| format!("{:032x}", i + 1)).collect();
+        let hashes: Vec<String> = (0..8).map(|i| format!("{:032x}", i + 1)).collect();
         let mut stream = Vec::new();
         for hash in &hashes {
             for name in names {
@@ -3698,7 +3911,7 @@ mod tests {
             assert!(verdict
                 .reason_details
                 .iter()
-                .any(|r| r.code == "batch_name_many_hashes" && r.count == Some(5)));
+                .any(|r| r.code == "batch_name_many_hashes" && r.count == Some(8)));
         }
 
         // Carried signals are still network signals.
@@ -3817,8 +4030,8 @@ mod tests {
     }
 
     /// Marking a row the connected server returned must not put that server in
-    /// `spam_server_ips`: every TCP row it returns lists no sources, and would
-    /// carry the server's reputation from then on.
+    /// `spam_server_ips`: every TCP row it returns would carry the server's
+    /// reputation from then on.
     #[test]
     fn server_reputation_applies_to_udp_rows_only() {
         let dir = temp_dir("udp-only");
@@ -4183,7 +4396,10 @@ mod tests {
         filter.mark_not_spam(&now);
         assert!(filter.db.spam_hashes.contains(&on_disk), "the file's data is kept");
         assert!(filter.db.spam_hashes.contains(&held), "the held change is re-applied");
-        assert!(filter.db.not_spam_hashes.contains(&auto), "background learning is kept");
+        assert!(
+            filter.db.auto_not_spam_hashes.contains(&auto),
+            "background learning is kept"
+        );
         assert!(filter.db.not_spam_hashes.contains(&now));
         assert!(filter.take_save_data().is_some(), "saving resumes");
         let _ = std::fs::remove_dir_all(dir);
@@ -4639,5 +4855,463 @@ mod tests {
         assert_eq!(normalize_filename("映画〈特別〉〜完全版〜"), "映画 特別 完全版");
         // Letters inside the CJK punctuation block stay inside their word.
         assert_eq!(normalize_filename("人々の〇〇"), "人々の〇〇");
+    }
+
+    fn load_json(dir: &Path, json: serde_json::Value) -> SpamFilter {
+        std::fs::write(dir.join("search_spam.json"), json.to_string()).unwrap();
+        SpamFilter::load(dir)
+    }
+
+    /// Runtime eviction drops the oldest learned entries; a file over the caps
+    /// loads the same way.
+    #[test]
+    fn an_over_cap_file_keeps_its_newest_learned_entries() {
+        let dir = temp_dir("load-newest");
+        let filenames: Vec<String> = (0..MAX_SPAM_FILENAMES + 5)
+            .map(|i| format!("learned{i} title"))
+            .collect();
+        let similar: Vec<String> = (0..MAX_SPAM_SIMILAR_NAMES + 5)
+            .map(|i| format!("distinct{i} signature"))
+            .collect();
+        let sizes: Vec<u64> = (1..=MAX_SPAM_SIZES as u64 + 3).collect();
+        let filter = load_json(
+            &dir,
+            serde_json::json!({
+                "spam_filenames": filenames,
+                "spam_similar_names": similar,
+                "spam_sizes": sizes,
+            }),
+        );
+        assert_eq!(filter.db.spam_filenames.len(), MAX_SPAM_FILENAMES);
+        assert_eq!(filter.db.spam_filenames[0], "learned5 title");
+        assert_eq!(
+            filter.db.spam_filenames.last().unwrap(),
+            &format!("learned{} title", MAX_SPAM_FILENAMES + 4)
+        );
+        assert_eq!(filter.db.spam_similar_names.len(), MAX_SPAM_SIMILAR_NAMES);
+        assert_eq!(filter.db.spam_similar_names[0], "distinct5 signature");
+        assert_eq!(filter.similar_name_features.len(), MAX_SPAM_SIMILAR_NAMES);
+        assert_eq!(filter.db.spam_sizes.len(), MAX_SPAM_SIZES);
+        assert_eq!(filter.db.spam_sizes.front(), Some(&4));
+        assert_eq!(filter.db.spam_sizes.back(), Some(&(MAX_SPAM_SIZES as u64 + 3)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A mark whose hash does not survive the load takes what only it learned
+    /// with it, as a mark evicted at runtime does.
+    #[test]
+    fn a_mark_dropped_on_load_takes_its_learned_data_with_it() {
+        let dir = temp_dir("load-orphan-mark");
+        let hashes: Vec<String> = (0..=MAX_SPAM_HASHES).map(|i| format!("{:032x}", i + 1)).collect();
+        let mut marks: Vec<serde_json::Value> = hashes
+            .iter()
+            .map(|h| serde_json::json!({ "hash": h }))
+            .collect();
+        marks[0] = serde_json::json!({
+            "hash": hashes[0],
+            "filename": "oldest evicted title",
+            "size": 777,
+            "source_ips": ["8.8.4.4"],
+            "server_ip": "9.9.9.9",
+        });
+        let filter = load_json(
+            &dir,
+            serde_json::json!({
+                "spam_hashes": hashes,
+                "spam_filenames": ["oldest evicted title", "unmarked learned title"],
+                "spam_sizes": [777, 888],
+                "spam_source_ips": ["8.8.4.4"],
+                "spam_server_ips": ["9.9.9.9"],
+                "udp_server_spam_ratios": { "9.9.9.9": 0.4 },
+                "spam_marks": marks,
+            }),
+        );
+        assert_eq!(filter.db.spam_hashes.len(), MAX_SPAM_HASHES);
+        assert!(!filter.db.spam_hashes.contains(&hashes[0]));
+        assert_eq!(filter.db.spam_marks.len(), MAX_SPAM_HASHES);
+        assert!(filter.db.spam_marks.iter().all(|m| m.hash != hashes[0]));
+        assert_eq!(&filter.db.spam_marks.last().unwrap().hash, hashes.last().unwrap());
+        assert_eq!(filter.db.spam_filenames, vec!["unmarked learned title".to_string()]);
+        assert_eq!(filter.db.spam_sizes, VecDeque::from([888]));
+        assert!(!filter.db.spam_source_ips.contains("8.8.4.4"));
+        assert!(!filter.db.spam_server_ips.contains("9.9.9.9"));
+        assert!(filter.db.udp_server_spam_ratios.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Rows out of the library are the user's own files, hashed yet or not.
+    #[test]
+    fn a_library_row_is_never_flagged_even_before_it_has_a_hash() {
+        let dir = temp_dir("local-unhashed");
+        let mut filter = SpamFilter::load(&dir);
+        let name = "Holiday Video Collection Uncut.avi";
+        filter.mark_spam(&sample_result(&"a1".repeat(16), name), &[], None);
+
+        let mut hashing = sample_result("", name);
+        hashing.result_origin = crate::search::merge::ORIGIN_LOCAL.to_string();
+        let verdict = explain(&filter, &hashing, &[]);
+        assert_eq!(verdict.score, 0);
+        assert_eq!(codes(&verdict), vec!["owned_file"]);
+
+        hashing.result_origin = crate::search::merge::combine_origin(
+            crate::search::merge::ORIGIN_KAD,
+            crate::search::merge::ORIGIN_LOCAL,
+        );
+        assert_eq!(codes(&explain(&filter, &hashing, &[])), vec!["owned_file"]);
+
+        hashing.result_origin = crate::search::merge::ORIGIN_KAD.to_string();
+        let network = explain(&filter, &hashing, &[]);
+        assert!(codes(&network).contains(&"exact_filename"), "{:?}", codes(&network));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Completed downloads fill their own set, so however many finish, the
+    /// user's explicit Mark not spam choices stay.
+    #[test]
+    fn completed_downloads_cannot_evict_explicit_not_spam_choices() {
+        let dir = temp_dir("not-spam-sets");
+        let mut filter = SpamFilter::load(&dir);
+        let explicit = "e1".repeat(16);
+        filter.mark_not_spam(&explicit);
+        for i in 0..AUTO_NOT_SPAM_HASHES_CAP + 5 {
+            filter.auto_mark_not_spam(&format!("{i:032x}"));
+        }
+        assert!(filter.db.not_spam_hashes.contains(&explicit));
+        assert_eq!(filter.db.not_spam_hashes.len(), 1);
+        assert_eq!(filter.db.auto_not_spam_hashes.len(), AUTO_NOT_SPAM_HASHES_CAP);
+        assert!(!filter.db.is_not_spam(&format!("{:032x}", 0)), "oldest auto entry went first");
+        let verdict = explain(&filter, &sample_result(&explicit, "anything.bin"), &[]);
+        assert_eq!(codes(&verdict), vec!["not_spam_marked"]);
+
+        // An explicit choice on an auto entry moves it; Mark spam clears both.
+        let auto = format!("{:032x}", 9);
+        filter.mark_not_spam(&auto);
+        assert!(filter.db.not_spam_hashes.contains(&auto));
+        assert!(!filter.db.auto_not_spam_hashes.contains(&auto));
+        let other = format!("{:032x}", 10);
+        filter.mark_spam(&sample_result(&other, "other.bin"), &[], None);
+        assert!(!filter.db.is_not_spam(&other));
+        assert_eq!(
+            filter.stats().not_spam_hashes,
+            filter.db.not_spam_hashes.len() + filter.db.auto_not_spam_hashes.len()
+        );
+
+        let (data, _, _) = filter.take_save_data().unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert!(saved["auto_not_spam_hashes"].as_array().is_some_and(|a| !a.is_empty()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A file written before the auto set existed keeps every whitelisted hash
+    /// as an explicit choice.
+    #[test]
+    fn an_older_not_spam_list_loads_as_explicit_choices() {
+        let dir = temp_dir("not-spam-legacy");
+        let hash = "b2".repeat(16);
+        let filter = load_json(&dir, serde_json::json!({ "not_spam_hashes": [hash] }));
+        assert!(filter.db.not_spam_hashes.contains(&hash));
+        assert_eq!(filter.db.auto_not_spam_hashes.len(), 0);
+        let verdict = explain(&filter, &sample_result(&hash, "anything.bin"), &[]);
+        assert_eq!(codes(&verdict), vec!["not_spam_marked"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The ratio map is full and the server just marked has the lowest ratio:
+    /// another server makes room.
+    #[test]
+    fn marking_a_new_server_keeps_its_ratio_when_the_map_is_full() {
+        let dir = temp_dir("ratio-evict");
+        let mut filter = SpamFilter::load(&dir);
+        for i in 0..MAX_SERVER_RATIOS {
+            filter
+                .db
+                .udp_server_spam_ratios
+                .insert(format!("1.2.{}.{}", i / 256, i % 256), 0.5);
+        }
+        let mut row = sample_result(&"c3".repeat(16), "flagged.bin");
+        row.result_origin = crate::search::merge::ORIGIN_SERVER_UDP.to_string();
+        row.origin_server_ip = Some("93.184.216.34".to_string());
+        filter.mark_spam(&row, &[], None);
+        assert_eq!(filter.db.udp_server_spam_ratios.len(), MAX_SERVER_RATIOS);
+        assert!(filter.db.udp_server_spam_ratios.contains_key("93.184.216.34"));
+        assert!(!filter.db.udp_server_spam_ratios.contains_key("1.2.0.0"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn sourced_rows(start: usize, count: usize, source: Option<&str>) -> Vec<SearchResult> {
+        (start..start + count)
+            .map(|i| {
+                let ip = format!("93.{}.{}.1:4662", 100 + i / 200, i % 200);
+                let sources = [source.unwrap_or(ip.as_str())];
+                sized_result(&format!("{i:032x}"), &format!("file {i}.bin"), 1000, &sources)
+            })
+            .collect()
+    }
+
+    fn unsourced_rows(start: usize, count: usize) -> Vec<SearchResult> {
+        (start..start + count)
+            .map(|i| sized_result(&format!("{i:032x}"), &format!("file {i}.bin"), 1000, &[]))
+            .collect()
+    }
+
+    const FLOOD_SOURCE: &str = "81.2.69.160:4662";
+
+    /// The hot-source share is of rows that list a source, and enough rows
+    /// make a source hot outright, so a flood stays visible in a big search.
+    #[test]
+    fn a_flooding_source_stays_hot_as_a_search_grows() {
+        let mut rows = unsourced_rows(0, 240);
+        rows.extend(sourced_rows(240, 100, None));
+        rows.extend(sourced_rows(340, 60, Some(FLOOD_SOURCE)));
+        let ctx = BatchSpamContext::analyze(&rows);
+        assert!(ctx.hot_source_ips.contains("81.2.69.160"));
+        assert_eq!(ctx.hot_source_ips.len(), 1);
+        assert!(ctx.source_concentrated(&rows[399]));
+        assert!(!ctx.source_concentrated(&rows[300]));
+
+        // Rows with no sources do not dilute the share.
+        let mut rows = unsourced_rows(0, 30);
+        rows.extend(sourced_rows(30, 8, Some(FLOOD_SOURCE)));
+        assert!(BatchSpamContext::analyze(&rows)
+            .hot_source_ips
+            .contains("81.2.69.160"));
+
+        // Below the share, and below the outright bar, it is not hot.
+        let mut rows = sourced_rows(0, 40, None);
+        rows.extend(sourced_rows(40, 30, Some(FLOOD_SOURCE)));
+        assert!(BatchSpamContext::analyze(&rows).hot_source_ips.is_empty());
+    }
+
+    /// A few results sharing one seeder in a small search are not a flood;
+    /// the minimum file count is where it starts.
+    #[test]
+    fn a_source_is_hot_only_from_the_minimum_file_count() {
+        let mut rows = sourced_rows(0, 5, None);
+        rows.extend(sourced_rows(5, BATCH_SOURCE_MIN_HITS - 1, Some(FLOOD_SOURCE)));
+        assert!(BatchSpamContext::analyze(&rows).hot_source_ips.is_empty());
+
+        let mut rows = sourced_rows(0, 5, None);
+        rows.extend(sourced_rows(5, BATCH_SOURCE_MIN_HITS, Some(FLOOD_SOURCE)));
+        assert!(BatchSpamContext::analyze(&rows)
+            .hot_source_ips
+            .contains("81.2.69.160"));
+    }
+
+    /// Fifty files from one sharer in a broad search of hundreds of sources
+    /// is a discography, not a flood: the outright bar still needs a share.
+    #[test]
+    fn a_large_sharer_in_a_broad_search_needs_a_minimum_share() {
+        let mut rows = sourced_rows(0, 600, None);
+        rows.extend(sourced_rows(600, 55, Some(FLOOD_SOURCE)));
+        assert!(BatchSpamContext::analyze(&rows).hot_source_ips.is_empty());
+
+        let mut rows = sourced_rows(0, 600, None);
+        rows.extend(sourced_rows(600, 70, Some(FLOOD_SOURCE)));
+        assert!(BatchSpamContext::analyze(&rows)
+            .hot_source_ips
+            .contains("81.2.69.160"));
+    }
+
+    /// A row a client filter kept off screen is never marked streamed, so it
+    /// comes back with every re-send; it is still one file.
+    #[test]
+    fn a_re_sent_row_is_counted_once() {
+        let flood = sourced_rows(5, BATCH_SOURCE_MIN_HITS - 1, Some(FLOOD_SOURCE));
+        let mut rows = sourced_rows(0, 5, None);
+        rows.extend(flood.iter().cloned());
+        let mut ctx = BatchSpamContext::analyze(&rows);
+        ctx.absorb(&flood);
+        ctx.absorb(&flood);
+        assert_eq!(ctx.result_count, rows.len());
+        assert_eq!(ctx.addressed_rows, rows.len());
+        assert_eq!(ctx.source_hits["81.2.69.160"], BATCH_SOURCE_MIN_HITS - 1);
+        assert!(ctx.hot_source_ips.is_empty());
+    }
+
+    /// "installer.exe" names countless genuine files. One Mark spam on one of
+    /// them must not hide the rest, even under Aggressive.
+    #[test]
+    fn an_exact_match_on_a_generic_name_is_weak_evidence() {
+        let dir = temp_dir("generic-exact");
+        let mut filter = SpamFilter::load(&dir);
+        let marked = ["d4".repeat(16), "d5".repeat(16)];
+        for (hash, name) in marked.iter().zip(["installer.exe", "Setup Installer Final.exe"]) {
+            let mut row = sample_result(hash, name);
+            row.file.size = 0;
+            filter.mark_spam(&row, &[], None);
+        }
+        let score = |filter: &SpamFilter, name: &str| {
+            let mut row = sample_result(&"e5".repeat(16), name);
+            row.file.size = 0;
+            filter.explain_result(
+                &row,
+                &[],
+                None,
+                SpamFilterProfile::Aggressive,
+                CommunityRating::default(),
+                &BatchSpamContext::default(),
+            )
+        };
+        for name in ["installer.exe", "Setup Installer Final.exe"] {
+            let verdict = score(&filter, name);
+            assert_eq!(verdict.score, SPAM_SMALLFULLNAME_HIT, "{name}: {:?}", codes(&verdict));
+            assert_eq!(codes(&verdict), vec!["exact_filename"], "no aggressive boost");
+            assert!(!verdict.is_spam);
+        }
+        assert!(
+            marked.iter().all(|hash| filter.db.spam_hashes.contains(hash)),
+            "the hashes are still learned"
+        );
+
+        let mut row = sample_result(&"f6".repeat(16), "Holiday Video Collection Uncut.avi");
+        row.file.size = 0;
+        filter.mark_spam(&row, &[], None);
+        let verdict = score(&filter, "Holiday Video Collection Uncut.avi");
+        assert!(codes(&verdict).contains(&"exact_filename"));
+        assert!(codes(&verdict).contains(&"aggressive_boost"), "a distinctive name is strong");
+        assert!(verdict.is_spam);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A weak exact match does not shut out a stronger similar-name match.
+    #[test]
+    fn the_stronger_of_exact_and_similar_name_is_the_name_signal() {
+        let dir = temp_dir("exact-vs-similar");
+        let mut filter = SpamFilter::load(&dir);
+        filter.mark_spam(&sample_result(&"a7".repeat(16), "Sample Video.avi"), &[], None);
+        filter.mark_spam(&sample_result(&"b8".repeat(16), "Sample Videos.mkv"), &[], None);
+        let mut probe = sample_result(&"c9".repeat(16), "Sample Video.avi");
+        probe.file.size = 0;
+        let verdict = explain(&filter, &probe, &[]);
+        assert_eq!(codes(&verdict), vec!["similar_name"]);
+        assert_eq!(verdict.score, SPAM_SIMILARNAME_NEARHIT);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The server list and the ratio map are capped apart; whichever evicts a
+    /// server evicts it from both, and a listed server without a ratio can
+    /// still be redeemed.
+    #[test]
+    fn a_spam_server_is_listed_exactly_when_it_has_a_ratio() {
+        let dir = temp_dir("server-sets");
+        let mut filter = SpamFilter::load(&dir);
+        let ip = |i: usize| format!("1.2.{}.{}", i / 256, i % 256);
+        for i in 0..=MAX_SPAM_SERVER_IPS {
+            filter.db.learn_spam_server(&ip(i));
+        }
+        assert_eq!(filter.db.spam_server_ips.len(), MAX_SPAM_SERVER_IPS);
+        assert!(!filter.db.has_server_reputation(&ip(0)), "evicted from both");
+        assert!(filter
+            .db
+            .spam_server_ips
+            .iter()
+            .all(|sip| filter.db.udp_server_spam_ratios.contains_key(sip)));
+        assert_eq!(filter.db.udp_server_spam_ratios.len(), MAX_SPAM_SERVER_IPS);
+
+        let stuck = "93.184.216.34";
+        filter.db.spam_server_ips.insert(stuck.to_string(), MAX_SPAM_SERVER_IPS);
+        filter.db.udp_server_spam_ratios.remove(stuck);
+        assert!(filter.has_server_reputation(stuck));
+        let clean = vec![sample_result(&"aa".repeat(16), "clean.bin")];
+        filter.record_server_clean_batch(stuck, &clean, SpamFilterProfile::Balanced);
+        assert!(!filter.db.spam_server_ips.contains(stuck));
+        assert!(!filter.has_server_reputation("8.8.8.8"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_file_over_the_server_caps_loads_with_both_sets_in_step() {
+        let dir = temp_dir("server-load");
+        let ips: Vec<String> = (0..MAX_SPAM_SERVER_IPS + 3)
+            .map(|i| format!("1.2.{}.{}", i / 256, i % 256))
+            .collect();
+        let ratios: serde_json::Map<String, serde_json::Value> = ips
+            .iter()
+            .enumerate()
+            .map(|(i, ip)| (ip.clone(), serde_json::json!(0.1 + i as f64 / 10_000.0)))
+            .collect();
+        let filter = load_json(
+            &dir,
+            serde_json::json!({ "spam_server_ips": ips, "udp_server_spam_ratios": ratios }),
+        );
+        assert_eq!(filter.db.spam_server_ips.len(), MAX_SPAM_SERVER_IPS);
+        assert!(filter
+            .db
+            .spam_server_ips
+            .iter()
+            .all(|sip| filter.db.udp_server_spam_ratios.contains_key(sip)));
+        assert!(!filter.db.udp_server_spam_ratios.contains_key(&ips[0]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Loaded hashes take the form lookups use, a learned size of 0 (which
+    /// would match every file under 5 MB) is dropped, and an empty hash is
+    /// never whitelisted.
+    #[test]
+    fn loading_normalizes_hashes_and_drops_empty_entries() {
+        let dir = temp_dir("load-normalize");
+        let upper = "AB".repeat(16);
+        let mut filter = load_json(
+            &dir,
+            serde_json::json!({
+                "spam_hashes": [upper, "", format!(" {} ", "cd".repeat(16))],
+                "not_spam_hashes": ["EF".repeat(16), ""],
+                "auto_not_spam_hashes": ["  "],
+                "spam_sizes": [0, 500],
+            }),
+        );
+        let spam: Vec<&String> = filter.db.spam_hashes.iter().collect();
+        assert_eq!(spam, vec![&"ab".repeat(16), &"cd".repeat(16)]);
+        assert!(filter.db.not_spam_hashes.contains(&"ef".repeat(16)));
+        assert_eq!(filter.db.not_spam_hashes.len(), 1);
+        assert_eq!(filter.db.auto_not_spam_hashes.len(), 0);
+        assert_eq!(filter.db.spam_sizes, VecDeque::from([500]));
+        let mut small = sample_result(&"11".repeat(16), "unrelated small file.bin");
+        small.file.size = 100;
+        assert!(!codes(&explain(&filter, &small, &[])).contains(&"size_signature"));
+
+        filter.mark_not_spam("  ");
+        assert!(!filter.db.not_spam_hashes.contains(""));
+        assert!(!filter.has_unsaved_changes());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// While saving is held over an unreadable file, the periodic flush tries
+    /// the read again, and a file that reads ends the hold with this
+    /// session's changes merged in.
+    #[test]
+    fn a_flush_retries_a_blocked_read_and_adopts_the_file() {
+        let dir = temp_dir("retry-blocked");
+        let path = dir.join("search_spam.json");
+        std::fs::create_dir_all(&path).unwrap();
+        let mut filter = SpamFilter::load(&dir);
+        let auto = "d1".repeat(16);
+        filter.auto_mark_not_spam(&auto);
+        assert!(!filter.is_dirty());
+        assert!(filter.has_unsaved_changes(), "the flush still has work to try");
+
+        filter.retry_blocked_load();
+        assert!(filter.take_save_data().is_none(), "still unreadable");
+
+        std::fs::remove_dir(&path).unwrap();
+        let on_disk = "e2".repeat(16);
+        std::fs::write(&path, saved_database(&[&on_disk])).unwrap();
+        filter.retry_blocked_load();
+        assert!(filter.db.spam_hashes.contains(&on_disk));
+        assert!(filter.db.auto_not_spam_hashes.contains(&auto));
+        assert!(filter.take_save_data().is_some(), "saving resumes");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ipv4_mapped_addresses_read_as_their_ipv4() {
+        assert_eq!(
+            extract_ip("[::ffff:93.184.216.34]:4662").as_deref(),
+            Some("93.184.216.34")
+        );
+        assert_eq!(extract_ip("::ffff:93.184.216.34").as_deref(), Some("93.184.216.34"));
+        assert!(!is_globally_routable_ip("::ffff:10.0.0.1"));
+        assert!(!is_globally_routable_ip("::ffff:127.0.0.1"));
+        assert!(is_globally_routable_ip("::ffff:93.184.216.34"));
     }
 }

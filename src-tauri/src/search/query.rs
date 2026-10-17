@@ -36,6 +36,13 @@ use crate::network::kad::publish::{
 const MAX_QUERY_BYTES: usize = 16 * 1024;
 const MAX_PARSE_DEPTH: usize = 64;
 
+/// Longest run of one operator put on the wire as parsed. eMule writes a run
+/// left-leaning, one level of nesting per operand, and its KAD nodes refuse a
+/// search tree nested 24 levels deep (Ember's, 32); servers have limits of
+/// their own. A longer run goes out as a balanced tree, which means the same
+/// and nests only as deep as the log of its length.
+const MAX_WIRE_CHAIN: usize = 8;
+
 /// A parsed search query as a boolean tree of keyword terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryExpr {
@@ -51,8 +58,9 @@ impl QueryExpr {
     /// Serialize to the eD2k binary search-expression format
     /// (`CSearchExpr`): `0x00 <op>` operator nodes (op `0x00`=AND, `0x01`=OR,
     /// `0x02`=NOT) and `0x01 <u16 len> <bytes>` string leaves. A flat AND-tree
-    /// produced from a plain keyword list is byte-identical to the output of
-    /// [`build_search_expression`](crate::network::kad::messages::build_search_expression).
+    /// of up to `MAX_WIRE_CHAIN` keywords is byte-identical to the output of
+    /// [`build_search_expression`](crate::network::kad::messages::build_search_expression);
+    /// a longer chain goes out balanced.
     pub fn to_wire_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(32);
         self.write_wire(&mut buf);
@@ -60,6 +68,14 @@ impl QueryExpr {
     }
 
     fn write_wire(&self, buf: &mut Vec<u8>) {
+        if let QueryExpr::And(..) | QueryExpr::Or(..) = self {
+            let operands = self.chain_operands();
+            if operands.len() > MAX_WIRE_CHAIN {
+                let op = if matches!(self, QueryExpr::And(..)) { 0x00 } else { 0x01 };
+                Self::write_balanced(buf, op, &operands);
+                return;
+            }
+        }
         match self {
             QueryExpr::Term(s) => {
                 buf.push(0x01);
@@ -91,6 +107,43 @@ impl QueryExpr {
         buf.push(op);
         l.write_wire(buf);
         r.write_wire(buf);
+    }
+
+    /// The operands of the run of this node's operator rooted here, in order:
+    /// `a b c d` is one AND of four, however it is nested.
+    fn chain_operands(&self) -> Vec<&QueryExpr> {
+        let same_op = |node: &QueryExpr| {
+            matches!(
+                (self, node),
+                (QueryExpr::And(..), QueryExpr::And(..)) | (QueryExpr::Or(..), QueryExpr::Or(..))
+            )
+        };
+        let mut operands = Vec::new();
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            match node {
+                QueryExpr::And(l, r) | QueryExpr::Or(l, r) if same_op(node) => {
+                    stack.push(r);
+                    stack.push(l);
+                }
+                _ => operands.push(node),
+            }
+        }
+        operands
+    }
+
+    fn write_balanced(buf: &mut Vec<u8>, op: u8, operands: &[&QueryExpr]) {
+        match operands {
+            [] => {}
+            [only] => only.write_wire(buf),
+            _ => {
+                let (left, right) = operands.split_at(operands.len().div_ceil(2));
+                buf.push(0x00);
+                buf.push(op);
+                Self::write_balanced(buf, op, left);
+                Self::write_balanced(buf, op, right);
+            }
+        }
     }
 
     /// Evaluate the expression against a *lowercased* haystack (typically a
@@ -186,9 +239,8 @@ impl QueryExpr {
     }
 
     /// True when this is a single bare keyword with no boolean structure. The
-    /// Kad result path skips local re-filtering in that case, preserving the
-    /// previous "only filter when there is more than one keyword" behavior
-    /// (a single-keyword Kad lookup is already exact for that keyword).
+    /// Ember keyword rows (`network::ember_search`) are matched against such a
+    /// query by its keyword alone, without the tree.
     pub fn is_trivial(&self) -> bool {
         matches!(self, QueryExpr::Term(_))
     }
@@ -354,11 +406,62 @@ pub fn parse(query: &str) -> Option<QueryExpr> {
     // The boolean parse produced nothing usable (e.g. every term was too
     // short). Fall back to the plain tokenizer so the query still searches.
     fold_and(
-        extract_query_keywords(query)
+        fallback_keywords(query)
             .into_iter()
             .map(QueryExpr::Term)
             .collect(),
     )
+}
+
+/// [`extract_query_keywords`] over the words the user asked for: not the
+/// operator words, which the parser consumed as operators (`ab AND cd` must
+/// not become a search for "and"), and not what a `-` or `NOT` excludes,
+/// which would become a search for exactly that.
+fn fallback_keywords(query: &str) -> Vec<String> {
+    let toks = lex(query);
+    let mut words: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        match &toks[i] {
+            Tok::Not => {
+                i = skip_operand(&toks, i + 1);
+                continue;
+            }
+            Tok::Word(w) | Tok::Phrase(w) => words.push(w),
+            Tok::LParen | Tok::RParen | Tok::And | Tok::Or => {}
+        }
+        i += 1;
+    }
+    extract_query_keywords(&words.join(" "))
+}
+
+/// The index just past the operand starting at `i`: one word or phrase, a
+/// whole parenthesised group, or a negated one of those.
+fn skip_operand(toks: &[Tok], mut i: usize) -> usize {
+    while matches!(toks.get(i), Some(Tok::Not)) {
+        i += 1;
+    }
+    match toks.get(i) {
+        Some(Tok::LParen) => {
+            let mut nested = 0usize;
+            while let Some(tok) = toks.get(i) {
+                i += 1;
+                match tok {
+                    Tok::LParen => nested += 1,
+                    Tok::RParen => {
+                        nested -= 1;
+                        if nested == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i
+        }
+        Some(_) => i + 1,
+        None => i,
+    }
 }
 
 fn clamp_query(query: &str) -> &str {
@@ -394,9 +497,9 @@ fn has_operators(query: &str) -> bool {
 }
 
 /// `AND`, `OR` and `NOT` as operators: upper-case only, as eMule's scanner
-/// and the search box's syntax hint have them. Matched in any case, ordinary
-/// title words became operators: `eminem not afraid` excluded "Not Afraid",
-/// and a related search for the title `truth or dare` became an OR.
+/// and the search box's syntax hint have them, so title words stay words:
+/// `eminem not afraid` keeps "Not Afraid", and a related search for the title
+/// `truth or dare` is not an OR.
 fn is_operator_word(raw: &str) -> bool {
     matches!(raw, "AND" | "OR" | "NOT")
 }
@@ -691,6 +794,13 @@ impl Parser {
             let right = self.parse_and(depth);
             left = match (left, right) {
                 (Some(l), Some(r)) => Some(Clause::or(l, r)),
+                // `tv OR -sport`: the side that searches came to nothing, so
+                // the exclusion has nothing to subtract from, and promoted
+                // to a search it would find exactly what was left out.
+                (Some(Clause::Exclude(_)), None) | (None, Some(Clause::Exclude(_))) => {
+                    self.dropped_exclusion = true;
+                    None
+                }
                 (Some(x), None) | (None, Some(x)) => Some(x),
                 (None, None) => None,
             };
@@ -1180,6 +1290,109 @@ mod tests {
     fn empty_or_too_short_query_is_none() {
         assert!(parse("").is_none());
         assert!(parse("a b").is_none()); // both < 3 bytes
+    }
+
+    #[test]
+    fn the_fallback_never_searches_for_an_operator_word() {
+        assert_eq!(parse("ab AND cd"), None);
+        assert_eq!(parse("ab OR cd NOT ef"), None);
+        assert_eq!(parse("(ab) AND (cd)"), None);
+        let query = format!(
+            "{}alpha AND beta{}",
+            "(".repeat(MAX_PARSE_DEPTH + 16),
+            ")".repeat(MAX_PARSE_DEPTH + 16)
+        );
+        assert_eq!(
+            parse(&query).map(|e| e.positive_terms()),
+            Some(vec!["alpha".to_string(), "beta".to_string()])
+        );
+        // Lower-case words are ordinary words, as on the boolean path.
+        assert_eq!(parse("ab and (cd)"), Some(term("and")));
+    }
+
+    /// The fallback reads the query the way the parser does, so a negated
+    /// word stays out of it rather than becoming a word to search for.
+    #[test]
+    fn the_fallback_never_searches_for_an_excluded_word() {
+        let deep = |inner: &str| {
+            format!(
+                "{}{inner}{}",
+                "(".repeat(MAX_PARSE_DEPTH + 16),
+                ")".repeat(MAX_PARSE_DEPTH + 16)
+            )
+        };
+        let terms = |query: &str| parse(query).map(|e| e.positive_terms());
+        let only = |words: &[&str]| Some(words.iter().map(|w| w.to_string()).collect());
+        assert_eq!(terms(&deep("alpha -beta")), only(&["alpha"]));
+        assert_eq!(terms(&deep("alpha NOT beta gamma")), only(&["alpha", "gamma"]));
+        assert_eq!(terms(&deep("alpha NOT (beta gamma) delta")), only(&["alpha", "delta"]));
+        assert_eq!(terms(&deep("alpha -\"beta gamma\" delta")), only(&["alpha", "delta"]));
+    }
+
+    /// `tv` is too short to search for, so the OR has only an exclusion left,
+    /// and it must not turn into a search for `sport`.
+    #[test]
+    fn an_exclusion_whose_alternative_is_too_short_is_never_searched_for() {
+        assert_eq!(parse("tv OR -sport"), None);
+        assert_eq!(parse("-sport OR tv"), None);
+        assert_eq!(parse("tv OR NOT sport"), None);
+        assert_eq!(parse("tv OR -sport OR movie"), Some(term("movie")));
+        assert_eq!(parse("-sport"), Some(term("sport")), "no OR: as before");
+    }
+
+    /// How deeply a wire expression nests, counting a leaf below its parents.
+    fn wire_depth(wire: &[u8]) -> usize {
+        fn node(wire: &[u8], pos: &mut usize) -> usize {
+            let kind = wire[*pos];
+            if kind == 0x00 {
+                *pos += 2;
+                let left = node(wire, pos);
+                let right = node(wire, pos);
+                1 + left.max(right)
+            } else {
+                let len = usize::from(u16::from_le_bytes([wire[*pos + 1], wire[*pos + 2]]));
+                *pos += 3 + len;
+                0
+            }
+        }
+        let mut pos = 0;
+        let depth = node(wire, &mut pos);
+        assert_eq!(pos, wire.len(), "one whole expression");
+        depth
+    }
+
+    /// eMule's KAD nodes refuse a tree nested 24 levels deep, and a long
+    /// query, or a pasted file name, is one AND per word. Up to
+    /// `MAX_WIRE_CHAIN` words the wire is unchanged; past it the run goes out
+    /// balanced, meaning the same at a fraction of the depth.
+    #[test]
+    fn a_long_run_of_words_goes_out_shallow() {
+        let words: Vec<String> = (0..40).map(|i| format!("word{i:02}")).collect();
+        let short = words[..MAX_WIRE_CHAIN].join(" ");
+        assert_eq!(
+            parse(&short).unwrap().to_wire_bytes(),
+            crate::network::kad::messages::build_search_expression(
+                &words[..MAX_WIRE_CHAIN],
+                &crate::network::kad::messages::SearchConstraints::default(),
+            ),
+            "eMule's left-leaning layout"
+        );
+
+        let long = parse(&words.join(" ")).unwrap();
+        let wire = long.to_wire_bytes();
+        assert!(wire_depth(&wire) <= 6, "depth {}", wire_depth(&wire));
+        let leaves = wire.iter().filter(|&&b| b == b'w').count();
+        assert_eq!(leaves, words.len(), "every word is still asked for");
+        assert_eq!(long.positive_terms(), words, "and kept for local filtering");
+
+        let alternatives = parse(&words.join(" OR ")).unwrap().to_wire_bytes();
+        assert!(wire_depth(&alternatives) <= 6);
+        assert_eq!(&alternatives[..2], &[0x00, 0x01]);
+
+        // A run inside another operator is balanced on its own.
+        let mixed = parse(&format!("({}) -cam", words.join(" "))).unwrap().to_wire_bytes();
+        assert_eq!(&mixed[..2], &[0x00, 0x02]);
+        assert!(wire_depth(&mixed) <= 7);
     }
 
     #[test]

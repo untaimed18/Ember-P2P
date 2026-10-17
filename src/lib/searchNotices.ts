@@ -13,5 +13,6 @@ export const SEARCH_NOTICES: ReadonlySet<string> = new Set([
   'EmberNoKeyword',
   'ServerUnavailable',
   'ServerNoAnswer',
+  'ServerNoLargeFiles',
   'NetworkNoKeyword',
 ]);

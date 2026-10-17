@@ -75,6 +75,9 @@ export type SearchTab = {
    *  show anyway (a timeout, a failure): `error` is only for a tab left with
    *  nothing. */
   interruption?: string;
+  /** When the search was started, as `Date.now()`. Absent on tabs restored
+   *  from storage, which are old by definition. */
+  startedAt?: number;
 };
 
 function withNotice(tab: SearchTab, notice: string): SearchTab {
@@ -414,7 +417,7 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
       ? incomingName
       : existingName || incomingName;
   const hash = incoming.file.hash || existing.file.hash || '';
-  const override = hash ? spamUserOverrides.get(hash) : undefined;
+  const override = hash && !existing.size_variant ? spamUserOverrides.get(hash) : undefined;
   const spam_rating = override
     ? override.spamRating
     : Math.max(existing.spam_rating ?? 0, incoming.spam_rating ?? 0);
@@ -575,6 +578,15 @@ function mergeIntoTab(tab: SearchTab, incoming: SearchResult[]): SearchTab {
         key = resultKey(result);
         at = index.get(key);
       }
+    } else if (at === undefined && result.file.hash && !result.size_variant && result.file.size) {
+      // The file's own row was shed and a variant claiming this size kept;
+      // pushed plain, the same hash and size would be listed twice.
+      const variantAt = index.get(`${result.file.hash}:${result.file.size}`);
+      if (variantAt !== undefined) {
+        result = { ...result, size_variant: true };
+        key = resultKey(result);
+        at = variantAt;
+      }
     }
     if (at === undefined) {
       if (shedKeys?.delete(key)) shed -= 1;
@@ -602,6 +614,7 @@ function mergeIntoTab(tab: SearchTab, incoming: SearchResult[]): SearchTab {
   return { ...tab, results, resultIndex: index, shed, shedKeys };
 }
 
+/** `tabs` itself when no tab has `requestId` or `fn` hands its tab back. */
 function updateTabByRequestId(
   tabs: SearchTab[],
   requestId: number,
@@ -609,14 +622,40 @@ function updateTabByRequestId(
 ): SearchTab[] {
   const i = tabs.findIndex((t) => t.requestId === requestId);
   if (i === -1) return tabs;
+  const updated = fn(tabs[i]);
+  if (updated === tabs[i]) return tabs;
   const next = [...tabs];
-  next[i] = fn(next[i]);
+  next[i] = updated;
   return next;
+}
+
+/**
+ * `searchTabs.update`, but silent when `fn` hands back the same array.
+ *
+ * A writable holding an object notifies on every `set`, even of the value it
+ * already has, and each notification makes the search page re-derive its whole
+ * list and marks the tabs for saving.
+ */
+function updateTabs(fn: (tabs: SearchTab[]) => SearchTab[]): void {
+  const tabs = get(searchTabs);
+  const next = fn(tabs);
+  if (next !== tabs) searchTabs.set(next);
+}
+
+function hasRequest(requestId: number): boolean {
+  return get(searchTabs).some((t) => t.requestId === requestId);
+}
+
+/** Merge a batch into the tab owning `requestId`, then settle the idle tabs
+ *  its growth may have taken past their total. */
+function mergeByRequestId(tabs: SearchTab[], requestId: number, incoming: SearchResult[], activeId: string | null): SearchTab[] {
+  const merged = updateTabByRequestId(tabs, requestId, (t) => mergeIntoTab(t, incoming));
+  return merged === tabs ? tabs : settleIdleTabs(merged, activeId);
 }
 
 /** Update a tab by network request id (for invoke completion / errors). */
 export function patchSearchTabByRequestId(requestId: number, fn: (tab: SearchTab) => SearchTab) {
-  searchTabs.update((tabs) => updateTabByRequestId(tabs, requestId, fn));
+  updateTabs((tabs) => updateTabByRequestId(tabs, requestId, fn));
 }
 
 /** Merge results into the tab owning `requestId`. The only supported way to
@@ -627,29 +666,32 @@ export function appendSearchResults(requestId: number, incoming: SearchResult[])
   const activeId = get(activeSearchTabId);
   // The invoke reply can land after `search-complete` already settled an idle
   // background tab, and can take the open tabs past their total.
-  searchTabs.update((tabs) =>
-    settleIdleTabs(updateTabByRequestId(tabs, requestId, (t) => mergeIntoTab(t, incoming)), activeId),
-  );
+  updateTabs((tabs) => mergeByRequestId(tabs, requestId, incoming, activeId));
 }
 
 /**
- * Where a hash sits in a tab, via the tab's own key index when it is usable.
+ * Where the file with this hash sits in a tab, via the tab's own key index when
+ * it is usable.
  *
- * `resultKey` *is* the hash for any row that has one, so an index hit is the
- * row and an index miss is authoritative — the same lookup `mergeIntoTab`
- * makes, and the reason the index exists. The size check is its validity test
- * (one entry per row is the invariant); the identity check behind it costs one
- * comparison and keeps a stale index from patching the wrong row, which a
- * scan cannot do.
+ * Never a `size_variant` row: that is another size claimed for the hash, keyed
+ * `hash:size`, and a verdict about the file is not one about the claim. So
+ * when only a variant is left — the file's own row shed — there is no match.
+ *
+ * `resultKey` is the bare hash for every other hashed row, so an index hit is
+ * the row and an index miss is authoritative — the same lookup `mergeIntoTab`
+ * makes. The size check is the index's validity test (one entry per row is the
+ * invariant); the identity check behind it keeps a stale index from patching
+ * the wrong row, which a scan cannot do.
  */
 function resultIndexOfHash(tab: SearchTab, fileHash: string): number {
   const index = tab.resultIndex;
   if (index && index.size === tab.results.length) {
     const at = index.get(fileHash);
     if (at === undefined) return -1;
-    if (tab.results[at]?.file.hash === fileHash) return at;
+    const row = tab.results[at];
+    if (row?.file.hash === fileHash && !row.size_variant) return at;
   }
-  return tab.results.findIndex((r) => r.file.hash === fileHash);
+  return tab.results.findIndex((r) => r.file.hash === fileHash && !r.size_variant);
 }
 
 /** The fields a spam verdict owns. Restored together, because a score without
@@ -759,11 +801,39 @@ function sameReasons(a: string[] | undefined, b: string[] | undefined): boolean 
   return a.every((v, i) => v === b[i]);
 }
 
-/** Ceiling on open search tabs, evicting oldest-first — the same bound
- *  `chatTabs.ts` puts on the chat dock. Set well below that store's 50
- *  because a search tab is far heavier: each one holds its own result array,
- *  up to `MAX_TAB_RESULTS` rows. */
-const MAX_SEARCH_TABS = 20;
+/** Ceiling on open search tabs — the same bound `chatTabs.ts` puts on the
+ *  chat dock. Set well below that store's 50 because a search tab is far
+ *  heavier: each one holds its own result array, up to `MAX_TAB_RESULTS` rows.
+ *  See `evictionIndex` for which tab a new one replaces. */
+export const MAX_SEARCH_TABS = 20;
+
+/** A search younger than this is not yet "found nothing", even stopped: its
+ *  results may still be on the way, or the user stopped it a moment ago. */
+const RECENT_SEARCH_MS = 10_000;
+
+/**
+ * The tab to close when a new one takes the strip past `MAX_SEARCH_TABS`: the
+ * oldest finished tab that found nothing, which costs nothing to lose, and
+ * otherwise the oldest. Never `keep`, the tab being opened.
+ *
+ * `wasSearching` holds the tabs this new search just stopped; they and any
+ * search started within `RECENT_SEARCH_MS` do not count as empty.
+ */
+function evictionIndex(
+  tabs: readonly SearchTab[],
+  keep: SearchTab,
+  wasSearching: ReadonlySet<string>,
+  now: number,
+): number {
+  const empty = tabs.findIndex((t) =>
+    t !== keep
+    && !t.isSearching
+    && !wasSearching.has(t.id)
+    && now - (t.startedAt ?? 0) >= RECENT_SEARCH_MS
+    && t.results.length === 0);
+  if (empty !== -1) return empty;
+  return tabs.findIndex((t) => t !== keep);
+}
 
 /**
  * Rows all open tabs may hold together before idle ones give some up.
@@ -855,10 +925,25 @@ async function cancelSearchWithRetry(requestId: number): Promise<void> {
   );
 }
 
-/** Start a new search tab and select it. Returns tab id and request id for invoke/searchFiles. */
-export function openSearchTab(query: string, method: SearchMethod, fileType?: string, filters?: SearchFilters, related?: RelatedSearchInfo): { tabId: string; requestId: number; stoppedOthers: boolean } {
+/**
+ * Start a new search tab and select it. Returns tab id and request id for
+ * invoke/searchFiles, and the tabs closed to make room for it.
+ *
+ * With `replaceTabId` naming an open tab, the new one takes that tab's place in
+ * the strip instead of going on the end — Search again — and, the count being
+ * unchanged, nothing is closed to make room.
+ */
+export function openSearchTab(
+  query: string,
+  method: SearchMethod,
+  fileType?: string,
+  filters?: SearchFilters,
+  related?: RelatedSearchInfo,
+  replaceTabId?: string,
+): { tabId: string; requestId: number; stoppedOthers: boolean; evicted: SearchTab[] } {
   const requestId = newSearchNonce();
   const id = newTabId();
+  const now = Date.now();
   const tab: SearchTab = {
     id,
     requestId,
@@ -872,12 +957,15 @@ export function openSearchTab(query: string, method: SearchMethod, fileType?: st
     isSearching: true,
     progress: null,
     error: null,
+    startedAt: now,
   };
   let stoppedOthers = false;
+  const evicted: SearchTab[] = [];
   searchTabs.update((tabs) => {
     // Capture original ids *before* rotating them: cancel and the pending
     // buffer are keyed by the in-flight request, not the discarded nonce.
     const searchingIds = tabs.filter((t) => t.isSearching).map((t) => t.requestId);
+    const wasSearching = new Set(tabs.filter((t) => t.isSearching).map((t) => t.id));
     const next = tabs.map((t) => {
       // The network keeps only the latest search to continue; a new one
       // replaces it, so no older tab can offer Search More any longer.
@@ -885,11 +973,19 @@ export function openSearchTab(query: string, method: SearchMethod, fileType?: st
       stoppedOthers = true;
       return { ...t, isSearching: false, progress: null, requestId: newSearchNonce() };
     });
-    next.push(tab);
+    const replaceAt = replaceTabId === undefined ? -1 : next.findIndex((t) => t.id === replaceTabId);
+    if (replaceAt !== -1) {
+      pendingByRequest.delete(next[replaceAt].requestId);
+      next[replaceAt] = tab;
+    } else {
+      next.push(tab);
+    }
     while (next.length > MAX_SEARCH_TABS) {
-      const evicted = next.shift();
-      if (!evicted) break;
-      pendingByRequest.delete(evicted.requestId);
+      const at = evictionIndex(next, tab, wasSearching, now);
+      if (at === -1) break;
+      const [gone] = next.splice(at, 1);
+      pendingByRequest.delete(gone.requestId);
+      evicted.push(gone);
     }
     for (const rid of searchingIds) {
       pendingByRequest.delete(rid);
@@ -898,7 +994,7 @@ export function openSearchTab(query: string, method: SearchMethod, fileType?: st
     return settleIdleTabs(next, id);
   });
   activeSearchTabId.set(id);
-  return { tabId: id, requestId, stoppedOthers };
+  return { tabId: id, requestId, stoppedOthers, evicted };
 }
 
 export function setActiveSearchTab(tabId: string | null) {
@@ -953,9 +1049,7 @@ export function flushPendingSearchResults(requestId: number) {
   pendingByRequest.delete(requestId);
   if (!incoming || incoming.length === 0) return;
   const activeId = get(activeSearchTabId);
-  searchTabs.update((tabs) =>
-    settleIdleTabs(updateTabByRequestId(tabs, requestId, (t) => mergeIntoTab(t, incoming)), activeId),
-  );
+  updateTabs((tabs) => mergeByRequestId(tabs, requestId, incoming, activeId));
 }
 
 function validRequestId(raw: unknown): number | null {
@@ -987,13 +1081,13 @@ function flushSearchResults() {
   const batch = new Map(pendingByRequest);
   pendingByRequest.clear();
   const activeId = get(activeSearchTabId);
-  searchTabs.update((tabs) => {
+  updateTabs((tabs) => {
     let next = tabs;
     for (const [requestId, incoming] of batch) {
       next = updateTabByRequestId(next, requestId, (t) => mergeIntoTab(t, incoming));
     }
     // A streaming tab growing is what takes the set past its total.
-    return settleIdleTabs(next, activeId);
+    return next === tabs ? tabs : settleIdleTabs(next, activeId);
   });
 }
 
@@ -1037,8 +1131,12 @@ function spamSettingsKey(
  * is rebuilt in place order — so positions and keys are exactly what they
  * were and the next streamed batch can use the index instead of rebuilding it.
  */
-function applyRescoredRows(tabId: string, scored: SearchResult[]) {
+function applyRescoredRows(tabId: string, sent: SearchResult[], scored: SearchResult[]) {
   if (scored.length === 0) return;
+  // The command scores in place and keeps the order, but drops `size_variant`,
+  // which only this store sets: keyed by its own fields, a variant's verdict
+  // would land on the file's row. Keyed by the row sent, it lands on itself.
+  const keyOf = (r: SearchResult, j: number) => resultKey(sent.length === scored.length ? sent[j] : r);
   // A chunked re-score outlives the tab it started on — closed, cleared, or
   // torn down with the page — so a chunk landing on nothing must not tell the
   // search page its rows changed and cost it a whole-list filter and sort.
@@ -1052,11 +1150,11 @@ function applyRescoredRows(tabId: string, scored: SearchResult[]) {
     // hits — and every one of them keys to `''`, so a hash-keyed map kept
     // only the last and every other hashless row in the tab then adopted
     // that one row's spam verdict.
-    const byKey = new Map(scored.map((r) => [resultKey(r), r]));
+    const byKey = new Map(scored.map((r, j) => [keyOf(r, j), r]));
     const results = current[i].results.map((r) => {
       const n = byKey.get(resultKey(r));
       if (!n) return r;
-      const override = r.file.hash ? spamUserOverrides.get(r.file.hash) : undefined;
+      const override = r.file.hash && !r.size_variant ? spamUserOverrides.get(r.file.hash) : undefined;
       return {
         ...r,
         spam_rating: override?.spamRating ?? n.spam_rating,
@@ -1093,7 +1191,8 @@ const RESCORE_IPC_CHUNK = 1_000;
 
 async function rescoreRowsIntoTab(tabId: string, query: string, rows: SearchResult[]) {
   for (let i = 0; i < rows.length; i += RESCORE_IPC_CHUNK) {
-    applyRescoredRows(tabId, await rescoreSearchResults(rows.slice(i, i + RESCORE_IPC_CHUNK), query));
+    const sent = rows.slice(i, i + RESCORE_IPC_CHUNK);
+    applyRescoredRows(tabId, sent, await rescoreSearchResults(sent, query));
   }
 }
 
@@ -1216,6 +1315,9 @@ export async function initSearchStore() {
       if (requestId === null) return;
       const incoming = event.payload.results;
       if (!Array.isArray(incoming)) return;
+      // A leg still running for a stopped, superseded or closed search: no tab
+      // will take these, so there is nothing to buffer or flush.
+      if (!hasRequest(requestId)) return;
       if (dev) {
         const origins = new Set(incoming.map((r) => r.result_origin).filter(Boolean));
         if (origins.size > 0) {
@@ -1245,19 +1347,17 @@ export async function initSearchStore() {
         flushSearchResults();
       }
       const activeId = get(activeSearchTabId);
-      searchTabs.update((tabs) =>
-        settleIdleTabs(
-          updateTabByRequestId(tabs, requestId, (t) => ({ ...t, isSearching: false, progress: null, canSearchMore })),
-          activeId,
-        ),
-      );
+      updateTabs((tabs) => {
+        const next = updateTabByRequestId(tabs, requestId, (t) => ({ ...t, isSearching: false, progress: null, canSearchMore }));
+        return next === tabs ? tabs : settleIdleTabs(next, activeId);
+      });
     }));
     registered.push(await listen<{ request_id: number; nodes_contacted: number; results_so_far: number; phase: string }>(
       'search-progress',
       (event) => {
         const requestId = validRequestId(event.payload?.request_id);
         if (requestId === null) return;
-        searchTabs.update((tabs) =>
+        updateTabs((tabs) =>
           updateTabByRequestId(tabs, requestId, (t) => {
             if (!t.isSearching) return t;
             const phase = typeof event.payload?.phase === 'string' ? event.payload.phase : '';
@@ -1279,7 +1379,7 @@ export async function initSearchStore() {
       if (requestId === null || typeof notice !== 'string') return;
       // Not gated on `isSearching`: a server that never answered is only
       // known to have not answered as its leg ends, which can be the end.
-      searchTabs.update((tabs) => updateTabByRequestId(tabs, requestId, (t) => withNotice(t, notice)));
+      updateTabs((tabs) => updateTabByRequestId(tabs, requestId, (t) => withNotice(t, notice)));
     }));
   } catch (e) {
     for (const u of registered) u();

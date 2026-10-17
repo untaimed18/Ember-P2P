@@ -553,20 +553,36 @@ pub(super) struct EmberKeywordSearch {
     /// `IterativeSearch::results` is append-only and deduped before push, so
     /// everything past this index is new.
     pub(super) last_streamed_count: usize,
-    /// Distinct eD2K file hashes this lookup has built a row for, for the
-    /// `results_so_far` the search page shows while the walk runs.
+    /// Distinct eD2K file hashes of the rows this lookup has put on screen, or
+    /// found again once another network had, for the `results_so_far` the
+    /// search page shows while the walk runs.
     ///
-    /// Counted here rather than from `IterativeSearch::results`, which holds
-    /// one entry per *record*: a file three publishers announced is three
-    /// records and one result, so that length would over-report what the user
-    /// is about to see. Re-deriving it per tick instead would mean verifying
-    /// every gathered signature again once a second.
+    /// Counted where the rows are emitted rather than where they are built,
+    /// since the emit's type, size, extension and availability filters drop
+    /// rows the page never shows. Nor from `IterativeSearch::results`, which
+    /// holds one entry per *record*: a file three publishers announced is three
+    /// records and one result.
     pub(super) streamed_files: HashSet<String>,
-    /// `(file hash, publisher key)` of every publisher the last streaming
-    /// rebuild counted. Each rebuild goes over everything gathered, so only the
-    /// rows whose counted set differs from this one carry anything new; the
-    /// rest are not sent again. Bounded by the search's result-blob cap.
-    pub(super) streamed_publishers: HashSet<([u8; 16], [u8; 32])>,
+    /// What streaming has done with each row: the publishers the last batch
+    /// carrying it counted, or that a rebuild held it back. Each rebuild goes
+    /// over everything gathered, so only the rows whose counted set differs
+    /// from this one carry anything new; the rest are not sent again. See
+    /// `ember_stream_rows`. Bounded by the search's result-blob cap.
+    pub(super) streamed_publishers: HashSet<EmberStreamMark>,
+}
+
+/// One row of an Ember keyword search: a file at one size.
+pub(super) type EmberRowKey = ([u8; 16], u64);
+
+/// What streaming has done with one row — see
+/// [`EmberKeywordSearch::streamed_publishers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum EmberStreamMark {
+    /// A publisher the last batch that carried the row counted.
+    Sent(EmberRowKey, [u8; 32]),
+    /// A row a rebuild built and held back. The next rebuild sends it,
+    /// whatever it then counts.
+    Held(EmberRowKey),
 }
 
 /// A batch of Ember DHT keyword results ready to emit (slice 10).

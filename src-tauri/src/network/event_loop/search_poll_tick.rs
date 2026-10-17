@@ -132,34 +132,6 @@ pub(in crate::network) async fn on_search_poll_tick(
                 search.commit_query_sent(contact_id, addr);
             }
             state.flood_protection.track_request(addr, opcode);
-            // Track publish requests for ack matching. poll_queries
-            // can return KadReq (routing lookup) or Publish* (store
-            // phase); only the latter expect a PublishRes so only
-            // those need an entry. Insert at send-time (not at
-            // search completion) — peers ack within milliseconds
-            // and we used to miss every single lookup-phase ack.
-            let (publish_target, is_source) = match &msg {
-                KadMessage::PublishSourceReq { target, .. } => (Some(*target), true),
-                KadMessage::PublishKeyReq { target, .. } => (Some(*target), false),
-                KadMessage::PublishNotesReq { target, .. } => (Some(*target), false),
-                _ => (None, false),
-            };
-            if let Some(target) = publish_target {
-                let file_hash = state
-                    .store_source_searches
-                    .get(&sid)
-                    .map(|(fh, _)| *fh)
-                    .unwrap_or(target);
-                let now_ts = chrono::Utc::now().timestamp();
-                let pending = state
-                    .publish_pending
-                    .entry((target, addr))
-                    .or_insert((file_hash, now_ts, is_source, 0));
-                pending.0 = file_hash;
-                pending.1 = now_ts;
-                pending.2 = is_source;
-                pending.3 = pending.3.saturating_add(1);
-            }
         } else if let Some(search) = state.search_manager.get_mut(&sid) {
             search.rollback_unsent_query(contact_id, &msg);
         }
@@ -376,22 +348,12 @@ pub(in crate::network) async fn on_search_poll_tick(
             );
 
             let new_results = search.results.len();
-            let stream_threshold = if pending.last_streamed_count == 0 { 1 } else { 20 };
-            // `>=` so the first batch streams at 1 result and later
-            // batches every 20 new results (strict `>` was off-by-one).
-            if new_results >= pending.last_streamed_count + stream_threshold {
+            if kad_keyword_batch_due(
+                pending.last_streamed_count,
+                new_results,
+                pending.last_streamed_at.elapsed(),
+            ) {
                 let new_entries = &search.results[pending.last_streamed_count..];
-                let mut batch = convert_search_results(new_entries, |ip| {
-                    is_search_source_safe(state, ip)
-                });
-                // Pull the per-pending data out by value so we
-                // don't hold an immutable borrow of
-                // `state.pending_keyword_searches` across the
-                // `await` below — the next statement re-borrows
-                // it mutably (`get_mut`).
-                let pending_request_id = pending.request_id;
-                let pending_file_type_filter = pending.file_type_filter.clone();
-                let pending_keywords = pending.keywords.clone();
                 // Re-apply the full boolean query locally: a Kad
                 // lookup only matches a single keyword hash, so
                 // OR/NOT branches the responding node doesn't store
@@ -401,8 +363,19 @@ pub(in crate::network) async fn on_search_poll_tick(
                 // with something it was never given under that key.
                 // `pending_keywords` still seeds the spam scorer in
                 // the enrich call below.
-                let pending_expr = pending.query_expr.clone();
-                batch.retain(|r| pending_expr.matches_name(&r.file.name));
+                let mut batch = convert_search_results_matching(
+                    new_entries,
+                    |ip| is_search_source_safe(state, ip),
+                    Some(&pending.query_expr),
+                );
+                // Pull the per-pending data out by value so we
+                // don't hold an immutable borrow of
+                // `state.pending_keyword_searches` across the
+                // `await` below — the next statement re-borrows
+                // it mutably (`get_mut`).
+                let pending_request_id = pending.request_id;
+                let pending_file_type_filter = pending.file_type_filter.clone();
+                let pending_keywords = pending.keywords.clone();
                 let resights = dedup_streamed_batch(
                     &mut state.active_search_request,
                     pending_request_id,
@@ -503,6 +476,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                 }
                 if let Some(p) = state.pending_keyword_searches.get_mut(&sid) {
                     p.last_streamed_count = new_results;
+                    p.last_streamed_at = std::time::Instant::now();
                 }
             }
         }
@@ -759,16 +733,13 @@ pub(in crate::network) async fn on_search_poll_tick(
                     "Keyword search {} completed: {} unique files ({} raw entries from KAD), {} local results",
                     sid.0, unique.len(), search.results.len(), local_results.len()
                 );
-                let all_results = convert_search_results(&search.results, |ip| {
-                    is_search_source_safe(state, ip)
-                });
                 // Same filter as the streamed batches above.
-                let before = all_results.len();
-                let filtered: Vec<SearchResult> = all_results
-                    .into_iter()
-                    .filter(|r| query_expr.matches_name(&r.file.name))
-                    .collect();
-                info!("Keyword filter: {before} -> {} results", filtered.len());
+                let filtered = convert_search_results_matching(
+                    &search.results,
+                    |ip| is_search_source_safe(state, ip),
+                    Some(&query_expr),
+                );
+                info!("Keyword filter: {} unique -> {} results", unique.len(), filtered.len());
                 filtered
             } else {
                 Vec::new()
@@ -780,11 +751,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                 if active.request_id == request_id {
                     let mut resights = Vec::new();
                     network_results.retain(|r| {
-                        if !r.file.hash.is_empty()
-                            && active.streamed_hashes.get(&r.file.hash).is_some_and(|&first| {
-                                first == 0 || r.file.size == 0 || first == r.file.size
-                            })
-                        {
+                        if active.already_streamed(&r.file.hash, r.file.size) {
                             resights.push(r.clone());
                             false
                         } else {
@@ -1473,7 +1440,8 @@ pub(in crate::network) async fn on_search_poll_tick(
                         }
                         for ls in &lowid_sources {
                             if state.server_connected {
-                                let ip_str = Ipv4Addr::from(ls.ed2k_server_ip).to_string();
+                                let server_ip = lowid_server_ip(ls);
+                                let ip_str = server_ip.to_string();
                                 if mgr.has_source_detail_for_ip(&transfer_id, &ip_str) {
                                     continue;
                                 }
@@ -1490,7 +1458,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                                         peer_name: String::new(),
                                         available_parts: None,
                                         total_parts: None,
-                                        country_code: crate::geoip::lookup_country(geoip, std::net::IpAddr::V4(ls.ip)),
+                                        country_code: crate::geoip::lookup_country(geoip, std::net::IpAddr::V4(server_ip)),
                                         user_hash: ls.source_user_hash,
                                         // A LowID peer only reachable
                                         // because a server will relay
@@ -1709,7 +1677,8 @@ pub(in crate::network) async fn on_search_poll_tick(
                             if !state.server_connected {
                                 continue;
                             }
-                            let ip_str = Ipv4Addr::from(ls.ed2k_server_ip).to_string();
+                            let server_ip = lowid_server_ip(ls);
+                            let ip_str = server_ip.to_string();
                             if mgr.has_source_detail_for_ip(&transfer_id, &ip_str) {
                                 continue;
                             }
@@ -1727,7 +1696,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                                     available_parts: None,
                                     total_parts: None,
                                     country_code: crate::geoip::lookup_country(
-                                        geoip, std::net::IpAddr::V4(ls.ip),
+                                        geoip, std::net::IpAddr::V4(server_ip),
                                     ),
                                     user_hash: ls.source_user_hash,
                                     origin: Some(crate::types::SourceOrigin::Server),
@@ -2523,6 +2492,26 @@ pub(in crate::network) async fn on_search_poll_tick(
     }
 }
 
+const KAD_KEYWORD_STREAM_BATCH: usize = 20;
+const KAD_KEYWORD_STREAM_FLUSH: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether a KAD keyword search's new rows go out on this tick: the first as
+/// soon as it arrives, then a full batch at a time, or whatever has gathered
+/// once [`KAD_KEYWORD_STREAM_FLUSH`] has passed since the last batch, so a
+/// handful of rows does not wait for the walk to end.
+fn kad_keyword_batch_due(streamed: usize, total: usize, since_last: std::time::Duration) -> bool {
+    total > streamed
+        && (streamed == 0
+            || total - streamed >= KAD_KEYWORD_STREAM_BATCH
+            || since_last >= KAD_KEYWORD_STREAM_FLUSH)
+}
+
+/// The eD2K server a type-2 (LowID) KAD source is registered on. Its IP is
+/// carried the eD2K way, a little-endian `u32`.
+fn lowid_server_ip(source: &KadSource) -> Ipv4Addr {
+    Ipv4Addr::from(source.ed2k_server_ip.to_le_bytes())
+}
+
 /// Every packet of a keyword batch, or `None` when one cannot be encoded: a
 /// node only counts as reached with the whole batch, so none is sent.
 fn encode_keyword_batch(batch: &kad::publish::KeywordPublishBatch) -> Option<Vec<Vec<u8>>> {
@@ -2570,4 +2559,43 @@ async fn send_keyword_batch(
         pending.3 = pending.3.saturating_add(1);
     }
     sent
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kad_rows_go_out_in_batches_or_after_a_short_wait() {
+        let quick = std::time::Duration::from_millis(500);
+        let late = KAD_KEYWORD_STREAM_FLUSH;
+        assert!(kad_keyword_batch_due(0, 1, quick), "the first row goes at once");
+        assert!(!kad_keyword_batch_due(0, 0, late), "nothing to send");
+        assert!(!kad_keyword_batch_due(5, 5, late), "nothing new");
+        assert!(!kad_keyword_batch_due(5, 24, quick), "19 new rows wait for a batch");
+        assert!(kad_keyword_batch_due(5, 25, quick), "a full batch goes");
+        assert!(kad_keyword_batch_due(5, 6, late), "a trickle goes once the wait is up");
+    }
+
+    #[test]
+    fn a_lowid_placeholder_shows_the_servers_address_in_order() {
+        let server = Ipv4Addr::new(198, 51, 100, 7);
+        let source = KadSource {
+            ip: Ipv4Addr::UNSPECIFIED,
+            tcp_port: 4662,
+            udp_port: 4672,
+            source_type: 2,
+            connect_options: 0,
+            buddy_ip: None,
+            buddy_port: None,
+            buddy_hash: None,
+            source_user_hash: None,
+            lowid: 1234,
+            ed2k_server_ip: u32::from_le_bytes(server.octets()),
+            ed2k_server_port: 4661,
+            is_ember_capable: false,
+            ember_noise_pub: None,
+        };
+        assert_eq!(lowid_server_ip(&source), server);
+    }
 }

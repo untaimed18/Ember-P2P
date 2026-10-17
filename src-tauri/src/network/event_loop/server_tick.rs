@@ -94,7 +94,7 @@ pub(in crate::network) async fn on_server_tick(
                     ed2k::server::ServerEvent::SearchResult { results, more } => {
                         let count = results.len();
                         info!("Server returned {count} search results via poll");
-                        let Some(ticket) = conn.take_search_reply().filter(|ticket| {
+                        let Some(ticket) = conn.take_search_reply(&results).filter(|ticket| {
                             state
                                 .pending_server_search
                                 .as_ref()
@@ -209,6 +209,7 @@ pub(in crate::network) async fn on_server_tick(
                                         tx: Some(tx),
                                         results: local,
                                         request_id,
+                                        answered: true,
                                     });
                                 } else {
                                     let _ = tx.send(local);
@@ -276,6 +277,30 @@ pub(in crate::network) async fn on_server_tick(
                                     request_id,
                                     &mut search_results,
                                 );
+                                let skip_hashes = {
+                                    let idx = local_index.read().await;
+                                    let mgr = transfer_manager.read().await;
+                                    owned_or_downloading_search_hashes(
+                                        search_results
+                                            .iter()
+                                            .chain(resights.iter())
+                                            .map(|r| r.file.hash.as_str()),
+                                        &idx,
+                                        &mgr,
+                                        &state.pending_downloads,
+                                    )
+                                };
+                                if let Some(active) = state
+                                    .active_search_request
+                                    .as_mut()
+                                    .filter(|a| a.request_id == request_id)
+                                {
+                                    note_ed2k_batch_availability(
+                                        active,
+                                        &mut search_results,
+                                        &skip_hashes,
+                                    );
+                                }
                                 let mut batch_spam =
                                     take_search_batch_spam(state, request_id);
                                 let emitted = enrich_and_emit_search_results(
@@ -295,27 +320,9 @@ pub(in crate::network) async fn on_server_tick(
                                     Some(&mut batch_spam),
                                 ).await;
                                 store_search_batch_spam(state, request_id, batch_spam);
-                                let skip_hashes = {
-                                    let idx = local_index.read().await;
-                                    let mgr = transfer_manager.read().await;
-                                    owned_or_downloading_search_hashes(
-                                        emitted
-                                            .iter()
-                                            .chain(resights.iter())
-                                            .map(|r| r.file.hash.as_str()),
-                                        &idx,
-                                        &mgr,
-                                        &state.pending_downloads,
-                                    )
-                                };
                                 if let Some(active) = state.active_search_request.as_mut() {
                                     if active.request_id == request_id {
                                         mark_streamed_hashes(active, &emitted);
-                                        let _ = note_ed2k_search_results(
-                                            active,
-                                            &emitted,
-                                            &skip_hashes,
-                                        );
                                         emit_search_resight_updates(
                                             app_handle,
                                             request_id,
@@ -349,6 +356,7 @@ pub(in crate::network) async fn on_server_tick(
                                         tx: None,
                                         results: Vec::new(),
                                         request_id,
+                                        answered: true,
                                     });
                                 } else {
                                     // Stopped by our page or result cap
@@ -954,7 +962,7 @@ pub(in crate::network) async fn on_server_tick(
                 if let Some(silent) = conn
                     .expire_search_reply(server_search_reply_wait(settings.search_timeout_secs))
                 {
-                    info!("Server never answered search {silent}; no longer waiting on it");
+                    info!("Server has not answered search {silent}; no longer holding the next search behind it");
                 }
                 if let Some(request_id) = send_deferred_server_search(state, &mut conn) {
                     drop_queued_server_followup(state, request_id);
@@ -979,14 +987,16 @@ pub(in crate::network) async fn on_server_tick(
                         && state.server_search_more_requests < MAX_SERVER_MORE_REQUESTS
                 });
             if let Some(request_id) = more_for {
-                state.server_search_more_due_at = None;
                 match conn.request_more_results(request_id) {
                     Ok(()) => {
+                        state.server_search_more_due_at = None;
                         state.server_search_more_requests += 1;
                         // The wait for the next page starts now, not when
                         // the previous one arrived.
                         state.server_search_age = 0;
                     }
+                    // Left due, so the next tick asks again; the pending
+                    // search's own timeout still bounds the retries.
                     Err(e) => debug!("OP_QUERY_MORE_RESULT not sent: {e}"),
                 }
             }
@@ -1028,10 +1038,13 @@ pub(in crate::network) async fn on_server_tick(
                             // search, not another page of the first.
                             state.server_search_more_due_at = None;
                             state.server_search_more_requests = 0;
+                            // Only queued behind a first request the
+                            // server answered.
                             state.pending_server_search = Some(PendingServerSearch {
                                 tx: None,
                                 results: Vec::new(),
                                 request_id: followup_id,
+                                answered: true,
                             });
                             state.server_search_age = 0;
                             info!(
@@ -1142,9 +1155,7 @@ pub(in crate::network) async fn on_server_tick(
             if let Some(mut pending) = state.pending_server_search.take() {
                 let request_id = pending.request_id;
                 info!("Server search timed out, returning {} local results", pending.results.len());
-                // A page of More going unanswered is not the server failing
-                // to answer the search: its first page is already on screen.
-                if state.server_search_more_requests == 0 {
+                if !pending.answered {
                     emit_search_notice(app_handle, request_id, "ServerNoAnswer");
                 }
                 if let Some(tx) = pending.tx.take() {
@@ -1309,7 +1320,10 @@ pub(in crate::network) async fn on_server_tick(
 /// How long the link waits on one unanswered server search request before
 /// letting a search held behind it go out. Kept under the pending search's own
 /// timeout (`server_search_age_limit` ticks plus the one that trips it), so a
-/// search released after a silent one still gets its full wait.
+/// search released after a silent one still gets its full wait. An answer that
+/// comes after this wait is still credited to the request it answers until
+/// another request goes out (see `SearchReplies`), so a search's own late
+/// answer inside its timeout is used.
 fn server_search_reply_wait(search_timeout_secs: u64) -> std::time::Duration {
     const TICK_SECS: u64 = 2;
     std::time::Duration::from_secs(u64::from(server_search_age_limit(search_timeout_secs)) * TICK_SECS)
