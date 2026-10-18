@@ -650,24 +650,47 @@ pub(crate) fn is_private_ip(ip: std::net::IpAddr) -> bool {
             let segs = v6.segments();
             let is_ula = (segs[0] & 0xFE00) == 0xFC00;
             let is_link_local = (segs[0] & 0xFFC0) == 0xFE80;
+            // RFC 3879: deprecated site-local fec0::/10, still routed on
+            // some internal networks.
+            let is_site_local = (segs[0] & 0xFFC0) == 0xFEC0;
             // RFC 3849: 2001:db8::/32 documentation prefix
             let is_doc_v6 = segs[0] == 0x2001 && segs[1] == 0x0DB8;
-            if is_ula || is_link_local || is_doc_v6 {
+            // RFC 8215: 64:ff9b:1::/48, NAT64 for local use only.
+            let is_local_nat64 = segs[0] == 0x0064 && segs[1] == 0xFF9B && segs[2] == 0x0001;
+            if is_ula || is_link_local || is_site_local || is_doc_v6 || is_local_nat64 {
                 return true;
             }
-            let is_v4_mapped = segs[0..5] == [0, 0, 0, 0, 0] && segs[5] == 0xFFFF;
-            if is_v4_mapped {
-                let mapped = std::net::Ipv4Addr::new(
-                    (segs[6] >> 8) as u8,
-                    segs[6] as u8,
-                    (segs[7] >> 8) as u8,
-                    segs[7] as u8,
-                );
-                return is_special_use_v4(mapped);
-            }
-            false
+            embedded_v4(segs).iter().any(|v4| is_special_use_v4(*v4))
         }
     }
+}
+
+/// The IPv4 addresses an IPv6 address carries and hands on to, for the forms
+/// that do: v4-mapped `::ffff:a.b.c.d`, v4-compatible `::a.b.c.d`, well-known
+/// NAT64 `64:ff9b::/96`, 6to4 `2002::/16`, and Teredo `2001::/32` (its server,
+/// and its client stored inverted). Each reaches the IPv4 address it names, so
+/// a private one inside is as private as the IPv4 itself.
+fn embedded_v4(segs: [u16; 8]) -> Vec<std::net::Ipv4Addr> {
+    let v4 = |hi: u16, lo: u16| {
+        std::net::Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8)
+    };
+    let mut out = Vec::new();
+    let mapped = segs[0..5] == [0, 0, 0, 0, 0] && segs[5] == 0xFFFF;
+    // `::` and `::1` are handled by the caller; anything else in `::/96` is
+    // the deprecated v4-compatible form.
+    let compatible = segs[0..6] == [0, 0, 0, 0, 0, 0];
+    let nat64 = segs[0..6] == [0x0064, 0xFF9B, 0, 0, 0, 0];
+    if mapped || compatible || nat64 {
+        out.push(v4(segs[6], segs[7]));
+    }
+    if segs[0] == 0x2002 {
+        out.push(v4(segs[1], segs[2]));
+    }
+    if segs[0] == 0x2001 && segs[1] == 0x0000 {
+        out.push(v4(segs[2], segs[3]));
+        out.push(v4(!segs[6], !segs[7]));
+    }
+    out
 }
 
 /// Maximum URL length accepted by [`validate_fetch_url`]. RFC 7230 doesn't
@@ -2212,6 +2235,35 @@ mod tests {
             "ملف عربي — קובץ עברי"
         );
         assert_eq!(sanitize_remote_text("a\u{0000}\nb\tc", 128), "abc");
+    }
+
+    /// IPv6 forms that hand traffic on to an IPv4 address are as private as
+    /// that address, so a hostile DNS answer cannot reach a LAN or metadata
+    /// address through them.
+    #[test]
+    fn ipv6_forms_that_carry_a_private_ipv4_are_private() {
+        let private = |s: &str| is_private_ip(s.parse().unwrap());
+        for addr in [
+            "64:ff9b::a9fe:a9fe",   // NAT64 to 169.254.169.254
+            "64:ff9b::7f00:1",      // NAT64 to 127.0.0.1
+            "64:ff9b:1::1",         // local-use NAT64
+            "::a9fe:a9fe",          // v4-compatible
+            "::ffff:10.0.0.1",      // v4-mapped
+            "fec0::1",              // site-local
+            "2002:c0a8:0101::1",    // 6to4 of 192.168.1.1
+            "2001:0:7f00:1::1",     // Teredo server 127.0.0.1
+            "2001:0:5ef5:79fb::f5ff:fffe", // Teredo client 10.0.0.1, inverted
+        ] {
+            assert!(private(addr), "{addr}");
+        }
+        for addr in [
+            "2606:4700::1111",
+            "64:ff9b::808:808",          // NAT64 to 8.8.8.8
+            "2002:0808:0808::1",         // 6to4 of 8.8.8.8
+            "2001:0:5ef5:79fb::f7f7:f7f7", // Teredo client 8.8.8.8, inverted
+        ] {
+            assert!(!private(addr), "{addr}");
+        }
     }
 
     #[test]

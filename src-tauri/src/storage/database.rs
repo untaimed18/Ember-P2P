@@ -11556,6 +11556,18 @@ impl Database {
         Ok(rows)
     }
 
+    /// Forget one web source of `file_hash`, retired for sending bad data, so a
+    /// restart does not bring it back.
+    pub fn delete_transfer_web_source(&self, file_hash: &str, url: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_transfer_web_sources_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM transfer_web_sources WHERE file_hash = ?1 AND url = ?2",
+            params![file_hash.to_ascii_lowercase(), url],
+        )?;
+        Ok(())
+    }
+
     /// Forget the web sources of `file_hash`: its download finished or went.
     pub fn delete_transfer_web_sources(&self, file_hash: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();

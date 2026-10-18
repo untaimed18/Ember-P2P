@@ -27,6 +27,15 @@ pub const MAX_WEB_SOURCES_PER_FILE: usize = 5;
 /// on its own between two retries.
 const MAX_CONSECUTIVE_FAILURES: u32 = 4;
 
+/// Corrupt parts a source may have mostly written before it is retired. One
+/// can be bad luck shared with a peer; two from the same mirror is the mirror.
+pub const MAX_BAD_PARTS: u32 = 2;
+
+/// Written ranges kept per source, merged. Past this a source stops being
+/// recorded rather than grow without bound, and goes unblamed for what it
+/// writes after.
+const MAX_WRITTEN_RANGES: usize = 1024;
+
 /// Whether web sources are used at all; the `web_sources_enabled` setting.
 static ENABLED: AtomicBool = AtomicBool::new(true);
 
@@ -38,6 +47,67 @@ struct WebSource {
     /// Refused for good this session: the server does not have the file, does
     /// not serve ranges, or keeps sending bytes that fail verification.
     retired: bool,
+    /// Byte ranges this source wrote that no verdict has judged yet, merged.
+    /// Kept here rather than in a worker, so a part judged after the worker
+    /// moved on, or finished by a peer, is still held against the mirror.
+    written: Vec<(u64, u64)>,
+    /// Corrupt parts this source wrote most of, over the session.
+    bad_parts: u32,
+}
+
+impl WebSource {
+    fn new(url: String) -> Self {
+        Self {
+            url,
+            failures: 0,
+            retry_at: None,
+            retired: false,
+            written: Vec::new(),
+            bad_parts: 0,
+        }
+    }
+}
+
+/// Add `[start, end)` to sorted, disjoint `ranges`, merging what it touches.
+fn insert_range(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) {
+    if start >= end {
+        return;
+    }
+    let at = ranges.partition_point(|&(_, e)| e < start);
+    let mut merged = (start, end);
+    let mut until = at;
+    while until < ranges.len() && ranges[until].0 <= merged.1 {
+        merged.0 = merged.0.min(ranges[until].0);
+        merged.1 = merged.1.max(ranges[until].1);
+        until += 1;
+    }
+    ranges.splice(at..until, std::iter::once(merged));
+}
+
+/// Bytes of sorted, disjoint `ranges` inside `[start, end)`.
+fn overlap(ranges: &[(u64, u64)], start: u64, end: u64) -> u64 {
+    ranges
+        .iter()
+        .map(|&(s, e)| e.min(end).saturating_sub(s.max(start)))
+        .sum()
+}
+
+/// Take `[start, end)` out of sorted, disjoint `ranges`.
+fn remove_range(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) {
+    let mut kept = Vec::with_capacity(ranges.len() + 1);
+    for &(s, e) in ranges.iter() {
+        if e <= start || s >= end {
+            kept.push((s, e));
+            continue;
+        }
+        if s < start {
+            kept.push((s, start));
+        }
+        if e > end {
+            kept.push((end, e));
+        }
+    }
+    *ranges = kept;
 }
 
 fn registry() -> &'static parking_lot::RwLock<HashMap<[u8; 16], Vec<WebSource>>> {
@@ -104,12 +174,7 @@ pub fn register(file_hash: [u8; 16], urls: impl IntoIterator<Item = String>) -> 
         if known.iter().any(|s| s.url == url) {
             continue;
         }
-        known.push(WebSource {
-            url: url.clone(),
-            failures: 0,
-            retry_at: None,
-            retired: false,
-        });
+        known.push(WebSource::new(url.clone()));
         added.push(url);
     }
     if known.is_empty() {
@@ -206,6 +271,62 @@ pub fn note_success(file_hash: &[u8; 16], url: &str) {
     }
 }
 
+/// `url` wrote `ranges` into `file_hash`'s part file.
+pub fn note_written(file_hash: &[u8; 16], url: &str, ranges: &[(u64, u64)]) {
+    if ranges.is_empty() {
+        return;
+    }
+    let mut map = registry().write();
+    let Some(source) = map
+        .get_mut(file_hash)
+        .and_then(|sources| sources.iter_mut().find(|s| s.url == url))
+    else {
+        return;
+    };
+    for &(start, end) in ranges {
+        if source.written.len() >= MAX_WRITTEN_RANGES {
+            break;
+        }
+        insert_range(&mut source.written, start, end);
+    }
+}
+
+/// A part check failed over `[start, end)`, whoever finished the part. Every
+/// source that wrote at least half of it is charged a bad part, and retired
+/// at [`MAX_BAD_PARTS`]; what any source wrote there is forgotten, since it is
+/// downloaded again. Returns the URLs this retired, for the caller to stop
+/// keeping with the download, so a restart does not bring them back.
+pub fn note_corrupt_range(file_hash: &[u8; 16], start: u64, end: u64) -> Vec<String> {
+    let mut retired = Vec::new();
+    let mut map = registry().write();
+    let Some(sources) = map.get_mut(file_hash) else {
+        return retired;
+    };
+    for source in sources.iter_mut() {
+        let wrote = overlap(&source.written, start, end);
+        remove_range(&mut source.written, start, end);
+        if wrote == 0 || wrote.saturating_mul(2) < end.saturating_sub(start) {
+            continue;
+        }
+        source.bad_parts = source.bad_parts.saturating_add(1);
+        if source.bad_parts >= MAX_BAD_PARTS && !source.retired {
+            source.retired = true;
+            retired.push(source.url.clone());
+        }
+    }
+    retired
+}
+
+/// Corrupt parts `url` has been charged for `file_hash` this session.
+#[cfg(test)]
+pub fn bad_parts(file_hash: &[u8; 16], url: &str) -> u32 {
+    registry()
+        .read()
+        .get(file_hash)
+        .and_then(|sources| sources.iter().find(|s| s.url == url))
+        .map_or(0, |s| s.bad_parts)
+}
+
 #[cfg(test)]
 pub(crate) fn clear_for_tests(file_hash: &[u8; 16]) {
     forget(file_hash);
@@ -265,5 +386,48 @@ mod tests {
 
         forget(&hash);
         assert!(urls(&hash).is_empty());
+    }
+
+    #[test]
+    fn written_ranges_merge_and_split() {
+        let mut ranges = Vec::new();
+        insert_range(&mut ranges, 10, 20);
+        insert_range(&mut ranges, 30, 40);
+        insert_range(&mut ranges, 20, 30);
+        assert_eq!(ranges, vec![(10, 40)]);
+        insert_range(&mut ranges, 50, 60);
+        assert_eq!(overlap(&ranges, 15, 55), 25 + 5);
+        remove_range(&mut ranges, 20, 52);
+        assert_eq!(ranges, vec![(10, 20), (52, 60)]);
+    }
+
+    /// A mirror is held to the parts it mostly wrote, whoever finished them,
+    /// across worker runs, and is retired at the second.
+    #[test]
+    fn a_mirror_is_charged_for_corrupt_parts_it_mostly_wrote() {
+        let hash = [0xCD; 16];
+        clear_for_tests(&hash);
+        let bad = "https://bad.example/f".to_string();
+        let good = "https://good.example/f".to_string();
+        register(hash, [bad.clone(), good.clone()]);
+        let part = 9_728_000u64;
+
+        note_written(&hash, &bad, &[(0, part / 2), (part / 2, part)]);
+        note_written(&hash, &good, &[(part, part + 1000)]);
+        assert!(note_corrupt_range(&hash, 0, part).is_empty(), "one bad part rests nothing");
+        assert_eq!(bad_parts(&hash, &bad), 1);
+        assert_eq!(bad_parts(&hash, &good), 0, "it wrote nothing there");
+
+        note_written(&hash, &bad, &[(part, part + part / 4)]);
+        assert!(
+            note_corrupt_range(&hash, part, 2 * part).is_empty(),
+            "a quarter of a part says little about the mirror"
+        );
+        note_written(&hash, &bad, &[(0, part)]);
+        assert_eq!(note_corrupt_range(&hash, 0, part), vec![bad.clone()]);
+        assert!(is_retired(&hash, &bad));
+        assert!(!ready(&hash).contains(&bad));
+        assert!(note_corrupt_range(&hash, 0, part).is_empty(), "retired once");
+        forget(&hash);
     }
 }

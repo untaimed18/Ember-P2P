@@ -475,6 +475,24 @@ fn touch_queued_from(outstanding: &mut [OutstandingRange], seq: u64) {
     }
 }
 
+/// A packet at `pkt_start` arrived for one of `current`'s ranges, so the next
+/// part's, all requested after them, are waiting their turn behind it too.
+/// Kept in a list of their own, they were never refreshed by it, and against
+/// a slow peer the next part's first block expired before its turn came,
+/// leaving it to other workers to download a second time. Call before the
+/// packet completes its range, which takes it out of `current`.
+pub(super) fn touch_pipelined_behind(
+    current: &[OutstandingRange],
+    pkt_start: u64,
+    pipelined: &mut [OutstandingRange],
+) {
+    if current.iter().any(|r| pkt_start >= r.start && pkt_start < r.end) {
+        for r in pipelined.iter_mut() {
+            r.touch();
+        }
+    }
+}
+
 /// Mark a requested `(start, end)` range complete when a packet's exclusive
 /// end matches it (eMule `nEndPos == cur_block->block->EndOffset` after the
 /// inclusive conversion). eMule also requires `lenWritten > 0` before
@@ -2194,6 +2212,25 @@ mod tests {
         assert!(take_completed_outstanding_range(&mut outstanding, 100, 200));
         let now = std::time::Instant::now();
         assert!(outstanding.iter().all(|r| r.expires_at > now));
+    }
+
+    /// The next part's ranges, requested after the current part's, wait
+    /// behind any packet of the current part; a packet for neither leaves
+    /// their deadlines alone.
+    #[test]
+    fn the_pipelined_part_waits_behind_the_current_one() {
+        let mut current = Vec::new();
+        push_outstanding_batch(&mut current, &[(0, 100), (100, 200)]);
+        let mut pipelined = Vec::new();
+        push_outstanding_batch(&mut pipelined, &[(1000, 1100)]);
+        let stale = std::time::Instant::now();
+        pipelined[0].expires_at = stale;
+
+        touch_pipelined_behind(&current, 5000, &mut pipelined);
+        assert_eq!(pipelined[0].expires_at, stale, "not a packet of the current part");
+
+        touch_pipelined_behind(&current, 150, &mut pipelined);
+        assert!(pipelined[0].expires_at > stale);
     }
 
     #[test]

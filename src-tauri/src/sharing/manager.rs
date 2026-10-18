@@ -1450,7 +1450,13 @@ impl TransferManager {
             TransferFailureCode::AichPinCorrupt,
             TransferFailureCode::EmberPinCorrupt,
         ];
+        // A row from before failure codes were kept says nothing of why it
+        // failed. With a pin on it, failing that pin is one possibility, and
+        // continuing would only fail it again; without one, it cannot be.
+        let unexplained_with_pin = transfer.failure_code.is_none()
+            && (transfer.expected_aich.is_some() || transfer.ember_file_hash.is_some());
         Self::is_failed_download(transfer)
+            && !unexplained_with_pin
             && !transfer
                 .failure_code
                 .as_deref()
@@ -3565,6 +3571,23 @@ mod tests {
             manager.get_transfers_since(None, 0).resumable_failed.is_empty(),
             "a row queued again is not offered as Failed"
         );
+    }
+
+    /// A Failed row saved before failure codes were kept: a pinned one may
+    /// have failed its pin, so it is not offered Resume; an unpinned one
+    /// cannot have, and is.
+    #[test]
+    fn a_failed_row_from_before_failure_codes_is_resumable_only_without_a_pin() {
+        let mut manager = TransferManager::new(4);
+        for (id, pinned) in [("legacy-pinned", true), ("legacy", false)] {
+            let mut legacy = sourced(id, 2);
+            legacy.status = TransferStatus::Failed;
+            legacy.failure_code = None;
+            legacy.expected_aich = pinned.then(|| "A".repeat(32));
+            manager.push_finished(legacy);
+            manager.note_failed_partial(id, true);
+            assert_eq!(manager.is_failed_resumable(id), !pinned, "{id}");
+        }
     }
 
     /// Resume is offered only where there is progress to continue from, and

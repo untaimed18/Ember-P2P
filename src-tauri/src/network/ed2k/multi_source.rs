@@ -29,7 +29,8 @@ use super::transfer::CompressedPartAccumulator;
 use super::transfer::{
     desynced_io_error, expire_outstanding_ranges, is_filtered_source_ip, is_packet_stream_desynced,
     packet_stream_desynced_error, push_outstanding_batch, refresh_outstanding_range,
-    take_completed_outstanding_range, DownloadEvent, OutstandingRange, PacketStreamDesynced,
+    take_completed_outstanding_range, touch_pipelined_behind, DownloadEvent, OutstandingRange,
+    PacketStreamDesynced,
 };
 
 mod web_worker;
@@ -3419,6 +3420,8 @@ impl MultiSourceDownload {
                 active_count: active_count.clone(),
                 disk_full: disk_full.clone(),
                 working: web_working.clone(),
+                ip_filter: self.ip_filter.clone(),
+                banned_ips: self.banned_ips.clone(),
             };
             let handle = tokio::spawn(web_worker::dispatch(template, total_sources.clone()));
             source_aborts.track(&handle);
@@ -10542,6 +10545,13 @@ async fn download_parts_from_source(
                         // `speed_bytes` stays on wire bytes — duplicates really
                         // did consume bandwidth, which is what a rate means.
                         src_transferred += newly_written;
+                        if let Some(pending) = pipelined_next.as_mut() {
+                            touch_pipelined_behind(
+                                &outstanding_ranges,
+                                start,
+                                &mut pending.outstanding_ranges,
+                            );
+                        }
                         if take_completed_outstanding_range(&mut outstanding_ranges, start, end) {
                             blocks_received_in_current_req += 1;
                         } else if let Some(pending) = pipelined_next.as_mut() {
@@ -10689,6 +10699,11 @@ async fn download_parts_from_source(
                             Ok(None) => {
                                 refresh_outstanding_range(&mut outstanding_ranges, start);
                                 if let Some(pending) = pipelined_next.as_mut() {
+                                    touch_pipelined_behind(
+                                        &outstanding_ranges,
+                                        start,
+                                        &mut pending.outstanding_ranges,
+                                    );
                                     refresh_outstanding_range(&mut pending.outstanding_ranges, start);
                                 }
                                 continue;
@@ -10706,6 +10721,11 @@ async fn download_parts_from_source(
                         };
                         refresh_outstanding_range(&mut outstanding_ranges, start);
                         if let Some(pending) = pipelined_next.as_mut() {
+                            touch_pipelined_behind(
+                                &outstanding_ranges,
+                                start,
+                                &mut pending.outstanding_ranges,
+                            );
                             refresh_outstanding_range(&mut pending.outstanding_ranges, start);
                         }
 

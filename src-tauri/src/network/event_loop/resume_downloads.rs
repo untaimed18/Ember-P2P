@@ -15,6 +15,10 @@ pub(in crate::network) struct RestoredPart {
     all_complete: bool,
 }
 
+/// How long a restore may spend, over every download, looking for finished
+/// files the database never recorded.
+const UNRECORDED_FINISH_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// What the blocking pool learned about the restored downloads.
 #[derive(Default)]
 pub(in crate::network) struct RestoredParts {
@@ -26,6 +30,10 @@ pub(in crate::network) struct RestoredParts {
     copies: HashMap<String, Vec<(PathBuf, String)>>,
     /// Where each download's part files were found.
     found: Vec<(String, String)>,
+    /// Downloads found nowhere whose recorded folder did not answer: their
+    /// part files may well be there, so they are no sign of a finish the
+    /// database missed.
+    unanswered: HashSet<String>,
 }
 
 /// A restored download, as reading its part files needs it.
@@ -202,7 +210,14 @@ fn restore_from_listings(
                     .get(&job.id)
                     .filter(|recorded| roots.iter().any(|root| same_folder(root, recorded)))
                 {
-                    crate::storage::part_folders::note_located(&job.id, Path::new(recorded))
+                    crate::storage::part_folders::note_located(&job.id, Path::new(recorded));
+                    let answered = roots.iter().zip(listings).any(|(root, listing)| {
+                        same_folder(root, recorded)
+                            && listing.as_ref().is_some_and(|l| l.parts.is_some())
+                    });
+                    if !answered {
+                        restored.unanswered.insert(job.id.clone());
+                    }
                 }
             }
         }
@@ -527,8 +542,13 @@ pub(in crate::network) async fn resume_incomplete_downloads(
             parts: progress_map,
             copies: mut completion_copies,
             found: found_parts,
+            unanswered,
         } = part_progress_map.take().unwrap();
         let found_parts: HashMap<String, String> = found_parts.into_iter().collect();
+        // Looking for a finished file the database missed lists folders that
+        // may be on an unanswering share. All of it shares one budget, so a
+        // restore of many downloads cannot hold up the network loop for long.
+        let probe_deadline = tokio::time::Instant::now() + UNRECORDED_FINISH_PROBE_BUDGET;
         let count = incomplete.len();
         info!("Resuming {count} incomplete downloads from previous session");
         let dl_folder = settings.download_folder.clone();
@@ -687,37 +707,49 @@ pub(in crate::network) async fn resume_incomplete_downloads(
             let unrecorded_finish = !interrupted_finish
                 && transfer.total_size > 0
                 && (transfer.completed_size > 0 || transfer.progress > 0.0)
-                && !found_parts.contains_key(&transfer.id);
+                && !found_parts.contains_key(&transfer.id)
+                && !unanswered.contains(&transfer.id);
             if interrupted_finish || unrecorded_finish {
                 let safe_name = crate::security::sanitize_filename(&transfer.file_name);
-                let published: Vec<PathBuf> = if part_path.exists() {
-                    Vec::new()
-                } else {
-                    // Listing Downloads is blocking I/O, and on a share that is
-                    // not answering it is a long one: off the network task, and
-                    // given up on rather than waited out.
-                    let downloads = PathBuf::from(&dl_folder).join("Downloads");
-                    // Its category's folder first, where completion put it,
-                    // then Downloads itself, where it went before it had one
-                    // or when that folder could not be made.
-                    let subdir = crate::storage::category_folders::completion_subdir(&transfer.id);
-                    let category_dir = (!subdir.is_empty())
-                        .then(|| subdir.iter().fold(downloads.clone(), |dir, s| dir.join(s)));
-                    let name = safe_name.clone();
-                    let listing = tokio::task::spawn_blocking(move || {
+                // Checking the `.part` and listing Downloads are blocking I/O,
+                // and on a share that is not answering long ones: off the
+                // network task, and given up on rather than waited out.
+                let downloads = PathBuf::from(&dl_folder).join("Downloads");
+                // Its category's folder first, where completion put it, then
+                // Downloads itself, where it went before it had one or when
+                // that folder could not be made.
+                let subdir = crate::storage::category_folders::completion_subdir(&transfer.id);
+                let category_dir = (!subdir.is_empty())
+                    .then(|| subdir.iter().fold(downloads.clone(), |dir, s| dir.join(s)));
+                let name = safe_name.clone();
+                let part_check = part_path.clone();
+                // Past the budget nothing more is started: each look could
+                // hang on the same dead share and hold a blocking thread.
+                let listing = (tokio::time::Instant::now() < probe_deadline).then(|| {
+                    tokio::task::spawn_blocking(move || {
+                        if part_check.exists() {
+                            return Vec::new();
+                        }
                         category_dir
                             .iter()
                             .chain(std::iter::once(&downloads))
                             .flat_map(|dir| ed2k::transfer::published_names(dir, &name))
                             .filter(|path| path.exists())
                             .collect::<Vec<_>>()
-                    });
-                    match tokio::time::timeout(std::time::Duration::from_secs(5), listing).await {
-                        Ok(Ok(found)) => found,
-                        _ => {
-                            warn!("Could not list {dl_folder}/Downloads in time to recover {}", transfer.id);
-                            Vec::new()
-                        }
+                    })
+                });
+                let looked = match listing {
+                    Some(listing) => tokio::time::timeout_at(probe_deadline, listing).await.ok(),
+                    None => None,
+                };
+                let published: Vec<PathBuf> = match looked {
+                    Some(Ok(found)) => found,
+                    _ => {
+                        warn!(
+                            "Could not look for {} in {dl_folder}/Downloads in time; resuming it as it was",
+                            transfer.id
+                        );
+                        Vec::new()
                     }
                 };
 
@@ -1147,16 +1179,28 @@ mod tests {
         let (current, slow) = (scratch.folder("current"), scratch.folder("slow"));
         let folders = scratch.folders(&current, &[&slow]);
         let id = uuid();
-        restore_from_listings(
+        let elsewhere = uuid();
+        let restored = restore_from_listings(
             &folders.roots(),
             &[Some(RootListing::read(&current, true)), None],
-            vec![job(&id)],
-            &HashMap::from([(id.clone(), slow.to_string_lossy().into_owned())]),
+            vec![job(&id), job(&elsewhere)],
+            &HashMap::from([
+                (id.clone(), slow.to_string_lossy().into_owned()),
+                (elsewhere.clone(), current.to_string_lossy().into_owned()),
+            ]),
         );
         assert!(crate::storage::part_folders::known_this_run(&id));
         assert!(
             crate::storage::part_folders::may_hold_parts(&id, &slow),
             "held for the slow folder rather than started over"
+        );
+        assert!(
+            restored.unanswered.contains(&id),
+            "its parts may be in the folder that did not answer"
+        );
+        assert!(
+            !restored.unanswered.contains(&elsewhere),
+            "its folder answered, and its parts were not there"
         );
     }
 

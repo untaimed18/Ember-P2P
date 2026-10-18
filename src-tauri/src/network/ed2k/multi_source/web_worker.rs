@@ -18,13 +18,20 @@ const WRITE_CHUNK: usize = super::super::messages::EMBLOCKSIZE as usize;
 /// the gap map, so nothing written is lost.
 const READ_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Least a mirror must send per [`THROUGHPUT_WINDOW`] to keep its range. The
+/// idle timeout alone let one byte every 29 seconds hold a part, and with it
+/// the end of the download, indefinitely.
+const MIN_BYTES_PER_WINDOW: u64 = 64 * 1024;
+const THROUGHPUT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A pass that wrote less than this into a part still unfinished waits
+/// [`THIN_PASS_PAUSE`] before asking again, so a mirror answering every range
+/// with a byte or two is not re-asked in a tight loop.
+const THIN_PASS_BYTES: u64 = WRITE_CHUNK as u64;
+const THIN_PASS_PAUSE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Redirects followed per request, each re-validated like the first URL.
 const MAX_REDIRECTS: usize = 5;
-
-/// Parts this source may fill that then fail their MD4 before it is retired.
-/// One can be bad luck shared with a peer; two from the same mirror is the
-/// mirror.
-const MAX_BAD_PARTS: u32 = 2;
 
 /// How long to wait when every unfinished part is already being worked on.
 const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
@@ -103,6 +110,11 @@ pub(super) struct WebWorker {
     /// Workers fetching or ready to, shared by all of them: one resting out
     /// its backoff is not counted, so the download does not wait on it.
     pub working: Arc<std::sync::atomic::AtomicUsize>,
+    /// The filter and bans every peer of the download is held to. A mirror
+    /// sees this computer's address as a peer does, so one in a range the
+    /// user blocked is not contacted either.
+    pub ip_filter: Option<crate::network::kad::ip_filter::SharedIpFilter>,
+    pub banned_ips: Option<super::super::upload::SharedBannedIps>,
 }
 
 /// Counts its worker in `WebWorker::working` while held.
@@ -157,41 +169,6 @@ impl Drop for ActiveRequest {
     }
 }
 
-/// What this source has written into each part since the part's last verdict,
-/// across however many passes it took. A mirror is judged on the bytes it
-/// put in the part, not on what one pass happened to carry: a pass can be
-/// mostly duplicates, and a mirror that drops every connection fills a part
-/// over several.
-#[derive(Default)]
-struct PartShares(HashMap<usize, PartShare>);
-
-#[derive(Default)]
-struct PartShare {
-    written: u64,
-    /// What the part still lacked when this source last left it. More missing
-    /// now means it was reopened since, and what was written before is gone.
-    missing_after: u64,
-}
-
-impl PartShares {
-    fn begin_pass(&mut self, part: usize, missing: u64) {
-        if self.0.get(&part).is_some_and(|s| missing > s.missing_after) {
-            self.0.remove(&part);
-        }
-    }
-
-    fn end_pass(&mut self, part: usize, written: u64, missing: u64) {
-        let share = self.0.entry(part).or_default();
-        share.written = share.written.saturating_add(written);
-        share.missing_after = missing;
-    }
-
-    /// The bytes to judge a verdict on `part` by; the count starts over.
-    fn take(&mut self, part: usize) -> u64 {
-        self.0.remove(&part).map_or(0, |s| s.written)
-    }
-}
-
 /// How a request ended, which decides what the source is told.
 enum FetchError {
     /// The server will never serve this file in parts: missing, refused, or
@@ -204,6 +181,22 @@ enum FetchError {
 }
 
 impl WebWorker {
+    /// Whether the IP filter or the ban list refuses `ip`, as they would a
+    /// peer at that address. Both are IPv4 only.
+    fn address_refused(&self, ip: std::net::IpAddr) -> bool {
+        let std::net::IpAddr::V4(v4) = ip else {
+            return false;
+        };
+        if let Some(filter) = &self.ip_filter {
+            if filter.read().unwrap_or_else(|e| e.into_inner()).is_blocked(v4) {
+                return true;
+            }
+        }
+        self.banned_ips
+            .as_ref()
+            .is_some_and(|banned| banned.read().unwrap_or_else(|e| e.into_inner()).contains(&v4))
+    }
+
     /// Shown in the source list: host as the address, the URL as the name.
     fn host_and_port(&self) -> (String, u16) {
         reqwest::Url::parse(&self.url)
@@ -259,8 +252,6 @@ impl WebWorker {
             self.drop_tx.clone(),
         );
         let mut transferred: u64 = 0;
-        let mut shares = PartShares::default();
-        let mut bad_parts: u32 = 0;
         // The address the last redirect landed on, reused until it fails so a
         // mirror behind a redirector is not re-resolved for every range.
         let mut effective_url = self.url.clone();
@@ -271,6 +262,14 @@ impl WebWorker {
             }
             if !web_sources::enabled() {
                 break;
+            }
+            // Retired elsewhere: by a corrupt part it mostly wrote, judged
+            // wherever that happened (see `web_sources::note_corrupt_range`),
+            // or by the download giving up on every mirror.
+            if web_sources::is_retired(&self.file_hash, &self.url) {
+                debug!("Web source {} retired for {}", self.url, self.transfer_id);
+                self.report("failed", 0, transferred, Some(SourceFailureKind::Permanent)).await;
+                return Ok(());
             }
             let picked = {
                 let mut t = self.tracker.write().await;
@@ -300,7 +299,6 @@ impl WebWorker {
                 continue;
             }
 
-            shares.begin_pass(part, gaps.iter().map(|&(gs, ge)| ge - gs).sum());
             // So a peer worker piling onto this part in the endgame asks for
             // these ranges last, as it does for another peer's requests.
             let in_flight: Vec<OutstandingRange> =
@@ -324,13 +322,15 @@ impl WebWorker {
             // Check what this source just filled now, while the claim still
             // keeps the sweep and every peer off it, so the verdict is about
             // this mirror and a bad one is found out after one part.
-            let to_check = {
+            let (to_check, part_done) = {
                 let t = self.tracker.read().await;
                 let (ps, pe) = t.part_range(part);
-                let missing = t.fillable_subranges(ps, pe).iter().map(|&(gs, ge)| ge - gs).sum();
-                shares.end_pass(part, written, missing);
-                (outcome.is_ok() && t.is_part_complete(part) && !t.is_part_verified(part))
-                    .then(|| ((ps, pe), t.part_content_generation(part)))
+                let done = t.is_part_complete(part);
+                (
+                    (outcome.is_ok() && done && !t.is_part_verified(part))
+                        .then(|| ((ps, pe), t.part_content_generation(part))),
+                    done,
+                )
             };
             let hashes = self.part_hashes.read().await.clone();
             let checked = match to_check {
@@ -357,7 +357,12 @@ impl WebWorker {
             };
 
             match outcome {
-                Ok(()) => web_sources::note_success(&self.file_hash, &self.url),
+                Ok(()) => {
+                    web_sources::note_success(&self.file_hash, &self.url);
+                    if written < THIN_PASS_BYTES && !part_done {
+                        self.pause(THIN_PASS_PAUSE).await;
+                    }
+                }
                 Err(FetchError::Stopped(e)) => return Err(e),
                 Err(FetchError::Permanent(why)) => {
                     warn!("Web source {} retired for {}: {why}", self.url, self.transfer_id);
@@ -388,26 +393,11 @@ impl WebWorker {
                 }
             }
 
-            // Held against the mirror only when it supplied most of the part:
-            // one a peer had mostly filled says little about the mirror.
-            let supplied = match &checked {
-                Some((_, ClaimedPartCheck::Unreadable)) | None => 0,
-                Some(_) => shares.take(part),
-            };
-            if let Some(((ps, pe), ClaimedPartCheck::Corrupt)) = checked {
-                if supplied.saturating_mul(2) >= pe - ps {
-                    bad_parts += 1;
-                    warn!(
-                        "Part {part} from web source {} failed verification ({bad_parts} so far)",
-                        self.url
-                    );
-                    if bad_parts >= MAX_BAD_PARTS {
-                        web_sources::note_failure(&self.file_hash, &self.url, true);
-                        self.report("failed", 0, transferred, Some(SourceFailureKind::Permanent))
-                            .await;
-                        return Ok(());
-                    }
-                }
+            if let Some((_, ClaimedPartCheck::Corrupt)) = checked {
+                warn!(
+                    "Part {part} filled by web source {} failed verification",
+                    self.url
+                );
             }
         }
         self.report("completed", 0, transferred, None).await;
@@ -578,6 +568,13 @@ impl WebWorker {
                         FetchError::Permanent(e)
                     }
                 })?;
+            let addrs: Vec<std::net::SocketAddr> =
+                addrs.into_iter().filter(|addr| !self.address_refused(addr.ip())).collect();
+            if addrs.is_empty() {
+                return Err(FetchError::Permanent(format!(
+                    "{host} is blocked by the IP filter or banned"
+                )));
+            }
             let client = crate::security::build_pinned_web_source_client(
                 &host,
                 &addrs,
@@ -632,6 +629,8 @@ impl WebWorker {
         let mut buf: Vec<u8> = Vec::with_capacity(WRITE_CHUNK);
         let mut window_start = std::time::Instant::now();
         let mut window_bytes: u64 = 0;
+        let mut floor_start = std::time::Instant::now();
+        let mut floor_bytes: u64 = 0;
         let mut reported_transferring = false;
         let mut got_any = false;
         loop {
@@ -648,8 +647,19 @@ impl WebWorker {
             };
             let done = chunk.is_none();
             if let Some(bytes) = chunk {
+                floor_bytes = floor_bytes.saturating_add(bytes.len() as u64);
                 let room = end.saturating_sub(pos + buf.len() as u64) as usize;
                 buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
+            }
+            if floor_start.elapsed() >= THROUGHPUT_WINDOW {
+                if floor_bytes < MIN_BYTES_PER_WINDOW {
+                    return Err(FetchError::Transient(format!(
+                        "too slow: {floor_bytes} bytes in {} s",
+                        THROUGHPUT_WINDOW.as_secs()
+                    )));
+                }
+                floor_start = std::time::Instant::now();
+                floor_bytes = 0;
             }
             let at_end = pos + buf.len() as u64 >= end;
             if buf.len() >= WRITE_CHUNK || ((done || at_end) && !buf.is_empty()) {
@@ -680,6 +690,7 @@ impl WebWorker {
                     return Err(FetchError::Stopped(anyhow::anyhow!("disk write failed")));
                 }
                 *written = written.saturating_add(outcome.newly_written);
+                web_sources::note_written(&self.file_hash, &self.url, &outcome.written_subranges);
                 if outcome.newly_written > 0 {
                     let _ = self
                         .progress_tx
@@ -688,6 +699,14 @@ impl WebWorker {
                 got_any = true;
                 pos += len;
                 buf.clear();
+                // Peers filled the rest of this range meanwhile: reading on
+                // would only download it again.
+                if outcome.newly_written == 0
+                    && pos < end
+                    && self.tracker.read().await.fillable_subranges(pos, end).is_empty()
+                {
+                    return Ok(());
+                }
                 let elapsed = window_start.elapsed();
                 if !reported_transferring || elapsed >= std::time::Duration::from_secs(1) {
                     let speed = (window_bytes as f64 / elapsed.as_secs_f64().max(0.001)) as u64;
@@ -756,7 +775,7 @@ fn parse_content_range(header: &str) -> Option<(u64, u64, Option<u64>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_encoded, parse_content_range, PartShares};
+    use super::{is_encoded, parse_content_range};
     use reqwest::header::HeaderValue;
 
     #[test]
@@ -768,27 +787,6 @@ mod tests {
         for encoded in ["gzip", "br", "deflate", " GZIP "] {
             assert!(is_encoded(Some(&HeaderValue::from_static(encoded))), "{encoded:?}");
         }
-    }
-
-    #[test]
-    fn a_mirror_is_judged_on_what_it_wrote_across_passes() {
-        let mut shares = PartShares::default();
-        // Two passes that each dropped early, then one that finished.
-        shares.begin_pass(0, 100);
-        shares.end_pass(0, 30, 70);
-        shares.begin_pass(0, 70);
-        shares.end_pass(0, 30, 40);
-        shares.begin_pass(0, 40);
-        shares.end_pass(0, 0, 0);
-        assert_eq!(shares.take(0), 60, "duplicates add nothing, earlier passes count");
-        assert_eq!(shares.take(0), 0, "a verdict starts the count over");
-
-        // Reopened since this source last left it: what it wrote is gone.
-        shares.begin_pass(1, 100);
-        shares.end_pass(1, 80, 20);
-        shares.begin_pass(1, 100);
-        shares.end_pass(1, 10, 0);
-        assert_eq!(shares.take(1), 10);
     }
 
     #[test]

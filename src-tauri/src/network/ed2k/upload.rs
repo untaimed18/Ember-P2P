@@ -1648,6 +1648,83 @@ fn is_relayed_session_ip(ip: IpAddr) -> bool {
     matches!(ip, IpAddr::V4(v4) if v4.octets()[0] == 0)
 }
 
+/// The peer relay each live relayed session came through, by its stand-in.
+///
+/// Any QUIC peer can open a stream as a relay, so the stand-in alone would
+/// hand it a fresh identity on every stream. What has to outlast a reconnect,
+/// the uncached-hash budget, is charged to the relay instead, and the relay's
+/// address is held to [`MAX_CONNECTIONS_PER_IP`] as it was before stand-ins.
+/// The rendezvous server relay arrives from `0.0.0.0` with a ticket for a
+/// known friend, so it is in neither.
+static RELAYED_VIA: parking_lot::RwLock<Option<HashMap<IpAddr, IpAddr>>> =
+    parking_lot::RwLock::new(None);
+
+/// A relayed session's place in its relay's per-address count and in
+/// [`RELAYED_VIA`], given up with the session.
+struct RelayedAdmission {
+    per_ip: Arc<parking_lot::Mutex<HashMap<IpAddr, usize>>>,
+    relay: IpAddr,
+    stand_in: IpAddr,
+}
+
+impl RelayedAdmission {
+    /// Admit one more session through `relay`, or `None` when the relay is
+    /// already at [`MAX_CONNECTIONS_PER_IP`].
+    fn admit(
+        per_ip: &Arc<parking_lot::Mutex<HashMap<IpAddr, usize>>>,
+        relay: IpAddr,
+        stand_in: IpAddr,
+    ) -> Option<Self> {
+        {
+            let mut counts = per_ip.lock();
+            let count = counts.entry(relay).or_insert(0);
+            if *count >= MAX_CONNECTIONS_PER_IP {
+                return None;
+            }
+            *count += 1;
+        }
+        RELAYED_VIA
+            .write()
+            .get_or_insert_with(HashMap::new)
+            .insert(stand_in, relay);
+        Some(Self {
+            per_ip: per_ip.clone(),
+            relay,
+            stand_in,
+        })
+    }
+}
+
+impl Drop for RelayedAdmission {
+    fn drop(&mut self) {
+        {
+            let mut counts = self.per_ip.lock();
+            if let Some(count) = counts.get_mut(&self.relay) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    counts.remove(&self.relay);
+                }
+            }
+        }
+        if let Some(map) = RELAYED_VIA.write().as_mut() {
+            map.remove(&self.stand_in);
+        }
+    }
+}
+
+/// The address budgets that must survive a reconnect are kept under: the
+/// relay's for a session that came through a peer relay, its own otherwise.
+fn budget_ip(ip: IpAddr) -> IpAddr {
+    if !is_relayed_session_ip(ip) {
+        return ip;
+    }
+    RELAYED_VIA
+        .read()
+        .as_ref()
+        .and_then(|map| map.get(&ip).copied())
+        .unwrap_or(ip)
+}
+
 /// Where an `AddRequestCount` ban lands. A relayed session's stand-in names
 /// nobody, so there is no address to ban there; that session is only closed.
 #[derive(Debug, PartialEq, Eq)]
@@ -4495,8 +4572,12 @@ const MAX_SX_ANSWER_ASKERS: usize = 4096;
 /// part file and once per four of them otherwise (`ListenSocket.cpp`
 /// `OP_REQUESTSOURCES`). Ember answered every request, so a peer could
 /// re-ask in a loop and have our whole source list for a hash each time.
+///
+/// Keyed by the asker's identity together with its address ([`budget_ip`]):
+/// the user hash is only claimed, so keyed by it alone, one request naming
+/// someone else's hash started their wait.
 struct SxAnswerLimiter {
-    last_answered: HashMap<QueueIdentity, std::time::Instant>,
+    last_answered: HashMap<(QueueIdentity, IpAddr), std::time::Instant>,
 }
 
 impl SxAnswerLimiter {
@@ -4510,7 +4591,7 @@ impl SxAnswerLimiter {
     /// eMule the clock restarts even if the answer turns out to be empty.
     fn try_answer(
         &mut self,
-        asker: &QueueIdentity,
+        asker: &(QueueIdentity, IpAddr),
         now: std::time::Instant,
         is_partial: bool,
         source_count: usize,
@@ -5872,10 +5953,29 @@ pub async fn start_upload_server(
                     server.ip_connection_counts.clone(),
                     count_key,
                 );
+                let relay_ip = req.peer_addr.ip();
+                let relayed_admission = if relayed && !relay_ip.is_unspecified() {
+                    match RelayedAdmission::admit(
+                        &server.ip_connection_counts,
+                        relay_ip,
+                        peer_ip,
+                    ) {
+                        Some(admission) => Some(admission),
+                        None => {
+                            debug!(
+                                "Dropping relayed stream via {relay_ip}: that relay is at its per-address limit"
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
 
                 let server = server.clone();
                 tokio::spawn(async move {
                     let _admission_guard = admission_guard;
+                    let _relayed_admission = relayed_admission;
                     // A coordinated friend-transfer punch makes us the eD2K
                     // initiator; every other adopted stream keeps the inbound
                     // role. Deciding here, rather than inside `run_session`,
@@ -6549,7 +6649,7 @@ impl UploadHandler {
         let sm = self.source_manager.read().await;
         let source_count = sm.source_count(file_hash);
         if !self.sx_answers.lock().try_answer(
-            asker,
+            &(asker.clone(), budget_ip(peer_ip)),
             std::time::Instant::now(),
             is_partial,
             source_count,
@@ -7137,7 +7237,7 @@ impl UploadHandler {
             .abuse_tracker
             .lock()
             .await
-            .try_spend_uncached_hash_job(peer_addr.ip());
+            .try_spend_uncached_hash_job(budget_ip(peer_addr.ip()));
         if !within_budget {
             warn!("Peer {peer_addr} exceeded its uncached hashset budget; refusing {opcode}");
             self.note_abusive_request(peer_addr.ip()).await;
@@ -18458,6 +18558,36 @@ mod abuse_and_seniority_tests {
         assert!(!is_relayed_session_ip("81.2.69.7".parse().unwrap()));
     }
 
+    /// Anyone can open a stream as a peer relay, so its address keeps the cap
+    /// it had before stand-ins, and a reconnect through it does not refill the
+    /// uncached-hash budget.
+    #[test]
+    fn a_peer_relay_is_held_to_the_per_address_cap_and_carries_the_budget() {
+        let per_ip = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let relay: IpAddr = "81.2.69.9".parse().unwrap();
+        let held: Vec<RelayedAdmission> = (0..MAX_CONNECTIONS_PER_IP)
+            .map(|_| {
+                RelayedAdmission::admit(&per_ip, relay, relayed_session_addr().ip())
+                    .expect("under the cap")
+            })
+            .collect();
+        assert!(
+            RelayedAdmission::admit(&per_ip, relay, relayed_session_addr().ip()).is_none(),
+            "one relay address cannot take every relayed slot"
+        );
+        let first = held[0].stand_in;
+        assert_eq!(budget_ip(first), relay, "the budget is the relay's");
+        let other: IpAddr = "81.2.69.10".parse().unwrap();
+        let elsewhere = RelayedAdmission::admit(&per_ip, other, relayed_session_addr().ip());
+        assert!(elsewhere.is_some(), "another relay has its own");
+
+        drop(held);
+        assert!(!per_ip.lock().contains_key(&relay), "ending the sessions frees the relay");
+        assert_eq!(budget_ip(first), first, "and forgets the stand-in");
+        let direct: IpAddr = "81.2.69.7".parse().unwrap();
+        assert_eq!(budget_ip(direct), direct);
+    }
+
     #[test]
     fn relayed_waiters_share_one_wider_queue_cap_instead_of_the_relays_ip() {
         let relayed_row = |n: u8| {
@@ -18503,7 +18633,8 @@ mod abuse_and_seniority_tests {
     #[test]
     fn source_exchange_answers_follow_emules_rare_and_common_intervals() {
         let mut limiter = SxAnswerLimiter::new();
-        let asker = QueueIdentity::UserHash([3u8; 16]);
+        let from: IpAddr = "81.2.69.20".parse().unwrap();
+        let asker = (QueueIdentity::UserHash([3u8; 16]), from);
         let t0 = std::time::Instant::now();
         let at = |secs: u64| t0 + std::time::Duration::from_secs(secs);
         assert!(limiter.try_answer(&asker, t0, true, 10));
@@ -18515,7 +18646,17 @@ mod abuse_and_seniority_tests {
         assert!(!limiter.try_answer(&asker, at(40 * 60 + 41 * 60), false, 1));
         assert!(limiter.try_answer(&asker, at(40 * 60 + 160 * 60), false, 1));
         // Another asker has its own clock.
-        assert!(limiter.try_answer(&QueueIdentity::UserHash([4u8; 16]), at(40 * 60 + 160 * 60), false, 1));
+        assert!(limiter.try_answer(
+            &(QueueIdentity::UserHash([4u8; 16]), from),
+            at(40 * 60 + 160 * 60),
+            false,
+            1
+        ));
+        // As does someone elsewhere naming the same hash, so claiming a
+        // hash cannot start its owner's wait.
+        let spoofer: IpAddr = "81.2.69.21".parse().unwrap();
+        assert!(limiter.try_answer(&(asker.0.clone(), spoofer), at(40 * 60 + 160 * 60), false, 1));
+        assert!(!limiter.try_answer(&asker, at(40 * 60 + 160 * 60 + 60), false, 1));
     }
 
     #[test]
@@ -18524,7 +18665,7 @@ mod abuse_and_seniority_tests {
         let now = std::time::Instant::now();
         for n in 0..(MAX_SX_ANSWER_ASKERS as u32 + 10) {
             let ip = IpAddr::V4(Ipv4Addr::from(0x5100_0000 + n));
-            assert!(limiter.try_answer(&QueueIdentity::Ip(ip), now, false, 0));
+            assert!(limiter.try_answer(&(QueueIdentity::Ip(ip), ip), now, false, 0));
         }
         assert!(limiter.last_answered.len() <= MAX_SX_ANSWER_ASKERS);
     }

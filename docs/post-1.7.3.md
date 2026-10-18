@@ -66,6 +66,32 @@ the receiving half of waiting offers, and every known limit, has moved to
 - **Release notes** in `docs/index.html`, checked with
   `node scripts/release-notes.mjs` and `node scripts/verify-release-policy.mjs`.
   The date says October 18, 2026: set it to the day the tag is cut.
+- **A pre-release audit** of the riskiest 1.7.4 work. Offline chat delivery
+  (client and Rendezvous server) had no defects; the live server already
+  advertises `chat_mailbox`, and the checklist now covers it. What the
+  downloads, uploads, web mirrors and eD2K server passes found is fixed:
+  - Relayed upload streams: any QUIC peer can open one, so each relay
+    address is held to `MAX_CONNECTIONS_PER_IP` again and the uncached-hash
+    budget is charged to the relay (`RelayedAdmission`, `budget_ip`), not the
+    stand-in. The Rendezvous relay, which carries friend tickets, is exempt.
+  - The source-exchange answer limit is keyed by identity and address, so a
+    claimed user hash cannot start its owner's wait.
+  - Web mirrors: blamed for any corrupt part they wrote most of, whoever
+    finished it, with the count kept in the registry and a mirror retired for
+    it dropped from the download for good (`note_corrupt_range`); held to
+    64 KiB a minute so a trickle cannot hold a part; no longer reading a range
+    peers filled, nor re-asked at once after a near-empty answer; refused
+    when the IP filter or ban list covers their address.
+  - The private-address check treats NAT64, v4-compatible, 6to4 and Teredo
+    addresses as private when the IPv4 inside is, and site-local and
+    local-use NAT64 outright.
+  - Startup restore looks for unrecorded finishes off the network loop
+    within one 10-second budget, and not for downloads whose recorded folder
+    did not answer.
+  - A pipelined next part's ranges wait behind the current part's packets
+    instead of expiring and being downloaded twice.
+  - A Failed row saved before failure codes is offered Resume only when it
+    carries no pin it might have failed.
 
 ## Left for 1.7.4
 

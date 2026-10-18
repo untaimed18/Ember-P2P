@@ -76,9 +76,32 @@ not reachable from outside (no port forwarding, UPnP off). Call them A
       name. It saves, and the box takes no 65th character.
 - [ ] Browse a friend whose shares are in the hundreds of files: the listing
       arrives (the friend-session frame limit is now 512 KiB both ways).
+- [ ] Messages to a friend who is offline, both on 1.7.4: quit Ember on B,
+      send three messages from A, then start B. Within a few minutes all
+      three arrive on B once each and in order, and turn Delivered on A.
+- [ ] The same with A quit before B starts: B still gets all three from the
+      Rendezvous server, and they turn Delivered on A when A next starts.
+- [ ] Send a message to B while B is offline, then bring B online while A
+      is still running: it arrives once, not twice.
+- [ ] Turn off "Deliver messages while friends are offline" on B, quit B,
+      and send from A. The message waits on A and arrives only once both
+      are online.
+- [ ] Set a 5-minute disappearing timer for B and send to B while B is
+      offline. On B it disappears 5 minutes after it is read; on A, 5
+      minutes after it turns Delivered.
 - [ ] Leave a friend chat idle for half an hour with one side on 1.7.4 and the
       other on 1.7.3. Note whether the session drops (it may, until both run
       1.7.3 or later; see the known limits in `docs/post-1.7.4.md`).
+
+## 2a. Downloads with web mirrors
+
+- [ ] Add an ed2k link that carries an `s=` HTTPS mirror for a file with few
+      peers. The mirror shows as HTTPS in the sources, fills parts, and the
+      file completes and verifies.
+- [ ] Block the mirror's address in the IP filter and add the link again for
+      another file. The mirror is not contacted and shows as failed.
+- [ ] Turn off "Use web sources from eD2K links" mid-download. The mirror
+      stops and the peers carry on.
 
 ## 3. Mixed versions (1.7.4 with 1.7.3)
 
@@ -88,6 +111,9 @@ Machine A on 1.7.4, machine B on 1.7.3, in the same rooms and mutual friends.
 - [ ] Neither shows a "needs a newer Ember" notice: 1.7.4 sends no envelope
       1.7.3 cannot read. If one appears, note the room and what was sent.
 - [ ] Room files and friend chat attachments work both ways.
+- [ ] Quit B (1.7.3) and send from A (1.7.4). The message waits on A and is
+      delivered directly when B is back; nothing is left on the server for
+      a build that never collects.
 - [ ] A friend request between them works both ways.
 
 ## 4. Translation review

@@ -1710,6 +1710,23 @@ pub(in crate::network) async fn on_download_event(
         }
     }
     if let DownloadEvent::PartCorrupted { ref file_hash, part_start, part_end, ref sender_user_hash, .. } = event {
+        // Web mirrors are not in the corruption blackbox, which tracks peers
+        // by address. Each is charged for the parts it wrote most of, whoever
+        // finished them, and one retired for it is dropped from the download
+        // for good.
+        let retired = ed2k::web_sources::note_corrupt_range(file_hash, part_start, part_end);
+        if !retired.is_empty() {
+            let db_web = db.clone();
+            let fh = hex::encode(file_hash);
+            tokio::task::spawn_blocking(move || {
+                for url in retired {
+                    warn!("Web source {url} retired: parts it wrote failed verification");
+                    if let Err(e) = db_web.delete_transfer_web_source(&fh, &url) {
+                        debug!("Could not forget a retired web source of {fh}: {e}");
+                    }
+                }
+            });
+        }
         // Snapshot who contributed still-unverified bytes to this
         // exact part range BEFORE `corrupted_part` marks them
         // corrupt (marking doesn't change which IP owns a block,
