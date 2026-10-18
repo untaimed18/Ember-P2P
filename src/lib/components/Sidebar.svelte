@@ -4,6 +4,7 @@
   import AboutDialog from '$lib/components/AboutDialog.svelte';
   import KeyboardShortcutsDialog from '$lib/components/KeyboardShortcutsDialog.svelte';
   import ShareEmberDialog from '$lib/components/ShareEmberDialog.svelte';
+  import IconGear from '$lib/components/IconGear.svelte';
   import { transfers } from '$lib/stores/transfers';
   import { friendRequests, fileOffers } from '$lib/stores/friends';
   import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
@@ -503,10 +504,7 @@
                 <polyline points="7,10 9.5,12.5 13.5,7.5"/>
               </svg>
             {:else if item.id === 'settings'}
-              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="10" cy="10" r="2.5"/>
-                <path d="M10 1.5v2M10 16.5v2M1.5 10h2M16.5 10h2M3.9 3.9l1.4 1.4M14.7 14.7l1.4 1.4M3.9 16.1l1.4-1.4M14.7 5.3l1.4-1.4"/>
-              </svg>
+              <IconGear size={20} />
             {/if}
           </span>
           <span class="nav-label">{item.label()}</span>

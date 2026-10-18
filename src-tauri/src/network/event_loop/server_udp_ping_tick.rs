@@ -40,10 +40,10 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
         let server = state.server_list.servers()[idx].clone();
         let now = crate::network::monotonic_secs();
         match server_udp.send_status_ping(&server, now).await {
-            Ok(bytes) if bytes > 0 => {
+            Ok((bytes, obfuscated)) if bytes > 0 => {
                 state
                     .server_list
-                    .record_udp_ping_sent(&server.ip, server.port, now);
+                    .record_udp_ping_sent(&server.ip, server.port, now, obfuscated);
                 stats_manager.add_overhead(
                     crate::storage::statistics::OverheadCategory::Server,
                     crate::storage::statistics::OverheadDirection::Upload,
@@ -94,6 +94,7 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
             // Status pings and global search results are
             // server-control traffic, not source-discovery.
             ServerUdpResponse::StatusResponse { .. }
+            | ServerUdpResponse::DescResponse { .. }
             | ServerUdpResponse::SearchResult { .. } =>
                 crate::storage::statistics::OverheadCategory::Server,
         };
@@ -102,37 +103,20 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
             crate::storage::statistics::OverheadDirection::Download,
             recv_bytes,
         );
-        // Reset the per-server UDP-failure counter on
-        // any inbound reply (status, sources, or search).
-        // The address is already canonicalised to the
-        // standard TCP+4 port by `try_recv_with`, so the
-        // server-list lookup uses `addr.port() - 4` for
-        // the matching TCP port.
-        {
-            let resp_addr = match &resp {
-                ServerUdpResponse::StatusResponse { addr, .. } => Some(*addr),
-                // FoundSources is recorded only after endpoint +
-                // recent-query correlation in its handler below.
-                ServerUdpResponse::FoundSources { .. } => None,
-                // Search replies are recorded only after the
-                // sent-IP allowlist check below (eMule
-                // ProcessUDPSearchAnswer).
-                ServerUdpResponse::SearchResult { .. } => None,
-            };
-            if let Some(a) = resp_addr {
-                let ip_str = a.ip().to_string();
-                let tcp_port = a.port().saturating_sub(4);
-                state.server_list.record_udp_reply(&ip_str, tcp_port);
-            }
-        }
+        // A reply clears the server's failure counters (`record_udp_reply`)
+        // only once it is known to answer something we sent: each arm below
+        // records it after its own check. The address is already
+        // canonicalised to the standard TCP+4 port by `try_recv_with`, so the
+        // list lookup uses `addr.port() - 4` for the TCP port.
         match resp {
             ServerUdpResponse::StatusResponse { addr, challenge, user_count, file_count, max_users, soft_files, hard_files, obfuscation_port_tcp, obfuscation_port_udp, udp_flags, server_udp_key } => {
                 // eMule: verify challenge to prevent spoofed status responses
-                let expected = server_udp.take_challenge(&addr);
-                if expected != Some(challenge) {
+                let now = crate::network::monotonic_secs();
+                if !server_udp.accept_status_reply(&addr, challenge, now) {
                     debug!("Ignoring UDP status from {addr}: challenge mismatch or unexpected");
                 } else {
                     let tcp_port = addr.port().saturating_sub(4);
+                    state.server_list.record_udp_reply(&addr.ip().to_string(), tcp_port);
                     state.server_list.update_server_stats(
                         &addr.ip().to_string(), tcp_port, user_count, file_count, obfuscation_port_tcp,
                     );
@@ -160,6 +144,51 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
                         &addr.ip().to_string(), tcp_port,
                         obfuscation_port_udp, server_udp_key, state.external_ip,
                     );
+                    // A server learned from another server's list push has
+                    // only its address for a name. Ask it, as eMule does
+                    // after a status reply, but only while it needs one:
+                    // the status reply recurs every few hours.
+                    let ip_str = addr.ip().to_string();
+                    if state.server_list.has_placeholder_name(&ip_str, tcp_port) {
+                        if let Some(entry) =
+                            state.server_list.find_by_addr(&ip_str, tcp_port).cloned()
+                        {
+                            let now = crate::network::monotonic_secs();
+                            match server_udp.send_desc_request(&entry, now).await {
+                                Ok(bytes) if bytes > 0 => stats_manager.add_overhead(
+                                    crate::storage::statistics::OverheadCategory::Server,
+                                    crate::storage::statistics::OverheadDirection::Upload,
+                                    bytes as u64,
+                                ),
+                                Ok(_) => {}
+                                Err(e) => debug!(
+                                    "Server description request to {ip_str}:{tcp_port} failed: {e}"
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+            ServerUdpResponse::DescResponse { addr, challenge, name } => {
+                let now = crate::network::monotonic_secs();
+                if !server_udp.accept_desc_reply(&addr, challenge, now) {
+                    debug!("Ignoring unsolicited or mismatched server description from {addr}");
+                    continue;
+                }
+                let ip_str = addr.ip().to_string();
+                let tcp_port = addr.port().saturating_sub(4);
+                state.server_list.record_udp_reply(&ip_str, tcp_port);
+                if let Some(name) = name {
+                    if state.server_list.update_server_name_from_ident(&ip_str, tcp_port, &name) {
+                        debug!("Learned name of server {ip_str}:{tcp_port} over UDP: {name}");
+                        let met_path = state.data_dir.join("server.met");
+                        spawn_save_server_met(
+                            &state.server_list,
+                            met_path,
+                            &state.server_met_save_generation,
+                            &state.server_met_save_lock,
+                        );
+                    }
                 }
             }
             ServerUdpResponse::FoundSources { addr, files } => {
@@ -513,7 +542,12 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
                     state.server_list.record_udp_reply(&ip_str, tcp_port);
 
                     debug!("UDP search returned {} results from {addr}", results.len());
-                    let search_results: Vec<SearchResult> = results.iter().map(|sr| {
+                    let search_results: Vec<SearchResult> = results.iter().filter(|sr| {
+                        state
+                            .active_search_request
+                            .as_ref()
+                            .is_none_or(|a| a.reply_row_matches(&sr.file_name))
+                    }).map(|sr| {
                         let hash_hex = hex::encode(sr.file_hash);
                         let extension = sr.file_name
                             .rsplit_once('.')
@@ -585,6 +619,12 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
                             spam_reason_details: Vec::new(),
                         }
                     }).collect();
+                    if search_results.len() < results.len() {
+                        debug!(
+                            "Dropped {} UDP row(s) from {addr} sharing no keyword with the search",
+                            results.len() - search_results.len()
+                        );
+                    }
                     // Extracted into owned values (rather than an `as_ref()`
                     // binding kept alive across the call below) so the
                     // `dedup_streamed_batch` call can take `active_search_request`
@@ -610,13 +650,37 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
                         kws,
                     )) = active_ctx
                     {
-                        state.server_udp_search_age = 0;
+                        // Rows answering another search are no reason to keep
+                        // waiting on this one's stragglers.
+                        if !search_results.is_empty() {
+                            state.server_udp_search_age = 0;
+                        }
                         let mut search_results = search_results;
                         let resights = dedup_streamed_batch(
                             &mut state.active_search_request,
                             request_id,
                             &mut search_results,
                         );
+                        let skip_hashes = {
+                            let idx = local_index.read().await;
+                            let mgr = transfer_manager.read().await;
+                            owned_or_downloading_search_hashes(
+                                search_results
+                                    .iter()
+                                    .chain(resights.iter())
+                                    .map(|r| r.file.hash.as_str()),
+                                &idx,
+                                &mgr,
+                                &state.pending_downloads,
+                            )
+                        };
+                        if let Some(active) = state
+                            .active_search_request
+                            .as_mut()
+                            .filter(|a| a.request_id == request_id)
+                        {
+                            note_ed2k_batch_availability(active, &mut search_results, &skip_hashes);
+                        }
                         let mut batch_spam = take_search_batch_spam(state, request_id);
                         let udp_server_ip = addr.ip().to_string();
                         let emitted = enrich_and_emit_search_results(
@@ -636,27 +700,9 @@ pub(in crate::network) async fn on_server_udp_ping_tick(
                             Some(&mut batch_spam),
                         ).await;
                         store_search_batch_spam(state, request_id, batch_spam);
-                        let skip_hashes = {
-                            let idx = local_index.read().await;
-                            let mgr = transfer_manager.read().await;
-                            owned_or_downloading_search_hashes(
-                                emitted
-                                    .iter()
-                                    .chain(resights.iter())
-                                    .map(|r| r.file.hash.as_str()),
-                                &idx,
-                                &mgr,
-                                &state.pending_downloads,
-                            )
-                        };
                         if let Some(active) = state.active_search_request.as_mut() {
                             if active.request_id == request_id {
                                 mark_streamed_hashes(active, &emitted);
-                                let _ = note_ed2k_search_results(
-                                    active,
-                                    &emitted,
-                                    &skip_hashes,
-                                );
                                 emit_search_resight_updates(
                                     app_handle,
                                     request_id,

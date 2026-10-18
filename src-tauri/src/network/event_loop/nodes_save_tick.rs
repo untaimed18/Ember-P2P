@@ -44,6 +44,9 @@ pub(in crate::network) async fn on_nodes_save_tick(
     // session. Retiring an address is a once-per-session decision
     // and belongs to the shutdown path. Still skipped when empty, so
     // a brand-new profile doesn't churn a zero-contact file.
+    if matches!(state.ember_nodes_file, ember::dht::bootstrap::NodesFileState::Unread) {
+        retry_unread_ember_nodes(state).await;
+    }
     let live = ember_persistable_contacts(state);
     state.ember_bootstrap_cache.observe(live.iter());
     let local_id = state.ember_dht.local_id();
@@ -92,5 +95,50 @@ pub(in crate::network) async fn on_nodes_save_tick(
                 error!("Failed periodic nodes_ember.dat save: {e}");
             }
         });
+    }
+}
+
+/// Read `nodes_ember.dat` again when the launch read failed with the file
+/// still there.
+///
+/// That failure leaves the save guard armed, and rightly — the file may hold
+/// peers this session has never heard of — but nothing ever re-read it, so a
+/// sharing violation that lasted a second at launch (antivirus, the indexer,
+/// backup software) kept every peer this session met out of the file until the
+/// next restart. Bounded, and off the loop like the launch read, so a file that
+/// is still locked costs one short wait per save and is tried again next time.
+async fn retry_unread_ember_nodes(state: &mut NetworkState) {
+    let path = state.data_dir.join("nodes_ember.dat");
+    let load_path = path.clone();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            load_path
+                .exists()
+                .then(|| ember::dht::bootstrap::load_nodes_with_state(&load_path))
+        }),
+    )
+    .await;
+    match read {
+        // Gone since launch: nothing left to preserve.
+        Ok(Ok(None)) => state.ember_nodes_file = ember::dht::bootstrap::NodesFileState::Loaded,
+        Ok(Ok(Some(Ok((entries, file_state))))) => {
+            info!(
+                "Read nodes_ember.dat on retry: {} remembered Ember peer(s)",
+                entries.len()
+            );
+            state.ember_bootstrap_cache.merge_late_load(entries);
+            state.ember_nodes_file = file_state;
+        }
+        Ok(Ok(Some(Err(e)))) => {
+            if matches!(e, ember::dht::bootstrap::NodesLoadError::Corrupt(_)) {
+                state.ember_nodes_file =
+                    ember::dht::bootstrap::settle_unloadable_nodes(&path, &e);
+            } else {
+                debug!("nodes_ember.dat still unreadable; will retry at the next save: {e}");
+            }
+        }
+        Ok(Err(e)) => debug!("nodes_ember.dat retry task failed: {e}"),
+        Err(_) => debug!("nodes_ember.dat retry read timed out; will retry at the next save"),
     }
 }

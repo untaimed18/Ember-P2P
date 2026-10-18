@@ -28,8 +28,8 @@ static LAST_CHECK_THIS_SESSION: parking_lot::Mutex<Option<i64>> = parking_lot::M
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateRecord {
     /// Unix seconds of the last update check, manual or automatic, whatever its
-    /// outcome. An attempt counts even when it fails, so "check weekly" retries
-    /// roughly weekly rather than on every poll after one offline evening.
+    /// outcome. An attempt counts even when it fails, so an offline machine
+    /// retries hourly rather than on every poll.
     #[serde(default)]
     pub last_check_at: Option<i64>,
     /// "Not now" on the silent-update countdown: no silent install before this
@@ -170,29 +170,18 @@ pub fn last_check_at(dir: &Path) -> Option<i64> {
     this_session.or_else(|| load(dir).last_check_at)
 }
 
-/// Every value `update_check_frequency` may take.
-pub const CHECK_FREQUENCIES: &[&str] = &["hourly", "daily", "weekly", "monthly"];
-
-/// Seconds between automatic checks for a `update_check_frequency` value.
-/// Anything unrecognised falls back to daily, the default.
-pub fn check_interval_secs(frequency: &str) -> i64 {
-    match frequency {
-        "hourly" => 3600,
-        "weekly" => 7 * 24 * 3600,
-        "monthly" => 30 * 24 * 3600,
-        _ => 24 * 3600,
-    }
-}
+/// Seconds between automatic checks while Ember keeps running.
+pub const CHECK_INTERVAL_SECS: i64 = 3600;
 
 /// Whether an automatic check is due at `now` (Unix seconds).
-pub fn check_due(last_check_at: Option<i64>, now: i64, frequency: &str) -> bool {
+pub fn check_due(last_check_at: Option<i64>, now: i64) -> bool {
     let Some(last) = last_check_at else {
         return true;
     };
     if last > now.saturating_add(MAX_FUTURE_SKEW_SECS) {
         return true;
     }
-    now.saturating_sub(last) >= check_interval_secs(frequency)
+    now.saturating_sub(last) >= CHECK_INTERVAL_SECS
 }
 
 #[cfg(test)]
@@ -218,40 +207,25 @@ mod tests {
 
     #[test]
     fn due_when_never_checked() {
-        assert!(check_due(None, NOW, "weekly"));
+        assert!(check_due(None, NOW));
     }
 
     #[test]
-    fn follows_the_configured_interval() {
-        let two_days_ago = Some(NOW - 2 * DAY);
-        assert!(check_due(two_days_ago, NOW, "daily"));
-        assert!(!check_due(two_days_ago, NOW, "weekly"));
-        assert!(!check_due(two_days_ago, NOW, "monthly"));
-        assert!(check_due(Some(NOW - 31 * DAY), NOW, "monthly"));
-    }
-
-    #[test]
-    fn hourly_checks_once_an_hour() {
-        assert!(!check_due(Some(NOW - 3600 + 60), NOW, "hourly"));
-        assert!(check_due(Some(NOW - 3600), NOW, "hourly"));
-    }
-
-    #[test]
-    fn unknown_frequency_is_daily() {
-        assert!(!check_due(Some(NOW - DAY + 60), NOW, "yearly"));
-        assert!(check_due(Some(NOW - DAY), NOW, "yearly"));
+    fn checks_once_an_hour() {
+        assert!(!check_due(Some(NOW - 3600 + 60), NOW));
+        assert!(check_due(Some(NOW - 3600), NOW));
+        assert!(check_due(Some(NOW - 2 * DAY), NOW));
     }
 
     #[test]
     fn tolerates_a_stamp_slightly_ahead_of_the_clock() {
-        assert!(!check_due(Some(NOW + 60), NOW, "daily"));
+        assert!(!check_due(Some(NOW + 60), NOW));
     }
 
     #[test]
     fn a_stamp_from_before_the_clock_stepped_back_counts_as_never_checked() {
-        assert!(check_due(Some(NOW + 3600), NOW, "daily"));
-        assert!(check_due(Some(NOW + 20 * 3600), NOW, "hourly"));
-        assert!(check_due(Some(NOW + 365 * DAY), NOW, "monthly"));
+        assert!(check_due(Some(NOW + 3600), NOW));
+        assert!(check_due(Some(NOW + 365 * DAY), NOW));
     }
 
     #[test]

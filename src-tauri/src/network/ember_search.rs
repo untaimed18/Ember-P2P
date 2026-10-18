@@ -14,7 +14,377 @@ use super::*;
 ///
 /// Called when a lookup starts, when a `FOUND_NODE` advances it, and
 /// from the staleness sweep after a query is marked failed.
+///
+/// The first drive of a user keyword search is also where its other walks
+/// start, if its query needs any (see [`start_ember_companion_walks`]): every
+/// caller that starts a keyword search drives it straight away.
 pub(super) async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkState, search_id: u32) {
+    if let Some(ember::dht::search::Companion::FeedsInto(main)) =
+        state.ember_search.get(search_id).map(|s| s.companion)
+    {
+        // The search it was gathering for is gone — cancelled, or reaped.
+        if state.ember_search.get(main).is_none() {
+            state.ember_search.remove(search_id);
+            state
+                .ember_dht_search_requests
+                .retain(|_, r| r.search_id != search_id);
+            return;
+        }
+    }
+    if state.ember_keyword_searches.contains_key(&search_id) {
+        if let Some(search) = state.ember_search.get_mut(search_id) {
+            search.mark_keyword_lookup();
+        }
+    }
+    let walks = start_ember_companion_walks(state, search_id);
+    drive_ember_search_once(socket, state, search_id).await;
+    for walk in walks {
+        drive_ember_search_once(socket, state, walk).await;
+    }
+}
+
+/// Most branches of an `OR` query one keyword search walks, its own walk's
+/// included. Within [`MAX_EMBER_FEEDING_WALKS`].
+const MAX_EMBER_OR_BRANCHES: usize = 3;
+
+/// Most walks one keyword search runs besides its own — its second spelling
+/// and its `OR` branches, each branch with one second spelling at most. Each is
+/// a slot of the pool shared with every other lookup, and those the user's
+/// searches can take are held back from background work, so one search may not
+/// spend them all; the pool also keeps its last slots from these walks
+/// (`start_feeding_find_value`).
+const MAX_EMBER_FEEDING_WALKS: usize = 4;
+
+/// Start the other walks a keyword search needs, each feeding its records into
+/// the search's own (see `Companion::FeedsInto`):
+///
+/// - Its *companion*, when the word its own walk is on hashes, as typed, to a
+///   different key than its normalised form. The normalised key is what the
+///   search itself walks (`compute_keyword_hashes` normalises). A publisher
+///   from before normalisation filed the same spelling under the other key, so
+///   without this walk a search typed in, say, decomposed accents would stop
+///   finding what every older release publishes.
+/// - One per branch of an `OR` its own key does not cover.
+///
+/// See [`ember_walk_plan`]. Asked once per search, on its first drive. Returns
+/// the walks started; a walk the pool has no slot for is left out.
+fn start_ember_companion_walks(state: &mut NetworkState, search_id: u32) -> Vec<u32> {
+    use ember::dht::search::Companion;
+    let mut started = Vec::new();
+    let Some(search) = state.ember_search.get_mut(search_id) else {
+        return started;
+    };
+    if search.companion != Companion::Unconsidered {
+        return started;
+    }
+    search.companion = Companion::None;
+    let constraints = search.value_constraints().clone();
+    let Some(kw) = state.ember_keyword_searches.get(&search_id) else {
+        return started;
+    };
+    let plan = ember_walk_plan(&kw.keywords, kw.query_expr.as_ref());
+    if let Some((legacy, extras)) = plan.companion {
+        if let Some(walk) = start_ember_feeding_walk(state, search_id, legacy, extras, &constraints) {
+            if let Some(search) = state.ember_search.get_mut(search_id) {
+                search.companion = Companion::Running(walk);
+            }
+            started.push(walk);
+        }
+    }
+    for (key, extras) in plan.branches {
+        if let Some(walk) = start_ember_feeding_walk(state, search_id, key, extras, &constraints) {
+            if let Some(search) = state.ember_search.get_mut(search_id) {
+                search.branch_walks.push(walk);
+            }
+            started.push(walk);
+        }
+    }
+    started
+}
+
+/// One walk that feeds `main` (see [`start_ember_companion_walks`]), asking
+/// what `main` asks.
+fn start_ember_feeding_walk(
+    state: &mut NetworkState,
+    main: u32,
+    key: [u8; 16],
+    extras: Vec<[u8; 16]>,
+    constraints: &ember::dht::messages::ValueConstraints,
+) -> Option<u32> {
+    let walk = state.ember_search.start_feeding_find_value(
+        ember::dht::EmberNodeId(key),
+        extras.clone(),
+        state.ember_dht.routing(),
+    )?;
+    if let Some(search) = state.ember_search.get_mut(walk) {
+        search.companion = ember::dht::search::Companion::FeedsInto(main);
+        search.set_value_constraints(constraints.clone());
+        search.mark_keyword_lookup();
+    }
+    seed_ember_local_records(state, walk, &key, &extras);
+    seed_ember_session_search_contacts(state, walk);
+    Some(walk)
+}
+
+/// The walks still running that feed `search_id`: its companion and its `OR`
+/// branch walks.
+pub(super) fn ember_feeding_walks(searches: &ember::dht::search::SearchManager, search_id: u32) -> Vec<u32> {
+    use ember::dht::search::Companion;
+    let Some(search) = searches.get(search_id) else {
+        return Vec::new();
+    };
+    let companion = match search.companion {
+        Companion::Running(walk) => Some(walk),
+        _ => None,
+    };
+    companion
+        .into_iter()
+        .chain(search.branch_walks.iter().copied())
+        .filter(|walk| {
+            searches
+                .get(*walk)
+                .is_some_and(|w| w.companion == Companion::FeedsInto(search_id))
+        })
+        .collect()
+}
+
+/// The key a keyword search's companion walk goes to and the extra keys it
+/// sends: the word `walked` was hashed from, as typed, when that hashes
+/// elsewhere, with the rest of the query as typed as a peer that predates
+/// normalisation would send it — none for a query with an `OR`, like the main
+/// walk.
+///
+/// The typed word is the one whose normalised form is `walked`, which need not
+/// be the longest typed word: the two spellings can differ in length. Walking
+/// the longest instead could put the companion on a word of another `OR`
+/// branch, leaving the search's own word unwalked in its older spelling. A
+/// query whose typed words none normalise to `walked` falls back to its longest
+/// typed word, unless it has an `OR`.
+pub(super) fn ember_spelling_walk_keys(
+    keywords: &[String],
+    query_expr: Option<&crate::search::query::QueryExpr>,
+    walked: &[u8; 16],
+) -> Option<([u8; 16], Vec<[u8; 16]>)> {
+    use ember::dht::search::{compute_keyword_hashes, extra_keyword_hashes, legacy_keyword_hashes};
+    let query = ember_walk_query(keywords, query_expr);
+    let mut hashed = legacy_keyword_hashes(&query);
+    let intersect = !query_expr.is_some_and(|e| e.contains_or());
+    let own = hashed
+        .iter()
+        .position(|(_, word)| compute_keyword_hashes(word).iter().any(|(key, _)| key == walked));
+    match own {
+        Some(at) => {
+            let word = hashed.remove(at);
+            hashed.insert(0, word);
+        }
+        None if !intersect => return None,
+        None => {}
+    }
+    let legacy = hashed.first()?.0;
+    if legacy == *walked {
+        return None;
+    }
+    let extras = extra_keyword_hashes(&hashed, intersect)
+        .into_iter()
+        .filter(|key| *key != legacy)
+        .collect();
+    Some((legacy, extras))
+}
+
+/// The walks a keyword search runs besides its own, as `(key, extra keys)`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct EmberWalkPlan {
+    /// Its own word in its older spelling (see [`ember_spelling_walk_keys`]).
+    pub(super) companion: Option<([u8; 16], Vec<[u8; 16]>)>,
+    /// The `OR` branches its own key does not cover.
+    pub(super) branches: Vec<([u8; 16], Vec<[u8; 16]>)>,
+}
+
+impl EmberWalkPlan {
+    fn keys(&self) -> impl Iterator<Item = [u8; 16]> + '_ {
+        self.companion.iter().chain(&self.branches).map(|(key, _)| *key)
+    }
+}
+
+/// Every walk a keyword search runs besides its own, at most
+/// [`MAX_EMBER_FEEDING_WALKS`], none on a key another walk of the search
+/// already takes.
+///
+/// The `OR` branches come in only for a query no term of which every match
+/// contains: otherwise the search's own walk is on such a term
+/// ([`ember_walk_query`]) and finds every match. Without one it walks the
+/// longest positive term, which covers only the branches that contain it, and
+/// the files matching through any other branch live under keys it never
+/// visits. At most [`MAX_EMBER_OR_BRANCHES`] branches are walked, the
+/// search's own included. A branch's terms are all in every file it matches,
+/// so its walk sends its other terms as extra keys; branches sharing a key share
+/// one walk, sending the extra keys they have in common. A branch is walked in
+/// its spelling as typed too, where that hashes elsewhere, once at most — after
+/// every branch has its normalised walk, and as the cap allows.
+pub(super) fn ember_walk_plan(
+    keywords: &[String],
+    query_expr: Option<&crate::search::query::QueryExpr>,
+) -> EmberWalkPlan {
+    use ember::dht::search::{compute_keyword_hashes, legacy_keyword_hashes};
+    let mut plan = EmberWalkPlan::default();
+    let Some((own_key, _)) = compute_keyword_hashes(&ember_walk_query(keywords, query_expr))
+        .first()
+        .cloned()
+    else {
+        return plan;
+    };
+    plan.companion = ember_spelling_walk_keys(keywords, query_expr, &own_key);
+    let Some(expr) = query_expr.filter(|expr| expr.required_terms().is_empty()) else {
+        return plan;
+    };
+    let mut taken: Vec<[u8; 16]> = std::iter::once(own_key).chain(plan.keys()).collect();
+    // The branches each walk serves, by its normalised key.
+    let mut groups: Vec<([u8; 16], Vec<String>)> = Vec::new();
+    for branch in ember_or_branches(expr) {
+        let query = branch.join(" ");
+        let hashed = compute_keyword_hashes(&query);
+        let Some((key, _)) = hashed.first() else {
+            continue;
+        };
+        if hashed.iter().any(|(k, _)| *k == own_key) {
+            continue;
+        }
+        if let Some((_, queries)) = groups.iter_mut().find(|(k, _)| k == key) {
+            queries.push(query);
+        } else if !taken.contains(key) && groups.len() + 1 < MAX_EMBER_OR_BRANCHES {
+            groups.push((*key, vec![query]));
+        }
+    }
+    let mut typed_walks = Vec::new();
+    for (key, queries) in &groups {
+        taken.push(*key);
+        plan.branches.push((*key, common_extra_keys(queries.iter(), compute_keyword_hashes, *key)));
+        let typed_key = |query: &String| legacy_keyword_hashes(query).first().map(|(k, _)| *k);
+        if let Some(typed) = queries.iter().filter_map(typed_key).find(|typed| typed != key) {
+            let spelled = queries.iter().filter(|query| typed_key(query) == Some(typed));
+            typed_walks.push((typed, common_extra_keys(spelled, legacy_keyword_hashes, typed)));
+        }
+    }
+    for (typed, extras) in typed_walks {
+        if !taken.contains(&typed) {
+            taken.push(typed);
+            plan.branches.push((typed, extras));
+        }
+    }
+    let room = MAX_EMBER_FEEDING_WALKS.saturating_sub(usize::from(plan.companion.is_some()));
+    plan.branches.truncate(room);
+    plan
+}
+
+/// The extra keys every one of `queries` sends when hashed by `hash`, its
+/// primary key aside: what a walk serving all of them may ask responders to
+/// intersect on.
+fn common_extra_keys<'a>(
+    queries: impl IntoIterator<Item = &'a String>,
+    hash: fn(&str) -> Vec<([u8; 16], String)>,
+    primary: [u8; 16],
+) -> Vec<[u8; 16]> {
+    let mut common: Option<Vec<[u8; 16]>> = None;
+    for query in queries {
+        let mine: Vec<[u8; 16]> = ember::dht::search::extra_keyword_hashes(&hash(query), true)
+            .into_iter()
+            .filter(|key| *key != primary)
+            .collect();
+        common = Some(match common {
+            None => mine,
+            Some(held) => held.into_iter().filter(|key| mine.contains(key)).collect(),
+        });
+    }
+    common.unwrap_or_default()
+}
+
+/// Sets of terms that between them cover a query: every file it matches
+/// contains every term of at least one set. One set per side of each `OR`; an
+/// `AND` takes the side with fewer sets, each joined by what the other side
+/// requires; the excluded side of a `NOT` adds nothing.
+fn ember_or_branches(expr: &crate::search::query::QueryExpr) -> Vec<Vec<String>> {
+    use crate::search::query::QueryExpr;
+    match expr {
+        QueryExpr::Term(term) => vec![vec![term.clone()]],
+        QueryExpr::Or(l, r) => {
+            let mut branches = ember_or_branches(l);
+            for branch in ember_or_branches(r) {
+                if !branches.contains(&branch) {
+                    branches.push(branch);
+                }
+            }
+            branches
+        }
+        QueryExpr::And(l, r) => {
+            let (left, right) = (ember_or_branches(l), ember_or_branches(r));
+            let (mut branches, other) = if right.len() < left.len() { (right, l) } else { (left, r) };
+            let required = other.required_terms();
+            for branch in &mut branches {
+                for term in &required {
+                    if !branch.contains(term) {
+                        branch.push(term.clone());
+                    }
+                }
+            }
+            branches
+        }
+        QueryExpr::Not(l, _) => ember_or_branches(l),
+    }
+}
+
+/// What [`maybe_finish_ember_search`] does with a completed search, as far as
+/// the walks feeding it are concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CompanionStep {
+    /// Report the search as usual.
+    Report,
+    /// Hold it: a walk feeding it, or the one it feeds, is still walking.
+    Wait,
+    /// It fed this search and has handed its records over; the search should
+    /// now be looked at again.
+    HandedTo(u32),
+    /// It fed a search that is gone; it has been dropped.
+    Dropped,
+}
+
+/// Settle a search's links to the walks feeding it, or to the one it feeds,
+/// once it may need reporting. A walk feeding a search is settled whether or
+/// not it has finished when that search is gone, so a cancelled search's walks
+/// stop at the next sweep.
+pub(super) fn settle_ember_companion(
+    searches: &mut ember::dht::search::SearchManager,
+    search_id: u32,
+    complete: bool,
+) -> CompanionStep {
+    use ember::dht::search::Companion;
+    let Some(companion) = searches.get(search_id).map(|s| s.companion) else {
+        return CompanionStep::Report;
+    };
+    match companion {
+        Companion::FeedsInto(main) if searches.get(main).is_none() => {
+            searches.remove(search_id);
+            CompanionStep::Dropped
+        }
+        Companion::FeedsInto(main) if complete => {
+            if let Some(walk) = searches.remove(search_id) {
+                if let Some(search) = searches.get_mut(main) {
+                    search.absorb_walk(walk);
+                    if search.companion == Companion::Running(search_id) {
+                        search.companion = Companion::None;
+                    }
+                    search.branch_walks.retain(|w| *w != search_id);
+                }
+            }
+            CompanionStep::HandedTo(main)
+        }
+        Companion::FeedsInto(_) => CompanionStep::Wait,
+        _ if !ember_feeding_walks(searches, search_id).is_empty() => CompanionStep::Wait,
+        _ => CompanionStep::Report,
+    }
+}
+
+/// One round of [`drive_ember_search`] for one search.
+async fn drive_ember_search_once(socket: &UdpSocket, state: &mut NetworkState, search_id: u32) {
     // A FIND_NODE search queries by target id; a FIND_VALUE search queries
     // by the record key(s) (the primary key plus any extra keyword hashes
     // for multi-keyword lookups), and a peer answers either with the
@@ -56,7 +426,10 @@ pub(super) async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkSt
             request_id: per_search_req_id,
             start_position,
             resume_after,
+            find_node,
+            narrow,
         } = query;
+        let asks_for_nodes = find_node || search_type == ember::dht::search::SearchType::FindNode;
         // The shortlist is not the routing table, and its contents arrive
         // straight out of a peer's `FOUND_NODE`. The table refuses an address
         // its IP policy blocks, but a search dialled its own shortlist
@@ -101,22 +474,14 @@ pub(super) async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkSt
             }
             continue;
         }
-        let (wire_req_id, frame) = match search_type {
-            ember::dht::search::SearchType::FindNode => state.ember_dht.build_find_node(target),
-            ember::dht::search::SearchType::FindValue => {
-                let mut keys = Vec::with_capacity(1 + extra_keys.len());
-                keys.push(target.0);
-                keys.extend_from_slice(&extra_keys);
-                // Non-zero on a page follow-up: this node already answered and
-                // said it holds records past what its datagram could carry.
-                state.ember_dht.build_find_value_resuming(
-                    keys,
-                    start_position,
-                    constraints.clone(),
-                    resume_after,
-                )
-            }
-        };
+        let (wire_req_id, frame) = ember_search_query_frame(
+            &mut state.ember_dht,
+            target,
+            asks_for_nodes,
+            &extra_keys,
+            &constraints,
+            (start_position, resume_after, narrow),
+        );
 
         // Tracked separately from `send_ok`: a query still sitting behind a
         // handshake has not reached the peer yet, so the ordinary query budget
@@ -195,14 +560,14 @@ pub(super) async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkSt
                         ember::dht::search::QueryFailure::NotSent,
                     )
                 });
-            if let Some(node_id) = failed {
-                fault_ember_search_contact(state, &node_id);
+            if failed.is_some() {
+                fault_ember_search_contact(state, &contact);
             }
             continue;
         }
 
         if !behind_handshake {
-            if search_type == ember::dht::search::SearchType::FindNode {
+            if asks_for_nodes {
                 state.ember_diagnostics.ember_dht_find_nodes_sent = state
                     .ember_diagnostics
                     .ember_dht_find_nodes_sent
@@ -258,6 +623,38 @@ pub(super) async fn drive_ember_search(socket: &UdpSocket, state: &mut NetworkSt
     maybe_finish_ember_search(state, search_id);
 }
 
+/// The frame one search query goes out as: a `FIND_NODE` for `target`, or a
+/// `FIND_VALUE` for it — with the search's extra keys and constraints only
+/// when the query is `narrow` (see `QueryTarget::narrow`), and from
+/// `start_position` past the `resume_after` anchors for a page follow-up.
+fn ember_search_query_frame(
+    dht: &mut ember::dht::engine::EmberDht,
+    target: ember::dht::EmberNodeId,
+    asks_for_nodes: bool,
+    extra_keys: &[[u8; 16]],
+    constraints: &ember::dht::messages::ValueConstraints,
+    (start_position, resume_after, narrow): (u16, ember::dht::messages::ResumeAnchors, bool),
+) -> (u32, Vec<u8>) {
+    if asks_for_nodes {
+        return dht.build_find_node(target);
+    }
+    let mut keys = Vec::with_capacity(1 + extra_keys.len());
+    keys.push(target.0);
+    if narrow {
+        keys.extend_from_slice(extra_keys);
+    }
+    dht.build_find_value_resuming(
+        keys,
+        start_position,
+        if narrow {
+            constraints.clone()
+        } else {
+            ember::dht::messages::ValueConstraints::default()
+        },
+        resume_after,
+    )
+}
+
 /// Resolve and tear down an iterative lookup if it has converged. Safe
 /// to call after every batch / response; a no-op while the search is
 /// still in progress.
@@ -266,8 +663,26 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
         Some(s) => (s.poll_complete(), s.search_type),
         None => return,
     };
-    if !complete {
-        return;
+    // A companion walk hands what it found to its search, which then reports
+    // for both; that search is held until then, or the rows of the companion's
+    // key would arrive after it had reported complete — bounded by the
+    // companion's own timeout, which runs from the same moment.
+    match settle_ember_companion(&mut state.ember_search, search_id, complete) {
+        CompanionStep::Report if complete => {}
+        CompanionStep::Report | CompanionStep::Wait => return,
+        CompanionStep::Dropped => {
+            state
+                .ember_dht_search_requests
+                .retain(|_, r| r.search_id != search_id);
+            return;
+        }
+        CompanionStep::HandedTo(main) => {
+            state
+                .ember_dht_search_requests
+                .retain(|_, r| r.search_id != search_id);
+            maybe_finish_ember_search(state, main);
+            return;
+        }
     }
 
     // A FIND_NODE lookup resolves with the closest contacts that
@@ -632,19 +1047,101 @@ pub(super) struct EmberKeywordBuilt {
     /// bound. The count travels with the digest so a later or more complete
     /// walk can supersede a pin made on thinner evidence.
     pub(super) corroborated: Vec<([u8; 16], [u8; 32], usize)>,
-    /// `(file hash, publisher key)` of every publisher a row's `availability`
-    /// counts — verified, under the walked key, and past the query filter.
+    /// `(file hash, publisher key)` of every publisher a file's rows count —
+    /// [`Self::counted_rows`] without the sizes.
+    #[cfg(test)]
     pub(super) counted_publishers: Vec<([u8; 16], [u8; 32])>,
+    /// Every publisher a row's `availability` counts — verified, under a
+    /// walked key, and past the query filter — by the row that counts it. The
+    /// streaming path compares these between rebuilds to tell which rows moved.
+    pub(super) counted_rows: Vec<(EmberRowKey, [u8; 32])>,
 }
 
-/// `(file hash, publisher key)` of a keyword-record value blob, read without
-/// the signature check: [`build_ember_keyword_built`] makes that one anyway.
-pub(super) fn ember_record_publisher(blob: &[u8]) -> Option<([u8; 16], [u8; 32])> {
-    let split = blob.len().checked_sub(64)?;
-    let (data, signature) = blob.split_at(split);
-    let rec =
-        ember::dht::publish::SignedRecord::parse_unverified(data, signature.try_into().ok()?)?;
-    Some((rec.file_hash, rec.publisher_key))
+/// The rows of a streaming rebuild worth sending, with `stream` (see
+/// `EmberKeywordSearch::streamed_publishers`) brought up to date.
+///
+/// A row already sent goes out again when the publishers it counts differ
+/// from those the last batch carrying it counted — as sets rather than counts,
+/// so a row whose plurality digest flipped to as many other publishers still
+/// goes. A row not yet sent waits until two publishers give it, or until the
+/// next rebuild, whichever comes first: the search page keeps the name a row
+/// first arrives with, and a row sent off the first record to arrive would
+/// show whatever that one record says. The closing batch sends every row.
+///
+/// The digest is taken off every row sent: only the closing build can say a
+/// digest is contested, which it does with an empty field, and a merge cannot
+/// tell that from "no claim" and so would leave a streamed digest pinned — the
+/// one a click enforces at completion.
+pub(super) fn ember_stream_rows(stream: &mut HashSet<EmberStreamMark>, built: EmberKeywordBuilt) -> Vec<SearchResult> {
+    let mut counted: HashMap<EmberRowKey, HashSet<[u8; 32]>> = HashMap::new();
+    for (row, publisher) in built.counted_rows {
+        counted.entry(row).or_default().insert(publisher);
+    }
+    let mut sent: HashMap<EmberRowKey, HashSet<[u8; 32]>> = HashMap::new();
+    for mark in stream.iter() {
+        if let EmberStreamMark::Sent(row, publisher) = mark {
+            sent.entry(*row).or_default().insert(*publisher);
+        }
+    }
+    let mut out = Vec::new();
+    let mut resent: HashMap<EmberRowKey, HashSet<[u8; 32]>> = HashMap::new();
+    for mut row in built.results {
+        let Some(key) = ember_row_key(&row) else {
+            continue;
+        };
+        let now = counted.remove(&key).unwrap_or_default();
+        let due = match sent.get(&key) {
+            Some(before) => *before != now,
+            None => now.len() >= 2 || stream.contains(&EmberStreamMark::Held(key)),
+        };
+        if !due {
+            if !sent.contains_key(&key) {
+                stream.insert(EmberStreamMark::Held(key));
+            }
+            continue;
+        }
+        row.file.ember_file_hash.clear();
+        out.push(row);
+        resent.insert(key, now);
+    }
+    stream.retain(|mark| match mark {
+        EmberStreamMark::Sent(row, _) | EmberStreamMark::Held(row) => !resent.contains_key(row),
+    });
+    for (row, publishers) in resent {
+        stream.extend(publishers.into_iter().map(|publisher| EmberStreamMark::Sent(row, publisher)));
+    }
+    out
+}
+
+/// Whether a streaming rebuild holds a row back for the next one.
+pub(super) fn ember_rows_held(stream: &HashSet<EmberStreamMark>) -> bool {
+    stream.iter().any(|mark| matches!(mark, EmberStreamMark::Held(_)))
+}
+
+fn ember_row_key(row: &SearchResult) -> Option<EmberRowKey> {
+    let hash: [u8; 16] = hex::decode(&row.file.hash).ok()?.try_into().ok()?;
+    Some((hash, row.file.size))
+}
+
+/// Count the rows of one Ember batch that are on screen toward the progress
+/// figure of the lookup running for `request_id`
+/// (`EmberKeywordSearch::streamed_files`): those the emit accepted, as it
+/// returned them, and those already shown that the lookup found again. A row
+/// the emit's filters dropped is in neither. The closing batch finds no lookup:
+/// it is gone by the time that batch is emitted.
+pub(super) fn note_ember_rows_shown(
+    keyword_searches: &mut HashMap<u32, EmberKeywordSearch>,
+    request_id: u64,
+    emitted: &[SearchResult],
+    resights: &[SearchResult],
+) {
+    if let Some(kw) = keyword_searches
+        .values_mut()
+        .find(|kw| kw.request_id == request_id)
+    {
+        kw.streamed_files
+            .extend(emitted.iter().chain(resights).map(|row| row.file.hash.clone()));
+    }
 }
 
 /// The text an Ember keyword search hashes its walk key from: the terms every
@@ -665,18 +1162,156 @@ pub(super) fn ember_walk_query(
     }
 }
 
+/// Which keyword records an Ember keyword search may show: those its walk could
+/// legitimately have found.
+///
+/// Anyone may STORE a signed record under any key, and a record proves only the
+/// key it was signed for. A record under `ubuntu` whose name has no `ubuntu` in
+/// it was not put there by a publisher deriving keys from that name, so it is
+/// dropped however it got there. Asked of the raw name the record signs, with
+/// the publishers' own derivations, so no honest record is lost.
+///
+/// A name long enough to have been shortened to fit the record (see
+/// `publish::record_name_may_be_clamped`) is the one exception: a publisher
+/// before 1.7.4 derived its keys from the whole name and signed the shortened
+/// one, so the key's word may be past the cut. Such a record is not held to the
+/// derivation or to carrying the key's own word; every other required word it
+/// must still carry.
+pub(super) struct EmberKeywordMatcher {
+    /// Keys the search walks: the normalised primary key and those of
+    /// [`ember_walk_plan`]. Empty only for a query with no word long enough to
+    /// hash, which never starts a walk.
+    walk_keys: Vec<[u8; 16]>,
+    /// Every word each match must contain — all the keywords, or the terms on
+    /// every side of a boolean query — as the key of its typed spelling and the
+    /// keys of its normalised form. A match must carry each as a word of its
+    /// name in one spelling or the other.
+    words: Vec<RequiredWord>,
+}
+
+struct RequiredWord {
+    typed: [u8; 16],
+    normalised: Vec<[u8; 16]>,
+}
+
+impl EmberKeywordMatcher {
+    pub(super) fn new(
+        keywords: &[String],
+        query_expr: Option<&crate::search::query::QueryExpr>,
+    ) -> Self {
+        use ember::dht::search::{compute_keyword_hashes, legacy_keyword_hashes};
+        let query = ember_walk_query(keywords, query_expr);
+        let mut walk_keys = Vec::new();
+        let own = compute_keyword_hashes(&query).first().map(|(key, _)| *key);
+        let plan = ember_walk_plan(keywords, query_expr);
+        for key in own.into_iter().chain(plan.keys()) {
+            if !walk_keys.contains(&key) {
+                walk_keys.push(key);
+            }
+        }
+        let required = match query_expr {
+            Some(expr) => expr.required_terms().join(" "),
+            None => keywords.join(" "),
+        };
+        let words = legacy_keyword_hashes(&required)
+            .into_iter()
+            .map(|(typed, word)| RequiredWord {
+                typed,
+                normalised: compute_keyword_hashes(&word)
+                    .into_iter()
+                    .map(|(k, _)| k)
+                    .collect(),
+            })
+            .collect();
+        Self { walk_keys, words }
+    }
+
+    /// `clamped` says the record's name may have been shortened to fit it.
+    pub(super) fn accepts(&self, rec: &ember::dht::publish::SignedRecord, clamped: bool) -> bool {
+        if self.walk_keys.is_empty() {
+            return true;
+        }
+        if !self.walk_keys.contains(&rec.keyword_hash) {
+            return false;
+        }
+        if !clamped && !ember::dht::search::name_hashes_to_key(&rec.file_name, &rec.keyword_hash) {
+            return false;
+        }
+        if self.words.len() < 2 && !clamped {
+            return true;
+        }
+        let name_keys = ember::dht::search::name_word_keys(&rec.file_name);
+        self.words.iter().all(|word| {
+            name_keys.contains(&word.typed)
+                || (!word.normalised.is_empty()
+                    && word.normalised.iter().all(|k| name_keys.contains(k)))
+                || (clamped
+                    && (word.typed == rec.keyword_hash || word.normalised.contains(&rec.keyword_hash)))
+        })
+    }
+}
+
+/// A boolean query with each term held in both spellings, so a name matches
+/// a term written either way: the term as typed against the name lowercased
+/// as typed, or both normalised (see `normalize_keyword_text`). Built once per
+/// rebuild rather than per row.
+enum SpelledExpr {
+    Term { typed: String, normalised: String },
+    And(Box<SpelledExpr>, Box<SpelledExpr>),
+    Or(Box<SpelledExpr>, Box<SpelledExpr>),
+    Not(Box<SpelledExpr>, Box<SpelledExpr>),
+}
+
+impl SpelledExpr {
+    fn new(expr: &crate::search::query::QueryExpr) -> Self {
+        use crate::search::query::QueryExpr;
+        let both = |l: &QueryExpr, r: &QueryExpr| (Box::new(Self::new(l)), Box::new(Self::new(r)));
+        match expr {
+            QueryExpr::Term(term) => Self::Term {
+                typed: term.clone(),
+                normalised: ember::dht::search::normalize_keyword_text(term),
+            },
+            QueryExpr::And(l, r) => {
+                let (l, r) = both(l, r);
+                Self::And(l, r)
+            }
+            QueryExpr::Or(l, r) => {
+                let (l, r) = both(l, r);
+                Self::Or(l, r)
+            }
+            QueryExpr::Not(l, r) => {
+                let (l, r) = both(l, r);
+                Self::Not(l, r)
+            }
+        }
+    }
+
+    /// `typed` is the name lowercased as `QueryExpr::matches_name` does it,
+    /// `normalised` the same name normalised. A term is present when it is
+    /// present in either, which is also what a `NOT` excludes.
+    fn matches(&self, typed: &str, normalised: &str) -> bool {
+        match self {
+            Self::Term { typed: t, normalised: n } => typed.contains(t.as_str()) || normalised.contains(n.as_str()),
+            Self::And(l, r) => l.matches(typed, normalised) && r.matches(typed, normalised),
+            Self::Or(l, r) => l.matches(typed, normalised) || r.matches(typed, normalised),
+            Self::Not(l, r) => l.matches(typed, normalised) && !r.matches(typed, normalised),
+        }
+    }
+}
+
 /// Build search rows from Ember DHT keyword `FIND_VALUE` blobs (slice 10).
 ///
 /// Each blob is re-verified (`from_value_blob` checks the publisher
-/// signature), kept only if it is a keyword record whose embedded
-/// `keyword_hash` matches the primary query keyword (defense in depth vs
-/// a LOOKUP peer returning unrelated signed records), and -- for multi-word
-/// queries -- AND-filtered so every query keyword appears in the file name
-/// (the DHT key only matched the primary keyword). Multi-keyword queries
-/// already ask peers to intersect by `file_hash` on the wire; the filename
-/// filter is defense-in-depth (and for peers that only held the primary
-/// key). Records are deduped by eD2K file hash, with `availability`
-/// reflecting the number of distinct publishers. Sources are empty: a
+/// signature) and kept only if it is a keyword record filed under a key the
+/// search walked by a name that derives that key, carrying every word of the
+/// walked query (see [`EmberKeywordMatcher`]), and -- for multi-word queries --
+/// AND-filtered so every query keyword appears in the file name. Multi-keyword
+/// queries already ask peers to intersect on the wire; the filename filter is
+/// defense-in-depth (and for peers that predate that intersection). Records
+/// are deduped by eD2K file hash, with `availability`
+/// reflecting the number of distinct publishers, and the name and size the
+/// most of those publishers give (see [`ember_row_description`]). Sources are
+/// empty: a
 /// keyword hit identifies the file, and source discovery runs separately
 /// via the slice-9 source lookup when a download starts.
 ///
@@ -704,152 +1339,186 @@ pub(super) fn build_ember_keyword_built(
     keywords: &[String],
     query_expr: Option<&crate::search::query::QueryExpr>,
 ) -> EmberKeywordBuilt {
-    use crate::search::index::infer_file_type;
+    let reader = EmberRecordReader::new(keywords, query_expr);
+    let readings: Vec<_> = held
+        .iter()
+        .filter_map(|record| {
+            let reading = reader.read(record, ember::dht::publish::SignedRecord::from_value_blob)?;
+            Some((record, reading))
+        })
+        .collect();
+    fold_ember_keyword_rows(readings.iter().map(|(record, reading)| (*record, reading)))
+}
 
-    let kw_lower: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
-    // Boolean queries get the same treatment as the KAD result path. Falling
-    // back to the flat AND below would reject the non-matching half of an
-    // `OR` and ignore the excluded side of a `NOT`.
-    let expr = query_expr.filter(|e| !e.is_trivial());
-    // Must be the same key the lookup walked, so it is derived the same way
-    // rather than re-implemented: picking the longest keyword independently
-    // disagrees with `compute_keyword_hashes` whenever two keywords tie on
-    // length (a stable descending sort keeps the first, `max_by_key` returns
-    // the last), which silently dropped every hit for queries like
-    // "ubuntu server".
-    let primary_hash = ember::dht::search::compute_keyword_hashes(&ember_walk_query(
-        keywords, query_expr,
-    ))
-    .first()
-        .map(|(h, _)| *h);
-    // file_hash -> (result, publisher_key -> ember digest votes)
-    let mut dedup: HashMap<[u8; 16], (SearchResult, EmberDigestVotes)> = HashMap::new();
+/// Read the records `search` gathered since the last call into
+/// `IterativeSearch::keyword_readings`, for the streaming rebuild, which then
+/// folds the rows from the readings ([`ember_keyword_readings`]) instead of
+/// parsing, tokenizing and matching every record again each time a slice is
+/// due.
+///
+/// Without verifying signatures a second time: every record in
+/// `IterativeSearch::results` has had its signature checked on the way in — a
+/// remote one by the search, our own by the store that admitted it. The
+/// closing build ([`build_ember_keyword_built`]) still verifies.
+pub(super) fn read_ember_keyword_records(
+    search: &mut ember::dht::search::IterativeSearch,
+    reader: &EmberRecordReader,
+) {
+    read_ember_keyword_records_with(search, reader, |blob| {
+        let split = blob.len().checked_sub(64)?;
+        let (data, signature) = blob.split_at(split);
+        ember::dht::publish::SignedRecord::parse_unverified(data, signature.try_into().ok()?)
+    });
+}
 
-    for held_record in held {
-        let Some(rec) = ember::dht::publish::SignedRecord::from_value_blob(&held_record.data)
-        else {
-            continue;
-        };
-        if rec.record_type != ember::dht::publish::RECORD_TYPE_KEYWORD {
-            continue;
+fn read_ember_keyword_records_with(
+    search: &mut ember::dht::search::IterativeSearch,
+    reader: &EmberRecordReader,
+    parse: impl Fn(&[u8]) -> Option<ember::dht::publish::SignedRecord>,
+) {
+    let read = search.keyword_readings.len().min(search.results.len());
+    search.keyword_readings.truncate(read);
+    for record in &search.results[read..] {
+        search.keyword_readings.push(reader.read(record, &parse));
+    }
+}
+
+/// The records of `search` it shows, beside how they were read, as far as
+/// [`read_ember_keyword_records`] has got.
+pub(super) fn ember_keyword_readings(
+    search: &ember::dht::search::IterativeSearch,
+) -> impl Iterator<Item = (&ember::dht::search::SearchResultRecord, &ember::dht::search::KeywordReading)> {
+    search
+        .results
+        .iter()
+        .zip(&search.keyword_readings)
+        .filter_map(|(record, reading)| Some((record, reading.as_ref()?)))
+}
+
+/// Which records one keyword search shows, asked of each record once.
+pub(super) struct EmberRecordReader {
+    /// Must be the keys the lookup walked, so they are derived the same way
+    /// rather than re-implemented: picking the longest keyword independently
+    /// disagrees with `compute_keyword_hashes` whenever two keywords tie on
+    /// length (a stable descending sort keeps the first, `max_by_key` returns
+    /// the last), which drops every hit for queries like "ubuntu server".
+    matcher: EmberKeywordMatcher,
+    /// Boolean queries get the same treatment as the KAD result path. Falling
+    /// back to the flat AND would reject the non-matching half of an `OR` and
+    /// ignore the excluded side of a `NOT`.
+    expr: Option<SpelledExpr>,
+    kw_lower: Vec<String>,
+    kw_normalised: Vec<String>,
+}
+
+impl EmberRecordReader {
+    pub(super) fn new(keywords: &[String], query_expr: Option<&crate::search::query::QueryExpr>) -> Self {
+        let kw_lower: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
+        let kw_normalised = kw_lower
+            .iter()
+            .map(|k| ember::dht::search::normalize_keyword_text(k))
+            .collect();
+        Self {
+            matcher: EmberKeywordMatcher::new(keywords, query_expr),
+            expr: query_expr.filter(|e| !e.is_trivial()).map(SpelledExpr::new),
+            kw_lower,
+            kw_normalised,
         }
-        if let Some(expected) = primary_hash {
-            if rec.keyword_hash != expected {
-                continue;
-            }
+    }
+
+    /// The record and the name it shows under, or `None` for a record this
+    /// search does not show.
+    fn read(
+        &self,
+        held_record: &ember::dht::search::SearchResultRecord,
+        parse: impl Fn(&[u8]) -> Option<ember::dht::publish::SignedRecord>,
+    ) -> Option<ember::dht::search::KeywordReading> {
+        let rec = parse(&held_record.data)?;
+        if rec.record_type != ember::dht::publish::RECORD_TYPE_KEYWORD {
+            return None;
+        }
+        let clamped = ember::dht::publish::record_name_may_be_clamped(
+            held_record.data.len().saturating_sub(64),
+        );
+        if !self.matcher.accepts(&rec, clamped) {
+            return None;
         }
         // The record's signed bytes keep the publisher's raw name; only the
         // display/derived copy is sanitized, as on the KAD result path.
-        let file_name = crate::security::sanitize_remote_text(&rec.file_name, 8192);
-        if file_name.is_empty() {
-            continue;
+        let name = crate::security::sanitize_remote_text(&rec.file_name, 8192);
+        if name.is_empty() {
+            return None;
         }
         // Local re-filter, mirroring the KAD keyword path: the DHT key only
         // matched the primary keyword, so the rest of the query is applied
-        // against the file name here.
-        if let Some(expr) = expr {
-            if !expr.matches_name(&file_name) {
-                continue;
+        // against the file name here — in either spelling, as the key was.
+        if let Some(expr) = &self.expr {
+            let typed = crate::network::kad::publish::kad_keyword_lowercase(&name);
+            let normalised = ember::dht::search::normalize_keyword_text(&name);
+            if !expr.matches(&typed, &normalised) {
+                return None;
             }
-        } else if kw_lower.len() > 1 {
-            let name_lower = file_name.to_lowercase();
-            if !kw_lower.iter().all(|k| name_lower.contains(k)) {
-                continue;
+        } else if self.kw_lower.len() > 1 {
+            let typed = name.to_lowercase();
+            let normalised = ember::dht::search::normalize_keyword_text(&name);
+            if !self
+                .kw_lower
+                .iter()
+                .zip(&self.kw_normalised)
+                .all(|(k, n)| typed.contains(k.as_str()) || normalised.contains(n.as_str()))
+            {
+                return None;
             }
         }
+        Some(ember::dht::search::KeywordReading { record: rec, name })
+    }
+}
 
-        match dedup.get_mut(&rec.file_hash) {
-            Some((existing, publisher_digests)) => {
-                note_ember_digest_vote(
-                    publisher_digests,
-                    rec.publisher_key,
-                    rec.ember_file_hash,
-                    held_record,
-                );
-                existing.availability = publisher_digests.len() as u32;
-                existing.file.complete_sources = publisher_digests.len() as u32;
-                existing.file.ember_file_hash = majority_ember_digest_hex(publisher_digests);
-                // First publisher to carry media decides the row's. Records from
-                // before the block existed have none, so a single peer that
-                // published it fills the columns for everyone.
-                if existing.media.is_none() {
-                    existing.media = rec.media.clone();
-                }
-            }
-            None => {
-                let extension = file_name
-                    .rsplit_once('.')
-                    .map(|(_, e)| e.to_string())
-                    .unwrap_or_default();
-                let file_type = infer_file_type(&extension);
-                let hash_hex = hex::encode(rec.file_hash);
-                let mut publisher_digests = EmberDigestVotes::new();
-                note_ember_digest_vote(
-                    &mut publisher_digests,
-                    rec.publisher_key,
-                    rec.ember_file_hash,
-                    held_record,
-                );
-                let ember_hex = majority_ember_digest_hex(&publisher_digests);
-                let sr = SearchResult {
-                    file: FileInfo {
-                        id: hash_hex.clone(),
-                        name: file_name,
-                        path: String::new(),
-                        size: rec.file_size,
-                        hash: hash_hex,
-                        aich_hash: String::new(),
-                        ember_file_hash: ember_hex,
-                        extension,
-                        modified_at: 0,
-                        priority: "normal".to_string(),
-                        requests: 0,
-                        accepted: 0,
-                        bytes_transferred: 0,
-                        alltime_requests: 0,
-                        alltime_accepted: 0,
-                        alltime_transferred: 0,
-                        complete_sources: 1,
-                        folder: String::new(),
-                        shared: false,
-                        friends_only: false,
-                        shared_kad: false,
-                        shared_ed2k: false,
-                        shared_ember: false,
-                    },
-                    peer_id: String::new(),
-                    peer_name: String::new(),
-                    availability: 1,
-                    file_type,
-                    source_addresses: Vec::new(),
-                    rating: None,
-                    comment: None,
-                    media: rec.media.clone(),
-                    spam_rating: 0,
-                    is_spam: false,
-                    clean_name: String::new(),
-                    result_origin: crate::search::merge::ORIGIN_EMBER.to_string(),
-                    origin_server_ip: None,
-                    spam_reasons: Vec::new(),
-                    spam_reason_details: Vec::new(),
-                };
-                dedup.insert(rec.file_hash, (sr, publisher_digests));
-            }
+/// Fold the records a search shows into its rows: one per file and size.
+///
+/// A file's digest votes, and with them its digest, the publishers it counts
+/// and its corroboration, are taken across every size, since one file has one
+/// content digest; each size's row then counts the counted publishers giving
+/// that size. Rows are kept apart by size as every other leg keeps them, and
+/// one publisher gives one size, its first record's.
+pub(super) fn fold_ember_keyword_rows<'a>(
+    readings: impl IntoIterator<
+        Item = (
+            &'a ember::dht::search::SearchResultRecord,
+            &'a ember::dht::search::KeywordReading,
+        ),
+    >,
+) -> EmberKeywordBuilt {
+    // file_hash -> (publisher_key -> ember digest votes, each publisher's
+    // description of the file in arrival order)
+    let mut dedup: HashMap<[u8; 16], (EmberDigestVotes, Vec<EmberRowClaim>)> = HashMap::new();
+    for (held_record, reading) in readings {
+        let rec = &reading.record;
+        let (votes, claims) = dedup.entry(rec.file_hash).or_default();
+        if !votes.contains_key(&rec.publisher_key) {
+            claims.push(EmberRowClaim {
+                publisher: rec.publisher_key,
+                name: reading.name.clone(),
+                size: rec.file_size,
+                media: rec.media.clone(),
+            });
         }
+        note_ember_digest_vote(votes, rec.publisher_key, rec.ember_file_hash, held_record);
     }
 
     // The digest on the row is what the search page hands to start_download
     // on click (user-chosen pin, even a plurality of one). Automatic fills
     // of ember_content_hashes still require corroboration.
     let mut corroborated = Vec::new();
-    let mut counted_publishers = Vec::new();
-    for (hash, (result, votes)) in dedup.iter_mut() {
+    let mut counted_rows = Vec::new();
+    let mut results = Vec::new();
+    for (hash, (votes, claims)) in &dedup {
         let plurality = majority_ember_digest(votes);
         // A click pins whatever the row carries, so a contested row carries
         // nothing: showing the plurality would let whoever planted more
         // records choose the pin that way instead.
         let contested = ember_digest_contested(votes);
-        result.file.ember_file_hash = if contested {
+        let digest_hex = if contested {
             String::new()
         } else {
             plurality.map(hex::encode).unwrap_or_default()
@@ -873,25 +1542,131 @@ pub(super) fn build_ember_keyword_built(
         } else {
             plurality
         };
-        let before = counted_publishers.len();
-        counted_publishers.extend(
-            votes
-                .iter()
-                .filter(|(_, vote)| vote.digest == [0u8; 32] || Some(vote.digest) == counted)
-                .map(|(publisher, _)| (*hash, *publisher)),
-        );
-        let sources = (counted_publishers.len() - before) as u32;
-        result.availability = sources;
-        result.file.complete_sources = sources;
+        let counts =
+            |vote: &EmberDigestVote| vote.digest == [0u8; 32] || Some(vote.digest) == counted;
+        // Each size's claims from the publishers counted, sizes in the order
+        // they first arrived.
+        let mut sizes: Vec<(u64, Vec<&EmberRowClaim>)> = Vec::new();
+        for claim in claims.iter().filter(|claim| votes.get(&claim.publisher).is_some_and(counts)) {
+            match sizes.iter_mut().find(|(size, _)| *size == claim.size) {
+                Some((_, group)) => group.push(claim),
+                None => sizes.push((claim.size, vec![claim])),
+            }
+        }
+        for (size, group) in sizes {
+            let Some((name, media)) = ember_row_description(&group) else {
+                continue;
+            };
+            counted_rows.extend(group.iter().map(|claim| ((*hash, size), claim.publisher)));
+            results.push(ember_keyword_row(*hash, size, name, media, group.len() as u32, digest_hex.clone()));
+        }
         if let Some((digest, responders)) = corroborated_ember_digest_with_count(votes) {
             corroborated.push((*hash, digest, responders));
         }
     }
     EmberKeywordBuilt {
-        results: dedup.into_values().map(|(sr, _)| sr).collect(),
+        results,
         corroborated,
-        counted_publishers,
+        #[cfg(test)]
+        counted_publishers: counted_rows.iter().map(|((file, _), publisher)| (*file, *publisher)).collect(),
+        counted_rows,
     }
+}
+
+/// What one publisher's record says about the file a row shows: its first
+/// record's, if it published several.
+struct EmberRowClaim {
+    publisher: [u8; 32],
+    name: String,
+    size: u64,
+    media: Option<crate::types::MediaMetadata>,
+}
+
+/// The name and media of one size's row, from the claims of the publishers it
+/// counts in the order they arrived: the name most of them give, a tie going
+/// to the claim that arrived first. Arrival order is what a responder decides,
+/// so it settles only what the publishers leave even.
+///
+/// The media is that claim's, or failing that the first any of them carries —
+/// publishers predating the media block carry none, and one that has it fills
+/// the columns for everyone.
+fn ember_row_description(claims: &[&EmberRowClaim]) -> Option<(String, Option<crate::types::MediaMetadata>)> {
+    let mut tally: HashMap<&str, (usize, usize)> = HashMap::new();
+    for (at, claim) in claims.iter().enumerate() {
+        tally.entry(claim.name.as_str()).or_insert((0, at)).0 += 1;
+    }
+    let (_, at) = tally
+        .into_values()
+        .max_by_key(|&(votes, at)| (votes, std::cmp::Reverse(at)))?;
+    let chosen = claims[at];
+    let media = std::iter::once(chosen)
+        .chain(claims.iter().copied())
+        .find_map(|claim| claim.media.clone());
+    Some((chosen.name.clone(), media))
+}
+
+/// One Ember row: `availability` counted publishers give file `hash` this
+/// `size` and, by plurality, this `name`.
+fn ember_keyword_row(
+    hash: [u8; 16],
+    size: u64,
+    name: String,
+    media: Option<crate::types::MediaMetadata>,
+    availability: u32,
+    ember_file_hash: String,
+) -> SearchResult {
+    let extension = ember_row_extension(&name);
+    let file_type = crate::search::index::infer_file_type(&extension);
+    let hash_hex = hex::encode(hash);
+    SearchResult {
+        file: FileInfo {
+            id: hash_hex.clone(),
+            name,
+            path: String::new(),
+            size,
+            hash: hash_hex,
+            aich_hash: String::new(),
+            ember_file_hash,
+            extension,
+            modified_at: 0,
+            priority: "normal".to_string(),
+            requests: 0,
+            accepted: 0,
+            bytes_transferred: 0,
+            alltime_requests: 0,
+            alltime_accepted: 0,
+            alltime_transferred: 0,
+            complete_sources: availability,
+            folder: String::new(),
+            shared: false,
+            friends_only: false,
+            shared_kad: false,
+            shared_ed2k: false,
+            shared_ember: false,
+        },
+        peer_id: String::new(),
+        peer_name: String::new(),
+        availability,
+        file_type,
+        source_addresses: Vec::new(),
+        rating: None,
+        comment: None,
+        media,
+        spam_rating: 0,
+        is_spam: false,
+        clean_name: String::new(),
+        result_origin: crate::search::merge::ORIGIN_EMBER.to_string(),
+        origin_server_ip: None,
+        spam_reasons: Vec::new(),
+        spam_reason_details: Vec::new(),
+    }
+}
+
+/// The extension a row shows for `name`: what follows its last dot.
+fn ember_row_extension(name: &str) -> String {
+    name.rsplit_once('.')
+        .map(|(_, extension)| extension.to_string())
+        .unwrap_or_default()
 }
 
 /// Sources one source lookup hands to the download. KAD takes 20
@@ -956,14 +1731,7 @@ pub(super) fn note_ember_digest_vote(
     }
 }
 
-/// Pick the best-supported non-zero Ember BLAKE3; empty if none.
-pub(super) fn majority_ember_digest_hex(publisher_digests: &EmberDigestVotes) -> String {
-    majority_ember_digest(publisher_digests)
-        .map(hex::encode)
-        .unwrap_or_default()
-}
-
-/// Raw-byte form of [`majority_ember_digest_hex`]: the digest the most
+/// The best-supported non-zero Ember BLAKE3 for a file: the digest the most
 /// responders vouch for, then the most distinct publishers name, or `None`
 /// when none of them published one.
 ///
@@ -1639,11 +2407,11 @@ mod ember_keyword_sanitize_tests {
 
     #[test]
     fn ember_keyword_build_strips_bidi_override_from_name() {
-        let blobs = vec![kw_blob("holiday\u{202E}gpj.exe\u{200B}")];
+        let blobs = vec![kw_blob("holiday \u{202E}gpj.exe\u{200B}")];
         let results = build_ember_keyword_built(&blobs, &["holiday".to_string()], None).results;
         assert_eq!(results.len(), 1);
         let r = &results[0];
-        assert_eq!(r.file.name, "holidaygpj.exe");
+        assert_eq!(r.file.name, "holiday gpj.exe");
         assert_eq!(r.file.extension, "exe");
     }
 
@@ -1652,5 +2420,769 @@ mod ember_keyword_sanitize_tests {
         let blobs = vec![kw_blob("\u{202E}\u{200B}")];
         let results = build_ember_keyword_built(&blobs, &["holiday".to_string()], None).results;
         assert!(results.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod ember_keyword_match_tests {
+    use super::*;
+
+    /// A keyword record signed by its own key, filed under `keyword`.
+    fn record_under(keyword: &str, file: u8, name: &str) -> ember::dht::search::SearchResultRecord {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[file; 32]);
+        let rec = ember::dht::publish::SignedRecord::keyword(keyword, [file; 16], [0u8; 32], 1, name, &sk);
+        let mut data = rec.data.clone();
+        data.extend_from_slice(&rec.signature);
+        ember::dht::search::SearchResultRecord {
+            data,
+            from_node: ember::dht::EmberNodeId([file; 16]),
+            confirmed_by: None,
+            from_subnet: Some(u64::from(file)),
+            confirmed_subnet: None,
+            from_local_store: false,
+        }
+    }
+
+    fn names(built: &EmberKeywordBuilt) -> Vec<String> {
+        let mut names: Vec<String> = built.results.iter().map(|r| r.file.name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    /// Anyone may store a signed record under any key, so a one-word search
+    /// keeps only the names that derive the word's key.
+    #[test]
+    fn a_single_word_search_shows_only_names_filed_under_that_word() {
+        let held = vec![
+            record_under("ubuntu", 1, "ubuntu-24.04-desktop.iso"),
+            record_under("ubuntu", 2, "totally unrelated.exe"),
+            record_under("ubuntu", 3, "ubuntux.iso"),
+            // The publisher strips a trailing three-letter token as an
+            // extension, so it never files a name under it.
+            record_under("iso", 4, "debian.iso"),
+        ];
+        let built = build_ember_keyword_built(&held, &["ubuntu".to_string()], None);
+        assert_eq!(names(&built), vec!["ubuntu-24.04-desktop.iso"]);
+        let built = build_ember_keyword_built(&held, &["iso".to_string()], None);
+        assert!(built.results.is_empty(), "debian.iso was never published under iso");
+    }
+
+    /// Every word of an AND query has to be a word of the name, not just a
+    /// substring of it — the same test responders order their answers by.
+    #[test]
+    fn a_multi_word_search_needs_every_word_in_the_name() {
+        let held = vec![
+            record_under("ubuntu", 1, "ubuntu-server-24.04.iso"),
+            record_under("ubuntu", 2, "ubuntu-servers.iso"),
+            record_under("ubuntu", 3, "ubuntu desktop.iso"),
+            record_under("ubuntu", 4, "server ubuntux.iso"),
+        ];
+        let keywords = vec!["ubuntu".to_string(), "server".to_string()];
+        let built = build_ember_keyword_built(&held, &keywords, None);
+        assert_eq!(names(&built), vec!["ubuntu-server-24.04.iso"]);
+
+        // The trailing token counts as a word of the name for a second word,
+        // even though the publisher did not file the name under it.
+        let keywords = vec!["ubuntu".to_string(), "iso".to_string()];
+        let built = build_ember_keyword_built(&held, &keywords, None);
+        assert_eq!(built.results.len(), 3);
+    }
+
+    /// Only the required side of a boolean query is demanded of every name.
+    #[test]
+    fn an_or_query_demands_only_the_words_every_match_contains() {
+        let held = vec![
+            record_under("ubuntu", 1, "ubuntu desktop.iso"),
+            record_under("ubuntu", 2, "ubuntu serverx.iso"),
+            record_under("ubuntu", 3, "ubuntu minimal.iso"),
+        ];
+        let expr = crate::search::query::parse("ubuntu (desktop OR serverx)").expect("parses");
+        let built = build_ember_keyword_built(&held, &expr.positive_terms(), Some(&expr));
+        assert_eq!(names(&built), vec!["ubuntu desktop.iso", "ubuntu serverx.iso"]);
+    }
+
+    /// A newer publisher files a decomposed name under the normalised key as
+    /// well, and that record has to survive the searcher's check.
+    #[test]
+    fn a_record_under_the_normalised_key_matches_its_decomposed_name() {
+        let normalised = ember::dht::search::compute_keyword_hashes("café")[0].1.clone();
+        let held = vec![record_under(&normalised, 1, "Cafe\u{301} del Mar.mp3")];
+        let built = build_ember_keyword_built(&held, &["Café".to_string()], None);
+        assert_eq!(built.results.len(), 1);
+
+        // Typed decomposed, the search walks the normalised key and the typed
+        // one, and accepts a record under either.
+        let typed = "cafe\u{301}";
+        let held = vec![
+            record_under(&normalised, 1, "Cafe\u{301} del Mar.mp3"),
+            record_under(typed, 2, "Cafe\u{301} Society.mp3"),
+        ];
+        let built = build_ember_keyword_built(&held, &[typed.to_string()], None);
+        assert_eq!(built.results.len(), 2);
+    }
+
+    /// The companion walk is only for a query whose typed spelling hashes
+    /// elsewhere, and it sends the typed spelling's other words — none for a
+    /// query with an `OR`.
+    #[test]
+    fn only_a_query_that_hashes_two_ways_gets_a_second_walk() {
+        use ember::dht::search::keyword_hash;
+        let walked = |q: &str| ember::dht::search::compute_keyword_hashes(q)[0].0;
+        for query in ["ubuntu", "Ubuntu Server", "café"] {
+            assert_eq!(
+                ember_spelling_walk_keys(&[query.to_string()], None, &walked(query)),
+                None,
+                "{query}"
+            );
+        }
+        let typed = "cafe\u{301}";
+        assert_eq!(
+            ember_spelling_walk_keys(&[typed.to_string()], None, &walked(typed)),
+            Some((keyword_hash(typed), vec![]))
+        );
+
+        let keywords = vec!["cafe\u{301}del".to_string(), "mar".to_string()];
+        let query = keywords.join(" ");
+        assert_eq!(
+            ember_spelling_walk_keys(&keywords, None, &walked(&query)),
+            Some((keyword_hash("cafe\u{301}del"), vec![keyword_hash("mar")])),
+            "the typed spelling's own extra keys, not the normalised ones"
+        );
+        let expr = crate::search::query::parse("cafe\u{301}del (mar OR sol)").expect("parses");
+        let (_, extras) = ember_spelling_walk_keys(&expr.positive_terms(), Some(&expr), &walked(&query))
+            .expect("hashes two ways");
+        assert!(extras.is_empty(), "an OR sends no keys to intersect on");
+    }
+
+    /// Two words, one of them spelled differently in the name than in the query,
+    /// in each direction. The key's word is matched in either spelling, and so
+    /// is the filter run on the rest of the query.
+    #[test]
+    fn a_multi_word_search_matches_across_spellings_both_ways() {
+        let normalised = |w: &str| ember::dht::search::compute_keyword_hashes(w)[0].1.clone();
+        let decomposed_name = "Cafe\u{301} del Mar.mp3";
+        let held = vec![record_under(&normalised("café"), 1, decomposed_name)];
+        let built = build_ember_keyword_built(&held, &["café".to_string(), "del".to_string()], None);
+        assert_eq!(names(&built), vec![decomposed_name], "composed query, decomposed name");
+
+        let composed_name = "Café del Mar.mp3";
+        let held = vec![record_under("café", 2, composed_name)];
+        let keywords = vec!["cafe\u{301}".to_string(), "del".to_string()];
+        let built = build_ember_keyword_built(&held, &keywords, None);
+        assert_eq!(names(&built), vec![composed_name], "decomposed query, composed name");
+
+        let expr = crate::search::query::parse("cafe\u{301} del").expect("parses");
+        let built = build_ember_keyword_built(&held, &expr.positive_terms(), Some(&expr));
+        assert_eq!(built.results.len(), 1, "a boolean query matches across spellings too");
+
+        // An excluded term is excluded in either spelling.
+        let expr = crate::search::query::parse("del -cafe\u{301}").expect("parses");
+        let held = vec![record_under("del", 3, composed_name)];
+        let built = build_ember_keyword_built(&held, &expr.positive_terms(), Some(&expr));
+        assert!(built.results.is_empty());
+    }
+
+    /// A name shortened to fit its record may have lost the word its key was
+    /// derived from. A publisher before 1.7.4 derived keys from the full name,
+    /// so the searcher does not hold such a record to the derivation or to the
+    /// key's own word; every other required word still has to be in what is
+    /// left.
+    #[test]
+    fn a_record_whose_name_was_shortened_to_fit_is_not_dropped() {
+        let long = |tail: &str| {
+            let filler: String = (0..400).map(|i| format!("w{i:03} ")).collect();
+            let mut name = format!("ubuntu {filler}");
+            while name.len() < 1500 {
+                name.push_str("pad ");
+            }
+            name.push_str(tail);
+            name
+        };
+        let held = vec![
+            record_under("serverlongword", 1, &long("serverlongword.iso")),
+            record_under("ubuntu", 2, &long("x.iso")),
+        ];
+        for record in &held {
+            let body = record.data.len() - 64;
+            assert!(ember::dht::publish::record_name_may_be_clamped(body), "the name was clamped");
+        }
+        let built = build_ember_keyword_built(&held, &["serverlongword".to_string()], None);
+        assert_eq!(built.results.len(), 1, "filed under a word the cut removed");
+        let built = build_ember_keyword_built(&held, &["ubuntu".to_string(), "w001".to_string()], None);
+        assert_eq!(built.results.len(), 1, "a word left in the name is found");
+        let built = build_ember_keyword_built(&held, &["ubuntu".to_string(), "missing".to_string()], None);
+        assert!(built.results.is_empty(), "the words left in the name are still required");
+
+        // A name that fits is held to the derivation as before.
+        let short = vec![record_under("serverlongword", 3, "ubuntu.iso")];
+        assert!(build_ember_keyword_built(&short, &["serverlongword".to_string()], None)
+            .results
+            .is_empty());
+    }
+
+    /// One node plants five records under a fake digest ahead of six real
+    /// publishers on four storers. Each streaming rebuild counts what has been
+    /// gathered so far, so once the real publishers arrive the row carries their
+    /// six — never the five and the six added together.
+    #[test]
+    fn streamed_counts_never_exceed_a_rebuild_of_what_was_gathered() {
+        let fake = [0xEEu8; 32];
+        let real = [0x77u8; 32];
+        let file = [0xF1u8; 16];
+        let blob = |seed: u16, digest: [u8; 32]| {
+            let mut key = [0x5Au8; 32];
+            key[..2].copy_from_slice(&seed.to_le_bytes());
+            let sk = ed25519_dalek::SigningKey::from_bytes(&key);
+            let rec = ember::dht::publish::SignedRecord::keyword("ubuntu", file, digest, 1, "ubuntu.iso", &sk);
+            let mut data = rec.data.clone();
+            data.extend_from_slice(&rec.signature);
+            data
+        };
+        let from = |node: u8, data: Vec<u8>| ember::dht::search::SearchResultRecord {
+            data,
+            from_node: ember::dht::EmberNodeId([node; 16]),
+            confirmed_by: None,
+            from_subnet: Some(u64::from(node)),
+            confirmed_subnet: None,
+            from_local_store: false,
+        };
+        let keywords = vec!["ubuntu".to_string()];
+        let (mut sm, sid) = one_walk();
+        let mut stream = HashSet::new();
+        let gather = |sm: &mut ember::dht::search::SearchManager, records: Vec<_>| {
+            sm.get_mut(sid).unwrap().results.extend(records);
+        };
+
+        gather(&mut sm, (0..5).map(|i| from(9, blob(1000 + i, fake))).collect());
+        let first = stream_once(&mut sm, sid, &mut stream, &keywords, None);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].availability, 5);
+
+        gather(
+            &mut sm,
+            [1u8, 2, 3, 4, 1, 2]
+                .into_iter()
+                .enumerate()
+                .map(|(i, node)| from(node, blob(i as u16, real)))
+                .collect(),
+        );
+        let second = stream_once(&mut sm, sid, &mut stream, &keywords, None);
+        assert_eq!(second.len(), 1, "the row's publishers changed");
+        assert_eq!(second[0].availability, 6, "the real digest's six, not 5 + 6");
+
+        let closing = build_ember_keyword_built(&sm.get(sid).unwrap().results, &keywords, None);
+        assert_eq!(closing.results[0].availability, second[0].availability);
+
+        assert!(
+            stream_once(&mut sm, sid, &mut stream, &keywords, None).is_empty(),
+            "nothing new, nothing to send"
+        );
+    }
+
+    /// A value walk to push gathered records into, as a running search holds
+    /// them.
+    fn one_walk() -> (ember::dht::search::SearchManager, u32) {
+        let rt = ember::dht::routing::RoutingTable::new(ember::dht::EmberNodeId([0; 16]), false);
+        let mut sm = ember::dht::search::SearchManager::new();
+        let sid = sm
+            .start_find_value(ember::dht::EmberNodeId([1; 16]), vec![], &rt)
+            .expect("slot");
+        (sm, sid)
+    }
+
+    /// The rows one streaming rebuild of `sid` sends, as the search tick
+    /// builds them.
+    fn stream_once(
+        sm: &mut ember::dht::search::SearchManager,
+        sid: u32,
+        stream: &mut HashSet<EmberStreamMark>,
+        keywords: &[String],
+        query_expr: Option<&crate::search::query::QueryExpr>,
+    ) -> Vec<SearchResult> {
+        let reader = EmberRecordReader::new(keywords, query_expr);
+        let search = sm.get_mut(sid).unwrap();
+        read_ember_keyword_records(search, &reader);
+        ember_stream_rows(stream, fold_ember_keyword_rows(ember_keyword_readings(search)))
+    }
+
+    fn two_linked_walks() -> (ember::dht::search::SearchManager, u32, u32) {
+        use ember::dht::search::{Companion, SearchManager};
+        let rt = ember::dht::routing::RoutingTable::new(ember::dht::EmberNodeId([0; 16]), false);
+        let mut sm = SearchManager::new();
+        let main = sm
+            .start_find_value(ember::dht::EmberNodeId([1; 16]), vec![], &rt)
+            .expect("slot");
+        let walk = sm
+            .start_find_value(ember::dht::EmberNodeId([2; 16]), vec![], &rt)
+            .expect("slot");
+        sm.get_mut(main).unwrap().companion = Companion::Running(walk);
+        sm.get_mut(walk).unwrap().companion = Companion::FeedsInto(main);
+        (sm, main, walk)
+    }
+
+    /// A finished search waits while its companion walks, then reports with
+    /// the companion's records.
+    #[test]
+    fn a_search_is_held_for_its_companion_and_then_takes_its_records() {
+        let (mut sm, main, walk) = two_linked_walks();
+        sm.get_mut(walk)
+            .unwrap()
+            .results
+            .push(record_under("ubuntu", 1, "ubuntu.iso"));
+
+        assert_eq!(settle_ember_companion(&mut sm, main, true), CompanionStep::Wait);
+        assert_eq!(settle_ember_companion(&mut sm, walk, false), CompanionStep::Wait);
+        assert_eq!(settle_ember_companion(&mut sm, walk, true), CompanionStep::HandedTo(main));
+        assert!(sm.get(walk).is_none(), "the companion is gone once it has handed over");
+        assert_eq!(sm.get(main).unwrap().results.len(), 1);
+        assert_eq!(settle_ember_companion(&mut sm, main, true), CompanionStep::Report);
+    }
+
+    /// A companion whose search was cancelled is dropped at the next sweep,
+    /// finished or not, rather than walking on for nobody.
+    #[test]
+    fn a_companion_of_a_cancelled_search_is_dropped() {
+        let (mut sm, main, walk) = two_linked_walks();
+        sm.remove(main);
+        assert_eq!(settle_ember_companion(&mut sm, walk, false), CompanionStep::Dropped);
+        assert!(sm.get(walk).is_none());
+
+        // A search whose companion vanished some other way is not held for it.
+        let (mut sm, main, walk) = two_linked_walks();
+        sm.remove(walk);
+        assert_eq!(settle_ember_companion(&mut sm, main, true), CompanionStep::Report);
+    }
+
+    /// Keys are derived from the name the record will sign, so a word cut off
+    /// to fit is not published as a key the name cannot vouch for.
+    #[test]
+    fn keywords_come_from_the_name_as_the_record_signs_it() {
+        let filler: String = (0..400).map(|i| format!("w{i:03} ")).collect();
+        let name = format!("ubuntu {filler}finalword.iso");
+        let signed = ember::dht::publish::keyword_record_signed_name(&name, None);
+        assert!(signed.len() < name.len());
+        let keywords = ember::dht::search::ember_publish_keywords(signed);
+        assert!(keywords.contains(&"ubuntu".to_string()));
+        assert!(!keywords.contains(&"finalword".to_string()));
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let rec = ember::dht::publish::SignedRecord::keyword("ubuntu", [1; 16], [0; 32], 1, &name, &sk);
+        assert_eq!(rec.file_name, signed, "the record signs exactly that name");
+        let short = "ubuntu server.iso";
+        assert_eq!(ember::dht::publish::keyword_record_signed_name(short, None), short);
+    }
+
+    /// A lookup timeout is charged only to the table entry at the address and
+    /// key that were dialled. A `FOUND_NODE` naming a real node's id at an
+    /// address that goes nowhere must not cost that node its place.
+    #[test]
+    fn a_bad_referral_does_not_fault_the_honest_contact_it_names() {
+        let held = ember::dht::EmberContact {
+            node_id: ember::dht::EmberNodeId([0x42; 16]),
+            addr: "81.2.3.4:4672".parse().unwrap(),
+            noise_pub: [0x11; 32],
+            ed25519_pub: [0x11; 32],
+            last_seen: 1_000,
+            failed_queries: 0,
+        };
+        assert!(ember_search_fault_lands(&held, &held.clone()));
+        let elsewhere = ember::dht::EmberContact {
+            addr: "203.0.113.9:4672".parse().unwrap(),
+            last_seen: 0,
+            ..held.clone()
+        };
+        assert!(!ember_search_fault_lands(&held, &elsewhere), "another address");
+        let other_key = ember::dht::EmberContact {
+            noise_pub: [0x22; 32],
+            ..held.clone()
+        };
+        assert!(!ember_search_fault_lands(&held, &other_key), "another key");
+        let unverified = ember::dht::EmberContact { last_seen: 0, ..held.clone() };
+        assert!(!ember_search_fault_lands(&unverified, &unverified.clone()), "a lead");
+    }
+
+    /// A record of one file filed under `ubuntu` by publisher `publisher`.
+    fn claim(
+        publisher: u8,
+        name: &str,
+        size: u64,
+        media: Option<&crate::types::MediaMetadata>,
+    ) -> ember::dht::search::SearchResultRecord {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[publisher; 32]);
+        let rec = ember::dht::publish::SignedRecord::keyword_with_media(
+            "ubuntu", [0xF7; 16], [0u8; 32], size, name, media, &sk,
+        );
+        let mut data = rec.data.clone();
+        data.extend_from_slice(&rec.signature);
+        ember::dht::search::SearchResultRecord {
+            data,
+            from_node: ember::dht::EmberNodeId([publisher; 16]),
+            confirmed_by: None,
+            from_subnet: Some(u64::from(publisher)),
+            confirmed_subnet: None,
+            from_local_store: false,
+        }
+    }
+
+    /// Each size of a file is a row of its own, counting the publishers giving
+    /// it and named as most of them name it, a tie going to the first. A row
+    /// is first streamed once two publishers give it or at the rebuild after
+    /// the one that first built it, so a lone first record does not decide the
+    /// name the page keeps; the closing batch has every row.
+    #[test]
+    fn a_rows_name_and_size_are_the_ones_most_publishers_give() {
+        let keywords = vec!["ubuntu".to_string()];
+        let (mut sm, sid) = one_walk();
+        let mut stream = HashSet::new();
+        let media = crate::types::MediaMetadata {
+            duration: Some(60),
+            ..Default::default()
+        };
+        let mut gather = |sm: &mut ember::dht::search::SearchManager, records: Vec<_>| {
+            sm.get_mut(sid).unwrap().results.extend(records);
+            let mut batch = stream_once(sm, sid, &mut stream, &keywords, None);
+            batch.sort_by_key(|row| row.file.size);
+            batch
+                .into_iter()
+                .map(|row| (row.file.size, row.file.name, row.availability, row.media))
+                .collect::<Vec<_>>()
+        };
+
+        let first = gather(&mut sm, vec![claim(1, "ubuntu typo.iso", 100, None)]);
+        assert!(first.is_empty(), "one record does not name a row yet");
+
+        let second = gather(
+            &mut sm,
+            vec![
+                claim(2, "ubuntu 24.04.iso", 100, None),
+                claim(3, "ubuntu 24.04.iso", 100, Some(&media)),
+                claim(4, "ubuntu setup.exe", 10, None),
+            ],
+        );
+        assert_eq!(
+            second,
+            vec![(100, "ubuntu 24.04.iso".to_string(), 3, Some(media.clone()))],
+            "first sent named as most of its publishers name it; the new size waits"
+        );
+
+        let third = gather(&mut sm, vec![]);
+        assert_eq!(
+            third,
+            vec![(10, "ubuntu setup.exe".to_string(), 1, None)],
+            "a held row goes out at the next rebuild"
+        );
+        assert!(gather(&mut sm, vec![]).is_empty(), "nothing moved");
+
+        let closing = build_ember_keyword_built(&sm.get(sid).unwrap().results, &keywords, None);
+        let mut rows: Vec<_> = closing
+            .results
+            .iter()
+            .map(|row| (row.file.size, row.file.name.clone(), row.file.extension.clone(), row.file_type.clone()))
+            .collect();
+        rows.sort();
+        let iso = crate::search::index::infer_file_type("iso");
+        let exe = crate::search::index::infer_file_type("exe");
+        assert_eq!(
+            rows,
+            vec![
+                (10, "ubuntu setup.exe".to_string(), "exe".to_string(), exe),
+                (100, "ubuntu 24.04.iso".to_string(), "iso".to_string(), iso),
+            ]
+        );
+
+        let row = |held: &[ember::dht::search::SearchResultRecord]| {
+            let built = build_ember_keyword_built(held, &keywords, None);
+            assert_eq!(built.results.len(), 1);
+            built.results.into_iter().next().unwrap()
+        };
+        let tie = row(&[claim(1, "ubuntu a.iso", 100, None), claim(2, "ubuntu b.iso", 100, None)]);
+        assert_eq!(tie.file.name, "ubuntu a.iso");
+        // One publisher's several records are one vote.
+        let repeats = row(&[
+            claim(1, "ubuntu a.iso", 100, None),
+            claim(1, "ubuntu b.iso", 100, None),
+            claim(1, "ubuntu c.iso", 100, None),
+            claim(2, "ubuntu b.iso", 100, None),
+        ]);
+        assert_eq!(repeats.file.name, "ubuntu a.iso");
+    }
+
+    /// A rebuild reads only the records added since the last one, and reading
+    /// them is what the closing build would make of them.
+    #[test]
+    fn a_streaming_rebuild_reads_each_record_once() {
+        let keywords = vec!["ubuntu".to_string()];
+        let (mut sm, sid) = one_walk();
+        let reader = EmberRecordReader::new(&keywords, None);
+        let parsed = std::cell::Cell::new(0usize);
+        let parse = |blob: &[u8]| {
+            parsed.set(parsed.get() + 1);
+            ember::dht::publish::SignedRecord::from_value_blob(blob)
+        };
+        let search = sm.get_mut(sid).unwrap();
+        search.results.extend([
+            record_under("ubuntu", 1, "ubuntu.iso"),
+            record_under("ubuntu", 2, "unrelated.iso"),
+        ]);
+        read_ember_keyword_records_with(search, &reader, parse);
+        read_ember_keyword_records_with(search, &reader, parse);
+        assert_eq!(parsed.get(), 2);
+        search.results.push(record_under("ubuntu", 3, "ubuntu server.iso"));
+        read_ember_keyword_records_with(search, &reader, parse);
+        assert_eq!(parsed.get(), 3, "only the new record");
+
+        let streamed = fold_ember_keyword_rows(ember_keyword_readings(search));
+        let closing = build_ember_keyword_built(&search.results, &keywords, None);
+        let names = |built: &EmberKeywordBuilt| {
+            let mut names: Vec<_> = built.results.iter().map(|r| r.file.name.clone()).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(&streamed), vec!["ubuntu server.iso", "ubuntu.iso"]);
+        assert_eq!(names(&streamed), names(&closing));
+    }
+
+    /// The frames a walk sends: a pinned session peer is asked the whole query
+    /// wherever it sorts; a node outside the k closest when first asked gets
+    /// the primary key alone, and so do its pages.
+    #[test]
+    fn far_hops_hear_only_the_primary_key_but_pinned_peers_hear_it_all() {
+        use ember::dht::{messages, EmberContact, EmberNodeId};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let target = EmberNodeId(ember::dht::search::keyword_hash("ubuntu"));
+        let at = |distance: u8, last_seen: i64, subnet: u8| EmberContact {
+            node_id: EmberNodeId(std::array::from_fn(|i| {
+                target.0[i] ^ if i == 0 { distance } else { 0 }
+            })),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, 1, subnet, 1)), 4662),
+            noise_pub: [distance; 32],
+            ed25519_pub: [distance; 32],
+            last_seen,
+            failed_queries: 0,
+        };
+        let now = chrono::Utc::now().timestamp();
+        let mut rt = ember::dht::routing::RoutingTable::new(EmberNodeId([0; 16]), false);
+        let seeds: Vec<EmberContact> = (0..ember::dht::K_BUCKET_SIZE as u8)
+            .map(|i| at(0x40 + i, now, i))
+            .collect();
+        for seed in &seeds {
+            rt.add_contact(seed.clone());
+        }
+        let far_seeds: Vec<EmberNodeId> = seeds[seeds.len() - 4..].iter().map(|c| c.node_id).collect();
+        let pin = EmberContact {
+            node_id: EmberNodeId(std::array::from_fn(|i| target.0[i] ^ 0xFF)),
+            ..at(0xFF, now, 200)
+        };
+        let extra = [0x22u8; 16];
+        let constraints = messages::ValueConstraints {
+            min_size: Some(1024),
+            ..Default::default()
+        };
+        let mut sm = ember::dht::search::SearchManager::new();
+        let sid = sm.start_find_value(target, vec![extra], &rt).expect("slot");
+        assert_eq!(sm.seed_extra_contacts(sid, vec![pin.clone()]), 1);
+        let mut dht = ember::dht::engine::EmberDht::new([9; 32], [9; 32], false);
+        let mut sent = |query: &ember::dht::search::QueryTarget| {
+            let (_, frame) = ember_search_query_frame(
+                &mut dht,
+                target,
+                query.find_node,
+                &[extra],
+                &constraints,
+                (query.start_position, query.resume_after, query.narrow),
+            );
+            match messages::decode_message(&frame, true, &[9; 32]).expect("decodes").payload {
+                messages::DhtPayload::FindValue { keys, constraints, start_position, .. } => {
+                    (keys, constraints, start_position)
+                }
+                other => panic!("expected FIND_VALUE, got {other:?}"),
+            }
+        };
+        let whole = (vec![target.0, extra], constraints.clone());
+        let primary_only = (vec![target.0], messages::ValueConstraints::default());
+
+        let search = sm.get_mut(sid).unwrap();
+        let mut leads: Vec<EmberContact> = (2..6).map(|d| at(d, 0, 100 + d)).collect();
+        let (mut far_first, mut far_page) = (false, false);
+        for _ in 0..64 {
+            let batch = search.next_to_query();
+            if batch.is_empty() {
+                break;
+            }
+            for query in batch {
+                let (keys, got, start) = sent(&query);
+                let node = query.contact.node_id;
+                let (records, page) = if node == pin.node_id {
+                    assert_eq!((keys, got), whole, "a pinned peer far from the key");
+                    (vec![], None)
+                } else if far_seeds.contains(&node) {
+                    assert_eq!((keys, got), primary_only, "a far hop, start {start}");
+                    if start == 0 {
+                        far_first = true;
+                        let blob = record_under("ubuntu", 7, "ubuntu.iso").data;
+                        (vec![blob], Some(ember::dht::search::ValuePage { next_position: 1, total_available: 9 }))
+                    } else {
+                        far_page = true;
+                        (vec![], None)
+                    }
+                } else {
+                    assert_eq!((keys, got), whole, "a hop near the key");
+                    (vec![], None)
+                };
+                search.process_response(query.request_id, &node, std::mem::take(&mut leads), records, page);
+            }
+        }
+        assert!(far_first && far_page, "the walk reached a far hop and paged it");
+    }
+
+    /// The typed-spelling walk is on the search's own word, and no branch walk
+    /// repeats a key another walk of the search takes.
+    #[test]
+    fn the_second_spelling_walk_follows_the_searchs_own_word() {
+        use ember::dht::search::{compute_keyword_hashes, keyword_hash};
+        let plan = |query: &str| {
+            let expr = crate::search::query::parse(query).expect("parses");
+            ember_walk_plan(&expr.positive_terms(), Some(&expr))
+        };
+        // `abcde` and the normalised `café` tie on length, so the search walks
+        // `abcde`; typed, `cafe\u{301}` is the longer word, but it is another
+        // branch's.
+        let mixed = plan("abcde OR cafe\u{301}");
+        assert_eq!(mixed.companion, None, "abcde has one spelling");
+        assert_eq!(
+            mixed.branches,
+            vec![
+                (compute_keyword_hashes("café")[0].0, vec![]),
+                (keyword_hash("cafe\u{301}"), vec![]),
+            ]
+        );
+
+        let own = plan("cafe\u{301}del OR mar");
+        assert_eq!(own.companion, Some((keyword_hash("cafe\u{301}del"), vec![])));
+        assert_eq!(own.branches, vec![(keyword_hash("mar"), vec![])]);
+    }
+
+    /// However many branches and spellings a query has, one search runs a
+    /// bounded number of extra walks, each on a key of its own.
+    #[test]
+    fn a_search_runs_a_bounded_number_of_extra_walks() {
+        let query = "ubuntu OR cafe\u{301} OR nai\u{308}ve OR re\u{301}sume\u{301} OR jalapen\u{303}o";
+        let expr = crate::search::query::parse(query).expect("parses");
+        let plan = ember_walk_plan(&expr.positive_terms(), Some(&expr));
+        let keys: Vec<[u8; 16]> = plan.keys().collect();
+        assert_eq!(keys.len(), MAX_EMBER_FEEDING_WALKS);
+        let distinct: HashSet<[u8; 16]> = keys.iter().copied().collect();
+        assert_eq!(distinct.len(), keys.len());
+    }
+
+    /// With no term common to every match, a search walks the longest term,
+    /// and each `OR` branch that does not contain it gets a walk of its own —
+    /// under its other terms as extra keys, a branch's every match carrying
+    /// them — up to three branches in all.
+    #[test]
+    fn each_or_branch_the_search_key_misses_gets_a_walk() {
+        use ember::dht::search::keyword_hash;
+        let walks = |query: &str| {
+            let expr = crate::search::query::parse(query).expect("parses");
+            ember_walk_plan(&expr.positive_terms(), Some(&expr)).branches
+        };
+        assert!(walks("ubuntu").is_empty());
+        assert!(walks("ubuntu (desktop OR server)").is_empty(), "ubuntu is in every match");
+        assert_eq!(walks("ubuntu OR debian"), vec![(keyword_hash("debian"), vec![])]);
+        assert_eq!(walks("(ubuntu server) OR debian"), vec![(keyword_hash("debian"), vec![])]);
+        assert_eq!(
+            walks("alpha OR (gamma delta)"),
+            vec![(keyword_hash("gamma"), vec![keyword_hash("delta")])]
+        );
+        assert_eq!(
+            walks("aaaa OR (bbbb cccc) OR (bbbb dddd)"),
+            vec![(keyword_hash("bbbb"), vec![])],
+            "branches sharing a key share a walk, intersecting on nothing they do not all carry"
+        );
+        assert_eq!(walks("aaaa OR bbbb OR cccc OR dddd OR eeee").len(), 2);
+
+        let normalised = ember::dht::search::compute_keyword_hashes("café")[0].0;
+        assert_eq!(
+            walks("ubuntu OR cafe\u{301}"),
+            vec![(normalised, vec![]), (keyword_hash("cafe\u{301}"), vec![])],
+            "a branch whose spelling hashes two ways is walked under both"
+        );
+    }
+
+    /// Rows found under a branch's key are kept like those under the search's
+    /// own key.
+    #[test]
+    fn records_found_by_an_or_branch_walk_are_kept() {
+        let held = vec![
+            record_under("ubuntu", 1, "ubuntu.iso"),
+            record_under("debian", 2, "debian.iso"),
+            record_under("fedora", 3, "fedora debian.iso"),
+        ];
+        let expr = crate::search::query::parse("ubuntu OR debian").expect("parses");
+        let built = build_ember_keyword_built(&held, &expr.positive_terms(), Some(&expr));
+        assert_eq!(names(&built), vec!["debian.iso", "ubuntu.iso"]);
+    }
+
+    /// A search waits for every walk feeding it, and each hands its records
+    /// over without disturbing the others' links.
+    #[test]
+    fn a_search_waits_for_its_branch_walks_and_its_companion() {
+        let (mut sm, main, walk) = two_linked_walks();
+        let rt = ember::dht::routing::RoutingTable::new(ember::dht::EmberNodeId([0; 16]), false);
+        let branch = sm
+            .start_find_value(ember::dht::EmberNodeId([3; 16]), vec![], &rt)
+            .expect("slot");
+        sm.get_mut(branch).unwrap().companion = ember::dht::search::Companion::FeedsInto(main);
+        sm.get_mut(main).unwrap().branch_walks.push(branch);
+        sm.get_mut(branch)
+            .unwrap()
+            .results
+            .push(record_under("debian", 2, "debian.iso"));
+        assert_eq!(ember_feeding_walks(&sm, main), vec![walk, branch]);
+
+        assert_eq!(settle_ember_companion(&mut sm, main, true), CompanionStep::Wait);
+        assert_eq!(settle_ember_companion(&mut sm, branch, true), CompanionStep::HandedTo(main));
+        let search = sm.get(main).unwrap();
+        assert_eq!(search.results.len(), 1);
+        assert!(search.branch_walks.is_empty());
+        assert_eq!(search.companion, ember::dht::search::Companion::Running(walk), "the companion still runs");
+        assert_eq!(settle_ember_companion(&mut sm, main, true), CompanionStep::Wait);
+        assert_eq!(settle_ember_companion(&mut sm, walk, true), CompanionStep::HandedTo(main));
+        assert_eq!(settle_ember_companion(&mut sm, main, true), CompanionStep::Report);
+    }
+
+    /// The progress figure counts the rows that reached the page — what the
+    /// emit returned as accepted, and rows found again — credited to the lookup
+    /// running for that request. A row the emit's filters dropped is not
+    /// returned, and not counted.
+    #[test]
+    fn rows_shown_count_toward_their_own_lookups_progress() {
+        let row = |hash: &str| {
+            let mut row = ember_keyword_row([0; 16], 1, "x.iso".to_string(), None, 1, String::new());
+            row.file.hash = hash.to_string();
+            row
+        };
+        let lookup = |request_id: u64| EmberKeywordSearch {
+            request_id,
+            keywords: vec!["ubuntu".to_string()],
+            query_expr: None,
+            file_type_filter: None,
+            min_size: None,
+            max_size: None,
+            file_extension: None,
+            min_availability: None,
+            last_streamed_count: 0,
+            streamed_files: HashSet::new(),
+            streamed_publishers: HashSet::new(),
+        };
+        let mut searches = HashMap::from([(1u32, lookup(10)), (2u32, lookup(20))]);
+        // Built: aa, bb, dd. The emit's filters dropped dd.
+        let emitted = vec![row("aa"), row("bb")];
+        let resights = vec![row("aa"), row("ee")];
+        note_ember_rows_shown(&mut searches, 20, &emitted, &resights);
+        note_ember_rows_shown(&mut searches, 99, &[row("cc")], &[]);
+        assert!(searches[&1].streamed_files.is_empty());
+        let mut counted: Vec<_> = searches[&2].streamed_files.iter().cloned().collect();
+        counted.sort();
+        assert_eq!(counted, vec!["aa", "bb", "ee"], "dd, filtered out, is not counted");
     }
 }

@@ -28,6 +28,21 @@ pub fn ed2k_known_met_part_hash_count(file_size: u64) -> usize {
     }
 }
 
+/// `part_hashes` in the form eMule stores and expects back
+/// (`CFileIdentifier::HasExpectedMD4HashCount`): one MD4 per part, plus the
+/// `MD4("")` of the empty last part when the size is an exact multiple of
+/// PARTSIZE. A set with any other length is returned unchanged.
+pub fn ed2k_known_met_hashset(part_hashes: &[[u8; 16]], file_size: u64) -> Vec<[u8; 16]> {
+    let mut hashes = part_hashes.to_vec();
+    if file_size >= PARTSIZE
+        && file_size.is_multiple_of(PARTSIZE)
+        && hashes.len() as u64 == file_size / PARTSIZE
+    {
+        hashes.push(Md4::digest([]).into());
+    }
+    hashes
+}
+
 /// Hash an already-opened file. Callers that enforce filesystem policy use
 /// this to bind verification to the same object identity later finalized.
 pub fn ed2k_hash_open_file(file: &mut std::fs::File) -> anyhow::Result<String> {
@@ -831,6 +846,29 @@ pub fn parse_ed2k_link_strict(link: &str) -> Result<ParsedEd2kLink, &'static str
     Ok((name, size, hash, aich, ember))
 }
 
+/// The `s=<url>` web sources of an ed2k file link — eMule's HTTP sources —
+/// in the order they appear, as written. Empty for anything that is not an
+/// ed2k file link. Whether a URL is usable is
+/// [`super::web_sources::normalize_web_source_url`]'s call.
+pub fn ed2k_link_web_sources(link: &str) -> Vec<String> {
+    let normalized = normalize_ed2k_uri(link);
+    let Some(inner) = strip_prefix_ignore_ascii_case(&normalized, "ed2k://|file|") else {
+        return Vec::new();
+    };
+    // Name, size and hash come first; a web source can only be a later field.
+    // The link ends at its `|/`, or at a line break when it has none: text
+    // holding several links must not lend this one the mirrors of the next.
+    let inner = inner.split(['\n', '\r']).next().unwrap_or_default();
+    inner
+        .split('|')
+        .skip(3)
+        .take_while(|seg| !seg.starts_with('/'))
+        .filter_map(|seg| seg.strip_prefix("s="))
+        .filter(|url| !url.trim().is_empty())
+        .map(|url| url.trim().to_string())
+        .collect()
+}
+
 /// Compatibility parser for collection imports. Invalid links (including
 /// malformed AICH-bearing links) are skipped rather than partially accepted.
 pub fn parse_ed2k_link(link: &str) -> Option<ParsedEd2kLink> {
@@ -922,6 +960,34 @@ mod link_tests {
         assert_eq!(hash, HASH);
         assert!(aich.is_none());
         assert!(ember.is_none());
+    }
+
+    #[test]
+    fn web_sources_are_read_from_s_segments_only() {
+        let link = format!(
+            "ed2k://|file|a.bin|9|{HASH}|s=https://mirror.example/a.bin|sources,1.2.3.4:1|s=http://other.example/a.bin|/"
+        );
+        assert_eq!(
+            ed2k_link_web_sources(&link),
+            vec!["https://mirror.example/a.bin", "http://other.example/a.bin"]
+        );
+        // A file named like a source is still the name.
+        let named = format!("ed2k://|file|s=trick|9|{HASH}|/");
+        assert!(ed2k_link_web_sources(&named).is_empty());
+        assert!(ed2k_link_web_sources("ed2k://|server|1.2.3.4|4661|/").is_empty());
+    }
+
+    #[test]
+    fn web_sources_stop_at_the_end_of_their_link() {
+        let two = format!(
+            "ed2k://|file|a.bin|9|{HASH}|s=https://a.example/a.bin|/\n\
+             ed2k://|file|b.bin|9|{HASH}|s=https://b.example/b.bin|/"
+        );
+        assert_eq!(ed2k_link_web_sources(&two), vec!["https://a.example/a.bin"]);
+        let unterminated = format!(
+            "ed2k://|file|a.bin|9|{HASH}|s=https://a.example/a.bin\nmore|s=https://b.example/b.bin|/"
+        );
+        assert_eq!(ed2k_link_web_sources(&unterminated), vec!["https://a.example/a.bin"]);
     }
 
     #[test]

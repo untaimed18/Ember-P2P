@@ -37,14 +37,6 @@ fn remove_all_case_insensitive(chars: &[char], pat_lower: &str) -> Vec<char> {
     if pat_char_len == 0 {
         return chars.to_vec();
     }
-    // Some Unicode lowercase mappings expand one source character into
-    // several characters. In that case a fixed source-character window
-    // cannot be mapped safely back for truncation; leave the display text
-    // unchanged rather than remove the wrong neighbouring characters.
-    let lowered_char_len: usize = chars.iter().map(|c| c.to_lowercase().count()).sum();
-    if lowered_char_len != chars.len() {
-        return chars.to_vec();
-    }
     let mut stack: Vec<char> = Vec::with_capacity(chars.len());
     for &c in chars {
         stack.push(c);
@@ -52,7 +44,7 @@ fn remove_all_case_insensitive(chars: &[char], pat_lower: &str) -> Vec<char> {
             let tail_start = stack.len() - pat_char_len;
             let tail_matches = stack[tail_start..]
                 .iter()
-                .flat_map(|c| c.to_lowercase())
+                .map(|&c| fold_char(c))
                 .eq(pat_lower.chars());
             if tail_matches {
                 stack.truncate(tail_start);
@@ -60,6 +52,21 @@ fn remove_all_case_insensitive(chars: &[char], pat_lower: &str) -> Vec<char> {
         }
     }
     stack
+}
+
+/// Lowercase one char to exactly one char, keeping any char whose lowercase is
+/// several (`İ`), so a match always spans as many source chars as the pattern
+/// and can be cut out without touching its neighbours.
+fn fold_char(c: char) -> char {
+    let mut lower = c.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(single), None) => single,
+        _ => c,
+    }
+}
+
+fn fold_str(s: &str) -> String {
+    s.chars().map(fold_char).collect()
 }
 
 /// Clean up a filename for display. Removes promotional text, replaces separators
@@ -77,7 +84,7 @@ pub fn cleanup_filename(name: &str, cleanup_strings: &[String]) -> String {
     let mut result = crate::security::sanitize_remote_text(&url_decode(&stem), usize::MAX);
 
     for pattern in cleanup_strings {
-        let pat_lower = pattern.to_lowercase();
+        let pat_lower = fold_str(pattern);
         if pat_lower.is_empty() {
             continue;
         }
@@ -137,15 +144,7 @@ fn remove_url_words_case_insensitive(s: &str, pat_lower: &str) -> String {
         return s.to_string();
     }
     let chars: Vec<char> = s.chars().collect();
-    let lower_chars: Vec<char> = s.to_lowercase().chars().collect();
-    // Case-folding essentially never changes char count for the
-    // ASCII-only patterns here, but if it ever does for some exotic
-    // input, positions in `lower_chars` can't be safely mapped back
-    // onto `chars` — bail out unchanged rather than risk misaligned
-    // indexing.
-    if lower_chars.len() != chars.len() {
-        return s.to_string();
-    }
+    let lower_chars: Vec<char> = chars.iter().map(|&c| fold_char(c)).collect();
     let pat_chars: Vec<char> = pat_lower.chars().collect();
     let pat_len = pat_chars.len();
     let n = chars.len();
@@ -170,7 +169,7 @@ fn remove_url_words_case_insensitive(s: &str, pat_lower: &str) -> String {
 pub fn strip_comment_urls(comment: &str) -> String {
     let mut result = comment.to_string();
     for pattern in COMMENT_URL_PATTERNS {
-        let pat_lower = pattern.to_lowercase();
+        let pat_lower = fold_str(pattern);
         result = remove_url_words_case_insensitive(&result, &pat_lower);
     }
     collapse_spaces(&result)
@@ -526,6 +525,25 @@ mod tests {
         let result = cleanup_filename(&name, &default_cleanup());
         assert!(!result.to_lowercase().contains("www"));
         assert!(result.contains("Real Title"));
+    }
+
+    #[test]
+    fn a_char_whose_lowercase_is_longer_does_not_switch_cleanup_off() {
+        let cleanup = default_cleanup();
+        assert_eq!(
+            cleanup_filename("İstanbul [www.sharelive.net].avi", &cleanup),
+            "İstanbul.avi"
+        );
+        assert_eq!(
+            cleanup_filename("WWW.Site.COM İzmir.mp3", &cleanup),
+            "Site İzmir.mp3"
+        );
+        let result = strip_comment_urls("İyi dosya http://spam.example thanks");
+        assert_eq!(result, "İyi dosya thanks");
+        // Matching is still case-blind across the rest of the name.
+        let chars: Vec<char> = "xİSHAREDy".chars().collect();
+        let kept: String = remove_all_case_insensitive(&chars, "shared").into_iter().collect();
+        assert_eq!(kept, "xİy");
     }
 
     #[test]

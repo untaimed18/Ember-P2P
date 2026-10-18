@@ -32,8 +32,8 @@ pub const MANIFEST_FILE: &str = "manifest.json";
 pub const REPORT_FILE: &str = "emule-import-report.json";
 const MANIFEST_VERSION: u32 = 1;
 /// Credits unused this long are left behind, as Ember's own are
-/// (`CreditManager::cleanup_stale(90)`).
-const CREDIT_MAX_AGE_SECS: i64 = 90 * 24 * 3600;
+/// (`CREDIT_EXPIRY_DAYS`, eMule's 150).
+const CREDIT_MAX_AGE_SECS: i64 = crate::network::ed2k::credits::CREDIT_EXPIRY_DAYS * 24 * 3600;
 /// Counting the subfolders a recursive share would add stops here.
 const SUBFOLDER_COUNT_CAP: usize = 5_000;
 /// Prefix a staged `.part` carries until its transfer row exists. The orphan

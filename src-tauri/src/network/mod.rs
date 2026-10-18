@@ -7,6 +7,7 @@ mod channel_relay;
 mod channel_xfer;
 mod chat;
 pub(crate) mod chat_attach;
+mod chat_mailbox;
 mod command;
 mod downloads;
 pub mod ed2k;
@@ -137,6 +138,7 @@ use self::channel_membership::*;
 use self::channel_relay::*;
 use self::channel_xfer::*;
 use self::chat::*;
+use self::chat_mailbox::*;
 use self::downloads::*;
 use self::ember_dht::*;
 use self::ember_peers::*;
@@ -708,6 +710,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         Arc::new(std::sync::RwLock::new(banned_ips.clone()));
     let shared_banned_hashes: ed2k::upload::SharedBannedHashes =
         Arc::new(std::sync::RwLock::new(banned_hashes));
+    ed2k::upload::register_udp_banned_hashes(&shared_banned_hashes);
     let shared_friends_only_hashes: ed2k::upload::SharedFriendsOnlyHashes =
         Arc::new(std::sync::RwLock::new(Default::default()));
 
@@ -717,9 +720,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // unmodified pre-haystack factory file is migrated in place).
     // Wrapped in a `parking_lot::RwLock` so the upload server can
     // hot-read on every handshake while the settings UI hot-swaps the
-    // pattern list. The filter is disabled by default — users have to
-    // opt in via Settings — to avoid surprising regressions for anyone
-    // who didn't ask for it. The defaults are conservative regardless.
+    // pattern list. New profiles start with it on; the built-in patterns
+    // are conservative, naming only clients that take without giving back.
     let shared_antileech: crate::security::antileech::SharedAntiLeechFilter = {
         let initial = crate::security::antileech::load_or_seed_defaults(
             &data_dir,
@@ -744,10 +746,20 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         met_path
                     );
                 } else {
-                    warn!(
-                        "Failed to load persisted server.met from {:?}: {} — will download community list after event loop starts if empty",
-                        met_path, e
-                    );
+                    // The bootstrap below saves the community list over this
+                    // path. Set the user's file aside first, so a list that
+                    // will not load is kept rather than replaced.
+                    let kept = data_dir.join("server.met.bad");
+                    match std::fs::rename(&met_path, &kept) {
+                        Ok(()) => warn!(
+                            "Failed to load persisted server.met from {:?}: {} — kept it as {:?}; will download community list after event loop starts",
+                            met_path, e, kept
+                        ),
+                        Err(rename_err) => warn!(
+                            "Failed to load persisted server.met from {:?}: {} — and could not set it aside ({}); will download community list after event loop starts",
+                            met_path, e, rename_err
+                        ),
+                    }
                 }
                 ServerList::new()
             }
@@ -792,6 +804,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // lives in `NetworkState`, which is built next.
     let (xfer_finish_tx, mut xfer_finish_rx) = mpsc::unbounded_channel::<XferFinishResult>();
     let (xfer_stream_tx, xfer_stream_rx) = mpsc::unbounded_channel::<StreamFetchOutcome>();
+    let (xfer_accept_tx, xfer_accept_rx) = mpsc::unbounded_channel::<XferAcceptPrepared>();
 
     // Before anything below can finish a download or sweep where finished
     // files land; `apply_network_settings` keeps it current from here.
@@ -934,6 +947,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         active_source_overflow: HashMap::new(),
         transfer_friend_hint: HashMap::new(),
         friend_xfer_attempts: HashMap::new(),
+        friend_xfer_waiting: HashMap::new(),
         friend_xfer_inbound_last: HashMap::new(),
         friend_xfer_stats: FriendXferStats::default(),
         friend_xfer_punch_serve: HashMap::new(),
@@ -962,12 +976,15 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         server_auto_reconnect: false,
         server_reconnect_failures: 0,
         server_reconnect_network_down: false,
+        server_last_attempt_failed: false,
+        last_server_session_low_id: false,
         preferred_ed2k_server: None,
         server_last_connect_attempt: None,
         pending_uss_pings: HashMap::new(),
         uss_host: None,
         uss_prev_host: None,
         uss_missed_pongs: 0,
+        uss_last_ping_at: None,
         uss_host_selected_at: 0,
         uss_rtt_queue,
         uss_enabled_flag,
@@ -1058,6 +1075,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         online_friends: HashMap::new(),
         pending_browse_requests: HashMap::new(),
         recent_ember_chat: HashMap::new(),
+        held_chat_expires: HashMap::new(),
+        chat_mailbox_round: None,
+        chat_mailbox_last_round: None,
+        chat_mailbox_rerun: false,
         ember_sessions: Arc::new(RwLock::new(HashMap::new())),
         // Mirror the `stats.status` initialization above. The upload listener
         // binds and starts accepting TCP connections immediately (see
@@ -1202,6 +1223,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         xfer_finish_tx,
         xfer_finish_in_flight: 0,
         xfer_finishing: HashMap::new(),
+        xfer_accepting: HashMap::new(),
+        xfer_accept_tx,
+        xfer_accept_rx,
         channel_member_touches: HashMap::new(),
         xfer_pending: HashMap::new(),
         xfer_grants: Default::default(),
@@ -1236,6 +1260,30 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let db = db.clone();
         let folders = settings.download_roots();
         let _ = tokio::task::spawn_blocking(move || chat_attach::sweep_interrupted(&db, &folders)).await;
+    }
+    // Web sources downloads were added with, before any of them can start.
+    ed2k::web_sources::set_enabled(settings.web_sources_enabled);
+    {
+        let db = db.clone();
+        match tokio::task::spawn_blocking(move || db.load_transfer_web_sources()).await {
+            Ok(Ok(rows)) => {
+                let mut by_file: HashMap<[u8; 16], Vec<String>> = HashMap::new();
+                for (file_hash, url) in rows {
+                    if let Some(hash) = parse_ed2k_hash16(&file_hash) {
+                        by_file.entry(hash).or_default().push(url);
+                    }
+                }
+                let files = by_file.len();
+                for (hash, urls) in by_file {
+                    ed2k::web_sources::register(hash, urls);
+                }
+                if files > 0 {
+                    info!("Loaded web sources for {files} download(s)");
+                }
+            }
+            Ok(Err(e)) => warn!("Failed to load download web sources: {e}"),
+            Err(e) => warn!("Web source load task failed: {e}"),
+        }
     }
     // In the background, one folder each, so an offline one holds up nothing;
     // only copies older than this run are touched, never one a completion
@@ -1615,8 +1663,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             {
                 // Built here and adopted by `insert_loaded_credit` rather
                 // than via `get_or_create`, which would bump `last_seen` to
-                // "now" and index it there, so cap eviction and the 90-day
-                // prune would both misjudge the record's real age.
+                // "now" and index it there, so cap eviction and the
+                // `CREDIT_EXPIRY_DAYS` prune would both misjudge the
+                // record's real age.
                 let mut record = ed2k::credits::CreditRecord::new(hash);
                 record.uploaded = uploaded;
                 record.downloaded = downloaded;
@@ -1705,7 +1754,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 Err(e) => debug!("Could not load clients.met: {e}"),
             }
         }
-        // Prune anything older than the 90-day cutoff right now instead
+        // Prune anything past `CREDIT_EXPIRY_DAYS` right now instead
         // of waiting for the first `credit_save_timer` tick (60 s in).
         // Without this, the Known Clients tab would render with stale
         // rows for the first minute of every session — annoying when
@@ -1713,7 +1762,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         // periodic prune at `credit_save_timer` still runs, but this
         // makes the steady state correct from second one.
         let pruned_before = cm.all_records().len();
-        cm.cleanup_stale(90);
+        cm.cleanup_stale(ed2k::credits::CREDIT_EXPIRY_DAYS);
         let pruned_after = cm.all_records().len();
         let any_pruned = pruned_before != pruned_after;
         if any_pruned {
@@ -1746,7 +1795,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     }
 
     let a4af_shared: Arc<RwLock<A4AFManager>> = Arc::new(RwLock::new(A4AFManager::new()));
-    let pending_dl_hashes: Arc<RwLock<Vec<[u8; 16]>>> = Arc::new(RwLock::new(Vec::new()));
     let active_port_tests: Arc<tokio::sync::Mutex<HashMap<std::net::IpAddr, mpsc::Sender<()>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let shared_server_addr: Arc<RwLock<Option<SocketAddr>>> = Arc::new(RwLock::new(None));
@@ -1814,8 +1862,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let ul_sm = source_manager.clone();
         let ul_comments = state.comment_manager.clone();
         let ul_cm = credit_manager.clone();
-        let ul_a4af = a4af_shared.clone();
-        let ul_pdh = pending_dl_hashes.clone();
         let ul_apt = active_port_tests.clone();
         let ul_buddy_hashes = pending_buddy_hashes.clone();
         let ul_buddy_tx = buddy_conn_tx.clone();
@@ -1880,8 +1926,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 ul_sm,
                 ul_comments,
                 ul_cm,
-                ul_a4af,
-                ul_pdh,
                 ul_apt,
                 ul_buddy_hashes,
                 ul_buddy_tx,
@@ -2780,7 +2824,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             } else {
                 match target {
                     Some((server_ip, server_port)) => {
-                        initiate_server_connect(
+                        let target = format!("{server_ip}:{server_port}");
+                        if let Err(reason) = initiate_server_connect(
                             &mut state,
                             &settings,
                             &app_handle,
@@ -2788,7 +2833,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             server_ip,
                             server_port,
                         )
-                        .await;
+                        .await
+                        {
+                            emit_server_auto_connect_failed(
+                                &app_handle,
+                                &format!("{target} can no longer be connected to: {reason}"),
+                            );
+                        }
                     }
                     None => {
                         emit_server_auto_connect_failed(
@@ -2924,6 +2975,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             &data,
                             settings.filter_servers_by_ip,
                             Some(&mut state.ip_filter),
+                            false,
                         ) {
                             Ok(stats) => {
                                 info!(
@@ -3674,6 +3726,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'small_timer' panicked: {}", describe_panic(&*__p));
                 }
+                // Here rather than an arm of its own: the loop is at
+                // `select!`'s branch limit. It keeps its own cadence.
+                on_chat_mailbox_tick(&mut state, &db, &app_handle, &settings, ed25519_secret_key, ed25519_pubkey);
             }
 
             // Buddy system: find a relay buddy if firewalled (always-on, like eMule)
@@ -3843,7 +3898,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &transfer_manager,
                     &source_manager,
                     &a4af_shared,
-                    &pending_dl_hashes,
                 ))
                 .catch_unwind()
                 .await;
@@ -4451,7 +4505,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // `SpamFilter::save_gate` with IPC mark_spam saves so the two
                 // paths cannot overwrite each other out of order.
                 let needs_spam_save = if !spam_save_in_flight {
-                    spam_filter.read().await.is_dirty()
+                    spam_filter.read().await.has_unsaved_changes()
                 } else {
                     false
                 };

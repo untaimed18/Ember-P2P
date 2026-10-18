@@ -581,9 +581,9 @@ pub(super) struct NetworkState {
     pub(super) per_file_sources: HashMap<String, ed2k::sources::PerFileSourceList>,
     /// Cap for each list in `per_file_sources`, from Max sources per file.
     pub(super) max_sources_per_file: usize,
-    /// KAD search state for active downloads not in pending_downloads.
-    /// Tracks (last_kad_search_at, search_count) so we periodically search
-    /// for additional sources via KAD even while the download is running.
+    /// Each download's KAD source search clock, eMule's `m_LastSearchTimeKad`
+    /// and `m_TotalSearchesKad`: the file's whether it is pending or running
+    /// (see `kad_source_search_may_start`).
     /// `(last search, searches so far)`. Monotonic, as is
     /// `ember_source_search_state`: on the wall clock a step back held each
     /// download's next search for the length of the step.
@@ -631,6 +631,10 @@ pub(super) struct NetworkState {
     /// Bounds retries and lets an `OP_EMBER_XFER_ACK` be matched to the
     /// request it answers.
     pub(super) friend_xfer_attempts: HashMap<([u8; 16], [u8; 16]), FriendXferAttempt>,
+    /// Downloads with a source parked behind another file's request to the
+    /// same friend, which is released when that request is over. See
+    /// `friend_transfer::route_friend_transfer_only_source`.
+    pub(super) friend_xfer_waiting: HashMap<[u8; 16], HashSet<String>>,
     /// When we last accepted an inbound `OP_EMBER_XFER_REQ` from each friend.
     /// A friend session is authenticated, so this is not an anti-spoofing
     /// measure — it just stops a buggy or malicious *friend* from using us as
@@ -723,6 +727,14 @@ pub(super) struct NetworkState {
     pub(super) server_reconnect_failures: u32,
     /// The last connect attempt failed because our own network was down.
     pub(super) server_reconnect_network_down: bool,
+    /// The last attempt failed to log in at all, with the network up. Only
+    /// then is a fast retry worth making plain: a session that logged in and
+    /// was later dropped proved the encrypted path works.
+    pub(super) server_last_attempt_failed: bool,
+    /// Whether the last server session to end was LowID. `low_id` is cleared
+    /// with the session, but the reconnect still has to log in on a port other
+    /// than the one that earned it.
+    pub(super) last_server_session_low_id: bool,
     /// Only server auto-reconnect / auto-connect may dial. Set on connect and
     /// persisted as last successful server on login.
     pub(super) preferred_ed2k_server: Option<(String, u16)>,
@@ -735,8 +747,10 @@ pub(super) struct NetworkState {
     /// Last USS host — excluded on the next selection so rotation cannot
     /// immediately re-pick the same unresponsive contact.
     pub(super) uss_prev_host: Option<SocketAddr>,
-    /// Consecutive *timed-out* USS pings (rotate host after 3)
+    /// Consecutive timed-out USS pings, for the log.
     pub(super) uss_missed_pongs: u32,
+    /// When the last USS ping went out, to any host in the pool.
+    pub(super) uss_last_ping_at: Option<std::time::Instant>,
     /// When the current USS host was selected
     pub(super) uss_host_selected_at: i64,
     /// Shared RTT queue for feeding latency samples to the limiter loop
@@ -1114,6 +1128,19 @@ pub(super) struct NetworkState {
     /// can reach this map; the short window suppresses accidental same-session
     /// application retries without accepting generic transfer-path chat.
     pub(super) recent_ember_chat: HashMap<[u8; 16], (String, i64)>,
+    /// Disappearing-message timers a friend named for something we have no
+    /// row for yet, by friend and target, with when each arrived. The timer
+    /// follows its message, but the message can still be on its way to the
+    /// database, so it is held for `CHAT_EXPIRE_HOLD_SECS` and applied when the
+    /// row lands. Bounded by `MAX_HELD_CHAT_EXPIRES` (both in `chat.rs`).
+    pub(super) held_chat_expires: HashMap<([u8; 16], ember::crypto::ChatExpireTarget), (u32, i64)>,
+    /// The chat mailbox round in progress, if any (`chat_mailbox.rs`).
+    pub(super) chat_mailbox_round: Option<tokio::task::JoinHandle<()>>,
+    /// When the last round started, which spaces out rounds asked for early.
+    pub(super) chat_mailbox_last_round: Option<std::time::Instant>,
+    /// A round was asked for early while one ran or too soon after: the tick
+    /// starts it once it may.
+    pub(super) chat_mailbox_rerun: bool,
     /// Shared Ember session map for sending outbound packets to friend connections
     pub(super) ember_sessions: upload_server::EmberSessionMap,
     /// Shared flag: set while the app is shutting down, so the upload listener
@@ -1632,6 +1659,14 @@ pub(super) struct NetworkState {
     /// `xfer_recv` by then, so this is what a cancel, a leave or a ban finds
     /// them by.
     pub(super) xfer_finishing: HashMap<[u8; 16], super::channel_xfer::XferFinishing>,
+    /// Accepts whose part file is being readied off the loop, with the size
+    /// each will need. Counted with `xfer_recv` against the receive cap and
+    /// the free-space check, since each is about to become a receive.
+    pub(super) xfer_accepting: HashMap<[u8; 16], u64>,
+    /// Where that disk work reports back; drained by the Kad process tick,
+    /// which is why both halves live here.
+    pub(super) xfer_accept_tx: mpsc::UnboundedSender<super::channel_xfer::XferAcceptPrepared>,
+    pub(super) xfer_accept_rx: mpsc::UnboundedReceiver<super::channel_xfer::XferAcceptPrepared>,
     /// `last_seen` touches waiting to be written, keyed by `(room, member)` and
     /// holding the newest timestamp seen. Drained by
     /// [`flush_channel_member_touches`] on its own interval.

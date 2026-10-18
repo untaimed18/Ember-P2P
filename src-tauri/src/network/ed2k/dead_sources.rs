@@ -167,6 +167,11 @@ impl DeadSourceList {
     /// firewalled sources for the short window and re-dialled peers unlikely to
     /// have become reachable, while a LowID node applied the long window to every
     /// source including reachable HighID peers that had merely blipped.
+    ///
+    /// Only a source we could not connect to belongs here. Every failure that
+    /// reaches the event loop today is either about the file or untagged
+    /// `Transient`, so nothing does yet.
+    #[allow(dead_code, reason = "needs connect-stage failures tagged by the download worker")]
     pub fn add_dead_source(
         &mut self,
         client_id: u32,

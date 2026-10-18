@@ -394,11 +394,16 @@ impl CompressedPartAccumulator {
 pub(super) const OUTSTANDING_RANGE_TTL: std::time::Duration =
     std::time::Duration::from_secs(30);
 
+static OUTSTANDING_RANGE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct OutstandingRange {
     pub start: u64,
     pub end: u64,
     expires_at: std::time::Instant,
+    /// Order the range was requested in. Uploaders serve in request order,
+    /// which is not offset order once blocks are held back and sent later.
+    seq: u64,
 }
 
 impl OutstandingRange {
@@ -407,6 +412,7 @@ impl OutstandingRange {
             start,
             end,
             expires_at: std::time::Instant::now() + OUTSTANDING_RANGE_TTL,
+            seq: OUTSTANDING_RANGE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -446,24 +452,44 @@ pub(super) fn expire_outstanding_ranges(outstanding: &mut Vec<OutstandingRange>)
 }
 
 pub(super) fn refresh_outstanding_range(outstanding: &mut [OutstandingRange], pkt_start: u64) {
-    if let Some(start) = outstanding
+    if let Some(seq) = outstanding
         .iter()
         .find(|r| pkt_start >= r.start && pkt_start < r.end)
-        .map(|r| r.start)
+        .map(|r| r.seq)
     {
-        touch_queued_from(outstanding, start);
+        touch_queued_from(outstanding, seq);
     }
 }
 
-/// Refresh every range from `start` on. Uploaders serve requests in order and
-/// ours ascend through the part, so the ranges after the one being sent are
-/// waiting their turn, not dropped. Timed from the request alone, the second
-/// of two blocks at 4 KB/s expired before its first byte (~45 s in), and each
-/// expiry re-requested more than the peer could ever deliver. Ranges before
-/// `start` the peer has skipped, and keep their own deadline.
-fn touch_queued_from(outstanding: &mut [OutstandingRange], start: u64) {
-    for r in outstanding.iter_mut().filter(|r| r.start >= start) {
+/// Refresh every range requested at or after `seq`. Uploaders serve requests
+/// in the order they were asked for, so the ranges after the one being sent
+/// are waiting their turn, not dropped. Timed from the request alone, the
+/// second of two blocks at 4 KB/s expired before its first byte (~45 s in),
+/// and each expiry re-requested more than the peer could ever deliver. Ranges
+/// requested earlier the peer has skipped, and keep their own deadline.
+/// Keyed on request order rather than offset: a held-back block goes out
+/// after higher offsets and waits behind them.
+fn touch_queued_from(outstanding: &mut [OutstandingRange], seq: u64) {
+    for r in outstanding.iter_mut().filter(|r| r.seq >= seq) {
         r.touch();
+    }
+}
+
+/// A packet at `pkt_start` arrived for one of `current`'s ranges, so the next
+/// part's, all requested after them, are waiting their turn behind it too.
+/// Kept in a list of their own, they were never refreshed by it, and against
+/// a slow peer the next part's first block expired before its turn came,
+/// leaving it to other workers to download a second time. Call before the
+/// packet completes its range, which takes it out of `current`.
+pub(super) fn touch_pipelined_behind(
+    current: &[OutstandingRange],
+    pkt_start: u64,
+    pipelined: &mut [OutstandingRange],
+) {
+    if current.iter().any(|r| pkt_start >= r.start && pkt_start < r.end) {
+        for r in pipelined.iter_mut() {
+            r.touch();
+        }
     }
 }
 
@@ -483,8 +509,8 @@ pub(super) fn take_completed_outstanding_range(
         .iter()
         .position(|r| pkt_start >= r.start && pkt_start < r.end && pkt_end == r.end)
     {
-        outstanding.swap_remove(i);
-        touch_queued_from(outstanding, pkt_end);
+        let done = outstanding.swap_remove(i);
+        touch_queued_from(outstanding, done.seq + 1);
         true
     } else {
         refresh_outstanding_range(outstanding, pkt_start);
@@ -794,6 +820,16 @@ pub enum SourceFailureKind {
 
 #[derive(Debug, Clone)]
 pub enum DownloadEvent {
+    /// A source worker stopped short of asking `friend` for this file over
+    /// plain eD2K, which that friend refuses — and counts toward banning the
+    /// asker. Not a source failure: nothing was asked. The network task asks
+    /// the friend for a friend transfer instead.
+    FriendTransferOnly {
+        transfer_id: String,
+        ip: String,
+        port: u16,
+        friend: [u8; 16],
+    },
     Progress {
         transfer_id: String,
         /// Bytes present on disk, from the gap list — eMule's `m_completedsize`
@@ -2151,6 +2187,50 @@ mod tests {
         assert!(take_completed_outstanding_range(&mut outstanding, 100, 200));
         let now = std::time::Instant::now();
         assert!(outstanding.iter().find(|r| r.start == 200).unwrap().expires_at > now);
+    }
+
+    #[test]
+    fn a_held_back_lower_block_requested_later_stays_queued() {
+        let mut outstanding = Vec::new();
+        push_outstanding_batch(&mut outstanding, &[(100, 200), (200, 300)]);
+        // A block deferred earlier goes out in a later request.
+        push_outstanding_batch(&mut outstanding, &[(0, 100)]);
+        for r in &mut outstanding {
+            r.expires_at = std::time::Instant::now();
+        }
+        refresh_outstanding_range(&mut outstanding, 150);
+        let now = std::time::Instant::now();
+        let live = |o: &[OutstandingRange], start: u64| {
+            o.iter().find(|r| r.start == start).unwrap().expires_at > now
+        };
+        assert!(live(&outstanding, 0), "requested after the block being served");
+        assert!(live(&outstanding, 200));
+
+        for r in &mut outstanding {
+            r.expires_at = std::time::Instant::now();
+        }
+        assert!(take_completed_outstanding_range(&mut outstanding, 100, 200));
+        let now = std::time::Instant::now();
+        assert!(outstanding.iter().all(|r| r.expires_at > now));
+    }
+
+    /// The next part's ranges, requested after the current part's, wait
+    /// behind any packet of the current part; a packet for neither leaves
+    /// their deadlines alone.
+    #[test]
+    fn the_pipelined_part_waits_behind_the_current_one() {
+        let mut current = Vec::new();
+        push_outstanding_batch(&mut current, &[(0, 100), (100, 200)]);
+        let mut pipelined = Vec::new();
+        push_outstanding_batch(&mut pipelined, &[(1000, 1100)]);
+        let stale = std::time::Instant::now();
+        pipelined[0].expires_at = stale;
+
+        touch_pipelined_behind(&current, 5000, &mut pipelined);
+        assert_eq!(pipelined[0].expires_at, stale, "not a packet of the current part");
+
+        touch_pipelined_behind(&current, 150, &mut pipelined);
+        assert!(pipelined[0].expires_at > stale);
     }
 
     #[test]
@@ -4273,13 +4353,7 @@ pub(crate) async fn maybe_send_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
     let Some(cm) = credit_manager else {
         return Ok(None);
     };
-    let peer_ip_u32 = match peer_addr.ip() {
-        std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-        std::net::IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(|v4| u32::from_be_bytes(v4.octets()))
-            .unwrap_or(0),
-    };
+    let peer_ip_u32 = CreditManager::ident_ip_of(peer_addr);
     // Read the request state under a short-lived guard and drop it before the
     // socket write. Holding the `CreditManager` read guard across
     // `write_packet_async().await` would block every `credit_manager.write()`
@@ -4313,15 +4387,10 @@ pub(crate) async fn maybe_send_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
 /// A peer's IPv4 as SecIdent v2 signs it: eMule's in-memory network-order
 /// `dwIP`, which `PokeUInt32` writes back out as the octets in order
 /// (`ClientCredits.cpp:440, :481-495`) — the same form as a HighID client ID,
-/// not the big-endian value credit bookkeeping keys on.
+/// not the big-endian value credit bookkeeping keys on. 0 wherever
+/// [`CreditManager::ident_ip_of`] is, a relayed session's stand-in included.
 fn secident_wire_ip(peer_addr: SocketAddr) -> u32 {
-    match peer_addr.ip() {
-        std::net::IpAddr::V4(v4) => u32::from_le_bytes(v4.octets()),
-        std::net::IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(|v4| u32::from_le_bytes(v4.octets()))
-            .unwrap_or(0),
-    }
+    CreditManager::ident_ip_of(peer_addr).swap_bytes()
 }
 
 pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Sized>(
@@ -4405,6 +4474,9 @@ pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
     Ok(())
 }
 
+/// Check a peer's `OP_SIGNATURE` against our outstanding challenge and record
+/// the outcome. Returns whether it verified: that this session, not merely
+/// some session under this user hash, proved it.
 pub(crate) async fn handle_secident_signature(
     credit_manager: Option<&Arc<tokio::sync::RwLock<CreditManager>>>,
     peer_user_hash: [u8; 16],
@@ -4413,9 +4485,9 @@ pub(crate) async fn handle_secident_signature(
     peer_secident_level: u8,
     payload: &[u8],
     our_client_id: u32,
-) {
+) -> bool {
     let Some(cm) = credit_manager else {
-        return;
+        return false;
     };
     let peer = crate::security::short_hash(&peer_user_hash);
     let sig_len = payload[0] as usize;
@@ -4425,19 +4497,13 @@ pub(crate) async fn handle_secident_signature(
              {} bytes, declared signature length {sig_len}",
             payload.len()
         );
-        return;
+        return false;
     }
     let Some(challenge) = pending_secident_challenge.take() else {
         debug!("SecIdent: ignored OP_SIGNATURE from {peer_addr} ({peer}) with no challenge of ours outstanding");
-        return;
+        return false;
     };
-    let peer_ip_u32 = match peer_addr.ip() {
-        std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-        std::net::IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(|v4| u32::from_be_bytes(v4.octets()))
-            .unwrap_or(0),
-    };
+    let peer_ip_u32 = CreditManager::ident_ip_of(peer_addr);
     let sig_bytes = &payload[1..1 + sig_len];
     let challenge_kind = if payload.len() == 1 + sig_len {
         None
@@ -4449,25 +4515,26 @@ pub(crate) async fn handle_secident_signature(
              {sig_len}-byte signature does not fit peer level {peer_secident_level}",
             payload.len()
         );
-        return;
+        return false;
     };
-    let verified = {
-        let cm = cm.read().await;
-        let local_ip = if our_client_id >= 0x0100_0000 {
-            our_client_id
-        } else {
-            0
-        };
-        cm.verify_signature(
-            &peer_user_hash,
-            challenge,
-            challenge_kind,
-            secident_wire_ip(peer_addr),
-            local_ip,
-            sig_bytes,
-        )
-    };
+    // Checked and recorded under one write lock. An unproven key can be
+    // replaced, and a failed check clears it, so a gap between the two let
+    // another connection swap the key in between: the signature passed
+    // against one key and a different one was marked proven.
     let mut cm = cm.write().await;
+    let local_ip = if our_client_id >= 0x0100_0000 {
+        our_client_id
+    } else {
+        0
+    };
+    let verified = cm.verify_signature(
+        &peer_user_hash,
+        challenge,
+        challenge_kind,
+        secident_wire_ip(peer_addr),
+        local_ip,
+        sig_bytes,
+    );
     if verified {
         debug!("SecIdent: verified {peer_addr} ({peer}), v{}", if challenge_kind.is_some() { 2 } else { 1 });
         cm.set_ident_state(peer_user_hash, IdentState::Verified);
@@ -4491,6 +4558,7 @@ pub(crate) async fn handle_secident_signature(
             cm.get_record(&peer_user_hash).map(|record| record.ident_state)
         );
     }
+    verified
 }
 
 /// Carried inside the `io::Error` of a packet read that was abandoned after

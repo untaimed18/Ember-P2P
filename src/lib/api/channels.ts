@@ -55,6 +55,9 @@ export interface ChannelInfo {
   /** The room's current key needs a newer Ember to open, so new messages stay
    *  locked until this device updates. Only ever set alongside `key_behind`. */
   newer_key: boolean;
+  /** Members send this room's messages in an envelope only a newer Ember
+   *  reads, so some never arrive here. Cleared with `newer_lines`. */
+  newer_envelope: boolean;
 }
 
 /** Most messages a room can pin, mirroring `CHANNEL_PIN_MAX` in

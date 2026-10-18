@@ -106,12 +106,26 @@ const INITIAL: UpdaterState = {
 
 export const updater = writable<UpdaterState>({ ...INITIAL });
 
-// Automatic checks are scheduled by the backend (`auto_update::scheduler`),
-// which also keeps the last-checked stamp, so a long-running Ember keeps
-// checking while its webview sits hidden and throttled in the tray. Their
-// results arrive through `applyBackgroundCheckResult`.
+// Automatic checks are scheduled by the backend (`auto_update::scheduler`):
+// at every launch and hourly while Ember runs, with no setting to turn them
+// off. Their results arrive through `applyBackgroundCheckResult`.
+//
+// "Later" lasts until Ember next starts. Checks come hourly, so a dismissal
+// that did not stick would bring the notice back every hour; one that stuck
+// for good — as it once did, in localStorage — meant a single click hid that
+// release for as long as it was the newest. `sessionStorage` lives as long as
+// this run of the app, including reloads such as a language change.
 const DISMISSED_UPDATE_STORAGE_KEY = 'ember.updater.dismissedUpdate';
-const LEGACY_DISMISSED_VERSION_STORAGE_KEY = 'ember.updater.dismissedVersion';
+const PERMANENT_DISMISSAL_STORAGE_KEYS = [
+  'ember.updater.dismissedUpdate',
+  'ember.updater.dismissedVersion',
+];
+
+try {
+  for (const key of PERMANENT_DISMISSAL_STORAGE_KEYS) localStorage.removeItem(key);
+} catch {
+  // Storage unavailable; there is nothing stored to clear either.
+}
 
 interface DismissedUpdateIdentity {
   securityEpoch: number;
@@ -126,24 +140,13 @@ function normalizeSecurityEpoch(value: unknown): number | null {
 
 function readDismissedUpdate(): DismissedUpdateIdentity | null {
   try {
-    const raw = localStorage.getItem(DISMISSED_UPDATE_STORAGE_KEY);
-    if (raw !== null) {
-      try {
-        const parsed = JSON.parse(raw) as Partial<DismissedUpdateIdentity>;
-        const securityEpoch = normalizeSecurityEpoch(parsed.securityEpoch);
-        if (securityEpoch !== null && typeof parsed.version === 'string' && parsed.version) {
-          return { securityEpoch, version: parsed.version };
-        }
-      } catch {
-        // Ignore a corrupt new-format value and try the legacy key below.
-      }
-    }
-
-    // Version-only dismissals predate epoch-aware updates. Model them as
-    // epoch 0 so they can still hide a legacy epoch-0 result, but can never
-    // suppress a newer security epoch that reuses an equal/lower version.
-    const legacyVersion = localStorage.getItem(LEGACY_DISMISSED_VERSION_STORAGE_KEY);
-    return legacyVersion ? { securityEpoch: 0, version: legacyVersion } : null;
+    const raw = sessionStorage.getItem(DISMISSED_UPDATE_STORAGE_KEY);
+    if (raw === null) return null;
+    const parsed = JSON.parse(raw) as Partial<DismissedUpdateIdentity>;
+    const securityEpoch = normalizeSecurityEpoch(parsed.securityEpoch);
+    return securityEpoch !== null && typeof parsed.version === 'string' && parsed.version
+      ? { securityEpoch, version: parsed.version }
+      : null;
   } catch {
     return null;
   }
@@ -157,15 +160,12 @@ function isUpdateDismissed(securityEpoch: number | null, version: string): boole
 
 function recordDismissedUpdate(securityEpoch: number, version: string): void {
   try {
-    localStorage.setItem(
+    sessionStorage.setItem(
       DISMISSED_UPDATE_STORAGE_KEY,
       JSON.stringify({ securityEpoch, version } satisfies DismissedUpdateIdentity),
     );
-    // The tuple is now authoritative. Removing the old key prevents a future
-    // storage fallback from reviving a stale version-only dismissal.
-    localStorage.removeItem(LEGACY_DISMISSED_VERSION_STORAGE_KEY);
   } catch {
-    // In-memory dismissal still works for this session.
+    // The store's `dismissed` flag still hides it until the next check.
   }
 }
 

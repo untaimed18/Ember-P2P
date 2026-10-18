@@ -1337,9 +1337,9 @@ footer.doc-end {
 </div>
 <p>
   The searcher walks the primary (longest) keyword key. Additional keys ride
-  along so a peer that holds records can intersect on <code>file_hash</code>
-  locally. On a miss the responder sends <code>FOUND_NODE</code> with closer
-  contacts, as in classic Kademlia. A declared count the buffer cannot satisfy
+  along so the responder serves the records that carry them too first (§8.2).
+  On a miss the responder sends <code>FOUND_NODE</code> with closer contacts, as
+  in classic Kademlia. A declared count the buffer cannot satisfy
   is a framing error — the whole frame is refused, so a peer cannot smuggle a
   truncated payload. Bytes after the last declared record are ignored, which
   leaves room for an additive trailer.
@@ -1463,21 +1463,68 @@ footer.doc-end {
 <h3>7.1 Keyword hash and tokenization</h3>
 <div class="eq">keyword_hash(s) = BLAKE3(s.to_lowercase().as_bytes())[0..16]</div>
 <p>
-  Publish, and the Search UI, tokenize with eMule’s <code>extract_keywords</code>
-  so Ember and KAD hash the same words: split on the eMule separators
-  <code>()[]{}&lt;&gt;,._-!?:;\/"</code> plus whitespace, keep tokens of
-  <strong>UTF-8 length ≥ 3</strong>, de-duplicate case-insensitively in first-seen
-  order, and drop a trailing 3-byte/3-character token when it is a file extension.
-  Stemming is not performed.
+  Words are cut with eMule’s tokenizer (<code>kad::publish::extract_keywords</code>),
+  so Ember and KAD agree where a word ends: split on the eMule separators
+  <code>␠()[]{}&lt;&gt;,._-!?:;\/"</code> (the space is the only whitespace among
+  them), keep tokens of <strong>UTF-8 length ≥ 3</strong>, lowercase each one
+  character for one character, move a repeat to the end, and drop a trailing
+  token of exactly 3 bytes and 3 characters as a file extension when more than
+  one word survives. A query is cut the same way but keeps a trailing
+  three-character token; words under 3 bytes are still dropped. Stemming is not
+  performed. This is the tokenizer from 1.6.5 on; 1.6.0 to 1.6.4 also split on
+  every whitespace character, lowercased in full (so a word-final
+  <code>Σ</code> became <code>ς</code>), kept a repeat where it first appeared,
+  and stripped the last <em>new</em> word as the extension. A searcher accepts a
+  name derived either way.
 </p>
 <p>
-  Each surviving token is hashed as above. The Search UI then packs those hashes
-  onto <code>FIND_VALUE</code> via <code>compute_keyword_hashes</code>: join the
-  tokens with spaces, split on whitespace, drop anything shorter than 2 characters
-  (already gone after <code>extract_keywords</code>), sort by length descending
-  (most selective first), and de-duplicate. The first hash is the primary walk
-  key; up to seven more ride along for peer-side <code>file_hash</code>
-  intersection.
+  <strong>Normalisation.</strong> <span class="badge">additive</span>
+  Text that reads the same could hash apart: a decomposed <code>Cafe&#x301;</code>
+  against the composed <code>Café</code>, full-width <code>ＵＢＵＮＴＵ</code>
+  against <code>ubuntu</code>, a typed final <code>ς</code> against the
+  <code>σ</code> that <code>Σ</code> lowercases to. Ember therefore also derives
+  <em>normalised</em> words, by running the tokenizer over
+  <code>normalize(text)</code>:
+</p>
+<div class="eq">normalize(t) = lower(NFKC(lower(NFKC(t))))&nbsp;&nbsp;where lower maps each character to its lowercase and <code>ς</code> to <code>σ</code></div>
+<p>
+  For ASCII text <code>normalize</code> is plain ASCII lowercasing, so every
+  ASCII word keeps exactly the key it always had. KAD is untouched: its keys
+  must match eMule byte for byte, so its tokenizer is never handed normalised
+  text.
+</p>
+<ul>
+  <li><strong>Publishing</strong> (<code>ember_publish_keywords</code>) files a
+  keyword record under every word of the name as cut above, which is what
+  releases from 1.6.5 on have published under, and additionally under each
+  normalised word that hashes to a different key. A record is still signed for
+  one key; a name with a word whose two forms differ simply has one more
+  record. The words come from the name as the record signs it: a name too long
+  for the record budget is shortened first (<code>keyword_record_signed_name</code>),
+  so no record is filed under a word its own name lacks. Releases before 1.7.4
+  derived the words from the full name, so a searcher does not hold a record
+  whose name fills the budget to the derivation, nor to carrying its key’s own
+  word.</li>
+  <li><strong>Searching</strong> (<code>compute_keyword_hashes</code>) walks the
+  normalised key of the query’s primary word. When that same word, as typed,
+  hashes elsewhere (<code>legacy_keyword_hashes</code>), the search also runs a
+  second walk to that key and reports the two together, so it still finds
+  publishers that predate normalisation and wrote the same spelling. The second
+  walk is on the word the first one walks, whichever word is longest as typed;
+  the other words of an <code>OR</code> are walked as branches (§8.2).</li>
+  <li><strong>Matching a name</strong> (<code>name_hashes_to_key</code>,
+  <code>name_word_keys</code>) accepts either form of each word.</li>
+</ul>
+<p>
+  An older searcher walks the key of its own spelling, which a newer publisher
+  still writes; an older publisher writes that same key, which a newer searcher
+  still walks. Nothing on the wire changed.
+</p>
+<p>
+  The searcher sorts the query’s words by length, longest (most selective)
+  first, and de-duplicates them. The first hash is the primary walk key; up to
+  seven more travel in the count-prefixed run of <code>FIND_VALUE</code>, and
+  the rest in the constraint block, for the responder’s AND (§8.2).
 </p>
 
 <h3>7.2 Source contact block</h3>
@@ -1668,7 +1715,13 @@ footer.doc-end {
   <li>Seed the shortlist from the routing table (verified contacts preferred). Local store may pre-fill FIND_VALUE results, capped at half the result budget so a well-stocked node cannot finish the search from itself alone.</li>
   <li>Query up to α pending contacts. A node may be asked twice in one search (one loss is not proof it is gone); a second miss marks it failed. A lead we have never heard from whose Noise handshake never completed gets one attempt: that is no evidence anything lives at the address.</li>
   <li>On FOUND_NODE, merge closer contacts — at most ⌈k/α⌉ = 4 shortlist entries per responder, the closest it named, since the IDs it returns are its to invent. Seeds from our own table and pinned session peers are exempt. On FOUND_VALUE, verify blobs and merge records, taking at most 5 keyword records per file from any one responder. Those two outcomes are independent: treating “no closer node” as “query not accepted” used to stall every value lookup until timeout.</li>
+  <li>A FOUND_VALUE carries no contacts, and a node holding even one record under the key answers with records alone, so a walk whose nearest hops all hold something would never learn of the replicas closer still. A node that answers a first FIND_VALUE with records, and is among the k closest entries that have not failed, is therefore also sent one <code>FIND_NODE</code> for the target — a <em>referral</em> — and the contacts it names join the shortlist as from any FOUND_NODE. Every version answers FIND_NODE, so this needs nothing of the responder. A referral is not retried, and losing one is not held against the node, which has just answered.</li>
+  <li>A timed-out first query is charged to the routing table only when the table holds that node at the address and Noise key the search dialled. A FOUND_NODE may pair a real node’s id with an address that goes nowhere; charging the id alone let its sender evict honest contacts.</li>
   <li>FIND_NODE converges once the k closest entries that have not failed have all answered, α consecutive responses have brought nothing closer, and at least k/2 nodes have answered. FIND_VALUE does <em>not</em> use this rule: every extra node is another chance at a record the closer ones did not hold. The walk continues until the shortlist is exhausted, the 300-result budget is full, or 60 seconds elapse.</li>
+  <li>A user keyword search also ends once the k closest entries that have not failed have all answered, every pinned session peer has answered or failed, no page or referral is owed, and no new record has been taken for 5 seconds. Records live on the k nodes closest to their key, so what is left past that point is farther nodes — mostly verified seeds the trim keeps — that seldom hold anything, and walking them to exhaustion can take most of the 60 seconds, holding the search’s completion that long. Source, channel and other value lookups still exhaust their shortlist.</li>
+  <li>A FIND_VALUE carries the search’s extra keys (§8.2) and its constraints to every pinned session peer, and to every other node that is among the k closest entries that have not failed when it is first asked — which includes the whole opening round and every hop of the descent. A node outside them when first asked, typically a far seed the trim kept and asked once the neighbourhood is done, is sent the primary key alone, and its page follow-ups are too, since their offsets count records of that first query. The primary key is the walk’s target and goes to every hop either way; the rest of the query does not. A pinned peer is asked in full wherever it sorts, because it is asked for records of its own. Every version answers a one-key FIND_VALUE.</li>
+  <li>A user keyword search drops any record under its key that is not a keyword record as it arrives, before it is charged to the 300-result budget or earns a page. The other value lookups take every record type.</li>
+  <li>A walk left with unasked entries and nothing outstanding — its driver gives up after a run of batches it could not dial — is driven again on the next 1-second sweep, rather than idling until its timeout.</li>
 </ul>
 
 <table class="data">
@@ -1676,6 +1729,7 @@ footer.doc-end {
   <tbody>
     <tr><td>MAX_ACTIVE_SEARCHES</td><td>64</td></tr>
     <tr><td>SEARCH_TIMEOUT_SECS</td><td>60</td></tr>
+    <tr><td>KEYWORD_SETTLE_SECS</td><td>5</td></tr>
     <tr><td>MAX_SEARCH_RESULTS</td><td>300</td></tr>
     <tr><td>MAX_LOCAL_SEED_RESULTS</td><td>150 (half the budget)</td></tr>
     <tr><td>MAX_RESULTS_PER_NODE</td><td>75 (quarter of the budget)</td></tr>
@@ -1692,11 +1746,61 @@ footer.doc-end {
 
 <h3>8.2 Multi-keyword search</h3>
 <p>
-  Intersection is <strong>sparse</strong>: missing secondary keys are skipped,
-  plus a filename match at emit time. It is not a strict worldwide AND of
-  every keyword. Product search already tokenizes with
-  <code>extract_keywords</code> (§7.1), so 1- and 2-byte tokens never become
-  DHT keys. Successive queries rotate which window a storer serves (§8.4).
+  A responder serves every record under the primary key, as it always has, but
+  <em>orders</em> them: first those that carry every additional key, then the
+  rest, each group in store order. A record carries a key when a word of its
+  signed name hashes to it, in either form (§7.1), with the trailing
+  three-letter token counted as a word. Secondary keys live near other ids, so
+  the node closest to the primary rarely holds them; the name is what lets the
+  match be made there. The words of each stored record’s name are worked out
+  once, on first use, and kept with the record — at most 64 keys, earliest words
+  first, so a record whose name carries the other words only past them is served
+  after the matches rather than among them.
+</p>
+<p>
+  Ordering rather than filtering is for searchers that predate it. They filter
+  by substring (<code>server</code> matches <code>servers</code>), so a
+  responder dropping the rest would cost them rows they used to get; leading
+  with the matches puts the rows a newer searcher keeps inside the first pages
+  and its per-node budget. The order depends only on each record’s name and the
+  store’s order, so it is the same on every page of a walk, and a record never
+  moves ahead of one it followed, which page anchors rely on (§8.4). A
+  responder predating this intersected only on secondary keys it held; its
+  answers are covered by the searcher’s own filter.
+</p>
+<p>
+  The searcher keeps a keyword record only if it is filed under a key the
+  search walked <em>and</em> its name derives that key by the publisher’s rules,
+  and if its name carries, as a word, every word each match must contain (all
+  the keywords, or the terms on every side of a boolean query). The rest of the
+  query is then matched against the name as on the KAD path, a term counting as
+  present when it appears in the name as typed or in both normalised. Anyone may
+  store a signed record under any key, so a record under <code>ubuntu</code>
+  whose name lacks the word is not shown. Product search tokenizes with the same
+  rules, so 1- and 2-byte tokens never become DHT keys.
+</p>
+<p>
+  A search walks a term every match contains. A query with none — the sides of
+  an <code>OR</code> share no term — walks its longest positive term, which
+  finds only the branches containing it, so each branch that does not is walked
+  as well, up to three branches in all. A branch’s other terms are in every file
+  it matches, so its walk sends them as extra keys; branches sharing a key share
+  one walk and send only the extra keys they have in common. A branch is also
+  walked once under its spelling as typed where that hashes elsewhere (§7.1).
+  No two walks of one search share a key, a search runs at most four walks
+  besides its own, and those walks leave the pool’s last four slots free for the
+  next search. Each hands its records to the search when it ends, as the second
+  walk of §7.1 does.
+</p>
+<p>
+  The records for one file are folded into one row per size, as every other
+  network’s rows are kept apart by size. The file’s digest votes, and with them
+  the publishers it counts, are taken across all its sizes, since one file has
+  one content digest; each size’s row counts the counted publishers giving that
+  size, one per publisher by its first record. A row’s name is the one most of
+  those publishers give, a tie going to the record that arrived first; the type
+  follows the name, and the media is that record’s, or else the first any of
+  them carries.
 </p>
 <p>
   The Search page exposes an <strong>Ember Only</strong> method. <strong>Global</strong>
@@ -1713,6 +1817,30 @@ footer.doc-end {
   result list. A 1-second sweep emits everything past it on the same cadence
   as KAD: the first record immediately, then every 20. Locally seeded records
   therefore reach the UI on the first tick.
+</p>
+<p>
+  Each streamed batch is a rebuild over everything gathered so far, carrying
+  only the rows whose counted publishers changed, and like the closing batch it
+  is a total rather than an increment. A row counts the publishers that agree
+  with its plurality digest, which no slice of the records can know, so slices
+  counted separately and added up over-counted in a way the closing batch could
+  not take back. A row is first streamed once two publishers give it, or at the
+  rebuild after the one that first built it, a sweep later at most: the page
+  keeps the name a row first arrives with, so a row sent off a lone first record
+  would keep whatever that record says. The closing batch carries every row.
+  Each rebuild reads only the records gathered since the last one and folds the
+  rows from what it read, so a record is parsed and matched once per search.
+  A search’s second walk (§7.1) and its <code>OR</code> branch
+  walks (§8.2) stream with it: their records are part of each rebuild while they
+  run, and join the search’s own when they end. The search reports complete only
+  once every one of them has.
+</p>
+<p>
+  The progress figure a running search shows counts the rows that reached the
+  page — accepted by the type, size, extension and availability filters, or
+  already shown by another network and found again — not the rows built. Its
+  count of nodes contacted is every node any of the search’s walks has asked,
+  and does not fall when a walk ends and hands its records over.
 </p>
 <p>
   Batches run through hash de-duplication against what KAD already streamed,
@@ -2287,7 +2415,8 @@ footer.doc-end {
   <li><strong>Content still moves over eD2K.</strong> Native 256&nbsp;KiB chunks and a BLAKE3 hash tree exist but nothing imports them. Downloads still verify the streaming BLAKE3 pin when one is present: mismatch is a permanent failure with a red Ember badge.</li>
   <li><strong>Bootstrap depends on eMule</strong> except for a previously persisted contact file.</li>
   <li><strong>A version bump still partitions</strong> peers running a build older than the advertised range (§6.1). The refusal is clean and counted, and the Ember page raises a banner, but the peer that needs to update cannot decode anything we send.</li>
-  <li><strong>Multi-keyword search is approximate</strong> — sparse intersection plus filename match, not a worldwide AND. A query may name up to 23 keywords, but only the first eight travel in the run every build reads; the rest ride the constraint block, so a peer predating it intersects on eight and leaves the remainder to the filename match.</li>
+  <li><strong>Multi-keyword AND is by word, not substring</strong> — a responder leads with the records whose name carries each extra keyword as a word (§8.2), and a newer searcher keeps only those, so <code>server</code> does not match <code>servers</code>. A searcher predating this still filters by substring. A query may name up to 23 keywords, but only the first eight travel in the run every build reads; the rest ride the constraint block, so a peer predating the block sees only the first eight and leaves the remainder to the searcher’s filter.</li>
+  <li><strong>Off-name counter on older storers.</strong> A storer counts records whose key no word of their name derives (<code>ember_dht_keyword_key_off_name</code>). A storer older than normalisation does not know the normalised derivation, so each record a newer publisher files under a normalised key that differs from the typed one counts there. Nothing is refused on the count.</li>
   <li><strong>A few records per reply</strong> — five for a bare keyword record, four with media, two in the worst case — but a searcher can now page a node until its key is exhausted (§8.4).</li>
   <li><strong>150 records per publisher per keyword, network-wide.</strong></li>
   <li><strong>Media columns fill only after a republish.</strong> A record published by a build predating the media block simply has none, so those columns stay empty until that publisher re-announces.</li>
@@ -2440,6 +2569,7 @@ footer.doc-end {
     <tr><td>Iterative lookup, FIND_VALUE key packing</td><td><code>dht/search.rs</code></td></tr>
     <tr><td>Keyword/source record builders</td><td><code>dht/publish.rs</code></td></tr>
     <tr><td>Filename / query tokenization</td><td><code>kad/publish.rs</code> · <code>extract_keywords()</code></td></tr>
+    <tr><td>Ember keyword normalisation and keys</td><td><code>dht/search.rs</code> · <code>normalize_keyword_text()</code>, <code>ember_publish_keywords()</code>, <code>compute_keyword_hashes()</code></td></tr>
     <tr><td>Streaming BLAKE3 file digest</td><td><code>ember/crypto.rs</code> · <code>Blake3FileHasher</code></td></tr>
     <tr><td>Adaptive abuse limits</td><td><code>dht/scale.rs</code></td></tr>
     <tr><td>Per-IP / per-peer rate limits</td><td><code>dht/protection.rs</code></td></tr>

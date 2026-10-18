@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { rememberShed, shedWeakestRows } from './searchOverflow';
+import { planIdleTrim, rememberShed, shedWeakestRows } from './searchOverflow';
 import type { SearchResult } from '$lib/types';
 
 /**
@@ -169,5 +169,34 @@ describe('rememberShed', () => {
     const shed = new Set(['old1', 'old2']);
     expect(rememberShed(shed, ['new1', 'new2'], kept(), 3)).toBe(2);
     expect([...shed]).toEqual(['old2', 'new1', 'new2']);
+  });
+});
+
+describe('planIdleTrim', () => {
+  const idle = (rows: number) => ({ rows, idle: true });
+  const busy = (rows: number) => ({ rows, idle: false });
+
+  it('keeps every row while the tabs together are under the cap', () => {
+    // Leaving a finished tab used to cut it to a few thousand rows on the
+    // spot, so coming back to it showed less than the search had found.
+    expect(planIdleTrim([idle(15_000), busy(15_000)], 30_000, 3_000)).toBeNull();
+  });
+
+  it('takes rows from the oldest idle tab first, and only as many as the cap needs', () => {
+    expect(planIdleTrim([idle(10_000), idle(10_000), busy(10_000)], 25_000, 3_000))
+      .toEqual([5_000, 10_000, 10_000]);
+  });
+
+  it('moves on to the next idle tab once one is at its floor', () => {
+    expect(planIdleTrim([idle(5_000), idle(10_000), busy(10_000)], 18_000, 3_000))
+      .toEqual([3_000, 5_000, 10_000]);
+  });
+
+  it('never trims the tab on screen or one still searching', () => {
+    expect(planIdleTrim([busy(15_000), busy(15_000)], 10_000, 3_000)).toBeNull();
+  });
+
+  it('leaves a tab already under the floor alone', () => {
+    expect(planIdleTrim([idle(1_000), idle(9_000)], 8_000, 3_000)).toEqual([1_000, 7_000]);
   });
 });

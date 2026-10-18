@@ -29,10 +29,19 @@
 //! boolean path never stripped, so quoting one word changed whether another
 //! was searched at all.
 
-use crate::network::kad::publish::{extract_query_keywords, kad_keyword_lowercase};
+use crate::network::kad::publish::{
+    extract_query_keywords, is_kad_keyword_separator, kad_keyword_lowercase,
+};
 
 const MAX_QUERY_BYTES: usize = 16 * 1024;
 const MAX_PARSE_DEPTH: usize = 64;
+
+/// Longest run of one operator put on the wire as parsed. eMule writes a run
+/// left-leaning, one level of nesting per operand, and its KAD nodes refuse a
+/// search tree nested 24 levels deep (Ember's, 32); servers have limits of
+/// their own. A longer run goes out as a balanced tree, which means the same
+/// and nests only as deep as the log of its length.
+const MAX_WIRE_CHAIN: usize = 8;
 
 /// A parsed search query as a boolean tree of keyword terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,8 +58,9 @@ impl QueryExpr {
     /// Serialize to the eD2k binary search-expression format
     /// (`CSearchExpr`): `0x00 <op>` operator nodes (op `0x00`=AND, `0x01`=OR,
     /// `0x02`=NOT) and `0x01 <u16 len> <bytes>` string leaves. A flat AND-tree
-    /// produced from a plain keyword list is byte-identical to the output of
-    /// [`build_search_expression`](crate::network::kad::messages::build_search_expression).
+    /// of up to `MAX_WIRE_CHAIN` keywords is byte-identical to the output of
+    /// [`build_search_expression`](crate::network::kad::messages::build_search_expression);
+    /// a longer chain goes out balanced.
     pub fn to_wire_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(32);
         self.write_wire(&mut buf);
@@ -58,6 +68,14 @@ impl QueryExpr {
     }
 
     fn write_wire(&self, buf: &mut Vec<u8>) {
+        if let QueryExpr::And(..) | QueryExpr::Or(..) = self {
+            let operands = self.chain_operands();
+            if operands.len() > MAX_WIRE_CHAIN {
+                let op = if matches!(self, QueryExpr::And(..)) { 0x00 } else { 0x01 };
+                Self::write_balanced(buf, op, &operands);
+                return;
+            }
+        }
         match self {
             QueryExpr::Term(s) => {
                 buf.push(0x01);
@@ -91,15 +109,76 @@ impl QueryExpr {
         r.write_wire(buf);
     }
 
+    /// The operands of the run of this node's operator rooted here, in order:
+    /// `a b c d` is one AND of four, however it is nested.
+    fn chain_operands(&self) -> Vec<&QueryExpr> {
+        let same_op = |node: &QueryExpr| {
+            matches!(
+                (self, node),
+                (QueryExpr::And(..), QueryExpr::And(..)) | (QueryExpr::Or(..), QueryExpr::Or(..))
+            )
+        };
+        let mut operands = Vec::new();
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            match node {
+                QueryExpr::And(l, r) | QueryExpr::Or(l, r) if same_op(node) => {
+                    stack.push(r);
+                    stack.push(l);
+                }
+                _ => operands.push(node),
+            }
+        }
+        operands
+    }
+
+    fn write_balanced(buf: &mut Vec<u8>, op: u8, operands: &[&QueryExpr]) {
+        match operands {
+            [] => {}
+            [only] => only.write_wire(buf),
+            _ => {
+                let (left, right) = operands.split_at(operands.len().div_ceil(2));
+                buf.push(0x00);
+                buf.push(op);
+                Self::write_balanced(buf, op, left);
+                Self::write_balanced(buf, op, right);
+            }
+        }
+    }
+
     /// Evaluate the expression against a *lowercased* haystack (typically a
-    /// filename). Mirrors the wire/server semantics: AND/OR on substring
-    /// presence, NOT as "left present and right absent".
+    /// filename). AND/OR test substring presence, as eD2k servers do, so a
+    /// result a server returned for a partial word is not thrown away here.
+    /// NOT is "left present and right absent", where the excluded side has to
+    /// be a whole word: `-cam` leaves "Camera" alone and `linux -arm` keeps
+    /// "Swarm".
     pub fn matches(&self, haystack_lower: &str) -> bool {
         match self {
             QueryExpr::Term(s) => haystack_lower.contains(s.as_str()),
             QueryExpr::And(l, r) => l.matches(haystack_lower) && r.matches(haystack_lower),
             QueryExpr::Or(l, r) => l.matches(haystack_lower) || r.matches(haystack_lower),
-            QueryExpr::Not(l, r) => l.matches(haystack_lower) && !r.matches(haystack_lower),
+            QueryExpr::Not(l, r) => {
+                l.matches(haystack_lower) && !r.matches_whole_words(haystack_lower)
+            }
+        }
+    }
+
+    /// [`Self::matches`] with every term required to be a whole word of the
+    /// haystack, split where the keyword tokenizer splits a filename.
+    fn matches_whole_words(&self, haystack_lower: &str) -> bool {
+        match self {
+            QueryExpr::Term(s) => haystack_lower
+                .split(is_kad_keyword_separator)
+                .any(|word| word == s),
+            QueryExpr::And(l, r) => {
+                l.matches_whole_words(haystack_lower) && r.matches_whole_words(haystack_lower)
+            }
+            QueryExpr::Or(l, r) => {
+                l.matches_whole_words(haystack_lower) || r.matches_whole_words(haystack_lower)
+            }
+            QueryExpr::Not(l, r) => {
+                l.matches_whole_words(haystack_lower) && !r.matches_whole_words(haystack_lower)
+            }
         }
     }
 
@@ -160,9 +239,8 @@ impl QueryExpr {
     }
 
     /// True when this is a single bare keyword with no boolean structure. The
-    /// Kad result path skips local re-filtering in that case, preserving the
-    /// previous "only filter when there is more than one keyword" behavior
-    /// (a single-keyword Kad lookup is already exact for that keyword).
+    /// Ember keyword rows (`network::ember_search`) are matched against such a
+    /// query by its keyword alone, without the tree.
     pub fn is_trivial(&self) -> bool {
         matches!(self, QueryExpr::Term(_))
     }
@@ -258,6 +336,16 @@ pub fn positive_terms_from_query(query: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Whether `name` contains at least one of `terms` as a substring, lowercased
+/// the way the terms were. An empty `terms` accepts every name.
+pub fn name_contains_any_term(name: &str, terms: &[String]) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let name = kad_keyword_lowercase(name);
+    terms.iter().any(|term| name.contains(term.as_str()))
+}
+
 /// Parse a raw user query into a [`QueryExpr`], or `None` when it yields no
 /// usable keyword (e.g. only sub-3-byte words). Operator-free queries are
 /// tokenized exactly like [`extract_keywords`] for full backward compatibility.
@@ -289,9 +377,12 @@ pub fn parse(query: &str) -> Option<QueryExpr> {
     // A `)` with no `(` to close ends `parse_or`; skip it and carry on, or
     // everything after it was dropped (`movie (2019)) 1080p` lost `1080p`).
     let mut parts = Vec::new();
+    let mut exclusions = Vec::new();
     loop {
-        if let Some(expr) = parser.parse_or(0) {
-            parts.push(expr);
+        match parser.parse_or(0) {
+            Some(Clause::Search(expr)) => parts.push(expr),
+            Some(Clause::Exclude(excluded)) => exclusions.extend(excluded),
+            None => {}
         }
         if !matches!(parser.peek(), Some(Tok::RParen)) {
             break;
@@ -299,22 +390,78 @@ pub fn parse(query: &str) -> Option<QueryExpr> {
         parser.advance();
     }
     if let Some(expr) = fold_and(parts) {
-        return Some(expr);
+        return Some(apply_exclusions(expr, exclusions));
     }
     // The plain tokenizer below cannot tell a negated word from any other, so
     // it would search for exactly the term the user asked to exclude.
     if parser.dropped_exclusion {
         return None;
     }
+    // Nothing anywhere in the query to subtract from (e.g. just "-foo"), so
+    // search for the negated terms rather than "everything except" them.
+    if let Some(expr) = fold_and(exclusions) {
+        return Some(expr);
+    }
 
     // The boolean parse produced nothing usable (e.g. every term was too
     // short). Fall back to the plain tokenizer so the query still searches.
     fold_and(
-        extract_query_keywords(query)
+        fallback_keywords(query)
             .into_iter()
             .map(QueryExpr::Term)
             .collect(),
     )
+}
+
+/// [`extract_query_keywords`] over the words the user asked for: not the
+/// operator words, which the parser consumed as operators (`ab AND cd` must
+/// not become a search for "and"), and not what a `-` or `NOT` excludes,
+/// which would become a search for exactly that.
+fn fallback_keywords(query: &str) -> Vec<String> {
+    let toks = lex(query);
+    let mut words: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        match &toks[i] {
+            Tok::Not => {
+                i = skip_operand(&toks, i + 1);
+                continue;
+            }
+            Tok::Word(w) | Tok::Phrase(w) => words.push(w),
+            Tok::LParen | Tok::RParen | Tok::And | Tok::Or => {}
+        }
+        i += 1;
+    }
+    extract_query_keywords(&words.join(" "))
+}
+
+/// The index just past the operand starting at `i`: one word or phrase, a
+/// whole parenthesised group, or a negated one of those.
+fn skip_operand(toks: &[Tok], mut i: usize) -> usize {
+    while matches!(toks.get(i), Some(Tok::Not)) {
+        i += 1;
+    }
+    match toks.get(i) {
+        Some(Tok::LParen) => {
+            let mut nested = 0usize;
+            while let Some(tok) = toks.get(i) {
+                i += 1;
+                match tok {
+                    Tok::LParen => nested += 1,
+                    Tok::RParen => {
+                        nested -= 1;
+                        if nested == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i
+        }
+        Some(_) => i + 1,
+        None => i,
+    }
 }
 
 fn clamp_query(query: &str) -> &str {
@@ -330,6 +477,10 @@ fn clamp_query(query: &str) -> &str {
 
 /// Whether `query` contains anything that needs the boolean parser. Plain
 /// space-separated queries skip it entirely and go through [`extract_keywords`].
+///
+/// A server directive counts: the plain tokenizer splits on `:`, so
+/// `related::<hash> video` would otherwise go out as `related` AND the hash
+/// AND `video`.
 fn has_operators(query: &str) -> bool {
     for raw in query.split_whitespace() {
         if raw.contains('(') || raw.contains(')') || raw.contains('"') {
@@ -338,7 +489,7 @@ fn has_operators(query: &str) -> bool {
         if raw.starts_with('-') && raw.len() > 1 {
             return true;
         }
-        if is_operator_word(raw) {
+        if is_operator_word(raw) || is_server_directive(raw) {
             return true;
         }
     }
@@ -346,9 +497,9 @@ fn has_operators(query: &str) -> bool {
 }
 
 /// `AND`, `OR` and `NOT` as operators: upper-case only, as eMule's scanner
-/// and the search box's syntax hint have them. Matched in any case, ordinary
-/// title words became operators: `eminem not afraid` excluded "Not Afraid",
-/// and a related search for the title `truth or dare` became an OR.
+/// and the search box's syntax hint have them, so title words stay words:
+/// `eminem not afraid` keeps "Not Afraid", and a related search for the title
+/// `truth or dare` is not an OR.
 fn is_operator_word(raw: &str) -> bool {
     matches!(raw, "AND" | "OR" | "NOT")
 }
@@ -364,6 +515,55 @@ fn fold_and(mut nodes: Vec<QueryExpr>) -> Option<QueryExpr> {
         acc = QueryExpr::And(Box::new(acc), Box::new(node));
     }
     Some(acc)
+}
+
+fn fold_or(mut nodes: Vec<QueryExpr>) -> Option<QueryExpr> {
+    if nodes.is_empty() {
+        return None;
+    }
+    let mut acc = nodes.remove(0);
+    for node in nodes {
+        acc = QueryExpr::Or(Box::new(acc), Box::new(node));
+    }
+    Some(acc)
+}
+
+fn apply_exclusions(expr: QueryExpr, exclusions: Vec<QueryExpr>) -> QueryExpr {
+    exclusions.into_iter().fold(expr, |acc, excluded| {
+        QueryExpr::Not(Box::new(acc), Box::new(excluded))
+    })
+}
+
+/// What one parsed operand contributes to the query around it.
+enum Clause {
+    Search(QueryExpr),
+    /// Only negated terms, as in the group of `movie (-cam -ts)`. Each is
+    /// subtracted from whatever the enclosing AND searches for; read as
+    /// positives they would search for exactly what the user left out.
+    Exclude(Vec<QueryExpr>),
+}
+
+impl Clause {
+    fn or(left: Clause, right: Clause) -> Clause {
+        match (left, right) {
+            (Clause::Search(l), Clause::Search(r)) => {
+                Clause::Search(QueryExpr::Or(Box::new(l), Box::new(r)))
+            }
+            // `a OR NOT b` has no form in eD2k's binary NOT, and as a filter it
+            // matches nearly everything; keep the half that searches.
+            (Clause::Search(s), Clause::Exclude(_)) | (Clause::Exclude(_), Clause::Search(s)) => {
+                Clause::Search(s)
+            }
+            // NOT x OR NOT y is NOT (x AND y).
+            (Clause::Exclude(l), Clause::Exclude(r)) => match (fold_or(l), fold_or(r)) {
+                (Some(l), Some(r)) => {
+                    Clause::Exclude(vec![QueryExpr::And(Box::new(l), Box::new(r))])
+                }
+                (Some(x), None) | (None, Some(x)) => Clause::Exclude(vec![x]),
+                (None, None) => Clause::Exclude(Vec::new()),
+            },
+        }
+    }
 }
 
 /// Split a raw word/phrase into eMule keyword tokens: the publisher's own
@@ -587,15 +787,21 @@ impl Parser {
     }
 
     /// `or_expr := and_expr ( OR and_expr )*`
-    fn parse_or(&mut self, depth: usize) -> Option<QueryExpr> {
+    fn parse_or(&mut self, depth: usize) -> Option<Clause> {
         let mut left = self.parse_and(depth);
         while matches!(self.peek(), Some(Tok::Or)) {
             self.advance();
             let right = self.parse_and(depth);
             left = match (left, right) {
-                (Some(l), Some(r)) => Some(QueryExpr::Or(Box::new(l), Box::new(r))),
-                (Some(l), None) => Some(l),
-                (None, Some(r)) => Some(r),
+                (Some(l), Some(r)) => Some(Clause::or(l, r)),
+                // `tv OR -sport`: the side that searches came to nothing, so
+                // the exclusion has nothing to subtract from, and promoted
+                // to a search it would find exactly what was left out.
+                (Some(Clause::Exclude(_)), None) | (None, Some(Clause::Exclude(_))) => {
+                    self.dropped_exclusion = true;
+                    None
+                }
+                (Some(x), None) | (None, Some(x)) => Some(x),
                 (None, None) => None,
             };
         }
@@ -603,7 +809,7 @@ impl Parser {
     }
 
     /// `and_expr := ( NOT? primary )+` with implicit AND between primaries.
-    fn parse_and(&mut self, depth: usize) -> Option<QueryExpr> {
+    fn parse_and(&mut self, depth: usize) -> Option<Clause> {
         let mut positives: Vec<QueryExpr> = Vec::new();
         let mut negatives: Vec<QueryExpr> = Vec::new();
         let mut wrote_positive = false;
@@ -613,44 +819,44 @@ impl Parser {
                 Some(Tok::And) => self.advance(),
                 Some(Tok::Not) => {
                     self.advance();
-                    if let Some(p) = self.parse_primary(depth) {
-                        negatives.push(p);
+                    match self.parse_primary(depth) {
+                        Some(Clause::Search(p)) => negatives.push(p),
+                        // NOT (NOT a AND NOT b) is a OR b.
+                        Some(Clause::Exclude(excluded)) => positives.extend(fold_or(excluded)),
+                        None => {}
                     }
                 }
                 Some(Tok::LParen) | Some(Tok::Word(_)) | Some(Tok::Phrase(_)) => {
-                    wrote_positive = true;
-                    if let Some(p) = self.parse_primary(depth) {
-                        positives.push(p);
+                    match self.parse_primary(depth) {
+                        Some(Clause::Search(p)) => {
+                            wrote_positive = true;
+                            positives.push(p);
+                        }
+                        Some(Clause::Exclude(excluded)) => negatives.extend(excluded),
+                        None => wrote_positive = true,
                     }
                 }
             }
         }
 
-        let mut acc = if !positives.is_empty() {
-            fold_and(positives)?
-        } else if negatives.is_empty() {
+        if let Some(acc) = fold_and(positives) {
+            return Some(Clause::Search(apply_exclusions(acc, negatives)));
+        }
+        if negatives.is_empty() {
             return None;
-        } else if wrote_positive {
+        }
+        if wrote_positive {
             // `tv -sport`: the user did name something to subtract from, it is
             // just too short to search for. Promoting the exclusion would
             // search for the very term they asked to leave out.
             self.dropped_exclusion = true;
             return None;
-        } else {
-            // Degenerate all-negative group (e.g. just "-foo"): there is nothing
-            // to subtract from, so treat the negated terms as positives rather
-            // than emitting a "match everything except" search.
-            return fold_and(negatives);
-        };
-
-        for neg in negatives {
-            acc = QueryExpr::Not(Box::new(acc), Box::new(neg));
         }
-        Some(acc)
+        Some(Clause::Exclude(negatives))
     }
 
     /// `primary := '(' or_expr ')' | quoted | word`
-    fn parse_primary(&mut self, depth: usize) -> Option<QueryExpr> {
+    fn parse_primary(&mut self, depth: usize) -> Option<Clause> {
         match self.peek() {
             Some(Tok::LParen) => {
                 self.advance();
@@ -673,6 +879,7 @@ impl Parser {
                         .map(QueryExpr::Term)
                         .collect(),
                 )
+                .map(Clause::Search)
             }
             Some(Tok::Phrase(p)) => {
                 let raw = p.clone();
@@ -683,6 +890,7 @@ impl Parser {
                         .map(QueryExpr::Term)
                         .collect(),
                 )
+                .map(Clause::Search)
             }
             _ => None,
         }
@@ -1085,6 +1293,109 @@ mod tests {
     }
 
     #[test]
+    fn the_fallback_never_searches_for_an_operator_word() {
+        assert_eq!(parse("ab AND cd"), None);
+        assert_eq!(parse("ab OR cd NOT ef"), None);
+        assert_eq!(parse("(ab) AND (cd)"), None);
+        let query = format!(
+            "{}alpha AND beta{}",
+            "(".repeat(MAX_PARSE_DEPTH + 16),
+            ")".repeat(MAX_PARSE_DEPTH + 16)
+        );
+        assert_eq!(
+            parse(&query).map(|e| e.positive_terms()),
+            Some(vec!["alpha".to_string(), "beta".to_string()])
+        );
+        // Lower-case words are ordinary words, as on the boolean path.
+        assert_eq!(parse("ab and (cd)"), Some(term("and")));
+    }
+
+    /// The fallback reads the query the way the parser does, so a negated
+    /// word stays out of it rather than becoming a word to search for.
+    #[test]
+    fn the_fallback_never_searches_for_an_excluded_word() {
+        let deep = |inner: &str| {
+            format!(
+                "{}{inner}{}",
+                "(".repeat(MAX_PARSE_DEPTH + 16),
+                ")".repeat(MAX_PARSE_DEPTH + 16)
+            )
+        };
+        let terms = |query: &str| parse(query).map(|e| e.positive_terms());
+        let only = |words: &[&str]| Some(words.iter().map(|w| w.to_string()).collect());
+        assert_eq!(terms(&deep("alpha -beta")), only(&["alpha"]));
+        assert_eq!(terms(&deep("alpha NOT beta gamma")), only(&["alpha", "gamma"]));
+        assert_eq!(terms(&deep("alpha NOT (beta gamma) delta")), only(&["alpha", "delta"]));
+        assert_eq!(terms(&deep("alpha -\"beta gamma\" delta")), only(&["alpha", "delta"]));
+    }
+
+    /// `tv` is too short to search for, so the OR has only an exclusion left,
+    /// and it must not turn into a search for `sport`.
+    #[test]
+    fn an_exclusion_whose_alternative_is_too_short_is_never_searched_for() {
+        assert_eq!(parse("tv OR -sport"), None);
+        assert_eq!(parse("-sport OR tv"), None);
+        assert_eq!(parse("tv OR NOT sport"), None);
+        assert_eq!(parse("tv OR -sport OR movie"), Some(term("movie")));
+        assert_eq!(parse("-sport"), Some(term("sport")), "no OR: as before");
+    }
+
+    /// How deeply a wire expression nests, counting a leaf below its parents.
+    fn wire_depth(wire: &[u8]) -> usize {
+        fn node(wire: &[u8], pos: &mut usize) -> usize {
+            let kind = wire[*pos];
+            if kind == 0x00 {
+                *pos += 2;
+                let left = node(wire, pos);
+                let right = node(wire, pos);
+                1 + left.max(right)
+            } else {
+                let len = usize::from(u16::from_le_bytes([wire[*pos + 1], wire[*pos + 2]]));
+                *pos += 3 + len;
+                0
+            }
+        }
+        let mut pos = 0;
+        let depth = node(wire, &mut pos);
+        assert_eq!(pos, wire.len(), "one whole expression");
+        depth
+    }
+
+    /// eMule's KAD nodes refuse a tree nested 24 levels deep, and a long
+    /// query, or a pasted file name, is one AND per word. Up to
+    /// `MAX_WIRE_CHAIN` words the wire is unchanged; past it the run goes out
+    /// balanced, meaning the same at a fraction of the depth.
+    #[test]
+    fn a_long_run_of_words_goes_out_shallow() {
+        let words: Vec<String> = (0..40).map(|i| format!("word{i:02}")).collect();
+        let short = words[..MAX_WIRE_CHAIN].join(" ");
+        assert_eq!(
+            parse(&short).unwrap().to_wire_bytes(),
+            crate::network::kad::messages::build_search_expression(
+                &words[..MAX_WIRE_CHAIN],
+                &crate::network::kad::messages::SearchConstraints::default(),
+            ),
+            "eMule's left-leaning layout"
+        );
+
+        let long = parse(&words.join(" ")).unwrap();
+        let wire = long.to_wire_bytes();
+        assert!(wire_depth(&wire) <= 6, "depth {}", wire_depth(&wire));
+        let leaves = wire.iter().filter(|&&b| b == b'w').count();
+        assert_eq!(leaves, words.len(), "every word is still asked for");
+        assert_eq!(long.positive_terms(), words, "and kept for local filtering");
+
+        let alternatives = parse(&words.join(" OR ")).unwrap().to_wire_bytes();
+        assert!(wire_depth(&alternatives) <= 6);
+        assert_eq!(&alternatives[..2], &[0x00, 0x01]);
+
+        // A run inside another operator is balanced on its own.
+        let mixed = parse(&format!("({}) -cam", words.join(" "))).unwrap().to_wire_bytes();
+        assert_eq!(&mixed[..2], &[0x00, 0x02]);
+        assert!(wire_depth(&mixed) <= 7);
+    }
+
+    #[test]
     fn leading_only_negation_falls_back_to_positive() {
         // "-cam" alone has nothing to subtract from; treat it as a positive
         // search rather than "everything except cam".
@@ -1111,6 +1422,119 @@ mod tests {
                 Box::new(term("sport"))
             ))
         );
+    }
+
+    /// The flat tokenizer splits on `:`, so a directive followed by a word used
+    /// to come apart into `related`, the hash and the word.
+    #[test]
+    fn a_directive_followed_by_a_word_stays_one_term() {
+        let expected = QueryExpr::And(
+            Box::new(term(&format!("related::{HASH}"))),
+            Box::new(term("video")),
+        );
+        assert_eq!(parse(&format!("related::{HASH} video")), Some(expected));
+        assert_eq!(
+            parse(&format!("video related::{HASH}")).map(|e| e.positive_terms()),
+            Some(vec!["video".to_string(), format!("related::{HASH}")])
+        );
+        let parsed = parse(&format!("ed2k::{} video", HASH.to_lowercase())).unwrap();
+        assert!(parsed.contains_server_directive());
+        assert_eq!(
+            parsed.positive_terms(),
+            vec![format!("ed2k::{HASH}"), "video".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_group_of_exclusions_subtracts_from_the_words_around_it() {
+        let expr = parse("movie (-cam -telesync)").unwrap();
+        assert_eq!(
+            expr,
+            QueryExpr::Not(
+                Box::new(QueryExpr::Not(Box::new(term("movie")), Box::new(term("cam")))),
+                Box::new(term("telesync"))
+            )
+        );
+        assert_eq!(expr.positive_terms(), vec!["movie".to_string()]);
+        assert!(expr.matches("movie 1080p bluray"));
+        assert!(!expr.matches("movie cam rip"));
+        assert!(!expr.matches("movie telesync rip"));
+
+        // Trailing, after a stray `)`, still excludes.
+        let expr = parse("movie) -cam").unwrap();
+        assert_eq!(
+            expr,
+            QueryExpr::Not(Box::new(term("movie")), Box::new(term("cam")))
+        );
+    }
+
+    /// NOT cam OR NOT rip is NOT (cam AND rip): only a file carrying both is out.
+    #[test]
+    fn alternative_exclusions_drop_only_files_matching_all_of_them() {
+        let expr = parse("movie (-cam OR -rip)").unwrap();
+        assert_eq!(
+            expr,
+            QueryExpr::Not(
+                Box::new(term("movie")),
+                Box::new(QueryExpr::And(Box::new(term("cam")), Box::new(term("rip"))))
+            )
+        );
+        assert!(expr.matches("movie cam"));
+        assert!(!expr.matches("movie cam rip"));
+    }
+
+    #[test]
+    fn an_excluding_alternative_does_not_become_a_search_for_it() {
+        let expr = parse("movie OR -cam").unwrap();
+        assert_eq!(expr, term("movie"));
+    }
+
+    /// With no positive word anywhere there is nothing to subtract from, so the
+    /// negated words are searched for, as before.
+    #[test]
+    fn a_query_of_nothing_but_exclusions_still_searches() {
+        assert_eq!(parse("(-cam)"), Some(term("cam")));
+        assert_eq!(
+            parse("-cam -rip"),
+            Some(QueryExpr::And(Box::new(term("cam")), Box::new(term("rip"))))
+        );
+        // A double negation is a positive.
+        assert_eq!(
+            parse("movie -(-cam)"),
+            Some(QueryExpr::And(Box::new(term("movie")), Box::new(term("cam"))))
+        );
+    }
+
+    #[test]
+    fn an_excluded_word_must_be_a_whole_word() {
+        let expr = parse("movie -cam").unwrap();
+        assert!(expr.matches_name("Movie Camera Review.avi"));
+        assert!(!expr.matches_name("Movie.CAM.x264.avi"));
+        assert!(!expr.matches_name("movie_cam-rip.avi"));
+
+        let expr = parse("linux -arm").unwrap();
+        assert!(expr.matches_name("linux-swarm-tools.iso"));
+        assert!(!expr.matches_name("Linux (ARM).iso"));
+
+        // Positive words still match inside longer ones, as servers match them.
+        assert!(parse("linux").unwrap().matches_name("archlinux.iso"));
+    }
+
+    #[test]
+    fn whole_word_exclusion_applies_inside_an_excluded_group() {
+        let expr = parse("movie -(cam rip)").unwrap();
+        assert!(expr.matches_name("movie camera ripper.avi"));
+        assert!(!expr.matches_name("movie cam rip.avi"));
+    }
+
+    #[test]
+    fn name_contains_any_term_is_lenient_and_case_blind() {
+        let terms = vec!["matrix".to_string(), "reloaded".to_string()];
+        assert!(name_contains_any_term("The.MATRIX.1999.avi", &terms));
+        assert!(name_contains_any_term("Reloaded-Edition.mkv", &terms));
+        assert!(name_contains_any_term("thematrixtrilogy.mkv", &terms));
+        assert!(!name_contains_any_term("ubuntu.iso", &terms));
+        assert!(name_contains_any_term("anything", &[]));
     }
 
     #[test]

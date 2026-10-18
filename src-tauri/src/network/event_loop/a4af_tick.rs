@@ -8,14 +8,12 @@ pub(in crate::network) async fn on_a4af_tick(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     a4af_shared: &Arc<RwLock<A4AFManager>>,
-    pending_dl_hashes: &Arc<RwLock<Vec<[u8; 16]>>>,
 ) {
     // A4AF only retasks existing eD2K peer sources. It has no
     // KAD dependency, so a KAD-only status gate silently disabled
     // it for the default server-only configuration. Empty pending
     // downloads/source lists make the work below a no-op.
     let mut file_priorities: HashMap<[u8; 16], ed2k::a4af::FileSwapInfo> = HashMap::new();
-    let mut dl_hashes_vec: Vec<[u8; 16]> = Vec::new();
 
     // Every download a source could be swapped *to* or *from* needs an
     // entry here: `process_swaps` skips a candidate whose target or
@@ -85,12 +83,6 @@ pub(in crate::network) async fn on_a4af_tick(
             // `has_needed_parts_on_assigned`.
             has_needed_parts: true,
         });
-        dl_hashes_vec.push(*hash);
-    }
-
-    {
-        let mut pdh = pending_dl_hashes.write().await;
-        *pdh = dl_hashes_vec;
     }
 
     // Feed NNP sources from persistent per-file lists into A4AF.

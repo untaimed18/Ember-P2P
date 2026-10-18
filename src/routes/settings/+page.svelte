@@ -3,9 +3,6 @@
     getSettings,
     getLaunchSettings,
     updateSettings,
-    downloadNodesDat,
-    downloadIpfilter,
-    openEmberWebsite,
     getLogFolderPath,
     openLogFolder,
     pickDownloadFolder as pickDownloadFolderDialog,
@@ -15,8 +12,6 @@
     SETTINGS_CHANGED_EVENT,
     type LaunchSettings,
     type UpdateSettingsResult,
-    type NodesDatDownloadResult,
-    type IpFilterDownloadResult,
   } from '$lib/api/settings';
   import type { WebService } from '$lib/types';
   import { openChatFilesFolder } from '$lib/api/friends';
@@ -47,6 +42,7 @@
     setAntileechEnabled,
     resetAntileechToDefaults,
     setBlockPrivateIps,
+    setIpFilterAutoUpdate,
     setIpFilterEnabled,
   } from '$lib/api/security';
   import type { AntiLeechSnapshot } from '$lib/types';
@@ -57,6 +53,7 @@
   import { relaunch } from '@tauri-apps/plugin-process';
   import { flushToastActionsBeforeExit } from '$lib/stores/toast';
   import BuyCoffeeButton from '$lib/components/BuyCoffeeButton.svelte';
+  import EmberLinks from '$lib/components/EmberLinks.svelte';
   import {
     discardPendingRestore,
     exportBackup,
@@ -70,6 +67,8 @@
     type RestoreSummary,
   } from '$lib/api/backup';
   import { collectBackupPrefs } from '$lib/backupPrefs';
+  import { lastBackupAt, noteBackupMade } from '$lib/backupReminder';
+  import { CHAT_DISAPPEAR_CHOICES, disappearLabel } from '$lib/chatDisappear';
   import {
     clampInputUtf8Bytes,
     formatDateTime,
@@ -209,55 +208,12 @@
       : m.settings_save_success();
   }
 
-  function nodesDownloadOutcomeMessage(result: NodesDatDownloadResult): string {
-    return result.outcome === 'applied' && result.appliedCount !== undefined
-      ? m.settings_nodes_downloaded_applied({
-          parsed: result.parsedCount,
-          applied: result.appliedCount,
-          bytes: formatSize(result.byteCount),
-        })
-      : m.settings_nodes_downloaded_deferred({
-          parsed: result.parsedCount,
-          bytes: formatSize(result.byteCount),
-        });
-  }
-
-  function ipFilterDownloadOutcomeMessage(result: IpFilterDownloadResult): string {
-    switch (result.outcome) {
-      case 'applied':
-        return m.settings_ipfilter_downloaded_applied({
-            entries: result.entryCount,
-            bytes: formatSize(result.byteCount),
-          });
-      case 'failed':
-        return m.settings_ipfilter_downloaded_failed({
-            entries: result.entryCount,
-            bytes: formatSize(result.byteCount),
-          });
-      default:
-        return m.settings_ipfilter_downloaded_deferred({
-            entries: result.entryCount,
-            bytes: formatSize(result.byteCount),
-          });
-    }
-  }
-
   // Download progress percent for the About card, when a content length is known.
   let aboutPercent = $derived(
     $updater.total && $updater.total > 0
       ? Math.min(100, Math.round(($updater.downloaded / $updater.total) * 100))
       : null,
   );
-  let websiteOpenError = $state('');
-
-  async function openWebsite() {
-    websiteOpenError = '';
-    try {
-      await openEmberWebsite();
-    } catch (e) {
-      websiteOpenError = translateError(e);
-    }
-  }
 
   /** Where `ember.log` lives. Resolved once so the path is on screen to copy
    *  into a bug report whether or not the folder will open. */
@@ -329,10 +285,6 @@
   let saveMessage: string | null = $state(null);
   let saveIsWarning = $state(false);
   let loadError: string | null = $state(null);
-  let downloadingNodes = $state(false);
-  let nodesResult: string | null = $state(null);
-  let nodesResultWarning = $state(false);
-  let nodesError: string | null = $state(null);
 
   // The ports and UPnP are read once, when the network stack starts (the
   // upload listener binds the TCP port in `start_upload_server` before any
@@ -358,6 +310,18 @@
   let restorePreview: BackupPreview | null = $state(null);
   let restoreStaged: RestoreSummary | null = $state(null);
   let pendingRestore: PendingRestoreStatus | null = $state(null);
+
+  /** Milliseconds; this install's own record, so a restored profile shows
+   *  "no backup yet" until one is made here. */
+  let lastBackupMs: number | null = $state(readLastBackup());
+
+  function readLastBackup(): number | null {
+    try {
+      return lastBackupAt(localStorage);
+    } catch {
+      return null;
+    }
+  }
 
   function showBackupMsg(msg: string, kind: 'progress' | 'success' | 'error') {
     backupMessage = msg;
@@ -435,6 +399,12 @@
       }
       backupPassphrase = '';
       backupPassphraseConfirm = '';
+      try {
+        noteBackupMade(localStorage, Date.now());
+      } catch {
+        // Only the reminder's clock is lost.
+      }
+      lastBackupMs = readLastBackup();
       const done = m.settings_backup_export_done({
         files: summary.files,
         size: formatSize(summary.bytes),
@@ -769,43 +739,37 @@
     );
   });
 
-  let downloadingFilter = $state(false);
-  let filterResult: string | null = $state(null);
-  let filterResultWarning = $state(false);
-  let filterError: string | null = $state(null);
   let spamStats: SpamStats | null = $state(null);
   let spamStatsLoading = $state(false);
   let spamStatsError: string | null = $state(null);
   let spamResetting = $state(false);
-  type SettingsSection = 'general' | 'notifications' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'webservices' | 'import' | 'backup' | 'about';
+  type SettingsSection = 'general' | 'notifications' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'webservices' | 'backup' | 'about';
 
-  /// Sidebar order, and the order the cards are declared in below.
-  ///
-  /// The two had drifted: Search was ninth here, between Channels and Backup,
-  /// while its card has always sat fourth, right after Transfers. Fourth is
-  /// the right answer — search is the front of the download flow, not an
-  /// afterthought behind the social sections — so this follows the markup
-  /// rather than the other way round. Keep them in step: the arrow-key
-  /// handling below walks this array, so a mismatch makes the keyboard order
-  /// disagree with what is on screen.
+  /// Sidebar order, and the order the cards are declared in below. Keep them
+  /// in step: while filtering, every matching card is on screen in DOM order,
+  /// and the arrow-key handling below walks this array, so a mismatch makes
+  /// the keyboard order disagree with what is on screen.
   const sections: SettingsSection[] = [
     'general',
     'notifications',
     'downloads',
-    // Declared between Transfers and Search in the markup below, so it sits
-    // there here too. While filtering, every matching card is on screen in DOM
-    // order, and this array is what the tablist and the arrow keys walk.
-    'webservices',
     'search',
+    'webservices',
     'bandwidth',
     'network',
     'security',
     'friends',
     'channels',
-    'import',
     'backup',
     'about',
   ];
+
+  /** Section ids that links and the session may still carry. Import was its
+   *  own section before it joined Backup. */
+  function knownSection(value: string | null | undefined): SettingsSection | null {
+    if (value === 'import') return 'backup';
+    return value && (sections as string[]).includes(value) ? (value as SettingsSection) : null;
+  }
 
   /**
    * `?section=network` opens straight to that card. Pages that send the user
@@ -820,17 +784,15 @@
    * binding, and re-syncing would fight the nav buttons.
    */
   function initialSection(): SettingsSection {
-    const known = (value: string | null): value is SettingsSection =>
-      !!value && (sections as string[]).includes(value);
     try {
-      const requested = get(page).url.searchParams.get('section');
-      if (known(requested)) return requested;
+      const requested = knownSection(get(page).url.searchParams.get('section'));
+      if (requested) return requested;
     } catch {
       /* no URL available — fall through */
     }
     try {
-      const remembered = sessionStorage.getItem(LAST_SECTION_KEY);
-      if (known(remembered)) return remembered;
+      const remembered = knownSection(sessionStorage.getItem(LAST_SECTION_KEY));
+      if (remembered) return remembered;
     } catch {
       /* storage disabled — General is the safe default */
     }
@@ -852,26 +814,26 @@
   // Only real navigations land here: `selectSection` writes the URL with
   // `replaceState`, which does not.
   afterNavigate((navigation) => {
-    const requested = navigation.to?.url.searchParams.get('section');
-    if (requested && (sections as string[]).includes(requested) && requested !== activeSection) {
-      activeSection = requested as SettingsSection;
+    const requested = knownSection(navigation.to?.url.searchParams.get('section'));
+    if (requested && requested !== activeSection) {
+      activeSection = requested;
       // The link names the section; the filter's last-used field must not
       // override it when the filter clears.
       filterFocusField = null;
       settingsFilter = '';
     }
   });
-  /// The import card scans eMule's folder when it mounts, so it waits until
-  /// the section is first opened rather than running on every Settings visit.
+  /// The import group scans eMule's folder when it mounts, so it waits until
+  /// its section is first opened rather than running on every Settings visit.
   let importOpened = $state(false);
   $effect(() => {
-    if (activeSection === 'import') importOpened = true;
+    if (activeSection === 'backup') importOpened = true;
   });
 
   /**
    * Free-text filter across every control on the page.
    *
-   * Eleven sections and around sixty controls is past the point where
+   * A dozen sections and around sixty controls is past the point where
    * scanning works, and "which section is the obfuscation toggle in?" has no
    * good answer until you have already found it.
    *
@@ -931,7 +893,10 @@
       const wholeCard = heading.includes(query);
       let cardMatches = 0;
       for (const field of card.querySelectorAll<HTMLElement>('.field')) {
-        const hit = wholeCard || (field.textContent?.toLowerCase().includes(query) ?? false);
+        // Likewise a group's heading: "power" finds the setting under Power.
+        const groupHeading = field.closest('.settings-group')?.querySelector(':scope > .subsection-title');
+        const wholeGroup = groupHeading?.textContent?.toLowerCase().includes(query) ?? false;
+        const hit = wholeCard || wholeGroup || (field.textContent?.toLowerCase().includes(query) ?? false);
         if (hit) {
           field.removeAttribute('data-filtered');
           cardMatches += 1;
@@ -998,7 +963,6 @@
       case 'channels': return m.settings_section_channels();
       case 'search': return m.settings_section_search();
       case 'webservices': return m.webservices_title();
-      case 'import': return m.settings_section_import();
       case 'backup': return m.settings_section_backup();
       case 'about': return m.settings_section_about();
     }
@@ -1023,7 +987,7 @@
    * also makes the section the user is looking at linkable.
    *
    * `replaceState` rather than `goto`/`pushState`: switching a panel is not a
-   * navigation, and stacking twelve history entries would turn Back into a
+   * navigation, and stacking a history entry per tab would turn Back into a
    * tour of the sidebar instead of a way out of Settings. It also stays clear
    * of `beforeNavigate`, which guards unsaved edits — a section switch must
    * not trip the leave prompt.
@@ -1118,54 +1082,6 @@
 
   let unmounted = false;
   onMount(() => {
-    let unlistenIpFilterReload: UnlistenFn | null = null;
-    let unlistenNodesBootstrap: UnlistenFn | null = null;
-    listen<{ outcome: 'applied' | 'failed'; entry_count: number; byte_count: number }>(
-      'ipfilter-reload-result',
-      (event) => {
-        if (unmounted) return;
-        const { outcome, entry_count, byte_count } = event.payload;
-        if (
-          (outcome !== 'applied' && outcome !== 'failed')
-          || !Number.isFinite(entry_count)
-          || !Number.isFinite(byte_count)
-        ) return;
-        showIpFilterDownloadOutcome({
-          outcome,
-          entryCount: entry_count,
-          byteCount: byte_count,
-        });
-      },
-    )
-      .then((fn) => {
-        if (unmounted) fn();
-        else unlistenIpFilterReload = fn;
-      })
-      .catch((e) => console.error('Failed to register IP-filter reload listener:', e));
-    listen<{ outcome: 'applied'; parsed_count: number; applied_count: number; byte_count: number }>(
-      'nodes-bootstrap-result',
-      (event) => {
-        if (unmounted) return;
-        const { parsed_count, applied_count, byte_count } = event.payload;
-        if (
-          !Number.isFinite(parsed_count)
-          || !Number.isFinite(applied_count)
-          || !Number.isFinite(byte_count)
-        ) return;
-        showNodesDownloadOutcome({
-          outcome: 'applied',
-          parsedCount: parsed_count,
-          appliedCount: applied_count,
-          byteCount: byte_count,
-        });
-      },
-    )
-      .then((fn) => {
-        if (unmounted) fn();
-        else unlistenNodesBootstrap = fn;
-      })
-      .catch((e) => console.error('Failed to register nodes bootstrap listener:', e));
-
     // Seed the schedule/sleep snapshot, then follow it. The event fires only on
     // change, so without the seed a page opened between two boundaries would
     // show nothing at all until the next one.
@@ -1231,8 +1147,6 @@
     return () => {
       unmounted = true;
       window.removeEventListener('keydown', handleFindKey);
-      unlistenIpFilterReload?.();
-      unlistenNodesBootstrap?.();
       unlistenRuntimeStatus?.();
       unlistenSettingsChanged?.();
       window.removeEventListener('beforeunload', handleBeforeUnload);
@@ -1505,6 +1419,7 @@
     'settings_revision',
     'antileech_enabled',
     'ip_filter_enabled',
+    'ip_filter_auto_update',
     'block_private_ips',
     'download_folder',
   ]);
@@ -1938,49 +1853,6 @@
     });
   }
 
-  function showIpFilterDownloadOutcome(result: IpFilterDownloadResult) {
-    const message = ipFilterDownloadOutcomeMessage(result);
-    if (result.outcome === 'failed') {
-      filterResult = null;
-      filterResultWarning = false;
-      filterError = message;
-      trackedTimeout(() => (filterError = null), 5000);
-      return;
-    }
-    filterError = null;
-    filterResult = message;
-    filterResultWarning = result.outcome === 'deferred';
-    trackedTimeout(() => {
-      filterResult = null;
-      filterResultWarning = false;
-    }, 5000);
-  }
-
-  async function handleDownloadFilter() {
-    downloadingFilter = true;
-    filterResult = null;
-    filterResultWarning = false;
-    filterError = null;
-    try {
-      showIpFilterDownloadOutcome(await downloadIpfilter());
-    } catch (e: unknown) {
-      filterError = translateError(e, m.settings_download_failed());
-      trackedTimeout(() => (filterError = null), 5000);
-    } finally {
-      downloadingFilter = false;
-    }
-  }
-
-  function showNodesDownloadOutcome(result: NodesDatDownloadResult) {
-    nodesError = null;
-    nodesResult = nodesDownloadOutcomeMessage(result);
-    nodesResultWarning = result.outcome !== 'applied';
-    trackedTimeout(() => {
-      nodesResult = null;
-      nodesResultWarning = false;
-    }, 5000);
-  }
-
   // Anti-leech filter state — loaded lazily when the Security section
   // is first opened so the rest of Settings doesn't pay the IPC round
   // trip. The textarea below is bound to `antileechDraft` (newline-
@@ -2253,15 +2125,19 @@
   }
 
   /**
-   * The IP filter and private-range switches apply the moment they flip, as
-   * the same switches on the Security page do. Queued so a quick on-off-on
-   * reaches the backend in the order it was clicked.
+   * The IP filter switches apply the moment they flip, as the same switches on
+   * the Security page do. Queued so a quick on-off-on reaches the backend in
+   * the order it was clicked.
    */
   let ipToggleQueue: Promise<void> = Promise.resolve();
-  function applyIpToggleLive(field: 'ip_filter_enabled' | 'block_private_ips', next: boolean) {
+  function applyIpToggleLive(
+    field: 'ip_filter_enabled' | 'ip_filter_auto_update' | 'block_private_ips',
+    next: boolean,
+  ) {
     ipToggleQueue = ipToggleQueue.then(async () => {
       try {
         if (field === 'ip_filter_enabled') await setIpFilterEnabled(next);
+        else if (field === 'ip_filter_auto_update') await setIpFilterAutoUpdate(next);
         else await setBlockPrivateIps(next);
         if (unmounted) return;
         // Already on disk, so it is not a pending change. Patch only this
@@ -2390,21 +2266,6 @@
     void handleAntileechToggle(want, ++antileechToggleGen);
   });
 
-  async function handleDownloadNodes() {
-    downloadingNodes = true;
-    nodesResult = null;
-    nodesResultWarning = false;
-    nodesError = null;
-    try {
-      showNodesDownloadOutcome(await downloadNodesDat());
-    } catch (e: unknown) {
-      nodesError = translateError(e, m.settings_download_failed());
-      trackedTimeout(() => (nodesError = null), 5000);
-    } finally {
-      downloadingNodes = false;
-    }
-  }
-
   function setTheme(t: Theme) {
     theme.set(t);
     applyTheme(t);
@@ -2417,6 +2278,42 @@
   function pickCloseBehavior(behavior: 'ask' | 'tray' | 'exit') {
     if (!settings) return;
     settings.close_to_tray_behavior = behavior;
+  }
+
+  /** The master switch, which every notification event depends on. */
+  let notifyOff = $derived.by(() => {
+    const current = settings;
+    return current?.notifications_enabled === false;
+  });
+
+  // The stored fields are "disabled" flags; the switches read the other way.
+  // Chat off refuses files too, so the files controls follow it.
+  let friendChatOn = $derived.by(() => {
+    const current = settings;
+    return current?.friend_chat_disabled !== true;
+  });
+  let friendFilesOn = $derived.by(() => {
+    const current = settings;
+    return friendChatOn && current?.friend_files_disabled !== true;
+  });
+
+  type WindowOnLaunch = 'remember' | 'maximized' | 'default';
+
+  /** Launching maximized overrides the remembered window at startup
+   *  (`window_state::for_launch`), so the two settings are one choice. */
+  let windowOnLaunch = $derived.by((): WindowOnLaunch => {
+    const current = settings;
+    if (!current) return 'remember';
+    if (current.launch_maximized) return 'maximized';
+    return current.remember_window_position ? 'remember' : 'default';
+  });
+
+  function setWindowOnLaunch(choice: WindowOnLaunch) {
+    if (!settings) return;
+    settings.launch_maximized = choice === 'maximized';
+    // Maximized leaves the remembered position alone: it is still where the
+    // window goes when it is restored down.
+    if (choice !== 'maximized') settings.remember_window_position = choice === 'remember';
   }
 
   /** Strips as you type, so the field can only ever hold a legal handle. A
@@ -2653,12 +2550,6 @@
                   <line x1="2.5" y1="10" x2="17.5" y2="10"/>
                   <path d="M10 2.5c2.2 2 3.4 4.7 3.4 7.5s-1.2 5.5-3.4 7.5c-2.2-2-3.4-4.7-3.4-7.5S7.8 4.5 10 2.5z"/>
                 </svg>
-              {:else if section === 'import'}
-                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M3 12.5v3c0 .6.4 1 1 1h12c.6 0 1-.4 1-1v-3"/>
-                  <line x1="10" y1="3" x2="10" y2="12"/>
-                  <polyline points="6.5,8.5 10,12 13.5,8.5"/>
-                </svg>
               {:else if section === 'backup'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                   <rect x="2.5" y="4" width="15" height="4" rx="1"/>
@@ -2711,136 +2602,106 @@
           </div>
         </div>
         <div class="card-body">
-          <div class="field">
-            <span class="field-label">{m.settings_theme_label()}</span>
-            <div class="theme-picker">
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_appearance()}</h4>
+            <div class="field">
+              <span class="field-label">{m.settings_theme_label()}</span>
+              <div class="theme-picker">
+                <button
+                  type="button"
+                  class="theme-swatch"
+                  class:selected={$themeFollowsSystem}
+                  onclick={followSystemTheme}
+                  aria-label={m.settings_theme_system_aria()}
+                  aria-pressed={$themeFollowsSystem}
+                >
+                  <div class="swatch-preview system-swatch">
+                    <div class="swatch-half light-swatch">
+                      <div class="swatch-sidebar"></div>
+                      <div class="swatch-content">
+                        <div class="swatch-line"></div>
+                        <div class="swatch-line short"></div>
+                      </div>
+                    </div>
+                    <div class="swatch-half dark-swatch">
+                      <div class="swatch-content">
+                        <div class="swatch-line"></div>
+                        <div class="swatch-line short"></div>
+                      </div>
+                    </div>
+                  </div>
+                  {#if $themeFollowsSystem}<span class="swatch-check">&#10003;</span>{/if}
+                  <span class="swatch-label">{m.settings_theme_system()}</span>
+                </button>
               <button
                 type="button"
                 class="theme-swatch"
-                class:selected={$themeFollowsSystem}
-                onclick={followSystemTheme}
-                aria-label={m.settings_theme_system_aria()}
-                aria-pressed={$themeFollowsSystem}
+                class:selected={!$themeFollowsSystem && $theme === 'light'}
+                onclick={() => setTheme('light')}
+                aria-label={m.settings_theme_light_aria()}
+                aria-pressed={!$themeFollowsSystem && $theme === 'light'}
               >
-                <div class="swatch-preview system-swatch">
-                  <div class="swatch-half light-swatch">
+                  <div class="swatch-preview light-swatch">
                     <div class="swatch-sidebar"></div>
                     <div class="swatch-content">
                       <div class="swatch-line"></div>
                       <div class="swatch-line short"></div>
                     </div>
                   </div>
-                  <div class="swatch-half dark-swatch">
+                  {#if !$themeFollowsSystem && $theme === 'light'}<span class="swatch-check">&#10003;</span>{/if}
+                  <span class="swatch-label">{m.settings_theme_light()}</span>
+                </button>
+                <button
+                  type="button"
+                  class="theme-swatch"
+                  class:selected={!$themeFollowsSystem && $theme === 'dark'}
+                  onclick={() => setTheme('dark')}
+                  aria-label={m.settings_theme_dark_aria()}
+                  aria-pressed={!$themeFollowsSystem && $theme === 'dark'}
+                >
+                  <div class="swatch-preview dark-swatch">
+                    <div class="swatch-sidebar"></div>
                     <div class="swatch-content">
                       <div class="swatch-line"></div>
                       <div class="swatch-line short"></div>
                     </div>
                   </div>
-                </div>
-                {#if $themeFollowsSystem}<span class="swatch-check">&#10003;</span>{/if}
-                <span class="swatch-label">{m.settings_theme_system()}</span>
-              </button>
-            <button
-              type="button"
-              class="theme-swatch"
-              class:selected={!$themeFollowsSystem && $theme === 'light'}
-              onclick={() => setTheme('light')}
-              aria-label={m.settings_theme_light_aria()}
-              aria-pressed={!$themeFollowsSystem && $theme === 'light'}
-            >
-                <div class="swatch-preview light-swatch">
-                  <div class="swatch-sidebar"></div>
-                  <div class="swatch-content">
-                    <div class="swatch-line"></div>
-                    <div class="swatch-line short"></div>
-                  </div>
-                </div>
-                {#if !$themeFollowsSystem && $theme === 'light'}<span class="swatch-check">&#10003;</span>{/if}
-                <span class="swatch-label">{m.settings_theme_light()}</span>
-              </button>
-              <button
-                type="button"
-                class="theme-swatch"
-                class:selected={!$themeFollowsSystem && $theme === 'dark'}
-                onclick={() => setTheme('dark')}
-                aria-label={m.settings_theme_dark_aria()}
-                aria-pressed={!$themeFollowsSystem && $theme === 'dark'}
-              >
-                <div class="swatch-preview dark-swatch">
-                  <div class="swatch-sidebar"></div>
-                  <div class="swatch-content">
-                    <div class="swatch-line"></div>
-                    <div class="swatch-line short"></div>
-                  </div>
-                </div>
-                {#if !$themeFollowsSystem && $theme === 'dark'}<span class="swatch-check">&#10003;</span>{/if}
-                <span class="swatch-label">{m.settings_theme_dark()}</span>
-              </button>
+                  {#if !$themeFollowsSystem && $theme === 'dark'}<span class="swatch-check">&#10003;</span>{/if}
+                  <span class="swatch-label">{m.settings_theme_dark()}</span>
+                </button>
+              </div>
             </div>
-          </div>
-          <div class="field">
-            <span class="field-label">{m.settings_language_label()}</span>
-            <span class="hint">{m.settings_language_description()}</span>
-            <!--
-              Radio-style locale picker. We render one button per
-              compiled locale (Paraglide exports the canonical list
-              as `locales`) so adding a new language to the project
-              automatically grows the picker — no UI edit needed.
-              Each label uses `languageLabel(locale)` which renders
-              the language name in its OWN language ("Español", not
-              "Spanish") because users recognize their native
-              language faster than a translation of it.
-            -->
-            <div class="behavior-picker" role="radiogroup" aria-label={m.settings_language_label()}>
+            <div class="field">
+              <span class="field-label">{m.settings_language_label()}</span>
               <!--
-                "System" radio: clears the explicit localStorage
-                choice and reloads, letting Paraglide's strategy
-                chain fall through to navigator.language / baseLocale.
-                Without this entry, a user who tried Spanish once
-                would be stuck on Spanish even if their OS locale
-                changed — there'd be no way back to "just follow the
-                OS" short of clearing localStorage by hand.
+                Radio-style locale picker. We render one button per
+                compiled locale (Paraglide exports the canonical list
+                as `locales`) so adding a new language to the project
+                automatically grows the picker — no UI edit needed.
+                Each label uses `languageLabel(locale)` which renders
+                the language name in its OWN language ("Español", not
+                "Spanish") because users recognize their native
+                language faster than a translation of it.
               -->
-              <button
-                type="button"
-                role="radio"
-                data-radio-value="system"
-                tabindex={followingSystem ? 0 : -1}
-                aria-checked={followingSystem}
-                class="behavior-card lang-card"
-                class:selected={followingSystem}
-                onclick={pickSystemLocale}
-                onkeydown={(e) =>
-                  handleRadioGroupKey(
-                    e,
-                    languageRadioValues,
-                    followingSystem ? 'system' : currentLocale,
-                    (value) => value === 'system' ? pickSystemLocale() : pickLocale(value as Locale),
-                    true,
-                  )}
-              >
-                <span class="behavior-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                    <circle cx="12" cy="12" r="9" />
-                    <path d="M3 12h18" />
-                    <path d="M12 3a14 14 0 0 1 0 18" />
-                    <path d="M12 3a14 14 0 0 0 0 18" />
-                  </svg>
-                </span>
-                <span class="behavior-title">{m.settings_language_system()}</span>
-                <span class="behavior-desc">{languageLabel(systemPreviewLocale)}</span>
-                {#if followingSystem}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
-              </button>
-              {#each locales as loc (loc)}
+              <div class="behavior-picker lang-picker" role="radiogroup" aria-label={m.settings_language_label()}>
+                <!--
+                  "System" radio: clears the explicit localStorage
+                  choice and reloads, letting Paraglide's strategy
+                  chain fall through to navigator.language / baseLocale.
+                  Without this entry, a user who tried Spanish once
+                  would be stuck on Spanish even if their OS locale
+                  changed — there'd be no way back to "just follow the
+                  OS" short of clearing localStorage by hand.
+                -->
                 <button
                   type="button"
                   role="radio"
-                  data-radio-value={loc}
-                  tabindex={!followingSystem && currentLocale === loc ? 0 : -1}
-                  aria-checked={!followingSystem && currentLocale === loc}
+                  data-radio-value="system"
+                  tabindex={followingSystem ? 0 : -1}
+                  aria-checked={followingSystem}
                   class="behavior-card lang-card"
-                  class:selected={!followingSystem && currentLocale === loc}
-                  onclick={() => pickLocale(loc)}
+                  class:selected={followingSystem}
+                  onclick={pickSystemLocale}
                   onkeydown={(e) =>
                     handleRadioGroupKey(
                       e,
@@ -2850,179 +2711,225 @@
                       true,
                     )}
                 >
-                  {#if localeFlagSrc(loc)}
-                    <span class="behavior-icon lang-flag-icon" aria-hidden="true">
-                      <img class="lang-flag" src={localeFlagSrc(loc)} alt="" />
-                    </span>
-                  {/if}
-                  <span class="behavior-title">{languageLabel(loc)}</span>
-                  <span class="behavior-desc">{loc.toUpperCase()}</span>
-                  {#if !followingSystem && currentLocale === loc}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
+                  <span class="behavior-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <circle cx="12" cy="12" r="9" />
+                      <path d="M3 12h18" />
+                      <path d="M12 3a14 14 0 0 1 0 18" />
+                      <path d="M12 3a14 14 0 0 0 0 18" />
+                    </svg>
+                  </span>
+                  <span class="lang-text">
+                    <span class="behavior-title">{m.settings_language_system()}</span>
+                    <span class="behavior-desc">{languageLabel(systemPreviewLocale)}</span>
+                  </span>
+                  {#if followingSystem}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
                 </button>
-              {/each}
+                {#each locales as loc (loc)}
+                  <button
+                    type="button"
+                    role="radio"
+                    data-radio-value={loc}
+                    tabindex={!followingSystem && currentLocale === loc ? 0 : -1}
+                    aria-checked={!followingSystem && currentLocale === loc}
+                    class="behavior-card lang-card"
+                    class:selected={!followingSystem && currentLocale === loc}
+                    onclick={() => pickLocale(loc)}
+                    onkeydown={(e) =>
+                      handleRadioGroupKey(
+                        e,
+                        languageRadioValues,
+                        followingSystem ? 'system' : currentLocale,
+                        (value) => value === 'system' ? pickSystemLocale() : pickLocale(value as Locale),
+                        true,
+                      )}
+                  >
+                    {#if localeFlagSrc(loc)}
+                      <span class="behavior-icon lang-flag-icon" aria-hidden="true">
+                        <img class="lang-flag" src={localeFlagSrc(loc)} alt="" />
+                      </span>
+                    {/if}
+                    <span class="lang-text">
+                      <span class="behavior-title">{languageLabel(loc)}</span>
+                      <span class="behavior-desc">{loc.toUpperCase()}</span>
+                    </span>
+                    {#if !followingSystem && currentLocale === loc}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
+                  </button>
+                {/each}
+              </div>
+              <span class="hint">{m.settings_language_description()}</span>
             </div>
           </div>
-          <div class="divider"></div>
-          <div class="field">
-            <label for="nickname">{m.settings_nickname_label()}</label>
-            <div class="apply-input">
-              <input
-                id="nickname"
-                value={settings.nickname}
-                maxlength="128"
-                oninput={clampNicknameInput}
-                oncompositionend={clampNicknameInput}
-                onkeydown={(e) => applyOnEnter(e, ['nickname'])}
-                placeholder={m.settings_nickname_placeholder()}
-              />
-              {@render applyButton(['nickname'], m.settings_nickname_label())}
+
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_identity()}</h4>
+            <div class="field">
+              <label for="nickname">{m.settings_nickname_label()}</label>
+              <div class="apply-input">
+                <input
+                  id="nickname"
+                  value={settings.nickname}
+                  maxlength="128"
+                  oninput={clampNicknameInput}
+                  oncompositionend={clampNicknameInput}
+                  onkeydown={(e) => applyOnEnter(e, ['nickname'])}
+                  placeholder={m.settings_nickname_placeholder()}
+                />
+                {@render applyButton(['nickname'], m.settings_nickname_label())}
+              </div>
+              <span class="hint">{m.settings_nickname_hint()}</span>
             </div>
-            <span class="hint">{m.settings_nickname_hint()}</span>
           </div>
-          <div class="divider"></div>
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_launch_maximized_label()}</span>
-              <span class="hint">{m.settings_launch_maximized_hint()}</span>
+
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_startup()}</h4>
+            <div class="field">
+              <label for="window-on-launch">{m.settings_window_on_launch_label()}</label>
+              <select
+                id="window-on-launch"
+                value={windowOnLaunch}
+                onchange={(e) => setWindowOnLaunch(e.currentTarget.value as WindowOnLaunch)}
+              >
+                <option value="remember">{m.settings_window_on_launch_remember()}</option>
+                <option value="maximized">{m.settings_window_on_launch_maximized()}</option>
+                <option value="default">{m.settings_window_on_launch_default()}</option>
+              </select>
+              <span class="hint">{m.settings_window_on_launch_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.launch_maximized} ariaLabel={m.settings_launch_maximized_label()} />
-          </div>
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_remember_window_label()}</span>
-              <span class="hint">{m.settings_remember_window_hint()}</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.remember_window_position} ariaLabel={m.settings_remember_window_label()} />
-          </div>
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_launch_at_login_label()}</span>
-              <span class="hint">{m.settings_launch_at_login_hint()}</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.launch_at_login} ariaLabel={m.settings_launch_at_login_label()} />
-          </div>
-          {#if settings.launch_at_login}
             <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_launch_at_login_label()}</span>
+                <span class="hint">{m.settings_launch_at_login_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.launch_at_login} ariaLabel={m.settings_launch_at_login_label()} />
+            </div>
+            <div class="field toggle-row nested" class:is-disabled={!settings.launch_at_login}>
               <div class="toggle-info">
                 <span class="toggle-title">{m.settings_start_hidden_at_login_label()}</span>
                 <span class="hint">{m.settings_start_hidden_at_login_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.start_hidden_at_login} ariaLabel={m.settings_start_hidden_at_login_label()} />
+              <ToggleSwitch
+                bind:checked={settings.start_hidden_at_login}
+                disabled={!settings.launch_at_login}
+                ariaLabel={m.settings_start_hidden_at_login_label()}
+              />
             </div>
-          {/if}
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_prevent_sleep_label()}</span>
-              <span class="hint">
-                {#if runtimeStatus && !runtimeStatus.sleep_inhibit_supported}
-                  {m.settings_prevent_sleep_unsupported()}
-                {:else}
-                  {m.settings_prevent_sleep_hint()}
-                {/if}
-              </span>
-              {#if runtimeStatus?.sleep_inhibit_held}
-                <span class="live-badge">{m.settings_prevent_sleep_active()}</span>
-              {/if}
+            <div class="field">
+              <span class="field-label">{m.settings_close_behavior_label()}</span>
+              <div class="behavior-picker" role="radiogroup" aria-label={m.settings_close_behavior_label()}>
+                <button
+                  type="button"
+                  role="radio"
+                  data-radio-value="ask"
+                  tabindex={settings.close_to_tray_behavior === 'ask' ? 0 : -1}
+                  aria-checked={settings.close_to_tray_behavior === 'ask'}
+                  class="behavior-card"
+                  class:selected={settings.close_to_tray_behavior === 'ask'}
+                  onclick={() => pickCloseBehavior('ask')}
+                  onkeydown={(e) =>
+                    handleRadioGroupKey(
+                      e,
+                      closeBehaviorValues,
+                      settings?.close_to_tray_behavior ?? 'ask',
+                      (value) => pickCloseBehavior(value as 'ask' | 'tray' | 'exit'),
+                    )}
+                >
+                  <span class="behavior-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h13A1.5 1.5 0 0 1 20 5.5v9A1.5 1.5 0 0 1 18.5 16H13l-4 4v-4H5.5A1.5 1.5 0 0 1 4 14.5z"/>
+                      <path d="M9.5 8.5a2.5 2.5 0 1 1 3.7 2.2c-.7.4-1.2.9-1.2 1.6"/>
+                      <circle cx="12" cy="14" r="0.6" fill="currentColor"/>
+                    </svg>
+                  </span>
+                  <span class="behavior-title">{m.settings_close_behavior_ask()}</span>
+                  <span class="behavior-desc">{m.settings_close_behavior_ask_desc()}</span>
+                  {#if settings.close_to_tray_behavior === 'ask'}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
+                </button>
+
+                <button
+                  type="button"
+                  role="radio"
+                  data-radio-value="tray"
+                  tabindex={settings.close_to_tray_behavior === 'tray' ? 0 : -1}
+                  aria-checked={settings.close_to_tray_behavior === 'tray'}
+                  class="behavior-card"
+                  class:selected={settings.close_to_tray_behavior === 'tray'}
+                  onclick={() => pickCloseBehavior('tray')}
+                  onkeydown={(e) =>
+                    handleRadioGroupKey(
+                      e,
+                      closeBehaviorValues,
+                      settings?.close_to_tray_behavior ?? 'ask',
+                      (value) => pickCloseBehavior(value as 'ask' | 'tray' | 'exit'),
+                    )}
+                >
+                  <span class="behavior-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                      <rect x="3.5" y="3.5" width="17" height="11" rx="2"/>
+                      <line x1="12" y1="6.5" x2="12" y2="13"/>
+                      <polyline points="9,10.5 12,13.5 15,10.5"/>
+                      <line x1="3.5" y1="19" x2="20.5" y2="19"/>
+                    </svg>
+                  </span>
+                  <span class="behavior-title">{m.settings_close_behavior_tray()}</span>
+                  <span class="behavior-desc">{m.settings_close_behavior_tray_desc()}</span>
+                  {#if settings.close_to_tray_behavior === 'tray'}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
+                </button>
+
+                <button
+                  type="button"
+                  role="radio"
+                  data-radio-value="exit"
+                  tabindex={settings.close_to_tray_behavior === 'exit' ? 0 : -1}
+                  aria-checked={settings.close_to_tray_behavior === 'exit'}
+                  class="behavior-card"
+                  class:selected={settings.close_to_tray_behavior === 'exit'}
+                  onclick={() => pickCloseBehavior('exit')}
+                  onkeydown={(e) =>
+                    handleRadioGroupKey(
+                      e,
+                      closeBehaviorValues,
+                      settings?.close_to_tray_behavior ?? 'ask',
+                      (value) => pickCloseBehavior(value as 'ask' | 'tray' | 'exit'),
+                    )}
+                >
+                  <span class="behavior-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M13 4h5a1.5 1.5 0 0 1 1.5 1.5v13A1.5 1.5 0 0 1 18 20h-5"/>
+                      <line x1="15" y1="12" x2="4" y2="12"/>
+                      <polyline points="7.5,8.5 4,12 7.5,15.5"/>
+                    </svg>
+                  </span>
+                  <span class="behavior-title">{m.settings_close_behavior_exit()}</span>
+                  <span class="behavior-desc">{m.settings_close_behavior_exit_desc()}</span>
+                  {#if settings.close_to_tray_behavior === 'exit'}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
+                </button>
+              </div>
+              <span class="hint">{m.settings_close_behavior_hint()}</span>
             </div>
-            <ToggleSwitch
-              bind:checked={settings.prevent_sleep_while_active}
-              disabled={!!runtimeStatus && !runtimeStatus.sleep_inhibit_supported}
-              ariaLabel={m.settings_prevent_sleep_label()}
-            />
           </div>
-          <div class="field">
-            <span class="field-label">{m.settings_close_behavior_label()}</span>
-            <span class="hint">
-              {m.settings_close_behavior_hint()}
-            </span>
-            <div class="behavior-picker" role="radiogroup" aria-label={m.settings_close_behavior_label()}>
-              <button
-                type="button"
-                role="radio"
-                data-radio-value="ask"
-                tabindex={settings.close_to_tray_behavior === 'ask' ? 0 : -1}
-                aria-checked={settings.close_to_tray_behavior === 'ask'}
-                class="behavior-card"
-                class:selected={settings.close_to_tray_behavior === 'ask'}
-                onclick={() => pickCloseBehavior('ask')}
-                onkeydown={(e) =>
-                  handleRadioGroupKey(
-                    e,
-                    closeBehaviorValues,
-                    settings?.close_to_tray_behavior ?? 'ask',
-                    (value) => pickCloseBehavior(value as 'ask' | 'tray' | 'exit'),
-                  )}
-              >
-                <span class="behavior-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h13A1.5 1.5 0 0 1 20 5.5v9A1.5 1.5 0 0 1 18.5 16H13l-4 4v-4H5.5A1.5 1.5 0 0 1 4 14.5z"/>
-                    <path d="M9.5 8.5a2.5 2.5 0 1 1 3.7 2.2c-.7.4-1.2.9-1.2 1.6"/>
-                    <circle cx="12" cy="14" r="0.6" fill="currentColor"/>
-                  </svg>
-                </span>
-                <span class="behavior-title">{m.settings_close_behavior_ask()}</span>
-                <span class="behavior-desc">{m.settings_close_behavior_ask_desc()}</span>
-                {#if settings.close_to_tray_behavior === 'ask'}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
-              </button>
 
-              <button
-                type="button"
-                role="radio"
-                data-radio-value="tray"
-                tabindex={settings.close_to_tray_behavior === 'tray' ? 0 : -1}
-                aria-checked={settings.close_to_tray_behavior === 'tray'}
-                class="behavior-card"
-                class:selected={settings.close_to_tray_behavior === 'tray'}
-                onclick={() => pickCloseBehavior('tray')}
-                onkeydown={(e) =>
-                  handleRadioGroupKey(
-                    e,
-                    closeBehaviorValues,
-                    settings?.close_to_tray_behavior ?? 'ask',
-                    (value) => pickCloseBehavior(value as 'ask' | 'tray' | 'exit'),
-                  )}
-              >
-                <span class="behavior-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                    <rect x="3.5" y="3.5" width="17" height="11" rx="2"/>
-                    <line x1="12" y1="6.5" x2="12" y2="13"/>
-                    <polyline points="9,10.5 12,13.5 15,10.5"/>
-                    <line x1="3.5" y1="19" x2="20.5" y2="19"/>
-                  </svg>
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_power()}</h4>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_prevent_sleep_label()}</span>
+                <span class="hint">
+                  {#if runtimeStatus && !runtimeStatus.sleep_inhibit_supported}
+                    {m.settings_prevent_sleep_unsupported()}
+                  {:else}
+                    {m.settings_prevent_sleep_hint()}
+                  {/if}
                 </span>
-                <span class="behavior-title">{m.settings_close_behavior_tray()}</span>
-                <span class="behavior-desc">{m.settings_close_behavior_tray_desc()}</span>
-                {#if settings.close_to_tray_behavior === 'tray'}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
-              </button>
-
-              <button
-                type="button"
-                role="radio"
-                data-radio-value="exit"
-                tabindex={settings.close_to_tray_behavior === 'exit' ? 0 : -1}
-                aria-checked={settings.close_to_tray_behavior === 'exit'}
-                class="behavior-card"
-                class:selected={settings.close_to_tray_behavior === 'exit'}
-                onclick={() => pickCloseBehavior('exit')}
-                onkeydown={(e) =>
-                  handleRadioGroupKey(
-                    e,
-                    closeBehaviorValues,
-                    settings?.close_to_tray_behavior ?? 'ask',
-                    (value) => pickCloseBehavior(value as 'ask' | 'tray' | 'exit'),
-                  )}
-              >
-                <span class="behavior-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M13 4h5a1.5 1.5 0 0 1 1.5 1.5v13A1.5 1.5 0 0 1 18 20h-5"/>
-                    <line x1="15" y1="12" x2="4" y2="12"/>
-                    <polyline points="7.5,8.5 4,12 7.5,15.5"/>
-                  </svg>
-                </span>
-                <span class="behavior-title">{m.settings_close_behavior_exit()}</span>
-                <span class="behavior-desc">{m.settings_close_behavior_exit_desc()}</span>
-                {#if settings.close_to_tray_behavior === 'exit'}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
-              </button>
+                {#if runtimeStatus?.sleep_inhibit_held}
+                  <span class="live-badge">{m.settings_prevent_sleep_active()}</span>
+                {/if}
+              </div>
+              <ToggleSwitch
+                bind:checked={settings.prevent_sleep_while_active}
+                disabled={!!runtimeStatus && !runtimeStatus.sleep_inhibit_supported}
+                ariaLabel={m.settings_prevent_sleep_label()}
+              />
             </div>
           </div>
         </div>
@@ -3043,104 +2950,111 @@
           </div>
         </div>
         <div class="card-body">
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_notifications_enabled_label()}</span>
-              <span class="hint">{m.settings_notifications_enabled_hint()}</span>
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_delivery()}</h4>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_notifications_enabled_label()}</span>
+                <span class="hint">{m.settings_notifications_enabled_hint()}</span>
+              </div>
+              <ToggleSwitch
+                bind:checked={settings.notifications_enabled}
+                ariaLabel={m.settings_notifications_enabled_label()}
+              />
             </div>
-            <ToggleSwitch
-              bind:checked={settings.notifications_enabled}
-              ariaLabel={m.settings_notifications_enabled_label()}
-            />
-          </div>
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_notifications_unfocused_label()}</span>
-              <span class="hint">{m.settings_notifications_unfocused_hint()}</span>
+            <div class="field toggle-row nested" class:is-disabled={notifyOff}>
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_notifications_unfocused_label()}</span>
+                <span class="hint">{m.settings_notifications_unfocused_hint()}</span>
+              </div>
+              <ToggleSwitch
+                bind:checked={settings.notifications_only_when_unfocused}
+                disabled={notifyOff}
+                ariaLabel={m.settings_notifications_unfocused_label()}
+              />
             </div>
-            <ToggleSwitch
-              bind:checked={settings.notifications_only_when_unfocused}
-              disabled={!settings.notifications_enabled}
-              ariaLabel={m.settings_notifications_unfocused_label()}
-            />
           </div>
 
-          <div class="divider"></div>
-
-          <span class="field-label">{m.settings_notifications_events_label()}</span>
-          <span class="hint">{m.settings_notifications_events_hint()}</span>
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_notify_download_complete()}</span>
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_notifications_events_label()}</h4>
+            <div class="field toggle-row" class:is-disabled={notifyOff}>
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_notify_download_complete()}</span>
+              </div>
+              <ToggleSwitch
+                bind:checked={settings.notify_download_complete}
+                disabled={notifyOff}
+                ariaLabel={m.settings_notify_download_complete()}
+              />
             </div>
-            <ToggleSwitch
-              bind:checked={settings.notify_download_complete}
-              disabled={!settings.notifications_enabled}
-              ariaLabel={m.settings_notify_download_complete()}
-            />
-          </div>
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_notify_download_failed()}</span>
+            <div class="field toggle-row" class:is-disabled={notifyOff}>
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_notify_download_failed()}</span>
+              </div>
+              <ToggleSwitch
+                bind:checked={settings.notify_download_failed}
+                disabled={notifyOff}
+                ariaLabel={m.settings_notify_download_failed()}
+              />
             </div>
-            <ToggleSwitch
-              bind:checked={settings.notify_download_failed}
-              disabled={!settings.notifications_enabled}
-              ariaLabel={m.settings_notify_download_failed()}
-            />
-          </div>
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_notify_friend_online()}</span>
+            <div class="field toggle-row" class:is-disabled={notifyOff}>
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_notify_friend_online()}</span>
+              </div>
+              <ToggleSwitch
+                bind:checked={settings.notify_friend_online}
+                disabled={notifyOff}
+                ariaLabel={m.settings_notify_friend_online()}
+              />
             </div>
-            <ToggleSwitch
-              bind:checked={settings.notify_friend_online}
-              disabled={!settings.notifications_enabled}
-              ariaLabel={m.settings_notify_friend_online()}
-            />
-          </div>
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_notify_friend_message()}</span>
-              <span class="hint">{m.settings_notify_friend_message_hint()}</span>
+            <div class="field toggle-row" class:is-disabled={notifyOff}>
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_notify_friend_message()}</span>
+                <span class="hint">{m.settings_notify_friend_message_hint()}</span>
+              </div>
+              <ToggleSwitch
+                bind:checked={settings.notify_friend_message}
+                disabled={notifyOff}
+                ariaLabel={m.settings_notify_friend_message()}
+              />
             </div>
-            <ToggleSwitch
-              bind:checked={settings.notify_friend_message}
-              disabled={!settings.notifications_enabled}
-              ariaLabel={m.settings_notify_friend_message()}
-            />
-          </div>
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_notify_friend_request()}</span>
+            <div class="field toggle-row" class:is-disabled={notifyOff}>
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_notify_friend_request()}</span>
+              </div>
+              <ToggleSwitch
+                bind:checked={settings.notify_friend_request}
+                disabled={notifyOff}
+                ariaLabel={m.settings_notify_friend_request()}
+              />
             </div>
-            <ToggleSwitch
-              bind:checked={settings.notify_friend_request}
-              disabled={!settings.notifications_enabled}
-              ariaLabel={m.settings_notify_friend_request()}
-            />
-          </div>
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_notify_shares_browsed()}</span>
-              <span class="hint">{m.settings_notify_shares_browsed_hint()}</span>
+            <div class="field toggle-row" class:is-disabled={notifyOff}>
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_notify_shares_browsed()}</span>
+                <span class="hint">{m.settings_notify_shares_browsed_hint()}</span>
+              </div>
+              <ToggleSwitch
+                bind:checked={settings.notify_shares_browsed}
+                disabled={notifyOff}
+                ariaLabel={m.settings_notify_shares_browsed()}
+              />
             </div>
-            <ToggleSwitch
-              bind:checked={settings.notify_shares_browsed}
-              disabled={!settings.notifications_enabled}
-              ariaLabel={m.settings_notify_shares_browsed()}
-            />
-          </div>
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_notify_channel_message()}</span>
-              <span class="hint">{m.settings_notify_channel_message_hint()}</span>
+            <div class="field toggle-row" class:is-disabled={notifyOff}>
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_notify_channel_message()}</span>
+                <span class="hint">
+                  {m.settings_notify_channel_message_hint()}
+                  <button type="button" class="link-btn" onclick={() => selectSection('channels')}>
+                    {m.settings_notify_channel_manage()}
+                  </button>
+                </span>
+              </div>
+              <ToggleSwitch
+                bind:checked={settings.notify_channel_message}
+                disabled={notifyOff}
+                ariaLabel={m.settings_notify_channel_message()}
+              />
             </div>
-            <ToggleSwitch
-              bind:checked={settings.notify_channel_message}
-              disabled={!settings.notifications_enabled}
-              ariaLabel={m.settings_notify_channel_message()}
-            />
           </div>
         </div>
       </section>
@@ -3161,17 +3075,13 @@
           </div>
         </div>
         <div class="card-body">
-          <!-- This section carries more than any other — a destination, four
-               limits, queue behaviour, preview, compression and history — and
-               the rules between those groups said nothing about what they
-               separated. Naming the groups is what makes the longest section
-               on the page scannable.
-               Each group is a container rather than a heading followed by
-               loose siblings, so the filter can decide a group's visibility
-               with the same rule it uses for everything else: show it if it
-               still holds a visible field. Deciding it by walking forward
-               from a heading to the next heading is what it did first, and
-               that missed the fields nested inside a `.field-row`. -->
+          <!-- Every section is built from these groups. Each is a container
+               rather than a heading followed by loose siblings, so the filter
+               can decide a group's visibility with the same rule it uses for
+               everything else: show it if it still holds a visible field.
+               Deciding it by walking forward from a heading to the next
+               heading is what it did first, and that missed the fields nested
+               inside a `.field-row`. -->
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_destination()}</h4>
             <div class="field">
@@ -3183,8 +3093,14 @@
               <span class="hint">{folderLayoutHint(settings.download_folder)}</span>
             </div>
             <div class="field">
+              <span class="field-label">{m.settings_category_folders_label()}</span>
+              <span class="hint">
+                {m.settings_category_folders_hint()}
+                <a href="/transfers" onclick={(e) => { e.preventDefault(); void goto('/transfers'); }}>{m.settings_open_page({ page: m.nav_transfers() })}</a>
+              </span>
+            </div>
+            <div class="field">
               <label for="low-disk-warning">{m.settings_low_disk_label()}</label>
-              <span class="hint">{m.settings_low_disk_hint()}</span>
               <select id="low-disk-warning" bind:value={settings.low_disk_warning_mb}>
                 <option value={0}>{m.settings_low_disk_off()}</option>
                 {#each LOW_DISK_CHOICES_MB as mb (mb)}
@@ -3194,6 +3110,7 @@
                   <option value={settings.low_disk_warning_mb}>{formatSize(settings.low_disk_warning_mb * 1024 * 1024)}</option>
                 {/if}
               </select>
+              <span class="hint">{m.settings_low_disk_hint()}</span>
             </div>
           </div>
 
@@ -3251,30 +3168,6 @@
               </div>
             </div>
 
-            <!-- eMule's Connection page keeps `maxconnections` and
-                 `MaxConnectionsPerFiveSeconds` beside the transfer limits, and
-                 the first of the two decides how many peers can be waiting in
-                 your upload queue at all — so it belongs in front of the user
-                 rather than in config.json. -->
-            <div class="field-row">
-              <div class="field half">
-                <label for="max-connections">{m.settings_max_connections()}</label>
-                <div class="apply-input">
-                  <input id="max-connections" type="number" min="1" max="2000" bind:value={settings.max_connections} onkeydown={(e) => applyOnEnter(e, ['max_connections'])} />
-                  {@render applyButton(['max_connections'], m.settings_max_connections())}
-                </div>
-                <span class="hint">{m.settings_max_connections_hint()}</span>
-              </div>
-              <div class="field half">
-                <label for="max-conn-per-five">{m.settings_max_conn_per_five()}</label>
-                <div class="apply-input">
-                  <input id="max-conn-per-five" type="number" min="0" max="500" bind:value={settings.max_connections_per_five_secs} onkeydown={(e) => applyOnEnter(e, ['max_connections_per_five_secs'])} />
-                  {@render applyButton(['max_connections_per_five_secs'], m.settings_max_conn_per_five())}
-                </div>
-                <span class="hint">{m.settings_max_conn_per_five_hint()}</span>
-              </div>
-            </div>
-
             <!-- eMule's `MaxSourcesPerFile` is a knob its users tune for rare
                  files, so it sits here beside the other limits. Applied live
                  on save to every download's source list and the source
@@ -3301,9 +3194,9 @@
 
           <!-- The remaining protocol budget / retry knobs (queue wait, retry
                rounds) stay in AppSettings for config.json and backend clamps,
-               but are intentionally not exposed here. `max_connections` and
-               `max_sources_per_file` used to be in that list; they are above
-               now, because eMule has always exposed both. -->
+               but are intentionally not exposed here. `max_sources_per_file`
+               is above and `max_connections` is under Network, because eMule
+               has always exposed both. -->
 
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_behavior()}</h4>
@@ -3338,9 +3231,26 @@
               </div>
               <ToggleSwitch bind:checked={settings.watch_clipboard_links} ariaLabel={m.settings_watch_clipboard_label()} />
             </div>
-            <!-- Grouped with the other transfer behaviour rather than with
-                 Preview, where it briefly sat: this governs what we send when
-                 uploading, and has nothing to do with previewing. -->
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_web_sources_label()}</span>
+                <span class="hint">{m.settings_web_sources_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.web_sources_enabled} ariaLabel={m.settings_web_sources_label()} />
+            </div>
+          </div>
+
+          <!-- Shared folders are chosen in the Library, so this only points
+               there; the switch is about what we send when uploading. -->
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_sharing()}</h4>
+            <div class="field">
+              <span class="field-label">{m.settings_shared_folders_label()}</span>
+              <span class="hint">
+                {m.settings_shared_folders_hint()}
+                <a href="/library" onclick={(e) => { e.preventDefault(); void goto('/library'); }}>{m.settings_open_page({ page: m.nav_library() })}</a>
+              </span>
+            </div>
             <div class="field toggle-row">
               <div class="toggle-info">
                 <span class="toggle-title">{m.settings_skip_compress_video()}</span>
@@ -3378,39 +3288,33 @@
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_history()}</h4>
             <div class="field">
-              <span class="toggle-title">{m.settings_download_history()}</span>
-              <span class="hint">
-                {m.settings_download_history_hint()}
-              </span>
-              <div class="history-grid">
-                <div class="history-card">
-                  <div class="history-stat-body">
-                    <span class="history-stat-label">{m.settings_history_stat_completed()}</span>
-                    <strong class="history-stat-value" class:is-loading={historyStatsLoading}>
-                      {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.completed ?? 0}
-                    </strong>
-                  </div>
-                  <button class="history-clear-btn" onclick={() => requestClearHistory('completed')}>{m.settings_clear_completed()}</button>
+              <span class="field-label">{m.settings_download_history()}</span>
+              <div class="stat-grid">
+                <div class="stat">
+                  <span>{m.settings_history_stat_completed()}</span>
+                  <strong class:is-loading={historyStatsLoading}>
+                    {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.completed ?? 0}
+                  </strong>
                 </div>
-                <div class="history-card">
-                  <div class="history-stat-body">
-                    <span class="history-stat-label">{m.settings_history_stat_cancelled()}</span>
-                    <strong class="history-stat-value" class:is-loading={historyStatsLoading}>
-                      {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.cancelled ?? 0}
-                    </strong>
-                  </div>
-                  <button class="history-clear-btn" onclick={() => requestClearHistory('cancelled')}>{m.settings_clear_cancelled()}</button>
+                <div class="stat">
+                  <span>{m.settings_history_stat_cancelled()}</span>
+                  <strong class:is-loading={historyStatsLoading}>
+                    {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.cancelled ?? 0}
+                  </strong>
                 </div>
-                <div class="history-card history-card-total">
-                  <div class="history-stat-body">
-                    <span class="history-stat-label">{m.settings_history_stat_total()}</span>
-                    <strong class="history-stat-value" class:is-loading={historyStatsLoading}>
-                      {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.total ?? 0}
-                    </strong>
-                  </div>
-                  <button class="history-clear-btn" onclick={() => requestClearHistory('all')}>{m.settings_clear_all_history()}</button>
+                <div class="stat">
+                  <span>{m.settings_history_stat_total()}</span>
+                  <strong class:is-loading={historyStatsLoading}>
+                    {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.total ?? 0}
+                  </strong>
                 </div>
               </div>
+              <div class="action-row">
+                <button class="action-btn danger" onclick={() => requestClearHistory('completed')}>{m.settings_clear_completed()}</button>
+                <button class="action-btn danger" onclick={() => requestClearHistory('cancelled')}>{m.settings_clear_cancelled()}</button>
+                <button class="action-btn danger" onclick={() => requestClearHistory('all')}>{m.settings_clear_all_history()}</button>
+              </div>
+              <span class="hint">{m.settings_download_history_hint()}</span>
               {#if historyStatsError}
                 <span class="hint hint-error" role="alert">{historyStatsError}</span>
               {/if}
@@ -3422,14 +3326,126 @@
         </div>
       </section>
 
+      <!-- Search -->
+      <section class="card" class:hidden={!filtering && activeSection !== 'search'} id={panelId('search')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('search')}>
+        <div class="card-header">
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="8.5" cy="8.5" r="5.5"/>
+              <line x1="12.5" y1="12.5" x2="17" y2="17"/>
+            </svg>
+          </span>
+          <div>
+            <h3>{m.settings_section_search()}</h3>
+            <p class="card-desc">{m.settings_search_desc()}</p>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_spam_filter()}</h4>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_spam_filter()}</span>
+                <span class="hint">{m.settings_spam_filter_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.spam_filter_enabled} ariaLabel={m.settings_spam_filter()} />
+            </div>
+            <div class="field nested" class:is-disabled={!settings.spam_filter_enabled}>
+              <label for="spam-filter-profile">{m.settings_spam_profile_label()}</label>
+              <select
+                id="spam-filter-profile"
+                bind:value={settings.spam_filter_profile}
+                disabled={!settings.spam_filter_enabled}
+              >
+                <option value="relaxed">{m.settings_spam_profile_relaxed()}</option>
+                <option value="balanced">{m.settings_spam_profile_balanced()}</option>
+                <option value="aggressive">{m.settings_spam_profile_aggressive()}</option>
+              </select>
+              <span class="hint">{m.settings_spam_profile_hint()}</span>
+            </div>
+            <div class="field">
+              <span class="field-label">{m.settings_spam_db_label()}</span>
+              {#if spamStatsLoading}
+                <span class="hint">{m.settings_spam_loading()}</span>
+              {:else if spamStatsError}
+                <span class="hint hint-error" role="alert">{spamStatsError}</span>
+              {:else if spamStats}
+                <div class="stat-grid">
+                  <div class="stat"><span>{m.settings_spam_stat_hashes()}</span><strong>{spamStats.spam_hashes}</strong></div>
+                  <div class="stat"><span>{m.settings_spam_stat_not_spam_hashes()}</span><strong>{spamStats.not_spam_hashes}</strong></div>
+                  <div class="stat"><span>{m.settings_spam_stat_names()}</span><strong>{spamStats.spam_filenames}</strong></div>
+                  <div class="stat"><span>{m.settings_spam_stat_source_ips()}</span><strong>{spamStats.spam_source_ips}</strong></div>
+                </div>
+              {/if}
+              <div class="action-row">
+                <button class="action-btn" onclick={refreshSpamStats} disabled={spamStatsLoading || spamResetting}>{m.settings_refresh_stats()}</button>
+                <button class="action-btn danger" onclick={handleResetSpamData} disabled={spamResetting}>
+                  {spamResetting ? m.settings_resetting() : m.settings_reset_spam_data()}
+                </button>
+              </div>
+              <span class="hint">{m.settings_spam_db_hint()}</span>
+            </div>
+          </div>
+
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_results()}</h4>
+            <div class="field">
+              <label for="search-timeout-secs">{m.settings_search_timeout_label()}</label>
+              <div class="apply-input">
+                <input
+                  id="search-timeout-secs"
+                  class="compact-number"
+                  type="number"
+                  min="30"
+                  max="600"
+                  step="1"
+                  bind:value={settings.search_timeout_secs}
+                  onkeydown={(e) => applyOnEnter(e, ['search_timeout_secs'])}
+                />
+                {@render applyButton(['search_timeout_secs'], m.settings_search_timeout_label())}
+              </div>
+              <span class="hint">{m.settings_search_timeout_hint()}</span>
+            </div>
+            <div class="field">
+              <label for="filename-cleanups">{m.settings_filename_cleanups_label()}</label>
+              <div class="apply-input">
+                <input id="filename-cleanups" type="text" bind:value={settings.filename_cleanups} onkeydown={(e) => applyOnEnter(e, ['filename_cleanups'])} placeholder={m.settings_filename_cleanups_placeholder()} />
+                {@render applyButton(['filename_cleanups'], m.settings_filename_cleanups_label())}
+              </div>
+              <span class="hint">{m.settings_filename_cleanups_hint_prefix()} <code>{m.settings_filename_cleanups_placeholder()}</code>{m.settings_filename_cleanups_hint_suffix()}</span>
+            </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_highlight_matches()}</span>
+                <span class="hint">{m.settings_highlight_matches_hint()}</span>
+              </div>
+              <ToggleSwitch
+                checked={$highlightMatches}
+                onchange={(on) => highlightMatches.set(on)}
+                ariaLabel={m.settings_highlight_matches()}
+              />
+            </div>
+          </div>
+
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_history()}</h4>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_save_search_history()}</span>
+                <span class="hint">{m.settings_save_search_history_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.save_search_history} ariaLabel={m.settings_save_search_history()} />
+            </div>
+          </div>
+        </div>
+      </section>
+
       <!-- Web services -->
-      <!-- Its own section rather than a group inside Transfers. It used to sit
-           under there on the grounds that it answers "why will this not
-           finish?", but it is reached from a file's right-click menu in
-           Search, Library and Transfers alike, and it is neither storage nor
-           concurrency — the two things that section says it is about. It is
-           also the only entry there that sends a file's details to a third
-           party, which is worth being able to find on its own. -->
+      <!-- Its own section rather than a group inside Transfers: it is reached
+           from a file's right-click menu in Search, Library and Transfers
+           alike, and it is the only setting that sends a file's details to a
+           third party, which is worth being able to find on its own. Next to
+           Search because looking a file up is what it is for. -->
       <section class="card" class:hidden={!filtering && activeSection !== 'webservices'} id={panelId('webservices')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('webservices')}>
         <div class="card-header">
           <span class="card-icon" aria-hidden="true">
@@ -3441,43 +3457,41 @@
           </span>
           <div>
             <h3>{m.webservices_title()}</h3>
-            <p class="card-desc">{m.webservices_desc()}</p>
+            <p class="card-desc">{m.settings_webservices_desc()}</p>
           </div>
         </div>
         <div class="card-body">
-          <div class="field">
-            <!-- What using it discloses. The what-it-is half of this pair is
-                 now the card description above, so only the consequence is
-                 repeated here. -->
-            <div class="webservice-intro">
-              <span class="hint">{m.webservices_privacy_note()}</span>
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_web_sites()}</h4>
+            <div class="field">
+              <!-- What it is and what using it discloses, ahead of the list
+                   they describe. -->
+              <span class="hint">{m.webservices_desc()} {m.webservices_privacy_note()}</span>
+              {#if settings.web_services.length === 0}
+                <span class="hint">{m.webservices_empty()}</span>
+              {:else}
+                <ul class="webservice-list">
+                  {#each settings.web_services as service, index (service.url)}
+                    <li class="webservice-row">
+                      <div class="webservice-text">
+                        <span class="webservice-name"><bdi dir="auto">{service.name}</bdi></span>
+                        <span class="hint webservice-url" title={service.url}>{service.url}</span>
+                      </div>
+                      <button
+                        class="action-btn ghost webservice-remove"
+                        onclick={() => removeWebService(index)}
+                        aria-label={m.settings_webservice_remove_aria({ name: service.name })}
+                      >{m.webservices_remove()}</button>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
             </div>
+          </div>
 
-            {#if settings.web_services.length === 0}
-              <span class="hint">{m.webservices_empty()}</span>
-            {:else}
-              <ul class="webservice-list">
-                {#each settings.web_services as service, index (service.url)}
-                  <li class="webservice-row">
-                    <div class="webservice-text">
-                      <span class="webservice-name"><bdi dir="auto">{service.name}</bdi></span>
-                      <span class="hint webservice-url" title={service.url}>{service.url}</span>
-                    </div>
-                    <button
-                      class="action-btn ghost webservice-remove"
-                      onclick={() => removeWebService(index)}
-                      aria-label={m.settings_webservice_remove_aria({ name: service.name })}
-                    >{m.webservices_remove()}</button>
-                  </li>
-                {/each}
-              </ul>
-            {/if}
-
-            <!-- Adding is a different activity from reviewing what is already
-                 configured, so it gets its own group rather than continuing the
-                 same flat stack. The rule is the separator; boxing it would make
-                 a second card inside a card. -->
-            <div class="webservice-form">
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_web_add()}</h4>
+            <div class="field">
               <div class="webservice-add">
                 <label class="webservice-field">
                   <span class="hint">{m.webservices_name_label()}</span>
@@ -3501,11 +3515,8 @@
                 </label>
                 <button class="action-btn" onclick={addWebService}>{m.webservices_add()}</button>
               </div>
-              <!-- Annotates the Address field above it, so it stays with the
-                   form instead of floating between the form and the buttons. -->
               <span class="hint">{m.webservices_placeholders()}</span>
-
-              <div class="webservice-actions">
+              <div class="action-row">
                 {#if canAddExample}
                   <button class="action-btn ghost" onclick={addExampleWebService}>
                     {m.webservices_add_example()}
@@ -3515,117 +3526,12 @@
                   {m.webservices_import()}
                 </button>
               </div>
+              {#if webServiceMessage}
+                <span class="feedback {webServiceMessage.kind === 'err' ? 'error' : 'success'}">
+                  {webServiceMessage.text}
+                </span>
+              {/if}
             </div>
-            {#if webServiceMessage}
-              <span class="feedback {webServiceMessage.kind === 'err' ? 'error' : 'success'}">
-                {webServiceMessage.text}
-              </span>
-            {/if}
-          </div>
-        </div>
-      </section>
-
-      <!-- Search -->
-      <section class="card" class:hidden={!filtering && activeSection !== 'search'} id={panelId('search')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('search')}>
-        <div class="card-header">
-          <span class="card-icon" aria-hidden="true">
-            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="8.5" cy="8.5" r="5.5"/>
-              <line x1="12.5" y1="12.5" x2="17" y2="17"/>
-            </svg>
-          </span>
-          <div>
-            <h3>{m.settings_section_search()}</h3>
-            <p class="card-desc">{m.settings_search_desc()}</p>
-          </div>
-        </div>
-        <div class="card-body">
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_spam_filter()}</span>
-              <span class="hint">{m.settings_spam_filter_hint()}</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.spam_filter_enabled} ariaLabel={m.settings_spam_filter()} />
-          </div>
-          <div class="field">
-            <label for="spam-filter-profile">{m.settings_spam_profile_label()}</label>
-            <span class="hint">{m.settings_spam_profile_hint()}</span>
-            <select
-              id="spam-filter-profile"
-              bind:value={settings.spam_filter_profile}
-              disabled={!settings.spam_filter_enabled}
-            >
-              <option value="relaxed">{m.settings_spam_profile_relaxed()}</option>
-              <option value="balanced">{m.settings_spam_profile_balanced()}</option>
-              <option value="aggressive">{m.settings_spam_profile_aggressive()}</option>
-            </select>
-          </div>
-          <div class="field">
-            <span class="field-label">{m.settings_spam_db_label()}</span>
-            <span class="hint">{m.settings_spam_db_hint()}</span>
-            {#if spamStatsLoading}
-              <span class="hint">{m.settings_spam_loading()}</span>
-            {:else if spamStatsError}
-              <span class="hint hint-error" role="alert">{spamStatsError}</span>
-            {:else if spamStats}
-              <div class="spam-stats-grid">
-                <div class="spam-stat"><span>{m.settings_spam_stat_hashes()}</span><strong>{spamStats.spam_hashes}</strong></div>
-                <div class="spam-stat"><span>{m.settings_spam_stat_not_spam_hashes()}</span><strong>{spamStats.not_spam_hashes}</strong></div>
-                <div class="spam-stat"><span>{m.settings_spam_stat_names()}</span><strong>{spamStats.spam_filenames}</strong></div>
-                <div class="spam-stat"><span>{m.settings_spam_stat_source_ips()}</span><strong>{spamStats.spam_source_ips}</strong></div>
-              </div>
-            {/if}
-            <div class="action-row">
-              <button class="action-btn" onclick={refreshSpamStats} disabled={spamStatsLoading || spamResetting}>{m.settings_refresh_stats()}</button>
-              <button class="danger" onclick={handleResetSpamData} disabled={spamResetting}>
-                {spamResetting ? m.settings_resetting() : m.settings_reset_spam_data()}
-              </button>
-            </div>
-          </div>
-          <div class="divider"></div>
-          <div class="field">
-            <label for="search-timeout-secs">{m.settings_search_timeout_label()}</label>
-            <div class="apply-input">
-              <input
-                id="search-timeout-secs"
-                class="compact-number"
-                type="number"
-                min="30"
-                max="600"
-                step="1"
-                bind:value={settings.search_timeout_secs}
-                onkeydown={(e) => applyOnEnter(e, ['search_timeout_secs'])}
-              />
-              {@render applyButton(['search_timeout_secs'], m.settings_search_timeout_label())}
-            </div>
-            <span class="hint">{m.settings_search_timeout_hint()}</span>
-          </div>
-          <div class="field">
-            <label for="filename-cleanups">{m.settings_filename_cleanups_label()}</label>
-            <span class="hint">{m.settings_filename_cleanups_hint_prefix()} <code>{m.settings_filename_cleanups_placeholder()}</code>{m.settings_filename_cleanups_hint_suffix()}</span>
-            <div class="apply-input">
-              <input id="filename-cleanups" type="text" bind:value={settings.filename_cleanups} onkeydown={(e) => applyOnEnter(e, ['filename_cleanups'])} placeholder={m.settings_filename_cleanups_placeholder()} />
-              {@render applyButton(['filename_cleanups'], m.settings_filename_cleanups_label())}
-            </div>
-          </div>
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_highlight_matches()}</span>
-              <span class="hint">{m.settings_highlight_matches_hint()}</span>
-            </div>
-            <ToggleSwitch
-              checked={$highlightMatches}
-              onchange={(on) => highlightMatches.set(on)}
-              ariaLabel={m.settings_highlight_matches()}
-            />
-          </div>
-          <div class="divider"></div>
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_save_search_history()}</span>
-              <span class="hint">{m.settings_save_search_history_hint()}</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.save_search_history} ariaLabel={m.settings_save_search_history()} />
           </div>
         </div>
       </section>
@@ -3647,6 +3553,19 @@
           </div>
         </div>
         <div class="card-body">
+          <!-- Rendered under the alternative download limit while those limits
+               are on, under the manual one otherwise. -->
+          {#snippet downloadRatioCapNote()}
+            {#if runtimeStatus?.download_ratio_cap}
+              <span class="hint download-ratio-cap" role="status">
+                {m.settings_download_ratio_cap_note({
+                  limit: formatSpeed(runtimeStatus.download_ratio_cap.limit),
+                  ratio: runtimeStatus.download_ratio_cap.ratio,
+                  upload: formatSpeed(runtimeStatus.download_ratio_cap.upload_below),
+                })}
+              </span>
+            {/if}
+          {/snippet}
           {#if runtimeStatus?.schedule}
             <!-- Without this, a user whose overnight rule is open sees the
                  manual number in the field and a different speed everywhere
@@ -3689,243 +3608,251 @@
               </span>
             </div>
           {/if}
-          <div class="field manual-speed-limit" class:is-inactive={settings.alt_speed_enabled}>
-            <div class="apply-input">
-              <div class="apply-grow">
-                <SpeedInput label={m.settings_max_upload_speed()} bind:value={settings.max_upload_speed} onenter={() => void applyFields(['max_upload_speed'])} />
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_speed_limits()}</h4>
+            <div class="field manual-speed-limit" class:is-inactive={settings.alt_speed_enabled}>
+              <div class="apply-input">
+                <div class="apply-grow">
+                  <SpeedInput label={m.settings_max_upload_speed()} bind:value={settings.max_upload_speed} onenter={() => void applyFields(['max_upload_speed'])} />
+                </div>
+                {@render applyButton(['max_upload_speed'], m.settings_max_upload_speed())}
               </div>
-              {@render applyButton(['max_upload_speed'], m.settings_max_upload_speed())}
+              <span class="hint">{m.settings_max_upload_speed_hint()}</span>
             </div>
-            <span class="hint">{m.settings_max_upload_speed_hint()}</span>
-          </div>
-          <div class="field manual-speed-limit" class:is-inactive={settings.alt_speed_enabled}>
-            <div class="apply-input">
-              <div class="apply-grow">
-                <SpeedInput label={m.settings_max_download_speed()} bind:value={settings.max_download_speed} onenter={() => void applyFields(['max_download_speed'])} />
+            <div class="field manual-speed-limit" class:is-inactive={settings.alt_speed_enabled}>
+              <div class="apply-input">
+                <div class="apply-grow">
+                  <SpeedInput label={m.settings_max_download_speed()} bind:value={settings.max_download_speed} onenter={() => void applyFields(['max_download_speed'])} />
+                </div>
+                {@render applyButton(['max_download_speed'], m.settings_max_download_speed())}
               </div>
-              {@render applyButton(['max_download_speed'], m.settings_max_download_speed())}
-            </div>
-          </div>
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_alt_speed_label()}</span>
-              <span class="hint">{m.settings_alt_speed_hint()}</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.alt_speed_enabled} ariaLabel={m.settings_alt_speed_label()} />
-          </div>
-          <div class="field alt-speed-limits" class:is-inactive={!settings.alt_speed_enabled}>
-            <div class="apply-input">
-              <div class="apply-grow">
-                <SpeedInput label={m.settings_alt_max_upload_speed()} bind:value={settings.alt_max_upload_speed} idScope="alt" onenter={() => void applyFields(['alt_max_upload_speed'])} />
-              </div>
-              {@render applyButton(['alt_max_upload_speed'], m.settings_alt_max_upload_speed())}
-            </div>
-            <div class="apply-input">
-              <div class="apply-grow">
-                <SpeedInput label={m.settings_alt_max_download_speed()} bind:value={settings.alt_max_download_speed} idScope="alt" onenter={() => void applyFields(['alt_max_download_speed'])} />
-              </div>
-              {@render applyButton(['alt_max_download_speed'], m.settings_alt_max_download_speed())}
-            </div>
-          </div>
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_uss_label()}</span>
-              <span class="hint">{m.settings_uss_hint()}</span>
-            </div>
-            <ToggleSwitch
-              bind:checked={settings.uss_enabled}
-              disabled={savedSettings?.max_upload_speed === 0}
-              ariaLabel={m.settings_uss_label()}
-            />
-          </div>
-
-          <div class="divider"></div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_schedule_label()}</span>
-              <span class="hint">{m.settings_schedule_hint()}</span>
-            </div>
-            <ToggleSwitch
-              bind:checked={settings.bandwidth_schedule_enabled}
-              ariaLabel={m.settings_schedule_label()}
-            />
-          </div>
-
-          <!-- Hidden while the feature is off: the rules are not in force, and
-               a timetable nobody is using is a card of controls that do
-               nothing. They are kept, not discarded — flipping the toggle back
-               brings them straight back.
-
-               The exception is a rule the backend would refuse. `validate`
-               checks the list whether or not the feature is enabled, so such a
-               rule blocks Apply either way, and hiding it would leave Apply
-               blocked with nothing on screen to fix. Shown dimmed in that case:
-               still not in force, but reachable. -->
-          {#if settings.bandwidth_schedule_enabled || scheduleHasError}
-            <div class="field schedule-editor" class:is-inactive={!settings.bandwidth_schedule_enabled || settings.alt_speed_enabled}>
-              {#if settings.bandwidth_schedule.length === 0}
-                <p class="schedule-empty">{m.schedule_empty()}</p>
-              {:else}
-                <p class="hint">{m.schedule_order_hint()}</p>
+              <span class="hint">{m.settings_max_download_speed_hint()}</span>
+              {#if !runtimeStatus?.alt_speed}
+                {@render downloadRatioCapNote()}
               {/if}
+            </div>
+            <div class="field toggle-row" class:is-disabled={savedSettings?.max_upload_speed === 0}>
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_uss_label()}</span>
+                <span class="hint">{m.settings_uss_hint()}</span>
+              </div>
+              <ToggleSwitch
+                bind:checked={settings.uss_enabled}
+                disabled={savedSettings?.max_upload_speed === 0}
+                ariaLabel={m.settings_uss_label()}
+              />
+            </div>
+          </div>
 
-              {#each settings.bandwidth_schedule as rule, index (rule.id)}
-                {@const problem = scheduleRuleError(rule)}
-                {@const isActive = settings.bandwidth_schedule_enabled && rule.id === activeScheduleRuleId}
-                <div class="schedule-rule" class:is-active={isActive} class:has-error={!!problem}>
-                  <div class="schedule-rule-head">
-                    <ToggleSwitch
-                      bind:checked={rule.enabled}
-                      ariaLabel={ruleControlLabel(m.schedule_rule_enabled_aria(), rule, index)}
-                    />
-                    <input
-                      class="schedule-name"
-                      type="text"
-                      bind:value={rule.label}
-                      maxlength={MAX_RULE_LABEL_CHARS}
-                      placeholder={m.schedule_name_placeholder()}
-                      aria-label={m.schedule_name_placeholder()}
-                    />
-                    {#if isActive}
-                      <span class="live-badge">{m.schedule_active_now()}</span>
-                    {/if}
-                    <div class="schedule-rule-actions">
-                      <button
-                        type="button"
-                        class="icon-btn"
-                        onclick={() => moveScheduleRule(index, -1)}
-                        disabled={index === 0}
-                        aria-label={ruleControlLabel(m.schedule_move_up(), rule, index)}
-                        title={m.schedule_move_up()}
-                      >&#9650;</button>
-                      <button
-                        type="button"
-                        class="icon-btn"
-                        onclick={() => moveScheduleRule(index, 1)}
-                        disabled={index === settings.bandwidth_schedule.length - 1}
-                        aria-label={ruleControlLabel(m.schedule_move_down(), rule, index)}
-                        title={m.schedule_move_down()}
-                      >&#9660;</button>
-                      <button
-                        type="button"
-                        class="icon-btn danger"
-                        onclick={() => removeScheduleRule(rule.id)}
-                        aria-label={ruleControlLabel(m.schedule_remove_rule(), rule, index)}
-                        title={m.schedule_remove_rule()}
-                      >&times;</button>
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_alt_limits()}</h4>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_alt_speed_label()}</span>
+                <span class="hint">{m.settings_alt_speed_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.alt_speed_enabled} ariaLabel={m.settings_alt_speed_label()} />
+            </div>
+            <!-- Editable while off, so the limits can be ready before they are
+                 switched on from the tray; dimmed because they are not in force. -->
+            <div class="field nested alt-speed-limits" class:is-inactive={!settings.alt_speed_enabled}>
+              <div class="apply-input">
+                <div class="apply-grow">
+                  <SpeedInput label={m.settings_alt_max_upload_speed()} bind:value={settings.alt_max_upload_speed} idScope="alt" onenter={() => void applyFields(['alt_max_upload_speed'])} />
+                </div>
+                {@render applyButton(['alt_max_upload_speed'], m.settings_alt_max_upload_speed())}
+              </div>
+              <div class="apply-input">
+                <div class="apply-grow">
+                  <SpeedInput label={m.settings_alt_max_download_speed()} bind:value={settings.alt_max_download_speed} idScope="alt" onenter={() => void applyFields(['alt_max_download_speed'])} />
+                </div>
+                {@render applyButton(['alt_max_download_speed'], m.settings_alt_max_download_speed())}
+              </div>
+              {#if runtimeStatus?.alt_speed}
+                {@render downloadRatioCapNote()}
+              {/if}
+            </div>
+          </div>
+
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_schedule()}</h4>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_schedule_label()}</span>
+                <span class="hint">{m.settings_schedule_hint()}</span>
+              </div>
+              <ToggleSwitch
+                bind:checked={settings.bandwidth_schedule_enabled}
+                ariaLabel={m.settings_schedule_label()}
+              />
+            </div>
+
+            <!-- Hidden while the feature is off: the rules are not in force, and
+                 a timetable nobody is using is a card of controls that do
+                 nothing. They are kept, not discarded — flipping the toggle back
+                 brings them straight back.
+
+                 The exception is a rule the backend would refuse. `validate`
+                 checks the list whether or not the feature is enabled, so such a
+                 rule blocks Apply either way, and hiding it would leave Apply
+                 blocked with nothing on screen to fix. Shown dimmed in that case:
+                 still not in force, but reachable. -->
+            {#if settings.bandwidth_schedule_enabled || scheduleHasError}
+              <div class="field schedule-editor" class:is-inactive={!settings.bandwidth_schedule_enabled || settings.alt_speed_enabled}>
+                {#if settings.bandwidth_schedule.length === 0}
+                  <p class="schedule-empty">{m.schedule_empty()}</p>
+                {:else}
+                  <p class="hint">{m.schedule_order_hint()}</p>
+                {/if}
+
+                {#each settings.bandwidth_schedule as rule, index (rule.id)}
+                  {@const problem = scheduleRuleError(rule)}
+                  {@const isActive = settings.bandwidth_schedule_enabled && rule.id === activeScheduleRuleId}
+                  <div class="schedule-rule" class:is-active={isActive} class:has-error={!!problem}>
+                    <div class="schedule-rule-head">
+                      <ToggleSwitch
+                        bind:checked={rule.enabled}
+                        ariaLabel={ruleControlLabel(m.schedule_rule_enabled_aria(), rule, index)}
+                      />
+                      <input
+                        class="schedule-name"
+                        type="text"
+                        bind:value={rule.label}
+                        maxlength={MAX_RULE_LABEL_CHARS}
+                        placeholder={m.schedule_name_placeholder()}
+                        aria-label={m.schedule_name_placeholder()}
+                      />
+                      {#if isActive}
+                        <span class="live-badge">{m.schedule_active_now()}</span>
+                      {/if}
+                      <div class="schedule-rule-actions">
+                        <button
+                          type="button"
+                          class="icon-btn"
+                          onclick={() => moveScheduleRule(index, -1)}
+                          disabled={index === 0}
+                          aria-label={ruleControlLabel(m.schedule_move_up(), rule, index)}
+                          title={m.schedule_move_up()}
+                        >&#9650;</button>
+                        <button
+                          type="button"
+                          class="icon-btn"
+                          onclick={() => moveScheduleRule(index, 1)}
+                          disabled={index === settings.bandwidth_schedule.length - 1}
+                          aria-label={ruleControlLabel(m.schedule_move_down(), rule, index)}
+                          title={m.schedule_move_down()}
+                        >&#9660;</button>
+                        <button
+                          type="button"
+                          class="icon-btn danger"
+                          onclick={() => removeScheduleRule(rule.id)}
+                          aria-label={ruleControlLabel(m.schedule_remove_rule(), rule, index)}
+                          title={m.schedule_remove_rule()}
+                        >&times;</button>
+                      </div>
                     </div>
-                  </div>
 
-                  <div class="schedule-days" role="group" aria-label={ruleControlLabel(m.schedule_days_label(), rule, index)}>
-                    {#each weekdayLabels as dayLabel, weekday (weekday)}
-                      <button
-                        type="button"
-                        class="day-chip"
-                        class:selected={hasDay(rule.days, weekday)}
-                        aria-pressed={hasDay(rule.days, weekday)}
-                        onclick={() => setRuleDays(rule.id, weekday)}
-                      >{dayLabel}</button>
-                    {/each}
-                  </div>
+                    <div class="schedule-days" role="group" aria-label={ruleControlLabel(m.schedule_days_label(), rule, index)}>
+                      {#each weekdayLabels as dayLabel, weekday (weekday)}
+                        <button
+                          type="button"
+                          class="day-chip"
+                          class:selected={hasDay(rule.days, weekday)}
+                          aria-pressed={hasDay(rule.days, weekday)}
+                          onclick={() => setRuleDays(rule.id, weekday)}
+                        >{dayLabel}</button>
+                      {/each}
+                    </div>
 
-                  <div class="schedule-times">
-                    <label class="schedule-time">
-                      <span>{m.schedule_from()}</span>
-                      <input
-                        type="time"
-                        value={minutesToTimeValue(rule.start_minute)}
-                        onchange={(e) => setRuleStart(rule.id, e.currentTarget)}
+                    <div class="schedule-times">
+                      <label class="schedule-time">
+                        <span>{m.schedule_from()}</span>
+                        <input
+                          type="time"
+                          value={minutesToTimeValue(rule.start_minute)}
+                          onchange={(e) => setRuleStart(rule.id, e.currentTarget)}
+                        />
+                      </label>
+                      <label class="schedule-time">
+                        <span>{m.schedule_to()}</span>
+                        <input
+                          type="time"
+                          value={minutesToTimeValue(rule.end_minute)}
+                          onchange={(e) => setRuleEnd(rule.id, e.currentTarget)}
+                        />
+                      </label>
+                      {#if isOvernight(rule)}
+                        <span class="schedule-overnight">{m.schedule_overnight()}</span>
+                      {/if}
+                    </div>
+
+                    <div class="schedule-limits">
+                      <!-- `idScope` keeps each rule's two fields from colliding
+                           with every other rule's, and with the manual limits
+                           above, which all share these labels. -->
+                      <SpeedInput
+                        label={m.settings_max_upload_speed()}
+                        idScope={rule.id}
+                        bind:value={rule.max_upload_speed}
                       />
-                    </label>
-                    <label class="schedule-time">
-                      <span>{m.schedule_to()}</span>
-                      <input
-                        type="time"
-                        value={minutesToTimeValue(rule.end_minute)}
-                        onchange={(e) => setRuleEnd(rule.id, e.currentTarget)}
+                      <SpeedInput
+                        label={m.settings_max_download_speed()}
+                        idScope={rule.id}
+                        bind:value={rule.max_download_speed}
                       />
-                    </label>
-                    {#if isOvernight(rule)}
-                      <span class="schedule-overnight">{m.schedule_overnight()}</span>
+                    </div>
+
+                    {#if problem}
+                      <span class="schedule-error">{problem}</span>
                     {/if}
                   </div>
+                {/each}
 
-                  <div class="schedule-limits">
-                    <!-- `idScope` keeps each rule's two fields from colliding
-                         with every other rule's, and with the manual limits
-                         above, which all share these labels. -->
-                    <SpeedInput
-                      label={m.settings_max_upload_speed()}
-                      idScope={rule.id}
-                      bind:value={rule.max_upload_speed}
-                    />
-                    <SpeedInput
-                      label={m.settings_max_download_speed()}
-                      idScope={rule.id}
-                      bind:value={rule.max_download_speed}
-                    />
-                  </div>
-
-                  {#if problem}
-                    <span class="schedule-error">{problem}</span>
-                  {/if}
+                <div class="schedule-footer">
+                  <button
+                    type="button"
+                    class="action-btn"
+                    onclick={addScheduleRule}
+                    disabled={settings.bandwidth_schedule.length >= MAX_SCHEDULE_RULES}
+                  >
+                    {settings.bandwidth_schedule.length >= MAX_SCHEDULE_RULES
+                      ? m.schedule_add_full({ max: MAX_SCHEDULE_RULES })
+                      : m.schedule_add_rule()}
+                  </button>
+                  <!-- The backend refuses the whole schedule for one malformed
+                       rule, and the rejection names no rule. Blocking here
+                       instead points at the row that is wrong, which is already
+                       showing its own reason. -->
+                  {@render applyButton(['bandwidth_schedule'], m.settings_schedule_label(), scheduleHasError)}
                 </div>
-              {/each}
+              </div>
+            {/if}
+          </div>
 
-              <div class="schedule-footer">
-                <button
-                  type="button"
-                  class="schedule-add"
-                  onclick={addScheduleRule}
-                  disabled={settings.bandwidth_schedule.length >= MAX_SCHEDULE_RULES}
-                >
-                  {settings.bandwidth_schedule.length >= MAX_SCHEDULE_RULES
-                    ? m.schedule_add_full({ max: MAX_SCHEDULE_RULES })
-                    : m.schedule_add_rule()}
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_speed_test_label()}</h4>
+            <div class="field">
+              <div class="action-row">
+                <button class="action-btn" onclick={runSpeedTest} disabled={speedTesting}>
+                  {speedTesting ? m.settings_speed_testing() : m.settings_run_speed_test()}
                 </button>
-                <!-- The backend refuses the whole schedule for one malformed
-                     rule, and the rejection names no rule. Blocking here
-                     instead points at the row that is wrong, which is already
-                     showing its own reason. -->
-                {@render applyButton(['bandwidth_schedule'], m.settings_schedule_label(), scheduleHasError)}
               </div>
+              {#if speedResult}
+                <div class="stat-grid speed-result-grid">
+                  <div class="stat"><span>{m.settings_speed_download()}</span><strong>{formatSpeed(speedResult.download_speed)}</strong></div>
+                  <div class="stat"><span>{m.settings_speed_upload()}</span><strong>{formatSpeed(speedResult.upload_speed)}</strong></div>
+                  <div class="stat"><span>{m.settings_speed_recommended_upload()}</span><strong>{formatSpeed(speedResult.recommended_upload_limit)}</strong></div>
+                  <div class="stat"><span>{m.settings_speed_recommended_download()}</span><strong>{formatSpeed(speedResult.recommended_download_limit)}</strong></div>
+                </div>
+                <div class="action-row">
+                  <button class="action-btn primary" onclick={applyRecommended}>{m.settings_apply_recommended()}</button>
+                </div>
+              {/if}
+              {#if speedError}
+                <span class="feedback error" role="alert">{speedError}</span>
+              {/if}
+              <span class="hint">{m.settings_speed_test_hint()}</span>
             </div>
-          {/if}
-
-          <div class="divider"></div>
-          <div class="field speed-test-section">
-            <div class="speed-test-header">
-              <span class="toggle-title">{m.settings_speed_test_label()}</span>
-              <button class="speed-test-btn" onclick={runSpeedTest} disabled={speedTesting}>
-                {speedTesting ? m.settings_speed_testing() : m.settings_run_speed_test()}
-              </button>
-            </div>
-            <span class="hint">{m.settings_speed_test_hint()}</span>
-            {#if speedResult}
-              <div class="speed-results">
-                <div class="speed-row">
-                  <span>{m.settings_speed_download()}</span>
-                  <span class="speed-value">{formatSpeed(speedResult.download_speed)}</span>
-                </div>
-                <div class="speed-row">
-                  <span>{m.settings_speed_upload()}</span>
-                  <span class="speed-value">{formatSpeed(speedResult.upload_speed)}</span>
-                </div>
-                <div class="speed-row recommended">
-                  <span>{m.settings_speed_recommended_upload()}</span>
-                  <span class="speed-value">{formatSpeed(speedResult.recommended_upload_limit)}</span>
-                </div>
-                <div class="speed-row recommended">
-                  <span>{m.settings_speed_recommended_download()}</span>
-                  <span class="speed-value">{formatSpeed(speedResult.recommended_download_limit)}</span>
-                </div>
-                <button class="apply-btn" onclick={applyRecommended}>{m.settings_apply_recommended()}</button>
-              </div>
-            {/if}
-            {#if speedError}
-              <span class="speed-error">{speedError}</span>
-            {/if}
           </div>
         </div>
       </section>
@@ -3949,100 +3876,111 @@
           </div>
         </div>
         <div class="card-body">
-          <div class="field-row">
-            <div class="field half">
-              <!-- The badge is hidden from the label's accessible name, which
-                   would otherwise read "TCP port Restart required", and
-                   announced as the input's description instead. -->
-              <label for="tcp-port">
-                {m.settings_tcp_port()}
-                <span class="restart-badge" class:pending={restartPending('tcp_port')} id="tcp-port-restart" aria-hidden="true">{m.settings_restart_badge()}</span>
-              </label>
-              <div class="apply-input">
-                <input id="tcp-port" type="number" min="1" max="65535" aria-describedby="tcp-port-restart" bind:value={settings.tcp_port} onkeydown={(e) => applyOnEnter(e, ['tcp_port'])} />
-                {@render applyButton(['tcp_port'], m.settings_tcp_port())}
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_ports()}</h4>
+            <div class="field-row">
+              <div class="field half">
+                <!-- The badge is hidden from the label's accessible name, which
+                     would otherwise read "TCP port Restart required", and
+                     announced as the input's description instead. -->
+                <label for="tcp-port">
+                  {m.settings_tcp_port()}
+                  <span class="restart-badge" class:pending={restartPending('tcp_port')} id="tcp-port-restart" aria-hidden="true">{m.settings_restart_badge()}</span>
+                </label>
+                <div class="apply-input">
+                  <input id="tcp-port" type="number" min="1" max="65535" aria-describedby="tcp-port-restart" bind:value={settings.tcp_port} onkeydown={(e) => applyOnEnter(e, ['tcp_port'])} />
+                  {@render applyButton(['tcp_port'], m.settings_tcp_port())}
+                </div>
+                <span class="hint">{m.settings_tcp_port_hint()}</span>
               </div>
-              <span class="hint">{m.settings_tcp_port_hint()}</span>
-            </div>
-            <div class="field half">
-              <label for="udp-port">
-                {m.settings_udp_port()}
-                <span class="restart-badge" class:pending={restartPending('udp_port')} id="udp-port-restart" aria-hidden="true">{m.settings_restart_badge()}</span>
-              </label>
-              <div class="apply-input">
-                <input id="udp-port" type="number" min="1" max="65535" aria-describedby="udp-port-restart" bind:value={settings.udp_port} onkeydown={(e) => applyOnEnter(e, ['udp_port'])} />
-                {@render applyButton(['udp_port'], m.settings_udp_port())}
+              <div class="field half">
+                <label for="udp-port">
+                  {m.settings_udp_port()}
+                  <span class="restart-badge" class:pending={restartPending('udp_port')} id="udp-port-restart" aria-hidden="true">{m.settings_restart_badge()}</span>
+                </label>
+                <div class="apply-input">
+                  <input id="udp-port" type="number" min="1" max="65535" aria-describedby="udp-port-restart" bind:value={settings.udp_port} onkeydown={(e) => applyOnEnter(e, ['udp_port'])} />
+                  {@render applyButton(['udp_port'], m.settings_udp_port())}
+                </div>
+                <span class="hint">{m.settings_udp_port_hint()}</span>
               </div>
-              <span class="hint">{m.settings_udp_port_hint()}</span>
+            </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_upnp_label()} <span class="restart-badge" class:pending={restartPending('upnp_enabled')}>{m.settings_restart_badge()}</span></span>
+                <span class="hint">{m.settings_upnp_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.upnp_enabled} ariaLabel={m.settings_upnp_label()} />
+            </div>
+            <div class="field">
+              <PortTest />
+            </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_stun_keepalive_label()}</span>
+                <span class="hint">{m.settings_stun_keepalive_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.stun_keepalive_enabled} ariaLabel={m.settings_stun_keepalive_label()} />
             </div>
           </div>
 
-          <div class="divider"></div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_upnp_label()} <span class="restart-badge" class:pending={restartPending('upnp_enabled')}>{m.settings_restart_badge()}</span></span>
-              <span class="hint">{m.settings_upnp_hint()}</span>
+          <!-- eMule's Connection page keeps `maxconnections` and
+               `MaxConnectionsPerFiveSeconds` in front of the user, and the
+               first of the two decides how many peers can be waiting in your
+               upload queue at all. Both are about what the router can take,
+               which is why they sit with the ports. -->
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_connections()}</h4>
+            <div class="field-row">
+              <div class="field half">
+                <label for="max-connections">{m.settings_max_connections()}</label>
+                <div class="apply-input">
+                  <input id="max-connections" type="number" min="1" max="2000" bind:value={settings.max_connections} onkeydown={(e) => applyOnEnter(e, ['max_connections'])} />
+                  {@render applyButton(['max_connections'], m.settings_max_connections())}
+                </div>
+                <span class="hint">{m.settings_max_connections_hint()}</span>
+              </div>
+              <div class="field half">
+                <label for="max-conn-per-five">{m.settings_max_conn_per_five()}</label>
+                <div class="apply-input">
+                  <input id="max-conn-per-five" type="number" min="0" max="500" bind:value={settings.max_connections_per_five_secs} onkeydown={(e) => applyOnEnter(e, ['max_connections_per_five_secs'])} />
+                  {@render applyButton(['max_connections_per_five_secs'], m.settings_max_conn_per_five())}
+                </div>
+                <span class="hint">{m.settings_max_conn_per_five_hint()}</span>
+              </div>
             </div>
-            <ToggleSwitch bind:checked={settings.upnp_enabled} ariaLabel={m.settings_upnp_label()} />
-          </div>
-          <div class="field">
-            <PortTest />
-          </div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_stun_keepalive_label()}</span>
-              <span class="hint">{m.settings_stun_keepalive_hint()}</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.stun_keepalive_enabled} ariaLabel={m.settings_stun_keepalive_label()} />
-          </div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_ember_native_label()}</span>
-              <span class="hint">{m.settings_ember_native_hint()} <a href="/ember" onclick={(e) => { e.preventDefault(); goto('/ember'); }}>{m.settings_ember_open_page()}</a></span>
-            </div>
-            <span class="always-on-badge">{m.settings_ember_status_on()}</span>
           </div>
 
-          <div class="divider"></div>
-
-          <!--
-            KAD bootstraps on startup and there is no switch for it, nor a
-            Disconnect on the KAD Network page: Ember depends on it staying
-            connected. So this row states the behavior rather than pretending
-            to offer a choice — same shape as the Ember row above.
-          -->
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.nav_kad_network()}</span>
-              <span class="hint">{m.settings_kad_auto_connect_hint()} <a href="/kad" onclick={(e) => { e.preventDefault(); goto('/kad'); }}>{m.settings_kad_open_page()}</a></span>
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_networks()}</h4>
+            <!-- Neither network has a switch: Ember's DHT bootstraps from other
+                 clients and Ember depends on KAD staying connected. One line
+                 says so and points at their pages, rather than two rows that
+                 look like settings and offer nothing. -->
+            <div class="field">
+              <span class="field-label">{m.settings_networks_label()}</span>
+              <span class="hint">
+                {m.settings_networks_hint()}
+                <a href="/ember" onclick={(e) => { e.preventDefault(); void goto('/ember'); }}>{m.settings_open_page({ page: m.nav_ember_network() })}</a>
+                ·
+                <a href="/kad" onclick={(e) => { e.preventDefault(); void goto('/kad'); }}>{m.settings_open_page({ page: m.nav_kad_network() })}</a>
+              </span>
             </div>
-            <span class="always-on-badge">{m.settings_kad_status_auto()}</span>
-          </div>
-
-          <div class="field nested">
-            <div class="action-row">
-              <button class="action-btn" onclick={handleDownloadNodes} disabled={downloadingNodes}>
-                {downloadingNodes ? m.settings_downloading() : m.settings_download_nodes_btn()}
-              </button>
-              {#if nodesResult}
-                <span class:warning={nodesResultWarning} class:success={!nodesResultWarning} class="feedback">{nodesResult}</span>
-              {/if}
-              {#if nodesError}<span class="feedback error">{nodesError}</span>{/if}
+            <!--
+              Relaying for other peers. Previously implicit for any reachable
+              node; now a choice, because relay attestations travel between
+              friends and a reachable node can be asked to carry traffic for
+              pairs it never traded with. The session ceiling stays in
+              config.json (`max_relay_sessions`), like max_friends — the
+              on/off decision is the one worth surfacing.
+            -->
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_relay_for_peers_label()}</span>
+                <span class="hint">{m.settings_relay_for_peers_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.relay_for_peers} ariaLabel={m.settings_relay_for_peers_label()} />
             </div>
-            <span class="hint">{m.settings_nodes_hint()}</span>
-          </div>
-
-          <div class="divider"></div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_auto_connect_server()}</span>
-              <span class="hint">{m.settings_auto_connect_server_hint()}</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.auto_connect_server} ariaLabel={m.settings_auto_connect_server()} />
           </div>
 
           <!--
@@ -4054,38 +3992,30 @@
             nothing in the backend adds servers from clients, so a toggle for
             it would only claim to do something.
           -->
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_update_servers_label()}</span>
-              <span class="hint">{m.settings_update_servers_hint()}</span>
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_ed2k_servers()}</h4>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_auto_connect_server()}</span>
+                <span class="hint">{m.settings_auto_connect_server_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.auto_connect_server} ariaLabel={m.settings_auto_connect_server()} />
             </div>
-            <ToggleSwitch bind:checked={settings.add_servers_from_server} ariaLabel={m.settings_update_servers_aria()} />
-          </div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_filter_servers_label()}</span>
-              <span class="hint">{m.settings_filter_servers_hint()}</span>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_update_servers_label()}</span>
+                <span class="hint">{m.settings_update_servers_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.add_servers_from_server} ariaLabel={m.settings_update_servers_aria()} />
             </div>
-            <ToggleSwitch bind:checked={settings.filter_servers_by_ip} ariaLabel={m.settings_filter_servers_label()} />
-          </div>
-
-          <!--
-            Relaying for other peers. Previously implicit for any reachable
-            node; now a choice, because relay attestations travel between
-            friends and a reachable node can be asked to carry traffic for
-            pairs it never traded with. The session ceiling stays in
-            config.json (`max_relay_sessions`), like max_friends — the
-            on/off decision is the one worth surfacing.
-          -->
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_relay_for_peers_label()}</span>
-              <span class="hint">{m.settings_relay_for_peers_hint()}</span>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_filter_servers_label()}</span>
+                <span class="hint">{m.settings_filter_servers_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.filter_servers_by_ip} ariaLabel={m.settings_filter_servers_label()} />
             </div>
-            <ToggleSwitch bind:checked={settings.relay_for_peers} ariaLabel={m.settings_relay_for_peers_label()} />
           </div>
-
         </div>
       </section>
 
@@ -4108,135 +4038,145 @@
             <div class="field">
               <span class="feedback error" role="alert">{m.secident_key_unreadable()}</span>
             </div>
-            <div class="divider"></div>
           {/if}
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_obfuscation_label()}</span>
-              <span class="hint">{m.settings_obfuscation_hint()}</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.obfuscation_enabled} ariaLabel={m.settings_obfuscation_label()} />
-          </div>
-
-          <div class="divider"></div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_ip_filter_label()}</span>
-              <span class="hint">{m.settings_ip_filter_hint()}</span>
-            </div>
-            <ToggleSwitch
-              bind:checked={settings.ip_filter_enabled}
-              ariaLabel={m.settings_ip_filter_label()}
-              onchange={(v) => applyIpToggleLive('ip_filter_enabled', v)}
-            />
-          </div>
-          {#if settings.ip_filter_enabled}
-            <div class="field nested">
-              <div class="action-row">
-                <button class="action-btn" onclick={handleDownloadFilter} disabled={downloadingFilter}>
-                  {downloadingFilter ? m.settings_downloading() : m.settings_download_ipfilter_btn()}
-                </button>
-                {#if filterResult}
-                  <span class:warning={filterResultWarning} class:success={!filterResultWarning} class="feedback">{filterResult}</span>
-                {/if}
-                {#if filterError}<span class="feedback error">{filterError}</span>{/if}
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_traffic()}</h4>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_obfuscation_label()}</span>
+                <span class="hint">{m.settings_obfuscation_hint()}</span>
               </div>
+              <ToggleSwitch bind:checked={settings.obfuscation_enabled} ariaLabel={m.settings_obfuscation_label()} />
             </div>
-          {/if}
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_filter_incoming_label()}</span>
-              <span class="hint">{m.settings_filter_incoming_hint()}</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.filter_incoming_connections} ariaLabel={m.settings_filter_incoming_label()} />
           </div>
 
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_block_private_label()}</span>
-              <span class="hint">{m.settings_block_private_hint()}</span>
+          <!-- The list itself — downloading, importing, editing ranges — lives
+               on the Security page; these are the switches that decide how it
+               is used, and they apply at once like the ones there. -->
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_blocking()}</h4>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_ip_filter_label()}</span>
+                <span class="hint">
+                  {m.settings_ip_filter_hint()}
+                  <a href="/security" onclick={(e) => { e.preventDefault(); void goto('/security'); }}>{m.settings_open_page({ page: m.nav_security() })}</a>
+                </span>
+              </div>
+              <ToggleSwitch
+                bind:checked={settings.ip_filter_enabled}
+                ariaLabel={m.settings_ip_filter_label()}
+                onchange={(v) => applyIpToggleLive('ip_filter_enabled', v)}
+              />
             </div>
-            <ToggleSwitch
-              bind:checked={settings.block_private_ips}
-              ariaLabel={m.settings_block_private_label()}
-              onchange={(v) => applyIpToggleLive('block_private_ips', v)}
-            />
-          </div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_allow_shared_browse_label()}</span>
-              <span class="hint">{m.settings_allow_shared_browse_hint()}</span>
+            <div class="field toggle-row nested" class:is-disabled={!settings.ip_filter_enabled}>
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_ip_filter_auto_update_label()}</span>
+                <span class="hint">{m.security_auto_update_title()}</span>
+              </div>
+              <ToggleSwitch
+                bind:checked={settings.ip_filter_auto_update}
+                disabled={!settings.ip_filter_enabled}
+                ariaLabel={m.settings_ip_filter_auto_update_label()}
+                onchange={(v) => applyIpToggleLive('ip_filter_auto_update', v)}
+              />
             </div>
-            <ToggleSwitch bind:checked={settings.allow_shared_files_browse} ariaLabel={m.settings_allow_shared_browse_label()} />
-          </div>
 
-          <div class="divider"></div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_antileech_label()}</span>
-              <span class="hint">
-                {m.settings_antileech_hint()}
-              </span>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_filter_incoming_label()}</span>
+                <span class="hint">{m.settings_filter_incoming_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.filter_incoming_connections} ariaLabel={m.settings_filter_incoming_label()} />
             </div>
-            <ToggleSwitch bind:checked={settings.antileech_enabled} ariaLabel={m.settings_antileech_label()} />
-          </div>
-          {#if settings.antileech_enabled}
-            <div class="field nested antileech-block">
-              {#if !antileechLoaded}
-                {#if antileechMessage && antileechMessage.kind === 'err'}
-                  <span class="feedback error">{antileechMessage.text}</span>
-                  <button class="action-btn ghost" onclick={loadAntileech}>{m.common_retry()}</button>
+
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_block_private_label()}</span>
+                <span class="hint">{m.settings_block_private_hint()}</span>
+              </div>
+              <ToggleSwitch
+                bind:checked={settings.block_private_ips}
+                ariaLabel={m.settings_block_private_label()}
+                onchange={(v) => applyIpToggleLive('block_private_ips', v)}
+              />
+            </div>
+
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_antileech_label()}</span>
+                <span class="hint">{m.settings_antileech_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.antileech_enabled} ariaLabel={m.settings_antileech_label()} />
+            </div>
+            {#if settings.antileech_enabled}
+              <div class="field nested antileech-block">
+                {#if !antileechLoaded}
+                  {#if antileechMessage && antileechMessage.kind === 'err'}
+                    <span class="feedback error">{antileechMessage.text}</span>
+                    <button class="action-btn ghost" onclick={loadAntileech}>{m.common_retry()}</button>
+                  {:else}
+                    <div class="hint">{m.settings_antileech_loading()}</div>
+                  {/if}
                 {:else}
-                  <div class="hint">{m.settings_antileech_loading()}</div>
-                {/if}
-              {:else}
-                <label for="antileech-textarea" class="antileech-label">
-                  {m.settings_antileech_patterns_prefix()} <code>#</code> {m.settings_antileech_patterns_suffix()}
-                </label>
-                <textarea
-                  id="antileech-textarea"
-                  class="antileech-textarea"
-                  bind:value={antileechDraft}
-                  rows="10"
-                  spellcheck="false"
-                  placeholder={m.settings_antileech_placeholder()}
-                ></textarea>
-                <div class="antileech-actions">
-                  <button class="action-btn" onclick={handleSaveAntileech} disabled={antileechSaving}>
-                    {antileechSaving ? m.settings_saving() : m.settings_antileech_save_btn()}
-                  </button>
-                  <button class="action-btn ghost" onclick={handleResetAntileech} disabled={antileechSaving}>
-                    {m.settings_antileech_restore_btn()}
-                  </button>
+                  <!-- Named by the switch above it; the format note is its
+                       description, under the box like every other hint. -->
+                  <textarea
+                    id="antileech-textarea"
+                    class="antileech-textarea"
+                    bind:value={antileechDraft}
+                    rows="8"
+                    spellcheck="false"
+                    aria-label={m.settings_antileech_label()}
+                    aria-describedby="antileech-patterns-hint"
+                    placeholder={m.settings_antileech_placeholder()}
+                  ></textarea>
+                  <div class="action-row">
+                    <button class="action-btn primary" onclick={handleSaveAntileech} disabled={antileechSaving}>
+                      {antileechSaving ? m.settings_saving() : m.settings_antileech_save_btn()}
+                    </button>
+                    <button class="action-btn ghost" onclick={handleResetAntileech} disabled={antileechSaving}>
+                      {m.settings_antileech_restore_btn()}
+                    </button>
+                  </div>
+                  <span id="antileech-patterns-hint" class="hint">
+                    {m.settings_antileech_patterns_prefix()} <code>#</code> {m.settings_antileech_patterns_suffix()}
+                  </span>
                   {#if antileechSnapshot}
                     <span class="hint antileech-path" title={antileechSnapshot.file_path}>
                       {m.settings_antileech_file_label({ path: antileechSnapshot.file_path })}
                     </span>
                   {/if}
-                </div>
-                {#if antileechMessage}
-                  <span class="feedback {antileechMessage.kind === 'err' ? 'error' : antileechMessage.kind === 'warn' ? 'warning' : 'success'}">
-                    {antileechMessage.text}
-                  </span>
+                  {#if antileechMessage}
+                    <span class="feedback {antileechMessage.kind === 'err' ? 'error' : antileechMessage.kind === 'warn' ? 'warning' : 'success'}">
+                      {antileechMessage.text}
+                    </span>
+                  {/if}
+                  {#if antileechCompileErrors.length > 0}
+                    <div class="antileech-errors">
+                      <div class="antileech-errors-title">{m.settings_antileech_errors_title()}</div>
+                      <ul>
+                        {#each antileechCompileErrors as [pattern, error]}
+                          <li><code>{pattern}</code> - {error}</li>
+                        {/each}
+                      </ul>
+                    </div>
+                  {/if}
                 {/if}
-                {#if antileechCompileErrors.length > 0}
-                  <div class="antileech-errors">
-                    <div class="antileech-errors-title">{m.settings_antileech_errors_title()}</div>
-                    <ul>
-                      {#each antileechCompileErrors as [pattern, error]}
-                        <li><code>{pattern}</code> - {error}</li>
-                      {/each}
-                    </ul>
-                  </div>
-                {/if}
-              {/if}
-            </div>
-          {/if}
+              </div>
+            {/if}
+          </div>
 
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_visibility()}</h4>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_allow_shared_browse_label()}</span>
+                <span class="hint">{m.settings_allow_shared_browse_hint()}</span>
+              </div>
+              <ToggleSwitch bind:checked={settings.allow_shared_files_browse} ariaLabel={m.settings_allow_shared_browse_label()} />
+            </div>
+          </div>
         </div>
       </section>
 
@@ -4257,92 +4197,147 @@
           </div>
         </div>
         <div class="card-body">
-          <div class="field">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_friend_require_approval()}</span>
-              <span class="hint">{m.settings_friend_require_approval_hint()}</span>
-            </div>
-          </div>
+          <!-- What being a friend allows, and that each friend can differ.
+               What a "Verified" request means is explained beside the requests
+               themselves, on the Friends page. -->
+          <p class="hint section-intro">{m.settings_friend_overrides_hint()}</p>
 
-          <div class="field">
-            <span class="hint">{m.settings_friend_overrides_hint()}</span>
-          </div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_friend_chat_disabled()}</span>
-              <span class="hint">{m.settings_friend_chat_disabled_hint()}</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.friend_chat_disabled} ariaLabel={m.settings_friend_chat_disabled()} />
-          </div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_friend_chat_read_receipts()}</span>
-              <span class="hint">{m.settings_friend_chat_read_receipts_hint()}</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.friend_chat_read_receipts} ariaLabel={m.settings_friend_chat_read_receipts()} />
-          </div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_friend_browse_disabled()}</span>
-              <span class="hint">{m.settings_friend_browse_disabled_hint()}</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.friend_browse_disabled} ariaLabel={m.settings_friend_browse_disabled()} />
-          </div>
-
-          <div class="field">
-            <label for="chat-attach-auto">{m.settings_chat_attach_auto_label()}</label>
-            <div class="chat-attach-row">
-              <div class="apply-input">
-                <div class="unit-input">
-                  <input
-                    id="chat-attach-auto"
-                    type="number"
-                    min="0"
-                    max="2048"
-                    inputmode="numeric"
-                    aria-describedby="chat-attach-auto-unit chat-attach-auto-hint"
-                    bind:value={settings.chat_attachment_auto_accept_mb}
-                    onkeydown={(e) => applyOnEnter(e, ['chat_attachment_auto_accept_mb'])}
-                  />
-                  <span id="chat-attach-auto-unit" class="unit-input-suffix">{m.settings_chat_attach_auto_unit()}</span>
-                </div>
-                {@render applyButton(['chat_attachment_auto_accept_mb'], m.settings_chat_attach_auto_label())}
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_chat()}</h4>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_friend_chat_label()}</span>
+                <span class="hint">{m.settings_friend_chat_hint()}</span>
               </div>
-              <button type="button" class="action-btn chat-files-btn" onclick={() => void openChatFilesFolder().catch((e) => showSaveMsg(translateError(e), true, 6000))}>
-                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
-                </svg>
-                {m.settings_chat_attach_open_folder()}
-              </button>
+              <ToggleSwitch
+                checked={friendChatOn}
+                onchange={(on) => { if (settings) settings.friend_chat_disabled = !on; }}
+                ariaLabel={m.settings_friend_chat_label()}
+              />
             </div>
-            <span id="chat-attach-auto-hint" class="hint">{m.settings_chat_attach_auto_hint()}</span>
+            <div class="field toggle-row nested" class:is-disabled={!friendChatOn}>
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_friend_chat_read_receipts()}</span>
+                <span class="hint">{m.settings_friend_chat_read_receipts_hint()}</span>
+              </div>
+              <ToggleSwitch
+                bind:checked={settings.friend_chat_read_receipts}
+                disabled={!friendChatOn}
+                ariaLabel={m.settings_friend_chat_read_receipts()}
+              />
+            </div>
+            <div class="field toggle-row nested" class:is-disabled={!friendChatOn}>
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_chat_mailbox_label()}</span>
+                <span class="hint">{m.settings_chat_mailbox_hint()}</span>
+              </div>
+              <ToggleSwitch
+                bind:checked={settings.chat_mailbox_enabled}
+                disabled={!friendChatOn}
+                ariaLabel={m.settings_chat_mailbox_label()}
+              />
+            </div>
+            <div class="field nested" class:is-disabled={!friendChatOn}>
+              <label for="chat-disappear">{m.settings_chat_disappear_label()}</label>
+              <select
+                id="chat-disappear"
+                bind:value={settings.chat_disappear_secs}
+                disabled={!friendChatOn}
+                aria-describedby="chat-disappear-hint"
+              >
+                <option value={0}>{m.chat_disappear_off()}</option>
+                {#each CHAT_DISAPPEAR_CHOICES as secs (secs)}
+                  <option value={secs}>{disappearLabel(secs)}</option>
+                {/each}
+              </select>
+              <span id="chat-disappear-hint" class="hint">{m.settings_chat_disappear_hint()}</span>
+            </div>
           </div>
 
-          <div class="field">
-            <label for="max-friends">{m.settings_max_friends()}</label>
-            <div class="apply-input">
-              <input
-                id="max-friends"
-                class="compact-number"
-                type="number"
-                min="1"
-                max="500"
-                bind:value={settings.max_friends}
-                onkeydown={(e) => applyOnEnter(e, ['max_friends'])}
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_files()}</h4>
+            <div class="field toggle-row" class:is-disabled={!friendChatOn}>
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_friend_files_label()}</span>
+                <span class="hint">{m.settings_friend_files_hint()}</span>
+              </div>
+              <ToggleSwitch
+                checked={friendFilesOn}
+                disabled={!friendChatOn}
+                onchange={(on) => { if (settings) settings.friend_files_disabled = !on; }}
+                ariaLabel={m.settings_friend_files_label()}
               />
-              {@render applyButton(['max_friends'], m.settings_max_friends())}
             </div>
-            <span class="hint">{m.settings_max_friends_hint()}</span>
+            <div class="field nested" class:is-disabled={!friendFilesOn}>
+              <label for="chat-attach-auto">{m.settings_chat_attach_auto_label()}</label>
+              <div class="chat-attach-row">
+                <div class="apply-input">
+                  <div class="unit-input">
+                    <input
+                      id="chat-attach-auto"
+                      type="number"
+                      min="0"
+                      max="2048"
+                      inputmode="numeric"
+                      aria-describedby="chat-attach-auto-unit chat-attach-auto-hint"
+                      disabled={!friendFilesOn}
+                      bind:value={settings.chat_attachment_auto_accept_mb}
+                      onkeydown={(e) => applyOnEnter(e, ['chat_attachment_auto_accept_mb'])}
+                    />
+                    <span id="chat-attach-auto-unit" class="unit-input-suffix">{m.settings_chat_attach_auto_unit()}</span>
+                  </div>
+                  {@render applyButton(['chat_attachment_auto_accept_mb'], m.settings_chat_attach_auto_label())}
+                </div>
+                <button type="button" class="action-btn chat-files-btn" onclick={() => void openChatFilesFolder().catch((e) => showSaveMsg(translateError(e), true, 6000))}>
+                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
+                  </svg>
+                  {m.settings_chat_attach_open_folder()}
+                </button>
+              </div>
+              <span id="chat-attach-auto-hint" class="hint">{m.settings_chat_attach_auto_hint()}</span>
+            </div>
+          </div>
+
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_sharing()}</h4>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_friend_browse_label()}</span>
+                <span class="hint">{m.settings_friend_browse_hint()}</span>
+              </div>
+              <ToggleSwitch
+                checked={settings.friend_browse_disabled !== true}
+                onchange={(on) => { if (settings) settings.friend_browse_disabled = !on; }}
+                ariaLabel={m.settings_friend_browse_label()}
+              />
+            </div>
+          </div>
+
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_limits()}</h4>
+            <div class="field">
+              <label for="max-friends">{m.settings_max_friends()}</label>
+              <div class="apply-input">
+                <input
+                  id="max-friends"
+                  class="compact-number"
+                  type="number"
+                  min="1"
+                  max="500"
+                  bind:value={settings.max_friends}
+                  onkeydown={(e) => applyOnEnter(e, ['max_friends'])}
+                />
+                {@render applyButton(['max_friends'], m.settings_max_friends())}
+              </div>
+              <span class="hint">{m.settings_max_friends_hint()}</span>
+            </div>
           </div>
 
           <!-- Friend session encryption stays forced on (see `saveFields`).
                Rendezvous URL remains in AppSettings
                for config.json only. Channel file offers live in the Channels
                section. -->
-
         </div>
       </section>
 
@@ -4363,52 +4358,55 @@
           </div>
         </div>
         <div class="card-body">
-          <div class="field">
-            <label for="channel_username">{m.settings_channel_username_label()}</label>
-            <div class="apply-input">
-              <input
-                id="channel_username"
-                value={settings.channel_username}
-                maxlength={CHANNEL_USERNAME_MAX}
-                spellcheck="false"
-                autocomplete="username"
-                autocapitalize="off"
-                placeholder={m.settings_channel_username_placeholder()}
-                oninput={(e) => setChannelUsername(e.currentTarget)}
-                onkeydown={(e) => applyOnEnter(e, ['channel_username'])}
-              />
-              {@render applyButton(['channel_username'], m.settings_channel_username_label())}
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_identity()}</h4>
+            <div class="field">
+              <label for="channel_username">{m.settings_channel_username_label()}</label>
+              <div class="apply-input">
+                <input
+                  id="channel_username"
+                  value={settings.channel_username}
+                  maxlength={CHANNEL_USERNAME_MAX}
+                  spellcheck="false"
+                  autocomplete="username"
+                  autocapitalize="off"
+                  placeholder={m.settings_channel_username_placeholder()}
+                  oninput={(e) => setChannelUsername(e.currentTarget)}
+                  onkeydown={(e) => applyOnEnter(e, ['channel_username'])}
+                />
+                {@render applyButton(['channel_username'], m.settings_channel_username_label())}
+              </div>
+              <span class="hint">{m.settings_channel_username_hint()}</span>
             </div>
-            <span class="hint">{m.settings_channel_username_hint()}</span>
           </div>
 
-          <div class="divider"></div>
-
-          <div class="field">
-            <label for="channel-file-offers">{m.settings_channel_file_offers()}</label>
-            <div class="chat-attach-row channel-offers-row">
-              <select
-                id="channel-file-offers"
-                bind:value={settings.channel_file_offers}
-              >
-                <option value="everyone">{m.settings_channel_file_offers_everyone()}</option>
-                <option value="friends">{m.settings_channel_file_offers_friends()}</option>
-                <option value="nobody">{m.settings_channel_file_offers_nobody()}</option>
-              </select>
-              <button type="button" class="action-btn chat-files-btn" onclick={() => void openChannelFilesFolder().catch((e) => showSaveMsg(translateError(e), true, 6000))}>
-                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
-                </svg>
-                {m.settings_channel_files_open_folder()}
-              </button>
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_files()}</h4>
+            <div class="field">
+              <label for="channel-file-offers">{m.settings_channel_file_offers()}</label>
+              <div class="chat-attach-row channel-offers-row">
+                <select
+                  id="channel-file-offers"
+                  bind:value={settings.channel_file_offers}
+                >
+                  <option value="everyone">{m.settings_channel_file_offers_everyone()}</option>
+                  <option value="friends">{m.settings_channel_file_offers_friends()}</option>
+                  <option value="nobody">{m.settings_channel_file_offers_nobody()}</option>
+                </select>
+                <button type="button" class="action-btn chat-files-btn" onclick={() => void openChannelFilesFolder().catch((e) => showSaveMsg(translateError(e), true, 6000))}>
+                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
+                  </svg>
+                  {m.settings_channel_files_open_folder()}
+                </button>
+              </div>
+              <span class="hint">{m.settings_channel_file_offers_hint()}</span>
             </div>
-            <span class="hint">{m.settings_channel_file_offers_hint()}</span>
           </div>
 
-          <div class="divider"></div>
-
-          <div class="field">
-            <div class="toggle-row">
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_rooms()}</h4>
+            <div class="field toggle-row">
               <div class="toggle-info">
                 <span class="toggle-title">{m.settings_channels_recover()}</span>
                 <span class="hint">{m.settings_channels_recover_hint()}</span>
@@ -4422,158 +4420,133 @@
             </div>
           </div>
 
-          <div class="divider"></div>
-
-          <!-- Silencing, ignoring and removing are per-device preferences kept
-               in localStorage, not room state, so nothing else in the app
-               lists them and this is the only place they can be undone.
-               All three are applied a row at a time somewhere else — from a
-               room's menu, or a member's — so all three are undoable a row at
-               a time here. Silenced and removed rooms used to be a bare count
-               with one bulk Clear, which meant reversing a single mistaken
-               mute cost the user every other one they had set. -->
-          <div class="field ignored-field">
-            <div class="toggle-row">
-              <div class="toggle-info">
-                <span class="toggle-title">{m.settings_channels_muted_rooms()}</span>
-                <span class="hint">{m.settings_channels_muted_rooms_hint()}</span>
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_this_device()}</h4>
+            <!-- Silencing, ignoring and removing are per-device preferences kept
+                 in localStorage, not room state, so nothing else in the app
+                 lists them and this is the only place they can be undone.
+                 All three are applied a row at a time somewhere else — from a
+                 room's menu, or a member's — so all three are undoable a row at
+                 a time here. Silenced and removed rooms used to be a bare count
+                 with one bulk Clear, which meant reversing a single mistaken
+                 mute cost the user every other one they had set. -->
+            <div class="field ignored-field">
+              <div class="toggle-row">
+                <div class="toggle-info">
+                  <span class="toggle-title">{m.settings_channels_muted_rooms()}</span>
+                  <span class="hint">{m.settings_channels_muted_rooms_hint()}</span>
+                </div>
+                <div class="channels-pref-action">
+                  <span class="channels-pref-count">{quietRooms.length}</span>
+                  <button
+                    type="button"
+                    class="action-btn danger"
+                    disabled={quietRooms.length === 0}
+                    onclick={() => { mutedClearConfirmOpen = true; }}
+                  >{m.settings_channels_clear()}</button>
+                </div>
               </div>
-              <div class="channels-pref-action">
-                <span class="channels-pref-count">{quietRooms.length}</span>
-                <button
-                  type="button"
-                  class="ghost"
-                  disabled={quietRooms.length === 0}
-                  onclick={() => { mutedClearConfirmOpen = true; }}
-                >{m.settings_channels_clear()}</button>
-              </div>
+              {#if quietRooms.length > 0}
+                <ul class="ignored-list">
+                  {#each quietRooms as [channelId, level] (channelId)}
+                    <li>
+                      <span class="ignored-name">
+                        <bdi dir="auto">{channelLabel(channelId)}</bdi>
+                        <span class="ignored-scope">{level === 'mentions'
+                          ? m.channels_notify_mentions()
+                          : m.channels_notify_none()}</span>
+                      </span>
+                      <button
+                        type="button"
+                        class="action-btn ghost"
+                        onclick={() => setChannelNotifyLevel(channelId, 'all')}
+                      >{m.channels_unmute()}</button>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
             </div>
-            {#if quietRooms.length > 0}
-              <ul class="ignored-list">
-                {#each quietRooms as [channelId, level] (channelId)}
-                  <li>
-                    <span class="ignored-name">
-                      <bdi dir="auto">{channelLabel(channelId)}</bdi>
-                      <span class="ignored-scope">{level === 'mentions'
-                        ? m.channels_notify_mentions()
-                        : m.channels_notify_none()}</span>
-                    </span>
-                    <button
-                      type="button"
-                      class="ghost"
-                      onclick={() => setChannelNotifyLevel(channelId, 'all')}
-                    >{m.channels_unmute()}</button>
-                  </li>
-                {/each}
-              </ul>
-            {/if}
-          </div>
 
-          <div class="field ignored-field">
-            <div class="toggle-row">
-              <div class="toggle-info">
-                <span class="toggle-title">{m.settings_channels_ignored_members()}</span>
-                <span class="hint">{m.settings_channels_ignored_members_hint()}</span>
+            <div class="field ignored-field">
+              <div class="toggle-row">
+                <div class="toggle-info">
+                  <span class="toggle-title">{m.settings_channels_ignored_members()}</span>
+                  <span class="hint">{m.settings_channels_ignored_members_hint()}</span>
+                </div>
+                <div class="channels-pref-action">
+                  <span class="channels-pref-count">{$ignoredMembers.length}</span>
+                  <button
+                    type="button"
+                    class="action-btn danger"
+                    disabled={$ignoredMembers.length === 0}
+                    onclick={() => { ignoredClearConfirmOpen = true; }}
+                  >{m.settings_channels_clear()}</button>
+                </div>
               </div>
-              <div class="channels-pref-action">
-                <span class="channels-pref-count">{$ignoredMembers.length}</span>
-                <button
-                  type="button"
-                  class="ghost"
-                  disabled={$ignoredMembers.length === 0}
-                  onclick={() => { ignoredClearConfirmOpen = true; }}
-                >{m.settings_channels_clear()}</button>
-              </div>
+              {#if $ignoredMembers.length > 0}
+                <ul class="ignored-list">
+                  {#each $ignoredMembers as entry (entry.pubkey)}
+                    <li>
+                      <span class="ignored-name">
+                        <bdi dir="auto">{entry.name.trim() || shortPubkey(entry.pubkey)}</bdi>
+                        <!-- Named rooms rather than a bare count: this list is
+                             the only place a scope set inside a room the user
+                             has since left can still be read or undone. -->
+                        {#if entry.rooms}
+                          <span class="ignored-scope">{m.settings_channels_ignored_in({
+                            rooms: entry.rooms.map(channelLabel).join(', '),
+                          })}</span>
+                        {/if}
+                      </span>
+                      <button
+                        type="button"
+                        class="action-btn ghost"
+                        onclick={() => toggleMemberIgnore(entry.pubkey)}
+                      >{m.channels_unignore()}</button>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
             </div>
-            {#if $ignoredMembers.length > 0}
-              <ul class="ignored-list">
-                {#each $ignoredMembers as entry (entry.pubkey)}
-                  <li>
-                    <span class="ignored-name">
-                      <bdi dir="auto">{entry.name.trim() || shortPubkey(entry.pubkey)}</bdi>
-                      <!-- Named rooms rather than a bare count: this list is
-                           the only place a scope set inside a room the user
-                           has since left can still be read or undone. -->
-                      {#if entry.rooms}
-                        <span class="ignored-scope">{m.settings_channels_ignored_in({
-                          rooms: entry.rooms.map(channelLabel).join(', '),
-                        })}</span>
-                      {/if}
-                    </span>
-                    <button
-                      type="button"
-                      class="ghost"
-                      onclick={() => toggleMemberIgnore(entry.pubkey)}
-                    >{m.channels_unignore()}</button>
-                  </li>
-                {/each}
-              </ul>
-            {/if}
-          </div>
 
-          <div class="field ignored-field">
-            <div class="toggle-row">
-              <div class="toggle-info">
-                <span class="toggle-title">{m.settings_channels_hidden_rooms()}</span>
-                <span class="hint">{m.settings_channels_hidden_rooms_hint()}</span>
+            <div class="field ignored-field">
+              <div class="toggle-row">
+                <div class="toggle-info">
+                  <span class="toggle-title">{m.settings_channels_hidden_rooms()}</span>
+                  <span class="hint">{m.settings_channels_hidden_rooms_hint()}</span>
+                </div>
+                <div class="channels-pref-action">
+                  <span class="channels-pref-count">{$hiddenChannels.length}</span>
+                  <button
+                    type="button"
+                    class="action-btn danger"
+                    disabled={$hiddenChannels.length === 0}
+                    onclick={() => { hiddenClearConfirmOpen = true; }}
+                  >{m.settings_channels_clear()}</button>
+                </div>
               </div>
-              <div class="channels-pref-action">
-                <span class="channels-pref-count">{$hiddenChannels.length}</span>
-                <button
-                  type="button"
-                  class="ghost"
-                  disabled={$hiddenChannels.length === 0}
-                  onclick={() => { hiddenClearConfirmOpen = true; }}
-                >{m.settings_channels_clear()}</button>
-              </div>
+              {#if $hiddenChannels.length > 0}
+                <ul class="ignored-list">
+                  {#each $hiddenChannels as channelId (channelId)}
+                    <li>
+                      <span class="ignored-name">
+                        <bdi dir="auto">{channelLabel(channelId)}</bdi>
+                      </span>
+                      <button
+                        type="button"
+                        class="action-btn ghost"
+                        onclick={() => unhideChannel(channelId)}
+                      >{m.channels_unignore()}</button>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
             </div>
-            {#if $hiddenChannels.length > 0}
-              <ul class="ignored-list">
-                {#each $hiddenChannels as channelId (channelId)}
-                  <li>
-                    <span class="ignored-name">
-                      <bdi dir="auto">{channelLabel(channelId)}</bdi>
-                    </span>
-                    <button
-                      type="button"
-                      class="ghost"
-                      onclick={() => unhideChannel(channelId)}
-                    >{m.channels_unignore()}</button>
-                  </li>
-                {/each}
-              </ul>
-            {/if}
           </div>
         </div>
       </section>
 
-      <!-- Import from eMule -->
-      <section class="card" class:hidden={!filtering && activeSection !== 'import'} id={panelId('import')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('import')}>
-        <div class="card-header">
-          <span class="card-icon" aria-hidden="true">
-            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M3 12.5v3c0 .6.4 1 1 1h12c.6 0 1-.4 1-1v-3"/>
-              <line x1="10" y1="3" x2="10" y2="12"/>
-              <polyline points="6.5,8.5 10,12 13.5,8.5"/>
-            </svg>
-          </span>
-          <div>
-            <h3>{m.settings_section_import()}</h3>
-            <p class="card-desc">{m.settings_import_desc()}</p>
-          </div>
-        </div>
-        <div class="card-body">
-          <div class="field">
-            {#if importOpened}
-              <EmuleImport mode="settings" onrestart={performRestart} />
-            {:else}
-              <span class="hint">{m.settings_import_hint()}</span>
-            {/if}
-          </div>
-        </div>
-      </section>
-
-      <!-- Backup & Restore -->
+      <!-- Backup & import -->
       <section class="card" class:hidden={!filtering && activeSection !== 'backup'} id={panelId('backup')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('backup')}>
         <div class="card-header">
           <span class="card-icon" aria-hidden="true">
@@ -4588,7 +4561,7 @@
             <p class="card-desc">{m.settings_backup_desc()}</p>
           </div>
         </div>
-        <div class="card-body backup-body">
+        <div class="card-body">
           {#if pendingRestore?.pending}
             <div class="field pending-restore" role="status">
               <span class="field-label">{m.settings_backup_pending_title()}</span>
@@ -4607,30 +4580,25 @@
                 </span>
               {/if}
               <div class="action-row">
-                <button class="action-btn" onclick={performRestart} disabled={backupBusy}>
+                <button class="action-btn primary" onclick={performRestart} disabled={backupBusy}>
                   {m.settings_restart_now()}
                 </button>
-                <button class="danger" onclick={handleDiscardPendingRestore} disabled={backupBusy}>
+                <button class="action-btn danger" onclick={handleDiscardPendingRestore} disabled={backupBusy}>
                   {m.settings_backup_pending_discard()}
                 </button>
               </div>
             </div>
           {/if}
 
-          <div class="backup-block">
-            <div class="backup-copy">
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_backup()}</h4>
+            <div class="field">
               <span class="field-label">{m.settings_backup_contents_label()}</span>
               <span class="hint">{m.settings_backup_contents_hint()}</span>
               <span class="hint">{m.settings_backup_excludes_hint()}</span>
             </div>
-          </div>
-
-          <div class="backup-block">
             <div class="field">
-              <div class="backup-copy">
-                <label for="backup-passphrase">{m.settings_backup_passphrase_label()}</label>
-                <span class="hint">{m.settings_backup_passphrase_hint()}</span>
-              </div>
+              <label for="backup-passphrase">{m.settings_backup_passphrase_label()}</label>
               <input
                 id="backup-passphrase"
                 type="password"
@@ -4638,6 +4606,7 @@
                 bind:value={backupPassphrase}
                 placeholder={m.settings_backup_passphrase_placeholder()}
               />
+              <span class="hint">{m.settings_backup_passphrase_hint()}</span>
             </div>
             <div class="field">
               <label for="backup-passphrase-confirm">{m.settings_backup_passphrase_confirm_label()}</label>
@@ -4647,32 +4616,42 @@
                 autocomplete="new-password"
                 bind:value={backupPassphraseConfirm}
               />
-            </div>
-            <div class="action-row">
-              <button
-                class="action-btn"
-                onclick={handleExportBackup}
-                disabled={backupBusy || backupPassphrase.length === 0}
-              >{m.settings_backup_export()}</button>
+              <div class="action-row">
+                <button
+                  class="action-btn primary"
+                  onclick={handleExportBackup}
+                  disabled={backupBusy || backupPassphrase.length === 0}
+                >{m.settings_backup_export()}</button>
+              </div>
+              <p class="backup-callout" role="note">
+                <span class="backup-callout-icon" aria-hidden="true">!</span>
+                <strong>{m.settings_backup_where_hint()}</strong>
+              </p>
+              <span class="hint">
+                {lastBackupMs !== null
+                  ? m.settings_backup_last({ when: formatDateTime(Math.floor(lastBackupMs / 1000)) })
+                  : m.settings_backup_never()}
+              </span>
             </div>
           </div>
 
           <!-- Hidden while a restore is staged: importing a second one is
                refused by the backend, so the banner's Restart / Discard pair
                is the only sensible next step. -->
-          <div class="backup-block" class:hidden={pendingRestore?.pending}>
-            <div class="divider"></div>
-            <div class="backup-copy">
-              <span class="field-label">{m.settings_backup_restore_label()}</span>
+          <div class="settings-group" class:hidden={pendingRestore?.pending}>
+            <h4 class="subsection-title">{m.settings_backup_restore_label()}</h4>
+            <div class="field">
+              <div class="action-row">
+                <button class="action-btn" onclick={handlePickBackupFile} disabled={backupBusy}>
+                  {m.settings_backup_choose_file()}
+                </button>
+              </div>
+              {#if restoreSource}
+                <span class="hint backup-path" title={restoreSource}>{restoreSource}</span>
+              {/if}
               <span class="hint">{m.settings_backup_restore_hint()}</span>
             </div>
-            <div class="action-row">
-              <button class="action-btn" onclick={handlePickBackupFile} disabled={backupBusy}>
-                {m.settings_backup_choose_file()}
-              </button>
-            </div>
             {#if restoreSource}
-              <span class="hint backup-path" title={restoreSource}>{restoreSource}</span>
               <div class="field">
                 <label for="restore-passphrase">{m.settings_backup_restore_passphrase_label()}</label>
                 <input
@@ -4681,55 +4660,57 @@
                   autocomplete="current-password"
                   bind:value={restorePassphrase}
                 />
-              </div>
-              <div class="action-row">
-                <button
-                  class="action-btn"
-                  onclick={handlePreviewBackup}
-                  disabled={backupBusy || restorePassphrase.length === 0}
-                >{m.settings_backup_inspect()}</button>
-                {#if restorePreview && !restorePreview.schema_too_new}
-                  <button class="danger" onclick={handleImportBackup} disabled={backupBusy}>
-                    {m.settings_backup_restore_now()}
+                <div class="action-row">
+                  <button
+                    class="action-btn"
+                    onclick={handlePreviewBackup}
+                    disabled={backupBusy || restorePassphrase.length === 0}
+                  >{m.settings_backup_inspect()}</button>
+                  {#if restorePreview && !restorePreview.schema_too_new}
+                    <button class="action-btn danger" onclick={handleImportBackup} disabled={backupBusy}>
+                      {m.settings_backup_restore_now()}
+                    </button>
+                  {/if}
+                  <button class="action-btn ghost" onclick={clearRestoreState} disabled={backupBusy}>
+                    {m.common_cancel()}
                   </button>
-                {/if}
-                <button class="action-btn" onclick={clearRestoreState} disabled={backupBusy}>
-                  {m.common_cancel()}
-                </button>
+                </div>
               </div>
             {/if}
             {#if restorePreview}
-              <div class="backup-preview">
-                <div class="spam-stat">
-                  <span>{m.settings_backup_preview_created()}</span>
-                  <strong>{formatDateTime(restorePreview.created_at)}</strong>
+              <div class="field">
+                <div class="stat-grid">
+                  <div class="stat">
+                    <span>{m.settings_backup_preview_created()}</span>
+                    <strong>{formatDateTime(restorePreview.created_at)}</strong>
+                  </div>
+                  <div class="stat">
+                    <span>{m.settings_backup_preview_version()}</span>
+                    <strong>{restorePreview.app_version}</strong>
+                  </div>
+                  <div class="stat">
+                    <span>{m.settings_backup_preview_files()}</span>
+                    <strong>{restorePreview.files.length}</strong>
+                  </div>
+                  <div class="stat">
+                    <span>{m.settings_backup_preview_size()}</span>
+                    <strong>{formatSize(restorePreview.total_bytes)}</strong>
+                  </div>
+                  <div class="stat">
+                    <span>{m.settings_backup_preview_identity()}</span>
+                    <strong>{restorePreview.includes_identity ? m.common_yes() : m.common_no()}</strong>
+                  </div>
                 </div>
-                <div class="spam-stat">
-                  <span>{m.settings_backup_preview_version()}</span>
-                  <strong>{restorePreview.app_version}</strong>
-                </div>
-                <div class="spam-stat">
-                  <span>{m.settings_backup_preview_files()}</span>
-                  <strong>{restorePreview.files.length}</strong>
-                </div>
-                <div class="spam-stat">
-                  <span>{m.settings_backup_preview_size()}</span>
-                  <strong>{formatSize(restorePreview.total_bytes)}</strong>
-                </div>
-                <div class="spam-stat">
-                  <span>{m.settings_backup_preview_identity()}</span>
-                  <strong>{restorePreview.includes_identity ? m.common_yes() : m.common_no()}</strong>
-                </div>
+                {#if restorePreview.missing.length > 0}
+                  <span class="hint">
+                    {m.settings_backup_preview_missing({ files: restorePreview.missing.join(', ') })}
+                  </span>
+                {/if}
+                {#if restorePreview.chat_key_set_aside}
+                  <span class="hint">{m.settings_backup_preview_chat_key_set_aside()}</span>
+                {/if}
+                <span class="hint">{m.settings_backup_restore_warning()}</span>
               </div>
-              {#if restorePreview.missing.length > 0}
-                <span class="hint">
-                  {m.settings_backup_preview_missing({ files: restorePreview.missing.join(', ') })}
-                </span>
-              {/if}
-              {#if restorePreview.chat_key_set_aside}
-                <span class="hint">{m.settings_backup_preview_chat_key_set_aside()}</span>
-              {/if}
-              <span class="hint">{m.settings_backup_restore_warning()}</span>
             {/if}
           </div>
 
@@ -4741,6 +4722,20 @@
               {backupMessage}
             </span>
           {/if}
+
+          <!-- Joined Backup because both move a whole profile in. The scan of
+               eMule's folder waits for the section to open (`importOpened`). -->
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_import()}</h4>
+            <div class="field">
+              <span class="hint">{m.settings_import_desc()}</span>
+              {#if importOpened}
+                <EmuleImport mode="settings" onrestart={performRestart} />
+              {:else}
+                <span class="hint">{m.settings_import_hint()}</span>
+              {/if}
+            </div>
+          </div>
         </div>
       </section>
 
@@ -4779,29 +4774,8 @@
                  left a ragged column, and the log path had nowhere to sit but
                  loose under both of them. -->
             <div class="about-actions">
-              <button type="button" class="about-action" onclick={() => void openWebsite()}>
-                <span class="about-action-icon" aria-hidden="true">
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                    <circle cx="8" cy="8" r="6" />
-                    <path d="M2.2 6.4h11.6M2.2 9.6h11.6" />
-                    <path d="M8 2c-1.8 2-1.8 10 0 12 1.8-2 1.8-10 0-12z" />
-                  </svg>
-                </span>
-                <span class="about-action-body">
-                  <span class="about-action-title">{m.settings_about_website_btn()}</span>
-                  <span class="about-action-desc">{m.settings_about_website_hint()}</span>
-                  {#if websiteOpenError}
-                    <span class="feedback error" role="alert">{websiteOpenError}</span>
-                  {/if}
-                </span>
-                <span class="about-action-go" aria-hidden="true">
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M9.5 2H14v4.5" />
-                    <path d="M14 2 7.5 8.5" />
-                    <path d="M6.5 3.5H3.5A1.5 1.5 0 0 0 2 5v7.5A1.5 1.5 0 0 0 3.5 14H11a1.5 1.5 0 0 0 1.5-1.5V9.5" />
-                  </svg>
-                </span>
-              </button>
+              <!-- The same links, in the same order, as the About dialog. -->
+              <EmberLinks />
               <button type="button" class="about-action" onclick={() => void revealLogs()}>
                 <span class="about-action-icon" aria-hidden="true">
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -4845,135 +4819,111 @@
             <BuyCoffeeButton />
           </div>
 
-          <div class="divider"></div>
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_updates()}</h4>
 
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_auto_check_updates_label()}</span>
-              <span class="hint">{m.settings_auto_check_updates_hint()}</span>
-            </div>
-            <ToggleSwitch
-              bind:checked={settings.auto_check_updates}
-              ariaLabel={m.settings_auto_check_updates_label()}
-              onchange={(on) => {
-                // Silent updates install what these checks find.
-                if (!on && settings) settings.silent_update_enabled = false;
-              }}
-            />
-          </div>
-          <div class="field" class:about-frequency-disabled={!settings.auto_check_updates}>
-            <label for="update-check-frequency">{m.settings_update_check_frequency_label()}</label>
-            <span class="hint">{m.settings_update_check_frequency_hint()}</span>
-            <select
-              id="update-check-frequency"
-              bind:value={settings.update_check_frequency}
-              disabled={!settings.auto_check_updates}
-            >
-              <option value="hourly">{m.settings_update_frequency_hourly()}</option>
-              <option value="daily">{m.settings_update_frequency_daily()}</option>
-              <option value="weekly">{m.settings_update_frequency_weekly()}</option>
-              <option value="monthly">{m.settings_update_frequency_monthly()}</option>
-            </select>
-          </div>
-          <div class="field toggle-row" class:about-frequency-disabled={!silentSupported}>
-            <div class="toggle-info">
-              <span class="toggle-title">{m.settings_silent_update_label()}</span>
-              <span class="hint">
-                {silentSupported ? m.settings_silent_update_hint() : silentUnsupportedHint}
-              </span>
-              {#if silentSupported && silentStatusText}
-                <span class="hint silent-update-status">
-                  {silentStatusText}
-                  {#if $silentUpdate?.enabled && $silentUpdate.phase === 'postponed'}
-                    <button type="button" class="silent-update-resume" onclick={() => void resumeSilentUpdate()}>
-                      {m.silent_update_resume_btn()}
-                    </button>
-                  {/if}
-                </span>
-              {/if}
-            </div>
-            <ToggleSwitch
-              bind:checked={settings.silent_update_enabled}
-              disabled={!silentSupported}
-              ariaLabel={m.settings_silent_update_label()}
-              onchange={(on) => {
-                if (on && settings) settings.auto_check_updates = true;
-              }}
-            />
-          </div>
+            <!-- A `.field`, so the filter can find the check and install
+                 buttons by their text. -->
+            <div class="field about-update-panel">
+              <div class="action-row">
+                <button
+                  class="action-btn"
+                  onclick={() => void checkForUpdates()}
+                  disabled={$updater.phase === 'checking' || $updater.phase === 'downloading' || $updater.phase === 'installing'}
+                >
+                  {$updater.phase === 'checking' ? m.updater_checking() : m.settings_about_check_btn()}
+                </button>
 
-          <div class="divider"></div>
+                {#if $updater.phase === 'available'}
+                  <button class="action-btn primary" onclick={() => void installUpdate()}>
+                    {m.updater_install()}
+                  </button>
+                {:else if $updater.phase === 'ready'}
+                  <button class="action-btn primary" onclick={() => void restartToUpdate()}>
+                    {m.updater_restart_now()}
+                  </button>
+                {:else if $updater.phase === 'stalled' && $updater.installerReady}
+                  <!-- Without this the phase was a dead end here: checking for
+                       updates finds the same version, which deliberately keeps the
+                       staged offer rather than re-downloading it, so this card
+                       showed the generic hint and no way to act on it. -->
+                  <button class="action-btn primary" onclick={() => void runStagedInstaller()}>
+                    {m.updater_stalled_run()}
+                  </button>
+                {/if}
+              </div>
 
-          <div class="about-update-panel">
-            <div class="action-row">
-              <button
-                class="action-btn"
-                onclick={() => void checkForUpdates()}
-                disabled={$updater.phase === 'checking' || $updater.phase === 'downloading' || $updater.phase === 'installing'}
+              <div
+                class="about-update-status"
+                class:success={$updater.phase === 'uptodate' || $updater.phase === 'available' || $updater.phase === 'ready'}
+                class:error={$updater.phase === 'error' || $updater.phase === 'stalled' || $updater.signatureMissing}
+                class:busy={$updater.phase === 'checking' || $updater.phase === 'downloading' || $updater.phase === 'installing'}
               >
-                {$updater.phase === 'checking' ? m.updater_checking() : m.settings_about_check_btn()}
-              </button>
-
-              {#if $updater.phase === 'available'}
-                <button class="action-btn primary" onclick={() => void installUpdate()}>
-                  {m.updater_install()}
-                </button>
-              {:else if $updater.phase === 'ready'}
-                <button class="action-btn primary" onclick={() => void restartToUpdate()}>
-                  {m.updater_restart_now()}
-                </button>
-              {:else if $updater.phase === 'stalled' && $updater.installerReady}
-                <!-- Without this the phase was a dead end here: checking for
-                     updates finds the same version, which deliberately keeps the
-                     staged offer rather than re-downloading it, so this card
-                     showed the generic hint and no way to act on it. -->
-                <button class="action-btn primary" onclick={() => void runStagedInstaller()}>
-                  {m.updater_stalled_run()}
-                </button>
-              {/if}
-            </div>
-
-            <div
-              class="about-update-status"
-              class:success={$updater.phase === 'uptodate' || $updater.phase === 'available' || $updater.phase === 'ready'}
-              class:error={$updater.phase === 'error' || $updater.phase === 'stalled' || $updater.signatureMissing}
-              class:busy={$updater.phase === 'checking' || $updater.phase === 'downloading' || $updater.phase === 'installing'}
-            >
-              {#if $updater.phase === 'uptodate'}
-                <span class="feedback success">{m.updater_uptodate()}</span>
-              {:else if $updater.phase === 'available'}
-                <span class="feedback success">{m.updater_available_status({ version: $updater.version ?? '' })}</span>
-              {:else if $updater.phase === 'downloading'}
-                <span class="hint">{aboutPercent !== null ? m.updater_downloading_pct({ pct: aboutPercent }) : m.updater_downloading()}</span>
-                {#if aboutPercent !== null}
-                  <div class="about-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={aboutPercent}>
-                    <div class="about-progress-fill" style="width: {aboutPercent}%"></div>
-                  </div>
+                {#if $updater.phase === 'uptodate'}
+                  <span class="feedback success">{m.updater_uptodate()}</span>
+                {:else if $updater.phase === 'available'}
+                  <span class="feedback success">{m.updater_available_status({ version: $updater.version ?? '' })}</span>
+                {:else if $updater.phase === 'downloading'}
+                  <span class="hint">{aboutPercent !== null ? m.updater_downloading_pct({ pct: aboutPercent }) : m.updater_downloading()}</span>
+                  {#if aboutPercent !== null}
+                    <div class="about-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={aboutPercent}>
+                      <div class="about-progress-fill" style="width: {aboutPercent}%"></div>
+                    </div>
+                  {/if}
+                {:else if $updater.phase === 'installing'}
+                  <span class="hint">{m.updater_installing()}</span>
+                {:else if $updater.phase === 'ready'}
+                  <span class="feedback success">{m.updater_ready_body({ version: $updater.version ?? '' })}</span>
+                {:else if $updater.phase === 'stalled'}
+                  <span class="feedback error">
+                    {$updater.installerReady
+                      ? m.updater_stalled_body({ version: $updater.version ?? '' })
+                      : m.updater_stalled_body_gone({ version: $updater.version ?? '' })}
+                  </span>
+                  <!-- `restoreStaged(staged, true)` sets both flags at once, so
+                       the `signatureMissing` branch below can never be reached
+                       from a re-offered staged installer. Say it here instead:
+                       the reason we fell back to the staged copy is that the
+                       newer release could not be verified, and that is exactly
+                       the user who is about to run an installer. -->
+                  {#if $updater.signatureMissing}
+                    <span class="feedback error about-update-note">{m.updater_signature_missing()}</span>
+                  {/if}
+                {:else if $updater.phase === 'error' || $updater.signatureMissing}
+                  <span class="feedback error">{m.updater_error_body({ detail: $updater.error ?? m.updater_signature_missing() })}</span>
+                {:else}
+                  <span class="hint">{m.settings_about_check_hint()}</span>
                 {/if}
-              {:else if $updater.phase === 'installing'}
-                <span class="hint">{m.updater_installing()}</span>
-              {:else if $updater.phase === 'ready'}
-                <span class="feedback success">{m.updater_ready_body({ version: $updater.version ?? '' })}</span>
-              {:else if $updater.phase === 'stalled'}
-                <span class="feedback error">
-                  {$updater.installerReady
-                    ? m.updater_stalled_body({ version: $updater.version ?? '' })
-                    : m.updater_stalled_body_gone({ version: $updater.version ?? '' })}
-                </span>
-                <!-- `restoreStaged(staged, true)` sets both flags at once, so
-                     the `signatureMissing` branch below can never be reached
-                     from a re-offered staged installer. Say it here instead:
-                     the reason we fell back to the staged copy is that the
-                     newer release could not be verified, and that is exactly
-                     the user who is about to run an installer. -->
-                {#if $updater.signatureMissing}
-                  <span class="feedback error about-update-note">{m.updater_signature_missing()}</span>
-                {/if}
-              {:else if $updater.phase === 'error' || $updater.signatureMissing}
-                <span class="feedback error">{m.updater_error_body({ detail: $updater.error ?? m.updater_signature_missing() })}</span>
-              {:else}
+              </div>
+              <!-- Checks have no setting, so the schedule is said here, under
+                   whatever the last one found. -->
+              {#if $updater.phase !== 'idle'}
                 <span class="hint">{m.settings_about_check_hint()}</span>
               {/if}
+            </div>
+
+            <div class="field toggle-row" class:is-disabled={!silentSupported}>
+              <div class="toggle-info">
+                <span class="toggle-title">{m.settings_silent_update_label()}</span>
+                <span class="hint">
+                  {silentSupported ? m.settings_silent_update_hint() : silentUnsupportedHint}
+                </span>
+                {#if silentSupported && silentStatusText}
+                  <span class="hint silent-update-status">
+                    {silentStatusText}
+                    {#if $silentUpdate?.enabled && $silentUpdate.phase === 'postponed'}
+                      <button type="button" class="silent-update-resume" onclick={() => void resumeSilentUpdate()}>
+                        {m.silent_update_resume_btn()}
+                      </button>
+                    {/if}
+                  </span>
+                {/if}
+              </div>
+              <ToggleSwitch
+                bind:checked={settings.silent_update_enabled}
+                disabled={!silentSupported}
+                ariaLabel={m.settings_silent_update_label()}
+              />
             </div>
           </div>
         </div>
@@ -5364,25 +5314,35 @@
     margin-bottom: -7px;
   }
 
-  /* Naming the groups replaced the rules that used to separate them, which
-     left this the only section on the page with no hairlines in it. They come
-     back, with the heading now saying what each one introduces. The first
-     group needs none — the card header is already that boundary. */
-  .card-body > .settings-group + .settings-group {
+  /* A hairline between groups, with the heading saying what each one
+     introduces. The first group needs none — the card header is already that
+     boundary. `~` rather than `+`, so a status line or banner between two
+     groups does not drop the rule above the second. */
+  .card-body > .settings-group ~ .settings-group {
     border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
     margin-top: 2px;
     padding-top: 20px;
   }
 
-  /* `+` cannot see past a hidden sibling, so a filter that drops the first
-     group would leave the next one's rule stranded directly under the card
-     header, reading as a stray line. The groups on screen while filtering are
-     a subset anyway, so a rule claiming to divide them says nothing true —
-     the card-body gap is separation enough. */
-  .cards-grid.filtering .card-body > .settings-group + .settings-group {
+  /* A filter that drops the first group would leave the next one's rule
+     stranded directly under the card header, reading as a stray line. The
+     groups on screen while filtering are a subset anyway, so a rule claiming
+     to divide them says nothing true — the card-body gap is separation
+     enough. */
+  .cards-grid.filtering .card-body > .settings-group ~ .settings-group {
     border-top: none;
     margin-top: 0;
     padding-top: 0;
+  }
+
+  .settings-group.hidden {
+    display: none;
+  }
+
+  /* A line of context ahead of a section's groups, where what it says covers
+     all of them rather than one control. */
+  .section-intro {
+    margin: 0;
   }
 
   .settings-no-results {
@@ -5451,15 +5411,18 @@
     gap: 8px;
   }
 
+  /* Same weight and colour as `.toggle-title`, so a labelled box and a switch
+     read as the same kind of row. */
   .field > label,
   .field > .field-label {
     display: flex;
     align-items: center;
     gap: 8px;
     font-size: var(--font-size-md);
-    color: var(--text-secondary);
+    color: var(--text-primary);
     margin-bottom: 0;
     font-weight: 500;
+    line-height: 1.4;
   }
 
   .field input[type='number'],
@@ -5467,6 +5430,11 @@
   .field input:not([type]),
   .field > select {
     width: 100%;
+  }
+
+  .field input[type='password'] {
+    width: 100%;
+    max-width: 28rem;
   }
 
   .field-row {
@@ -5582,32 +5550,45 @@
     margin-top: 0;
   }
 
-  .always-on-badge {
-    flex-shrink: 0;
-    font-size: var(--font-size-sm);
-    font-weight: 600;
-    color: var(--text-secondary);
-    white-space: nowrap;
-  }
-
+  /* A setting that only means something while the one above it is on. */
   .nested {
     margin-left: 0;
     margin-top: -8px;
     padding-left: 12px;
+    border-left: 2px solid color-mix(in srgb, var(--border) 70%, transparent);
   }
 
-  .divider {
-    height: 1px;
-    background: var(--border);
-    margin: 2px 0;
-    opacity: 0.6;
+  /* Its control is disabled; the words go quiet with it. The control dims
+     itself, so dimming the whole row would dim it twice. */
+  .field.is-disabled > .toggle-info,
+  .field.is-disabled > label,
+  .field.is-disabled > .hint {
+    opacity: 0.55;
+  }
+
+  /* An in-text action that switches section rather than navigating, so it
+     is a button, but it reads as the links beside it. */
+  .link-btn {
+    display: inline;
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--accent);
+    font: inherit;
+    cursor: pointer;
+  }
+
+  .link-btn:hover {
+    background: none;
+    color: var(--accent);
+    text-decoration: underline;
   }
 
   /* ── Folder input ──────────────────────────────── */
   .folder-input {
     display: flex;
     align-items: stretch;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-sm);
     overflow: hidden;
     background: var(--bg-input);
@@ -5685,6 +5666,20 @@
   .action-btn.primary:hover {
     filter: brightness(1.06);
     color: var(--on-accent);
+  }
+
+  /* Deletes or resets something with no undo. Outlined rather than filled:
+     the confirmation that follows is where the weight belongs, and a row of
+     solid red buttons would drown out everything else in the section. */
+  .action-btn.danger {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+  }
+
+  .action-btn.danger:hover {
+    color: var(--danger);
+    border-color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 10%, var(--bg-surface));
   }
 
   .about-identity {
@@ -5833,7 +5828,7 @@
   .about-action {
     display: flex;
     align-items: flex-start;
-    gap: 10px;
+    gap: 12px;
     width: 100%;
     padding: 10px 12px;
     border: 1px solid var(--border);
@@ -5841,6 +5836,7 @@
     background: var(--bg-surface);
     color: inherit;
     font-family: inherit;
+    font-weight: 400;
     text-align: left;
     cursor: pointer;
     transition:
@@ -5854,19 +5850,21 @@
     border-color: var(--accent-dim);
   }
 
+  /* Sized like the link rows above it (`EmberLinks`), so the column of icons
+     lines up. */
   .about-action-icon {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
-    width: 26px;
-    height: 26px;
-    border-radius: var(--radius-sm);
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    width: 32px;
+    height: 32px;
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--accent) 13%, transparent);
     color: var(--accent);
   }
 
-  .about-action-icon svg { width: 15px; height: 15px; }
+  .about-action-icon svg { width: 17px; height: 17px; }
 
   .about-action-body {
     flex: 1;
@@ -5965,10 +5963,6 @@
   }
 
 
-  .about-frequency-disabled {
-    opacity: 0.55;
-  }
-
   .silent-update-status {
     display: block;
     margin-top: 4px;
@@ -6059,19 +6053,16 @@
     flex-direction: column;
     gap: 8px;
   }
-  .antileech-label {
-    font-size: var(--font-size-sm);
-    color: var(--text-muted);
-  }
   .antileech-textarea {
     width: 100%;
-    min-height: 180px;
+    box-sizing: border-box;
+    min-height: 140px;
     padding: 8px 10px;
     font-family: var(--font-mono);
     font-size: var(--font-size-sm);
-    line-height: 1.4;
+    line-height: 1.5;
     color: var(--text-primary);
-    background: var(--bg-secondary);
+    background: var(--bg-input);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     resize: vertical;
@@ -6079,19 +6070,16 @@
   .antileech-textarea:focus {
     outline: none;
     border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-halo);
   }
-  .antileech-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
+  .antileech-block .hint code {
+    font-family: var(--font-mono);
+    padding: 0 4px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+    color: var(--text-primary);
   }
   /* Web services list + add form. */
-  .webservice-intro {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
   .webservice-list {
     list-style: none;
     margin: 0;
@@ -6152,13 +6140,6 @@
     border-color: var(--danger);
     background: color-mix(in srgb, var(--danger) 8%, transparent);
   }
-  .webservice-form {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    padding-top: 12px;
-    border-top: 1px solid var(--border);
-  }
   .webservice-add {
     display: flex;
     align-items: flex-end;
@@ -6181,7 +6162,7 @@
     padding: 6px 8px;
     color: var(--text-primary);
     background: var(--bg-secondary);
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-sm);
   }
   .webservice-field input:focus {
@@ -6189,20 +6170,11 @@
     border-color: var(--accent);
   }
   /* Secondary ways in, so they sit further from the form than its own note. */
-  .webservice-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-    margin-top: 6px;
-  }
   .antileech-path {
-    font-size: var(--font-size-xs);
-    margin-left: auto;
+    font-family: var(--font-mono);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    max-width: 50%;
   }
   .antileech-errors {
     margin-top: 6px;
@@ -6428,6 +6400,59 @@
     border-radius: inherit;
   }
 
+  /* Ten languages as full-size cards took four rows of the section. As
+     one-line chips — flag beside the name — they fit in two or three, and
+     as many per row as the width allows. */
+  .lang-picker {
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 8px;
+  }
+
+  .lang-card {
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+    /* Room on the right for the check mark. */
+    padding: 8px 30px 8px 10px;
+  }
+
+  .lang-card .behavior-icon {
+    width: 24px;
+    height: 24px;
+    flex-shrink: 0;
+    margin-bottom: 0;
+  }
+
+  .lang-card .behavior-icon :global(svg) {
+    width: 14px;
+    height: 14px;
+  }
+
+  .lang-text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .lang-text .behavior-title,
+  .lang-text .behavior-desc {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .lang-text .behavior-desc {
+    font-size: var(--font-size-xs);
+  }
+
+  .lang-card .behavior-check {
+    top: 50%;
+    right: 8px;
+    width: 16px;
+    height: 16px;
+    transform: translateY(-50%);
+  }
+
   .behavior-title {
     font-size: var(--font-size-md);
     font-weight: 600;
@@ -6463,100 +6488,15 @@
       grid-template-columns: 1fr;
     }
 
+    /* Chips are small enough to keep sharing a row. */
+    .lang-picker {
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    }
+
     /* Paired fields (ports, limits) stack rather than squeeze side by side. */
     .field-row {
       flex-direction: column;
     }
-  }
-
-  .speed-test-section {
-    padding-top: 0;
-    margin-top: 0;
-  }
-
-  .speed-test-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    margin-bottom: 0;
-  }
-
-  .speed-test-btn {
-    padding: 4px 12px;
-    font-size: var(--font-size-sm);
-    border-radius: var(--radius-sm);
-    border: 1px solid var(--border);
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-    cursor: pointer;
-  }
-
-  .speed-test-btn:hover:not(:disabled) {
-    background: var(--bg-hover);
-  }
-
-  .speed-test-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .speed-results {
-    margin-top: 0;
-    padding: 8px 12px;
-    background: var(--bg-tertiary);
-    border-radius: var(--radius-md);
-    font-size: var(--font-size-md);
-  }
-
-  .speed-row {
-    display: flex;
-    justify-content: space-between;
-    padding: 2px 0;
-    color: var(--text-secondary);
-  }
-
-  .speed-row.recommended {
-    border-top: 1px solid var(--border);
-    margin-top: 4px;
-    padding-top: 6px;
-    color: var(--text-primary);
-    font-weight: 600;
-  }
-
-  .speed-row.recommended + .speed-row.recommended {
-    border-top: none;
-    margin-top: 0;
-    padding-top: 2px;
-  }
-
-  .speed-value {
-    font-weight: 600;
-    color: var(--text-primary);
-  }
-
-  .apply-btn {
-    margin-top: 8px;
-    width: 100%;
-    padding: 6px;
-    font-size: var(--font-size-sm);
-    font-weight: 600;
-    border-radius: var(--radius-sm);
-    border: none;
-    background: var(--accent);
-    color: var(--on-accent);
-    cursor: pointer;
-  }
-
-  .apply-btn:hover {
-    opacity: 0.9;
-  }
-
-  .speed-error {
-    display: block;
-    margin-top: 6px;
-    color: var(--danger);
-    font-size: var(--font-size-sm);
   }
 
   /* Shared "this is happening right now" marker: the sleep inhibitor being
@@ -6760,112 +6700,92 @@
     gap: 10px;
   }
 
-  .schedule-add {
-    align-self: flex-start;
-    padding: 6px 12px;
-    border: 1px dashed var(--border);
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--text-secondary);
-    font-size: var(--font-size-md);
-    cursor: pointer;
-  }
-
-  .schedule-add:hover:not(:disabled) {
-    border-color: var(--accent);
-    color: var(--accent);
-  }
-
-  .schedule-add:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .spam-stats-grid {
+  /* Every set of figures on the page — spam data, download history, the
+     speed test, a backup's contents — in the same tiles. */
+  .stat-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
     gap: 8px;
-    margin-top: 0;
   }
 
-  .spam-stat {
+  /* The two recommended-limit cards carry the longest labels, so they take a
+     larger share than Download and Upload; "Recommended download limit" no
+     longer wraps onto a second line. Narrow windows go back to two columns. */
+  .stat-grid.speed-result-grid {
+    grid-template-columns: 1fr 1fr 1.25fr 1.5fr;
+  }
+
+  @media (max-width: 760px) {
+    .stat-grid.speed-result-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
+  .stat {
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--bg-surface);
-    padding: 8px;
+    padding: 8px 10px;
     display: flex;
     flex-direction: column;
     gap: 2px;
+    min-width: 0;
   }
 
-  .spam-stat span {
+  .stat span {
     font-size: var(--font-size-xs);
     color: var(--text-muted);
   }
 
-  .spam-stat strong {
+  .stat strong {
     font-size: var(--font-size-lg);
     color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+    overflow-wrap: anywhere;
   }
 
-  .backup-body {
+  .stat strong.is-loading {
+    font-size: var(--font-size-sm);
+    font-weight: 500;
+    color: var(--text-muted);
+  }
+
+  /* Where to keep the file is the one piece of backup advice that decides
+     whether the backup is any use, so it stands out from the grey hints. */
+  .backup-callout {
     display: flex;
-    flex-direction: column;
-    gap: 22px;
-    padding: 22px 20px 24px;
-  }
-
-  .backup-block {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-  }
-
-  .backup-block.hidden {
-    display: none;
-  }
-
-  .backup-block > .divider {
-    margin: 0;
-  }
-
-  .backup-copy {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    max-width: 68ch;
-  }
-
-  .backup-body .field {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    margin-bottom: 0;
-  }
-
-  .backup-body .field > label,
-  .backup-body .field > .field-label,
-  .backup-copy > label,
-  .backup-copy > .field-label {
-    margin-bottom: 0;
-    color: var(--text-primary);
-    font-weight: 600;
-  }
-
-  .backup-body .hint {
-    margin-top: 0;
-    line-height: 1.5;
-  }
-
-  .backup-body input[type='password'] {
-    width: 100%;
-    max-width: 28rem;
-  }
-
-  .backup-preview {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    align-items: center;
     gap: 10px;
+    margin: 2px 0 0;
+    padding: 9px 12px;
+    max-width: 68ch;
+    border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--accent) 10%, var(--bg-surface));
+    font-size: var(--font-size-sm);
+    line-height: 1.45;
+    color: var(--text-primary);
+  }
+
+  .backup-callout strong {
+    font-weight: 700;
+  }
+
+  .backup-callout-icon {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: var(--on-accent);
+    font-size: 14px;
+    font-weight: 800;
+    line-height: 1;
+    box-shadow: 0 0 0 3px var(--accent-halo);
   }
 
   .pending-restore {
@@ -6888,81 +6808,6 @@
     max-width: 68ch;
   }
 
-  .history-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-    gap: 10px;
-    margin-top: 0;
-  }
-
-  .history-card {
-    display: flex;
-    flex-direction: column;
-    border: 1px solid var(--border);
-    border-top: 2px solid var(--accent);
-    border-radius: var(--radius-sm);
-    background: var(--bg-surface);
-    overflow: hidden;
-    min-width: 0;
-  }
-
-  .history-stat-body {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding: 12px 14px 10px;
-  }
-
-  .history-stat-label {
-    font-size: var(--font-size-xs);
-    font-weight: 500;
-    color: var(--text-muted);
-    letter-spacing: 0.01em;
-  }
-
-  .history-stat-value {
-    font-size: var(--font-size-3xl);
-    font-weight: 700;
-    line-height: 1.1;
-    color: var(--text-primary);
-    font-variant-numeric: tabular-nums;
-  }
-
-  .history-stat-value.is-loading {
-    font-size: var(--font-size-sm);
-    font-weight: 500;
-    color: var(--text-muted);
-  }
-
-  .history-clear-btn {
-    margin-top: auto;
-    width: 100%;
-    padding: 8px 12px;
-    border: none;
-    border-top: 1px solid var(--border);
-    border-radius: 0;
-    background: color-mix(in srgb, var(--bg-primary) 55%, transparent);
-    color: var(--text-secondary);
-    font-size: var(--font-size-sm);
-    font-weight: 600;
-    cursor: pointer;
-    text-align: left;
-    transition: background var(--transition-normal), color var(--transition-normal);
-  }
-
-  .history-clear-btn:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
-  }
-
-  .history-clear-btn:active:not(:disabled) {
-    transform: none;
-  }
-
-  .history-card-total .history-clear-btn:hover {
-    color: var(--danger);
-  }
-
   @media (max-width: 1200px) {
     .settings-layout {
       padding: 8px 16px 16px;
@@ -6979,7 +6824,7 @@
     }
 
     /* The search box, then the tabs as one row that scrolls sideways,
-       pinned to the top. Stacked, thirteen tabs pushed every setting below
+       pinned to the top. Stacked, a dozen tabs pushed every setting below
        the fold before the first one could be reached. */
     .settings-nav {
       top: 0;
@@ -7067,7 +6912,7 @@
   .unit-input {
     display: inline-flex;
     align-items: stretch;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-sm);
     overflow: hidden;
     background: var(--bg-input);

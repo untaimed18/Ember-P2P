@@ -169,6 +169,7 @@ pub(super) fn reset_ed2k_server_session(state: &mut NetworkState, app_handle: &t
     // have a related search keep planning around a co-share request that can no
     // longer be sent.
     ed2k::server::set_server_flags_mirror(0);
+    ed2k::server::set_server_session_up(false);
     state.server_poll_count = 0;
     state.server_search_more_due_at = None;
     state.server_search_more_requests = 0;
@@ -179,6 +180,11 @@ pub(super) fn reset_ed2k_server_session(state: &mut NetworkState, app_handle: &t
     // A new session has no memory of the search that left pages unread.
     if let Some(finished) = state.finished_search.as_mut() {
         finished.server_has_more = false;
+    }
+    // Kept past the session: a LowID says the forwarded port did not work, and
+    // the reconnect picks its login port on that (`login_tcp_port`).
+    if state.server_client_id != 0 {
+        state.last_server_session_low_id = state.low_id;
     }
     state.low_id = false;
     state.server_client_id = 0;
@@ -540,20 +546,16 @@ pub(super) fn abandon_server_auto_reconnect(
     emit_server_auto_connect_failed(app_handle, detail);
 }
 
-/// Capture the TCP port for `OP_LOGINREQUEST`, then run session teardown.
-/// `reset_ed2k_server_session` clears `low_id`; the capture must happen first.
+/// Run session teardown, then pick the TCP port for the next
+/// `OP_LOGINREQUEST`. The teardown clears `low_id` but keeps it as
+/// `last_server_session_low_id`, which `login_tcp_port` reads, so every path
+/// to a new login picks the port the same way.
 pub(super) fn capture_advertised_tcp_port_then_reset_ed2k_session(
     state: &mut NetworkState,
     app_handle: &tauri::AppHandle,
 ) -> u16 {
-    let tcp_port = capture_advertised_tcp_port_then_reset_low_id(
-        state.upnp_tcp_port,
-        state.external_tcp_port,
-        state.tcp_port,
-        &mut state.low_id,
-    );
     reset_ed2k_server_session(state, app_handle);
-    tcp_port
+    login_tcp_port(state)
 }
 
 /// Establish a new eD2K server connection to `ip`:`port`, tearing down any
@@ -572,10 +574,19 @@ pub(super) async fn initiate_server_connect(
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
     ip: String,
     port: u16,
-) {
+) -> Result<(), ServerDialRefusal> {
+    // Checked before anything is torn down: a refused server leaves the
+    // current session as it was.
+    if let Some(reason) = server_dial_refusal(state, settings, &ip, port) {
+        warn!("Not connecting to {ip}:{port}: {reason}");
+        emit_server_log(app_handle, &format!("Not connecting to {ip}:{port}: {reason}."));
+        return Err(reason);
+    }
     state.server_auto_reconnect = true;
     state.server_reconnect_failures = 0;
     state.server_reconnect_network_down = false;
+    state.server_last_attempt_failed = false;
+    state.server_last_connect_attempt = Some(std::time::Instant::now());
     state.preferred_ed2k_server = Some((ip.clone(), port));
     // Joining a server is a deliberate "come back online", so it lifts the
     // outbound stop the same way `KadConnect` does. The upload listener needs
@@ -591,9 +602,11 @@ pub(super) async fn initiate_server_connect(
     if let Some(handle) = state.pending_server_connect.take() {
         handle.abort();
     }
-    let tcp_port = if let Some(conn) = state.server_connection.take() {
+    // Either half alone still means a session to end: a panic in the server
+    // tick can leave the flag up with the connection gone.
+    let tcp_port = if state.server_connected || state.server_connection.is_some() {
         emit_server_log(app_handle, "Disconnecting from current server...");
-        drop(conn);
+        drop(state.server_connection.take());
         state.server_connected = false;
         state.server_addr = None;
         *shared_server_addr.write().await = None;
@@ -605,7 +618,7 @@ pub(super) async fn initiate_server_connect(
         );
         tcp_port
     } else {
-        advertised_tcp_port(state)
+        login_tcp_port(state)
     };
     let user_hash = state.user_hash;
     let nickname = settings.nickname.clone();
@@ -694,6 +707,99 @@ pub(super) async fn initiate_server_connect(
             result: result.map(|(conn, session, _)| (conn, session)),
         }
     }));
+    Ok(())
+}
+
+/// Why a server is not dialed (`server_dial_refusal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerDialRefusal {
+    /// Removed, or pruned after failing.
+    NotInList,
+    BlockedByIpFilter,
+}
+
+impl std::fmt::Display for ServerDialRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotInList => "it is no longer in the server list",
+            Self::BlockedByIpFilter => "it is blocked by the IP filter",
+        })
+    }
+}
+
+/// Why `ip:port` must not be dialed, if it must not: it has left the server
+/// list (removed, or pruned after failing), or the IP filter blocks it.
+/// Logging in sends our user hash, nickname and port, so this is checked
+/// before the connection rather than after the login.
+pub(super) fn server_dial_refusal(
+    state: &NetworkState,
+    settings: &AppSettings,
+    ip: &str,
+    port: u16,
+) -> Option<ServerDialRefusal> {
+    if state.server_list.find_by_addr(ip, port).is_none() {
+        return Some(ServerDialRefusal::NotInList);
+    }
+    if settings.filter_servers_by_ip {
+        // While the filter is still loading it blocks nothing yet, as in the
+        // check after login.
+        let loading = state.ip_filter.is_enabled() && !state.ip_filter.ranges_ready();
+        if let Ok(v4) = ip.parse::<Ipv4Addr>() {
+            if !loading && state.ip_filter.is_blocked_readonly(v4) {
+                return Some(ServerDialRefusal::BlockedByIpFilter);
+            }
+        }
+    }
+    None
+}
+
+/// The TCP port to log in with (`login_tcp_port_from`).
+pub(super) fn login_tcp_port(state: &NetworkState) -> u16 {
+    login_tcp_port_from(
+        state.upnp_tcp_port,
+        state.external_tcp_port,
+        state.tcp_port,
+        state.low_id,
+        state.last_server_session_low_id,
+    )
+}
+
+/// Stop treating a removed server as somewhere to go back to: not by
+/// auto-reconnect, and not at the next launch from `last_ed2k_server.json`. A
+/// live session with it carries on until it ends.
+pub(super) async fn forget_removed_server_as_target(
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
+    ip: &str,
+    port: u16,
+) {
+    let is_target = state
+        .preferred_ed2k_server
+        .as_ref()
+        .is_some_and(|(pip, pport)| pip == ip && *pport == port);
+    if is_target {
+        state.preferred_ed2k_server = None;
+        state.server_auto_reconnect = false;
+        // An attempt still under way would log in to it anyway.
+        if let Some(handle) = state.pending_server_connect.take() {
+            handle.abort();
+            *shared_server_addr.write().await = None;
+            state.stats.server_status = "disconnected".to_string();
+            let _ = app_handle.emit(
+                "server-status-changed",
+                serde_json::json!({ "status": "disconnected" }),
+            );
+        }
+    }
+    let last_path = state.data_dir.join("last_ed2k_server.json");
+    let names_it = ed2k::server_list::LastEd2kServer::load(&last_path)
+        .is_some_and(|last| last.ip == ip && last.port == port);
+    if names_it {
+        if let Err(e) = std::fs::remove_file(&last_path) {
+            warn!("Could not forget the removed server as the last one: {e}");
+        }
+    }
 }
 
 pub(super) fn server_entry_to_info(server: &ServerEntry) -> ServerInfo {
@@ -715,20 +821,34 @@ pub(super) fn server_entry_to_info(server: &ServerEntry) -> ServerInfo {
     }
 }
 
+/// The `(ip, port)` the connected server is filed under in the server list.
+/// `server_addr` holds the list address, not the obfuscation port the socket
+/// may have gone to (see `on_server_connect_result`).
+pub(super) fn connected_server_list_key(state: &NetworkState) -> Option<(String, u16)> {
+    let addr = state.server_addr?;
+    Some((addr.ip().to_string(), addr.port()))
+}
+
 pub(super) fn connected_server_info(state: &NetworkState) -> Option<ServerInfo> {
     let session = &state.server_connection.as_ref()?.session;
-    let addr = state.server_addr?;
+    let (ip, port) = connected_server_list_key(state)?;
     // The live session carries the user/file counts but not the capacity
     // limits — those come from `server.met` (ST_MAXUSERS / ST_SOFTFILES /
     // ST_HARDFILES) or an extended UDP status reply. Zeroing them here meant
     // the server the user is actually on was the one row that could never show
     // its limits, which is backwards. Borrow them from the list entry.
-    let ip = addr.ip().to_string();
-    let limits = state.server_list.find_by_addr(&ip, addr.port());
+    let limits = state.server_list.find_by_addr(&ip, port);
+    // A server that names itself on the wire wins; otherwise show what the
+    // list calls it rather than a blank.
+    let name = if session.server_name.trim().is_empty() {
+        limits.map(|s| s.name.clone()).unwrap_or_default()
+    } else {
+        session.server_name.clone()
+    };
     Some(ServerInfo {
         ip,
-        port: addr.port(),
-        name: session.server_name.clone(),
+        port,
+        name,
         description: limits.map(|s| s.description.clone()).unwrap_or_default(),
         user_count: session.user_count,
         file_count: session.file_count,

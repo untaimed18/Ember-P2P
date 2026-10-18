@@ -162,6 +162,10 @@ pub(in crate::network) async fn on_ember_search_tick(
                 }
                 _ => ember::dht::search::QueryFailure::TimedOut,
             };
+            let queried = state
+                .ember_search
+                .get(req.search_id)
+                .and_then(|search| search.queried_contact(req.per_search_req_id));
             let failed = state
                 .ember_search
                 .get_mut(req.search_id)
@@ -172,11 +176,11 @@ pub(in crate::network) async fn on_ember_search_tick(
             // answer can arrive under a request id this sweep is
             // not watching, and a busy peer often replies to
             // something else first.
-            if let Some(node_id) = failed {
+            if let (Some(node_id), Some(queried)) = (failed, queried) {
                 let last_seen =
                     state.ember_dht.contact_for(&node_id).map(|c| c.last_seen);
                 if ember_ping_timeout_is_a_fault(last_seen, req.sent_unix) {
-                    fault_ember_search_contact(state, &node_id);
+                    fault_ember_search_contact(state, &queried);
                 }
             }
             touched.insert(req.search_id);
@@ -203,8 +207,21 @@ pub(in crate::network) async fn on_ember_search_tick(
     //     most are already done, which then refuses the user's own
     //     search. Placed before the backstop so a reaped search is
     //     still streamed and emitted by steps 7 and 8 in this tick.
+    //
+    //     A walk with work left and nothing outstanding is driven
+    //     instead: the driver gives up after a run of batches it
+    //     could not dial, and with no query on the wire nothing else
+    //     would ask the rest of its shortlist before the timeout.
     for search_id in state.ember_search.active_ids() {
-        maybe_finish_ember_search(state, search_id);
+        if state
+            .ember_search
+            .get(search_id)
+            .is_some_and(|search| search.stalled())
+        {
+            drive_ember_search(udp_socket, state, search_id).await;
+        } else {
+            maybe_finish_ember_search(state, search_id);
+        }
     }
 
     // 3) Backstop: reap searches the SearchManager considers
@@ -706,21 +723,27 @@ pub(in crate::network) async fn on_ember_search_tick(
     drain_ember_callback_connects(state, connect_serve_tx).await;
 
     // 7) Stream keyword hits out of lookups that are still walking.
-    //    `FIND_VALUE` is deliberately excluded from early
-    //    convergence, so a lookup on a cold table can run most of
-    //    the 60-second cap; buffering until it converged meant the
-    //    user watched KAD rows land with nothing from Ember until
-    //    the very end. Cadence matches the KAD path: the first
-    //    record goes out at once, then every 20.
+    //    A lookup on a cold table can run most of the 60-second cap
+    //    before its neighbourhood settles, and buffering until then
+    //    would leave KAD rows on screen with nothing from Ember.
+    //    Cadence matches the KAD path: a rebuild on the first record,
+    //    then every 20.
     if !state.ember_keyword_searches.is_empty() {
         let search_ids: Vec<u32> =
             state.ember_keyword_searches.keys().copied().collect();
         for search_id in search_ids {
-            let Some((gathered, nodes_contacted)) = state
-                .ember_search
-                .get(search_id)
-                .map(|s| (s.results.len(), s.queried_count()))
-            else {
+            // The walks feeding a search stream with it: their records join
+            // the search's only when they finish, and the rows of their keys
+            // should not wait for that.
+            let feeding = ember_feeding_walks(&state.ember_search, search_id);
+            let Some((gathered, nodes_contacted)) = state.ember_search.get(search_id).map(|s| {
+                feeding
+                    .iter()
+                    .filter_map(|walk| state.ember_search.get(*walk))
+                    .fold((s.results.len(), s.queried_count()), |(records, nodes), w| {
+                        (records + w.results.len(), nodes + w.queried_count())
+                    })
+            }) else {
                 continue;
             };
             let Some(cursor) = state
@@ -755,61 +778,48 @@ pub(in crate::network) async fn on_ember_search_tick(
                     },
                 );
             }
+            // A row held back for the next rebuild (see `ember_stream_rows`)
+            // gets it on the next tick, whether or not new records are due.
             let threshold = if cursor == 0 { 1 } else { 20 };
-            if gathered < cursor + threshold {
-                continue;
-            }
-            let Some(records) = state
-                .ember_search
-                .get(search_id)
-                .map(|s| s.results[cursor..].to_vec())
-            else {
-                continue;
-            };
             let Some(kw) = state.ember_keyword_searches.get_mut(&search_id) else {
                 continue;
             };
+            if gathered < cursor + threshold && !ember_rows_held(&kw.streamed_publishers) {
+                continue;
+            }
             // Advanced even when the rows below all fail the query
             // filter: those records have been considered, and not
             // moving the cursor would re-examine them every tick.
             kw.last_streamed_count = gathered;
-            // A publisher an earlier slice counted for a file is not counted
-            // again; see `streamed_publishers`. Only what the build counted is
-            // recorded, so a record it refused — forged, under another key,
-            // failing the query — cannot hide that publisher's valid one.
-            let records: Vec<_> = records
-                .into_iter()
-                .filter(|record| {
-                    ember_record_publisher(&record.data)
-                        .is_none_or(|pair| !kw.streamed_publishers.contains(&pair))
-                })
-                .collect();
-            let mut built = build_ember_keyword_built(
-                &records,
-                &kw.keywords,
-                kw.query_expr.as_ref(),
-            );
-            kw.streamed_publishers
-                .extend(built.counted_publishers.drain(..));
-            for row in &mut built.results {
-                kw.streamed_files.insert(row.file.hash.clone());
-                // A slice's plurality digest is a partial answer, and only the
-                // closing rebuild can say a digest is contested: it does so
-                // with an empty field, which a merge cannot tell from "no
-                // claim" and so would leave the slice's digest pinned — the one
-                // a click enforces at completion. Only that rebuild sets it.
-                row.file.ember_file_hash.clear();
+            // Every slice is a rebuild over all the walk has gathered: a
+            // row's count is the publishers agreeing with its plurality
+            // digest, which only the whole set can say, so each batch is a
+            // total. Each record is read once, and the rows folded from the
+            // readings.
+            let walks: Vec<u32> = std::iter::once(search_id).chain(feeding.iter().copied()).collect();
+            let reader = EmberRecordReader::new(&kw.keywords, kw.query_expr.as_ref());
+            for walk in &walks {
+                if let Some(search) = state.ember_search.get_mut(*walk) {
+                    read_ember_keyword_records(search, &reader);
+                }
             }
+            let built = fold_ember_keyword_rows(
+                walks
+                    .iter()
+                    .filter_map(|walk| state.ember_search.get(*walk))
+                    .flat_map(ember_keyword_readings),
+            );
+            let results = ember_stream_rows(&mut kw.streamed_publishers, built);
             // Streamed pages deliberately do not seed the enforced
-            // digest map. Corroboration is computed per batch, so a
-            // slice holding two early publishers "agrees" on a digest
-            // the finished walk may well contradict — and the closing
-            // batch below re-derives every plurality across *all*
-            // records anyway. Pinning here only risked enforcing the
-            // partial answer, which fails completion for good.
+            // digest map. A rebuild part-way through the walk can find
+            // two early publishers "agreeing" on a digest the finished
+            // walk may well contradict — and the closing batch below
+            // re-derives every plurality across *all* records anyway.
+            // Pinning here only risked enforcing the partial answer,
+            // which fails completion for good.
             let batch = EmberKeywordResultBatch {
                 request_id: kw.request_id,
-                results: built.results,
+                results,
                 keywords: kw.keywords.clone(),
                 file_type_filter: kw.file_type_filter.clone(),
                 min_size: kw.min_size,
@@ -854,17 +864,15 @@ pub(in crate::network) async fn on_ember_search_tick(
                 request_id,
                 &mut results,
             );
-            // The closing batch is rebuilt from every record the walk
-            // gathered (see `maybe_finish_ember_search`), so it is
-            // the total rather than an addition to it.
-            let batch_kind = if final_batch {
-                DhtBatchKind::Cumulative
-            } else {
-                DhtBatchKind::Incremental
-            };
+            // Every Ember batch, streamed or closing, is rebuilt from
+            // every record the walk has gathered (see step 7 and
+            // `maybe_finish_ember_search`), so each is the total rather
+            // than an addition to it.
+            let batch_kind = DhtBatchKind::Cumulative;
+            let mut emitted = Vec::new();
             if !results.is_empty() {
                 let mut batch_spam = take_search_batch_spam(state, request_id);
-                let mut emitted = enrich_and_emit_search_results(
+                emitted = enrich_and_emit_search_results(
                     app_handle,
                     spam_filter,
                     comment_manager,
@@ -889,6 +897,7 @@ pub(in crate::network) async fn on_ember_search_tick(
                     }
                 }
             }
+            note_ember_rows_shown(&mut state.ember_keyword_searches, request_id, &emitted, &resights);
             if !resights.is_empty() {
                 if let Some(active) = state.active_search_request.as_mut() {
                     if active.request_id == request_id {

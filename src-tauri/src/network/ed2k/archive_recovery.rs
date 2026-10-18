@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,15 +11,33 @@ use tracing::{debug, info};
 const ZIP_LOCAL_HEADER_MAGIC: u32 = 0x04034b50;
 const ZIP_CENTRAL_DIR_MAGIC: u32 = 0x02014b50;
 const ZIP_END_OF_CENTRAL_DIR_MAGIC: u32 = 0x06054b50;
+const ZIP_DATA_DESCRIPTOR_MAGIC: u32 = 0x08074b50;
 const ZIP_LOCAL_HEADER_SIZE: usize = 30;
 const ZIP_CENTRAL_DIR_ENTRY_SIZE: usize = 46;
+const ZIP_END_OF_CENTRAL_DIR_SIZE: usize = 22;
+/// General-purpose bit 3: the local header's CRC and sizes are zero and the
+/// real ones follow the data in a data descriptor (and the central directory).
+const ZIP_FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
 
 // --- RAR constants ---
 const RAR_SIGNATURE_OLD: &[u8] = b"RE~^";
 const RAR_SIGNATURE_NEW: &[u8] = b"Rar!\x1a\x07\x00";
+const RAR5_SIGNATURE: &[u8] = b"Rar!\x1a\x07\x01\x00";
 const RAR_HEAD_FILE: u8 = 0x74;
 const RAR_HEAD_MAIN: u8 = 0x73;
-const RAR_LONG_BLOCK: u16 = 0x8000;
+/// `LHD_LARGE`: HIGH_PACK_SIZE and HIGH_UNP_SIZE follow the fixed header, and
+/// the name moves from byte 32 to 40. Not `0x8000` (`LONG_BLOCK`), which only
+/// says data follows the header and is set on every file header.
+const RAR_LHD_LARGE: u16 = 0x0100;
+/// `LHD_UNICODE`: the name is a plain name, a NUL, then an encoded Unicode one.
+const RAR_LHD_UNICODE: u16 = 0x0200;
+/// The file header fields before the name: through ATTR.
+const RAR_FILE_HEAD_FIXED: usize = 32;
+/// A main archive header with no flags, `HEAD_CRC` 0x90CF, exactly as WinRAR
+/// writes it.
+const RAR_MAIN_HEADER: [u8; 13] = [
+    0xCF, 0x90, RAR_HEAD_MAIN, 0x00, 0x00, 0x0D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
 
 // --- ACE constants ---
 const ACE_SIGNATURE: &[u8] = b"**ACE**";
@@ -284,6 +303,36 @@ struct ZipLocalEntry {
     data_offset: u64,
 }
 
+/// What a central directory record says about the entry whose local header
+/// sits at its (archive-start adjusted) offset.
+struct ZipCentralEntry {
+    crc32: u32,
+    compressed_size: u32,
+    uncompressed_size: u32,
+    method: u16,
+}
+
+/// The CRC and sizes an entry is recovered with, wherever they came from.
+#[derive(Clone, Copy)]
+struct ZipSizes {
+    crc32: u32,
+    compressed_size: u32,
+    uncompressed_size: u32,
+    /// Bytes of data descriptor known to follow the data, so the scan can step
+    /// over it.
+    descriptor_len: u64,
+    /// Locating the descriptor already proved the data against `crc32`.
+    crc_checked: bool,
+}
+
+fn le_u16(bytes: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([bytes[at], bytes[at + 1]])
+}
+
+fn le_u32(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+}
+
 fn recover_zip(
     input: &mut std::fs::File,
     output: &mut std::fs::File,
@@ -292,6 +341,7 @@ fn recover_zip(
     control: Option<&TransferControl>,
 ) -> anyhow::Result<usize> {
     let file_size = input.metadata()?.len();
+    let central = read_zip_central_directory(input, file_size, filled, budget, control)?;
     let mut entries: Vec<ZipLocalEntry> = Vec::new();
     let mut buf = [0u8; 4];
 
@@ -352,22 +402,12 @@ fn recover_zip(
                 pos = data_offset;
                 continue;
             }
-            if compressed_size as u64 > MAX_RECOVERY_ENTRY_BYTES
-                || uncompressed_size as u64 > MAX_RECOVERY_ENTRY_BYTES
-                || (uncompressed_size as u64)
-                    > (compressed_size as u64)
-                        .max(1)
-                        .saturating_mul(MAX_DECOMPRESSION_RATIO)
-            {
-                pos += 4;
-                continue;
-            }
 
             let data_offset =
                 pos + ZIP_LOCAL_HEADER_SIZE as u64 + name_len as u64 + extra_len as u64;
-            let entry_end = data_offset + compressed_size as u64;
-
-            if entry_end > file_size {
+            // The name and extra field are copied into the output as well, so
+            // they have to be downloaded bytes just as the data does.
+            if !is_filled(pos, data_offset, filled) {
                 pos += 4;
                 continue;
             }
@@ -386,29 +426,91 @@ fn recover_zip(
                 }
             }
 
+            let central_entry = central.get(&pos).filter(|c| c.method == method);
+            let local_sizes = ZipSizes {
+                crc32,
+                compressed_size,
+                uncompressed_size,
+                descriptor_len: 0,
+                crc_checked: false,
+            };
+            let sizes = if flags & ZIP_FLAG_DATA_DESCRIPTOR == 0 {
+                Some(local_sizes)
+            } else if let Some(c) = central_entry {
+                Some(ZipSizes {
+                    crc32: c.crc32,
+                    compressed_size: c.compressed_size,
+                    uncompressed_size: c.uncompressed_size,
+                    descriptor_len: 0,
+                    crc_checked: false,
+                })
+            } else {
+                match find_zip_data_descriptor(input, filled, data_offset, method, budget, control)?
+                {
+                    Some(found) => Some(found),
+                    // Some writers fill in the local header despite bit 3; the
+                    // CRC check below still has to pass.
+                    None if compressed_size > 0 => Some(local_sizes),
+                    None => None,
+                }
+            };
+            let Some(sizes) = sizes else {
+                debug!("ZIP entry at {pos}: sizes deferred to a data descriptor that cannot be located, skipping");
+                pos = data_offset;
+                continue;
+            };
+            if sizes.compressed_size == u32::MAX || sizes.uncompressed_size == u32::MAX {
+                pos = data_offset;
+                continue;
+            }
+            if sizes.compressed_size as u64 > MAX_RECOVERY_ENTRY_BYTES
+                || sizes.uncompressed_size as u64 > MAX_RECOVERY_ENTRY_BYTES
+                || (sizes.uncompressed_size as u64)
+                    > (sizes.compressed_size as u64)
+                        .max(1)
+                        .saturating_mul(MAX_DECOMPRESSION_RATIO)
+            {
+                pos += 4;
+                continue;
+            }
+
+            let entry_end = data_offset + sizes.compressed_size as u64;
+            if entry_end > file_size {
+                pos += 4;
+                continue;
+            }
+
             // Validate: entry data must be within filled ranges
-            if compressed_size > 0 && !is_filled(data_offset, entry_end, filled) {
+            if sizes.compressed_size > 0 && !is_filled(data_offset, entry_end, filled) {
                 debug!("ZIP entry at {pos}: data not fully downloaded, skipping");
                 pos = entry_end;
                 continue;
             }
 
-            // A CRC value of zero is valid (rare, but possible). Skip local
-            // header validation only when bit 3 says the authoritative CRC is
-            // carried in a following data descriptor.
-            let crc_valid = if (flags & 0x08) == 0 {
+            // A CRC value of zero is valid (rare, but possible).
+            let crc_valid = if sizes.crc_checked {
+                true
+            } else if matches!(method, 0 | 8) {
                 validate_zip_crc(
                     input,
                     data_offset,
-                    compressed_size,
-                    uncompressed_size,
+                    sizes.compressed_size,
+                    sizes.uncompressed_size,
                     method,
-                    crc32,
+                    sizes.crc32,
                     budget,
                     control,
                 )?
             } else {
-                true
+                // No decoder to check the CRC with, so only a downloaded central
+                // directory that agrees on every field vouches for the entry;
+                // otherwise any `PK\3\4` inside compressed data whose method
+                // field is not 0 or 8 passed as an entry.
+                central_entry.is_some_and(|c| {
+                    c.crc32 == sizes.crc32
+                        && c.compressed_size == sizes.compressed_size
+                        && c.uncompressed_size == sizes.uncompressed_size
+                })
             };
 
             if !crc_valid {
@@ -427,9 +529,9 @@ fn recover_zip(
 
             budget.add_entry()?;
             entries.push(ZipLocalEntry {
-                compressed_size,
-                uncompressed_size,
-                crc32,
+                compressed_size: sizes.compressed_size,
+                uncompressed_size: sizes.uncompressed_size,
+                crc32: sizes.crc32,
                 method,
                 flags,
                 file_name: safe_file_name,
@@ -439,7 +541,7 @@ fn recover_zip(
                 data_offset,
             });
 
-            pos = entry_end;
+            pos = entry_end + sizes.descriptor_len;
         }
     }
 
@@ -491,7 +593,7 @@ fn recover_zip(
         // Write local file header
         output.write_u32::<LittleEndian>(ZIP_LOCAL_HEADER_MAGIC)?;
         output.write_u16::<LittleEndian>(20)?; // version needed
-        output.write_u16::<LittleEndian>(entry.flags & !0x08)?; // clear data descriptor flag
+        output.write_u16::<LittleEndian>(entry.flags & !ZIP_FLAG_DATA_DESCRIPTOR)?;
         output.write_u16::<LittleEndian>(entry.method)?;
         output.write_u16::<LittleEndian>(entry.mod_time)?;
         output.write_u16::<LittleEndian>(entry.mod_date)?;
@@ -525,7 +627,7 @@ fn recover_zip(
         cd.write_u32::<LittleEndian>(ZIP_CENTRAL_DIR_MAGIC)?;
         cd.write_u16::<LittleEndian>(20)?; // version made by
         cd.write_u16::<LittleEndian>(20)?; // version needed
-        cd.write_u16::<LittleEndian>(entry.flags & !0x08)?;
+        cd.write_u16::<LittleEndian>(entry.flags & !ZIP_FLAG_DATA_DESCRIPTOR)?;
         cd.write_u16::<LittleEndian>(entry.method)?;
         cd.write_u16::<LittleEndian>(entry.mod_time)?;
         cd.write_u16::<LittleEndian>(entry.mod_date)?;
@@ -735,11 +837,315 @@ fn validate_zip_crc(
             budget,
             control,
         )?,
-        // Recovery preserves unsupported methods verbatim, but cannot verify
-        // their uncompressed CRC without a decoder.
-        _ => return Ok(true),
+        _ => return Ok(false),
     };
     Ok(actual_crc == Some(expected_crc))
+}
+
+/// Central directory records keyed by where each entry's local header sits in
+/// the `.part`, or an empty map when the end record or the directory itself was
+/// not downloaded (or is ZIP64 / multi-disk, which this does not read).
+fn read_zip_central_directory(
+    input: &mut std::fs::File,
+    file_size: u64,
+    filled: &[(u64, u64)],
+    budget: &RecoveryBudget,
+    control: Option<&TransferControl>,
+) -> anyhow::Result<HashMap<u64, ZipCentralEntry>> {
+    let mut entries = HashMap::new();
+    let tail_len = file_size.min(ZIP_END_OF_CENTRAL_DIR_SIZE as u64 + u16::MAX as u64);
+    if tail_len < ZIP_END_OF_CENTRAL_DIR_SIZE as u64 {
+        return Ok(entries);
+    }
+    let tail_start = file_size - tail_len;
+    let mut tail = vec![0u8; tail_len as usize];
+    input.seek(SeekFrom::Start(tail_start))?;
+    input.read_exact(&mut tail)?;
+    let magic = ZIP_END_OF_CENTRAL_DIR_MAGIC.to_le_bytes();
+    let Some(at) = (0..=tail.len() - ZIP_END_OF_CENTRAL_DIR_SIZE).rev().find(|&i| {
+        tail[i..i + 4] == magic
+            && is_filled(
+                tail_start + i as u64,
+                tail_start + (i + ZIP_END_OF_CENTRAL_DIR_SIZE) as u64,
+                filled,
+            )
+    }) else {
+        return Ok(entries);
+    };
+    let record = &tail[at..at + ZIP_END_OF_CENTRAL_DIR_SIZE];
+    if le_u16(record, 4) != 0 || le_u16(record, 6) != 0 {
+        return Ok(entries);
+    }
+    let count = le_u16(record, 10) as usize;
+    let cd_size = le_u32(record, 12);
+    let cd_offset = le_u32(record, 16);
+    if cd_size == u32::MAX || cd_offset == u32::MAX {
+        return Ok(entries);
+    }
+    let end_record_at = tail_start + at as u64;
+    // Recorded offsets count from the start of the archive, which a prepended
+    // self-extractor stub moves away from the start of the file.
+    let Some(cd_start) = end_record_at.checked_sub(cd_size as u64) else {
+        return Ok(entries);
+    };
+    let Some(bias) = cd_start.checked_sub(cd_offset as u64) else {
+        return Ok(entries);
+    };
+    if !is_filled(cd_start, end_record_at, filled) {
+        return Ok(entries);
+    }
+
+    input.seek(SeekFrom::Start(cd_start))?;
+    let mut reader = std::io::BufReader::new(Read::take(&mut *input, cd_size as u64));
+    let mut header = [0u8; ZIP_CENTRAL_DIR_ENTRY_SIZE];
+    for i in 0..count.min(MAX_RECOVERY_ENTRIES) {
+        if i % 1024 == 0 {
+            budget.check(control)?;
+        }
+        if reader.read_exact(&mut header).is_err() || le_u32(&header, 0) != ZIP_CENTRAL_DIR_MAGIC {
+            break;
+        }
+        let variable =
+            le_u16(&header, 28) as u64 + le_u16(&header, 30) as u64 + le_u16(&header, 32) as u64;
+        if std::io::copy(&mut Read::take(&mut reader, variable), &mut std::io::sink())? != variable
+        {
+            break;
+        }
+        let local_offset = le_u32(&header, 42);
+        if local_offset == u32::MAX {
+            continue;
+        }
+        entries.insert(
+            local_offset as u64 + bias,
+            ZipCentralEntry {
+                crc32: le_u32(&header, 16),
+                compressed_size: le_u32(&header, 20),
+                uncompressed_size: le_u32(&header, 24),
+                method: le_u16(&header, 10),
+            },
+        );
+    }
+    Ok(entries)
+}
+
+/// End of the run of contiguous downloaded bytes that `at` falls in.
+fn filled_run_end(at: u64, filled: &[(u64, u64)]) -> Option<u64> {
+    let mut end = None;
+    for &(start, stop) in filled {
+        match end {
+            None if start <= at && at < stop => end = Some(stop),
+            Some(e) if start <= e => end = Some(stop.max(e)),
+            Some(_) => break,
+            None => {}
+        }
+    }
+    end
+}
+
+/// Sizes and CRC for a bit-3 entry with no central directory to ask, read from
+/// the data descriptor after its data.
+///
+/// Deflate marks its own end, so inflating finds where the descriptor starts.
+/// Stored data does not, so the descriptor is searched for, and only the
+/// signed form is accepted: an unsigned one is twelve bytes any data can
+/// contain (twelve zero bytes "describe" an empty entry). Other methods cannot
+/// be bounded at all. Both found forms are checked against the CRC and sizes of
+/// the data they close, so a match is never taken on the descriptor's say-so.
+fn find_zip_data_descriptor(
+    input: &mut std::fs::File,
+    filled: &[(u64, u64)],
+    data_offset: u64,
+    method: u16,
+    budget: &RecoveryBudget,
+    control: Option<&TransferControl>,
+) -> anyhow::Result<Option<ZipSizes>> {
+    let Some(run_end) = filled_run_end(data_offset, filled) else {
+        return Ok(None);
+    };
+    let limit = run_end.min(data_offset.saturating_add(MAX_RECOVERY_ENTRY_BYTES + 16));
+    match method {
+        8 => {
+            let Some((compressed, uncompressed, crc)) =
+                inflate_zip_entry(input, data_offset, limit, budget, control)?
+            else {
+                return Ok(None);
+            };
+            let (Ok(compressed), Ok(uncompressed)) =
+                (u32::try_from(compressed), u32::try_from(uncompressed))
+            else {
+                return Ok(None);
+            };
+            read_zip_data_descriptor(
+                input,
+                data_offset + compressed as u64,
+                limit,
+                ZipSizes {
+                    crc32: crc,
+                    compressed_size: compressed,
+                    uncompressed_size: uncompressed,
+                    descriptor_len: 0,
+                    crc_checked: true,
+                },
+            )
+        }
+        0 => find_stored_zip_data_descriptor(input, data_offset, limit, budget, control),
+        _ => Ok(None),
+    }
+}
+
+/// Inflate a raw deflate stream starting at `start` without reading at or past
+/// `limit`: `(compressed bytes, uncompressed bytes, CRC-32)` when the stream
+/// ends in time, `None` when it is corrupt or runs out of downloaded bytes.
+fn inflate_zip_entry(
+    input: &mut std::fs::File,
+    start: u64,
+    limit: u64,
+    budget: &RecoveryBudget,
+    control: Option<&TransferControl>,
+) -> anyhow::Result<Option<(u64, u64, u32)>> {
+    let max_output = (limit - start)
+        .max(1)
+        .saturating_mul(MAX_DECOMPRESSION_RATIO)
+        .min(MAX_RECOVERY_ENTRY_BYTES);
+    let mut inflater = flate2::Decompress::new(false);
+    let mut hasher = crc32fast::Hasher::new();
+    let mut in_buf = vec![0u8; 64 * 1024];
+    let mut out_buf = vec![0u8; 64 * 1024];
+    let (mut in_pos, mut in_len) = (0usize, 0usize);
+    let mut next_read = start;
+    input.seek(SeekFrom::Start(start))?;
+    loop {
+        budget.check(control)?;
+        if in_pos == in_len {
+            let want = (limit - next_read).min(in_buf.len() as u64) as usize;
+            if want == 0 {
+                return Ok(None);
+            }
+            input.read_exact(&mut in_buf[..want])?;
+            next_read += want as u64;
+            (in_pos, in_len) = (0, want);
+        }
+        let (before_in, before_out) = (inflater.total_in(), inflater.total_out());
+        let Ok(status) = inflater.decompress(
+            &in_buf[in_pos..in_len],
+            &mut out_buf,
+            flate2::FlushDecompress::None,
+        ) else {
+            return Ok(None);
+        };
+        let consumed = (inflater.total_in() - before_in) as usize;
+        let produced = (inflater.total_out() - before_out) as usize;
+        in_pos += consumed;
+        hasher.update(&out_buf[..produced]);
+        if inflater.total_out() > max_output {
+            return Ok(None);
+        }
+        if status == flate2::Status::StreamEnd {
+            return Ok(Some((
+                inflater.total_in(),
+                inflater.total_out(),
+                hasher.finalize(),
+            )));
+        }
+        if consumed == 0 && produced == 0 && in_pos < in_len {
+            return Ok(None);
+        }
+    }
+}
+
+/// `expected` with its descriptor length set, if the descriptor at `at`
+/// (signature optional) states exactly its CRC and sizes.
+fn read_zip_data_descriptor(
+    input: &mut std::fs::File,
+    at: u64,
+    limit: u64,
+    expected: ZipSizes,
+) -> anyhow::Result<Option<ZipSizes>> {
+    let available = limit.saturating_sub(at).min(16) as usize;
+    if available < 12 {
+        return Ok(None);
+    }
+    let mut descriptor = [0u8; 16];
+    input.seek(SeekFrom::Start(at))?;
+    input.read_exact(&mut descriptor[..available])?;
+    let states_expected = |fields: &[u8]| {
+        le_u32(fields, 0) == expected.crc32
+            && le_u32(fields, 4) == expected.compressed_size
+            && le_u32(fields, 8) == expected.uncompressed_size
+    };
+    let descriptor_len = if available == 16
+        && le_u32(&descriptor, 0) == ZIP_DATA_DESCRIPTOR_MAGIC
+        && states_expected(&descriptor[4..])
+    {
+        16
+    } else if states_expected(&descriptor) {
+        12
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(ZipSizes {
+        descriptor_len,
+        ..expected
+    }))
+}
+
+/// The first signed data descriptor after `data_offset` that states the CRC
+/// and length of exactly the bytes before it.
+fn find_stored_zip_data_descriptor(
+    input: &mut std::fs::File,
+    data_offset: u64,
+    limit: u64,
+    budget: &RecoveryBudget,
+    control: Option<&TransferControl>,
+) -> anyhow::Result<Option<ZipSizes>> {
+    const DESCRIPTOR_LEN: usize = 16;
+    let magic = ZIP_DATA_DESCRIPTOR_MAGIC.to_le_bytes();
+    // CRC of `data_offset..base` at the top of each window.
+    let mut hasher = crc32fast::Hasher::new();
+    let mut base = data_offset;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        budget.check(control)?;
+        let available = (limit - base).min(buf.len() as u64) as usize;
+        if available < DESCRIPTOR_LEN {
+            return Ok(None);
+        }
+        input.seek(SeekFrom::Start(base))?;
+        input.read_exact(&mut buf[..available])?;
+        // Every offset whose whole descriptor is in `buf`; the rest are
+        // examined at the start of the next window.
+        let scanned = available - DESCRIPTOR_LEN + 1;
+        // `hasher` is advanced only up to each candidate, so a run of fake
+        // descriptors costs one pass over the window, not one per candidate.
+        let mut hashed = 0;
+        for i in 0..scanned {
+            if buf[i..i + 4] != magic {
+                continue;
+            }
+            let length = base + i as u64 - data_offset;
+            let compressed = le_u32(&buf, i + 8);
+            if compressed as u64 != length || le_u32(&buf, i + 12) != compressed {
+                continue;
+            }
+            let crc = le_u32(&buf, i + 4);
+            hasher.update(&buf[hashed..i]);
+            hashed = i;
+            if hasher.clone().finalize() == crc {
+                return Ok(Some(ZipSizes {
+                    crc32: crc,
+                    compressed_size: compressed,
+                    uncompressed_size: compressed,
+                    descriptor_len: DESCRIPTOR_LEN as u64,
+                    crc_checked: true,
+                }));
+            }
+        }
+        hasher.update(&buf[hashed..scanned]);
+        base += scanned as u64;
+        if base - data_offset > u32::MAX as u64 {
+            return Ok(None);
+        }
+    }
 }
 
 /// CRC-32 of exactly `expected_size` bytes drained from `reader`, or `None`
@@ -794,46 +1200,25 @@ fn recover_rar(
 ) -> anyhow::Result<usize> {
     let file_size = input.metadata()?.len();
 
-    // Detect RAR signature to determine old vs new format
-    let mut sig_buf = [0u8; 7];
-    let is_new_format = if filled.first().map(|r| r.0).unwrap_or(0) == 0 {
+    // Only the RAR 2.x/3.x block layout is scanned for below. RAR 5 headers are
+    // vint-encoded and RAR 1.x headers have a different fixed layout, so either
+    // would be misparsed; and when the signature was not downloaded the header
+    // CRC check is what keeps the scan from accepting their bytes.
+    if is_filled(0, RAR5_SIGNATURE.len() as u64, filled) {
+        let mut signature = [0u8; RAR5_SIGNATURE.len()];
         input.seek(SeekFrom::Start(0))?;
-        if input.read_exact(&mut sig_buf).is_ok() {
-            sig_buf == RAR_SIGNATURE_NEW
-        } else {
-            true
+        input.read_exact(&mut signature)?;
+        if signature == RAR5_SIGNATURE {
+            anyhow::bail!("RAR 5 archives cannot be recovered: only RAR 2.x/3.x is supported");
         }
-    } else {
-        true
-    };
-
-    // Write RAR signature + main archive header
-    if is_new_format {
-        budget.reserve_output(RAR_SIGNATURE_NEW.len() as u64)?;
-        output.write_all(RAR_SIGNATURE_NEW)?;
-    } else {
-        budget.reserve_output(RAR_SIGNATURE_OLD.len() as u64)?;
-        output.write_all(RAR_SIGNATURE_OLD)?;
+        if signature.starts_with(RAR_SIGNATURE_OLD) {
+            anyhow::bail!("RAR 1.x archives cannot be recovered: only RAR 2.x/3.x is supported");
+        }
     }
 
-    // Write minimal main archive header
-    let main_header: [u8; 13] = [
-        0x73,
-        0x00,          // HEAD_CRC (placeholder)
-        RAR_HEAD_MAIN, // HEAD_TYPE
-        0x00,
-        0x00, // HEAD_FLAGS
-        0x0D,
-        0x00, // HEAD_SIZE (13)
-        0x00,
-        0x00, // HighPosAv
-        0x00,
-        0x00,
-        0x00,
-        0x00, // PosAv
-    ];
-    budget.reserve_output(main_header.len() as u64)?;
-    output.write_all(&main_header)?;
+    budget.reserve_output((RAR_SIGNATURE_NEW.len() + RAR_MAIN_HEADER.len()) as u64)?;
+    output.write_all(RAR_SIGNATURE_NEW)?;
+    output.write_all(&RAR_MAIN_HEADER)?;
 
     // Scan for RAR file headers in filled ranges
     let mut recovered = 0usize;
@@ -899,13 +1284,24 @@ fn recover_rar(
                 continue;
             }
 
-            if name_size == 0 || name_size > 512 || 32 + name_size > header_data.len() {
+            // A real header carries its CRC, as unrar checks; bytes inside
+            // compressed data that merely look like one rarely do.
+            if !is_filled(pos, pos + head_size, filled)
+                || rar_head_crc(&header_data) != u16::from_le_bytes([header_data[0], header_data[1]])
+            {
+                pos += 1;
+                continue;
+            }
+
+            let large = (head_flags & RAR_LHD_LARGE) != 0;
+            let name_start = RAR_FILE_HEAD_FIXED + if large { 8 } else { 0 };
+            if name_size == 0 || name_size > 512 || name_start + name_size > header_data.len() {
                 pos += 1;
                 continue;
             }
 
             // High part of packed size for large files
-            let high_pack = if (head_flags & RAR_LONG_BLOCK) != 0 && header_data.len() >= 36 {
+            let high_pack = if large {
                 u32::from_le_bytes([
                     header_data[32],
                     header_data[33],
@@ -951,18 +1347,12 @@ fn recover_rar(
             // Directory check: eMule uses HEAD_FLAGS bits 5-7 (0xE0)
             let is_dir = (head_flags & 0xE0) == 0xE0;
 
-            // Sanitize the inner filename in place before writing the
-            // header. The filename sits at byte 32 in the file header
-            // with `name_size` bytes; we already validated the bounds
-            // above. Without this, a peer-supplied name like `..\..\x`
-            // would be carried verbatim into the recovered archive,
-            // leaving a zip-slip-class write for a downstream
-            // extractor (e.g. WinRAR, 7-Zip).
-            let name_start = 32usize;
-            let name_end = name_start + name_size;
-            if name_end <= header_data.len() {
-                sanitize_archive_name_in_place(&mut header_data[name_start..name_end]);
-            }
+            // Sanitize the inner filename before writing the header. Without
+            // this, a peer-supplied name like `..\..\x` would be carried
+            // verbatim into the recovered archive, leaving a zip-slip-class
+            // write for a downstream extractor (e.g. WinRAR, 7-Zip).
+            let header_data =
+                rar_file_header_with_safe_name(&header_data, head_flags, name_start, name_size);
 
             // Write header + data to output
             budget.add_entry()?;
@@ -995,6 +1385,59 @@ fn recover_rar(
 
     output.flush()?;
     Ok(recovered)
+}
+
+/// `header` rebuilt around a sanitized name, with a `HEAD_CRC` that matches.
+///
+/// A Unicode name keeps only its plain part: the encoded part after the NUL is
+/// what extractors prefer, it cannot be sanitized as bytes, and blanking the
+/// NUL in place left a name neither half of which decoded. Its flag goes with
+/// it, and `NAME_SIZE` and `HEAD_SIZE` follow the shorter name. A Unicode name
+/// with no NUL is all UTF-8 (as unrar reads it) and keeps the flag: replacing
+/// ASCII bytes leaves it valid UTF-8. Subfolder separators become `_` like any
+/// other, which changes the bytes the CRC covers: without recomputing it,
+/// every such entry read as a corrupt header.
+fn rar_file_header_with_safe_name(
+    header: &[u8],
+    head_flags: u16,
+    name_start: usize,
+    name_size: usize,
+) -> Vec<u8> {
+    let raw_name = &header[name_start..name_start + name_size];
+    let mut flags = head_flags;
+    let mut name = raw_name.to_vec();
+    if flags & RAR_LHD_UNICODE != 0 {
+        if let Some(nul) = raw_name.iter().position(|&b| b == 0) {
+            name.truncate(nul);
+            flags &= !RAR_LHD_UNICODE;
+        }
+    }
+    if name.is_empty() {
+        name.push(b'_');
+    }
+    sanitize_archive_name_in_place(&mut name);
+
+    let mut out = Vec::with_capacity(header.len());
+    out.extend_from_slice(&header[..name_start]);
+    out.extend_from_slice(&name);
+    out.extend_from_slice(&header[name_start + name_size..]);
+    out[3..5].copy_from_slice(&flags.to_le_bytes());
+    // Bounded by the caller's 4096-byte HEAD_SIZE and 512-byte name, and the
+    // name only ever gets shorter.
+    let head_size = out.len() as u16;
+    out[5..7].copy_from_slice(&head_size.to_le_bytes());
+    out[26..28].copy_from_slice(&(name.len() as u16).to_le_bytes());
+    let crc = rar_head_crc(&out);
+    out[0..2].copy_from_slice(&crc.to_le_bytes());
+    out
+}
+
+/// RAR 2.x/3.x `HEAD_CRC`: the low 16 bits of CRC-32 over the header from
+/// `HEAD_TYPE` on.
+fn rar_head_crc(header: &[u8]) -> u16 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&header[2..]);
+    (hasher.finalize() & 0xFFFF) as u16
 }
 
 // ==========================================================================
@@ -1055,7 +1498,7 @@ fn recover_ace(
                 break;
             }
 
-            let _head_crc = u16::from_le_bytes([header_start[0], header_start[1]]);
+            let head_crc = u16::from_le_bytes([header_start[0], header_start[1]]);
             let head_size = u16::from_le_bytes([header_start[2], header_start[3]]) as u64;
 
             if !(10..=4096).contains(&head_size) {
@@ -1082,6 +1525,15 @@ fn recover_ace(
             }
 
             if header_body.len() < 31 {
+                pos += 1;
+                continue;
+            }
+
+            // unace rejects a header whose CRC does not match, and checking it
+            // here keeps look-alike bytes inside packed data from being taken
+            // for headers.
+            if !is_filled(pos, pos + 4 + head_size, filled) || ace_head_crc(&header_body) != head_crc
+            {
                 pos += 1;
                 continue;
             }
@@ -1122,16 +1574,20 @@ fn recover_ace(
             // Sanitize the embedded filename before writing. ACE FILE32
             // headers carry `FNAME_SIZE` at bytes 29..31 of the body
             // (the 1-byte HEAD_TYPE prefix shifts the spec offsets by
-            // one) followed by the filename. As with RAR above, we
-            // mutate in place to keep all surrounding offsets valid.
-            if header_body.len() >= 31 {
-                let fname_size = u16::from_le_bytes([header_body[29], header_body[30]]) as usize;
-                let fname_start = 31usize;
-                let fname_end = fname_start.saturating_add(fname_size);
-                if fname_size > 0 && fname_end <= header_body.len() {
-                    sanitize_archive_name_in_place(&mut header_body[fname_start..fname_end]);
-                }
+            // one) followed by the filename. Mutated in place to keep all
+            // surrounding offsets valid; any change has to be followed by a
+            // new HEAD_CRC, or unace rejects the entry as a corrupt header.
+            let fname_size = u16::from_le_bytes([header_body[29], header_body[30]]) as usize;
+            let fname_start = 31usize;
+            let fname_end = fname_start.saturating_add(fname_size);
+            if fname_size > 0 && fname_end <= header_body.len() {
+                sanitize_archive_name_in_place(&mut header_body[fname_start..fname_end]);
             }
+            let header_start = {
+                let mut rebuilt = header_start;
+                rebuilt[0..2].copy_from_slice(&ace_head_crc(&header_body).to_le_bytes());
+                rebuilt
+            };
 
             // Write header + data
             budget.add_entry()?;
@@ -1165,6 +1621,14 @@ fn recover_ace(
     Ok(recovered)
 }
 
+/// ACE `HEAD_CRC`: the low 16 bits of unace's CRC-32 (initial value all ones,
+/// no final inversion) over the `HEAD_SIZE` bytes from `HEAD_TYPE` on.
+fn ace_head_crc(body: &[u8]) -> u16 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(body);
+    (!hasher.finalize() & 0xFFFF) as u16
+}
+
 /// Check if a file name has an archive extension we can recover.
 pub fn is_recoverable_archive(file_name: &str) -> bool {
     let ext = Path::new(file_name)
@@ -1177,6 +1641,487 @@ pub fn is_recoverable_archive(file_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stored RAR 3 file header as WinRAR writes it: `LONG_BLOCK` set,
+    /// `HEAD_CRC` valid.
+    fn rar_file_entry(name: &[u8], flags: u16, data: &[u8]) -> Vec<u8> {
+        let mut h = vec![0u8, 0, RAR_HEAD_FILE];
+        h.extend_from_slice(&(0x8000 | flags).to_le_bytes());
+        h.extend_from_slice(&((RAR_FILE_HEAD_FIXED + name.len()) as u16).to_le_bytes());
+        h.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        h.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        h.push(2); // HOST_OS: Win32
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(data);
+        h.extend_from_slice(&hasher.finalize().to_le_bytes());
+        h.extend_from_slice(&0u32.to_le_bytes()); // FTIME
+        h.push(29); // UNP_VER
+        h.push(0x30); // METHOD: store
+        h.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        h.extend_from_slice(&0x20u32.to_le_bytes()); // ATTR
+        h.extend_from_slice(name);
+        let crc = rar_head_crc(&h);
+        h[0..2].copy_from_slice(&crc.to_le_bytes());
+        h.extend_from_slice(data);
+        h
+    }
+
+    #[test]
+    fn rar_entries_are_recovered_with_valid_headers_and_safe_names() {
+        let base = std::env::temp_dir().join(format!(
+            "ember-rar-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut archive = RAR_SIGNATURE_NEW.to_vec();
+        archive.extend_from_slice(&RAR_MAIN_HEADER);
+        archive.extend_from_slice(&rar_file_entry(b"movie.avi", 0, b"frames"));
+        archive.extend_from_slice(&rar_file_entry(
+            b"dir\\..\\x.txt\0\x01\x02",
+            RAR_LHD_UNICODE,
+            b"text",
+        ));
+        let input_path = base.join("in.rar");
+        let output_path = base.join("out.rar");
+        std::fs::write(&input_path, &archive).unwrap();
+        let mut input = std::fs::File::open(&input_path).unwrap();
+        let mut output = std::fs::File::create(&output_path).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let mut budget = RecoveryBudget::new(&cancelled);
+
+        let recovered = recover_rar(
+            &mut input,
+            &mut output,
+            &[(0, archive.len() as u64)],
+            &mut budget,
+            None,
+        )
+        .unwrap();
+        drop(output);
+        assert_eq!(recovered, 2, "a name of four bytes or more is not a size");
+
+        let out = std::fs::read(&output_path).unwrap();
+        assert_eq!(&out[..7], RAR_SIGNATURE_NEW);
+        assert_eq!(&out[7..20], &RAR_MAIN_HEADER);
+        let mut at = 20;
+        let mut names = Vec::new();
+        while at < out.len() {
+            let head_size = u16::from_le_bytes([out[at + 5], out[at + 6]]) as usize;
+            let header = &out[at..at + head_size];
+            assert_eq!(
+                rar_head_crc(header),
+                u16::from_le_bytes([header[0], header[1]]),
+                "every header written carries a CRC that matches it"
+            );
+            let flags = u16::from_le_bytes([header[3], header[4]]);
+            assert_eq!(flags & RAR_LHD_UNICODE, 0);
+            let name_size = u16::from_le_bytes([header[26], header[27]]) as usize;
+            names.push(header[32..32 + name_size].to_vec());
+            let pack = u32::from_le_bytes([header[7], header[8], header[9], header[10]]) as usize;
+            at += head_size + pack;
+        }
+        assert_eq!(names, vec![b"movie.avi".to_vec(), b"dir_.._x.txt".to_vec()]);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    type RawRecovery = fn(
+        &mut std::fs::File,
+        &mut std::fs::File,
+        &[(u64, u64)],
+        &mut RecoveryBudget,
+        Option<&TransferControl>,
+    ) -> anyhow::Result<usize>;
+
+    /// Run one format's recovery over the whole of `archive`; the result and
+    /// the bytes it wrote.
+    fn recover_raw(
+        label: &str,
+        archive: &[u8],
+        recover: RawRecovery,
+    ) -> (anyhow::Result<usize>, Vec<u8>) {
+        let base = std::env::temp_dir().join(format!(
+            "ember-{label}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let input_path = base.join("in");
+        let output_path = base.join("out");
+        std::fs::write(&input_path, archive).unwrap();
+        let mut input = std::fs::File::open(&input_path).unwrap();
+        let mut output = std::fs::File::create(&output_path).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let mut budget = RecoveryBudget::new(&cancelled);
+        let result = recover(
+            &mut input,
+            &mut output,
+            &[(0, archive.len() as u64)],
+            &mut budget,
+            None,
+        );
+        drop((input, output));
+        let written = std::fs::read(&output_path).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+        (result, written)
+    }
+
+    /// RAR 5 headers are vint-encoded; read as RAR 3 blocks they are garbage,
+    /// so a recognisable RAR 5 archive is refused up front, even when it holds
+    /// bytes that would pass for a RAR 3 file header.
+    #[test]
+    fn rar5_and_rar1_archives_fail_closed() {
+        for (signature, version) in [
+            (RAR5_SIGNATURE, "RAR 5"),
+            (b"RE~^\0\0\0\0".as_slice(), "RAR 1.x"),
+        ] {
+            let mut archive = signature.to_vec();
+            archive.extend_from_slice(&rar_file_entry(b"movie.avi", 0, b"frames"));
+            let (result, _) = recover_raw("rar-version", &archive, recover_rar);
+            let error = result.expect_err("an unsupported RAR version must not be scanned");
+            assert!(error.to_string().contains(version), "{error}");
+        }
+    }
+
+    /// With `LHD_UNICODE` and no NUL the whole name is UTF-8, which survives
+    /// byte-level sanitizing, so the flag that says so has to stay.
+    #[test]
+    fn a_utf8_rar_name_keeps_its_unicode_flag() {
+        let name = "dossier/été.txt".as_bytes();
+        let entry = rar_file_entry(name, RAR_LHD_UNICODE, b"");
+        let header =
+            rar_file_header_with_safe_name(&entry, 0x8000 | RAR_LHD_UNICODE, 32, name.len());
+        let flags = u16::from_le_bytes([header[3], header[4]]);
+        assert_ne!(flags & RAR_LHD_UNICODE, 0);
+        assert_eq!(&header[32..], "dossier_été.txt".as_bytes());
+        assert_eq!(rar_head_crc(&header), u16::from_le_bytes([header[0], header[1]]));
+    }
+
+    /// A stored ACE FILE32 header and its data, `HEAD_CRC` valid.
+    fn ace_file_entry(name: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut body = vec![ACE_FILE_HEADER_TYPE];
+        body.extend_from_slice(&0x0001u16.to_le_bytes()); // HEAD_FLAGS: ADDSIZE
+        body.extend_from_slice(&(data.len() as u32).to_le_bytes()); // PACK_SIZE
+        body.extend_from_slice(&(data.len() as u32).to_le_bytes()); // ORIG_SIZE
+        body.extend_from_slice(&0u32.to_le_bytes()); // FTIME
+        body.extend_from_slice(&0x20u32.to_le_bytes()); // ATTR
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(data);
+        body.extend_from_slice(&(!hasher.finalize()).to_le_bytes()); // CRC32
+        body.extend_from_slice(&0u32.to_le_bytes()); // TECH_INFO: stored
+        body.extend_from_slice(&0u16.to_le_bytes()); // RESERVED
+        body.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        body.extend_from_slice(name);
+        let mut entry = ace_head_crc(&body).to_le_bytes().to_vec();
+        entry.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        entry.extend_from_slice(&body);
+        entry.extend_from_slice(data);
+        entry
+    }
+
+    /// Sanitizing an ACE name changes bytes `HEAD_CRC` covers, and it used to be
+    /// written back unchanged, so unace rejected every entry whose name had a
+    /// separator in it. Headers whose CRC does not match are not entries.
+    #[test]
+    fn ace_entries_are_recovered_with_valid_headers_and_safe_names() {
+        let mut archive = ace_file_entry(b"..\\evil.txt", b"payload");
+        let mut corrupt = ace_file_entry(b"other.txt", b"more");
+        corrupt[0] ^= 0xFF;
+        archive.extend_from_slice(&corrupt);
+
+        let (result, out) = recover_raw("ace", &archive, recover_ace);
+        assert_eq!(result.unwrap(), 1, "the header with a bad CRC is not an entry");
+        let head_size = u16::from_le_bytes([out[2], out[3]]) as usize;
+        let body = &out[4..4 + head_size];
+        assert_eq!(ace_head_crc(body), u16::from_le_bytes([out[0], out[1]]));
+        assert_eq!(&body[31..], b".._evil.txt");
+        assert_eq!(&out[4 + head_size..], b"payload");
+    }
+
+    fn crc32_of(data: &[u8]) -> u32 {
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(data);
+        hasher.finalize()
+    }
+
+    fn deflate(data: &[u8]) -> Vec<u8> {
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// A local header with bit 3 set and zero CRC and sizes, as streaming
+    /// writers produce, followed by `data` and the descriptor closing it.
+    fn zip_descriptor_entry(
+        name: &[u8],
+        method: u16,
+        data: &[u8],
+        plain: &[u8],
+        signed: bool,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes
+            .write_u32::<LittleEndian>(ZIP_LOCAL_HEADER_MAGIC)
+            .unwrap();
+        bytes.write_u16::<LittleEndian>(20).unwrap();
+        bytes
+            .write_u16::<LittleEndian>(ZIP_FLAG_DATA_DESCRIPTOR)
+            .unwrap();
+        bytes.write_u16::<LittleEndian>(method).unwrap();
+        bytes.extend_from_slice(&[0u8; 16]); // time, date, CRC, sizes
+        bytes.write_u16::<LittleEndian>(name.len() as u16).unwrap();
+        bytes.write_u16::<LittleEndian>(0).unwrap();
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(data);
+        if signed {
+            bytes
+                .write_u32::<LittleEndian>(ZIP_DATA_DESCRIPTOR_MAGIC)
+                .unwrap();
+        }
+        bytes.write_u32::<LittleEndian>(crc32_of(plain)).unwrap();
+        bytes.write_u32::<LittleEndian>(data.len() as u32).unwrap();
+        bytes.write_u32::<LittleEndian>(plain.len() as u32).unwrap();
+        bytes
+    }
+
+    struct CentralRecord<'a> {
+        local_offset: u32,
+        name: &'a [u8],
+        method: u16,
+        flags: u16,
+        crc32: u32,
+        compressed_size: u32,
+        uncompressed_size: u32,
+    }
+
+    /// A central directory plus end record, placed at `cd_offset` as the
+    /// archive records it.
+    fn zip_central_directory(records: &[CentralRecord], cd_offset: u32) -> Vec<u8> {
+        let mut cd = Vec::new();
+        for r in records {
+            cd.write_u32::<LittleEndian>(ZIP_CENTRAL_DIR_MAGIC).unwrap();
+            cd.write_u16::<LittleEndian>(20).unwrap();
+            cd.write_u16::<LittleEndian>(20).unwrap();
+            cd.write_u16::<LittleEndian>(r.flags).unwrap();
+            cd.write_u16::<LittleEndian>(r.method).unwrap();
+            cd.write_u32::<LittleEndian>(0).unwrap(); // time + date
+            cd.write_u32::<LittleEndian>(r.crc32).unwrap();
+            cd.write_u32::<LittleEndian>(r.compressed_size).unwrap();
+            cd.write_u32::<LittleEndian>(r.uncompressed_size).unwrap();
+            cd.write_u16::<LittleEndian>(r.name.len() as u16).unwrap();
+            cd.extend_from_slice(&[0u8; 12]); // extra, comment, disk, attributes
+            cd.write_u32::<LittleEndian>(r.local_offset).unwrap();
+            cd.extend_from_slice(r.name);
+        }
+        let mut bytes = cd.clone();
+        bytes
+            .write_u32::<LittleEndian>(ZIP_END_OF_CENTRAL_DIR_MAGIC)
+            .unwrap();
+        bytes.write_u32::<LittleEndian>(0).unwrap(); // disk numbers
+        bytes.write_u16::<LittleEndian>(records.len() as u16).unwrap();
+        bytes.write_u16::<LittleEndian>(records.len() as u16).unwrap();
+        bytes.write_u32::<LittleEndian>(cd.len() as u32).unwrap();
+        bytes.write_u32::<LittleEndian>(cd_offset).unwrap();
+        bytes.write_u16::<LittleEndian>(0).unwrap();
+        bytes
+    }
+
+    /// `recover_archive` over `bytes` with `filled` verified, then `inspect`
+    /// on the recovered archive.
+    fn recover_zip_and<T>(
+        label: &str,
+        bytes: &[u8],
+        filled: &[(u64, u64)],
+        inspect: impl FnOnce(&Path) -> T,
+    ) -> anyhow::Result<T> {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (root, allowed, base) = approved_recovery_dir(label);
+        let part = root.join("input.part");
+        std::fs::write(&part, bytes).unwrap();
+        let result = recover_archive(
+            &part,
+            "sample.zip",
+            filled,
+            &root,
+            &allowed,
+            None,
+            &AtomicBool::new(false),
+        )
+        .map(|path| inspect(&path));
+        let _ = std::fs::remove_dir_all(base);
+        result
+    }
+
+    /// Every entry's name and contents, read back through the `zip` crate,
+    /// which checks each one's CRC as it reads.
+    fn zip_contents(path: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+        (0..archive.len())
+            .map(|i| {
+                let mut file = archive.by_index(i).unwrap();
+                let name = file.name().to_string();
+                let mut data = Vec::new();
+                file.read_to_end(&mut data).unwrap();
+                (name, data)
+            })
+            .collect()
+    }
+
+    /// Bit 3 leaves CRC and sizes zero in the local header. Recovery used to
+    /// copy those zeros, skip the CRC check, and write every such entry as an
+    /// empty file it then counted as recovered.
+    #[test]
+    fn zip_data_descriptor_entries_keep_their_contents() {
+        let plain = b"compressible text ".repeat(64);
+        let deflated = deflate(&plain);
+        let mut bytes = zip_descriptor_entry(b"signed.txt", 8, &deflated, &plain, true);
+        bytes.extend_from_slice(&zip_descriptor_entry(
+            b"unsigned.txt",
+            8,
+            &deflated,
+            &plain,
+            false,
+        ));
+        bytes.extend_from_slice(&zip_descriptor_entry(
+            b"stored.bin",
+            0,
+            b"STORED",
+            b"STORED",
+            true,
+        ));
+
+        let filled = [(0, bytes.len() as u64)];
+        let entries = recover_zip_and("descriptor", &bytes, &filled, zip_contents)
+            .expect("descriptor entries are recoverable");
+        assert_eq!(
+            entries,
+            vec![
+                ("signed.txt".to_string(), plain.clone()),
+                ("unsigned.txt".to_string(), plain),
+                ("stored.bin".to_string(), b"STORED".to_vec()),
+            ]
+        );
+    }
+
+    /// Stored data may hold any number of signed descriptors whose sizes fit
+    /// but whose CRC does not; the real one after them is still found, across
+    /// read windows, with each candidate checked against the running CRC.
+    #[test]
+    fn a_stored_descriptor_is_found_past_a_run_of_fake_ones() {
+        let magic = ZIP_DATA_DESCRIPTOR_MAGIC.to_le_bytes();
+        let mut data = vec![0x5au8; 150_000];
+        for at in (1000..data.len() - 16).step_by(997) {
+            let len = (at as u32).to_le_bytes();
+            data[at..at + 4].copy_from_slice(&magic);
+            data[at + 4..at + 8].copy_from_slice(&0xdead_beef_u32.to_le_bytes());
+            data[at + 8..at + 12].copy_from_slice(&len);
+            data[at + 12..at + 16].copy_from_slice(&len);
+        }
+        let mut bytes = data.clone();
+        bytes.extend_from_slice(&magic);
+        bytes.extend_from_slice(&crc32_of(&data).to_le_bytes());
+        bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+
+        let path = std::env::temp_dir().join(format!(
+            "ember-fake-descriptors-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+        let mut input = std::fs::File::open(&path).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let budget = RecoveryBudget::new(&cancelled);
+        let found =
+            find_stored_zip_data_descriptor(&mut input, 0, bytes.len() as u64, &budget, None)
+                .unwrap()
+                .expect("the real descriptor is found");
+        drop(input);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(found.compressed_size, data.len() as u32);
+        assert_eq!(found.crc32, crc32_of(&data));
+    }
+
+    /// Stored data does not mark its own end and an unsigned descriptor can be
+    /// any twelve bytes, so only a downloaded central directory can size such
+    /// an entry; without one it is skipped rather than emptied. The directory's
+    /// offsets are relative to the archive, which here sits behind a stub.
+    #[test]
+    fn an_unsigned_stored_descriptor_entry_needs_the_central_directory() {
+        let data = b"STORED BYTES";
+        let local = zip_descriptor_entry(b"stored.bin", 0, data, data, false);
+        assert!(
+            recover_zip_and("nocd", &local, &[(0, local.len() as u64)], |_| ()).is_err(),
+            "an entry that cannot be sized must not be recovered"
+        );
+
+        let mut bytes = b"MZstub!".to_vec();
+        bytes.extend_from_slice(&local);
+        bytes.extend_from_slice(&zip_central_directory(
+            &[CentralRecord {
+                local_offset: 0,
+                name: b"stored.bin",
+                method: 0,
+                flags: ZIP_FLAG_DATA_DESCRIPTOR,
+                crc32: crc32_of(data),
+                compressed_size: data.len() as u32,
+                uncompressed_size: data.len() as u32,
+            }],
+            local.len() as u32,
+        ));
+        let entries = recover_zip_and("cd", &bytes, &[(0, bytes.len() as u64)], zip_contents)
+            .expect("the central directory sizes the entry");
+        assert_eq!(entries, vec![("stored.bin".to_string(), data.to_vec())]);
+    }
+
+    /// The name and extra field are copied into the output, so bytes that were
+    /// never downloaded must not supply them.
+    #[test]
+    fn zip_entry_name_must_be_downloaded() {
+        let bytes = stored_zip_entry();
+        let name_end = (ZIP_LOCAL_HEADER_SIZE + b"a.txt".len()) as u64;
+        assert!(recover_zip_and(
+            "name",
+            &bytes,
+            &[(0, ZIP_LOCAL_HEADER_SIZE as u64), (name_end, bytes.len() as u64)],
+            |_| (),
+        )
+        .is_err());
+    }
+
+    /// A method this code cannot decode has no CRC check, so it is only
+    /// trusted when the central directory describes the same entry.
+    #[test]
+    fn an_undecodable_zip_method_needs_central_directory_agreement() {
+        const BZIP2: u16 = 12;
+        let data = b"BZh9 not really";
+        let crc = crc32_of(b"the plain text");
+        let local = zip_local_entry(b"c.bin", data, BZIP2, 14, crc);
+        assert!(recover_zip_and("method", &local, &[(0, local.len() as u64)], |_| ()).is_err());
+
+        let mut bytes = local.clone();
+        bytes.extend_from_slice(&zip_central_directory(
+            &[CentralRecord {
+                local_offset: 0,
+                name: b"c.bin",
+                method: BZIP2,
+                flags: 0,
+                crc32: crc,
+                compressed_size: data.len() as u32,
+                uncompressed_size: 14,
+            }],
+            local.len() as u32,
+        ));
+        let count = recover_zip_and("method-cd", &bytes, &[(0, bytes.len() as u64)], |path| {
+            zip::ZipArchive::new(std::fs::File::open(path).unwrap())
+                .unwrap()
+                .len()
+        })
+        .expect("a corroborated entry is kept");
+        assert_eq!(count, 1);
+    }
 
     fn stored_zip_entry() -> Vec<u8> {
         let data = b"TEST";

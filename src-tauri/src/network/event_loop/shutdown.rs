@@ -305,9 +305,9 @@ pub(in crate::network) async fn save_on_shutdown(
         // the same file: whichever rename landed last would win, so the older
         // periodic snapshot could bury this newer one.
         //
-        // The write itself goes to the blocking pool under the same deadline:
-        // `save_nodes` fsyncs the file and its directory, and inline on the
-        // runtime nothing would bound that stall.
+        // The write itself goes to the blocking pool under a deadline of its
+        // own: `save_nodes` fsyncs the file and its directory, and inline on
+        // the runtime nothing would bound that stall.
         let phase_deadline =
             shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(2));
         match tokio::time::timeout_at(
@@ -326,7 +326,12 @@ pub(in crate::network) async fn save_on_shutdown(
                         nodes_file_state,
                     )
                 });
-                match tokio::time::timeout_at(phase_deadline, writer).await {
+                // Its own budget once the lock is held, as for nodes.dat: this
+                // is the only save that records which peers went silent, and
+                // waiting out a periodic writer must not leave it a sliver.
+                let write_deadline =
+                    shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(2));
+                match tokio::time::timeout_at(write_deadline, writer).await {
                     Ok(Ok(Ok(()))) => {}
                     Ok(Ok(Err(e))) => error!("Failed to save nodes_ember.dat on shutdown: {e}"),
                     Ok(Err(e)) => error!("nodes_ember.dat shutdown writer failed: {e}"),

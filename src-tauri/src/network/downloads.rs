@@ -6,6 +6,11 @@
 
 use super::*;
 
+/// How often the retry sweep revisits a download still waiting for its first
+/// source. What it sends has its own floor — each server's UDP ask, each LowID
+/// callback, each known source's reask, and the KAD search
+/// ([`kad_source_search_interval`]) — so this only bounds how soon a newly
+/// due one is noticed.
 pub(super) fn pending_download_retry_interval(search_count: u32) -> i64 {
     match search_count {
         0 => 0,
@@ -70,19 +75,57 @@ pub(super) fn shutdown_phase_deadline(
     std::cmp::min(global, tokio::time::Instant::now() + phase_max)
 }
 
-/// KAD re-search interval for active downloads that already have sources.
-/// More relaxed than `pending_download_retry_interval` since these downloads
-/// are already transferring — we're just looking for additional sources.
-/// eMule uses KADEMLIAREASKTIME (1 hour) * m_TotalSearchesKad (up to 7).
-pub(super) fn active_download_kad_interval(search_count: u32) -> i64 {
-    match search_count {
-        0 => 15,
-        1 => 30,
-        2 => 60,
-        3..=5 => 300,
-        6..=10 => 900,
-        _ => 3600,
-    }
+/// eMule `KADEMLIAREASKTIME` (`Opcodes.h`, `HR2MS(1)`).
+const KADEMLIAREASKTIME_SECS: u64 = 3600;
+/// eMule stops counting `m_TotalSearchesKad` at 7, which caps the wait.
+const KAD_SOURCE_SEARCH_MAX_COUNT: u32 = 7;
+
+/// Wait after a file's `search_count`th KAD source search before the next.
+///
+/// eMule's `CPartFile::Process` searches a file whose `m_LastSearchTimeKad`
+/// has passed — at once for a new file, whose stamp is zero — then sets it to
+/// `now + KADEMLIAREASKTIME * m_TotalSearchesKad`: one hour after the first
+/// search, two after the second, up to seven. It keeps that clock whether or
+/// not the file has sources yet, so a download that starts or stalls does not
+/// restart it.
+pub(super) fn kad_source_search_interval(search_count: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        KADEMLIAREASKTIME_SECS * u64::from(search_count.min(KAD_SOURCE_SEARCH_MAX_COUNT)),
+    )
+}
+
+/// Whether a file's KAD source search may start: none of its own is still
+/// running (eMule's `GetKadFileSearchID()` check) and its clock in
+/// `active_kad_search_state` has run out. Every path that starts one asks
+/// this, so a resume, a promotion or the Find Sources button cannot restart
+/// the backoff or follow a search a minute after the last.
+pub(super) fn kad_source_search_may_start(
+    state: &NetworkState,
+    tid: &str,
+    now: std::time::Instant,
+) -> bool {
+    // A tick of slack, so a check landing just short of the interval on the
+    // periodic sweep does not wait a whole extra sweep.
+    const SLACK: std::time::Duration = std::time::Duration::from_secs(1);
+    !state.download_source_searches.values().any(|(t, _)| t == tid)
+        && state.active_kad_search_state.get(tid).is_none_or(|&(at, count)| {
+            now.saturating_duration_since(at) + SLACK >= kad_source_search_interval(count)
+        })
+}
+
+/// Stamp the start of a KAD source search on the file's clock and return how
+/// many it has had.
+pub(super) fn note_kad_source_search(
+    state: &mut NetworkState,
+    tid: &str,
+    now: std::time::Instant,
+) -> u32 {
+    state
+        .active_kad_search_state
+        .entry(tid.to_string())
+        .and_modify(|e| *e = (now, e.1.saturating_add(1)))
+        .or_insert((now, 1))
+        .1
 }
 
 pub(super) fn expected_aich_bytes(value: Option<&str>) -> Option<[u8; 20]> {
@@ -846,7 +889,10 @@ async fn start_pending_download_worker(
         .collect();
 
     if live_sources.is_empty() && !callback_stream_in_hand {
-        if !pending_download_has_parked_ember_sources(state, transfer_id) {
+        // A mirror from the link is a source too, and needs no peer to start.
+        if !pending_download_has_parked_ember_sources(state, transfer_id)
+            && !ed2k::web_sources::has_ready(&hash_bytes)
+        {
             state
                 .pending_downloads
                 .insert(transfer_id.to_string(), pending);
@@ -1248,5 +1294,20 @@ mod disk_space_probe_tests {
         let cache = monitor.cache.lock();
         assert!(cache.refreshing.contains(&dir));
         assert!(cache.readings.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod kad_source_search_interval_tests {
+    use super::*;
+
+    #[test]
+    fn first_search_is_immediate_then_hours_apart_up_to_seven() {
+        let hours = |n: u64| std::time::Duration::from_secs(n * 3600);
+        assert_eq!(kad_source_search_interval(0), std::time::Duration::ZERO);
+        assert_eq!(kad_source_search_interval(1), hours(1));
+        assert_eq!(kad_source_search_interval(2), hours(2));
+        assert_eq!(kad_source_search_interval(7), hours(7));
+        assert_eq!(kad_source_search_interval(u32::MAX), hours(7));
     }
 }

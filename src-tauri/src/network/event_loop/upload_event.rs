@@ -130,6 +130,22 @@ fn note_no_known_record(index: &LocalIndex, hash_hex: &str, what: &str) {
     }
 }
 
+/// Free a friend's outbound-dial slot when the attempt that reserved it ends.
+/// An attempt that outlived its reservation (pruned at ten minutes, or
+/// replaced by a newer dial) finds a different instant there and leaves it.
+fn release_outbound_session_slot(
+    slots: &mut HashMap<[u8; 16], std::time::Instant>,
+    friend: [u8; 16],
+    reserved_at: Option<std::time::Instant>,
+) {
+    match reserved_at {
+        Some(at) if slots.get(&friend) != Some(&at) => {}
+        _ => {
+            slots.remove(&friend);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn on_upload_event(
     event: UploadEvent,
@@ -396,10 +412,9 @@ pub(in crate::network) async fn on_upload_event(
             let _ = reply_tx.try_send(framed);
         } else if friend_hashes.read().await.contains(&offer_eh) {
             let status = if !settings.files_allowed_from(&offer_eh) {
-                // Reuse the chat switch as the "no unsolicited
-                // contact from friends" control rather than adding
-                // a second one that could disagree with it; a
-                // friend's own files setting narrows it.
+                // Chat off refuses files too; with chat on, the
+                // global files switch decides unless the friend has
+                // a files setting of their own.
                 ed2k::messages::OFFER_STATUS_DECLINED
             } else {
                 ed2k::messages::OFFER_STATUS_ACCEPTED
@@ -574,8 +589,10 @@ pub(in crate::network) async fn on_upload_event(
     {
         let activity_eh = match &event.kind {
             UploadEventKind::EmberChatMessage { ember_hash, .. }
+            | UploadEventKind::EmberChatMailboxAware { ember_hash, .. }
             | UploadEventKind::EmberChatTyping { ember_hash, .. }
             | UploadEventKind::EmberChatRead { ember_hash, .. }
+            | UploadEventKind::EmberChatExpire { ember_hash, .. }
             | UploadEventKind::EmberBrowseRequest { ember_hash, .. }
             | UploadEventKind::EmberBrowseResponse { ember_hash, .. }
             // An unverified request is only a claimed hash. Counting it would
@@ -625,6 +642,11 @@ pub(in crate::network) async fn on_upload_event(
                     );
                 }
             }
+            // Ahead of the flush below, which can fill the session's
+            // queue and leave no room for it.
+            if still_friend {
+                on_friend_session_for_mailbox(state, settings, *ember_hash).await;
+            }
             // The session is live, so anything the user typed
             // while this friend was unreachable can go out now —
             // unless chat with them was turned off since, which
@@ -649,6 +671,13 @@ pub(in crate::network) async fn on_upload_event(
                 }
                 // Files queued while they were away, the same way.
                 chat_attach::send_queued(state, db, app_handle, settings, *ember_hash).await;
+            }
+            if still_friend {
+                // Their receipts for what was left them, and anything they
+                // left us, without waiting out the interval.
+                start_chat_mailbox_round(
+                    state, db, app_handle, settings, ed25519_secret_key, ed25519_pubkey, true,
+                );
             }
             if still_friend && !ip.is_unspecified() && *port > 0 {
                 let hash_hex = hex::encode(ember_hash);
@@ -733,49 +762,58 @@ pub(in crate::network) async fn on_upload_event(
                 // reconnect backoff so a later disconnect can re-dial
                 // promptly instead of waiting out the cooldown.
                 state.friend_reconnect_last.remove(ember_hash);
-                let ip_str = match ip {
-                    std::net::IpAddr::V4(v4) => v4.to_string(),
-                    std::net::IpAddr::V6(v6) => v6.to_string(),
-                };
-                let db2 = db.clone();
-                let h2 = hash_hex.clone();
-                let ip2 = ip_str.clone();
-                let port = *port;
-                tokio::task::spawn_blocking(move || {
-                    if let Err(e) = db2.update_friend_address(&h2, &ip2, port) {
-                        warn!("Failed to persist friend {h2} address {ip2}:{port}: {e}");
+                // A relayed session reports no address: it is online, but
+                // nothing about where to reach it is known.
+                if let Some(ip) = ip {
+                    let ip_str = ip.to_string();
+                    let db2 = db.clone();
+                    let h2 = hash_hex.clone();
+                    let ip2 = ip_str.clone();
+                    let port = *port;
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = db2.update_friend_address(&h2, &ip2, port) {
+                            warn!("Failed to persist friend {h2} address {ip2}:{port}: {e}");
+                        }
+                    });
+                    // `FriendSeen` now carries the peer's Hello listen
+                    // port (see the emission sites in upload.rs), so
+                    // it's safe to reseed download sources from it too.
+                    if let std::net::IpAddr::V4(v4) = ip {
+                        reseed_friend_endpoint(
+                            state,
+                            source_manager,
+                            credit_manager,
+                            transfer_manager,
+                            friend_hashes,
+                            *ember_hash,
+                            None,
+                            *v4,
+                            port,
+                        )
+                        .await;
                     }
-                });
-                // `FriendSeen` now carries the peer's Hello listen
-                // port (see the emission sites in upload.rs), so
-                // it's safe to reseed download sources from it too.
-                if let std::net::IpAddr::V4(v4) = ip {
-                    reseed_friend_endpoint(
-                        state,
-                        source_manager,
-                        credit_manager,
-                        transfer_manager,
-                        friend_hashes,
-                        *ember_hash,
-                        None,
-                        *v4,
-                        port,
-                    )
-                    .await;
+                    let _ = app_handle.emit(
+                        "ember:friend-online",
+                        serde_json::json!({
+                            "user_hash": hash_hex,
+                            "ip": ip_str,
+                            "port": port,
+                        }),
+                    );
+                } else {
+                    let _ = app_handle.emit(
+                        "ember:friend-online",
+                        serde_json::json!({ "user_hash": hash_hex }),
+                    );
                 }
-                let _ = app_handle.emit(
-                    "ember:friend-online",
-                    serde_json::json!({
-                        "user_hash": hash_hex,
-                        "ip": ip_str,
-                        "port": port,
-                    }),
-                );
                 // A friend who dials *us* never produces
                 // `EmberFriendConnected` (that is emitted only by
                 // the outbound dial path), so without flushing
                 // here queued chat would sit unsent while the UI
                 // showed the friend online and new sends worked.
+                // Whether we collect goes first, for the reason the
+                // outbound arm gives.
+                on_friend_session_for_mailbox(state, settings, *ember_hash).await;
                 if settings.chat_allowed_with(ember_hash) {
                     flush_pending_chat(
                         db,
@@ -796,7 +834,15 @@ pub(in crate::network) async fn on_upload_event(
                     )
                     .await;
                 }
+                start_chat_mailbox_round(
+                    state, db, app_handle, settings, ed25519_secret_key, ed25519_pubkey, true,
+                );
             }
+        UploadEventKind::EmberChatMailboxAware { ember_hash, collects }
+            if friend_hashes.read().await.contains(ember_hash) =>
+        {
+            on_friend_mailbox_aware(db, *ember_hash, *collects).await;
+        }
         _ => {}
     }
 
@@ -909,7 +955,7 @@ pub(in crate::network) async fn on_upload_event(
         }
     }
 
-    if let UploadEventKind::EmberChatMessage { ember_hash: chat_eh, ref message } = event.kind {
+    if let UploadEventKind::EmberChatMessage { ember_hash: chat_eh, ref message, msg_id } = event.kind {
         if !friend_hashes.read().await.contains(&chat_eh) {
             debug!("Dropping secure chat event after friend removal");
             return;
@@ -945,26 +991,63 @@ pub(in crate::network) async fn on_upload_event(
             // deliberately doesn't participate in that ownership
             // check, so this shared map is what catches it.
             let now = chrono::Utc::now().timestamp();
-            let is_dup = state
-                .recent_ember_chat
-                .get(&chat_eh)
-                .is_some_and(|(last_msg, last_at)| {
-                    *last_msg == cleaned
-                        && now.saturating_sub(*last_at) <= EMBER_CHAT_DEDUP_WINDOW_SECS
-                });
-            if !is_dup {
-                match persist_chat_history_message(
-                    db.clone(),
-                    hash_hex.clone(),
-                    "received",
-                    cleaned.clone(),
-                )
-                .await
-                {
+            // A message with a mailbox id is told apart by that id alone: two
+            // identical texts sent in a row are two messages, and dropping
+            // the second here would leave its mailbox copy to show later.
+            let is_dup = msg_id.is_none()
+                && state
+                    .recent_ember_chat
+                    .get(&chat_eh)
+                    .is_some_and(|(last_msg, last_at)| {
+                        *last_msg == cleaned
+                            && now.saturating_sub(*last_at) <= EMBER_CHAT_DEDUP_WINDOW_SECS
+                    });
+            // Our own timer for this chat, which the sender's — when it
+            // follows — can only shorten.
+            let own_ttl = settings.chat_disappear_secs_for(&chat_eh);
+            let stored = match msg_id {
+                _ if is_dup => None,
+                // The direct copy of a message the friend may also have left
+                // in the chat mailbox: shown once, whichever copy arrives
+                // first, with the id noted in the same transaction as the row.
+                Some(id) => {
+                    let db_once = db.clone();
+                    let hex_once = hash_hex.clone();
+                    let message = cleaned.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        db_once.insert_received_chat_once(&hex_once, &message, own_ttl, &id, now, None)
+                    })
+                    .await
+                    {
+                        Ok(Ok(Some((row, _)))) => Some(Ok(row)),
+                        Ok(Ok(None)) => None,
+                        Ok(Err(e)) => Some(Err(format!("Failed to persist chat history: {e}"))),
+                        Err(e) => Some(Err(format!("Chat history persistence task failed: {e}"))),
+                    }
+                }
+                None => Some(
+                    persist_chat_history_message(
+                        db.clone(),
+                        hash_hex.clone(),
+                        "received",
+                        cleaned.clone(),
+                        own_ttl,
+                    )
+                    .await,
+                ),
+            };
+            if let Some(stored) = stored {
+                match stored {
                     Ok(id) => {
                         state
                             .recent_ember_chat
                             .insert(chat_eh, (cleaned.clone(), now));
+                        let target = crate::network::ember::crypto::ChatExpireTarget::Message(
+                            crate::network::ember::crypto::chat_body_hash(&cleaned),
+                        );
+                        if let Some(ttl) = take_held_chat_expire(state, chat_eh, target) {
+                            apply_peer_chat_expire(state, db, app_handle, chat_eh, target, ttl).await;
+                        }
                         let _ = app_handle.emit("ember:chat-message", serde_json::json!({
                             "user_hash": hash_hex,
                             "id": id,
@@ -1029,6 +1112,17 @@ pub(in crate::network) async fn on_upload_event(
             Ok(Ok(None)) => {}
             Ok(Err(e)) => warn!("Failed to apply chat read receipt from {hash_hex}: {e}"),
             Err(e) => warn!("Chat read-receipt task failed for {hash_hex}: {e}"),
+        }
+    }
+
+    if let UploadEventKind::EmberChatExpire { ember_hash: expire_eh, target, ttl_secs } = event.kind {
+        // The same gates as the message it follows: a timer for a chat we
+        // refuse, or from someone who is no longer a friend, names nothing.
+        if settings.chat_allowed_with(&expire_eh)
+            && friend_hashes.read().await.contains(&expire_eh)
+            && !db.chat_locked()
+        {
+            apply_peer_chat_expire(state, db, app_handle, expire_eh, target, ttl_secs).await;
         }
     }
 
@@ -1646,7 +1740,7 @@ pub(in crate::network) async fn on_upload_event(
         .await;
     }
 
-    if let UploadEventKind::EmberFriendSearchFailed { ember_hash: failed_eh } = event.kind {
+    if let UploadEventKind::EmberFriendSearchFailed { ember_hash: failed_eh, reserved_at } = event.kind {
         // Pure cleanup signal from the rendezvous /
         // chat-auto-connect / browse-auto-connect spawns.
         // Distinct from `EmberFriendDisconnected` so we
@@ -1659,7 +1753,7 @@ pub(in crate::network) async fn on_upload_event(
         // `ember:friend-search-failed` event with a
         // structured reason is emitted from inside the
         // spawn itself; here we only mutate state.
-        state.outbound_session_tasks.remove(&failed_eh);
+        release_outbound_session_slot(&mut state.outbound_session_tasks, failed_eh, reserved_at);
     }
 
     // Reputation: record upload-side events
@@ -1876,5 +1970,33 @@ pub(in crate::network) async fn on_upload_event(
             upload_queue_handle,
             transfer_status_writes,
         ).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_finished_attempt_frees_only_its_own_reservation() {
+        let friend = [7u8; 16];
+        let old = std::time::Instant::now();
+        let newer = old + std::time::Duration::from_secs(1);
+        let mut slots = HashMap::from([(friend, newer)]);
+
+        // The older attempt ends after a newer one reserved the slot.
+        release_outbound_session_slot(&mut slots, friend, Some(old));
+        assert_eq!(slots.get(&friend), Some(&newer));
+
+        release_outbound_session_slot(&mut slots, friend, Some(newer));
+        assert!(!slots.contains_key(&friend));
+    }
+
+    #[test]
+    fn an_attempt_without_a_reservation_still_frees_the_slot() {
+        let friend = [9u8; 16];
+        let mut slots = HashMap::from([(friend, std::time::Instant::now())]);
+        release_outbound_session_slot(&mut slots, friend, None);
+        assert!(slots.is_empty());
     }
 }

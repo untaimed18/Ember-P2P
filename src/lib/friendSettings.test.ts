@@ -5,6 +5,7 @@ import {
   browseAllowedFor,
   chatAllowedWith,
   compactOverrides,
+  disappearSecsFor,
   filesAllowedFrom,
   friendNotifies,
   friendOverrides,
@@ -22,6 +23,7 @@ function settingsWith(
   return {
     friend_chat_disabled: false,
     friend_browse_disabled: false,
+    friend_files_disabled: false,
     friend_chat_read_receipts: true,
     chat_attachment_auto_accept_mb: 25,
     notify_friend_online: false,
@@ -30,6 +32,16 @@ function settingsWith(
     ...patch,
   } as AppSettings;
 }
+
+describe('disappearing messages', () => {
+  it('follows the default unless a friend has their own timer, off included', () => {
+    expect(disappearSecsFor(settingsWith(), ANA)).toBe(0);
+    const s = settingsWith({ chat_disappear_secs: 86_400 }, { [ANA]: { disappear_secs: 0 }, [BEN]: { disappear_secs: 3_600 } });
+    expect(disappearSecsFor(s, ANA)).toBe(0);
+    expect(disappearSecsFor(s, BEN)).toBe(3_600);
+    expect(disappearSecsFor(s, 'aa'.repeat(16))).toBe(86_400);
+  });
+});
 
 describe('friend settings', () => {
   it('follows the global settings for a friend with no overrides', () => {
@@ -68,6 +80,13 @@ describe('friend settings', () => {
     expect(chatAllowedWith(s, ANA)).toBe(true);
     expect(filesAllowedFrom(s, ANA)).toBe(false);
     expect(filesAllowedFrom(s, BEN)).toBe(true);
+  });
+
+  it('follows the global files switch unless a friend has their own', () => {
+    const s = settingsWith({ friend_files_disabled: true }, { [ANA]: { files: true } });
+    expect(chatAllowedWith(s, BEN)).toBe(true);
+    expect(filesAllowedFrom(s, BEN)).toBe(false);
+    expect(filesAllowedFrom(s, ANA)).toBe(true);
   });
 
   it('reads an auto-accept of 0 as always ask, and caps it like the global one', () => {

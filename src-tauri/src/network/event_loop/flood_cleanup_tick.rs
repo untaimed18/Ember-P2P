@@ -11,6 +11,21 @@ pub(in crate::network) async fn on_flood_cleanup_tick(
 ) {
     state.flood_protection.cleanup();
 
+    // Disappearing messages, on this tick's half-minute so the shortest timer
+    // is kept to within it. An open conversation hides each one at its exact
+    // time on its own; this is what deletes it.
+    let db_expire = db.clone();
+    let expire_now = chrono::Utc::now().timestamp();
+    match tokio::task::spawn_blocking(move || db_expire.expire_disappearing_chat(expire_now)).await {
+        Ok(Ok(gone)) => {
+            for (friend_hash, ids, xfer_ids) in gone {
+                emit_chat_removed(app_handle, &friend_hash, &ids, &xfer_ids);
+            }
+        }
+        Ok(Err(e)) => debug!("Disappearing-message sweep failed: {e}"),
+        Err(e) => debug!("Disappearing-message sweep panicked: {e}"),
+    }
+
     // Prevent unbounded growth of peer_nicknames
     const MAX_NICKNAME_ENTRIES: usize = 500;
     if state.peer_nicknames.len() > MAX_NICKNAME_ENTRIES {

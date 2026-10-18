@@ -2,6 +2,7 @@
   import { onDestroy, tick, untrack } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import {
+    deleteChatMessage,
     discardFailedChatMessage,
     getChatMessages,
     sendChatMessage,
@@ -13,8 +14,10 @@
     parseChatAttachment,
     pickAndSendChatAttachment,
     type ChatAttachment,
+    type ChatExpiry,
     type ChatMessage,
   } from '$lib/api/friends';
+  import { disappearLabel, disappearsIn } from '$lib/chatDisappear';
   import ChatAttachmentBubble from '$lib/components/ChatAttachmentBubble.svelte';
   import { placeAttachments } from '$lib/chatAttachmentPlacement';
   import {
@@ -87,7 +90,7 @@
   import { portal } from '$lib/actions/portal';
   import { rovingToolbar } from '$lib/actions/rovingToolbar';
   import { appSettings } from '$lib/stores/settings';
-  import { chatAllowedWith, readReceiptsWith } from '$lib/friendSettings';
+  import { chatAllowedWith, disappearSecsFor, readReceiptsWith } from '$lib/friendSettings';
   import { getDraft, setDraft, clearDraft, registerDraftFlusher } from '$lib/stores/chatTabs';
   import { firstRowBelow, recalledScroll, rememberScroll, type ScrollSpot } from '$lib/chatScrollMemory';
   import { insertAtSelection } from '$lib/emojiPicker';
@@ -238,6 +241,10 @@
   let showReadReceipts = $derived(
     !isChannel && !!friendHash && readReceiptsWith($appSettings, friendHash),
   );
+  /** The disappearing timer new messages in this chat get, 0 for none. */
+  let disappearSecs = $derived(
+    !isChannel && friendHash ? disappearSecsFor($appSettings, friendHash) : 0,
+  );
   let chatLocked = $state(false);
 
   $effect(() => {
@@ -375,7 +382,8 @@
   // Delivery events can beat the IPC response that appends an optimistic
   // queued bubble. Keep their durable row IDs briefly so that response can
   // reconcile the bubble instead of leaving it permanently queued.
-  const earlyDeliveredIds = new Set<number>();
+  /** By row id, with when it disappears if delivery started a timer. */
+  const earlyDeliveredIds = new Map<number, number | null>();
   /** The room equivalent, keeping the state itself: a room line can also be
    *  reported failed before the send's response appends it. */
   const earlyRoomDelivery = new Map<number, 'delivered' | 'queued' | 'failed'>();
@@ -1021,6 +1029,84 @@
     return () => clearInterval(timer);
   });
 
+  /** Attachment states the backend keeps a card for whatever happens: the
+   *  transfer is still running, so neither a timer nor "Delete chat" ends it. */
+  const LIVE_ATTACHMENT_STATUSES: ReadonlySet<string> = new Set([
+    'queued', 'offered', 'awaiting', 'accepted', 'active',
+  ]);
+
+  function applyExpiries(items: ChatExpiry[]) {
+    if (items.length === 0) return;
+    const at = new Map(items.map((item) => [item.id, item.expires_at]));
+    if (!messages.some((msg) => at.has(msg.id))) return;
+    messages = messages.map((msg) => (at.has(msg.id) ? { ...msg, expires_at: at.get(msg.id) } : msg));
+  }
+
+  function removeFromView(ids: number[], xferIds: string[]) {
+    if (ids.length > 0) {
+      const gone = new Set(ids);
+      messages = messages.filter((msg) => !gone.has(msg.id));
+    }
+    if (xferIds.length > 0) {
+      const gone = new Set(xferIds);
+      attachments = attachments.filter((a) => !gone.has(a.xfer_id));
+    }
+  }
+
+  // Disappearing messages and deletions in this friend's conversation. The
+  // backend's sweep deletes on its half-minute; the timer below hides each one
+  // at its own moment, so a message never outstays its time on screen.
+  $effect(() => {
+    if (isChannel || !friendHash) return;
+    const hash = friendHash.toLowerCase();
+    const mine = (other: string | undefined) => (other ?? '').toLowerCase() === hash;
+    let disposed = false;
+    const offs: UnlistenFn[] = [];
+    const keep = (off: UnlistenFn) => (disposed ? off() : offs.push(off));
+    (async () => {
+      try {
+        keep(await listen<{ user_hash: string; items: ChatExpiry[] }>('ember:chat-expiry', (event) => {
+          if (!disposed && mine(event.payload.user_hash)) applyExpiries(event.payload.items ?? []);
+        }));
+        keep(await listen<{ user_hash: string; ids: number[]; xfer_ids: string[] }>('ember:chat-removed', (event) => {
+          if (!disposed && mine(event.payload.user_hash)) {
+            removeFromView(event.payload.ids ?? [], event.payload.xfer_ids ?? []);
+          }
+        }));
+        keep(await listen<{ user_hash: string }>('ember:chat-cleared', (event) => {
+          if (disposed || !mine(event.payload.user_hash)) return;
+          messages = [];
+          hasMoreHistory = false;
+          oldestDbId = null;
+          unreadMarkerId = null;
+          attachments = attachments.filter((a) => LIVE_ATTACHMENT_STATUSES.has(a.status));
+        }));
+      } catch (e) {
+        console.warn('ChatConversation: failed to register disappearing-message listeners', e);
+      }
+    })();
+    return () => {
+      disposed = true;
+      for (const off of offs) off();
+    };
+  });
+
+  $effect(() => {
+    let next = Infinity;
+    for (const msg of messages) {
+      if (msg.expires_at && msg.expires_at < next) next = msg.expires_at;
+    }
+    if (!Number.isFinite(next)) return;
+    // Capped so a timer weeks out does not overflow setTimeout; it simply
+    // re-arms when it fires early.
+    const wait = Math.min(Math.max(0, next * 1000 - Date.now()) + 250, 2 ** 31 - 1);
+    const timer = setTimeout(() => {
+      const nowSecs = Date.now() / 1000;
+      messages = messages.filter((msg) => !(msg.expires_at && msg.expires_at <= nowSecs));
+    }, wait);
+    return () => clearTimeout(timer);
+  });
+
   // Edits and reactions from other members. Both arrive as a nudge rather than a
   // payload to patch in: the edit event carries the new text (it is one line), but
   // reactions are a tally the backend already counted, so re-reading is both
@@ -1435,7 +1521,7 @@
     }
     let fn: UnlistenFn;
     try {
-      fn = await listen<{ user_hash: string; id?: number; message: string; direction: string; timestamp: number }>('ember:chat-message', (event) => {
+      fn = await listen<{ user_hash: string; id?: number; message: string; direction: string; timestamp: number; expires_at?: number | null }>('ember:chat-message', (event) => {
         if (gen !== loadGen) return;
         if ((event.payload.user_hash || '').toLowerCase() !== (hash || '').toLowerCase()) return;
         // Narrow the direction rather than asserting it (as `stores/friends.ts`
@@ -1470,9 +1556,10 @@
           if (hasDurableId) {
             const at = messages.findIndex((mm) => mm.id === durableId);
             if (at !== -1) {
-              if (messages[at].delivery === 'queued') {
+              const expiresAt = event.payload.expires_at ?? messages[at].expires_at ?? null;
+              if (messages[at].delivery === 'queued' || expiresAt !== (messages[at].expires_at ?? null)) {
                 const next = [...messages];
-                next[at] = { ...next[at], delivery: 'delivered' };
+                next[at] = { ...next[at], delivery: 'delivered', expires_at: expiresAt };
                 messages = next;
               }
               return;
@@ -1497,6 +1584,7 @@
             read: true,
             delivery: 'delivered' as const,
             seen: false,
+            expires_at: event.payload.expires_at ?? null,
           }];
           commitLiveMessages(next, direction === 'sent' || wasPinned);
           noteMissedMessage(wasPinned, direction);
@@ -1518,7 +1606,7 @@
     // Delivery notices carry the durable outbox row ID. Buffer an early notice
     // until its optimistic queued bubble has been appended.
     try {
-      const deliveryFn = await listen<{ user_hash: string; id: number; delivery: string }>(
+      const deliveryFn = await listen<{ user_hash: string; id: number; delivery: string; expires_at?: number | null }>(
         'ember:chat-delivery',
         (event) => {
           if (gen !== loadGen) return;
@@ -1533,11 +1621,17 @@
             // The early-arrival buffer is a delivered-only reconciliation; an
             // abandoned row is already `failed` in the DB, so a later load
             // renders it correctly without help.
-            if (delivery === 'delivered') earlyDeliveredIds.add(event.payload.id);
+            if (delivery === 'delivered') {
+              earlyDeliveredIds.set(event.payload.id, event.payload.expires_at ?? null);
+            }
             return;
           }
           const next = [...messages];
-          next[at] = { ...next[at], delivery };
+          next[at] = {
+            ...next[at],
+            delivery,
+            expires_at: event.payload.expires_at ?? next[at].expires_at ?? null,
+          };
           messages = next;
         },
       );
@@ -1794,8 +1888,10 @@
     }
     if (!h) return;
     try {
-      await markMessagesRead(h);
+      const started = await markMessagesRead(h);
       clearUnread(h);
+      // Reading starts a received message's disappearing timer.
+      if (h === friendHash && Array.isArray(started)) applyExpiries(started);
     } catch (e) {
       console.warn('markMessagesRead failed:', e);
     }
@@ -2463,6 +2559,7 @@
     // typed, marked as waiting, instead of an apparently-vanished message.
     if (result.delivery === 'queued' && h === friendHash) {
       const durableId = result.id ?? --msgIdCounter;
+      const earlyExpiresAt = result.id !== null ? earlyDeliveredIds.get(result.id) ?? null : null;
       const alreadyDelivered = result.id !== null && earlyDeliveredIds.delete(result.id);
       const existing = messages.findIndex((message) => message.id === durableId);
       if (existing === -1) {
@@ -2475,10 +2572,11 @@
           read: true,
           delivery: alreadyDelivered ? 'delivered' as const : 'queued' as const,
           seen: false,
+          expires_at: earlyExpiresAt,
         }];
       } else if (alreadyDelivered && messages[existing].delivery === 'queued') {
         const next = [...messages];
-        next[existing] = { ...next[existing], delivery: 'delivered' };
+        next[existing] = { ...next[existing], delivery: 'delivered', expires_at: earlyExpiresAt };
         messages = next;
       }
       scrollToBottom();
@@ -2792,9 +2890,17 @@
    *  implying a delete that cannot happen. */
   async function handleRemoveMessage(id: number) {
     const channel = channelId;
-    if (!channel || id <= 0 || removingMessage !== null) return;
+    const friend = friendHash;
+    if ((!channel && !friend) || id <= 0 || removingMessage !== null) return;
     removingMessage = id;
     try {
+      if (!channel) {
+        // From this computer only; the friend's copy follows their own
+        // settings. A queued message goes with it and is never sent.
+        await deleteChatMessage(friend, id);
+        if (friend === friendHash) messages = messages.filter((msg) => msg.id !== id);
+        return;
+      }
       await deleteChannelMessage(channel, id);
       if (channel === channelId) {
         const removed = messages.find((msg) => msg.id === id)?.msg_id;
@@ -2805,7 +2911,7 @@
         }
       }
     } catch (e: unknown) {
-      if (channel === channelId) {
+      if (channel === channelId && friend === friendHash) {
         sendError = translateError(e, m.error_operation_failed());
       }
     } finally {
@@ -3342,6 +3448,15 @@
       datetime={msg.timestamp ? new Date(msg.timestamp * 1000).toISOString() : undefined}
       title={msg.timestamp ? formatDateTime(msg.timestamp, { dateStyle: 'full', timeStyle: 'medium' }) : undefined}
     >{formatClock(msg.timestamp)}</time>
+    {#if msg.expires_at}
+      {@const left = disappearsIn(msg.expires_at, editClockNow)}
+      <span class="bubble-disappear" role="img" title={left} aria-label={left}>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="10" height="10" aria-hidden="true">
+          <circle cx="8" cy="9" r="5.5"/>
+          <path d="M8 6.2V9l1.8 1.2M6.5 1.8h3"/>
+        </svg>
+      </span>
+    {/if}
     {#if (msg.edited_at ?? 0) > 0}
       <span class="bubble-edited" title={m.channels_edited_at({ time: formatTime(msg.edited_at ?? 0) })}>
         {m.channels_edited()}
@@ -3453,6 +3568,10 @@
           aria-label={m.channels_pinned_next_count({ index: shownPinIndex + 1, total: pinEntries.length })}
         >
           {m.channels_pinned_count({ index: shownPinIndex + 1, total: pinEntries.length })}
+          <!-- Says it moves on; the count alone read as a label. -->
+          <svg class="conv-pin-next" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M6 3.5L10.5 8 6 12.5"/>
+          </svg>
         </button>
       {/if}
       {#if canPin}
@@ -3464,7 +3583,12 @@
           title={m.channels_unpin_message()}
           aria-label={m.channels_unpin_message()}
         >
-          <IconX size={11} />
+          <!-- The pin struck through, not the ✕ that cancels a reply: this one
+               takes the pin down for everyone in the room. -->
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="11" height="11" aria-hidden="true">
+            <path d="M6 2.5h4M7 2.5v4L4.5 9h7L9 6.5v-4M8 9v4.5"/>
+            <path d="M2.5 2.5l11 11"/>
+          </svg>
         </button>
       {/if}
     </div>
@@ -3674,7 +3798,7 @@
             >{folded ? m.chat_show_more() : m.chat_show_less()}</button>
           {/if}
           {/if}
-          {#if !isChannel && (endsRun || pending || failed || (row.msg.edited_at ?? 0) > 0)}
+          {#if !isChannel && (endsRun || pending || failed || (row.msg.edited_at ?? 0) > 0 || row.msg.expires_at)}
             {@render messageTimestamp(row.msg)}
           {/if}
           <!-- Copy is offered on every line. Edit and remove are channels
@@ -3744,6 +3868,7 @@
               {/if}
               {#if isChannel && row.msg.id > 0 && canEdit(row.msg) && editingId !== row.msg.id}
                 <button
+                  type="button"
                   class="bubble-edit-btn"
                   onclick={() => startEdit(row.msg)}
                   title={m.channels_edit_message()}
@@ -3754,15 +3879,22 @@
                   </svg>
                 </button>
               {/if}
-              {#if isChannel && row.msg.id > 0}
+              {#if row.msg.id > 0}
+                {@const removeLabel = isChannel ? m.channels_remove_local() : m.chat_delete_message()}
                 <button
+                  type="button"
                   class="bubble-remove"
                   disabled={removingMessage === row.msg.id}
                   onclick={() => handleRemoveMessage(row.msg.id)}
-                  title={m.channels_remove_local()}
-                  aria-label={m.channels_remove_local()}
+                  title={removeLabel}
+                  aria-label={removeLabel}
                 >
-                  <IconX size={11} />
+                  <!-- A bin, not the ✕ that cancels a reply or closes a bar. -->
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="11" height="11" aria-hidden="true">
+                    <path d="M2.5 4.5h11"/>
+                    <path d="M6.5 4.5V3a1 1 0 011-1h1a1 1 0 011 1v1.5"/>
+                    <path d="M4 4.5l.7 8.1a1 1 0 001 .9h4.6a1 1 0 001-.9l.7-8.1"/>
+                  </svg>
                 </button>
               {/if}
             </div>
@@ -3850,7 +3982,9 @@
         {#if isChannel && (slowSend || failed)}
           <div class="bubble-status">
             {#if slowSend}
-              <span title={m.channels_delivery_sending_title()}>{m.chat_delivery_queued()}</span>
+              <!-- Not "Queued": in a friend chat that means held for later,
+                   while here the line is still on its way into the room. -->
+              <span title={m.channels_delivery_sending_title()}>{m.channels_delivery_sending()}</span>
             {:else}
               <span class="failed" title={m.channels_delivery_failed_title()}>{m.chat_delivery_failed()}</span>
               <button
@@ -4020,6 +4154,18 @@
         </button>
       </div>
     {/if}
+    {#if disappearSecs > 0}
+      <!-- Said where the message is written, so nobody sends one without
+           knowing it will go. Phrased for what this side controls: our own
+           messages, on both computers. -->
+      <div class="conv-disappear-note">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true">
+          <circle cx="8" cy="9" r="5.5"/>
+          <path d="M8 6.2V9l1.8 1.2M6.5 1.8h3"/>
+        </svg>
+        <span>{m.chat_disappear_note({ time: disappearLabel(disappearSecs) })}</span>
+      </div>
+    {/if}
     <div class="conv-input-area">
       <!-- Focus never leaves the textarea, so the highlighted suggestion is
            spoken from here rather than by moving focus onto it. Always in the
@@ -4049,148 +4195,166 @@
           {/each}
         </ul>
       {/if}
-      {#if !isChannel}
-        <!-- Usable while the friend is offline too: the file waits and is
-             offered when they are back, which the title says. -->
-        <button
-          type="button"
-          class="conv-attach"
-          class:busy={attaching}
-          onclick={sendAttachment}
-          disabled={attaching}
-          title={attaching
-            ? m.chat_attach_preparing()
-            : isOnline
-              ? m.chat_attach_button()
-              : m.chat_attach_button_offline({ name: friendName || friendHash.slice(0, 8) })}
-          aria-label={m.chat_attach_button()}
-          aria-busy={attaching}
-        >
-          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M15.5 9.5 10 15a3.5 3.5 0 0 1-5-5l6-6a2.3 2.3 0 0 1 3.3 3.3l-6 6a1.2 1.2 0 0 1-1.7-1.7L12 6"/>
-          </svg>
-        </button>
-      {/if}
-      <textarea
-        class="conv-input"
-        bind:value={inputText}
-        bind:this={chatInputEl}
-        onkeydown={handleKeydown}
-        oninput={(e) => {
-          refreshMentionToken();
-          notifyOutgoingTyping(e.currentTarget.value);
-        }}
-        onclick={refreshMentionToken}
-        onkeyup={refreshMentionToken}
-        onblur={() => (mentionStart = -1)}
-        placeholder={isChannel
-          ? friendName.trim()
-            ? m.channels_send_placeholder_named({ room: friendName.trim() })
-            : m.channels_send_placeholder()
-          : m.chat_input_placeholder()}
-        aria-label={m.chat_input_label()}
-        aria-describedby={isChannel && replyTarget ? replyBarId : undefined}
-        maxlength={COMPOSER_MAX_CHARS}
-        rows="2"
-        readonly={sending}
-      ></textarea>
-      <!-- The count changes every second, and even a polite region reads out
-           each change, so only the start and end of the wait are spoken. -->
-      <span class="sr-only" role="status" aria-live="polite">{slowModeAnnouncement}</span>
-      {#if slowModeLeft > 0}
-        <span class="conv-slow-mode" aria-hidden="true">
-          {m.chat_slow_mode_wait({ seconds: slowModeLeft })}
-        </span>
-      {/if}
-      <div
-        class="conv-emoji"
-        onfocusout={(e) => {
-          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) emojiOpen = false;
-        }}
-      >
-        <button
-          type="button"
-          class="conv-format-toggle conv-emoji-toggle"
-          class:open={emojiOpen}
-          onclick={() => (emojiOpen = !emojiOpen)}
-          disabled={sending}
-          title={m.chat_emoji_button()}
-          aria-label={m.chat_emoji_button()}
-          aria-expanded={emojiOpen}
-          aria-controls={emojiPickerId}
-        >
-          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="10" cy="10" r="7"/>
-            <path d="M7 11.8a3.6 3.6 0 0 0 6 0"/>
-            <line x1="7.6" y1="8" x2="7.6" y2="8.1"/>
-            <line x1="12.4" y1="8" x2="12.4" y2="8.1"/>
-          </svg>
-        </button>
-        {#if emojiOpen}
-          <EmojiPicker
-            id={emojiPickerId}
-            onpick={insertEmoji}
-            onclose={() => {
-              emojiOpen = false;
-              chatInputEl?.focus();
-            }}
-          />
+      <!-- One box for the message and everything that acts on it, so the
+           tools read as part of the composer rather than loose icons beside
+           it. Unpositioned: the mention list and the sheets still anchor to
+           the row. -->
+      <div class="conv-composer" class:is-sending={sending}>
+        {#if !isChannel}
+          <!-- Usable while the friend is offline too: the file waits and is
+               offered when they are back, which the title says. -->
+          <button
+            type="button"
+            class="conv-attach"
+            class:busy={attaching}
+            onclick={sendAttachment}
+            disabled={attaching}
+            title={attaching
+              ? m.chat_attach_preparing()
+              : isOnline
+                ? m.chat_attach_button()
+                : m.chat_attach_button_offline({ name: friendName || friendHash.slice(0, 8) })}
+            aria-label={m.chat_attach_button()}
+            aria-busy={attaching}
+          >
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M15.5 9.5 10 15a3.5 3.5 0 0 1-5-5l6-6a2.3 2.3 0 0 1 3.3 3.3l-6 6a1.2 1.2 0 0 1-1.7-1.7L12 6"/>
+            </svg>
+          </button>
         {/if}
-      </div>
-      <!-- A cheat-sheet rather than toolbar buttons: the markers are typed, and
-           a row of B/I/S controls would crowd a composer the dock already
-           keeps narrow. Closes on focus leaving it, so it never lingers. -->
-      <div
-        class="conv-format-help"
-        onfocusout={(e) => {
-          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) formatHelpOpen = false;
-        }}
-      >
-        <button
-          type="button"
-          class="conv-format-toggle"
-          class:open={formatHelpOpen}
-          onclick={() => (formatHelpOpen = !formatHelpOpen)}
-          onkeydown={(e) => {
-            if (e.key === 'Escape' && formatHelpOpen) {
-              // Only the sheet, not the room's own Escape handling.
-              e.preventDefault();
-              e.stopPropagation();
-              formatHelpOpen = false;
-            }
+        <textarea
+          class="conv-input"
+          bind:value={inputText}
+          bind:this={chatInputEl}
+          onkeydown={handleKeydown}
+          oninput={(e) => {
+            refreshMentionToken();
+            notifyOutgoingTyping(e.currentTarget.value);
           }}
-          title={m.chat_format_help()}
-          aria-label={m.chat_format_help()}
-          aria-expanded={formatHelpOpen}
-          aria-controls={formatSheetId}
-        >Aa</button>
-        {#if formatHelpOpen}
-          <div class="conv-format-sheet" id={formatSheetId} role="note" aria-label={m.chat_format_help()}>
-            <div class="conv-format-row"><code>**{m.chat_format_bold()}**</code><strong>{m.chat_format_bold()}</strong></div>
-            <div class="conv-format-row"><code>*{m.chat_format_italic()}*</code><em>{m.chat_format_italic()}</em></div>
-            <div class="conv-format-row"><code>~~{m.chat_format_strike()}~~</code><s>{m.chat_format_strike()}</s></div>
-            <div class="conv-format-row"><code>`{m.chat_format_code()}`</code><code class="fmt-code">{m.chat_format_code()}</code></div>
-            <p class="conv-format-note">{m.chat_format_code_block()}</p>
-          </div>
+          onclick={refreshMentionToken}
+          onkeyup={refreshMentionToken}
+          onblur={() => (mentionStart = -1)}
+          placeholder={isChannel
+            ? friendName.trim()
+              ? m.channels_send_placeholder_named({ room: friendName.trim() })
+              : m.channels_send_placeholder()
+            : m.chat_input_placeholder_named({ name: friendName || friendHash.slice(0, 8) })}
+          aria-label={m.chat_input_label()}
+          aria-describedby={isChannel && replyTarget ? replyBarId : undefined}
+          maxlength={COMPOSER_MAX_CHARS}
+          rows="1"
+          readonly={sending}
+        ></textarea>
+        <!-- The count changes every second, and even a polite region reads out
+             each change, so only the start and end of the wait are spoken. -->
+        <span class="sr-only" role="status" aria-live="polite">{slowModeAnnouncement}</span>
+        {#if slowModeLeft > 0}
+          <span class="conv-slow-mode" aria-hidden="true">
+            {m.chat_slow_mode_wait({ seconds: slowModeLeft })}
+          </span>
         {/if}
+        <div
+          class="conv-emoji"
+          onfocusout={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) emojiOpen = false;
+          }}
+        >
+          <button
+            type="button"
+            class="conv-format-toggle conv-emoji-toggle"
+            class:open={emojiOpen}
+            onclick={() => (emojiOpen = !emojiOpen)}
+            disabled={sending}
+            title={m.chat_emoji_button()}
+            aria-label={m.chat_emoji_button()}
+            aria-expanded={emojiOpen}
+            aria-controls={emojiPickerId}
+          >
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="10" cy="10" r="7"/>
+              <path d="M7 11.8a3.6 3.6 0 0 0 6 0"/>
+              <line x1="7.6" y1="8" x2="7.6" y2="8.1"/>
+              <line x1="12.4" y1="8" x2="12.4" y2="8.1"/>
+            </svg>
+          </button>
+          {#if emojiOpen}
+            <EmojiPicker
+              id={emojiPickerId}
+              onpick={insertEmoji}
+              onclose={() => {
+                emojiOpen = false;
+                chatInputEl?.focus();
+              }}
+            />
+          {/if}
+        </div>
+        <!-- A cheat-sheet rather than toolbar buttons: the markers are typed, and
+             a row of B/I/S controls would crowd a composer the dock already
+             keeps narrow. Closes on focus leaving it, so it never lingers. -->
+        <div
+          class="conv-format-help"
+          onfocusout={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) formatHelpOpen = false;
+          }}
+        >
+          <button
+            type="button"
+            class="conv-format-toggle"
+            class:open={formatHelpOpen}
+            onclick={() => (formatHelpOpen = !formatHelpOpen)}
+            onkeydown={(e) => {
+              if (e.key === 'Escape' && formatHelpOpen) {
+                // Only the sheet, not the room's own Escape handling.
+                e.preventDefault();
+                e.stopPropagation();
+                formatHelpOpen = false;
+              }
+            }}
+            title={m.chat_format_help()}
+            aria-label={m.chat_format_help()}
+            aria-expanded={formatHelpOpen}
+            aria-controls={formatSheetId}
+          >Aa</button>
+          {#if formatHelpOpen}
+            <div class="conv-format-sheet" id={formatSheetId} role="note" aria-label={m.chat_format_help()}>
+              <div class="conv-format-row"><code>**{m.chat_format_bold()}**</code><strong>{m.chat_format_bold()}</strong></div>
+              <div class="conv-format-row"><code>*{m.chat_format_italic()}*</code><em>{m.chat_format_italic()}</em></div>
+              <div class="conv-format-row"><code>~~{m.chat_format_strike()}~~</code><s>{m.chat_format_strike()}</s></div>
+              <div class="conv-format-row"><code>`{m.chat_format_code()}`</code><code class="fmt-code">{m.chat_format_code()}</code></div>
+              <p class="conv-format-note">{m.chat_format_code_block()}</p>
+              <!-- The keys used to fill the placeholder, which left no room for
+                   whose conversation it is. -->
+              <div class="conv-format-keys">
+                <div class="conv-format-row">
+                  <span><kbd>{m.chat_key_enter()}</kbd></span>
+                  <span>{m.chat_shortcut_send()}</span>
+                </div>
+                <div class="conv-format-row">
+                  <span><kbd>{m.chat_key_shift()}</kbd>+<kbd>{m.chat_key_enter()}</kbd></span>
+                  <span>{m.chat_shortcut_newline()}</span>
+                </div>
+              </div>
+            </div>
+          {/if}
+        </div>
+        <button
+          type="button"
+          class="conv-send"
+          onclick={handleSend}
+          onmousedown={(e) => {
+            // Keep the caret in the composer; a click would otherwise move
+            // focus to this button (and then lose it when the button disables).
+            e.preventDefault();
+          }}
+          disabled={!inputText.trim() || sending || slowModeLeft > 0}
+          title={slowModeLeft > 0 ? m.chat_slow_mode_wait({ seconds: slowModeLeft }) : m.chat_send_title_short()}
+          aria-label={m.chat_send_aria()}
+        >
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3 10l14-7-7 14-2-5z"/><line x1="10" y1="17" x2="17" y2="3"/>
+          </svg>
+        </button>
       </div>
-      <button
-        type="button"
-        class="conv-send"
-        onclick={handleSend}
-        onmousedown={(e) => {
-          // Keep the caret in the composer; a click would otherwise move
-          // focus to this button (and then lose it when the button disables).
-          e.preventDefault();
-        }}
-        disabled={!inputText.trim() || sending || slowModeLeft > 0}
-        title={slowModeLeft > 0 ? m.chat_slow_mode_wait({ seconds: slowModeLeft }) : m.chat_send_title_short()}
-        aria-label={m.chat_send_aria()}
-      >
-        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M3 10l14-7-7 14-2-5z"/><line x1="10" y1="17" x2="17" y2="3"/>
-        </svg>
-      </button>
     </div>
   {/if}
 </div>
@@ -4852,8 +5016,12 @@
     gap: 3px;
   }
 
+  /* In the cluster rather than floating; relative, not static, so its
+     enlarged hit area (below) has something to hang from. */
   .conversation.channel .bubble-remove {
-    position: static;
+    position: relative;
+    top: auto;
+    inset-inline-end: auto;
   }
 
   .conversation.channel .bubble-edit-btn,
@@ -4937,6 +5105,27 @@
   .bubble-reply-btn:hover {
     background: var(--bg-hover);
     color: var(--text-primary);
+  }
+
+  /* Drawn at 18 px so the cluster stays small on the bubble's edge, but hit
+     at 24, the smallest target that is comfortable to press: an invisible
+     margin around each. Neighbours' margins overlap in the gap between them,
+     where either is a fair reading of the click. */
+  .bubble-copy-btn,
+  .bubble-reply-btn,
+  .bubble-pin-btn,
+  .bubble-edit-btn {
+    position: relative;
+  }
+
+  .bubble-copy-btn::after,
+  .bubble-reply-btn::after,
+  .bubble-pin-btn::after,
+  .bubble-edit-btn::after,
+  .bubble-remove::after {
+    content: '';
+    position: absolute;
+    inset: -3px;
   }
 
   /* The line a reply answers, above its text. Tinted from `currentColor` like
@@ -5171,7 +5360,10 @@
 
   .conv-pin-cycle {
     flex-shrink: 0;
-    padding: 1px 6px;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 1px 4px 1px 6px;
     border: 1px solid var(--border);
     border-radius: var(--radius-pill);
     background: transparent;
@@ -5185,6 +5377,12 @@
   .conv-pin-cycle:hover {
     background: var(--bg-hover);
     color: var(--text-primary);
+  }
+
+  .conv-pin-next {
+    width: 10px;
+    height: 10px;
+    flex-shrink: 0;
   }
 
   .bubble-pin-btn {
@@ -5235,7 +5433,7 @@
   .bubble-edit-input {
     width: 100%;
     padding: 5px 7px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-sm);
     background: var(--bg-primary);
     color: var(--text-primary);
@@ -5808,6 +6006,36 @@
     text-overflow: ellipsis;
   }
 
+  .conv-disappear-note {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 16px 0;
+    border-top: 1px solid var(--border);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    flex-shrink: 0;
+  }
+
+  .conv-disappear-note svg {
+    flex-shrink: 0;
+    color: var(--accent);
+  }
+
+  /* The note and the composer read as one strip. */
+  .conv-disappear-note + .conv-input-area {
+    border-top: none;
+    padding-top: 6px;
+  }
+
+  .bubble-disappear {
+    display: inline-flex;
+    align-items: center;
+    margin-inline-start: 4px;
+    opacity: 0.85;
+  }
+
   .conv-input-area {
     display: flex;
     gap: 8px;
@@ -5879,7 +6107,6 @@
   .conv-format-help,
   .conv-emoji {
     display: flex;
-    align-self: center;
   }
 
   .conv-emoji-toggle {
@@ -5967,41 +6194,100 @@
     font-size: var(--font-size-xs);
   }
 
+  .conv-format-keys {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 6px;
+    padding-top: 7px;
+    border-top: 1px solid var(--border);
+  }
+
+  .conv-format-keys > .conv-format-row > span:last-child {
+    color: var(--text-secondary);
+  }
+
+  .conv-format-keys kbd {
+    display: inline-block;
+    padding: 0 5px;
+    border: 1px solid var(--border);
+    border-bottom-width: 2px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
+    line-height: 1.5;
+  }
+
   /* Aligned to the bottom of the row so it sits level with the send button
      rather than floating against the top of a two-row textarea. */
   .conv-slow-mode {
     align-self: flex-end;
-    padding-bottom: 10px;
+    padding: 0 4px 8px;
     font-size: var(--font-size-xs);
     font-variant-numeric: tabular-nums;
     color: var(--text-secondary);
     white-space: nowrap;
   }
 
+  /* The field and its tools in one rounded box. Controls sit on the bottom
+     edge, so they stay level with the last line as the message grows. */
+  .conv-composer {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+    padding: 4px;
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    background: var(--bg-input);
+    box-shadow: var(--shadow-sm);
+    transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+  }
+
+  .conv-composer:focus-within {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-halo);
+  }
+
   .conv-input {
     flex: 1;
-    padding: 8px 12px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    background: var(--bg-primary);
+    min-width: 0;
+    box-sizing: border-box;
+    align-self: center;
+    padding: 6px 6px;
+    border: none;
+    background: transparent;
     color: var(--text-primary);
     font-size: var(--font-size-md);
     font-family: inherit;
     resize: none;
     outline: none;
     line-height: 1.4;
-    min-height: 40px;
-    max-height: 120px;
+    min-height: 32px;
+    max-height: 140px;
+    overflow-y: auto;
   }
 
-  .conversation.channel .conv-input {
-    background: var(--bg-input);
-    box-shadow: var(--shadow-sm);
-  }
-
+  /* The shared `textarea:focus` rule draws a ring around the field, which
+     inside the pill reads as a square box. The composer shows focus. */
   .conv-input:focus {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 2px var(--accent-halo);
+    box-shadow: none;
+  }
+
+  /* Rooms have no attach button, so the text needs its own inset. */
+  .conv-composer > .conv-input:first-child {
+    padding-inline-start: 12px;
+  }
+
+  .conv-input::placeholder {
+    color: var(--text-muted);
+  }
+
+  .conv-composer.is-sending .conv-input {
+    color: var(--text-secondary);
   }
 
   .conv-input:disabled {
@@ -6009,8 +6295,9 @@
   }
 
   .conv-send {
-    width: 40px;
-    height: 40px;
+    width: 32px;
+    height: 32px;
+    margin-inline-start: 2px;
     padding: 0;
     border: none;
     border-radius: 50%;
@@ -6022,15 +6309,25 @@
     justify-content: center;
     flex-shrink: 0;
     line-height: 1;
-    transition: background var(--transition-fast), opacity var(--transition-fast);
+    transition:
+      background var(--transition-fast),
+      color var(--transition-fast),
+      transform var(--transition-fast);
   }
 
   .conv-send:hover:not(:disabled) {
     background: var(--accent-hover);
   }
 
+  .conv-send:active:not(:disabled) {
+    transform: scale(0.92);
+  }
+
+  /* Nothing to send yet: a quiet grey rather than a washed-out accent, so the
+     button lights up the moment there is something to send. */
   .conv-send:disabled {
-    opacity: 0.5;
+    background: var(--bg-hover);
+    color: var(--text-muted);
     cursor: default;
   }
 
@@ -6040,16 +6337,15 @@
   }
 
   .conv-send svg {
-    width: 18px;
-    height: 18px;
+    width: 16px;
+    height: 16px;
   }
 
   /* Quiet beside the send button: it is the second thing you reach for. */
   .conv-attach {
-    width: 36px;
-    height: 36px;
+    width: 32px;
+    height: 32px;
     padding: 0;
-    align-self: center;
     border: none;
     border-radius: 50%;
     background: transparent;

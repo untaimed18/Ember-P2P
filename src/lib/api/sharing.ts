@@ -61,6 +61,8 @@ export interface ShareBrowserEntry {
   size?: number | null;
   /** Files currently offered from a partly shared folder. */
   shared_count?: number | null;
+  /** A file the Library lists as Not shared: the user unshared it there. */
+  library_unshared?: boolean;
 }
 
 export interface ShareBrowserView {
@@ -307,6 +309,11 @@ export async function batchSetPriority(filePaths: string[], priority: string): P
 
 export async function batchUnshare(filePaths: string[]): Promise<number> {
   return invoke('batch_unshare', { filePaths });
+}
+
+/** Share Library files again. Resolves with the number actually re-shared. */
+export async function shareLibraryFiles(filePaths: string[]): Promise<number> {
+  return invoke('share_library_files', { filePaths });
 }
 
 /**

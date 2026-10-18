@@ -21,6 +21,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use super::ratio::{self, DownloadRatioCap};
 use super::MAX_CONFIGURED_SPEED_BPS;
 
 /// Minutes in a day. A window's exclusive end may equal this ("until
@@ -92,9 +93,26 @@ pub struct ActiveScheduleRule {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResolvedLimits {
     pub max_upload_speed: u64,
+    /// The download limit to enforce: the chosen one, lowered by eMule's
+    /// upload ratio where that applies (see [`super::ratio`]).
     pub max_download_speed: u64,
     /// `None` when the manual limits are in force.
     pub active: Option<ActiveScheduleRule>,
+    /// Set when the ratio rule is what lowered `max_download_speed`.
+    pub download_ratio_cap: Option<DownloadRatioCap>,
+}
+
+impl ResolvedLimits {
+    /// The only constructor, so no source of limits can skip the ratio rule.
+    fn new(upload: u64, download: u64, active: Option<ActiveScheduleRule>) -> Self {
+        let (max_download_speed, download_ratio_cap) = ratio::effective_download(upload, download);
+        Self {
+            max_upload_speed: upload,
+            max_download_speed,
+            active,
+            download_ratio_cap,
+        }
+    }
 }
 
 /// Local weekday (0 = Monday) and minute-of-day right now.
@@ -171,8 +189,9 @@ pub fn active_rule(
 
 /// Resolve the caps in force at `(weekday, minute)`.
 ///
-/// `manual_upload` / `manual_download` are the Settings values, used verbatim
-/// when the schedule is off or no window is open.
+/// `manual_upload` / `manual_download` are the Settings values, used when the
+/// schedule is off or no window is open. Either pair is subject to the upload
+/// ratio.
 pub fn resolve(
     schedule_enabled: bool,
     rules: &[BandwidthScheduleRule],
@@ -183,22 +202,18 @@ pub fn resolve(
 ) -> ResolvedLimits {
     if schedule_enabled {
         if let Some(rule) = active_rule(rules, weekday, minute) {
-            return ResolvedLimits {
-                max_upload_speed: rule.max_upload_speed,
-                max_download_speed: rule.max_download_speed,
-                active: Some(ActiveScheduleRule {
+            return ResolvedLimits::new(
+                rule.max_upload_speed,
+                rule.max_download_speed,
+                Some(ActiveScheduleRule {
                     id: rule.id.clone(),
                     label: rule.label.clone(),
                     end_minute: rule.end_minute,
                 }),
-            };
+            );
         }
     }
-    ResolvedLimits {
-        max_upload_speed: manual_upload,
-        max_download_speed: manual_download,
-        active: None,
-    }
+    ResolvedLimits::new(manual_upload, manual_download, None)
 }
 
 /// [`resolve`] against the persisted settings, with the alternative limits
@@ -209,11 +224,11 @@ pub fn resolve_settings(
     minute: u16,
 ) -> ResolvedLimits {
     if settings.alt_speed_enabled {
-        return ResolvedLimits {
-            max_upload_speed: settings.alt_max_upload_speed,
-            max_download_speed: settings.alt_max_download_speed,
-            active: None,
-        };
+        return ResolvedLimits::new(
+            settings.alt_max_upload_speed,
+            settings.alt_max_download_speed,
+            None,
+        );
     }
     resolve(
         settings.bandwidth_schedule_enabled,
@@ -558,7 +573,7 @@ mod tests {
             max_download_speed: 222,
             bandwidth_schedule_enabled: true,
             bandwidth_schedule: vec![rule(ALL_DAYS, 0, MINUTES_PER_DAY)],
-            alt_max_upload_speed: 7,
+            alt_max_upload_speed: 70_000,
             alt_max_download_speed: 0,
             ..Default::default()
         };
@@ -566,8 +581,79 @@ mod tests {
 
         settings.alt_speed_enabled = true;
         let resolved = resolve_settings(&settings, MON, 600);
-        assert_eq!((resolved.max_upload_speed, resolved.max_download_speed), (7, 0));
+        assert_eq!((resolved.max_upload_speed, resolved.max_download_speed), (70_000, 0));
         assert!(resolved.active.is_none());
+    }
+
+    /// The ratio holds whichever source the limits come from, and follows the
+    /// window: the cap opens and closes with the rule that causes it.
+    #[test]
+    fn a_scheduled_low_upload_caps_downloads_only_while_its_window_is_open() {
+        let mut night = rule(day(MON), 22 * 60, 6 * 60);
+        night.max_upload_speed = 2 * 1024;
+        night.max_download_speed = 0;
+
+        let open = resolve(true, std::slice::from_ref(&night), 0, 0, MON, 23 * 60);
+        assert_eq!(open.max_upload_speed, 2 * 1024);
+        assert_eq!(open.max_download_speed, 6 * 1024);
+        let cap = open.download_ratio_cap.expect("the rule's upload is below 4 KB/s");
+        assert_eq!((cap.limit, cap.ratio, cap.upload_below), (6 * 1024, 3, 4 * 1024));
+        assert!(open.active.is_some());
+
+        let closed = resolve(true, std::slice::from_ref(&night), 0, 0, TUE, 6 * 60);
+        assert_eq!((closed.max_upload_speed, closed.max_download_speed), (0, 0));
+        assert_eq!(closed.download_ratio_cap, None);
+    }
+
+    /// A rule that raises the upload past 10 KB/s lifts a cap the manual
+    /// limits would have imposed.
+    #[test]
+    fn a_scheduled_upload_of_10_kb_s_lifts_the_manual_cap() {
+        let mut day_rule = rule(ALL_DAYS, 9 * 60, 17 * 60);
+        day_rule.max_upload_speed = 10 * 1024;
+        day_rule.max_download_speed = 0;
+
+        let manual = resolve(true, std::slice::from_ref(&day_rule), 5 * 1024, 0, MON, 8 * 60);
+        assert_eq!(manual.max_download_speed, 20 * 1024);
+        assert!(manual.download_ratio_cap.is_some());
+
+        let scheduled = resolve(true, std::slice::from_ref(&day_rule), 5 * 1024, 0, MON, 9 * 60);
+        assert_eq!(scheduled.max_download_speed, 0);
+        assert_eq!(scheduled.download_ratio_cap, None);
+    }
+
+    /// A rule whose own download limit is already below the cap keeps it.
+    #[test]
+    fn a_scheduled_download_below_the_cap_is_not_reported_as_capped() {
+        let mut r = rule(ALL_DAYS, 0, MINUTES_PER_DAY);
+        r.max_upload_speed = 9 * 1024;
+        r.max_download_speed = 30 * 1024;
+        let resolved = resolve(true, &[r], 0, 0, MON, 600);
+        assert_eq!(resolved.max_download_speed, 30 * 1024);
+        assert_eq!(resolved.download_ratio_cap, None);
+    }
+
+    #[test]
+    fn manual_and_alternative_limits_are_capped_too() {
+        let mut settings = crate::types::AppSettings {
+            max_upload_speed: 4 * 1024 - 1,
+            max_download_speed: 100 * 1024,
+            alt_max_upload_speed: 8 * 1024,
+            alt_max_download_speed: 0,
+            ..Default::default()
+        };
+        let manual = resolve_settings(&settings, MON, 600);
+        assert_eq!(manual.max_download_speed, 3 * (4 * 1024 - 1));
+        assert_eq!(manual.download_ratio_cap.map(|c| c.ratio), Some(3));
+
+        settings.alt_speed_enabled = true;
+        let alt = resolve_settings(&settings, MON, 600);
+        assert_eq!(alt.max_download_speed, 32 * 1024);
+        assert_eq!(alt.download_ratio_cap.map(|c| c.ratio), Some(4));
+
+        // The saved settings are not touched; only what is enforced changes.
+        assert_eq!(settings.max_download_speed, 100 * 1024);
+        assert_eq!(settings.alt_max_download_speed, 0);
     }
 
     /// Unlimited is `0` in `AppSettings`, so a rule must be able to *raise* the

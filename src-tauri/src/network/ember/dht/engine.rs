@@ -2317,10 +2317,10 @@ impl EmberDht {
     /// closest node to the key — and on a small network it is the difference
     /// between finding everything and finding nothing.
     ///
-    /// `extra_keys` applies the same multi-keyword intersection a remote peer
-    /// would, so our own store answers a query exactly as another node's
-    /// would rather than contributing everything under the primary key and
-    /// relying on a downstream filter to clean up. `constraints` likewise: they
+    /// `extra_keys` keeps only the records carrying every one of them, which
+    /// are the ones a remote peer would serve first and the only ones this
+    /// build's own search keeps, rather than contributing everything under the
+    /// primary key and relying on a downstream filter to clean up. `constraints` likewise: they
     /// are applied before the cap, exactly as a responder applies them before
     /// it packs, or a narrow search seeded from a large key would be handed
     /// the first records under it and find none of the ones it asked for.
@@ -2351,10 +2351,11 @@ impl EmberDht {
         // out. The records past the share follow rather than being dropped: they
         // are what a remote copy confirms.
         intersect_live_records(&self.store, &keys)
-            .map(|(_key, records)| {
+            .map(|(_key, records, matching)| {
                 let mut taken: HashMap<([u8; 16], [u8; 32]), usize> = HashMap::new();
                 let (within, beyond): (Vec<_>, Vec<_>) = records
                     .into_iter()
+                    .take(matching)
                     .filter(|r| super::publish::record_matches_constraints(&r.data, constraints))
                     .partition(|r| {
                         super::search::publisher_share(&r.data).is_none_or(|share| {
@@ -2934,11 +2935,9 @@ impl EmberDht {
                 // unbounded scan by naming keys in both places.
                 keys.extend_from_slice(&constraints.extra_keys);
                 keys.truncate(messages::MAX_FIND_VALUE_KEYS_TOTAL);
-                // Multi-keyword wire intersection (when `keys.len() > 1`):
-                // serve primary-key (`keys[0]`) records; when this node also
-                // holds secondary keys, filter by `file_hash` intersection.
-                // Missing secondaries are skipped (sparse DHT locality) —
-                // filename AND at emit remains the cross-key filter.
+                // Multi-keyword (when `keys.len() > 1`): serve the primary-key
+                // (`keys[0]`) records, those carrying every secondary key first
+                // — see `intersect_live_records`.
                 if let Some(reply) = intersect_find_value_records(
                     &self.store,
                     &keys,
@@ -3174,18 +3173,9 @@ fn callback_tokens_match(expected: &[u8; 16], got: &[u8; 16]) -> bool {
 
 use super::publish::file_hash_from_record_data;
 
-/// Multi-keyword FIND_VALUE answer: primary-key blobs, optionally narrowed
-/// to `file_hash`es that also appear under a secondary key this node holds.
-///
-/// Secondary keywords live near different IDs on a sparse DHT, so the
-/// peer closest to the primary often holds none of the extras. Missing
-/// secondaries are skipped so we still serve primary hits; the searcher
-/// applies filename AND at emit. When we *do* hold secondaries, a non-empty
-/// intersection is a bandwidth win (don't send primary hits that cannot
-/// match). An *empty* intersection used to return `None` (`FOUND_NODE`),
-/// which hid the primary blobs on a small or dense overlay where one node
-/// holds many unrelated keys — holding the wrong extra was then worse than
-/// holding none. Serve the primary in that case too.
+/// Multi-keyword FIND_VALUE answer: the primary-key blobs, those carrying every
+/// secondary key first (see [`intersect_live_records`]), packed for one
+/// datagram.
 ///
 /// `start_position` is the searcher's offset into our live list for the primary
 /// key, and `resume_after` the records its last page ended on; see
@@ -3198,7 +3188,7 @@ fn intersect_find_value_records(
     resume_after: &messages::ResumeAnchors,
     constraints: &messages::ValueConstraints,
 ) -> Option<FoundValueReply> {
-    let (primary, mut filtered) = intersect_live_records(store, keys)?;
+    let (primary, mut filtered, _) = intersect_live_records(store, keys)?;
 
     // Before the packing below, which is the whole point: a constraint applied
     // after truncation cannot recover the matching records that fell outside the
@@ -3364,8 +3354,22 @@ fn record_blob(record: &super::store::DhtRecord) -> Vec<u8> {
     b
 }
 
-/// The live records under `keys[0]` whose file hash also appears under every
-/// other key, with no packing applied.
+/// The live records under `keys[0]`, those carrying every other key first,
+/// with no packing applied — and how many lead.
+///
+/// A record carries a key when a word of its signed name hashes to it, in
+/// either spelling (see `search::name_word_keys`), which is the same word its
+/// publisher derived the key from. Secondary keys live near other ids, so the
+/// node closest to the primary rarely holds them; the name is what lets the AND
+/// apply here at all.
+///
+/// Ordered rather than filtered. A searcher from before this keeps whatever
+/// its own filter keeps, which matches substrings (`server` in `servers`), so
+/// dropping the rest would lose it rows it used to get; leading with the
+/// matches puts the rows a newer searcher keeps inside the first pages and the
+/// per-node budget. The order depends only on each record's own name and the
+/// store's order, so it is the same on every page of one walk and a record
+/// never moves ahead of one it followed — which is what page anchors rely on.
 ///
 /// Split out from [`intersect_find_value_records`] so a caller reading its own
 /// store does not inherit a limit that exists only because a reply has to fit in
@@ -3373,80 +3377,34 @@ fn record_blob(record: &super::store::DhtRecord) -> Vec<u8> {
 fn intersect_live_records<'a>(
     store: &'a DhtStore,
     keys: &[[u8; 16]],
-) -> Option<([u8; 16], Vec<&'a super::store::DhtRecord>)> {
+) -> Option<([u8; 16], Vec<&'a super::store::DhtRecord>, usize)> {
     let primary = *keys.first()?;
     let primary_recs = store.get_live(&primary);
     if primary_recs.is_empty() {
         return None;
     }
 
-    let mut allowed: Option<HashSet<[u8; 16]>> = None;
-    for (i, key) in keys.iter().enumerate().skip(1) {
-        // A repeated secondary narrows to the set it already narrowed to, and
-        // one query can name a hot key many times over. Compared against the
-        // earlier secondaries only: the primary named as a secondary still
-        // narrows, dropping records that declare no file hash.
-        if keys[1..i].contains(key) {
-            continue;
-        }
-        // Iterated, not collected: a secondary key is read only for the file
-        // hashes its records declare, and a hot key holds up to
-        // `MAX_RECORDS_PER_KEY` of them. Collecting each of the seven a
-        // `FIND_VALUE` may carry was an allocation per key, per datagram.
-        let mut held = false;
-        let mut narrowed: HashSet<[u8; 16]> = HashSet::new();
-        for r in store.live_records(key) {
-            held = true;
-            let Some(hash) = file_hash_from_record_data(&r.data) else {
-                continue;
-            };
-            // Built against what is still a candidate rather than at the
-            // secondary's own size and intersected afterwards, so the working
-            // set only ever shrinks. Identical result: intersection is
-            // commutative and a hash the previous keys dropped cannot return.
-            if allowed.as_ref().is_none_or(|prev| prev.contains(&hash)) {
-                narrowed.insert(hash);
-            }
-        }
-        // Sparse-DHT locality: a key this node does not hold is skipped rather
-        // than treated as an empty intersection.
-        if !held {
-            continue;
-        }
-        let exhausted = narrowed.is_empty();
-        allowed = Some(narrowed);
-        // No candidates left, and none can come back. The primary is then
-        // served unfiltered (see below), so the remaining keys cannot change
-        // the answer and reading them would only cost the scan.
-        if exhausted {
-            break;
+    // One query can name a hot key many times over; each is tested once.
+    let mut extras: Vec<[u8; 16]> = Vec::new();
+    for key in &keys[1..] {
+        if !extras.contains(key) {
+            extras.push(*key);
         }
     }
-
-    let filtered: Vec<&_> = match &allowed {
-        None => primary_recs,
-        Some(set) => {
-            let hit: Vec<&_> = primary_recs
-                .iter()
-                .copied()
-                .filter(|r| {
-                    file_hash_from_record_data(&r.data)
-                        .map(|h| set.contains(&h))
-                        .unwrap_or(false)
-                })
-                .collect();
-            if hit.is_empty() {
-                primary_recs
-            } else {
-                hit
-            }
-        }
-    };
-
-    if filtered.is_empty() {
-        return None;
+    if extras.is_empty() {
+        let all = primary_recs.len();
+        return Some((primary, primary_recs, all));
     }
-    Some((primary, filtered))
+
+    // Each record's name keys are worked out once and kept on the record, so a
+    // hot key paged by many searchers is tokenized once rather than per page.
+    let (mut ordered, rest): (Vec<&_>, Vec<&_>) = primary_recs.into_iter().partition(|r| {
+        let words = r.name_keys();
+        extras.iter().all(|key| words.contains(key))
+    });
+    let matching = ordered.len();
+    ordered.extend(rest);
+    Some((primary, ordered, matching))
 }
 
 /// Shorthand for the tests that predate `FIND_VALUE` paging: ask for the first
@@ -4417,7 +4375,12 @@ mod tests {
         let a_noise = a.local_noise_pub;
         let a_addr = addr(24, 4672);
 
-        let record = a.build_keyword_record("ubuntu", [9u8; 16], [0u8; 32], 4096, "ubuntu.iso");
+        // A name carrying every word asked for, so the AND keeps the record.
+        let words: Vec<String> = (0..messages::MAX_FIND_VALUE_KEYS + 4)
+            .map(|i| format!("word{i}"))
+            .collect();
+        let name = format!("ubuntu {}.iso", words.join(" "));
+        let record = a.build_keyword_record("ubuntu", [9u8; 16], [0u8; 32], 4096, &name);
         let key = record.keyword_hash;
         let (_rid, store_bytes) = a.build_store(key, record.data.clone(), record.signature);
         assert!(
@@ -4426,9 +4389,7 @@ mod tests {
         );
 
         let mut keys = vec![key];
-        for i in 0..(messages::MAX_FIND_VALUE_KEYS as u8 + 4) {
-            keys.push([i; 16]);
-        }
+        keys.extend(words.iter().map(|w| super::super::search::keyword_hash(w)));
         let (_frid, find_bytes) = a.build_find_value_page_one(keys);
 
         let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
@@ -4663,8 +4624,8 @@ mod tests {
     }
 
     /// A query with more keywords than the count-prefixed run can name must still
-    /// intersect on all of them. The surplus rides in the constraint block, and
-    /// the responder merges the two runs before intersecting — so where a key
+    /// be matched on all of them. The surplus rides in the constraint block, and
+    /// the responder merges the two runs before matching — so where a key
     /// travelled cannot change the answer.
     #[test]
     fn keys_past_the_count_prefixed_run_still_intersect() {
@@ -4676,31 +4637,24 @@ mod tests {
         let b_addr = addr(71, 4672);
 
         // Ten words, so two have to travel in the block. Only one of the two
-        // files carries every word, and the odd one out is under the *last*
-        // word — the one that would be dropped if the surplus were truncated
-        // rather than carried.
+        // files carries every word, and the odd one out lacks the *last* word —
+        // the one that would be dropped if the surplus were truncated rather
+        // than carried. It is stored first, so only matching can put the other
+        // ahead of it.
         let words: Vec<String> = (0..10).map(|i| format!("keyword{i}")).collect();
         let wanted = [0x11u8; 16];
         let other = [0x22u8; 16];
-        let mut stored = 0i64;
-        for (w, word) in words.iter().enumerate() {
-            let mut files = vec![wanted];
-            if w < words.len() - 1 {
-                files.push(other);
-            }
-            for file_hash in files {
-                let record =
-                    a.build_keyword_record(word, file_hash, [0u8; 32], 4096, "release.mkv");
-                let (_rid, bytes) = a.build_store(
-                    record.keyword_hash,
-                    record.data.clone(),
-                    record.signature,
-                );
-                assert!(b
-                    .handle_message(&bytes, a_addr, a_noise, 1000 + stored)
-                    .stored_record);
-                stored += 1;
-            }
+        let all_but_last = words[..words.len() - 1].join(" ");
+        for (stored, (file_hash, name)) in [
+            (other, format!("{all_but_last}.mkv")),
+            (wanted, format!("{}.mkv", words.join(" "))),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let record = a.build_keyword_record(&words[0], file_hash, [0u8; 32], 4096, &name);
+            let (_rid, bytes) = a.build_store(record.keyword_hash, record.data.clone(), record.signature);
+            assert!(b.handle_message(&bytes, a_addr, a_noise, 1000 + stored as i64).stored_record);
         }
 
         let keys: Vec<[u8; 16]> = words
@@ -4725,8 +4679,8 @@ mod tests {
             .collect();
         assert_eq!(
             hashes,
-            vec![wanted],
-            "the keyword carried in the block has to narrow the answer like any other"
+            vec![wanted, other],
+            "the keyword carried in the block has to order the answer like any other"
         );
     }
 
@@ -5405,155 +5359,115 @@ mod tests {
         }
     }
 
+    /// Two files under `ubuntu`, one of whose names also spells `server`. Both
+    /// are served, so a searcher filtering by substring still gets every row it
+    /// used to; the one carrying both words comes first, though it was stored
+    /// last.
     #[test]
-    fn find_value_intersects_multi_keyword_by_file_hash() {
+    fn find_value_serves_records_naming_every_keyword_first() {
         let mut a = dht(30);
         let mut b = dht(31);
-        let mut c = dht(32); // second publisher (store dedupes by publisher key)
         let a_noise = a.local_noise_pub;
-        let c_noise = c.local_noise_pub;
         let b_noise = b.local_noise_pub;
         let a_addr = addr(30, 4672);
-        let c_addr = addr(32, 4672);
         let b_addr = addr(31, 4672);
 
         let both = [1u8; 16];
         let only_ubuntu = [2u8; 16];
-        let r_both_u = a.build_keyword_record("ubuntu", both, [0u8; 32], 100, "ubuntu-server.iso");
-        let r_both_s = a.build_keyword_record("server", both, [0u8; 32], 100, "ubuntu-server.iso");
-        let r_only = c.build_keyword_record("ubuntu", only_ubuntu, [0u8; 32], 50, "ubuntu.iso");
-
-        for rec in [&r_both_u, &r_both_s] {
+        let r_only = a.build_keyword_record("ubuntu", only_ubuntu, [0u8; 32], 50, "ubuntu-servers.iso");
+        let r_both = a.build_keyword_record("ubuntu", both, [0u8; 32], 100, "ubuntu-server.iso");
+        for rec in [&r_only, &r_both] {
             let (_rid, bytes) = a.build_store(rec.keyword_hash, rec.data.clone(), rec.signature);
-            assert!(
-                b.handle_message(&bytes, a_addr, a_noise, 1000)
-                    .stored_record
-            );
-        }
-        {
-            let (_rid, bytes) =
-                c.build_store(r_only.keyword_hash, r_only.data.clone(), r_only.signature);
-            assert!(
-                b.handle_message(&bytes, c_addr, c_noise, 1000)
-                    .stored_record
-            );
+            assert!(b.handle_message(&bytes, a_addr, a_noise, 1000).stored_record);
         }
 
-        let (_frid, find_bytes) =
-            a.build_find_value_page_one(vec![r_both_u.keyword_hash, r_both_s.keyword_hash]);
+        let server = super::super::search::keyword_hash("server");
+        let (_frid, find_bytes) = a.build_find_value_page_one(vec![r_both.keyword_hash, server]);
         let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
-        assert!(on_b.find_value_hit, "peer holds primary+secondary keys");
+        assert!(on_b.find_value_hit, "the peer holds the primary key");
         let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1002);
-        let blobs = on_a.found_value.expect("FOUND_VALUE").records;
-        assert_eq!(blobs.len(), 1, "only file_hash present under both keys");
-        let parsed = SignedRecord::from_value_blob(&blobs[0]).unwrap();
-        assert_eq!(parsed.file_hash, both);
-        assert_eq!(parsed.file_name, "ubuntu-server.iso");
+        let names: Vec<String> = on_a
+            .found_value
+            .expect("FOUND_VALUE")
+            .records
+            .iter()
+            .map(|blob| SignedRecord::from_value_blob(blob).unwrap().file_name)
+            .collect();
+        assert_eq!(names, vec!["ubuntu-server.iso", "ubuntu-servers.iso"]);
     }
 
+    /// Nothing under the primary carries the secondary: the primary's records
+    /// are still served, as a searcher predating the ordering expects, rather
+    /// than answering `FOUND_NODE` as if the key were empty. Our own store, read
+    /// for this build's search, keeps only the records that match.
     #[test]
-    fn find_value_serves_primary_when_secondary_not_held() {
-        // Sparse DHT: peer near "ubuntu" does not hold "server". It must
-        // still return primary hits (filename AND filters at the searcher).
-        let mut a = dht(33);
-        let mut b = dht(34);
-        let a_noise = a.local_noise_pub;
-        let b_noise = b.local_noise_pub;
-        let a_addr = addr(33, 4672);
-        let b_addr = addr(34, 4672);
-
-        let rec = a.build_keyword_record("ubuntu", [9u8; 16], [0u8; 32], 10, "ubuntu.iso");
-        let (_rid, store_bytes) = a.build_store(rec.keyword_hash, rec.data.clone(), rec.signature);
-        assert!(
-            b.handle_message(&store_bytes, a_addr, a_noise, 1000)
-                .stored_record
-        );
-
-        let secondary = a.build_keyword_record("server", [9u8; 16], [0u8; 32], 10, "ubuntu.iso");
-        let (_frid, find_bytes) =
-            a.build_find_value_page_one(vec![rec.keyword_hash, secondary.keyword_hash]);
-        let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
-        assert!(
-            on_b.find_value_hit,
-            "missing secondary must not suppress primary FOUND_VALUE"
-        );
-        let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1002);
-        let blobs = on_a.found_value.expect("FOUND_VALUE").records;
-        assert_eq!(blobs.len(), 1);
-    }
-
-    #[test]
-    fn find_value_serves_primary_when_secondary_hashes_do_not_overlap() {
-        // Dense / small overlay: this node holds both keys, but for different
-        // files. Returning FOUND_NODE hid the primary hits; filename AND at
-        // the searcher is the right filter.
+    fn find_value_with_no_record_matching_every_key_still_serves_the_primary() {
         let mut a = dht(35);
         let mut b = dht(36);
         let a_noise = a.local_noise_pub;
-        let b_noise = b.local_noise_pub;
         let a_addr = addr(35, 4672);
-        let b_addr = addr(36, 4672);
 
         let ubuntu = a.build_keyword_record("ubuntu", [1u8; 16], [0u8; 32], 10, "ubuntu.iso");
         let server = a.build_keyword_record("server", [2u8; 16], [0u8; 32], 10, "server.iso");
         for rec in [&ubuntu, &server] {
             let (_rid, bytes) = a.build_store(rec.keyword_hash, rec.data.clone(), rec.signature);
-            assert!(
-                b.handle_message(&bytes, a_addr, a_noise, 1000)
-                    .stored_record
-            );
+            assert!(b.handle_message(&bytes, a_addr, a_noise, 1000).stored_record);
         }
 
         let (_frid, find_bytes) =
             a.build_find_value_page_one(vec![ubuntu.keyword_hash, server.keyword_hash]);
         let on_b = b.handle_message(&find_bytes, a_addr, a_noise, 1001);
-        assert!(
-            on_b.find_value_hit,
-            "unrelated secondary records must not suppress primary FOUND_VALUE"
-        );
-        let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1002);
-        let blobs = on_a.found_value.expect("FOUND_VALUE").records;
-        assert_eq!(blobs.len(), 1);
-        let parsed = SignedRecord::from_value_blob(&blobs[0]).unwrap();
-        assert_eq!(parsed.file_hash, [1u8; 16]);
+        assert!(on_b.find_value_hit);
+
+        let unconstrained = messages::ValueConstraints::default();
+        assert!(b.local_records(&ubuntu.keyword_hash, &[server.keyword_hash], &unconstrained).is_empty());
+        assert_eq!(b.local_records(&ubuntu.keyword_hash, &[], &unconstrained).len(), 1);
     }
 
-    /// `intersect_live_records` reads each distinct secondary once. That has to
-    /// give exactly what intersecting every key as named does, repeats and the
-    /// primary-as-secondary case included.
+    /// A word is matched in either spelling, so a searcher sending the
+    /// normalised key finds a name typed in decomposed accents, and one sending
+    /// the key of that spelling still does too.
+    #[test]
+    fn a_secondary_matches_the_name_in_either_spelling() {
+        let mut store = DhtStore::new();
+        let a = dht(39);
+        let rec = a.build_keyword_record("ubuntu", [5u8; 16], [0u8; 32], 10, "ubuntu cafe\u{301}.iso");
+        assert!(store.store(rec.keyword_hash, rec.data.clone(), rec.signature));
+        let normalised = super::super::search::compute_keyword_hashes("café")[0].0;
+        let typed = super::super::search::keyword_hash("cafe\u{301}");
+        assert_ne!(normalised, typed);
+        for secondary in [normalised, typed] {
+            let got = intersect_live_records(&store, &[rec.keyword_hash, secondary]);
+            assert_eq!(got.map(|(_, recs, matching)| (recs.len(), matching)), Some((1, 1)));
+        }
+        let missing = super::super::search::keyword_hash("server");
+        let got = intersect_live_records(&store, &[rec.keyword_hash, missing]);
+        assert_eq!(got.map(|(_, recs, matching)| (recs.len(), matching)), Some((1, 0)));
+    }
+
+    /// `intersect_live_records` tests each distinct secondary once, against the
+    /// record's cached name keys. That has to give exactly what testing every
+    /// key as named does, record by record and in the same order, repeats and
+    /// the primary-as-secondary case included.
     #[test]
     fn repeated_find_value_keys_intersect_as_if_each_were_read() {
-        fn every_key_read(store: &DhtStore, keys: &[[u8; 16]]) -> Option<([u8; 16], Vec<[u8; 64]>)> {
+        type Answer = ([u8; 16], Vec<[u8; 64]>, usize);
+        fn every_key_read(store: &DhtStore, keys: &[[u8; 16]]) -> Option<Answer> {
             let primary = *keys.first()?;
             let primary_recs = store.get_live(&primary);
             if primary_recs.is_empty() {
                 return None;
             }
-            let mut allowed: Option<HashSet<[u8; 16]>> = None;
-            for key in &keys[1..] {
-                let held: Vec<_> = store.live_records(key).collect();
-                if held.is_empty() {
-                    continue;
-                }
-                let hashes: HashSet<[u8; 16]> = held
-                    .iter()
-                    .filter_map(|r| file_hash_from_record_data(&r.data))
-                    .collect();
-                allowed = Some(match allowed {
-                    None => hashes,
-                    Some(prev) => prev.intersection(&hashes).copied().collect(),
-                });
-            }
-            let hit: Vec<_> = match &allowed {
-                None => primary_recs.clone(),
-                Some(set) => primary_recs
-                    .iter()
-                    .copied()
-                    .filter(|r| file_hash_from_record_data(&r.data).is_some_and(|h| set.contains(&h)))
-                    .collect(),
+            let carries = |r: &super::super::store::DhtRecord| {
+                let rec = SignedRecord::parse_unverified(&r.data, r.signature).unwrap();
+                let words = super::super::search::name_word_keys(&rec.file_name);
+                keys[1..].iter().all(|key| words.contains(key))
             };
-            let chosen = if hit.is_empty() { primary_recs } else { hit };
-            Some((primary, chosen.iter().map(|r| r.signature).collect()))
+            let mut ordered: Vec<[u8; 64]> =
+                primary_recs.iter().filter(|r| carries(r)).map(|r| r.signature).collect();
+            let matching = ordered.len();
+            ordered.extend(primary_recs.iter().filter(|r| !carries(r)).map(|r| r.signature));
+            Some((primary, ordered, matching))
         }
 
         let a = dht(37);
@@ -5594,8 +5508,9 @@ mod tests {
                     w => key_of[words[w as usize]],
                 })
                 .collect();
-            let got = intersect_live_records(&store, &keys)
-                .map(|(key, recs)| (key, recs.iter().map(|r| r.signature).collect::<Vec<_>>()));
+            let got = intersect_live_records(&store, &keys).map(|(key, recs, matching)| {
+                (key, recs.iter().map(|r| r.signature).collect::<Vec<_>>(), matching)
+            });
             assert_eq!(got, every_key_read(&store, &keys), "keys {keys:?}");
         }
     }

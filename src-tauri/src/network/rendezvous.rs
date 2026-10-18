@@ -97,6 +97,8 @@ pub(crate) struct ServerFeatures {
     /// older or third-party server only accepts the legacy pubkey-derived
     /// intro and refuses anything else.
     pub sealed_intro: bool,
+    /// Holds sealed chat for a friend who is offline (`/v4/chat-mailbox/*`).
+    pub chat_mailbox: bool,
 }
 
 type ProtocolCache =
@@ -241,6 +243,7 @@ pub(crate) async fn negotiate_server_features(base_url: &str) -> Result<ServerFe
             let features = ServerFeatures {
                 protocol: RendezvousProtocol::IpBoundV4,
                 sealed_intro: body["sealed_intro"].as_bool() == Some(true),
+                chat_mailbox: body["chat_mailbox"].as_bool() == Some(true),
             };
             remember_v4_server(base_url).await;
             remember_protocol(base_url, features).await;
@@ -265,6 +268,7 @@ pub(crate) async fn negotiate_server_features(base_url: &str) -> Result<ServerFe
         let features = ServerFeatures {
             protocol: RendezvousProtocol::LegacyV3,
             sealed_intro: false,
+            chat_mailbox: false,
         };
         remember_protocol(base_url, features).await;
         Ok(features)
@@ -2060,6 +2064,7 @@ mod intro_presence_tests {
             ServerFeatures {
                 protocol: RendezvousProtocol::IpBoundV4,
                 sealed_intro: true,
+                chat_mailbox: false,
             },
         )
         .await;
@@ -2670,6 +2675,125 @@ pub async fn offer_channel_relay_ticket(
         ticket_id,
         initiator_token,
     })
+}
+
+/// One page of the chat mailbox: at most 32 sealed entries of up to 4608
+/// bytes, hex encoded.
+const MAX_CHAT_MAILBOX_RESPONSE_BYTES: usize = 512 * 1024;
+const CHAT_MAILBOX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// A sealed entry collected from a chat mailbox box.
+#[derive(Debug, Clone)]
+pub struct ChatMailboxItem {
+    pub mailbox: [u8; 32],
+    pub id: [u8; 16],
+    pub blob: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ChatMailboxPage {
+    pub items: Vec<ChatMailboxItem>,
+    /// More entries are waiting than this page carried.
+    pub more: bool,
+}
+
+/// Whether the server holds sealed chat for offline friends.
+pub async fn chat_mailbox_supported(base_url: &str) -> bool {
+    negotiate_server_features(base_url)
+        .await
+        .is_ok_and(|features| features.chat_mailbox)
+}
+
+async fn chat_mailbox_post(
+    base_url: &str,
+    route: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    require_https(base_url)?;
+    let url = format!("{}{route}", base_url.trim_end_matches('/'));
+    tokio::time::timeout(CHAT_MAILBOX_TIMEOUT, async {
+        let resp = client(base_url)
+            .await?
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("chat mailbox {route}: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("chat mailbox {route}: status {}", resp.status()));
+        }
+        serde_json::from_slice(&read_bounded_bytes(resp, MAX_CHAT_MAILBOX_RESPONSE_BYTES).await?)
+            .map_err(|e| format!("chat mailbox {route} bad body: {e}"))
+    })
+    .await
+    .map_err(|_| format!("chat mailbox {route} timed out"))?
+}
+
+/// Leave a sealed entry in `mailbox`. Returns the id the server filed it
+/// under, which deleting it again takes.
+pub async fn chat_mailbox_put(
+    base_url: &str,
+    mailbox: &[u8; 32],
+    blob: &[u8],
+) -> Result<[u8; 16], String> {
+    let body = chat_mailbox_post(
+        base_url,
+        "/v4/chat-mailbox/put",
+        serde_json::json!({ "box": hex::encode(mailbox), "blob": hex::encode(blob) }),
+    )
+    .await?;
+    let mut id = [0u8; 16];
+    hex::decode_to_slice(body["id"].as_str().unwrap_or_default(), &mut id)
+        .map_err(|_| "chat mailbox put: no entry id in the answer".to_string())?;
+    Ok(id)
+}
+
+/// Entries waiting in any of `boxes`. Entries the server sends for a box not
+/// asked for, or that do not decode, are dropped here.
+pub async fn chat_mailbox_fetch(base_url: &str, boxes: &[[u8; 32]]) -> Result<ChatMailboxPage, String> {
+    let body = chat_mailbox_post(
+        base_url,
+        "/v4/chat-mailbox/fetch",
+        serde_json::json!({ "boxes": boxes.iter().map(hex::encode).collect::<Vec<_>>() }),
+    )
+    .await?;
+    let mut page = ChatMailboxPage {
+        items: Vec::new(),
+        more: body["more"].as_bool() == Some(true),
+    };
+    for item in body["items"].as_array().map(Vec::as_slice).unwrap_or_default() {
+        let mut mailbox = [0u8; 32];
+        let mut id = [0u8; 16];
+        if hex::decode_to_slice(item["box"].as_str().unwrap_or_default(), &mut mailbox).is_err()
+            || hex::decode_to_slice(item["id"].as_str().unwrap_or_default(), &mut id).is_err()
+            || !boxes.contains(&mailbox)
+        {
+            continue;
+        }
+        let Ok(blob) = hex::decode(item["blob"].as_str().unwrap_or_default()) else {
+            continue;
+        };
+        page.items.push(ChatMailboxItem { mailbox, id, blob });
+    }
+    Ok(page)
+}
+
+/// Remove collected entries from `mailbox`.
+pub async fn chat_mailbox_delete(
+    base_url: &str,
+    mailbox: &[u8; 32],
+    ids: &[[u8; 16]],
+) -> Result<(), String> {
+    chat_mailbox_post(
+        base_url,
+        "/v4/chat-mailbox/delete",
+        serde_json::json!({
+            "box": hex::encode(mailbox),
+            "ids": ids.iter().map(hex::encode).collect::<Vec<_>>(),
+        }),
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Poll tickets addressed to this registered identity. The server never

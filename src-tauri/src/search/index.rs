@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::network::kad::publish::kad_keyword_lowercase;
+use crate::network::kad::publish::{is_kad_keyword_separator, kad_keyword_lowercase};
 use crate::search::merge::ORIGIN_LOCAL;
 use crate::types::{FileInfo, SearchResult};
 
@@ -302,7 +302,7 @@ impl LocalIndex {
             .and_then(|e| e.exact_file_hashes())
             .unwrap_or_default();
 
-        let mut results: Vec<(usize, u32)> = self
+        let mut results: Vec<(usize, LocalHitRank)> = self
             .files
             .iter()
             .enumerate()
@@ -324,10 +324,10 @@ impl LocalIndex {
                     return exact_hashes
                         .iter()
                         .any(|hash| hash.eq_ignore_ascii_case(&file.hash))
-                        .then_some((idx, 1u32));
+                        .then_some((idx, LocalHitRank::default()));
                 }
                 let expr = match expr.as_ref() {
-                    None => return Some((idx, 1u32)),
+                    None => return Some((idx, LocalHitRank::default())),
                     Some(expr) => expr,
                 };
                 // The terms' lowercaser; see `QueryExpr::matches_name`.
@@ -335,19 +335,17 @@ impl LocalIndex {
                 if !expr.matches(&name_lower) {
                     return None;
                 }
-                let score = if positive.is_empty() {
-                    1u32
-                } else {
-                    positive
-                        .iter()
-                        .filter(|t| name_lower.contains(t.as_str()))
-                        .count()
-                        .max(1) as u32
-                };
-                Some((idx, score))
+                Some((idx, LocalHitRank::of(&name_lower, &positive)))
             })
             .collect();
-        results.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+        // Rows with equal ranks fall back to name, then path (unique per row),
+        // so the rows kept past the cap do not depend on insertion order.
+        let order = |a: &(usize, LocalHitRank), b: &(usize, LocalHitRank)| {
+            let (fa, fb) = (&self.files[a.0], &self.files[b.0]);
+            a.1.cmp(&b.1)
+                .then_with(|| fa.name.cmp(&fb.name))
+                .then_with(|| fa.path.cmp(&fb.path))
+        };
 
         if results.len() > Self::LOCAL_SEARCH_MAX {
             // Said out loud, because the rows past the cap are indistinguishable
@@ -358,12 +356,14 @@ impl LocalIndex {
                 results.len(),
                 Self::LOCAL_SEARCH_MAX,
             );
+            results.select_nth_unstable_by(Self::LOCAL_SEARCH_MAX - 1, order);
+            results.truncate(Self::LOCAL_SEARCH_MAX);
         }
+        results.sort_unstable_by(order);
 
         results
             .into_iter()
-            .take(Self::LOCAL_SEARCH_MAX)
-            .filter_map(|(idx, _score)| self.files.get(idx).map(file_to_local_result))
+            .filter_map(|(idx, _rank)| self.files.get(idx).map(file_to_local_result))
             .collect()
     }
 
@@ -1500,6 +1500,55 @@ fn local_file_matches_filters(
     true
 }
 
+/// How well a library name answers a query's positive terms; the better hit
+/// orders first. All zero for a hash or filter-only listing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct LocalHitRank {
+    whole_words: std::cmp::Reverse<usize>,
+    substrings: std::cmp::Reverse<usize>,
+    /// Byte offset of the earliest term occurrence.
+    first_at: usize,
+    name_chars: usize,
+}
+
+impl LocalHitRank {
+    /// `name_lower` and `terms` lowercased alike (see `QueryExpr::matches_name`).
+    fn of(name_lower: &str, terms: &[String]) -> Self {
+        if terms.is_empty() {
+            return Self::default();
+        }
+        let mut whole_words = 0;
+        let mut substrings = 0;
+        let mut first_at = usize::MAX;
+        for term in terms.iter().filter(|t| !t.is_empty()) {
+            let mut found = false;
+            let mut whole = false;
+            for (at, _) in name_lower.match_indices(term.as_str()) {
+                if !found {
+                    found = true;
+                    first_at = first_at.min(at);
+                }
+                let before = name_lower[..at].chars().next_back();
+                let after = name_lower[at + term.len()..].chars().next();
+                if before.is_none_or(is_kad_keyword_separator)
+                    && after.is_none_or(is_kad_keyword_separator)
+                {
+                    whole = true;
+                    break;
+                }
+            }
+            substrings += usize::from(found);
+            whole_words += usize::from(whole);
+        }
+        Self {
+            whole_words: std::cmp::Reverse(whole_words),
+            substrings: std::cmp::Reverse(substrings),
+            first_at,
+            name_chars: name_lower.chars().count(),
+        }
+    }
+}
+
 fn file_to_local_result(file: &FileInfo) -> SearchResult {
     SearchResult {
         file: file.clone(),
@@ -2493,5 +2542,87 @@ mod local_index_tests {
         )]);
         assert!(index.search("").is_empty());
         assert!(index.search("  ").is_empty());
+    }
+
+    fn names(results: &[crate::types::SearchResult]) -> Vec<&str> {
+        results.iter().map(|r| r.file.name.as_str()).collect()
+    }
+
+    #[test]
+    fn local_hits_rank_whole_words_then_position_then_length() {
+        let mut index = LocalIndex::new();
+        index.add_files(
+            [
+                "A/the matrixreloaded.mkv",
+                "A/old matrix film.mkv",
+                "A/matrix trilogy box set.mkv",
+                "A/matrix.mkv",
+                "A/thematrix.mkv",
+            ]
+            .iter()
+            .enumerate()
+            .map(|(i, path)| file(path, &format!("{i:032x}"), true, "normal"))
+            .collect(),
+        );
+        assert_eq!(
+            names(&index.search("matrix")),
+            vec![
+                "matrix.mkv",
+                "matrix trilogy box set.mkv",
+                "old matrix film.mkv",
+                "thematrix.mkv",
+                "the matrixreloaded.mkv",
+            ]
+        );
+    }
+
+    #[test]
+    fn local_hits_matching_more_terms_rank_first() {
+        let mut index = LocalIndex::new();
+        index.add_files(vec![
+            file("A/alpha only.bin", &"1".repeat(32), true, "normal"),
+            file("A/alpha and beta.bin", &"2".repeat(32), true, "normal"),
+        ]);
+        assert_eq!(
+            names(&index.search("alpha OR beta")),
+            vec!["alpha and beta.bin", "alpha only.bin"]
+        );
+    }
+
+    /// Past the cap the best hits are kept, whatever order the library was
+    /// indexed in.
+    #[test]
+    fn the_local_cap_keeps_the_best_hits_in_any_insertion_order() {
+        let build = |reverse: bool| {
+            let mut paths: Vec<String> = (0..LocalIndex::LOCAL_SEARCH_MAX + 10)
+                .map(|i| format!("A/xsong{i:05}.mp3"))
+                .collect();
+            paths.push("A/song.mp3".to_string());
+            if reverse {
+                paths.reverse();
+            }
+            let mut index = LocalIndex::new();
+            index.add_files(
+                paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, path)| file(path, &format!("{i:032x}"), true, "normal"))
+                    .collect(),
+            );
+            index
+                .search("song")
+                .into_iter()
+                .map(|r| r.file.path)
+                .collect::<Vec<_>>()
+        };
+        let forward = build(false);
+        assert_eq!(forward.len(), LocalIndex::LOCAL_SEARCH_MAX);
+        assert_eq!(forward[0], "A/song.mp3");
+        assert_eq!(forward[1], "A/xsong00000.mp3");
+        assert_eq!(
+            forward.last().unwrap(),
+            &format!("A/xsong{:05}.mp3", LocalIndex::LOCAL_SEARCH_MAX - 2)
+        );
+        assert_eq!(forward, build(true));
     }
 }

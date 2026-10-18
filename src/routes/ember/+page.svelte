@@ -672,15 +672,11 @@
 
   {#if isActive}
     <section class="stat-grid" aria-label={m.ember_overview_aria()}>
-      <div class="stat-card stat" title={peerCount > verifiedCount ? m.ember_overview_peers_of_hint({ verified: verifiedCount, total: peerCount }) : undefined}>
-        <div class="value">
-          {#if peerCount > verifiedCount}
-            {m.ember_overview_peers_of({ verified: verifiedCount, total: peerCount })}
-          {:else}
-            {verifiedCount}
-          {/if}
-        </div>
-        <div class="label">{m.ember_overview_peers()}</div>
+      <!-- Confirmed contacts only. The routing table's total swings as
+           unverified entries come and go, so it lives in the stats below. -->
+      <div class="stat-card stat">
+        <div class="value">{formatNumber(verifiedCount)}</div>
+        <div class="label">{m.ember_overview_contacts()}</div>
       </div>
       <div class="stat-card stat" title={publishedTotal > 0 ? m.ember_overview_published_of_hint({ published: publishedCount, total: publishedTotal }) : undefined}>
         <div class="value">
@@ -1409,7 +1405,7 @@
     min-width: 140px;
     max-width: 260px;
     padding: 6px 12px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
     border-radius: var(--radius-pill);
     background: var(--bg-primary);
     color: var(--text-primary);

@@ -31,6 +31,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+mod chat_mailbox;
 mod registry;
 
 const MAX_HTTP_CONNECTIONS: usize = 256;
@@ -2515,6 +2516,13 @@ struct AppState {
     /// this process and vanish on restart.
     channels_registry: Arc<RwLock<registry::ChannelRegistry>>,
     registry_persister: Arc<RegistryPersister>,
+    /// Sealed chat waiting for an offline friend; see `chat_mailbox`.
+    chat_mailbox: Arc<RwLock<chat_mailbox::ChatMailboxStore>>,
+    /// Its own budget, so a busy mailbox neither spends nor is starved by the
+    /// general API's.
+    chat_mailbox_rate_limits: RateLimitBucket,
+    /// Deposits pooled per [`client_network`].
+    chat_mailbox_network_rate_limits: RateLimitBucket,
 }
 
 #[derive(Deserialize)]
@@ -2845,6 +2853,7 @@ enum BodyRateGate {
     General,
     TicketRead,
     Punch,
+    ChatMailbox,
 }
 
 /// Handlers charge their bucket only after the `Json` extractor has read the
@@ -2875,6 +2884,14 @@ async fn reject_exhausted_rate_budget(
                 &state.punch_rate_limits,
                 canonical_ip(client_ip),
                 MAX_PUNCH_PER_MINUTE,
+            )
+            .await
+        }
+        BodyRateGate::ChatMailbox => {
+            rate_budget_exhausted(
+                &state.chat_mailbox_rate_limits,
+                client_ip,
+                chat_mailbox::MAX_MAILBOX_REQUESTS_PER_MINUTE,
             )
             .await
         }
@@ -3560,6 +3577,8 @@ async fn protocol_v4() -> Json<serde_json::Value> {
         // where this is advertised, and fall back to the legacy intro
         // elsewhere, since older servers refuse the sealed form.
         "sealed_intro": true,
+        // `/v4/chat-mailbox/*`: sealed chat held for a friend who is offline.
+        "chat_mailbox": true,
     }))
 }
 
@@ -5957,8 +5976,14 @@ async fn stats_handler(
     let presence_count = state.store.read().await.len();
     let uptime_secs = state.started_at.elapsed().as_secs();
     let channels_registry_read_only = state.channels_registry.read().await.is_read_only();
+    let (chat_mailbox_items, chat_mailbox_bytes) = {
+        let mailbox = state.chat_mailbox.read().await;
+        (mailbox.item_count(), mailbox.total_bytes())
+    };
 
     Ok(Json(serde_json::json!({
+        "chat_mailbox_items": chat_mailbox_items,
+        "chat_mailbox_bytes": chat_mailbox_bytes,
         "active_relay_sessions": relay_count,
         "active_punch_requests": punch_count,
         "relay_ip_count": relay_ip_count,
@@ -6132,6 +6157,16 @@ async fn sweep_expired(state: AppState) {
         // as the general one so the per-IP entries don't pile up after
         // a punch burst goes quiet.
         state.punch_rate_limits.write().await.prune(now, RATE_WINDOW * 2);
+        state
+            .chat_mailbox_rate_limits
+            .write()
+            .await
+            .prune(now, RATE_WINDOW * 2);
+        state
+            .chat_mailbox_network_rate_limits
+            .write()
+            .await
+            .prune(now, RATE_WINDOW * 2);
 
         // Swept against its own hour-long window. Using the general one here
         // would drop entries that are still inside their budget and hand the
@@ -6235,6 +6270,12 @@ async fn sweep_expired(state: AppState) {
             let mut capabilities = state.capability_store.write().await;
             capabilities.retain(|_, entry| entry.expires_at > now);
         }
+        {
+            let removed = state.chat_mailbox.write().await.prune_expired(now);
+            if removed > 0 {
+                debug!("swept {removed} uncollected chat mailbox entries");
+            }
+        }
     }
 }
 
@@ -6279,11 +6320,17 @@ fn build_router(state: AppState) -> Router {
         .route("/v3/punch/register", post(punch_register_v3))
         .route("/v4/punch/register", post(punch_register_v4))
         .route_layer(rate_gate(BodyRateGate::Punch));
+    let chat_mailbox_body_routes = Router::new()
+        .route("/v4/chat-mailbox/put", post(chat_mailbox::chat_mailbox_put))
+        .route("/v4/chat-mailbox/fetch", post(chat_mailbox::chat_mailbox_fetch))
+        .route("/v4/chat-mailbox/delete", post(chat_mailbox::chat_mailbox_delete))
+        .route_layer(rate_gate(BodyRateGate::ChatMailbox));
 
     Router::new()
         .merge(general_body_routes)
         .merge(ticket_read_body_routes)
         .merge(punch_body_routes)
+        .merge(chat_mailbox_body_routes)
         .route("/lookup/{id}", get(legacy_presence_lookup_gone))
         .route("/v3/identity/{id}", get(legacy_identity_lookup))
         .route("/v4/protocol", get(protocol_v4))
@@ -6353,6 +6400,9 @@ async fn main() {
         started_at: Instant::now(),
         channels_registry: load_channels_registry(),
         registry_persister: Arc::new(RegistryPersister::default()),
+        chat_mailbox: Arc::new(RwLock::new(chat_mailbox::ChatMailboxStore::default())),
+        chat_mailbox_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+        chat_mailbox_network_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
     };
 
     tokio::spawn(sweep_expired(state.clone()));
@@ -6542,7 +6592,7 @@ mod relay_ticket_tests {
     use super::*;
     use ed25519_dalek::Signer;
 
-    fn test_state() -> AppState {
+    pub(crate) fn test_state() -> AppState {
         AppState {
             store: Arc::new(RwLock::new(HashMap::new())),
             capability_store: Arc::new(RwLock::new(HashMap::new())),
@@ -6568,6 +6618,9 @@ mod relay_ticket_tests {
             started_at: Instant::now(),
             channels_registry: Arc::new(RwLock::new(registry::ChannelRegistry::in_memory())),
             registry_persister: Arc::new(RegistryPersister::default()),
+            chat_mailbox: Arc::new(RwLock::new(chat_mailbox::ChatMailboxStore::default())),
+            chat_mailbox_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+            chat_mailbox_network_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
         }
     }
 

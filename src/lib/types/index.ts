@@ -236,6 +236,10 @@ export interface SearchResult {
   /** The same reasons, coded and parameterised. Preferred over `spam_reasons`
    *  because it renders in the active locale; see `spamReasonTexts`. */
   spam_reason_details?: SpamReason[];
+  /** Set by the search store, never by the backend: this row claims a size
+   *  other than the one the tab's row for the same hash has, so it is kept
+   *  as its own row (keyed by hash and size) rather than merged into it. */
+  size_variant?: boolean;
 }
 
 export interface StartDownloadResponse {
@@ -847,6 +851,9 @@ export interface FriendOverrides {
   notify_online?: boolean;
   /** Messages and files from this friend. */
   notify_messages?: boolean;
+  /** Disappearing messages with this friend, in seconds; 0 is off whatever
+   *  the default says. */
+  disappear_secs?: number;
 }
 
 export interface AppSettings {
@@ -883,8 +890,9 @@ export interface AppSettings {
    *  separate Ember-only friend browse feature. */
   allow_shared_files_browse: boolean;
   /** eMule-style web services: sites openable for one file from its context
-   *  menu, with the file's facts substituted into a URL template. Empty by
-   *  default — opening one tells a third party which file you are after. */
+   *  menu, with the file's facts substituted into a URL template. A new
+   *  profile gets one example; opening any of them tells a third party which
+   *  file you are after, and asks first. */
   web_services: WebService[];
   /** Download categories the user made, offered beside the built-in ones. */
   download_categories?: string[];
@@ -910,6 +918,9 @@ export interface AppSettings {
   remove_finished_downloads: boolean;
   /** Globally prioritize first/last part of every download for faster preview. */
   preview_priority_all: boolean;
+  /** Download from the HTTP/HTTPS mirrors (`s=`) an ed2k link names. On by
+   *  default. */
+  web_sources_enabled: boolean;
   /** External media player for Preview; empty uses the system default handler.
    *  Only settable via `pickPreviewPlayer()` — see that function. */
   preview_player: string;
@@ -949,8 +960,17 @@ export interface AppSettings {
   friend_chat_disabled: boolean;
   /** Send and display friend-chat read receipts. Off both ways. */
   friend_chat_read_receipts: boolean;
+  /** Disappearing messages by default, in seconds; 0 is off. A friend's own
+   *  `disappear_secs` wins. See `CHAT_DISAPPEAR_CHOICES`. */
+  chat_disappear_secs: number;
+  /** Leave chat for offline friends in the rendezvous chat mailbox, and
+   *  collect what they left us there. */
+  chat_mailbox_enabled: boolean;
   /** Disable browse-shares responses to friends */
   friend_browse_disabled: boolean;
+  /** Decline files friends send (chat attachments and file offers). A friend's
+   *  own `files` override wins; chat off refuses files regardless. */
+  friend_files_disabled: boolean;
   /** Encrypt friend sessions with RC4 obfuscation */
   friend_session_encryption: boolean;
   /** Who may offer you a file in a channel. Gates the prompt only — accepting
@@ -1003,16 +1023,9 @@ export interface AppSettings {
    *  window is created at its configured size), so a change only affects
    *  the next launch. Off by default. */
   launch_maximized: boolean;
-  /** Automatically check for updates shortly after launch, subject to
-   *  `update_check_frequency`. The "Check for updates" button in Settings →
-   *  About always works manually regardless of this setting. Defaults to
-   *  true (Ember's original always-check-on-launch behavior). */
-  auto_check_updates: boolean;
-  /** How often the automatic background update check may run. */
-  update_check_frequency: 'hourly' | 'daily' | 'weekly' | 'monthly';
   /** Install updates without asking, once nothing is transferring and the user
-   *  is away, after a one-minute warning. Only on together with
-   *  `auto_check_updates`. */
+   *  is away, after a one-minute warning. Update checks themselves always run
+   *  (at launch and hourly) and have no setting. */
   silent_update_enabled: boolean;
 
   /** Master switch for desktop notifications. Off silences every category
@@ -1099,6 +1112,17 @@ export interface ActiveScheduleRule {
   end_minute: number;
 }
 
+/** eMule's upload ratio holding the download limit down: below 4 KB/s of
+ *  upload, downloads get 3× it; below 10 KB/s, 4×. */
+export interface DownloadRatioCap {
+  /** The download limit in force, bytes/sec. */
+  limit: number;
+  /** The multiple of the upload limit that `limit` is. */
+  ratio: number;
+  /** The threshold the upload limit is below, bytes/sec. */
+  upload_below: number;
+}
+
 /** State that changes without anybody pressing anything: which bandwidth
  *  window is open and whether sleep is being deferred.
  *
@@ -1106,13 +1130,16 @@ export interface ActiveScheduleRule {
  *  event, which the backend emits only on change. */
 export interface RuntimeStatus {
   /** Caps actually in force, whatever their source. Equal to the manual
-   *  settings unless {@link schedule} is set. */
+   *  settings unless {@link schedule}, {@link alt_speed} or
+   *  {@link download_ratio_cap} is set. */
   effective_upload_speed: number;
   effective_download_speed: number;
   /** Absent when the manual limits are in force. */
   schedule?: ActiveScheduleRule;
   /** The alternative limits are in force, overriding manual and schedule. */
   alt_speed: boolean;
+  /** Absent unless the upload ratio is what lowered the download limit. */
+  download_ratio_cap?: DownloadRatioCap;
   /** Whether this platform can hold a sleep inhibitor at all. False means the
    *  `prevent_sleep_while_active` toggle would do nothing, so the UI disables
    *  it rather than offering a dead switch. */

@@ -22,11 +22,7 @@ use super::*;
 // Ember Transfer replies travel to the UI through a Tauri command's `Result`,
 // so they carry the same coded shape the rest of the command layer uses and
 // stay translatable.
-use crate::commands::errors::{coded, coded_ctx};
-
-/// Free space an accepted room transfer must leave beyond its own size, so
-/// taking it up does not run the volume to its last byte.
-const XFER_DISK_HEADROOM: u64 = 64 * 1024 * 1024;
+use crate::commands::errors::coded;
 
 /// Remove every hash-pass handoff for a file in the index, returning the ones
 /// the reconcile will write into a record. Draining the rest too is what keeps
@@ -192,6 +188,118 @@ pub(crate) async fn handle_command(
     }
 }
 
+/// Why a file may not be offered to a friend whose session has not shown it
+/// honours friends-only markings, or `None` when it may.
+///
+/// The offer's friends-only flag rides a trailing byte older builds never
+/// read; one of those would file the copy as public and republish it, which
+/// cannot be taken back. A file not marked here is held back too while the
+/// catalog that would say so is not trusted (`known.met` still loading, or
+/// only read in part), with its own reason, since it may well be public.
+fn friends_only_offer_refusal(
+    restricted: bool,
+    catalog_trusted: bool,
+    session_honours_friends_only: bool,
+) -> Option<String> {
+    if session_honours_friends_only || (!restricted && catalog_trusted) {
+        return None;
+    }
+    Some(if restricted {
+        coded(
+            "peers_offer_needs_newer_ember",
+            "Your friend's Ember is too old to keep friends-only files private",
+        )
+    } else {
+        coded(
+            "peers_offer_library_unconfirmed",
+            "Ember cannot yet confirm this file is not friends-only",
+        )
+    })
+}
+
+/// Whether a search with no positive keyword still searches on its filters
+/// alone: only when the box is genuinely empty and it is not a related search.
+fn is_filter_only_search(query: &str, has_usable_filters: bool, related_hashes: &[String]) -> bool {
+    has_usable_filters && query.trim().is_empty() && related_hashes.is_empty()
+}
+
+/// eMule's "Search Related Files" request: the `related::<hash>` term alone.
+///
+/// Never given the panel's constraints: a server ANDs them into a filename
+/// search, which then answers with every file that passes the filters.
+fn related_search_expression(co_share_term: &str) -> Vec<u8> {
+    kad::messages::build_search_expression_with_node(
+        Some(crate::search::query::QueryExpr::Term(co_share_term.to_string()).to_wire_bytes()),
+        &kad::messages::SearchConstraints::default(),
+    )
+}
+
+/// The words every row of the connected server's answer to this search should
+/// share at least one of. A row sharing none answers some other request, and
+/// is dropped (`SearchTicket::match_terms`).
+///
+/// Lenient on purpose, since servers match substrings: any one positive term
+/// is enough. Empty — accept everything — wherever a correct row need not
+/// contain a typed word at all: a related search, a server directive, a
+/// filter-only search, and a non-ASCII term a server may fold differently.
+fn server_reply_match_terms(
+    query_expr: Option<&crate::search::query::QueryExpr>,
+    related: bool,
+) -> Vec<String> {
+    let Some(expr) = query_expr.filter(|_| !related) else {
+        return Vec::new();
+    };
+    if expr.contains_server_directive() {
+        return Vec::new();
+    }
+    let terms = expr.positive_terms();
+    if terms.iter().any(|term| !term.is_ascii()) {
+        return Vec::new();
+    }
+    terms
+}
+
+/// The keyword request for the connected server, given whether it has
+/// large-file support.
+///
+/// A server without it refuses a 64-bit size leaf, but it cannot index a file
+/// past 4 GiB either, so a maximum above that excludes nothing it holds and
+/// goes as the largest 32-bit size. A minimum above it leaves such a server
+/// nothing to answer with: `None`.
+fn server_keyword_expression(
+    search_expr: &[u8],
+    query_expr: Option<&crate::search::query::QueryExpr>,
+    constraints: &kad::messages::SearchConstraints<'_>,
+    large_files: bool,
+) -> Option<Vec<u8>> {
+    const LARGEST_32BIT_SIZE: u64 = u32::MAX as u64;
+    if large_files || !kad::messages::search_expression_uses_64bit(search_expr) {
+        return Some(search_expr.to_vec());
+    }
+    if constraints.min_size.is_some_and(|min| min > LARGEST_32BIT_SIZE) {
+        return None;
+    }
+    let clamped = kad::messages::SearchConstraints {
+        max_size: constraints.max_size.map(|max| max.min(LARGEST_32BIT_SIZE)),
+        ..*constraints
+    };
+    Some(kad::messages::build_search_expression_with_node(
+        query_expr.map(|expr| expr.to_wire_bytes()),
+        &clamped,
+    ))
+}
+
+/// The term a KAD keyword search walks to: the longest, and the first of
+/// equally long ones. Measured in UTF-8 bytes, the unit the publisher's own
+/// keyword rule uses (a word is kept at 3 bytes or more); every term passed
+/// that rule, so a trailing extension-like word is never longer than the
+/// words before it and never wins over them.
+fn kad_lookup_keyword(terms: &[String]) -> Option<&String> {
+    terms
+        .iter()
+        .reduce(|best, term| if term.len() > best.len() { term } else { best })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_command_inner(
     socket: &UdpSocket,
@@ -264,20 +372,6 @@ async fn handle_command_inner(
                 crate::search::merge::wire_search_file_type(ui_file_type.as_deref())
                     .map(|s| s.to_string());
             let mut active_request = ActiveSearchRequest {
-                request_id,
-                server_pending: false,
-                kad_pending: false,
-                udp_pending: false,
-                ember_pending: false,
-                kad_ran: false,
-                ember_ran: false,
-                udp_search_deadline: 0,
-                udp_search_sent_ips: HashSet::new(),
-                ed2k_found_sources: 0,
-                udp_found_sources: 0,
-                ed2k_noted_availability: HashMap::new(),
-                ed2k_noted_complete_sources: HashMap::new(),
-                dht_noted_availability: HashMap::new(),
                 file_type_filter: file_type_filter.clone(),
                 min_size: search_filters.as_ref().and_then(|f| f.min_size),
                 max_size: search_filters.as_ref().and_then(|f| f.max_size),
@@ -285,17 +379,13 @@ async fn handle_command_inner(
                     .as_ref()
                     .and_then(|f| f.file_extension.clone()),
                 min_availability: search_filters.as_ref().and_then(|f| f.min_availability),
-                keywords: Vec::new(),
                 server_ip: state.server_addr.map(|a| a.ip().to_string()),
-                server_result_count: 0,
-                streamed_hashes: std::collections::HashSet::new(),
                 exclude_hashes: exclude_hashes.iter().cloned().collect(),
                 // Seeded with the library hashes the caller resolved, so every
                 // streamed packet of this search scores them as files we hold
                 // rather than as rows in whatever result set they arrived in.
                 batch_spam: crate::search::spam::BatchSpamContext::for_owned_hashes(owned_hashes),
-                udp_search_expr: Vec::new(),
-                server_has_more: false,
+                ..ActiveSearchRequest::new(request_id)
             };
 
             // eMule's native "Search Related Files": the connected server is
@@ -369,7 +459,14 @@ async fn handle_command_inner(
             // whole search. Every keyword leg is gated on this rather than on
             // its own reading of `keywords` so none of them can put an empty
             // expression on the wire.
-            let has_keyword_query = !keywords.is_empty() || has_usable_filters;
+            //
+            // Filters alone only make a search when nothing was typed and no
+            // file was named: a related search's panel filters narrow its rows
+            // here instead, and a query whose words were all too short is not
+            // a request for everything that passes the filters.
+            let filter_only = keywords.is_empty()
+                && is_filter_only_search(&query, has_usable_filters, &related_hashes);
+            let has_keyword_query = !keywords.is_empty() || filter_only;
             // A co-share request needs no keywords: the hashes *are* the query.
             // Without this a related search on a file whose name yields no
             // searchable token (all words under the eD2k 3-byte minimum) would
@@ -419,7 +516,7 @@ async fn handle_command_inner(
             let server_directive_query = query_expr
                 .as_ref()
                 .is_some_and(|expr| expr.contains_server_directive());
-            let legs = search_legs(
+            let mut legs = search_legs(
                 method,
                 has_keyword_query,
                 !keywords.is_empty() && !server_directive_query,
@@ -427,30 +524,65 @@ async fn handle_command_inner(
                     .user_offline
                     .load(std::sync::atomic::Ordering::Relaxed),
             );
+            // A filter-only expression matches every file that passes it; the
+            // connected server caps its answer, but the global sweep would ask
+            // it of every server in the list.
+            if filter_only {
+                legs.udp = false;
+            }
 
             // --- TCP server search ---
-            if legs.server && state.server_connected {
+            let mut server_asked = false;
+            let server_large_files = state.server_connection.as_ref().is_some_and(|c| {
+                c.session.server_flags & ed2k::server::SRV_TCPFLG_LARGEFILES != 0
+            });
+            let server_keyword_expr = if has_keyword_query {
+                server_keyword_expression(
+                    &search_expr,
+                    query_expr.as_ref(),
+                    &search_constraints,
+                    server_large_files,
+                )
+            } else {
+                Some(search_expr.clone())
+            };
+            let server_has_keyword_query = has_keyword_query && server_keyword_expr.is_some();
+            // The panel filters narrow the co-share answer's rows
+            // (`active_request.min_size` and friends) rather than riding on
+            // the request. Both questions are sent under the same
+            // `request_id`, so both answers land in the same tab; the
+            // co-share request goes out from the poll loop once the first
+            // has delivered.
+            let (first_expr, followup_expr) = server_search_phases(
+                server_keyword_expr.as_deref().unwrap_or_default(),
+                co_share_term.as_deref().map(related_search_expression),
+                server_has_keyword_query,
+            );
+            let server_too_small_for_query =
+                legs.server && state.server_connected && server_keyword_expr.is_none();
+            if server_too_small_for_query {
+                info!("TCP server search skipped: the server cannot search for files over 4 GiB");
+                emit_search_notice(app_handle, request_id, "ServerNoLargeFiles");
+            }
+            let keyword_match_terms = if has_keyword_query {
+                server_reply_match_terms(query_expr.as_ref(), !related_hashes.is_empty())
+            } else {
+                Vec::new()
+            };
+            active_request.reply_match_terms = keyword_match_terms.clone();
+            if legs.server && state.server_connected && !first_expr.is_empty() {
                 if let Some(conn) = state.server_connection.as_mut() {
-                    // The co-share term must be wrapped as a `QueryExpr::Term`
-                    // by hand rather than parsed: `:` is an eD2k keyword
-                    // separator, so parsing `related::<hash>` would send the
-                    // server a keyword search for "related".
-                    let co_share_expr = co_share_term.as_deref().map(|term| {
-                        kad::messages::build_search_expression_with_node(
-                            Some(
-                                crate::search::query::QueryExpr::Term(term.to_string())
-                                    .to_wire_bytes(),
-                            ),
-                            &search_constraints,
-                        )
-                    });
-                    // Both questions are sent under the same `request_id`, so
-                    // both answers land in the same tab; the co-share request
-                    // goes out from the poll loop once the first has delivered.
-                    let (first_expr, followup_expr) =
-                        server_search_phases(&search_expr, co_share_expr, has_keyword_query);
-                    match conn.send_search_expr_bytes(&first_expr) {
-                        Ok(()) => {
+                    let ticket = crate::network::ed2k::server::SearchTicket {
+                        request_id,
+                        match_terms: if server_has_keyword_query {
+                            keyword_match_terms
+                        } else {
+                            Vec::new()
+                        },
+                    };
+                    match conn.send_search_expr_bytes(ticket, &first_expr) {
+                        Ok(_) => {
+                            server_asked = true;
                             active_request.server_pending = true;
                             state.server_search_more_due_at = None;
                             state.server_search_more_requests = 0;
@@ -458,6 +590,7 @@ async fn handle_command_inner(
                                 tx: None,
                                 results: Vec::new(),
                                 request_id,
+                                answered: false,
                             });
                             state.server_search_age = 0;
                             // Queued only now that the first request is on the
@@ -521,6 +654,7 @@ async fn handle_command_inner(
                     );
                 }
                 if !state.udp_search_queue.is_empty() {
+                    server_asked = true;
                     active_request.udp_pending = true;
                     state.server_udp_search_age = 0;
                     // One second per queued packet safely exceeds the real
@@ -536,6 +670,12 @@ async fn handle_command_inner(
                         state.udp_search_queue.len()
                     );
                 }
+            }
+
+            // A server leg that `ServerNoLargeFiles` already explained is not
+            // also "unavailable".
+            if ((legs.server && !server_too_small_for_query) || legs.udp) && !server_asked {
+                emit_search_notice(app_handle, request_id, "ServerUnavailable");
             }
 
             // --- KAD search ---
@@ -556,10 +696,8 @@ async fn handle_command_inner(
                 // holds all of them; only an OR with no shared term falls
                 // back to a key that can see just part of the answer.
                 let required = query_expr.required_terms();
-                let Some(primary_keyword) = required
-                    .iter()
-                    .max_by_key(|k| k.len())
-                    .or_else(|| keywords.iter().max_by_key(|k| k.len()))
+                let Some(primary_keyword) =
+                    kad_lookup_keyword(&required).or_else(|| kad_lookup_keyword(&keywords))
                 else {
                     kad_skip_phase = Some("KadBusy");
                     break 'kad false;
@@ -611,6 +749,7 @@ async fn handle_command_inner(
                 );
                 if let Some(search) = state.search_manager.get_mut(&sid) {
                     search.search_terms_data = kad_search_expr;
+                    search.answer_filter = Some(query_expr.clone());
                 }
                 // Claim the oneshot before marking the leg pending. The other
                 // order left `kad_pending` set on a leg that never started, and
@@ -631,6 +770,7 @@ async fn handle_command_inner(
                         query_expr,
                         request_id,
                         last_streamed_count: 0,
+                        last_streamed_at: std::time::Instant::now(),
                         file_type_filter,
                     },
                 );
@@ -652,12 +792,15 @@ async fn handle_command_inner(
             // --- Ember DHT keyword search (slice 10 + multi-keyword wire) ---
             // Streaming-only: it never touches the invoke oneshot (`tx`); its
             // hits arrive via `search-results` events and it gates
-            // `search-complete` through `ember_pending`. Uses the longest
-            // (most selective) keyword as the DHT walk key; remaining
-            // keyword hashes ride on FIND_VALUE for peer-side file_hash
-            // intersection on AND-only queries (OR skips extras — that
-            // intersection would drop the non-matching half). Filename
-            // filtering remains defense-in-depth via `query_expr`.
+            // `search-complete` through `ember_pending`. Walks a term every
+            // match contains when there is one (`ember_walk_query`), else the
+            // longest positive keyword; remaining keyword hashes ride on
+            // FIND_VALUE for peer-side file_hash intersection on AND-only
+            // queries (OR skips extras — that intersection would drop the
+            // non-matching half). Its first drive starts its extra walks — the
+            // walked word's older spelling and the OR branches that key misses
+            // (`ember_walk_plan`) — and it reports once they have all finished.
+            // Filename filtering remains defense-in-depth via `query_expr`.
             // Deliberately not gated on having contacts. With none the search
             // completes immediately from whatever the local store holds
             // rather than being skipped, which keeps a momentarily empty
@@ -741,6 +884,8 @@ async fn handle_command_inner(
                         active_request.ember_ran = true;
                         drive_ember_search(socket, state, search_id).await;
                     }
+                } else {
+                    emit_search_notice(app_handle, request_id, "EmberNoKeyword");
                 }
             }
 
@@ -846,6 +991,9 @@ async fn handle_command_inner(
             // would hit `Closed` on dispatch and waste a round.
             state.active_established_senders.remove(&transfer_id);
             state.active_source_overflow.remove(&transfer_id);
+            // eMule's `StopFile` zeroes both `m_LastSearchTimeKad` and
+            // `m_TotalSearchesKad`, so a stopped file searches afresh when it
+            // is resumed. (A worker that ends and is re-queued keeps it.)
             state.active_kad_search_state.remove(&transfer_id);
             // `deleting` was captured at the top of this arm, *before*
             // `cleanup_ack.take()` below. The ack is moved into the join task
@@ -942,6 +1090,19 @@ async fn handle_command_inner(
                         state.corruption_blackbox.remove_file(&fh_arr);
                         if let Ok(mut map) = state.aich_recovery_pending.write() {
                             map.retain(|(file_hash, _), _| *file_hash != fh_arr);
+                        }
+                        // Its mirrors go with it, so adding the file again
+                        // later starts from its new link, not from mirrors
+                        // this session already gave up on.
+                        if deleting {
+                            ed2k::web_sources::forget(&fh_arr);
+                            let db_web = db.clone();
+                            let fh_web = fh.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(e) = db_web.delete_transfer_web_sources(&fh_web) {
+                                    debug!("Could not forget the web sources of {fh_web}: {e}");
+                                }
+                            });
                         }
                     }
                 }
@@ -1063,7 +1224,23 @@ async fn handle_command_inner(
             // dispatch to a dead established channel.
             state.active_established_senders.remove(&transfer_id);
             state.active_source_overflow.remove(&transfer_id);
-            state.active_kad_search_state.remove(&transfer_id);
+            // eMule's `PauseFile` keeps the KAD search clock, except that it
+            // stops a search still running and zeroes its time, so the resumed
+            // file may search again (the count stands). Here the search runs on
+            // to report what it finds, and the next may follow once it ends.
+            if state
+                .download_source_searches
+                .values()
+                .any(|(tid, _)| tid == &transfer_id)
+            {
+                if let Some(clock) = state.active_kad_search_state.get_mut(&transfer_id) {
+                    if let Some(due) = std::time::Instant::now()
+                        .checked_sub(kad_source_search_interval(clock.1))
+                    {
+                        clock.0 = due;
+                    }
+                }
+            }
             if let Some(pfs) = state.per_file_sources.get_mut(&transfer_id) {
                 pfs.reset_active_states();
             }
@@ -1151,6 +1328,9 @@ async fn handle_command_inner(
                     .await
                     .get_transfer(&transfer_id)
                     .is_some_and(|t| t.friends_only);
+            if transfer_friends_only {
+                control.mark_friends_only();
+            }
             // Seed expected BLAKE3 from search/UI so verify does not depend
             // solely on having processed an Ember keyword hit this session.
             // Non-search starts (deep link, friend browse, collections) often
@@ -1202,7 +1382,7 @@ async fn handle_command_inner(
                 }
             }
 
-            let has_source = !peer_ip.is_empty() && peer_ip != "0.0.0.0" && peer_port > 0;
+            let has_source = !crate::security::names_no_peer_address(&peer_ip) && peer_port > 0;
             // Best-effort: a friend-browse download almost always implies an
             // active friend session, so this binding is usually already
             // known this session (see `EmberFriendConnected` /
@@ -1345,7 +1525,9 @@ async fn handle_command_inner(
                             .map(|t| priority_str_to_u32(&t.priority))
                             .unwrap_or(1)
                     };
-                    let kad_available = kad_ready_for_sources(state);
+                    let kad_now = std::time::Instant::now();
+                    let kad_available = kad_ready_for_sources(state)
+                        && kad_source_search_may_start(state, &transfer_id, kad_now);
                     let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
                     let mut closest = state
                         .routing_table
@@ -1363,6 +1545,7 @@ async fn handle_command_inner(
                             state
                                 .download_source_searches
                                 .insert(sid, (transfer_id.clone(), hash_bytes));
+                            note_kad_source_search(state, &transfer_id, kad_now);
                             info!(
                                 "Started KAD source search {} for queued/paused download {}",
                                 sid.0, transfer_id
@@ -1549,7 +1732,10 @@ async fn handle_command_inner(
                             .map(|t| priority_str_to_u32(&t.priority))
                             .unwrap_or(1)
                     };
-                    {
+                    // As for a worker below: a start overtaken by a Pause
+                    // must not set the row searching, nor displace the
+                    // control a later Resume made.
+                    if !control.is_cancelled() {
                         let mut mgr = transfer_manager.write().await;
                         mgr.update_status(&transfer_id, TransferStatus::Searching);
                         mgr.register_control(&transfer_id, control.clone());
@@ -1743,9 +1929,9 @@ async fn handle_command_inner(
                 // (the common path: user clicks Download on a search
                 // result, frontend passes the first `source_addresses`
                 // entry) would only see that one peer until the next
-                // periodic sweep — the source_retry_timer for KAD (15s+
-                // on `active_download_kad_interval(0)`) and the 4-minute
-                // TCP `OP_GETSOURCES` batch. A search result reporting
+                // periodic sweep — the KAD source search clock
+                // (`kad_source_search_interval`) and the 4-minute TCP
+                // `OP_GETSOURCES` batch. A search result reporting
                 // "27 sources" then looked like it had exactly one in the
                 // transfer view, and a single failed connection left the
                 // file stuck. Match the `has_source = false` branch's
@@ -1762,15 +1948,12 @@ async fn handle_command_inner(
                 )
                 .await;
 
-                // Seed both sweeps so they schedule their next lookup on the
-                // normal cadence (~30s for KAD when count==1) instead of
-                // re-firing immediately. A leg with nowhere to send this ask
+                // Seed the Ember sweep so it schedules its next lookup on the
+                // normal cadence instead of re-firing immediately (the KAD leg
+                // keeps its own clock). A leg with nowhere to send this ask
                 // records (now, 0), which lets its sweep retry as soon as that
                 // network is available again.
                 let asked_at = std::time::Instant::now();
-                state
-                    .active_kad_search_state
-                    .insert(transfer_id.clone(), (asked_at, u32::from(ask.kad)));
                 state
                     .ember_source_search_state
                     .insert(transfer_id.clone(), (asked_at, u32::from(ask.ember)));
@@ -1894,11 +2077,7 @@ async fn handle_command_inner(
                 // Seed the Ember sweep so it re-asks on the normal backoff
                 // rather than immediately. A leg with nowhere to send this ask
                 // records (now, 0), which lets the sweep try again as soon as
-                // Ember is available. `active_kad_search_state` is deliberately
-                // left alone: this download has no sources yet, so its KAD
-                // retries are the pending-download timer's business below, and
-                // an entry here would look to the active sweep like a turn
-                // already taken once the download starts moving.
+                // Ember is available. The KAD leg stamped the file's own clock.
                 state
                     .ember_source_search_state
                     .insert(transfer_id.clone(), (std::time::Instant::now(), u32::from(ask.ember)));
@@ -2171,6 +2350,55 @@ async fn handle_command_inner(
                         ips_to_ban.push(ip);
                     }
                 }
+                // eMule drops a banned client from the waiting list
+                // (`CUpDownClient::Ban` → `RemoveFromWaitingQueue`). Left in
+                // place, the row kept answering its UDP reasks with a rank,
+                // and the peer kept its place in a queue it can never be
+                // served from. Its addresses are the ones the live-session
+                // capture would have banned had it been connected.
+                //
+                // The hash is published before the purge: a re-ask landing
+                // between the two would otherwise queue the peer again.
+                if let Ok(mut set) = shared_banned_hashes.write() {
+                    set.insert(kad_id.0);
+                }
+                if kad_id.0 != [0u8; 16] {
+                    // Keeps a row restored from the last session, if that
+                    // merge is still pending, from bringing the peer back.
+                    ed2k::upload_queue_store::note_asked(&ed2k::upload::QueueIdentity::UserHash(
+                        kad_id.0,
+                    ));
+                    let queued_ips: Vec<std::net::IpAddr> = upload_queue
+                        .lock()
+                        .await
+                        .iter()
+                        .filter(|entry| entry.user_hash == kad_id.0)
+                        .flat_map(|entry| entry.current_addr.map(|a| a.ip()).into_iter().chain(entry.last_ip))
+                        .collect();
+                    for ip in queued_ips {
+                        let v4 = match ip {
+                            std::net::IpAddr::V4(v4) => Some(v4),
+                            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+                        };
+                        // `0.0.0.0/8` is the stand-in a relayed session is
+                        // queued under (`relayed_session_addr`), not an
+                        // address anyone can be banned at.
+                        if let Some(v4) =
+                            v4.filter(|v4| v4.octets()[0] != 0 && !ips_to_ban.contains(v4))
+                        {
+                            ips_to_ban.push(v4);
+                        }
+                    }
+                    let purged =
+                        ed2k::upload::purge_queue_rows_for_banned_hash(upload_queue, &kad_id.0).await;
+                    if purged > 0 {
+                        info!("Removed {purged} upload-queue row(s) of banned peer {peer_id_hex}");
+                    }
+                }
+                // `0.0.0.0/8` names nobody: identity-only source rows and
+                // older stored addresses use `0.0.0.0` as a placeholder, and
+                // relayed sessions are recorded in the rest of the block.
+                ips_to_ban.retain(|ip| ip.octets()[0] != 0);
                 for ip in &ips_to_ban {
                     state.banned_ips.insert(*ip);
                 }
@@ -2183,9 +2411,6 @@ async fn handle_command_inner(
                 // admitted. Nothing in the write depends on the sets.
                 if let Ok(mut shared) = shared_banned_ips.write() {
                     *shared = state.banned_ips.clone();
-                }
-                if let Ok(mut set) = shared_banned_hashes.write() {
-                    set.insert(kad_id.0);
                 }
                 // Keep ReputationManager in sync so Trust badges and
                 // reputation-gated connect paths see the manual ban
@@ -3367,245 +3592,10 @@ async fn handle_command_inner(
                 root: offer.root,
                 received_at: offer.received_at,
             };
-            let reply = if accept {
-                ember::channel::XferReply::Accept
-            } else {
-                ember::channel::XferReply::Decline
-            };
             if accept {
-                // The cap the offer was measured against, re-checked at the
-                // moment it is taken up. An offer only counted itself against
-                // `xfer_pending`, so four queued prompts on top of an already
-                // busy receiver could all be accepted and land as seven
-                // concurrent downloads — each holding an open file handle and a
-                // request window the tick budget was never sized for.
-                if state.xfer_recv.len() >= ember::channel::XFER_MAX_ACTIVE {
-                    let _ = tx.send(Err(coded(
-                        "channels_xfer_busy",
-                        "Too many transfers are already running",
-                    )));
-                    return;
-                }
-                // No longer in the room it came from — left, deleted, or walked
-                // out when the directory listed it gone. Its frames are dropped
-                // from here on, so the transfer could never finish.
-                if !cached_channel_view(state, db, offer.channel_id)
-                    .is_some_and(|view| view.row.in_room_now())
-                {
-                    state.xfer_pending.remove(&xfer_id);
-                    emit_xfer_update(
-                        app_handle,
-                        &xfer_id,
-                        &offer.channel_id,
-                        &offer.peer,
-                        "receive",
-                        &offer.name,
-                        offer.size,
-                        0,
-                        "not_allowed",
-                    );
-                    let _ = tx.send(Err(coded(
-                        "channels_xfer_no_member",
-                        "That member is not in this room",
-                    )));
-                    return;
-                }
-                // Banned since the prompt appeared. The offer path refuses a
-                // banned sender outright, and nothing re-read that decision
-                // afterwards — so a member evicted while their dialog sat on
-                // screen could still be let in by the click that answered it.
-                // Declining stays available either way: that is cleanup.
-                if db
-                    .channel_member_is_banned(
-                        &hex::encode(offer.channel_id),
-                        &hex::encode(offer.peer),
-                    )
-                    .unwrap_or(false)
-                {
-                    state.xfer_pending.remove(&xfer_id);
-                    emit_xfer_update(
-                        app_handle,
-                        &xfer_id,
-                        &offer.channel_id,
-                        &offer.peer,
-                        "receive",
-                        &offer.name,
-                        offer.size,
-                        0,
-                        "not_allowed",
-                    );
-                    let _ = tx.send(Err(coded(
-                        "channels_xfer_no_member",
-                        "That member is not in this room",
-                    )));
-                    return;
-                }
-                // Room for the whole file before a byte is asked for. The
-                // sender picks the size, and the content is only checked
-                // against its hash as it arrives, so without this a large offer
-                // filled the disk and then failed. The offer stays answerable:
-                // the user can free space and accept again, or deny it. A
-                // volume that cannot report its space is let through, as eD2K
-                // downloads do; a full disk still fails the write safely.
-                let free = tokio::task::spawn_blocking({
-                    let root = download_folder.clone();
-                    move || fs2::available_space(root).ok()
-                })
-                .await
-                .ok()
-                .flatten();
-                // Receives already running grow their part files as data
-                // arrives, so what they still owe is spoken for too.
-                let owed: u64 = state
-                    .xfer_recv
-                    .values()
-                    .map(|recv| recv.size.saturating_sub(recv.bytes_received()))
-                    .fold(0, u64::saturating_add);
-                if free.is_some_and(|free| {
-                    free < offer.size.saturating_add(XFER_DISK_HEADROOM).saturating_add(owed)
-                }) {
-                    let _ = tx.send(Err(coded(
-                        "channels_xfer_no_space",
-                        "Not enough free disk space for this file",
-                    )));
-                    return;
-                }
-                // Part files sit beside the ones eD2K downloads use, so a
-                // half-received transfer never appears in the finished folder.
-                // Through the approved-root layer, exactly as the eD2K download
-                // path does it. This was the one download path in the
-                // application writing with bare `std::fs` — `create_dir_all`,
-                // a truncating `OpenOptions::open`, and later a `rename`, all
-                // by pathname with no root-identity pin and no reparse-point
-                // refusal. The `.part` name is derived from `xfer_id`, which is
-                // decoded straight off the wire, so the path a receive will
-                // write to is chosen by the *sending* peer: a symlink planted
-                // there is followed and truncated, and a junction at
-                // `Downloads` is traversed on completion. `prepare_approved_subdir`
-                // creates handle-relative and refuses a reparse point;
-                // `open_or_create_approved` refuses a path that resolves
-                // outside the approved root. Both also re-pin the root, so a
-                // download folder whose approval has been revoked is refused
-                // here rather than silently written to.
-                //
-                // Off the network task because the download folder can be a
-                // network share or a spinning disk behind a virus scanner,
-                // where these are hundreds of milliseconds — and this task also
-                // drives UDP receive, every timer and every IPC snapshot.
-                // Nothing else can touch `state` while we await (the loop is one
-                // task and this handler holds `&mut`), so the capacity and ban
-                // checks above still hold on the far side.
-                let allowed_roots = vec![download_folder.to_string_lossy().into_owned()];
-                crate::storage::part_folders::note_part_owner(&format!(
-                    "ember-xfer-{}",
-                    hex::encode(xfer_id)
-                ));
-                let part_name = format!("ember-xfer-{}.part", hex::encode(xfer_id));
-                let prepared = tokio::task::spawn_blocking({
-                    let root = download_folder.clone();
-                    let allowed = allowed_roots.clone();
-                    let part_name = part_name.clone();
-                    move || -> std::io::Result<(
-                        std::path::PathBuf,
-                        std::path::PathBuf,
-                        crate::security::filesystem::ObjectIdentity,
-                        std::fs::File,
-                    )> {
-                        let temp_dir = crate::security::filesystem::prepare_approved_subdir(
-                            &root, "Temp", &allowed,
-                        )?;
-                        let done_dir = crate::security::filesystem::prepare_approved_subdir(
-                            &root,
-                            ember::xfer::CHANNEL_FILES_DIR,
-                            &allowed,
-                        )?;
-                        let (part_path, file) =
-                            crate::security::filesystem::open_or_create_approved(
-                                &temp_dir.join(part_name),
-                                &allowed,
-                                true,
-                            )?;
-                        // Recorded now so completion can refuse a `.part` that
-                        // was swapped underneath the transfer.
-                        let identity =
-                            crate::security::filesystem::object_identity_from_file(&file)?;
-                        Ok((part_path, done_dir, identity, file))
-                    }
-                })
-                .await;
-                let (part_path, done_dir, part_identity, file) = match prepared
-                    .map_err(|e| e.to_string())
-                    .and_then(|opened| opened.map_err(|e| e.to_string()))
-                {
-                    Ok(prepared) => prepared,
-                    Err(e) => {
-                        let _ = tx.send(Err(coded_ctx(
-                            "channels_xfer_failed",
-                            "Could not open a place to save the file",
-                            e,
-                        )));
-                        return;
-                    }
-                };
-                state.xfer_recv.insert(
-                    xfer_id,
-                    ember::xfer::RecvState::new(
-                        offer.channel_id,
-                        offer.peer,
-                        offer.key,
-                        offer.name.clone(),
-                        offer.size,
-                        offer.root,
-                        part_path,
-                        done_dir.join(&offer.name),
-                        download_folder.clone(),
-                        part_identity,
-                        file,
-                    ),
-                );
-            }
-            let plain = ember::channel::encode_xfer_reply(
-                &offer.key,
-                &state.local_ed25519_pubkey,
-                &offer.peer,
-                &xfer_id,
-                reply,
-            );
-            // Rolled back on a reply that never left, exactly as the offer side
-            // does. Marking the transfer active regardless held a receive slot
-            // and an open file for a sender who was never told to start, and the
-            // offer had already been consumed so there was nothing left to
-            // answer — the user's only recourse was to wait out the timeout.
-            if !send_xfer_frame(socket, state, db, offer.channel_id, offer.peer, &plain).await {
-                if let Some(recv) = state.xfer_recv.remove(&xfer_id) {
-                    let _ = std::fs::remove_file(&recv.part_path);
-                }
-                let _ = tx.send(Err(coded(
-                    "channels_xfer_unreachable",
-                    "Could not reach that member right now",
-                )));
-                return;
-            }
-            state.xfer_pending.remove(&xfer_id);
-            if !accept {
-                super::channel_xfer::remember_declined_xfer(xfer_id, offer.channel_id, offer.peer, plain);
-            }
-            emit_xfer_update(
-                app_handle,
-                &xfer_id,
-                &offer.channel_id,
-                &offer.peer,
-                "receive",
-                &offer.name,
-                offer.size,
-                0,
-                if accept { "active" } else { "declined" },
-            );
-            let _ = tx.send(Ok(()));
-            if accept {
-                start_xfer_stream_fetch(socket, state, db, xfer_id).await;
+                begin_xfer_accept(state, db, app_handle, xfer_id, offer, download_folder, tx);
             } else {
-                state.xfer_stream_ports.remove(&xfer_id);
+                answer_xfer_offer(socket, state, db, app_handle, xfer_id, offer, false, tx).await;
             }
         }
 
@@ -3630,7 +3620,7 @@ async fn handle_command_inner(
                     "receive",
                 ));
             } else if let Some(recv) = state.xfer_recv.remove(&xfer_id) {
-                let _ = std::fs::remove_file(&recv.part_path);
+                discard_part_file(recv.part_path.clone());
                 target = Some((
                     recv.channel_id,
                     recv.peer,
@@ -4054,14 +4044,13 @@ async fn handle_command_inner(
             )
             .await;
             let asked_at = std::time::Instant::now();
-            // Stamp both sweeps so the ask the user just made counts as this
-            // round's ask: without it the periodic sweep sees a file it has not
-            // asked about recently and immediately asks again, which on a
-            // repeatedly clicked button is how one file talks over every other
-            // download's turn.
-            state
-                .active_kad_search_state
-                .insert(transfer_id.clone(), (asked_at, u32::from(outcome.kad)));
+            // Stamp the Ember sweep so the ask the user just made counts as
+            // this round's ask: without it the periodic sweep sees a file it
+            // has not asked about recently and immediately asks again, which
+            // on a repeatedly clicked button is how one file talks over every
+            // other download's turn. The KAD leg stamped its own clock, and
+            // asks KAD only when that clock allows, as eMule has no button
+            // that skips it.
             state
                 .ember_source_search_state
                 .insert(transfer_id.clone(), (asked_at, u32::from(outcome.ember)));
@@ -4811,9 +4800,35 @@ async fn handle_command_inner(
             // to allow updating the owned `settings` variable.
         }
 
-        NetworkCommand::ConnectToServer { ip, port } => {
-            initiate_server_connect(state, settings, app_handle, shared_server_addr, ip, port)
-                .await;
+        NetworkCommand::ChatMailboxRound => {
+            start_chat_mailbox_round(
+                state,
+                db,
+                app_handle,
+                settings,
+                ed25519_secret_key,
+                ed25519_pubkey,
+                true,
+            );
+        }
+
+        NetworkCommand::ConnectToServer { ip, port, tx } => {
+            let target = format!("{ip}:{port}");
+            let result =
+                initiate_server_connect(state, settings, app_handle, shared_server_addr, ip, port)
+                    .await
+                    .map_err(|reason| match reason {
+                        ServerDialRefusal::NotInList => coded(
+                            "server_not_in_list",
+                            "That server is not in your server list. Add it first.",
+                        ),
+                        ServerDialRefusal::BlockedByIpFilter => crate::commands::errors::coded_ctx(
+                            "server_blocked_by_ip_filter",
+                            "That server is blocked by your IP filter",
+                            target,
+                        ),
+                    });
+            let _ = tx.send(result);
         }
 
         NetworkCommand::DisconnectServer => {
@@ -4882,6 +4897,8 @@ async fn handle_command_inner(
                     &state.server_met_save_generation,
                     &state.server_met_save_lock,
                 );
+                forget_removed_server_as_target(state, app_handle, shared_server_addr, &ip, port)
+                    .await;
                 Ok(format!("Removed server {ip}:{port}"))
             } else {
                 Err(format!("Server {ip}:{port} not found in the list"))
@@ -4960,6 +4977,7 @@ async fn handle_command_inner(
                     + state.xfer_recv.len()
                     + state.xfer_streams.len()
                     + state.xfer_finish_in_flight
+                    + state.xfer_accepting.len()
                     + super::chat_attach::running_fetches(state),
             );
         }
@@ -5238,14 +5256,15 @@ async fn handle_command_inner(
                 let _ = tx.send(Err("File is restricted to mutual friends".into()));
                 return;
             }
+            // Until known.met is absorbed a restricted row can read public,
+            // and the recipient would republish it.
+            let friends_only = restricted || !known_files.is_authoritative();
             let payload = ed2k::messages::build_ember_file_offer(&ed2k::messages::EmberFileOffer {
                 file_hash,
                 file_size,
                 file_name,
                 ember_file_hash,
-                // Until known.met is absorbed a restricted row can read
-                // public, and the recipient would republish it.
-                friends_only: restricted || !known_files.is_authoritative(),
+                friends_only,
             });
             let sessions = state.ember_sessions.read().await;
             let Some(session) = sessions
@@ -5256,6 +5275,17 @@ async fn handle_command_inner(
                 let _ = tx.send(Err("Friend is offline".into()));
                 return;
             };
+            // Browse holds friends-only files back from an older session for
+            // the reason `friends_only_offer_refusal` gives.
+            if let Some(error) = friends_only_offer_refusal(
+                restricted,
+                known_files.is_authoritative(),
+                session.honours_friends_only(),
+            ) {
+                drop(sessions);
+                let _ = tx.send(Err(error));
+                return;
+            }
             let mut framed = Vec::with_capacity(6 + payload.len());
             framed.push(OP_EMULEPROT);
             framed.extend_from_slice(&((1 + payload.len()) as u32).to_le_bytes());
@@ -5989,6 +6019,7 @@ async fn handle_command_inner(
                 &data,
                 settings.filter_servers_by_ip,
                 Some(&mut state.ip_filter),
+                false,
             );
             if result.is_ok() {
                 let met_path = state.data_dir.join("server.met");
@@ -6075,39 +6106,12 @@ async fn handle_command_inner(
                                 return Err("Expected AICH hash mismatch; preview blocked".into());
                             }
                         }
-                        // The contiguous verified run from the start of the file,
-                        // and nothing past the first gap. Copying every verified
-                        // part instead sized the preview to the last one and left
-                        // the holes between as zeros: with preview priority
-                        // fetching the first and last parts first, the player got
-                        // a full-length file whose middle was silence, and read
-                        // its duration off that. A short prefix is what
-                        // `can_preview` actually promises.
-                        //
-                        // Bounded by `PREVIEW_MAX_BYTES`: on a nearly complete
-                        // download that run *is* the whole file, and copying
-                        // all of it duplicated gigabytes into the preview temp
-                        // directory.
-                        let preview_limit =
-                            ed2k::preview::PREVIEW_MAX_BYTES.min(file_size);
-                        let verified_ranges: Vec<ed2k::preview::FilledRange> =
-                            verified_complete_parts
-                                .iter()
-                                .take_while(|verified| **verified)
-                                .enumerate()
-                                .map(|(index, _)| {
-                                    let start = index as u64 * part_size;
-                                    ed2k::preview::FilledRange {
-                                        start,
-                                        end: (start + part_size).min(file_size),
-                                    }
-                                })
-                                .take_while(|range| range.start < preview_limit)
-                                .map(|range| ed2k::preview::FilledRange {
-                                    start: range.start,
-                                    end: range.end.min(preview_limit),
-                                })
-                                .collect();
+                        let verified_ranges = ed2k::preview::preview_ranges(
+                            &file_name_for_preview,
+                            file_size,
+                            &verified_complete_parts,
+                            part_size,
+                        );
 
                         let preview_path = ed2k::preview::create_preview_file(
                             &part_path,
@@ -6194,10 +6198,12 @@ async fn handle_command_inner(
                                 return;
                             }
                             let hash_hex = hex::encode(friend_eh);
+                            let ttl_secs = settings.chat_disappear_secs_for(&friend_eh);
                             let pending_id = match queue_outbound_chat_message(
                                 db.clone(),
-                                hash_hex,
+                                hash_hex.clone(),
                                 message.clone(),
+                                ttl_secs,
                             )
                             .await
                             {
@@ -6210,11 +6216,58 @@ async fn handle_command_inner(
                                     return;
                                 }
                             };
-                            match sender.tx.try_send(packet) {
+                            let db_ids = db.clone();
+                            let hex_ids = hash_hex.clone();
+                            let mailbox_id = tokio::task::spawn_blocking(move || {
+                                db_ids.assign_chat_mailbox_ids(&hex_ids, &[pending_id])
+                            })
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .and_then(|ids| ids.get(&pending_id).map(|(msg_id, _)| *msg_id));
+                            let mut frames = Vec::with_capacity(3);
+                            // A round that started while the friend was away
+                            // may be leaving this row in the mailbox: with its
+                            // id ahead of it, the friend shows it once.
+                            if let Some(sealed) = mailbox_id.and_then(|msg_id| {
+                                crate::network::ember::crypto::encrypt_chat_id(
+                                    &ed25519_secret_key,
+                                    &peer_pubkey,
+                                    &msg_id,
+                                )
+                            }) {
+                                frames.push(ed2k::messages::build_ember_ext_frame(
+                                    ed2k::messages::EMBER_EXT_CHAT_ID,
+                                    &sealed,
+                                ));
+                            }
+                            frames.push(packet);
+                            if ttl_secs > 0 {
+                                let target = crate::network::ember::crypto::ChatExpireTarget::Message(
+                                    crate::network::ember::crypto::chat_body_hash(&message),
+                                );
+                                // Sent with its timer or not yet: bare, it would
+                                // expire here and stay with the friend. The
+                                // queued row goes out with the next flush.
+                                match chat_expire_frame(
+                                    &ed25519_secret_key,
+                                    &peer_pubkey,
+                                    target,
+                                    ttl_secs,
+                                ) {
+                                    Some(frame) => frames.push(frame),
+                                    None => {
+                                        debug!("Chat {pending_id} stays queued: its disappearing timer could not be sealed");
+                                        let _ = tx.send(Err(format!("ChatAlreadyQueued:{pending_id}")));
+                                        return;
+                                    }
+                                }
+                            }
+                            match try_send_frames_together(&sender.tx, frames) {
                                 Ok(()) => {
-                                    match mark_outbound_chat_delivered(db.clone(), pending_id).await
+                                    match mark_outbound_chat_delivered(db.clone(), hash_hex.clone(), pending_id).await
                                     {
-                                        Ok(()) => {
+                                        Ok(expires_at) => {
                                             let _ = app_handle.emit(
                                                 "ember:chat-message",
                                                 serde_json::json!({
@@ -6223,6 +6276,7 @@ async fn handle_command_inner(
                                                     "message": message,
                                                     "direction": "sent",
                                                     "timestamp": chrono::Utc::now().timestamp(),
+                                                    "expires_at": expires_at,
                                                 }),
                                             );
                                             let _ = tx.send(Ok(()));
@@ -6256,6 +6310,7 @@ async fn handle_command_inner(
                         db.clone(),
                         queued_hash,
                         message.clone(),
+                        settings.chat_disappear_secs_for(&friend_eh),
                     )
                     .await
                     {
@@ -6269,6 +6324,17 @@ async fn handle_command_inner(
                         }
                     };
                     let _ = tx.send(Err(format!("ChatAlreadyQueued:{queued_id}")));
+                    // Left in the chat mailbox now if they collect from it,
+                    // rather than at the next round.
+                    start_chat_mailbox_round(
+                        state,
+                        db,
+                        app_handle,
+                        settings,
+                        ed25519_secret_key,
+                        ed25519_pubkey,
+                        true,
+                    );
                     if state.outbound_session_tasks.contains_key(&friend_eh) {
                         debug!("Chat remains queued while an existing friend connection attempt finishes");
                     } else {
@@ -6283,9 +6349,10 @@ async fn handle_command_inner(
                         if let Some((ip_str, port)) = addr_opt {
                             if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
                                 let addr = SocketAddr::new(ip.into(), port);
+                                let reserved_at = std::time::Instant::now();
                                 state
                                     .outbound_session_tasks
-                                    .insert(friend_eh, std::time::Instant::now());
+                                    .insert(friend_eh, reserved_at);
                                 let our_user_hash = state.user_hash;
                                 let our_ember_hash = ember_hash;
                                 let nickname = settings.nickname.clone();
@@ -6341,7 +6408,7 @@ async fn handle_command_inner(
                                                 );
                                                 let _ = ul_tx2.send(upload_server::UploadEvent {
                                                     transfer_id: String::new(),
-                                                    kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                                    kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh, reserved_at: Some(reserved_at) },
                                                 }).await;
                                                 return;
                                             }
@@ -6394,7 +6461,7 @@ async fn handle_command_inner(
                                     // slot only gated this connect attempt.
                                     let _ = ul_tx2.send(upload_server::UploadEvent {
                                         transfer_id: String::new(),
-                                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh, reserved_at: Some(reserved_at) },
                                     }).await;
                                 });
                             } else {
@@ -6430,9 +6497,10 @@ async fn handle_command_inner(
                             let fh = friend_hashes.clone();
                             let ultx2 = ul_event_tx.clone();
                             let nat_ctx = state.friend_nat_context.clone();
+                            let reserved_at = std::time::Instant::now();
                             state
                                 .outbound_session_tasks
-                                .insert(friend_eh, std::time::Instant::now());
+                                .insert(friend_eh, reserved_at);
                             debug!(
                                 "No stored address for {}, trying rendezvous for chat",
                                 hex::encode(friend_eh)
@@ -6477,7 +6545,7 @@ async fn handle_command_inner(
                                                     );
                                                     let _ = ultx2.send(upload_server::UploadEvent {
                                                         transfer_id: String::new(),
-                                                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh, reserved_at: Some(reserved_at) },
                                                     }).await;
                                                     return;
                                                 }
@@ -6521,7 +6589,7 @@ async fn handle_command_inner(
                                 // misleading offline UI events.
                                 let _ = ultx2.send(upload_server::UploadEvent {
                                     transfer_id: String::new(),
-                                    kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                    kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh, reserved_at: Some(reserved_at) },
                                 }).await;
                             });
                         }
@@ -6655,9 +6723,10 @@ async fn handle_command_inner(
                         if let Some((ip_str, port)) = addr_opt {
                             if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
                                 let addr = SocketAddr::new(ip.into(), port);
+                                let reserved_at = std::time::Instant::now();
                                 state
                                     .outbound_session_tasks
-                                    .insert(friend_eh, std::time::Instant::now());
+                                    .insert(friend_eh, reserved_at);
                                 let our_user_hash = state.user_hash;
                                 let our_ember_hash = ember_hash;
                                 let nickname = settings.nickname.clone();
@@ -6752,7 +6821,7 @@ async fn handle_command_inner(
                                     // slot only gated this connect attempt.
                                     let _ = ul_tx2.send(upload_server::UploadEvent {
                                         transfer_id: String::new(),
-                                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh, reserved_at: Some(reserved_at) },
                                     }).await;
                                 });
                             } else {
@@ -6793,9 +6862,10 @@ async fn handle_command_inner(
                             let browse_event_tx = ul_event_tx.clone();
                             let ultx2 = ul_event_tx.clone();
                             let nat_ctx = state.friend_nat_context.clone();
+                            let reserved_at = std::time::Instant::now();
                             state
                                 .outbound_session_tasks
-                                .insert(friend_eh, std::time::Instant::now());
+                                .insert(friend_eh, reserved_at);
                             info!(
                                 "No stored address for {}, trying rendezvous for browse",
                                 hex::encode(friend_eh)
@@ -6886,7 +6956,7 @@ async fn handle_command_inner(
                                 // not EmberFriendDisconnected — see chat path.
                                 let _ = ultx2.send(upload_server::UploadEvent {
                                     transfer_id: String::new(),
-                                    kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                    kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh, reserved_at: Some(reserved_at) },
                                 }).await;
                             });
                         }
@@ -7203,6 +7273,168 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::Shutdown { .. } => {}
+    }
+}
+
+#[cfg(test)]
+mod search_request_tests {
+    use super::{
+        is_filter_only_search, kad_lookup_keyword, related_search_expression,
+        server_keyword_expression, server_reply_match_terms,
+    };
+    use crate::network::kad::messages::{
+        build_search_expression_with_node, search_expression_uses_64bit, SearchConstraints,
+    };
+    use crate::search::query::parse;
+
+    #[test]
+    fn a_server_without_large_files_gets_its_size_limit_in_32_bits() {
+        const GIB: u64 = 1 << 30;
+        let expr = parse("movie").unwrap();
+        let expr_for = |constraints: &SearchConstraints| {
+            build_search_expression_with_node(Some(expr.to_wire_bytes()), constraints)
+        };
+        let over = SearchConstraints {
+            min_size: Some(GIB),
+            max_size: Some(8 * GIB),
+            ..Default::default()
+        };
+        let full = expr_for(&over);
+        assert!(search_expression_uses_64bit(&full));
+        assert_eq!(
+            server_keyword_expression(&full, Some(&expr), &over, true).as_deref(),
+            Some(full.as_slice()),
+            "a large-file server is sent the search unchanged"
+        );
+        let clamped = server_keyword_expression(&full, Some(&expr), &over, false).unwrap();
+        assert!(!search_expression_uses_64bit(&clamped));
+        assert_eq!(
+            clamped,
+            expr_for(&SearchConstraints {
+                max_size: Some(u64::from(u32::MAX)),
+                ..over
+            })
+        );
+
+        // Nothing such a server indexes can meet a minimum past 4 GiB.
+        let big_min = SearchConstraints {
+            min_size: Some(5 * GIB),
+            ..Default::default()
+        };
+        let full = expr_for(&big_min);
+        assert_eq!(server_keyword_expression(&full, Some(&expr), &big_min, false), None);
+
+        // A search with no size past 4 GiB goes out as it is.
+        let small = SearchConstraints {
+            max_size: Some(GIB),
+            ..Default::default()
+        };
+        let full = expr_for(&small);
+        assert_eq!(
+            server_keyword_expression(&full, Some(&expr), &small, false).as_deref(),
+            Some(full.as_slice())
+        );
+    }
+
+    const HASH: &str = "AABBCCDDEEFF00112233445566778899";
+
+    fn lookup(query: &str) -> Option<String> {
+        let terms = parse(query).unwrap().required_terms();
+        kad_lookup_keyword(&terms).cloned()
+    }
+
+    #[test]
+    fn the_kad_lookup_word_is_the_first_of_the_longest() {
+        assert_eq!(lookup("linux mint iso").as_deref(), Some("linux"));
+        assert_eq!(lookup("abcd wxyz").as_deref(), Some("abcd"));
+        assert_eq!(lookup("star wars").as_deref(), Some("star"));
+        // A trailing three-letter word ties at best, and a tie keeps the
+        // earlier word.
+        assert_eq!(lookup("foo bar mp3").as_deref(), Some("foo"));
+        assert_eq!(lookup("ubuntu iso").as_deref(), Some("ubuntu"));
+        assert_eq!(lookup("mp3").as_deref(), Some("mp3"));
+        assert_eq!(kad_lookup_keyword(&[]), None);
+        assert_eq!(lookup("big flac").as_deref(), Some("flac"));
+        // Bytes, as the publisher counts them: two CJK characters are six.
+        assert_eq!(lookup("abcd 東京").as_deref(), Some("東京"));
+    }
+
+    #[test]
+    fn the_related_request_is_the_bare_term_whatever_the_filters() {
+        let term = format!("related::{HASH}");
+        let wire = related_search_expression(&term);
+        let mut expected = vec![0x01];
+        expected.extend_from_slice(&(term.len() as u16).to_le_bytes());
+        expected.extend_from_slice(term.as_bytes());
+        assert_eq!(wire, expected, "no AND node, no constraint leaf");
+    }
+
+    #[test]
+    fn filters_alone_search_only_with_an_empty_box_and_no_seed() {
+        let none: Vec<String> = Vec::new();
+        let seed = vec![HASH.to_lowercase()];
+        assert!(is_filter_only_search("", true, &none));
+        assert!(is_filter_only_search("   ", true, &none));
+        assert!(!is_filter_only_search("", false, &none));
+        // Every word under the 3-byte minimum is not an empty box.
+        assert!(!is_filter_only_search("a b", true, &none));
+        assert!(!is_filter_only_search("", true, &seed), "a related search's filters narrow its rows");
+    }
+
+    #[test]
+    fn server_reply_terms_are_the_positive_words_of_a_plain_search() {
+        let expr = parse("matrix reloaded -cam").unwrap();
+        assert_eq!(
+            server_reply_match_terms(Some(&expr), false),
+            vec!["matrix".to_string(), "reloaded".to_string()]
+        );
+    }
+
+    #[test]
+    fn server_reply_terms_accept_everything_where_a_row_need_not_share_a_word() {
+        let plain = parse("matrix").unwrap();
+        assert!(server_reply_match_terms(Some(&plain), true).is_empty(), "related");
+        assert!(server_reply_match_terms(None, false).is_empty(), "filter-only");
+        let directive = parse(&format!("related::{HASH} video")).unwrap();
+        assert!(server_reply_match_terms(Some(&directive), false).is_empty());
+        let accented = parse("café").unwrap();
+        assert!(server_reply_match_terms(Some(&accented), false).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod friends_only_offer_tests {
+    use super::friends_only_offer_refusal;
+
+    fn code(error: Option<String>) -> Option<String> {
+        error.map(|e| {
+            let envelope: serde_json::Value = serde_json::from_str(&e).expect("a coded error");
+            envelope["code"].as_str().expect("with a code").to_string()
+        })
+    }
+
+    #[test]
+    fn a_friend_who_honours_the_marking_gets_any_file() {
+        for (restricted, trusted) in [(true, true), (true, false), (false, false), (false, true)] {
+            assert_eq!(friends_only_offer_refusal(restricted, trusted, true), None);
+        }
+    }
+
+    #[test]
+    fn an_older_friend_gets_only_a_file_known_to_be_public() {
+        assert_eq!(friends_only_offer_refusal(false, true, false), None);
+        assert_eq!(
+            code(friends_only_offer_refusal(true, true, false)).as_deref(),
+            Some("peers_offer_needs_newer_ember")
+        );
+        assert_eq!(
+            code(friends_only_offer_refusal(true, false, false)).as_deref(),
+            Some("peers_offer_needs_newer_ember")
+        );
+        assert_eq!(
+            code(friends_only_offer_refusal(false, false, false)).as_deref(),
+            Some("peers_offer_library_unconfirmed")
+        );
     }
 }
 

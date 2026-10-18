@@ -116,24 +116,23 @@ pub(super) fn advertised_tcp_port_from(
         .unwrap_or(configured_tcp_port)
 }
 
-/// Port captured for `OP_LOGINREQUEST` *before* session teardown clears
-/// `low_id`. That flag is evidence our own forward is not carrying traffic;
-/// capturing after it is cleared would advertise the UPnP port that just
-/// earned the LowID.
-pub(super) fn capture_advertised_tcp_port_then_reset_low_id(
+/// Port for the next `OP_LOGINREQUEST`. A LowID, on this session or on the one
+/// that just ended (`last_session_low_id`; teardown clears `low_id`), is
+/// evidence our own forward is not carrying traffic, so the login does not
+/// advertise the UPnP port that just earned it.
+pub(super) fn login_tcp_port_from(
     upnp_tcp_port: Option<u16>,
     external_tcp_port: Option<u16>,
     configured_tcp_port: u16,
-    low_id: &mut bool,
+    low_id: bool,
+    last_session_low_id: bool,
 ) -> u16 {
-    let tcp_port = advertised_tcp_port_from(
+    advertised_tcp_port_from(
         upnp_tcp_port,
         external_tcp_port,
         configured_tcp_port,
-        *low_id,
-    );
-    *low_id = false;
-    tcp_port
+        low_id || last_session_low_id,
+    )
 }
 
 /// UDP counterpart of `advertised_tcp_port` — the KAD-peer-voted or

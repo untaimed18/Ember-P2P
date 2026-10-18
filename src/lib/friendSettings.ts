@@ -9,12 +9,13 @@ import type { AppSettings, FriendOverrides } from '$lib/types';
 /** Highest per-friend auto-accept ceiling, in MB. Matches the global one. */
 export const FRIEND_AUTO_ACCEPT_MAX_MB = 2048;
 
-/** The backend's limit on a friend's name, in UTF-8 bytes. */
-export const FRIEND_NAME_MAX_BYTES = 64;
+/** The backend's limit on a friend's name, in characters (Unicode code
+ *  points), the same for names typed here and names a request brings in. */
+export const FRIEND_NAME_MAX_CHARS = 64;
 
-/** Whether a name, as it will be saved, is over {@link FRIEND_NAME_MAX_BYTES}. */
+/** Whether a name, as it will be saved, is over {@link FRIEND_NAME_MAX_CHARS}. */
 export function friendNameTooLong(name: string): boolean {
-  return new TextEncoder().encode(name.trim()).length > FRIEND_NAME_MAX_BYTES;
+  return [...name.trim()].length > FRIEND_NAME_MAX_CHARS;
 }
 
 type Settings = AppSettings | null | undefined;
@@ -30,7 +31,10 @@ export function chatAllowedWith(settings: Settings, friendHash: string): boolean
 
 /** Files from this friend. Never while chat with them is off. */
 export function filesAllowedFrom(settings: Settings, friendHash: string): boolean {
-  return chatAllowedWith(settings, friendHash) && (friendOverrides(settings, friendHash).files ?? true);
+  return (
+    chatAllowedWith(settings, friendHash) &&
+    (friendOverrides(settings, friendHash).files ?? settings?.friend_files_disabled !== true)
+  );
 }
 
 /** The ceiling under which this friend's files download without asking, in MB. */
@@ -50,6 +54,16 @@ export function readReceiptsWith(settings: Settings, friendHash: string): boolea
     chatAllowedWith(settings, friendHash) &&
     (friendOverrides(settings, friendHash).read_receipts ?? settings?.friend_chat_read_receipts !== false)
   );
+}
+
+/** The disappearing-message timers offered, in seconds: five minutes, one hour,
+ *  one day, one week and four weeks. Mirrors `CHAT_DISAPPEAR_CHOICES`. */
+export const CHAT_DISAPPEAR_CHOICES = [300, 3_600, 86_400, 604_800, 2_419_200] as const;
+
+/** The disappearing-message timer with this friend, in seconds; 0 is off. */
+export function disappearSecsFor(settings: Settings, friendHash: string): number {
+  const secs = friendOverrides(settings, friendHash).disappear_secs ?? settings?.chat_disappear_secs ?? 0;
+  return Number.isFinite(secs) && secs > 0 ? secs : 0;
 }
 
 /** Whether this friend's online, message and file notifications are wanted,

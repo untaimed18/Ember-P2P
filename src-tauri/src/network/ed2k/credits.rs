@@ -4,12 +4,22 @@ use zeroize::ZeroizeOnDrop;
 const MAX_CREDIT_RATIO: f64 = 10.0;
 const MIN_CREDIT_RATIO: f64 = 1.0;
 
-/// Hard ceiling on per-peer credit records held in memory. The 90-day
-/// `cleanup_stale` sweep is the primary reaper; this cap is a backstop so a
-/// peer churning `user_hash` (or Ember pubkey) across reconnects — each
-/// OP_PUBLICKEY seeds a record via `get_or_create` — can't grow the maps
-/// without bound between sweeps. At capacity, inserting a new record evicts
-/// the least-recently-seen one, mirroring the bounded DHT store / comment maps.
+/// Age, in days since last contact, past which `cleanup_stale` drops a
+/// credit record. eMule's `CClientCreditsList::LoadList` expires records
+/// after 150 days (`12960000` seconds); a shorter window would forget peers
+/// that an eMule client sharing the same network still credits.
+pub const CREDIT_EXPIRY_DAYS: i64 = 150;
+
+/// Hard ceiling on per-peer credit records held in memory. The
+/// [`CREDIT_EXPIRY_DAYS`] `cleanup_stale` sweep is the primary reaper; this
+/// cap is a backstop so a peer churning `user_hash` (or Ember pubkey) across
+/// reconnects — every Hello seeds a record via `note_client_identity` — can't
+/// grow the maps without bound between sweeps. At capacity, inserting a new
+/// eD2K record evicts the least-recently-seen record that holds nothing
+/// worth keeping (see [`CreditRecord::is_disposable`]), and only falls back
+/// to the least-recently-seen record overall when every one carries credit,
+/// so a flood of fresh hashes evicts its own records rather than real
+/// creditors.
 const MAX_CREDIT_RECORDS: usize = 50_000;
 
 /// Upper bound on binding-only eD2K→Ember mappings held in memory; see
@@ -235,10 +245,11 @@ pub struct CreditRecord {
     /// eMule reads this off `CreditStruct::nKeySize`, which it only ever
     /// fills in from inside `CClientCredits::Verified()` — so for eMule "a
     /// key is stored" and "a key has proven itself" are the same fact. Ours
-    /// aren't: [`CreditManager::set_public_key`] binds the key the moment
-    /// `OP_PUBLICKEY` arrives, long before any challenge is answered, so a
-    /// bound key says nothing about verification and neither does
-    /// `ident_state` (the inbound path parks at `Needed` in between).
+    /// aren't: [`CreditManager::set_public_key`] holds the key in memory the
+    /// moment `OP_PUBLICKEY` arrives, long before any challenge is answered,
+    /// so a bound key says nothing about verification and neither does
+    /// `ident_state` (the record parks at `Needed` in between). Whether the
+    /// *current* key has proven itself is the private `key_proven`.
     ///
     /// Persisted in the v3 `clients.met` crypto-anchor section (see
     /// `CLIENTS_MET_ANCHOR_MAGIC`) rather than derived, because
@@ -285,6 +296,20 @@ pub struct CreditRecord {
     /// never displaces it and nothing that grants, scores or recognises a
     /// peer reads this. Set by [`CreditManager::promote_proven_ember`].
     pub proven_ember_hash: Option<[u8; 16]>,
+    /// Whether `public_key` has answered one of our challenges — eMule's
+    /// "the key is in `CreditStruct`" (`CClientCredits::Verified`).
+    ///
+    /// Until it has, the key is only what `OP_PUBLICKEY` claimed: it is
+    /// never persisted (see [`Self::persisted_public_key`]), a different key
+    /// may replace it, and a failed challenge discards it. Once it has, it is
+    /// written out with the record and can never be replaced. A user hash
+    /// travels in the clear in every Hello, so pinning the first key seen let
+    /// anyone lock a peer out of its credit with one junk `OP_PUBLICKEY`.
+    ///
+    /// Not stored on its own: a persisted key is a proven one, so loaders set
+    /// this from "key present and anchored" in
+    /// [`CreditManager::insert_loaded_credit`].
+    key_proven: bool,
 }
 
 /// Credit record for verified Ember peers.
@@ -374,7 +399,31 @@ impl CreditRecord {
             client_software: String::new(),
             seen_ip: 0,
             proven_ember_hash: None,
+            key_proven: false,
         }
+    }
+
+    /// The SecIdent key to write to disk: the bound key once it has answered
+    /// a challenge, nothing before that. eMule likewise only stores a key
+    /// inside `CClientCredits::Verified`.
+    pub fn persisted_public_key(&self) -> &[u8] {
+        if self.key_proven {
+            &self.public_key
+        } else {
+            &[]
+        }
+    }
+
+    /// Nothing here is worth keeping over a stranger's record: no bytes in
+    /// either direction, no key that ever proved itself, no Ember link.
+    /// Every Hello creates one of these, so they are what the
+    /// `MAX_CREDIT_RECORDS` backstop evicts first.
+    fn is_disposable(&self) -> bool {
+        self.uploaded == 0
+            && self.downloaded == 0
+            && !self.crypto_verified_once
+            && self.ember_hash.is_none()
+            && self.proven_ember_hash.is_none()
     }
 }
 
@@ -449,6 +498,14 @@ pub struct CreditManager {
     ember_credits: HashMap<[u8; 32], EmberCreditRecord>,
     #[zeroize(skip)]
     credit_seen: LastSeenIndex<[u8; 16]>,
+    /// The subset of `credit_seen` that may still be
+    /// [`CreditRecord::is_disposable`]. A record never becomes disposable
+    /// again once it stops being so (bytes only grow, the anchor and Ember
+    /// links are never cleared), so entries are added when a record is
+    /// created or loaded and pruned lazily when eviction finds one that
+    /// moved on.
+    #[zeroize(skip)]
+    disposable_seen: LastSeenIndex<[u8; 16]>,
     #[zeroize(skip)]
     ember_seen: LastSeenIndex<[u8; 32]>,
     /// eD2K user hash → Ember hash learned from an offline binding check on a
@@ -535,6 +592,7 @@ impl CreditManager {
             credits: HashMap::new(),
             ember_credits: HashMap::new(),
             credit_seen: LastSeenIndex::default(),
+            disposable_seen: LastSeenIndex::default(),
             ember_seen: LastSeenIndex::default(),
             bound_ember_hashes: HashMap::new(),
             our_public_key: Vec::new(),
@@ -880,20 +938,22 @@ impl CreditManager {
         // `add_uploaded` / `add_downloaded`. Peers that connected, did a
         // partial handshake, and never transferred bytes (Unknown / Failed
         // / Needed states) kept their creation-time `last_seen` forever,
-        // so the 90-day `cleanup_stale` sweep evicted them by *first
+        // so the `cleanup_stale` sweep evicted them by *first
         // contact* age rather than *last contact* age — visible in the
         // Known Clients tab as months-old "Unknown" rows for peers we
         // actually still talked to recently.
         let now = chrono::Utc::now().timestamp();
         // Backstop the table size before inserting a brand-new record (see
-        // MAX_CREDIT_RECORDS): when full, evict the least-recently-seen entry.
-        // Only runs on genuine inserts — updating an existing record can't grow
-        // the map, so it never evicts.
+        // MAX_CREDIT_RECORDS). Only runs on genuine inserts — updating an
+        // existing record can't grow the map, so it never evicts.
         self.make_room_for_credit(&user_hash);
         // Before handing out `&mut`: the caller may mutate any field, and once
         // `record` is borrowed from `self` we can no longer touch the flag.
         self.mark_credit_unsaved(user_hash);
         self.credit_seen.set(user_hash, now);
+        if !self.credits.contains_key(&user_hash) {
+            self.disposable_seen.set(user_hash, now);
+        }
         let record = self
             .credits
             .entry(user_hash)
@@ -906,11 +966,33 @@ impl CreditManager {
         if self.credits.contains_key(incoming) || self.credits.len() < MAX_CREDIT_RECORDS {
             return;
         }
-        if let Some(oldest) = self.credit_seen.oldest(&self.credits, |r| r.last_seen) {
-            self.credits.remove(&oldest);
-            self.credit_seen.remove(&oldest);
-            self.mark_credit_unsaved(oldest);
+        let victim = self
+            .oldest_disposable_credit()
+            .or_else(|| self.credit_seen.oldest(&self.credits, |r| r.last_seen));
+        if let Some(victim) = victim {
+            self.forget_credit(victim);
         }
+    }
+
+    /// Least-recently-seen record that is still
+    /// [`CreditRecord::is_disposable`], dropping index entries for records
+    /// that have since earned their place.
+    fn oldest_disposable_credit(&mut self) -> Option<[u8; 16]> {
+        loop {
+            let key = self.disposable_seen.oldest(&self.credits, |r| r.last_seen)?;
+            if self.credits.get(&key).is_some_and(CreditRecord::is_disposable) {
+                return Some(key);
+            }
+            self.disposable_seen.remove(&key);
+        }
+    }
+
+    /// Drop a record and queue its SQLite row for deletion.
+    fn forget_credit(&mut self, user_hash: [u8; 16]) {
+        self.credits.remove(&user_hash);
+        self.credit_seen.remove(&user_hash);
+        self.disposable_seen.remove(&user_hash);
+        self.mark_credit_unsaved(user_hash);
     }
 
     /// Adopt a record read from storage exactly as stored, indexed at its
@@ -919,34 +1001,79 @@ impl CreditManager {
     /// Unlike [`Self::get_or_create`] this neither bumps `last_seen` nor marks
     /// the row for rewrite: it already matches disk, and the first flush
     /// reconciles the whole table anyway (`needs_full_sync`). Past
-    /// `MAX_CREDIT_RECORDS` the least-recently-seen record by stored age —
-    /// possibly this one — is dropped and queued for deletion, so a store
-    /// that outgrew the cap keeps its most recent peers.
-    pub fn insert_loaded_credit(&mut self, record: CreditRecord) {
+    /// `MAX_CREDIT_RECORDS` a record holding nothing
+    /// ([`CreditRecord::is_disposable`]) gives way first, then the
+    /// least-recently-seen by stored age — possibly this one — is dropped and
+    /// queued for deletion, so a store that outgrew the cap keeps its
+    /// creditors and, among those, its most recent peers.
+    ///
+    /// Two things on disk are not taken at face value. A key on a record that
+    /// never verified was persisted by builds that stored every
+    /// `OP_PUBLICKEY` unproven; it is dropped, as eMule would never have
+    /// written it (see [`CreditRecord::key_proven`]). And a `last_seen` in the
+    /// future, stamped while the clock was wrong, is pulled back to now, or
+    /// the record would never age out or be evicted.
+    pub fn insert_loaded_credit(&mut self, mut record: CreditRecord) {
+        let mut rewritten = false;
+        let now = chrono::Utc::now().timestamp();
+        if record.last_seen > now {
+            record.last_seen = now;
+            rewritten = true;
+        }
+        if !record.public_key.is_empty() && !record.crypto_verified_once {
+            record.public_key.clear();
+            rewritten = true;
+        }
+        record.key_proven = !record.public_key.is_empty();
+        if record.public_key.is_empty()
+            && matches!(record.ident_state, IdentState::Needed | IdentState::Failed)
+        {
+            // eMule's `InitalizeIdent`: no stored key is IS_NOTAVAILABLE.
+            record.ident_state = IdentState::Unknown;
+        }
+        if rewritten {
+            self.touch_dirty();
+        }
         let user_hash = record.user_hash;
         if let Some(existing) = self.credits.get_mut(&user_hash) {
             self.credit_seen.set(user_hash, record.last_seen);
+            if record.is_disposable() {
+                self.disposable_seen.set(user_hash, record.last_seen);
+            } else {
+                self.disposable_seen.remove(&user_hash);
+            }
             *existing = record;
             return;
         }
         if self.credits.len() >= MAX_CREDIT_RECORDS {
-            if let Some(oldest) = self.credit_seen.oldest(&self.credits, |r| r.last_seen) {
-                let oldest_seen = self.credits.get(&oldest).map_or(i64::MAX, |r| r.last_seen);
-                if record.last_seen <= oldest_seen {
+            let victim = self
+                .oldest_disposable_credit()
+                .or_else(|| self.credit_seen.oldest(&self.credits, |r| r.last_seen));
+            if let Some(victim) = victim {
+                let rank = |r: &CreditRecord| (!r.is_disposable(), r.last_seen);
+                let victim_rank = self.credits.get(&victim).map(rank);
+                if victim_rank.is_some_and(|victim_rank| rank(&record) <= victim_rank) {
                     self.mark_credit_unsaved(user_hash);
                     return;
                 }
-                self.credits.remove(&oldest);
-                self.credit_seen.remove(&oldest);
-                self.mark_credit_unsaved(oldest);
+                self.forget_credit(victim);
             }
         }
         self.credit_seen.set(user_hash, record.last_seen);
+        if record.is_disposable() {
+            self.disposable_seen.set(user_hash, record.last_seen);
+        }
         self.credits.insert(user_hash, record);
     }
 
-    /// Ember counterpart of [`Self::insert_loaded_credit`].
-    pub fn insert_loaded_ember_credit(&mut self, record: EmberCreditRecord) {
+    /// Ember counterpart of [`Self::insert_loaded_credit`], including its
+    /// clamp of a future `last_seen`.
+    pub fn insert_loaded_ember_credit(&mut self, mut record: EmberCreditRecord) {
+        let now = chrono::Utc::now().timestamp();
+        if record.last_seen > now {
+            record.last_seen = now;
+            self.touch_dirty();
+        }
         let pub_key = record.pub_key;
         if let Some(existing) = self.ember_credits.get_mut(&pub_key) {
             self.ember_seen.set(pub_key, record.last_seen);
@@ -1042,7 +1169,7 @@ impl CreditManager {
         true
     }
 
-    /// `current_ip` as for [`Self::add_uploaded`]; see [`credit_ip`].
+    /// `current_ip` as for [`Self::add_uploaded`]; see [`Self::ident_ip_of`].
     pub fn add_downloaded(&mut self, user_hash: [u8; 16], current_ip: u32, bytes: u64) -> bool {
         if !self.credit_accepted(&user_hash, current_ip) {
             return false;
@@ -1127,9 +1254,12 @@ impl CreditManager {
     /// re-asks when the IP moved), passed, and then had the result thrown
     /// away: the stale pin kept it `BadGuy` forever, which zeroes its queue
     /// score and can refuse it a slot outright once the queue is busy.
+    ///
+    /// A proof from no known address (`current_ip == 0`, e.g. a relayed
+    /// session) keeps the pin it has rather than clearing it.
     pub fn check_identity_ip(&mut self, user_hash: [u8; 16], current_ip: u32) {
         let record = self.get_or_create(user_hash);
-        if record.ident_state == IdentState::Verified {
+        if record.ident_state == IdentState::Verified && current_ip != 0 {
             record.ident_ip = current_ip;
         }
         self.promote_proven_ember(user_hash);
@@ -1138,6 +1268,15 @@ impl CreditManager {
     /// eMule CClientCredits::GetCurrentIdentState(dwForIP): returns BadGuy
     /// dynamically when a verified client's IP doesn't match, without mutating
     /// the stored ident_state.
+    ///
+    /// A record verified with no pin (`ident_ip == 0`: the proof came over a
+    /// relay, or from an address with no IPv4) matches no address either. It
+    /// used to read `Verified` from anywhere, so a direct session naming that
+    /// cleartext user hash took its credit without answering SecIdent. eMule
+    /// always records `m_dwIdentIP` when it verifies, so it has no such case:
+    /// a session earns the state by proving the hash itself — directly, which
+    /// pins its address ([`Self::check_identity_ip`]), or on a relay, whose
+    /// caller passes 0 once that session has proved it.
     pub fn get_current_ident_state(&self, user_hash: &[u8; 16], current_ip: u32) -> IdentState {
         match self.credits.get(user_hash) {
             Some(record) => {
@@ -1149,7 +1288,6 @@ impl CreditManager {
                 // stored state instead of spuriously labelling a verified peer a
                 // BadGuy (which also wrongly floored their credit ratio).
                 if record.ident_state == IdentState::Verified
-                    && record.ident_ip != 0
                     && current_ip != 0
                     && record.ident_ip != current_ip
                 {
@@ -1250,8 +1388,8 @@ impl CreditManager {
             // that never recorded an IP): that comparison is vacuously true
             // without ever having pinned the identity to a real address, so
             // require both sides to be non-zero before skipping the
-            // challenge. Mirrors the same non-zero requirement
-            // `get_current_ident_state` uses for its BadGuy comparison.
+            // challenge. That is exactly when `get_current_ident_state`
+            // reads `Verified` from a known address: a pin that matches it.
             Some(record)
                 if !record.public_key.is_empty()
                     && record.ident_state == IdentState::Verified
@@ -1261,7 +1399,11 @@ impl CreditManager {
             {
                 None
             }
-            Some(record) if !record.public_key.is_empty() => Some(1),
+            // Only a proven key skips the key request. An unproven one may be
+            // a stranger's junk sent under this hash in an earlier session;
+            // asking for the signature alone would fail the real peer against
+            // it, while asking for the key too lets its own key replace it.
+            Some(record) if record.key_proven && !record.public_key.is_empty() => Some(1),
             _ => Some(2),
         }
     }
@@ -1320,21 +1462,19 @@ impl CreditManager {
     /// Bind a peer's RSA public key to their user hash. Returns whether the
     /// key is bound to this hash once the call returns.
     ///
-    /// Trust on first use: the first key seen for a hash owns that identity,
-    /// and a *different* key arriving later is refused rather than silently
-    /// replacing it. Overwriting was a credit-theft primitive — a user hash
-    /// travels in the clear in every Hello, so anyone who had seen a peer
-    /// could connect claiming that hash, push their own key, and inherit the
-    /// balances bound to it. Recovery was impossible: `secident_request_state`
-    /// only asks for a key when none is stored, so the genuine peer was never
-    /// asked again, its signatures no longer matched, and it was pinned at
-    /// `IdentState::Failed` with credit refused from then on.
+    /// Mirrors eMule's `CClientCredits::SetSecureIdent`: the key is held in
+    /// memory only and the record goes to `Needed` until a signature proves
+    /// it. An unproven key may be replaced by a different one; a key that has
+    /// proven itself ([`CreditRecord::key_proven`]) never can. Overwriting a
+    /// proven key was a credit-theft primitive — a user hash travels in the
+    /// clear in every Hello, so anyone who had seen a peer could connect
+    /// claiming that hash, push their own key, and inherit its balances.
+    /// Pinning the *first* key seen instead locked the real peer out for good
+    /// on one junk `OP_PUBLICKEY`, which is why only a proof pins it.
     ///
-    /// The residual limitation is inherent to eD2K: a hash nobody has bound
-    /// yet can be claimed by whoever gets there first, and a peer that
-    /// genuinely rotates its keypair stays unverified until its record ages
-    /// out of `cleanup_stale`. Both are strictly better than handing an
-    /// attacker an established identity.
+    /// The residual limitation is inherent to eD2K: a peer that genuinely
+    /// rotates its keypair after verifying stays unverified until its record
+    /// ages out of `cleanup_stale`, as in eMule.
     #[must_use = "a refused key means this peer is not the identity it claims; \
                   callers that go on to trust it are the bug this return exists to catch"]
     pub fn set_public_key(&mut self, user_hash: [u8; 16], key: Vec<u8>) -> bool {
@@ -1350,19 +1490,31 @@ impl CreditManager {
             return false;
         }
         let record = self.get_or_create(user_hash);
-        if record.public_key.is_empty() {
-            record.public_key = key;
-            return true;
-        }
         if record.public_key == key {
+            // The download path binds without setting `Needed` itself, which
+            // left a keyed record scored as unverified but accruing credit.
+            if record.ident_state == IdentState::Unknown {
+                record.ident_state = IdentState::Needed;
+            }
             return true;
         }
-        tracing::warn!(
-            "Refusing a public key that differs from the one already bound to {}; \
-             keeping the established identity",
-            crate::security::short_hash(&user_hash)
-        );
-        false
+        if record.key_proven {
+            tracing::warn!(
+                "Refusing a public key that differs from the one already proven for {}; \
+                 keeping the established identity",
+                crate::security::short_hash(&user_hash)
+            );
+            return false;
+        }
+        if !record.public_key.is_empty() {
+            tracing::debug!(
+                "Replacing an unproven public key for {}",
+                crate::security::short_hash(&user_hash)
+            );
+        }
+        record.public_key = key;
+        record.ident_state = IdentState::Needed;
+        true
     }
 
     /// Persist the Ember identity bound to an eD2K `user_hash`. Only for
@@ -1402,6 +1554,30 @@ impl CreditManager {
         }
         self.set_ember_hash(user_hash, ember_hash);
         true
+    }
+
+    /// A manager with a fresh RSA keypair, as a first run makes, without the
+    /// key file.
+    #[cfg(test)]
+    pub(crate) fn with_generated_keys() -> Self {
+        let mut cm = Self::new();
+        let (public_key, private_key) = generate_rsa_keypair();
+        cm.our_public_key = public_key;
+        cm.our_private_key = private_key;
+        cm.crypto_available = !cm.our_public_key.is_empty();
+        cm
+    }
+
+    /// Whether `ember_hash` is proven to own `user_hash`: SecIdent vouched for
+    /// the link ([`CreditRecord::proven_ember_hash`]), and no other identity
+    /// holds the persisted friend link. A Noise session proves only the Ember
+    /// key; the user hash in its HELLO is still a claim without this.
+    pub fn ember_identity_proven_for(&self, user_hash: &[u8; 16], ember_hash: &[u8; 16]) -> bool {
+        *ember_hash != [0u8; 16]
+            && self.credits.get(user_hash).is_some_and(|record| {
+                record.proven_ember_hash == Some(*ember_hash)
+                    && record.ember_hash.is_none_or(|bound| bound == *ember_hash)
+            })
     }
 
     /// The Ember identity persisted for `user_hash`, if any.
@@ -1448,13 +1624,18 @@ impl CreditManager {
     /// IPv4, IPv4-mapped IPv6 unwrapped, and 0 for anything else. Shared by
     /// [`Self::note_bound_ember_hash`]'s callers and the SecIdent handler so
     /// the two addresses compare.
+    ///
+    /// `0.0.0.0/8` is 0 too: it is the stand-in a relayed upload session is
+    /// recorded under, which names nobody and must neither pin a verified
+    /// identity nor be compared against its pin.
     pub fn ident_ip_of(addr: std::net::SocketAddr) -> u32 {
-        match addr.ip() {
-            std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-            std::net::IpAddr::V6(v6) => v6
-                .to_ipv4_mapped()
-                .map(|v4| u32::from_be_bytes(v4.octets()))
-                .unwrap_or(0),
+        let v4 = match addr.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+        };
+        match v4 {
+            Some(v4) if v4.octets()[0] != 0 => u32::from_be_bytes(v4.octets()),
+            _ => 0,
         }
     }
 
@@ -1566,6 +1747,17 @@ impl CreditManager {
             // deriving the anchor from the state would hand the reset back to
             // the attacker one restart later.
             record.crypto_verified_once = true;
+            // `Verified` is only set once `verify_signature` passed against
+            // the bound key, so this is where it becomes eMule's stored key.
+            if !record.public_key.is_empty() {
+                record.key_proven = true;
+            }
+        }
+        if state == IdentState::Failed && !record.key_proven {
+            // The key that just failed proved nothing, so it must not stand
+            // in the way of the real one: with it gone the next challenge
+            // asks for key and signature again.
+            record.public_key.clear();
         }
         record.ident_state = state;
     }
@@ -1583,17 +1775,37 @@ impl CreditManager {
         self.credits.get(user_hash)
     }
 
+    /// Drop records not seen for `max_age_days` (normally
+    /// [`CREDIT_EXPIRY_DAYS`]).
+    ///
+    /// A `last_seen` in the future was stamped while the clock ran ahead; it
+    /// is pulled back to now, or the record would outlive every sweep and
+    /// never be the eviction victim once the clock is corrected.
     pub fn cleanup_stale(&mut self, max_age_days: i64) {
-        let cutoff = chrono::Utc::now().timestamp() - (max_age_days * 86400);
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now - (max_age_days * 86400);
         let before = self.credits.len() + self.ember_credits.len();
+        let mut clamped = false;
         let unsaved_credit_keys = &mut self.unsaved_credit_keys;
         let credit_seen = &mut self.credit_seen;
+        let disposable_seen = &mut self.disposable_seen;
         self.credits.retain(|k, r| {
+            if r.last_seen > now {
+                r.last_seen = now;
+                unsaved_credit_keys.insert(*k);
+                clamped = true;
+            }
             let keep = r.last_seen > cutoff;
             if keep {
                 credit_seen.set(*k, r.last_seen);
+                if r.is_disposable() {
+                    disposable_seen.set(*k, r.last_seen);
+                } else {
+                    disposable_seen.remove(k);
+                }
             } else {
                 credit_seen.remove(k);
+                disposable_seen.remove(k);
                 unsaved_credit_keys.insert(*k);
             }
             keep
@@ -1605,6 +1817,11 @@ impl CreditManager {
         let unsaved_ember_keys = &mut self.unsaved_ember_keys;
         let ember_seen = &mut self.ember_seen;
         self.ember_credits.retain(|k, r| {
+            if r.last_seen > now {
+                r.last_seen = now;
+                unsaved_ember_keys.insert(*k);
+                clamped = true;
+            }
             let keep = r.last_seen > cutoff;
             if keep {
                 ember_seen.set(*k, r.last_seen);
@@ -1614,10 +1831,10 @@ impl CreditManager {
             }
             keep
         });
-        // Only dirty when the sweep actually evicted something. This runs on
+        // Only dirty when the sweep actually changed something. This runs on
         // the same 60s tick as the flush, so bumping unconditionally would
         // re-dirty the state every tick and defeat the gate entirely.
-        if self.credits.len() + self.ember_credits.len() != before {
+        if clamped || self.credits.len() + self.ember_credits.len() != before {
             self.touch_dirty();
         }
     }
@@ -1747,8 +1964,9 @@ impl CreditManager {
             buf.extend_from_slice(&r.last_seen.to_le_bytes());
             buf.extend_from_slice(&r.ident_ip.to_le_bytes());
             buf.push(r.ident_state.to_u8());
-            buf.extend_from_slice(&(r.public_key.len() as u16).to_le_bytes());
-            buf.extend_from_slice(&r.public_key);
+            let public_key = r.persisted_public_key();
+            buf.extend_from_slice(&(public_key.len() as u16).to_le_bytes());
+            buf.extend_from_slice(public_key);
             // v2 trailer.
             match r.ember_hash {
                 Some(eh) => {
@@ -1815,6 +2033,10 @@ impl CreditManager {
         if data.len() < 4 {
             return Ok(0);
         }
+        if let Some(loaded) = self.load_emule_clients_met(&data) {
+            tracing::info!("Loaded {} eMule credit records from {}", loaded, path.display());
+            return Ok(loaded);
+        }
 
         // Format detection. The versioned (v1) cache leads with CLIENTS_MET_MAGIC
         // followed by a version byte and the record count; the original layout
@@ -1855,7 +2077,7 @@ impl CreditManager {
         let read_err = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad credit record");
         let mut loaded = 0;
         let expected = count.min(50000);
-        let mut loaded_hashes: Vec<[u8; 16]> = Vec::new();
+        let mut parsed: Vec<CreditRecord> = Vec::new();
         for _ in 0..expected {
             if offset + fixed_prefix > data.len() {
                 break;
@@ -1959,9 +2181,10 @@ impl CreditManager {
                 // which is the primary store, does.
                 seen_ip: 0,
                 proven_ember_hash: None,
+                // Settled by `insert_loaded_credit` once the anchor is known.
+                key_proven: false,
             };
-            self.insert_loaded_credit(record);
-            loaded_hashes.push(user_hash);
+            parsed.push(record);
             loaded += 1;
         }
         // Only read the anchor section when every record parsed: a truncated
@@ -1975,13 +2198,13 @@ impl CreditManager {
         // earlier verification — so "Verified but absent from the section"
         // means the writer had no anchor column to read, not that the record
         // is unanchored.
+        //
+        // Both sections are applied before the records are adopted, because
+        // adoption keeps a stored key only on an anchored record.
         if has_anchor_section && loaded == expected {
             if let Some(anchored) = read_anchor_section(&data, offset) {
-                for user_hash in &loaded_hashes {
-                    if !anchored.contains(user_hash) {
-                        continue;
-                    }
-                    if let Some(record) = self.credits.get_mut(user_hash) {
+                for record in parsed.iter_mut() {
+                    if anchored.contains(&record.user_hash) {
                         record.crypto_verified_once = true;
                     }
                 }
@@ -1992,16 +2215,24 @@ impl CreditManager {
             // a missing name is simply a row we have never been introduced to.
             if has_identity_section {
                 if let Some(after_anchors) = anchor_section_end(&data, offset) {
+                    let index: HashMap<[u8; 16], usize> = parsed
+                        .iter()
+                        .enumerate()
+                        .map(|(i, record)| (record.user_hash, i))
+                        .collect();
                     for (user_hash, peer_name, client_software) in
                         read_identity_section(&data, after_anchors)
                     {
-                        if let Some(record) = self.credits.get_mut(&user_hash) {
-                            record.peer_name = peer_name;
-                            record.client_software = client_software;
+                        if let Some(&i) = index.get(&user_hash) {
+                            parsed[i].peer_name = peer_name;
+                            parsed[i].client_software = client_software;
                         }
                     }
                 }
             }
+        }
+        for record in parsed {
+            self.insert_loaded_credit(record);
         }
         // Loading matches disk, so this is not itself a change to persist —
         // except when the file we just read predates the current format. The
@@ -2012,6 +2243,61 @@ impl CreditManager {
         }
         tracing::info!("Loaded {} credit records from {}", loaded, path.display());
         Ok(loaded)
+    }
+
+    /// Adopt an eMule/aMule `clients.met` dropped into the data folder, or
+    /// `None` when `data` is not one.
+    ///
+    /// eMule's file is a version byte (`CREDITFILE_VERSION` 0x12, or 0x11
+    /// for 0.29-era files without keys), a `u32` count and fixed-size
+    /// `CreditStruct` records, written whole (`CClientCreditsList::SaveList`).
+    /// Ember's magic-less legacy layout also starts with a count, whose low
+    /// byte can be 0x11 or 0x12, so the length must account exactly for
+    /// `count` eMule records as well; a legacy file would need its first user
+    /// hash byte to make that work out, which a real one never does.
+    ///
+    /// A key eMule stored is one that answered eMule's own challenge (it only
+    /// writes `abySecureIdent` inside `Verified`), and eMule trusts it across
+    /// restarts, so it is adopted as proven and anchored like the importer's
+    /// (`emule_import::apply`); the peer still identifies again (`Needed`).
+    fn load_emule_clients_met(&mut self, data: &[u8]) -> Option<usize> {
+        /// `sizeof(CreditStruct_29a)`: key, lo/lo/last-seen/hi/hi u32s, u16.
+        const RECORD_29_LEN: usize = 16 + 4 * 5 + 2;
+        /// `sizeof(CreditStruct)`: the above, key size byte, `MAXPUBKEYSIZE`.
+        const RECORD_LEN: usize = RECORD_29_LEN + 1 + 80;
+        let record_len = match data.first()? {
+            0x12 => RECORD_LEN,
+            0x11 => RECORD_29_LEN,
+            _ => return None,
+        };
+        let count = u32::from_le_bytes(data.get(1..5)?.try_into().ok()?) as usize;
+        if count.checked_mul(record_len)? != data.len() - 5 {
+            return None;
+        }
+        let credits = match crate::emule_import::formats::parse_clients_met(data) {
+            Ok(credits) => credits,
+            Err(e) => {
+                tracing::warn!("Unreadable eMule clients.met: {e}");
+                return Some(0);
+            }
+        };
+        let mut loaded = 0;
+        for credit in credits {
+            let mut record = CreditRecord::new(credit.user_hash);
+            record.uploaded = credit.uploaded;
+            record.downloaded = credit.downloaded;
+            record.last_seen = credit.last_seen;
+            if !credit.public_key.is_empty() {
+                record.public_key = credit.public_key;
+                record.ident_state = IdentState::Needed;
+                record.crypto_verified_once = true;
+            }
+            self.insert_loaded_credit(record);
+            loaded += 1;
+        }
+        // Nothing on disk is in Ember's format yet.
+        self.touch_dirty();
+        Some(loaded)
     }
 }
 
@@ -2163,17 +2449,6 @@ fn generate_rsa_keypair() -> (Vec<u8>, Vec<u8>) {
     };
 
     (pub_der.as_ref().to_vec(), priv_der.as_bytes().to_vec())
-}
-
-/// A peer address as the IPv4 `u32` the identity checks compare, `0` when it
-/// has none.
-pub(crate) fn credit_ip(addr: std::net::SocketAddr) -> u32 {
-    match addr.ip() {
-        std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-        std::net::IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map_or(0, |v4| u32::from_be_bytes(v4.octets())),
-    }
 }
 
 /// `cryptkey.dat` as eMule and aMule write it: the RSA-384 private key as
@@ -2336,29 +2611,129 @@ mod tests {
 
     /// A user hash is public — it goes out in the clear in every Hello — so
     /// "whoever sends a key last owns the identity" let anyone claim a peer's
-    /// hash, inherit its credit, and lock the real peer out of verifying for
-    /// good. First key seen wins.
+    /// hash and inherit its credit. Once a key has answered a challenge it
+    /// owns the hash.
     #[test]
-    fn a_second_differing_public_key_cannot_displace_the_first() {
+    fn a_differing_public_key_cannot_displace_a_proven_one() {
         let mut cm = CreditManager::new();
         let victim = [0x11u8; 16];
         let honest = vec![0xAAu8; 64];
         let attacker = vec![0xBBu8; 64];
 
         assert!(cm.set_public_key(victim, honest.clone()));
+        cm.set_ident_state(victim, IdentState::Verified);
         assert!(
             !cm.set_public_key(victim, attacker),
-            "a different key for a bound hash must be refused",
+            "a different key for a proven hash must be refused",
         );
-        assert_eq!(
-            cm.get_record(&victim).unwrap().public_key,
-            honest,
-            "the originally bound key must survive",
-        );
+        let record = cm.get_record(&victim).unwrap();
+        assert_eq!(record.public_key, honest, "the proven key must survive");
+        assert_eq!(record.ident_state, IdentState::Verified, "a refused key changes nothing");
         assert!(
             cm.set_public_key(victim, honest),
             "re-sending the same key stays a no-op success",
         );
+        assert_eq!(cm.get_record(&victim).unwrap().ident_state, IdentState::Verified);
+
+        cm.set_ident_state(victim, IdentState::Failed);
+        assert_eq!(
+            cm.get_record(&victim).unwrap().public_key,
+            vec![0xAAu8; 64],
+            "a stranger failing a challenge on the hash must not cost it its proven key",
+        );
+    }
+
+    /// Regression: the first `OP_PUBLICKEY` for a hash used to be pinned (and
+    /// persisted) before anything proved it, so one Hello carrying a victim's
+    /// hash and a junk key locked the victim out of credit for good. As in
+    /// eMule, an unproven key is only a claim: the real one replaces it, a
+    /// failed challenge discards it, and none of it reaches disk.
+    #[test]
+    fn an_unproven_public_key_never_locks_the_real_peer_out() {
+        let mut cm = CreditManager::new();
+        cm.crypto_available = true;
+        let victim = [0x12u8; 16];
+        let junk = vec![0xBBu8; 64];
+        let honest = vec![0xAAu8; 64];
+
+        assert!(cm.set_public_key(victim, junk.clone()));
+        assert_eq!(cm.get_record(&victim).unwrap().ident_state, IdentState::Needed);
+        assert!(
+            cm.get_record(&victim).unwrap().persisted_public_key().is_empty(),
+            "an unproven key must not be written to disk",
+        );
+        assert_eq!(
+            cm.secident_request_state(&victim, 0x0A00_0001, 2),
+            Some(2),
+            "a later session must be asked for its key, not only a signature",
+        );
+        assert!(
+            cm.set_public_key(victim, honest.clone()),
+            "the real key replaces an unproven one",
+        );
+        assert_eq!(cm.get_record(&victim).unwrap().public_key, honest);
+
+        // The attacker gets there again and fails its challenge.
+        assert!(cm.set_public_key(victim, junk));
+        cm.set_ident_state(victim, IdentState::Failed);
+        assert!(
+            !cm.has_public_key(&victim),
+            "a key that failed its challenge is discarded",
+        );
+        assert_eq!(cm.secident_request_state(&victim, 0x0A00_0001, 2), Some(2));
+
+        // The real peer sends its key and answers.
+        assert!(cm.set_public_key(victim, honest.clone()));
+        cm.set_ident_state(victim, IdentState::Verified);
+        cm.check_identity_ip(victim, 0x0A00_0001);
+        let record = cm.get_record(&victim).unwrap();
+        assert_eq!(record.persisted_public_key(), honest.as_slice(), "a proven key is persisted");
+        assert_eq!(cm.secident_request_state(&victim, 0x0A00_0002, 2), Some(1));
+    }
+
+    /// Rows written before unproven keys stopped being persisted still carry
+    /// one. On a record that never verified it proves nothing, so it is
+    /// dropped on load; on an anchored record it is the proven key.
+    #[test]
+    fn a_stored_key_loads_only_on_an_anchored_record() {
+        let mut cm = CreditManager::new();
+        let stale = [0x13u8; 16];
+        let proven = [0x14u8; 16];
+        for (user_hash, anchored) in [(stale, false), (proven, true)] {
+            let mut record = CreditRecord::new(user_hash);
+            record.uploaded = 4096;
+            record.public_key = vec![0xCCu8; 64];
+            record.ident_state = IdentState::Needed;
+            record.crypto_verified_once = anchored;
+            cm.insert_loaded_credit(record);
+        }
+
+        let stale = cm.get_record(&stale).unwrap();
+        assert!(stale.public_key.is_empty());
+        assert_eq!(stale.ident_state, IdentState::Unknown, "no key is eMule's IS_NOTAVAILABLE");
+        assert_eq!(stale.uploaded, 4096, "only the key goes");
+        let proven = cm.get_record(&proven).unwrap();
+        assert_eq!(proven.persisted_public_key(), [0xCCu8; 64].as_slice());
+        assert_eq!(proven.ident_state, IdentState::Needed);
+        assert!(!cm.set_public_key([0x14u8; 16], vec![0xDDu8; 64]), "a loaded proven key is pinned");
+    }
+
+    /// The download path binds a key without setting `Needed` itself. The
+    /// record must still stop accruing credit until the key proves itself,
+    /// the way eMule's `SetSecureIdent` parks it at IS_IDNEEDED, instead of
+    /// being scored as unverified while it collects credit.
+    #[test]
+    fn binding_a_key_parks_the_record_until_it_verifies() {
+        let mut cm = CreditManager::new();
+        cm.crypto_available = true;
+        let peer = [0x15u8; 16];
+        assert!(cm.set_public_key(peer, vec![0xAAu8; 64]));
+        assert_eq!(cm.get_record(&peer).unwrap().ident_state, IdentState::Needed);
+        assert!(!cm.add_downloaded(peer, 0, 2 * 1_048_576));
+
+        cm.set_ident_state(peer, IdentState::Verified);
+        assert!(cm.add_downloaded(peer, 0, 2 * 1_048_576));
+        assert!(cm.get_score_ratio(&peer, 0) > MIN_CREDIT_RATIO);
     }
 
     /// Regression: a verified peer that moves to a new address is
@@ -2386,6 +2761,34 @@ mod tests {
             cm.get_current_ident_state(&peer, second_ip),
             IdentState::Verified,
             "a peer that re-proved its identity must not stay BadGuy",
+        );
+    }
+
+    /// A relayed upload session is recorded under a `0.0.0.0/8` stand-in.
+    /// Compared against the pin it made a verified friend `BadGuy`; pinned, it
+    /// made the friend's next direct session `BadGuy`.
+    #[test]
+    fn a_relayed_stand_in_neither_pins_nor_is_compared() {
+        let stand_in: std::net::SocketAddr = "0.0.0.7:0".parse().unwrap();
+        let direct: std::net::SocketAddr = "81.2.69.7:4662".parse().unwrap();
+        let mapped: std::net::SocketAddr = "[::ffff:0.0.0.7]:0".parse().unwrap();
+        assert_eq!(CreditManager::ident_ip_of(stand_in), 0);
+        assert_eq!(CreditManager::ident_ip_of(mapped), 0);
+        assert_eq!(CreditManager::ident_ip_of(direct), 0x5102_4507);
+
+        let mut cm = CreditManager::new();
+        let peer = [0x24u8; 16];
+        cm.set_ident_state(peer, IdentState::Verified);
+        cm.check_identity_ip(peer, CreditManager::ident_ip_of(direct));
+        assert_eq!(
+            cm.get_current_ident_state(&peer, CreditManager::ident_ip_of(stand_in)),
+            IdentState::Verified,
+        );
+        cm.check_identity_ip(peer, CreditManager::ident_ip_of(stand_in));
+        assert_eq!(
+            cm.get_current_ident_state(&peer, CreditManager::ident_ip_of(direct)),
+            IdentState::Verified,
+            "a proof over the relay keeps the direct pin",
         );
     }
 
@@ -2652,6 +3055,7 @@ mod tests {
             r.ident_ip = 0x0102_0304;
             r.ident_state = IdentState::Verified;
             r.public_key = vec![0xABu8; 12];
+            r.key_proven = true;
             r.crypto_verified_once = true;
         }
 
@@ -2909,23 +3313,23 @@ mod tests {
     }
 
     /// Regression: every mutating credit operation must bump
-    /// `last_seen` so the 90-day `cleanup_stale` sweep evicts records
-    /// based on time-since-last-contact, not time-since-first-contact.
+    /// `last_seen` so the [`CREDIT_EXPIRY_DAYS`] `cleanup_stale` sweep evicts
+    /// records based on time-since-last-contact, not time-since-first-contact.
     /// Before this was fixed, peers we connected with regularly but
     /// never traded bytes with (Unknown / Failed / Needed states) kept
     /// their creation-time timestamp forever and aged out at first
-    /// contact + 90d, surfacing in the Known Clients tab as months-old
-    /// entries we had in fact talked to that morning.
+    /// contact + the expiry window, surfacing in the Known Clients tab as
+    /// months-old entries we had in fact talked to that morning.
     #[test]
     fn last_seen_bumps_on_every_mutation() {
         let mut cm = CreditManager::new();
         let user = [0x42u8; 16];
 
-        // Seed a record dated to ~120 days ago by hand so any
-        // cleanup_stale(90) call would normally evict it. Each mutation
-        // below must push `last_seen` forward to roughly "now", proving
-        // the timestamp tracks contact freshness.
-        let stale_ts = chrono::Utc::now().timestamp() - 120 * 86400;
+        // Seed a record dated past the expiry window by hand so any
+        // `cleanup_stale(CREDIT_EXPIRY_DAYS)` call would normally evict it.
+        // Each mutation below must push `last_seen` forward to roughly
+        // "now", proving the timestamp tracks contact freshness.
+        let stale_ts = chrono::Utc::now().timestamp() - (CREDIT_EXPIRY_DAYS + 30) * 86400;
         {
             let r = cm.get_or_create(user);
             r.last_seen = stale_ts;
@@ -3019,16 +3423,16 @@ mod tests {
         let stale = [0x02u8; 16];
         let now = chrono::Utc::now().timestamp();
         cm.get_or_create(fresh).last_seen = now;
-        cm.get_or_create(stale).last_seen = now - 100 * 86400;
+        cm.get_or_create(stale).last_seen = now - (CREDIT_EXPIRY_DAYS + 10) * 86400;
 
-        cm.cleanup_stale(90);
+        cm.cleanup_stale(CREDIT_EXPIRY_DAYS);
         assert!(
             cm.get_record(&fresh).is_some(),
-            "fresh record must survive 90d cutoff"
+            "fresh record must survive the expiry cutoff"
         );
         assert!(
             cm.get_record(&stale).is_none(),
-            "100d-old record must be pruned"
+            "a record past the expiry window must be pruned"
         );
     }
 
@@ -3082,7 +3486,7 @@ mod tests {
         cm.mark_saved_if_generation(generation);
         assert!(!cm.is_dirty());
 
-        cm.cleanup_stale(90);
+        cm.cleanup_stale(CREDIT_EXPIRY_DAYS);
         assert!(
             !cm.is_dirty(),
             "a no-op sweep must not schedule another full rewrite"
@@ -3090,10 +3494,11 @@ mod tests {
 
         // ...but one that actually evicts does have to be persisted.
         let stale = [0x0Au8; 16];
-        cm.get_or_create(stale).last_seen = chrono::Utc::now().timestamp() - 100 * 86400;
+        cm.get_or_create(stale).last_seen =
+            chrono::Utc::now().timestamp() - (CREDIT_EXPIRY_DAYS + 10) * 86400;
         let generation = cm.dirty_generation();
         cm.mark_saved_if_generation(generation);
-        cm.cleanup_stale(90);
+        cm.cleanup_stale(CREDIT_EXPIRY_DAYS);
         assert!(
             cm.is_dirty(),
             "an eviction changes what belongs on disk and must be flushed"
@@ -3175,7 +3580,7 @@ mod tests {
 
     /// The credit map must stay bounded under user_hash churn (a peer
     /// rotating its hash across reconnects, seeding one record per OP_PUBLICKEY)
-    /// even between 90-day cleanup sweeps. See MAX_CREDIT_RECORDS.
+    /// even between `cleanup_stale` sweeps. See MAX_CREDIT_RECORDS.
     #[test]
     fn credits_map_is_bounded() {
         let mut cm = CreditManager::new();
@@ -3247,7 +3652,8 @@ mod tests {
         for i in 0..total {
             let mut record = CreditRecord::new(key(i));
             record.last_seen = now - age_of(i);
-            record.uploaded = i;
+            // Non-zero, so every row is a creditor and only age decides.
+            record.uploaded = i + 1;
             cm.insert_loaded_credit(record);
         }
         assert_eq!(cm.credits.len(), MAX_CREDIT_RECORDS);
@@ -3298,6 +3704,220 @@ mod tests {
         cm.get_or_create(key(u64::MAX));
         assert!(cm.get_record(&key(0)).is_some(), "a freshly seen record survives");
         assert_eq!(cm.credits.len(), MAX_CREDIT_RECORDS);
+    }
+
+    /// Every Hello with a fresh user hash creates a record, so a flood of
+    /// them used to push out the least-recently-seen records whatever they
+    /// held — real creditors first, being the ones not seen this minute.
+    #[test]
+    fn a_hash_flood_evicts_its_own_records_before_a_creditor() {
+        let key = |i: u64| {
+            let mut h = [0u8; 16];
+            h[..8].copy_from_slice(&i.to_le_bytes());
+            h[15] = 4;
+            h
+        };
+        let mut cm = CreditManager::new();
+        let now = chrono::Utc::now().timestamp();
+        let creditor = key(0);
+        let anchored = key(1);
+        cm.get_or_create(creditor).downloaded = 5 * 1_048_576;
+        cm.get_or_create(anchored).crypto_verified_once = true;
+        cm.get_or_create(creditor).last_seen = now - 60 * 86400;
+        cm.get_or_create(anchored).last_seen = now - 60 * 86400;
+        for i in 2..MAX_CREDIT_RECORDS as u64 {
+            cm.get_or_create(key(i)).last_seen = now - 30 * 86400;
+        }
+        cm.get_or_create(key(2)).last_seen = now - 40 * 86400;
+        cm.cleanup_stale(CREDIT_EXPIRY_DAYS);
+
+        for i in 0..1_000u64 {
+            cm.note_client_identity(key(u64::MAX - i), None, "flood", "");
+        }
+        assert_eq!(cm.credits.len(), MAX_CREDIT_RECORDS);
+        assert!(cm.get_record(&creditor).is_some(), "a creditor outlives fresher strangers");
+        assert!(cm.get_record(&anchored).is_some(), "so does a proven identity");
+        assert!(cm.get_record(&key(2)).is_none(), "the oldest stranger went instead");
+
+        // With nothing disposable left, age decides again.
+        for i in 2..MAX_CREDIT_RECORDS as u64 {
+            if let Some(r) = cm.credits.get_mut(&key(i)) {
+                r.uploaded = 1;
+            }
+        }
+        for i in 0..1_000u64 {
+            if let Some(r) = cm.credits.get_mut(&key(u64::MAX - i)) {
+                r.uploaded = 1;
+            }
+        }
+        cm.get_or_create(key(u64::MAX / 2));
+        assert_eq!(cm.credits.len(), MAX_CREDIT_RECORDS);
+        assert_eq!(
+            [creditor, anchored]
+                .iter()
+                .filter(|hash| cm.get_record(hash).is_none())
+                .count(),
+            1,
+            "a full table of creditors falls back to least recently seen, one record at a time",
+        );
+    }
+
+    /// Loading past the cap applies the same preference: a stored creditor
+    /// is kept over a more recent row that holds nothing.
+    #[test]
+    fn loading_past_the_cap_keeps_creditors_over_hash_only_rows() {
+        let key = |i: u64| {
+            let mut h = [0u8; 16];
+            h[..8].copy_from_slice(&i.to_le_bytes());
+            h[15] = 5;
+            h
+        };
+        let now = chrono::Utc::now().timestamp();
+        let mut cm = CreditManager::new();
+        for i in 0..MAX_CREDIT_RECORDS as u64 {
+            let mut record = CreditRecord::new(key(i));
+            record.last_seen = now - 10;
+            cm.insert_loaded_credit(record);
+        }
+        let mut creditor = CreditRecord::new(key(u64::MAX));
+        creditor.last_seen = now - 100 * 86400;
+        creditor.uploaded = 1;
+        cm.insert_loaded_credit(creditor);
+        assert!(cm.get_record(&key(u64::MAX)).is_some());
+        assert_eq!(cm.credits.len(), MAX_CREDIT_RECORDS);
+
+        let mut stranger = CreditRecord::new(key(u64::MAX - 1));
+        stranger.last_seen = now - 20;
+        cm.insert_loaded_credit(stranger);
+        assert!(
+            cm.get_record(&key(u64::MAX - 1)).is_none(),
+            "an older hash-only row does not displace a newer one"
+        );
+    }
+
+    /// eMule keeps a peer's credit for 150 days without contact; expiring at
+    /// 90 forgot peers an eMule client on the same network still credits.
+    #[test]
+    fn credit_expiry_matches_emules_150_days() {
+        let mut cm = CreditManager::new();
+        let now = chrono::Utc::now().timestamp();
+        cm.get_or_create([0x18u8; 16]).last_seen = now - 120 * 86400;
+        cm.get_or_create([0x19u8; 16]).last_seen = now - 151 * 86400;
+        cm.cleanup_stale(CREDIT_EXPIRY_DAYS);
+        assert!(cm.get_record(&[0x18u8; 16]).is_some());
+        assert!(cm.get_record(&[0x19u8; 16]).is_none());
+    }
+
+    /// A clock that ran far ahead stamps records in the future. Left alone
+    /// they would never age out, and never be the eviction victim.
+    #[test]
+    fn a_future_last_seen_is_pulled_back_to_now() {
+        let now = chrono::Utc::now().timestamp();
+        let future = now + 10 * 365 * 86400;
+        let mut cm = CreditManager::new();
+        let loaded = [0x16u8; 16];
+        let mut record = CreditRecord::new(loaded);
+        record.last_seen = future;
+        cm.insert_loaded_credit(record);
+        assert!(cm.get_record(&loaded).unwrap().last_seen <= chrono::Utc::now().timestamp());
+        let mut ember = EmberCreditRecord::new([0x16u8; 32]);
+        ember.last_seen = future;
+        cm.insert_loaded_ember_credit(ember);
+        assert!(cm.get_ember_record(&[0x16u8; 32]).unwrap().last_seen <= chrono::Utc::now().timestamp());
+
+        let stamped = [0x17u8; 16];
+        cm.get_or_create(stamped).last_seen = future;
+        let flush = cm.begin_flush();
+        cm.finish_flush(&flush);
+        cm.mark_saved_if_generation(cm.dirty_generation());
+        cm.cleanup_stale(CREDIT_EXPIRY_DAYS);
+        assert!(cm.get_record(&stamped).unwrap().last_seen <= chrono::Utc::now().timestamp());
+        assert!(cm.is_dirty(), "the corrected timestamp has to reach disk");
+        assert!(cm.begin_flush().credit_keys.contains(&stamped));
+    }
+
+    fn emule_credit_struct(hash: u8, up: u64, down: u64, last_seen: u32, key: &[u8]) -> Vec<u8> {
+        let mut r = vec![hash; 16];
+        r.extend_from_slice(&(up as u32).to_le_bytes());
+        r.extend_from_slice(&(down as u32).to_le_bytes());
+        r.extend_from_slice(&last_seen.to_le_bytes());
+        r.extend_from_slice(&((up >> 32) as u32).to_le_bytes());
+        r.extend_from_slice(&((down >> 32) as u32).to_le_bytes());
+        r.extend_from_slice(&0u16.to_le_bytes());
+        r.push(key.len() as u8);
+        let mut ident = [0u8; 80];
+        ident[..key.len()].copy_from_slice(key);
+        r.extend_from_slice(&ident);
+        r
+    }
+
+    /// An eMule `clients.met` dropped into the data folder starts with its
+    /// version byte, which the magic-less legacy reader took as the low byte
+    /// of a count and then read every record one byte out of step.
+    #[test]
+    fn an_emule_clients_met_is_read_in_emules_layout() {
+        let now = chrono::Utc::now().timestamp() as u32;
+        let keyed = [0x21u8; 16];
+        let keyless = [0x22u8; 16];
+        let mut data = vec![0x12];
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend(emule_credit_struct(0x21, 5 << 32 | 7, 3 * 1_048_576, now, &[0x30; 76]));
+        data.extend(emule_credit_struct(0x22, 9, 11, now - 86400, &[]));
+        let path = std::env::temp_dir().join(format!("ember-emule-clients-{}.met", unique_nanos()));
+        std::fs::write(&path, &data).unwrap();
+        let mut cm = CreditManager::new();
+        let n = cm.load_from_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(n, 2);
+        let record = cm.get_record(&keyed).expect("keyed record");
+        assert_eq!((record.uploaded, record.downloaded), (5 << 32 | 7, 3 * 1_048_576));
+        assert_eq!(record.last_seen, i64::from(now));
+        assert_eq!(
+            record.persisted_public_key(),
+            [0x30u8; 76].as_slice(),
+            "eMule only stores a key that verified, and trusts it"
+        );
+        assert!(record.crypto_verified_once, "its totals survive the next verification");
+        assert_eq!(record.ident_state, IdentState::Needed);
+        let record = cm.get_record(&keyless).expect("keyless record");
+        assert_eq!((record.uploaded, record.downloaded), (9, 11));
+        assert_eq!(record.ident_state, IdentState::Unknown);
+        assert!(cm.is_dirty(), "the file is rewritten in Ember's format");
+
+        // 0.29-era records stop before the key fields.
+        let mut old = vec![0x11];
+        old.extend_from_slice(&1u32.to_le_bytes());
+        old.extend_from_slice(&emule_credit_struct(0x23, 40, 50, now, &[])[..16 + 4 * 5 + 2]);
+        let path = std::env::temp_dir().join(format!("ember-emule-29-{}.met", unique_nanos()));
+        std::fs::write(&path, &old).unwrap();
+        let mut cm = CreditManager::new();
+        assert_eq!(cm.load_from_file(&path).unwrap(), 1);
+        let _ = std::fs::remove_file(&path);
+        let record = cm.get_record(&[0x23u8; 16]).expect("0.29 record");
+        assert_eq!((record.uploaded, record.downloaded), (40, 50));
+    }
+
+    /// Ember's legacy layout starts with a `u32` count, so 17 records begin
+    /// with 0x11 — that file must still be read as Ember's own.
+    #[test]
+    fn a_legacy_file_whose_count_starts_like_emules_version_is_still_legacy() {
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&0x11u32.to_le_bytes());
+        for i in 0..0x11u8 {
+            legacy.extend_from_slice(&[i + 1; 16]);
+            legacy.extend_from_slice(&2048u64.to_le_bytes());
+            legacy.extend_from_slice(&1024u64.to_le_bytes());
+            legacy.extend_from_slice(&1_699_999_999i64.to_le_bytes());
+            legacy.extend_from_slice(&0u16.to_le_bytes());
+        }
+        let path = std::env::temp_dir().join(format!("ember-legacy-17-{}.met", unique_nanos()));
+        std::fs::write(&path, &legacy).unwrap();
+        let mut cm = CreditManager::new();
+        let n = cm.load_from_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(n, 0x11);
+        assert_eq!(cm.get_record(&[0x11u8; 16]).map(|r| r.uploaded), Some(2048));
     }
 
     /// A friend's session proves its key, not the eD2K hash it names, so it
@@ -3495,9 +4115,9 @@ mod tests {
         let stale = [0x5Au8; 32];
         let now = chrono::Utc::now().timestamp();
         cm.get_or_create_ember(fresh).last_seen = now;
-        cm.get_or_create_ember(stale).last_seen = now - 100 * 86400;
+        cm.get_or_create_ember(stale).last_seen = now - (CREDIT_EXPIRY_DAYS + 10) * 86400;
 
-        cm.cleanup_stale(90);
+        cm.cleanup_stale(CREDIT_EXPIRY_DAYS);
         assert!(cm.get_ember_record(&fresh).is_some());
         assert!(cm.get_ember_record(&stale).is_none());
     }
@@ -3517,6 +4137,7 @@ mod tests {
             r.ident_ip = 0x0102_0304;
             r.ident_state = IdentState::Verified;
             r.public_key = vec![0xAB; 12];
+            r.key_proven = true;
         }
         let bytes = cm.serialize();
         // Sanity: the versioned magic must lead the buffer.
@@ -3662,7 +4283,10 @@ mod tests {
         assert_eq!(rec.uploaded, 2048);
         assert_eq!(rec.downloaded, 1024);
         assert_eq!(rec.last_seen, 1_699_999_999);
-        assert_eq!(rec.public_key, public_key);
+        assert!(
+            rec.public_key.is_empty(),
+            "a legacy row's key was stored unproven, so it is not adopted"
+        );
         assert_eq!(rec.ident_ip, 0, "legacy rows default ident_ip to 0");
         assert_eq!(
             rec.ident_state,

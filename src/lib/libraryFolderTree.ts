@@ -5,6 +5,8 @@ export type LibraryFolderNode = {
   name: string;
   count: number;
   size: number;
+  /** Of `count`, the files that are listed but not shared. */
+  unshared: number;
   isShare: boolean;
   children: LibraryFolderNode[];
 };
@@ -14,6 +16,7 @@ export type LibraryFolderRow = {
   name: string;
   count: number;
   size: number;
+  unshared: number;
   isShare: boolean;
   hasChildren: boolean;
   expanded: boolean;
@@ -41,6 +44,7 @@ type MutableNode = {
   name: string;
   count: number;
   size: number;
+  unshared: number;
   isShare: boolean;
   children: Map<string, MutableNode>;
 };
@@ -58,9 +62,14 @@ function freeze(node: MutableNode): LibraryFolderNode {
     name: node.name,
     count: node.count,
     size: node.size,
+    unshared: node.unshared,
     isShare: node.isShare,
     children,
   };
+}
+
+function emptyNode(path: string, name: string, isShare: boolean): MutableNode {
+  return { path, name, count: 0, size: 0, unshared: 0, isShare, children: new Map() };
 }
 
 /**
@@ -71,21 +80,15 @@ function freeze(node: MutableNode): LibraryFolderNode {
  */
 export function buildLibraryFolderTree(
   shares: string[],
-  files: { path: string; size: number }[],
+  /** `shared` left out counts as shared. */
+  files: { path: string; size: number; shared?: boolean }[],
   normalize: (path: string) => string,
   /** Folders to show even with nothing in them yet, such as download category
    *  folders set up before anything finished there. Only those inside a
    *  share appear, as any folder does. */
   emptyFolders: string[] = [],
 ): LibraryFolderNode[] {
-  const shareNodes: MutableNode[] = shares.map((path) => ({
-    path,
-    name: lastSegment(path),
-    count: 0,
-    size: 0,
-    isShare: true,
-    children: new Map(),
-  }));
+  const shareNodes: MutableNode[] = shares.map((path) => emptyNode(path, lastSegment(path), true));
   const normalizedShares = shareNodes.map((node) => ({
     node,
     norm: normalize(node.path),
@@ -104,8 +107,10 @@ export function buildLibraryFolderTree(
     );
     if (!match) continue;
     const { node } = match;
+    const unshared = file.shared === false ? 1 : 0;
     node.count += 1;
     node.size += file.size;
+    node.unshared += unshared;
 
     const fileDirs = withoutVerbatimPrefix(file.path).split(/[\\/]/).filter(Boolean);
     fileDirs.pop();
@@ -120,18 +125,12 @@ export function buildLibraryFolderTree(
       const key = childKey(segment, caseInsensitive);
       let child = cursor.children.get(key);
       if (!child) {
-        child = {
-          path: cursorPath,
-          name: segment,
-          count: 0,
-          size: 0,
-          isShare: false,
-          children: new Map(),
-        };
+        child = emptyNode(cursorPath, segment, false);
         cursor.children.set(key, child);
       }
       child.count += 1;
       child.size += file.size;
+      child.unshared += unshared;
       cursor = child;
     }
   }
@@ -152,14 +151,7 @@ export function buildLibraryFolderTree(
       const key = childKey(segment, caseInsensitive);
       let child = cursor.children.get(key);
       if (!child) {
-        child = {
-          path: cursorPath,
-          name: segment,
-          count: 0,
-          size: 0,
-          isShare: false,
-          children: new Map(),
-        };
+        child = emptyNode(cursorPath, segment, false);
         cursor.children.set(key, child);
       }
       cursor = child;
@@ -183,6 +175,7 @@ export function flattenLibraryFolderTree(
       name: node.name,
       count: node.count,
       size: node.size,
+      unshared: node.unshared,
       isShare: node.isShare,
       hasChildren,
       expanded: isExpanded,

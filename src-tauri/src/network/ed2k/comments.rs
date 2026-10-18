@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -31,6 +31,10 @@ pub struct FileComment {
     pub comment: String,
     /// 0 = ed2k peer, 1 = KAD
     pub origin: u8,
+    /// Address the vote arrived from, when the transport names one. Groups
+    /// votes into voters for [`CommentManager::fake_rating_stats`].
+    #[serde(skip)]
+    pub source_ip: Option<IpAddr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -153,7 +157,10 @@ impl CommentManager {
         comment: String,
         origin: u8,
     ) {
-        self.record_peer_comment(file_hash, user_name, rating, comment, origin);
+        // Ed2k peers are keyed by their `ip:port`, which is also where the
+        // vote came from.
+        let source_ip = parse_ip_like(&user_name);
+        self.record_peer_comment(file_hash, user_name, rating, comment, origin, source_ip);
     }
 
     /// Record a KAD note received from `source_ip`, subject to that IP's
@@ -172,7 +179,14 @@ impl CommentManager {
                 return false;
             }
         }
-        if !self.record_peer_comment(file_hash, publisher, rating, comment, 1) {
+        if !self.record_peer_comment(
+            file_hash,
+            publisher,
+            rating,
+            comment,
+            1,
+            Some(IpAddr::V4(source_ip)),
+        ) {
             return false;
         }
         let now = self.tick();
@@ -205,6 +219,7 @@ impl CommentManager {
         rating: u8,
         comment: String,
         origin: u8,
+        source_ip: Option<IpAddr>,
     ) -> bool {
         let user_name =
             sanitize_comment_field(&user_name, MAX_COMMENT_USER_CHARS, MAX_COMMENT_USER_BYTES);
@@ -245,6 +260,7 @@ impl CommentManager {
             updated.rating = rating;
             updated.comment = comment;
             updated.origin = origin;
+            updated.source_ip = source_ip.or(updated.source_ip);
             entry.peer_comments.push(updated);
             return true;
         }
@@ -256,6 +272,7 @@ impl CommentManager {
             rating,
             comment,
             origin,
+            source_ip,
         });
         true
     }
@@ -295,33 +312,41 @@ impl CommentManager {
             .unwrap_or(false)
     }
 
-    /// Count of `(fake_votes, total_rated_votes)` among peer ratings for a
-    /// file. Feeds the spam filter's community-verdict signal: a file the
-    /// network has predominantly rated "fake" is a strong spam indicator.
-    /// Only rated (rating > 0) peer comments are counted.
+    /// `(fake_voters, rated_voters)` for a file: distinct voters, not rows.
+    /// Feeds the spam filter's community-verdict signal: a file the network
+    /// has predominantly rated "fake" is a strong spam indicator.
+    ///
+    /// Rows are one per wire identity, and a host can mint identities freely,
+    /// so a voter is a network instead (see [`voter_key`]): rated rows from one
+    /// IPv4 /24 or IPv6 /48 are one voter, and every rated row that names no
+    /// address is one voter between them. A voter counts as fake when most of
+    /// its rated rows say fake (a tie is not fake), so one forged row cannot
+    /// turn a voter that otherwise rated the file well — least of all the
+    /// shared unaddressed one, which holds every notes-search row. Our own
+    /// rating is a voter of its own.
     pub fn fake_rating_stats(&self, file_hash: &str) -> (u32, u32) {
-        match self.comments.get(file_hash) {
-            Some(info) => {
-                let mut fake = 0u32;
-                let mut total = 0u32;
-                if info.our_rating > 0 {
-                    total += 1;
-                    if info.our_rating == RATING_FAKE {
-                        fake += 1;
-                    }
-                }
-                for c in &info.peer_comments {
-                    if c.rating > 0 {
-                        total += 1;
-                        if c.rating == RATING_FAKE {
-                            fake += 1;
-                        }
-                    }
-                }
-                (fake, total)
-            }
-            None => (0, 0),
+        let Some(info) = self.comments.get(file_hash) else {
+            return (0, 0);
+        };
+        // voter -> (fake rows, rated rows)
+        let mut voters: HashMap<String, (u32, u32)> = HashMap::new();
+        for comment in info.peer_comments.iter().filter(|c| c.rating > 0) {
+            let rows = voters.entry(voter_key(comment)).or_default();
+            rows.0 += u32::from(comment.rating == RATING_FAKE);
+            rows.1 += 1;
         }
+        let mut total = voters.len() as u32;
+        let mut fake = voters
+            .values()
+            .filter(|(fake, rated)| fake * 2 > *rated)
+            .count() as u32;
+        if info.our_rating > 0 {
+            total += 1;
+            if info.our_rating == RATING_FAKE {
+                fake += 1;
+            }
+        }
+        (fake, total)
     }
 
     pub fn load_from_db_rows(&mut self, rows: Vec<(String, u8, String)>) {
@@ -330,6 +355,35 @@ impl CommentManager {
             entry.our_rating = rating;
             entry.our_comment = comment;
         }
+    }
+}
+
+/// `ip` or `ip:port` / `[v6]:port`, as ed2k peer comments name their author.
+fn parse_ip_like(text: &str) -> Option<IpAddr> {
+    text.parse::<std::net::SocketAddr>()
+        .map(|sock| sock.ip())
+        .or_else(|_| text.parse::<IpAddr>())
+        .ok()
+}
+
+/// The voter a rated row belongs to: the network it came from (IPv4 /24,
+/// IPv6 /48), or one shared voter for every row that names no address.
+///
+/// Rows without an address — KAD notes found by a notes search, anonymous
+/// ratings — carry only a wire identity, and identities are free to mint, so
+/// together they can never count as more than one voter.
+fn voter_key(comment: &FileComment) -> String {
+    let ip = comment.source_ip.or_else(|| parse_ip_like(&comment.user_name));
+    match ip.map(|ip| ip.to_canonical()) {
+        Some(IpAddr::V4(v4)) => {
+            let [a, b, c, _] = v4.octets();
+            format!("net4:{a}.{b}.{c}")
+        }
+        Some(IpAddr::V6(v6)) => {
+            let s = v6.segments();
+            format!("net6:{:x}:{:x}:{:x}", s[0], s[1], s[2])
+        }
+        None => "unaddressed".to_string(),
     }
 }
 
@@ -409,24 +463,27 @@ mod tests {
 
     /// Rating-only votes usually carry no name, and the upsert deduped on that
     /// field alone — so N anonymous votes became one `""` row on a
-    /// last-writer-wins basis. The aggregates count rows, so the count was
-    /// wrong, and a late positive rating erased the fake votes before it.
+    /// last-writer-wins basis, and a late positive rating erased the fake
+    /// votes before it. The rows stay apart; nothing tells their authors
+    /// apart, so for the verdict they are one voter.
     #[test]
     fn anonymous_rating_votes_are_not_collapsed_into_one_row() {
         let mut cm = CommentManager::new();
         for _ in 0..4 {
             cm.add_peer_comment("aa", String::new(), RATING_FAKE, String::new(), 0);
         }
-        let (fake, total) = cm.fake_rating_stats("aa");
-        assert_eq!((fake, total), (4, 4), "each anonymous vote must count once");
         assert_eq!(cm.get_comments("aa").unwrap().peer_comments.len(), 4);
-
-        // A later positive vote is one more vote, not a rewrite of the others.
-        cm.add_peer_comment("aa", String::new(), RATING_EXCELLENT, String::new(), 0);
-        let (fake, total) = cm.fake_rating_stats("aa");
         assert_eq!(
-            (fake, total),
-            (4, 5),
+            cm.fake_rating_stats("aa"),
+            (1, 1),
+            "votes nothing tells apart are one voter"
+        );
+
+        cm.add_peer_comment("aa", String::new(), RATING_EXCELLENT, String::new(), 0);
+        assert_eq!(cm.get_comments("aa").unwrap().peer_comments.len(), 5);
+        assert_eq!(
+            cm.fake_rating_stats("aa"),
+            (1, 1),
             "a late positive vote must not erase accumulated fake evidence"
         );
 
@@ -501,7 +558,7 @@ mod tests {
             cm.add_peer_comment(&format!("f{i}"), "p".into(), RATING_GOOD, String::new(), 1);
         }
         cm.add_peer_comment("f0", "q".into(), RATING_GOOD, String::new(), 1);
-        assert!(cm.record_peer_comment("new", "p".into(), RATING_GOOD, String::new(), 1));
+        assert!(cm.record_peer_comment("new", "p".into(), RATING_GOOD, String::new(), 1, None));
         assert!(cm.get_comments("new").is_some());
         assert!(cm.get_comments("f0").is_some(), "recently touched file survives");
         assert!(cm.get_comments("f1").is_none(), "least recently seen file is evicted");
@@ -529,6 +586,80 @@ mod tests {
             cm.get_comments("aa").unwrap().peer_comments.len(),
             MAX_KAD_NOTES_PER_SOURCE_IP + 1
         );
+    }
+
+    /// A KAD publisher id is free to mint, so one host sending three "fake"
+    /// notes under three ids is still one voter.
+    #[test]
+    fn fake_notes_from_one_host_are_one_voter() {
+        let mut cm = CommentManager::new();
+        let spammer = Ipv4Addr::new(203, 0, 113, 7);
+        for i in 0..3 {
+            cm.add_kad_note("aa", spammer, format!("id{i}"), RATING_FAKE, String::new());
+        }
+        assert_eq!(cm.get_comments("aa").unwrap().peer_comments.len(), 3);
+        assert_eq!(cm.fake_rating_stats("aa"), (1, 1));
+
+        // A neighbour in the same /24 is the same network, not a second voter.
+        let neighbour = Ipv4Addr::new(203, 0, 113, 200);
+        cm.add_kad_note("aa", neighbour, "other".into(), RATING_FAKE, String::new());
+        assert_eq!(cm.fake_rating_stats("aa"), (1, 1));
+    }
+
+    #[test]
+    fn distinct_networks_are_distinct_voters() {
+        let mut cm = CommentManager::new();
+        cm.add_kad_note("aa", Ipv4Addr::new(198, 51, 100, 1), "alice".into(), RATING_FAKE, String::new());
+        cm.add_kad_note("aa", Ipv4Addr::new(192, 0, 2, 1), "bob".into(), RATING_FAKE, String::new());
+        cm.add_peer_comment("aa", "93.184.216.34:4662".into(), RATING_GOOD, String::new(), 0);
+        assert_eq!(cm.fake_rating_stats("aa"), (2, 3));
+
+        // Ed2k peers in one /24 share a network.
+        cm.add_peer_comment("cc", "93.184.216.34:4662".into(), RATING_FAKE, String::new(), 0);
+        cm.add_peer_comment("cc", "93.184.216.35:4662".into(), RATING_FAKE, String::new(), 0);
+        assert_eq!(cm.fake_rating_stats("cc"), (1, 1));
+
+        // An IPv4-mapped IPv6 address is that IPv4 address.
+        cm.add_peer_comment("cc", "[::ffff:93.184.216.36]:4662".into(), RATING_FAKE, String::new(), 0);
+        assert_eq!(cm.fake_rating_stats("cc"), (1, 1));
+    }
+
+    /// A notes search names each note's publisher by KAD id alone, and a host
+    /// can mint as many ids as it likes: those rows are one voter together.
+    #[test]
+    fn kad_notes_without_an_address_are_one_voter_between_them() {
+        let mut cm = CommentManager::new();
+        for i in 0..5 {
+            cm.add_peer_comment("aa", format!("{i:032x}"), RATING_FAKE, String::new(), 1);
+        }
+        assert_eq!(cm.get_comments("aa").unwrap().peer_comments.len(), 5);
+        assert_eq!(cm.fake_rating_stats("aa"), (1, 1));
+
+        cm.add_kad_note("aa", Ipv4Addr::new(198, 51, 100, 1), "addressed".into(), RATING_FAKE, String::new());
+        assert_eq!(cm.fake_rating_stats("aa"), (2, 2));
+    }
+
+    /// Ten honest notes and one forged "fake" from the notes search share the
+    /// unaddressed voter, which stays honest; with one addressed fake beside
+    /// it that is one fake voter of two, not two of two.
+    #[test]
+    fn one_forged_row_does_not_turn_a_voter_fake() {
+        let mut cm = CommentManager::new();
+        for i in 0..10 {
+            cm.add_peer_comment("aa", format!("{i:032x}"), RATING_GOOD, String::new(), 1);
+        }
+        cm.add_peer_comment("aa", format!("{:032x}", 99), RATING_FAKE, String::new(), 1);
+        assert_eq!(cm.fake_rating_stats("aa"), (0, 1));
+        cm.add_kad_note("aa", Ipv4Addr::new(198, 51, 100, 1), "addressed".into(), RATING_FAKE, String::new());
+        assert_eq!(cm.fake_rating_stats("aa"), (1, 2));
+
+        // A voter split evenly is not fake; a majority is.
+        let mut split = CommentManager::new();
+        split.add_peer_comment("bb", "93.184.216.34:4662".into(), RATING_FAKE, String::new(), 0);
+        split.add_peer_comment("bb", "93.184.216.35:4662".into(), RATING_GOOD, String::new(), 0);
+        assert_eq!(split.fake_rating_stats("bb"), (0, 1));
+        split.add_peer_comment("bb", "93.184.216.36:4662".into(), RATING_FAKE, String::new(), 0);
+        assert_eq!(split.fake_rating_stats("bb"), (1, 1));
     }
 
     #[test]

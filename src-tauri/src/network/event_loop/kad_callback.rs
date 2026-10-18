@@ -191,6 +191,7 @@ pub(in crate::network) async fn on_kad_callback_conn(
         peer_user_hash: cb_peer_user_hash,
         emule_info_done: cb_emule_info_done,
         peer_caps: cb_peer_caps,
+        friend_connect_back: cb_friend_ember_hash,
     });
     let mut closed_senders: Vec<String> = Vec::new();
     for tid in &matching_tids {
@@ -358,6 +359,7 @@ pub(in crate::network) async fn on_kad_callback_conn(
             )
             .await;
         }
+        release_sources_waiting_on_friend(state, transfer_manager, app_handle, friend_eh).await;
     }
 
     if !stream_dispatched {

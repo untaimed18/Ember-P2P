@@ -451,7 +451,8 @@ pub(super) fn drain_active_source_overflow(state: &mut NetworkState) -> Vec<(Str
             // listening (the receive task is gone with the worker).
             state.active_established_senders.remove(&transfer_id);
             state.active_source_overflow.remove(&transfer_id);
-            state.active_kad_search_state.remove(&transfer_id);
+            // `active_kad_search_state` stays: it is the file's KAD search
+            // clock, and a worker that ended may be re-queued.
             state
                 .download_source_searches
                 .retain(|_, (tid, _)| tid != &transfer_id);
@@ -878,17 +879,16 @@ pub(super) async fn send_kad_callback_req(
 
 pub(super) const MAX_FAIL_COUNT_FOR_UDP: u32 = 3;
 
-/// Maximum number of UDP source-discovery queries we'll send to a
-/// single server with no inbound UDP reply before treating it as
-/// dead-for-UDP and skipping it. Distinct from [`MAX_FAIL_COUNT_FOR_UDP`]
-/// (which counts TCP connect failures); a server can be perfectly
-/// healthy on TCP and still completely silent on UDP because its
-/// admin firewalled the UDP port, it doesn't index our specific file
-/// hashes, or it requires UDP obfuscation we never negotiated.
+/// Unanswered status pings in a row before a server is treated as
+/// dead-for-UDP and left out of source queries. Distinct from
+/// [`MAX_FAIL_COUNT_FOR_UDP`] (which counts TCP connect failures); a server
+/// can be perfectly healthy on TCP and still completely silent on UDP because
+/// its admin firewalled the UDP port.
 ///
-/// Re-eligible the moment any inbound UDP reply arrives — the recv
-/// path resets the per-server counter via `record_udp_reply`.
-pub(super) const MAX_UDP_CONSECUTIVE_FAILURES: u32 = 5;
+/// Pings keep going out while it is excluded, and the first verified reply
+/// makes it eligible again (`record_udp_reply`). eMule excludes a server
+/// after one unanswered ping; two lets a single lost datagram pass.
+pub(super) const MAX_UDP_CONSECUTIVE_FAILURES: u32 = 2;
 pub(super) const SERVER_UDP_SOURCE_REASK_SECS: i64 = 30 * 60;
 pub(super) const SERVER_UDP_SOURCE_REPLY_TTL_SECS: i64 = 120;
 
@@ -1153,7 +1153,7 @@ pub(super) fn inject_source_into_active_transfers(
         // rationale on `active_established_senders`.
         state.active_established_senders.remove(transfer_id);
         state.active_source_overflow.remove(transfer_id);
-        state.active_kad_search_state.remove(transfer_id);
+        // The KAD search clock stays, as above.
         state
             .download_source_searches
             .retain(|_, (tid, _)| tid != transfer_id);
@@ -1204,9 +1204,11 @@ pub(super) fn inject_source_into_active_transfers(
 /// This is what a download's opening fan-out does and what the Transfers
 /// "find sources" button does, which is the reason it is one function: three
 /// call sites drifting apart is how a network quietly stops being asked.
-/// Callers keep their own bookkeeping around it — `active_kad_search_state`,
-/// `ember_source_search_state`, `PendingDownload::search_count` — which is what
-/// the returned outcome is for.
+/// The KAD leg keeps the file's search clock itself
+/// (`kad_source_search_may_start`), so no caller can restart its backoff.
+/// Callers keep the rest of their bookkeeping around it —
+/// `ember_source_search_state`, `PendingDownload::search_count` — which is
+/// what the returned outcome is for.
 pub(super) async fn ask_networks_for_sources(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -1222,7 +1224,8 @@ pub(super) async fn ask_networks_for_sources(
     // KAD: the closest contacts we know of, reachable ones first — a
     // firewalled contact can only answer through a callback, so it is the
     // least useful place to spend one of the opening queries.
-    if kad_ready_for_sources(state) {
+    let kad_now = std::time::Instant::now();
+    if kad_ready_for_sources(state) && kad_source_search_may_start(state, transfer_id, kad_now) {
         let mut closest = state
             .routing_table
             .find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
@@ -1249,6 +1252,7 @@ pub(super) async fn ask_networks_for_sources(
                 state
                     .download_source_searches
                     .insert(sid, (transfer_id.to_string(), file_hash));
+                note_kad_source_search(state, transfer_id, kad_now);
                 info!(
                     "Started KAD source search {} for download {}",
                     sid.0, transfer_id

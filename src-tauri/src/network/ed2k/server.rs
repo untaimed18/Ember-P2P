@@ -130,6 +130,19 @@ pub fn related_search_supported() -> bool {
     RELATED_SEARCH_SUPPORTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether we are logged in to a server, for the upload side, which shares the
+/// server's address before login so it can recognise the server's port test.
+/// Our Hello names the server we are on, and until login that is none.
+static SERVER_SESSION_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_server_session_up(up: bool) {
+    SERVER_SESSION_UP.store(up, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn server_session_up() -> bool {
+    SERVER_SESSION_UP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A file to offer to the ed2k server via OP_OFFERFILES.
 pub struct OfferFile {
     pub hash: [u8; 16],
@@ -439,7 +452,15 @@ impl Ed2kServerConnection {
                     }
                 }
                 OP_IDCHANGE => {
-                    if payload.len() >= 4 {
+                    // No client ID, no session: taken as one, it read as a
+                    // HighID of 0 and offered our files under it.
+                    if payload.len() < 4 {
+                        return Err(anyhow::anyhow!(
+                            "server sent an ID change without an ID ({} bytes)",
+                            payload.len()
+                        ));
+                    }
+                    {
                         session.client_id =
                             u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
                         if session.client_id == 0 {
@@ -595,8 +616,182 @@ pub struct ServerLink {
     /// obfuscated connection, an RC4 send keystream the server no longer
     /// agrees with, so nothing written afterwards can be parsed.
     write_failure: Arc<OnceLock<String>>,
+    search_replies: SearchReplies,
     reader: tokio::task::JoinHandle<()>,
     writer: tokio::task::JoinHandle<()>,
+}
+
+/// The search a server reply is credited to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchTicket {
+    pub request_id: u64,
+    /// A reply row whose name contains none of these was not an answer to
+    /// this search. Empty accepts every row.
+    pub match_terms: Vec<String>,
+}
+
+/// What became of a search handed to [`ServerLink::send_search_expr_bytes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchSend {
+    Sent,
+    /// Held until the server answers the request ahead of it, or that answer
+    /// is given up on; [`ServerLink::take_deferred_search`] hands it back.
+    Deferred,
+}
+
+/// Pairs `OP_SEARCHRESULT` replies with the requests that asked for them.
+///
+/// The reply names no request; a server answers `OP_SEARCHREQUEST` and
+/// `OP_QUERY_MORE_RESULT` in the order they arrive, so a reply belongs to the
+/// oldest request still owed one. Keeping at most one owed at a time is what
+/// makes that unambiguous: a search started while an answer is owed waits for
+/// it, and the answer is credited to the search that asked, not the one that
+/// replaced it.
+///
+/// A wait can be given up on so the search held behind it goes out. The
+/// request given up on is kept until then: a reply with nothing sent since is
+/// its late answer. Once another request has gone out, the next reply could
+/// be either one's:
+///
+/// - Both requests belong to the same search (a related search's co-share
+///   request after its own keyword request, a More page): the reply is that
+///   search's either way, and the waiting request takes it.
+/// - The waiting request has match terms: a reply with a row sharing one is
+///   its answer, and the caller drops the rows that share none. A reply none
+///   of whose rows shares one is the earlier request's.
+/// - It has none (a co-share request, a filter-only search): a reply with a
+///   row sharing none of the earlier request's terms is the waiting one's. A
+///   reply whose every row shares one is the earlier request's, and so is any
+///   reply when neither has terms, since nothing tells them apart and
+///   crediting another search's rows is worse than missing a reply.
+///
+/// A reply judged the earlier request's is discarded and the waiting request
+/// stays owed. An empty reply credits no rows, so the waiting request takes
+/// it. One the waiting request takes may still have been the earlier one's,
+/// so the next reply with nothing sent since is credited to it as well.
+#[derive(Debug, Default)]
+struct SearchReplies {
+    awaiting: Option<Awaiting>,
+    deferred: Option<(SearchTicket, Vec<u8>)>,
+    /// The request whose wait was given up on, or that was credited with an
+    /// answer that might have been its predecessor's, while no request has
+    /// been sent after it: an unexpected reply is its answer.
+    stale: Option<SearchTicket>,
+    /// What `OP_QUERY_MORE_RESULT` continues: the server pages the last
+    /// search it answered.
+    last_answered: Option<SearchTicket>,
+}
+
+#[derive(Debug)]
+struct Awaiting {
+    ticket: SearchTicket,
+    sent_at: std::time::Instant,
+    /// The stale request this one was sent after, whose answer might still
+    /// arrive ahead of this one's.
+    after: Option<SearchTicket>,
+}
+
+/// Whether a reply whose rows carry `names`, arriving after `earlier` was
+/// given up on and `waiting` was sent, answers `waiting` (see
+/// [`SearchReplies`]).
+fn ambiguous_reply_answers_waiting(
+    waiting: &SearchTicket,
+    earlier: &SearchTicket,
+    names: &[&str],
+) -> bool {
+    use crate::search::query::name_contains_any_term;
+    if names.is_empty() || waiting.request_id == earlier.request_id {
+        return true;
+    }
+    if !waiting.match_terms.is_empty() {
+        return names
+            .iter()
+            .any(|name| name_contains_any_term(name, &waiting.match_terms));
+    }
+    !earlier.match_terms.is_empty()
+        && names
+            .iter()
+            .any(|name| !name_contains_any_term(name, &earlier.match_terms))
+}
+
+impl SearchReplies {
+    fn owed(&self) -> bool {
+        self.awaiting.is_some()
+    }
+
+    fn defer(&mut self, ticket: SearchTicket, expr: &[u8]) {
+        if let Some((replaced, _)) = &self.deferred {
+            debug!(
+                "Server search {} superseded by {} before it was sent",
+                replaced.request_id, ticket.request_id
+            );
+        }
+        self.deferred = Some((ticket, expr.to_vec()));
+    }
+
+    fn sent(&mut self, ticket: SearchTicket, now: std::time::Instant) {
+        self.awaiting = Some(Awaiting {
+            ticket,
+            sent_at: now,
+            after: self.stale.take(),
+        });
+    }
+
+    fn more_ticket(&self, request_id: u64) -> SearchTicket {
+        self.last_answered
+            .as_ref()
+            .filter(|t| t.request_id == request_id)
+            .cloned()
+            .unwrap_or(SearchTicket {
+                request_id,
+                match_terms: Vec::new(),
+            })
+    }
+
+    /// The request a reply whose rows carry `names` answers.
+    fn answered<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) -> Option<SearchTicket> {
+        let Some(awaiting) = self.awaiting.take() else {
+            let ticket = self.stale.take()?;
+            self.last_answered = Some(ticket.clone());
+            return Some(ticket);
+        };
+        if let Some(earlier) = &awaiting.after {
+            let names: Vec<&str> = names.into_iter().collect();
+            if !ambiguous_reply_answers_waiting(&awaiting.ticket, earlier, &names) {
+                debug!(
+                    "Server reply does not look like search {}'s; taking it for search {} given up on before it",
+                    awaiting.ticket.request_id, earlier.request_id
+                );
+                self.awaiting = Some(Awaiting {
+                    after: None,
+                    ..awaiting
+                });
+                return None;
+            }
+            // Its own answer may still be behind this one.
+            self.stale = Some(awaiting.ticket.clone());
+        }
+        self.last_answered = Some(awaiting.ticket.clone());
+        Some(awaiting.ticket)
+    }
+
+    fn expire(&mut self, wait: std::time::Duration, now: std::time::Instant) -> Option<u64> {
+        let awaiting = self.awaiting.as_ref()?;
+        if now.saturating_duration_since(awaiting.sent_at) < wait {
+            return None;
+        }
+        let awaiting = self.awaiting.take()?;
+        let request_id = awaiting.ticket.request_id;
+        self.stale = Some(awaiting.ticket);
+        Some(request_id)
+    }
+
+    fn take_deferred(&mut self) -> Option<(SearchTicket, Vec<u8>)> {
+        if self.owed() {
+            return None;
+        }
+        self.deferred.take()
+    }
 }
 
 impl Drop for ServerLink {
@@ -690,6 +885,7 @@ impl ServerLink {
             outbound,
             inbound,
             write_failure,
+            search_replies: SearchReplies::default(),
             reader,
             writer,
         }
@@ -758,8 +954,15 @@ impl ServerLink {
     /// `OP_SEARCHREQUEST`. Multi-word queries MUST use the AND-tree wire
     /// format for reliable results across all eD2K servers.
     ///
-    /// The result arrives later as `ServerEvent::SearchResult`.
-    pub fn send_search_expr_bytes(&mut self, expr: &[u8]) -> anyhow::Result<()> {
+    /// The result arrives later as `ServerEvent::SearchResult`, and
+    /// [`Self::take_search_reply`] says which search it answers. While an
+    /// earlier request is still owed its answer this one is held back rather
+    /// than sent (see [`SearchReplies`]); a later search replaces it there.
+    pub fn send_search_expr_bytes(
+        &mut self,
+        ticket: SearchTicket,
+        expr: &[u8],
+    ) -> anyhow::Result<SearchSend> {
         // A server without large-file support cannot parse a 64-bit size
         // leaf; the UDP sweep leaves such servers out for the same reason.
         if self.session.server_flags & SRV_TCPFLG_LARGEFILES == 0
@@ -767,12 +970,51 @@ impl ServerLink {
         {
             anyhow::bail!("server lacks large-file support for a size limit past 4 GiB");
         }
+        if self.search_replies.owed() {
+            info!(
+                "Holding OP_SEARCHREQUEST for search {} until the server answers search {}",
+                ticket.request_id,
+                self.search_replies
+                    .awaiting
+                    .as_ref()
+                    .map_or(0, |a| a.ticket.request_id),
+            );
+            self.search_replies.defer(ticket, expr);
+            return Ok(SearchSend::Deferred);
+        }
         info!(
             "Queuing OP_SEARCHREQUEST expression ({} bytes payload)",
             expr.len(),
         );
         self.queue(OP_SEARCHREQUEST, expr)?;
-        Ok(())
+        self.search_replies.sent(ticket, std::time::Instant::now());
+        Ok(SearchSend::Sent)
+    }
+
+    /// Which search the `OP_SEARCHRESULT` just received, carrying `results`,
+    /// answers, or `None` when it answers none still owed one (see
+    /// [`SearchReplies`]). The caller still checks that search is waiting.
+    pub fn take_search_reply(&mut self, results: &[ServerSearchResult]) -> Option<SearchTicket> {
+        self.search_replies
+            .answered(results.iter().map(|r| r.file_name.as_str()))
+    }
+
+    /// Stop holding the next search behind a request the server has left
+    /// unanswered for `wait`, returning its search id. Its answer, if it still
+    /// comes before another request goes out, is credited to it.
+    pub fn expire_search_reply(&mut self, wait: std::time::Duration) -> Option<u64> {
+        self.search_replies.expire(wait, std::time::Instant::now())
+    }
+
+    /// The search held back by [`Self::send_search_expr_bytes`], once nothing
+    /// is owed ahead of it. The caller decides whether it is still wanted.
+    pub fn take_deferred_search(&mut self) -> Option<(SearchTicket, Vec<u8>)> {
+        self.search_replies.take_deferred()
+    }
+
+    /// Whether a search reply is owed or a search is held back waiting.
+    pub fn search_reply_outstanding(&self) -> bool {
+        self.search_replies.owed() || self.search_replies.deferred.is_some()
     }
 
     /// Send a source request to the server (eMule DownloadQueue.cpp format).
@@ -855,9 +1097,16 @@ impl ServerLink {
         Ok(())
     }
 
-    /// Ask for the next page of the current search (eMule `SearchMore`).
-    pub fn request_more_results(&mut self) -> anyhow::Result<()> {
+    /// Ask for the next page of the last search the server answered (eMule
+    /// `SearchMore`), crediting it to `request_id`. Refused while a reply is
+    /// owed or a search is held back: the page would answer the wrong one.
+    pub fn request_more_results(&mut self, request_id: u64) -> anyhow::Result<()> {
+        if self.search_reply_outstanding() {
+            anyhow::bail!("a server search reply is still outstanding");
+        }
         self.queue(OP_QUERY_MORE_RESULT, &[])?;
+        let ticket = self.search_replies.more_ticket(request_id);
+        self.search_replies.sent(ticket, std::time::Instant::now());
         debug!("Queued OP_QUERY_MORE_RESULT to server");
         Ok(())
     }
@@ -1165,7 +1414,13 @@ fn parse_server_event(opcode: u8, payload: &[u8]) -> Vec<ServerEvent> {
                 events.push(ServerEvent::SearchResult { results, more });
             }
             Err(e) => {
+                // Still the answer to the request it replies to; dropping it
+                // would leave that request owed and credit the next reply to it.
                 debug!("Failed to parse search result: {e}");
+                events.push(ServerEvent::SearchResult {
+                    results: Vec::new(),
+                    more: false,
+                });
             }
         },
         OP_FOUNDSOURCES | OP_FOUNDSOURCES_OBFU => {
@@ -1224,7 +1479,17 @@ fn parse_server_ident_name(payload: &[u8]) -> Option<String> {
     }
     let tag_count =
         u32::from_le_bytes([payload[22], payload[23], payload[24], payload[25]]) as usize;
-    let mut offset = 26;
+    server_name_from_tags(payload, 26, tag_count)
+}
+
+/// The `ST_SERVERNAME` string out of `tag_count` tags starting at `offset`.
+/// Shared by the TCP `OP_SERVERIDENT` and the UDP `OP_SERVER_DESC_RES`, which
+/// carry the same tag list behind different headers.
+pub(super) fn server_name_from_tags(
+    payload: &[u8],
+    mut offset: usize,
+    tag_count: usize,
+) -> Option<String> {
     for _ in 0..tag_count.min(32) {
         if offset >= payload.len() {
             break;
@@ -1527,7 +1792,7 @@ mod tests {
         let mut refused = None;
         for _ in 0..4096 {
             let started = std::time::Instant::now();
-            let result = link.send_search_expr_bytes(&payload);
+            let result = link.queue(OP_SEARCHREQUEST, &payload);
             spent += started.elapsed();
             if let Err(e) = result {
                 refused = Some(e);
@@ -1537,10 +1802,7 @@ mod tests {
         }
 
         let err = refused.expect("the queue never filled against a server that does not read");
-        assert_eq!(
-            err.downcast_ref::<io::Error>().map(io::Error::kind),
-            Some(io::ErrorKind::WouldBlock)
-        );
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         assert!(link.write_failure().is_none());
         assert!(spent < std::time::Duration::from_secs(1), "sends took {spent:?}");
     }
@@ -1582,10 +1844,14 @@ mod tests {
             Some(io::ErrorKind::BrokenPipe)
         );
         assert!(link.request_callback(0x00AB_CDEF).is_err());
-        assert!(link.request_more_results().is_err());
+        assert!(link.request_more_results(1).is_err());
         assert!(link.send_get_sources(&[7u8; 16], 1024).is_err());
         assert!(link.offer_files_chunk(&[offer("movie.avi")], 4662).is_err());
-        assert!(link.send_search_expr_bytes(b"x").is_err());
+        assert!(link.send_search_expr_bytes(ticket(1, &[]), b"x").is_err());
+        assert!(
+            !link.search_reply_outstanding(),
+            "a request that never reached the queue is owed nothing"
+        );
         // A later failure does not overwrite the first, root-cause reason.
         assert_eq!(link.write_failure(), Some("server write timed out"));
 
@@ -1596,6 +1862,173 @@ mod tests {
             .expect("peer read timed out")
             .unwrap();
         assert_eq!(n, 0, "a broken connection must not put further frames on the wire");
+    }
+
+    fn ticket(request_id: u64, terms: &[&str]) -> SearchTicket {
+        SearchTicket {
+            request_id,
+            match_terms: terms.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    /// Search B started before the server answered search A: the answer that
+    /// arrives next is A's, and B goes out only after it.
+    #[tokio::test]
+    async fn a_search_started_while_one_is_owed_waits_for_its_answer() {
+        let (mut link, mut peer) = loopback_link(SERVER_WRITE_QUEUE).await;
+
+        assert_eq!(
+            link.send_search_expr_bytes(ticket(1, &["alpha"]), b"A").unwrap(),
+            SearchSend::Sent
+        );
+        assert_eq!(
+            link.send_search_expr_bytes(ticket(2, &["bravo"]), b"B").unwrap(),
+            SearchSend::Deferred
+        );
+        assert_eq!(
+            link.send_search_expr_bytes(ticket(3, &["charlie"]), b"C").unwrap(),
+            SearchSend::Deferred,
+            "a newer search replaces the one held back"
+        );
+        assert!(link.request_more_results(1).is_err());
+        assert!(link.take_deferred_search().is_none(), "search 1 is still owed");
+
+        let mut wire = vec![0u8; 7];
+        tokio::time::timeout(std::time::Duration::from_secs(5), peer.read_exact(&mut wire))
+            .await
+            .expect("search 1 never reached the server")
+            .unwrap();
+        assert_eq!(wire, server_wire_packet(OP_EDONKEYHEADER, OP_SEARCHREQUEST, b"A").unwrap());
+
+        assert_eq!(link.take_search_reply(&[]), Some(ticket(1, &["alpha"])));
+        assert_eq!(link.take_search_reply(&[]), None, "nothing else is owed");
+        let (held, expr) = link.take_deferred_search().expect("search 3 was held");
+        assert_eq!(held, ticket(3, &["charlie"]));
+        assert_eq!(expr, b"C");
+        assert!(!link.search_reply_outstanding());
+    }
+
+    #[test]
+    fn more_results_are_credited_to_the_search_they_continue() {
+        let mut replies = SearchReplies::default();
+        let now = std::time::Instant::now();
+        replies.sent(ticket(7, &["alpha"]), now);
+        assert_eq!(replies.answered(std::iter::empty()), Some(ticket(7, &["alpha"])));
+        assert_eq!(replies.more_ticket(7), ticket(7, &["alpha"]));
+        // Search More for a search the server did not answer last keeps no
+        // terms rather than borrowing another search's.
+        assert_eq!(replies.more_ticket(8), ticket(8, &[]));
+    }
+
+    /// A server that never answers cannot hold the next search back forever.
+    #[test]
+    fn an_unanswered_request_is_given_up_on_after_the_wait() {
+        let mut replies = SearchReplies::default();
+        let sent_at = std::time::Instant::now();
+        let wait = std::time::Duration::from_secs(28);
+        replies.sent(ticket(1, &[]), sent_at);
+        replies.defer(ticket(2, &[]), b"B");
+
+        assert_eq!(replies.expire(wait, sent_at + wait / 2), None);
+        assert!(replies.take_deferred().is_none());
+
+        assert_eq!(replies.expire(wait, sent_at + wait), Some(1));
+        let (held, _) = replies.take_deferred().expect("search 2 is released");
+        assert_eq!(held.request_id, 2);
+    }
+
+    /// The answer to a request whose wait ran out, arriving before anything
+    /// else was sent, is that request's: inside its own timeout it is used.
+    #[test]
+    fn a_late_answer_with_nothing_sent_since_is_its_own_searchs() {
+        let mut replies = SearchReplies::default();
+        let sent_at = std::time::Instant::now();
+        let wait = std::time::Duration::from_secs(28);
+        replies.sent(ticket(1, &["alpha"]), sent_at);
+        assert_eq!(replies.expire(wait, sent_at + wait), Some(1));
+        assert_eq!(replies.answered(["alpha.avi"]), Some(ticket(1, &["alpha"])));
+        assert_eq!(replies.answered(["alpha.avi"]), None, "one reply per request");
+    }
+
+    /// Search 2 went out after search 1's wait ran out. A reply sharing none
+    /// of search 2's words is search 1's late answer, and search 2 is still
+    /// owed its own; a reply that does share one is search 2's.
+    #[test]
+    fn after_an_expiry_the_waiting_searchs_words_decide_whose_reply_it_is() {
+        let wait = std::time::Duration::from_secs(28);
+        let start = |replies: &mut SearchReplies| {
+            let sent_at = std::time::Instant::now();
+            replies.sent(ticket(1, &["alpha"]), sent_at);
+            replies.expire(wait, sent_at + wait);
+            replies.sent(ticket(2, &["bravo"]), sent_at + wait);
+        };
+
+        let mut replies = SearchReplies::default();
+        start(&mut replies);
+        assert_eq!(replies.answered(["alpha.avi", "alpha 2.avi"]), None);
+        assert!(replies.owed(), "search 2's own answer is still to come");
+        assert_eq!(replies.answered(["alpha bravo.avi"]), Some(ticket(2, &["bravo"])));
+        assert!(!replies.owed());
+
+        let mut replies = SearchReplies::default();
+        start(&mut replies);
+        assert_eq!(replies.answered(["bravo.avi"]), Some(ticket(2, &["bravo"])));
+        // Had that been search 1's answer after all, search 2's follows it.
+        assert_eq!(replies.answered(["bravo 2.avi"]), Some(ticket(2, &["bravo"])));
+
+        // An empty reply credits no rows: the waiting search takes it.
+        let mut replies = SearchReplies::default();
+        start(&mut replies);
+        assert_eq!(replies.answered(std::iter::empty()), Some(ticket(2, &["bravo"])));
+    }
+
+    /// A search with no words of its own (a co-share request, a filter-only
+    /// search) sent after search 1 was given up on cannot take search 1's late
+    /// answer: the earlier search's words are what rule a reply in or out.
+    #[test]
+    fn a_wordless_search_does_not_take_the_earlier_searchs_late_answer() {
+        let wait = std::time::Duration::from_secs(28);
+        let start = |replies: &mut SearchReplies, earlier: SearchTicket, waiting: SearchTicket| {
+            let sent_at = std::time::Instant::now();
+            replies.sent(earlier, sent_at);
+            replies.expire(wait, sent_at + wait);
+            replies.sent(waiting, sent_at + wait);
+        };
+
+        let mut replies = SearchReplies::default();
+        start(&mut replies, ticket(1, &["alpha"]), ticket(2, &[]));
+        assert_eq!(replies.answered(["alpha.avi", "alpha 2.avi"]), None);
+        assert!(replies.owed(), "search 2's own answer is still to come");
+        assert_eq!(replies.answered(["other.avi"]), Some(ticket(2, &[])));
+
+        let mut replies = SearchReplies::default();
+        start(&mut replies, ticket(1, &["alpha"]), ticket(2, &[]));
+        assert_eq!(
+            replies.answered(["alpha.avi", "unrelated.mkv"]),
+            Some(ticket(2, &[])),
+            "a row search 1 could not have matched makes it search 2's"
+        );
+
+        // Neither has words: nothing tells the replies apart.
+        let mut replies = SearchReplies::default();
+        start(&mut replies, ticket(1, &[]), ticket(2, &[]));
+        assert_eq!(replies.answered(["anything.avi"]), None);
+        assert_eq!(replies.answered(["anything.avi"]), Some(ticket(2, &[])));
+
+        // A co-share request after its own search's keyword request: the reply
+        // is that search's either way.
+        let mut replies = SearchReplies::default();
+        start(&mut replies, ticket(5, &["alpha"]), ticket(5, &[]));
+        assert_eq!(replies.answered(["alpha.avi"]), Some(ticket(5, &[])));
+    }
+
+    #[test]
+    fn an_unparsable_search_result_still_answers_its_request() {
+        let events = parse_server_event(OP_SEARCHRESULT, &[0x01, 0x00]);
+        assert!(matches!(
+            events.as_slice(),
+            [ServerEvent::SearchResult { results, more: false }] if results.is_empty()
+        ));
     }
 
     #[tokio::test]
@@ -1753,16 +2186,63 @@ mod tests {
         assert!(server_indexes_file_size(OLD_MAX_EMULE_FILE_SIZE + 1, SRV_TCPFLG_LARGEFILES));
     }
 
+    /// One result record: FT_FILENAME, then FT_FILESIZE unless `size` is 0.
+    fn search_record(hash: u8, name: &[u8], size: u32) -> Vec<u8> {
+        let mut record = [hash; 16].to_vec();
+        record.extend_from_slice(&0x0102_0304u32.to_le_bytes());
+        record.extend_from_slice(&4662u16.to_le_bytes());
+        record.extend_from_slice(&(if size == 0 { 1u32 } else { 2 }).to_le_bytes());
+        record.push(0x02 | 0x80);
+        record.push(0x01);
+        record.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        record.extend_from_slice(name);
+        if size != 0 {
+            record.push(0x03 | 0x80);
+            record.push(0x02);
+            record.extend_from_slice(&size.to_le_bytes());
+        }
+        record
+    }
+
     fn search_result_payload(declared: u32, records: u32, trailing: &[u8]) -> Vec<u8> {
         let mut payload = declared.to_le_bytes().to_vec();
         for n in 0..records {
-            payload.extend_from_slice(&[n as u8; 16]);
-            payload.extend_from_slice(&0x0102_0304u32.to_le_bytes());
-            payload.extend_from_slice(&4662u16.to_le_bytes());
-            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload.extend_from_slice(&search_record(n as u8, b"file.avi", 1000));
         }
         payload.extend_from_slice(trailing);
         payload
+    }
+
+    /// A record whose tags stopped decoding part-way, or that names no file
+    /// or no size, is not a result: it would be a row with whatever the tags
+    /// that did decode left behind.
+    #[test]
+    fn only_whole_records_with_a_name_and_a_size_are_results() {
+        let mut payload = 4u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&search_record(1, b"kept.avi", 1000));
+        payload.extend_from_slice(&search_record(2, b"no size.avi", 0));
+        payload.extend_from_slice(&search_record(3, b"", 1000));
+        payload.extend_from_slice(&search_record(4, b"kept too.avi", 2000));
+        payload.push(0x01);
+        let (results, more) = parse_search_result(&payload).unwrap();
+        assert_eq!(
+            results.iter().map(|r| r.file_name.as_str()).collect::<Vec<_>>(),
+            ["kept.avi", "kept too.avi"]
+        );
+        assert!(more, "every record was read in step, so the flag still counts");
+
+        // FT_FILESIZE, then a name tag whose length runs past the end.
+        let mut broken = 1u32.to_le_bytes().to_vec();
+        broken.extend_from_slice(&[5u8; 16]);
+        broken.extend_from_slice(&0x0102_0304u32.to_le_bytes());
+        broken.extend_from_slice(&4662u16.to_le_bytes());
+        broken.extend_from_slice(&2u32.to_le_bytes());
+        broken.extend_from_slice(&[0x03 | 0x80, 0x02]);
+        broken.extend_from_slice(&1000u32.to_le_bytes());
+        broken.extend_from_slice(&[0x02 | 0x80, 0x01, 0x40, 0x00, b'x']);
+        let (results, more) = parse_search_result(&broken).unwrap();
+        assert!(results.is_empty());
+        assert!(!more);
     }
 
     #[test]
@@ -1995,6 +2475,57 @@ mod tests {
         assert_eq!(r.media.codec.as_deref(), Some("mp3"));
         assert_eq!(r.rating, Some(4));
         assert_eq!(r.comment.as_deref(), Some("great rip"));
+    }
+
+    fn one_named_result(name: &[u8]) -> Vec<u8> {
+        let mut payload = 1u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&search_record(0, name, 1000));
+        payload
+    }
+
+    #[test]
+    fn a_name_that_is_not_utf8_is_read_as_windows_1252() {
+        let (results, _) = parse_search_result(&one_named_result(b"Caf\xE9 \x93Live\x94 \x80.mp3"))
+            .expect("parse");
+        assert_eq!(results[0].file_name, "Café \u{201C}Live\u{201D} €.mp3");
+
+        let utf8 = "Café 東京.mp3";
+        let (results, _) = parse_search_result(&one_named_result(utf8.as_bytes())).expect("parse");
+        assert_eq!(results[0].file_name, utf8, "valid UTF-8 is left as it is");
+
+        // One stray byte in otherwise valid UTF-8 is the only byte read as
+        // Windows-1252.
+        let mut stray = "Café 東京".as_bytes().to_vec();
+        stray.insert(6, 0x92);
+        assert_eq!(decode_wire_text(&stray), "Café \u{2019}東京");
+        assert_eq!(decode_wire_text(b"\xE6\x9D"), "\u{E6}\u{9D}", "a cut-off sequence");
+
+        // An undefined byte decodes to a control, which the sanitizer drops.
+        assert_eq!(decode_wire_text(b"a\x81b\xFF"), "a\u{81}b\u{FF}");
+        let (results, _) = parse_search_result(&one_named_result(b"a\x81b.avi")).expect("parse");
+        assert_eq!(results[0].file_name, "ab.avi");
+    }
+
+    #[test]
+    fn an_absurdly_long_name_is_capped_and_keeps_its_extension() {
+        let long = format!("{}.mkv", "é".repeat(5000));
+        let (results, _) = parse_search_result(&one_named_result(long.as_bytes())).expect("parse");
+        let name = &results[0].file_name;
+        assert_eq!(name.chars().count(), MAX_RESULT_NAME_CHARS);
+        assert!(name.ends_with("é.mkv"));
+
+        let no_ext = "x".repeat(MAX_RESULT_NAME_CHARS + 10);
+        assert_eq!(cap_result_name(no_ext).len(), MAX_RESULT_NAME_CHARS);
+        let ordinary = "Some Movie (2024).mkv".to_string();
+        assert_eq!(cap_result_name(ordinary.clone()), ordinary);
+        let at_cap = "y".repeat(MAX_RESULT_NAME_CHARS);
+        assert_eq!(cap_result_name(at_cap.clone()), at_cap);
+
+        // Four-byte characters reach the byte cap well before the character
+        // cap; the name must still be one Mark spam accepts.
+        let wide = cap_result_name(format!("{}.mp3", "\u{1F600}".repeat(400)));
+        assert!(wide.len() <= MAX_RESULT_NAME_BYTES);
+        assert!(wide.ends_with("\u{1F600}.mp3"));
     }
 }
 
@@ -2318,13 +2849,84 @@ fn parse_media_length_str(s: &str) -> Option<u32> {
     }
 }
 
+/// Longest file name a server search result keeps, in characters.
+///
+/// The row has one name, used for display and as the name a download starts
+/// under, and `start_download` already cuts that to 255 bytes, so nothing a
+/// download can use is lost; 8192 characters of name only ever reached the
+/// results table.
+pub(crate) const MAX_RESULT_NAME_CHARS: usize = 512;
+/// And in bytes: `mark_spam` refuses a name longer than this
+/// (`MAX_MARK_SPAM_FILENAME`), so a row past it could not be marked.
+pub(crate) const MAX_RESULT_NAME_BYTES: usize = 1024;
+
+/// `name` cut to [`MAX_RESULT_NAME_CHARS`] and [`MAX_RESULT_NAME_BYTES`],
+/// keeping a short extension so the row still has the file type and extension
+/// the filters and download read.
+pub(crate) fn cap_result_name(name: String) -> String {
+    if name.chars().count() <= MAX_RESULT_NAME_CHARS && name.len() <= MAX_RESULT_NAME_BYTES {
+        return name;
+    }
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext)
+        .filter(|ext| !ext.is_empty() && ext.chars().count() <= 16 && !ext.contains(' '));
+    let (chars_left, bytes_left) = match ext {
+        Some(ext) => (
+            MAX_RESULT_NAME_CHARS - ext.chars().count() - 1,
+            MAX_RESULT_NAME_BYTES - ext.len() - 1,
+        ),
+        None => (MAX_RESULT_NAME_CHARS, MAX_RESULT_NAME_BYTES),
+    };
+    let mut stem = String::new();
+    for c in name.chars().take(chars_left) {
+        if stem.len() + c.len_utf8() > bytes_left {
+            break;
+        }
+        stem.push(c);
+    }
+    match ext {
+        Some(ext) => format!("{stem}.{ext}"),
+        None => stem,
+    }
+}
+
+/// A string tag's bytes as text: UTF-8, which every Unicode server sends, with
+/// any byte that is not part of valid UTF-8 read as Windows-1252, the code page
+/// servers without Unicode support relay most Western names in. One stray
+/// byte costs only itself.
+pub(crate) fn decode_wire_text(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        text.push_str(chunk.valid());
+        text.extend(chunk.invalid().iter().map(|&b| cp1252_char(b)));
+    }
+    text
+}
+
+fn cp1252_char(byte: u8) -> char {
+    // 0x80..=0x9F; the five bytes Windows-1252 leaves undefined map to the C1
+    // control of the same value, as WHATWG's decoder does.
+    const HIGH: [char; 32] = [
+        '\u{20AC}', '\u{0081}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}',
+        '\u{2021}', '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{008D}',
+        '\u{017D}', '\u{008F}', '\u{0090}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}',
+        '\u{2022}', '\u{2013}', '\u{2014}', '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}',
+        '\u{0153}', '\u{009D}', '\u{017E}', '\u{0178}',
+    ];
+    match byte {
+        0x80..=0x9F => HIGH[usize::from(byte - 0x80)],
+        _ => char::from(byte),
+    }
+}
+
 impl ServerResultTags {
     /// Route a decoded string value to the right field by tag id (KAD-style
     /// byte ids) or, for old-format tags, by lowercased name.
     fn apply_string(&mut self, name_id: u8, name: Option<&str>, value: String) {
         let value = crate::security::sanitize_remote_text(&value, 8192);
         if name_id == 0x01 {
-            self.file_name = value;
+            self.file_name = cap_result_name(value);
             return;
         }
         if value.is_empty() {
@@ -2402,8 +3004,7 @@ fn read_tag_value(
             }
             let bytes = cursor.get_ref().get(start..end).unwrap_or(&[]);
             cursor.set_position(end as u64);
-            let keep = &bytes[..bytes.len().min(8192)];
-            sink.apply_string(name_id, name, String::from_utf8_lossy(keep).to_string());
+            sink.apply_string(name_id, name, decode_wire_text(bytes));
             true
         }
         // TAGTYPE_UINT32 (0x03)
@@ -2529,7 +3130,7 @@ fn read_tag_value(
             if Read::read_exact(cursor, &mut sbuf).is_err() {
                 return false;
             }
-            sink.apply_string(name_id, name, String::from_utf8_lossy(&sbuf).to_string());
+            sink.apply_string(name_id, name, decode_wire_text(&sbuf));
             true
         }
         _ => false,
@@ -2543,10 +3144,14 @@ fn read_tag_value(
 /// (`SearchList.cpp:264-281`): 0x01 means more, 0x00 or anything else does
 /// not. It is only meaningful if every declared record was read in step, so a
 /// truncated or desynchronised answer never asks for another page.
+///
+/// A record is kept only when all its tags were read and it names a file and
+/// a size: a record cut short by a bad tag has lost whatever followed it.
 fn parse_search_result(payload: &[u8]) -> anyhow::Result<(Vec<ServerSearchResult>, bool)> {
     let mut cursor = Cursor::new(payload);
     let count = ReadBytesExt::read_u32::<LittleEndian>(&mut cursor)? as usize;
     let mut results = Vec::with_capacity(count.min(1000));
+    let mut records_read = 0usize;
     let mut last_in_sync = true;
 
     for _ in 0..count.min(1000) {
@@ -2619,6 +3224,19 @@ fn parse_search_result(payload: &[u8]) -> anyhow::Result<(Vec<ServerSearchResult
             }
         }
 
+        // If a tag failed to decode mid-record the cursor is no longer aligned
+        // to the next result; stop rather than decoding subsequent entries from
+        // a mid-tag offset (which would emit garbage rows). The surplus-tag
+        // path above keeps us aligned on success, so only a desync forces the
+        // break. Mirrors the UDP sibling in `server_udp.rs`.
+        last_in_sync = in_sync;
+        if !in_sync {
+            break;
+        }
+        records_read += 1;
+        if tags.file_name.is_empty() || tags.file_size == 0 {
+            continue;
+        }
         results.push(ServerSearchResult {
             file_hash,
             client_id,
@@ -2631,19 +3249,9 @@ fn parse_search_result(payload: &[u8]) -> anyhow::Result<(Vec<ServerSearchResult
             comment: tags.comment,
             media: tags.media,
         });
-
-        // If a tag failed to decode mid-record the cursor is no longer aligned
-        // to the next result; stop rather than decoding subsequent entries from
-        // a mid-tag offset (which would emit garbage rows). The surplus-tag
-        // path above keeps us aligned on success, so only a desync forces the
-        // break. Mirrors the UDP sibling in `server_udp.rs`.
-        last_in_sync = in_sync;
-        if !in_sync {
-            break;
-        }
     }
 
-    let aligned = results.len() == count && last_in_sync;
+    let aligned = records_read == count && last_in_sync;
     let trailing = payload.len().saturating_sub(cursor.position() as usize);
     let more = aligned && trailing == 1 && payload.last() == Some(&0x01);
     Ok((results, more))

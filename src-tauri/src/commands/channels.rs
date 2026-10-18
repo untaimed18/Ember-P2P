@@ -153,6 +153,10 @@ pub struct ChannelInfo {
     /// The room's current key was sealed to us in a way only a newer Ember can
     /// open, so new messages stay locked until this device updates.
     pub newer_key: bool,
+    /// Members send this room's messages in an envelope only a newer Ember
+    /// reads, so some of what they say never arrives here. Cleared with
+    /// `newer_lines` when the user dismisses the notice.
+    pub newer_envelope: bool,
 }
 
 impl ChannelInfo {
@@ -160,6 +164,7 @@ impl ChannelInfo {
     fn with_newer(mut self, status: crate::storage::database::ChannelNewerStatus) -> Self {
         self.newer_lines = status.lines;
         self.newer_key = self.key_behind && status.key;
+        self.newer_envelope = status.envelope;
         self
     }
 
@@ -198,6 +203,7 @@ impl ChannelInfo {
             language: row.language,
             newer_lines: 0,
             newer_key: false,
+            newer_envelope: false,
         }
     }
 

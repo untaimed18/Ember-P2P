@@ -28,8 +28,8 @@ const MAX_PERSISTED_CONTACTS: usize = crate::network::EMBER_PERSIST_MAX_CONTACTS
 /// The parse loop is already capped, so a forged header cannot drive an
 /// allocation — but `std::fs::read` happens first and will happily pull a
 /// hand-edited or corrupted multi-gigabyte file entirely into memory on the
-/// startup path. `MAX_PERSISTED_CONTACTS` (200) contacts of roughly a hundred
-/// bytes each is about 20 KB, so this is orders of magnitude of slack while
+/// startup path. `MAX_PERSISTED_CONTACTS` (1,000) contacts of roughly a hundred
+/// bytes each is about 100 KB, so this is well over an order of magnitude of slack while
 /// still bounding the read. `kad/bootstrap.rs` guards its own loader the same
 /// way.
 const MAX_NODES_EMBER_BYTES: u64 = 4 * 1024 * 1024;

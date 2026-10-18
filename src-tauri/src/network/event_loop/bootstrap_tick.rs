@@ -65,7 +65,7 @@ pub(in crate::network) async fn on_bootstrap_tick(
             // conditions that persist for the session and must stay
             // on screen even once KAD finishes bootstrapping.
             let _ = app_handle.emit("network-error", serde_json::json!({
-                "message": "Unable to connect to the KAD network. Try downloading the latest nodes.dat from Settings > Network.",
+                "message": "Unable to connect to the KAD network. Try Bootstrap on the KAD Network page and use the default nodes.dat.",
                 "transient": true,
             }));
         }
@@ -460,7 +460,8 @@ pub(in crate::network) async fn on_bootstrap_tick(
             for tid in tids {
                 let (hash_bytes, file_size) = {
                     let Some(pd) = state.pending_downloads.get_mut(&tid) else { continue; };
-                    if pd.control.is_cancelled() { continue; }
+                    // Like the server source asks: never for a paused file.
+                    if pd.control.is_cancelled() || pd.control.is_paused() { continue; }
                     let hash_bytes = match hex::decode(&pd.file_hash) {
                         Ok(b) if b.len() == 16 => b,
                         _ => continue,
@@ -472,7 +473,8 @@ pub(in crate::network) async fn on_bootstrap_tick(
                 let mut file_hash_arr = [0u8; 16];
                 file_hash_arr.copy_from_slice(&hash_bytes[..16]);
 
-                if kad_started < MAX_INITIAL_KAD {
+                let kad_now = std::time::Instant::now();
+                if kad_started < MAX_INITIAL_KAD && kad_source_search_may_start(state, &tid, kad_now) {
                     let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
                     let closest = state.routing_table.find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
                     if !closest.is_empty() {
@@ -485,6 +487,7 @@ pub(in crate::network) async fn on_bootstrap_tick(
                         );
                         if sid != SearchId(0) {
                             state.download_source_searches.insert(sid, (tid.clone(), file_hash_arr));
+                            note_kad_source_search(state, &tid, kad_now);
                             kad_started += 1;
                             did_search = true;
                         } else {

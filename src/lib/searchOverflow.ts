@@ -69,6 +69,35 @@ export function shedWeakestRows(results: SearchResult[], keep: number): void {
   results.length = keep;
 }
 
+/**
+ * How many rows each tab keeps once the open tabs together hold more than
+ * `cap`, or `null` when they do not and nothing has to go.
+ *
+ * Only `idle` tabs give rows up, oldest (first) first, each down to no fewer
+ * than `floor`, and only as many as it takes to get back under `cap` — so a
+ * tab is trimmed for the memory the whole set is using, never just for having
+ * been left. Entries for tabs that keep everything are their own row count.
+ */
+export function planIdleTrim(
+  tabs: readonly { rows: number; idle: boolean }[],
+  cap: number,
+  floor: number,
+): number[] | null {
+  let excess = tabs.reduce((n, t) => n + t.rows, 0) - cap;
+  if (excess <= 0) return null;
+  const keep = tabs.map((t) => t.rows);
+  let trimmed = false;
+  for (let i = 0; i < tabs.length && excess > 0; i++) {
+    if (!tabs[i].idle) continue;
+    const cut = Math.min(tabs[i].rows - floor, excess);
+    if (cut <= 0) continue;
+    keep[i] -= cut;
+    excess -= cut;
+    trimmed = true;
+  }
+  return trimmed ? keep : null;
+}
+
 /** Dropped rows a tab remembers, so that one which comes back and is dropped
  *  again counts once. Past this the oldest are forgotten, and may count twice. */
 export const MAX_REMEMBERED_SHED = 15_000;

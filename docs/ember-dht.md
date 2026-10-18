@@ -551,9 +551,38 @@ a certainty, which is not the same as gone.
 
 ## Known limits (document for users / release notes)
 
-- Multi-keyword search uses sparse DHT intersection (missing secondary
-  keys are skipped) plus a filename match at emit time — not a strict
-  worldwide AND of every keyword key.
+- Multi-keyword AND is by word, not substring, for this build's searches: a
+  responder serves every record under the primary key but leads with those whose
+  signed name carries every other keyword as a word, and the searcher keeps only
+  those. `server` does not match `servers`. A searcher predating this still gets
+  every record (subject to the per-node budget) and filters by substring, as it
+  always did.
+- An `OR` query whose sides share no term walks its longest term plus up to two
+  more branches that lack it, and at most four extra walks in all counting
+  second spellings, so a query of four or more such branches still misses the
+  files matching only through the rest.
+- A keyword walk ends once the k closest live contacts and every pinned session
+  peer have answered and no record has arrived for 5 seconds, rather than
+  exhausting its shortlist; a record held only by a farther node is missed.
+  Only those k closest and the pinned session peers hear the query's extra keys
+  and filters: any farther hop is asked for the primary key alone and its answer
+  is filtered locally.
+- A stored record keeps at most 64 keys of its name's words, earliest first, for ordering
+  multi-keyword answers, so a match whose other words come later in a long name
+  is served after the matches rather than among them.
+- Keywords are normalised (NFKC, lowercase, final sigma folded) for Ember keys
+  only. A name whose normalised words hash differently from its words as typed
+  is published under both; a search walks the normalised key and, when the query
+  as typed hashes elsewhere, that key too. ASCII is unaffected.
+- A storer predating normalisation counts every record filed under a
+  normalised key that differs from the typed one in
+  `ember_dht_keyword_key_off_name`, since it cannot derive that key from the
+  name. Read that counter on such storers with this in mind; nothing is refused
+  on it.
+- A name too long for its record is shortened before signing. Releases before
+  1.7.4 derived keywords from the full name, so a record of theirs may sit under
+  a word its signed name no longer has; the searcher accepts such a record
+  without that word, provided the rest of the query is in what is left.
 - A peer serves only a few records per keyword *datagram* — five for a bare
   record, four for one carrying media, two in the worst case — but a searcher can
   now page a node until its key is exhausted, bounded by the per-node result

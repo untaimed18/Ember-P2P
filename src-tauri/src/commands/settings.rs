@@ -829,6 +829,12 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
+    let disappear = crate::types::normalize_chat_disappear_secs(settings.chat_disappear_secs);
+    if disappear != settings.chat_disappear_secs {
+        settings.chat_disappear_secs = disappear;
+        changed = true;
+    }
+
     // A hand-edited or damaged entry is repaired or dropped, not a reason to
     // reset every other setting.
     let overrides = normalize_friend_overrides(settings.friend_overrides.clone());
@@ -854,22 +860,6 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
             .collect();
         settings.channel_username =
             crate::commands::channels::sanitize_channel_username(&repaired).unwrap_or_default();
-        changed = true;
-    }
-
-    let freq = settings.update_check_frequency.trim().to_ascii_lowercase();
-    if !crate::auto_update::record::CHECK_FREQUENCIES.contains(&freq.as_str()) {
-        settings.update_check_frequency = "daily".to_string();
-        changed = true;
-    } else if freq != settings.update_check_frequency {
-        settings.update_check_frequency = freq;
-        changed = true;
-    }
-
-    // Silent updates act on what the automatic checks find, so without those
-    // checks there is nothing for them to install.
-    if settings.silent_update_enabled && !settings.auto_check_updates {
-        settings.silent_update_enabled = false;
         changed = true;
     }
 
@@ -1096,14 +1086,6 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         return Err(coded(
             "settings_friend_overrides_invalid",
             "A friend's settings could not be saved",
-        ));
-    }
-    if !crate::auto_update::record::CHECK_FREQUENCIES
-        .contains(&settings.update_check_frequency.as_str())
-    {
-        return Err(coded(
-            "settings_update_check_frequency_invalid",
-            "Update check frequency must be 'hourly', 'daily', 'weekly', or 'monthly'",
         ));
     }
     // Checked whether or not the timetable is switched on: the rules persist
@@ -1505,12 +1487,7 @@ pub async fn update_settings(
     settings.spam_filter_profile = settings.spam_filter_profile.trim().to_ascii_lowercase();
     settings.close_to_tray_behavior = settings.close_to_tray_behavior.trim().to_ascii_lowercase();
     settings.channel_file_offers = settings.channel_file_offers.trim().to_ascii_lowercase();
-    settings.update_check_frequency = settings.update_check_frequency.trim().to_ascii_lowercase();
-    // Silent updates act on what the automatic checks find; the Settings page
-    // switches the two together, and this holds the rule for any other caller.
-    if !settings.auto_check_updates {
-        settings.silent_update_enabled = false;
-    }
+    settings.chat_disappear_secs = crate::types::normalize_chat_disappear_secs(settings.chat_disappear_secs);
     // Web services are URL templates the user curates, so they are normalised
     // here rather than trusted: each is checked for a http/https scheme, a host
     // and no embedded credentials, duplicates by URL are dropped, and the list
@@ -2882,26 +2859,39 @@ pub async fn set_quick_limits(
 /// Official Ember project website (GitHub Pages).
 const EMBER_WEBSITE_URL: &str = "https://untaimed18.github.io/Ember-P2P/";
 
-/// Open the Ember website in the user's default browser.
-///
-/// The URL is hardcoded so the frontend cannot redirect this command at an
-/// arbitrary destination.
+/// The source repository: code, releases and issues.
+const EMBER_GITHUB_URL: &str = "https://github.com/untaimed18/Ember-P2P";
+
+/// The official subreddit.
+const EMBER_REDDIT_URL: &str = "https://www.reddit.com/r/EmberP2P/";
+
+/// The project's own pages, by name. The frontend names one of these rather
+/// than passing a URL: the addresses are hardcoded here so a compromised
+/// renderer cannot point the browser at an arbitrary destination.
+fn ember_link_url(target: &str) -> Option<&'static str> {
+    match target {
+        "website" => Some(EMBER_WEBSITE_URL),
+        "github" => Some(EMBER_GITHUB_URL),
+        "reddit" => Some(EMBER_REDDIT_URL),
+        _ => None,
+    }
+}
+
+/// Open one of the project's pages (website, GitHub, Reddit) in the default
+/// browser.
 #[tauri::command]
-pub async fn open_ember_website() -> Result<(), String> {
-    crate::security::filesystem::open_url_with_default_app(EMBER_WEBSITE_URL).map_err(|e| {
-        coded_ctx(
-            "settings_open_website_failed",
-            "Failed to open the Ember website",
-            e,
-        )
-    })
+pub async fn open_ember_link(target: String) -> Result<(), String> {
+    let url = ember_link_url(&target)
+        .ok_or_else(|| coded("settings_unknown_link", "Unknown link"))?;
+    crate::security::filesystem::open_url_with_default_app(url)
+        .map_err(|e| coded_ctx("settings_open_link_failed", "Failed to open the link", e))
 }
 
 /// The project's Buy Me a Coffee page.
 const EMBER_SUPPORT_URL: &str = "https://buymeacoffee.com/emberp2p";
 
 /// Open the support page in the user's default browser. Hardcoded for the
-/// same reason as [`open_ember_website`].
+/// same reason as [`open_ember_link`].
 #[tauri::command]
 pub async fn open_support_page() -> Result<(), String> {
     crate::security::filesystem::open_url_with_default_app(EMBER_SUPPORT_URL).map_err(|e| {
@@ -2913,7 +2903,7 @@ pub async fn open_support_page() -> Result<(), String> {
     })
 }
 
-/// The official site, for copying. Same constant [`open_ember_website`] opens
+/// The official site, for copying. Same constant [`open_ember_link`] opens
 /// so the clipboard and the browser cannot drift.
 #[tauri::command]
 pub fn get_ember_website_url() -> String {
@@ -3534,7 +3524,7 @@ fn ember_share_intent_url(target: &str, text: &str) -> Result<String, String> {
 /// (or the mail client, for email).
 ///
 /// `target` is a name (`x`, `facebook`, …), never a URL. The site itself is
-/// the same hardcoded constant [`open_ember_website`] uses, so a compromised
+/// the same hardcoded constant [`open_ember_link`] uses, so a compromised
 /// renderer cannot point this at an arbitrary host.
 #[tauri::command]
 pub async fn open_ember_share(target: String, text: String) -> Result<(), String> {
@@ -3762,6 +3752,17 @@ mod tests {
     fn get_ember_website_url_is_the_hardcoded_site() {
         assert_eq!(get_ember_website_url(), EMBER_WEBSITE_URL);
         assert!(EMBER_WEBSITE_URL.starts_with("https://"));
+    }
+
+    #[test]
+    fn ember_links_are_a_fixed_allowlist_of_https_pages() {
+        for target in ["website", "github", "reddit"] {
+            let url = ember_link_url(target).expect(target);
+            assert!(url.starts_with("https://"), "{target}: {url}");
+        }
+        assert_eq!(ember_link_url("website"), Some(EMBER_WEBSITE_URL));
+        assert_eq!(ember_link_url("GitHub"), None, "names are lowercase");
+        assert_eq!(ember_link_url("https://evil.example/"), None);
     }
 
     #[test]

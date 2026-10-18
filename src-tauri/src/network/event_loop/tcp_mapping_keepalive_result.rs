@@ -55,7 +55,7 @@ pub(in crate::network) async fn on_tcp_mapping_keepalive_result(
                     state.external_tcp_port, state.server_login_tcp_port
                 );
                 state.last_tcp_remap_reconnect_at = Some(std::time::Instant::now());
-                initiate_server_connect(
+                let _ = initiate_server_connect(
                     state,
                     settings,
                     app_handle,

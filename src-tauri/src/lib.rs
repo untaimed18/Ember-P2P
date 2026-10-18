@@ -990,9 +990,11 @@ pub fn run() {
 
             let local_index = Arc::new(RwLock::new(LocalIndex::new()));
 
+            let (initial_upload_limit, initial_download_limit) =
+                background::effective_limits_now(&settings);
             let bandwidth_limiter = Arc::new(BandwidthLimiter::new(
-                settings.max_upload_speed,
-                settings.max_download_speed,
+                initial_upload_limit,
+                initial_download_limit,
             ));
             let uss_rtt_queue = bandwidth::new_uss_rtt_queue();
             let uss_enabled_flag = bandwidth::new_uss_enabled_flag(settings.uss_enabled);
@@ -2431,6 +2433,7 @@ pub fn run() {
             commands::sharing::set_file_priority,
             commands::sharing::batch_set_priority,
             commands::sharing::batch_unshare,
+            commands::sharing::share_library_files,
             commands::sharing::set_files_friends_only,
             commands::sharing::reload_shared_files,
             commands::sharing::unshare_file,
@@ -2468,6 +2471,8 @@ pub fn run() {
             commands::peers::reset_friend_code,
             commands::peers::send_chat_message,
             commands::peers::discard_failed_chat_message,
+            commands::peers::delete_chat_history,
+            commands::peers::delete_chat_message,
             commands::peers::get_chat_messages,
             commands::peers::is_chat_locked,
             commands::peers::mark_messages_read,
@@ -2571,7 +2576,7 @@ pub fn run() {
             commands::settings::take_pending_restore_expired_notice,
             commands::settings::take_pending_restore_download_folder_notice,
             commands::settings::take_pending_known_met_notice,
-            commands::settings::open_ember_website,
+            commands::settings::open_ember_link,
             commands::settings::open_support_page,
             commands::settings::get_ember_website_url,
             commands::settings::open_ember_share,

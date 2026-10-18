@@ -48,14 +48,9 @@ pub(in crate::network) async fn on_udp_source_tick(
                     pkt_len,
                 );
                 state.udp_discovery_sent = state.udp_discovery_sent.saturating_add(1);
-                // Per-server pruning: bump
-                // udp_consecutive_failures. The recv path
-                // resets it on any inbound UDP reply, so a
-                // genuinely responsive server ratchets back
-                // to zero immediately. Servers that never
-                // reply hit MAX_UDP_CONSECUTIVE_FAILURES
-                // and get excluded from future UDP queries
-                // by `is_eligible_udp_server`.
+                // Only the time is noted: a server with no sources
+                // for a file says nothing, so its silence here is not
+                // a failure (see `record_udp_query_sent`).
                 if let Some(tcp_port) = server_tcp_port {
                     let ip_str = addr.ip().to_string();
                     state.server_list.record_udp_query_sent(&ip_str, tcp_port);

@@ -403,6 +403,32 @@ fn decode_owned_rooms_extra(extra: &[u8]) -> Option<Vec<channel::OwnedRoomSalt>>
 /// apart on where the name — and therefore the contact block — begins.
 pub(super) const RECORD_HEADER_LEN: usize = 1 + 16 + 16 + 32 + 8 + 32 + 8 + 2;
 
+/// The raw file name bytes in record body `data`; `None` for a body too short
+/// to carry the name its header declares.
+pub(super) fn name_bytes_from_record_data(data: &[u8]) -> Option<&[u8]> {
+    let len_bytes = data.get(RECORD_HEADER_LEN - 2..RECORD_HEADER_LEN)?;
+    let name_len = u16::from_le_bytes([len_bytes[0], len_bytes[1]]) as usize;
+    data.get(RECORD_HEADER_LEN..RECORD_HEADER_LEN + name_len)
+}
+
+/// Whether a record body `data_len` bytes long may carry a name the publisher
+/// shortened to fit [`messages::MAX_STORE_RECORD_BYTES`]. The clamp backs off
+/// to a UTF-8 boundary, so a clamped body can end up to three bytes short.
+pub fn record_name_may_be_clamped(data_len: usize) -> bool {
+    data_len + 3 >= messages::MAX_STORE_RECORD_BYTES
+}
+
+/// The file name a keyword record carrying `media` signs for `file_name`:
+/// shortened, where it has to be, to fit the record budget. Keywords are
+/// derived from this rather than from the full name, so every key a record is
+/// filed under is one a word of its signed name hashes to.
+pub fn keyword_record_signed_name<'a>(
+    file_name: &'a str,
+    media: Option<&crate::types::MediaMetadata>,
+) -> &'a str {
+    clamp_name_to_record_budget(file_name, encode_media_trailer(media).len())
+}
+
 /// Version byte leading a keyword record's optional media block.
 const MEDIA_TRAILER_VERSION: u8 = 0x01;
 
@@ -555,9 +581,7 @@ pub(super) fn record_matches_constraints(
         return false;
     }
     if constraints.file_type.is_some() || constraints.file_extension.is_some() {
-        let name_len =
-            u16::from_le_bytes([data[RECORD_HEADER_LEN - 2], data[RECORD_HEADER_LEN - 1]]) as usize;
-        let Some(name) = data.get(RECORD_HEADER_LEN..RECORD_HEADER_LEN + name_len) else {
+        let Some(name) = name_bytes_from_record_data(data) else {
             return false;
         };
         // Lossy is right here and not in `parse_unverified`: this only decides

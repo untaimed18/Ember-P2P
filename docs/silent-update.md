@@ -94,10 +94,10 @@ not parse holds nothing to recover and is replaced.
 
 ### Periodic check
 
-Fifteen seconds after launch, and then every 5 minutes, the scheduler
-(`src-tauri/src/auto_update/scheduler.rs`) checks whether an update check is due
-under `update_check_frequency` (hourly / daily / weekly / monthly), using
-`last_check_at` from the state file. If one is due, it calls `run_check`, the
+Fifteen seconds after every launch the scheduler
+(`src-tauri/src/auto_update/scheduler.rs`) checks, whenever the last check was.
+After that it asks every 5 minutes whether an hour has passed since
+`last_check_at` in the state file. Checks have no setting. Each one calls `run_check`, the
 same function behind `secure_updater_check`, sharing `UpdaterService.operation`,
 so it can never race a manual check or install. Every attempt, manual or
 automatic, stamps `last_check_at`. The scheduler also keeps the session's own
@@ -107,9 +107,11 @@ minutes ahead of the clock was written before the clock stepped back, and
 counts as no check at all rather than holding checks off until wall time
 catches up.
 
-This check runs for **everyone with `auto_check_updates` on**, not only silent
-update users. Without silent updates it only raises the existing "update
-available" notice (`UpdateNotice.svelte`). That fixes, for everyone, the problem
+This check runs for **everyone**, not only silent update users. Without silent
+updates it only raises the existing "update available" notice
+(`UpdateNotice.svelte`). "Later" on that notice lasts until Ember next starts
+(`sessionStorage`), so hourly checks do not bring it back within a run, and a
+dismissal can never hide a release for good. That fixes, for everyone, the problem
 that a long-running Ember never hears about new releases. The frontend's own
 launch-time check moves over to this timer. Its `localStorage` timestamp
 (`ember.updater.lastCheckedAt` in `src/lib/stores/updater.ts`) is replaced by the

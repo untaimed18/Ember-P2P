@@ -14,8 +14,10 @@ use crate::network::{
 };
 #[cfg(debug_assertions)]
 use crate::network::{EmberMaintenanceResult, EmberPublishResult};
+use crate::security::MAX_FRIEND_NICKNAME_CHARS;
 use crate::types::EmberDiagnostics;
 use crate::types::*;
+use tauri::Emitter;
 
 /// Result returned by the `ember_ping_peer` harness command — either
 /// the round-trip time of the matching `Pong` or the reason the
@@ -123,15 +125,11 @@ pub struct EmberDhtMaintenanceResult {
     pub error: Option<String>,
 }
 
-/// Maximum stored friend nickname size. L18: aligned with the
-/// frontend `maxlength="64"` constraints in `+page.svelte` so a
-/// peer who advertises a longer nickname (or a future rogue UI
-/// surface) doesn't end up with rows that overflow the friends
-/// list ellipsis breakpoints. The previous 256-byte ceiling was
-/// generous-but-inconsistent: foreign nicknames truncated by the
-/// backend at 256 chars couldn't be rendered cleanly anyway, and a
-/// 256-char nickname pushed several columns of UI off-screen.
-const MAX_FRIEND_NICKNAME_LEN: usize = 64;
+/// Whether a friend name, as it will be stored, is over the one limit
+/// inbound requests are held to as well.
+fn friend_nickname_too_long(nick: &str) -> bool {
+    nick.chars().count() > MAX_FRIEND_NICKNAME_CHARS
+}
 
 fn parse_user_hash(hex_str: &str) -> Result<[u8; 16], String> {
     parse_16_byte_hash(
@@ -355,11 +353,11 @@ pub async fn add_friend(
     } else {
         nick
     };
-    if nick.len() > MAX_FRIEND_NICKNAME_LEN {
+    if friend_nickname_too_long(&nick) {
         return Err(coded_ctx(
             "peers_nickname_too_long",
-            format!("Nickname too long (max {MAX_FRIEND_NICKNAME_LEN} bytes)"),
-            MAX_FRIEND_NICKNAME_LEN,
+            format!("Nickname too long (max {MAX_FRIEND_NICKNAME_CHARS} characters)"),
+            MAX_FRIEND_NICKNAME_CHARS,
         ));
     }
 
@@ -692,11 +690,11 @@ pub async fn update_friend_nickname(
     } else {
         cleaned
     };
-    if cleaned.len() > MAX_FRIEND_NICKNAME_LEN {
+    if friend_nickname_too_long(&cleaned) {
         return Err(coded_ctx(
             "peers_nickname_too_long",
-            format!("Nickname too long (max {MAX_FRIEND_NICKNAME_LEN} bytes)"),
-            MAX_FRIEND_NICKNAME_LEN,
+            format!("Nickname too long (max {MAX_FRIEND_NICKNAME_CHARS} characters)"),
+            MAX_FRIEND_NICKNAME_CHARS,
         ));
     }
     let canonical = user_hash_hex.to_lowercase();
@@ -806,6 +804,66 @@ pub struct ChatMessageInfo {
     pub delivery: String,
     /// The friend has opened this outbound message. Received rows are false.
     pub seen: bool,
+    /// When this disappearing message is deleted, in Unix seconds, once its
+    /// timer has started; `None` otherwise.
+    pub expires_at: Option<i64>,
+}
+
+/// A disappearing message whose timer just started.
+#[derive(serde::Serialize)]
+pub struct ChatExpiryInfo {
+    pub id: i64,
+    pub expires_at: i64,
+}
+
+/// Delete the whole conversation with a friend from this device. Their copy is
+/// theirs; the confirmation in the UI says so.
+#[tauri::command]
+pub async fn delete_chat_history(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    user_hash_hex: String,
+) -> Result<(), String> {
+    let canonical = user_hash_hex.to_lowercase();
+    parse_user_hash(&canonical)?;
+    let db = state.db.clone();
+    let friend = canonical.clone();
+    tokio::task::spawn_blocking(move || db.delete_chat_history(&friend))
+        .await
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("peers_failed_delete_chat", "Failed to delete the conversation", e))?;
+    // Take back anything left for them in the chat mailbox before they
+    // collect it. Best effort here; every round does it anyway.
+    let _ = state.network_tx.try_send(NetworkCommand::ChatMailboxRound);
+    // Every view of it — the dock and the Friends page can both have it open —
+    // and the unread badge, which would otherwise count what is gone.
+    let _ = app.emit("ember:chat-cleared", serde_json::json!({ "user_hash": canonical }));
+    Ok(())
+}
+
+/// Delete one message of a conversation from this device. A message still
+/// waiting to be sent is withdrawn, so it never goes.
+#[tauri::command]
+pub async fn delete_chat_message(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    user_hash_hex: String,
+    id: i64,
+) -> Result<(), String> {
+    let canonical = user_hash_hex.to_lowercase();
+    parse_user_hash(&canonical)?;
+    let db = state.db.clone();
+    let friend = canonical.clone();
+    tokio::task::spawn_blocking(move || db.delete_chat_message(&friend, id))
+        .await
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("peers_failed_delete_message", "Failed to delete the message", e))?;
+    let _ = state.network_tx.try_send(NetworkCommand::ChatMailboxRound);
+    let _ = app.emit(
+        "ember:chat-removed",
+        serde_json::json!({ "user_hash": canonical, "ids": [id], "xfer_ids": [] }),
+    );
+    Ok(())
 }
 
 /// Map the stored `chat_messages.delivery` integer to the string the UI uses.
@@ -911,8 +969,15 @@ pub async fn send_chat_message(
             // task means one place covers all of those paths.
             let db = state.db.clone();
             let friend_hex = canonical.clone();
+            let ttl_secs = state.config.read().await.settings.chat_disappear_secs_for(&hash);
             let queued_id = tokio::task::spawn_blocking(move || {
-                db.insert_pending_chat_message(&friend_hex, &cleaned)
+                db.insert_chat_message_ttl(
+                    &friend_hex,
+                    "sent",
+                    &cleaned,
+                    crate::storage::database::CHAT_QUEUED,
+                    ttl_secs,
+                )
             })
             .await
             .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
@@ -1046,6 +1111,7 @@ pub async fn get_chat_messages(
             read: row.read,
             delivery: delivery_label(row.delivery),
             seen: row.seen,
+            expires_at: row.expires_at,
         })
         .collect())
 }
@@ -1084,7 +1150,7 @@ pub async fn offer_file_to_friend(
 pub async fn mark_messages_read(
     state: tauri::State<'_, AppState>,
     friend_hash: String,
-) -> Result<(), String> {
+) -> Result<Vec<ChatExpiryInfo>, String> {
     let friend_hash = friend_hash.to_lowercase();
     let eh = parse_user_hash(&friend_hash)?;
     if !state.friend_hashes.read().await.contains(&eh) {
@@ -1092,7 +1158,9 @@ pub async fn mark_messages_read(
     }
     let db = state.db.clone();
     let marked_hash = friend_hash.clone();
-    tokio::task::spawn_blocking(move || db.mark_messages_read(&marked_hash))
+    // Reading is what starts a received message's disappearing timer, so the
+    // timers this started go back to the view that read them.
+    let started = tokio::task::spawn_blocking(move || db.mark_messages_read(&marked_hash))
         .await
         .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
         .map_err(|e| {
@@ -1127,7 +1195,10 @@ pub async fn mark_messages_read(
             }
         }
     }
-    Ok(())
+    Ok(started
+        .into_iter()
+        .map(|(id, expires_at)| ChatExpiryInfo { id, expires_at })
+        .collect())
 }
 
 /// Tell a friend we are (or have stopped) composing. Live only; ignored if
@@ -2861,8 +2932,21 @@ mod tests {
 
     use super::{
         chat_failure_is_permanent, code_permanent_chat_failure, format_friend_code,
-        parse_friend_code, require_public_ember_peer_ip_for_mode, INTRO_SECRET_LEN,
+        friend_nickname_too_long, parse_friend_code, require_public_ember_peer_ip_for_mode,
+        INTRO_SECRET_LEN,
     };
+
+    /// A name a friend request brings in can always be saved again from the
+    /// rename box, whatever script it is in.
+    #[test]
+    fn an_inbound_friend_name_is_never_too_long_to_save() {
+        for long in ["名".repeat(200), "é".repeat(200), "💬".repeat(200), "A".repeat(200)] {
+            let inbound = crate::security::sanitize_inbound_friend_nickname(&long);
+            assert!(!friend_nickname_too_long(&inbound), "{inbound}");
+        }
+        assert!(!friend_nickname_too_long(&"名".repeat(64)));
+        assert!(friend_nickname_too_long(&"名".repeat(65)));
+    }
 
     /// "Copy member ID" in a room yields a bare Ed25519 key. Add Friend has to
     /// take the same string back, or the two halves of one identity disagree

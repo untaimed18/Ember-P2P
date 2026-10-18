@@ -34,6 +34,44 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 /// paths refuse instead. Bump this when introducing a new migration.
 pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 62;
 
+/// A status write keeps the stored failure code only while the row stays
+/// Failed: any other status means it was taken up again.
+const UPDATE_TRANSFER_STATUS_SQL: &str = "UPDATE transfers
+     SET status = ?1, failure_code = CASE WHEN ?1 = 'failed' THEN failure_code END
+     WHERE id = ?2";
+
+/// The failure a stored `failure_code` names, `None` for one this build does
+/// not know.
+fn persisted_failure_code(code: &str) -> Option<TransferFailureCode> {
+    use TransferFailureCode as F;
+    [
+        F::Cancelled,
+        F::RemoteMissingFile,
+        F::EmberContentHashMismatch,
+        F::AichHashMismatch,
+        F::HashMismatch,
+        F::DownloadTimedOut,
+        F::InsufficientDisk,
+        F::ConnectionFailed,
+        F::PeerHandshakeFailed,
+        F::QueueWaitInterrupted,
+        F::HashsetRequestFailed,
+        F::ConnectionLost,
+        F::PermanentFailure,
+        F::TransientFailure,
+        F::NetworkChannelUnavailable,
+        F::DownloadFolderUnavailable,
+        F::PartFolderOffline,
+        F::EmberPinCorrupt,
+        F::AichPinCorrupt,
+        F::FinalVerifyInconclusive,
+        F::LocalReadFailed,
+        F::CompletionMoveFailed,
+    ]
+    .into_iter()
+    .find(|f| f.as_code() == code)
+}
+
 /// Longest room name kept from a moderation snapshot. Keep in step with
 /// `MAX_CHANNEL_NAME_CHARS` in `commands/channels.rs`, the cap an owner names
 /// a room under.
@@ -69,6 +107,10 @@ pub struct FriendChatRow {
     pub delivery: i64,
     /// The friend has opened our sent message. Received rows stay false.
     pub seen: bool,
+    /// When a disappearing message is deleted, in Unix seconds. `None` for
+    /// one without a timer, and for one whose timer has not started: a sent
+    /// message counts from delivery, a received one from when it is read.
+    pub expires_at: Option<i64>,
 }
 
 /// One chat attachment, as either side of it needs to see it.
@@ -169,18 +211,24 @@ pub struct ChannelNewerStatus {
     pub lines: i64,
     /// The room's key came sealed in a version this build cannot open.
     pub key: bool,
+    /// Members sent this room's frames in a gossip or relay envelope version
+    /// this build cannot read, so what they say does not reach it at all.
+    pub envelope: bool,
 }
 
 impl ChannelNewerStatus {
     fn note(&mut self, source: &str, kind: i64) {
+        use crate::network::ember::channel as ch;
         let Ok(kind) = u8::try_from(kind) else {
             return;
         };
         match source {
-            "line" if !crate::network::ember::channel::ext_kind_understood(kind) => self.lines += 1,
-            "key" if !crate::network::ember::channel::epoch_envelope_version_supported(kind) => {
+            "line" if !ch::ext_kind_understood(kind) => self.lines += 1,
+            "key" if !ch::epoch_envelope_version_supported(kind) => {
                 self.key = true;
             }
+            "envelope" if !ch::gossip_envelope_version_supported(kind) => self.envelope = true,
+            "relay" if !ch::relay_envelope_version_supported(kind) => self.envelope = true,
             _ => {}
         }
     }
@@ -686,6 +734,11 @@ pub const CHAT_FAILED: i64 = 2;
 /// to someone who never returns is retried on every reconnect forever and
 /// counted as unsent for the life of the database.
 const CHAT_QUEUE_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60;
+/// How long a received mailbox id is remembered. Past this a copy cannot
+/// still be waiting on the server, which holds entries for a week, in any box
+/// the recipient still reads (the last week and a day of clock skew), or in
+/// the sender's queue, which gives up after a week.
+const CHAT_MAILBOX_SEEN_RETAIN_SECS: i64 = 10 * 24 * 60 * 60;
 /// How long a settled `chat_attachments` row (finished, refused, expired,
 /// failed) stays in the transcript before it is deleted.
 const CHAT_ATTACHMENT_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
@@ -3277,7 +3330,11 @@ impl Database {
             set_version(&tx, 62)?;
             tx.commit()?;
         }
-
+        // Why a download failed, kept for Failed rows so a failure Resume must
+        // not continue is still known after a restart. Outside the numbered
+        // chain: 1.7.0 has to open this database, and it names every
+        // `transfers` column it reads or writes, so one more is invisible to it.
+        Self::add_column_if_missing(&conn, "transfers", "failure_code", "TEXT")?;
         // Finish a v23 encryption pass that was deferred because chat was
         // locked at the time. The version is already 23 or later, so the
         // migration itself will never run again — without this the history
@@ -4328,9 +4385,14 @@ impl Database {
             TransferStatus::Insufficient => "insufficient",
             TransferStatus::NoneNeeded => "noneneeded",
         };
+        let failure_code = if transfer.status == TransferStatus::Failed {
+            transfer.failure_code.as_deref()
+        } else {
+            None
+        };
         conn.execute(
-            "INSERT INTO transfers (id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich, ember_file_hash, friends_only)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            "INSERT INTO transfers (id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich, ember_file_hash, friends_only, failure_code)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
              ON CONFLICT(id) DO UPDATE SET
                file_name = excluded.file_name,
                file_hash = excluded.file_hash,
@@ -4347,7 +4409,8 @@ impl Database {
                category = excluded.category,
                expected_aich = excluded.expected_aich,
                ember_file_hash = excluded.ember_file_hash,
-               friends_only = MAX(friends_only, excluded.friends_only)",
+               friends_only = MAX(friends_only, excluded.friends_only),
+               failure_code = excluded.failure_code",
             params![
                 transfer.id,
                 transfer.file_name,
@@ -4373,6 +4436,7 @@ impl Database {
                 transfer.expected_aich,
                 transfer.ember_file_hash,
                 transfer.friends_only,
+                failure_code,
             ],
         )?;
         Ok(())
@@ -4405,7 +4469,7 @@ impl Database {
         // still owned by a known transfer id and survive orphan sweep. They are
         // restored into the manager as Failed (not auto-started).
         let mut stmt = conn.prepare(
-            "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich, ember_file_hash, friends_only
+            "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich, ember_file_hash, friends_only, failure_code
              FROM transfers
              WHERE status NOT IN ('completed', 'noneneeded')
                AND status NOT LIKE 'queue_overflow%'
@@ -4478,6 +4542,15 @@ impl Database {
                     if pin_corrupt {
                         status = TransferStatus::Failed;
                     }
+                    let stored_failure = if status == TransferStatus::Failed {
+                        row.get::<_, Option<String>>(17)
+                            .ok()
+                            .flatten()
+                            .and_then(|code| persisted_failure_code(&code))
+                    } else {
+                        None
+                    };
+                    let failure = pin_failure.or(stored_failure);
                     Ok(Transfer {
                         id: row.get(0)?,
                         // Defense-in-depth: re-sanitize the persisted name on
@@ -4506,8 +4579,8 @@ impl Database {
                         transferred: transferred_val,
                         completed_size: transferred_val,
                         started_at: row.get(11)?,
-                        failure_reason: pin_failure.map(|f| f.message().to_string()),
-                        failure_code: pin_failure.map(|f| f.as_code().to_string()),
+                        failure_reason: failure.map(|f| f.message().to_string()),
+                        failure_code: failure.map(|f| f.as_code().to_string()),
                         failure_kind: pin_corrupt.then(|| "permanent".to_string()),
                         failure_stage: None,
                         priority: row
@@ -4760,9 +4833,17 @@ impl Database {
 
     pub fn update_transfer_status(&self, transfer_id: &str, status: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
+        conn.execute(UPDATE_TRANSFER_STATUS_SQL, params![status, transfer_id])?;
+        Ok(())
+    }
+
+    /// Mark a download Failed together with why, which a restart reads back
+    /// to know whether Resume may continue it.
+    pub fn mark_transfer_failed(&self, transfer_id: &str, failure_code: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
         conn.execute(
-            "UPDATE transfers SET status = ?1 WHERE id = ?2",
-            params![status, transfer_id],
+            "UPDATE transfers SET status = 'failed', failure_code = ?1 WHERE id = ?2",
+            params![failure_code, transfer_id],
         )?;
         Ok(())
     }
@@ -4779,7 +4860,7 @@ impl Database {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         {
-            let mut stmt = tx.prepare("UPDATE transfers SET status = ?1 WHERE id = ?2")?;
+            let mut stmt = tx.prepare(UPDATE_TRANSFER_STATUS_SQL)?;
             for (transfer_id, status) in updates {
                 stmt.execute(params![status, transfer_id])?;
             }
@@ -6037,20 +6118,48 @@ impl Database {
                 warn!("Skipping friend with an unusable stored hash: {hash_hex}");
                 continue;
             };
-            let Ok(pubkey) = <[u8; 32]>::try_from(pubkey) else {
-                warn!("Skipping friend {hash_hex} with an unusable stored public key");
-                continue;
-            };
-            if !crate::network::ember::crypto::verify_ember_hash_binding(&pubkey, &hash) {
-                warn!(
-                    "Skipping friend {hash_hex}: the stored public key does not match the \
-                     friend hash, so presence advertised under it would be unreachable"
-                );
-                continue;
+            if let Some(pubkey) = Self::usable_friend_public_key(&hash_hex, &hash, pubkey) {
+                keys.push((hash, pubkey));
             }
-            keys.push((hash, pubkey));
         }
         Ok(keys)
+    }
+
+    /// One friend's stored public key, under the same checks as
+    /// `get_friend_public_keys`. `None` when they are not on the list or have
+    /// no usable key.
+    pub fn get_friend_public_key(&self, user_hash: &[u8; 16]) -> anyhow::Result<Option<[u8; 32]>> {
+        let hash_hex = hex::encode(user_hash);
+        let pubkey: Option<Vec<u8>> = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT ed25519_pubkey FROM friends \
+                 WHERE user_hash = ?1 AND ed25519_pubkey IS NOT NULL",
+                params![hash_hex],
+                |row| row.get(0),
+            )
+            .optional()?
+        };
+        Ok(pubkey.and_then(|pubkey| Self::usable_friend_public_key(&hash_hex, user_hash, pubkey)))
+    }
+
+    fn usable_friend_public_key(
+        hash_hex: &str,
+        hash: &[u8; 16],
+        pubkey: Vec<u8>,
+    ) -> Option<[u8; 32]> {
+        let Ok(pubkey) = <[u8; 32]>::try_from(pubkey) else {
+            warn!("Skipping friend {hash_hex} with an unusable stored public key");
+            return None;
+        };
+        if !crate::network::ember::crypto::verify_ember_hash_binding(&pubkey, hash) {
+            warn!(
+                "Skipping friend {hash_hex}: the stored public key does not match the \
+                 friend hash, so presence advertised under it would be unreachable"
+            );
+            return None;
+        }
+        Some(pubkey)
     }
 
     /// Remove a friend. Returns true when the removal left a friend request to
@@ -6509,6 +6618,18 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// `Some(mutual)` when `user_hash` is on the friends list, `None` when not.
+    pub fn friend_mutual(&self, user_hash: &str) -> anyhow::Result<Option<bool>> {
+        let conn = self.conn.lock();
+        Ok(conn
+            .query_row(
+                "SELECT COALESCE(mutual, 0) FROM friends WHERE user_hash = ?1",
+                params![user_hash],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+            .optional()?)
+    }
+
     /// How often a friend has been asked through rooms, and when last, as
     /// `(asks, asked_at)`. `None` when they are not on the list.
     pub fn room_friend_request_asks(&self, user_hash: &str) -> anyhow::Result<Option<(i64, i64)>> {
@@ -6604,7 +6725,9 @@ impl Database {
             ))
         });
         match result {
-            Ok((ip, port)) if !ip.is_empty() && port > 0 => Ok(Some((ip, port))),
+            Ok((ip, port)) if !crate::security::names_no_peer_address(&ip) && port > 0 => {
+                Ok(Some((ip, port)))
+            }
             Ok(_) => Ok(None),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
@@ -7111,31 +7234,56 @@ impl Database {
 
     /// Delivery state of an outbound chat message. Received messages are
     /// always [`ChatDelivery::Delivered`].
+    #[cfg(test)]
     pub fn insert_chat_message(
         &self,
         friend_hash: &str,
         direction: &str,
         message: &str,
     ) -> anyhow::Result<i64> {
-        self.insert_chat_message_with_delivery(friend_hash, direction, message, CHAT_DELIVERED)
+        self.insert_chat_message_ttl(friend_hash, direction, message, CHAT_DELIVERED, 0)
     }
 
     /// Store an outbound message that could not be handed to a live session,
     /// so it can be flushed the next time the friend is reachable.
+    #[cfg(test)]
     pub fn insert_pending_chat_message(
         &self,
         friend_hash: &str,
         message: &str,
     ) -> anyhow::Result<i64> {
-        self.insert_chat_message_with_delivery(friend_hash, "sent", message, CHAT_QUEUED)
+        self.insert_chat_message_ttl(friend_hash, "sent", message, CHAT_QUEUED, 0)
     }
 
-    pub fn insert_chat_message_with_delivery(
+    /// Store a chat row carrying a disappearing-message timer, in seconds (0
+    /// for none). The timer starts at once only for a sent message stored as
+    /// delivered; a queued one starts when it is delivered, and a received one
+    /// when it is read — see [`FriendChatRow::expires_at`].
+    pub fn insert_chat_message_ttl(
         &self,
         friend_hash: &str,
         direction: &str,
         message: &str,
         delivery: i64,
+        ttl_secs: u32,
+    ) -> anyhow::Result<i64> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let new_id = self.insert_chat_row(&tx, friend_hash, direction, message, delivery, ttl_secs)?;
+        tx.commit()?;
+        Ok(new_id)
+    }
+
+    /// The body of [`Self::insert_chat_message_ttl`], inside the caller's
+    /// transaction.
+    fn insert_chat_row(
+        &self,
+        tx: &Connection,
+        friend_hash: &str,
+        direction: &str,
+        message: &str,
+        delivery: i64,
+        ttl_secs: u32,
     ) -> anyhow::Result<i64> {
         // Cap stored message length. Incoming chat text comes straight off
         // the wire from a peer, so bound it here (on a char boundary, so we
@@ -7159,8 +7307,6 @@ impl Database {
         // covers months-to-years of normal conversation; beyond that we
         // age out the oldest entries on insert so the DB stays compact.
         const MAX_MESSAGES_PER_FRIEND: i64 = 5_000;
-        let conn = self.conn.lock();
-        let tx = conn.unchecked_transaction()?;
         let now = chrono::Utc::now().timestamp();
         let body_hash = Self::friend_chat_body_hash_hex(message);
         tx.execute(
@@ -7169,6 +7315,16 @@ impl Database {
             params![friend_hash, direction, CHAT_CIPHERTEXT_PREFIX, now, if direction == "sent" { 1 } else { 0 }, delivery, body_hash],
         )?;
         let new_id = tx.last_insert_rowid();
+        if ttl_secs > 0 {
+            Self::ensure_chat_timers_locked(tx)?;
+            let expires_at = (direction == "sent" && delivery == CHAT_DELIVERED)
+                .then(|| now.saturating_add(i64::from(ttl_secs)));
+            tx.execute(
+                "INSERT OR REPLACE INTO chat_message_timers (message_id, friend_hash, ttl_secs, expires_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![new_id, friend_hash, ttl_secs, expires_at],
+            )?;
+        }
         let encrypted = Self::encrypt_chat_body(
             self.require_chat_key()?,
             new_id,
@@ -7194,8 +7350,326 @@ impl Database {
              )",
             params![friend_hash, MAX_MESSAGES_PER_FRIEND],
         )?;
-        tx.commit()?;
         Ok(new_id)
+    }
+
+    /// Store a message `friend_hash` sent under mailbox id `msg_id`, unless a
+    /// copy of it already was. The id is noted as shown, the row stored, and
+    /// the sender's timer applied together, so a crash between them cannot
+    /// leave the id marked shown with no message behind it (the friend would
+    /// then be told it arrived). `None` when it was already shown; otherwise
+    /// the new row, and its expiry if the sender's timer started it.
+    pub fn insert_received_chat_once(
+        &self,
+        friend_hash: &str,
+        message: &str,
+        own_ttl: u32,
+        msg_id: &[u8; 16],
+        now: i64,
+        peer_ttl: Option<u32>,
+    ) -> anyhow::Result<Option<(i64, Option<(i64, i64)>)>> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        Self::ensure_chat_timers_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let fresh = tx.execute(
+            "INSERT OR IGNORE INTO chat_mailbox_seen (friend_hash, msg_id, seen_at) VALUES (?1, ?2, ?3)",
+            params![friend_hash, hex::encode(msg_id), now],
+        )? > 0;
+        if !fresh {
+            return Ok(None);
+        }
+        let id = self.insert_chat_row(&tx, friend_hash, "received", message, CHAT_DELIVERED, own_ttl)?;
+        let expiry = match peer_ttl.filter(|ttl| *ttl > 0) {
+            Some(ttl) => {
+                let body_hash = Self::friend_chat_body_hash_hex(message);
+                Self::apply_peer_chat_ttl_in(&tx, friend_hash, &body_hash, ttl)?
+                    .and_then(|(row, at)| at.map(|at| (row, at)))
+            }
+            None => None,
+        };
+        tx.commit()?;
+        Ok(Some((id, expiry)))
+    }
+
+    /// Chat-mailbox bookkeeping, in tables of their own for the reason
+    /// [`Self::ensure_chat_timers_locked`] gives.
+    ///
+    /// `friend_chat_caps` records the friends who said they collect from the
+    /// mailbox. `chat_mailbox_sent` holds the mailbox id given to each message
+    /// for such a friend, and where the server keeps its copy once one is
+    /// left: the row stays queued until the friend's receipt names that id,
+    /// and a direct send of it carries the id. `chat_mailbox_seen` is the
+    /// receiving side's record of ids already shown, so the mailbox copy and
+    /// the direct one are not both stored.
+    fn ensure_chat_mailbox_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS friend_chat_caps (
+                friend_hash TEXT PRIMARY KEY,
+                mailbox INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS chat_mailbox_sent (
+                message_id INTEGER PRIMARY KEY,
+                friend_hash TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                deposited_at INTEGER NOT NULL,
+                box_id TEXT NOT NULL DEFAULT '',
+                item_id TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_mailbox_sent_msg
+                ON chat_mailbox_sent(friend_hash, msg_id);
+            CREATE TABLE IF NOT EXISTS chat_mailbox_seen (
+                friend_hash TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                seen_at INTEGER NOT NULL,
+                PRIMARY KEY (friend_hash, msg_id)
+            );",
+        )?;
+        Self::add_column_if_missing(conn, "chat_mailbox_sent", "box_id", "TEXT NOT NULL DEFAULT ''")?;
+        Self::add_column_if_missing(conn, "chat_mailbox_sent", "item_id", "TEXT NOT NULL DEFAULT ''")?;
+        Ok(())
+    }
+
+    /// Record that `friend_hash` collects chat left in the mailbox.
+    pub fn set_friend_chat_mailbox(&self, friend_hash: &str, collects: bool) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        conn.execute(
+            "INSERT INTO friend_chat_caps (friend_hash, mailbox) VALUES (?1, ?2) \
+             ON CONFLICT(friend_hash) DO UPDATE SET mailbox = excluded.mailbox",
+            params![friend_hash, i64::from(collects)],
+        )?;
+        Ok(())
+    }
+
+    /// The friends known to collect chat left in the mailbox.
+    pub fn chat_mailbox_friends(&self) -> anyhow::Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        let mut stmt = conn.prepare("SELECT friend_hash FROM friend_chat_caps WHERE mailbox = 1")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// The mailbox ids assigned to these rows of `friend_hash`, and whether
+    /// the server has taken each.
+    pub fn chat_mailbox_ids(
+        &self,
+        friend_hash: &str,
+        ids: &[i64],
+    ) -> anyhow::Result<std::collections::HashMap<i64, ([u8; 16], bool)>> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT msg_id, deposited_at FROM chat_mailbox_sent \
+             WHERE message_id = ?1 AND friend_hash = ?2",
+        )?;
+        let mut out = std::collections::HashMap::new();
+        for id in ids {
+            let Some((hex_id, deposited_at)) = stmt
+                .query_row(params![id, friend_hash], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .optional()?
+            else {
+                continue;
+            };
+            let mut msg_id = [0u8; 16];
+            if hex::decode_to_slice(&hex_id, &mut msg_id).is_ok() {
+                out.insert(*id, (msg_id, deposited_at > 0));
+            }
+        }
+        Ok(out)
+    }
+
+    /// [`Self::chat_mailbox_ids`], first giving an id to each of these queued
+    /// rows that lacks one when `friend_hash` collects from the mailbox. A
+    /// direct send carries the id, so a copy a round leaves meanwhile is
+    /// shown once whichever arrives first.
+    pub fn assign_chat_mailbox_ids(
+        &self,
+        friend_hash: &str,
+        ids: &[i64],
+    ) -> anyhow::Result<std::collections::HashMap<i64, ([u8; 16], bool)>> {
+        {
+            let conn = self.conn.lock();
+            Self::ensure_chat_mailbox_locked(&conn)?;
+            let collects: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM friend_chat_caps WHERE friend_hash = ?1 AND mailbox = 1)",
+                params![friend_hash],
+                |row| row.get(0),
+            )?;
+            if collects && !ids.is_empty() {
+                let tx = conn.unchecked_transaction()?;
+                {
+                    let mut stmt = tx.prepare(
+                        "INSERT OR IGNORE INTO chat_mailbox_sent (message_id, friend_hash, msg_id, deposited_at) \
+                         VALUES (?1, ?2, ?3, 0)",
+                    )?;
+                    for id in ids {
+                        let mut msg_id = [0u8; 16];
+                        OsRng.fill_bytes(&mut msg_id);
+                        stmt.execute(params![id, friend_hash, hex::encode(msg_id)])?;
+                    }
+                }
+                tx.commit()?;
+            }
+        }
+        self.chat_mailbox_ids(friend_hash, ids)
+    }
+
+    /// Give a queued message its mailbox id, before it is sent. Recorded
+    /// first so a deposit cut short is retried under the same id, which the
+    /// friend recognises if both copies reach them. A row that already has
+    /// one (a direct send gave it) keeps it; the id it has is returned.
+    pub fn record_chat_mailbox_sent(
+        &self,
+        message_id: i64,
+        friend_hash: &str,
+        msg_id: &[u8; 16],
+    ) -> anyhow::Result<[u8; 16]> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO chat_mailbox_sent (message_id, friend_hash, msg_id, deposited_at) \
+             VALUES (?1, ?2, ?3, 0)",
+            params![message_id, friend_hash, hex::encode(msg_id)],
+        )?;
+        let stored: String = conn.query_row(
+            "SELECT msg_id FROM chat_mailbox_sent WHERE message_id = ?1",
+            params![message_id],
+            |row| row.get(0),
+        )?;
+        let mut out = [0u8; 16];
+        hex::decode_to_slice(&stored, &mut out)
+            .map_err(|e| anyhow::anyhow!("Corrupt chat mailbox id for message {message_id}: {e}"))?;
+        Ok(out)
+    }
+
+    /// The server took the message's mailbox copy as `item_id` in `box_id`,
+    /// which is what withdrawing it again takes.
+    pub fn mark_chat_mailbox_deposited(
+        &self,
+        message_id: i64,
+        now: i64,
+        box_id: &[u8; 32],
+        item_id: &[u8; 16],
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        conn.execute(
+            "UPDATE chat_mailbox_sent SET deposited_at = ?2, box_id = ?3, item_id = ?4 \
+             WHERE message_id = ?1",
+            params![message_id, now.max(1), hex::encode(box_id), hex::encode(item_id)],
+        )?;
+        Ok(())
+    }
+
+    /// Mailbox copies of messages delivered, or deleted by the user or with
+    /// the friend. The round takes each back, so a deleted message is not
+    /// collected after all and a delivered one does not sit on the server for
+    /// the rest of the week. A message given up on as failed keeps its copy:
+    /// the friend may yet collect it, and their receipt then marks it
+    /// delivered.
+    pub fn chat_mailbox_stale_deposits(&self) -> anyhow::Result<Vec<(i64, [u8; 32], [u8; 16])>> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT message_id, box_id, item_id FROM chat_mailbox_sent \
+             WHERE deposited_at > 0 AND message_id NOT IN \
+                 (SELECT id FROM chat_messages WHERE delivery IN (?1, ?2) AND direction = 'sent')",
+        )?;
+        let rows: Vec<(i64, String, String)> = stmt
+            .query_map(params![CHAT_QUEUED, CHAT_FAILED], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut out = Vec::new();
+        for (message_id, box_hex, item_hex) in rows {
+            let mut box_id = [0u8; 32];
+            let mut item_id = [0u8; 16];
+            if hex::decode_to_slice(&box_hex, &mut box_id).is_ok()
+                && hex::decode_to_slice(&item_hex, &mut item_id).is_ok()
+            {
+                out.push((message_id, box_id, item_id));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The server no longer holds these messages' mailbox copies.
+    pub fn forget_chat_mailbox_sent(&self, message_ids: &[i64]) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        let mut stmt = conn.prepare("DELETE FROM chat_mailbox_sent WHERE message_id = ?1")?;
+        for id in message_ids {
+            stmt.execute(params![id])?;
+        }
+        Ok(())
+    }
+
+    /// Whether `message_id` is still a queued outbound message.
+    pub fn chat_message_still_queued(&self, message_id: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chat_messages \
+             WHERE id = ?1 AND delivery = ?2 AND direction = 'sent')",
+            params![message_id, CHAT_QUEUED],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The messages to `friend_hash` that these mailbox ids name, which their
+    /// receipt has just confirmed: queued ones, and ones given up on as
+    /// failed while their copy still waited to be collected.
+    pub fn chat_mailbox_receipted(
+        &self,
+        friend_hash: &str,
+        msg_ids: &[[u8; 16]],
+    ) -> anyhow::Result<Vec<i64>> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT s.message_id FROM chat_mailbox_sent s \
+             JOIN chat_messages m ON m.id = s.message_id \
+             WHERE s.friend_hash = ?1 AND s.msg_id = ?2 \
+               AND m.delivery IN (?3, ?4) AND m.direction = 'sent'",
+        )?;
+        let mut out = Vec::new();
+        for msg_id in msg_ids {
+            if let Some(id) = stmt
+                .query_row(params![friend_hash, hex::encode(msg_id), CHAT_QUEUED, CHAT_FAILED], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()?
+            {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Forget mailbox bookkeeping nothing can need any more: ids seen longer
+    /// ago than an entry can wait on the server, and ids of messages that are
+    /// gone or no longer queued.
+    pub fn prune_chat_mailbox(&self, now: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_mailbox_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM chat_mailbox_seen WHERE seen_at < ?1",
+            params![now - CHAT_MAILBOX_SEEN_RETAIN_SECS],
+        )?;
+        // Never deposited, or deposited longer ago than the server keeps
+        // anything: there is no copy to take back.
+        conn.execute(
+            "DELETE FROM chat_mailbox_sent WHERE message_id NOT IN \
+                 (SELECT id FROM chat_messages WHERE delivery = ?1 AND direction = 'sent') \
+               AND (deposited_at = 0 OR deposited_at < ?2)",
+            params![CHAT_QUEUED, now - CHAT_MAILBOX_SEEN_RETAIN_SECS],
+        )?;
+        Ok(())
     }
 
     /// Outbound messages still waiting on a session, oldest first, so a flush
@@ -7276,13 +7750,79 @@ impl Database {
         )? > 0)
     }
 
-    /// Move a stored outbound message between delivery states.
+    /// Move a stored outbound message between delivery states. Delivery starts
+    /// a disappearing message's timer, once.
     pub fn set_chat_delivery(&self, id: i64, delivery: i64) -> anyhow::Result<usize> {
         let conn = self.conn.lock();
-        Ok(conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        let updated = tx.execute(
             "UPDATE chat_messages SET delivery = ?1 WHERE id = ?2",
             params![delivery, id],
-        )?)
+        )?;
+        if updated > 0 && delivery == CHAT_DELIVERED {
+            Self::start_sent_timer_locked(&tx, id, chrono::Utc::now().timestamp())?;
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Start a delivered message's disappearing timer, if it has one that has
+    /// not started.
+    fn start_sent_timer_locked(conn: &Connection, id: i64, now: i64) -> anyhow::Result<()> {
+        Self::ensure_chat_timers_locked(conn)?;
+        conn.execute(
+            "UPDATE chat_message_timers SET expires_at = ?2 + ttl_secs \
+             WHERE message_id = ?1 AND expires_at IS NULL \
+               AND EXISTS (SELECT 1 FROM chat_messages WHERE id = ?1 AND direction = 'sent')",
+            params![id, now],
+        )?;
+        Ok(())
+    }
+
+    /// The timers of these rows of `friend_hash`, by id; rows without one are
+    /// left out.
+    pub fn chat_ttls(
+        &self,
+        friend_hash: &str,
+        ids: &[i64],
+    ) -> anyhow::Result<std::collections::HashMap<i64, u32>> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_timers_locked(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT ttl_secs FROM chat_message_timers \
+             WHERE message_id = ?1 AND friend_hash = ?2 AND ttl_secs > 0",
+        )?;
+        let mut out = std::collections::HashMap::new();
+        for id in ids {
+            if let Some(ttl) = stmt
+                .query_row(params![id, friend_hash], |row| row.get::<_, u32>(0))
+                .optional()?
+            {
+                out.insert(*id, ttl);
+            }
+        }
+        Ok(out)
+    }
+
+    /// When these rows of `friend_hash` disappear, for the ones whose timer has
+    /// started. For telling an open conversation after the timer moved.
+    pub fn chat_expiries(&self, friend_hash: &str, ids: &[i64]) -> anyhow::Result<Vec<(i64, i64)>> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_timers_locked(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT expires_at FROM chat_message_timers \
+             WHERE message_id = ?1 AND friend_hash = ?2 AND expires_at IS NOT NULL",
+        )?;
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(at) = stmt
+                .query_row(params![id, friend_hash], |row| row.get::<_, i64>(0))
+                .optional()?
+            {
+                out.push((*id, at));
+            }
+        }
+        Ok(out)
     }
 
     /// [`Self::set_chat_delivery`] for many rows in one transaction. Returns,
@@ -7294,10 +7834,18 @@ impl Database {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let mut matched = Vec::with_capacity(ids.len());
+        let now = chrono::Utc::now().timestamp();
         {
             let mut stmt = tx.prepare("UPDATE chat_messages SET delivery = ?1 WHERE id = ?2")?;
             for id in ids {
                 matched.push(stmt.execute(params![delivery, id])? > 0);
+            }
+        }
+        if delivery == CHAT_DELIVERED {
+            for (id, hit) in ids.iter().zip(&matched) {
+                if *hit {
+                    Self::start_sent_timer_locked(&tx, *id, now)?;
+                }
             }
         }
         tx.commit()?;
@@ -7390,102 +7938,360 @@ impl Database {
         before_id: Option<i64>,
     ) -> anyhow::Result<Vec<FriendChatRow>> {
         let conn = self.conn.lock();
-        let rows: Vec<(i64, String, String, i64, bool, i64, bool)> = if let Some(bid) = before_id {
+        Self::ensure_chat_timers_locked(&conn)?;
+        type Raw = (i64, String, String, i64, bool, i64, bool, Option<i64>);
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Raw> {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get::<_, i64>(4)? != 0,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)? != 0,
+                row.get(7)?,
+            ))
+        };
+        let rows: Vec<Raw> = if let Some(bid) = before_id {
             let mut stmt = conn.prepare(
-                "SELECT id, direction, message, timestamp, read, delivery, seen \
-                 FROM chat_messages WHERE friend_hash = ?1 AND id < ?2 ORDER BY id DESC LIMIT ?3"
+                "SELECT m.id, m.direction, m.message, m.timestamp, m.read, m.delivery, m.seen, t.expires_at \
+                 FROM chat_messages m LEFT JOIN chat_message_timers t ON t.message_id = m.id \
+                 WHERE m.friend_hash = ?1 AND m.id < ?2 ORDER BY m.id DESC LIMIT ?3"
             )?;
-            let mapped = stmt.query_map(params![friend_hash, bid, limit], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get::<_, i64>(4)? != 0,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)? != 0,
-                ))
-            })?;
+            let mapped = stmt.query_map(params![friend_hash, bid, limit], map_row)?;
             mapped.collect::<Result<Vec<_>, _>>()?
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, direction, message, timestamp, read, delivery, seen \
-                 FROM chat_messages WHERE friend_hash = ?1 ORDER BY id DESC LIMIT ?2"
+                "SELECT m.id, m.direction, m.message, m.timestamp, m.read, m.delivery, m.seen, t.expires_at \
+                 FROM chat_messages m LEFT JOIN chat_message_timers t ON t.message_id = m.id \
+                 WHERE m.friend_hash = ?1 ORDER BY m.id DESC LIMIT ?2"
             )?;
-            let mapped = stmt.query_map(params![friend_hash, limit], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get::<_, i64>(4)? != 0,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)? != 0,
-                ))
-            })?;
+            let mapped = stmt.query_map(params![friend_hash, limit], map_row)?;
             mapped.collect::<Result<Vec<_>, _>>()?
         };
-        let to_row = |id, direction, message, timestamp, read, delivery, seen| FriendChatRow {
-            id,
-            direction,
-            message,
-            timestamp,
-            read,
-            delivery,
-            seen,
-        };
+        drop(conn);
         // Locked: every row is sealed, so report them all as unavailable in one
         // go rather than warning once per row for a condition that is a property
         // of the database, not of any individual message.
-        let Some(chat_key) = self.chat_key.as_deref() else {
-            return Ok(rows
-                .into_iter()
-                .map(|(id, direction, _stored, timestamp, read, delivery, seen)| {
-                    to_row(
-                        id,
-                        direction,
-                        CHAT_UNAVAILABLE_TEXT.to_string(),
-                        timestamp,
-                        read,
-                        delivery,
-                        seen,
-                    )
-                })
-                .collect());
-        };
+        let chat_key = self.chat_key.as_deref();
         let mut messages = Vec::with_capacity(rows.len());
-        for (id, direction, stored, timestamp, read, delivery, seen) in rows {
-            match Self::decrypt_chat_body(chat_key, id, friend_hash, &direction, timestamp, &stored)
-            {
-                Ok(message) => {
-                    messages.push(to_row(id, direction, message, timestamp, read, delivery, seen))
+        for (id, direction, stored, timestamp, read, delivery, seen, expires_at) in rows {
+            let message = match chat_key {
+                None => CHAT_UNAVAILABLE_TEXT.to_string(),
+                Some(key) => {
+                    match Self::decrypt_chat_body(key, id, friend_hash, &direction, timestamp, &stored) {
+                        Ok(message) => message,
+                        Err(error) => {
+                            tracing::warn!(
+                                "Chat row {id} for friend {friend_hash} is unavailable; preserving its ciphertext for later recovery: {error}"
+                            );
+                            CHAT_UNAVAILABLE_TEXT.to_string()
+                        }
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        "Chat row {id} for friend {friend_hash} is unavailable; preserving its ciphertext for later recovery: {error}"
-                    );
-                    messages.push(to_row(
-                        id,
-                        direction,
-                        CHAT_UNAVAILABLE_TEXT.to_string(),
-                        timestamp,
-                        read,
-                        delivery,
-                        seen,
-                    ));
-                }
-            }
+            };
+            messages.push(FriendChatRow {
+                id,
+                direction,
+                message,
+                timestamp,
+                read,
+                delivery,
+                seen,
+                expires_at,
+            });
         }
         Ok(messages)
     }
 
-    pub fn mark_messages_read(&self, friend_hash: &str) -> anyhow::Result<()> {
+    /// Mark everything received from `friend_hash` read, which also starts the
+    /// timer on each disappearing message among it. Returns `(id, expires_at)`
+    /// for every timer this started, so an open conversation can show it.
+    pub fn mark_messages_read(&self, friend_hash: &str) -> anyhow::Result<Vec<(i64, i64)>> {
         let conn = self.conn.lock();
-        conn.execute(
+        Self::ensure_chat_timers_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let now = chrono::Utc::now().timestamp();
+        let started: Vec<(i64, i64)> = tx
+            .prepare(
+                "UPDATE chat_message_timers SET read_at = ?2, expires_at = ?2 + ttl_secs \
+                 WHERE friend_hash = ?1 AND ttl_secs > 0 AND expires_at IS NULL \
+                   AND message_id IN (SELECT id FROM chat_messages \
+                       WHERE friend_hash = ?1 AND read = 0 AND direction = 'received') \
+                 RETURNING message_id, expires_at",
+            )?
+            .query_map(params![friend_hash, now], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        tx.execute(
             "UPDATE chat_messages SET read = 1 WHERE friend_hash = ?1 AND read = 0",
             params![friend_hash],
         )?;
-        Ok(())
+        tx.commit()?;
+        Ok(started)
+    }
+
+    /// A friend's disappearing timer for a message they sent us, named by its
+    /// body hash: the newest received row with that body takes it, or keeps
+    /// its own if that is shorter — the sender decides how long their words
+    /// live, and our own setting can only make that sooner. Counted from when
+    /// we read it; a message already read when its timer arrives — the timer
+    /// follows it within moments — counts from now. Only a row that reached
+    /// us within [`crate::types::CHAT_DISAPPEAR_PEER_WINDOW_SECS`] takes it, so
+    /// a friend cannot time out what they sent long ago. Returns the row and
+    /// its expiry if it has started, or `None` when no row matches yet.
+    pub fn apply_peer_chat_ttl(
+        &self,
+        friend_hash: &str,
+        body_hash: &str,
+        ttl_secs: u32,
+    ) -> anyhow::Result<Option<(i64, Option<i64>)>> {
+        if body_hash.is_empty() || ttl_secs == 0 {
+            return Ok(None);
+        }
+        let conn = self.conn.lock();
+        Self::ensure_chat_timers_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let applied = Self::apply_peer_chat_ttl_in(&tx, friend_hash, body_hash, ttl_secs)?;
+        tx.commit()?;
+        Ok(applied)
+    }
+
+    /// The body of [`Self::apply_peer_chat_ttl`], inside the caller's
+    /// transaction.
+    fn apply_peer_chat_ttl_in(
+        tx: &Connection,
+        friend_hash: &str,
+        body_hash: &str,
+        ttl_secs: u32,
+    ) -> anyhow::Result<Option<(i64, Option<i64>)>> {
+        let now = chrono::Utc::now().timestamp();
+        let Some((id, read)) = tx
+            .query_row(
+                "SELECT id, read FROM chat_messages \
+                 WHERE friend_hash = ?1 AND direction = 'received' AND body_hash = ?2 \
+                   AND timestamp >= ?3 \
+                 ORDER BY id DESC LIMIT 1",
+                params![
+                    friend_hash,
+                    body_hash,
+                    now - crate::types::CHAT_DISAPPEAR_PEER_WINDOW_SECS
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0)),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let existing: Option<(u32, Option<i64>)> = tx
+            .query_row(
+                "SELECT ttl_secs, read_at FROM chat_message_timers WHERE message_id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let ttl = match existing {
+            Some((own, _)) if own > 0 => own.min(ttl_secs),
+            _ => ttl_secs,
+        };
+        let started_at = existing
+            .and_then(|(_, read_at)| read_at)
+            .or_else(|| read.then_some(now));
+        let expires_at = started_at.map(|at| at.saturating_add(i64::from(ttl)));
+        tx.execute(
+            "INSERT OR REPLACE INTO chat_message_timers \
+                 (message_id, friend_hash, ttl_secs, read_at, expires_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, friend_hash, ttl, started_at, expires_at],
+        )?;
+        Ok(Some((id, expires_at)))
+    }
+
+    /// Give a chat attachment a disappearing timer, keeping a shorter one it
+    /// already has: our own setting, when the card is created, on either side.
+    /// Whether a row matched.
+    pub fn set_chat_attachment_ttl(
+        &self,
+        friend_hash: &str,
+        xfer_id: &str,
+        ttl_secs: u32,
+    ) -> anyhow::Result<bool> {
+        self.set_chat_attachment_ttl_where(friend_hash, xfer_id, ttl_secs, false)
+    }
+
+    /// [`Self::set_chat_attachment_ttl`] for the timer a friend names, which
+    /// only ever reaches a file they sent: a transfer id is no secret from the
+    /// friend it was offered to, and without this they could put a timer on
+    /// the card for a file we sent them. Only a card offered within
+    /// [`crate::types::CHAT_DISAPPEAR_PEER_WINDOW_SECS`] takes it, as with
+    /// messages.
+    pub fn set_received_chat_attachment_ttl(
+        &self,
+        friend_hash: &str,
+        xfer_id: &str,
+        ttl_secs: u32,
+    ) -> anyhow::Result<bool> {
+        self.set_chat_attachment_ttl_where(friend_hash, xfer_id, ttl_secs, true)
+    }
+
+    fn set_chat_attachment_ttl_where(
+        &self,
+        friend_hash: &str,
+        xfer_id: &str,
+        ttl_secs: u32,
+        received_only: bool,
+    ) -> anyhow::Result<bool> {
+        if ttl_secs == 0 {
+            return Ok(false);
+        }
+        let conn = self.conn.lock();
+        Self::ensure_chat_timers_locked(&conn)?;
+        let offered_since = if received_only {
+            chrono::Utc::now().timestamp() - crate::types::CHAT_DISAPPEAR_PEER_WINDOW_SECS
+        } else {
+            i64::MIN
+        };
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chat_attachments \
+             WHERE xfer_id = ?1 AND friend_hash = ?2 \
+               AND (?3 = 0 OR (direction = 'received' AND created_at >= ?4)))",
+            params![xfer_id, friend_hash, received_only, offered_since],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO chat_attachment_timers (xfer_id, friend_hash, ttl_secs) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(xfer_id) DO UPDATE SET ttl_secs = MIN(ttl_secs, excluded.ttl_secs)",
+            params![xfer_id, friend_hash, ttl_secs],
+        )?;
+        Ok(true)
+    }
+
+    /// Delete every disappearing message and attachment card whose time is up,
+    /// returning what went per friend as `(friend_hash, message ids, transfer
+    /// ids)` so open conversations can drop them.
+    ///
+    /// A message still waiting to be sent has no expiry yet and is never
+    /// touched. An attachment goes only once it is settled: a transfer still
+    /// running holds a read grant or a file being written, and cutting either
+    /// off is the friend's or the user's decision, not a timer's.
+    pub fn expire_disappearing_chat(
+        &self,
+        now: i64,
+    ) -> anyhow::Result<Vec<(String, Vec<i64>, Vec<String>)>> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_timers_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let messages: Vec<(String, i64)> = tx
+            .prepare(
+                "DELETE FROM chat_messages WHERE id IN (SELECT message_id FROM chat_message_timers \
+                     WHERE expires_at IS NOT NULL AND expires_at <= ?1) \
+                 RETURNING friend_hash, id",
+            )?
+            .query_map(params![now], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        // A card's timer runs from when its transfer settled: started here,
+        // and started over if the transfer is tried again.
+        tx.execute(
+            "DELETE FROM chat_attachment_timer_starts WHERE xfer_id IN ( \
+                 SELECT xfer_id FROM chat_attachments \
+                 WHERE status IN ('queued', 'offered', 'awaiting', 'accepted', 'active'))",
+            [],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO chat_attachment_timer_starts (xfer_id, started_at) \
+             SELECT t.xfer_id, ?1 FROM chat_attachment_timers t \
+             JOIN chat_attachments a ON a.xfer_id = t.xfer_id \
+             WHERE a.status NOT IN ('queued', 'offered', 'awaiting', 'accepted', 'active')",
+            params![now],
+        )?;
+        let attachments: Vec<(String, String)> = tx
+            .prepare(
+                "DELETE FROM chat_attachments WHERE xfer_id IN ( \
+                     SELECT a.xfer_id FROM chat_attachments a \
+                     JOIN chat_attachment_timers t ON t.xfer_id = a.xfer_id \
+                     JOIN chat_attachment_timer_starts s ON s.xfer_id = a.xfer_id \
+                     WHERE s.started_at + t.ttl_secs <= ?1 \
+                       AND a.status NOT IN ('queued', 'offered', 'awaiting', 'accepted', 'active')) \
+                 RETURNING friend_hash, xfer_id",
+            )?
+            .query_map(params![now], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        // Timers whose message or card is gone — expired just now, deleted by
+        // the user or with the friend, or trimmed by the per-friend cap.
+        tx.execute(
+            "DELETE FROM chat_message_timers \
+             WHERE message_id NOT IN (SELECT id FROM chat_messages)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM chat_attachment_timers \
+             WHERE xfer_id NOT IN (SELECT xfer_id FROM chat_attachments)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM chat_attachment_timer_starts \
+             WHERE xfer_id NOT IN (SELECT xfer_id FROM chat_attachment_timers)",
+            [],
+        )?;
+        tx.commit()?;
+        let mut by_friend: std::collections::BTreeMap<String, (Vec<i64>, Vec<String>)> =
+            std::collections::BTreeMap::new();
+        for (friend, id) in messages {
+            by_friend.entry(friend).or_default().0.push(id);
+        }
+        for (friend, xfer) in attachments {
+            by_friend.entry(friend).or_default().1.push(xfer);
+        }
+        Ok(by_friend
+            .into_iter()
+            .map(|(friend, (ids, xfers))| (friend, ids, xfers))
+            .collect())
+    }
+
+    /// Delete the conversation with `friend_hash` from this device: every
+    /// message, including ones still waiting to be sent, and every settled
+    /// attachment card. A file offer not yet sent is withdrawn, and an offer
+    /// of theirs we never answered goes; neither has anything running. A file
+    /// still transferring keeps its card until it finishes, for the reason
+    /// [`Self::expire_disappearing_chat`] gives, and goes at the first sweep
+    /// after that. Files already received stay where they were saved. Returns
+    /// how many messages went.
+    pub fn delete_chat_history(&self, friend_hash: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_timers_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let deleted = tx.execute(
+            "DELETE FROM chat_messages WHERE friend_hash = ?1",
+            params![friend_hash],
+        )?;
+        tx.execute(
+            "DELETE FROM chat_attachments WHERE friend_hash = ?1 \
+               AND (status NOT IN ('queued', 'offered', 'awaiting', 'accepted', 'active') \
+                    OR (direction = 'sent' AND status = 'queued') \
+                    OR (direction = 'received' AND status = 'awaiting'))",
+            params![friend_hash],
+        )?;
+        tx.execute(
+            "INSERT INTO chat_attachment_timers (xfer_id, friend_hash, ttl_secs) \
+             SELECT xfer_id, friend_hash, 0 FROM chat_attachments WHERE friend_hash = ?1 \
+             ON CONFLICT(xfer_id) DO UPDATE SET ttl_secs = 0",
+            params![friend_hash],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    /// Delete one message of the conversation with `friend_hash` from this
+    /// device. A message still queued is withdrawn with it, so it is never
+    /// sent. Whether a row matched.
+    pub fn delete_chat_message(&self, friend_hash: &str, id: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Ok(conn.execute(
+            "DELETE FROM chat_messages WHERE id = ?1 AND friend_hash = ?2",
+            params![id, friend_hash],
+        )? > 0)
     }
 
     /// Body hash of the newest received message this device has already read,
@@ -8480,12 +9286,41 @@ impl Database {
         Ok(added)
     }
 
+    /// Note that a member sent this room's frames in an envelope version this
+    /// build cannot read. `source` is `envelope` for the gossip envelope and
+    /// `relay` for the overlay relay one; one row per version, so a room
+    /// flooded with them still holds a handful. Returns whether it was news.
+    pub fn note_channel_newer_envelope(
+        &self,
+        channel_id: &str,
+        source: &str,
+        version: u8,
+        seen_at: i64,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            matches!(source, "envelope" | "relay"),
+            "not an envelope source: {source}"
+        );
+        let conn = self.conn.lock();
+        Self::ensure_channel_newer_frames_locked(&conn)?;
+        Ok(conn.execute(
+            "INSERT OR IGNORE INTO channel_newer_frames
+                (channel_id, source, ref, kind, seen_at)
+             VALUES (?1, ?2, ?3, ?3, ?4)",
+            params![channel_id, source, i64::from(version), seen_at],
+        )? > 0)
+    }
+
     /// The user has seen that some of a room's lines need a newer Ember.
+    /// Clears the envelope notes with them: both are one banner the user put
+    /// away. A member still sending such envelopes is noted again after Ember
+    /// restarts (`NOTED_NEWER_ENVELOPES` in `channel_gossip.rs`).
     pub fn dismiss_channel_newer_lines(&self, channel_id: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         Self::ensure_channel_newer_frames_locked(&conn)?;
         Ok(conn.execute(
-            "DELETE FROM channel_newer_frames WHERE channel_id = ?1 AND source = 'line'",
+            "DELETE FROM channel_newer_frames
+             WHERE channel_id = ?1 AND source IN ('line', 'envelope', 'relay')",
             params![channel_id],
         )? > 0)
     }
@@ -10668,6 +11503,120 @@ impl Database {
     /// beside `transfers` rather than as a column of it for the same reason as
     /// [`Self::ensure_sealed_offer_readers_locked`]: a numbered migration would
     /// stop 1.7.0 from opening the database after a downgrade.
+    /// Web sources (`s=` URLs) of downloads, by file hash, in a table of its
+    /// own for the reason [`Self::ensure_transfer_part_folders_locked`] gives.
+    fn ensure_transfer_web_sources_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS transfer_web_sources (
+                file_hash TEXT NOT NULL,
+                url TEXT NOT NULL,
+                added_at INTEGER NOT NULL,
+                PRIMARY KEY (file_hash, url)
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Remember web sources for the download of `file_hash`.
+    pub fn add_transfer_web_sources(&self, file_hash: &str, urls: &[String]) -> anyhow::Result<()> {
+        if urls.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        Self::ensure_transfer_web_sources_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let now = chrono::Utc::now().timestamp();
+        for url in urls {
+            tx.execute(
+                "INSERT OR IGNORE INTO transfer_web_sources (file_hash, url, added_at) VALUES (?1, ?2, ?3)",
+                params![file_hash.to_ascii_lowercase(), url, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every remembered web source, as `(file_hash, url)`, oldest first per
+    /// file. Rows for a file no download names any more are deleted first:
+    /// they belonged to one that was removed while the app was closed.
+    pub fn load_transfer_web_sources(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock();
+        Self::ensure_transfer_web_sources_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM transfer_web_sources WHERE file_hash NOT IN \
+             (SELECT lower(file_hash) FROM transfers WHERE direction = 'download')",
+            [],
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT file_hash, url FROM transfer_web_sources ORDER BY file_hash, added_at, rowid",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Forget one web source of `file_hash`, retired for sending bad data, so a
+    /// restart does not bring it back.
+    pub fn delete_transfer_web_source(&self, file_hash: &str, url: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_transfer_web_sources_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM transfer_web_sources WHERE file_hash = ?1 AND url = ?2",
+            params![file_hash.to_ascii_lowercase(), url],
+        )?;
+        Ok(())
+    }
+
+    /// Forget the web sources of `file_hash`: its download finished or went.
+    pub fn delete_transfer_web_sources(&self, file_hash: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_transfer_web_sources_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM transfer_web_sources WHERE file_hash = ?1",
+            params![file_hash.to_ascii_lowercase()],
+        )?;
+        Ok(())
+    }
+
+    /// Disappearing-message timers, in tables of their own for the reason
+    /// [`Self::ensure_transfer_part_folders_locked`] gives: columns on
+    /// `chat_messages` would raise the schema version 1.7.0 checks.
+    ///
+    /// `ttl_secs` is the timer a row was written with or told about;
+    /// `expires_at` is when it goes, set once the timer starts — at delivery
+    /// for a sent message, when it is read for a received one — and `read_at`
+    /// is kept so a timer the sender names after it was opened still counts
+    /// from then. A row whose message is gone is an orphan the sweep clears.
+    /// Attachments carry a timer counted from when the transfer settled, which
+    /// the sweep notes in `chat_attachment_timer_starts` (and forgets if it is
+    /// tried again); counted from the offer, a slow or late-accepted file lost
+    /// its card the moment it finished. A timer of 0 deletes the card as soon
+    /// as it settles: what deleting the chat asks of a transfer still running.
+    fn ensure_chat_timers_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS chat_message_timers (
+                message_id INTEGER PRIMARY KEY,
+                friend_hash TEXT NOT NULL,
+                ttl_secs INTEGER NOT NULL,
+                read_at INTEGER,
+                expires_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_message_timers_expires
+                ON chat_message_timers(expires_at) WHERE expires_at IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS chat_attachment_timers (
+                xfer_id TEXT PRIMARY KEY,
+                friend_hash TEXT NOT NULL,
+                ttl_secs INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS chat_attachment_timer_starts (
+                xfer_id TEXT PRIMARY KEY,
+                started_at INTEGER NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
     fn ensure_transfer_part_folders_locked(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS transfer_part_folders (
@@ -14204,6 +15153,43 @@ mod tests {
         assert!(friends[0].6, "mutual flag");
     }
 
+    /// The single-row lookups agree with the full-list readers they replace:
+    /// listed or not, mutual or not, and a key only when it binds to the hash.
+    #[test]
+    fn single_friend_lookups_match_the_list_readers() {
+        let db = friends_only_db();
+        let key = crate::network::ember::crypto::signing_key_from_bytes(&[9u8; 32]);
+        let pubkey = key.verifying_key().to_bytes();
+        let hash = crate::network::ember::crypto::node_id_from_ed25519_bytes(&pubkey)
+            .expect("a generated key is on the curve");
+        let hash_hex = hex::encode(hash);
+
+        assert_eq!(db.friend_mutual(&hash_hex).expect("lookup"), None);
+        assert_eq!(db.get_friend_public_key(&hash).expect("lookup"), None);
+
+        db.add_friend(&hash_hex, "Kim", Some(&pubkey)).expect("add");
+        assert_eq!(db.friend_mutual(&hash_hex).expect("lookup"), Some(false));
+        assert_eq!(db.get_friend_public_key(&hash).expect("lookup"), Some(pubkey));
+
+        db.set_friend_mutual(&hash_hex, "1.2.3.4", 4662, Some(&pubkey))
+            .expect("promote");
+        assert_eq!(db.friend_mutual(&hash_hex).expect("lookup"), Some(true));
+
+        let stranger = [0x33u8; 16];
+        db.add_friend(&hex::encode(stranger), "Mismatch", Some(&pubkey))
+            .expect("add");
+        assert_eq!(
+            db.get_friend_public_key(&stranger).expect("lookup"),
+            None,
+            "a key that does not bind to the hash is not usable"
+        );
+        assert!(db
+            .get_friend_public_keys()
+            .expect("list")
+            .iter()
+            .all(|(h, _)| *h != stranger));
+    }
+
     #[test]
     fn adding_without_a_nickname_keeps_the_request_name() {
         let db = friends_only_db();
@@ -15404,6 +16390,75 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("AICH")));
         }
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// Why a Failed download failed is read back after a restart, so a
+    /// failure Resume must not continue stays one; any other status drops it.
+    #[test]
+    fn a_failed_downloads_failure_code_survives_a_restart() {
+        for code in TransferFailureCode::ALL {
+            assert_eq!(persisted_failure_code(code.as_code()), Some(*code), "{code:?}");
+        }
+        assert_eq!(persisted_failure_code("from_a_newer_build"), None);
+
+        let path = std::env::temp_dir().join(format!(
+            "ember-failure-code-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).unwrap();
+        let insert = |id: &str, status: &str| {
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO transfers (
+                        id, file_name, file_hash, peer_id, peer_name, direction, status,
+                        progress, speed, total_size, transferred, started_at, priority, category
+                     ) VALUES (?1, 'file.bin', ?2, '', '', 'download', ?3, 0, 0, 4, 0, 1, 'normal', '')",
+                    params![id, "11".repeat(16), status],
+                )
+                .unwrap();
+        };
+        insert("mismatch", "searching");
+        insert("legacy", "failed");
+        insert("resumed", "searching");
+        db.mark_transfer_failed("mismatch", TransferFailureCode::AichHashMismatch.as_code())
+            .unwrap();
+        db.update_transfer_status("mismatch", "failed").unwrap();
+        db.mark_transfer_failed("resumed", TransferFailureCode::HashMismatch.as_code())
+            .unwrap();
+        db.update_transfer_status("resumed", "paused").unwrap();
+        db.update_transfer_status("resumed", "failed").unwrap();
+
+        let mut saved = db.get_incomplete_downloads().unwrap();
+        saved.sort_by(|a, b| a.id.cmp(&b.id));
+        let code_of = |rows: &[Transfer], id: &str| {
+            rows.iter().find(|t| t.id == id).unwrap().failure_code.clone()
+        };
+        assert_eq!(
+            code_of(&saved, "mismatch").as_deref(),
+            Some(TransferFailureCode::AichHashMismatch.as_code())
+        );
+        assert_eq!(code_of(&saved, "legacy"), None, "an older row behaves as before");
+        assert_eq!(code_of(&saved, "resumed"), None, "resuming it dropped the old failure");
+
+        let mut row = saved.into_iter().find(|t| t.id == "legacy").unwrap();
+        row.failure_code = Some(TransferFailureCode::EmberContentHashMismatch.as_code().into());
+        db.save_transfer(&row).unwrap();
+        let reloaded = db.get_incomplete_downloads().unwrap();
+        assert_eq!(
+            code_of(&reloaded, "legacy").as_deref(),
+            Some(TransferFailureCode::EmberContentHashMismatch.as_code())
+        );
+        row.status = TransferStatus::Queued;
+        db.save_transfer(&row).unwrap();
+        db.update_transfer_status("legacy", "failed").unwrap();
+        assert_eq!(code_of(&db.get_incomplete_downloads().unwrap(), "legacy"), None);
+
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
@@ -20038,6 +21093,43 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
+    /// An envelope version this build cannot read raises the room's notice
+    /// once per version, a version it can read never does, and dismissing the
+    /// lines notice puts it away too.
+    #[test]
+    fn a_room_notes_envelopes_only_a_newer_ember_reads() {
+        use crate::network::ember::channel::CHANNEL_MSG_VERSION;
+        let path = std::env::temp_dir().join(format!(
+            "ember-newer-envelope-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let channel_id = "6c".repeat(16);
+        db.insert_channel(&channel_id, &"5b".repeat(32), "Room", "public", false, None, None)
+            .expect("insert channel");
+
+        assert!(db.note_channel_newer_envelope(&channel_id, "envelope", 2, 100).unwrap());
+        assert!(!db.note_channel_newer_envelope(&channel_id, "envelope", 2, 101).unwrap());
+        assert!(db.channel_newer_status(&channel_id).unwrap().envelope);
+        assert!(db.note_channel_newer_envelope(&channel_id, "relay", 3, 102).unwrap());
+        assert!(db.note_channel_newer_envelope(&channel_id, "bogus", 3, 102).is_err());
+
+        assert!(db.dismiss_channel_newer_lines(&channel_id).unwrap());
+        assert!(!db.channel_newer_status(&channel_id).unwrap().envelope);
+
+        // A version this build reads, noted by one that did not, says nothing.
+        db.note_channel_newer_envelope(&channel_id, "envelope", CHANNEL_MSG_VERSION, 200)
+            .unwrap();
+        assert!(!db.channel_newer_status(&channel_id).unwrap().envelope);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
     /// What a room was sent that needs a newer Ember is counted, bounded,
     /// dismissed, superseded by a key this build can open, and forgotten with
     /// the room.
@@ -22474,6 +23566,350 @@ mod tests {
 
     /// Queued outbound chat has to survive a restart, otherwise the queue is
     /// no better than the in-memory send it replaced.
+    #[test]
+    fn disappearing_chat_counts_from_delivery_and_reading_and_then_goes() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-chat-disappear-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let friend = "ab".repeat(16);
+        let other = "cd".repeat(16);
+        let hour = 3_600u32;
+
+        // Sent: queued has no expiry, delivery starts it.
+        let queued = db
+            .insert_chat_message_ttl(&friend, "sent", "later", CHAT_QUEUED, hour)
+            .unwrap();
+        assert!(db.chat_expiries(&friend, &[queued]).unwrap().is_empty());
+        db.set_chat_delivery(queued, CHAT_DELIVERED).unwrap();
+        let sent_at = db.chat_expiries(&friend, &[queued]).unwrap()[0].1;
+
+        // Received: nothing counts until it is read.
+        let received = db
+            .insert_chat_message_ttl(&friend, "received", "hello", CHAT_DELIVERED, 0)
+            .unwrap();
+        let hash = Database::friend_chat_body_hash_hex("hello");
+        let (row, started) = db.apply_peer_chat_ttl(&friend, &hash, hour).unwrap().unwrap();
+        assert_eq!(row, received);
+        assert_eq!(started, None, "an unread message's timer has not started");
+        let read = db.mark_messages_read(&friend).unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].0, received);
+
+        // A longer timer from the sender cannot outlast ours; a shorter one wins.
+        let (_, longer) = db.apply_peer_chat_ttl(&friend, &hash, hour * 24).unwrap().unwrap();
+        assert_eq!(longer, Some(read[0].1));
+        let (_, shorter) = db.apply_peer_chat_ttl(&friend, &hash, 300).unwrap().unwrap();
+        assert!(shorter.unwrap() < read[0].1);
+
+        // A timer for something that reached us long ago does not apply.
+        let old = db
+            .insert_chat_message_ttl(&friend, "received", "long ago", CHAT_DELIVERED, 0)
+            .unwrap();
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE chat_messages SET timestamp = timestamp - 86400 WHERE id = ?1",
+                params![old],
+            )
+            .unwrap();
+        let old_hash = Database::friend_chat_body_hash_hex("long ago");
+        assert!(db.apply_peer_chat_ttl(&friend, &old_hash, 300).unwrap().is_none());
+        db.delete_chat_message(&friend, old).unwrap();
+
+        // A message without a timer, and another friend's, are left alone.
+        let keep = db.insert_chat_message_ttl(&friend, "sent", "stays", CHAT_DELIVERED, 0).unwrap();
+        let theirs = db.insert_chat_message_ttl(&other, "sent", "theirs", CHAT_DELIVERED, 0).unwrap();
+        let gone = db.expire_disappearing_chat(sent_at + 1).unwrap();
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].0, friend);
+        let mut ids = gone[0].1.clone();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![queued, received]);
+        let left: Vec<i64> = db.get_chat_messages(&friend, 50, None).unwrap().iter().map(|r| r.id).collect();
+        assert_eq!(left, vec![keep]);
+        assert_eq!(db.get_chat_messages(&other, 50, None).unwrap()[0].id, theirs);
+
+        // Deleting the chat takes the rest, queued sends included, and only
+        // that friend's.
+        db.insert_chat_message_ttl(&friend, "sent", "never sent", CHAT_QUEUED, 0).unwrap();
+        assert_eq!(db.delete_chat_history(&friend).unwrap(), 2);
+        assert!(db.get_chat_messages(&friend, 50, None).unwrap().is_empty());
+        assert!(db.delete_chat_message(&other, theirs).unwrap());
+        assert!(!db.delete_chat_message(&other, theirs).unwrap());
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn web_sources_are_kept_per_file_and_pruned_with_their_download() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-web-sources-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).expect("open db");
+        let kept = "AB".repeat(16);
+        let gone = "cd".repeat(16);
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO transfers (id, file_name, file_hash, peer_id, direction, status) \
+                 VALUES ('t1', 'a.bin', ?1, '', 'download', 'downloading')",
+                params![kept.to_ascii_lowercase()],
+            )
+            .expect("transfer row");
+        let urls = vec!["https://a.example/f".to_string(), "http://b.example/f".to_string()];
+        db.add_transfer_web_sources(&kept, &urls).unwrap();
+        db.add_transfer_web_sources(&kept, &urls[..1]).unwrap();
+        db.add_transfer_web_sources(&gone, &urls[..1]).unwrap();
+
+        let loaded = db.load_transfer_web_sources().unwrap();
+        assert_eq!(
+            loaded,
+            vec![
+                (kept.to_ascii_lowercase(), urls[0].clone()),
+                (kept.to_ascii_lowercase(), urls[1].clone()),
+            ],
+            "deduplicated, and a file with no download is pruned"
+        );
+        db.delete_transfer_web_sources(&kept).unwrap();
+        assert!(db.load_transfer_web_sources().unwrap().is_empty());
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_friend_times_only_files_they_sent_and_only_settled_cards_disappear() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-attach-disappear-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).expect("open db");
+        let friend = "ab".repeat(16);
+        let root = "00".repeat(32);
+        let (sent, received, running, old) =
+            ("11".repeat(16), "22".repeat(16), "33".repeat(16), "44".repeat(16));
+        let now = chrono::Utc::now().timestamp();
+        let card = |xfer: &str, direction: &str, status: &str, at: i64| {
+            db.upsert_chat_attachment(xfer, &friend, direction, "f.txt", 1, &root, None, status, at, at + 100)
+                .expect("card");
+        };
+        card(&sent, "sent", "complete", now);
+        card(&received, "received", "complete", now);
+        card(&running, "received", "active", now);
+        card(&old, "received", "complete", now - 86_400);
+
+        assert!(
+            !db.set_received_chat_attachment_ttl(&friend, &sent, 60).unwrap(),
+            "a friend's timer never reaches a file we sent them"
+        );
+        assert!(
+            !db.set_received_chat_attachment_ttl(&friend, &old, 60).unwrap(),
+            "nor a card offered long ago"
+        );
+        assert!(db.set_received_chat_attachment_ttl(&friend, &received, 60).unwrap());
+        assert!(db.set_chat_attachment_ttl(&friend, &running, 60).unwrap());
+
+        // The first sweep starts the settled card's timer; it goes a minute on.
+        assert!(db.expire_disappearing_chat(now).unwrap().is_empty());
+        let gone = db.expire_disappearing_chat(now + 61).unwrap();
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].2, vec![received.clone()], "the running one waits until it settles");
+        assert!(db.chat_attachment(&running).is_some());
+        assert!(db.chat_attachment(&sent).is_some());
+
+        // Its timer counts from when it settled, not from the offer.
+        db.set_chat_attachment_status(&running, "complete", None, None).unwrap();
+        assert!(db.expire_disappearing_chat(now + 120).unwrap().is_empty(), "just settled");
+        let gone = db.expire_disappearing_chat(now + 181).unwrap();
+        assert_eq!(gone[0].2, vec![running.clone()]);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn chat_mailbox_bookkeeping_tracks_deposits_receipts_and_seen_ids() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-chat-mailbox-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).expect("open db");
+        let friend = "ab".repeat(16);
+        let other = "cd".repeat(16);
+        let now = chrono::Utc::now().timestamp();
+
+        assert!(db.chat_mailbox_friends().unwrap().is_empty());
+        db.set_friend_chat_mailbox(&friend, true).unwrap();
+        db.set_friend_chat_mailbox(&other, false).unwrap();
+        assert_eq!(
+            db.chat_mailbox_friends().unwrap(),
+            std::collections::HashSet::from([friend.clone()])
+        );
+
+        let queued = db
+            .insert_chat_message_ttl(&friend, "sent", "while you were out", CHAT_QUEUED, 0)
+            .unwrap();
+        let plain = db
+            .insert_chat_message_ttl(&friend, "sent", "not left anywhere", CHAT_QUEUED, 0)
+            .unwrap();
+        db.record_chat_mailbox_sent(queued, &friend, &[1; 16]).unwrap();
+        let ids = db.chat_mailbox_ids(&friend, &[queued, plain]).unwrap();
+        assert_eq!(ids.get(&queued), Some(&([1; 16], false)), "assigned, not yet taken");
+        assert!(!ids.contains_key(&plain));
+        assert_eq!(
+            db.record_chat_mailbox_sent(queued, &friend, &[9; 16]).unwrap(),
+            [1; 16],
+            "the id already given is the one used"
+        );
+        db.mark_chat_mailbox_deposited(queued, now, &[7; 32], &[8; 16]).unwrap();
+        assert_eq!(
+            db.chat_mailbox_ids(&friend, &[queued]).unwrap().get(&queued),
+            Some(&([1; 16], true)),
+            "a retry keeps the first id"
+        );
+        assert!(db.chat_message_still_queued(queued).unwrap());
+        assert!(db.chat_mailbox_stale_deposits().unwrap().is_empty(), "still queued");
+
+        assert!(db.chat_mailbox_receipted(&other, &[[1; 16]]).unwrap().is_empty(), "another friend's receipt");
+        assert_eq!(db.chat_mailbox_receipted(&friend, &[[1; 16], [2; 16]]).unwrap(), vec![queued]);
+        db.set_chat_delivery_many(&[queued], CHAT_DELIVERED).unwrap();
+        assert!(
+            db.chat_mailbox_receipted(&friend, &[[1; 16]]).unwrap().is_empty(),
+            "a delivered row is not delivered twice"
+        );
+        db.prune_chat_mailbox(now).unwrap();
+        assert_eq!(
+            db.chat_mailbox_stale_deposits().unwrap(),
+            vec![(queued, [7; 32], [8; 16])],
+            "kept until its server copy is taken back"
+        );
+        db.forget_chat_mailbox_sent(&[queued]).unwrap();
+        assert!(db.chat_mailbox_ids(&friend, &[queued]).unwrap().is_empty());
+
+        // A deposited message the user deletes is taken back too.
+        let withdrawn = db
+            .insert_chat_message_ttl(&friend, "sent", "never mind", CHAT_QUEUED, 0)
+            .unwrap();
+        db.record_chat_mailbox_sent(withdrawn, &friend, &[3; 16]).unwrap();
+        db.mark_chat_mailbox_deposited(withdrawn, now, &[7; 32], &[4; 16]).unwrap();
+        db.delete_chat_message(&friend, withdrawn).unwrap();
+        assert_eq!(db.chat_mailbox_stale_deposits().unwrap(), vec![(withdrawn, [7; 32], [4; 16])]);
+        // One never taken by the server has nothing to take back.
+        db.record_chat_mailbox_sent(plain, &friend, &[6; 16]).unwrap();
+        db.delete_chat_message(&friend, plain).unwrap();
+        db.prune_chat_mailbox(now).unwrap();
+        assert!(db.chat_mailbox_ids(&friend, &[plain]).unwrap().is_empty());
+        assert_eq!(db.chat_mailbox_stale_deposits().unwrap().len(), 1);
+
+        // A row given up on is still rescued by a receipt that comes late.
+        let late = db
+            .insert_chat_message_ttl(&friend, "sent", "slow friend", CHAT_QUEUED, 0)
+            .unwrap();
+        db.record_chat_mailbox_sent(late, &friend, &[10; 16]).unwrap();
+        db.mark_chat_mailbox_deposited(late, now, &[7; 32], &[13; 16]).unwrap();
+        db.set_chat_delivery_many(&[late], CHAT_FAILED).unwrap();
+        assert!(
+            !db.chat_mailbox_stale_deposits().unwrap().iter().any(|(id, _, _)| *id == late),
+            "its copy is left for the friend to collect"
+        );
+        db.prune_chat_mailbox(now).unwrap();
+        assert_eq!(db.chat_mailbox_receipted(&friend, &[[10; 16]]).unwrap(), vec![late]);
+
+        // A direct send gives ids only for a friend who collects.
+        let direct = db
+            .insert_chat_message_ttl(&friend, "sent", "live", CHAT_QUEUED, 0)
+            .unwrap();
+        let other_direct = db
+            .insert_chat_message_ttl(&other, "sent", "live", CHAT_QUEUED, 0)
+            .unwrap();
+        let given = db.assign_chat_mailbox_ids(&friend, &[direct]).unwrap();
+        let (direct_id, taken) = given[&direct];
+        assert!(!taken);
+        assert_eq!(
+            db.assign_chat_mailbox_ids(&friend, &[direct]).unwrap()[&direct].0,
+            direct_id,
+            "stable once given"
+        );
+        assert_eq!(db.record_chat_mailbox_sent(direct, &friend, &[11; 16]).unwrap(), direct_id);
+        assert!(db.assign_chat_mailbox_ids(&other, &[other_direct]).unwrap().is_empty());
+
+        let received = |hash: &str| {
+            db.get_chat_messages(hash, 100, None)
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.direction == "received")
+                .count()
+        };
+        assert!(db.insert_received_chat_once(&friend, "hi", 0, &[5; 16], now, None).unwrap().is_some());
+        assert!(
+            db.insert_received_chat_once(&friend, "hi", 0, &[5; 16], now, None).unwrap().is_none(),
+            "the second copy"
+        );
+        assert_eq!(received(&friend), 1);
+        assert!(db.insert_received_chat_once(&other, "hi", 0, &[5; 16], now, None).unwrap().is_some(), "per friend");
+        let (_, expiry) = db
+            .insert_received_chat_once(&friend, "timed", 0, &[12; 16], now, Some(600))
+            .unwrap()
+            .unwrap();
+        assert_eq!(expiry, None, "the sender's timer waits for it to be read");
+        db.prune_chat_mailbox(now + CHAT_MAILBOX_SEEN_RETAIN_SECS + 1).unwrap();
+        assert!(
+            db.insert_received_chat_once(&friend, "hi", 0, &[5; 16], now, None).unwrap().is_some(),
+            "forgotten after the retention"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deleting_a_chat_withdraws_unsent_offers_and_clears_live_cards_once_settled() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-delete-chat-cards-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).expect("open db");
+        let friend = "ab".repeat(16);
+        let root = "00".repeat(32);
+        let now = chrono::Utc::now().timestamp();
+        let card = |xfer: &str, direction: &str, status: &str| {
+            db.upsert_chat_attachment(xfer, &friend, direction, "f.txt", 1, &root, None, status, now, now + 100)
+                .expect("card");
+            xfer.to_string()
+        };
+        let queued = card(&"11".repeat(16), "sent", "queued");
+        let awaiting = card(&"22".repeat(16), "received", "awaiting");
+        let active = card(&"33".repeat(16), "sent", "active");
+        let done = card(&"44".repeat(16), "received", "complete");
+
+        db.delete_chat_history(&friend).unwrap();
+        assert!(db.chat_attachment(&queued).is_none(), "never sent, so never will be");
+        assert!(db.chat_attachment(&awaiting).is_none());
+        assert!(db.chat_attachment(&done).is_none());
+        assert!(db.chat_attachment(&active).is_some(), "still transferring");
+
+        assert!(db.expire_disappearing_chat(now).unwrap().is_empty());
+        db.set_chat_attachment_status(&active, "complete", None, None).unwrap();
+        let gone = db.expire_disappearing_chat(now + 1).unwrap();
+        assert_eq!(gone[0].2, vec![active.clone()], "goes once it settles");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn queued_chat_survives_restart_and_flush_marks_it_delivered() {
         let path = std::env::temp_dir().join(format!(

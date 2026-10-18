@@ -53,6 +53,12 @@ const ACTIVE_DEGRADED_SECS: i64 = 20;
 const ACTIVE_STALLED_SECS: i64 = 60;
 const SEARCHING_DEGRADED_SECS: i64 = 45;
 const QUEUED_DEGRADED_SECS: i64 = 300;
+/// How many finished rows `completed` keeps; see
+/// [`TransferManager::push_finished`].
+pub const MAX_FINISHED_ROWS: usize = 1000;
+/// How many failed downloads `completed` keeps besides those: as many as
+/// there can be pending downloads (`MAX_PENDING_DOWNLOADS`).
+pub const MAX_FAILED_ROWS: usize = 10_000;
 
 /// Global "preview priority for all downloads" preference (eMule's global
 /// preview option). When set, [`TransferControl::is_preview_priority`] reports
@@ -93,6 +99,10 @@ pub struct TransferControl {
     /// mirrored from [`Transfer::priority`] so the multi-source download worker
     /// can bias global connection-slot acquisition without a manager round-trip.
     download_priority: AtomicU8,
+    /// Mirrored from [`Transfer::friends_only`] for the download worker, which
+    /// must not ask a friend for this file over plain eD2K (see
+    /// `friend_refuses_plain_ed2k`). Only ever set, like the flag it mirrors.
+    friends_only: AtomicBool,
     /// Display name applied by Rename while a download is running. Completion
     /// and the `.part.met` sidecar both read this so a rename sticks even on
     /// the callback path, whose tracker is not in the shared registry.
@@ -129,6 +139,7 @@ impl TransferControl {
             preview_priority: AtomicBool::new(false),
             preview_ready: AtomicBool::new(false),
             download_priority: AtomicU8::new(2),
+            friends_only: AtomicBool::new(false),
             pending_rename: std::sync::Mutex::new(PendingRename::default()),
         })
     }
@@ -288,6 +299,14 @@ impl TransferControl {
         self.download_priority.load(Ordering::Acquire)
     }
 
+    pub fn mark_friends_only(&self) {
+        self.friends_only.store(true, Ordering::Release);
+    }
+
+    pub fn is_friends_only(&self) -> bool {
+        self.friends_only.load(Ordering::Acquire)
+    }
+
     /// False once completion has read the name: the file is about to be (or
     /// has been) moved under it, so a rename now would only relabel the row.
     #[must_use]
@@ -330,6 +349,13 @@ pub struct TransferManager {
     /// it, and its result is sent whatever happened to the row meanwhile.
     /// Keyed to the generation of the control the check reports under.
     restore_verifications: HashMap<String, u64>,
+    /// Restored downloads that went straight into `active` for their
+    /// re-verification. Should it not finish them, they take a download slot
+    /// only if one is free.
+    restore_rejoins: HashSet<String>,
+    /// Failed downloads whose `.part` was there when last looked at: the ones
+    /// Resume can pick up where they stopped.
+    failed_partials: HashSet<String>,
     /// Per-transfer source details (eMule-style per-source tracking)
     source_details: HashMap<String, Vec<crate::types::SourceInfo>>,
     /// Bumped by every structural change to `queue` made here. Nothing
@@ -509,6 +535,9 @@ pub struct TransferDelta {
     /// [`TransferManager::restored`]: until it is set, a row the caller has
     /// not seen yet may still be on its way.
     pub restored: bool,
+    /// Every Failed download Resume can continue, in full on each answer: a
+    /// partial checked after the row failed changes no row.
+    pub resumable_failed: Vec<String>,
 }
 
 struct RowRevision {
@@ -671,6 +700,8 @@ impl TransferManager {
             speed_history: HashMap::new(),
             controls: HashMap::new(),
             restore_verifications: HashMap::new(),
+            restore_rejoins: HashSet::new(),
+            failed_partials: HashSet::new(),
             source_details: HashMap::new(),
             queue_generation: 0,
             queue_index: std::sync::Mutex::new(QueueIndex::default()),
@@ -719,12 +750,13 @@ impl TransferManager {
         self.install_control(id, control, seed);
     }
 
-    /// The per-row settings a fresh control must carry: priority ordinal and
-    /// the per-file preview flag.
-    fn control_seed(transfer: &Transfer) -> (u8, bool) {
+    /// The per-row settings a fresh control must carry: priority ordinal, the
+    /// per-file preview flag, and the friends-only flag.
+    fn control_seed(transfer: &Transfer) -> (u8, bool, bool) {
         (
             Self::priority_ordinal(&transfer.priority),
             transfer.preview_priority,
+            transfer.friends_only,
         )
     }
 
@@ -732,13 +764,40 @@ impl TransferManager {
         &mut self,
         id: &str,
         control: Arc<TransferControl>,
-        seed: Option<(u8, bool)>,
+        seed: Option<(u8, bool, bool)>,
     ) {
-        if let Some((ord, preview_priority)) = seed {
+        if let Some((ord, preview_priority, friends_only)) = seed {
             control.set_download_priority_ordinal(ord);
             control.set_preview_priority(preview_priority);
+            if friends_only {
+                control.mark_friends_only();
+            }
         }
-        self.controls.insert(id.to_string(), control);
+        let download = self
+            .active
+            .get(id)
+            .or_else(|| self.queued(id))
+            .is_some_and(|t| t.direction == TransferDirection::Download);
+        // A cancelled control comes from a command that was overtaken, e.g. a
+        // start sent before a Pause: put over the live control a later Resume
+        // made, it would cancel that one's worker.
+        if control.is_cancelled()
+            && self
+                .controls
+                .get(id)
+                .is_some_and(|live| !live.is_cancelled() && !Arc::ptr_eq(live, &control))
+        {
+            return;
+        }
+        if let Some(replaced) = self.controls.insert(id.to_string(), control.clone()) {
+            // Commands reach a download's worker only through the control
+            // registered here, so one replaced is beyond their reach: a
+            // worker, or the per-source tasks it spawned, still on it would
+            // go on writing the `.part` beside the next worker.
+            if download && !Arc::ptr_eq(&replaced, &control) {
+                replaced.cancel();
+            }
+        }
     }
 
     pub fn is_control_cancelled(&self, id: &str) -> bool {
@@ -755,16 +814,49 @@ impl TransferManager {
     }
 
     /// `true` when one was running and the result being handled is its own:
-    /// it came from the check's control, or from no worker at all.
-    pub fn finish_restore_verification(&mut self, id: &str, generation: Option<u64>) -> bool {
+    /// it came from the check's control, or from no worker at all. `rejoin`
+    /// is false for a check that finished the download: its row is about to
+    /// complete, and parked in the queue it could be promoted and started.
+    pub fn finish_restore_verification(
+        &mut self,
+        id: &str,
+        generation: Option<u64>,
+        rejoin: bool,
+    ) -> bool {
         let own = self
             .restore_verifications
             .get(id)
             .is_some_and(|&check| generation.is_none_or(|g| g == check));
         if own {
             self.restore_verifications.remove(id);
+            if self.restore_rejoins.remove(id) && rejoin {
+                self.rejoin_after_restore_check(id);
+            }
         }
         own
+    }
+
+    /// Have [`Self::finish_restore_verification`] give `id` back its download
+    /// slot only if one is free. For a check whose failure resumes the
+    /// download, not one that puts it back paused or stopped: that is done to
+    /// the row while it is still in `active`.
+    pub fn rejoin_queue_after_restore_check(&mut self, id: &str) {
+        self.restore_rejoins.insert(id.to_string());
+    }
+
+    /// A restored row is put into `active` for its check without asking for a
+    /// slot. While it is still the check's, and the others already fill every
+    /// slot, it waits at the head of the queue instead: a failed check
+    /// otherwise left it searching in `active`, where it started a worker
+    /// beyond the cap.
+    fn rejoin_after_restore_check(&mut self, id: &str) {
+        let checking = self
+            .active
+            .get(id)
+            .is_some_and(|t| t.status == TransferStatus::Verifying);
+        if checking && self.active_download_count() > self.max_concurrent as usize {
+            self.park_resumed_in_queue(id);
+        }
     }
 
     pub fn is_restore_verification_running(&self, id: &str) -> bool {
@@ -988,6 +1080,7 @@ impl TransferManager {
             return false;
         }
         self.completed.retain(|t| t.id != id);
+        self.failed_partials.remove(&id);
         if transfer.direction == TransferDirection::Upload {
             self.active.insert(id, transfer);
             return true;
@@ -1244,10 +1337,8 @@ impl TransferManager {
             Self::clear_failure_context(&mut transfer);
             Self::clear_runtime_health(&mut transfer);
             self.retire_download_control(id, &transfer.direction);
-            self.completed.push(transfer);
-            if self.completed.len() > 1000 {
-                self.completed.drain(..self.completed.len() - 1000);
-            }
+            self.failed_partials.remove(id);
+            self.push_finished(transfer);
             self.speed_history.remove(id);
             self.source_details.remove(id);
             // Its file is already where it finished; a later category change
@@ -1287,13 +1378,159 @@ impl TransferManager {
         transfer.failure_stage = failure_stage;
         Self::clear_runtime_health(&mut transfer);
         self.retire_download_control(id, &transfer.direction);
-        self.completed.push(transfer);
-        if self.completed.len() > 1000 {
-            self.completed.drain(..self.completed.len() - 1000);
-        }
+        self.failed_partials.remove(id);
+        self.push_finished(transfer);
         self.speed_history.remove(id);
         self.source_details.remove(id);
         Some(self.promote_next())
+    }
+
+    /// Add a row to `completed`, which keeps the newest
+    /// [`MAX_FINISHED_ROWS`] rows besides failed downloads, and the newest
+    /// [`MAX_FAILED_ROWS`] failed downloads. Those are kept apart because each
+    /// still owns a `.part` that only its row can resume or remove, and the
+    /// list was the only place it could be seen. Over their own cap, the
+    /// oldest whose `.part` is gone go first.
+    pub fn push_finished(&mut self, transfer: Transfer) {
+        self.completed.push(transfer);
+        let failed = self
+            .completed
+            .iter()
+            .filter(|t| Self::is_failed_download(t))
+            .count();
+        let mut excess_failed = failed.saturating_sub(MAX_FAILED_ROWS);
+        let mut dropped_failed = Vec::new();
+        for keep_resumable in [true, false] {
+            if excess_failed == 0 {
+                break;
+            }
+            let partials = &self.failed_partials;
+            self.completed.retain(|t| {
+                if excess_failed == 0
+                    || !Self::is_failed_download(t)
+                    || (keep_resumable && partials.contains(&t.id))
+                {
+                    return true;
+                }
+                excess_failed -= 1;
+                dropped_failed.push(t.id.clone());
+                false
+            });
+        }
+        for id in &dropped_failed {
+            self.failed_partials.remove(id);
+        }
+        let failed = failed.min(MAX_FAILED_ROWS);
+        let mut excess = (self.completed.len() - failed).saturating_sub(MAX_FINISHED_ROWS);
+        if excess > 0 {
+            self.completed.retain(|t| {
+                if excess == 0 || Self::is_failed_download(t) {
+                    return true;
+                }
+                excess -= 1;
+                false
+            });
+        }
+    }
+
+    fn is_failed_download(transfer: &Transfer) -> bool {
+        transfer.status == TransferStatus::Failed
+            && transfer.direction == TransferDirection::Download
+    }
+
+    /// Whether Resume may continue a Failed download from its `.part`. Not
+    /// one whose bytes failed a trusted pin, which they would fail again, nor
+    /// one whose stored pin was corrupt and dropped, which would finish on
+    /// MD4 alone. The one rule for what the UI offers and the commands do.
+    fn failure_allows_resume(transfer: &Transfer) -> bool {
+        const NOT_RESUMABLE: [TransferFailureCode; 5] = [
+            TransferFailureCode::AichHashMismatch,
+            TransferFailureCode::EmberContentHashMismatch,
+            TransferFailureCode::Cancelled,
+            TransferFailureCode::AichPinCorrupt,
+            TransferFailureCode::EmberPinCorrupt,
+        ];
+        // A row from before failure codes were kept says nothing of why it
+        // failed. With a pin on it, failing that pin is one possibility, and
+        // continuing would only fail it again; without one, it cannot be.
+        let unexplained_with_pin = transfer.failure_code.is_none()
+            && (transfer.expected_aich.is_some() || transfer.ember_file_hash.is_some());
+        Self::is_failed_download(transfer)
+            && !unexplained_with_pin
+            && !transfer
+                .failure_code
+                .as_deref()
+                .is_some_and(|code| NOT_RESUMABLE.iter().any(|f| f.as_code() == code))
+    }
+
+    /// `true` for a Failed download whose failure lets Resume continue it,
+    /// whether or not its `.part` is still there.
+    pub fn is_failed_resumable(&self, id: &str) -> bool {
+        self.completed
+            .iter()
+            .any(|t| t.id == id && Self::failure_allows_resume(t))
+    }
+
+    /// Record whether a Failed download's `.part` is on disk, as last looked
+    /// at. Only a row Resume could continue is recorded.
+    pub fn note_failed_partial(&mut self, id: &str, present: bool) {
+        let resumable = present && self.is_failed_resumable(id);
+        if resumable {
+            self.failed_partials.insert(id.to_string());
+        } else {
+            self.failed_partials.remove(id);
+        }
+    }
+
+    fn resumable_failed_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.failed_partials.iter().cloned().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The Failed download of `file_hash` Resume can continue, if any.
+    pub fn resumable_failed_id_for_hash(&self, file_hash: &str) -> Option<String> {
+        self.completed
+            .iter()
+            .rev()
+            .find(|t| t.file_hash == file_hash && self.failed_partials.contains(&t.id))
+            .map(|t| t.id.clone())
+    }
+
+    /// Take a Failed download out of the finished list and queue it again,
+    /// as a fresh start of the same row: no failure or health carried over,
+    /// a slot only if one is free, and a new control; `paused`, it waits
+    /// Paused in the queue instead. `Some(true)` when it went straight into a
+    /// slot. `None` for any row that is not a Failed download Resume may
+    /// continue.
+    pub fn revive_failed(&mut self, id: &str, paused: bool) -> Option<bool> {
+        if self.is_pending(id) {
+            return None;
+        }
+        let pos = self
+            .completed
+            .iter()
+            .position(|t| t.id == id && Self::failure_allows_resume(t))?;
+        let mut transfer = self.completed.remove(pos);
+        self.failed_partials.remove(id);
+        Self::clear_failure_context(&mut transfer);
+        Self::clear_runtime_health(&mut transfer);
+        transfer.speed = 0;
+        transfer.active_sources = 0;
+        transfer.queued_sources = 0;
+        transfer.status = if paused {
+            TransferStatus::Paused
+        } else {
+            Self::queued_wait_status(&transfer)
+        };
+        let seed = Self::control_seed(&transfer);
+        let active_now = self.enqueue(transfer);
+        let control = TransferControl::new();
+        if paused {
+            control.pause();
+        }
+        self.install_control(id, control, Some(seed));
+        Some(active_now)
     }
 
     pub fn update_status(&mut self, id: &str, status: TransferStatus) {
@@ -1896,6 +2133,12 @@ impl TransferManager {
         }
     }
 
+    /// Whether `id` is a download still running or waiting to: one that
+    /// [`Self::stop`] would act on. A row that completed or failed is not.
+    pub fn is_pending(&self, id: &str) -> bool {
+        self.active.contains_key(id) || self.queue_position(id).is_some()
+    }
+
     /// eMule "Stop": remove from active scheduling without deleting partial data.
     pub fn stop(&mut self, id: &str) -> Vec<Transfer> {
         if let Some(control) = self.controls.get(id) {
@@ -2146,6 +2389,9 @@ impl TransferManager {
         // ahead of cancel can't leave a sticky red "failed" row in memory
         // (and therefore in get_transfers) after the user cancelled.
         self.completed.retain(|t| t.id != id);
+        self.failed_partials.remove(id);
+        self.restore_rejoins.remove(id);
+        self.restore_verifications.remove(id);
         self.controls.remove(id);
         self.speed_history.remove(id);
         self.source_details.remove(id);
@@ -2160,6 +2406,9 @@ impl TransferManager {
         self.queue.retain(|t| t.id != id);
         self.queue_changed();
         self.completed.retain(|t| t.id != id);
+        self.failed_partials.remove(id);
+        self.restore_rejoins.remove(id);
+        self.restore_verifications.remove(id);
         self.controls.remove(id);
         self.speed_history.remove(id);
         self.source_details.remove(id);
@@ -2275,6 +2524,21 @@ impl TransferManager {
             return None;
         }
         Some(Self::health_update(transfer))
+    }
+
+    /// Clear a row's failure and health, for a retry after nothing that went
+    /// wrong with the download itself. `None` when there was neither.
+    pub fn clear_retry_context(&mut self, id: &str) -> Option<TransferHealthUpdate> {
+        let transfer = self.get_transfer_mut(id)?;
+        let clean = transfer.health == TransferHealth::Healthy
+            && transfer.health_reason.is_none()
+            && transfer.health_code.is_none()
+            && transfer.stalled_since.is_none()
+            && transfer.failure_code.is_none()
+            && transfer.failure_reason.is_none();
+        Self::clear_failure_context(transfer);
+        Self::clear_runtime_health(transfer);
+        (!clean).then(|| Self::health_update(transfer))
     }
 
     fn health_update(transfer: &Transfer) -> TransferHealthUpdate {
@@ -2446,6 +2710,7 @@ impl TransferManager {
             },
             transfers,
             restored: self.restored,
+            resumable_failed: self.resumable_failed_ids(),
         }
     }
 
@@ -3137,14 +3402,17 @@ mod tests {
         assert_eq!(manager.completed.last().unwrap().id, "t1004");
     }
 
-    /// `fail` keeps its own copy of the same drain, so it needs its own case:
-    /// the two have to stay in step or one of them starts growing unbounded.
+    /// `fail` goes through the same cap, so it needs its own case: a failed
+    /// upload session is let go like a finished row. (A failed download is
+    /// not; see `failed_downloads_are_not_dropped_from_the_finished_list`.)
     #[test]
     fn the_completed_ring_caps_failed_rows_the_same_way() {
         let mut manager = TransferManager::new(1);
         for i in 0..1002 {
             let id = format!("f{i:04}");
-            manager.enqueue(download(&id));
+            let mut upload = download(&id);
+            upload.direction = TransferDirection::Upload;
+            manager.enqueue(upload);
             manager
                 .fail(&id, TransferFailureCode::TransientFailure, None, None)
                 .expect("each row fails in turn");
@@ -3192,6 +3460,315 @@ mod tests {
         assert!(manager.queue.is_empty());
     }
 
+    /// What `stop_transfer` checks before writing "stopped": a row that
+    /// completed first is not Stop's to end, and recording it stopped brought
+    /// the finished download back at the next launch.
+    #[test]
+    fn a_completed_download_is_no_longer_pending() {
+        let mut manager = TransferManager::new(2);
+        manager.enqueue(sourced("done", 2));
+        manager.enqueue(sourced("waiting", 2));
+        manager.enqueue(sourced("queued", 2));
+        assert!(manager.is_pending("done"));
+        assert!(manager.is_pending("queued"));
+
+        manager.complete("done");
+        assert!(!manager.is_pending("done"));
+        manager.stop("done");
+        assert_eq!(
+            manager.get_transfer("done").map(|t| &t.status),
+            Some(&TransferStatus::Completed),
+            "a Stop that arrives late changes nothing"
+        );
+        assert!(!manager.is_pending("unknown"));
+    }
+
+    fn failed_with_partial(manager: &mut TransferManager, id: &str) {
+        manager.enqueue(sourced(id, 2));
+        manager.register_control(id, TransferControl::new());
+        manager.fail(
+            id,
+            TransferFailureCode::LocalReadFailed,
+            Some("permanent".into()),
+            None,
+        );
+        manager.note_failed_partial(id, true);
+    }
+
+    /// Resume of a Failed download: the same row, out of the finished list and
+    /// back in line for a slot, with nothing of the failure left on it.
+    #[test]
+    fn a_failed_download_is_revived_into_a_free_slot_or_the_queue() {
+        let mut manager = TransferManager::new(2);
+        manager.enqueue(sourced("running", 2));
+        failed_with_partial(&mut manager, "broken");
+        manager.enqueue(sourced("other", 2));
+        assert_eq!(manager.get_transfers_since(None, 0).resumable_failed, ["broken"]);
+        assert_eq!(
+            manager
+                .resumable_failed_id_for_hash(&download("broken").file_hash)
+                .as_deref(),
+            Some("broken")
+        );
+
+        assert_eq!(manager.revive_failed("broken", false), Some(false), "both slots are taken");
+        assert!(manager.completed.is_empty());
+        let row = manager.queued("broken").expect("waits in the queue");
+        assert_eq!(row.status, TransferStatus::Queued);
+        assert!(row.failure_code.is_none() && row.failure_reason.is_none());
+        assert_eq!(row.health, TransferHealth::Healthy);
+        assert!(manager.get_control("broken").is_some_and(|c| !c.is_cancelled()));
+        assert!(manager.get_transfers_since(None, 0).resumable_failed.is_empty());
+        assert_eq!(manager.revive_failed("broken", false), None, "only a Failed row is revived");
+
+        failed_with_partial(&mut manager, "again");
+        manager.cancel("other");
+        manager.cancel("broken");
+        assert_eq!(manager.revive_failed("again", false), Some(true), "a slot is free");
+        assert!(manager.active.contains_key("again"));
+        assert_eq!(manager.revive_failed("unknown", false), None);
+
+        failed_with_partial(&mut manager, "held");
+        assert_eq!(manager.revive_failed("held", true), Some(false));
+        assert_eq!(manager.queued("held").map(|t| &t.status), Some(&TransferStatus::Paused));
+        assert!(manager.get_control("held").is_some_and(|c| c.is_paused()));
+    }
+
+    /// A Failed download whose bytes failed a trusted pin, or whose stored
+    /// pin was corrupt and dropped, is never offered Resume nor revived: it
+    /// would fail the pin again, or finish verified by MD4 alone.
+    #[test]
+    fn a_failure_that_distrusts_the_bytes_or_lost_the_pin_is_not_resumable() {
+        let mut manager = TransferManager::new(4);
+        for (id, code) in [
+            ("aich", TransferFailureCode::AichHashMismatch),
+            ("ember", TransferFailureCode::EmberContentHashMismatch),
+            ("aich-pin", TransferFailureCode::AichPinCorrupt),
+            ("ember-pin", TransferFailureCode::EmberPinCorrupt),
+        ] {
+            manager.enqueue(sourced(id, 2));
+            manager.fail(id, code, None, None);
+            manager.note_failed_partial(id, true);
+            assert!(!manager.is_failed_resumable(id), "{id}");
+            assert_eq!(manager.revive_failed(id, false), None, "{id}");
+            assert!(manager.get_transfer(id).is_some_and(|t| t.status == TransferStatus::Failed));
+        }
+        // Loaded at startup as Failed, as the database restores a row whose pin
+        // was corrupt.
+        let mut restored = sourced("restored", 2);
+        restored.status = TransferStatus::Failed;
+        restored.failure_code = Some(TransferFailureCode::AichPinCorrupt.as_code().into());
+        manager.push_finished(restored);
+        manager.note_failed_partial("restored", true);
+        assert!(manager.get_transfers_since(None, 0).resumable_failed.is_empty());
+        assert_eq!(manager.resumable_failed_id_for_hash(&download("restored").file_hash), None);
+        assert_eq!(manager.revive_failed("restored", false), None);
+
+        failed_with_partial(&mut manager, "fine");
+        assert!(manager.is_failed_resumable("fine"));
+        manager.enqueue(sourced("fine", 2));
+        assert!(
+            manager.get_transfers_since(None, 0).resumable_failed.is_empty(),
+            "a row queued again is not offered as Failed"
+        );
+    }
+
+    /// A Failed row saved before failure codes were kept: a pinned one may
+    /// have failed its pin, so it is not offered Resume; an unpinned one
+    /// cannot have, and is.
+    #[test]
+    fn a_failed_row_from_before_failure_codes_is_resumable_only_without_a_pin() {
+        let mut manager = TransferManager::new(4);
+        for (id, pinned) in [("legacy-pinned", true), ("legacy", false)] {
+            let mut legacy = sourced(id, 2);
+            legacy.status = TransferStatus::Failed;
+            legacy.failure_code = None;
+            legacy.expected_aich = pinned.then(|| "A".repeat(32));
+            manager.push_finished(legacy);
+            manager.note_failed_partial(id, true);
+            assert_eq!(manager.is_failed_resumable(id), !pinned, "{id}");
+        }
+    }
+
+    /// Resume is offered only where there is progress to continue from, and
+    /// not where continuing would fail the same trusted pin again.
+    #[test]
+    fn only_a_failed_download_with_its_partial_is_resumable() {
+        let mut manager = TransferManager::new(4);
+        failed_with_partial(&mut manager, "kept");
+        manager.note_failed_partial("kept", false);
+        assert!(manager.get_transfers_since(None, 0).resumable_failed.is_empty());
+
+        manager.enqueue(sourced("pinned", 2));
+        manager.fail("pinned", TransferFailureCode::AichHashMismatch, None, None);
+        manager.note_failed_partial("pinned", true);
+        manager.enqueue(sourced("done", 2));
+        manager.complete("done");
+        manager.note_failed_partial("done", true);
+        manager.enqueue(sourced("live", 2));
+        manager.note_failed_partial("live", true);
+        assert!(manager.get_transfers_since(None, 0).resumable_failed.is_empty());
+
+        failed_with_partial(&mut manager, "removed");
+        manager.remove("removed");
+        assert!(manager.get_transfers_since(None, 0).resumable_failed.is_empty());
+    }
+
+    /// The finished list is capped, but not at the cost of a failed download:
+    /// dropped, it could neither be resumed nor removed while its `.part` stayed.
+    #[test]
+    fn failed_downloads_are_not_dropped_from_the_finished_list() {
+        let mut manager = TransferManager::new(1);
+        let mut failed = download("failed");
+        failed.status = TransferStatus::Failed;
+        manager.push_finished(failed);
+        for i in 0..=MAX_FINISHED_ROWS {
+            let mut done = download(&format!("done-{i}"));
+            done.status = TransferStatus::Completed;
+            manager.push_finished(done);
+        }
+        assert_eq!(manager.completed.len(), MAX_FINISHED_ROWS + 1);
+        assert_eq!(manager.completed[0].id, "failed");
+        assert_eq!(manager.completed[1].id, "done-1", "the oldest finished row went");
+    }
+
+    /// Failed downloads have a cap of their own, so however many there are
+    /// a finished row just added stays, and the list stays bounded: the
+    /// oldest failed rows whose `.part` is gone go before any with one.
+    #[test]
+    fn failed_downloads_have_their_own_bound_on_the_finished_list() {
+        let mut manager = TransferManager::new(1);
+        for i in 0..MAX_FAILED_ROWS {
+            let mut failed = download(&format!("failed-{i}"));
+            failed.status = TransferStatus::Failed;
+            manager.push_finished(failed);
+            if i < 2 {
+                manager.note_failed_partial(&format!("failed-{i}"), true);
+            }
+        }
+        let mut done = download("done");
+        done.status = TransferStatus::Completed;
+        manager.push_finished(done);
+        assert!(manager.get_transfer("done").is_some(), "the row just given is kept");
+
+        let mut newest = download("failed-new");
+        newest.status = TransferStatus::Failed;
+        manager.push_finished(newest);
+        assert_eq!(manager.completed.len(), MAX_FAILED_ROWS + 1);
+        assert!(manager.get_transfer("failed-0").is_some(), "its `.part` keeps it");
+        assert!(manager.get_transfer("failed-1").is_some());
+        assert!(manager.get_transfer("failed-2").is_none(), "the oldest without one went");
+        assert!(manager.get_transfer("failed-new").is_some());
+    }
+
+    /// A restored row is verified in `active` whatever the cap. A check that
+    /// does not finish it must not leave it there searching past the cap.
+    #[test]
+    fn a_restored_row_whose_check_did_not_finish_it_waits_for_a_slot() {
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(sourced("running", 2));
+        for id in ["checked", "kept-paused"] {
+            let mut row = sourced(id, 2);
+            row.status = TransferStatus::Verifying;
+            manager.active.insert(id.to_string(), row);
+            let control = TransferControl::new();
+            manager.begin_restore_verification(id, &control);
+            manager.register_control(id, control);
+        }
+        manager.rejoin_queue_after_restore_check("checked");
+
+        assert!(manager.finish_restore_verification("checked", None, true));
+        let parked = manager.queued("checked").expect("waits for a slot");
+        assert_eq!(parked.status, TransferStatus::Queued);
+        assert!(manager.finish_restore_verification("kept-paused", None, true));
+        assert_eq!(
+            manager.active.get("kept-paused").map(|t| &t.status),
+            Some(&TransferStatus::Verifying),
+            "left in `active` for its paused state to be given back"
+        );
+
+        let mut free = TransferManager::new(2);
+        let mut row = sourced("alone", 2);
+        row.status = TransferStatus::Verifying;
+        free.active.insert("alone".to_string(), row);
+        free.begin_restore_verification("alone", &TransferControl::new());
+        free.rejoin_queue_after_restore_check("alone");
+        assert!(free.finish_restore_verification("alone", None, true));
+        assert!(free.active.contains_key("alone"), "a free slot keeps it");
+    }
+
+    /// A check that finished the download leaves its row where it is for
+    /// `complete`: parked in the queue meanwhile, it read Queued and a Pause
+    /// or Cancel elsewhere could promote it and start the finished file.
+    #[test]
+    fn a_restore_check_that_finished_the_download_does_not_park_it() {
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(sourced("running", 2));
+        let mut row = sourced("finished", 2);
+        row.status = TransferStatus::Verifying;
+        manager.active.insert("finished".to_string(), row);
+        let control = TransferControl::new();
+        manager.begin_restore_verification("finished", &control);
+        manager.register_control("finished", control);
+        manager.rejoin_queue_after_restore_check("finished");
+
+        assert!(manager.finish_restore_verification("finished", None, false));
+        assert_eq!(
+            manager.active.get("finished").map(|t| &t.status),
+            Some(&TransferStatus::Verifying)
+        );
+        assert!(manager.queued("finished").is_none());
+        let promoted = manager.cancel("running");
+        assert!(promoted.is_empty(), "nothing waits in the queue to be promoted");
+        assert!(manager.complete("finished").is_some());
+        assert_eq!(status_of(&manager, "finished"), TransferStatus::Completed);
+    }
+
+    /// A start overtaken by a Pause carries a cancelled control. Registered
+    /// after a Resume installed a live one, it must not replace and cancel it.
+    #[test]
+    fn a_cancelled_control_does_not_displace_a_live_one() {
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(sourced("a", 2));
+        let stale = TransferControl::new();
+        manager.register_control("a", stale.clone());
+        stale.cancel();
+        let live = TransferControl::new();
+        manager.register_control("a", live.clone());
+        assert!(stale.is_cancelled());
+
+        manager.register_control("a", stale.clone());
+        assert!(!live.is_cancelled(), "the live control keeps running");
+        assert!(manager
+            .get_control("a")
+            .is_some_and(|c| Arc::ptr_eq(&c, &live)));
+
+        live.cancel();
+        let other = TransferControl::new();
+        other.cancel();
+        manager.register_control("a", other.clone());
+        assert!(
+            manager.get_control("a").is_some_and(|c| Arc::ptr_eq(&c, &other)),
+            "over a control that is cancelled too, it is installed as before"
+        );
+    }
+
+    /// A control replaced is out of every command's reach, so whatever still
+    /// runs on it is stopped.
+    #[test]
+    fn replacing_a_download_control_cancels_the_old_one() {
+        let mut manager = TransferManager::new(1);
+        manager.enqueue(sourced("a", 2));
+        let old = TransferControl::new();
+        manager.register_control("a", old.clone());
+        manager.register_control("a", old.clone());
+        assert!(!old.is_cancelled(), "re-registering the same control keeps it");
+        let new = TransferControl::new();
+        manager.register_control("a", new.clone());
+        assert!(old.is_cancelled());
+        assert!(!new.is_cancelled());
+    }
+
     /// Stop parks the row at the front of the queue as `Stopped`, which
     /// `can_auto_run` rejects. A Cancel arriving afterwards — the ordinary
     /// stop-then-delete sequence — must therefore find nothing to promote,
@@ -3202,6 +3779,7 @@ mod tests {
         manager.enqueue(sourced("a", 2));
         manager.enqueue(sourced("b", 2));
 
+        assert!(manager.is_pending("a"));
         let promoted = manager.stop("a");
         assert_eq!(
             ids(&promoted),
@@ -3562,8 +4140,8 @@ mod tests {
             );
         }
 
-        assert!(manager.finish_restore_verification("single", None));
-        assert!(!manager.finish_restore_verification("single", None));
+        assert!(manager.finish_restore_verification("single", None, true));
+        assert!(!manager.finish_restore_verification("single", None, true));
         manager.resume("single");
         assert_ne!(status_of(&manager, "single"), TransferStatus::Paused);
     }
@@ -3576,9 +4154,9 @@ mod tests {
         let other = TransferControl::new();
         manager.begin_restore_verification("restored", &check);
 
-        assert!(!manager.finish_restore_verification("restored", Some(other.generation())));
+        assert!(!manager.finish_restore_verification("restored", Some(other.generation()), true));
         assert!(manager.is_restore_verification_running("restored"));
-        assert!(manager.finish_restore_verification("restored", Some(check.generation())));
+        assert!(manager.finish_restore_verification("restored", Some(check.generation()), true));
         assert!(!manager.is_restore_verification_running("restored"));
     }
 

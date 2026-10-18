@@ -1,0 +1,801 @@
+//! One web source of a download: fetch the parts no peer is working on with
+//! HTTP `Range` requests, into the shared part file.
+//!
+//! A child of `multi_source` so it uses the same claim → reserve → write →
+//! commit path, and the same MD4 sweep, as a peer worker — a mirror is one more
+//! source of bytes, verified like any other. See `super::super::web_sources`
+//! for the URL rules and the per-URL backoff this reports into.
+
+use super::*;
+use crate::network::ed2k::transfer::SourceFailureKind;
+use crate::network::ed2k::web_sources;
+
+/// Bytes gathered from the response body before each reserve/write/commit:
+/// the eMule block size, so a write is the same unit a peer's would be.
+const WRITE_CHUNK: usize = super::super::messages::EMBLOCKSIZE as usize;
+
+/// A read that stalls this long ends the request; the next one resumes from
+/// the gap map, so nothing written is lost.
+const READ_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Least a mirror must send per [`THROUGHPUT_WINDOW`] to keep its range. The
+/// idle timeout alone let one byte every 29 seconds hold a part, and with it
+/// the end of the download, indefinitely.
+const MIN_BYTES_PER_WINDOW: u64 = 64 * 1024;
+const THROUGHPUT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A pass that wrote less than this into a part still unfinished waits
+/// [`THIN_PASS_PAUSE`] before asking again, so a mirror answering every range
+/// with a byte or two is not re-asked in a tight loop.
+const THIN_PASS_BYTES: u64 = WRITE_CHUNK as u64;
+const THIN_PASS_PAUSE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Redirects followed per request, each re-validated like the first URL.
+const MAX_REDIRECTS: usize = 5;
+
+/// How long to wait when every unfinished part is already being worked on.
+const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often the dispatcher looks for web sources added since it started —
+/// a link with mirrors pasted again for a file already downloading.
+const DISPATCH_RECHECK: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Run a worker for each web source of the download as it becomes ready,
+/// until the file is complete or the download stops. It does not end when no
+/// source is ready: one may be added, finish resting, or be switched back on
+/// while the download runs. The download aborts it once the peers are done
+/// and no worker is fetching (`WebWorker::working`).
+///
+/// One task owns them all so the download waits on one handle, and holds each
+/// worker in an [`super::super::transfer::AbortOnDrop`] so that aborting it —
+/// which every early exit of the download does — stops every worker with it.
+/// A dropped `JoinHandle` alone would leave them writing to a part file the
+/// next run of the download is about to open.
+pub(super) async fn dispatch(template: WebWorker, total_sources: Arc<AtomicU32>) {
+    let mut running: HashMap<String, super::super::transfer::AbortOnDrop> = HashMap::new();
+    let mut counted: HashSet<String> = HashSet::new();
+    let mut next_worker = 0usize;
+    loop {
+        if check_control(&template.control).await.is_err()
+            || template.tracker.read().await.all_complete()
+        {
+            return;
+        }
+        running.retain(|_, handle| !handle.0.is_finished());
+        for url in web_sources::ready(&template.file_hash) {
+            if running.contains_key(&url) {
+                continue;
+            }
+            if counted.insert(url.clone()) {
+                total_sources.fetch_add(1, Ordering::Relaxed);
+            }
+            let mut worker = template.clone();
+            worker.url = url.clone();
+            worker.worker = template.worker + next_worker;
+            next_worker += 1;
+            // Counted before the spawn, so the download never sees a gap
+            // between a source being ready and its worker starting.
+            let working = Working::new(&template.working);
+            let handle = tokio::spawn(async move {
+                let _ = worker.run(working).await;
+            });
+            running.insert(url, super::super::transfer::AbortOnDrop(handle));
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(DISPATCH_RECHECK) => {}
+            _ = template.control.wait_cancel_or_pause() => {}
+        }
+    }
+}
+
+/// What a web source worker needs from the download it serves.
+#[derive(Clone)]
+pub(super) struct WebWorker {
+    pub url: String,
+    /// Distinct from every peer worker's index, for claims and log lines.
+    pub worker: usize,
+    pub transfer_id: String,
+    pub file_hash: [u8; 16],
+    pub file_size: u64,
+    pub tracker: Arc<RwLock<PartTracker>>,
+    pub output: super::super::write_coordinator::PartFileWriter,
+    pub part_hashes: Arc<RwLock<Vec<[u8; 16]>>>,
+    pub bandwidth: Arc<BandwidthLimiter>,
+    pub control: Arc<TransferControl>,
+    pub progress_tx: mpsc::Sender<(usize, i64)>,
+    pub event_tx: mpsc::Sender<DownloadEvent>,
+    pub drop_tx: DropReleaseTx,
+    pub active_count: Arc<AtomicU32>,
+    pub disk_full: Arc<AtomicBool>,
+    /// Workers fetching or ready to, shared by all of them: one resting out
+    /// its backoff is not counted, so the download does not wait on it.
+    pub working: Arc<std::sync::atomic::AtomicUsize>,
+    /// The filter and bans every peer of the download is held to. A mirror
+    /// sees this computer's address as a peer does, so one in a range the
+    /// user blocked is not contacted either.
+    pub ip_filter: Option<crate::network::kad::ip_filter::SharedIpFilter>,
+    pub banned_ips: Option<super::super::upload::SharedBannedIps>,
+}
+
+/// Counts its worker in `WebWorker::working` while held.
+struct Working {
+    count: Arc<std::sync::atomic::AtomicUsize>,
+    held: bool,
+}
+
+impl Working {
+    fn new(count: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        let mut working = Self { count: count.clone(), held: false };
+        working.hold();
+        working
+    }
+
+    fn hold(&mut self) {
+        if !self.held {
+            self.count.fetch_add(1, Ordering::Relaxed);
+            self.held = true;
+        }
+    }
+
+    fn release(&mut self) {
+        if self.held {
+            self.count.fetch_sub(1, Ordering::Relaxed);
+            self.held = false;
+        }
+    }
+}
+
+impl Drop for Working {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Counts a request in the download's active sources while its body streams.
+/// A guard rather than a pair of calls: the worker is aborted mid-await on
+/// every early exit of the download, which would skip the decrement.
+struct ActiveRequest(Arc<AtomicU32>);
+
+impl ActiveRequest {
+    fn new(count: &Arc<AtomicU32>) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self(count.clone())
+    }
+}
+
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// How a request ended, which decides what the source is told.
+enum FetchError {
+    /// The server will never serve this file in parts: missing, refused, or
+    /// ignoring `Range`. Retires the source.
+    Permanent(String),
+    /// Worth another try later: a timeout, a 5xx, a dropped connection.
+    Transient(String),
+    /// The download is stopping or the disk is full; not the server's fault.
+    Stopped(anyhow::Error),
+}
+
+impl WebWorker {
+    /// Whether the IP filter or the ban list refuses `ip`, as they would a
+    /// peer at that address. Both are IPv4 only.
+    fn address_refused(&self, ip: std::net::IpAddr) -> bool {
+        let std::net::IpAddr::V4(v4) = ip else {
+            return false;
+        };
+        if let Some(filter) = &self.ip_filter {
+            if filter.read().unwrap_or_else(|e| e.into_inner()).is_blocked(v4) {
+                return true;
+            }
+        }
+        self.banned_ips
+            .as_ref()
+            .is_some_and(|banned| banned.read().unwrap_or_else(|e| e.into_inner()).contains(&v4))
+    }
+
+    /// Shown in the source list: host as the address, the URL as the name.
+    fn host_and_port(&self) -> (String, u16) {
+        reqwest::Url::parse(&self.url)
+            .ok()
+            .map(|u| {
+                (
+                    u.host_str().unwrap_or("web").to_string(),
+                    u.port_or_known_default().unwrap_or(0),
+                )
+            })
+            .unwrap_or_else(|| ("web".to_string(), 0))
+    }
+
+    async fn report(&self, status: &str, speed: u64, transferred: u64, kind: Option<SourceFailureKind>) {
+        let (host, port) = self.host_and_port();
+        // The protocol as the client name — the same in every language — with
+        // the URL beside it as the name, which is what tells mirrors apart.
+        let label = web_sources::source_label(&self.url);
+        let _ = self
+            .event_tx
+            .send(DownloadEvent::SourceDetail {
+                transfer_id: self.transfer_id.clone(),
+                ip: host,
+                port,
+                status: status.to_string(),
+                queue_rank: None,
+                speed,
+                transferred,
+                client_software: label.to_string(),
+                peer_name: crate::security::sanitize_remote_text(&self.url, 200),
+                failure_kind: kind,
+                available_parts: None,
+                total_parts: None,
+                country_code: None,
+            })
+            .await;
+    }
+
+    /// Run until the file is complete, the download stops, or this source has
+    /// nothing more to give. Returns the shape every source task returns.
+    async fn run(self, working: Working) -> (usize, Vec<usize>, anyhow::Result<()>) {
+        let worker = self.worker;
+        let result = self.run_inner(working).await;
+        (worker, Vec::new(), result)
+    }
+
+    async fn run_inner(self, mut working: Working) -> anyhow::Result<()> {
+        self.adopt_single_part_hash().await;
+        self.report("connecting", 0, 0, None).await;
+        let mut guard = InProgressGuard::with_release_tx(
+            self.tracker.clone(),
+            self.worker,
+            self.drop_tx.clone(),
+        );
+        let mut transferred: u64 = 0;
+        // The address the last redirect landed on, reused until it fails so a
+        // mirror behind a redirector is not re-resolved for every range.
+        let mut effective_url = self.url.clone();
+        loop {
+            check_control(&self.control).await?;
+            if disk_full_hit(&self.disk_full) || self.tracker.read().await.all_complete() {
+                break;
+            }
+            if !web_sources::enabled() {
+                break;
+            }
+            // Retired elsewhere: by a corrupt part it mostly wrote, judged
+            // wherever that happened (see `web_sources::note_corrupt_range`),
+            // or by the download giving up on every mirror.
+            if web_sources::is_retired(&self.file_hash, &self.url) {
+                debug!("Web source {} retired for {}", self.url, self.transfer_id);
+                self.report("failed", 0, transferred, Some(SourceFailureKind::Permanent)).await;
+                return Ok(());
+            }
+            let picked = {
+                let mut t = self.tracker.write().await;
+                let claimed = t.in_progress_flags();
+                let part = (0..t.part_count).find(|&p| {
+                    !t.is_part_complete(p) && !claimed.get(p).copied().unwrap_or(false)
+                });
+                part.map(|p| {
+                    guard.claim_locked(p, &mut t);
+                    let (ps, pe) = t.part_range(p);
+                    (p, t.fillable_subranges(ps, pe))
+                })
+            };
+            let Some((part, gaps)) = picked else {
+                // Every unfinished part has a peer on it. Wait, rather than
+                // racing them for the same bytes.
+                self.pause(IDLE_RECHECK).await;
+                continue;
+            };
+            if gaps.is_empty() {
+                // Its missing bytes are all mid-write by someone else.
+                {
+                    let mut t = self.tracker.write().await;
+                    guard.release_locked(part, &mut t);
+                }
+                self.pause(std::time::Duration::from_millis(250)).await;
+                continue;
+            }
+
+            // So a peer worker piling onto this part in the endgame asks for
+            // these ranges last, as it does for another peer's requests.
+            let in_flight: Vec<OutstandingRange> =
+                gaps.iter().map(|&(gs, ge)| OutstandingRange::new(gs, ge)).collect();
+            guard.publish_in_flight(&in_flight, None).await;
+            let mut written: u64 = 0;
+            let mut outcome: Result<(), FetchError> = Ok(());
+            for (gs, ge) in gaps {
+                match self
+                    .fetch_range(&mut effective_url, gs, ge, &mut transferred, &mut written)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(e) => {
+                        outcome = Err(e);
+                        break;
+                    }
+                }
+            }
+            guard.publish_in_flight(&[], None).await;
+            // Check what this source just filled now, while the claim still
+            // keeps the sweep and every peer off it, so the verdict is about
+            // this mirror and a bad one is found out after one part.
+            let (to_check, part_done) = {
+                let t = self.tracker.read().await;
+                let (ps, pe) = t.part_range(part);
+                let done = t.is_part_complete(part);
+                (
+                    (outcome.is_ok() && done && !t.is_part_verified(part))
+                        .then(|| ((ps, pe), t.part_content_generation(part))),
+                    done,
+                )
+            };
+            let hashes = self.part_hashes.read().await.clone();
+            let checked = match to_check {
+                Some((range, generation)) if hashes.len() > part => Some((
+                    range,
+                    hash_claimed_part(
+                        &self.tracker,
+                        &hashes,
+                        &self.output,
+                        &mut guard,
+                        part,
+                        range,
+                        generation,
+                        &self.file_hash,
+                        &self.event_tx,
+                    )
+                    .await,
+                )),
+                _ => {
+                    let mut t = self.tracker.write().await;
+                    guard.release_locked(part, &mut t);
+                    None
+                }
+            };
+
+            match outcome {
+                Ok(()) => {
+                    web_sources::note_success(&self.file_hash, &self.url);
+                    if written < THIN_PASS_BYTES && !part_done {
+                        self.pause(THIN_PASS_PAUSE).await;
+                    }
+                }
+                Err(FetchError::Stopped(e)) => return Err(e),
+                Err(FetchError::Permanent(why)) => {
+                    warn!("Web source {} retired for {}: {why}", self.url, self.transfer_id);
+                    web_sources::note_failure(&self.file_hash, &self.url, true);
+                    self.report("failed", 0, transferred, Some(SourceFailureKind::Permanent)).await;
+                    return Ok(());
+                }
+                Err(FetchError::Transient(why)) => {
+                    debug!("Web source {} failed for {}: {why}", self.url, self.transfer_id);
+                    // A connection that dropped after delivering data is one
+                    // failure, not one more in a run: a mirror that keeps
+                    // making progress is rested, never retired for it.
+                    if written > 0 {
+                        web_sources::note_success(&self.file_hash, &self.url);
+                    }
+                    web_sources::note_failure(&self.file_hash, &self.url, false);
+                    self.report("failed", 0, transferred, Some(SourceFailureKind::Transient)).await;
+                    // Rest as long as the backoff says, then carry on; a source
+                    // that keeps failing is retired by it and this ends.
+                    effective_url = self.url.clone();
+                    working.release();
+                    if !self.wait_until_ready().await {
+                        return Ok(());
+                    }
+                    working.hold();
+                    self.report("connecting", 0, transferred, None).await;
+                    continue;
+                }
+            }
+
+            if let Some((_, ClaimedPartCheck::Corrupt)) = checked {
+                warn!(
+                    "Part {part} filled by web source {} failed verification",
+                    self.url
+                );
+            }
+        }
+        self.report("completed", 0, transferred, None).await;
+        Ok(())
+    }
+
+    /// Sleep `for_`, waking early if the download stops.
+    async fn pause(&self, for_: std::time::Duration) {
+        tokio::select! {
+            _ = tokio::time::sleep(for_) => {}
+            _ = self.control.wait_cancel_or_pause() => {}
+        }
+    }
+
+    /// Wait out this source's backoff. `false` when it was retired instead,
+    /// the feature was switched off, or the download stopped or finished.
+    async fn wait_until_ready(&self) -> bool {
+        loop {
+            if self.control.is_cancelled()
+                || self.control.is_paused()
+                || !web_sources::enabled()
+                || self.tracker.read().await.all_complete()
+            {
+                return false;
+            }
+            if web_sources::ready(&self.file_hash).contains(&self.url) {
+                return true;
+            }
+            if !web_sources::urls(&self.file_hash).contains(&self.url)
+                || web_sources::is_retired(&self.file_hash, &self.url)
+            {
+                return false;
+            }
+            self.pause(IDLE_RECHECK).await;
+        }
+    }
+
+    /// A file of one part has its file hash as that part's MD4, so it can be
+    /// verified part by part with no peer to hand over a hashset — which a
+    /// download with only web sources would otherwise never get.
+    async fn adopt_single_part_hash(&self) {
+        let single = self.tracker.read().await.part_count == 1;
+        if !single || !self.part_hashes.read().await.is_empty() {
+            return;
+        }
+        let hashes = vec![self.file_hash];
+        if super::super::transfer::verify_hashset(&self.file_hash, &hashes, self.file_size) {
+            install_verified_part_hashes(&self.part_hashes, &self.tracker, hashes).await;
+        }
+    }
+
+    /// Fetch `[start, end)` and write what is still missing of it. Adds the
+    /// bytes off the wire to `transferred` and those that filled a gap to
+    /// `written`.
+    async fn fetch_range(
+        &self,
+        effective_url: &mut String,
+        start: u64,
+        end: u64,
+        transferred: &mut u64,
+        written: &mut u64,
+    ) -> Result<(), FetchError> {
+        let response = match self.send_range(effective_url, start, end).await {
+            Ok(r) => r,
+            Err(e @ (FetchError::Permanent(_) | FetchError::Transient(_)))
+                if effective_url.as_str() != self.url =>
+            {
+                // The redirect target may be what failed; start again from the
+                // address the link named.
+                debug!(
+                    "Web source redirect target failed ({}), retrying {}",
+                    fetch_error_text(&e),
+                    self.url
+                );
+                *effective_url = self.url.clone();
+                self.send_range(effective_url, start, end).await?
+            }
+            Err(e) => return Err(e),
+        };
+
+        let status = response.status().as_u16();
+        // We ask for `identity`; a range of an encoded body is a range of the
+        // encoding, and writing it would only cost a failed part hash. Error
+        // pages are often compressed, so only a body we would write counts.
+        if matches!(status, 200 | 206)
+            && is_encoded(response.headers().get(reqwest::header::CONTENT_ENCODING))
+        {
+            return Err(FetchError::Permanent(
+                "the server sends the file encoded".to_string(),
+            ));
+        }
+
+        // Where the body starts, which a server ignoring `Range` puts at 0.
+        let body_start = match status {
+            206 => {
+                let header = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default();
+                match parse_content_range(header) {
+                    Some((first, _last, total)) => {
+                        if total.is_some_and(|t| t != self.file_size) {
+                            return Err(FetchError::Permanent(format!(
+                                "the server's file is {} bytes, not {}",
+                                total.unwrap_or(0),
+                                self.file_size
+                            )));
+                        }
+                        if first != start {
+                            return Err(FetchError::Permanent(format!(
+                                "asked for bytes from {start}, got them from {first}"
+                            )));
+                        }
+                        first
+                    }
+                    None => {
+                        return Err(FetchError::Permanent(
+                            "partial answer without a usable Content-Range".to_string(),
+                        ))
+                    }
+                }
+            }
+            200 => {
+                // The whole file. Usable only for a range at its start: reading
+                // the rest away to reach a later one would cost the file.
+                let length_ok = response
+                    .content_length()
+                    .is_none_or(|len| len == self.file_size);
+                if start != 0 || !length_ok {
+                    return Err(FetchError::Permanent(
+                        "the server does not serve parts of the file".to_string(),
+                    ));
+                }
+                0
+            }
+            404 | 410 => return Err(FetchError::Permanent("the file is not on the server".into())),
+            401 | 403 => return Err(FetchError::Permanent("the server refused access".into())),
+            416 => return Err(FetchError::Permanent("the server's file is shorter".into())),
+            status => {
+                return Err(FetchError::Transient(format!("server answered {status}")));
+            }
+        };
+
+        let _active = ActiveRequest::new(&self.active_count);
+        self.stream_body(response, body_start, end, transferred, written)
+            .await
+    }
+
+    /// GET `url` for bytes `[start, end)`, following redirects by hand so each
+    /// hop is validated and DNS-pinned like the first.
+    async fn send_range(
+        &self,
+        url: &mut String,
+        start: u64,
+        end: u64,
+    ) -> Result<reqwest::Response, FetchError> {
+        let user_agent = format!("Ember/{}", env!("CARGO_PKG_VERSION"));
+        for _ in 0..=MAX_REDIRECTS {
+            let (validated, host, addrs) = crate::security::validate_fetch_url_with(url, true)
+                .await
+                .map_err(|e| {
+                    // A lookup that failed or timed out may work next time; an
+                    // address the rules refuse never will.
+                    if e.starts_with("DNS lookup") || e.contains("could not be resolved") {
+                        FetchError::Transient(e)
+                    } else {
+                        FetchError::Permanent(e)
+                    }
+                })?;
+            let addrs: Vec<std::net::SocketAddr> =
+                addrs.into_iter().filter(|addr| !self.address_refused(addr.ip())).collect();
+            if addrs.is_empty() {
+                return Err(FetchError::Permanent(format!(
+                    "{host} is blocked by the IP filter or banned"
+                )));
+            }
+            let client = crate::security::build_pinned_web_source_client(
+                &host,
+                &addrs,
+                &user_agent,
+                READ_IDLE,
+            )
+            .map_err(FetchError::Transient)?;
+            let request = client
+                .get(&validated)
+                .header(reqwest::header::RANGE, format!("bytes={start}-{}", end - 1))
+                // A range of an encoded body is a range of the encoding, not of
+                // the file.
+                .header(reqwest::header::ACCEPT_ENCODING, "identity");
+            let response = tokio::select! {
+                r = request.send() => r.map_err(|e| FetchError::Transient(format!("request failed: {e}")))?,
+                _ = self.control.wait_cancel_or_pause() => {
+                    return Err(FetchError::Stopped(anyhow::anyhow!("cancelled by user")));
+                }
+            };
+            // Only the codes that name a new location for the same resource:
+            // 300 is a choice to make and 304 a cache answer to a conditional
+            // request we never send.
+            if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| FetchError::Transient("redirect without a Location".into()))?;
+                let next = reqwest::Url::parse(&validated)
+                    .and_then(|base| base.join(location))
+                    .map_err(|e| FetchError::Permanent(format!("bad redirect: {e}")))?;
+                *url = next.to_string();
+                continue;
+            }
+            return Ok(response);
+        }
+        Err(FetchError::Permanent(format!("more than {MAX_REDIRECTS} redirects")))
+    }
+
+    /// Read the body from `body_start`, writing each chunk of `[.., end)` that
+    /// is still missing, until `end` or the body runs out.
+    async fn stream_body(
+        &self,
+        mut response: reqwest::Response,
+        body_start: u64,
+        end: u64,
+        transferred: &mut u64,
+        written: &mut u64,
+    ) -> Result<(), FetchError> {
+        let wire = self.tracker.read().await.transferred_counter();
+        let mut pos = body_start;
+        let mut buf: Vec<u8> = Vec::with_capacity(WRITE_CHUNK);
+        let mut window_start = std::time::Instant::now();
+        let mut window_bytes: u64 = 0;
+        let mut floor_start = std::time::Instant::now();
+        let mut floor_bytes: u64 = 0;
+        let mut reported_transferring = false;
+        let mut got_any = false;
+        loop {
+            if !web_sources::enabled() {
+                // Switched off mid-request. What was written stays; the worker
+                // ends at the top of its loop rather than after a whole part.
+                return Ok(());
+            }
+            let chunk = tokio::select! {
+                c = response.chunk() => c.map_err(|e| FetchError::Transient(format!("read failed: {e}")))?,
+                _ = self.control.wait_cancel_or_pause() => {
+                    return Err(FetchError::Stopped(anyhow::anyhow!("cancelled by user")));
+                }
+            };
+            let done = chunk.is_none();
+            if let Some(bytes) = chunk {
+                floor_bytes = floor_bytes.saturating_add(bytes.len() as u64);
+                let room = end.saturating_sub(pos + buf.len() as u64) as usize;
+                buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
+            }
+            if floor_start.elapsed() >= THROUGHPUT_WINDOW {
+                if floor_bytes < MIN_BYTES_PER_WINDOW {
+                    return Err(FetchError::Transient(format!(
+                        "too slow: {floor_bytes} bytes in {} s",
+                        THROUGHPUT_WINDOW.as_secs()
+                    )));
+                }
+                floor_start = std::time::Instant::now();
+                floor_bytes = 0;
+            }
+            let at_end = pos + buf.len() as u64 >= end;
+            if buf.len() >= WRITE_CHUNK || ((done || at_end) && !buf.is_empty()) {
+                let len = buf.len() as u64;
+                if !self.bandwidth.acquire_download(len).await {
+                    return Err(FetchError::Stopped(anyhow::anyhow!("bandwidth limiter stopped")));
+                }
+                wire.fetch_add(len, Ordering::Relaxed);
+                *transferred = transferred.saturating_add(len);
+                window_bytes = window_bytes.saturating_add(len);
+                let outcome = write_gap_subranges_ms(
+                    &self.tracker,
+                    &self.output,
+                    pos,
+                    &buf,
+                    self.worker,
+                    "web ",
+                    Some(&self.drop_tx),
+                )
+                .await;
+                if let Some(e) = outcome.disk_full {
+                    self.disk_full.store(true, Ordering::Relaxed);
+                    return Err(FetchError::Stopped(anyhow::anyhow!(
+                        "stage:insufficient_disk disk write failed: {e}"
+                    )));
+                }
+                if !outcome.write_ok {
+                    return Err(FetchError::Stopped(anyhow::anyhow!("disk write failed")));
+                }
+                *written = written.saturating_add(outcome.newly_written);
+                web_sources::note_written(&self.file_hash, &self.url, &outcome.written_subranges);
+                if outcome.newly_written > 0 {
+                    let _ = self
+                        .progress_tx
+                        .try_send((self.worker, outcome.newly_written as i64));
+                }
+                got_any = true;
+                pos += len;
+                buf.clear();
+                // Peers filled the rest of this range meanwhile: reading on
+                // would only download it again.
+                if outcome.newly_written == 0
+                    && pos < end
+                    && self.tracker.read().await.fillable_subranges(pos, end).is_empty()
+                {
+                    return Ok(());
+                }
+                let elapsed = window_start.elapsed();
+                if !reported_transferring || elapsed >= std::time::Duration::from_secs(1) {
+                    let speed = (window_bytes as f64 / elapsed.as_secs_f64().max(0.001)) as u64;
+                    self.report("transferring", speed, *transferred, None).await;
+                    reported_transferring = true;
+                    window_start = std::time::Instant::now();
+                    window_bytes = 0;
+                }
+            }
+            if pos >= end {
+                return Ok(());
+            }
+            if done {
+                // Short body: what came is written, and the gap map says what
+                // is left. Nothing at all is a failure.
+                return if got_any {
+                    Ok(())
+                } else {
+                    Err(FetchError::Transient("the server sent no data".to_string()))
+                };
+            }
+        }
+    }
+}
+
+impl From<FetchError> for anyhow::Error {
+    fn from(e: FetchError) -> Self {
+        match e {
+            FetchError::Permanent(s) | FetchError::Transient(s) => anyhow::anyhow!(s),
+            FetchError::Stopped(e) => e,
+        }
+    }
+}
+
+fn fetch_error_text(e: &FetchError) -> &str {
+    match e {
+        FetchError::Permanent(s) | FetchError::Transient(s) => s,
+        FetchError::Stopped(_) => "stopped",
+    }
+}
+
+fn is_encoded(content_encoding: Option<&reqwest::header::HeaderValue>) -> bool {
+    content_encoding.is_some_and(|v| {
+        let v = v.as_bytes().trim_ascii();
+        !v.is_empty() && !v.eq_ignore_ascii_case(b"identity") && !v.eq_ignore_ascii_case(b"none")
+    })
+}
+
+/// `bytes first-last/total` → `(first, last, total)`; `total` is `None` for
+/// `*`. Anything else, or a range that runs backwards, is `None`.
+fn parse_content_range(header: &str) -> Option<(u64, u64, Option<u64>)> {
+    let rest = header.trim().strip_prefix("bytes")?.trim_start();
+    let (range, total) = rest.split_once('/')?;
+    let (first, last) = range.trim().split_once('-')?;
+    let first: u64 = first.trim().parse().ok()?;
+    let last: u64 = last.trim().parse().ok()?;
+    if last < first {
+        return None;
+    }
+    let total = match total.trim() {
+        "*" => None,
+        t => Some(t.parse().ok()?),
+    };
+    Some((first, last, total))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_encoded, parse_content_range};
+    use reqwest::header::HeaderValue;
+
+    #[test]
+    fn only_a_real_content_encoding_counts() {
+        assert!(!is_encoded(None));
+        for plain in ["identity", " Identity ", "NONE", "none", ""] {
+            assert!(!is_encoded(Some(&HeaderValue::from_static(plain))), "{plain:?}");
+        }
+        for encoded in ["gzip", "br", "deflate", " GZIP "] {
+            assert!(is_encoded(Some(&HeaderValue::from_static(encoded))), "{encoded:?}");
+        }
+    }
+
+    #[test]
+    fn content_range_is_read_strictly() {
+        assert_eq!(parse_content_range("bytes 0-99/1000"), Some((0, 99, Some(1000))));
+        assert_eq!(parse_content_range("bytes 500-999/*"), Some((500, 999, None)));
+        assert_eq!(parse_content_range(" bytes 7-7/8 "), Some((7, 7, Some(8))));
+        for bad in ["", "bytes */1000", "bytes 9-1/10", "items 0-1/2", "bytes 0-x/2", "bytes 0-1"] {
+            assert_eq!(parse_content_range(bad), None, "{bad}");
+        }
+    }
+}

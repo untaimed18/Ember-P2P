@@ -280,7 +280,9 @@ fn apply_credits(pending: &Path, db: &Database) -> anyhow::Result<u64> {
                 row.1 = row.1.max(credit.uploaded);
                 row.2 = row.2.max(credit.downloaded);
                 row.3 = row.3.max(credit.last_seen);
-                if row.4.is_empty() && has_key {
+                // A key on an unanchored row was never proven here and is
+                // dropped when credits load, so eMule's key replaces it.
+                if has_key && (row.4.is_empty() || !row.8) {
                     row.4 = credit.public_key.clone();
                     row.6 = needed;
                     row.8 = true;
@@ -364,7 +366,8 @@ fn apply_server_met(data_dir: &Path, pending: &Path) -> anyhow::Result<u64> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => ServerList::new(),
         Err(e) => anyhow::bail!("Ember's server.met could not be read, so it was left as it is: {e}"),
     };
-    let stats = list.merge_from_bytes_filtered(&std::fs::read(pending.join("server.met"))?, false, None)?;
+    // The user's own list, so the priorities they set in eMule come along.
+    let stats = list.merge_from_bytes_filtered(&std::fs::read(pending.join("server.met"))?, false, None, true)?;
     if stats.added + stats.updated + stats.filtered + stats.at_capacity == 0 {
         anyhow::bail!("eMule's server.met has no servers Ember can read");
     }

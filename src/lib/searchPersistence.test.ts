@@ -8,6 +8,7 @@ import {
   parsePersistedSearch,
   trimPersistPayload,
 } from './searchPersistence';
+import { MAX_MIN_SOURCES } from './searchQuery';
 import type { SearchTab } from '$lib/stores/search';
 import type { SearchResult } from '$lib/types';
 
@@ -94,25 +95,122 @@ describe('forPersist', () => {
     expect(stripped.results).toHaveLength(PERSIST_MAX_RESULTS);
   });
 
-  it('counts the rows it leaves out among the dropped ones', () => {
+  it('counts the rows it leaves out as dropped to save memory, apart from the overflow', () => {
     // A restored tab shows only what was stored, so the "results dropped" line
-    // has to say so rather than report the tab's own overflow alone.
-    const overflowing = { ...tab('a', PERSIST_MAX_RESULTS + 250), shed: 40, shedKeys: new Set(['x']) };
+    // has to say so — without blaming the query for rows the storage quota
+    // left out.
+    const overflowing = {
+      ...tab('a', PERSIST_MAX_RESULTS + 250),
+      shed: 40,
+      memoryShed: 10,
+      shedKeys: new Set(['x']),
+    };
     const stripped = forPersist(overflowing);
 
-    expect(stripped.shed).toBe(290);
+    expect(stripped.shed).toBe(40);
+    expect(stripped.memoryShed).toBe(260);
     expect(stripped.shedKeys).toBeUndefined();
-    expect(forPersist(tab('b', 3)).shed).toBe(0);
+    expect(forPersist(tab('b', 3)).memoryShed).toBe(0);
   });
 
   it('adds the rows a smaller retry leaves out too', () => {
     const payload = buildPersistPayload([tab('a', PERSIST_MAX_RESULTS + 250)], 'a');
-    expect(trimPersistPayload(payload, 25).tabs[0].shed).toBe(PERSIST_MAX_RESULTS + 225);
+    const retried = trimPersistPayload(payload, 25).tabs[0];
+    expect(retried.memoryShed).toBe(PERSIST_MAX_RESULTS + 225);
+    expect(retried.shed).toBe(0);
   });
 
   it('takes no stored count it cannot add to', () => {
-    const raw = JSON.stringify({ tabs: [{ id: 'a', query: 'q', results: [], shed: 'many' }], activeId: 'a' });
-    expect(parsePersistedSearch(raw).tabs[0].shed).toBe(0);
+    const raw = JSON.stringify({
+      tabs: [{ id: 'a', query: 'q', results: [], shed: 'many', memoryShed: -3 }],
+      activeId: 'a',
+    });
+    const restored = parsePersistedSearch(raw).tabs[0];
+    expect(restored.shed).toBe(0);
+    expect(restored.memoryShed).toBe(0);
+  });
+
+  it('restores filters only as values the search command accepts', () => {
+    // Search again re-sends a tab's filters and selecting it puts them back
+    // in the panel; one the backend refuses would fail every later search.
+    const raw = JSON.stringify({
+      tabs: [{
+        id: 'a',
+        query: 'q',
+        results: [],
+        filters: { fileExtension: 'mkv', minSize: 1.5, maxSize: -1, minAvailability: 9_999_999_999 },
+      }],
+      activeId: 'a',
+    });
+    expect(parsePersistedSearch(raw).tabs[0].filters).toEqual({
+      fileType: undefined,
+      fileExtension: 'mkv',
+      minSize: 2,
+      maxSize: undefined,
+      minAvailability: MAX_MIN_SOURCES,
+    });
+  });
+
+  it('falls back to the default network for a method it does not know', () => {
+    const raw = JSON.stringify({
+      tabs: [
+        { id: 'a', query: 'q', results: [], method: 'carrier-pigeon' },
+        { id: 'b', query: 'q', results: [], method: 42 },
+        { id: 'c', query: 'q', results: [], method: 'kad' },
+      ],
+      activeId: 'a',
+    });
+    expect(parsePersistedSearch(raw).tabs.map((t) => t.method)).toEqual(['global', 'global', 'kad']);
+  });
+
+  it('drops a file type that is not text', () => {
+    const raw = JSON.stringify({
+      tabs: [
+        { id: 'a', query: 'q', results: [], fileType: { name: 'Video' } },
+        { id: 'b', query: 'q', results: [], fileType: 'Audio' },
+      ],
+      activeId: 'a',
+    });
+    expect(parsePersistedSearch(raw).tabs.map((t) => t.fileType)).toEqual([undefined, 'Audio']);
+  });
+
+  it('drops a related label without its text, and the kinds it does not know', () => {
+    // The tab strip reads every field of `related` while it renders.
+    const raw = JSON.stringify({
+      tabs: [
+        { id: 'a', query: 'q', results: [], related: { seedLabel: 'seed.mkv', queryLabel: 'seed', kinds: ['series', 'telepathy', 7] } },
+        { id: 'b', query: 'q', results: [], related: { seedLabel: 3, queryLabel: 'seed', kinds: [] } },
+        { id: 'c', query: 'q', results: [], related: 'yes' },
+        { id: 'd', query: 'q', results: [], related: { seedLabel: 's', queryLabel: '', kinds: 'series' } },
+      ],
+      activeId: 'a',
+    });
+    expect(parsePersistedSearch(raw).tabs.map((t) => t.related)).toEqual([
+      { seedLabel: 'seed.mkv', queryLabel: 'seed', kinds: ['series'] },
+      undefined,
+      undefined,
+      { seedLabel: 's', queryLabel: '', kinds: [] },
+    ]);
+  });
+
+  it('keeps the first of two tabs with one id', () => {
+    const raw = JSON.stringify({
+      tabs: [
+        { id: 'a', query: 'first', results: [] },
+        { id: 'b', query: 'other', results: [] },
+        { id: 'a', query: 'repeat', results: [] },
+      ],
+      activeId: 'a',
+    });
+    expect(parsePersistedSearch(raw).tabs.map((t) => t.query)).toEqual(['first', 'other']);
+  });
+
+  it('drops an error that is not text', () => {
+    const raw = JSON.stringify({
+      tabs: [{ id: 'a', query: 'q', results: [], error: { code: 'x' } }],
+      activeId: 'a',
+    });
+    expect(parsePersistedSearch(raw).tabs[0].error).toBeNull();
   });
 
   it('keeps the best-sourced rows rather than the first ones stored', () => {

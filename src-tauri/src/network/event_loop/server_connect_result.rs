@@ -43,18 +43,19 @@ pub(in crate::network) async fn on_server_connect_result(
                         warn!("Server {ip}:{port} blocked by IP filter, disconnecting");
                         emit_server_log(app_handle, &format!("Server {ip}:{port} blocked by IP filter"));
                         drop(conn);
-                        state.server_list.record_failure(&ip, port);
+                        state.server_list.record_failure(&ip, port, false);
                         let met_path = state.data_dir.join("server.met");
                         spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
                         *shared_server_addr.write().await = None;
                         state.server_reconnect_failures =
                             state.server_reconnect_failures.saturating_add(1);
                         state.server_reconnect_network_down = false;
+                        state.server_last_connect_attempt = Some(std::time::Instant::now());
                         state.stats.server_status = "disconnected".to_string();
                         let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "disconnected" }));
-                        if state.server_auto_reconnect
-                            && state.server_reconnect_failures >= AUTO_CONNECT_MAX_FAILURES
-                        {
+                        // Blocked stays blocked: another attempt would only
+                        // log in to it again.
+                        if state.server_auto_reconnect {
                             abandon_server_auto_reconnect(
                                 state,
                                 app_handle,
@@ -65,6 +66,13 @@ pub(in crate::network) async fn on_server_connect_result(
                     }
                 }
             }
+
+            // From here on the server is known by its list address. `addr` is
+            // where the socket went, which with obfuscation is the server's
+            // obfuscation port; but peers name a server by its standard port
+            // (our Hello, LowID sources from UDP, Source Exchange and KAD all
+            // carry it), and so does the server list.
+            let addr = SocketAddr::new(addr.ip(), port);
 
             for motd in &session.motd_messages {
                 emit_server_log(app_handle, &format!("Server: {motd}"));
@@ -86,8 +94,25 @@ pub(in crate::network) async fn on_server_connect_result(
             state.server_client_id = session.client_id;
             state.server_login_tcp_port = Some(login_tcp_port);
             state.server_list.record_success(&ip, port);
+            // Most servers send OP_SERVERIDENT only while we log in, and that
+            // copy lands on the session, so this is where the list entry gets
+            // its name.
+            if state
+                .server_list
+                .update_server_name_from_ident(&ip, port, &session.server_name)
+            {
+                let met_path = state.data_dir.join("server.met");
+                spawn_save_server_met(
+                    &state.server_list,
+                    met_path,
+                    &state.server_met_save_generation,
+                    &state.server_met_save_lock,
+                );
+            }
             state.server_connected = true;
+            state.server_last_attempt_failed = false;
             ed2k::server::set_server_flags_mirror(session.server_flags);
+            ed2k::server::set_server_session_up(true);
             // `server_reconnect_failures` is deliberately left alone: only a
             // session that lasts clears it (`handle_server_disconnect`).
             state.server_reconnect_network_down = false;
@@ -425,14 +450,22 @@ pub(in crate::network) async fn on_server_connect_result(
             // A server we never reached has not failed; counting it would
             // prune the preferred server from the list during an outage.
             if !network_down {
-                state.server_list.record_failure(&ip, port);
+                // Not pruned while auto-reconnect is still after it.
+                let still_target = state.server_auto_reconnect
+                    && state
+                        .preferred_ed2k_server
+                        .as_ref()
+                        .is_some_and(|(pip, pport)| *pip == ip && *pport == port);
+                state.server_list.record_failure(&ip, port, still_target);
                 let met_path = state.data_dir.join("server.met");
                 spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
             }
+            state.server_last_attempt_failed = !network_down;
+            // The backoff runs from here: an attempt can take two minutes to
+            // fail, which used to eat the whole wait before the next one.
+            state.server_last_connect_attempt = Some(std::time::Instant::now());
             state.stats.server_status = "disconnected".to_string();
             let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "disconnected" }));
-            // Keep `server_last_connect_attempt` so reconnect backoff
-            // still applies when retrying the same preferred host.
         }
         Err(e) => {
             warn!("Server connection task panicked: {e}");
@@ -440,6 +473,7 @@ pub(in crate::network) async fn on_server_connect_result(
             state.server_reconnect_failures =
                 state.server_reconnect_failures.saturating_add(1);
             state.server_reconnect_network_down = false;
+            state.server_last_connect_attempt = Some(std::time::Instant::now());
             *shared_server_addr.write().await = None;
             state.stats.server_status = "disconnected".to_string();
             let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "disconnected" }));

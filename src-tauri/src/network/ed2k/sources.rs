@@ -3,7 +3,8 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use super::dead_sources::{
-    FILEREASKTIME_SECS, KAD_CALLBACK_REASK_SECS, SOURCECLIENTREASKS_SECS as SOURCECLIENTREASKS_I64,
+    FILEREASKTIME_SECS, KAD_CALLBACK_REASK_SECS, MIN_REQUESTTIME_SECS,
+    SOURCECLIENTREASKS_SECS as SOURCECLIENTREASKS_I64,
 };
 use super::messages::build_answer_sources1_versioned;
 use super::transfer::is_filtered_source_ip;
@@ -87,6 +88,24 @@ pub(crate) fn sx_answer_source_id(src: &SourceEntry) -> u32 {
 // ---------------------------------------------------------------------------
 // Per-file download source list  (eMule CPartFile::srclist equivalent)
 // ---------------------------------------------------------------------------
+
+/// Whether parking a row in `WaitCallbackKad` would break off what it is in the
+/// middle of. A queued row is included: the active-download source search
+/// re-reports a firewalled peer every few minutes, and each report used to
+/// park the row and make its callback due at once, so a peer that had queued
+/// us was sent a fresh `CallbackReq`, and then our file request, well inside
+/// eMule's `MIN_REQUESTTIME`. That costs our place in its queue, and repeated,
+/// counts toward eMule's request-flood ban. Such a row is reasked on its own
+/// schedule instead.
+fn callback_park_would_interrupt(state: &DownloadSourceState) -> bool {
+    matches!(
+        state,
+        DownloadSourceState::Connecting
+            | DownloadSourceState::Downloading
+            | DownloadSourceState::OnQueue { .. }
+            | DownloadSourceState::NoneNeededParts
+    )
+}
 
 /// eMule download-source state machine (DS_* in DownloadClient.h).
 #[derive(Debug, Clone)]
@@ -476,6 +495,10 @@ impl DownloadSourceEntry {
 
     /// Whether this source should receive a UDP reask ping
     /// (27 min after last ask, i.e. 2 min before FILEREASKTIME).
+    ///
+    /// Only a source that has us queued: `CPartFile::Process` calls
+    /// `UDPReaskForDownload` from its `DS_ONQUEUE` case alone. A failed source
+    /// has no queue entry to keep, and is retried over TCP on its own timer.
     pub fn needs_udp_reask(&self) -> bool {
         if self.udp_port == 0 {
             return false;
@@ -486,10 +509,7 @@ impl DownloadSourceEntry {
         let last = self.last_asked.max(self.last_udp_reask);
         let elapsed = last.elapsed().as_secs();
         let threshold = (FILEREASKTIME_SECS - 120).max(0) as u64;
-        matches!(
-            self.state,
-            DownloadSourceState::OnQueue { .. } | DownloadSourceState::Failed
-        ) && elapsed >= threshold
+        matches!(self.state, DownloadSourceState::OnQueue { .. }) && elapsed >= threshold
     }
 }
 
@@ -544,18 +564,17 @@ impl PerFileSourceList {
         if user_hash == [0u8; 16] || new_port == 0 || new_ip.is_unspecified() {
             return false;
         }
-        let known = self
-            .sources
-            .iter()
-            .any(|s| s.source_user_hash == Some(user_hash));
-        if !known {
-            return false;
-        }
-        self.add_source_with_identity(new_ip, new_port, 0, Some(user_hash));
-        if let Some(existing) = self
+        // Moved before `add_source_with_identity` merges the endpoint: that
+        // keeps a row it is talking to, or asked recently, where it is, but
+        // this address comes from the peer's own session rather than from one
+        // of two rival source reports.
+        let Some(existing) = self
             .sources
             .iter_mut()
             .find(|s| s.source_user_hash == Some(user_hash))
+        else {
+            return false;
+        };
         {
             // Only clear the brakes when the endpoint actually moved.
             //
@@ -579,9 +598,9 @@ impl PerFileSourceList {
                 // Arm an immediate reask so the worker does not wait FILEREASKTIME.
                 existing.arm_callback_reask();
             }
-            return true;
         }
-        false
+        self.add_source_with_identity(new_ip, new_port, 0, Some(user_hash));
+        true
     }
 
     pub fn add_source_full(&mut self, ip: Ipv4Addr, tcp_port: u16, udp_port: u16) -> bool {
@@ -618,16 +637,57 @@ impl PerFileSourceList {
                     // HighID peers often change listen port across relaunch.
                     // When we already know who they are, move the dial target
                     // instead of freezing on the stale IP:port.
-                    if !ip.is_unspecified()
+                    //
+                    // A row we are talking to at its current address stays
+                    // there, and a moved row is only made `New` (dialable at
+                    // once) when we last asked the peer at least
+                    // `MIN_REQUESTTIME` ago. That limit is on the peer's user
+                    // hash, not its address, so two reports alternating
+                    // between two addresses must not buy a redial each.
+                    let moved = !ip.is_unspecified()
                         && (existing.ip.is_unspecified()
                             || existing.ip != ip
-                            || existing.tcp_port != tcp_port)
-                    {
+                            || existing.tcp_port != tcp_port);
+                    let relocate = moved
+                        && (existing.ip.is_unspecified()
+                            || !callback_park_would_interrupt(&existing.state));
+                    if relocate {
+                        // A placeholder was never dialled anywhere, and a row
+                        // only gets `last_asked` stamped at creation, so its
+                        // clock says nothing about having asked the peer.
+                        let placeholder = existing.ip.is_unspecified();
                         existing.ip = ip;
                         existing.tcp_port = tcp_port;
-                        existing.state = DownloadSourceState::New;
-                        existing.fail_count = 0;
-                        existing.state_changed = Instant::now();
+                        // Someone else reported this address: it is no longer
+                        // only the claim a firewalled record made.
+                        existing.callback_addr_unverified_claim = false;
+                        let asked_recently = existing.last_asked.elapsed().as_secs()
+                            < MIN_REQUESTTIME_SECS as u64;
+                        // A ban follows the user hash, and a friend connect
+                        // ends on its own clock; neither is the address's.
+                        let keeps_state = matches!(
+                            existing.state,
+                            DownloadSourceState::Banned | DownloadSourceState::FriendConnect
+                        );
+                        if !keeps_state
+                            && (placeholder
+                                || matches!(existing.state, DownloadSourceState::New)
+                                || !asked_recently)
+                        {
+                            existing.state = DownloadSourceState::New;
+                            existing.fail_count = 0;
+                            existing.state_changed = Instant::now();
+                        } else if matches!(
+                            existing.state,
+                            DownloadSourceState::WaitCallbackKad
+                                | DownloadSourceState::LowToLowIp
+                                | DownloadSourceState::EmberRelay
+                        ) {
+                            // Parked for the old route, which the new address
+                            // does not need; `Failed` keeps the ask floor.
+                            existing.state = DownloadSourceState::Failed;
+                            existing.state_changed = Instant::now();
+                        }
                     }
                 }
                 // Relocating onto an endpoint another row already holds left two
@@ -640,7 +700,10 @@ impl PerFileSourceList {
                 // too. Left in `New` by the relocation above it also reported
                 // `time_until_reask() == 0` forever, so it was re-offered on
                 // every pass and the address appeared twice in the dial list.
-                if !ip.is_unspecified() {
+                if !ip.is_unspecified()
+                    && self.sources[idx].ip == ip
+                    && self.sources[idx].tcp_port == tcp_port
+                {
                     if let Some(dup) = self
                         .sources
                         .iter()
@@ -948,12 +1011,9 @@ impl PerFileSourceList {
                 s.source_user_hash = source_user_hash;
             }
             // Same guard, and same reasoning, as `set_ember_callback_buddy`
-            // below: a row that is connecting or transferring keeps its state
-            // and only has its buddy fields refreshed.
-            if !matches!(
-                s.state,
-                DownloadSourceState::Connecting | DownloadSourceState::Downloading
-            ) {
+            // below: a row that is connecting, transferring or queued keeps its
+            // state and only has its buddy fields refreshed.
+            if !callback_park_would_interrupt(&s.state) {
                 s.state = DownloadSourceState::WaitCallbackKad;
                 s.state_changed = Instant::now();
             }
@@ -1013,10 +1073,7 @@ impl PerFileSourceList {
             // return `u64::MAX`, and started firing `CallbackReq` at a peer we
             // were connected to — and `reset_active_states` does not cover
             // `WaitCallbackKad`, so the row stayed parked afterwards.
-            if !matches!(
-                s.state,
-                DownloadSourceState::Connecting | DownloadSourceState::Downloading
-            ) {
+            if !callback_park_would_interrupt(&s.state) {
                 s.state = DownloadSourceState::WaitCallbackKad;
                 s.state_changed = Instant::now();
             }
@@ -1040,6 +1097,7 @@ impl PerFileSourceList {
     /// *source's* `HasLowID()` (`DeadSourceList.cpp:121`). Every state here is one
     /// a peer only reaches because it cannot accept an inbound connection: it is
     /// waiting to call us back, or the two of us are both firewalled.
+    #[allow(dead_code, reason = "used with `DeadSourceList::add_dead_source`")]
     pub fn source_is_firewalled(
         &self,
         ip: Ipv4Addr,
@@ -2235,57 +2293,9 @@ impl SourceManager {
             .unwrap_or_default()
     }
 
-    /// Return UDP sources due for a re-ask (eMule: SOURCECLIENTREASKS interval).
-    /// Only returns sources whose `last_asked` is older than `reask_interval` seconds ago.
-    ///
-    /// `last_asked == None` means "never asked" (see [`source_eviction_index`] —
-    /// only we ever set it), and it must NOT count as due. When that was a 0
-    /// sentinel, a plain `now - last_asked` read it as overdue by decades, so the
-    /// first `OP_REASKFILEPING` went out on the next 5 s timer tick — seconds
-    /// after our TCP file request for the same hash, and far inside eMule's
-    /// `MIN_REQUESTTIME`. That is the reask rate uploaders ban a user hash
-    /// for, which is the whole reason the TCP path is floored at
-    /// `MIN_REQUESTTIME_SECS`. A UDP reask only maintains a queue position we
-    /// already hold, so having never asked, there is nothing to maintain.
-    /// The sibling predicates (`can_request_sources_for`,
-    /// `get_lowid_sources_needing_callback`) special-case `None` the same way.
-    pub fn get_udp_sources_due_for_reask(
-        &self,
-        file_hash: &[u8; 16],
-        reask_interval: i64,
-    ) -> Vec<(Ipv4Addr, u16, u16)> {
-        self.get_udp_sources_due_for_reask_at(file_hash, reask_interval, Instant::now())
-    }
-
-    /// [`Self::get_udp_sources_due_for_reask`] with the reask clock read as
-    /// `asked_now`; `last_seen` is still judged against the wall clock.
-    fn get_udp_sources_due_for_reask_at(
-        &self,
-        file_hash: &[u8; 16],
-        reask_interval: i64,
-        asked_now: Instant,
-    ) -> Vec<(Ipv4Addr, u16, u16)> {
-        let now = chrono::Utc::now().timestamp();
-        let interval = Duration::from_secs(reask_interval.max(0) as u64);
-        self.sources
-            .get(file_hash)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|e| {
-                        now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS
-                            && e.udp_port > 0
-                            && !e.not_for_reconnect
-                            && e.last_asked
-                                .is_some_and(|at| asked_now.saturating_duration_since(at) >= interval)
-                    })
-                    .map(|e| (e.ip, e.tcp_port, e.udp_port))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Mark a source as asked (update `last_asked` timestamp).
+    /// Record an ask of either kind, a TCP file request or an
+    /// `OP_REASKFILEPING`. What keeps a row we wait on from expiring, and what
+    /// tells a contacted source from one never tried when the list is trimmed.
     pub fn mark_asked(&mut self, file_hash: &[u8; 16], ip: Ipv4Addr, port: u16) {
         if let Some(entries) = self.sources.get_mut(file_hash) {
             if let Some(entry) = entries
@@ -3601,6 +3611,43 @@ mod tests {
         assert!(pfs.callback_reask_due(ip, 4662, None));
         pfs.mark_callback_requested(ip, 4662, None);
         assert!(!pfs.callback_reask_due(ip, 4662, None));
+    }
+
+    /// The active-download source search re-reports a firewalled peer every
+    /// few minutes. A row that already holds our place in that peer's queue
+    /// keeps it: only the buddy route is refreshed, and no callback is due.
+    #[test]
+    fn a_callback_rediscovery_leaves_a_queued_row_alone() {
+        let hash = [0x4B; 16];
+        let ip = Ipv4Addr::new(5, 5, 5, 9);
+        let buddy = Ipv4Addr::new(6, 6, 6, 9);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
+        assert!(pfs.add_source_full(ip, 4662, 0));
+        pfs.set_on_queue(ip, 4662, Some(42), None);
+
+        pfs.set_kad_callback_buddy(ip, 4662, buddy, 4672, [0xAA; 16], Some([0xBB; 16]), false);
+        assert!(matches!(
+            pfs.sources[0].state,
+            DownloadSourceState::OnQueue { rank: Some(42) }
+        ));
+        assert_eq!(pfs.sources[0].callback_buddy_ip, Some(buddy));
+        assert!(!pfs.callback_reask_due(ip, 4662, None));
+
+        pfs.set_ember_callback_buddy(
+            ip,
+            4662,
+            buddy,
+            4672,
+            [0xAAu8; 32],
+            [0xB2u8; 16],
+            [0xBBu8; 16],
+            Some([0xCCu8; 16]),
+            Some([0xDDu8; 16]),
+            TEST_ENDORSED_UNTIL,
+            false,
+        );
+        assert!(matches!(pfs.sources[0].state, DownloadSourceState::OnQueue { .. }));
+        assert!(!pfs.sources[0].ember_callback_reask_due(TEST_NOW));
     }
 
     #[test]
@@ -5136,41 +5183,6 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
     }
 
-    /// `last_asked == None` is "we have never asked this peer". It was a 0
-    /// sentinel, which a plain `now - last_asked` read as overdue by decades: the first
-    /// `OP_REASKFILEPING` went out on the next 5 s timer tick — right after our
-    /// TCP file request for the same hash, and far inside eMule's
-    /// `MIN_REQUESTTIME`. That is exactly the reask rate that gets a user hash
-    /// banned by eMule uploaders, and it bypassed the `MIN_REQUESTTIME` floor
-    /// the TCP path is careful to respect.
-    #[test]
-    fn a_source_we_never_asked_is_not_due_for_a_udp_reask() {
-        let hash = [0xC3; 16];
-        let peer = [0xC4; 16];
-        let ip = Ipv4Addr::new(9, 9, 9, 10);
-        let mut sm = SourceManager::new();
-        sm.register_source_full_opts(hash, ip, 4662, 4672, peer, 0, None);
-
-        assert!(
-            sm.get_udp_sources_due_for_reask(&hash, FILEREASKTIME_SECS)
-                .is_empty(),
-            "a never-asked source has no queue position to maintain"
-        );
-
-        // Once we have actually asked, the clock starts: still not due now...
-        sm.mark_asked(&hash, ip, 4662);
-        assert!(sm
-            .get_udp_sources_due_for_reask(&hash, FILEREASKTIME_SECS)
-            .is_empty());
-
-        // ...and due once a full reask interval has passed.
-        let later = Instant::now() + Duration::from_secs(FILEREASKTIME_SECS as u64 + 1);
-        assert_eq!(
-            sm.get_udp_sources_due_for_reask_at(&hash, FILEREASKTIME_SECS, later),
-            vec![(ip, 4662, 4672)]
-        );
-    }
-
     #[test]
     fn get_sources_skips_not_for_reconnect_and_dedupes_by_hash() {
         let hash = [0xA1; 16];
@@ -5508,5 +5520,132 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// Two source reports naming one user hash at two addresses used to
+    /// reset the row to `New` on every flip, and `New` is dialable at once.
+    #[test]
+    fn alternating_user_hash_reports_do_not_buy_a_redial() {
+        let hash = [0x71; 16];
+        let peer = Some([0x72; 16]);
+        let a = Ipv4Addr::new(198, 51, 100, 1);
+        let b = Ipv4Addr::new(198, 51, 100, 2);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
+        assert!(pfs.add_source_with_identity(a, 4662, 4672, peer));
+        pfs.set_failed_with_penalty(a, 4662, 1, None);
+        pfs.sources[0].last_asked = Instant::now();
+
+        for (ip, port) in [(b, 4663), (a, 4662), (b, 4663)] {
+            pfs.add_source_with_identity(ip, port, 0, peer);
+            let row = &pfs.sources[0];
+            assert_eq!((row.ip, row.tcp_port), (ip, port), "the dial target still moves");
+            assert!(matches!(row.state, DownloadSourceState::Failed));
+            assert!(row.time_until_reask() > 0);
+            assert!(!row.can_try_tcp());
+        }
+        assert_eq!(pfs.sources.len(), 1);
+
+        pfs.sources[0].last_asked =
+            Instant::now() - Duration::from_secs(MIN_REQUESTTIME_SECS as u64 + 1);
+        pfs.add_source_with_identity(a, 4662, 0, peer);
+        assert!(
+            matches!(pfs.sources[0].state, DownloadSourceState::New),
+            "a peer not asked within MIN_REQUESTTIME is retried at its new address"
+        );
+    }
+
+    /// A row that cannot be dialled where it is must not stay parked once a
+    /// report gives it an address that can: a placeholder was never asked at
+    /// all, and a route park belonged to the old address.
+    #[test]
+    fn a_relocated_row_is_never_left_parked_on_its_old_route() {
+        let hash = [0x75; 16];
+        let a = Ipv4Addr::new(198, 51, 100, 5);
+        let b = Ipv4Addr::new(198, 51, 100, 6);
+
+        let mut placeholder = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
+        assert!(placeholder.add_source_with_identity(Ipv4Addr::UNSPECIFIED, 0, 0, Some([0x76; 16])));
+        placeholder.sources[0].state = DownloadSourceState::LowToLowIp;
+        placeholder.add_source_with_identity(a, 4662, 0, Some([0x76; 16]));
+        assert_eq!(placeholder.sources[0].ip, a);
+        assert!(matches!(placeholder.sources[0].state, DownloadSourceState::New));
+
+        let mut parked = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
+        assert!(parked.add_source_with_identity(a, 4662, 0, Some([0x77; 16])));
+        parked.set_kad_callback_buddy(a, 4662, b, 4672, [0xAA; 16], Some([0x77; 16]), true);
+        parked.sources[0].callback_addr_unverified_claim = true;
+        parked.sources[0].last_asked = Instant::now();
+        parked.add_source_with_identity(b, 4663, 0, Some([0x77; 16]));
+        let row = &parked.sources[0];
+        assert!(matches!(row.state, DownloadSourceState::Failed), "unparked");
+        assert!(!row.callback_addr_unverified_claim);
+        assert!(row.time_until_reask() > 0, "but still held to the ask floor");
+
+        let mut banned = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
+        assert!(banned.add_source_with_identity(a, 4662, 0, Some([0x78; 16])));
+        banned.set_banned(a, 4662, None);
+        banned.sources[0].last_asked =
+            Instant::now() - Duration::from_secs(MIN_REQUESTTIME_SECS as u64 + 1);
+        banned.add_source_with_identity(b, 4662, 0, Some([0x78; 16]));
+        assert!(
+            matches!(banned.sources[0].state, DownloadSourceState::Banned),
+            "a new address does not lift a ban"
+        );
+    }
+
+    /// A row we are talking to stays at the address we are talking to it on.
+    #[test]
+    fn a_queued_source_is_not_moved_by_a_report_elsewhere() {
+        let hash = [0x73; 16];
+        let peer = Some([0x74; 16]);
+        let a = Ipv4Addr::new(198, 51, 100, 3);
+        let b = Ipv4Addr::new(198, 51, 100, 4);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
+        assert!(pfs.add_source_with_identity(a, 4662, 4672, peer));
+        pfs.set_on_queue(a, 4662, Some(12), None);
+
+        pfs.add_source_with_identity(b, 4662, 0, peer);
+        let row = &pfs.sources[0];
+        assert_eq!((row.ip, row.tcp_port), (a, 4662));
+        assert!(matches!(row.state, DownloadSourceState::OnQueue { rank: Some(12) }));
+        assert_eq!(pfs.sources.len(), 1);
+    }
+
+    /// The peer's own session is authoritative, unlike a source report.
+    #[test]
+    fn a_friend_relocation_still_moves_a_queued_source() {
+        let hash = [0x75; 16];
+        let peer = [0x76; 16];
+        let a = Ipv4Addr::new(198, 51, 100, 5);
+        let b = Ipv4Addr::new(198, 51, 100, 6);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
+        assert!(pfs.add_source_with_identity(a, 4662, 4672, Some(peer)));
+        pfs.set_on_queue(a, 4662, Some(12), None);
+
+        assert!(pfs.relocate_user_hash(peer, b, 4663));
+        let row = &pfs.sources[0];
+        assert_eq!((row.ip, row.tcp_port), (b, 4663));
+        assert!(matches!(row.state, DownloadSourceState::New));
+    }
+
+    /// eMule pings only queued sources over UDP; a failed one waits for its
+    /// TCP reask.
+    #[test]
+    fn only_a_queued_source_gets_a_udp_reask() {
+        let hash = [0x77; 16];
+        let queued = Ipv4Addr::new(198, 51, 100, 7);
+        let failed = Ipv4Addr::new(198, 51, 100, 8);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
+        assert!(pfs.add_source_full(queued, 4662, 4672));
+        assert!(pfs.add_source_full(failed, 4662, 4672));
+        pfs.set_on_queue(queued, 4662, Some(3), None);
+        pfs.set_failed_with_penalty(failed, 4662, 1, None);
+        let long_ago = Instant::now() - Duration::from_secs(FILEREASKTIME_SECS as u64);
+        for row in &mut pfs.sources {
+            row.last_asked = long_ago;
+            row.last_udp_reask = long_ago;
+        }
+
+        assert_eq!(pfs.sources_needing_udp_reask(), vec![(queued, 4662, 4672)]);
     }
 }

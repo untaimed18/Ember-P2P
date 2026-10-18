@@ -62,6 +62,15 @@ export interface ChatMessage {
   delivery: ChatDelivery;
   /** The friend has opened this outbound message. Incoming rows are false. */
   seen?: boolean;
+  /** When this disappearing message is deleted, in Unix seconds, once its
+   *  timer has started (at delivery for ours, when read for theirs). */
+  expires_at?: number | null;
+}
+
+/** A disappearing message whose timer just started. */
+export interface ChatExpiry {
+  id: number;
+  expires_at: number;
 }
 
 export interface ChatSendResult {
@@ -141,8 +150,20 @@ export async function getChatMessages(friendHash: string, limit?: number, before
   return invoke('get_chat_messages', { friendHash, limit: limit ?? 50, beforeId: beforeId ?? null });
 }
 
-export async function markMessagesRead(friendHash: string): Promise<void> {
+/** Mark a conversation read. Returns the disappearing timers that reading
+ *  started. */
+export async function markMessagesRead(friendHash: string): Promise<ChatExpiry[]> {
   return invoke('mark_messages_read', { friendHash });
+}
+
+/** Delete the whole conversation with a friend from this computer. */
+export async function deleteChatHistory(userHashHex: string): Promise<void> {
+  return invoke('delete_chat_history', { userHashHex });
+}
+
+/** Delete one message from this computer; a queued one is never sent. */
+export async function deleteChatMessage(userHashHex: string, id: number): Promise<void> {
+  return invoke('delete_chat_message', { userHashHex, id });
 }
 
 /** Live composing signal. Resolves even if the friend is offline — the packet is dropped. */

@@ -108,6 +108,7 @@ function room(partial: Partial<ChannelInfo> & { channel_id: string }): ChannelIn
     language: '',
     newer_lines: 0,
     newer_key: false,
+    newer_envelope: false,
     ...partial,
   } as ChannelInfo;
 }

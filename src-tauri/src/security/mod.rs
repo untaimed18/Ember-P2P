@@ -586,6 +586,23 @@ fn is_this_network_v4(v4: std::net::Ipv4Addr) -> bool {
     v4.octets()[0] == 0
 }
 
+/// Whether `ip`, a stored or caller-supplied peer address, names no host:
+/// empty, or anywhere in `0.0.0.0/8`. Not just `0.0.0.0`: the rest of that
+/// block is where relayed upload sessions are recorded, and an address taken
+/// from one of those names nobody.
+pub(crate) fn names_no_peer_address(ip: &str) -> bool {
+    if ip.is_empty() {
+        return true;
+    }
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => is_this_network_v4(v4),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            v6.is_unspecified() || v6.to_ipv4_mapped().is_some_and(is_this_network_v4)
+        }
+        Err(_) => false,
+    }
+}
+
 /// Reserved for future use / class E (240.0.0.0/4, includes 255.255.255.255)
 fn is_reserved_future_v4(v4: std::net::Ipv4Addr) -> bool {
     v4.octets()[0] >= 240
@@ -633,24 +650,47 @@ pub(crate) fn is_private_ip(ip: std::net::IpAddr) -> bool {
             let segs = v6.segments();
             let is_ula = (segs[0] & 0xFE00) == 0xFC00;
             let is_link_local = (segs[0] & 0xFFC0) == 0xFE80;
+            // RFC 3879: deprecated site-local fec0::/10, still routed on
+            // some internal networks.
+            let is_site_local = (segs[0] & 0xFFC0) == 0xFEC0;
             // RFC 3849: 2001:db8::/32 documentation prefix
             let is_doc_v6 = segs[0] == 0x2001 && segs[1] == 0x0DB8;
-            if is_ula || is_link_local || is_doc_v6 {
+            // RFC 8215: 64:ff9b:1::/48, NAT64 for local use only.
+            let is_local_nat64 = segs[0] == 0x0064 && segs[1] == 0xFF9B && segs[2] == 0x0001;
+            if is_ula || is_link_local || is_site_local || is_doc_v6 || is_local_nat64 {
                 return true;
             }
-            let is_v4_mapped = segs[0..5] == [0, 0, 0, 0, 0] && segs[5] == 0xFFFF;
-            if is_v4_mapped {
-                let mapped = std::net::Ipv4Addr::new(
-                    (segs[6] >> 8) as u8,
-                    segs[6] as u8,
-                    (segs[7] >> 8) as u8,
-                    segs[7] as u8,
-                );
-                return is_special_use_v4(mapped);
-            }
-            false
+            embedded_v4(segs).iter().any(|v4| is_special_use_v4(*v4))
         }
     }
+}
+
+/// The IPv4 addresses an IPv6 address carries and hands on to, for the forms
+/// that do: v4-mapped `::ffff:a.b.c.d`, v4-compatible `::a.b.c.d`, well-known
+/// NAT64 `64:ff9b::/96`, 6to4 `2002::/16`, and Teredo `2001::/32` (its server,
+/// and its client stored inverted). Each reaches the IPv4 address it names, so
+/// a private one inside is as private as the IPv4 itself.
+fn embedded_v4(segs: [u16; 8]) -> Vec<std::net::Ipv4Addr> {
+    let v4 = |hi: u16, lo: u16| {
+        std::net::Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8)
+    };
+    let mut out = Vec::new();
+    let mapped = segs[0..5] == [0, 0, 0, 0, 0] && segs[5] == 0xFFFF;
+    // `::` and `::1` are handled by the caller; anything else in `::/96` is
+    // the deprecated v4-compatible form.
+    let compatible = segs[0..6] == [0, 0, 0, 0, 0, 0];
+    let nat64 = segs[0..6] == [0x0064, 0xFF9B, 0, 0, 0, 0];
+    if mapped || compatible || nat64 {
+        out.push(v4(segs[6], segs[7]));
+    }
+    if segs[0] == 0x2002 {
+        out.push(v4(segs[1], segs[2]));
+    }
+    if segs[0] == 0x2001 && segs[1] == 0x0000 {
+        out.push(v4(segs[2], segs[3]));
+        out.push(v4(!segs[6], !segs[7]));
+    }
+    out
 }
 
 /// Maximum URL length accepted by [`validate_fetch_url`]. RFC 7230 doesn't
@@ -670,7 +710,18 @@ pub const MAX_FETCH_URL_LEN: usize = 2048;
 /// (the pin only proves *which* host you reached, not that the bytes
 /// weren't modified in flight). Users who paste a custom http:// URL
 /// into the IP filter import field get a clear "https only" error.
+#[cfg(test)]
 fn parse_fetch_url(url: &str) -> Result<(String, String, u16), String> {
+    parse_fetch_url_with(url, false)
+}
+
+/// [`parse_fetch_url`], also accepting `http://` when `allow_http` is set.
+///
+/// For ed2k web sources only: eMule's `s=` links are commonly plain HTTP, and
+/// what comes back is checked against the file's MD4 part hashes and AICH tree
+/// before it is used or shared, so a tampered byte is caught and re-fetched
+/// rather than trusted. Every other caller keeps HTTPS-only.
+pub fn parse_fetch_url_with(url: &str, allow_http: bool) -> Result<(String, String, u16), String> {
     let url = url.trim();
     if url.is_empty() {
         return Err("URL is empty".into());
@@ -696,8 +747,13 @@ fn parse_fetch_url(url: &str) -> Result<(String, String, u16), String> {
         return Err("URLs with userinfo (user:pass@host) are not allowed".into());
     }
     let parsed = reqwest::Url::parse(url).map_err(|error| format!("Invalid URL: {error}"))?;
-    if parsed.scheme() != "https" {
-        return Err("Only https:// URLs are allowed".into());
+    let scheme_ok = parsed.scheme() == "https" || (allow_http && parsed.scheme() == "http");
+    if !scheme_ok {
+        return Err(if allow_http {
+            "Only http:// and https:// URLs are allowed".into()
+        } else {
+            "Only https:// URLs are allowed".into()
+        });
     }
     // Belt and braces against any encoding the raw scan above does not model.
     if !parsed.username().is_empty() || parsed.password().is_some() {
@@ -722,11 +778,19 @@ fn parse_fetch_url(url: &str) -> Result<(String, String, u16), String> {
 pub async fn validate_fetch_url(
     url: &str,
 ) -> Result<(String, String, Vec<std::net::SocketAddr>), String> {
+    validate_fetch_url_with(url, false).await
+}
+
+/// [`validate_fetch_url`] with [`parse_fetch_url_with`]'s scheme rule.
+pub async fn validate_fetch_url_with(
+    url: &str,
+    allow_http: bool,
+) -> Result<(String, String, Vec<std::net::SocketAddr>), String> {
     // Parse once through `Url` so the normalized/punycode host is the exact
     // value used for DNS lookup, reqwest's resolver pin, and the final request.
     // Raw Unicode hostnames otherwise validate one key and connect under a
     // different IDNA key, bypassing DNS pinning.
-    let (normalized_url, host, url_port) = parse_fetch_url(url)?;
+    let (normalized_url, host, url_port) = parse_fetch_url_with(url, allow_http)?;
     if host == "localhost" {
         return Err("URLs pointing to private/loopback addresses are blocked".into());
     }
@@ -812,6 +876,30 @@ pub fn build_pinned_client(
         // and fast; anything over a minute is already failing.
         .timeout(std::time::Duration::from_secs(60))
         .connect_timeout(std::time::Duration::from_secs(15));
+    for addr in addrs {
+        builder = builder.resolve(host, *addr);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))
+}
+
+/// [`build_pinned_client`] for an ed2k web source: plain HTTP allowed (see
+/// [`parse_fetch_url_with`]), and no ceiling on the whole request — a range of
+/// a large file can take as long as the link is slow — but a read that stalls
+/// for `idle` ends it.
+pub fn build_pinned_web_source_client(
+    host: &str,
+    addrs: &[std::net::SocketAddr],
+    user_agent: &str,
+    idle: std::time::Duration,
+) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(idle)
+        .user_agent(user_agent);
     for addr in addrs {
         builder = builder.resolve(host, *addr);
     }
@@ -1882,14 +1970,18 @@ pub fn sanitize_remote_text(text: &str, max_chars: usize) -> String {
 /// friend-request handling must impose its own narrow bound before creating a
 /// display string, emitting an event, or writing a log/DB row.
 pub const MAX_INBOUND_FRIEND_NICKNAME_BYTES: usize = 256;
-pub const MAX_INBOUND_FRIEND_NICKNAME_CHARS: usize = 64;
+/// The one limit on a stored friend name, in characters, for names a request
+/// brings in and names the user types alike: accepting a request must never
+/// store a name the rename box would then refuse. `src/lib/friendSettings.ts`
+/// holds the same number.
+pub const MAX_FRIEND_NICKNAME_CHARS: usize = 64;
 
 /// Normalize a friend-request nickname supplied as decoded text.
 ///
 /// This keeps the request UI compatible with peers that send decorative
 /// Unicode while guaranteeing a compact, single-line display value.
 pub fn sanitize_inbound_friend_nickname(name: &str) -> String {
-    let cleaned = sanitize_remote_text(name, MAX_INBOUND_FRIEND_NICKNAME_CHARS);
+    let cleaned = sanitize_remote_text(name, MAX_FRIEND_NICKNAME_CHARS);
     if cleaned.is_empty() {
         "Anonymous".to_string()
     } else {
@@ -1997,6 +2089,16 @@ fn filter_message_text(text: &str, keep_joiners: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relayed_stand_ins_name_no_peer_address() {
+        for none in ["", "0.0.0.0", "0.0.0.7", "0.255.255.255", "::", "::ffff:0.0.0.7"] {
+            assert!(names_no_peer_address(none), "{none:?}");
+        }
+        for some in ["81.2.69.7", "10.0.0.1", "1.0.0.0", "2001:db8::1", "::ffff:81.2.69.7"] {
+            assert!(!names_no_peer_address(some), "{some:?}");
+        }
+    }
 
     #[test]
     fn path_within_dir_treats_a_drive_root_as_a_directory() {
@@ -2135,11 +2237,40 @@ mod tests {
         assert_eq!(sanitize_remote_text("a\u{0000}\nb\tc", 128), "abc");
     }
 
+    /// IPv6 forms that hand traffic on to an IPv4 address are as private as
+    /// that address, so a hostile DNS answer cannot reach a LAN or metadata
+    /// address through them.
+    #[test]
+    fn ipv6_forms_that_carry_a_private_ipv4_are_private() {
+        let private = |s: &str| is_private_ip(s.parse().unwrap());
+        for addr in [
+            "64:ff9b::a9fe:a9fe",   // NAT64 to 169.254.169.254
+            "64:ff9b::7f00:1",      // NAT64 to 127.0.0.1
+            "64:ff9b:1::1",         // local-use NAT64
+            "::a9fe:a9fe",          // v4-compatible
+            "::ffff:10.0.0.1",      // v4-mapped
+            "fec0::1",              // site-local
+            "2002:c0a8:0101::1",    // 6to4 of 192.168.1.1
+            "2001:0:7f00:1::1",     // Teredo server 127.0.0.1
+            "2001:0:5ef5:79fb::f5ff:fffe", // Teredo client 10.0.0.1, inverted
+        ] {
+            assert!(private(addr), "{addr}");
+        }
+        for addr in [
+            "2606:4700::1111",
+            "64:ff9b::808:808",          // NAT64 to 8.8.8.8
+            "2002:0808:0808::1",         // 6to4 of 8.8.8.8
+            "2001:0:5ef5:79fb::f7f7:f7f7", // Teredo client 8.8.8.8, inverted
+        ] {
+            assert!(!private(addr), "{addr}");
+        }
+    }
+
     #[test]
     fn inbound_friend_nickname_is_bounded_before_storage_or_logging() {
         let payload = vec![b'A'; MAX_INBOUND_FRIEND_NICKNAME_BYTES * 64];
         let nickname = normalize_inbound_friend_nickname(&payload);
-        assert_eq!(nickname.chars().count(), MAX_INBOUND_FRIEND_NICKNAME_CHARS);
+        assert_eq!(nickname.chars().count(), MAX_FRIEND_NICKNAME_CHARS);
         assert_eq!(
             normalize_inbound_friend_nickname(b"Al\xE2\x80\xAEice"),
             "Alice"
@@ -2150,10 +2281,7 @@ mod tests {
         split_multibyte.extend_from_slice("💬".as_bytes());
         let normalized = normalize_inbound_friend_nickname(&split_multibyte);
         assert_ne!(normalized, "Anonymous");
-        assert_eq!(
-            normalized.chars().count(),
-            MAX_INBOUND_FRIEND_NICKNAME_CHARS
-        );
+        assert_eq!(normalized.chars().count(), MAX_FRIEND_NICKNAME_CHARS);
     }
 
     #[test]

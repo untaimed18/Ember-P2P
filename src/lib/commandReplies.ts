@@ -22,13 +22,15 @@ export function countsIn(text: string, expected: number): number[] | null {
 
 /**
  * `download_server_met` replies "Downloaded server.met: A added, U updated,
- * F filtered, D dropped at capacity"; the counts are read in that order.
+ * F filtered, D dropped at capacity"; the counts are read in that order. A
+ * file that ended early adds "(the file was cut short)".
  */
 export function serverMetDownloadedText(reply: string): string {
   const counts = countsIn(reply, 4);
   if (!counts) return m.servers_met_updated();
   const [added, updated, filtered, dropped] = counts.map(formatNumber);
-  return m.servers_met_downloaded({ added, updated, filtered, dropped });
+  const text = m.servers_met_downloaded({ added, updated, filtered, dropped });
+  return reply.includes('cut short') ? `${text} ${m.servers_met_cut_short()}` : text;
 }
 
 /** `kad_bootstrap_url` replies "Loaded N contacts from nodes.dat". */

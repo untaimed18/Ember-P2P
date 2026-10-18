@@ -775,6 +775,26 @@ impl RoutingTable {
             .count()
     }
 
+    /// Verified contacts we can call connected at `now`: every verified bucket
+    /// contact, plus cached ones heard from within `CONTACT_TIMEOUT_SECS`.
+    ///
+    /// Not [`Self::verified_held`]. Bucket contacts are liveness-pinged and
+    /// evicted once they stop answering, but nothing pings the replacement
+    /// cache — a verified entry there is only purged after two hours of
+    /// silence — so counting all of it called a peer connected for up to two
+    /// hours after it left.
+    pub fn verified_connected(&self, now: i64) -> usize {
+        let recent_cached = self
+            .buckets
+            .iter()
+            .flat_map(|b| b.replacement_cache.iter())
+            .filter(|c| {
+                c.is_verified() && now.saturating_sub(c.last_seen) < super::CONTACT_TIMEOUT_SECS
+            })
+            .count();
+        self.verified_len() + recent_cached
+    }
+
     /// Add or update a contact. Returns what action the caller should take.
     pub fn add_contact(&mut self, contact: EmberContact) -> AddResult {
         if contact.node_id == self.local_id {
@@ -917,6 +937,9 @@ impl RoutingTable {
                     self.release_ip(evicted.addr.ip());
                     *self.global_subnet_count.entry(subnet).or_insert(0) += 1;
                     *self.global_ip_count.entry(ip).or_insert(0) += 1;
+                    // Outranked, not disproven: it waits for a slot like any
+                    // other contact a full bucket turned away.
+                    self.add_to_cache(bucket_idx, evicted, scale);
                     return AddResult::Added;
                 }
             }
@@ -1013,6 +1036,7 @@ impl RoutingTable {
                     evicted.node_id,
                     self.buckets[bucket_idx].contacts.back().unwrap().node_id
                 );
+                self.add_to_cache(bucket_idx, evicted, scale);
                 return AddResult::Added;
             }
         }
@@ -3582,10 +3606,63 @@ mod tests {
             matches!(rt.add_contact(live.clone()), AddResult::Added),
             "the lead at the newcomer's address can make room under the per-IP cap"
         );
-        assert!(rt.get_contact(&live.node_id).is_some());
-        assert!(rt.get_contact(&same_ip.node_id).is_none());
-        assert!(rt.get_contact(&same_subnet.node_id).is_some());
-        assert!(rt.get_contact(&other_subnet.node_id).is_some());
+        let bucket = &rt.buckets[local.bucket_index(&live.node_id).expect("a bucket")];
+        assert!(bucket.find(&live.node_id).is_some());
+        assert!(bucket.find(&same_ip.node_id).is_none(), "the lead at its address gives up the slot");
+        assert!(
+            bucket.find_in_cache(&same_ip.node_id).is_some(),
+            "and waits in the replacement cache rather than being forgotten"
+        );
+        assert!(bucket.find(&same_subnet.node_id).is_some());
+        assert!(bucket.find(&other_subnet.node_id).is_some());
+    }
+
+    /// Nothing pings the replacement cache, so a peer parked there that has
+    /// gone quiet is remembered but no longer counted as connected.
+    #[test]
+    fn a_quiet_cached_peer_is_not_counted_as_connected() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let mut id = 0x80u8;
+        while rt.total_contacts() < K_BUCKET_SIZE {
+            assert!(matches!(rt.add_contact(contact_at(id, 80, id, 1, 1)), AddResult::Added));
+            id += 1;
+        }
+        let now = chrono::Utc::now().timestamp();
+        let mut parked = contact_at(id, 81, id, 1, 1);
+        parked.last_seen = now - 2 * super::super::CONTACT_TIMEOUT_SECS;
+        rt.add_contact(parked.clone());
+        assert!(rt.buckets[local.bucket_index(&parked.node_id).unwrap()]
+            .find_in_cache(&parked.node_id)
+            .is_some());
+
+        assert_eq!(rt.verified_held(), K_BUCKET_SIZE + 1);
+        assert_eq!(rt.verified_connected(now), K_BUCKET_SIZE);
+    }
+
+    /// Both ways a verified newcomer takes a lead's slot keep the lead: it was
+    /// outranked, not shown to be dead.
+    #[test]
+    fn a_lead_a_verified_peer_displaces_from_a_full_bucket_is_cached() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let mut id = 0x80u8;
+        while rt.total_contacts() < K_BUCKET_SIZE {
+            let mut c = contact_at(id, 80, id, 1, 1);
+            c.last_seen = 0;
+            assert!(matches!(rt.add_contact(c), AddResult::Added));
+            id += 1;
+        }
+        let live = contact_at(id, 81, id, 1, 1);
+        assert!(matches!(rt.add_contact(live.clone()), AddResult::Added));
+
+        let bucket = &rt.buckets[local.bucket_index(&live.node_id).expect("a bucket")];
+        assert!(bucket.find(&live.node_id).is_some());
+        assert_eq!(bucket.contacts.len(), K_BUCKET_SIZE);
+        let displaced: Vec<_> = bucket.replacement_cache.iter().collect();
+        assert_eq!(displaced.len(), 1, "exactly the one lead that made room");
+        assert!(!displaced[0].is_verified());
+        assert!(bucket.find(&displaced[0].node_id).is_none());
     }
 
     /// A move we refuse must leave the entry alone. Pairing the old address

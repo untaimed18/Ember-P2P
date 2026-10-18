@@ -7,7 +7,8 @@ use tracing::info;
 const MIN_PREVIEW_SIZE: u64 = 16 * 1024;
 const COPY_BUFFER_SIZE: usize = 16 * 1024;
 
-/// Ceiling on how much of a `.part` is copied into the preview temp file.
+/// Ceiling on each verified run copied into the preview temp file (the head,
+/// and for [`TRAILING_INDEX_EXTENSIONS`] the tail).
 ///
 /// The contiguous MD4-verified run reaches the end of the file on a nearly
 /// complete download, and copying all of it duplicated multiple gigabytes into
@@ -16,6 +17,13 @@ const COPY_BUFFER_SIZE: usize = 16 * 1024;
 /// of playable media settles. Well above the first-256 KB window
 /// [`can_preview`] gates on, so the preview stays genuinely watchable.
 pub const PREVIEW_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Containers that normally keep the index a player needs before it can
+/// decode anything (the MP4 `moov` box) at the end of the file, addressed by
+/// absolute offsets into the media data. A head-only copy of one of these
+/// opens in the player and then shows nothing, which is why preview priority
+/// fetches the last part as well as the first.
+const TRAILING_INDEX_EXTENSIONS: &[&str] = &["mp4", "m4v", "mov", "m4a", "3gp"];
 static PREVIEW_TEMP: OnceLock<
     parking_lot::Mutex<Option<crate::security::filesystem::PinnedTempDir>>,
 > = OnceLock::new();
@@ -122,6 +130,101 @@ pub fn can_preview(
         .all(|&ok| ok)
 }
 
+/// The MD4-verified byte ranges a preview copies, in ascending order.
+///
+/// The contiguous verified run from the start of the file, and nothing past
+/// the first gap. Copying every verified part instead sized the preview to the
+/// last one and left the holes between as zeros: with preview priority
+/// fetching the first and last parts first, the player got a full-length file
+/// whose middle was silence, and read its duration off that.
+///
+/// [`TRAILING_INDEX_EXTENSIONS`] are the exception. They cannot play at all
+/// without their tail, and they read their duration from the index rather
+/// than the file length, so the contiguous verified run at the end of the
+/// file is copied too, at its real offset, leaving a hole in between.
+///
+/// Each run is bounded by [`PREVIEW_MAX_BYTES`]: on a nearly complete
+/// download the head run *is* the whole file.
+pub fn preview_ranges(
+    file_name: &str,
+    file_size: u64,
+    verified_parts: &[bool],
+    part_size: u64,
+) -> Vec<FilledRange> {
+    let mut ranges = Vec::new();
+    let leading = verified_parts.iter().take_while(|&&ok| ok).count() as u64;
+    let head_end = leading
+        .saturating_mul(part_size)
+        .min(file_size)
+        .min(PREVIEW_MAX_BYTES);
+    if head_end > 0 {
+        ranges.push(FilledRange {
+            start: 0,
+            end: head_end,
+        });
+    }
+
+    let ext = Path::new(file_name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if TRAILING_INDEX_EXTENSIONS.contains(&ext.as_str()) {
+        let trailing = verified_parts.iter().rev().take_while(|&&ok| ok).count();
+        if trailing > 0 {
+            let first_tail_part = (verified_parts.len() - trailing) as u64;
+            let tail_start = first_tail_part
+                .saturating_mul(part_size)
+                .max(file_size.saturating_sub(PREVIEW_MAX_BYTES))
+                .max(head_end);
+            if tail_start < file_size {
+                ranges.push(FilledRange {
+                    start: tail_start,
+                    end: file_size,
+                });
+            }
+        }
+    }
+    ranges
+}
+
+/// Ask the filesystem not to allocate the unwritten parts of `file`.
+///
+/// A preview with a tail is as long as the download, and NTFS fills every
+/// byte below a write with real zeros unless the file is sparse — which would
+/// put back the multi-gigabyte copy [`PREVIEW_MAX_BYTES`] exists to prevent.
+#[cfg(windows)]
+fn mark_sparse(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let mut returned: u32 = 0;
+    // SAFETY: `file` owns the handle for the duration of the call, and
+    // FSCTL_SET_SPARSE takes no input or output buffers.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle().cast(),
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Elsewhere the filesystem leaves a region past `set_len` unallocated on its own.
+#[cfg(not(windows))]
+fn mark_sparse(_file: &std::fs::File) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Create a temporary preview file by copying filled ranges.
 pub fn create_preview_file(
     part_file_path: &Path,
@@ -173,6 +276,23 @@ pub fn create_preview_file(
     let (preview_path, mut dst) = temp_dir.create_random_file(safe_stem, safe_ext)?;
 
     let mut src = std::fs::File::open(part_file_path)?;
+
+    let contiguous = verified_ranges
+        .iter()
+        .scan(0u64, |reached, range| {
+            (range.start == *reached).then(|| *reached = range.end)
+        })
+        .count();
+    let mut verified_ranges = verified_ranges;
+    if contiguous < verified_ranges.len() {
+        if let Err(error) = mark_sparse(&dst) {
+            tracing::warn!(
+                %error,
+                "the preview temp folder cannot hold sparse files; previewing the start of the file only"
+            );
+            verified_ranges = &verified_ranges[..contiguous];
+        }
+    }
 
     let last_end = verified_ranges.iter().map(|r| r.end).max().unwrap_or(0);
     dst.set_len(last_end)?;
@@ -443,6 +563,83 @@ mod tests {
         let preview =
             create_preview_file(&part, &[FilledRange { start: 0, end: 4 }], "movie.mp4").unwrap();
         assert_eq!(std::fs::read(&preview).unwrap(), b"GOOD");
+        let _ = std::fs::remove_file(preview);
+        let _ = std::fs::remove_file(part);
+    }
+
+    fn spans(ranges: &[FilledRange]) -> Vec<(u64, u64)> {
+        ranges.iter().map(|r| (r.start, r.end)).collect()
+    }
+
+    #[test]
+    fn a_preview_stops_at_the_first_gap() {
+        let size = 3 * 100 - 40;
+        assert_eq!(
+            spans(&preview_ranges("movie.mkv", size, &[true, false, true], 100)),
+            vec![(0, 100)]
+        );
+        assert_eq!(
+            spans(&preview_ranges("movie.mkv", size, &[true, true, true], 100)),
+            vec![(0, size)]
+        );
+    }
+
+    /// An MP4 whose `moov` is at the end opened as a blank window when only
+    /// the head was copied, though preview priority had already fetched the
+    /// last part.
+    #[test]
+    fn an_mp4_preview_keeps_its_verified_tail_at_its_real_offset() {
+        let size = 4 * 100 - 40;
+        assert_eq!(
+            spans(&preview_ranges("Movie.MP4", size, &[true, false, true, true], 100)),
+            vec![(0, 100), (200, size)]
+        );
+        assert_eq!(
+            spans(&preview_ranges("movie.mp4", size, &[true, false, false, false], 100)),
+            vec![(0, 100)],
+            "no verified tail yet"
+        );
+        assert_eq!(
+            spans(&preview_ranges("movie.mp4", size, &[true; 4], 100)),
+            vec![(0, size)],
+            "a complete run is not split in two"
+        );
+    }
+
+    #[test]
+    fn each_preview_run_is_capped() {
+        let part = 10 * 1024 * 1024;
+        let size = 100 * part;
+        let mut verified = vec![true; 100];
+        assert_eq!(
+            spans(&preview_ranges("movie.mkv", size, &verified, part)),
+            vec![(0, PREVIEW_MAX_BYTES)]
+        );
+        verified[50] = false;
+        assert_eq!(
+            spans(&preview_ranges("movie.mp4", size, &verified, part)),
+            vec![(0, PREVIEW_MAX_BYTES), (size - PREVIEW_MAX_BYTES, size)]
+        );
+    }
+
+    #[test]
+    fn a_preview_with_a_tail_leaves_the_gap_empty() {
+        let part = std::env::temp_dir().join(format!(
+            "ember-preview-tail-test-{}-{}.part",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(&part, b"HEADskipTAIL").unwrap();
+        let preview = create_preview_file(
+            &part,
+            &[
+                FilledRange { start: 0, end: 4 },
+                FilledRange { start: 8, end: 12 },
+            ],
+            "movie.mp4",
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&preview).unwrap(), b"HEAD\0\0\0\0TAIL");
         let _ = std::fs::remove_file(preview);
         let _ = std::fs::remove_file(part);
     }

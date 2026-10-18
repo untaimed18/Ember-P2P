@@ -6,7 +6,11 @@ use tracing::{debug, info};
 use super::messages::*;
 use super::types::*;
 
-/// eMule Defines.h SEARCHKEYWORD_TOTAL -- this is a RAW answer count (not unique).
+/// eMule Defines.h SEARCHKEYWORD_TOTAL -- a count of answers, not of unique
+/// files, and only of answers with a name and a size, as in
+/// `ProcessResultKeyword`. eMule also wants the looked-up keyword's words in
+/// the name; Ember wants the whole query there, which is stricter and can only
+/// make a search run longer, never stop it sooner.
 /// eMule calls PrepareToStop() at this threshold: no new queries are sent but
 /// late responses from already-queried nodes continue to be accepted.
 const KEYWORD_SEARCH_STOP_THRESHOLD: usize = 300;
@@ -21,16 +25,14 @@ pub const STORE_PUBLISH_TARGET_TOTAL: usize = 10;
 ///
 /// [`SearchType::FindSource`] sends `KADEMLIA2_SEARCH_SOURCE_REQ` (see
 /// `fetch_message`), which is eMule's `CSearch::FILE` — `Search.cpp:489-512`.
-/// This used to hold 20, which is `SEARCHFINDSOURCE_TOTAL`: the limit for
-/// `CSearch::FINDSOURCE`, a different search that sends `KADEMLIA_CALLBACK_REQ`
-/// (`Search.cpp:845-870`) to locate a firewalled peer's buddy. Ember has no
-/// equivalent of that one — it takes the buddy address straight from the source
-/// record — so the constant was simply the wrong one of the pair.
+/// It is not `SEARCHFINDSOURCE_TOTAL` (20): that limits `CSearch::FINDSOURCE`,
+/// a different search that sends `KADEMLIA_CALLBACK_REQ` (`Search.cpp:845-870`)
+/// to locate a firewalled peer's buddy, which Ember takes straight from the
+/// source record instead.
 ///
-/// At 20 a single well-stocked index node could satisfy the whole threshold with
-/// its first response page, so a source lookup stopped querying almost
-/// immediately and found a fraction of the sources eMule would for the same
-/// popular file.
+/// A limit of 20 would be met by one well-stocked index node's first page, so
+/// a source lookup would stop querying almost at once and find a fraction of
+/// the sources eMule does for the same popular file.
 const SOURCE_SEARCH_STOP_THRESHOLD: usize = 300;
 const NOTES_SEARCH_STOP_THRESHOLD: usize = 50;
 /// Raw entries one search will hold before it stops accepting more.
@@ -66,6 +68,12 @@ const TIMEOUT_STORE_NOTES: i64 = 100; // SEARCHSTORENOTES_LIFETIME
 const TIMEOUT_FIND_BUDDY: i64 = 100; // SEARCHFINDBUDDY_LIFETIME
 /// Grace period after entering fetch phase for late results (eMule PrepareToStop gives 15s)
 const FETCH_TIMEOUT_SECS: i64 = 15;
+/// A responder splits one answer over many datagrams sent back to back. A
+/// search that has nothing else to wait for (its answer quota reached during
+/// lookup, or every fetch request answered) waits this long after the last
+/// one before it completes, so the rest of an answer already on the wire
+/// counts and a full page can still be followed by a request for the next.
+const RESULT_QUOTA_SETTLE_SECS: i64 = 2;
 /// eMule deletes a "stopping" search ~15s after `PrepareToStop()` (Search.cpp
 /// back-dates `m_tCreated` to `now - LIFETIME + SEC(15)`) and runs the prune
 /// every second via `CSearchManager::JumpStart()`. We mirror that: once a
@@ -159,6 +167,17 @@ pub struct SearchState {
     /// Prevents new queries from being sent but keeps the search alive
     /// so that late responses from already-queried nodes are still accepted.
     stop_querying: bool,
+    /// When the answer count first reached the search type's answer quota
+    /// (eMule `SEARCHKEYWORD_TOTAL` and friends).
+    result_quota_reached_at: Option<i64>,
+    /// The user's query for a keyword search. Answers whose name does not hold
+    /// it are kept in `results` but do not count toward the answer quota.
+    pub answer_filter: Option<crate::search::query::QueryExpr>,
+    /// Keyword answers in `results` that eMule would count
+    /// (`kad_search::is_usable_keyword_answer`).
+    usable_results: usize,
+    /// When the last `SearchRes` datagram for this search arrived.
+    last_result_at: Option<i64>,
     /// Set when entering fetch phase; used for fetch-specific timeout.
     fetch_started_at: Option<i64>,
     /// Tracks how many lookup rounds returned no closer contacts.
@@ -211,6 +230,20 @@ pub struct SearchState {
     /// `pending` (which tracks routing KadReq queries) to avoid breaking convergence.
     pub store_pending: HashSet<KadId>,
     store_pending_times: HashMap<KadId, i64>,
+    /// Contacts whose keyword/source/notes request already timed out once and
+    /// was offered again. A second timeout writes the contact off.
+    store_retried: HashSet<KadId>,
+    /// Keyword/source/notes requests handed out per contact, less those that
+    /// never left the socket. Only these contacts may answer with `SearchRes`.
+    search_requests_out: HashMap<KadId, u32>,
+    /// Address each sent keyword/source/notes request went to, and the
+    /// contact it was for. Unlike `tried`, a later routing request to the
+    /// same address under another id does not replace the entry.
+    search_request_addrs: HashMap<(Ipv4Addr, u16), KadId>,
+    /// Entry ids each contact has answered with in this search. A responder
+    /// lists an entry once per answer, so a repeat is the same page arriving
+    /// again (a late answer to a request that was retried) and is not counted.
+    answered_entries: HashMap<KadId, HashSet<KadId>>,
     /// Publish candidates the outbound governor held back. Left out of
     /// `next_publish_candidates` so they do not fill every batch while their
     /// budget refills; the completion pass still tries them once.
@@ -265,6 +298,10 @@ impl SearchState {
             completed: false,
             completed_at: None,
             stop_querying: false,
+            result_quota_reached_at: None,
+            answer_filter: None,
+            usable_results: 0,
+            last_result_at: None,
             fetch_started_at: None,
             lookup_stale_rounds: 0,
             responded_during_lookup: HashSet::new(),
@@ -280,6 +317,10 @@ impl SearchState {
             store_sent: HashSet::new(),
             store_pending: HashSet::new(),
             store_pending_times: HashMap::new(),
+            store_retried: HashSet::new(),
+            search_requests_out: HashMap::new(),
+            search_request_addrs: HashMap::new(),
+            answered_entries: HashMap::new(),
             publish_deferred: HashSet::new(),
             find_buddy_sent: HashSet::new(),
             store_acks_received: 0,
@@ -451,14 +492,57 @@ impl SearchState {
             }
         }
 
+        let fetching =
+            self.phase == SearchPhase::Fetch && self.search_type.accepts_search_results();
         for c in &batch {
             self.pending.insert(c.id);
             self.pending_times.insert(c.id, now);
             if self.phase == SearchPhase::Fetch {
                 self.fetched.insert(c.id);
             }
+            if fetching {
+                *self.search_requests_out.entry(c.id).or_insert(0) += 1;
+            }
         }
         batch
+    }
+
+    fn release_search_request(&mut self, contact_id: &KadId) {
+        if let Some(out) = self.search_requests_out.get_mut(contact_id) {
+            *out -= 1;
+            if *out == 0 {
+                self.search_requests_out.remove(contact_id);
+            }
+        }
+    }
+
+    /// The contact a `SearchRes` arriving from `from` answers for, if this
+    /// search sent it a keyword/source/notes request. A reply from an address
+    /// it never sent anything to may come from a contact at the same IP behind
+    /// a NAT that rewrote the port; `claimed` (the sender id in the packet)
+    /// picks among several.
+    pub fn search_result_sender(&self, from: SocketAddr, claimed: &KadId) -> Option<KadId> {
+        let std::net::IpAddr::V4(ip) = from.ip() else {
+            return None;
+        };
+        let asked = |id: &KadId| self.search_requests_out.contains_key(id);
+        if let Some(id) = self.search_request_addrs.get(&(ip, from.port())) {
+            return asked(id).then_some(*id);
+        }
+        if self.tried.contains_key(&(ip, from.port())) {
+            return None;
+        }
+        let same_ip: Vec<KadId> = self
+            .search_request_addrs
+            .iter()
+            .filter(|((tip, _), id)| *tip == ip && asked(id))
+            .map(|(_, id)| *id)
+            .collect();
+        same_ip
+            .iter()
+            .find(|id| *id == claimed)
+            .or(same_ip.first())
+            .copied()
     }
 
     /// eMule `CSearch::ProcessResponse` immediate dispatch (`SendFindValue`):
@@ -515,6 +599,7 @@ impl SearchState {
             KadMessage::SearchKeyReq { .. }
             | KadMessage::SearchSourceReq { .. }
             | KadMessage::SearchNotesReq { .. } => {
+                self.release_search_request(&contact_id);
                 self.fetched.remove(&contact_id);
                 self.store_sent.remove(&contact_id);
                 self.store_pending.remove(&contact_id);
@@ -553,6 +638,7 @@ impl SearchState {
             | KadMessage::SearchNotesReq { .. } => {
                 // Both reservations stay, so neither Fetch nor JumpStart picks
                 // the contact again; only the wait for its answer goes.
+                self.release_search_request(&contact_id);
                 self.fetched.insert(contact_id);
                 self.store_sent.insert(contact_id);
                 self.store_pending.remove(&contact_id);
@@ -577,6 +663,9 @@ impl SearchState {
     pub fn commit_query_sent(&mut self, contact_id: KadId, addr: SocketAddr) {
         if let std::net::IpAddr::V4(ip) = addr.ip() {
             self.tried.insert((ip, addr.port()), contact_id);
+            if self.search_requests_out.contains_key(&contact_id) {
+                self.search_request_addrs.insert((ip, addr.port()), contact_id);
+            }
         }
     }
 
@@ -616,6 +705,7 @@ impl SearchState {
             self.fetched.insert(c.id);
             self.store_pending.insert(c.id);
             self.store_pending_times.insert(c.id, now);
+            *self.search_requests_out.entry(c.id).or_insert(0) += 1;
             let msg = self.build_fetch_message_for(&c);
             result.push((c, msg));
         }
@@ -812,11 +902,27 @@ impl SearchState {
         self.pending_times.remove(from);
         self.store_pending.remove(from);
         self.store_pending_times.remove(from);
+        self.last_result_at = Some(chrono::Utc::now().timestamp());
 
-        let count = entries.len();
+        let mut count = 0usize;
         let before = self.results.len();
+        let keyword = matches!(self.search_type, SearchType::FindKeyword);
+        let answered = self.answered_entries.entry(*from).or_default();
         for entry in entries {
+            if answered.contains(&entry.id) {
+                continue;
+            }
+            count += 1;
             if self.results.len() < MAX_SEARCH_RESULT_ENTRIES {
+                if keyword
+                    && crate::network::kad_search::is_usable_keyword_answer(
+                        &entry,
+                        self.answer_filter.as_ref(),
+                    )
+                {
+                    self.usable_results += 1;
+                }
+                answered.insert(entry.id);
                 self.results.push(entry);
             }
         }
@@ -905,13 +1011,15 @@ impl SearchState {
         for id in &store_timed_out {
             self.store_pending.remove(id);
             self.store_pending_times.remove(id);
-            // Unlike routing timeouts (`handle_timeout`), a StorePacket /
-            // Search*Req timeout must not permanently consume the contact.
-            // Leaving `store_sent`/`fetched` set blocked `next_store_queries`
-            // and made Fetch treat the peer as done, so slow nodes never got
-            // another keyword/source/notes page.
-            self.store_sent.remove(id);
-            self.fetched.remove(id);
+            // Unlike routing timeouts (`handle_timeout`), a first StorePacket /
+            // Search*Req timeout does not consume the contact: clearing
+            // `store_sent`/`fetched` lets a slow node be asked again for its
+            // keyword/source/notes page. Only once, so a node that is gone does
+            // not hold the search open with a request every timeout.
+            if self.store_retried.insert(*id) {
+                self.store_sent.remove(id);
+                self.fetched.remove(id);
+            }
             self.check_completion();
         }
         timed_out
@@ -948,36 +1056,68 @@ impl SearchState {
         }
     }
 
-    /// eMule checks `GetAnswers() >= SEARCHKEYWORD_TOTAL` which counts raw
+    /// eMule checks `GetAnswers() >= SEARCHKEYWORD_TOTAL` which counts
     /// individual results (including duplicates from different nodes).  When
     /// the threshold is reached eMule calls PrepareToStop(): new queries stop
     /// but late responses from already-queried nodes keep flowing in.
     fn should_stop_querying(&self) -> bool {
-        let threshold_reached = match self.search_type {
-            SearchType::FindKeyword => self.results.len() >= KEYWORD_SEARCH_STOP_THRESHOLD,
-            SearchType::FindSource { .. } => self.results.len() >= SOURCE_SEARCH_STOP_THRESHOLD,
-            SearchType::FindNotes { .. } => self.results.len() >= NOTES_SEARCH_STOP_THRESHOLD,
-            SearchType::FindBuddy => self.find_buddy_sent.len() >= FIND_BUDDY_REQUEST_TOTAL,
-            _ => false,
-        };
+        let threshold_reached = self.result_quota_reached()
+            || (matches!(self.search_type, SearchType::FindBuddy)
+                && self.find_buddy_sent.len() >= FIND_BUDDY_REQUEST_TOTAL);
         // Stop early enough that a query we send can still be answered before
         // the search expires — and no earlier. The margin is one
         // `PENDING_TIMEOUT_SECS`, which is exactly how long a sent query is
         // given before `expire_pending` writes it off, so the last query this
-        // allows is the last one whose answer can still count.
-        //
-        // It was a flat 20 seconds, the only number in this file with no eMule
-        // citation behind it and twice the margin the timeout actually needs. On
-        // a 45-second keyword search that ended querying at 25 seconds and left
-        // the remaining twenty listening to nodes it had already asked: nearly
-        // half the walk spent unable to reach anyone new, on every keyword,
-        // source and notes lookup alike.
+        // allows is the last one whose answer can still count. A wider margin
+        // leaves the end of every keyword, source and notes walk listening to
+        // nodes it already asked instead of reaching new ones.
         let now = chrono::Utc::now().timestamp();
         let early_lifetime_stop = (self.search_type.accepts_search_results()
             || matches!(self.search_type, SearchType::FindBuddy))
             && now.saturating_sub(self.started_at)
                 >= self.lifetime_secs().saturating_sub(PENDING_TIMEOUT_SECS);
         threshold_reached || early_lifetime_stop
+    }
+
+    /// The answer quota, or the storage cap: past it nothing more is kept, so
+    /// asking further nodes can only spend their bandwidth.
+    fn result_quota_reached(&self) -> bool {
+        if self.search_type.accepts_search_results()
+            && self.results.len() >= MAX_SEARCH_RESULT_ENTRIES
+        {
+            return true;
+        }
+        match self.search_type {
+            SearchType::FindKeyword => self.usable_results >= KEYWORD_SEARCH_STOP_THRESHOLD,
+            SearchType::FindSource { .. } => self.results.len() >= SOURCE_SEARCH_STOP_THRESHOLD,
+            SearchType::FindNotes { .. } => self.results.len() >= NOTES_SEARCH_STOP_THRESHOLD,
+            _ => false,
+        }
+    }
+
+    /// eMule `PrepareToStop` at the answer quota: a lookup that reached it
+    /// sends nothing more, so it is done once the result requests it already
+    /// sent have answered, and at the latest one stop grace after the quota.
+    /// Routing requests still in flight can only bring contacts it will no
+    /// longer ask.
+    fn quota_lookup_settled(&self) -> bool {
+        let Some(reached_at) = self.result_quota_reached_at else {
+            return false;
+        };
+        let now = chrono::Utc::now().timestamp();
+        let within = |since: i64, secs: i64| (0..secs).contains(&(now - since));
+        if !within(reached_at, FETCH_TIMEOUT_SECS) {
+            return true;
+        }
+        self.store_pending.is_empty() && !self.answer_still_arriving()
+    }
+
+    /// A `SearchRes` datagram landed within the last
+    /// `RESULT_QUOTA_SETTLE_SECS`, so more of that answer may be on the wire.
+    fn answer_still_arriving(&self) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        self.last_result_at
+            .is_some_and(|t| (0..RESULT_QUOTA_SETTLE_SECS).contains(&(now - t)))
     }
 
     pub fn find_buddy_requests_sent(&self) -> usize {
@@ -1020,7 +1160,7 @@ impl SearchState {
     }
 
     fn check_phase_transition(&mut self) {
-        if self.phase != SearchPhase::Lookup {
+        if self.phase != SearchPhase::Lookup || self.result_quota_reached_at.is_some() {
             return;
         }
         if matches!(
@@ -1124,15 +1264,27 @@ impl SearchState {
     }
 
     fn check_completion(&mut self) {
-        // eMule PrepareToStop: stop sending queries once we have enough raw
-        // results, but keep the search alive to receive late responses.
+        // eMule PrepareToStop: stop sending queries once we have enough
+        // answers, but keep the search alive to receive late responses.
+        if self.result_quota_reached_at.is_none() && self.result_quota_reached() {
+            self.result_quota_reached_at = Some(chrono::Utc::now().timestamp());
+        }
         if !self.stop_querying && self.should_stop_querying() {
             self.stop_querying = true;
         }
 
         match self.phase {
             SearchPhase::Lookup => {
-                if matches!(
+                if self.search_type.accepts_search_results() {
+                    if !self.completed && self.quota_lookup_settled() {
+                        info!(
+                            "Search {}: answer quota reached during lookup ({} raw results), ending",
+                            self.id.0,
+                            self.results.len()
+                        );
+                        self.mark_completed();
+                    }
+                } else if matches!(
                     self.search_type,
                     SearchType::FindNode | SearchType::FindBuddy
                 ) {
@@ -1175,8 +1327,14 @@ impl SearchState {
                 {
                     return;
                 }
-                // Wait for both routing query and store query responses
-                if self.pending.is_empty() && self.store_pending.is_empty() {
+                // Wait for both routing query and store query responses, and
+                // for the rest of an answer: it spans many datagrams, and the
+                // first one is what takes its contact off `store_pending`.
+                // The poll tick re-checks every second, so the settle ends it.
+                if self.pending.is_empty()
+                    && self.store_pending.is_empty()
+                    && !self.answer_still_arriving()
+                {
                     let has_unfetched = !self.stop_querying
                         && self
                             .closest
@@ -1498,6 +1656,24 @@ impl SearchManager {
         self.active.values().filter(|s| !s.completed).count()
     }
 
+    /// Searches a `SearchRes` for `target` from `from` answers, each with the
+    /// contact it is credited to (see [`SearchState::search_result_sender`]).
+    /// Completed searches still take answers until the poll tick finalizes
+    /// them: a node answers in several datagrams, and the first one from the
+    /// last pending node is what completes the search.
+    pub fn search_result_recipients(
+        &self,
+        target: &KadId,
+        from: SocketAddr,
+        claimed: &KadId,
+    ) -> Vec<(SearchId, KadId)> {
+        self.active
+            .iter()
+            .filter(|(_, s)| s.target == *target && s.search_type.accepts_search_results())
+            .filter_map(|(id, s)| Some((*id, s.search_result_sender(from, claimed)?)))
+            .collect()
+    }
+
     pub fn poll_queries(&mut self) -> Vec<(SearchId, SocketAddr, KadMessage, KadId)> {
         let mut queries = Vec::new();
         let search_ids: Vec<SearchId> = self.active.keys().cloned().collect();
@@ -1523,14 +1699,18 @@ impl SearchManager {
             // eMule's total search lifetime is 45s for keyword searches. Force
             // transition to fetch late enough to allow slower lookups, while still
             // leaving room for fetch responses before overall expiry.
+            // A lookup that already reached its answer quota sends nothing in
+            // Fetch either; `check_completion` ends it from Lookup instead.
             let elapsed = chrono::Utc::now().timestamp() - state.started_at;
-            if should_force_fetch_after_lookup(
-                state.phase,
-                state.search_type,
-                elapsed,
-                state.queried.len(),
-                state.responded_during_lookup.len(),
-            ) {
+            if state.result_quota_reached_at.is_none()
+                && should_force_fetch_after_lookup(
+                    state.phase,
+                    state.search_type,
+                    elapsed,
+                    state.queried.len(),
+                    state.responded_during_lookup.len(),
+                )
+            {
                 info!(
                     "Search {}: forcing transition to fetch after {}s in lookup (queried={}, verified={})",
                     sid.0, elapsed, state.queried.len(), state.responded_during_lookup.len()
@@ -1538,6 +1718,9 @@ impl SearchManager {
                 state.phase = SearchPhase::Fetch;
                 state.settle_in_flight_routing_queries();
                 state.fetch_started_at = Some(chrono::Utc::now().timestamp());
+                state.check_completion();
+            } else if state.result_quota_reached_at.is_some() || state.phase == SearchPhase::Fetch {
+                state.check_completion();
             }
 
             // eMule `JumpStart`: `m_mapPossible.empty()` -> `PrepareToStop()`
@@ -1765,10 +1948,10 @@ mod tests {
     fn keyword_paging_advances_by_a_whole_emule_answer() {
         let mut state = SearchState::new(SearchId(1), kad_id(1), SearchType::FindKeyword);
         let peer = contact(kad_id(2), 2);
-        let batch = |n: u8| {
+        let batch = |n: usize| {
             (0..20)
                 .map(|i| SearchResultEntry {
-                    id: KadId([n.wrapping_mul(20).wrapping_add(i); KAD_ID_SIZE]),
+                    id: entry_id(n * 20 + i),
                     tags: Vec::new(),
                 })
                 .collect::<Vec<_>>()
@@ -1789,6 +1972,190 @@ mod tests {
         assert_eq!(
             requested_start_position(&state, &peer),
             SEARCH_RESULT_PAGE_SIZE as u16
+        );
+    }
+
+    fn entry_id(i: usize) -> KadId {
+        let mut id = [0xEE; KAD_ID_SIZE];
+        id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        KadId(id)
+    }
+
+    fn named_entry(i: usize, name: &str, size: u32) -> SearchResultEntry {
+        SearchResultEntry {
+            id: entry_id(i),
+            tags: vec![
+                KadTag {
+                    name: TagName::Id(TAG_FILENAME),
+                    value: TagValue::String(name.to_string()),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_FILESIZE),
+                    value: TagValue::Uint32(size),
+                },
+            ],
+        }
+    }
+
+    fn result_entries(count: usize) -> Vec<SearchResultEntry> {
+        (0..count)
+            .map(|i| named_entry(i, &format!("holiday clip {i}.avi"), 4096))
+            .collect()
+    }
+
+    fn bare_entries(count: usize) -> Vec<SearchResultEntry> {
+        (0..count)
+            .map(|i| SearchResultEntry {
+                id: entry_id(i),
+                tags: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// eMule `ProcessResultKeyword` drops an answer without a name or a size,
+    /// or whose name lacks the search words, before `m_uAnswers` counts it.
+    #[test]
+    fn only_answers_emule_would_keep_count_toward_the_keyword_quota() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
+        state.answer_filter = crate::search::query::parse("holiday");
+        let junk: Vec<SearchResultEntry> = (0..KEYWORD_SEARCH_STOP_THRESHOLD)
+            .map(|i| match i % 3 {
+                0 => named_entry(i, "unrelated.avi", 4096),
+                1 => named_entry(i, "holiday clip.avi", 0),
+                _ => SearchResultEntry {
+                    id: entry_id(i),
+                    tags: Vec::new(),
+                },
+            })
+            .collect();
+        state.handle_search_results(&kad_id(2), junk);
+        assert_eq!(state.results.len(), KEYWORD_SEARCH_STOP_THRESHOLD);
+        assert!(!state.stop_querying, "none of these is an answer eMule counts");
+        assert!(state.result_quota_reached_at.is_none());
+
+        state.handle_search_results(&kad_id(3), result_entries(KEYWORD_SEARCH_STOP_THRESHOLD));
+        assert!(state.stop_querying);
+    }
+
+    #[test]
+    fn source_answers_count_toward_their_quota_without_a_name() {
+        let mut state = SearchState::new(
+            SearchId(1),
+            near_kad_id(0),
+            SearchType::FindSource { file_size: 1 },
+        );
+        state.handle_search_results(&kad_id(2), bare_entries(SOURCE_SEARCH_STOP_THRESHOLD));
+        assert!(state.stop_querying);
+    }
+
+    /// A popular keyword fills eMule's `SEARCHKEYWORD_TOTAL` from answers sent
+    /// during the walk; once those answers have landed there is nothing left
+    /// to wait for, routing replies still in flight or not.
+    #[test]
+    fn a_lookup_at_the_answer_quota_completes_once_its_answers_settle() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
+        let peer = contact(near_kad_id(1), 1);
+        let router = contact(near_kad_id(2), 2);
+        let now = chrono::Utc::now().timestamp();
+        state.closest = vec![peer.clone(), router.clone()];
+        state.responded_during_lookup.insert(peer.id);
+        state.pending.insert(router.id);
+        state.pending_times.insert(router.id, now);
+
+        state.handle_search_results(&peer.id, result_entries(KEYWORD_SEARCH_STOP_THRESHOLD));
+        assert!(state.stop_querying);
+        assert_eq!(state.phase, SearchPhase::Lookup);
+        assert!(
+            !state.completed,
+            "the rest of a fragmented answer may still be arriving"
+        );
+
+        state.last_result_at = Some(now - RESULT_QUOTA_SETTLE_SECS);
+        state.check_completion();
+        assert!(state.completed);
+        assert_eq!(state.phase, SearchPhase::Lookup);
+    }
+
+    #[test]
+    fn a_lookup_at_the_answer_quota_waits_for_sent_result_requests_up_to_the_stop_grace() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
+        let answered = kad_id(2);
+        let asked = kad_id(3);
+        let now = chrono::Utc::now().timestamp();
+        state.store_pending.insert(asked);
+        state.store_pending_times.insert(asked, now);
+
+        state.handle_search_results(&answered, result_entries(KEYWORD_SEARCH_STOP_THRESHOLD));
+        state.last_result_at = Some(now - RESULT_QUOTA_SETTLE_SECS);
+        state.check_completion();
+        assert!(!state.completed, "a sent SearchKeyReq has not answered yet");
+
+        state.result_quota_reached_at = Some(now - FETCH_TIMEOUT_SECS);
+        state.check_completion();
+        assert!(state.completed);
+    }
+
+    #[test]
+    fn a_lookup_short_of_the_answer_quota_keeps_its_lifetime() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
+        state.handle_search_results(
+            &kad_id(2),
+            result_entries(KEYWORD_SEARCH_STOP_THRESHOLD - 1),
+        );
+        state.last_result_at = Some(chrono::Utc::now().timestamp() - FETCH_TIMEOUT_SECS);
+        state.check_completion();
+        assert!(!state.stop_querying);
+        assert!(state.result_quota_reached_at.is_none());
+        assert!(!state.completed);
+    }
+
+    /// Nothing else calls back into a search whose requests have all
+    /// answered, so the poll tick has to be what ends it.
+    #[test]
+    fn the_poll_tick_ends_a_settled_quota_lookup() {
+        let mut manager = SearchManager::new();
+        let peer = contact(near_kad_id(1), 1);
+        let (sid, ..) =
+            manager.start_search(near_kad_id(0), SearchType::FindKeyword, vec![peer.clone()]);
+        let search = manager.get_mut(&sid).unwrap();
+        search.handle_search_results(&peer.id, result_entries(KEYWORD_SEARCH_STOP_THRESHOLD));
+
+        assert!(manager.poll_queries().is_empty());
+        assert!(!manager.get(&sid).unwrap().completed);
+
+        let search = manager.get_mut(&sid).unwrap();
+        search.last_result_at = Some(chrono::Utc::now().timestamp() - RESULT_QUOTA_SETTLE_SECS);
+        assert!(manager.poll_queries().is_empty());
+        let search = manager.get(&sid).unwrap();
+        assert!(search.completed);
+        assert_eq!(
+            search.phase,
+            SearchPhase::Lookup,
+            "no pointless switch to Fetch"
+        );
+    }
+
+    #[test]
+    fn a_forced_switch_to_fetch_with_nothing_left_completes_on_that_tick() {
+        let mut manager = SearchManager::new();
+        let peer = contact(near_kad_id(1), 1);
+        let (sid, ..) =
+            manager.start_search(near_kad_id(0), SearchType::FindKeyword, vec![peer.clone()]);
+        let search = manager.get_mut(&sid).unwrap();
+        search.started_at = chrono::Utc::now().timestamp() - LOOKUP_FORCE_FETCH_SECS;
+        search.queried.extend([peer.id, kad_id(0x51), kad_id(0x52)]);
+        search.responded_during_lookup.insert(peer.id);
+        search.store_sent.insert(peer.id);
+        search.handle_search_results(&peer.id, result_entries(20));
+        assert!(!search.completed);
+        search.last_result_at = Some(chrono::Utc::now().timestamp() - RESULT_QUOTA_SETTLE_SECS);
+
+        manager.poll_queries();
+        let search = manager.get(&sid).unwrap();
+        assert_eq!(search.phase, SearchPhase::Fetch);
+        assert!(
+            search.completed,
+            "every fetch candidate already answered during lookup"
         );
     }
 
@@ -1830,6 +2197,276 @@ mod tests {
         assert!(!state.store_pending.contains(&peer));
         assert!(!state.store_sent.contains(&peer));
         assert!(!state.fetched.contains(&peer));
+    }
+
+    #[test]
+    fn a_result_request_that_times_out_twice_is_not_sent_a_third_time() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
+        let peer = contact(near_kad_id(1), 1);
+        state.closest = vec![peer.clone()];
+        state.responded_during_lookup.insert(peer.id);
+        let time_out = |state: &mut SearchState| {
+            let sent_at = chrono::Utc::now().timestamp() - PENDING_TIMEOUT_SECS;
+            state.store_pending_times.insert(peer.id, sent_at);
+            state.expire_pending();
+        };
+
+        assert_eq!(state.next_store_queries().len(), 1);
+        time_out(&mut state);
+        assert_eq!(state.next_store_queries().len(), 1, "one retry");
+        time_out(&mut state);
+        assert!(state.next_store_queries().is_empty());
+
+        state.phase = SearchPhase::Fetch;
+        assert!(
+            state.next_to_query().is_empty(),
+            "Fetch does not ask it again either"
+        );
+        assert!(state.store_pending.is_empty());
+    }
+
+    fn addr_of(c: &KadContact) -> SocketAddr {
+        SocketAddr::new(c.ip.into(), c.udp_port)
+    }
+
+    /// eMule takes a `SearchRes` only from an address it sent a search
+    /// request to (`IsOnOutTrackList`). A routing `KadReq` is not one.
+    #[test]
+    fn search_results_are_taken_only_from_contacts_sent_a_search_request() {
+        let mut manager = SearchManager::new();
+        let target = near_kad_id(0);
+        let asked = contact(near_kad_id(1), 1);
+        let routed = contact(near_kad_id(2), 2);
+        let (sid, ..) = manager.start_search(
+            target,
+            SearchType::FindKeyword,
+            vec![asked.clone(), routed.clone()],
+        );
+        let search = manager.get_mut(&sid).unwrap();
+        for c in [&asked, &routed] {
+            search.commit_query_sent(c.id, addr_of(c));
+        }
+        search.closest.retain(|c| c.id == asked.id);
+        search.responded_during_lookup.insert(asked.id);
+        let (to, msg) = search.next_store_queries().remove(0);
+        assert_eq!(to.id, asked.id);
+        assert!(matches!(msg, KadMessage::SearchKeyReq { .. }));
+        search.commit_query_sent(asked.id, addr_of(&asked));
+
+        assert_eq!(
+            manager.search_result_recipients(&target, addr_of(&asked), &asked.id),
+            vec![(sid, asked.id)]
+        );
+        assert!(
+            manager
+                .search_result_recipients(&target, addr_of(&routed), &routed.id)
+                .is_empty(),
+            "only ever sent a routing request"
+        );
+        assert!(manager
+            .search_result_recipients(&near_kad_id(9), addr_of(&asked), &asked.id)
+            .is_empty());
+        let stranger = SocketAddr::new(Ipv4Addr::new(198, 51, 100, 1).into(), 4672);
+        assert!(manager
+            .search_result_recipients(&target, stranger, &asked.id)
+            .is_empty());
+    }
+
+    #[test]
+    fn a_nat_rewritten_port_is_credited_only_to_an_asked_contact_at_that_ip() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
+        let asked = contact(near_kad_id(1), 1);
+        let mut routed = contact(near_kad_id(2), 1);
+        routed.udp_port += 100;
+        state.commit_query_sent(asked.id, addr_of(&asked));
+        state.commit_query_sent(routed.id, addr_of(&routed));
+        state.closest = vec![asked.clone()];
+        state.responded_during_lookup.insert(asked.id);
+        state.next_store_queries();
+        state.commit_query_sent(asked.id, addr_of(&asked));
+
+        let rewritten = SocketAddr::new(asked.ip.into(), asked.udp_port + 7);
+        assert_eq!(
+            state.search_result_sender(rewritten, &routed.id),
+            Some(asked.id)
+        );
+        assert_eq!(
+            state.search_result_sender(addr_of(&routed), &routed.id),
+            None,
+            "a known address that was never asked is not a NAT rewrite"
+        );
+    }
+
+    /// A contact that only ever had a routing request sent, plus a search
+    /// request that was reserved and rolled back before the send.
+    #[test]
+    fn a_search_request_that_never_left_the_socket_does_not_admit_answers() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
+        let peer = contact(near_kad_id(1), 1);
+        state.commit_query_sent(peer.id, addr_of(&peer));
+        state.closest = vec![peer.clone()];
+        state.responded_during_lookup.insert(peer.id);
+        let (_, msg) = state.next_store_queries().remove(0);
+        state.rollback_unsent_query(peer.id, &msg);
+        assert_eq!(state.search_result_sender(addr_of(&peer), &peer.id), None);
+
+        let (_, msg) = state.next_store_queries().remove(0);
+        state.commit_query_sent(peer.id, addr_of(&peer));
+        assert!(matches!(msg, KadMessage::SearchKeyReq { .. }));
+        assert_eq!(state.search_result_sender(addr_of(&peer), &peer.id), Some(peer.id));
+    }
+
+    #[test]
+    fn a_failed_page_two_send_keeps_the_sent_first_page_answerable() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
+        let peer = contact(near_kad_id(1), 1);
+        state.closest = vec![peer.clone()];
+        state.responded_during_lookup.insert(peer.id);
+        state.next_store_queries();
+        state.commit_query_sent(peer.id, addr_of(&peer));
+
+        state.handle_search_results(&peer.id, bare_entries(SEARCH_RESULT_PAGE_SIZE));
+        let (_, page_two) = state.next_store_queries().remove(0);
+        state.rollback_unsent_query(peer.id, &page_two);
+        assert_eq!(
+            state.search_result_sender(addr_of(&peer), &peer.id),
+            Some(peer.id),
+            "the rest of page one may still arrive"
+        );
+    }
+
+    #[test]
+    fn a_fetch_request_admits_its_answers() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
+        let peer = contact(near_kad_id(1), 1);
+        state.closest = vec![peer.clone()];
+        state.responded_during_lookup.insert(peer.id);
+        state.phase = SearchPhase::Fetch;
+        let batch = state.next_to_query();
+        assert_eq!(batch.len(), 1);
+        assert!(matches!(
+            state.build_query_message(&peer),
+            KadMessage::SearchKeyReq { .. }
+        ));
+        state.commit_query_sent(peer.id, addr_of(&peer));
+        assert_eq!(state.search_result_sender(addr_of(&peer), &peer.id), Some(peer.id));
+    }
+
+    /// `tried` keeps one id per address and every send replaces it; a later
+    /// routing request to the same address under another id must not turn
+    /// away the answer to the search request sent there.
+    #[test]
+    fn a_later_routing_request_to_the_same_address_keeps_the_answer_credited() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
+        let asked = contact(near_kad_id(1), 1);
+        let mut renamed = contact(near_kad_id(2), 1);
+        renamed.udp_port = asked.udp_port;
+        state.closest = vec![asked.clone()];
+        state.responded_during_lookup.insert(asked.id);
+        state.next_store_queries();
+        state.commit_query_sent(asked.id, addr_of(&asked));
+        state.commit_query_sent(renamed.id, addr_of(&renamed));
+
+        assert_eq!(
+            state.search_result_sender(addr_of(&asked), &asked.id),
+            Some(asked.id)
+        );
+    }
+
+    #[test]
+    fn a_page_arriving_twice_counts_once() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
+        let peer = contact(near_kad_id(1), 1);
+        let half = result_entries(SEARCH_RESULT_PAGE_SIZE / 2);
+        state.handle_search_results(&peer.id, half.clone());
+        state.handle_search_results(&peer.id, half);
+        assert_eq!(state.results.len(), SEARCH_RESULT_PAGE_SIZE / 2);
+        assert_eq!(state.usable_results, SEARCH_RESULT_PAGE_SIZE / 2);
+        assert_eq!(
+            requested_start_position(&state, &peer),
+            0,
+            "half a page, however often it arrives, does not ask for page two"
+        );
+
+        state.handle_search_results(&kad_id(9), result_entries(10));
+        assert_eq!(
+            state.usable_results,
+            SEARCH_RESULT_PAGE_SIZE / 2 + 10,
+            "another node's copy counts"
+        );
+    }
+
+    #[test]
+    fn junk_filling_the_storage_cap_stops_querying() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
+        state.handle_search_results(&kad_id(2), bare_entries(MAX_SEARCH_RESULT_ENTRIES));
+        assert_eq!(state.usable_results, 0);
+        assert!(state.stop_querying);
+        assert!(state.next_to_query().is_empty());
+    }
+
+    fn fetching_search(manager: &mut SearchManager, peer: &KadContact) -> SearchId {
+        let (sid, ..) =
+            manager.start_search(near_kad_id(0), SearchType::FindKeyword, vec![peer.clone()]);
+        let search = manager.get_mut(&sid).unwrap();
+        search.responded_during_lookup.insert(peer.id);
+        search.queried.insert(peer.id);
+        search.phase = SearchPhase::Fetch;
+        search.fetch_started_at = Some(chrono::Utc::now().timestamp());
+        assert_eq!(search.next_to_query().len(), 1);
+        sid
+    }
+
+    /// The first datagram of the last fetch answer takes its contact off
+    /// `pending`; the rest of that answer still has to count.
+    #[test]
+    fn a_fetch_waits_for_the_rest_of_its_last_answer() {
+        let mut manager = SearchManager::new();
+        let peer = contact(near_kad_id(1), 1);
+        let sid = fetching_search(&mut manager, &peer);
+        let search = manager.get_mut(&sid).unwrap();
+        search.handle_search_results(&peer.id, result_entries(20));
+        assert!(!search.completed, "the answer is still arriving");
+        manager.poll_queries();
+        assert!(!manager.get(&sid).unwrap().completed);
+
+        let search = manager.get_mut(&sid).unwrap();
+        search.last_result_at = Some(chrono::Utc::now().timestamp() - RESULT_QUOTA_SETTLE_SECS);
+        assert!(manager.poll_queries().is_empty());
+        assert!(manager.get(&sid).unwrap().completed, "the poll tick ends it");
+    }
+
+    #[test]
+    fn a_full_fetch_page_is_followed_by_a_request_for_the_next() {
+        let mut manager = SearchManager::new();
+        let peer = contact(near_kad_id(1), 1);
+        let sid = fetching_search(&mut manager, &peer);
+        let search = manager.get_mut(&sid).unwrap();
+        for datagram in bare_entries(SEARCH_RESULT_PAGE_SIZE).chunks(20) {
+            search.handle_search_results(&peer.id, datagram.to_vec());
+        }
+        assert!(!search.completed);
+
+        let queries = manager.poll_queries();
+        assert_eq!(queries.len(), 1);
+        assert!(matches!(
+            queries[0].2,
+            KadMessage::SearchKeyReq { start_position, .. }
+                if start_position == SEARCH_RESULT_PAGE_SIZE as u16
+        ));
+    }
+
+    #[test]
+    fn a_fetch_still_receiving_ends_at_its_lifetime() {
+        let mut manager = SearchManager::new();
+        let peer = contact(near_kad_id(1), 1);
+        let sid = fetching_search(&mut manager, &peer);
+        let search = manager.get_mut(&sid).unwrap();
+        search.handle_search_results(&peer.id, result_entries(20));
+        let lifetime = search.lifetime_secs();
+        search.started_at -= lifetime + FETCH_TIMEOUT_SECS;
+        manager.poll_queries();
+        assert!(manager.get(&sid).unwrap().completed);
     }
 
     #[test]

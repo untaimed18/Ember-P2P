@@ -311,9 +311,14 @@ pub enum NetworkCommand {
         priority: u8,
         tx: oneshot::Sender<Result<(), String>>,
     },
+    /// Run a chat mailbox round now: chat was deleted, and any copy of it left
+    /// for an offline friend should be taken back before they collect it.
+    ChatMailboxRound,
+    /// Answers once the attempt has started, or with why it was refused.
     ConnectToServer {
         ip: String,
         port: u16,
+        tx: oneshot::Sender<Result<(), String>>,
     },
     DisconnectServer,
     AddServer {

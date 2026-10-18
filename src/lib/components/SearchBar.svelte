@@ -7,6 +7,7 @@
     value = $bindable(''),
     placeholder = m.search_bar_placeholder(),
     onsubmit,
+    onclear,
     recentKey,
     recentMax = 10,
     maxLength = 256,
@@ -14,7 +15,11 @@
   }: {
     value?: string;
     placeholder?: string;
-    onsubmit?: (query: string) => void;
+    /** Return `false` when the query was refused, so it stays out of the
+     *  recent list: picking it again would only be refused again. */
+    onsubmit?: (query: string) => boolean | void;
+    /** The user emptied the box with its × or Escape. */
+    onclear?: () => void;
     /**
      * When set, the component persists recent submitted queries under this
      * localStorage key and exposes them as a dropdown when the input is
@@ -107,8 +112,7 @@
 
   function submit(q: string) {
     if (!onsubmit) return;
-    addRecent(q);
-    onsubmit(q);
+    if (onsubmit(q) !== false) addRecent(q);
     showRecent = false;
     activeIndex = -1;
   }
@@ -116,6 +120,12 @@
   function pickRecent(q: string) {
     value = q;
     submit(q);
+  }
+
+  /** Submit what the box holds, as Enter does — recent list included — for a
+   *  page's own Search button. */
+  export function submitQuery() {
+    submit(value);
   }
 
   /**
@@ -173,6 +183,7 @@
       e.stopPropagation();
       value = '';
       activeIndex = -1;
+      onclear?.();
       return;
     }
     if (e.key === 'Enter') {
@@ -274,6 +285,7 @@
         class="clear-btn"
         onclick={() => {
           value = '';
+          onclear?.();
           inputEl?.focus();
         }}
         title={m.search_bar_clear()}

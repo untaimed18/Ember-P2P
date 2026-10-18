@@ -11,6 +11,41 @@ pub(super) fn name_spam_penalty(name: &str) -> usize {
         + name.matches('[').count().saturating_sub(1) * 3
 }
 
+/// A remote file name with invisible and reordering characters removed, before
+/// the display cap. Query matching runs on this, so a word past the cap still
+/// matches.
+fn sanitized_result_name(raw: &str) -> String {
+    crate::security::sanitize_remote_text(raw, 8192)
+}
+
+/// A remote file name as search rows show it: sanitized, and capped like a
+/// server result's name.
+pub(crate) fn search_result_name(raw: &str) -> String {
+    ed2k::server::cap_result_name(sanitized_result_name(raw))
+}
+
+/// Whether a keyword answer counts toward the answer quota: it needs a file
+/// name and a non-zero size, as eMule's `CSearch::ProcessResultKeyword`
+/// requires, and the name has to hold the whole query. eMule only wants the
+/// looked-up keyword's words there, so this is stricter: it can make a search
+/// run longer, never stop it sooner.
+pub(crate) fn is_usable_keyword_answer(
+    entry: &kad::messages::SearchResultEntry,
+    filter: Option<&crate::search::query::QueryExpr>,
+) -> bool {
+    let mut name = "";
+    let mut size = 0u64;
+    for tag in &entry.tags {
+        match &tag.name {
+            TagName::Id(TAG_FILENAME) => name = tag.string_value().unwrap_or(name),
+            TagName::Id(TAG_FILESIZE) => size = tag.as_file_size().unwrap_or(size),
+            _ => {}
+        }
+    }
+    let name = sanitized_result_name(name);
+    !name.is_empty() && size != 0 && filter.is_none_or(|expr| expr.matches_name(&name))
+}
+
 pub(super) fn kad_tag_file_rating(tag: &kad::types::KadTag) -> Option<u8> {
     let raw = kad_tag_uint::<u32>(tag)?;
     crate::network::ed2k::comments::unpack_file_rating(raw.into())
@@ -24,9 +59,21 @@ fn kad_tag_uint<T: TryFrom<u64>>(tag: &kad::types::KadTag) -> Option<T> {
     tag.as_uint().and_then(|v| T::try_from(v).ok())
 }
 
+#[cfg(test)]
 pub(super) fn convert_search_results(
     entries: &[kad::messages::SearchResultEntry],
     is_source_safe: impl Fn(Ipv4Addr) -> bool,
+) -> Vec<SearchResult> {
+    convert_search_results_matching(entries, is_source_safe, None)
+}
+
+/// KAD keyword entries as search rows, keeping only entries whose name holds
+/// `name_filter` (every entry for `None`). Matched on the name before the
+/// display cap, so filter here rather than on the rows' `file.name`.
+pub(super) fn convert_search_results_matching(
+    entries: &[kad::messages::SearchResultEntry],
+    is_source_safe: impl Fn(Ipv4Addr) -> bool,
+    name_filter: Option<&crate::search::query::QueryExpr>,
 ) -> Vec<SearchResult> {
     use crate::search::index::infer_file_type;
 
@@ -181,7 +228,7 @@ pub(super) fn convert_search_results(
                         }
                     }
                     TagName::Id(TAG_FILESIZE) => {
-                        if let Some(v) = tag.as_uint() {
+                        if let Some(v) = tag.as_file_size() {
                             size = v;
                         }
                     }
@@ -233,7 +280,14 @@ pub(super) fn convert_search_results(
             // Sanitize every remote string before deriving extension/type.
             // Ordinary Arabic/Hebrew characters remain intact; only controls,
             // bidi overrides and zero-width formatters are removed.
-            name = crate::security::sanitize_remote_text(&name, 8192);
+            name = sanitized_result_name(&name);
+            if name.is_empty()
+                || size == 0
+                || !name_filter.is_none_or(|expr| expr.matches_name(&name))
+            {
+                return None;
+            }
+            name = ed2k::server::cap_result_name(name);
             file_type = crate::security::sanitize_remote_text(&file_type, 128);
             comment = comment
                 .map(|value| crate::security::sanitize_remote_text(&value, 4096))
@@ -254,9 +308,6 @@ pub(super) fn convert_search_results(
                 .codec
                 .map(|value| crate::security::sanitize_remote_text(&value, 128))
                 .filter(|value| !value.is_empty());
-            if name.is_empty() {
-                return None;
-            }
 
             let extension = name
                 .rsplit_once('.')
@@ -298,18 +349,21 @@ pub(super) fn convert_search_results(
         })
         .collect();
 
-    // Deduplicate by file hash, accumulating source counts across KAD nodes.
-    // In eMule (CSearch::ProcessResult), each search result entry with the
-    // same file hash adds to the source count. If TAG_SOURCES is 0 or absent,
-    // the entry still counts as 1 source (the publishing node itself).
-    let mut dedup: HashMap<String, SearchResult> = HashMap::new();
-    let mut sources_accum: HashMap<String, u32> = HashMap::new();
-    let mut complete_accum: HashMap<String, u32> = HashMap::new();
+    // Deduplicate by file hash, combining source counts across KAD nodes (the
+    // larger estimate wins, see below). If TAG_SOURCES is 0 or absent, the
+    // entry still counts as 1 source (the publishing node itself).
+    // Keyed on the size too: the hash is public, so a node can pair a real one
+    // with any size, and that claim stays on a row of its own as in
+    // `search::merge`.
+    let mut dedup: HashMap<(String, u64), SearchResult> = HashMap::new();
+    let mut sources_accum: HashMap<(String, u64), u32> = HashMap::new();
+    let mut complete_accum: HashMap<(String, u64), u32> = HashMap::new();
 
     for p in parsed {
         let effective_sources = if p.sources_tag > 0 { p.sources_tag } else { 1 };
+        let key = (p.hash.clone(), p.size);
 
-        if let Some(existing) = dedup.get_mut(&p.hash) {
+        if let Some(existing) = dedup.get_mut(&key) {
             existing.result_origin = crate::search::merge::combine_origin(
                 &existing.result_origin,
                 crate::search::merge::ORIGIN_KAD,
@@ -324,18 +378,14 @@ pub(super) fn convert_search_results(
             // same swarm, so adding them counts that swarm twice: eMule's
             // `AddSources` and `AddCompleteSources` both branch on
             // `m_bKademlia` and keep the larger value, and its parent rollup in
-            // `CSearchList::AddToList` maxes across children too.
-            //
-            // This summed `TAG_SOURCES`, citing `CSearch::ProcessResult`. That
-            // is the wrong function: it is the Kad search layer handing results
-            // to `AddToList`, which is where the merge — and the max — happens.
-            // The effect was an availability that climbed with the number of
-            // nodes that answered rather than with the size of the swarm.
-            let acc = sources_accum.entry(p.hash.clone()).or_insert(0);
+            // `CSearchList::AddToList` maxes across children too. A sum would
+            // climb with the number of nodes that answered rather than with
+            // the size of the swarm.
+            let acc = sources_accum.entry(key.clone()).or_insert(0);
             *acc = (*acc).max(effective_sources).min(MAX_KAD_AVAILABILITY);
             existing.availability = (*acc).max(existing.source_addresses.len() as u32);
 
-            let cs = complete_accum.entry(p.hash.clone()).or_insert(0);
+            let cs = complete_accum.entry(key).or_insert(0);
             *cs = (*cs).max(p.complete_sources_tag).min(MAX_KAD_AVAILABILITY);
             existing.file.complete_sources = *cs;
 
@@ -382,10 +432,10 @@ pub(super) fn convert_search_results(
                 source_addresses.push(p.source_addr.clone());
             }
             let availability = effective_sources.max(source_addresses.len() as u32);
-            sources_accum.insert(p.hash.clone(), effective_sources);
-            complete_accum.insert(p.hash.clone(), p.complete_sources_tag);
+            sources_accum.insert(key.clone(), effective_sources);
+            complete_accum.insert(key.clone(), p.complete_sources_tag);
             dedup.insert(
-                p.hash.clone(),
+                key,
                 SearchResult {
                     file: FileInfo {
                         id: p.hash.clone(),
@@ -473,7 +523,7 @@ pub(super) fn convert_note_search_results(
                         }
                     }
                     TagName::Id(TAG_FILESIZE) => {
-                        if let Some(v) = tag.as_uint() {
+                        if let Some(v) = tag.as_file_size() {
                             size = v;
                         }
                     }
@@ -504,7 +554,7 @@ pub(super) fn convert_note_search_results(
                 return None;
             }
 
-            name = crate::security::sanitize_remote_text(&name, 8192);
+            name = search_result_name(&name);
             comment = comment
                 .map(|value| crate::security::sanitize_remote_text(&value, 4096))
                 .filter(|value| !value.is_empty());
@@ -943,12 +993,9 @@ pub(super) fn extract_kad_sources(entries: &[kad::messages::SearchResultEntry]) 
                     // the buddy IP to `SetBuddyIP(dwBuddyIP)` / the callback
                     // `SendPacket` RAW (already network order). So the source
                     // needs the big-endian transform (`to_be_bytes`) while the
-                    // buddy must use little-endian (`to_le_bytes`). Using
-                    // `to_be_bytes` here byte-reversed every buddy address —
-                    // turning real residential buddies (e.g. 88.147.30.21) into
-                    // unroutable DoD ranges (21.30.147.88), so every
-                    // KADEMLIA_CALLBACK_REQ was fired into the void and no
-                    // firewalled source ever connected back.
+                    // buddy must use little-endian (`to_le_bytes`); the other
+                    // order reverses the buddy address (88.147.30.21 becomes
+                    // 21.30.147.88), and no callback request reaches it.
                     let b_ip = Ipv4Addr::from(server_ip.to_le_bytes());
                     let b_hash = buddy_hash.map(KadId);
                     if !sources.iter().any(|s: &KadSource| {
@@ -1263,10 +1310,7 @@ pub(super) fn search_entry_tag_u64(tag: &KadTag) -> Option<u64> {
     if !matches!(&tag.name, TagName::Id(TAG_FILESIZE)) {
         return None;
     }
-    tag.uint64_value()
-        .or_else(|| tag.uint32_value().map(|v| v as u64))
-        .or_else(|| tag.uint16_value().map(|v| v as u64))
-        .or_else(|| tag.uint8_value().map(|v| v as u64))
+    tag.as_file_size()
 }
 
 pub(super) fn matches_search_expr_impl(
@@ -1464,5 +1508,145 @@ mod convert_tests {
         assert_eq!(results[0].file.name, clean);
         assert_eq!(results[0].file.extension, "zip");
         assert_eq!(results[0].file_type, "Arc");
+    }
+
+    fn with_size(name: &str, size: u32) -> kad::messages::SearchResultEntry {
+        let mut e = entry(name);
+        e.tags[1].value = TagValue::Uint32(size);
+        e
+    }
+
+    #[test]
+    fn a_keyword_result_without_a_size_is_dropped() {
+        let mut unsized_entry = entry("Holiday Clip.avi");
+        unsized_entry.tags.truncate(1);
+        let results = convert_search_results(
+            &[with_size("Holiday Clip.avi", 0), unsized_entry],
+            |_| true,
+        );
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn one_hash_with_different_sizes_keeps_a_row_per_size() {
+        let results = convert_search_results(
+            &[
+                with_size("Holiday Clip.avi", 700),
+                with_size("Holiday Clip.avi", 9_999),
+                with_size("Holiday Clip.avi", 700),
+            ],
+            |_| true,
+        );
+        let mut sizes: Vec<u64> = results.iter().map(|r| r.file.size).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![700, 9_999]);
+        assert!(results.iter().all(|r| r.file.hash == results[0].file.hash));
+    }
+
+    #[test]
+    fn an_absurdly_long_name_is_capped_on_a_char_boundary() {
+        use ed2k::server::MAX_RESULT_NAME_CHARS;
+        let long = "é".repeat(MAX_RESULT_NAME_CHARS + 100);
+        let results = convert_search_results(&[entry(&long)], |_| true);
+        assert_eq!(results[0].file.name.chars().count(), MAX_RESULT_NAME_CHARS);
+        assert_eq!(
+            crate::security::sanitize_filename(&results[0].file.name),
+            crate::security::sanitize_filename(&long),
+            "the name a download is saved under does not change"
+        );
+
+        let named = format!("{}.mkv", "é".repeat(MAX_RESULT_NAME_CHARS));
+        let results = convert_search_results(&[entry(&named)], |_| true);
+        assert_eq!(results[0].file.name.chars().count(), MAX_RESULT_NAME_CHARS);
+        assert_eq!(results[0].file.extension, "mkv");
+    }
+
+    #[test]
+    fn a_query_word_past_the_name_cap_still_matches() {
+        let query = crate::search::query::parse("holiday").expect("query parses");
+        let long = format!(
+            "{} holiday.avi",
+            "x".repeat(ed2k::server::MAX_RESULT_NAME_CHARS)
+        );
+        assert!(is_usable_keyword_answer(&entry(&long), Some(&query)));
+
+        let results = convert_search_results_matching(
+            &[entry(&long), entry("Other.avi")],
+            |_| true,
+            Some(&query),
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].file.name.chars().count(),
+            ed2k::server::MAX_RESULT_NAME_CHARS
+        );
+        assert_eq!(results[0].file.extension, "avi");
+    }
+
+    #[test]
+    fn a_usable_keyword_answer_has_a_name_a_size_and_the_query() {
+        let query = crate::search::query::parse("holiday").expect("query parses");
+        assert!(is_usable_keyword_answer(&entry("Holiday Clip.avi"), Some(&query)));
+        assert!(is_usable_keyword_answer(&entry("Other.avi"), None));
+        assert!(!is_usable_keyword_answer(&entry("Other.avi"), Some(&query)));
+        assert!(!is_usable_keyword_answer(&with_size("Holiday Clip.avi", 0), Some(&query)));
+        assert!(!is_usable_keyword_answer(&entry(" \u{200B} "), None));
+    }
+
+    const OVER_4_GIB: u64 = 5 * 1024 * 1024 * 1024 + 123;
+
+    fn emule_large_size_tag() -> KadTag {
+        KadTag {
+            name: TagName::Id(TAG_FILESIZE),
+            value: TagValue::Bsob(OVER_4_GIB.to_le_bytes().to_vec()),
+        }
+    }
+
+    #[test]
+    fn a_keyword_result_over_4_gib_keeps_emules_bsob_size() {
+        let mut large = entry("Big Archive.iso");
+        large.tags[1] = emule_large_size_tag();
+        let results = convert_search_results(&[large], |_| true);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file.size, OVER_4_GIB);
+    }
+
+    #[test]
+    fn a_note_result_over_4_gib_keeps_emules_bsob_size() {
+        let mut note = entry("Big Archive.iso");
+        note.tags[1] = emule_large_size_tag();
+        note.tags.push(KadTag {
+            name: TagName::Id(TAG_DESCRIPTION),
+            value: TagValue::String("good copy".to_string()),
+        });
+        let results = convert_note_search_results(&[note], &KadId([0x42; 16]));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file.size, OVER_4_GIB);
+    }
+
+    #[test]
+    fn size_filters_and_exact_size_lookups_see_a_bsob_size() {
+        let mut tags = entry("Big Archive.iso").tags;
+        tags[1] = emule_large_size_tag();
+
+        let at_least = |value| KadSearchExpr::Numeric {
+            tag: SearchTagRef::Id(TAG_FILESIZE),
+            op: KadNumericOp::Ge,
+            value,
+        };
+        assert!(matches_search_expr_for_tags(
+            &at_least(u32::MAX as u64 + 1),
+            &tags
+        ));
+        assert!(!matches_search_expr_for_tags(
+            &at_least(OVER_4_GIB + 1),
+            &tags
+        ));
+
+        assert!(matches_requested_file_size_tags(&tags, OVER_4_GIB));
+        assert!(!matches_requested_file_size_tags(
+            &tags,
+            OVER_4_GIB & u32::MAX as u64
+        ));
     }
 }

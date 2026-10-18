@@ -555,6 +555,13 @@ export async function initFriendsStore() {
         }
       }),
     );
+    // A deleted conversation takes its unread messages with it.
+    registered.push(
+      await listen<{ user_hash: string }>('ember:chat-cleared', (event) => {
+        const hash = validFriendHash(event.payload?.user_hash);
+        if (hash) dropUnread(hash);
+      }),
+    );
     registered.push(
       await listen<{ user_hash: string }>(UNREAD_CLEARED_EVENT, (event) => {
         const hash = validFriendHash(event.payload?.user_hash);

@@ -7,10 +7,14 @@
 //! by the OS, which makes it the wrong place for anything that has to happen on
 //! a clock.
 //!
+//! Checks always run and have no setting: once shortly after every launch,
+//! whenever the last check was, and then hourly for as long as Ember stays
+//! open. The "Check for updates" button in Settings → About checks on demand.
+//!
 //! The result is emitted to the frontend, which applies it exactly as it applies
 //! a silent check it ran itself. A webview that was not listening yet, or has
 //! reloaded since, asks for it with `get_last_update_check_result`, since the
-//! next check may be a month away.
+//! next check may be an hour away.
 
 use std::time::Duration;
 
@@ -30,9 +34,8 @@ pub const CHECK_RESULT_EVENT: &str = "ember:updater-check-result";
 /// frontend's hand-off status query (1.5 s after mount) has settled first.
 const FIRST_CHECK_DELAY: Duration = Duration::from_secs(15);
 
-/// How often the scheduler asks whether a check is due. Asking is only a config
-/// read and a small file read; the fastest cadence it serves is hourly, which
-/// this keeps within a few minutes of on time.
+/// How often the scheduler asks whether a check is due. Asking is only a small
+/// file read, and this keeps the hourly check within a few minutes of on time.
 const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Pause before restarting a panicked scheduler, so a panic that reproduces on
@@ -49,57 +52,59 @@ pub fn spawn(app: AppHandle) {
         return;
     }
     tauri::async_runtime::spawn(async move {
+        let mut launch = true;
         loop {
-            let result = std::panic::AssertUnwindSafe(run(app.clone()))
+            let result = std::panic::AssertUnwindSafe(run(app.clone(), launch))
                 .catch_unwind()
                 .await;
             if result.is_ok() {
                 return;
             }
+            launch = false;
             tracing::error!("Update scheduler panicked; restarting it");
             tokio::time::sleep(RESTART_DELAY).await;
         }
     });
 }
 
-async fn run(app: AppHandle) {
+async fn run(app: AppHandle, launch: bool) {
     tokio::time::sleep(FIRST_CHECK_DELAY).await;
+    // Every launch checks, even a minute after the last: someone reopening
+    // Ember is the moment they are most likely to act on what it finds. A
+    // restart after a panic is not a launch, and keeps to the schedule, or a
+    // panic on every pass would check every minute.
+    if launch || check_due() {
+        check(&app).await;
+    }
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     // A machine waking from a week of sleep should check once, not replay a
     // week of missed polls.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // `interval` fires at once; the check above has just been decided.
+    ticker.tick().await;
     loop {
         ticker.tick().await;
-        maybe_check(&app).await;
+        if check_due() {
+            check(&app).await;
+        }
     }
 }
 
-async fn maybe_check(app: &AppHandle) {
-    let Some(state) = app.try_state::<AppState>() else {
-        return;
-    };
-    let (enabled, frequency) = {
-        let config = state.config.read().await;
-        (
-            config.settings.auto_check_updates,
-            config.settings.update_check_frequency.clone(),
-        )
-    };
-    if !enabled {
-        return;
-    }
+fn check_due() -> bool {
     let dir = match crate::storage::paths::ensure_data_dir() {
         Ok(dir) => dir,
         Err(error) => {
             tracing::warn!("Skipping the automatic update check: no data folder ({error})");
-            return;
+            return false;
         }
     };
-    let last = record::last_check_at(&dir);
-    if !record::check_due(last, chrono::Utc::now().timestamp(), &frequency) {
+    record::check_due(record::last_check_at(&dir), chrono::Utc::now().timestamp())
+}
+
+async fn check(app: &AppHandle) {
+    if app.try_state::<AppState>().is_none() {
         return;
     }
-
     let service = app.state::<UpdaterService>();
     let result = run_check(app, &service)
         .await

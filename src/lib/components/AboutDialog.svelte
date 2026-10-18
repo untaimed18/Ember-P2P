@@ -1,8 +1,7 @@
 <script lang="ts">
   import * as m from '$lib/paraglide/messages';
-  import { openEmberWebsite } from '$lib/api/settings';
-  import { translateError } from '$lib/i18n';
   import BuyCoffeeButton from './BuyCoffeeButton.svelte';
+  import EmberLinks from './EmberLinks.svelte';
   const appVersion = import.meta.env.VITE_APP_VERSION;
   const license = import.meta.env.VITE_APP_LICENSE;
   // Description used to come from the package.json `description`
@@ -23,20 +22,9 @@
   // Element focused before the dialog opened, restored on close.
   let returnFocusEl: HTMLElement | null = null;
   const instanceId = Math.random().toString(36).slice(2, 10);
-  let websiteError = $state('');
 
   function close() {
     open = false;
-    websiteError = '';
-  }
-
-  async function openWebsite() {
-    websiteError = '';
-    try {
-      await openEmberWebsite();
-    } catch (e) {
-      websiteError = translateError(e);
-    }
   }
 
   function handleKeydown(e: KeyboardEvent) {
@@ -99,32 +87,32 @@
       bind:this={panelEl}
       transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
     >
-      <div class="about-brand">
-        <div class="about-mark" aria-hidden="true">
-          <img src="/icon.png" alt="" width="48" height="48" />
+      <div class="about-hero">
+        <div class="about-brand">
+          <div class="about-mark" aria-hidden="true">
+            <img src="/icon.png" alt="" width="52" height="52" />
+          </div>
+          <div class="about-wordmark">
+            <h2 id="about-title-{instanceId}">EMBER</h2>
+            <p class="about-tagline">{m.app_tagline()}</p>
+            <p class="about-version">{m.about_dialog_version({ version: appVersion })}</p>
+          </div>
         </div>
-        <div class="about-wordmark">
-          <h2 id="about-title-{instanceId}">EMBER</h2>
-          <p class="about-tagline">{m.app_tagline()}</p>
-        </div>
+        <p id="about-desc-{instanceId}" class="about-description">{m.about_dialog_description()}</p>
       </div>
 
-      <p id="about-desc-{instanceId}" class="about-version">{m.about_dialog_version({ version: appVersion })}</p>
-      <p class="about-description">{m.about_dialog_description()}</p>
-      <p class="about-license">{m.about_dialog_license({ license })}</p>
-      {#if websiteError}
-        <p class="about-website-error" role="alert">{websiteError}</p>
-      {/if}
+      <section class="about-section" aria-labelledby="about-links-{instanceId}">
+        <h3 id="about-links-{instanceId}" class="about-section-title">{m.about_dialog_links_title()}</h3>
+        <EmberLinks />
+      </section>
 
       <div class="about-support">
         <p class="about-support-text">{m.support_body()}</p>
         <BuyCoffeeButton size="sm" />
       </div>
 
-      <div class="about-actions">
-        <button type="button" class="about-website" onclick={() => void openWebsite()}>
-          {m.about_dialog_website()}
-        </button>
+      <div class="about-footer">
+        <p class="about-license">{m.about_dialog_license({ license })}</p>
         <button type="button" class="primary about-close" onclick={close}>{m.common_close()}</button>
       </div>
     </div>
@@ -143,36 +131,53 @@
   }
 
   .about-panel {
+    width: min(420px, calc(100vw - 48px));
+    max-height: calc(100vh - 48px);
+    overflow-y: auto;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
-    padding: 22px 24px 20px;
-    min-width: 300px;
-    max-width: 380px;
+    padding: 0 0 18px;
     box-shadow:
       inset 0 1px 0 var(--surface-highlight),
       var(--shadow-lg);
+  }
+
+  /* The same warm wash as the Settings → About card, so the two read as one
+     place. */
+  .about-hero {
+    padding: 22px 24px 16px;
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(
+      160deg,
+      color-mix(in srgb, var(--accent) 12%, transparent) 0%,
+      transparent 70%
+    );
   }
 
   .about-brand {
     display: flex;
     align-items: center;
     gap: 14px;
-    margin-bottom: 14px;
   }
 
   .about-mark {
-    width: 48px;
-    height: 48px;
+    width: 52px;
+    height: 52px;
     border-radius: var(--radius-md);
     overflow: hidden;
     flex-shrink: 0;
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--border) 70%, transparent);
   }
 
   .about-mark img {
     width: 100%;
     height: 100%;
     display: block;
+  }
+
+  .about-wordmark {
+    min-width: 0;
   }
 
   .about-wordmark h2 {
@@ -186,46 +191,53 @@
 
   .about-tagline {
     font-size: var(--font-size-2xs);
+    font-weight: 600;
     color: var(--text-muted);
     text-transform: uppercase;
-    letter-spacing: 1px;
-    margin: 0;
-    line-height: 1;
+    letter-spacing: 0.9px;
+    margin: 0 0 8px;
+    line-height: 1.2;
   }
 
   .about-version {
-    font-size: var(--font-size-md);
+    display: inline-block;
+    margin: 0;
+    padding: 2px 8px;
+    font-size: var(--font-size-xs);
     font-weight: 600;
-    color: var(--text-primary);
-    margin: 0 0 10px;
+    color: var(--badge-accent-text);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+    border-radius: var(--radius-pill);
+    line-height: 1.4;
   }
 
   .about-description {
     color: var(--text-secondary);
     font-size: var(--font-size-md);
     line-height: 1.5;
-    margin: 0 0 12px;
+    margin: 14px 0 0;
   }
 
-  .about-license {
-    color: var(--text-muted);
-    font-size: var(--font-size-sm);
-    margin: 0 0 18px;
+  .about-section {
+    padding: 16px 24px 0;
   }
 
-  .about-website-error {
-    color: var(--danger);
-    font-size: var(--font-size-sm);
-    margin: -10px 0 14px;
+  .about-section-title {
+    margin: 0 0 8px;
+    font-size: var(--font-size-xs);
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-secondary);
   }
 
   .about-support {
     display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 10px;
-    padding: 12px 14px;
-    margin: 0 0 18px;
+    align-items: center;
+    gap: 12px;
+    margin: 14px 24px 0;
+    padding: 10px 12px;
     border: 1px solid color-mix(in srgb, #ffdd00 35%, var(--border));
     border-radius: var(--radius-md);
     background: linear-gradient(
@@ -236,38 +248,31 @@
   }
 
   .about-support-text {
+    flex: 1;
     margin: 0;
     color: var(--text-secondary);
     font-size: var(--font-size-sm);
-    line-height: 1.5;
+    line-height: 1.45;
   }
 
-  .about-actions {
+  .about-footer {
     display: flex;
     justify-content: space-between;
     align-items: center;
     gap: 12px;
+    padding: 16px 24px 0;
   }
 
-  .about-website {
-    padding: 8px 4px;
-    font-size: var(--font-size-md);
-    font-weight: 600;
-    border: none;
-    background: transparent;
-    color: var(--accent);
-    cursor: pointer;
-    text-decoration: underline;
-    text-underline-offset: 2px;
+  .about-license {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
   }
 
-  .about-website:hover {
-    filter: brightness(1.08);
-  }
-
-  .about-website:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-    border-radius: var(--radius-sm);
+  @media (max-width: 480px) {
+    .about-support {
+      flex-direction: column;
+      align-items: flex-start;
+    }
   }
 </style>

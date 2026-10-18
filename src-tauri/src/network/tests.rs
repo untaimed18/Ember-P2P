@@ -805,16 +805,12 @@ fn advertised_tcp_port_prefers_the_stun_remap_once_the_server_says_lowid() {
 }
 
 #[test]
-fn login_tcp_port_is_captured_before_session_reset_clears_low_id() {
-    let mut low_id = true;
-    let port = capture_advertised_tcp_port_then_reset_low_id(
-        Some(4662),
-        Some(51234),
-        4662,
-        &mut low_id,
-    );
-    assert_eq!(port, 51234);
-    assert!(!low_id);
+fn login_tcp_port_remembers_a_lowid_past_session_reset() {
+    // The session that ended was LowID; teardown has cleared `low_id`.
+    assert_eq!(login_tcp_port_from(Some(4662), Some(51234), 4662, false, true), 51234);
+    assert_eq!(login_tcp_port_from(Some(4662), Some(51234), 4662, true, false), 51234);
+    // A HighID session proved the forward works.
+    assert_eq!(login_tcp_port_from(Some(4662), Some(51234), 4662, false, false), 4662);
 }
 
 #[test]
@@ -1215,33 +1211,9 @@ fn sample_search_result(hash: &str) -> SearchResult {
 
 fn sample_active_search_request(request_id: u64) -> ActiveSearchRequest {
     ActiveSearchRequest {
-        request_id,
-        server_pending: false,
         kad_pending: true,
-        udp_pending: false,
-        ember_pending: false,
         kad_ran: true,
-        ember_ran: false,
-        udp_search_deadline: 0,
-        udp_search_sent_ips: HashSet::new(),
-        ed2k_found_sources: 0,
-        udp_found_sources: 0,
-        ed2k_noted_availability: HashMap::new(),
-        ed2k_noted_complete_sources: HashMap::new(),
-        dht_noted_availability: HashMap::new(),
-        file_type_filter: None,
-        min_size: None,
-        max_size: None,
-        file_extension: None,
-        min_availability: None,
-        keywords: Vec::new(),
-        server_ip: None,
-        server_result_count: 0,
-        streamed_hashes: std::collections::HashSet::new(),
-        exclude_hashes: std::collections::HashSet::new(),
-        batch_spam: crate::search::spam::BatchSpamContext::default(),
-        udp_search_expr: Vec::new(),
-        server_has_more: false,
+        ..ActiveSearchRequest::new(request_id)
     }
 }
 
@@ -1496,7 +1468,7 @@ fn note_ed2k_search_results_udp_sums_tcp_uses_max() {
         ..sample_search_result("hash1")
     };
     assert!(!note_ed2k_search_results(&mut active, &[more], &none));
-    assert_eq!(active.ed2k_noted_availability.get("hash1"), Some(&3));
+    assert_eq!(active.ed2k_noted_total("hash1", 1234), Some(3));
     assert_eq!(active.ed2k_found_sources, 3);
 
     // UDP cross-server: sum onto noted total.
@@ -1506,7 +1478,7 @@ fn note_ed2k_search_results_udp_sums_tcp_uses_max() {
         ..sample_search_result("hash1")
     };
     assert!(!note_ed2k_search_results(&mut active, &[udp], &none));
-    assert_eq!(active.ed2k_noted_availability.get("hash1"), Some(&7));
+    assert_eq!(active.ed2k_noted_total("hash1", 1234), Some(7));
     assert_eq!(active.ed2k_found_sources, 5); // spam-capped at 5
 }
 
@@ -1527,10 +1499,7 @@ fn ed2k_noted_totals_stop_growing_at_the_soft_cap() {
         })
         .collect();
     note_ed2k_search_results(&mut active, &batch, &none);
-    assert_eq!(
-        active.ed2k_noted_availability.len(),
-        MAX_STREAMED_HASHES_SOFT_CAP
-    );
+    assert_eq!(active.ed2k_noted_sources.len(), MAX_STREAMED_HASHES_SOFT_CAP);
 
     let fresh = SearchResult {
         result_origin: crate::search::merge::ORIGIN_SERVER_UDP.to_string(),
@@ -1539,11 +1508,11 @@ fn ed2k_noted_totals_stop_growing_at_the_soft_cap() {
     };
     note_ed2k_search_results(&mut active, &[fresh], &none);
     assert_eq!(
-        active.ed2k_noted_availability.len(),
+        active.ed2k_noted_sources.len(),
         MAX_STREAMED_HASHES_SOFT_CAP,
         "a hash first seen past the cap must not grow the map"
     );
-    assert!(active.ed2k_noted_complete_sources.len() <= MAX_STREAMED_HASHES_SOFT_CAP);
+    assert_eq!(active.ed2k_noted_total("past-the-cap", 1234), None);
 
     let resight = SearchResult {
         result_origin: crate::search::merge::ORIGIN_SERVER_UDP.to_string(),
@@ -1552,8 +1521,8 @@ fn ed2k_noted_totals_stop_growing_at_the_soft_cap() {
     };
     note_ed2k_search_results(&mut active, &[resight], &none);
     assert_eq!(
-        active.ed2k_noted_availability.get("hash0"),
-        Some(&6),
+        active.ed2k_noted_total("hash0", 1234),
+        Some(6),
         "an already-tracked hash must keep summing past the cap"
     );
 
@@ -1588,7 +1557,7 @@ fn note_ed2k_search_results_skips_owned_hashes_for_cap() {
     };
     assert!(!note_ed2k_search_results(&mut active, &[owned], &skip));
     assert_eq!(active.ed2k_found_sources, 0);
-    assert_eq!(active.ed2k_noted_availability.get("ownedhash"), Some(&4));
+    assert_eq!(active.ed2k_noted_total("ownedhash", 1234), Some(4));
 
     let other = SearchResult {
         result_origin: crate::search::merge::ORIGIN_SERVER_TCP.to_string(),
@@ -1649,19 +1618,25 @@ fn a_resight_is_emitted_with_every_servers_complete_sources_summed() {
         &none,
     );
     assert_eq!(
-        active.ed2k_noted_complete_sources.get("hash1"),
-        Some(&3),
+        active.ed2k_noted_complete_total("hash1", 1234),
+        Some(3),
         "the first server's count stands on its own"
     );
 
-    // A TCP "More results" re-list repeats the same server's figure, so it
-    // replaces rather than accumulates.
+    // A TCP "More results" re-list repeats the same server's figure, so the
+    // larger of the two stands rather than their sum.
     note_ed2k_search_results(
         &mut active,
         &[ed2k_row(crate::search::merge::ORIGIN_SERVER_TCP, 25, 4)],
         &none,
     );
-    assert_eq!(active.ed2k_noted_complete_sources.get("hash1"), Some(&4));
+    assert_eq!(active.ed2k_noted_complete_total("hash1", 1234), Some(4));
+    note_ed2k_search_results(
+        &mut active,
+        &[ed2k_row(crate::search::merge::ORIGIN_SERVER_TCP, 25, 2)],
+        &none,
+    );
+    assert_eq!(active.ed2k_noted_complete_total("hash1", 1234), Some(4));
 
     // A UDP reply is a different server, so it adds.
     let mut resights = vec![ed2k_row(crate::search::merge::ORIGIN_SERVER_UDP, 4, 5)];
@@ -1697,7 +1672,7 @@ fn min_sources_does_not_eat_the_sources_a_second_server_adds() {
         ..sample_search_result("hash1")
     }];
     note_ed2k_resight_availability(&mut active, &mut resights, &none);
-    assert_eq!(active.ed2k_noted_availability.get("hash1"), Some(&29));
+    assert_eq!(active.ed2k_noted_total("hash1", 1234), Some(29));
     let kept = filter_results_by_client_constraints(resights, &active);
     assert_eq!(
         kept.len(),
@@ -1728,7 +1703,7 @@ fn a_dht_resight_is_left_out_of_the_ed2k_total() {
     note_ed2k_resight_availability(&mut active, &mut resights, &none);
     assert_eq!(resights[0].availability, 6);
     assert_eq!(resights[1].availability, 2);
-    assert!(active.ed2k_noted_availability.is_empty());
+    assert!(active.ed2k_noted_sources.is_empty());
     assert_eq!(active.ed2k_found_sources, 0);
 }
 
@@ -1833,7 +1808,7 @@ fn one_file_on_two_dht_legs_keeps_a_total_per_leg() {
         "Ember's two publishers must not inherit KAD's six nodes"
     );
 
-    let noted = active.dht_noted_availability.get("hash1").copied().unwrap();
+    let noted = active.dht_noted_availability.get("hash1", 1234).copied().unwrap();
     assert_eq!((noted.kad, noted.ember), (6, 2));
 }
 
@@ -1851,7 +1826,7 @@ fn a_server_row_is_left_to_the_ed2k_total() {
     assert_eq!(rows[0].availability, 25);
     assert!(active
         .dht_noted_availability
-        .get("hash1")
+        .get("hash1", 1234)
         .is_none_or(|n| n.kad == 0 && n.ember == 0));
 }
 
@@ -1866,7 +1841,7 @@ fn the_running_total_is_capped_like_the_per_batch_counts() {
         assert_eq!(batch[0].availability, MAX_KAD_AVAILABILITY);
     }
     assert_eq!(
-        active.dht_noted_availability.get("hash1").unwrap().kad,
+        active.dht_noted_availability.get("hash1", 1234).unwrap().kad,
         MAX_KAD_AVAILABILITY
     );
 }
@@ -1896,6 +1871,30 @@ fn dedup_streamed_batch_is_noop_for_mismatched_or_missing_request() {
     );
 }
 
+/// The UI keeps a row claiming another size for a hash as a row of its own, so
+/// it has to arrive scored like any new row, not as an unscored re-sight.
+#[test]
+fn dedup_streamed_batch_treats_another_size_for_a_hash_as_a_new_row() {
+    let mut active = Some(sample_active_search_request(7));
+    mark_streamed_hashes(active.as_mut().unwrap(), &[sample_search_result("aa")]);
+
+    let mut other_size = sample_search_result("aa");
+    other_size.file.size = 9_999;
+    let mut unknown_size = sample_search_result("aa");
+    unknown_size.file.size = 0;
+    let mut batch = vec![sample_search_result("aa"), other_size, unknown_size];
+    let resights = dedup_streamed_batch(&mut active, 7, &mut batch);
+
+    assert_eq!(
+        batch.iter().map(|r| r.file.size).collect::<Vec<_>>(),
+        vec![9_999]
+    );
+    assert_eq!(
+        resights.iter().map(|r| r.file.size).collect::<Vec<_>>(),
+        vec![1234, 0]
+    );
+}
+
 /// Regression guard: hitting `MAX_STREAMED_HASHES_SOFT_CAP` must not
 /// disable dedup entirely. Hashes tracked before the cap was reached
 /// should keep being filtered on every later sighting; only a brand
@@ -1905,7 +1904,9 @@ fn dedup_streamed_batch_is_noop_for_mismatched_or_missing_request() {
 fn dedup_streamed_batch_keeps_deduping_already_tracked_hashes_past_soft_cap() {
     let mut active = sample_active_search_request(7);
     for i in 0..MAX_STREAMED_HASHES_SOFT_CAP {
-        active.streamed_hashes.insert(format!("preexisting-{i}"));
+        active
+            .streamed_hashes
+            .insert(format!("preexisting-{i}"), vec![1234]);
     }
     let mut active = Some(active);
 
@@ -1931,7 +1932,7 @@ fn dedup_streamed_batch_keeps_deduping_already_tracked_hashes_past_soft_cap() {
         "set must not grow past the soft cap"
     );
     assert!(
-        !active_ref.streamed_hashes.contains("brand-new"),
+        !active_ref.streamed_hashes.contains_key("brand-new"),
         "new hashes seen past the cap are not tracked (documented trade-off)"
     );
 }
@@ -2310,8 +2311,10 @@ fn the_publish_queue_count_tracks_its_contents() {
     assert_eq!(actual, 12, "four records across three targets");
 
     // And the cap actually stops admitting once reached.
-    let mut capped = EmberBatchPublisher::default();
-    capped.queued_count = EMBER_BATCH_QUEUE_MAX;
+    let mut capped = EmberBatchPublisher {
+        queued_count: EMBER_BATCH_QUEUE_MAX,
+        ..Default::default()
+    };
     assert!(!capped.enqueue(&targets, record_ref(2, 0), record));
     assert!(
         capped.queued.is_empty(),

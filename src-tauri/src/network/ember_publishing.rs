@@ -955,9 +955,10 @@ pub(super) fn ember_keyword_files_per_tick(publishable: usize, contacts: usize) 
 }
 
 /// How often a download re-queries the Ember DHT for sources, indexed by
-/// how many times it has already searched (slice 9). Mirrors the spirit of
-/// the KAD `active_download_kad_interval` backoff: eager at first, then
+/// how many times it has already searched (slice 9): eager at first, then
 /// progressively calmer so a long-running download isn't a steady DHT load.
+/// Its own schedule, not KAD's: the Ember DHT is not held to eMule's hourly
+/// source-search cadence (`kad_source_search_interval`).
 pub(super) fn ember_source_search_interval(search_count: u32) -> std::time::Duration {
     let secs = match search_count {
         0 => 0,
@@ -2809,9 +2810,12 @@ pub(super) async fn maybe_publish_ember_keywords(
         let media = known_files
             .media_for(&file_hash)
             .and_then(|(_, media)| media);
-        // Same tokenization as KAD keyword publishing/search so an Ember
-        // search hashes the identical keyword set.
-        let keywords = kad::publish::extract_keywords(&file_name);
+        // KAD's tokenization, which Ember has published under since 1.6.5,
+        // plus the normalised spellings newer searchers walk — of the name as
+        // the record signs it, so a word cut off to fit is not a key the
+        // record's own name cannot vouch for.
+        let signed_name = ember::dht::publish::keyword_record_signed_name(&file_name, media.as_ref());
+        let keywords = ember::dht::search::ember_publish_keywords(signed_name);
         if keywords.is_empty() {
             // Nothing to publish for this name, ever. Mark it done so it does
             // not get re-selected every tick and starve the rest of the

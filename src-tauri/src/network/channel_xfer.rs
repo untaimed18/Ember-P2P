@@ -5,6 +5,11 @@
 //! way `command.rs` does.
 
 use super::*;
+use crate::commands::errors::{coded, coded_ctx};
+
+/// Free space an accepted room transfer must leave beyond its own size, so
+/// taking it up does not run the volume to its last byte.
+const XFER_DISK_HEADROOM: u64 = 64 * 1024 * 1024;
 
 /// Data-block budget, deliberately separate from the chat one.
 ///
@@ -868,10 +873,7 @@ async fn sync_xfer_streams(
         let Some(recv) = state.xfer_recv.remove(&xfer_id) else {
             continue;
         };
-        let part_path = recv.part_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let _ = std::fs::remove_file(&part_path);
-        });
+        discard_part_file(recv.part_path.clone());
         let plain = ember::channel::encode_xfer_cancel(
             &recv.key,
             &state.local_ed25519_pubkey,
@@ -937,7 +939,7 @@ pub(super) fn drop_channel_transfers_for(
     state.xfer_recv.retain(|xfer_id, recv| {
         if matches(&recv.channel_id, &recv.peer) {
             // Half a file is not a file.
-            let _ = std::fs::remove_file(&recv.part_path);
+            discard_part_file(recv.part_path.clone());
             ended.push((*xfer_id, recv.peer, recv.name.clone(), recv.size, "receive"));
             return false;
         }
@@ -1621,6 +1623,373 @@ pub(super) async fn apply_xfer_reply(
     );
 }
 
+/// Delete a receive's `.part` file without waiting for it. On Windows,
+/// removing a large file whose handle was just released blocks on the
+/// antivirus filter driver, and on the network task that stalls every peer
+/// and timer. Nothing that calls this depends on the delete landing.
+pub(super) fn discard_part_file(path: std::path::PathBuf) {
+    tokio::task::spawn_blocking(move || {
+        let _ = std::fs::remove_file(&path);
+    });
+}
+
+/// A room transfer's part file, readied off the event loop for an accept.
+pub(super) struct PreparedXferPart {
+    part_path: std::path::PathBuf,
+    done_dir: std::path::PathBuf,
+    identity: crate::security::filesystem::ObjectIdentity,
+    file: std::fs::File,
+}
+
+pub(super) enum XferPrepareError {
+    NoSpace,
+    Failed(String),
+}
+
+/// An accept's disk work, posted back through `NetworkState::xfer_accept_tx`
+/// and finished by [`apply_xfer_accept_prepared`].
+pub(super) struct XferAcceptPrepared {
+    xfer_id: [u8; 16],
+    offer: ember::xfer::PendingOffer,
+    download_folder: std::path::PathBuf,
+    tx: oneshot::Sender<Result<(), String>>,
+    prepared: Result<PreparedXferPart, XferPrepareError>,
+}
+
+enum XferAcceptRefusal {
+    /// The receive cap is full. The offer stays answerable.
+    Busy,
+    /// The room or the sender's standing changed. The offer is dropped.
+    NotAllowed,
+}
+
+/// Whether an accept may go ahead. Asked when the user answers, and again
+/// once the part file is ready, since the loop has run in between.
+fn xfer_accept_refusal(
+    state: &mut NetworkState,
+    db: &Database,
+    offer: &ember::xfer::PendingOffer,
+) -> Option<XferAcceptRefusal> {
+    // The cap the offer was measured against, re-checked at the moment it is
+    // taken up. An offer only counted itself against `xfer_pending`, so four
+    // queued prompts on top of an already busy receiver could all be accepted
+    // and land as seven concurrent downloads — each holding an open file
+    // handle and a request window the tick budget was never sized for.
+    // Accepts still readying their part file are about to become receives.
+    if state.xfer_recv.len() + state.xfer_accepting.len() >= ember::channel::XFER_MAX_ACTIVE {
+        return Some(XferAcceptRefusal::Busy);
+    }
+    // No longer in the room it came from — left, deleted, or walked out when
+    // the directory listed it gone. Its frames are dropped from here on, so
+    // the transfer could never finish.
+    if !cached_channel_view(state, db, offer.channel_id).is_some_and(|view| view.row.in_room_now())
+    {
+        return Some(XferAcceptRefusal::NotAllowed);
+    }
+    // Banned since the prompt appeared. The offer path refuses a banned sender
+    // outright, and nothing re-read that decision afterwards — so a member
+    // evicted while their dialog sat on screen could still be let in by the
+    // click that answered it. Declining stays available either way: that is
+    // cleanup.
+    if db
+        .channel_member_is_banned(&hex::encode(offer.channel_id), &hex::encode(offer.peer))
+        .unwrap_or(false)
+    {
+        return Some(XferAcceptRefusal::NotAllowed);
+    }
+    None
+}
+
+fn refuse_xfer_accept(
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    xfer_id: [u8; 16],
+    offer: &ember::xfer::PendingOffer,
+    refusal: XferAcceptRefusal,
+    tx: oneshot::Sender<Result<(), String>>,
+) {
+    match refusal {
+        XferAcceptRefusal::Busy => {
+            let _ = tx.send(Err(coded(
+                "channels_xfer_busy",
+                "Too many transfers are already running",
+            )));
+        }
+        XferAcceptRefusal::NotAllowed => {
+            state.xfer_pending.remove(&xfer_id);
+            emit_xfer_update(
+                app_handle,
+                &xfer_id,
+                &offer.channel_id,
+                &offer.peer,
+                "receive",
+                &offer.name,
+                offer.size,
+                0,
+                "not_allowed",
+            );
+            let _ = tx.send(Err(coded(
+                "channels_xfer_no_member",
+                "That member is not in this room",
+            )));
+        }
+    }
+}
+
+/// Take up a waiting offer: check it may go ahead, then ready its part file
+/// off the event loop. The download folder can be a network share or a
+/// spinning disk behind a virus scanner, where that is hundreds of
+/// milliseconds, and the loop also drives UDP receive, every timer and every
+/// IPC snapshot. [`apply_xfer_accept_prepared`] finishes the accept.
+pub(super) fn begin_xfer_accept(
+    state: &mut NetworkState,
+    db: &Database,
+    app_handle: &tauri::AppHandle,
+    xfer_id: [u8; 16],
+    offer: ember::xfer::PendingOffer,
+    download_folder: std::path::PathBuf,
+    tx: oneshot::Sender<Result<(), String>>,
+) {
+    // An earlier accept of this offer is still readying its file, and it is
+    // the one that reports how the accept ends.
+    if state.xfer_accepting.contains_key(&xfer_id) {
+        let _ = tx.send(Ok(()));
+        return;
+    }
+    if let Some(refusal) = xfer_accept_refusal(state, db, &offer) {
+        refuse_xfer_accept(state, app_handle, xfer_id, &offer, refusal, tx);
+        return;
+    }
+    // Room for the whole file before a byte is asked for. The sender picks
+    // the size, and the content is only checked against its hash as it
+    // arrives, so without this a large offer filled the disk and then failed.
+    // Receives already running grow their part files as data arrives, and
+    // accepts still readying theirs are about to, so what they owe is spoken
+    // for too.
+    let owed: u64 = state
+        .xfer_recv
+        .values()
+        .map(|recv| recv.size.saturating_sub(recv.bytes_received()))
+        .chain(state.xfer_accepting.values().copied())
+        .fold(0, u64::saturating_add);
+    let needed = offer.size.saturating_add(XFER_DISK_HEADROOM).saturating_add(owed);
+    crate::storage::part_folders::note_part_owner(&format!("ember-xfer-{}", hex::encode(xfer_id)));
+    let part_name = format!("ember-xfer-{}.part", hex::encode(xfer_id));
+    state.xfer_accepting.insert(xfer_id, offer.size);
+    let report = state.xfer_accept_tx.clone();
+    tokio::spawn(async move {
+        let root = download_folder.clone();
+        let prepared =
+            tokio::task::spawn_blocking(move || prepare_xfer_part(&root, &part_name, needed))
+                .await
+                .unwrap_or_else(|e| Err(XferPrepareError::Failed(e.to_string())));
+        let _ = report.send(XferAcceptPrepared {
+            xfer_id,
+            offer,
+            download_folder,
+            tx,
+            prepared,
+        });
+    });
+}
+
+/// The disk half of an accept, on the blocking pool.
+///
+/// A volume that cannot report its free space is let through, as eD2K
+/// downloads do; a full disk still fails the write safely. The offer stays
+/// answerable after `NoSpace`: the user can free space and accept again.
+///
+/// Part files sit beside the ones eD2K downloads use, so a half-received
+/// transfer never appears in the finished folder, and go through the
+/// approved-root layer exactly as the eD2K download path does. The `.part`
+/// name is derived from `xfer_id`, which is decoded straight off the wire, so
+/// the path a receive writes to is chosen by the *sending* peer: with bare
+/// `std::fs` a symlink planted there was followed and truncated, and a
+/// junction at `Downloads` traversed on completion. `prepare_approved_subdir`
+/// creates handle-relative and refuses a reparse point;
+/// `open_or_create_approved` refuses a path that resolves outside the
+/// approved root. Both also re-pin the root, so a download folder whose
+/// approval has been revoked is refused here rather than silently written to.
+fn prepare_xfer_part(
+    root: &std::path::Path,
+    part_name: &str,
+    needed: u64,
+) -> Result<PreparedXferPart, XferPrepareError> {
+    if fs2::available_space(root).is_ok_and(|free| free < needed) {
+        return Err(XferPrepareError::NoSpace);
+    }
+    let allowed = vec![root.to_string_lossy().into_owned()];
+    (|| -> std::io::Result<PreparedXferPart> {
+        let temp_dir =
+            crate::security::filesystem::prepare_approved_subdir(root, "Temp", &allowed)?;
+        let done_dir = crate::security::filesystem::prepare_approved_subdir(
+            root,
+            ember::xfer::CHANNEL_FILES_DIR,
+            &allowed,
+        )?;
+        let (part_path, file) = crate::security::filesystem::open_or_create_approved(
+            &temp_dir.join(part_name),
+            &allowed,
+            true,
+        )?;
+        // Recorded now so completion can refuse a `.part` that was swapped
+        // underneath the transfer.
+        let identity = crate::security::filesystem::object_identity_from_file(&file)?;
+        Ok(PreparedXferPart {
+            part_path,
+            done_dir,
+            identity,
+            file,
+        })
+    })()
+    .map_err(|e| XferPrepareError::Failed(e.to_string()))
+}
+
+/// Finish an accept whose part file is ready. The offer is checked again
+/// first: while the disk work ran it may have been declined, cancelled,
+/// expired or dropped by a ban or a leave, or the room may have changed.
+pub(super) async fn apply_xfer_accept_prepared(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    done: XferAcceptPrepared,
+) {
+    let XferAcceptPrepared {
+        xfer_id,
+        offer,
+        download_folder,
+        tx,
+        prepared,
+    } = done;
+    state.xfer_accepting.remove(&xfer_id);
+    let part = match prepared {
+        Ok(part) => part,
+        Err(XferPrepareError::NoSpace) => {
+            let _ = tx.send(Err(coded(
+                "channels_xfer_no_space",
+                "Not enough free disk space for this file",
+            )));
+            return;
+        }
+        Err(XferPrepareError::Failed(e)) => {
+            let _ = tx.send(Err(coded_ctx(
+                "channels_xfer_failed",
+                "Could not open a place to save the file",
+                e,
+            )));
+            return;
+        }
+    };
+    let PreparedXferPart {
+        part_path,
+        done_dir,
+        identity,
+        file,
+    } = part;
+    let still_waiting = state.xfer_pending.get(&xfer_id).is_some_and(|now| {
+        now.channel_id == offer.channel_id
+            && now.peer == offer.peer
+            && now.root == offer.root
+            && now.size == offer.size
+    });
+    if !still_waiting {
+        drop(file);
+        discard_part_file(part_path);
+        let _ = tx.send(Err(coded(
+            "channels_xfer_not_found",
+            "That transfer is no longer waiting",
+        )));
+        return;
+    }
+    if let Some(refusal) = xfer_accept_refusal(state, db, &offer) {
+        drop(file);
+        discard_part_file(part_path);
+        refuse_xfer_accept(state, app_handle, xfer_id, &offer, refusal, tx);
+        return;
+    }
+    state.xfer_recv.insert(
+        xfer_id,
+        ember::xfer::RecvState::new(
+            offer.channel_id,
+            offer.peer,
+            offer.key,
+            offer.name.clone(),
+            offer.size,
+            offer.root,
+            part_path,
+            done_dir.join(&offer.name),
+            download_folder,
+            identity,
+            file,
+        ),
+    );
+    answer_xfer_offer(socket, state, db, app_handle, xfer_id, offer, true, tx).await;
+}
+
+/// Send the user's answer to a waiting offer and settle it. An accept
+/// arrives here with its receive already in `xfer_recv`.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn answer_xfer_offer(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    xfer_id: [u8; 16],
+    offer: ember::xfer::PendingOffer,
+    accept: bool,
+    tx: oneshot::Sender<Result<(), String>>,
+) {
+    let reply = if accept {
+        ember::channel::XferReply::Accept
+    } else {
+        ember::channel::XferReply::Decline
+    };
+    let plain = ember::channel::encode_xfer_reply(
+        &offer.key,
+        &state.local_ed25519_pubkey,
+        &offer.peer,
+        &xfer_id,
+        reply,
+    );
+    // Rolled back on a reply that never left, exactly as the offer side does.
+    // Marking the transfer active regardless held a receive slot and an open
+    // file for a sender who was never told to start, and the offer had already
+    // been consumed so there was nothing left to answer — the user's only
+    // recourse was to wait out the timeout.
+    if !send_xfer_frame(socket, state, db, offer.channel_id, offer.peer, &plain).await {
+        if let Some(recv) = state.xfer_recv.remove(&xfer_id) {
+            discard_part_file(recv.part_path.clone());
+        }
+        let _ = tx.send(Err(coded(
+            "channels_xfer_unreachable",
+            "Could not reach that member right now",
+        )));
+        return;
+    }
+    state.xfer_pending.remove(&xfer_id);
+    if !accept {
+        remember_declined_xfer(xfer_id, offer.channel_id, offer.peer, plain);
+    }
+    emit_xfer_update(
+        app_handle,
+        &xfer_id,
+        &offer.channel_id,
+        &offer.peer,
+        "receive",
+        &offer.name,
+        offer.size,
+        0,
+        if accept { "active" } else { "declined" },
+    );
+    let _ = tx.send(Ok(()));
+    if accept {
+        start_xfer_stream_fetch(socket, state, db, xfer_id).await;
+    } else {
+        state.xfer_stream_ports.remove(&xfer_id);
+    }
+}
+
 pub(super) fn apply_xfer_block_request(
     state: &mut NetworkState,
     xfer_id: [u8; 16],
@@ -1660,7 +2029,7 @@ pub(super) fn apply_xfer_block_data(
             if let Some(dead) = state.xfer_recv.remove(&xfer_id) {
                 // Half a file helps nobody, and leaving it behind means the
                 // download folder collects `.part` files nothing will finish.
-                let _ = std::fs::remove_file(&dead.part_path);
+                discard_part_file(dead.part_path.clone());
             }
             emit_xfer_update(
                 app_handle,
@@ -2043,7 +2412,7 @@ pub(super) fn apply_xfer_cancel(
         }
         let recv = state.xfer_recv.remove(&xfer_id).expect("just checked");
         // Half a file is not a file. Nothing is left in the download folder.
-        let _ = std::fs::remove_file(&recv.part_path);
+        discard_part_file(recv.part_path.clone());
         emit_xfer_update(
             app_handle,
             &xfer_id,
@@ -2316,14 +2685,7 @@ pub(super) async fn drive_channel_transfers(
         .collect();
     for xfer_id in stalled_recv {
         if let Some(recv) = state.xfer_recv.remove(&xfer_id) {
-            // Detached: nothing below depends on the delete landing, and on
-            // Windows removing a large file whose handle was just released
-            // blocks on the antivirus filter driver — on the network task,
-            // once per stalled transfer.
-            let part_path = recv.part_path.clone();
-            tokio::task::spawn_blocking(move || {
-                let _ = std::fs::remove_file(&part_path);
-            });
+            discard_part_file(recv.part_path.clone());
             let plain = ember::channel::encode_xfer_cancel(
                 &recv.key,
                 &me,

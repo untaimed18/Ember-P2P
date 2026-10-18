@@ -1225,6 +1225,17 @@ mod tests {
         assert_eq!(keyword_to_kad_id("UBUNTU"), keyword_to_kad_id("ubuntu"));
     }
 
+    /// Ember normalises keywords before hashing them; KAD must not, because
+    /// eMule does not. Decomposed accents, full-width letters and a typed
+    /// final sigma all reach the MD4 exactly as written, lowercased 1:1.
+    #[test]
+    fn kad_keywords_are_not_unicode_normalised() {
+        assert_eq!(extract_keywords("Cafe\u{301} del Mar.mp3"), vec!["cafe\u{301}", "del", "mar"]);
+        assert_eq!(extract_keywords("ＵＢＵＮＴＵ.iso"), vec!["ｕｂｕｎｔｕ"]);
+        assert_eq!(extract_query_keywords("οδος"), vec!["οδος"]);
+        assert_ne!(keyword_to_kad_id("Cafe\u{301}"), keyword_to_kad_id("Café"));
+    }
+
     /// Every Ember build has to derive the same rendezvous key or nodes
     /// advertise themselves where nobody is looking. Pinning the value guards
     /// the derivation against an innocent-looking refactor of the seed string

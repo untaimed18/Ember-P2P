@@ -4349,6 +4349,31 @@ fn truncate_utf8_owned(s: &str, max_bytes: usize) -> String {
 }
 
 const CHANNEL_RELAY_ENVELOPE_VERSION: u8 = 1;
+
+/// Whether this build reads a gossip envelope ([`CHANNEL_MSG_VERSION`]) of
+/// `version`, outer header or sealed body alike.
+pub fn gossip_envelope_version_supported(version: u8) -> bool {
+    version == CHANNEL_MSG_VERSION
+}
+
+/// Whether this build reads an overlay relay envelope of `version`.
+pub fn relay_envelope_version_supported(version: u8) -> bool {
+    version == CHANNEL_RELAY_ENVELOPE_VERSION
+}
+
+/// The room a frame names when its envelope version is one this build does
+/// not read: the first byte is the version and the next sixteen the room id,
+/// in both envelopes. A later version that moved the room id would only go
+/// unreported. `None` for a version this build reads, or too short a frame.
+pub fn unread_envelope_room(bytes: &[u8], supported: fn(u8) -> bool) -> Option<(u8, [u8; 16])> {
+    let (&version, rest) = bytes.split_first()?;
+    if supported(version) || rest.len() < 16 {
+        return None;
+    }
+    let mut channel_id = [0u8; 16];
+    channel_id.copy_from_slice(&rest[..16]);
+    Some((version, channel_id))
+}
 /// `version(1) + channel_id(16) + target_id(16)` before the inner gossip body.
 pub const CHANNEL_RELAY_ENVELOPE_HEADER: usize = 1 + 16 + 16;
 
@@ -4891,6 +4916,33 @@ fn decrypt_gossip_body(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn an_unread_envelope_names_its_room_and_a_read_one_does_not() {
+        let room = [0x42u8; 16];
+        let gossip = ChannelGossip::new_plaintext(room, &[7u8; 32], 1, b"hi", 4).encode();
+        assert_eq!(unread_envelope_room(&gossip, gossip_envelope_version_supported), None);
+
+        let mut newer = gossip.clone();
+        newer[0] = CHANNEL_MSG_VERSION + 1;
+        assert_eq!(
+            unread_envelope_room(&newer, gossip_envelope_version_supported),
+            Some((CHANNEL_MSG_VERSION + 1, room))
+        );
+        assert!(ChannelGossip::decode(&newer).is_none());
+
+        let relay = encode_channel_relay_envelope(&room, &[2u8; 16], &gossip);
+        assert_eq!(unread_envelope_room(&relay, relay_envelope_version_supported), None);
+        let mut newer_relay = relay;
+        newer_relay[0] = CHANNEL_RELAY_ENVELOPE_VERSION + 1;
+        assert_eq!(
+            unread_envelope_room(&newer_relay, relay_envelope_version_supported),
+            Some((CHANNEL_RELAY_ENVELOPE_VERSION + 1, room))
+        );
+
+        // Too short to carry a room id at all.
+        assert_eq!(unread_envelope_room(&[9u8; 10], gossip_envelope_version_supported), None);
+    }
 
     // One fixed room / message / time for the chat frames below. A signature
     // only verifies against the context it was made for, so both ends of a
