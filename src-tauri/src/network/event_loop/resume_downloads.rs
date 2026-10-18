@@ -585,7 +585,9 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 transfer.transferred = transfer.transferred.max(completed_bytes);
                 transfer.progress =
                     ((completed_bytes as f64 / transfer.total_size as f64) * 100.0).min(100.0);
-                control.set_preview_ready(preview_ready);
+                // Same gate as the live worker: `PreviewFile` refuses an
+                // AICH-pinned download until it is complete.
+                control.set_preview_ready(preview_ready && transfer.expected_aich.is_none());
             }
 
             // A completion copy of the file's size may be the only complete

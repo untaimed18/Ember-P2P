@@ -6344,39 +6344,12 @@ async fn handle_command_inner(
                                 return Err("Expected AICH hash mismatch; preview blocked".into());
                             }
                         }
-                        // The contiguous verified run from the start of the file,
-                        // and nothing past the first gap. Copying every verified
-                        // part instead sized the preview to the last one and left
-                        // the holes between as zeros: with preview priority
-                        // fetching the first and last parts first, the player got
-                        // a full-length file whose middle was silence, and read
-                        // its duration off that. A short prefix is what
-                        // `can_preview` actually promises.
-                        //
-                        // Bounded by `PREVIEW_MAX_BYTES`: on a nearly complete
-                        // download that run *is* the whole file, and copying
-                        // all of it duplicated gigabytes into the preview temp
-                        // directory.
-                        let preview_limit =
-                            ed2k::preview::PREVIEW_MAX_BYTES.min(file_size);
-                        let verified_ranges: Vec<ed2k::preview::FilledRange> =
-                            verified_complete_parts
-                                .iter()
-                                .take_while(|verified| **verified)
-                                .enumerate()
-                                .map(|(index, _)| {
-                                    let start = index as u64 * part_size;
-                                    ed2k::preview::FilledRange {
-                                        start,
-                                        end: (start + part_size).min(file_size),
-                                    }
-                                })
-                                .take_while(|range| range.start < preview_limit)
-                                .map(|range| ed2k::preview::FilledRange {
-                                    start: range.start,
-                                    end: range.end.min(preview_limit),
-                                })
-                                .collect();
+                        let verified_ranges = ed2k::preview::preview_ranges(
+                            &file_name_for_preview,
+                            file_size,
+                            &verified_complete_parts,
+                            part_size,
+                        );
 
                         let preview_path = ed2k::preview::create_preview_file(
                             &part_path,

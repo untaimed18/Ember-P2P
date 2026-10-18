@@ -2631,13 +2631,25 @@ pub fn open_with_default_app(path: &Path) -> io::Result<()> {
 /// `LD_LIBRARY_PATH` and GStreamer paths in place dies immediately, which is
 /// what made Preview look like it did nothing at all. Choosing the player
 /// explicitly does not change that — it only changes who picks the binary.
+///
+/// On Windows the `\\?\` prefix comes off for the reason
+/// [`open_with_default_app`] gives, and because some players (VLC among them)
+/// cannot open the extended form either.
 pub fn launch_with_player(player: &Path, file: &Path) -> io::Result<()> {
     use std::process::Stdio;
     let mut cmd = std::process::Command::new(player);
     #[cfg(all(unix, not(target_os = "macos")))]
     apply_host_desktop_env(&mut cmd);
-    cmd.arg(file)
-        .stdin(Stdio::null())
+    #[cfg(windows)]
+    {
+        let value = file
+            .to_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path is not UTF-8"))?;
+        cmd.arg(strip_extended_path_prefix(value));
+    }
+    #[cfg(not(windows))]
+    cmd.arg(file);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
