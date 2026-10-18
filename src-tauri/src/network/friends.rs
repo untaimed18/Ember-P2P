@@ -739,15 +739,10 @@ pub(super) async fn process_inbound_friend_request(
         if db_q.is_friend_blocked(&h_q).unwrap_or(false) {
             return FriendRequestDbOutcome::Blocked;
         }
-        let (is_friend, already_mutual) = db_q
-            .get_friends_full()
-            .ok()
-            .and_then(|rows| {
-                rows.into_iter()
-                    .find(|(h, ..)| h == &h_q)
-                    .map(|(_, _, _, _, _, _, mutual)| (true, mutual))
-            })
-            .unwrap_or((false, false));
+        let (is_friend, already_mutual) = match db_q.friend_mutual(&h_q) {
+            Ok(Some(mutual)) => (true, mutual),
+            Ok(None) | Err(_) => (false, false),
+        };
         if already_mutual {
             // Leftover queue rows from the old double-approval path.
             let _ = db_q.remove_friend_request(&h_q);
@@ -1149,20 +1144,10 @@ async fn ask_unmatched_friend_through_rooms(app_handle: &tauri::AppHandle, targe
     let db = app_state.db.clone();
     let hash_hex = hex::encode(target_hash);
     let pubkey = tokio::task::spawn_blocking(move || {
-        let mutual = db
-            .get_friends_full()
-            .ok()?
-            .into_iter()
-            .find(|(hash, ..)| *hash == hash_hex)
-            .map(|(.., mutual)| mutual)?;
-        if mutual {
+        if db.friend_mutual(&hash_hex).ok()?? {
             return None;
         }
-        db.get_friend_public_keys()
-            .ok()?
-            .into_iter()
-            .find(|(hash, _)| *hash == target_hash)
-            .map(|(_, key)| key)
+        db.get_friend_public_key(&target_hash).ok()?
     })
     .await
     .ok()

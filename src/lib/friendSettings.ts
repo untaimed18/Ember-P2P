@@ -9,12 +9,13 @@ import type { AppSettings, FriendOverrides } from '$lib/types';
 /** Highest per-friend auto-accept ceiling, in MB. Matches the global one. */
 export const FRIEND_AUTO_ACCEPT_MAX_MB = 2048;
 
-/** The backend's limit on a friend's name, in UTF-8 bytes. */
-export const FRIEND_NAME_MAX_BYTES = 64;
+/** The backend's limit on a friend's name, in characters (Unicode code
+ *  points), the same for names typed here and names a request brings in. */
+export const FRIEND_NAME_MAX_CHARS = 64;
 
-/** Whether a name, as it will be saved, is over {@link FRIEND_NAME_MAX_BYTES}. */
+/** Whether a name, as it will be saved, is over {@link FRIEND_NAME_MAX_CHARS}. */
 export function friendNameTooLong(name: string): boolean {
-  return new TextEncoder().encode(name.trim()).length > FRIEND_NAME_MAX_BYTES;
+  return [...name.trim()].length > FRIEND_NAME_MAX_CHARS;
 }
 
 type Settings = AppSettings | null | undefined;

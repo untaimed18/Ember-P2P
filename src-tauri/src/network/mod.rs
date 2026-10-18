@@ -804,6 +804,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // lives in `NetworkState`, which is built next.
     let (xfer_finish_tx, mut xfer_finish_rx) = mpsc::unbounded_channel::<XferFinishResult>();
     let (xfer_stream_tx, xfer_stream_rx) = mpsc::unbounded_channel::<StreamFetchOutcome>();
+    let (xfer_accept_tx, xfer_accept_rx) = mpsc::unbounded_channel::<XferAcceptPrepared>();
 
     // Before anything below can finish a download or sweep where finished
     // files land; `apply_network_settings` keeps it current from here.
@@ -1222,6 +1223,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         xfer_finish_tx,
         xfer_finish_in_flight: 0,
         xfer_finishing: HashMap::new(),
+        xfer_accepting: HashMap::new(),
+        xfer_accept_tx,
+        xfer_accept_rx,
         channel_member_touches: HashMap::new(),
         xfer_pending: HashMap::new(),
         xfer_grants: Default::default(),

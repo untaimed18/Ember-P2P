@@ -1,7 +1,7 @@
 # Channels: wire and DHT formats
 
 The format spec for Channels, written before the formats freeze at the end of
-the beta ([post-1.7.3 item 4](post-1.7.3.md#4-a-short-format-spec)). It covers
+the beta ([post-1.7.4 item 4](post-1.7.4.md#4-a-short-format-spec)). It covers
 what goes over the gossip mesh, what is kept on the Ember DHT, and the one
 friend-session sub-type the Channels audit added. Every number here is read
 from the code; identifiers are in backticks so they can be grepped. Where the
@@ -53,7 +53,7 @@ A room frame is three layers deep:
 `"ember-channel-gossip-v1\0" || channel_id || msg_id || sender_counter ||
 timestamp` (`gossip_aad`). Neither version byte nor `ttl` is under the AEAD:
 `ttl` has to change as the frame travels, which is why a relay can raise it
-(see [post-1.7.3 item 8](post-1.7.3.md#8-an-authenticated-marker-on-catch-up-re-serves)).
+(see [post-1.7.4 item 8](post-1.7.4.md#8-an-authenticated-marker-on-catch-up-re-serves)).
 `GOSSIP_ENVELOPE_OVERHEAD` (41) is the body version, nonce and tag.
 
 ## Relay envelope
@@ -102,7 +102,7 @@ would only go unreported. The same goes for the sealed body inside a v1
 header: its byte 0 stays the body version.
 
 **Not done: relaying an unknown version unopened.** Item 3 of the post-1.7.3
-plan asked for it. It is not done because members only pass on frames that
+plan asked for it, and it is still open in the post-1.7.4 plan. It is not done because members only pass on frames that
 open: `handle_inbound_channel_relay` forwards only for a room we are in
 (`inbound_channel_relay_may_forward`), and refuses a frame that does not open
 under one of the room's keys unless we are behind the room's key; gossip is
@@ -287,7 +287,9 @@ but `channel_store_ok` refuses those first. The `extra` each kind carries:
 - **3, moderation.** The owner's whole governance snapshot (welcome, bans,
   moderators, `ModerationTail`). The storer does not check its shape; readers
   do. Worst case 1164 of 1165 bytes (see
-  [post-1.7.3 item 1](post-1.7.3.md#1-decide-the-future-of-the-room-settings-snapshot)).
+  [post-1.7.4 item 1](post-1.7.4.md#1-decide-the-future-of-the-room-settings-snapshot)).
+  Decided for 1.7.5: this record freezes as it is, and new room settings go
+  in a second record, kind 8.
 - **4, handoff.** `version(8) || successor_pubkey(32) || successor_id(16) ||
   flags(1)`, 57 bytes; `successor_id` must derive from `successor_pubkey`.
   `HANDOFF_FLAG_KEEP_JOIN_SECRET` (`0x01`) in the flags.
@@ -329,7 +331,7 @@ signed that comes back (`merged_lists`), and takes a lookup that finds
 nothing as "no list" only once `MIN_RESPONDERS_FOR_ABSENCE` (4) nodes have
 answered. Builds older than kind 7 do not store it. The known limits (one
 identity on two devices, the list revealing a room count) are under
-[Owned-room recovery](post-1.7.3.md#owned-room-recovery-known-limits).
+[Owned-room recovery](post-1.7.4.md#owned-room-recovery).
 
 ## Friend sessions: `EMBER_EXT_BROWSE_SCOPE_AWARE`
 
@@ -386,12 +388,14 @@ browses sends the scope frame ahead of the request.
 - The meaning of `EMBER_EXT_BROWSE_SCOPE_AWARE`, and that it or
   `EMBER_EXT_MAILBOX_AWARE` marks a session as honouring friends-only files.
 
-**Open, to decide before the freeze** (detail in
-[post-1.7.3.md](post-1.7.3.md#channels-before-the-beta-badge-comes-off)):
+**Open, to decide before the freeze in 1.7.5** (detail in
+[post-1.7.4.md](post-1.7.4.md#channels-the-format-freeze)):
 
-- **Item 1, room settings.** Freeze the moderation snapshot and put new
-  settings in extension frames, or add a "room settings" record as kind 8
-  with its own storer rule and a TTL equal to `CHANNEL_GOVERNANCE_TTL`.
+- **Item 1, room settings. Decided:** a "room settings" record as kind 8,
+  with a version byte, its own storer rule and a TTL equal to
+  `CHANNEL_GOVERNANCE_TTL`. The moderation snapshot (kind 3) freezes as it
+  is. Still to define in 1.7.5: the record's layout, the storer rule, and
+  what members do when only one of the two records arrives.
 - **Item 2, chat v2.** A chat and edit format with tagged optional fields, as
   an extension kind sent beside today's line; which release stops sending
   15 and 19 is to be written here.

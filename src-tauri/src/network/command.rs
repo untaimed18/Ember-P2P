@@ -22,11 +22,7 @@ use super::*;
 // Ember Transfer replies travel to the UI through a Tauri command's `Result`,
 // so they carry the same coded shape the rest of the command layer uses and
 // stay translatable.
-use crate::commands::errors::{coded, coded_ctx};
-
-/// Free space an accepted room transfer must leave beyond its own size, so
-/// taking it up does not run the volume to its last byte.
-const XFER_DISK_HEADROOM: u64 = 64 * 1024 * 1024;
+use crate::commands::errors::coded;
 
 /// Remove every hash-pass handoff for a file in the index, returning the ones
 /// the reconcile will write into a record. Draining the rest too is what keeps
@@ -3596,245 +3592,10 @@ async fn handle_command_inner(
                 root: offer.root,
                 received_at: offer.received_at,
             };
-            let reply = if accept {
-                ember::channel::XferReply::Accept
-            } else {
-                ember::channel::XferReply::Decline
-            };
             if accept {
-                // The cap the offer was measured against, re-checked at the
-                // moment it is taken up. An offer only counted itself against
-                // `xfer_pending`, so four queued prompts on top of an already
-                // busy receiver could all be accepted and land as seven
-                // concurrent downloads — each holding an open file handle and a
-                // request window the tick budget was never sized for.
-                if state.xfer_recv.len() >= ember::channel::XFER_MAX_ACTIVE {
-                    let _ = tx.send(Err(coded(
-                        "channels_xfer_busy",
-                        "Too many transfers are already running",
-                    )));
-                    return;
-                }
-                // No longer in the room it came from — left, deleted, or walked
-                // out when the directory listed it gone. Its frames are dropped
-                // from here on, so the transfer could never finish.
-                if !cached_channel_view(state, db, offer.channel_id)
-                    .is_some_and(|view| view.row.in_room_now())
-                {
-                    state.xfer_pending.remove(&xfer_id);
-                    emit_xfer_update(
-                        app_handle,
-                        &xfer_id,
-                        &offer.channel_id,
-                        &offer.peer,
-                        "receive",
-                        &offer.name,
-                        offer.size,
-                        0,
-                        "not_allowed",
-                    );
-                    let _ = tx.send(Err(coded(
-                        "channels_xfer_no_member",
-                        "That member is not in this room",
-                    )));
-                    return;
-                }
-                // Banned since the prompt appeared. The offer path refuses a
-                // banned sender outright, and nothing re-read that decision
-                // afterwards — so a member evicted while their dialog sat on
-                // screen could still be let in by the click that answered it.
-                // Declining stays available either way: that is cleanup.
-                if db
-                    .channel_member_is_banned(
-                        &hex::encode(offer.channel_id),
-                        &hex::encode(offer.peer),
-                    )
-                    .unwrap_or(false)
-                {
-                    state.xfer_pending.remove(&xfer_id);
-                    emit_xfer_update(
-                        app_handle,
-                        &xfer_id,
-                        &offer.channel_id,
-                        &offer.peer,
-                        "receive",
-                        &offer.name,
-                        offer.size,
-                        0,
-                        "not_allowed",
-                    );
-                    let _ = tx.send(Err(coded(
-                        "channels_xfer_no_member",
-                        "That member is not in this room",
-                    )));
-                    return;
-                }
-                // Room for the whole file before a byte is asked for. The
-                // sender picks the size, and the content is only checked
-                // against its hash as it arrives, so without this a large offer
-                // filled the disk and then failed. The offer stays answerable:
-                // the user can free space and accept again, or deny it. A
-                // volume that cannot report its space is let through, as eD2K
-                // downloads do; a full disk still fails the write safely.
-                let free = tokio::task::spawn_blocking({
-                    let root = download_folder.clone();
-                    move || fs2::available_space(root).ok()
-                })
-                .await
-                .ok()
-                .flatten();
-                // Receives already running grow their part files as data
-                // arrives, so what they still owe is spoken for too.
-                let owed: u64 = state
-                    .xfer_recv
-                    .values()
-                    .map(|recv| recv.size.saturating_sub(recv.bytes_received()))
-                    .fold(0, u64::saturating_add);
-                if free.is_some_and(|free| {
-                    free < offer.size.saturating_add(XFER_DISK_HEADROOM).saturating_add(owed)
-                }) {
-                    let _ = tx.send(Err(coded(
-                        "channels_xfer_no_space",
-                        "Not enough free disk space for this file",
-                    )));
-                    return;
-                }
-                // Part files sit beside the ones eD2K downloads use, so a
-                // half-received transfer never appears in the finished folder.
-                // Through the approved-root layer, exactly as the eD2K download
-                // path does it. This was the one download path in the
-                // application writing with bare `std::fs` — `create_dir_all`,
-                // a truncating `OpenOptions::open`, and later a `rename`, all
-                // by pathname with no root-identity pin and no reparse-point
-                // refusal. The `.part` name is derived from `xfer_id`, which is
-                // decoded straight off the wire, so the path a receive will
-                // write to is chosen by the *sending* peer: a symlink planted
-                // there is followed and truncated, and a junction at
-                // `Downloads` is traversed on completion. `prepare_approved_subdir`
-                // creates handle-relative and refuses a reparse point;
-                // `open_or_create_approved` refuses a path that resolves
-                // outside the approved root. Both also re-pin the root, so a
-                // download folder whose approval has been revoked is refused
-                // here rather than silently written to.
-                //
-                // Off the network task because the download folder can be a
-                // network share or a spinning disk behind a virus scanner,
-                // where these are hundreds of milliseconds — and this task also
-                // drives UDP receive, every timer and every IPC snapshot.
-                // Nothing else can touch `state` while we await (the loop is one
-                // task and this handler holds `&mut`), so the capacity and ban
-                // checks above still hold on the far side.
-                let allowed_roots = vec![download_folder.to_string_lossy().into_owned()];
-                crate::storage::part_folders::note_part_owner(&format!(
-                    "ember-xfer-{}",
-                    hex::encode(xfer_id)
-                ));
-                let part_name = format!("ember-xfer-{}.part", hex::encode(xfer_id));
-                let prepared = tokio::task::spawn_blocking({
-                    let root = download_folder.clone();
-                    let allowed = allowed_roots.clone();
-                    let part_name = part_name.clone();
-                    move || -> std::io::Result<(
-                        std::path::PathBuf,
-                        std::path::PathBuf,
-                        crate::security::filesystem::ObjectIdentity,
-                        std::fs::File,
-                    )> {
-                        let temp_dir = crate::security::filesystem::prepare_approved_subdir(
-                            &root, "Temp", &allowed,
-                        )?;
-                        let done_dir = crate::security::filesystem::prepare_approved_subdir(
-                            &root,
-                            ember::xfer::CHANNEL_FILES_DIR,
-                            &allowed,
-                        )?;
-                        let (part_path, file) =
-                            crate::security::filesystem::open_or_create_approved(
-                                &temp_dir.join(part_name),
-                                &allowed,
-                                true,
-                            )?;
-                        // Recorded now so completion can refuse a `.part` that
-                        // was swapped underneath the transfer.
-                        let identity =
-                            crate::security::filesystem::object_identity_from_file(&file)?;
-                        Ok((part_path, done_dir, identity, file))
-                    }
-                })
-                .await;
-                let (part_path, done_dir, part_identity, file) = match prepared
-                    .map_err(|e| e.to_string())
-                    .and_then(|opened| opened.map_err(|e| e.to_string()))
-                {
-                    Ok(prepared) => prepared,
-                    Err(e) => {
-                        let _ = tx.send(Err(coded_ctx(
-                            "channels_xfer_failed",
-                            "Could not open a place to save the file",
-                            e,
-                        )));
-                        return;
-                    }
-                };
-                state.xfer_recv.insert(
-                    xfer_id,
-                    ember::xfer::RecvState::new(
-                        offer.channel_id,
-                        offer.peer,
-                        offer.key,
-                        offer.name.clone(),
-                        offer.size,
-                        offer.root,
-                        part_path,
-                        done_dir.join(&offer.name),
-                        download_folder.clone(),
-                        part_identity,
-                        file,
-                    ),
-                );
-            }
-            let plain = ember::channel::encode_xfer_reply(
-                &offer.key,
-                &state.local_ed25519_pubkey,
-                &offer.peer,
-                &xfer_id,
-                reply,
-            );
-            // Rolled back on a reply that never left, exactly as the offer side
-            // does. Marking the transfer active regardless held a receive slot
-            // and an open file for a sender who was never told to start, and the
-            // offer had already been consumed so there was nothing left to
-            // answer — the user's only recourse was to wait out the timeout.
-            if !send_xfer_frame(socket, state, db, offer.channel_id, offer.peer, &plain).await {
-                if let Some(recv) = state.xfer_recv.remove(&xfer_id) {
-                    let _ = std::fs::remove_file(&recv.part_path);
-                }
-                let _ = tx.send(Err(coded(
-                    "channels_xfer_unreachable",
-                    "Could not reach that member right now",
-                )));
-                return;
-            }
-            state.xfer_pending.remove(&xfer_id);
-            if !accept {
-                super::channel_xfer::remember_declined_xfer(xfer_id, offer.channel_id, offer.peer, plain);
-            }
-            emit_xfer_update(
-                app_handle,
-                &xfer_id,
-                &offer.channel_id,
-                &offer.peer,
-                "receive",
-                &offer.name,
-                offer.size,
-                0,
-                if accept { "active" } else { "declined" },
-            );
-            let _ = tx.send(Ok(()));
-            if accept {
-                start_xfer_stream_fetch(socket, state, db, xfer_id).await;
+                begin_xfer_accept(state, db, app_handle, xfer_id, offer, download_folder, tx);
             } else {
-                state.xfer_stream_ports.remove(&xfer_id);
+                answer_xfer_offer(socket, state, db, app_handle, xfer_id, offer, false, tx).await;
             }
         }
 
@@ -3859,7 +3620,7 @@ async fn handle_command_inner(
                     "receive",
                 ));
             } else if let Some(recv) = state.xfer_recv.remove(&xfer_id) {
-                let _ = std::fs::remove_file(&recv.part_path);
+                discard_part_file(recv.part_path.clone());
                 target = Some((
                     recv.channel_id,
                     recv.peer,
@@ -5216,6 +4977,7 @@ async fn handle_command_inner(
                     + state.xfer_recv.len()
                     + state.xfer_streams.len()
                     + state.xfer_finish_in_flight
+                    + state.xfer_accepting.len()
                     + super::chat_attach::running_fetches(state),
             );
         }

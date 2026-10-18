@@ -52,7 +52,7 @@
   import IconX from '$lib/components/IconX.svelte';
   import IconGear from '$lib/components/IconGear.svelte';
   import FriendSettingsDialog from '$lib/components/FriendSettingsDialog.svelte';
-  import { chatAllowedWith, friendNameTooLong, friendOverrides, FRIEND_NAME_MAX_BYTES } from '$lib/friendSettings';
+  import { chatAllowedWith, friendNameTooLong, friendOverrides, FRIEND_NAME_MAX_CHARS } from '$lib/friendSettings';
 
   let friends: FriendInfo[] = $derived($friendsListStore);
   function chatDisabledFor(hash: string): boolean {
@@ -659,7 +659,7 @@
     const nick = newNickname.trim();
     if (!hash) { addError = m.friends_validation_hash_required(); return; }
     if (!isAcceptedFriendInput(hash)) { addError = m.friends_validation_hash_format(); return; }
-    if (friendNameTooLong(nick)) { addError = m.friend_settings_name_too_long({ max: FRIEND_NAME_MAX_BYTES }); return; }
+    if (friendNameTooLong(nick)) { addError = m.friend_settings_name_too_long({ max: FRIEND_NAME_MAX_CHARS }); return; }
     const canonicalHash = friendHashFromCode(hash);
     // A current code for someone already listed is how a one-sided add made
     // from an older code becomes findable, so it goes through as an update.
@@ -768,7 +768,7 @@
     const hash = editingHash;
     const nick = editNickname.trim();
     if (friendNameTooLong(nick)) {
-      error = m.friend_settings_name_too_long({ max: FRIEND_NAME_MAX_BYTES });
+      error = m.friend_settings_name_too_long({ max: FRIEND_NAME_MAX_CHARS });
       saveEditPending = false;
       return;
     }

@@ -22,7 +22,7 @@
     friendNameTooLong,
     friendOverrides,
     FRIEND_AUTO_ACCEPT_MAX_MB,
-    FRIEND_NAME_MAX_BYTES as NAME_MAX_BYTES,
+    FRIEND_NAME_MAX_CHARS as NAME_MAX_CHARS,
   } from '$lib/friendSettings';
   import type { FriendInfo } from '$lib/api/friends';
   import type { FriendOverrides } from '$lib/types';
@@ -294,7 +294,7 @@
             disabled={busy}
           />
           <span id="fs-name-hint-{instanceId}" class="fs-note" class:fs-error-text={nameTooLong}>
-            {nameTooLong ? m.friend_settings_name_too_long({ max: NAME_MAX_BYTES }) : m.friend_settings_name_hint()}
+            {nameTooLong ? m.friend_settings_name_too_long({ max: NAME_MAX_CHARS }) : m.friend_settings_name_hint()}
           </span>
         </section>
 

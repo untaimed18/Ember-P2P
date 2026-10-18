@@ -24,6 +24,11 @@ pub(in crate::network) async fn on_kad_process_tick(
     while let Ok(finished) = xfer_finish_rx.try_recv() {
         apply_xfer_finish(udp_socket, state, db, app_handle, finished).await;
     }
+    // Accepts whose part file is ready. Ahead of the same gates, since the
+    // user's click is waiting on the answer.
+    while let Ok(prepared) = state.xfer_accept_rx.try_recv() {
+        apply_xfer_accept_prepared(udp_socket, state, db, app_handle, prepared).await;
+    }
     // Ember Transfer pacing shares this 100ms tick rather than
     // taking its own arm — `tokio::select!` tops out at 64
     // branches and this loop is already at the limit. It runs

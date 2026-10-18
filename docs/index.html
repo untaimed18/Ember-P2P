@@ -125,7 +125,7 @@
   <section class="download-band" id="download">
     <div class="container">
       <img src="icon.png" alt="" width="72" height="72">
-      <h2>Download Ember 1.7.3</h2>
+      <h2>Download Ember 1.7.4</h2>
       <p>Free for Windows 10 and 11, and for x86-64 Linux as a <code>.deb</code> or an AppImage. Every release is signed, and Ember updates itself.</p>
       <div class="btn-group">
         <a href="https://github.com/untaimed18/Ember-P2P/releases/latest" class="btn btn-light" target="_blank" rel="noopener"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Download from GitHub</a>
@@ -142,6 +142,102 @@
           <h2>Release notes</h2>
           <p>Every Ember release, newest first. These are the same notes published on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
         </div>
+
+        <article class="release" id="release-1-7-4">
+              <div class="release-header">
+                <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.7.4" target="_blank" rel="noopener">Ember v1.7.4</a></h3>
+                <time class="release-date" datetime="2026-10-18">October 18, 2026</time>
+              </div>
+              <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.7.4" target="_blank" rel="noopener"><code>v1.7.4</code></a></p>
+              <div class="release-notes">
+                <p>Chat keeps going when a friend is away: messages to a friend who is offline wait for them, end-to-end encrypted, for up to a week, and messages can disappear on a timer. Downloads use the web mirrors in eD2K links, and full audits of downloads, uploads, search and eD2K server handling fixed dozens of problems, from the same blocks downloaded from two sources to search results credited to the wrong search. Settings are reorganized, the dark theme is easier to read, and unshared files stay in the Library as Not shared.</p>
+
+                <h4>Before you upgrade</h4>
+
+                <ul>
+                  <li><strong>The Ember DHT wire version is unchanged at version 4,</strong> and the room formats are unchanged, so 1.7.4 sees every release back to 1.6 on the overlay and shares rooms with 1.7.3 normally</li>
+                  <li><strong>Messages to a friend who is offline wait on the Rendezvous server</strong> for up to a week, end-to-end encrypted, so the server cannot read them. Both of you need 1.7.4. Turn it off under Settings &gt; Friends</li>
+                  <li><strong>Friends on older versions keep disappearing messages.</strong> They receive them normally, but nothing tells their Ember to delete them</li>
+                  <li><strong>Friends-only files are sent only to friends whose Ember keeps them private.</strong> A friend on 1.7.3 counts once they have browsed you since connecting; before that, and for friends on 1.7.2 or older, the send is refused with a message saying their Ember is too old. Friends on 1.7.0 to 1.7.2 still don&rsquo;t see your friends-only files when they browse you</li>
+                  <li><strong>Ember checks for updates at every launch and then hourly.</strong> The settings for automatic checks and how often are gone; silent updates still have their own switch</li>
+                  <li><strong>Idle connections to a friend older than 1.7.3 can still drop.</strong> Once both of you run 1.7.3 or later they hold</li>
+                  <li><strong>If you may go back to 1.7.1,</strong> set Max uploads to a number first: 1.7.1 reads Auto as one slot</li>
+                </ul>
+
+                <h4>What&rsquo;s New</h4>
+
+                <h5>Friends and chat</h5>
+                <ul>
+                  <li><strong>Messages wait for friends who are offline,</strong> and are collected when they come back, with delivery receipts. A message that also arrives directly is shown once</li>
+                  <li><strong>Disappearing messages:</strong> a default timer under Settings &gt; Friends and one per friend, from 5 minutes to 4 weeks. Messages you send count from delivery, messages you receive from when you read them</li>
+                  <li><strong>Delete a whole chat</strong> from the chat dock, or one message from its toolbar</li>
+                  <li><strong>The chat composer is redesigned</strong> as one box for attachments, text, emoji, formatting and Send, and the Friend settings window matches File Details</li>
+                  <li><strong>Friend names can be 64 characters in any script.</strong> The limit was 64 bytes, which left about 21 characters in Chinese or Japanese, and a name a friend request brought in could not always be saved again</li>
+                </ul>
+
+                <h5>Downloads</h5>
+                <ul>
+                  <li><strong>Downloads use the web mirrors in eD2K links</strong> (their <code>s=</code> parts). Each mirror fills parts no peer is working on and is checked like any other source; a failing or corrupt mirror rests and is then dropped. Turn it off under Settings &gt; Downloads</li>
+                  <li><strong>Preview plays MP4, M4V, MOV, M4A and 3GP files</strong> once their start and end have arrived, and a player you chose, such as VLC, now opens the preview</li>
+                </ul>
+
+                <h5>Library</h5>
+                <ul>
+                  <li><strong>Unsharing a file keeps it in the Library as Not shared.</strong> Share it again from the bulk bar, the right-click menu or the file panel, and undo an unshare from its notice or with <kbd>Ctrl</kbd>+<kbd>Z</kbd></li>
+                  <li><strong>A size filter and a Never requested filter</strong> join the others, and folder cards show what each holds</li>
+                  <li><strong>The Share Files browser</strong> gains name and type filters, sorting, select all, <kbd>Shift</kbd> ranges and keyboard navigation</li>
+                </ul>
+
+                <h5>Search</h5>
+                <ul>
+                  <li><strong>A search says when a network was not asked, did not answer, or stopped early,</strong> and results show TCP and UDP source counts</li>
+                  <li><strong>Results work from the keyboard and with screen readers,</strong> and Search Again keeps the tab&rsquo;s own filters</li>
+                </ul>
+
+                <h5>Settings and look</h5>
+                <ul>
+                  <li><strong>Settings are reorganized into consistent groups.</strong> Import joins Backup, a reminder suggests a backup, and Settings &gt; Friends can turn off accepting files from friends</li>
+                  <li><strong>New installs start with better defaults:</strong> anti-leech on, no compression for video uploads, uploads no longer keep the computer awake, and a speed test during setup</li>
+                  <li><strong>The dark theme is easier to read,</strong> with firmer muted text, input borders and scrollbars, and Settings is drawn as a gear</li>
+                  <li><strong>About links to the website, GitHub and Reddit</strong></li>
+                </ul>
+
+                <h5>Rooms</h5>
+                <ul>
+                  <li><strong>Ban asks first,</strong> and says when banning will change a private room&rsquo;s key</li>
+                  <li><strong>A room says when members send messages only a newer Ember can read</strong></li>
+                  <li><strong>A room file waiting for you shows a banner</strong> with a way to it, and Copy invite says why when only the owner may invite</li>
+                  <li><strong>A room&rsquo;s members show at launch,</strong> instead of &ldquo;Just you for now&rdquo; until the room is opened</li>
+                </ul>
+
+                <h5>Ember network</h5>
+                <ul>
+                  <li><strong>The Ember DHT remembers up to 1,000 contacts,</strong> and the Ember page shows only contacts that have answered</li>
+                </ul>
+
+                <h4>What&rsquo;s Fixed</h4>
+
+                <ul>
+                  <li><strong>Downloads:</strong> the same blocks downloaded from two sources, source exchange answers ignored at some stages, queued firewalled sources dropped, failed downloads that would not resume, Stop undoing a completed download, and RAR, ACE and ZIP recovery and AICH repair. <code>.part.met</code> files now carry hashsets eMule accepts</li>
+                  <li><strong>Uploads:</strong> credit gaps through relays and unproven identities, one unreachable peer holding up every upload slot, peers gaming their queue position, and banned peers left in the queue. Credits are now kept for 150 days</li>
+                  <li><strong>Search:</strong> server replies credited to the wrong search, KAD sizes over 4 GiB, one Mark spam penalizing a whole server, generic and repeated names scored as spam, and leaving a tab deleting its results</li>
+                  <li><strong>eD2K servers:</strong> the connected server is lit on the Servers page, servers keep their names and your choices through list merges, and removed or blocked servers are no longer dialed</li>
+                  <li><strong>Accepting a room file no longer pauses Ember</strong> while a slow download folder is prepared</li>
+                  <li><strong>Preview after a restart</strong> is no longer offered for a download it would then refuse</li>
+                </ul>
+
+                <p class="full-changelog">
+                  <strong>Full Changelog</strong>
+                  <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.7.3...v1.7.4" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.7.3...v1.7.4</a>
+                </p>
+              </div>
+            </article>
+
+        <details class="older-releases">
+          <summary>
+            <span class="when-closed">Show 41 older releases</span><span class="when-open">Hide older releases</span>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+          </summary>
 
         <article class="release" id="release-1-7-3">
               <div class="release-header">
@@ -219,12 +315,6 @@
                 </p>
               </div>
             </article>
-
-        <details class="older-releases">
-          <summary>
-            <span class="when-closed">Show 40 older releases</span><span class="when-open">Hide older releases</span>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
-          </summary>
 
         <article class="release" id="release-1-7-2">
               <div class="release-header">

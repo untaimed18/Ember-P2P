@@ -2,16 +2,19 @@
 
 What automated checks cannot cover before tagging `v1.7.4`. Tick each box, and
 file anything that fails before tagging rather than after. Channels is still a
-beta: this is the cross-machine run `docs/post-1.7.3.md` item 5 asks for, and
-its results decide whether the formats can freeze.
+beta: this is the cross-machine run `docs/post-1.7.3.md` asks 1.7.4 for, on
+today's formats, and its results are the baseline for the format freeze
+planned for 1.7.5 in `docs/post-1.7.4.md`.
 
 ## 0. Automated checks
 
-- [ ] `npm test` and `npm run check` pass.
-- [ ] `cargo clippy --tests` is clean and `cargo test --lib` passes in `src-tauri`.
-- [ ] `node scripts/verify-release-policy.mjs` passes for 1.7.4.
-- [ ] `node scripts/release-notes.mjs` prints the 1.7.4 notes, and they read
+- [x] `npm test` and `npm run check` pass.
+- [x] `cargo clippy --tests` is clean and `cargo test --lib` passes in `src-tauri`.
+- [x] `node scripts/verify-release-policy.mjs` passes for 1.7.4.
+- [x] `node scripts/release-notes.mjs` prints the 1.7.4 notes, and they read
       correctly as Markdown.
+
+Run on October 18, 2026. Run them again if anything changes before tagging.
 
 ## 1. Channels across real machines
 
@@ -54,6 +57,10 @@ not reachable from outside (no port forwarding, UPnP off). Call them A
 - [ ] Offer a file in a room, then save over it on the offering machine before
       anyone downloads it. The download fails as "source gone"; it does not
       arrive with the new contents.
+- [ ] Accept a room file with the download folder on a slow or network drive.
+      Chat and other transfers keep moving while it is prepared, and the file
+      arrives. Cancel another one straight after accepting it: no
+      `ember-xfer-*.part` is left in the download folder's `Temp`.
 
 ## 2. Friends
 
@@ -64,11 +71,14 @@ not reachable from outside (no port forwarding, UPnP off). Call them A
       to keep friends-only files private". After they browse you, it goes.
 - [ ] Send a file that is not friends-only to the 1.7.3 friend. It goes as
       before.
+- [ ] Accept a friend request from someone whose nickname is 64 Chinese
+      characters, then open their settings and save without changing the
+      name. It saves, and the box takes no 65th character.
 - [ ] Browse a friend whose shares are in the hundreds of files: the listing
       arrives (the friend-session frame limit is now 512 KiB both ways).
 - [ ] Leave a friend chat idle for half an hour with one side on 1.7.4 and the
       other on 1.7.3. Note whether the session drops (it may, until both run
-      1.7.3 or later; see `docs/post-1.7.3.md`).
+      1.7.3 or later; see the known limits in `docs/post-1.7.4.md`).
 
 ## 3. Mixed versions (1.7.4 with 1.7.3)
 
@@ -88,6 +98,8 @@ New strings this release, in all eight non-English locales:
 - [ ] `error_peers_offer_library_unconfirmed` (the same refusal while the
       library is still loading or was only read in part).
 - [ ] `channels_newer_envelope` (members on a newer Ember).
+- [ ] `friend_settings_name_too_long` and `error_peers_nickname_too_long`,
+      reworded from bytes to characters.
 - [ ] Channels UX pass: `channels_ban_confirm*` (the Ban confirmation),
       `channels_offers_waiting_*` and `channels_offers_review` (the file
       waiting banner), `channels_hide_listing_aria`, `channels_delivery_sending`,

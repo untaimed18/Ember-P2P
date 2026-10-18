@@ -1947,14 +1947,18 @@ pub fn sanitize_remote_text(text: &str, max_chars: usize) -> String {
 /// friend-request handling must impose its own narrow bound before creating a
 /// display string, emitting an event, or writing a log/DB row.
 pub const MAX_INBOUND_FRIEND_NICKNAME_BYTES: usize = 256;
-pub const MAX_INBOUND_FRIEND_NICKNAME_CHARS: usize = 64;
+/// The one limit on a stored friend name, in characters, for names a request
+/// brings in and names the user types alike: accepting a request must never
+/// store a name the rename box would then refuse. `src/lib/friendSettings.ts`
+/// holds the same number.
+pub const MAX_FRIEND_NICKNAME_CHARS: usize = 64;
 
 /// Normalize a friend-request nickname supplied as decoded text.
 ///
 /// This keeps the request UI compatible with peers that send decorative
 /// Unicode while guaranteeing a compact, single-line display value.
 pub fn sanitize_inbound_friend_nickname(name: &str) -> String {
-    let cleaned = sanitize_remote_text(name, MAX_INBOUND_FRIEND_NICKNAME_CHARS);
+    let cleaned = sanitize_remote_text(name, MAX_FRIEND_NICKNAME_CHARS);
     if cleaned.is_empty() {
         "Anonymous".to_string()
     } else {
@@ -2214,7 +2218,7 @@ mod tests {
     fn inbound_friend_nickname_is_bounded_before_storage_or_logging() {
         let payload = vec![b'A'; MAX_INBOUND_FRIEND_NICKNAME_BYTES * 64];
         let nickname = normalize_inbound_friend_nickname(&payload);
-        assert_eq!(nickname.chars().count(), MAX_INBOUND_FRIEND_NICKNAME_CHARS);
+        assert_eq!(nickname.chars().count(), MAX_FRIEND_NICKNAME_CHARS);
         assert_eq!(
             normalize_inbound_friend_nickname(b"Al\xE2\x80\xAEice"),
             "Alice"
@@ -2225,10 +2229,7 @@ mod tests {
         split_multibyte.extend_from_slice("💬".as_bytes());
         let normalized = normalize_inbound_friend_nickname(&split_multibyte);
         assert_ne!(normalized, "Anonymous");
-        assert_eq!(
-            normalized.chars().count(),
-            MAX_INBOUND_FRIEND_NICKNAME_CHARS
-        );
+        assert_eq!(normalized.chars().count(), MAX_FRIEND_NICKNAME_CHARS);
     }
 
     #[test]

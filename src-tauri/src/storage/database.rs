@@ -6118,20 +6118,48 @@ impl Database {
                 warn!("Skipping friend with an unusable stored hash: {hash_hex}");
                 continue;
             };
-            let Ok(pubkey) = <[u8; 32]>::try_from(pubkey) else {
-                warn!("Skipping friend {hash_hex} with an unusable stored public key");
-                continue;
-            };
-            if !crate::network::ember::crypto::verify_ember_hash_binding(&pubkey, &hash) {
-                warn!(
-                    "Skipping friend {hash_hex}: the stored public key does not match the \
-                     friend hash, so presence advertised under it would be unreachable"
-                );
-                continue;
+            if let Some(pubkey) = Self::usable_friend_public_key(&hash_hex, &hash, pubkey) {
+                keys.push((hash, pubkey));
             }
-            keys.push((hash, pubkey));
         }
         Ok(keys)
+    }
+
+    /// One friend's stored public key, under the same checks as
+    /// `get_friend_public_keys`. `None` when they are not on the list or have
+    /// no usable key.
+    pub fn get_friend_public_key(&self, user_hash: &[u8; 16]) -> anyhow::Result<Option<[u8; 32]>> {
+        let hash_hex = hex::encode(user_hash);
+        let pubkey: Option<Vec<u8>> = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT ed25519_pubkey FROM friends \
+                 WHERE user_hash = ?1 AND ed25519_pubkey IS NOT NULL",
+                params![hash_hex],
+                |row| row.get(0),
+            )
+            .optional()?
+        };
+        Ok(pubkey.and_then(|pubkey| Self::usable_friend_public_key(&hash_hex, user_hash, pubkey)))
+    }
+
+    fn usable_friend_public_key(
+        hash_hex: &str,
+        hash: &[u8; 16],
+        pubkey: Vec<u8>,
+    ) -> Option<[u8; 32]> {
+        let Ok(pubkey) = <[u8; 32]>::try_from(pubkey) else {
+            warn!("Skipping friend {hash_hex} with an unusable stored public key");
+            return None;
+        };
+        if !crate::network::ember::crypto::verify_ember_hash_binding(&pubkey, hash) {
+            warn!(
+                "Skipping friend {hash_hex}: the stored public key does not match the \
+                 friend hash, so presence advertised under it would be unreachable"
+            );
+            return None;
+        }
+        Some(pubkey)
     }
 
     /// Remove a friend. Returns true when the removal left a friend request to
@@ -6588,6 +6616,18 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    /// `Some(mutual)` when `user_hash` is on the friends list, `None` when not.
+    pub fn friend_mutual(&self, user_hash: &str) -> anyhow::Result<Option<bool>> {
+        let conn = self.conn.lock();
+        Ok(conn
+            .query_row(
+                "SELECT COALESCE(mutual, 0) FROM friends WHERE user_hash = ?1",
+                params![user_hash],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+            .optional()?)
     }
 
     /// How often a friend has been asked through rooms, and when last, as
@@ -15099,6 +15139,43 @@ mod tests {
         assert_eq!(friends[0].3, "1.2.3.4");
         assert_eq!(friends[0].4, 4662);
         assert!(friends[0].6, "mutual flag");
+    }
+
+    /// The single-row lookups agree with the full-list readers they replace:
+    /// listed or not, mutual or not, and a key only when it binds to the hash.
+    #[test]
+    fn single_friend_lookups_match_the_list_readers() {
+        let db = friends_only_db();
+        let key = crate::network::ember::crypto::signing_key_from_bytes(&[9u8; 32]);
+        let pubkey = key.verifying_key().to_bytes();
+        let hash = crate::network::ember::crypto::node_id_from_ed25519_bytes(&pubkey)
+            .expect("a generated key is on the curve");
+        let hash_hex = hex::encode(hash);
+
+        assert_eq!(db.friend_mutual(&hash_hex).expect("lookup"), None);
+        assert_eq!(db.get_friend_public_key(&hash).expect("lookup"), None);
+
+        db.add_friend(&hash_hex, "Kim", Some(&pubkey)).expect("add");
+        assert_eq!(db.friend_mutual(&hash_hex).expect("lookup"), Some(false));
+        assert_eq!(db.get_friend_public_key(&hash).expect("lookup"), Some(pubkey));
+
+        db.set_friend_mutual(&hash_hex, "1.2.3.4", 4662, Some(&pubkey))
+            .expect("promote");
+        assert_eq!(db.friend_mutual(&hash_hex).expect("lookup"), Some(true));
+
+        let stranger = [0x33u8; 16];
+        db.add_friend(&hex::encode(stranger), "Mismatch", Some(&pubkey))
+            .expect("add");
+        assert_eq!(
+            db.get_friend_public_key(&stranger).expect("lookup"),
+            None,
+            "a key that does not bind to the hash is not usable"
+        );
+        assert!(db
+            .get_friend_public_keys()
+            .expect("list")
+            .iter()
+            .all(|(h, _)| *h != stranger));
     }
 
     #[test]

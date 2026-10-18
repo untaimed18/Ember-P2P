@@ -72,6 +72,9 @@ pub(super) struct FriendXferAttempt {
     /// timeout and the per-`(friend, file)` cooldown.
     pub(super) sent_at: std::time::Instant,
     pub(super) attempts: u32,
+    /// Set by the first accept for this nonce. A friend may repeat its ack,
+    /// and each repeat must not publish another punch registration.
+    pub(super) accepted: bool,
 }
 
 /// Why [`friend_xfer_send_decision`] allowed or refused an
@@ -345,6 +348,7 @@ pub(super) async fn request_friend_transfer(
             sent_at: now,
             attempts: previous_attempts + 1,
             transport,
+            accepted: false,
         },
     );
     info!(
@@ -669,6 +673,21 @@ fn take_abandoned_friend_xfer_attempt(
     attempts.remove(&key).map(|attempt| (key, attempt.transfer_id))
 }
 
+/// Mark the attempt under `key` accepted. `true` only for the first accept,
+/// so a repeated ack neither counts twice nor registers a second punch.
+fn first_friend_xfer_accept(
+    attempts: &mut HashMap<([u8; 16], [u8; 16]), FriendXferAttempt>,
+    key: &([u8; 16], [u8; 16]),
+) -> bool {
+    match attempts.get_mut(key) {
+        Some(attempt) if !attempt.accepted => {
+            attempt.accepted = true;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Apply a friend's answer to our own `OP_EMBER_XFER_REQ`.
 ///
 /// An accept is informational: the inbound expectation was registered when the
@@ -700,6 +719,14 @@ pub(super) async fn handle_friend_transfer_ack(
     let attempt_transport = state.friend_xfer_attempts[&key].transport;
 
     if status == ed2k::messages::XFER_STATUS_ACCEPTED {
+        if !first_friend_xfer_accept(&mut state.friend_xfer_attempts, &key) {
+            debug!(
+                "Ignoring a repeated transfer accept from friend {} for {}",
+                hex::encode(friend),
+                hex::encode(key.1)
+            );
+            return;
+        }
         state.friend_xfer_stats.accepted = state.friend_xfer_stats.accepted.saturating_add(1);
         debug!(
             "Friend {} accepted our transfer request for {}",
@@ -1296,6 +1323,7 @@ mod friend_transfer_tests {
             sent_at,
             attempts,
             transport: FriendXferTransport::ConnectBack { tcp_port: 4662 },
+            accepted: false,
         }
     }
 
@@ -1318,6 +1346,22 @@ mod friend_transfer_tests {
             tcp_port,
             nonce: [0x5A; 16],
         }
+    }
+
+    /// Only the first accept for a nonce goes on to count and register a
+    /// punch; a repeat is ignored, and a fresh request starts unaccepted.
+    #[test]
+    fn a_repeated_accept_registers_no_second_punch() {
+        let now = Instant::now();
+        let key = (FRIEND_A, FILE_1);
+        let mut attempts = HashMap::new();
+        assert!(!first_friend_xfer_accept(&mut attempts, &key), "no attempt, nothing to accept");
+        attempts.insert(key, attempt("t1", [1; 16], now, 1));
+        assert!(first_friend_xfer_accept(&mut attempts, &key));
+        assert!(!first_friend_xfer_accept(&mut attempts, &key));
+        assert!(!first_friend_xfer_accept(&mut attempts, &key));
+        attempts.insert(key, attempt("t1", [2; 16], now, 2));
+        assert!(first_friend_xfer_accept(&mut attempts, &key), "a resend is a new request");
     }
 
     /// A friends-only source refused only because a request to that friend is

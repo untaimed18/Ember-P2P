@@ -14,6 +14,7 @@ use crate::network::{
 };
 #[cfg(debug_assertions)]
 use crate::network::{EmberMaintenanceResult, EmberPublishResult};
+use crate::security::MAX_FRIEND_NICKNAME_CHARS;
 use crate::types::EmberDiagnostics;
 use crate::types::*;
 use tauri::Emitter;
@@ -124,15 +125,11 @@ pub struct EmberDhtMaintenanceResult {
     pub error: Option<String>,
 }
 
-/// Maximum stored friend nickname size. L18: aligned with the
-/// frontend `maxlength="64"` constraints in `+page.svelte` so a
-/// peer who advertises a longer nickname (or a future rogue UI
-/// surface) doesn't end up with rows that overflow the friends
-/// list ellipsis breakpoints. The previous 256-byte ceiling was
-/// generous-but-inconsistent: foreign nicknames truncated by the
-/// backend at 256 chars couldn't be rendered cleanly anyway, and a
-/// 256-char nickname pushed several columns of UI off-screen.
-const MAX_FRIEND_NICKNAME_LEN: usize = 64;
+/// Whether a friend name, as it will be stored, is over the one limit
+/// inbound requests are held to as well.
+fn friend_nickname_too_long(nick: &str) -> bool {
+    nick.chars().count() > MAX_FRIEND_NICKNAME_CHARS
+}
 
 fn parse_user_hash(hex_str: &str) -> Result<[u8; 16], String> {
     parse_16_byte_hash(
@@ -356,11 +353,11 @@ pub async fn add_friend(
     } else {
         nick
     };
-    if nick.len() > MAX_FRIEND_NICKNAME_LEN {
+    if friend_nickname_too_long(&nick) {
         return Err(coded_ctx(
             "peers_nickname_too_long",
-            format!("Nickname too long (max {MAX_FRIEND_NICKNAME_LEN} bytes)"),
-            MAX_FRIEND_NICKNAME_LEN,
+            format!("Nickname too long (max {MAX_FRIEND_NICKNAME_CHARS} characters)"),
+            MAX_FRIEND_NICKNAME_CHARS,
         ));
     }
 
@@ -693,11 +690,11 @@ pub async fn update_friend_nickname(
     } else {
         cleaned
     };
-    if cleaned.len() > MAX_FRIEND_NICKNAME_LEN {
+    if friend_nickname_too_long(&cleaned) {
         return Err(coded_ctx(
             "peers_nickname_too_long",
-            format!("Nickname too long (max {MAX_FRIEND_NICKNAME_LEN} bytes)"),
-            MAX_FRIEND_NICKNAME_LEN,
+            format!("Nickname too long (max {MAX_FRIEND_NICKNAME_CHARS} characters)"),
+            MAX_FRIEND_NICKNAME_CHARS,
         ));
     }
     let canonical = user_hash_hex.to_lowercase();
@@ -2935,8 +2932,21 @@ mod tests {
 
     use super::{
         chat_failure_is_permanent, code_permanent_chat_failure, format_friend_code,
-        parse_friend_code, require_public_ember_peer_ip_for_mode, INTRO_SECRET_LEN,
+        friend_nickname_too_long, parse_friend_code, require_public_ember_peer_ip_for_mode,
+        INTRO_SECRET_LEN,
     };
+
+    /// A name a friend request brings in can always be saved again from the
+    /// rename box, whatever script it is in.
+    #[test]
+    fn an_inbound_friend_name_is_never_too_long_to_save() {
+        for long in ["名".repeat(200), "é".repeat(200), "💬".repeat(200), "A".repeat(200)] {
+            let inbound = crate::security::sanitize_inbound_friend_nickname(&long);
+            assert!(!friend_nickname_too_long(&inbound), "{inbound}");
+        }
+        assert!(!friend_nickname_too_long(&"名".repeat(64)));
+        assert!(friend_nickname_too_long(&"名".repeat(65)));
+    }
 
     /// "Copy member ID" in a room yields a bare Ed25519 key. Add Friend has to
     /// take the same string back, or the two halves of one identity disagree

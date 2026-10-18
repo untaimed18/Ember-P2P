@@ -1659,6 +1659,14 @@ pub(super) struct NetworkState {
     /// `xfer_recv` by then, so this is what a cancel, a leave or a ban finds
     /// them by.
     pub(super) xfer_finishing: HashMap<[u8; 16], super::channel_xfer::XferFinishing>,
+    /// Accepts whose part file is being readied off the loop, with the size
+    /// each will need. Counted with `xfer_recv` against the receive cap and
+    /// the free-space check, since each is about to become a receive.
+    pub(super) xfer_accepting: HashMap<[u8; 16], u64>,
+    /// Where that disk work reports back; drained by the Kad process tick,
+    /// which is why both halves live here.
+    pub(super) xfer_accept_tx: mpsc::UnboundedSender<super::channel_xfer::XferAcceptPrepared>,
+    pub(super) xfer_accept_rx: mpsc::UnboundedReceiver<super::channel_xfer::XferAcceptPrepared>,
     /// `last_seen` touches waiting to be written, keyed by `(room, member)` and
     /// holding the newest timestamp seen. Drained by
     /// [`flush_channel_member_touches`] on its own interval.
