@@ -62,6 +62,7 @@ fn persisted_failure_code(code: &str) -> Option<TransferFailureCode> {
         F::NetworkChannelUnavailable,
         F::DownloadFolderUnavailable,
         F::PartFolderOffline,
+        F::PartFilesRemoved,
         F::EmberPinCorrupt,
         F::AichPinCorrupt,
         F::FinalVerifyInconclusive,

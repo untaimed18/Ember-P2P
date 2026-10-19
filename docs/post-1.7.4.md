@@ -31,6 +31,14 @@ measured against.
   connection or proxy and try again." (`updater_check_unreachable`, and
   `updater_install_unreachable` for the download), instead of "Secure update
   check failed", which users took for a certificate problem.
+- **Downloads whose part files were removed wait Stopped.** Removing a
+  download's `.part` and `.part.met` from `Temp` while Ember was closed got
+  it started over from zero at the next launch, downloading everything again
+  unasked; removing them is how eMule drops a download. When the recorded
+  folder answered and no finished file turns up, the row is restored Stopped
+  with no progress and reads "Stopped: part files removed"
+  (`part_files_removed`). Resume starts it over, Cancel removes it. A folder
+  that did not answer still holds its downloads, as before.
 - **Still open from the same report:** a second download location for users
   with no proxy at all. It needs a host reachable from those networks, the
   release workflow uploading to it, a second manifest signed with the same

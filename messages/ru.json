@@ -2406,6 +2406,8 @@
   "transfers_failure_reason_no_channel": "Сетевая служба недоступна",
   "transfers_failure_reason_download_folder": "Нет доступа на запись к папке загрузок",
   "transfers_failure_reason_part_folder_offline": "Диск с прогрессом этой загрузки не подключён. Загрузка продолжится, когда он снова будет доступен, или нажмите «Возобновить», чтобы начать её заново.",
+  "transfers_failure_reason_part_files_removed": "Временные файлы этой загрузки были удалены, поэтому её прогресс потерян. Нажмите «Возобновить», чтобы начать её заново, или отмените её, чтобы удалить.",
+  "transfers_dl_status_part_files_removed": "Остановлено: временные файлы удалены",
   "transfers_failure_reason_ember_pin_corrupt": "Сохранённый дайджест Ember повреждён. Отмените эту загрузку и добавьте ссылку eh= заново.",
   "transfers_failure_reason_aich_pin_corrupt": "Сохранённая метка AICH повреждена. Отмените эту загрузку и добавьте ссылку AICH заново.",
   "transfers_failure_reason_final_verify_inconclusive": "Не удалось прочитать готовый файл для проверки",

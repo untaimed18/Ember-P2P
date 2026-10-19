@@ -2654,7 +2654,10 @@
         // ranks still show in the source drawer via SourceInfo.queue_rank.
         return m.transfer_status_queued();
       case 'paused': return m.transfer_status_paused();
-      case 'stopped': return m.transfer_status_stopped();
+      case 'stopped':
+        return t.failure_code === 'part_files_removed'
+          ? m.transfers_dl_status_part_files_removed()
+          : m.transfer_status_stopped();
       case 'verifying': return m.transfer_status_verifying();
       case 'completing': return m.transfer_status_completing();
       case 'completed': return m.transfers_dl_status_complete();
@@ -5005,7 +5008,10 @@
           : m.transfers_dl_tooltip_queued_base();
       }
       case 'paused': return m.transfers_dl_tooltip_paused();
-      case 'stopped': return m.transfers_dl_tooltip_stopped();
+      case 'stopped':
+        return t.failure_code === 'part_files_removed'
+          ? transferFailureReasonText(t.failure_reason, t.failure_code)
+          : m.transfers_dl_tooltip_stopped();
       case 'verifying': return m.transfers_dl_tooltip_verifying();
       case 'completing': return m.transfers_dl_tooltip_completing();
       case 'completed': return m.transfers_dl_tooltip_completed();
@@ -5839,7 +5845,7 @@
                         tooltip so the user can distinguish transient from
                         terminal failures without opening the context menu.
                       -->
-                      {#if t.status === 'failed' && (t.failure_reason || t.failure_code)}
+                      {#if (t.status === 'failed' || t.failure_code === 'part_files_removed') && (t.failure_reason || t.failure_code)}
                         <span class="failure-hint" title={failureContextTooltip(t)}>{transferFailureReasonText(t.failure_reason, t.failure_code)}</span>
                       {:else if t.health !== 'healthy' && (t.health_reason || t.health_code)}
                         {@const health = transferHealthReasonText(t.health_reason, t.health_code, t.failure_code)}

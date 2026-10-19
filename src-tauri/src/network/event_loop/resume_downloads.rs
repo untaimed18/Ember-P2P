@@ -19,6 +19,18 @@ pub(in crate::network) struct RestoredPart {
 /// files the database never recorded.
 const UNRECORDED_FINISH_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Restore `transfer`, whose part files were removed, as Stopped with nothing
+/// downloaded: its progress went with them.
+fn mark_part_files_removed(transfer: &mut Transfer) {
+    let code = ed2k::transfer::TransferFailureCode::PartFilesRemoved;
+    transfer.status = TransferStatus::Stopped;
+    transfer.completed_size = 0;
+    transfer.transferred = 0;
+    transfer.progress = 0.0;
+    transfer.failure_code = Some(code.as_code().to_string());
+    transfer.failure_reason = Some(code.message().to_string());
+}
+
 /// What the blocking pool learned about the restored downloads.
 #[derive(Default)]
 pub(in crate::network) struct RestoredParts {
@@ -935,6 +947,19 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 // no final file — fall through to normal restore as Searching
                 if interrupted_finish {
                     transfer.status = TransferStatus::Searching;
+                }
+                // Its part files are gone from a folder that answered, and no
+                // finished file of it is there: they were removed, most likely
+                // on purpose, as removing them is how eMule drops a download.
+                // Started over, it would download everything again unasked; it
+                // waits Stopped instead, and Resume starts it over.
+                if unrecorded_finish {
+                    info!(
+                        "Restored download {} has no part files left; keeping it Stopped",
+                        transfer.id
+                    );
+                    mark_part_files_removed(&mut transfer);
+                    control.pause();
                 }
             }
 

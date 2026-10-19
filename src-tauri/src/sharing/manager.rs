@@ -899,6 +899,14 @@ impl TransferManager {
         transfer.failure_stage = None;
     }
 
+    /// A row restored Stopped because its part files were removed says so
+    /// until it is resumed, which starts it over.
+    fn clear_part_files_removed(transfer: &mut Transfer) {
+        if transfer.failure_code.as_deref() == Some(TransferFailureCode::PartFilesRemoved.as_code()) {
+            Self::clear_failure_context(transfer);
+        }
+    }
+
     /// Write a health verdict onto a row, keeping `health_reason` and
     /// `health_code` derived from the same variant.
     fn apply_health_code(transfer: &mut Transfer, code: Option<TransferHealthCode>) {
@@ -2238,6 +2246,7 @@ impl TransferManager {
             self.queue_changed();
             transfer.status = Self::queued_wait_status(&transfer);
             Self::clear_runtime_health(&mut transfer);
+            Self::clear_part_files_removed(&mut transfer);
             if let Some(control) = self.controls.get(id) {
                 control.resume();
             }
@@ -2339,6 +2348,7 @@ impl TransferManager {
                 let transfer = &mut self.queue[idx];
                 transfer.status = Self::queued_wait_status(transfer);
                 Self::clear_runtime_health(transfer);
+                Self::clear_part_files_removed(transfer);
                 let promote = if transfer.direction == TransferDirection::Upload {
                     transfer.status = TransferStatus::Active;
                     true
@@ -3571,6 +3581,28 @@ mod tests {
             manager.get_transfers_since(None, 0).resumable_failed.is_empty(),
             "a row queued again is not offered as Failed"
         );
+    }
+
+    /// A download restored Stopped because its part files were removed stops
+    /// saying so once it is resumed, alone or with others.
+    #[test]
+    fn resuming_a_download_whose_part_files_were_removed_clears_the_notice() {
+        let mut manager = TransferManager::new(4);
+        for id in ["one", "batch"] {
+            let mut stopped = sourced(id, 2);
+            stopped.status = TransferStatus::Stopped;
+            stopped.failure_code = Some(TransferFailureCode::PartFilesRemoved.as_code().into());
+            stopped.failure_reason = Some(TransferFailureCode::PartFilesRemoved.message().into());
+            manager.enqueue(stopped);
+            manager.register_control(id, TransferControl::new());
+        }
+        manager.resume("one");
+        manager.resume_many(&["batch".to_string()], false);
+        for id in ["one", "batch"] {
+            let row = manager.get_transfer(id).expect("still listed");
+            assert_ne!(row.status, TransferStatus::Stopped, "{id}");
+            assert!(row.failure_code.is_none() && row.failure_reason.is_none(), "{id}");
+        }
     }
 
     /// A Failed row saved before failure codes were kept: a pinned one may

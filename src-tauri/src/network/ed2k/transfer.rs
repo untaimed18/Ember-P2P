@@ -1428,6 +1428,8 @@ transfer_failure_codes! {
         "The download folder cannot be written; check it in Settings";
     PartFolderOffline => "part_folder_offline",
         "The drive holding this download's progress is not connected; Resume starts it over";
+    PartFilesRemoved => "part_files_removed",
+        "This download's part files were removed; Resume starts it over";
     EmberPinCorrupt => "ember_pin_corrupt",
         "Persisted Ember digest was corrupt; cancel and re-add the eh= link";
     AichPinCorrupt => "aich_pin_corrupt",
@@ -1767,14 +1769,17 @@ mod tests {
             );
         }
 
-        // The three variants the classifier cannot reach are assigned directly:
-        // two by the database loader for a corrupt persisted pin, one by the
-        // command layer when the network channel is gone. Named here so a
-        // variant added without a producer is visible rather than assumed.
+        // The variants the classifier cannot reach are assigned directly: two
+        // by the database loader for a corrupt persisted pin, one by the
+        // command layer when the network channel is gone, and one by the
+        // startup restore for a download whose part files were removed. Named
+        // here so a variant added without a producer is visible rather than
+        // assumed.
         let assigned_elsewhere = [
             C::EmberPinCorrupt,
             C::AichPinCorrupt,
             C::NetworkChannelUnavailable,
+            C::PartFilesRemoved,
         ];
         let produced: std::collections::HashSet<_> =
             cases.iter().map(|(_, _, code)| *code).collect();
