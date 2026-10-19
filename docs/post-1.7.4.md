@@ -12,6 +12,31 @@ plan: the decision on item 1 below (a kind 8 record), and the cross-machine
 run in `docs/release-checklist-1.7.4.md`, which is the baseline item 5 is
 measured against.
 
+1.7.5 has done these so far, from user reports after 1.7.4 shipped:
+
+- **Library sorting by all-time totals.** Requests, Accepted and Transferred
+  sort by the all-time figure in brackets, with this session's breaking ties
+  (`compareAllTime`). By the session alone nearly every file sorted as 0
+  after a restart.
+- **Updates through the system proxy.** Where GitHub's download hosts are
+  blocked, as in mainland China, the update check failed with no way round
+  it: the updater ignored proxies by design. It now goes through the HTTP or
+  HTTPS proxy the OS or environment names for the address
+  (`system_proxy_for`, Windows and macOS settings through hyper-util's
+  `client-proxy-system`), and stays direct and DNS-pinned otherwise.
+  Integrity is unchanged: the manifest and every installer are still checked
+  against the signing key. Every other HTTP client in Ember stays direct.
+- **Saying when the update server cannot be reached.** A connection, DNS or
+  timeout failure now reads "Couldn't reach the update server. Check your
+  connection or proxy and try again." (`updater_check_unreachable`, and
+  `updater_install_unreachable` for the download), instead of "Secure update
+  check failed", which users took for a certificate problem.
+- **Still open from the same report:** a second download location for users
+  with no proxy at all. It needs a host reachable from those networks, the
+  release workflow uploading to it, a second manifest signed with the same
+  key, and the updater trying it after GitHub. Planned separately in
+  `docs/update-mirror-plan.md`, not scheduled.
+
 ## Channels: the format freeze
 
 All nine items ship together in 1.7.5, and the formats freeze with them.

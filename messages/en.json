@@ -3566,6 +3566,8 @@
   "error_transfers_upload_queue_failed": "Failed to get upload queue",
   "error_transfers_file_details_failed": "Failed to read file details",
   "error_updater_check_failed": "Secure update check failed. Please try again later.",
+  "error_updater_check_unreachable": "Couldn't reach the update server. Check your connection or proxy and try again.",
+  "error_updater_install_unreachable": "Couldn't download the update. Check your connection or proxy and try again.",
   "error_updater_handoff_check_failed": "Secure update hand-off check failed. Please try again later.",
   "error_updater_install_failed": "Secure update install failed. Please try again later.",
   "error_updater_install_failed_services_stopped": "Secure update install failed. Ember stopped its network services for the update; restart Ember to resume transfers.",

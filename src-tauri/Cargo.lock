@@ -1493,6 +1493,8 @@ dependencies = [
  "futures",
  "hex",
  "hkdf",
+ "http",
+ "hyper-util",
  "icu_normalizer",
  "igd-next",
  "keyring",

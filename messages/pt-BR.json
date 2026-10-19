@@ -3563,6 +3563,8 @@
   "error_transfers_upload_queue_failed": "Falha ao obter a fila de upload",
   "error_transfers_file_details_failed": "Falha ao ler os detalhes do arquivo",
   "error_updater_check_failed": "A verificação segura de atualizações falhou. Tente novamente mais tarde.",
+  "error_updater_check_unreachable": "Não foi possível acessar o servidor de atualizações. Verifique sua conexão ou seu proxy e tente novamente.",
+  "error_updater_install_unreachable": "Não foi possível baixar a atualização. Verifique sua conexão ou seu proxy e tente novamente.",
   "error_updater_handoff_check_failed": "A verificação da entrega da atualização segura falhou. Tente novamente mais tarde.",
   "error_updater_install_failed": "A instalação segura da atualização falhou. Tente novamente mais tarde.",
   "error_updater_install_failed_services_stopped": "A instalação segura da atualização falhou. O Ember parou seus serviços de rede para a atualização; reinicie o Ember para retomar as transferências.",

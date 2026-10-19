@@ -3566,6 +3566,8 @@
   "error_transfers_upload_queue_failed": "Uploadwarteschlange konnte nicht abgerufen werden",
   "error_transfers_file_details_failed": "Dateidetails konnten nicht gelesen werden",
   "error_updater_check_failed": "Die sichere Updateprüfung ist fehlgeschlagen. Bitte versuchen Sie es später erneut.",
+  "error_updater_check_unreachable": "Der Update-Server ist nicht erreichbar. Prüfen Sie Ihre Verbindung oder Ihren Proxy und versuchen Sie es erneut.",
+  "error_updater_install_unreachable": "Das Update konnte nicht heruntergeladen werden. Prüfen Sie Ihre Verbindung oder Ihren Proxy und versuchen Sie es erneut.",
   "error_updater_handoff_check_failed": "Die Prüfung der sicheren Update-Übergabe ist fehlgeschlagen. Bitte versuchen Sie es später erneut.",
   "error_updater_install_failed": "Die sichere Update-Installation ist fehlgeschlagen. Bitte versuchen Sie es später erneut.",
   "error_updater_install_failed_services_stopped": "Die sichere Update-Installation ist fehlgeschlagen. Ember hat seine Netzwerkdienste für das Update beendet; starten Sie Ember neu, um die Übertragungen fortzusetzen.",

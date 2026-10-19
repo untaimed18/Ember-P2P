@@ -3563,6 +3563,8 @@
   "error_transfers_upload_queue_failed": "Impossibile ottenere la coda upload",
   "error_transfers_file_details_failed": "Impossibile leggere i dettagli del file",
   "error_updater_check_failed": "Il controllo sicuro degli aggiornamenti non è riuscito. Riprova più tardi.",
+  "error_updater_check_unreachable": "Impossibile raggiungere il server degli aggiornamenti. Controlla la connessione o il proxy e riprova.",
+  "error_updater_install_unreachable": "Impossibile scaricare l'aggiornamento. Controlla la connessione o il proxy e riprova.",
   "error_updater_handoff_check_failed": "Il controllo del passaggio dell'aggiornamento sicuro non è riuscito. Riprova più tardi.",
   "error_updater_install_failed": "L'installazione sicura dell'aggiornamento non è riuscita. Riprova più tardi.",
   "error_updater_install_failed_services_stopped": "L'installazione sicura dell'aggiornamento non è riuscita. Ember ha interrotto i suoi servizi di rete per l'aggiornamento; riavvia Ember per riprendere i trasferimenti.",

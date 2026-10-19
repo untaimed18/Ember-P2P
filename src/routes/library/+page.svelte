@@ -87,6 +87,7 @@
     buildLibraryFolderTree,
     flattenLibraryFolderTree,
   } from '$lib/libraryFolderTree';
+  import { compareAllTime } from '$lib/libraryStats';
   import * as m from '$lib/paraglide/messages';
   import { codedErrorOf, getLocale, translateError } from '$lib/i18n';
   import { highlightMatches } from '$lib/stores/highlight';
@@ -2262,9 +2263,9 @@
         case 'extension': cmp = collator.compare(typeSortKey(a), typeSortKey(b)) || collator.compare(a.extension, b.extension); break;
         case 'priority': cmp = (priorityOrder[a.priority] ?? 2) - (priorityOrder[b.priority] ?? 2); break;
         case 'hash': cmp = collator.compare(a.hash, b.hash); break;
-        case 'requests': cmp = a.requests - b.requests; break;
-        case 'accepted': cmp = a.accepted - b.accepted; break;
-        case 'bytes_transferred': cmp = a.bytes_transferred - b.bytes_transferred; break;
+        case 'requests': cmp = compareAllTime(a.requests, a.alltime_requests, b.requests, b.alltime_requests); break;
+        case 'accepted': cmp = compareAllTime(a.accepted, a.alltime_accepted, b.accepted, b.alltime_accepted); break;
+        case 'bytes_transferred': cmp = compareAllTime(a.bytes_transferred, a.alltime_transferred, b.bytes_transferred, b.alltime_transferred); break;
         case 'folder': cmp = collator.compare(a.folder, b.folder); break;
         case 'complete_sources': cmp = a.complete_sources - b.complete_sources; break;
         case 'modified_at': cmp = (a.modified_at || 0) - (b.modified_at || 0); break;

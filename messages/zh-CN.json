@@ -3563,6 +3563,8 @@
   "error_transfers_upload_queue_failed": "获取上传队列失败",
   "error_transfers_file_details_failed": "读取文件详情失败",
   "error_updater_check_failed": "安全更新检查失败。请稍后重试。",
+  "error_updater_check_unreachable": "无法连接到更新服务器。请检查网络连接或代理设置后重试。",
+  "error_updater_install_unreachable": "无法下载更新。请检查网络连接或代理设置后重试。",
   "error_updater_handoff_check_failed": "安全更新交接检查失败。请稍后重试。",
   "error_updater_install_failed": "安全更新安装失败。请稍后重试。",
   "error_updater_install_failed_services_stopped": "安全更新安装失败。Ember 已为此次更新停止其网络服务；请重启 Ember 以恢复传输。",

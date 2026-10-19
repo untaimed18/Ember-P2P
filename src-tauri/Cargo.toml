@@ -63,6 +63,9 @@ rand = "0.8"
 flate2 = "1"
 hex = "0.4"
 reqwest = { version = "0.13", features = ["rustls", "stream", "json"], default-features = false }
+# The updater alone follows the system proxy; every other client stays direct.
+hyper-util = { version = "0.1", features = ["client-proxy", "client-proxy-system"] }
+http = "1"
 sha2 = "0.10"
 base64 = "0.22"
 minisign-verify = "0.2.5"

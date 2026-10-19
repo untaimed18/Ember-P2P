@@ -3563,6 +3563,8 @@
   "error_transfers_upload_queue_failed": "No se pudo obtener la cola de subida",
   "error_transfers_file_details_failed": "No se pudieron leer los detalles del archivo",
   "error_updater_check_failed": "La comprobación segura de actualizaciones ha fallado. Vuelva a intentarlo más tarde.",
+  "error_updater_check_unreachable": "No se pudo conectar con el servidor de actualizaciones. Compruebe su conexión o su proxy y vuelva a intentarlo.",
+  "error_updater_install_unreachable": "No se pudo descargar la actualización. Compruebe su conexión o su proxy y vuelva a intentarlo.",
   "error_updater_handoff_check_failed": "La comprobación de la entrega de la actualización segura ha fallado. Vuelva a intentarlo más tarde.",
   "error_updater_install_failed": "La instalación segura de la actualización ha fallado. Vuelva a intentarlo más tarde.",
   "error_updater_install_failed_services_stopped": "La instalación segura de la actualización ha fallado. Ember detuvo sus servicios de red para la actualización; reinicie Ember para reanudar las transferencias.",

@@ -3563,6 +3563,8 @@
   "error_transfers_upload_queue_failed": "Échec de la récupération de la file d'envoi",
   "error_transfers_file_details_failed": "Échec de la lecture des détails du fichier",
   "error_updater_check_failed": "La vérification sécurisée des mises à jour a échoué. Veuillez réessayer plus tard.",
+  "error_updater_check_unreachable": "Impossible de joindre le serveur de mises à jour. Vérifiez votre connexion ou votre proxy, puis réessayez.",
+  "error_updater_install_unreachable": "Impossible de télécharger la mise à jour. Vérifiez votre connexion ou votre proxy, puis réessayez.",
   "error_updater_handoff_check_failed": "La vérification du transfert de la mise à jour sécurisée a échoué. Veuillez réessayer plus tard.",
   "error_updater_install_failed": "L'installation sécurisée de la mise à jour a échoué. Veuillez réessayer plus tard.",
   "error_updater_install_failed_services_stopped": "L'installation sécurisée de la mise à jour a échoué. Ember a arrêté ses services réseau pour la mise à jour ; redémarrez Ember pour reprendre les transferts.",
