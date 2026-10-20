@@ -2427,6 +2427,7 @@ pub fn run() {
             commands::sharing::get_shared_folders,
             commands::sharing::get_unapproved_shared_folders,
             commands::sharing::reapprove_shared_folder,
+            commands::sharing::reapprove_shared_folders,
             commands::sharing::get_file_media_metadata,
             commands::sharing::get_folder_priorities,
             commands::sharing::set_folder_priority,

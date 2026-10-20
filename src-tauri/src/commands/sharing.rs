@@ -6162,20 +6162,149 @@ pub async fn get_unapproved_shared_folders(
     let Ok(registry) = crate::security::filesystem::approved_roots() else {
         return Ok(Vec::new());
     };
-    tokio::task::spawn_blocking(move || {
-        folders
-            .into_iter()
-            .filter(|folder| {
-                let path = std::path::Path::new(folder);
-                if crate::security::is_network_path(folder) && !registry.is_recorded(path) {
-                    return false;
-                }
-                std::fs::symlink_metadata(path).is_ok() && registry.verify_root(path).is_err()
-            })
-            .collect()
+    tokio::task::spawn_blocking(move || unapproved_among(folders, &registry))
+        .await
+        .map_err(|error| coded_ctx("sharing_task_failed", "Task failed", error))
+}
+
+/// The folders of `folders` that [`get_unapproved_shared_folders`] reports.
+/// Blocking.
+fn unapproved_among(
+    folders: Vec<String>,
+    registry: &crate::security::filesystem::ApprovedRootRegistry,
+) -> Vec<String> {
+    folders
+        .into_iter()
+        .filter(|folder| {
+            let path = std::path::Path::new(folder);
+            if crate::security::is_network_path(folder) && !registry.is_recorded(path) {
+                return false;
+            }
+            std::fs::symlink_metadata(path).is_ok() && registry.verify_root(path).is_err()
+        })
+        .collect()
+}
+
+/// Walk folders the user has just re-approved.
+///
+/// Every scan since the approval lapsed refused them, so their files stay out
+/// of the library until something walks them again; without this, re-approving
+/// read as having done nothing until the user found Reload. A pass already
+/// running was planned while they were refused, so wait that one out with a
+/// scan of just these, as adding a folder does.
+async fn scan_reapproved_folders(app: &tauri::AppHandle, folders: &[String]) {
+    match reload_shared_files(app.clone(), app.state::<AppState>()).await {
+        Err(error) if error.contains("sharing_reload_in_flight") => {
+            tokio::spawn(settle_recheck_without_watcher(
+                app.clone(),
+                folders.iter().map(std::path::PathBuf::from).collect(),
+                std::time::Duration::ZERO,
+            ));
+        }
+        Err(error) => warn!("Could not scan the re-approved shared folders: {error}"),
+        Ok(()) => {}
+    }
+}
+
+/// Most folders the re-approve-all dialog names before summing up the rest,
+/// so a long list cannot push its buttons off screen.
+const REAPPROVE_ALL_LISTED: usize = 8;
+
+/// Re-approve every shared folder Ember stopped recognising, after one native
+/// confirmation that names them. Returns the folders approved; empty when the
+/// user kept them blocked or none needed it.
+///
+/// What a restore onto a reinstalled or different computer leaves behind:
+/// every share's approval is tied to the volume and file IDs it was given on,
+/// so all of them lapse at once, and approving them one dialog at a time was a
+/// chore the Library did not even explain.
+#[tauri::command]
+pub async fn reapprove_shared_folders(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let registry = crate::security::filesystem::approved_roots()
+        .map_err(|error| coded_ctx("sharing_reapprove_failed", "Could not re-approve the folders", error))?;
+    let folders = state.config.read().await.settings.shared_folders.clone();
+    let dialog_app = app.clone();
+    let dialog_registry = registry.clone();
+    let asked = tokio::task::spawn_blocking(move || {
+        let pending = unapproved_among(folders, &dialog_registry);
+        if pending.is_empty() {
+            return None;
+        }
+        let mut list: Vec<String> = pending
+            .iter()
+            .take(REAPPROVE_ALL_LISTED)
+            .map(|folder| format!("• {}", crate::commands::settings::elide_for_dialog(folder)))
+            .collect();
+        if pending.len() > REAPPROVE_ALL_LISTED {
+            list.push(format!("…and {} more", pending.len() - REAPPROVE_ALL_LISTED));
+        }
+        let prompt = format!(
+            "Ember no longer recognises these shared folders:\n\n{}\n\nThis happens after restoring a backup on a new or reinstalled computer, or after a drive is reconnected. Re-approve them only if they are still your folders. If something else was put at one of these paths, re-approving shares whatever is there now.",
+            list.join("\n")
+        );
+        let approved = dialog_app
+            .dialog()
+            .message(prompt)
+            .title("Re-approve shared folders?")
+            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                "Re-approve all".to_string(),
+                "Keep blocked".to_string(),
+            ))
+            .blocking_show();
+        Some((pending, approved))
     })
     .await
-    .map_err(|error| coded_ctx("sharing_task_failed", "Task failed", error))
+    .map_err(|error| coded_ctx("sharing_task_failed", "Task failed", error))?;
+    let Some((pending, true)) = asked else {
+        return Ok(Vec::new());
+    };
+
+    // As for one folder: re-read under the settings lock, since any of them may
+    // have been removed while the dialog was open.
+    let _settings_save_guard = state.settings_save_lock.lock().await;
+    let settings = state.config.read().await.settings.clone();
+    let still_shared: Vec<String> = pending
+        .into_iter()
+        .filter(|folder| settings.shared_folders.contains(folder))
+        .collect();
+    if still_shared.is_empty() {
+        return Ok(Vec::new());
+    }
+    let roots = settings.configured_roots();
+    let approved = tokio::task::spawn_blocking(move || {
+        if registry.reapprove_roots(&roots, &still_shared).is_ok() {
+            return Ok(still_shared);
+        }
+        // The batch is all or nothing, so one folder whose drive went away
+        // while the dialog was open kept every other one blocked. Approve what
+        // still can be, one at a time.
+        let mut approved = Vec::new();
+        let mut last_error = None;
+        for folder in still_shared {
+            match registry.reapprove_roots(&roots, std::slice::from_ref(&folder)) {
+                Ok(()) => approved.push(folder),
+                Err(error) => {
+                    warn!("Could not re-approve shared folder {folder}: {error}");
+                    last_error = Some(error);
+                }
+            }
+        }
+        match last_error {
+            Some(error) if approved.is_empty() => Err(error),
+            _ => Ok(approved),
+        }
+    })
+    .await
+    .map_err(|error| coded_ctx("sharing_task_failed", "Task failed", error))?
+    .map_err(|error| coded_ctx("sharing_reapprove_failed", "Could not re-approve the folders", error))?;
+    drop(_settings_save_guard);
+    info!("Re-approved {} shared folders on the user's confirmation", approved.len());
+    scan_reapproved_folders(&app, &approved).await;
+    Ok(approved)
 }
 
 /// Re-approve a shared folder Ember stopped recognising, once the user has
@@ -6231,7 +6360,12 @@ pub async fn reapprove_shared_folder(
     .await
     .map_err(|error| coded_ctx("sharing_task_failed", "Task failed", error))??;
     match answer {
-        None => return Ok(true),
+        // Approved since the Library last looked, perhaps by Re-approve all;
+        // still scanned, since the caller is told a scan has started.
+        None => {
+            scan_reapproved_folders(&app, std::slice::from_ref(&path)).await;
+            return Ok(true);
+        }
         Some(false) => return Ok(false),
         Some(true) => {}
     }
@@ -6250,7 +6384,9 @@ pub async fn reapprove_shared_folder(
         .await
         .map_err(|error| coded_ctx("sharing_task_failed", "Task failed", error))?
         .map_err(|error| coded_ctx("sharing_reapprove_failed", "Could not re-approve the folder", error))?;
+    drop(_settings_save_guard);
     info!("Re-approved shared folder {path} on the user's confirmation");
+    scan_reapproved_folders(&app, std::slice::from_ref(&path)).await;
     Ok(true)
 }
 

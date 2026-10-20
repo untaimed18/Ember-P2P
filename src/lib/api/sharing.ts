@@ -193,9 +193,18 @@ export async function getUnapprovedSharedFolders(): Promise<string[]> {
 }
 
 /** Ask the user, in a native dialog, to re-approve a shared folder Ember no
- *  longer recognises. Resolves to whether it is approved afterwards. */
+ *  longer recognises. Resolves to whether it is approved afterwards; when it
+ *  is, a scan of it has been started. */
 export async function reapproveSharedFolder(path: string): Promise<boolean> {
   return invoke('reapprove_shared_folder', { path });
+}
+
+/** Ask the user, in one native dialog naming them all, to re-approve every
+ *  shared folder Ember no longer recognises. Resolves to the folders approved;
+ *  empty if they were kept blocked. Either call starts a scan of what it
+ *  approved. */
+export async function reapproveSharedFolders(): Promise<string[]> {
+  return invoke('reapprove_shared_folders');
 }
 
 export async function getFolderPriorities(): Promise<Record<string, string>> {

@@ -6,6 +6,7 @@
     getSharedFolders,
     getUnapprovedSharedFolders,
     reapproveSharedFolder,
+    reapproveSharedFolders,
     reloadSharedFiles,
     getScanStatus,
     getHashingPaused,
@@ -3308,10 +3309,38 @@
   async function handleReapproveFolder(path: string) {
     try {
       if (!(await reapproveSharedFolder(path))) return;
-      const displayName = path.split(/[\\/]/).filter(Boolean).pop() || path;
-      toastSuccess(m.library_folder_reapproved({ name: displayName }));
+      afterReapproved([path]);
       await refresh();
     } catch (e: unknown) { error = toErr(e); }
+  }
+
+  let reapprovingAll = $state(false);
+  async function handleReapproveAll() {
+    if (reapprovingAll) return;
+    reapprovingAll = true;
+    try {
+      const approved = await reapproveSharedFolders();
+      if (approved.length === 0) return;
+      afterReapproved(approved);
+      await refresh();
+    } catch (e: unknown) {
+      error = toErr(e);
+    } finally {
+      reapprovingAll = false;
+    }
+  }
+
+  /** Re-approving starts a full rescan in the backend, as Reload does, which
+   *  also lifts a Stop; show it the same way rather than wait for the poll. */
+  function afterReapproved(approved: string[]) {
+    const name = (path: string) => path.split(/[\\/]/).filter(Boolean).pop() || path;
+    toastSuccess(plural(approved.length, {
+      one: () => m.library_folder_reapproved({ name: name(approved[0]) }),
+      other: () => m.library_folders_reapproved_other({ count: formatNumber(approved.length) }),
+    }));
+    stoppedByUser = false;
+    hashingStateEpoch += 1;
+    scanning = true;
   }
 
   function formatSavedTime(ts: number | null): string {
@@ -4736,6 +4765,21 @@
         <span class="scan-text">{m.library_scan_truncated({ limit: formatNumber(100000) })}</span>
       </div>
     {/if}
+    <!-- With nothing listed, the empty state below says the same and offers
+         the same button, so only one of the two is shown. -->
+    {#if unapprovedFolders.length > 0 && files.length > 0}
+      <div class="scan-banner scan-warning" role="status">
+        <span class="scan-text">
+          {plural(unapprovedFolders.length, {
+            one: m.library_unapproved_banner_one,
+            other: () => m.library_unapproved_banner_other({ count: formatNumber(unapprovedFolders.length) }),
+          })}
+        </span>
+        <button class="scan-btn resume-btn" onclick={handleReapproveAll} disabled={reapprovingAll}>
+          {m.library_reapprove_all()}
+        </button>
+      </div>
+    {/if}
     {#if sortedFiles.length === 0 && hasActiveLibraryFilters && files.length > 0}
       <div class="empty-state">
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="56" height="56" aria-hidden="true">
@@ -4760,6 +4804,20 @@
           <div class="spinner lg"></div>
           <p class="empty-title">{m.common_loading()}</p>
         {/if}
+      </div>
+    {:else if sortedFiles.length === 0 && !scanning && unapprovedFolders.length > 0}
+      <!-- Ahead of "No shared files": the folders are still listed, Ember
+           just will not walk them, and offering Add Folder sent people to
+           re-add a folder that was already there. -->
+      <div class="empty-state">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="56" height="56" aria-hidden="true">
+          <path d="M3 7v13a1 1 0 0 0 1 1h16a1 1 0 0 0 1-1V9a1 1 0 0 0-1-1h-9l-2-2H4a1 1 0 0 0-1 1z"></path>
+          <rect x="9" y="13" width="6" height="5" rx="1"></rect>
+          <path d="M10.5 13v-1.5a1.5 1.5 0 0 1 3 0V13"></path>
+        </svg>
+        <p class="empty-title">{m.library_empty_unapproved()}</p>
+        <p class="empty-sub">{m.library_empty_unapproved_sub()}</p>
+        <button type="button" class="empty-action" onclick={handleReapproveAll} disabled={reapprovingAll}>{m.library_reapprove_all()}</button>
       </div>
     {:else if sortedFiles.length === 0 && !scanning}
       <div class="empty-state">

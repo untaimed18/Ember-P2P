@@ -192,7 +192,7 @@
       <div class="dialog-actions">
         <button type="button" class="ghost" onclick={close}>{m.common_cancel()}</button>
         <button type="button" onclick={() => void submit()} disabled={busy || count === 0 || tooLong} aria-busy={busy}>
-          {busy ? m.search_downloading_ellipsis() : m.transfers_add_links_submit()}
+          {busy ? m.transfers_pasting() : m.transfers_add_links_submit()}
         </button>
       </div>
     </div>

@@ -5697,7 +5697,7 @@
     cursor: pointer;
   }
 
-  .field.is-disabled label.toggle-title {
+  .toggle-row:has(:global(button[role='switch']:disabled)) label.toggle-title {
     cursor: default;
   }
 
