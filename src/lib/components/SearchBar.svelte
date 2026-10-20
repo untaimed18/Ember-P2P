@@ -439,6 +439,12 @@
     background: var(--bg-hover);
   }
 
+  .clear-btn:focus-visible {
+    color: var(--text-primary);
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
   .recent-dropdown {
     position: absolute;
     top: calc(100% + 6px);

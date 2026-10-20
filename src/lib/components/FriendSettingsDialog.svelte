@@ -391,7 +391,7 @@
         <button type="button" class="ghost" disabled={busy || customCount === 0} onclick={reset}>{m.friend_settings_reset()}</button>
         <span class="fs-spacer"></span>
         <button type="button" class="ghost" disabled={busy} onclick={close}>{m.common_cancel()}</button>
-        <button type="submit" disabled={busy || !loadedAtOpen || nameTooLong || !autoMbValid}>{m.common_save()}</button>
+        <button type="submit" disabled={busy || !loadedAtOpen || nameTooLong || !autoMbValid} aria-busy={busy}>{busy ? m.settings_saving() : m.common_save()}</button>
       </div>
     </form>
   </div>

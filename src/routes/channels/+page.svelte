@@ -230,6 +230,9 @@
   let banTarget = $state<ChannelMemberInfo | null>(null);
   let banRotates = $state(false);
   let banOpen = $state(false);
+  let demoteTarget = $state<ChannelMemberInfo | null>(null);
+  let demoteOpen = $state(false);
+  let claimOpen = $state(false);
   let composeMode = $state<'create' | 'join' | null>(null);
   let membersOpen = $state(true);
   /** The directory stays up alongside an open room; the header toggle hands the
@@ -1118,7 +1121,7 @@
       return;
     }
     if (membersOpen && typeof window !== 'undefined' && window.matchMedia(MQ_MAX_LG).matches) {
-      membersOpen = false;
+      void setMembersOpen(false);
       e.preventDefault();
     }
   }
@@ -2113,6 +2116,15 @@
     }
   }
 
+  function requestRemoveModerator(member: ChannelMemberInfo) {
+    demoteTarget = member;
+    demoteOpen = true;
+  }
+
+  function confirmRemoveModerator() {
+    if (demoteTarget) void handleRemoveModerator(demoteTarget.member_pubkey);
+  }
+
   async function handleRemoveModerator(memberPubkey: string) {
     const id = selectedId;
     if (!id || moderationBusy) return;
@@ -2656,7 +2668,23 @@
    *  so the pane opens even where it covers the conversation. */
   function reviewRoomOffers() {
     xferCollapsed = false;
-    membersOpen = true;
+    void setMembersOpen(true);
+  }
+
+  let membersSlotEl: HTMLDivElement | undefined = $state(undefined);
+  let membersToggleEl: HTMLButtonElement | undefined = $state(undefined);
+  let membersCloseEl: HTMLButtonElement | undefined = $state(undefined);
+
+  /** Where the pane covers the conversation, focus goes into it on the way in
+   *  and back to the toggle on the way out; otherwise it would stay behind on
+   *  a page the pane is drawn over. */
+  async function setMembersOpen(open: boolean) {
+    const focusInside = !!membersSlotEl?.contains(document.activeElement);
+    membersOpen = open;
+    if (!window.matchMedia(MQ_MAX_LG).matches) return;
+    await tick();
+    if (open) membersCloseEl?.focus();
+    else if (focusInside) membersToggleEl?.focus();
   }
   let roomOffersLabel = $derived(
     plural(roomOffersWaiting, {
@@ -2958,7 +2986,7 @@
         >
           {#if directoryList.length > 0}
             <div class="search-wrap">
-              <span class="search-icon">
+              <span class="search-icon" aria-hidden="true">
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
                   <circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="17" y2="17"/>
                 </svg>
@@ -2998,7 +3026,7 @@
                     disabled={markingAllRead}
                     aria-busy={markingAllRead ? 'true' : undefined}
                     onclick={markAllRead}
-                  >{m.channels_mark_all_read()}</button>
+                  >{markingAllRead ? m.channels_marking_all_read() : m.channels_mark_all_read()}</button>
                 {/if}
               </div>
               {#if roomSections.yours.length > 0}
@@ -3073,6 +3101,8 @@
                     aria-current={ch.in_room && ch.channel_id === selectedId ? 'true' : undefined}
                     aria-label={ch.in_room ? undefined : m.channels_join_room_aria({ name: ch.name })}
                     aria-busy={!ch.in_room && joiningIds.includes(ch.channel_id) ? 'true' : undefined}
+                    aria-disabled={!ch.in_room && needsUsername ? 'true' : undefined}
+                    title={!ch.in_room && needsUsername ? m.channels_username_required() : undefined}
                     disabled={!ch.in_room && joiningIds.includes(ch.channel_id)}
                     onclick={() => {
                       if (ch.in_room) void selectChannel(ch.channel_id);
@@ -3432,12 +3462,13 @@
                 <button
                   class="icon-btn members-toggle"
                   class:on={membersOpen}
-                  onclick={() => (membersOpen = !membersOpen)}
+                  bind:this={membersToggleEl}
+                  onclick={() => void setMembersOpen(!membersOpen)}
                   title={membersToggleLabel}
                   aria-pressed={membersOpen}
                   aria-label={membersToggleLabel}
                 >
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <circle cx="6" cy="6" r="2.2"/>
                     <path d="M2 13c0-2.2 1.8-4 4-4s4 1.8 4 4"/>
                     <circle cx="11.5" cy="6.5" r="1.7"/>
@@ -3540,7 +3571,12 @@
             {#if selected.successor_id}
               <div class="successor-banner" role="status">
                 <span>{m.channels_successor_banner()}</span>
-                <button class="ghost" onclick={openSuccessor} disabled={openingSuccessor}>{m.channels_open_successor()}</button>
+                <button
+                  class="ghost"
+                  onclick={openSuccessor}
+                  disabled={openingSuccessor}
+                  aria-busy={openingSuccessor ? 'true' : undefined}
+                >{openingSuccessor ? m.channels_opening_successor() : m.channels_open_successor()}</button>
               </div>
             {:else if transferPendingTo}
               <div class="successor-banner" role="status">
@@ -3607,7 +3643,7 @@
               <div class="successor-banner" role="status">
                 <span>{nomineeNotice}</span>
                 {#if selected.can_claim}
-                  <button class="ghost" disabled={claiming} onclick={handleClaim}>
+                  <button class="ghost" disabled={claiming} onclick={() => (claimOpen = true)}>
                     {claiming ? m.channels_taking_over() : m.channels_claim_ownership()}
                   </button>
                 {/if}
@@ -3650,7 +3686,7 @@
                   }}
                 />
                 <button type="submit" disabled={!searchQuery.trim() || searching}>
-                  {searching ? m.channels_discovering() : m.common_search()}
+                  {searching ? m.channels_searching() : m.common_search()}
                 </button>
               </form>
               {#if searchRan}
@@ -3703,11 +3739,11 @@
         </section>
 
         {#if selected}
-          <div class="members-slot">
+          <div class="members-slot" bind:this={membersSlotEl}>
           <button
             class="members-backdrop"
             type="button"
-            onclick={() => (membersOpen = false)}
+            onclick={() => void setMembersOpen(false)}
             aria-label={m.channels_hide_members()}
             tabindex={membersOpen ? 0 : -1}
             inert={!membersOpen}
@@ -3722,7 +3758,8 @@
               {/if}
               <button
                 class="icon-btn members-close"
-                onclick={() => (membersOpen = false)}
+                bind:this={membersCloseEl}
+                onclick={() => void setMembersOpen(false)}
                 aria-label={m.channels_hide_members()}
               >
                 <IconX size={14} />
@@ -3886,7 +3923,7 @@
                                 role="menuitem"
                                 tabindex="-1"
                                 disabled={moderationBusy}
-                                onclick={(e) => { closeCardMenu(e.currentTarget); handleRemoveModerator(mem.member_pubkey); }}
+                                onclick={(e) => { closeCardMenu(e.currentTarget); requestRemoveModerator(mem); }}
                               >{m.channels_remove_moderator()}</button>
                             {:else}
                               <button
@@ -4353,6 +4390,24 @@
   confirmLabel={m.channels_ban()}
   danger
   onconfirm={confirmBan}
+/>
+
+<ConfirmDialog
+  bind:open={demoteOpen}
+  title={m.channels_remove_moderator_confirm({ name: demoteTarget ? roomMemberLabel(demoteTarget) : '' })}
+  message={m.channels_remove_moderator_confirm_body()}
+  confirmLabel={m.channels_remove_moderator()}
+  danger
+  onconfirm={confirmRemoveModerator}
+/>
+
+<ConfirmDialog
+  bind:open={claimOpen}
+  title={m.channels_claim_confirm()}
+  message={m.channels_claim_confirm_body()}
+  confirmLabel={m.channels_claim_ownership()}
+  danger
+  onconfirm={handleClaim}
 />
 
 <ConfirmDialog
@@ -5599,7 +5654,7 @@
     min-height: 0;
     border-top: 1px solid var(--border);
     background: var(--bg-surface);
-    box-shadow: 0 -8px 18px -14px rgba(0, 0, 0, 0.35);
+    box-shadow: var(--shadow-up-sm);
   }
 
   .xfer-drawer-head {

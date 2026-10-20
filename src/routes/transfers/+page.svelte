@@ -29,7 +29,8 @@
   import { getPeerReputationBatch, labelForReputation, type PeerReputationInfo } from '$lib/api/reputation';
   import {
     formatSize, formatLiveSpeed, formatDate, formatDateWithYear, formatDurationSecs,
-    formatRemaining, formatRelativeTime, formatNumber, copyToClipboard, readFromClipboard,
+    formatRemaining, formatRelativeTime, formatNumber, formatDecimal, compareFileNames,
+    copyToClipboard, readFromClipboard,
   } from '$lib/utils';
   import { onMount, onDestroy, untrack } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
@@ -1781,7 +1782,9 @@
         case 'peer_name': raw = cmpStr(a.peer_name, b.peer_name); break;
         case 'user_name': raw = cmpStr(a.user_hash || a.peer_ip, b.user_hash || b.peer_ip); break;
         case 'client_software': raw = cmpStr(a.client_software, b.client_software); break;
-        case 'file_name': raw = cmpStr(a.file_name, b.file_name); break;
+        case 'file_name':
+          raw = a.file_name && b.file_name ? compareFileNames(a.file_name, b.file_name) : cmpStr(a.file_name, b.file_name);
+          break;
         case 'wait_time': raw = cmpNum(a.wait_seconds, b.wait_seconds); break;
         case 'queue_rank': raw = cmpNum(a.queue_rank, b.queue_rank); break;
         case 'credit_ratio': raw = cmpNum(a.credit_ratio, b.credit_ratio); break;
@@ -2141,7 +2144,7 @@
   function compareDownloads(a: Transfer, b: Transfer): number {
     let cmp = 0;
     switch (dlSortField) {
-      case 'file_name': cmp = sortCollator.compare(a.file_name, b.file_name); break;
+      case 'file_name': cmp = compareFileNames(a.file_name, b.file_name); break;
       case 'total_size': cmp = a.total_size - b.total_size; break;
       case 'transferred': cmp = a.transferred - b.transferred; break;
       case 'completed_size': cmp = (a.completed_size || 0) - (b.completed_size || 0); break;
@@ -2165,7 +2168,7 @@
     // Fixed-direction tie-break, as the upload sort has: the list is re-sorted
     // on every store update, and equal keys otherwise kept whatever order the
     // backend last emitted, so rows sharing a priority or status reshuffled.
-    return sortCollator.compare(a.file_name, b.file_name) || a.id.localeCompare(b.id);
+    return compareFileNames(a.file_name, b.file_name) || a.id.localeCompare(b.id);
   }
 
   let sortedActiveDownloads = $derived.by(() => {
@@ -2573,7 +2576,7 @@
       switch (ulSortField) {
         case 'country': cmp = cmpCountry(a.country_code, b.country_code); break;
         case 'peer_name': cmp = (a.peer_name || a.peer_id).localeCompare(b.peer_name || b.peer_id); break;
-        case 'file_name': cmp = a.file_name.localeCompare(b.file_name); break;
+        case 'file_name': cmp = compareFileNames(a.file_name, b.file_name); break;
         case 'speed': cmp = displaySpeed(a) - displaySpeed(b); break;
         case 'transferred': cmp = a.transferred - b.transferred; break;
         case 'waited': cmp = (a.wait_time || 0) - (b.wait_time || 0); break;
@@ -6369,7 +6372,7 @@
                          dimming the row's position, not by replacing it. -->
                     <td class="num-cell" class:rank-idle={!q.connected} title={q.connected ? '' : m.transfers_queue_disconnected_title()}>{q.queue_rank}</td>
                   {:else if column.key === 'credit_ratio'}
-                    <td class="num-cell" title={m.transfers_queue_credit_title()}>{q.credit_ratio.toFixed(2)}</td>
+                    <td class="num-cell" title={m.transfers_queue_credit_title()}>{formatDecimal(q.credit_ratio, 2)}</td>
                   {:else if column.key === 'transfer_history'}
                     <td class="num-cell" title={m.transfers_queue_transfer_history_title({ up: formatSize(q.uploaded), down: formatSize(q.downloaded) })}>
                       {formatSize(q.uploaded)} / {formatSize(q.downloaded)}
@@ -6586,7 +6589,7 @@
                   {:else if column.key === 'downloaded'}
                     <td class="num-cell" title={m.transfers_known_downloaded_title()}>{kc.downloaded > 0 ? formatSize(kc.downloaded) : '\u2014'}</td>
                   {:else if column.key === 'credit_ratio'}
-                    <td class="num-cell" title={!kc.has_public_key ? m.transfers_known_no_pubkey_title() : m.transfers_known_credit_title()}>{kc.credit_ratio.toFixed(2)}</td>
+                    <td class="num-cell" title={!kc.has_public_key ? m.transfers_known_no_pubkey_title() : m.transfers_known_credit_title()}>{formatDecimal(kc.credit_ratio, 2)}</td>
                   {:else if column.key === 'reputation'}
                     {@const rep = reputationMap[kc.user_hash]}
                     {@const label = labelForReputation(rep)}
@@ -8322,6 +8325,10 @@
   .transfer-table th.sortable:hover {
     color: var(--text-primary);
     background: var(--bg-hover);
+  }
+  .transfer-table th.sortable:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
   .transfer-table th.drag-enabled {
     cursor: grab;

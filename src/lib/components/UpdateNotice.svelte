@@ -242,6 +242,12 @@
     100% { transform: translateX(320%); }
   }
 
+  @media (prefers-reduced-motion: reduce) {
+    .notice-progress.indeterminate .notice-progress-fill {
+      animation: none !important;
+    }
+  }
+
   .notice-notes-toggle {
     align-self: flex-start;
     border: none;

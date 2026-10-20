@@ -515,17 +515,26 @@
     if (col.sortField) toggleSort(col.sortField);
   }
 
-  function onRowKeydown(event: KeyboardEvent, focused: FileInfo) {
+  // The table is one tab stop: focus stays on the scroll container, the page's
+  // arrow keys move `selectedPath`, and `aria-activedescendant` points at the
+  // selected row. A focused row would be lost to `<body>` as soon as
+  // virtualization unmounted it.
+  const uid = $props.id();
+  function rowId(index: number): string {
+    return `${uid}-row-${index}`;
+  }
+
+  let activeIndex = $derived(selectedPath ? sortedFiles.findIndex((f) => f.path === selectedPath) : -1);
+  let activeRowId = $derived(
+    activeIndex >= virtualSlice.startIdx && activeIndex < virtualSlice.endIdx ? rowId(activeIndex) : undefined,
+  );
+
+  function onGridKeydown(event: KeyboardEvent) {
     // Do not replace a checkbox's own native keyboard behavior.
     if (event.target !== event.currentTarget) return;
-    // The arrow keys move the selection, not focus, so focus can sit on the
-    // row clicked earlier while another is selected. These keys act on the
-    // selected row, the one the user can see is current; acting on the
-    // focused one opened, checked or offered a menu for a different file.
-    const file =
-      selectedPath && selectedPath !== focused.path
-        ? (sortedFiles.find((f) => f.path === selectedPath) ?? focused)
-        : focused;
+    const index = activeIndex;
+    const file = index >= 0 ? sortedFiles[index] : undefined;
+    if (!file) return;
     if (event.key === 'Enter') {
       event.preventDefault();
       event.stopPropagation();
@@ -543,24 +552,21 @@
       event.preventDefault();
       event.stopPropagation();
       swallowKeyboardContextMenu();
-      // Beside the row the menu is for; the focused row when that one is
-      // scrolled out of the rendered window.
-      const focusedRow = event.currentTarget;
-      const selectedRow =
-        file !== focused && focusedRow instanceof HTMLElement
-          ? focusedRow.parentElement?.querySelector('tr.selected')
-          : null;
-      const row = selectedRow ?? focusedRow;
-      const rect = row instanceof HTMLElement ? row.getBoundingClientRect() : null;
-      onRowContextMenu(
-        new MouseEvent('contextmenu', {
-          bubbles: true,
-          cancelable: true,
-          clientX: rect ? rect.left + Math.min(24, rect.width / 2) : 0,
-          clientY: rect ? rect.top + Math.min(16, rect.height / 2) : 0,
-        }),
-        file,
-      );
+      // Beside the row the menu is for, brought into the rendered window first.
+      scrollRowIntoView(index);
+      void tick().then(() => {
+        const row = document.getElementById(rowId(index)) ?? scrollContainer;
+        const rect = row?.getBoundingClientRect();
+        onRowContextMenu(
+          new MouseEvent('contextmenu', {
+            bubbles: true,
+            cancelable: true,
+            clientX: rect ? rect.left + Math.min(24, rect.width / 2) : 0,
+            clientY: rect ? rect.top + Math.min(16, rect.height / 2) : 0,
+          }),
+          file,
+        );
+      });
     }
   }
 
@@ -650,9 +656,21 @@
     </thead>
   </table>
 </div>
-<div class="vtable-scroll scroll-shadows" bind:this={scrollContainer} use:passiveScroll={onTableScroll} title={m.library_table_hint()}>
-  <div class="vtable-spacer" style="height:{sortedFiles.length * ROW_HEIGHT}px;">
-    <table class="lib-table vtable-body" style="transform:translateY({virtualSlice.topPad}px);min-width:{tableMinWidth}px;">
+<div
+  class="vtable-scroll scroll-shadows"
+  class:no-cursor={activeIndex < 0}
+  bind:this={scrollContainer}
+  use:passiveScroll={onTableScroll}
+  title={m.library_table_hint()}
+  role="grid"
+  tabindex="0"
+  aria-label={m.library_files_grid_aria()}
+  aria-rowcount={sortedFiles.length}
+  aria-activedescendant={activeRowId}
+  onkeydown={onGridKeydown}
+>
+  <div class="vtable-spacer" role="presentation" style="height:{sortedFiles.length * ROW_HEIGHT}px;">
+    <table class="lib-table vtable-body" role="presentation" style="transform:translateY({virtualSlice.topPad}px);min-width:{tableMinWidth}px;">
       <colgroup>
         {#if onToggleCheck}<col style="width:32px;" />{/if}
         {#each visibleColumns as col (col.key)}
@@ -661,21 +679,25 @@
       </colgroup>
       <tbody>
         {#each virtualSlice.visible as file, i (file.path)}
+          <!-- The role is not redundant: the table is presentational, so the
+               rows belong to the scroll container's grid. -->
+          <!-- svelte-ignore a11y_no_redundant_roles -->
           <tr
+            id={rowId(virtualSlice.startIdx + i)}
+            role="row"
+            aria-rowindex={virtualSlice.startIdx + i + 1}
             class:row-alt={((virtualSlice.startIdx + i) & 1) === 1}
             class:selected={selectedPath === file.path}
             class:ctx-target={contextPath === file.path && selectedPath !== file.path}
             class:row-missing={missingPaths.has(file.path)}
-            tabindex="0"
             aria-selected={selectedPath === file.path}
             onclick={() => onSelectPath(file.path)}
             ondblclick={() => onOpenFile(file.path)}
             oncontextmenu={(e) => { closeMenu(); onRowContextMenu(e, file); }}
-            onkeydown={(e) => onRowKeydown(e, file)}
             style="height:{ROW_HEIGHT}px;"
           >
             {#if onToggleCheck}
-              <td class="col-check" onclick={(e) => e.stopPropagation()}>
+              <td class="col-check" role="gridcell" onclick={(e) => e.stopPropagation()}>
                 <input
                   type="checkbox"
                   checked={checkedPaths.has(file.path)}
@@ -696,7 +718,7 @@
             {#each visibleColumns as col (col.key)}
               {#if col.key === 'name'}
                 {@const nameParts = splitOnMatch(file.name)}
-                <td class="cell-name" title={missingPaths.has(file.path) ? m.library_row_missing_title({ path: file.path }) : file.path}>
+                <td class="cell-name" role="gridcell" title={missingPaths.has(file.path) ? m.library_row_missing_title({ path: file.path }) : file.path}>
                   <FileTypeIcon kind={fileTypeKey(file.extension || extensionFromPath(file.path))} size={18} />
                   {#if missingPaths.has(file.path)}
                     <svg class="missing-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true">
@@ -706,13 +728,13 @@
                   {#if nameParts}{nameParts[0]}<mark class="name-match">{nameParts[1]}</mark>{nameParts[2]}{:else}{file.name}{/if}
                 </td>
               {:else if col.key === 'size'}
-                <td class="cell-num">{formatSize(file.size)}</td>
+                <td class="cell-num" role="gridcell">{formatSize(file.size)}</td>
               {:else if col.key === 'type'}
-                <td class="cell-type" title={fileType(file.extension)}>{fileType(file.extension)}</td>
+                <td class="cell-type" role="gridcell" title={fileType(file.extension)}>{fileType(file.extension)}</td>
               {:else if col.key === 'priority'}
-                <td class="cell-prio prio-{file.priority}" title={priorityLabel(file.priority)}>{priorityLabel(file.priority)}</td>
+                <td class="cell-prio prio-{file.priority}" role="gridcell" title={priorityLabel(file.priority)}>{priorityLabel(file.priority)}</td>
               {:else if col.key === 'hash'}
-                <td class="cell-hash" title={file.hash || m.library_hashing()}>
+                <td class="cell-hash" role="gridcell" title={file.hash || m.library_hashing()}>
                   {#if file.hash}
                     {file.hash.substring(0, 16)}&hellip;
                   {:else}
@@ -720,21 +742,21 @@
                   {/if}
                 </td>
               {:else if col.key === 'requests'}
-                <td class="cell-num">{formatNumber(file.requests)}{file.alltime_requests ? ` (${formatNumber(file.alltime_requests)})` : ''}</td>
+                <td class="cell-num" role="gridcell">{formatNumber(file.requests)}{file.alltime_requests ? ` (${formatNumber(file.alltime_requests)})` : ''}</td>
               {:else if col.key === 'accepted'}
-                <td class="cell-num">{formatNumber(file.accepted)}{file.alltime_accepted ? ` (${formatNumber(file.alltime_accepted)})` : ''}</td>
+                <td class="cell-num" role="gridcell">{formatNumber(file.accepted)}{file.alltime_accepted ? ` (${formatNumber(file.alltime_accepted)})` : ''}</td>
               {:else if col.key === 'transferred'}
-                <td class="cell-num">{formatTransferred(file.bytes_transferred, file.alltime_transferred)}</td>
+                <td class="cell-num" role="gridcell">{formatTransferred(file.bytes_transferred, file.alltime_transferred)}</td>
               {:else if col.key === 'folder'}
-                <td class="cell-folder" title={file.folder}>{file.folder.split(/[\\/]/).filter(Boolean).pop() || file.folder}</td>
+                <td class="cell-folder" role="gridcell" title={file.folder}>{file.folder.split(/[\\/]/).filter(Boolean).pop() || file.folder}</td>
               {:else if col.key === 'modified'}
-                <td class="cell-date" title={file.modified_at ? formatDateTime(file.modified_at) : ''}>{formatDate(file.modified_at)}</td>
+                <td class="cell-date" role="gridcell" title={file.modified_at ? formatDateTime(file.modified_at) : ''}>{formatDate(file.modified_at)}</td>
               {:else if col.key === 'sources'}
-                <td class="cell-num">{file.complete_sources ? formatNumber(file.complete_sources) : '\u2014'}</td>
+                <td class="cell-num" role="gridcell">{file.complete_sources ? formatNumber(file.complete_sources) : '\u2014'}</td>
               {:else if col.key === 'shared'}
                 <!-- What varies among shared files is where each has actually
                      reached, so that is what a shared row shows. -->
-                <td class="cell-shared">
+                <td class="cell-shared" role="gridcell">
                   {#if !file.shared}
                     <span class="not-shared" title={m.library_not_shared_title()}>{m.library_not_shared()}</span>
                   {:else if !file.hash}
@@ -931,7 +953,14 @@
   .lib-table tbody tr:hover td {
     background: var(--bg-hover);
   }
-  .lib-table tbody tr:focus-visible td {
+  .vtable-scroll:focus {
+    outline: none;
+  }
+  .vtable-scroll.no-cursor:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  .vtable-scroll:focus-visible .lib-table tbody tr.selected td {
     outline: 2px solid var(--accent);
     outline-offset: -2px;
   }

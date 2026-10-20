@@ -38,7 +38,7 @@ const PROBE_TIMEOUT_MS: u64 = 12_000;
 /// taken to mean nothing is there. Counted from the walk itself, not from the
 /// routing table, which can be full of contacts that left while this device
 /// was off — a walk none of them answer finishes just as empty.
-const MIN_RESPONDERS_FOR_ABSENCE: usize = 4;
+pub(crate) const MIN_RESPONDERS_FOR_ABSENCE: usize = 4;
 /// Rooms looked up at once: a few lookups each, inside the background search
 /// pool without crowding out everything else that uses it.
 const PROBE_BATCH: usize = 3;

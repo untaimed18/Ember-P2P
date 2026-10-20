@@ -451,6 +451,11 @@
     }
   }
 
+  function sortLabel(key: 'name' | 'size', column: string): string | undefined {
+    if (sortKey !== key) return undefined;
+    return sortAsc ? m.common_sorted_ascending_aria({ column }) : m.common_sorted_descending_aria({ column });
+  }
+
   /**
    * Sharing the open folder takes its subfolders too, as every Ember share
    * does. Unticked, it shares the files directly in it instead, through the
@@ -490,7 +495,7 @@
     if (ownFilesOnly) {
       return plural(currentOwnFiles.length, {
         one: m.library_explorer_share_file_one,
-        other: () => m.library_explorer_share_file_other({ count: currentOwnFiles.length }),
+        other: () => m.library_explorer_share_file_other({ count: formatNumber(currentOwnFiles.length) }),
       });
     }
     if (selectedCount === 0) {
@@ -502,20 +507,20 @@
     if (selectedFileCount > 0 && selectedFolderCount === 0) {
       return plural(selectedFileCount, {
         one: m.library_explorer_share_file_one,
-        other: () => m.library_explorer_share_file_other({ count: selectedFileCount }),
+        other: () => m.library_explorer_share_file_other({ count: formatNumber(selectedFileCount) }),
       });
     }
     if (selectedFileCount === 0 && selectedFolderCount === 1 && selectedEntries[0]?.share_status === 'partial') {
       return m.library_explorer_share_rest();
     }
     if (selectedFileCount === 0 && selectedFolderCount === 1) return m.library_explorer_share_folder();
-    return m.library_explorer_share_other({ count: selectedCount });
+    return m.library_explorer_share_other({ count: formatNumber(selectedCount) });
   });
   let shareOutcome = $derived.by(() => {
     if (ownFilesOnly) {
       return currentOwnFiles.length === 0
         ? m.library_explorer_outcome_no_own_files()
-        : m.library_explorer_outcome_own_files({ count: currentOwnFiles.length });
+        : m.library_explorer_outcome_own_files({ count: formatNumber(currentOwnFiles.length) });
     }
     if (selectedCount === 0) {
       if (filterActive) return m.library_explorer_outcome_filtered();
@@ -1047,6 +1052,8 @@
               <button
                 type="button"
                 class="sort-btn"
+                aria-pressed={sortKey === 'name'}
+                aria-label={sortLabel('name', m.browse_col_name())}
                 onclick={() => toggleSort('name')}
               >
                 {m.browse_col_name()}
@@ -1056,6 +1063,8 @@
               <button
                 type="button"
                 class="sort-btn sort-size"
+                aria-pressed={sortKey === 'size'}
+                aria-label={sortLabel('size', m.library_col_size())}
                 onclick={() => toggleSort('size')}
               >
                 {#if sortKey === 'size'}<span class="sort-arrow" aria-hidden="true">{sortAsc ? '▲' : '▼'}</span>{/if}
@@ -1143,7 +1152,7 @@
         {#if offerSubfolderChoice}
           <label class="subfolder-choice">
             <input type="checkbox" bind:checked={includeSubfolders} disabled={sharing} />
-            <span>{m.library_explorer_include_subfolders({ count: currentSubfolders })}</span>
+            <span>{m.library_explorer_include_subfolders({ count: formatNumber(currentSubfolders) })}</span>
           </label>
         {/if}
         <!-- Always rendered, so the buttons below keep their place when the
@@ -1462,6 +1471,10 @@
     justify-self: start;
   }
   button.sort-btn:not(:disabled):hover { color: var(--text-primary); background: none; transform: none; }
+  button.sort-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
   button.sort-btn.sort-size { justify-self: end; }
   .sort-arrow { font-size: 0.7em; }
   button.link-btn {

@@ -4349,10 +4349,15 @@
           disabled={!inputText.trim() || sending || slowModeLeft > 0}
           title={slowModeLeft > 0 ? m.chat_slow_mode_wait({ seconds: slowModeLeft }) : m.chat_send_title_short()}
           aria-label={m.chat_send_aria()}
+          aria-busy={sending}
         >
-          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M3 10l14-7-7 14-2-5z"/><line x1="10" y1="17" x2="17" y2="3"/>
-          </svg>
+          {#if sending}
+            <span class="spinner sm current" aria-hidden="true"></span>
+          {:else}
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 10l14-7-7 14-2-5z"/><line x1="10" y1="17" x2="17" y2="3"/>
+            </svg>
+          {/if}
         </button>
       </div>
     </div>

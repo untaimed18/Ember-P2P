@@ -5476,6 +5476,76 @@ fn inside_ids(rows: &[StoredChannel]) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// How long a shard walk the network task refused waits before asking again.
+/// A refusal means the background search pool was full; walks there finish
+/// or time out within seconds, so one more ask usually lands.
+const INDEX_SHARD_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// What one public-index shard walk turned up.
+struct ShardWalk {
+    shard: u8,
+    blobs: Vec<Vec<u8>>,
+    /// Enough of the network answered that a room missing from `blobs` can
+    /// be taken as gone. A refused, timed-out or barely answered walk says
+    /// nothing about the rooms it did not return.
+    settled: bool,
+}
+
+/// Walk one shard, asking once more if the network task refused it.
+///
+/// Discover asks for all sixteen shards at once on a pool other automatic
+/// work shares, so a refusal is routine; a timeout has already spent the
+/// whole budget and is not repeated.
+async fn walk_index_shard(state: &AppState, shard: u8, key: [u8; 16]) -> ShardWalk {
+    let mut walk = find_raw_keys_counted(state, vec![key], DEFAULT_FIND_TIMEOUT_MS).await;
+    if walk.is_err() {
+        tokio::time::sleep(INDEX_SHARD_RETRY_DELAY).await;
+        walk = find_raw_keys_counted(state, vec![key], DEFAULT_FIND_TIMEOUT_MS).await;
+    }
+    match walk {
+        Ok(Some((blobs, responded))) => ShardWalk {
+            shard,
+            blobs,
+            settled: responded >= crate::commands::channel_recovery::MIN_RESPONDERS_FOR_ABSENCE,
+        },
+        Ok(None) => {
+            tracing::debug!(shard, "channel index shard walk timed out");
+            ShardWalk { shard, blobs: Vec::new(), settled: false }
+        }
+        Err(error) => {
+            tracing::debug!(shard, %error, "channel index shard walk refused twice");
+            ShardWalk { shard, blobs: Vec::new(), settled: false }
+        }
+    }
+}
+
+/// Cached rooms this walk cannot rule out: filed under a shard that did not
+/// settle, or any of them when the directory could not be read. `skip` names
+/// rooms already listed or not to be shown.
+///
+/// Without this a refused shard read as an empty one, and every room in it
+/// dropped off Discover until a later walk happened to get through.
+fn carry_forward_cached(
+    cached: Vec<CachedChannel>,
+    unsettled: &std::collections::HashSet<u8>,
+    directory_read: bool,
+    skip: impl Fn(&str) -> bool,
+) -> Vec<CachedChannel> {
+    cached
+        .into_iter()
+        .filter(|c| !skip(&c.channel_id))
+        .filter(|c| {
+            let Some(id) = hex::decode(&c.channel_id)
+                .ok()
+                .and_then(|b| <[u8; 16]>::try_from(b).ok())
+            else {
+                return false;
+            };
+            !directory_read || unsettled.contains(&channel::index_shard(&id))
+        })
+        .collect()
+}
+
 /// One shard's worth of listings, tagged with the walk that asked for them.
 #[derive(Clone, serde::Serialize)]
 struct GatheredChannelBatch<'a> {
@@ -5522,12 +5592,25 @@ pub async fn gather_channels(
 
     require_ember(&state).await?;
     let db = state.db.clone();
-    let local = tokio::task::spawn_blocking(move || db.list_channels())
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .unwrap_or_default();
+    let (local, cached) = tokio::task::spawn_blocking(move || {
+        (
+            db.list_channels().unwrap_or_default(),
+            db.list_cached_channels().unwrap_or_default(),
+        )
+    })
+    .await
+    .unwrap_or_default();
     let joined_ids = inside_ids(&local);
+    let hidden: std::collections::HashSet<String> = local
+        .iter()
+        .filter(|c| c.deleted)
+        .map(|c| c.channel_id.clone())
+        .collect();
+    let cached_languages: std::collections::HashMap<String, String> = cached
+        .iter()
+        .filter(|c| !c.language.is_empty())
+        .map(|c| (c.channel_id.clone(), c.language.clone()))
+        .collect();
 
     let url = rendezvous_url(&state).await;
     let (directory, deleted) = tokio::join!(
@@ -5541,6 +5624,7 @@ pub async fn gather_channels(
     // walks below turn up, which is the right behaviour — but it used to be
     // indistinguishable from "the network has no rooms". Log it so an empty
     // Discover can be told apart from an unreachable directory.
+    let directory_read = directory.is_ok();
     let directory = match directory {
         Ok(list) => list,
         Err(error) => {
@@ -5586,7 +5670,8 @@ pub async fn gather_channels(
 
     let mut walks: futures::stream::FuturesUnordered<_> = channel::all_index_keys()
         .into_iter()
-        .map(|key| find_raw_keys(&state, vec![key]))
+        .zip(0u8..)
+        .map(|(key, shard)| walk_index_shard(&state, shard, key))
         .collect();
 
     let mut signed_at: std::collections::HashMap<String, ListingOrigin> =
@@ -5618,6 +5703,12 @@ pub async fn gather_channels(
         }
         signed_at.insert(id.clone(), (out.len(), None, true));
         let name = discovered_room_name(&listing.name, &id);
+        // The directory carries no language, and a walk whose shard lookups are
+        // refused or time out hears no signed listing to bring one in. Start
+        // from the one the last signed listing gave, or every such walk cleared
+        // the language on screen and in the cache; a listing heard below still
+        // replaces it.
+        let language = cached_languages.get(&id).cloned().unwrap_or_default();
         out.push(GatheredChannelInfo {
             joined: joined_ids.contains(&id),
             channel_id: id,
@@ -5625,16 +5716,20 @@ pub async fn gather_channels(
             name,
             private: false,
             member_count: None,
-            language: String::new(),
+            language,
         });
     }
     if !out.is_empty() {
         emit(&out);
     }
 
+    let mut unsettled: std::collections::HashSet<u8> = std::collections::HashSet::new();
     while let Some(shard) = walks.next().await {
+        if !shard.settled {
+            unsettled.insert(shard.shard);
+        }
         let mut changed = Vec::new();
-        for (listing, timestamp) in listings_from_blobs(shard.unwrap_or_default(), &joined_ids) {
+        for (listing, timestamp) in listings_from_blobs(shard.blobs, &joined_ids) {
             if deleted.contains(&listing.channel_id) {
                 continue;
             }
@@ -5646,6 +5741,40 @@ pub async fn gather_channels(
         if !changed.is_empty() {
             emit(&changed);
         }
+    }
+
+    let carried: Vec<GatheredChannelInfo> = carry_forward_cached(
+        cached,
+        &unsettled,
+        directory_read,
+        |id| signed_at.contains_key(id) || deleted.contains(id) || hidden.contains(id),
+    )
+    .into_iter()
+    .map(|c| GatheredChannelInfo {
+        joined: joined_ids.contains(&c.channel_id),
+        channel_id: c.channel_id,
+        pubkey: c.pubkey,
+        name: c.name,
+        private: false,
+        member_count: None,
+        language: c.language,
+    })
+    .collect();
+    if !unsettled.is_empty() || !directory_read {
+        tracing::debug!(
+            unsettled = unsettled.len(),
+            directory_read,
+            kept = carried.len(),
+            "Discover walk incomplete; keeping cached rooms it could not rule out"
+        );
+    }
+    // Not written back to the cache below: the cache's age limit is what
+    // retires a room no walk has heard from in a month.
+    let carried_ids: std::collections::HashSet<String> =
+        carried.iter().map(|c| c.channel_id.clone()).collect();
+    if !carried.is_empty() {
+        emit(&carried);
+        out.extend(carried);
     }
 
     // A room the user has not joined shows no roster, so the directory is the
@@ -5669,6 +5798,7 @@ pub async fn gather_channels(
 
     let listings: Vec<CachedChannel> = out
         .iter()
+        .filter(|c| !carried_ids.contains(&c.channel_id))
         .map(|c| CachedChannel {
             channel_id: c.channel_id.clone(),
             pubkey: c.pubkey.clone(),
@@ -5781,12 +5911,6 @@ async fn publish_signed_record(
     }
 }
 
-async fn find_raw_keys(state: &AppState, keys: Vec<[u8; 16]>) -> Result<Vec<Vec<u8>>, String> {
-    Ok(find_raw_keys_within(state, keys, DEFAULT_FIND_TIMEOUT_MS)
-        .await?
-        .unwrap_or_default())
-}
-
 /// `None` means the caller timed out (or the waiter was dropped) before the
 /// search completed. `Some(blobs)` — including empty — means the walk finished.
 async fn find_raw_keys_within(
@@ -5794,8 +5918,21 @@ async fn find_raw_keys_within(
     keys: Vec<[u8; 16]>,
     timeout_ms: u64,
 ) -> Result<Option<Vec<Vec<u8>>>, String> {
+    Ok(find_raw_keys_counted(state, keys, timeout_ms)
+        .await?
+        .map(|(records, _)| records))
+}
+
+/// [`find_raw_keys_within`], also saying how many nodes answered the walk.
+/// An empty result is only evidence of absence when enough of them did: a
+/// walk whose contacts have all left finishes just as empty.
+async fn find_raw_keys_counted(
+    state: &AppState,
+    keys: Vec<[u8; 16]>,
+    timeout_ms: u64,
+) -> Result<Option<(Vec<Vec<u8>>, usize)>, String> {
     if keys.is_empty() {
-        return Ok(Some(Vec::new()));
+        return Ok(Some((Vec::new(), 0)));
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -5803,13 +5940,17 @@ async fn find_raw_keys_within(
         .try_send(NetworkCommand::FindEmberKeys { keys, tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     let pending = await_reply(rx, "channels_gather_failed", "No response from network").await??;
+    let responded = pending.responded.clone();
     match tokio::time::timeout(
         std::time::Duration::from_millis(timeout_ms),
         pending.records_rx,
     )
     .await
     {
-        Ok(Ok(records)) => Ok(Some(records)),
+        Ok(Ok(records)) => Ok(Some((
+            records,
+            responded.load(std::sync::atomic::Ordering::Acquire),
+        ))),
         Ok(Err(_)) => Ok(None),
         Err(_) => {
             let _ = state
@@ -6660,6 +6801,51 @@ mod tests {
         assert_eq!(found.len(), 1, "only the room's own listing is read");
         assert_eq!(found[0].0.name, "Lobby");
         assert_eq!(found[0].0.language, "de");
+    }
+
+    /// A shard that did not settle says nothing about the rooms under it, so
+    /// those stay listed from the cache; a settled shard's absences stand, and
+    /// with the directory unread nothing can be ruled out.
+    #[test]
+    fn cached_rooms_stay_only_where_the_walk_could_not_rule_them_out() {
+        let cached = |first_byte: u8| CachedChannel {
+            channel_id: hex::encode([first_byte; 16]),
+            pubkey: "00".repeat(32),
+            name: format!("Room {first_byte}"),
+            language: "de".to_string(),
+        };
+        let rows = || vec![cached(0x03), cached(0x13), cached(0x04), cached(0x05)];
+        let ids = |kept: Vec<CachedChannel>| {
+            kept.into_iter().map(|c| c.channel_id).collect::<Vec<_>>()
+        };
+        let unsettled = std::collections::HashSet::from([3u8]);
+
+        assert_eq!(
+            ids(carry_forward_cached(rows(), &unsettled, true, |_| false)),
+            vec![hex::encode([0x03u8; 16]), hex::encode([0x13u8; 16])],
+            "both rooms in shard 3 stay, the settled shards' absences stand"
+        );
+
+        let listed = hex::encode([0x13u8; 16]);
+        assert_eq!(
+            ids(carry_forward_cached(rows(), &unsettled, true, |id| id == listed)),
+            vec![hex::encode([0x03u8; 16])],
+            "a room already listed is not added twice"
+        );
+
+        assert_eq!(
+            carry_forward_cached(rows(), &std::collections::HashSet::new(), false, |_| false).len(),
+            4,
+            "with the directory unread, no absence is evidence"
+        );
+
+        let mut bad = rows();
+        bad.push(CachedChannel { channel_id: "zz".to_string(), ..cached(0x03) });
+        assert_eq!(
+            carry_forward_cached(bad, &unsettled, false, |_| false).len(),
+            4,
+            "a malformed id is dropped"
+        );
     }
 
     fn reaction_row(msg: &str, member: &str, reaction: u8) -> (String, String, u8) {

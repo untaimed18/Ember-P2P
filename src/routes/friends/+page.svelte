@@ -1122,6 +1122,7 @@
       </div>
       <div class="requests-list">
         {#each pendingOffers as offer (offerKey(offer.user_hash, offer.file_hash))}
+          {@const accepting = $acceptingOfferStore === offerKey(offer.user_hash, offer.file_hash)}
           <div
             class="request-card"
             in:fly={{ y: 6, duration: 200 }}
@@ -1151,13 +1152,14 @@
               <button
                 class="request-accept"
                 disabled={$acceptingOfferStore !== null}
+                aria-busy={accepting}
                 onclick={() => acceptOffer(offer)}
-              >{m.friends_offer_download()}</button>
+              >{accepting ? m.browse_downloading() : m.friends_offer_download()}</button>
               <!-- Only the offer being accepted is held, as in the dock:
                    dismissing another one starts nothing. -->
               <button
                 class="request-reject"
-                disabled={$acceptingOfferStore === offerKey(offer.user_hash, offer.file_hash)}
+                disabled={accepting}
                 onclick={() => clearFileOffer(offer.user_hash, offer.file_hash)}
               >{m.common_dismiss()}</button>
             </div>
@@ -1463,7 +1465,6 @@
         <div class="card-controls">
           <button
             class="chat-btn"
-            class:has-unread={unread > 0}
             onclick={() => openChat(f)}
             disabled={chatDisabledFor(f.user_hash)}
             title={chatDisabledFor(f.user_hash)
@@ -1954,6 +1955,7 @@
   .add-form-inner input:focus {
     border-color: var(--accent);
     outline: none;
+    box-shadow: 0 0 0 2px var(--accent-halo);
   }
 
   .hash-input {
@@ -2005,6 +2007,7 @@
   .search-input:focus {
     border-color: var(--accent);
     outline: none;
+    box-shadow: 0 0 0 2px var(--accent-halo);
   }
 
   .search-clear {
@@ -2752,6 +2755,7 @@
     border-color: var(--danger);
   }
 
+  .request-accept:disabled,
   .request-block:disabled,
   .request-reject:disabled {
     opacity: 0.5;
@@ -2864,7 +2868,6 @@
     color: var(--text-secondary);
     padding: 12px 16px;
     border-radius: var(--radius-lg);
-    margin-bottom: 12px;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -2881,7 +2884,6 @@
     color: var(--text-secondary);
     padding: 12px 16px;
     border-radius: var(--radius-lg);
-    margin-bottom: 12px;
     display: flex;
     align-items: center;
     gap: 14px;

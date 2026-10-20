@@ -2798,20 +2798,27 @@
             </div>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_launch_at_login_label()}</span>
-                <span class="hint">{m.settings_launch_at_login_hint()}</span>
+                <label class="toggle-title" id="launch-at-login-label" for="launch-at-login-switch">{m.settings_launch_at_login_label()}</label>
+                <span class="hint" id="launch-at-login-hint">{m.settings_launch_at_login_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.launch_at_login} ariaLabel={m.settings_launch_at_login_label()} />
+              <ToggleSwitch
+                id="launch-at-login-switch"
+                bind:checked={settings.launch_at_login}
+                ariaLabelledby="launch-at-login-label"
+                ariaDescribedby="launch-at-login-hint"
+              />
             </div>
             <div class="field toggle-row nested" class:is-disabled={!settings.launch_at_login}>
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_start_hidden_at_login_label()}</span>
-                <span class="hint">{m.settings_start_hidden_at_login_hint()}</span>
+                <label class="toggle-title" id="start-hidden-label" for="start-hidden-switch">{m.settings_start_hidden_at_login_label()}</label>
+                <span class="hint" id="start-hidden-hint">{m.settings_start_hidden_at_login_hint()}</span>
               </div>
               <ToggleSwitch
+                id="start-hidden-switch"
                 bind:checked={settings.start_hidden_at_login}
                 disabled={!settings.launch_at_login}
-                ariaLabel={m.settings_start_hidden_at_login_label()}
+                ariaLabelledby="start-hidden-label"
+                ariaDescribedby="start-hidden-hint"
               />
             </div>
             <div class="field">
@@ -2913,8 +2920,8 @@
             <h4 class="subsection-title">{m.settings_group_power()}</h4>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_prevent_sleep_label()}</span>
-                <span class="hint">
+                <label class="toggle-title" id="prevent-sleep-label" for="prevent-sleep-switch">{m.settings_prevent_sleep_label()}</label>
+                <span class="hint" id="prevent-sleep-hint">
                   {#if runtimeStatus && !runtimeStatus.sleep_inhibit_supported}
                     {m.settings_prevent_sleep_unsupported()}
                   {:else}
@@ -2926,9 +2933,11 @@
                 {/if}
               </div>
               <ToggleSwitch
+                id="prevent-sleep-switch"
                 bind:checked={settings.prevent_sleep_while_active}
                 disabled={!!runtimeStatus && !runtimeStatus.sleep_inhibit_supported}
-                ariaLabel={m.settings_prevent_sleep_label()}
+                ariaLabelledby="prevent-sleep-label"
+                ariaDescribedby="prevent-sleep-hint"
               />
             </div>
           </div>
@@ -2954,23 +2963,27 @@
             <h4 class="subsection-title">{m.settings_group_delivery()}</h4>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_notifications_enabled_label()}</span>
-                <span class="hint">{m.settings_notifications_enabled_hint()}</span>
+                <label class="toggle-title" id="notifications-enabled-label" for="notifications-enabled-switch">{m.settings_notifications_enabled_label()}</label>
+                <span class="hint" id="notifications-enabled-hint">{m.settings_notifications_enabled_hint()}</span>
               </div>
               <ToggleSwitch
+                id="notifications-enabled-switch"
                 bind:checked={settings.notifications_enabled}
-                ariaLabel={m.settings_notifications_enabled_label()}
+                ariaLabelledby="notifications-enabled-label"
+                ariaDescribedby="notifications-enabled-hint"
               />
             </div>
             <div class="field toggle-row nested" class:is-disabled={notifyOff}>
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_notifications_unfocused_label()}</span>
-                <span class="hint">{m.settings_notifications_unfocused_hint()}</span>
+                <label class="toggle-title" id="notifications-unfocused-label" for="notifications-unfocused-switch">{m.settings_notifications_unfocused_label()}</label>
+                <span class="hint" id="notifications-unfocused-hint">{m.settings_notifications_unfocused_hint()}</span>
               </div>
               <ToggleSwitch
+                id="notifications-unfocused-switch"
                 bind:checked={settings.notifications_only_when_unfocused}
                 disabled={notifyOff}
-                ariaLabel={m.settings_notifications_unfocused_label()}
+                ariaLabelledby="notifications-unfocused-label"
+                ariaDescribedby="notifications-unfocused-hint"
               />
             </div>
           </div>
@@ -2979,70 +2992,78 @@
             <h4 class="subsection-title">{m.settings_notifications_events_label()}</h4>
             <div class="field toggle-row" class:is-disabled={notifyOff}>
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_notify_download_complete()}</span>
+                <label class="toggle-title" id="notify-download-complete-label" for="notify-download-complete-switch">{m.settings_notify_download_complete()}</label>
               </div>
               <ToggleSwitch
+                id="notify-download-complete-switch"
                 bind:checked={settings.notify_download_complete}
                 disabled={notifyOff}
-                ariaLabel={m.settings_notify_download_complete()}
+                ariaLabelledby="notify-download-complete-label"
               />
             </div>
             <div class="field toggle-row" class:is-disabled={notifyOff}>
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_notify_download_failed()}</span>
+                <label class="toggle-title" id="notify-download-failed-label" for="notify-download-failed-switch">{m.settings_notify_download_failed()}</label>
               </div>
               <ToggleSwitch
+                id="notify-download-failed-switch"
                 bind:checked={settings.notify_download_failed}
                 disabled={notifyOff}
-                ariaLabel={m.settings_notify_download_failed()}
+                ariaLabelledby="notify-download-failed-label"
               />
             </div>
             <div class="field toggle-row" class:is-disabled={notifyOff}>
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_notify_friend_online()}</span>
+                <label class="toggle-title" id="notify-friend-online-label" for="notify-friend-online-switch">{m.settings_notify_friend_online()}</label>
               </div>
               <ToggleSwitch
+                id="notify-friend-online-switch"
                 bind:checked={settings.notify_friend_online}
                 disabled={notifyOff}
-                ariaLabel={m.settings_notify_friend_online()}
+                ariaLabelledby="notify-friend-online-label"
               />
             </div>
             <div class="field toggle-row" class:is-disabled={notifyOff}>
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_notify_friend_message()}</span>
-                <span class="hint">{m.settings_notify_friend_message_hint()}</span>
+                <label class="toggle-title" id="notify-friend-message-label" for="notify-friend-message-switch">{m.settings_notify_friend_message()}</label>
+                <span class="hint" id="notify-friend-message-hint">{m.settings_notify_friend_message_hint()}</span>
               </div>
               <ToggleSwitch
+                id="notify-friend-message-switch"
                 bind:checked={settings.notify_friend_message}
                 disabled={notifyOff}
-                ariaLabel={m.settings_notify_friend_message()}
+                ariaLabelledby="notify-friend-message-label"
+                ariaDescribedby="notify-friend-message-hint"
               />
             </div>
             <div class="field toggle-row" class:is-disabled={notifyOff}>
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_notify_friend_request()}</span>
+                <label class="toggle-title" id="notify-friend-request-label" for="notify-friend-request-switch">{m.settings_notify_friend_request()}</label>
               </div>
               <ToggleSwitch
+                id="notify-friend-request-switch"
                 bind:checked={settings.notify_friend_request}
                 disabled={notifyOff}
-                ariaLabel={m.settings_notify_friend_request()}
+                ariaLabelledby="notify-friend-request-label"
               />
             </div>
             <div class="field toggle-row" class:is-disabled={notifyOff}>
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_notify_shares_browsed()}</span>
-                <span class="hint">{m.settings_notify_shares_browsed_hint()}</span>
+                <label class="toggle-title" id="notify-shares-browsed-label" for="notify-shares-browsed-switch">{m.settings_notify_shares_browsed()}</label>
+                <span class="hint" id="notify-shares-browsed-hint">{m.settings_notify_shares_browsed_hint()}</span>
               </div>
               <ToggleSwitch
+                id="notify-shares-browsed-switch"
                 bind:checked={settings.notify_shares_browsed}
                 disabled={notifyOff}
-                ariaLabel={m.settings_notify_shares_browsed()}
+                ariaLabelledby="notify-shares-browsed-label"
+                ariaDescribedby="notify-shares-browsed-hint"
               />
             </div>
             <div class="field toggle-row" class:is-disabled={notifyOff}>
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_notify_channel_message()}</span>
-                <span class="hint">
+                <label class="toggle-title" id="notify-channel-message-label" for="notify-channel-message-switch">{m.settings_notify_channel_message()}</label>
+                <span class="hint" id="notify-channel-message-hint">
                   {m.settings_notify_channel_message_hint()}
                   <button type="button" class="link-btn" onclick={() => selectSection('channels')}>
                     {m.settings_notify_channel_manage()}
@@ -3050,9 +3071,11 @@
                 </span>
               </div>
               <ToggleSwitch
+                id="notify-channel-message-switch"
                 bind:checked={settings.notify_channel_message}
                 disabled={notifyOff}
-                ariaLabel={m.settings_notify_channel_message()}
+                ariaLabelledby="notify-channel-message-label"
+                ariaDescribedby="notify-channel-message-hint"
               />
             </div>
           </div>
@@ -3202,41 +3225,66 @@
             <h4 class="subsection-title">{m.settings_group_behavior()}</h4>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_add_paused()}</span>
-                <span class="hint">{m.settings_add_paused_hint()}</span>
+                <label class="toggle-title" id="add-paused-label" for="add-paused-switch">{m.settings_add_paused()}</label>
+                <span class="hint" id="add-paused-hint">{m.settings_add_paused_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.add_downloads_paused} ariaLabel={m.settings_add_paused()} />
+              <ToggleSwitch
+                id="add-paused-switch"
+                bind:checked={settings.add_downloads_paused}
+                ariaLabelledby="add-paused-label"
+                ariaDescribedby="add-paused-hint"
+              />
             </div>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_auto_remove()}</span>
-                <span class="hint">{m.settings_auto_remove_hint()}</span>
+                <label class="toggle-title" id="auto-remove-label" for="auto-remove-switch">{m.settings_auto_remove()}</label>
+                <span class="hint" id="auto-remove-hint">{m.settings_auto_remove_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.remove_finished_downloads} ariaLabel={m.settings_auto_remove()} />
+              <ToggleSwitch
+                id="auto-remove-switch"
+                bind:checked={settings.remove_finished_downloads}
+                ariaLabelledby="auto-remove-label"
+                ariaDescribedby="auto-remove-hint"
+              />
             </div>
             <!-- Turning it on raises a native confirmation from the backend;
                  declining it leaves the save holding the Recycle Bin, which
                  the switch then shows again. -->
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_delete_permanently()}</span>
-                <span class="hint">{m.settings_delete_permanently_hint()}</span>
+                <label class="toggle-title" id="delete-permanently-label" for="delete-permanently-switch">{m.settings_delete_permanently()}</label>
+                <span class="hint" id="delete-permanently-hint">{m.settings_delete_permanently_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.delete_permanently} ariaLabel={m.settings_delete_permanently()} />
+              <ToggleSwitch
+                id="delete-permanently-switch"
+                bind:checked={settings.delete_permanently}
+                ariaLabelledby="delete-permanently-label"
+                ariaDescribedby="delete-permanently-hint"
+              />
             </div>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_watch_clipboard_label()}</span>
-                <span class="hint">{m.settings_watch_clipboard_hint()}</span>
+                <label class="toggle-title" id="watch-clipboard-label" for="watch-clipboard-switch">{m.settings_watch_clipboard_label()}</label>
+                <span class="hint" id="watch-clipboard-hint">{m.settings_watch_clipboard_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.watch_clipboard_links} ariaLabel={m.settings_watch_clipboard_label()} />
+              <ToggleSwitch
+                id="watch-clipboard-switch"
+                bind:checked={settings.watch_clipboard_links}
+                ariaLabelledby="watch-clipboard-label"
+                ariaDescribedby="watch-clipboard-hint"
+              />
             </div>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_web_sources_label()}</span>
-                <span class="hint">{m.settings_web_sources_hint()}</span>
+                <label class="toggle-title" id="web-sources-label" for="web-sources-switch">{m.settings_web_sources_label()}</label>
+                <span class="hint" id="web-sources-hint">{m.settings_web_sources_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.web_sources_enabled} ariaLabel={m.settings_web_sources_label()} />
+              <ToggleSwitch
+                id="web-sources-switch"
+                bind:checked={settings.web_sources_enabled}
+                ariaLabelledby="web-sources-label"
+                ariaDescribedby="web-sources-hint"
+              />
             </div>
           </div>
 
@@ -3253,10 +3301,15 @@
             </div>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_skip_compress_video()}</span>
-                <span class="hint">{m.settings_skip_compress_video_hint()}</span>
+                <label class="toggle-title" id="skip-compress-video-label" for="skip-compress-video-switch">{m.settings_skip_compress_video()}</label>
+                <span class="hint" id="skip-compress-video-hint">{m.settings_skip_compress_video_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.skip_compress_video} ariaLabel={m.settings_skip_compress_video()} />
+              <ToggleSwitch
+                id="skip-compress-video-switch"
+                bind:checked={settings.skip_compress_video}
+                ariaLabelledby="skip-compress-video-label"
+                ariaDescribedby="skip-compress-video-hint"
+              />
             </div>
           </div>
 
@@ -3264,10 +3317,15 @@
             <h4 class="subsection-title">{m.settings_group_preview()}</h4>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_preview_priority_all()}</span>
-                <span class="hint">{m.settings_preview_priority_all_hint()}</span>
+                <label class="toggle-title" id="preview-priority-all-label" for="preview-priority-all-switch">{m.settings_preview_priority_all()}</label>
+                <span class="hint" id="preview-priority-all-hint">{m.settings_preview_priority_all_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.preview_priority_all} ariaLabel={m.settings_preview_priority_all()} />
+              <ToggleSwitch
+                id="preview-priority-all-switch"
+                bind:checked={settings.preview_priority_all}
+                ariaLabelledby="preview-priority-all-label"
+                ariaDescribedby="preview-priority-all-hint"
+              />
             </div>
             <div class="field">
               <label for="preview-player">{m.settings_preview_player_label()}</label>
@@ -3345,10 +3403,15 @@
             <h4 class="subsection-title">{m.settings_group_spam_filter()}</h4>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_spam_filter()}</span>
-                <span class="hint">{m.settings_spam_filter_hint()}</span>
+                <label class="toggle-title" id="spam-filter-label" for="spam-filter-switch">{m.settings_spam_filter()}</label>
+                <span class="hint" id="spam-filter-hint">{m.settings_spam_filter_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.spam_filter_enabled} ariaLabel={m.settings_spam_filter()} />
+              <ToggleSwitch
+                id="spam-filter-switch"
+                bind:checked={settings.spam_filter_enabled}
+                ariaLabelledby="spam-filter-label"
+                ariaDescribedby="spam-filter-hint"
+              />
             </div>
             <div class="field nested" class:is-disabled={!settings.spam_filter_enabled}>
               <label for="spam-filter-profile">{m.settings_spam_profile_label()}</label>
@@ -3416,13 +3479,15 @@
             </div>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_highlight_matches()}</span>
-                <span class="hint">{m.settings_highlight_matches_hint()}</span>
+                <label class="toggle-title" id="highlight-matches-label" for="highlight-matches-switch">{m.settings_highlight_matches()}</label>
+                <span class="hint" id="highlight-matches-hint">{m.settings_highlight_matches_hint()}</span>
               </div>
               <ToggleSwitch
+                id="highlight-matches-switch"
                 checked={$highlightMatches}
                 onchange={(on) => highlightMatches.set(on)}
-                ariaLabel={m.settings_highlight_matches()}
+                ariaLabelledby="highlight-matches-label"
+                ariaDescribedby="highlight-matches-hint"
               />
             </div>
           </div>
@@ -3431,10 +3496,15 @@
             <h4 class="subsection-title">{m.settings_group_history()}</h4>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_save_search_history()}</span>
-                <span class="hint">{m.settings_save_search_history_hint()}</span>
+                <label class="toggle-title" id="save-search-history-label" for="save-search-history-switch">{m.settings_save_search_history()}</label>
+                <span class="hint" id="save-search-history-hint">{m.settings_save_search_history_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.save_search_history} ariaLabel={m.settings_save_search_history()} />
+              <ToggleSwitch
+                id="save-search-history-switch"
+                bind:checked={settings.save_search_history}
+                ariaLabelledby="save-search-history-label"
+                ariaDescribedby="save-search-history-hint"
+              />
             </div>
           </div>
         </div>
@@ -3633,13 +3703,15 @@
             </div>
             <div class="field toggle-row" class:is-disabled={savedSettings?.max_upload_speed === 0}>
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_uss_label()}</span>
-                <span class="hint">{m.settings_uss_hint()}</span>
+                <label class="toggle-title" id="uss-label" for="uss-switch">{m.settings_uss_label()}</label>
+                <span class="hint" id="uss-hint">{m.settings_uss_hint()}</span>
               </div>
               <ToggleSwitch
+                id="uss-switch"
                 bind:checked={settings.uss_enabled}
                 disabled={savedSettings?.max_upload_speed === 0}
-                ariaLabel={m.settings_uss_label()}
+                ariaLabelledby="uss-label"
+                ariaDescribedby="uss-hint"
               />
             </div>
           </div>
@@ -3648,10 +3720,15 @@
             <h4 class="subsection-title">{m.settings_group_alt_limits()}</h4>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_alt_speed_label()}</span>
-                <span class="hint">{m.settings_alt_speed_hint()}</span>
+                <label class="toggle-title" id="alt-speed-label" for="alt-speed-switch">{m.settings_alt_speed_label()}</label>
+                <span class="hint" id="alt-speed-hint">{m.settings_alt_speed_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.alt_speed_enabled} ariaLabel={m.settings_alt_speed_label()} />
+              <ToggleSwitch
+                id="alt-speed-switch"
+                bind:checked={settings.alt_speed_enabled}
+                ariaLabelledby="alt-speed-label"
+                ariaDescribedby="alt-speed-hint"
+              />
             </div>
             <!-- Editable while off, so the limits can be ready before they are
                  switched on from the tray; dimmed because they are not in force. -->
@@ -3678,12 +3755,14 @@
             <h4 class="subsection-title">{m.settings_group_schedule()}</h4>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_schedule_label()}</span>
-                <span class="hint">{m.settings_schedule_hint()}</span>
+                <label class="toggle-title" id="schedule-label" for="schedule-switch">{m.settings_schedule_label()}</label>
+                <span class="hint" id="schedule-hint">{m.settings_schedule_hint()}</span>
               </div>
               <ToggleSwitch
+                id="schedule-switch"
                 bind:checked={settings.bandwidth_schedule_enabled}
-                ariaLabel={m.settings_schedule_label()}
+                ariaLabelledby="schedule-label"
+                ariaDescribedby="schedule-hint"
               />
             </div>
 
@@ -3907,20 +3986,30 @@
             </div>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_upnp_label()} <span class="restart-badge" class:pending={restartPending('upnp_enabled')}>{m.settings_restart_badge()}</span></span>
-                <span class="hint">{m.settings_upnp_hint()}</span>
+                <label class="toggle-title" id="upnp-label" for="upnp-switch">{m.settings_upnp_label()} <span class="restart-badge" class:pending={restartPending('upnp_enabled')} id="upnp-restart" aria-hidden="true">{m.settings_restart_badge()}</span></label>
+                <span class="hint" id="upnp-hint">{m.settings_upnp_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.upnp_enabled} ariaLabel={m.settings_upnp_label()} />
+              <ToggleSwitch
+                id="upnp-switch"
+                bind:checked={settings.upnp_enabled}
+                ariaLabelledby="upnp-label"
+                ariaDescribedby="upnp-restart upnp-hint"
+              />
             </div>
             <div class="field">
               <PortTest />
             </div>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_stun_keepalive_label()}</span>
-                <span class="hint">{m.settings_stun_keepalive_hint()}</span>
+                <label class="toggle-title" id="stun-keepalive-label" for="stun-keepalive-switch">{m.settings_stun_keepalive_label()}</label>
+                <span class="hint" id="stun-keepalive-hint">{m.settings_stun_keepalive_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.stun_keepalive_enabled} ariaLabel={m.settings_stun_keepalive_label()} />
+              <ToggleSwitch
+                id="stun-keepalive-switch"
+                bind:checked={settings.stun_keepalive_enabled}
+                ariaLabelledby="stun-keepalive-label"
+                ariaDescribedby="stun-keepalive-hint"
+              />
             </div>
           </div>
 
@@ -3976,10 +4065,15 @@
             -->
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_relay_for_peers_label()}</span>
-                <span class="hint">{m.settings_relay_for_peers_hint()}</span>
+                <label class="toggle-title" id="relay-for-peers-label" for="relay-for-peers-switch">{m.settings_relay_for_peers_label()}</label>
+                <span class="hint" id="relay-for-peers-hint">{m.settings_relay_for_peers_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.relay_for_peers} ariaLabel={m.settings_relay_for_peers_label()} />
+              <ToggleSwitch
+                id="relay-for-peers-switch"
+                bind:checked={settings.relay_for_peers}
+                ariaLabelledby="relay-for-peers-label"
+                ariaDescribedby="relay-for-peers-hint"
+              />
             </div>
           </div>
 
@@ -3996,24 +4090,39 @@
             <h4 class="subsection-title">{m.settings_group_ed2k_servers()}</h4>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_auto_connect_server()}</span>
-                <span class="hint">{m.settings_auto_connect_server_hint()}</span>
+                <label class="toggle-title" id="auto-connect-server-label" for="auto-connect-server-switch">{m.settings_auto_connect_server()}</label>
+                <span class="hint" id="auto-connect-server-hint">{m.settings_auto_connect_server_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.auto_connect_server} ariaLabel={m.settings_auto_connect_server()} />
+              <ToggleSwitch
+                id="auto-connect-server-switch"
+                bind:checked={settings.auto_connect_server}
+                ariaLabelledby="auto-connect-server-label"
+                ariaDescribedby="auto-connect-server-hint"
+              />
             </div>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_update_servers_label()}</span>
-                <span class="hint">{m.settings_update_servers_hint()}</span>
+                <label class="toggle-title" for="update-servers-switch">{m.settings_update_servers_label()}</label>
+                <span class="hint" id="update-servers-hint">{m.settings_update_servers_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.add_servers_from_server} ariaLabel={m.settings_update_servers_aria()} />
+              <ToggleSwitch
+                id="update-servers-switch"
+                bind:checked={settings.add_servers_from_server}
+                ariaLabel={m.settings_update_servers_aria()}
+                ariaDescribedby="update-servers-hint"
+              />
             </div>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_filter_servers_label()}</span>
-                <span class="hint">{m.settings_filter_servers_hint()}</span>
+                <label class="toggle-title" id="filter-servers-label" for="filter-servers-switch">{m.settings_filter_servers_label()}</label>
+                <span class="hint" id="filter-servers-hint">{m.settings_filter_servers_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.filter_servers_by_ip} ariaLabel={m.settings_filter_servers_label()} />
+              <ToggleSwitch
+                id="filter-servers-switch"
+                bind:checked={settings.filter_servers_by_ip}
+                ariaLabelledby="filter-servers-label"
+                ariaDescribedby="filter-servers-hint"
+              />
             </div>
           </div>
         </div>
@@ -4043,10 +4152,15 @@
             <h4 class="subsection-title">{m.settings_group_traffic()}</h4>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_obfuscation_label()}</span>
-                <span class="hint">{m.settings_obfuscation_hint()}</span>
+                <label class="toggle-title" id="obfuscation-label" for="obfuscation-switch">{m.settings_obfuscation_label()}</label>
+                <span class="hint" id="obfuscation-hint">{m.settings_obfuscation_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.obfuscation_enabled} ariaLabel={m.settings_obfuscation_label()} />
+              <ToggleSwitch
+                id="obfuscation-switch"
+                bind:checked={settings.obfuscation_enabled}
+                ariaLabelledby="obfuscation-label"
+                ariaDescribedby="obfuscation-hint"
+              />
             </div>
           </div>
 
@@ -4057,57 +4171,73 @@
             <h4 class="subsection-title">{m.settings_group_blocking()}</h4>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_ip_filter_label()}</span>
-                <span class="hint">
+                <label class="toggle-title" id="ip-filter-label" for="ip-filter-switch">{m.settings_ip_filter_label()}</label>
+                <span class="hint" id="ip-filter-hint">
                   {m.settings_ip_filter_hint()}
                   <a href="/security" onclick={(e) => { e.preventDefault(); void goto('/security'); }}>{m.settings_open_page({ page: m.nav_security() })}</a>
                 </span>
               </div>
               <ToggleSwitch
+                id="ip-filter-switch"
                 bind:checked={settings.ip_filter_enabled}
-                ariaLabel={m.settings_ip_filter_label()}
+                ariaLabelledby="ip-filter-label"
+                ariaDescribedby="ip-filter-hint"
                 onchange={(v) => applyIpToggleLive('ip_filter_enabled', v)}
               />
             </div>
             <div class="field toggle-row nested" class:is-disabled={!settings.ip_filter_enabled}>
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_ip_filter_auto_update_label()}</span>
-                <span class="hint">{m.security_auto_update_title()}</span>
+                <label class="toggle-title" id="ip-filter-auto-update-label" for="ip-filter-auto-update-switch">{m.settings_ip_filter_auto_update_label()}</label>
+                <span class="hint" id="ip-filter-auto-update-hint">{m.security_auto_update_title()}</span>
               </div>
               <ToggleSwitch
+                id="ip-filter-auto-update-switch"
                 bind:checked={settings.ip_filter_auto_update}
                 disabled={!settings.ip_filter_enabled}
-                ariaLabel={m.settings_ip_filter_auto_update_label()}
+                ariaLabelledby="ip-filter-auto-update-label"
+                ariaDescribedby="ip-filter-auto-update-hint"
                 onchange={(v) => applyIpToggleLive('ip_filter_auto_update', v)}
               />
             </div>
 
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_filter_incoming_label()}</span>
-                <span class="hint">{m.settings_filter_incoming_hint()}</span>
+                <label class="toggle-title" id="filter-incoming-label" for="filter-incoming-switch">{m.settings_filter_incoming_label()}</label>
+                <span class="hint" id="filter-incoming-hint">{m.settings_filter_incoming_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.filter_incoming_connections} ariaLabel={m.settings_filter_incoming_label()} />
+              <ToggleSwitch
+                id="filter-incoming-switch"
+                bind:checked={settings.filter_incoming_connections}
+                ariaLabelledby="filter-incoming-label"
+                ariaDescribedby="filter-incoming-hint"
+              />
             </div>
 
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_block_private_label()}</span>
-                <span class="hint">{m.settings_block_private_hint()}</span>
+                <label class="toggle-title" id="block-private-label" for="block-private-switch">{m.settings_block_private_label()}</label>
+                <span class="hint" id="block-private-hint">{m.settings_block_private_hint()}</span>
               </div>
               <ToggleSwitch
+                id="block-private-switch"
                 bind:checked={settings.block_private_ips}
-                ariaLabel={m.settings_block_private_label()}
+                ariaLabelledby="block-private-label"
+                ariaDescribedby="block-private-hint"
                 onchange={(v) => applyIpToggleLive('block_private_ips', v)}
               />
             </div>
 
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_antileech_label()}</span>
-                <span class="hint">{m.settings_antileech_hint()}</span>
+                <label class="toggle-title" id="antileech-label" for="antileech-switch">{m.settings_antileech_label()}</label>
+                <span class="hint" id="antileech-hint">{m.settings_antileech_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.antileech_enabled} ariaLabel={m.settings_antileech_label()} />
+              <ToggleSwitch
+                id="antileech-switch"
+                bind:checked={settings.antileech_enabled}
+                ariaLabelledby="antileech-label"
+                ariaDescribedby="antileech-hint"
+              />
             </div>
             {#if settings.antileech_enabled}
               <div class="field nested antileech-block">
@@ -4171,10 +4301,15 @@
             <h4 class="subsection-title">{m.settings_group_visibility()}</h4>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_allow_shared_browse_label()}</span>
-                <span class="hint">{m.settings_allow_shared_browse_hint()}</span>
+                <label class="toggle-title" id="allow-shared-browse-label" for="allow-shared-browse-switch">{m.settings_allow_shared_browse_label()}</label>
+                <span class="hint" id="allow-shared-browse-hint">{m.settings_allow_shared_browse_hint()}</span>
               </div>
-              <ToggleSwitch bind:checked={settings.allow_shared_files_browse} ariaLabel={m.settings_allow_shared_browse_label()} />
+              <ToggleSwitch
+                id="allow-shared-browse-switch"
+                bind:checked={settings.allow_shared_files_browse}
+                ariaLabelledby="allow-shared-browse-label"
+                ariaDescribedby="allow-shared-browse-hint"
+              />
             </div>
           </div>
         </div>
@@ -4206,35 +4341,41 @@
             <h4 class="subsection-title">{m.settings_group_chat()}</h4>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_friend_chat_label()}</span>
-                <span class="hint">{m.settings_friend_chat_hint()}</span>
+                <label class="toggle-title" id="friend-chat-label" for="friend-chat-switch">{m.settings_friend_chat_label()}</label>
+                <span class="hint" id="friend-chat-hint">{m.settings_friend_chat_hint()}</span>
               </div>
               <ToggleSwitch
+                id="friend-chat-switch"
                 checked={friendChatOn}
                 onchange={(on) => { if (settings) settings.friend_chat_disabled = !on; }}
-                ariaLabel={m.settings_friend_chat_label()}
+                ariaLabelledby="friend-chat-label"
+                ariaDescribedby="friend-chat-hint"
               />
             </div>
             <div class="field toggle-row nested" class:is-disabled={!friendChatOn}>
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_friend_chat_read_receipts()}</span>
-                <span class="hint">{m.settings_friend_chat_read_receipts_hint()}</span>
+                <label class="toggle-title" id="read-receipts-label" for="read-receipts-switch">{m.settings_friend_chat_read_receipts()}</label>
+                <span class="hint" id="read-receipts-hint">{m.settings_friend_chat_read_receipts_hint()}</span>
               </div>
               <ToggleSwitch
+                id="read-receipts-switch"
                 bind:checked={settings.friend_chat_read_receipts}
                 disabled={!friendChatOn}
-                ariaLabel={m.settings_friend_chat_read_receipts()}
+                ariaLabelledby="read-receipts-label"
+                ariaDescribedby="read-receipts-hint"
               />
             </div>
             <div class="field toggle-row nested" class:is-disabled={!friendChatOn}>
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_chat_mailbox_label()}</span>
-                <span class="hint">{m.settings_chat_mailbox_hint()}</span>
+                <label class="toggle-title" id="chat-mailbox-label" for="chat-mailbox-switch">{m.settings_chat_mailbox_label()}</label>
+                <span class="hint" id="chat-mailbox-hint">{m.settings_chat_mailbox_hint()}</span>
               </div>
               <ToggleSwitch
+                id="chat-mailbox-switch"
                 bind:checked={settings.chat_mailbox_enabled}
                 disabled={!friendChatOn}
-                ariaLabel={m.settings_chat_mailbox_label()}
+                ariaLabelledby="chat-mailbox-label"
+                ariaDescribedby="chat-mailbox-hint"
               />
             </div>
             <div class="field nested" class:is-disabled={!friendChatOn}>
@@ -4258,14 +4399,16 @@
             <h4 class="subsection-title">{m.settings_group_files()}</h4>
             <div class="field toggle-row" class:is-disabled={!friendChatOn}>
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_friend_files_label()}</span>
-                <span class="hint">{m.settings_friend_files_hint()}</span>
+                <label class="toggle-title" id="friend-files-label" for="friend-files-switch">{m.settings_friend_files_label()}</label>
+                <span class="hint" id="friend-files-hint">{m.settings_friend_files_hint()}</span>
               </div>
               <ToggleSwitch
+                id="friend-files-switch"
                 checked={friendFilesOn}
                 disabled={!friendChatOn}
                 onchange={(on) => { if (settings) settings.friend_files_disabled = !on; }}
-                ariaLabel={m.settings_friend_files_label()}
+                ariaLabelledby="friend-files-label"
+                ariaDescribedby="friend-files-hint"
               />
             </div>
             <div class="field nested" class:is-disabled={!friendFilesOn}>
@@ -4303,13 +4446,15 @@
             <h4 class="subsection-title">{m.settings_group_sharing()}</h4>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_friend_browse_label()}</span>
-                <span class="hint">{m.settings_friend_browse_hint()}</span>
+                <label class="toggle-title" id="friend-browse-label" for="friend-browse-switch">{m.settings_friend_browse_label()}</label>
+                <span class="hint" id="friend-browse-hint">{m.settings_friend_browse_hint()}</span>
               </div>
               <ToggleSwitch
+                id="friend-browse-switch"
                 checked={settings.friend_browse_disabled !== true}
                 onchange={(on) => { if (settings) settings.friend_browse_disabled = !on; }}
-                ariaLabel={m.settings_friend_browse_label()}
+                ariaLabelledby="friend-browse-label"
+                ariaDescribedby="friend-browse-hint"
               />
             </div>
           </div>
@@ -4904,12 +5049,12 @@
 
             <div class="field toggle-row" class:is-disabled={!silentSupported}>
               <div class="toggle-info">
-                <span class="toggle-title">{m.settings_silent_update_label()}</span>
-                <span class="hint">
+                <label class="toggle-title" id="silent-update-label" for="silent-update-switch">{m.settings_silent_update_label()}</label>
+                <span class="hint" id="silent-update-hint">
                   {silentSupported ? m.settings_silent_update_hint() : silentUnsupportedHint}
                 </span>
                 {#if silentSupported && silentStatusText}
-                  <span class="hint silent-update-status">
+                  <span class="hint silent-update-status" id="silent-update-status">
                     {silentStatusText}
                     {#if $silentUpdate?.enabled && $silentUpdate.phase === 'postponed'}
                       <button type="button" class="silent-update-resume" onclick={() => void resumeSilentUpdate()}>
@@ -4920,9 +5065,11 @@
                 {/if}
               </div>
               <ToggleSwitch
+                id="silent-update-switch"
                 bind:checked={settings.silent_update_enabled}
                 disabled={!silentSupported}
-                ariaLabel={m.settings_silent_update_label()}
+                ariaLabelledby="silent-update-label"
+                ariaDescribedby="silent-update-hint silent-update-status"
               />
             </div>
           </div>
@@ -5544,6 +5691,14 @@
     font-weight: 500;
     color: var(--text-primary);
     line-height: 1.4;
+  }
+
+  label.toggle-title {
+    cursor: pointer;
+  }
+
+  .field.is-disabled label.toggle-title {
+    cursor: default;
   }
 
   .toggle-info .hint {

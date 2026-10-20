@@ -924,6 +924,7 @@
         <div class="dock-offers" role="region" aria-label={m.chat_dock_offers_title()}>
           <div class="dock-offers-title">{m.chat_dock_offers_title()}</div>
           {#each pendingOffers as offer (`${offer.user_hash}:${offer.file_hash}`)}
+            {@const accepting = $acceptingOffer === offerKey(offer.user_hash, offer.file_hash)}
             <div class="dock-offer">
               <div class="dock-offer-info">
                 <span class="dock-offer-name"><bdi dir="auto">{offer.file_name}</bdi></span>
@@ -937,14 +938,15 @@
                   type="button"
                   class="dock-offer-accept"
                   disabled={$acceptingOffer !== null}
+                  aria-busy={accepting}
                   onclick={() => void acceptDockOffer(offer)}
-                >{m.friends_offer_download()}</button>
+                >{accepting ? m.browse_downloading() : m.friends_offer_download()}</button>
                 <!-- Only the row being accepted is held: dismissing a
                      different offer starts nothing and can go through. -->
                 <button
                   type="button"
                   class="dock-offer-dismiss"
-                  disabled={$acceptingOffer === offerKey(offer.user_hash, offer.file_hash)}
+                  disabled={accepting}
                   onclick={() => clearFileOffer(offer.user_hash, offer.file_hash)}
                 >{m.common_dismiss()}</button>
               </div>

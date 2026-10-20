@@ -65,6 +65,9 @@
   let drafts = $state<Record<string, string>>({});
   /** Categories whose folder was just saved, for the brief confirmation. */
   let saved = $state<Record<string, number>>({});
+  /** The category whose remove button was pressed and is waiting on a second
+   *  click. Removing one takes its downloads out of it, so it asks first. */
+  let confirmingRemove = $state<string | null>(null);
   const SAVED_FLASH_MS = 1800;
   let dialogEl: HTMLDivElement | undefined = $state(undefined);
   let overlayEl: HTMLDivElement | undefined = $state(undefined);
@@ -89,6 +92,7 @@
     busy = false;
     drafts = {};
     saved = {};
+    confirmingRemove = null;
     requestAnimationFrame(() => inputEl?.focus());
     return () => {
       const el = returnFocusEl;
@@ -116,7 +120,7 @@
   async function add() {
     if (busy || !cleaned) return;
     if (full) {
-      error = m.transfers_categories_limit({ max: MAX_CATEGORIES });
+      error = m.transfers_categories_limit({ max: formatNumber(MAX_CATEGORIES) });
       return;
     }
     if (isTaken(cleaned)) {
@@ -143,8 +147,23 @@
     inputEl?.focus();
   }
 
+  async function askRemove(category: string) {
+    confirmingRemove = category;
+    await tick();
+    dialogEl?.querySelector<HTMLButtonElement>('.cat-confirm-cancel')?.focus();
+  }
+
+  async function cancelRemove() {
+    const category = confirmingRemove;
+    confirmingRemove = null;
+    await tick();
+    const index = category === null ? -1 : categories.indexOf(category);
+    dialogEl?.querySelectorAll<HTMLButtonElement>('.cat-remove')[index]?.focus();
+  }
+
   async function remove(category: string) {
     if (busy) return;
+    confirmingRemove = null;
     const index = categories.indexOf(category);
     busy = true;
     error = null;
@@ -212,7 +231,9 @@
     if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
-      void close();
+      // Backs out of a remove first, as it does a folder edit.
+      if (confirmingRemove !== null) void cancelRemove();
+      else void close();
       return;
     }
     trapTabKey(e, dialogEl);
@@ -294,10 +315,29 @@
           disabled={busy}
           aria-label={m.transfers_categories_remove_aria({ name: category })}
           title={m.transfers_categories_remove_aria({ name: category })}
-          onclick={() => void remove(category)}
+          aria-expanded={confirmingRemove === category}
+          onclick={() => void askRemove(category)}
         ><IconX size={14} /></button>
       {/if}
     </div>
+    {#if confirmingRemove === category}
+      {@const count = counts[category] ?? 0}
+      <div class="cat-confirm" role="group" aria-label={m.transfers_categories_remove_confirm({ name: category })}>
+        <p>
+          <strong>{m.transfers_categories_remove_confirm({ name: category })}</strong>
+          {#if count > 0}
+            {plural(count, {
+              one: m.transfers_categories_remove_confirm_moves_one,
+              other: () => m.transfers_categories_remove_confirm_moves_other({ count: formatNumber(count) }),
+            })}
+          {/if}
+        </p>
+        <div class="cat-confirm-actions">
+          <button type="button" class="ghost cat-confirm-cancel" disabled={busy} onclick={() => void cancelRemove()}>{m.common_cancel()}</button>
+          <button type="button" class="danger" disabled={busy} onclick={() => void remove(category)}>{m.common_remove()}</button>
+        </div>
+      </div>
+    {/if}
     {@render folderField(category, key)}
   </li>
 {/snippet}
@@ -384,7 +424,7 @@
           <section class="cat-section" aria-labelledby="categories-yours-{instanceId}">
             <div class="cat-section-head">
               <h4 id="categories-yours-{instanceId}">{m.transfers_categories_yours_title()}</h4>
-              <span class="cat-section-count">{categories.length}/{MAX_CATEGORIES}</span>
+              <span class="cat-section-count">{formatNumber(categories.length)}/{formatNumber(MAX_CATEGORIES)}</span>
             </div>
             <p class="cat-section-note">{m.transfers_categories_hint()}</p>
             {#if categories.length === 0}
@@ -684,6 +724,33 @@
   .cat-remove {
     width: 26px;
     height: 26px;
+  }
+
+  .cat-confirm {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    margin: 8px 0 0 40px;
+    padding: 8px 10px;
+    border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border));
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--danger) 8%, transparent);
+  }
+  .cat-confirm p {
+    flex: 1;
+    min-width: 12em;
+    margin: 0;
+    font-size: var(--font-size-sm);
+    line-height: 1.45;
+    color: var(--text-secondary);
+  }
+  .cat-confirm strong {
+    color: var(--text-primary);
+  }
+  .cat-confirm-actions {
+    display: flex;
+    gap: 6px;
   }
 
   .cat-footnote {

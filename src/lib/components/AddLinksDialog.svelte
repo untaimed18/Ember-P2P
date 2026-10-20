@@ -174,7 +174,7 @@
         rows="8"
         spellcheck="false"
         autocomplete="off"
-        placeholder="ed2k://|file|…|/"
+        placeholder={m.transfers_add_links_placeholder()}
         aria-label={m.transfers_add_links_title()}
       ></textarea>
       <div class="add-links-status" aria-live="polite">
@@ -191,8 +191,8 @@
       </div>
       <div class="dialog-actions">
         <button type="button" class="ghost" onclick={close}>{m.common_cancel()}</button>
-        <button type="button" onclick={() => void submit()} disabled={busy || count === 0 || tooLong}>
-          {m.transfers_add_links_submit()}
+        <button type="button" onclick={() => void submit()} disabled={busy || count === 0 || tooLong} aria-busy={busy}>
+          {busy ? m.search_downloading_ellipsis() : m.transfers_add_links_submit()}
         </button>
       </div>
     </div>

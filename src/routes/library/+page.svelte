@@ -60,6 +60,7 @@
     formatNumber,
     formatDateTime,
     formatClockTime,
+    compareFileNames,
     copyToClipboard as writeClipboard,
   } from '$lib/utils';
   import type { FileInfo, MediaMetadata } from '$lib/types';
@@ -2233,13 +2234,6 @@
 
   const priorityOrder: Record<string, number> = { verylow: 0, low: 1, normal: 2, high: 3, release: 4, auto: 5 };
 
-  // One reused collator instead of an implicit `String.prototype.localeCompare`
-  // collator per comparison (which, on a 50k-row sort, is hundreds of
-  // thousands of allocations). `numeric: true` also gives natural ordering so
-  // "File2" sorts before "File10", and `sensitivity: 'base'` makes the sort
-  // case/accent-insensitive the way users expect from a file manager.
-  const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
-
   let sortedFiles = $derived.by(() => {
     const copy = [...filteredFiles];
     const dir = sortAsc ? 1 : -1;
@@ -2258,15 +2252,15 @@
     copy.sort((a, b) => {
       let cmp = 0;
       switch (sortField) {
-        case 'name': cmp = collator.compare(a.name, b.name); break;
+        case 'name': cmp = compareFileNames(a.name, b.name); break;
         case 'size': cmp = a.size - b.size; break;
-        case 'extension': cmp = collator.compare(typeSortKey(a), typeSortKey(b)) || collator.compare(a.extension, b.extension); break;
+        case 'extension': cmp = compareFileNames(typeSortKey(a), typeSortKey(b)) || compareFileNames(a.extension, b.extension); break;
         case 'priority': cmp = (priorityOrder[a.priority] ?? 2) - (priorityOrder[b.priority] ?? 2); break;
-        case 'hash': cmp = collator.compare(a.hash, b.hash); break;
+        case 'hash': cmp = compareFileNames(a.hash, b.hash); break;
         case 'requests': cmp = compareAllTime(a.requests, a.alltime_requests, b.requests, b.alltime_requests); break;
         case 'accepted': cmp = compareAllTime(a.accepted, a.alltime_accepted, b.accepted, b.alltime_accepted); break;
         case 'bytes_transferred': cmp = compareAllTime(a.bytes_transferred, a.alltime_transferred, b.bytes_transferred, b.alltime_transferred); break;
-        case 'folder': cmp = collator.compare(a.folder, b.folder); break;
+        case 'folder': cmp = compareFileNames(a.folder, b.folder); break;
         case 'complete_sources': cmp = a.complete_sources - b.complete_sources; break;
         case 'modified_at': cmp = (a.modified_at || 0) - (b.modified_at || 0); break;
       }
@@ -2276,10 +2270,10 @@
       // ascending regardless of the primary sort direction so names stay A→Z.
       if (cmp === 0) {
         if (sortField !== 'name') {
-          const byName = collator.compare(a.name, b.name);
+          const byName = compareFileNames(a.name, b.name);
           if (byName !== 0) return byName;
         }
-        return collator.compare(a.path, b.path);
+        return compareFileNames(a.path, b.path);
       }
       return dir * cmp;
     });
@@ -4896,7 +4890,7 @@
         </div>
         <button
           type="button"
-          class="icon-close drawer-close"
+          class="icon-close drawer-close drawer-rename"
           disabled={!selectedFile.hash}
           onclick={() => { const f = selectedFile; if (f) openRename(f); }}
           title={selectedFile.hash ? m.library_rename_title() : m.library_rename_not_hashed()}
@@ -6326,6 +6320,16 @@
   }
   .drawer-close {
     margin-top: 1px;
+  }
+  /* The close button's shape, without its danger tint: renaming is not a
+     way out. */
+  button.icon-close.drawer-rename:hover:not(:disabled) {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+  button.icon-close.drawer-rename:active:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 20%, transparent);
   }
   .drawer-body {
     flex: 1;

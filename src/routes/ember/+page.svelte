@@ -823,6 +823,7 @@
                 type="button"
                 class="copy-btn"
                 onclick={() => copyText(diagnosticsText(), 'diagnostics')}
+                title={m.ember_copy_diagnostics()}
               >
                 {#if copiedKey === 'diagnostics'}{m.ember_copied()}
                 {:else if copiedKey === 'diagnostics:error'}{m.ember_copy_failed()}
