@@ -2149,7 +2149,9 @@ pub struct MultiSourceDownload {
     pub sources: Vec<DownloadSource>,
     pub download_folders: crate::storage::part_folders::SharedDownloadFolders,
     pub user_hash: [u8; 16],
-    pub nickname: String,
+    /// Read when each connection opens, so a rename mid-download is what
+    /// every later session announces.
+    pub nickname: Arc<tokio::sync::RwLock<String>>,
     pub tcp_port: u16,
     pub udp_port: u16,
     pub bandwidth_limiter: Arc<BandwidthLimiter>,
@@ -3172,7 +3174,7 @@ impl MultiSourceDownload {
             let file_hash = self.file_hash;
             let file_size = self.file_size;
             let user_hash = self.user_hash;
-            let nickname = self.nickname.clone();
+            let nickname = self.nickname.read().await.clone();
             let tcp_port = self.tcp_port;
             let udp_port = self.udp_port;
             let bw = self.bandwidth_limiter.clone();
@@ -3195,7 +3197,7 @@ impl MultiSourceDownload {
             let src_ember_hash = self.ember_hash;
             let src_ember_pubkey = self.ed25519_public_key;
             let src_ember_secret = self.ed25519_secret_key;
-            let nick_for_src = self.nickname.clone();
+            let nick_for_src = self.nickname.read().await.clone();
             let sem_clone = conn_semaphore.clone();
             let qw = queue_wait_secs;
             let shared_out = shared_part_file.clone();
@@ -3703,7 +3705,7 @@ impl MultiSourceDownload {
                             let fh = self.file_hash;
                             let fs = self.file_size;
                             let uh = self.user_hash;
-                            let nn = self.nickname.clone();
+                            let nn = self.nickname.read().await.clone();
                             let tp = self.tcp_port;
                             let up = self.udp_port;
                             let bw = self.bandwidth_limiter.clone();
@@ -3734,7 +3736,7 @@ impl MultiSourceDownload {
                             let inj_ember_hash = self.ember_hash;
                             let inj_ember_pubkey = self.ed25519_public_key;
                             let inj_ember_secret = self.ed25519_secret_key;
-                            let inj_nick = self.nickname.clone();
+                            let inj_nick = self.nickname.read().await.clone();
                             let inj_qw = queue_wait_secs;
                             let inj_shared_out = shared_part_file.clone();
                             let inj_epx = self.ember_payload.clone();
@@ -3960,7 +3962,7 @@ impl MultiSourceDownload {
                             let fh = self.file_hash;
                             let fs = self.file_size;
                             let uh = self.user_hash;
-                            let nn = self.nickname.clone();
+                            let nn = self.nickname.read().await.clone();
                             let tp = self.tcp_port;
                             let up = self.udp_port;
                             let bw = self.bandwidth_limiter.clone();
@@ -3991,7 +3993,7 @@ impl MultiSourceDownload {
                             let inj_ember_hash = self.ember_hash;
                             let inj_ember_pubkey = self.ed25519_public_key;
                             let inj_ember_secret = self.ed25519_secret_key;
-                            let inj_nick = self.nickname.clone();
+                            let inj_nick = self.nickname.read().await.clone();
                             let inj_qw = queue_wait_secs;
                             let inj_shared_out = shared_part_file.clone();
                             let inj_epx = self.ember_payload.clone();
@@ -4366,7 +4368,7 @@ impl MultiSourceDownload {
                     let fh = self.file_hash;
                     let fs = self.file_size;
                     let uh = self.user_hash;
-                    let nn = self.nickname.clone();
+                    let nn = self.nickname.read().await.clone();
                     let tp = self.tcp_port;
                     let up = self.udp_port;
                     let bw = self.bandwidth_limiter.clone();
@@ -4394,7 +4396,7 @@ impl MultiSourceDownload {
                     let a_ember_hash = self.ember_hash;
                     let a_ember_pubkey = self.ed25519_public_key;
                     let a_ember_secret = self.ed25519_secret_key;
-                    let a_nick = self.nickname.clone();
+                    let a_nick = self.nickname.read().await.clone();
                     let a_qw = queue_wait_secs;
                     let a_shared_out = shared_part_file.clone();
                     let a_epx = self.ember_payload.clone();
@@ -4953,7 +4955,7 @@ impl MultiSourceDownload {
                 let file_hash = self.file_hash;
                 let file_size = self.file_size;
                 let user_hash = self.user_hash;
-                let nickname = self.nickname.clone();
+                let nickname = self.nickname.read().await.clone();
                 let tcp_port = self.tcp_port;
                 let udp_port = self.udp_port;
                 let bw = self.bandwidth_limiter.clone();
@@ -4981,7 +4983,7 @@ impl MultiSourceDownload {
                 let r_ember_hash = self.ember_hash;
                 let r_ember_pubkey = self.ed25519_public_key;
                 let r_ember_secret = self.ed25519_secret_key;
-                let r_nick = self.nickname.clone();
+                let r_nick = self.nickname.read().await.clone();
                 let rfail_etx = event_tx.clone();
                 let rfail_tid = self.transfer_id.clone();
                 let rfail_ip = source.peer_ip.clone();

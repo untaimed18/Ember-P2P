@@ -714,6 +714,23 @@ export async function initFriendsStore() {
       ),
     );
     registered.push(
+      await listen<{ user_hash: string }>('ember:friend-renamed', (event) => {
+        const hash = validFriendHash(event.payload?.user_hash);
+        if (!hash) return;
+        // The open chat tab keeps its own copy of the name. Both windows hear
+        // the event; the main one renames the tab, which forwards it.
+        void refreshFriendsList().then(() => {
+          if (isChatWindow()) return;
+          const f = get(friendsList).find((row) => row.user_hash.toLowerCase() === hash);
+          if (!f) return;
+          const name = f.nickname || `${hash.slice(0, 8)}\u2026`;
+          void import('$lib/stores/chatTabs')
+            .then(({ renameTab }) => renameTab(hash, name))
+            .catch((e) => console.warn('friends: could not rename the chat tab', e));
+        });
+      }),
+    );
+    registered.push(
       await listen<{ user_hash: string }>('ember:friend-confirmed', (event) => {
         const hash = validFriendHash(event.payload?.user_hash);
         if (!hash) return;
@@ -766,9 +783,10 @@ export async function initFriendsStore() {
         seedLive?.requests.add(hash);
         friendRequests.update((cur) => cur.filter((r) => r.sender_hash !== hash));
         scheduleFriendRequestRefetch();
+        // The payload is the name they chose; a label the user gave them wins.
         const nickname = safeEventText(event.payload?.nickname, 128);
-        rememberFriendName(hash, nickname);
-        const name = friendLabel(hash, nickname, get(friendNames));
+        if (!get(friendNames).has(hash)) rememberFriendName(hash, nickname);
+        const name = friendLabel(hash, null, get(friendNames));
         if (!isChatWindow()) toastSuccess(m.friends_auto_confirmed({ name }));
         scheduleFriendsListRefresh();
       }),

@@ -3511,6 +3511,11 @@ impl Database {
             "hold_released",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        // What the user calls a friend, kept apart from `nickname`, which is
+        // what the friend calls themselves and follows their own renames. Outside
+        // the numbered chain so 1.7.0 still opens the database; it never reads
+        // this column and shows `nickname` as before.
+        Self::add_column_if_missing(&conn, "friends", "alias", "TEXT NOT NULL DEFAULT ''")?;
         // Finish a v23 encryption pass that was deferred because chat was
         // locked at the time. The version is already 23 or later, so the
         // migration itself will never run again — without this the history
@@ -6145,17 +6150,36 @@ impl Database {
         Ok(())
     }
 
+    /// Persist a friend the user added by code, under a name the user typed:
+    /// it is their label for the friend, and stands in for the friend's own
+    /// name too until one is known. See [`Self::add_friend_named`].
+    #[cfg(test)]
+    pub fn add_friend(
+        &self,
+        user_hash: &str,
+        nickname: &str,
+        ed25519_pubkey: Option<&[u8; 32]>,
+    ) -> anyhow::Result<Option<bool>> {
+        self.add_friend_named(user_hash, nickname, nickname, ed25519_pubkey)
+    }
+
     /// Persist a friend the user added by code.
+    ///
+    /// `alias` is the user's label for them, empty for none. The friend's own
+    /// name comes from their pending request when there is one; otherwise
+    /// `stand_in` holds its place until their first verified session says
+    /// what it is.
     ///
     /// `Ok(None)` — blocked, nothing written.
     /// `Ok(Some(mutual))` — row written. `mutual` is true when a matching
     /// verified `friend_requests` row existed and was consumed (same grant as
     /// `accept_friend_request`), so pasting someone's code after they already
     /// asked is not left as a one-sided friend plus a leftover request.
-    pub fn add_friend(
+    pub fn add_friend_named(
         &self,
         user_hash: &str,
-        nickname: &str,
+        alias: &str,
+        stand_in: &str,
         ed25519_pubkey: Option<&[u8; 32]>,
     ) -> anyhow::Result<Option<bool>> {
         let mut conn = self.conn.lock();
@@ -6205,17 +6229,18 @@ impl Database {
             }
         };
 
+        let nick_is_theirs = pending.as_ref().is_some_and(|(req_nick, ..)| !req_nick.is_empty());
         let (stored_nick, mutual, pending_pubkey, pending_ip, pending_port) =
             if let Some((req_nick, ip, port, pk)) = pending {
-                let nick = if nickname.is_empty() {
-                    req_nick
+                let nick = if req_nick.is_empty() {
+                    stand_in.to_string()
                 } else {
-                    nickname.to_string()
+                    req_nick
                 };
                 (nick, true, pk, ip, port)
             } else {
                 (
-                    nickname.to_string(),
+                    stand_in.to_string(),
                     false,
                     None,
                     String::new(),
@@ -6226,15 +6251,27 @@ impl Database {
             .map(|key| key.as_slice())
             .or(pending_pubkey.as_deref());
 
+        // A stand-in name must not replace one the friend already gave us; a
+        // name from their verified request may.
         tx.execute(
-            "INSERT INTO friends (user_hash, nickname, added_at, mutual, ed25519_pubkey) \
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO friends (user_hash, nickname, alias, added_at, mutual, ed25519_pubkey) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(user_hash) DO UPDATE SET \
-                 nickname = CASE WHEN excluded.nickname != '' \
+                 nickname = CASE WHEN excluded.nickname != '' AND (?7 OR friends.nickname = '') \
                      THEN excluded.nickname ELSE friends.nickname END, \
+                 alias = CASE WHEN excluded.alias != '' \
+                     THEN excluded.alias ELSE friends.alias END, \
                  mutual = MAX(friends.mutual, excluded.mutual), \
                  ed25519_pubkey = COALESCE(excluded.ed25519_pubkey, friends.ed25519_pubkey)",
-            params![user_hash, stored_nick, now, if mutual { 1i64 } else { 0 }, pubkey],
+            params![
+                user_hash,
+                stored_nick,
+                alias,
+                now,
+                if mutual { 1i64 } else { 0 },
+                pubkey,
+                nick_is_theirs
+            ],
         )?;
         if mutual && !pending_ip.is_empty() && pending_port > 0 {
             tx.execute(
@@ -6823,7 +6860,7 @@ impl Database {
         // user's only handle on the entry afterwards.
         let nickname: String = tx
             .query_row(
-                "SELECT nickname FROM friends WHERE user_hash = ?1",
+                "SELECT COALESCE(NULLIF(alias, ''), nickname) FROM friends WHERE user_hash = ?1",
                 params![user_hash],
                 |row| row.get(0),
             )
@@ -6987,14 +7024,29 @@ impl Database {
         Ok(rows)
     }
 
-    /// Update the nickname for an existing friend. Returns `Ok(true)`
-    /// if the row existed and was updated, `Ok(false)` if no friend
-    /// matches `user_hash` (so the caller can surface a real error
-    /// instead of silently succeeding).
-    pub fn update_friend_nickname(&self, user_hash: &str, nickname: &str) -> anyhow::Result<bool> {
+    /// Set the user's own label for a friend; empty clears it, so the card
+    /// shows the friend's own name again. Returns `Ok(true)` if the row
+    /// existed, `Ok(false)` if no friend matches `user_hash` (so the caller
+    /// can surface a real error instead of silently succeeding).
+    pub fn set_friend_alias(&self, user_hash: &str, alias: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         let updated = conn.execute(
-            "UPDATE friends SET nickname = ?2 WHERE user_hash = ?1",
+            "UPDATE friends SET alias = ?2 WHERE user_hash = ?1",
+            params![user_hash, alias],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Record the name a friend calls themselves, as their verified session
+    /// announced it. Never touches the user's label. `Ok(true)` only when the
+    /// stored name changed, so the caller knows whether anything shows it.
+    pub fn refresh_friend_self_name(&self, user_hash: &str, nickname: &str) -> anyhow::Result<bool> {
+        if nickname.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE friends SET nickname = ?2 WHERE user_hash = ?1 AND nickname != ?2",
             params![user_hash, nickname],
         )?;
         Ok(updated > 0)
@@ -7045,12 +7097,16 @@ impl Database {
         }
     }
 
+    /// `(user_hash, nickname, added_at, last_ip, last_port, last_seen, mutual,
+    /// alias)`. `nickname` is the friend's own name and `alias` the user's
+    /// label for them, empty when they set none.
+    #[allow(clippy::type_complexity)]
     pub fn get_friends_full(
         &self,
-    ) -> anyhow::Result<Vec<(String, String, i64, String, u16, i64, bool)>> {
+    ) -> anyhow::Result<Vec<(String, String, i64, String, u16, i64, bool, String)>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT user_hash, nickname, added_at, COALESCE(last_ip, ''), COALESCE(last_port, 0), COALESCE(last_seen, 0), COALESCE(mutual, 0) FROM friends ORDER BY added_at DESC"
+            "SELECT user_hash, nickname, added_at, COALESCE(last_ip, ''), COALESCE(last_port, 0), COALESCE(last_seen, 0), COALESCE(mutual, 0), alias FROM friends ORDER BY added_at DESC"
         )?;
         let rows = stmt
             .query_map([], |row| {
@@ -7062,6 +7118,7 @@ impl Database {
                     row.get::<_, i64>(4)?.clamp(0, u16::MAX as i64) as u16,
                     row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)? != 0,
+                    row.get::<_, String>(7)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -15844,7 +15901,8 @@ mod tests {
                 mutual INTEGER NOT NULL DEFAULT 0,
                 ed25519_pubkey BLOB,
                 room_asks INTEGER NOT NULL DEFAULT 0,
-                room_asked_at INTEGER NOT NULL DEFAULT 0
+                room_asked_at INTEGER NOT NULL DEFAULT 0,
+                alias TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE friend_requests (
                 sender_hash TEXT PRIMARY KEY,
@@ -16255,7 +16313,8 @@ mod tests {
         );
         let friends = db.get_friends_full().expect("list");
         assert_eq!(friends.len(), 1);
-        assert_eq!(friends[0].1, "Ally");
+        assert_eq!(friends[0].1, "Alice", "their own name comes from their request");
+        assert_eq!(friends[0].7, "Ally", "what the user typed is their label");
         assert_eq!(friends[0].3, "1.2.3.4");
         assert_eq!(friends[0].4, 4662);
         assert!(friends[0].6, "mutual flag");
@@ -16306,6 +16365,72 @@ mod tests {
         assert_eq!(db.add_friend("bb", "", None).expect("add"), Some(true));
         let friends = db.get_friends_full().expect("list");
         assert_eq!(friends[0].1, "Bob");
+        assert_eq!(friends[0].7, "", "nothing typed, so no label");
+    }
+
+    /// A friend renaming themselves reaches their card, and a label the user
+    /// gave them stays on top of it.
+    #[test]
+    fn a_friends_own_rename_never_replaces_the_users_label() {
+        let db = friends_only_db();
+        db.add_friend("aa", "Mum", None).expect("add");
+        let row = &db.get_friends_full().expect("list")[0];
+        assert_eq!((row.1.as_str(), row.7.as_str()), ("Mum", "Mum"), "the typed name stands in");
+
+        assert!(db.refresh_friend_self_name("aa", "Brady").expect("refresh"));
+        assert!(
+            !db.refresh_friend_self_name("aa", "Brady").expect("refresh"),
+            "the same name again is not a change"
+        );
+        assert!(!db.refresh_friend_self_name("aa", "").expect("refresh"), "no name is not a rename");
+        let row = &db.get_friends_full().expect("list")[0];
+        assert_eq!((row.1.as_str(), row.7.as_str()), ("Brady", "Mum"));
+
+        assert!(db.set_friend_alias("aa", "").expect("clear"));
+        assert!(db.refresh_friend_self_name("aa", "Brady2").expect("refresh"));
+        let row = &db.get_friends_full().expect("list")[0];
+        assert_eq!((row.1.as_str(), row.7.as_str()), ("Brady2", ""), "an unlabelled card follows");
+
+        assert!(!db.set_friend_alias("zz", "Nobody").expect("missing"), "no such friend");
+        assert!(!db.refresh_friend_self_name("zz", "Nobody").expect("missing"));
+    }
+
+    /// Pasting a newer code for someone already listed must not put the typed
+    /// stand-in back over the name their session gave us.
+    #[test]
+    fn re_adding_a_friend_keeps_the_name_they_gave() {
+        let db = friends_only_db();
+        db.add_friend("aa", "", None).expect("add");
+        db.refresh_friend_self_name("aa", "Brady").expect("refresh");
+        db.add_friend("aa", "Bro", None).expect("re-add");
+        let row = &db.get_friends_full().expect("list")[0];
+        assert_eq!((row.1.as_str(), row.7.as_str()), ("Brady", "Bro"));
+    }
+
+    /// A name the peer goes by (a room nickname, an eD2K name) only holds the
+    /// place of theirs: it is no label, so their first session replaces it.
+    #[test]
+    fn a_name_the_peer_goes_by_is_not_kept_as_a_label() {
+        let db = friends_only_db();
+        db.add_friend_named("aa", "", "RoomName", None).expect("add");
+        db.refresh_friend_self_name("aa", "Brady").expect("refresh");
+        let row = &db.get_friends_full().expect("list")[0];
+        assert_eq!((row.1.as_str(), row.7.as_str()), ("Brady", ""));
+
+        db.add_friend_named("aa", "", "OtherRoomName", None).expect("re-add");
+        let row = &db.get_friends_full().expect("list")[0];
+        assert_eq!(row.1, "Brady", "a stand-in never replaces the name they gave");
+    }
+
+    /// Blocking keeps the name the user knew them by, which is their label.
+    #[test]
+    fn blocking_records_the_label_the_user_knew() {
+        let db = friends_only_db();
+        db.add_friend("aa", "", None).expect("add");
+        db.refresh_friend_self_name("aa", "Brady").expect("refresh");
+        db.set_friend_alias("aa", "Mum").expect("label");
+        db.block_friend("aa").expect("block");
+        assert_eq!(db.get_blocked_friends().expect("blocks")[0].1, "Mum");
     }
 
     #[test]

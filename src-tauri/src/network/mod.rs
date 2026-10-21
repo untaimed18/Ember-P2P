@@ -870,6 +870,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         stun_sourced_udp_port: None,
         firewalled: !upnp_success,
         firewall_checks_sent: 0,
+        shared_nickname: Arc::new(tokio::sync::RwLock::new(settings.nickname.clone())),
         peer_nicknames: HashMap::new(),
         publish_pending: HashMap::new(),
         publish_confirmed: 0,
@@ -1858,8 +1859,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
     // Shared so Settings nickname changes hot-reload into Hello / EmuleInfo
     // without restarting the upload listener.
-    let shared_nickname: Arc<tokio::sync::RwLock<String>> =
-        Arc::new(tokio::sync::RwLock::new(settings.nickname.clone()));
+    let shared_nickname = state.shared_nickname.clone();
 
     // Start the peer-to-peer upload listener (accepts incoming file requests from other KAD peers)
     {

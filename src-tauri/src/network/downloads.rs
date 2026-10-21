@@ -1039,7 +1039,7 @@ async fn start_pending_download_worker(
         sources: download_sources,
         download_folders: state.download_folders.clone(),
         user_hash: state.user_hash,
-        nickname: settings.nickname.clone(),
+        nickname: state.shared_nickname.clone(),
         tcp_port: advertised_tcp_port(state),
         udp_port: advertised_udp_port(state),
         bandwidth_limiter: bandwidth_limiter.clone(),

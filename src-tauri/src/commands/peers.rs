@@ -293,7 +293,13 @@ pub(crate) fn parse_friend_code(value: &str) -> Result<ParsedFriendCode, String>
 #[derive(serde::Serialize)]
 pub struct FriendInfo {
     pub user_hash: String,
+    /// The name to show: the user's label when they set one, else the
+    /// friend's own name.
     pub nickname: String,
+    /// The user's label for this friend, empty when they set none.
+    pub alias: String,
+    /// What the friend calls themselves, as their last verified session said.
+    pub self_name: String,
     pub added_at: i64,
     pub last_ip: String,
     pub last_port: u16,
@@ -329,6 +335,10 @@ pub async fn add_friend(
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
     nickname: Option<String>,
+    // The name is one the peer goes by (a room nickname, an eD2K Hello name)
+    // rather than one the user typed: it only stands in for theirs, and is
+    // not kept as the user's label once they say what they are called.
+    name_is_theirs: Option<bool>,
 ) -> Result<(), String> {
     let ParsedFriendCode {
         canonical,
@@ -408,8 +418,13 @@ pub async fn add_friend(
     let db = state.db.clone();
     let db_hash = canonical.clone();
     let db_nick = nick.clone();
+    let db_alias = if name_is_theirs.unwrap_or(false) {
+        String::new()
+    } else {
+        nick.clone()
+    };
     let db_result = tokio::task::spawn_blocking(move || {
-        db.add_friend(&db_hash, &db_nick, friend_pubkey.as_ref())
+        db.add_friend_named(&db_hash, &db_alias, &db_nick, friend_pubkey.as_ref())
     })
     .await;
     let became_mutual = match db_result {
@@ -676,6 +691,8 @@ pub async fn get_blocked_friends(
         .collect())
 }
 
+/// Set the user's own label for a friend. An empty name clears it, and the
+/// card goes back to the name the friend chose.
 #[tauri::command]
 pub async fn update_friend_nickname(
     state: tauri::State<'_, AppState>,
@@ -704,7 +721,7 @@ pub async fn update_friend_nickname(
     let db_hash = canonical;
     let db_nick = cleaned;
     let updated =
-        tokio::task::spawn_blocking(move || db.update_friend_nickname(&db_hash, &db_nick))
+        tokio::task::spawn_blocking(move || db.set_friend_alias(&db_hash, &db_nick))
             .await
             .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
             .map_err(|e| coded_ctx("peers_failed_update_friend", "Failed to update friend", e))?;
@@ -735,14 +752,18 @@ pub async fn get_friends(state: tauri::State<'_, AppState>) -> Result<Vec<Friend
     Ok(rows
         .into_iter()
         .map(
-            |(user_hash, nickname, added_at, last_ip, last_port, last_seen, mutual)| FriendInfo {
-                user_hash,
-                nickname,
-                added_at,
-                last_ip,
-                last_port,
-                last_seen,
-                mutual,
+            |(user_hash, self_name, added_at, last_ip, last_port, last_seen, mutual, alias)| {
+                FriendInfo {
+                    user_hash,
+                    nickname: if alias.is_empty() { self_name.clone() } else { alias.clone() },
+                    alias,
+                    self_name,
+                    added_at,
+                    last_ip,
+                    last_port,
+                    last_seen,
+                    mutual,
+                }
             },
         )
         .collect())

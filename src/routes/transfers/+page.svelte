@@ -3410,7 +3410,7 @@
             break;
           }
           const nick = kc.peer_name || undefined;
-          await addFriend(kc.ember_hash, nick);
+          await addFriend(kc.ember_hash, nick, true);
           await refreshFriendHashes();
           showInfo(m.transfers_added_friend({
             name: nick || kc.ember_hash.slice(0, 8) + '\u2026',
@@ -3543,7 +3543,7 @@
         case 'add_friend': {
           const emberHash = emberHashForUpload(t);
           if (!emberHash) { transferError = m.transfers_no_ember_hash(); break; }
-          await addFriend(emberHash, t.peer_name || undefined);
+          await addFriend(emberHash, t.peer_name || undefined, true);
           await refreshFriendHashes();
           showInfo(m.transfers_added_friend({ name: t.peer_name || emberHash.slice(0, 8) + '\u2026' }));
           break;

@@ -3,7 +3,13 @@ import * as m from '$lib/paraglide/messages';
 
 export interface FriendInfo {
   user_hash: string;
+  /** The name to show: the user's label when they set one, else the name the
+   *  friend chose. */
   nickname: string;
+  /** The user's own label for this friend; empty when they set none. */
+  alias: string;
+  /** The name the friend chose, as their last verified session said. */
+  self_name: string;
   added_at: number;
   last_ip: string;
   last_port: number;
@@ -83,8 +89,15 @@ export async function getFriends(): Promise<FriendInfo[]> {
   return invoke('get_friends');
 }
 
-export async function addFriend(userHashHex: string, nickname?: string): Promise<void> {
-  return invoke('add_friend', { userHashHex, nickname: nickname || null });
+/** `nameIsTheirs`: the name is one the peer goes by (a room nickname, an eD2K
+ *  name) rather than one the user typed, so it only stands in for theirs and
+ *  never becomes the user's label. */
+export async function addFriend(
+  userHashHex: string,
+  nickname?: string,
+  nameIsTheirs = false,
+): Promise<void> {
+  return invoke('add_friend', { userHashHex, nickname: nickname || null, nameIsTheirs });
 }
 
 export async function removeFriend(userHashHex: string): Promise<void> {
@@ -115,6 +128,7 @@ export async function isChatLocked(): Promise<boolean> {
   return invoke('is_chat_locked');
 }
 
+/** Set the user's label for a friend; an empty one goes back to their own name. */
 export async function updateFriendNickname(userHashHex: string, nickname: string): Promise<void> {
   return invoke('update_friend_nickname', { userHashHex, nickname });
 }

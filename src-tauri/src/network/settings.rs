@@ -218,6 +218,7 @@ pub(super) async fn apply_settings_update(
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
 ) {
     let old_channel_username = settings.channel_username.clone();
+    let old_nickname = settings.nickname.clone();
     let session_friends: Vec<[u8; 16]> = state.ember_sessions.read().await.keys().copied().collect();
     let collected_before: Vec<bool> = session_friends
         .iter()
@@ -251,11 +252,36 @@ pub(super) async fn apply_settings_update(
         let mut nick = shared_nickname.write().await;
         *nick = settings.nickname.clone();
     }
+    if settings.nickname != old_nickname {
+        announce_nickname_to_friends(state, &settings.nickname).await;
+    }
     source_manager
         .write()
         .await
         .set_max_per_file(settings.max_sources_per_file);
     if settings.filter_servers_by_ip {
         apply_server_ip_filter(state, shared_server_addr, app_handle, true).await;
+    }
+}
+
+/// Tell every friend connected now what we are called, so their card changes
+/// without waiting for the next session. The friend request is the frame a
+/// session already opens with to say this, and each side reads it at any
+/// point in a session; a friend's own label for us is theirs to keep.
+async fn announce_nickname_to_friends(state: &NetworkState, nickname: &str) {
+    let mut frame = Vec::with_capacity(6 + nickname.len());
+    frame.push(OP_EMULEPROT);
+    frame.extend_from_slice(&((1 + nickname.len()) as u32).to_le_bytes());
+    frame.push(ed2k::messages::OP_EMBER_FRIEND_REQ);
+    frame.extend_from_slice(nickname.as_bytes());
+    let sessions = state.ember_sessions.read().await;
+    let mut told = 0usize;
+    for session in sessions.values().filter(|h| h.is_fresh()) {
+        if session.tx.try_send(frame.clone()).is_ok() {
+            told += 1;
+        }
+    }
+    if told > 0 {
+        info!("Told {told} connected friend(s) our new nickname");
     }
 }

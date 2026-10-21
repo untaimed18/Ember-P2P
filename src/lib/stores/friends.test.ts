@@ -16,6 +16,8 @@ function friend(userHash: string, nickname = ''): FriendInfo {
   return {
     user_hash: userHash,
     nickname,
+    alias: '',
+    self_name: nickname,
     added_at: 0,
     last_ip: '',
     last_port: 0,

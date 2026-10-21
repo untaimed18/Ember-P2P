@@ -2421,7 +2421,7 @@
     addingFriend = [...addingFriend, pk];
     try {
       const code = await channelMemberFriendCode(pk);
-      await addFriend(code, mem.nickname || undefined);
+      await addFriend(code, mem.nickname || undefined, true);
       await refreshFriendsList();
       toastSuccess(m.channels_friend_added({ name }));
     } catch (e) {

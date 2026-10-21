@@ -213,7 +213,10 @@
     const q = searchQuery.trim().toLowerCase();
     if (q) {
       list = list.filter(
-        (f) => f.user_hash.toLowerCase().includes(q) || f.nickname.toLowerCase().includes(q),
+        (f) =>
+          f.user_hash.toLowerCase().includes(q) ||
+          f.nickname.toLowerCase().includes(q) ||
+          (f.self_name ?? '').toLowerCase().includes(q),
       );
     }
     return list.slice().sort((a, b) => {
@@ -787,24 +790,29 @@
   /** Save a friend's name, from the card or from their settings, and carry it
    *  to every place that shows it. */
   async function renameFriend(hash: string, nick: string): Promise<void> {
-    await updateFriendNickname(hash, nick);
+    const selfName = friends.find((f) => f.user_hash === hash)?.self_name ?? '';
+    // Their own name, saved unchanged or typed back, is no label: the card
+    // keeps following their renames.
+    const label = nick === selfName ? '' : nick;
+    await updateFriendNickname(hash, label);
+    const shown = label || selfName;
     patchFriendsList((list) =>
-      list.map((f) => (f.user_hash === hash ? { ...f, nickname: nick } : f)),
+      list.map((f) => (f.user_hash === hash ? { ...f, alias: label, nickname: shown } : f)),
     );
-    showFriendName(hash, nick);
+    showFriendName(hash, shown, label);
     // The backend drops characters it will not store, so the saved name can
     // differ from the typed one. Whatever list the store holds once this
     // settles postdates the rename.
     void refreshFriendsList().then(() => {
       const saved = friends.find((f) => f.user_hash === hash);
-      if (saved && saved.nickname !== nick) showFriendName(hash, saved.nickname);
+      if (saved && saved.nickname !== shown) showFriendName(hash, saved.nickname, saved.alias);
     });
   }
 
   /** The open settings dialog and the chat tab keep their own copy of the
    *  name; the list and the name cache follow the store. */
-  function showFriendName(hash: string, nick: string) {
-    if (settingsFor?.user_hash === hash) settingsFor = { ...settingsFor, nickname: nick };
+  function showFriendName(hash: string, nick: string, alias: string) {
+    if (settingsFor?.user_hash === hash) settingsFor = { ...settingsFor, nickname: nick, alias };
     renameChatTab(hash, nick || hash.slice(0, 8) + '\u2026');
   }
 
@@ -1410,7 +1418,7 @@
               onkeydown={editKeydown}
               onblur={saveEdit}
               maxlength="64"
-              placeholder={m.friends_nickname_edit_placeholder()}
+              placeholder={f.self_name || m.friends_nickname_edit_placeholder()}
               use:autoFocus
               aria-label={m.friends_nickname_edit_placeholder()}
               aria-invalid={friendNameTooLong(editNickname)}
@@ -1422,6 +1430,15 @@
                      the surrounding UI direction. -->
                 {#if f.nickname}<bdi dir="auto">{f.nickname}</bdi>{:else}{m.friends_no_nickname()}{/if}
               </button>
+              <!-- Beside a label, the name they chose stays in view, so a
+                   label never hides who this is and their renames still show. -->
+              {#if f.alias && f.self_name && f.self_name !== f.alias}
+                <bdi
+                  dir="auto"
+                  class="self-name"
+                  title={m.friends_self_name_title({ name: f.self_name })}
+                >{f.self_name}</bdi>
+              {/if}
               {#if f.mutual && isOnline}
                 <!-- Icon only: the encryption guarantee is identical for every
                      mutual online friend, so spelling it out on each card was
@@ -2108,6 +2125,17 @@
     display: inline-flex;
     color: var(--accent);
     flex-shrink: 0;
+  }
+
+  /* Gives way before the label does when the card is narrow. */
+  .self-name {
+    flex-shrink: 2;
+    min-width: 0;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .lock-glyph svg {

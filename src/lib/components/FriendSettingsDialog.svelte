@@ -96,7 +96,7 @@
   let disappearOn = $derived((disappear === 'default' ? disappearDefault : Number(disappear)) > 0);
 
   let online = $derived($onlineFriends.has(hash));
-  let displayName = $derived(name.trim() || opened.nickname || shortId);
+  let displayName = $derived(name.trim() || opened.self_name || shortId);
 
   let nameTooLong = $derived(friendNameTooLong(name));
   let autoMbValid = $derived(
@@ -288,7 +288,7 @@
             maxlength="64"
             autocomplete="off"
             spellcheck="false"
-            placeholder={shortId}
+            placeholder={opened.self_name || shortId}
             aria-describedby="fs-name-hint-{instanceId}"
             aria-invalid={nameTooLong}
             disabled={busy}

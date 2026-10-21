@@ -326,6 +326,10 @@ pub(super) struct NetworkState {
     pub(super) stun_sourced_udp_port: Option<u16>,
     pub(super) firewalled: bool,
     pub(super) firewall_checks_sent: u32,
+    /// Our nickname as Settings has it now. Downloads outlive a rename, so
+    /// they read this per connection: a friend hearing the old name from one
+    /// session and the new one from another would see their card flip.
+    pub(super) shared_nickname: Arc<tokio::sync::RwLock<String>>,
     pub(super) peer_nicknames: HashMap<KadId, String>,
     /// Outstanding publish requests awaiting `PublishRes` acks.
     ///
