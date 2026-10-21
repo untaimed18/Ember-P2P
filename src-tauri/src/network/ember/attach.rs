@@ -578,6 +578,25 @@ pub fn decode_attach_cancel(bytes: &[u8]) -> Option<([u8; 16], AttachCancel)> {
     Some((xfer_id, AttachCancel::from_byte(bytes[17])?))
 }
 
+/// The body of an `EMBER_EXT_ATTACH_WAITS` that names an offer. From the
+/// offer's receiver it says `xfer_id` is kept waiting for its user; from the
+/// offer's sender, sent back in answer, that the grant is held for it.
+pub fn encode_attach_held(xfer_id: &[u8; 16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 16);
+    out.push(ATTACH_VERSION);
+    out.extend_from_slice(xfer_id);
+    out
+}
+
+/// The offer an `EMBER_EXT_ATTACH_WAITS` names. `None` for the empty form,
+/// which names none, and for any body this one cannot read.
+pub fn decode_attach_held(bytes: &[u8]) -> Option<[u8; 16]> {
+    if bytes.len() != 1 + 16 || bytes[0] != ATTACH_VERSION {
+        return None;
+    }
+    bytes[1..17].try_into().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,6 +704,23 @@ mod tests {
             assert_eq!(decode_attach_cancel(&bytes), Some((id, reason)));
         }
         assert!(decode_attach_reply(&[ATTACH_VERSION, 0, 0]).is_none());
+    }
+
+    /// The empty form only says the build waits; the named form is the one a
+    /// sender holds a grant on, so nothing else may read as it.
+    #[test]
+    fn only_a_whole_held_note_names_an_offer() {
+        let id = [4u8; 16];
+        assert_eq!(decode_attach_held(&encode_attach_held(&id)), Some(id));
+        assert_eq!(decode_attach_held(&[]), None);
+        let held = encode_attach_held(&id);
+        assert_eq!(decode_attach_held(&held[..16]), None);
+        let mut longer = held.clone();
+        longer.push(0);
+        assert_eq!(decode_attach_held(&longer), None);
+        let mut newer = held;
+        newer[0] = ATTACH_VERSION + 1;
+        assert_eq!(decode_attach_held(&newer), None);
     }
 
     /// Both ends derive the same capability without agreeing who is which —

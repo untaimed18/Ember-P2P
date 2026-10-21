@@ -1065,6 +1065,21 @@ pub async fn run_friend_session_over_transport(
                                                 }).await;
                                             }
                                         }
+                                        // Either form says the build holds what
+                                        // it offers; see the inbound reader.
+                                        Some((super::messages::EMBER_EXT_ATTACH_WAITS, _)) => {
+                                            session_ember_session_handle.mark_holds_offers();
+                                            if let Some(kind) = super::upload::attach_event_from_ext(
+                                                peer_ember_hash,
+                                                &payload,
+                                                (!relayed).then_some(addr),
+                                            ) {
+                                                let _ = session_ul_event_tx.send(UploadEvent {
+                                                    transfer_id: String::new(),
+                                                    kind,
+                                                }).await;
+                                            }
+                                        }
                                         Some((super::messages::EMBER_EXT_BROWSE_SCOPE, body)) => {
                                             let _ = session_ul_event_tx.send(UploadEvent {
                                                 transfer_id: String::new(),

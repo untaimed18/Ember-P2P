@@ -29,6 +29,11 @@ pub(in crate::network) async fn on_kad_process_tick(
     while let Ok(prepared) = state.xfer_accept_rx.try_recv() {
         apply_xfer_accept_prepared(udp_socket, state, db, app_handle, prepared).await;
     }
+    // Looks at the files of chat attachments a friend is keeping, done on
+    // the blocking pool; a changed one is told to the friend from here.
+    while let Ok(looked) = state.attach_held_rx.try_recv() {
+        crate::network::chat_attach::apply_held_look(state, db, app_handle, looked).await;
+    }
     // Ember Transfer pacing shares this 100ms tick rather than
     // taking its own arm — `tokio::select!` tops out at 64
     // branches and this loop is already at the limit. It runs

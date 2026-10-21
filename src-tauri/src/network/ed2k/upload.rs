@@ -77,6 +77,10 @@ pub struct EmberSessionHandle {
     /// and spread to the friend's other live secure sessions (see
     /// [`SecureSessionEntry`]).
     honours_friends_only: Arc<std::sync::atomic::AtomicBool>,
+    /// The friend has sent `EMBER_EXT_ATTACH_WAITS` on this session: it will
+    /// hold a file it offers us once we say we are keeping the offer for the
+    /// user. Shared and spread exactly as `honours_friends_only` is.
+    holds_offers: Arc<std::sync::atomic::AtomicBool>,
 }
 
 static NEXT_EMBER_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -89,6 +93,9 @@ struct SecureSessionEntry {
     /// is set on all of them: a frame the friend sent down a duplicate
     /// connection still counts on the one our session map holds.
     honours_friends_only: Arc<std::sync::atomic::AtomicBool>,
+    /// The session's [`EmberSessionHandle::holds_offers`] flag, for the same
+    /// reason.
+    holds_offers: Arc<std::sync::atomic::AtomicBool>,
 }
 
 type SecureRevocationIndex = std::sync::Mutex<HashMap<[u8; 16], HashMap<u64, SecureSessionEntry>>>;
@@ -167,6 +174,7 @@ impl EmberSessionHandle {
             relayed: false,
             peer_addr: None,
             honours_friends_only: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            holds_offers: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -189,6 +197,28 @@ impl EmberSessionHandle {
     /// build would drop the flag and republish the file as public.
     pub fn honours_friends_only(&self) -> bool {
         self.honours_friends_only.load(Ordering::Relaxed)
+    }
+
+    /// Record that the friend's build holds the files it offers us while we
+    /// keep them waiting, on this session and on every other live secure
+    /// session of the same friend.
+    pub fn mark_holds_offers(&self) {
+        self.holds_offers.store(true, Ordering::Relaxed);
+        let (Some(registration), Some(index)) =
+            (self.secure_registration.as_ref(), SECURE_REVOCATION_INDEX.get())
+        else {
+            return;
+        };
+        let index = index.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for entry in index.get(&registration.ember_hash).into_iter().flat_map(|s| s.values()) {
+            entry.holds_offers.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether an offer from this friend may wait for our user past an
+    /// offer's five minutes: an older build lapses it there whatever we say.
+    pub fn holds_offers(&self) -> bool {
+        self.holds_offers.load(Ordering::Relaxed)
     }
 
     pub fn via_relay(mut self, relayed: bool) -> Self {
@@ -227,11 +257,18 @@ impl EmberSessionHandle {
         {
             handle.honours_friends_only.store(true, Ordering::Relaxed);
         }
+        if sessions
+            .values()
+            .any(|entry| entry.holds_offers.load(Ordering::Relaxed))
+        {
+            handle.holds_offers.store(true, Ordering::Relaxed);
+        }
         sessions.insert(
             handle.session_id,
             SecureSessionEntry {
                 shutdown: handle.shutdown.clone(),
                 honours_friends_only: handle.honours_friends_only.clone(),
+                holds_offers: handle.holds_offers.clone(),
             },
         );
         drop(index);
@@ -307,6 +344,28 @@ impl EmberSessionHandle {
 }
 
 pub type EmberSessionMap = Arc<RwLock<HashMap<[u8; 16], EmberSessionHandle>>>;
+
+/// What the network loop hears when an upload-side session with `peer` ends:
+/// the slot owner's end as [`UploadEventKind::EmberFriendDisconnected`], and
+/// a friend's secure duplicate's as
+/// [`UploadEventKind::EmberFriendSessionEnded`]. Either may have carried
+/// chat attachment notes, since friend frames are read on both.
+fn session_end_event(
+    owns_slot: bool,
+    is_friend: bool,
+    peer: Option<[u8; 16]>,
+    session: Option<&EmberSessionHandle>,
+) -> Option<UploadEventKind> {
+    let (ember_hash, session) = (peer?, session?);
+    let session_id = session.session_id();
+    if owns_slot {
+        Some(UploadEventKind::EmberFriendDisconnected { ember_hash, session_id })
+    } else if is_friend && session.is_secure_v2() {
+        Some(UploadEventKind::EmberFriendSessionEnded { ember_hash, session_id })
+    } else {
+        None
+    }
+}
 
 /// Friend chat/browse authorization on a live secure-v2 stream.
 ///
@@ -413,6 +472,14 @@ pub(crate) fn attach_event_from_ext(
                 reason,
             }
         }
+        super::messages::EMBER_EXT_ATTACH_WAITS => UploadEventKind::EmberAttachHeld {
+            ember_hash,
+            xfer_id: if body.is_empty() {
+                None
+            } else {
+                Some(attach::decode_attach_held(body)?)
+            },
+        },
         _ => return None,
     };
     Some(kind)
@@ -3438,6 +3505,15 @@ pub enum UploadEventKind {
         xfer_id: [u8; 16],
         reason: crate::network::ember::attach::AttachCancel,
     },
+    /// `EMBER_EXT_ATTACH_WAITS` from a friend. `None` for the empty form: a
+    /// session came up, or the friend let go of offers it held, and wants to
+    /// hear again which of its offers we keep. Otherwise the offer a note
+    /// names: theirs we offered and they keep, or ours they offered and say
+    /// they hold.
+    EmberAttachHeld {
+        ember_hash: [u8; 16],
+        xfer_id: Option<[u8; 16]>,
+    },
     /// A friend answered a file offer we sent them.
     EmberFileOfferAck {
         ember_hash: [u8; 16],
@@ -3445,6 +3521,18 @@ pub enum UploadEventKind {
         file_hash: [u8; 16],
     },
     EmberFriendDisconnected {
+        ember_hash: [u8; 16],
+        session_id: u64,
+    },
+    /// A secure session with a friend ended that never held the
+    /// `ember_sessions` slot: a duplicate kept beside a fresh one, as each end
+    /// of a crossed pair of dials holds. Unlike `EmberFriendDisconnected` it
+    /// says nothing about whether the friend is online, and nothing dials
+    /// them again; only the chat attachment holds that may have been agreed
+    /// over it are let go (`chat_attach::on_session_ended`). It is not moved
+    /// into the slot when the owner ends first: that end's reconnect claims
+    /// it.
+    EmberFriendSessionEnded {
         ember_hash: [u8; 16],
         session_id: u64,
     },
@@ -15163,6 +15251,23 @@ impl UploadHandler {
                                         .await;
                                 }
                             }
+                            // Either form says the build holds what it
+                            // offers. Marked here, ahead of the offers that
+                            // follow on this stream, so they are judged by it.
+                            Some((super::messages::EMBER_EXT_ATTACH_WAITS, _)) => {
+                                if let Some(session) = ember_session_handle.as_ref() {
+                                    session.mark_holds_offers();
+                                }
+                                if let Some(kind) = attach_event_from_ext(eh, &payload, attach_addr) {
+                                    let _ = self
+                                        .upload_event_tx
+                                        .send(UploadEvent {
+                                            transfer_id: String::new(),
+                                            kind,
+                                        })
+                                        .await;
+                                }
+                            }
                             Some((super::messages::EMBER_EXT_BROWSE_SCOPE, body)) => {
                                 if let Some(session) = ember_session_handle.as_ref() {
                                     let _ = self
@@ -15306,7 +15411,6 @@ impl UploadHandler {
             peer_ember_hash,
             ember_session_handle.as_ref(),
         ) {
-            let session_id = session.session_id();
             let mut sessions = self.ember_sessions.write().await;
             let remove_current = sessions
                 .get(&eh)
@@ -15314,15 +15418,18 @@ impl UploadHandler {
             if remove_current {
                 sessions.remove(&eh);
             }
-            drop(sessions);
+        }
+        if let Some(kind) = session_end_event(
+            owns_ember_slot,
+            is_friend,
+            peer_ember_hash,
+            ember_session_handle.as_ref(),
+        ) {
             let _ = self
                 .upload_event_tx
                 .send(UploadEvent {
                     transfer_id: String::new(),
-                    kind: UploadEventKind::EmberFriendDisconnected {
-                        ember_hash: eh,
-                        session_id,
-                    },
+                    kind,
                 })
                 .await;
         }
@@ -17274,6 +17381,54 @@ mod ember_session_handle_tests {
         let legacy = EmberSessionHandle::new(channel(), [2; 32]);
         legacy.mark_honours_friends_only();
         assert!(legacy.honours_friends_only());
+    }
+
+    /// The friend's `EMBER_EXT_ATTACH_WAITS` may arrive down a duplicate
+    /// connection; the offers it describes are judged on the one our map
+    /// holds. It is a mark of its own, not the friends-only one.
+    #[test]
+    fn a_holds_offers_mark_reaches_every_live_session_of_that_friend() {
+        let hash = [0xE5; 16];
+        let channel = || tokio::sync::mpsc::channel::<Vec<u8>>(1).0;
+        let a = EmberSessionHandle::new_secure(channel(), [2; 32], hash);
+        let b = EmberSessionHandle::new_secure(channel(), [2; 32], hash);
+        let stranger = EmberSessionHandle::new_secure(channel(), [3; 32], [0xE6; 16]);
+        assert!(!a.holds_offers() && !b.holds_offers());
+
+        a.mark_holds_offers();
+        assert!(b.holds_offers(), "the duplicate is marked too");
+        assert!(!a.honours_friends_only(), "the other mark is left alone");
+        assert!(!stranger.holds_offers());
+        assert!(EmberSessionHandle::new_secure(channel(), [2; 32], hash).holds_offers());
+
+        drop((a, b));
+        assert!(!EmberSessionHandle::new_secure(channel(), [2; 32], hash).holds_offers());
+    }
+
+    /// Each end of a crossed pair of dials routes through its own and reads
+    /// the friend's frames on the other, so holds can be agreed over a
+    /// session that never held the slot. Its end reaches the loop too, as an
+    /// end of its own that neither marks the friend offline nor redials.
+    #[test]
+    fn a_duplicate_secure_sessions_end_reaches_the_loop() {
+        let hash = [0xE7; 16];
+        let channel = || tokio::sync::mpsc::channel::<Vec<u8>>(1).0;
+        let duplicate = EmberSessionHandle::new_secure(channel(), [2; 32], hash);
+        let id = duplicate.session_id();
+        assert!(matches!(
+            session_end_event(false, true, Some(hash), Some(&duplicate)),
+            Some(UploadEventKind::EmberFriendSessionEnded { ember_hash, session_id })
+                if ember_hash == hash && session_id == id
+        ));
+        assert!(matches!(
+            session_end_event(true, true, Some(hash), Some(&duplicate)),
+            Some(UploadEventKind::EmberFriendDisconnected { ember_hash, session_id })
+                if ember_hash == hash && session_id == id
+        ));
+        assert!(session_end_event(false, false, Some(hash), Some(&duplicate)).is_none(), "not a friend");
+        assert!(session_end_event(false, true, Some(hash), None).is_none(), "never authenticated");
+        let legacy = EmberSessionHandle::new(channel(), [2; 32]);
+        assert!(session_end_event(false, true, Some(hash), Some(&legacy)).is_none(), "not secure");
     }
 
     /// The guard owns both halves of an admission — the unit of the

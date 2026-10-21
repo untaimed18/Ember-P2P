@@ -98,6 +98,7 @@ pub(in crate::network) async fn on_ember_search_tick(
         && state.ember_pending_channel_presence.is_empty()
         && state.ember_channel_presence_buffer.is_empty()
         && state.ember_pending_channel_moderation.is_empty()
+        && state.ember_pending_channel_settings.is_empty()
         && state.ember_pending_channel_handoff.is_empty()
         && state.ember_pending_channel_epoch.is_empty()
         && state.ember_pending_channel_claim.is_empty()
@@ -1004,6 +1005,7 @@ async fn apply_channel_ingest_results(
             serde_json::json!({ "channel_id": hex::encode(channel_id) }),
         );
     }
+    state.channel_settings_fetch_owed.extend(results.settings_owed);
     for (channel_id, successor_id) in results.claimed {
         let _ = app_handle.emit(
             "ember:channel-handoff",
@@ -1014,9 +1016,15 @@ async fn apply_channel_ingest_results(
             }),
         );
     }
-    // The room is readable again, so the list's badges and the composer state
+    // The room's keys changed, so the list's badges and the composer state
     // want refreshing.
     for channel_id in results.rekeyed {
+        // A member behind by more than one epoch fetches one epoch per pass,
+        // newest missing first, so the next is due on the next maintenance
+        // tick rather than possibly the one after: the tick and the fetch
+        // interval are both a minute. So is a key dropped because the owner's
+        // commitments contradict it.
+        state.channel_epoch_fetch_at.remove(&channel_id);
         let _ = app_handle.emit(
             "ember:channel-moderation",
             serde_json::json!({ "channel_id": hex::encode(channel_id) }),

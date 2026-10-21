@@ -2070,6 +2070,13 @@ pub fn sanitize_outgoing_message_text(text: &str) -> Option<String> {
     filter_message_text(text, false)
 }
 
+/// `text` with the joiners [`sanitize_message_text`] keeps taken out, and
+/// nothing else changed: for text already sanitised on receipt, what
+/// [`sanitize_outgoing_message_text`] would have sent.
+pub fn without_message_text_joiners(text: &str) -> String {
+    text.chars().filter(|c| !is_message_text_joiner(*c)).collect()
+}
+
 fn filter_message_text(text: &str, keep_joiners: bool) -> Option<String> {
     let mut out = String::with_capacity(text.len().min(MAX_CHAT_LEN * 4));
     let mut count = 0usize;

@@ -120,11 +120,38 @@ enum HashSlot {
     },
 }
 
-fn hash_cache() -> &'static std::sync::Mutex<std::collections::HashMap<FileStamp, HashSlot>> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<FileStamp, HashSlot>>,
-    > = std::sync::OnceLock::new();
+type HashCache = std::sync::Mutex<std::collections::HashMap<FileStamp, HashSlot>>;
+
+fn hash_cache() -> &'static HashCache {
+    #[cfg(test)]
+    if let Some(own) = OWN_HASH_CACHE.with(std::cell::Cell::get) {
+        return own;
+    }
+    static CACHE: std::sync::OnceLock<HashCache> = std::sync::OnceLock::new();
     CACHE.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+thread_local! {
+    static OWN_HASH_CACHE: std::cell::Cell<Option<&'static HashCache>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Give the calling thread a hash cache of its own until the guard drops, so a
+/// test that judges a file by what the cache holds cannot have the entry
+/// evicted by tests hashing in parallel. Only for tests whose hashing all
+/// happens on this thread: a job on the blocking pool still uses the shared one.
+#[cfg(test)]
+pub(crate) fn isolate_hash_cache() -> impl Drop {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OWN_HASH_CACHE.with(|own| own.set(None));
+        }
+    }
+    let cache: &'static HashCache = Box::leak(Box::default());
+    OWN_HASH_CACHE.with(|own| own.set(Some(cache)));
+    Restore
 }
 
 enum HashLookup {
@@ -282,6 +309,89 @@ pub fn hash_for_serving(path: &std::path::Path) -> Result<std::sync::Arc<HashTre
         // Another caller is already reading it, and a blocking caller cannot
         // wait on that job; one more read is the rare case.
         HashLookup::Wait(_) => hash_stamped_file(&stamp),
+    }
+}
+
+/// How a file we offered looked when it was last checked. See
+/// [`check_held_source`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceStamp(FileStamp);
+
+/// What [`check_held_source`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HeldSource {
+    /// Still there and, as far as can be told, still the file offered. Keep
+    /// this for the next check.
+    Unchanged(SourceStamp),
+    /// The bytes as they are now have not been read since the stamp moved, or
+    /// since the offer. Keep the earlier stamp, if any, have
+    /// [`prewarm_attachment_hash`] read the file, and ask again.
+    Checking,
+    /// It could not be looked at just now for some reason other than not
+    /// being there (a share that is asleep, a lock, a permission). Keep the
+    /// earlier stamp and look again later: nothing says it changed.
+    Unreadable,
+    /// Not there, a different size, or different bytes: a stream for it would
+    /// be refused as [`AttachStreamStatus::SourceGone`].
+    Gone,
+}
+
+/// Whether the file an offer waiting on the friend names is still the one
+/// offered under `size` and `root`. Blocking, but never reads the file.
+///
+/// A stamp that has not moved since `last` settles it. Otherwise — the stamp
+/// moved, or this is the first look — it is decided by the tree the hash
+/// cache holds for the file as it is now, compared with the offer's root. The
+/// first look at a file that has not moved since the offer finds the tree it
+/// was hashed into then (see [`hash_for_serving`]) unless that has aged out
+/// of the cache. Either way a same-size edit between the offer and the first
+/// look is caught, and a file that was only touched is not mistaken for one
+/// that changed. Until a tree for the file as it is exists the answer is
+/// [`HeldSource::Checking`]: hashing is a read of the whole file. A rewrite
+/// the stamp cannot see is still caught by the stream, which checks the root
+/// on every serve.
+pub fn check_held_source(
+    path: &std::path::Path,
+    size: u64,
+    root: &[u8; 32],
+    last: Option<&SourceStamp>,
+) -> HeldSource {
+    let stamp = match std::fs::File::open(path).and_then(|file| FileStamp::of(path, &file)) {
+        Ok(stamp) => stamp,
+        Err(e) => return held_source_unopened(&e),
+    };
+    if stamp.size != size {
+        return HeldSource::Gone;
+    }
+    if last.is_some_and(|SourceStamp(seen)| *seen == stamp) {
+        return HeldSource::Unchanged(SourceStamp(stamp));
+    }
+    match cached_tree(&stamp) {
+        Some(tree) if tree.file_size == size && tree.root_hash == *root => {
+            HeldSource::Unchanged(SourceStamp(stamp))
+        }
+        Some(_) => HeldSource::Gone,
+        None => HeldSource::Checking,
+    }
+}
+
+/// What a held offer's file that could not be opened and stamped says: gone
+/// only when it is not there.
+fn held_source_unopened(error: &std::io::Error) -> HeldSource {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        HeldSource::Gone
+    } else {
+        HeldSource::Unreadable
+    }
+}
+
+/// The finished tree for `stamp`, if the cache has one. Unlike
+/// [`lookup_hash`] this never claims a job.
+fn cached_tree(stamp: &FileStamp) -> Option<std::sync::Arc<HashTree>> {
+    let cache = hash_cache().lock().unwrap_or_else(|e| e.into_inner());
+    match cache.get(stamp) {
+        Some(HashSlot::Ready { tree, .. }) => Some(tree.clone()),
+        _ => None,
     }
 }
 
@@ -1014,6 +1124,97 @@ mod tests {
         assert!(outcome.complete);
         assert_eq!(times_hashed(&source), 2);
         let _ = std::fs::remove_file(&source);
+    }
+
+    /// The check itself never reads the file, and one that finds it only
+    /// touched must not report a file the stream would still serve as gone.
+    #[test]
+    fn a_held_source_is_judged_by_its_stamp_then_by_a_tree_read_elsewhere() {
+        let _own = isolate_hash_cache();
+        let source = temp_path("src-held");
+        std::fs::write(&source, b"held version").expect("write");
+        let root = HashTree::from_data(b"held version").root_hash;
+        let set_modified = |secs: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(&source)
+                .and_then(|f| {
+                    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(secs))
+                })
+                .expect("move mtime");
+        };
+
+        hash_for_serving(&source).expect("hashed for its offer");
+        let HeldSource::Unchanged(first) = check_held_source(&source, 12, &root, None) else {
+            panic!("the first look finds the tree the offer was hashed into");
+        };
+        assert_eq!(
+            check_held_source(&source, 12, &root, Some(&first)),
+            HeldSource::Unchanged(first.clone())
+        );
+        assert_eq!(times_hashed(&source), 1, "nothing moved, nothing read again");
+
+        set_modified(10);
+        assert_eq!(check_held_source(&source, 12, &root, Some(&first)), HeldSource::Checking);
+        assert_eq!(times_hashed(&source), 1, "the check itself never reads it");
+        prewarm_attachment_hash(&source);
+        let HeldSource::Unchanged(touched) = check_held_source(&source, 12, &root, Some(&first)) else {
+            panic!("touched, not changed");
+        };
+        assert_ne!(touched, first);
+        assert_eq!(times_hashed(&source), 2);
+
+        std::fs::write(&source, b"other bytes!").expect("rewrite");
+        set_modified(20);
+        assert_eq!(check_held_source(&source, 12, &root, Some(&touched)), HeldSource::Checking);
+        prewarm_attachment_hash(&source);
+        assert_eq!(check_held_source(&source, 12, &root, Some(&touched)), HeldSource::Gone);
+        assert_eq!(check_held_source(&source, 13, &root, None), HeldSource::Gone, "another size");
+        let _ = std::fs::remove_file(&source);
+        assert_eq!(check_held_source(&source, 12, &root, None), HeldSource::Gone);
+    }
+
+    /// Edited at the same size between the offer and the first look: no tree
+    /// for the file as it is now, so it is read, and then it is not the one
+    /// offered. With nothing in the cache at all the first look reads it too,
+    /// and a file that is still the offered one stays held.
+    #[test]
+    fn the_first_look_at_a_held_source_compares_it_with_the_offer() {
+        let _own = isolate_hash_cache();
+        let source = temp_path("src-held-first");
+        std::fs::write(&source, b"as offered").expect("write");
+        let root = HashTree::from_data(b"as offered").root_hash;
+        hash_for_serving(&source).expect("hashed for its offer");
+        std::fs::write(&source, b"as edited!").expect("same-size edit");
+        std::fs::File::options()
+            .write(true)
+            .open(&source)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10)))
+            .expect("move mtime");
+        assert_eq!(check_held_source(&source, 10, &root, None), HeldSource::Checking);
+        prewarm_attachment_hash(&source);
+        assert_eq!(check_held_source(&source, 10, &root, None), HeldSource::Gone);
+
+        let edited_root = HashTree::from_data(b"as edited!").root_hash;
+        let _fresh = isolate_hash_cache();
+        assert_eq!(check_held_source(&source, 10, &edited_root, None), HeldSource::Checking);
+        prewarm_attachment_hash(&source);
+        assert!(matches!(
+            check_held_source(&source, 10, &edited_root, None),
+            HeldSource::Unchanged(_)
+        ));
+        let _ = std::fs::remove_file(&source);
+    }
+
+    /// Only a file that is not there is gone; any other failure to open it is
+    /// looked at again later.
+    #[test]
+    fn a_held_source_that_cannot_be_opened_is_gone_only_when_missing() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(held_source_unopened(&Error::from(ErrorKind::NotFound)), HeldSource::Gone);
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::TimedOut, ErrorKind::Other] {
+            assert_eq!(held_source_unopened(&Error::from(kind)), HeldSource::Unreadable, "{kind:?}");
+        }
     }
 
     /// Idle trees go whether or not the cache is full.

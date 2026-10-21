@@ -146,6 +146,18 @@ fn release_outbound_session_slot(
     }
 }
 
+/// Whether, as session `session_id` with `friend` ends, the session map routes
+/// to the friend through a live session other than it.
+fn another_session_routes(
+    sessions: &HashMap<[u8; 16], ed2k::upload::EmberSessionHandle>,
+    friend: [u8; 16],
+    session_id: u64,
+) -> bool {
+    sessions
+        .get(&friend)
+        .is_some_and(|handle| handle.session_id() != session_id && handle.is_fresh())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn on_upload_event(
     event: UploadEvent,
@@ -517,6 +529,11 @@ pub(in crate::network) async fn on_upload_event(
             reason,
         );
     }
+    if let UploadEventKind::EmberAttachHeld { ember_hash: attach_eh, xfer_id } = event.kind {
+        if friend_hashes.read().await.contains(&attach_eh) {
+            chat_attach::on_held(state, db, app_handle, attach_eh, xfer_id).await;
+        }
+    }
 
     if let UploadEventKind::EmberFileOfferAck { ember_hash: ack_eh, status, file_hash } = event.kind {
         let _ = app_handle.emit(
@@ -646,6 +663,7 @@ pub(in crate::network) async fn on_upload_event(
             // queue and leave no room for it.
             if still_friend {
                 on_friend_session_for_mailbox(state, settings, *ember_hash).await;
+                chat_attach::on_friend_session(state, *ember_hash).await;
             }
             // The session is live, so anything the user typed
             // while this friend was unreachable can go out now —
@@ -814,6 +832,7 @@ pub(in crate::network) async fn on_upload_event(
                 // Whether we collect goes first, for the reason the
                 // outbound arm gives.
                 on_friend_session_for_mailbox(state, settings, *ember_hash).await;
+                chat_attach::on_friend_session(state, *ember_hash).await;
                 if settings.chat_allowed_with(ember_hash) {
                     flush_pending_chat(
                         db,
@@ -1572,14 +1591,8 @@ pub(in crate::network) async fn on_upload_event(
         // newer replacement session. Re-enter the sole dispatcher
         // so the new head is sent instead of being stranded.
         dispatch_browse_head(state, app_handle, dc_eh).await;
-        let newer_session_active = state
-            .ember_sessions
-            .read()
-            .await
-            .get(&dc_eh)
-            .is_some_and(|handle| {
-                handle.session_id() != session_id && handle.is_fresh()
-            });
+        let newer_session_active =
+            another_session_routes(&*state.ember_sessions.read().await, dc_eh, session_id);
         if newer_session_active {
             debug!(
                 "Ignoring disconnect from retired friend session {} for {}",
@@ -1592,6 +1605,10 @@ pub(in crate::network) async fn on_upload_event(
                 "user_hash": hash_hex,
             }));
         }
+        // A retired session too: either end of an offer held across it may
+        // have been told something over it that the other never heard. A
+        // duplicate that never held the slot ends as `EmberFriendSessionEnded`.
+        chat_attach::on_session_ended(state, db, app_handle, dc_eh, newer_session_active).await;
 
         if !newer_session_active
             && friend_hashes.read().await.contains(&dc_eh)
@@ -1618,6 +1635,12 @@ pub(in crate::network) async fn on_upload_event(
                 debug!("Friend {} reconnect skipped (backoff cooldown)", hash_hex);
             }
         }
+    }
+
+    if let UploadEventKind::EmberFriendSessionEnded { ember_hash: dc_eh, session_id } = event.kind {
+        let newer_session_active =
+            another_session_routes(&*state.ember_sessions.read().await, dc_eh, session_id);
+        chat_attach::on_session_ended(state, db, app_handle, dc_eh, newer_session_active).await;
     }
 
     // A friend cannot dial us and is asking us to dial them
@@ -1976,6 +1999,23 @@ pub(in crate::network) async fn on_upload_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A duplicate's end finds the map routing through the session it sat
+    /// beside, so the holds it ends ask again over that one; the owner's own
+    /// end, or one beside a session gone quiet, has nothing to ask over.
+    #[test]
+    fn a_duplicates_end_finds_the_session_that_still_routes() {
+        let friend = [0xE8u8; 16];
+        let channel = || tokio::sync::mpsc::channel::<Vec<u8>>(1).0;
+        let routes = ed2k::upload::EmberSessionHandle::new_secure(channel(), [2; 32], friend);
+        let duplicate = ed2k::upload::EmberSessionHandle::new_secure(channel(), [2; 32], friend);
+        let sessions = HashMap::from([(friend, routes.clone())]);
+        assert!(another_session_routes(&sessions, friend, duplicate.session_id()));
+        assert!(!another_session_routes(&sessions, friend, routes.session_id()));
+        assert!(!another_session_routes(&HashMap::new(), friend, duplicate.session_id()));
+        routes.backdate_for_test(600);
+        assert!(!another_session_routes(&sessions, friend, duplicate.session_id()));
+    }
 
     #[test]
     fn a_finished_attempt_frees_only_its_own_reservation() {

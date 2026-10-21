@@ -367,6 +367,37 @@ pub const EMBER_EXT_MAILBOX_AWARE: u8 = 0x10;
 /// collected it there shows it once.
 pub const EMBER_EXT_CHAT_ID: u8 = 0x11;
 
+/// [`OP_EMBER_EXT`] sub-type: chat attachment offers that wait for the user.
+/// Two forms, told apart by the body.
+///
+/// Empty: "an offer you make me can wait for my answer, and tell me again
+/// which of mine you keep". Sent whenever a secure session comes up, ahead of
+/// the queued files that go out then, and by a sender that let held offers go
+/// when one of the friend's sessions ended while another stayed up. The
+/// reader marks the session; a receiver names only to a marked session, since
+/// only such a sender answers. On receiving it a receiver puts every offer
+/// the sender had said it holds back on
+/// [`crate::network::ember::attach::ATTACH_OFFER_TTL_SECS`] from then, and
+/// names each again.
+///
+/// `ATTACH_VERSION || xfer_id`
+/// ([`crate::network::ember::attach::encode_attach_held`]), meaning by which
+/// end of the offer sends it. From the offer's receiver: "I am keeping your
+/// offer of this file for my user", sent when an offer is left waiting on the
+/// user and again after every session change. From the offer's sender, in
+/// answer: "I hold it", sent only when it does. The sender holds its grant
+/// past five minutes only on the receiver's note, and the receiver waits past
+/// five minutes only on the sender's echo, so neither waits on the other
+/// longer than the other will. A sender whose offer is over answers with
+/// [`EMBER_EXT_ATTACH_CANCEL`] instead; one that will not hold an offer that
+/// is still answerable says nothing.
+///
+/// Not [`EMBER_EXT_MAILBOX_AWARE`]: 1.7.4 sends that and still drops an
+/// offer at five minutes, so it says nothing about waiting. A peer that
+/// predates this ignores both forms and never sends either, so nothing waits
+/// with it.
+pub const EMBER_EXT_ATTACH_WAITS: u8 = 0x12;
+
 const DHT_MEET_FLAG_ANSWER: u8 = 0x01;
 
 /// [`EMBER_EXT_DHT_MEET`] body: `udp_port(2, LE) || flags(1)`.

@@ -147,10 +147,9 @@ pub async fn pick_and_send_chat_attachment(
                 .and_then(|n| n.to_str())
                 .unwrap_or("file"),
         ));
-        let tree = std::fs::File::open(&canonical)
-            .and_then(|f| {
-                crate::network::ember::transfer::HashTree::from_reader(std::io::BufReader::new(f))
-            })
+        // Into the serving cache: the stream reads the tree from there, and a
+        // friend keeping the offer has the file compared against it.
+        let tree = crate::network::ember::attach_stream::hash_for_serving(&canonical)
             .map_err(|e| coded_ctx("peers_attach_failed", "Could not send that file", e))?;
         if tree.file_size != meta.len() {
             return Err(coded_ctx(

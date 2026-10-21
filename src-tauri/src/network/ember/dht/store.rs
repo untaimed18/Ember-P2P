@@ -8,7 +8,7 @@ use crate::network::ember::crypto;
 use super::publish::{
     channel_flags_from_data, channel_kind_from_data, CHANNEL_FLAG_DEPARTED, CHANNEL_KIND_CLAIM,
     CHANNEL_KIND_EPOCH, CHANNEL_KIND_HANDOFF, CHANNEL_KIND_INDEX, CHANNEL_KIND_MODERATION,
-    CHANNEL_KIND_OWNED_ROOMS, CHANNEL_KIND_PRESENCE, RECORD_TYPE_CHANNEL,
+    CHANNEL_KIND_OWNED_ROOMS, CHANNEL_KIND_PRESENCE, CHANNEL_KIND_SETTINGS, RECORD_TYPE_CHANNEL,
     RECORD_TYPE_KEYWORD, RECORD_TYPE_SOURCE,
 };
 use super::{scale, EmberNodeId};
@@ -215,8 +215,8 @@ const _: () = assert!(
     "a handoff must outlive a room listing and the generic keyword TTL"
 );
 
-/// A room's governance snapshot, and each member's sealed copy of its current
-/// content key, the owner's own among them.
+/// A room's governance snapshot and its settings record, and each member's
+/// sealed copy of its current content key, the owner's own among them.
 ///
 /// Only the owner can refresh either, and does every few hours while its
 /// device is up. The owner itself depends on them most when it is not: a
@@ -248,9 +248,12 @@ fn record_ttl(data: &[u8]) -> Duration {
             }
             Some(CHANNEL_KIND_INDEX) => CHANNEL_INDEX_TTL,
             Some(CHANNEL_KIND_HANDOFF | CHANNEL_KIND_CLAIM) => CHANNEL_HANDOFF_TTL,
-            Some(CHANNEL_KIND_MODERATION | CHANNEL_KIND_EPOCH | CHANNEL_KIND_OWNED_ROOMS) => {
-                CHANNEL_GOVERNANCE_TTL
-            }
+            Some(
+                CHANNEL_KIND_MODERATION
+                | CHANNEL_KIND_EPOCH
+                | CHANNEL_KIND_OWNED_ROOMS
+                | CHANNEL_KIND_SETTINGS,
+            ) => CHANNEL_GOVERNANCE_TTL,
             _ => KEYWORD_RECORD_TTL,
         },
         _ => KEYWORD_RECORD_TTL,
@@ -3897,6 +3900,18 @@ mod tests {
         let owned = SignedRecord::owned_rooms(&[[3u8; 16]], &ed25519_dalek::SigningKey::from_bytes(&[0x43; 32]))
             .expect("one salt fits");
         assert_eq!(record_ttl(&owned.data), CHANNEL_GOVERNANCE_TTL);
+        // Lives as long as the snapshot it sits beside.
+        let settings = SignedRecord::channel_settings_at(
+            &[(2, [0x5C; 32]), (1, [0x5B; 32])],
+            1,
+            ident.channel_id,
+            ident.pubkey,
+            true,
+            &ident.signing_key,
+            chrono::Utc::now().timestamp(),
+        )
+        .expect("two commitments fit");
+        assert_eq!(record_ttl(&settings.data), CHANNEL_GOVERNANCE_TTL);
 
         let presence = SignedRecord::channel_presence(
             "Ana",
@@ -3915,6 +3930,47 @@ mod tests {
         let mut weeks_old = moderation.data.clone();
         weeks_old[105..113].copy_from_slice(&(now - 21 * 86_400).to_le_bytes());
         assert!(record_is_current(&weeks_old, now));
+    }
+
+    /// The startup load holds a settings record to the storer rule the wire
+    /// does: kept where the room key filed it, dropped from any other slot.
+    #[test]
+    fn a_settings_record_comes_back_from_disk_only_in_its_own_slot() {
+        use super::super::publish::SignedRecord;
+        use crate::network::ember::channel::{moderation_key, ChannelIdentity};
+
+        let ident = ChannelIdentity::generate();
+        let record = SignedRecord::channel_settings_at(
+            &[(1, [0x71; 32])],
+            1,
+            ident.channel_id,
+            ident.pubkey,
+            true,
+            &ident.signing_key,
+            now_ts(),
+        )
+        .expect("one commitment fits");
+        let persisted = |data: Vec<u8>, signature: [u8; 64]| PersistedRecord {
+            key: [0u8; 16],
+            data,
+            signature,
+            publisher_key: record.publisher_key,
+            created_at: record.timestamp,
+            attributed_ip: None,
+        };
+        let mut restored = DhtStore::new();
+        restored.set_local_id(EmberNodeId([0u8; 16]));
+        assert_eq!(restored.restore(vec![persisted(record.data.clone(), record.signature)]), 1);
+        assert_eq!(restored.get_live(&record.keyword_hash).len(), 1);
+
+        // Re-signed into the snapshot's slot, where it would replace the room's
+        // governance: refused, though the room key really did sign it.
+        let mut misfiled = record.data.clone();
+        misfiled[1..17].copy_from_slice(&moderation_key(&ident.channel_id));
+        let signature = sign(&ident.signing_key, &misfiled);
+        let mut moved = DhtStore::new();
+        moved.set_local_id(EmberNodeId([0u8; 16]));
+        assert_eq!(moved.restore(vec![persisted(misfiled, signature)]), 0);
     }
 
     /// A member who missed the move has only these two records to find the

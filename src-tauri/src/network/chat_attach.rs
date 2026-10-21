@@ -20,7 +20,7 @@
 //! | `unreachable` | both     | the recipient never got a direct connection to the sender |
 //! | `source_gone` | both     | the sender's file changed or went away before it was read |
 //! | `failed`      | both     | it could not be finished                        |
-//! | `expired`     | both     | nobody answered in time, or a restart stranded it |
+//! | `expired`     | both     | nobody answered in time, a restart stranded it, or the session it waited on ended |
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -33,17 +33,18 @@ use tracing::{debug, info, warn};
 
 use super::ed2k::messages::{
     build_ember_ext_frame, EMBER_EXT_ATTACH_CANCEL, EMBER_EXT_ATTACH_OFFER, EMBER_EXT_ATTACH_REPLY,
+    EMBER_EXT_ATTACH_WAITS,
 };
 use super::ember::attach::{
     self, AttachCancel, AttachOffer, AttachReply, AttachStreamStatus, ATTACH_GRANT_TTL_SECS,
     ATTACH_OFFER_TTL_SECS,
 };
 use super::ed2k::secure_stream::SecureStreamParts;
-use super::ember::attach_stream::{self, FetchError};
+use super::ember::attach_stream::{self, FetchError, HeldSource, SourceStamp};
 use super::ember::attach_tcp;
 use super::NetworkState;
 use crate::commands::errors::{coded, coded_ctx};
-use crate::storage::database::{ChatAttachmentRow, Database};
+use crate::storage::database::{ChatAttachmentRow, Database, OfferHold};
 use crate::types::AppSettings;
 
 /// Frontend event carrying one attachment's current state.
@@ -202,6 +203,25 @@ const REOFFER_REOPENS: &[&str] = &["failed", "unreachable", "expired"];
 /// the re-offer it asked for. After that the re-offer is asked about afresh.
 const RETRY_ASK_WINDOW_SECS: i64 = 120;
 
+/// How long an offer the sender has said it holds stays answerable here, from
+/// when the offer arrived. Only while the sender's word stands: a session with
+/// them ending, or their asking for our notes again, puts it back on an
+/// offer's lifetime from then until the sender says so again (see
+/// [`InboundHold`]).
+const HELD_OFFER_WAIT_SECS: i64 = ATTACH_GRANT_TTL_SECS;
+
+/// How long a sender holds an offer the friend said it is keeping, from the
+/// first time it heard so: the receiver's wait and an offer's lifetime more,
+/// so an accept sent at the receiver's last moment still finds the grant. A
+/// hold taken up again after a session ended runs to the same end, never
+/// past it.
+const HELD_OFFER_GRANT_SECS: i64 = HELD_OFFER_WAIT_SECS + ATTACH_OFFER_TTL_SECS;
+
+/// Half-minute ticks on which a note or an empty `EMBER_EXT_ATTACH_WAITS` the
+/// session had no room for is sent again: two minutes, well inside the five an
+/// offer named again waits for the sender's word.
+const OWED_HOLD_TRIES: u8 = 4;
+
 fn retryable(direction: &str, status: &str) -> bool {
     match direction {
         "sent" => RETRYABLE_SENT.contains(&status),
@@ -336,6 +356,43 @@ pub(crate) struct InboundAttach {
     received_at: i64,
     /// A re-offer our own "Try again" asked for.
     requested: bool,
+    /// Where it stands with the sender about waiting for the user.
+    hold: InboundHold,
+    /// Half-minute ticks left to send again a note naming it that a session
+    /// holding offers had no room for (see [`retry_owed_holds`]).
+    notes_owed: u8,
+}
+
+/// Where an offer waiting on our user stands with its sender. Only the
+/// sender's echo of our note moves it to the day-long wait, so the two ends
+/// never disagree in the direction that matters: we never wait longer than
+/// the sender has said it will hold the grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InboundHold {
+    /// Never named to the sender: an offer's lifetime from its arrival.
+    Unnamed,
+    /// Named (see [`name_held_offer`]), and not confirmed since: an offer's
+    /// lifetime from `since`, which is the arrival for a first note and the
+    /// moment the sender's word lapsed for one named again.
+    Named { since: i64 },
+    /// The sender echoed the note: it holds the grant.
+    Held,
+}
+
+impl InboundAttach {
+    fn lapses_at(&self) -> i64 {
+        inbound_lapses_at(self.received_at, self.hold)
+    }
+}
+
+/// When an offer that arrived at `received_at` stops being answerable here.
+fn inbound_lapses_at(received_at: i64, hold: InboundHold) -> i64 {
+    let held_until = received_at + HELD_OFFER_WAIT_SECS;
+    match hold {
+        InboundHold::Unnamed => received_at + ATTACH_OFFER_TTL_SECS,
+        InboundHold::Named { since } => (since + ATTACH_OFFER_TTL_SECS).min(held_until),
+        InboundHold::Held => held_until,
+    }
 }
 
 /// Our disappearing timer for a file we offer `friend`, recorded on our own
@@ -421,7 +478,16 @@ async fn send_ext(
     sub_type: u8,
     body: &[u8],
 ) -> Result<(), String> {
-    let sessions = state.ember_sessions.read().await;
+    send_ext_over(&*state.ember_sessions.read().await, friend, sub_type, body)
+}
+
+/// [`send_ext`] with the session map already read.
+fn send_ext_over(
+    sessions: &std::collections::HashMap<[u8; 16], super::ed2k::upload::EmberSessionHandle>,
+    friend: &[u8; 16],
+    sub_type: u8,
+    body: &[u8],
+) -> Result<(), String> {
     let Some(session) = sessions
         .get(friend)
         .filter(|h| h.is_fresh() && h.is_secure_v2())
@@ -593,6 +659,23 @@ fn not_found() -> String {
         "peers_attach_not_found",
         "That file transfer is no longer running",
     )
+}
+
+fn source_gone() -> String {
+    coded(
+        "peers_attach_source_gone",
+        "Your friend's file changed or was moved, so it can no longer be sent",
+    )
+}
+
+/// Why an offer with no answerable entry here cannot be answered, by what its
+/// row became. Said without dialing: a file the sender reported changed is
+/// already `source_gone` (see [`check_held_sources`]).
+fn unanswerable(status: Option<&str>) -> String {
+    match status {
+        Some("source_gone") => source_gone(),
+        _ => not_found(),
+    }
 }
 
 // --- Sending -----------------------------------------------------------------
@@ -861,7 +944,8 @@ async fn offer_again_body(
 /// Offer a file we sent before again, under the same transfer id, so the
 /// conversation keeps one card for it. The row goes back to `status` (with
 /// `expires_at` when given) only from one of `from`, and the friend gets the
-/// offer it had, with our QUIC port as it is now.
+/// offer it had, with our QUIC port as it is now. One the friend asked for
+/// cannot be held (see [`Database::reopen_chat_attachment_for_friend`]).
 #[allow(clippy::too_many_arguments)]
 async fn reoffer(
     state: &mut NetworkState,
@@ -873,6 +957,7 @@ async fn reoffer(
     status: &str,
     expires_at: Option<i64>,
     from: &[&str],
+    asked_by_friend: bool,
 ) -> Result<(), String> {
     let xfer_hex = hex::encode(xfer_id);
     let row = db.chat_attachment(&xfer_hex).ok_or_else(not_found)?;
@@ -890,9 +975,12 @@ async fn reoffer(
         }
         Err(OfferAgainError::Other(e)) => return Err(e),
     };
-    let reopened = db
-        .reopen_chat_attachment(&xfer_hex, from, status, expires_at)
-        .map_err(|e| coded_ctx("peers_attach_failed", "Could not send that file", e))?;
+    let reopened = if asked_by_friend {
+        db.reopen_chat_attachment_for_friend(&xfer_hex, from, status, expires_at)
+    } else {
+        db.reopen_chat_attachment(&xfer_hex, from, status, expires_at)
+    }
+    .map_err(|e| coded_ctx("peers_attach_failed", "Could not send that file", e))?;
     if !reopened {
         return Err(not_found());
     }
@@ -965,6 +1053,7 @@ pub(super) async fn retry(
             "offered",
             Some(now + ATTACH_OFFER_TTL_SECS),
             RETRYABLE_SENT,
+            false,
         )
         .await;
     }
@@ -1106,7 +1195,8 @@ pub(super) async fn on_reply(
 /// file readable past what the user gave it. One that broke before the grant
 /// began — they could never reach us — is offered again as the first offer
 /// was, so their accept grants it once, as it would have; but no later than
-/// the grant could have run from when the user sent it.
+/// the grant could have run from when the user sent it, and on an offer's
+/// lifetime only: a hold taken from then would run past that.
 ///
 /// When it will not be offered again for good — the grant ran out, the file
 /// is gone, chat with them is off — they are told, so their card stops
@@ -1125,8 +1215,9 @@ async fn on_friend_retry(
     let xfer_hex = hex::encode(xfer_id);
     let expires_at = db.chat_attachment_expiry(&xfer_hex).unwrap_or(0);
     let granted = db.chat_attachment_was_granted(&xfer_hex);
+    let held = db.chat_attachment_was_held(&xfer_hex);
     let Some((status, offer_expiry)) =
-        friend_retry_reopens(granted, row.attempt, row.created_at, expires_at, now)
+        friend_retry_reopens(granted, held, row.attempt, row.created_at, expires_at, now)
     else {
         info!(
             "Chat attachment: {} asked for {xfer_hex} again after its grant ran out",
@@ -1145,6 +1236,7 @@ async fn on_friend_retry(
         status,
         offer_expiry,
         FRIEND_RETRYABLE_SENT,
+        true,
     )
     .await
     {
@@ -1175,14 +1267,17 @@ async fn on_friend_retry(
 /// expiry; `None` when it is too late. See [`on_friend_retry`].
 fn friend_retry_reopens(
     granted: bool,
+    held: bool,
     attempt: u32,
     created_at: i64,
     expires_at: i64,
     now: i64,
 ) -> Option<(&'static str, Option<i64>)> {
     // Rows from before grants were recorded: one still on its first offer's
-    // lifetime never had one.
-    let never_granted = !granted && (attempt > 0 || expires_at <= created_at + ATTACH_OFFER_TTL_SECS);
+    // lifetime never had one. A hold is newer than that record, and moves
+    // the expiry past the offer's without a grant.
+    let never_granted =
+        !granted && (attempt > 0 || held || expires_at <= created_at + ATTACH_OFFER_TTL_SECS);
     if never_granted {
         (now < created_at + ATTACH_GRANT_TTL_SECS).then_some(("offered", Some(now + ATTACH_OFFER_TTL_SECS)))
     } else {
@@ -1472,6 +1567,8 @@ pub(super) async fn on_offer(
             name,
             received_at: now,
             requested: false,
+            hold: InboundHold::Unnamed,
+            notes_owed: 0,
         },
     );
 
@@ -1479,8 +1576,60 @@ pub(super) async fn on_offer(
     // `awaiting` as "offered you a file", which is wrong for one fetched
     // without asking.
     if risky || !try_auto_accept(state, db, app, settings, friend, xfer_id, size, now).await {
+        hold_for_user(state, xfer_id).await;
         emit_by_id(app, db, &xfer_hex);
     }
+}
+
+/// Ask the sender to hold an offer that now waits on the user. It still lapses
+/// here on an offer's lifetime until the sender echoes the note (see
+/// [`on_held`]); only then does it wait [`HELD_OFFER_WAIT_SECS`].
+async fn hold_for_user(state: &mut NetworkState, xfer_id: [u8; 16]) {
+    let unnamed = state
+        .attach_inbound
+        .get(&xfer_id)
+        .is_some_and(|inbound| inbound.hold == InboundHold::Unnamed);
+    if unnamed {
+        let sessions = state.ember_sessions.read().await;
+        name_held_offer(&mut state.attach_inbound, &sessions, &xfer_id);
+    }
+}
+
+/// Send the sender of `xfer_id` the note naming it as kept for our user, and
+/// mark it named. Only to a session that sent `EMBER_EXT_ATTACH_WAITS`: an
+/// older sender never answers it, and lapses its grant at five minutes
+/// whatever we say. Returns whether the note went; one such a session had no
+/// room for is owed, and tried again on the next ticks.
+///
+/// Naming moves nothing here: a first note leaves the offer on its lifetime
+/// from its arrival, and one named again stays on the lifetime it was put
+/// back on.
+fn name_held_offer(
+    inbound: &mut std::collections::HashMap<[u8; 16], InboundAttach>,
+    sessions: &std::collections::HashMap<[u8; 16], super::ed2k::upload::EmberSessionHandle>,
+    xfer_id: &[u8; 16],
+) -> bool {
+    let Some(offer) = inbound.get_mut(xfer_id) else {
+        return false;
+    };
+    let Some(session) = sessions
+        .get(&offer.friend)
+        .filter(|h| h.is_fresh() && h.is_secure_v2() && h.holds_offers())
+    else {
+        return false;
+    };
+    let note = build_ember_ext_frame(EMBER_EXT_ATTACH_WAITS, &attach::encode_attach_held(xfer_id));
+    if session.tx.try_send(note).is_err() {
+        if offer.notes_owed == 0 {
+            offer.notes_owed = OWED_HOLD_TRIES;
+        }
+        return false;
+    }
+    offer.notes_owed = 0;
+    if offer.hold == InboundHold::Unnamed {
+        offer.hold = InboundHold::Named { since: offer.received_at };
+    }
+    true
 }
 
 /// Whether a receive of `xfer_id` is still running.
@@ -1569,6 +1718,8 @@ async fn on_reoffer(
             name: row.file_name,
             received_at: now,
             requested: asked_at.is_some(),
+            hold: InboundHold::Unnamed,
+            notes_owed: 0,
         },
     );
     if asked {
@@ -1579,6 +1730,7 @@ async fn on_reoffer(
     } else if !risky && try_auto_accept(state, db, app, settings, friend, xfer_id, size, now).await {
         return;
     }
+    hold_for_user(state, xfer_id).await;
     emit_by_id(app, db, &xfer_hex);
 }
 
@@ -1653,28 +1805,59 @@ pub(super) fn auto_accept_allowed(
 
 /// Retire offers nobody answered in time.
 ///
-/// The sender's side of a first offer lapses on its own clock. A re-offer we
+/// The sender's side of a first offer lapses on its own clock, and one it
+/// holds no earlier than ours (see [`HELD_OFFER_GRANT_SECS`]). A re-offer we
 /// asked for with "Try again" may have gone out already accepted, which it
 /// would hold until the grant ran out, so the sender hears it lapsed.
 async fn prune_inbound(state: &mut NetworkState, db: &Database, app: &tauri::AppHandle, now: i64) {
-    let lapsed: Vec<[u8; 16]> = state
-        .attach_inbound
+    let lapsed = {
+        let sessions = state.ember_sessions.read().await;
+        settle_lapsed(db, &mut state.attach_inbound, &sessions, now)
+    };
+    emit_lapsed(app, db, &lapsed);
+}
+
+/// [`prune_inbound`] with the session map already read. Returns the offers
+/// that lapsed, whose cards have to catch up.
+fn settle_lapsed(
+    db: &Database,
+    inbound: &mut std::collections::HashMap<[u8; 16], InboundAttach>,
+    sessions: &std::collections::HashMap<[u8; 16], super::ed2k::upload::EmberSessionHandle>,
+    now: i64,
+) -> Vec<[u8; 16]> {
+    take_lapsed(inbound, now)
+        .into_iter()
+        .map(|(id, lapsed)| {
+            let _ = db.set_chat_attachment_status(&hex::encode(id), "expired", None, None);
+            if lapsed.requested {
+                let body = attach::encode_attach_reply(&id, AttachReply::Busy, None);
+                let _ = send_ext_over(sessions, &lapsed.friend, EMBER_EXT_ATTACH_REPLY, &body);
+            }
+            id
+        })
+        .collect()
+}
+
+fn emit_lapsed(app: &tauri::AppHandle, db: &Database, lapsed: &[[u8; 16]]) {
+    for id in lapsed {
+        emit_by_id(app, db, &hex::encode(id));
+    }
+}
+
+/// Take out of `inbound` every offer no longer answerable at `now`.
+fn take_lapsed(
+    inbound: &mut std::collections::HashMap<[u8; 16], InboundAttach>,
+    now: i64,
+) -> Vec<([u8; 16], InboundAttach)> {
+    let lapsed: Vec<[u8; 16]> = inbound
         .iter()
-        .filter(|(_, a)| a.received_at + ATTACH_OFFER_TTL_SECS <= now)
+        .filter(|(_, a)| a.lapses_at() <= now)
         .map(|(id, _)| *id)
         .collect();
-    for id in lapsed {
-        let Some(inbound) = state.attach_inbound.remove(&id) else {
-            continue;
-        };
-        let xfer_hex = hex::encode(id);
-        let _ = db.set_chat_attachment_status(&xfer_hex, "expired", None, None);
-        emit_by_id(app, db, &xfer_hex);
-        if inbound.requested {
-            let body = attach::encode_attach_reply(&id, AttachReply::Busy, None);
-            let _ = send_ext(state, &inbound.friend, EMBER_EXT_ATTACH_REPLY, &body).await;
-        }
-    }
+    lapsed
+        .into_iter()
+        .filter_map(|id| inbound.remove(&id).map(|a| (id, a)))
+        .collect()
 }
 
 /// The user answered an offer.
@@ -1687,8 +1870,13 @@ pub(super) async fn respond(
     accept: bool,
 ) -> Result<(), String> {
     prune_inbound(state, db, app, chrono::Utc::now().timestamp()).await;
-    if !state.attach_inbound.contains_key(&xfer_id) {
-        return Err(not_found());
+    if let Some((why, row)) = why_unanswerable(&state.attach_inbound, db, &xfer_id) {
+        // The card may still be drawn from before the sender said the file
+        // went; it catches up as the answer is given.
+        if let Some(row) = &row {
+            emit_row(app, row);
+        }
+        return Err(why);
     }
     if accept {
         return accept_offer(state, db, app, settings, xfer_id).await;
@@ -1703,6 +1891,66 @@ pub(super) async fn respond(
     let _ = db.set_chat_attachment_status(&xfer_hex, "declined", None, None);
     emit_by_id(app, db, &xfer_hex);
     Ok(())
+}
+
+/// Why an answer to `xfer_id` can go nowhere, said from its row without a
+/// dial, with the row for the card to catch up from. `None` while the offer is
+/// still waiting here.
+fn why_unanswerable(
+    inbound: &std::collections::HashMap<[u8; 16], InboundAttach>,
+    db: &Database,
+    xfer_id: &[u8; 16],
+) -> Option<(String, Option<ChatAttachmentRow>)> {
+    if inbound.contains_key(xfer_id) {
+        return None;
+    }
+    let row = db.chat_attachment(&hex::encode(xfer_id));
+    Some((unanswerable(row.as_ref().map(|r| r.status.as_str())), row))
+}
+
+/// The address `friend`'s session is connected from now, for the dial an
+/// accept makes: `None` inside for a relayed one, and `None` with no session.
+/// An offer held across a session that was replaced came in on the old one,
+/// whose address may be stale.
+fn session_peer_addr(
+    sessions: &std::collections::HashMap<[u8; 16], super::ed2k::upload::EmberSessionHandle>,
+    friend: &[u8; 16],
+) -> Option<Option<SocketAddr>> {
+    sessions
+        .get(friend)
+        .filter(|h| h.is_secure_v2())
+        .map(|h| h.peer_addr())
+}
+
+/// Where an accept dials, from [`session_peer_addr`] and the address the
+/// offer came in on.
+#[derive(Debug, PartialEq, Eq)]
+enum AcceptDial {
+    /// This target, reached through the session at this address. With no
+    /// session it is the offer's own, and the accept then fails to send and
+    /// puts the offer back.
+    To(SocketAddr, Option<SocketAddr>),
+    /// The session it would go out on is relayed. A passing state: the offer
+    /// keeps waiting for a direct session, as it would for no session.
+    Relayed,
+    /// Nothing that can be dialled: the offer is over.
+    Nowhere,
+}
+
+fn accept_dial(
+    session: Option<Option<SocketAddr>>,
+    offered_from: Option<SocketAddr>,
+    quic_port: u16,
+) -> AcceptDial {
+    let peer_addr = match session {
+        Some(None) => return AcceptDial::Relayed,
+        Some(addr) => addr,
+        None => offered_from,
+    };
+    match peer_addr.and_then(|addr| dial_target(addr.ip(), quic_port)) {
+        Some(dial) => AcceptDial::To(dial, peer_addr),
+        None => AcceptDial::Nowhere,
+    }
 }
 
 async fn accept_offer(
@@ -1747,27 +1995,32 @@ async fn accept_offer(
     let Some(inbound) = state.attach_inbound.remove(&xfer_id) else {
         return Err(not_found());
     };
-    let Some(dial) = inbound
-        .peer_addr
-        .and_then(|addr| dial_target(addr.ip(), inbound.offer.quic_port))
-    else {
-        let _ = send_ext(
-            state,
-            &inbound.friend,
-            EMBER_EXT_ATTACH_CANCEL,
-            &attach::encode_attach_cancel(&xfer_id, AttachCancel::Unreachable),
-        )
-        .await;
-        let xfer_hex = hex::encode(xfer_id);
-        let _ = db.set_chat_attachment_status(&xfer_hex, "unreachable", None, None);
-        emit_by_id(app, db, &xfer_hex);
-        return Err(relayed());
+    let session = session_peer_addr(&*state.ember_sessions.read().await, &inbound.friend);
+    let (dial, peer_addr) = match accept_dial(session, inbound.peer_addr, inbound.offer.quic_port) {
+        AcceptDial::To(dial, peer_addr) => (dial, peer_addr),
+        AcceptDial::Relayed => {
+            state.attach_inbound.insert(xfer_id, inbound);
+            return Err(relayed());
+        }
+        AcceptDial::Nowhere => {
+            let _ = send_ext(
+                state,
+                &inbound.friend,
+                EMBER_EXT_ATTACH_CANCEL,
+                &attach::encode_attach_cancel(&xfer_id, AttachCancel::Unreachable),
+            )
+            .await;
+            let xfer_hex = hex::encode(xfer_id);
+            let _ = db.set_chat_attachment_status(&xfer_hex, "unreachable", None, None);
+            emit_by_id(app, db, &xfer_hex);
+            return Err(relayed());
+        }
     };
     // The port the sender punches toward, chosen for how it reaches us.
     let reply = attach::encode_attach_reply(
         &xfer_id,
         AttachReply::Accept,
-        quic_port_for(state, inbound.peer_addr),
+        quic_port_for(state, peer_addr),
     );
     if let Err(e) = send_ext(state, &inbound.friend, EMBER_EXT_ATTACH_REPLY, &reply).await {
         // Put it back: the user can try again once the friend reconnects, until
@@ -1796,7 +2049,7 @@ async fn accept_offer(
         friend: inbound.friend,
         peer_pubkey: inbound.peer_pubkey,
         dial,
-        tcp_dials: friend_tcp_candidates(db, &inbound.friend, inbound.peer_addr),
+        tcp_dials: friend_tcp_candidates(db, &inbound.friend, peer_addr),
         xfer_id,
         size: inbound.offer.size,
         root: inbound.offer.root,
@@ -2231,6 +2484,527 @@ async fn receive_over_tcp(
     }
 }
 
+// --- Offers that wait for the user ---------------------------------------------
+//
+// An offer lapses after `ATTACH_OFFER_TTL_SECS` unless both ends agree, per
+// offer, that it waits. They agree over `EMBER_EXT_ATTACH_WAITS`:
+//
+// - Empty, either way: sent by each side when a session comes up
+//   (`on_friend_session`), and by a sender that has just let held offers go
+//   while another session with the friend is still up. The reader marks the
+//   session as one that holds offers; the receiver takes back the day from
+//   every offer of the friend's it was told is held, and names each offer
+//   still waiting on the user that the sender does not hold
+//   (`on_friend_waits`).
+// - Naming an offer, receiver to sender: "I am keeping this for my user"
+//   (`name_held_offer`). The sender holds the grant (`on_held`,
+//   `Database::hold_chat_attachment_offer`) and echoes the same note back.
+// - Naming an offer, sender to receiver: that echo, "I hold it". Only the
+//   echo moves the receiver to the day-long wait (`confirm_held`). A sender
+//   that will not hold an offer that is still answerable says nothing, and
+//   the receiver keeps it on its five minutes; one whose offer is over
+//   answers with `AttachCancel`.
+//
+// Which of the two a named note is follows from which end of the offer this
+// node is on. Any secure session with the friend ending — the one the session
+// map routes through, one it retired, or a duplicate that never held its slot
+// — releases the sender's holds and puts the receiver's back on five minutes
+// from then (`on_session_ended`), since either end may have been told
+// something over it the other never heard. The receiver names them again over
+// the session that is left, or the next one, and the sender holds them again
+// to where the first hold ended. A note or empty form the session had no room
+// for is sent again on the next few half-minute ticks (`retry_owed_holds`).
+// Nothing of it survives a restart.
+
+/// Tell a friend whose session just came up that offers they make us can wait
+/// for our answer, and that we want to hear again which of ours they keep.
+/// Sent before the files queued for them go out, so a receiver on the same
+/// build knows to keep those waiting too.
+pub(super) async fn on_friend_session(state: &mut NetworkState, friend: [u8; 16]) {
+    if send_ext(state, &friend, EMBER_EXT_ATTACH_WAITS, &[]).await.is_err() {
+        owe_waits(&mut state.attach_waits_owed, friend);
+    }
+}
+
+/// Owe `friend` an empty `EMBER_EXT_ATTACH_WAITS` that did not go, unless it
+/// is owed already.
+fn owe_waits(owed: &mut std::collections::HashMap<[u8; 16], u8>, friend: [u8; 16]) {
+    owed.entry(friend).or_insert(OWED_HOLD_TRIES);
+}
+
+/// Send again what a session had no room for: empty forms owed to friends,
+/// and notes owed for offers still waiting here. Each is tried on at most
+/// [`OWED_HOLD_TRIES`] ticks; after that the next session's empty form starts
+/// the round again. On the half-minute tick.
+pub(super) async fn retry_owed_holds(state: &mut NetworkState) {
+    let now = chrono::Utc::now().timestamp();
+    let sessions = state.ember_sessions.read().await;
+    retry_owed_at(&mut state.attach_waits_owed, &mut state.attach_inbound, &sessions, now);
+}
+
+fn retry_owed_at(
+    waits_owed: &mut std::collections::HashMap<[u8; 16], u8>,
+    inbound: &mut std::collections::HashMap<[u8; 16], InboundAttach>,
+    sessions: &std::collections::HashMap<[u8; 16], super::ed2k::upload::EmberSessionHandle>,
+    now: i64,
+) {
+    waits_owed.retain(|friend, tries| {
+        if send_ext_over(sessions, friend, EMBER_EXT_ATTACH_WAITS, &[]).is_ok() {
+            return false;
+        }
+        *tries = tries.saturating_sub(1);
+        *tries > 0
+    });
+    let owed: Vec<[u8; 16]> = inbound
+        .iter()
+        .filter(|(_, a)| a.notes_owed > 0 && a.lapses_at() > now)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in owed {
+        if !name_held_offer(inbound, sessions, &id) {
+            if let Some(offer) = inbound.get_mut(&id) {
+                offer.notes_owed = offer.notes_owed.saturating_sub(1);
+            }
+        }
+    }
+}
+
+/// `EMBER_EXT_ATTACH_WAITS` from a friend: the empty form when `xfer_id` is
+/// `None`; otherwise a note naming an offer, which is their keeping one of
+/// ours or their echo for one of theirs we named.
+pub(super) async fn on_held(
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app: &tauri::AppHandle,
+    friend: [u8; 16],
+    xfer_id: Option<[u8; 16]>,
+) {
+    let Some(xfer_id) = xfer_id else {
+        on_friend_waits(state, db, app, friend).await;
+        return;
+    };
+    let xfer_hex = hex::encode(xfer_id);
+    let now = chrono::Utc::now().timestamp();
+    if state.attach_inbound.contains_key(&xfer_id) {
+        if let Some(lapses_at) = confirm_held(&mut state.attach_inbound, &friend, &xfer_id, now) {
+            let _ = db.set_chat_attachment_expiry(&xfer_hex, lapses_at);
+            debug!(
+                "Chat attachment: {} holds {xfer_hex}; it waits for us until {lapses_at}",
+                crate::security::short_hash(&friend),
+            );
+        }
+        return;
+    }
+    match answer_hold_note(db, &xfer_hex, &hex::encode(friend), now) {
+        HoldAnswer::Echo(hold) => {
+            let note = attach::encode_attach_held(&xfer_id);
+            let _ = send_ext(state, &friend, EMBER_EXT_ATTACH_WAITS, &note).await;
+            if hold != OfferHold::Standing {
+                info!(
+                    "Chat attachment: {} is keeping {xfer_hex} for later; holding it ({hold:?})",
+                    crate::security::short_hash(&friend),
+                );
+                watch_held_source(state, db, friend, xfer_id);
+            }
+        }
+        HoldAnswer::Quiet => {}
+        HoldAnswer::Cancel(reason) => {
+            info!(
+                "Chat attachment: {} is keeping {xfer_hex}, which is over here ({reason:?})",
+                crate::security::short_hash(&friend),
+            );
+            let body = attach::encode_attach_cancel(&xfer_id, reason);
+            let _ = send_ext(state, &friend, EMBER_EXT_ATTACH_CANCEL, &body).await;
+        }
+    }
+}
+
+/// What a sender does with a friend's note naming an offer of ours.
+#[derive(Debug, PartialEq, Eq)]
+enum HoldAnswer {
+    /// It is held: echo the note.
+    Echo(OfferHold),
+    /// Not held, but still answerable on its own lifetime, or not ours to
+    /// them: nothing is said, and the receiver keeps it no longer than that.
+    Quiet,
+    /// It is over here: say so, so their card stops waiting on it.
+    Cancel(AttachCancel),
+}
+
+fn answer_hold_note(db: &Database, xfer_hex: &str, friend_hex: &str, now: i64) -> HoldAnswer {
+    let hold = db
+        .hold_chat_attachment_offer(
+            xfer_hex,
+            friend_hex,
+            now,
+            now + ATTACH_OFFER_TTL_SECS,
+            HELD_OFFER_GRANT_SECS,
+        )
+        .unwrap_or(OfferHold::Refused);
+    if hold.is_held() {
+        return HoldAnswer::Echo(hold);
+    }
+    let Some(row) = db
+        .chat_attachment(xfer_hex)
+        .filter(|row| row.direction == "sent" && row.friend_hash == friend_hex)
+    else {
+        return HoldAnswer::Quiet;
+    };
+    let in_date = db.chat_attachment_expiry(xfer_hex).is_some_and(|at| at > now);
+    match row.status.as_str() {
+        "offered" | "accepted" | "active" if in_date => HoldAnswer::Quiet,
+        "queued" | "complete" => HoldAnswer::Quiet,
+        "source_gone" => HoldAnswer::Cancel(AttachCancel::SourceGone),
+        _ => HoldAnswer::Cancel(AttachCancel::User),
+    }
+}
+
+/// The sender's echo of our note: it holds `xfer_id`, so the offer waits the
+/// day here. Only for one from that friend we named and have not heard back
+/// on, and not one that lapsed here meanwhile. Returns when it now lapses.
+fn confirm_held(
+    inbound: &mut std::collections::HashMap<[u8; 16], InboundAttach>,
+    friend: &[u8; 16],
+    xfer_id: &[u8; 16],
+    now: i64,
+) -> Option<i64> {
+    let offer = inbound.get_mut(xfer_id).filter(|a| a.friend == *friend)?;
+    if !matches!(offer.hold, InboundHold::Named { .. }) || offer.lapses_at() <= now {
+        return None;
+    }
+    offer.hold = InboundHold::Held;
+    Some(offer.lapses_at())
+}
+
+/// The sender's word on the offers from `friend` it said it holds no longer
+/// stands at `now`: each goes back on an offer's lifetime from then, named
+/// and waiting for the sender to say so again. Returns those that moved, with
+/// when each now lapses.
+fn unconfirm_held(
+    inbound: &mut std::collections::HashMap<[u8; 16], InboundAttach>,
+    friend: &[u8; 16],
+    now: i64,
+) -> Vec<([u8; 16], i64)> {
+    inbound
+        .iter_mut()
+        .filter(|(_, a)| a.friend == *friend && a.hold == InboundHold::Held)
+        .map(|(id, a)| {
+            a.hold = InboundHold::Named { since: now };
+            (*id, a.lapses_at())
+        })
+        .collect()
+}
+
+/// Name every offer from `friend` still waiting here that the sender does
+/// not hold: ones named before, so the sender holds what it let go of, and
+/// ones never named because no session that holds offers was up when they
+/// came. Not one that lapsed at `now`: the sender would hold for a day an
+/// offer both cards already call expired. Returns how many notes went.
+fn name_unheld(
+    inbound: &mut std::collections::HashMap<[u8; 16], InboundAttach>,
+    sessions: &std::collections::HashMap<[u8; 16], super::ed2k::upload::EmberSessionHandle>,
+    friend: &[u8; 16],
+    now: i64,
+) -> usize {
+    let unheld: Vec<[u8; 16]> = inbound
+        .iter()
+        .filter(|(_, a)| a.friend == *friend && a.hold != InboundHold::Held && a.lapses_at() > now)
+        .map(|(id, _)| *id)
+        .collect();
+    unheld
+        .iter()
+        .filter(|id| name_held_offer(inbound, sessions, id))
+        .count()
+}
+
+fn record_lapses(db: &Database, moved: &[([u8; 16], i64)]) {
+    for (xfer_id, lapses_at) in moved {
+        let _ = db.set_chat_attachment_expiry(&hex::encode(xfer_id), *lapses_at);
+    }
+}
+
+/// The friend's empty `EMBER_EXT_ATTACH_WAITS`: a session with them came up,
+/// or they let go of what they held while one stayed up. Whatever they said
+/// they hold may be what they let go, so it goes back on five minutes and is
+/// named again with every other offer of theirs still waiting; their echo
+/// gives the day back.
+async fn on_friend_waits(state: &mut NetworkState, db: &Database, app: &tauri::AppHandle, friend: [u8; 16]) {
+    let now = chrono::Utc::now().timestamp();
+    let lapsed = {
+        let sessions = state.ember_sessions.read().await;
+        friend_waits_at(db, &mut state.attach_inbound, &sessions, &friend, now)
+    };
+    emit_lapsed(app, db, &lapsed);
+}
+
+/// [`on_friend_waits`] at `now`, with the session map already read. Offers
+/// that lapsed go first, so none is named again. Returns those, for their
+/// cards.
+fn friend_waits_at(
+    db: &Database,
+    inbound: &mut std::collections::HashMap<[u8; 16], InboundAttach>,
+    sessions: &std::collections::HashMap<[u8; 16], super::ed2k::upload::EmberSessionHandle>,
+    friend: &[u8; 16],
+    now: i64,
+) -> Vec<[u8; 16]> {
+    let lapsed = settle_lapsed(db, inbound, sessions, now);
+    let moved = unconfirm_held(inbound, friend, now);
+    record_lapses(db, &moved);
+    name_unheld(inbound, sessions, friend, now);
+    lapsed
+}
+
+/// A secure session with `friend` ended: the last one, one a newer session
+/// retired, or a duplicate beside the one the session map holds. With
+/// `newer_session_active` the map's session is still up. Each end of a held
+/// offer was told what it holds over a session that may be gone, so both let
+/// go and agree again. Ours go back on an offer's lifetime from now (an
+/// accept already on its way still finds the grant), and the friend is asked
+/// over the session that is left to name again what they keep. Theirs we
+/// were told are held go back on it too, and are named again over that
+/// session, or over the next one when its empty form arrives.
+pub(super) async fn on_session_ended(
+    state: &mut NetworkState,
+    db: &Database,
+    app: &tauri::AppHandle,
+    friend: [u8; 16],
+    newer_session_active: bool,
+) {
+    let now = chrono::Utc::now().timestamp();
+    let ended = {
+        let sessions = state.ember_sessions.read().await;
+        session_ended_at(db, &mut state.attach_inbound, &sessions, &friend, now, newer_session_active)
+    };
+    emit_lapsed(app, db, &ended.lapsed);
+    if !ended.released.is_empty() {
+        info!(
+            "Chat attachment: released {} held offer(s) to {} with a session",
+            ended.released.len(),
+            crate::security::short_hash(&friend),
+        );
+    }
+    if ended.waits_owed {
+        owe_waits(&mut state.attach_waits_owed, friend);
+    }
+}
+
+/// What [`session_ended_at`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SessionEnded {
+    /// Offers waiting here that had lapsed, for their cards.
+    lapsed: Vec<[u8; 16]>,
+    /// Our offers to the friend it let go of.
+    released: Vec<String>,
+    /// The empty form asking the friend to name them again did not go.
+    waits_owed: bool,
+}
+
+/// [`on_session_ended`] at `now`, with the session map already read.
+fn session_ended_at(
+    db: &Database,
+    inbound: &mut std::collections::HashMap<[u8; 16], InboundAttach>,
+    sessions: &std::collections::HashMap<[u8; 16], super::ed2k::upload::EmberSessionHandle>,
+    friend: &[u8; 16],
+    now: i64,
+    newer_session_active: bool,
+) -> SessionEnded {
+    let lapsed = settle_lapsed(db, inbound, sessions, now);
+    let released = db
+        .release_held_chat_attachment_offers(Some(&hex::encode(friend)), now + ATTACH_OFFER_TTL_SECS)
+        .unwrap_or_default();
+    let waits_owed = newer_session_active
+        && !released.is_empty()
+        && send_ext_over(sessions, friend, EMBER_EXT_ATTACH_WAITS, &[]).is_err();
+    let moved = unconfirm_held(inbound, friend, now);
+    record_lapses(db, &moved);
+    if newer_session_active {
+        name_unheld(inbound, sessions, friend, now);
+    }
+    SessionEnded { lapsed, released, waits_owed }
+}
+
+/// What a look at a held offer's file found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HeldLook {
+    /// No longer an offer of ours waiting on the friend (answered,
+    /// cancelled, lapsed): it stops being watched.
+    NotWaiting,
+    Found(HeldSource),
+    /// The look did not finish: the next tick tries again.
+    Failed,
+}
+
+/// One look, posted back to the network loop through
+/// `NetworkState::attach_held_tx`.
+pub(crate) struct HeldLooked {
+    xfer_id: [u8; 16],
+    look: HeldLook,
+}
+
+/// Start watching the file of an offer whose hold just started or resumed,
+/// against the root it was offered under (see
+/// [`attach_stream::check_held_source`]), unless it is watched already.
+fn watch_held_source(state: &mut NetworkState, db: &Arc<Database>, friend: [u8; 16], xfer_id: [u8; 16]) {
+    state.attach_held_sources.entry(xfer_id).or_insert(HeldWatch {
+        friend,
+        last: None,
+        gone_once: false,
+    });
+    start_held_look(state, db, xfer_id);
+}
+
+/// Look again at the file of every held offer, so the friend hears at once of
+/// one that changed or went and their card says so before they press Accept.
+/// On the half-minute tick: the stream would catch it too, but only after a
+/// dial the user waited on.
+pub(super) fn check_held_sources(state: &mut NetworkState, db: &Arc<Database>) {
+    let held: Vec<[u8; 16]> = state.attach_held_sources.keys().copied().collect();
+    for xfer_id in held {
+        start_held_look(state, db, xfer_id);
+    }
+}
+
+/// Look at one held offer's file on the blocking pool, unless a look at it is
+/// still running: a file on a share that is asleep holds up only its own
+/// look, never the network task or the next tick's. The entry stays in the
+/// map while it runs, so a look that fails leaves it watched.
+fn start_held_look(state: &mut NetworkState, db: &Arc<Database>, xfer_id: [u8; 16]) {
+    let Some(last) = state.attach_held_sources.get(&xfer_id).map(|watch| watch.last.clone()) else {
+        return;
+    };
+    if !state.attach_held_looking.insert(xfer_id) {
+        return;
+    }
+    let db = db.clone();
+    let report = state.attach_held_tx.clone();
+    tokio::spawn(async move {
+        let look = tokio::task::spawn_blocking(move || look_at_held(&db, &xfer_id, last.as_ref()))
+            .await
+            .unwrap_or(HeldLook::Failed);
+        let _ = report.send(HeldLooked { xfer_id, look });
+    });
+}
+
+/// [`attach_stream::check_held_source`] for one held offer, reading the file
+/// when that is what it takes to decide: its stamp moved, or the hash cache
+/// has no tree to compare the first look with. Blocking.
+fn look_at_held(db: &Database, xfer_id: &[u8; 16], last: Option<&SourceStamp>) -> HeldLook {
+    let xfer_hex = hex::encode(xfer_id);
+    let waiting = db
+        .chat_attachment(&xfer_hex)
+        .is_some_and(|row| row.direction == "sent" && row.status == "offered");
+    let Some((path, size, root_hex)) = waiting.then(|| db.chat_attachment_source(&xfer_hex)).flatten()
+    else {
+        return HeldLook::NotWaiting;
+    };
+    let mut root = [0u8; 32];
+    if hex::decode_to_slice(&root_hex, &mut root).is_err() {
+        return HeldLook::NotWaiting;
+    }
+    let path = PathBuf::from(path);
+    HeldLook::Found(match attach_stream::check_held_source(&path, size, &root, last) {
+        HeldSource::Checking => {
+            attach_stream::prewarm_attachment_hash(&path);
+            attach_stream::check_held_source(&path, size, &root, last)
+        }
+        found => found,
+    })
+}
+
+/// A look at a held offer's file, back on the network task.
+///
+/// A file found changed or gone by two looks in a row (see
+/// [`note_held_look`]) settles the offer as `source_gone` only while it is
+/// still `offered`, and the friend is told. One the friend accepted
+/// meanwhile is left to its stream, which refuses a changed file itself;
+/// settling it here would cut a transfer that may be serving the file as
+/// offered.
+pub(super) async fn apply_held_look(
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app: &tauri::AppHandle,
+    looked: HeldLooked,
+) {
+    let HeldLooked { xfer_id, look } = looked;
+    let Some(friend) = note_held_look(
+        &mut state.attach_held_sources,
+        &mut state.attach_held_looking,
+        xfer_id,
+        look,
+    ) else {
+        return;
+    };
+    let xfer_hex = hex::encode(xfer_id);
+    if !settle_held_source_gone(db, &xfer_hex) {
+        return;
+    }
+    emit_by_id(app, db, &xfer_hex);
+    info!(
+        "Chat attachment: the file for held {xfer_hex} changed or went; told {}",
+        crate::security::short_hash(&friend),
+    );
+    let body = attach::encode_attach_cancel(&xfer_id, AttachCancel::SourceGone);
+    let _ = send_ext(state, &friend, EMBER_EXT_ATTACH_CANCEL, &body).await;
+}
+
+/// Held offers being watched.
+pub(crate) type HeldSources = std::collections::HashMap<[u8; 16], HeldWatch>;
+
+/// One held offer being watched.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct HeldWatch {
+    /// The friend it is held for.
+    friend: [u8; 16],
+    /// How its file looked when last settled.
+    last: Option<SourceStamp>,
+    /// The last look that settled anything found it gone. One such look is
+    /// not enough: over a day of half-minute looks, some catch a save midway
+    /// through deleting and renaming, or truncating and writing.
+    gone_once: bool,
+}
+
+/// Bring the watch up to date with a look at `xfer_id`'s file. Returns the
+/// friend to tell when the file changed or went, by two settling looks in a
+/// row, which are a tick apart; it stops being watched then, as it does once
+/// the offer is no longer waiting. Anything that settles nothing — a look
+/// that failed, a file being read or out of reach — leaves the watch as it
+/// was for the next tick.
+fn note_held_look(
+    sources: &mut HeldSources,
+    looking: &mut std::collections::HashSet<[u8; 16]>,
+    xfer_id: [u8; 16],
+    look: HeldLook,
+) -> Option<[u8; 16]> {
+    looking.remove(&xfer_id);
+    match look {
+        HeldLook::NotWaiting => {
+            sources.remove(&xfer_id);
+            None
+        }
+        HeldLook::Failed | HeldLook::Found(HeldSource::Checking | HeldSource::Unreadable) => None,
+        HeldLook::Found(HeldSource::Unchanged(stamp)) => {
+            if let Some(watch) = sources.get_mut(&xfer_id) {
+                watch.last = Some(stamp);
+                watch.gone_once = false;
+            }
+            None
+        }
+        HeldLook::Found(HeldSource::Gone) => {
+            let watch = sources.get_mut(&xfer_id)?;
+            if !watch.gone_once {
+                watch.gone_once = true;
+                return None;
+            }
+            sources.remove(&xfer_id).map(|watch| watch.friend)
+        }
+    }
+}
+
+fn settle_held_source_gone(db: &Database, xfer_hex: &str) -> bool {
+    db.reopen_chat_attachment(xfer_hex, &["offered"], "source_gone", None)
+        .unwrap_or(false)
+}
+
 // --- Either side ---------------------------------------------------------------
 
 /// Stop whatever this node is doing for `xfer_id` and clear its part file.
@@ -2312,15 +3086,7 @@ pub(super) fn on_cancel(
     if row.friend_hash != hex::encode(friend) {
         return;
     }
-    // An offer still waiting on us was withdrawn, whatever the sender calls
-    // it. Settling it as `failed` would make it look like a receive that broke.
-    let status = match reason {
-        _ if row.direction == "received" && row.status == "awaiting" => "cancelled",
-        AttachCancel::User => "cancelled",
-        AttachCancel::Unreachable => "unreachable",
-        AttachCancel::SourceGone => "source_gone",
-        AttachCancel::Stalled | AttachCancel::Corrupt => "failed",
-    };
+    let status = cancelled_as(&row.direction, &row.status, reason);
     info!(
         "Chat attachment: {} stopped {xfer_hex} ({reason:?})",
         crate::security::short_hash(&friend),
@@ -2345,6 +3111,22 @@ pub(super) fn on_cancel(
     }
 }
 
+/// What a friend's cancel settles our row as.
+///
+/// An offer still waiting on us was withdrawn, whatever the sender calls it:
+/// settling it as `failed` would make it look like a receive that broke. The
+/// one exception is a file the sender says is gone, which a held offer is told
+/// of before anyone presses Accept, and the card should say so.
+fn cancelled_as(direction: &str, status: &str, reason: AttachCancel) -> &'static str {
+    match reason {
+        AttachCancel::SourceGone => "source_gone",
+        _ if direction == "received" && status == "awaiting" => "cancelled",
+        AttachCancel::User => "cancelled",
+        AttachCancel::Unreachable => "unreachable",
+        AttachCancel::Stalled | AttachCancel::Corrupt => "failed",
+    }
+}
+
 /// A friend was removed. Their rows went with them, which already stops our
 /// grants resolving; what is left is in memory: offers of theirs waiting to be
 /// accepted and receives still pulling from them.
@@ -2353,6 +3135,8 @@ pub(super) fn forget_friend(state: &mut NetworkState, settings: &AppSettings, fr
         stop_local(state, settings, &xfer_id);
     }
     state.attach_auto_log.remove(friend);
+    state.attach_held_sources.retain(|_, watch| watch.friend != *friend);
+    state.attach_waits_owed.remove(friend);
     NEW_OFFER_RATE.lock().remove(friend);
 }
 
@@ -2381,12 +3165,16 @@ fn transfers_with(
 /// across processes. Both are marked and their part files cleared, so the
 /// transcript says what happened instead of showing a transfer that will never
 /// move. Unanswered offers of our own keep their grant until it lapses — the
-/// friend may still answer after we come back — and a send that was cut off
-/// goes back to `accepted`, since the friend's receive can resume against the
-/// same grant if it dials again.
+/// friend may still answer after we come back — except that one held for a
+/// friend keeping it is released like any other at a session's end, back on
+/// an offer's lifetime until the friend names it again over the next
+/// session. A send that was cut off goes back to `accepted`, since the
+/// friend's receive can resume against the same grant if it dials again.
 pub(super) fn sweep_interrupted(db: &Database, download_folders: &[String]) {
     let now = chrono::Utc::now().timestamp();
     let _ = db.expire_chat_attachments(now);
+    let _ = db.prune_settled_chat_attachments(now);
+    let _ = db.release_held_chat_attachment_offers(None, now + ATTACH_OFFER_TTL_SECS);
     let _ = db.requeue_interrupted_outbound_chat_attachments();
     let Ok(stranded) = db.interrupted_inbound_chat_attachments() else {
         return;
@@ -2587,34 +3375,87 @@ mod tests {
         // Could never reach us: offered again as the first offer was.
         let now = sent + 60;
         assert_eq!(
-            friend_retry_reopens(false, 0, sent, first_offer_lapses, now),
+            friend_retry_reopens(false, false, 0, sent, first_offer_lapses, now),
             Some(("offered", Some(now + ATTACH_OFFER_TTL_SECS)))
         );
         // Still so after the offer's own lifetime, within the day.
         let later = sent + 3_600;
         assert_eq!(
-            friend_retry_reopens(false, 0, sent, first_offer_lapses, later),
+            friend_retry_reopens(false, false, 0, sent, first_offer_lapses, later),
             Some(("offered", Some(later + ATTACH_OFFER_TTL_SECS)))
         );
         // But not past it.
         assert_eq!(
-            friend_retry_reopens(false, 2, sent, first_offer_lapses, sent + ATTACH_GRANT_TTL_SECS),
+            friend_retry_reopens(false, false, 2, sent, first_offer_lapses, sent + ATTACH_GRANT_TTL_SECS),
             None
         );
 
         // Had its grant: reopened inside it, unextended.
         let grant_ends = sent + 120 + ATTACH_GRANT_TTL_SECS;
         assert_eq!(
-            friend_retry_reopens(true, 1, sent, grant_ends, sent + 7_200),
+            friend_retry_reopens(true, false, 1, sent, grant_ends, sent + 7_200),
             Some(("accepted", None))
         );
-        assert_eq!(friend_retry_reopens(true, 1, sent, grant_ends, grant_ends), None);
+        assert_eq!(friend_retry_reopens(true, false, 1, sent, grant_ends, grant_ends), None);
         // A row from before grants were recorded whose expiry moved past the
         // offer's had one.
         assert_eq!(
-            friend_retry_reopens(false, 0, sent, grant_ends, sent + 7_200),
+            friend_retry_reopens(false, false, 0, sent, grant_ends, sent + 7_200),
             Some(("accepted", None))
         );
+    }
+
+    /// A held offer's expiry moved past the offer's without anyone accepting
+    /// it. Ended unanswered on its first attempt, it is not taken for a row
+    /// from before grants were recorded: a friend's retry reopens it as
+    /// offered, within the day the user's send had, not as accepted.
+    #[test]
+    fn a_held_but_unanswered_offer_reopens_as_offered_on_a_friends_retry() {
+        let sent = 1_000_000;
+        let held_until = sent + 10 + HELD_OFFER_GRANT_SECS;
+        let now = sent + 7_200;
+        assert_eq!(
+            friend_retry_reopens(false, true, 0, sent, held_until, now),
+            Some(("offered", Some(now + ATTACH_OFFER_TTL_SECS)))
+        );
+        assert_eq!(friend_retry_reopens(false, true, 0, sent, held_until, sent + ATTACH_GRANT_TTL_SECS), None);
+        assert_eq!(
+            friend_retry_reopens(true, true, 0, sent, held_until, now),
+            Some(("accepted", None)),
+            "one accepted while held had its grant"
+        );
+
+        let (db, path) = attach_db("friend-retry-held");
+        let (receiver_hex, at) = ("6b".repeat(16), 2_000_000);
+        let (sent_id, _) = offer_both_ends(&db, ("ec", "fc"), &receiver_hex, at);
+        assert_eq!(
+            answer_hold_note(&db, &sent_id, &receiver_hex, at + 1),
+            HoldAnswer::Echo(OfferHold::Started)
+        );
+        db.set_chat_attachment_status(&sent_id, "unreachable", None, None).expect("ended unanswered");
+        let expires = db.chat_attachment_expiry(&sent_id).expect("expiry");
+        let row = db.chat_attachment(&sent_id).expect("row");
+        let retried = at + 3_600;
+        let (status, expiry) = friend_retry_reopens(
+            db.chat_attachment_was_granted(&sent_id),
+            db.chat_attachment_was_held(&sent_id),
+            row.attempt,
+            row.created_at,
+            expires,
+            retried,
+        )
+        .expect("within the day");
+        assert_eq!(status, "offered");
+        assert!(db
+            .reopen_chat_attachment_for_friend(&sent_id, FRIEND_RETRYABLE_SENT, status, expiry)
+            .expect("reopen"));
+        assert_eq!(
+            answer_hold_note(&db, &sent_id, &receiver_hex, retried + 1),
+            HoldAnswer::Quiet,
+            "their note on the retry is not held, so their side stays on five minutes"
+        );
+        assert_eq!(db.chat_attachment_expiry(&sent_id), Some(retried + ATTACH_OFFER_TTL_SECS));
+        drop_attach_db(db, path);
     }
 
     /// What "Try again" is offered on: an ended send our user can re-offer, and
@@ -2750,6 +3591,8 @@ mod tests {
             name: "f".into(),
             received_at: 0,
             requested: false,
+            hold: InboundHold::Unnamed,
+            notes_owed: 0,
         };
         let inbound = std::collections::HashMap::from([
             ([10u8; 16], offer(gone, 10)),
@@ -2762,6 +3605,840 @@ mod tests {
         let mut found = transfers_with(&inbound, &fetches, &gone);
         found.sort();
         assert_eq!(found, vec![[10u8; 16], [20u8; 16]]);
+    }
+
+    fn attach_db(tag: &str) -> (Database, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "ember-chat-attach-{tag}-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        (Database::open_at(&path).expect("open db"), path)
+    }
+
+    fn drop_attach_db(db: Database, path: PathBuf) {
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    use crate::network::ed2k::upload::{attach_event_from_ext, EmberSessionHandle, UploadEventKind};
+    use std::collections::{HashMap, HashSet};
+
+    type Sessions = HashMap<[u8; 16], EmberSessionHandle>;
+
+    /// Both ends of one offer made at `at`, on an offer's lifetime, as each
+    /// records it: the sender's row and the receiver's waiting one. One
+    /// database holds both, so each gets an id of its own.
+    fn offer_both_ends(db: &Database, ids: (&str, &str), friend: &str, at: i64) -> (String, String) {
+        let (sent, received) = (ids.0.repeat(16), ids.1.repeat(16));
+        for (xfer, direction, status, source) in [
+            (&sent, "sent", "offered", Some("C:\\private\\f.bin")),
+            (&received, "received", "awaiting", None),
+        ] {
+            db.upsert_chat_attachment(
+                xfer,
+                friend,
+                direction,
+                "f.bin",
+                10,
+                &"33".repeat(32),
+                source,
+                status,
+                at,
+                at + ATTACH_OFFER_TTL_SECS,
+            )
+            .expect("insert");
+        }
+        (sent, received)
+    }
+
+    fn id_of(hex_id: &str) -> [u8; 16] {
+        let mut id = [0u8; 16];
+        hex::decode_to_slice(hex_id, &mut id).expect("hex id");
+        id
+    }
+
+    /// The receiver's waiting offer from `sender`, as `on_offer` leaves it,
+    /// having come in on a session from `addr`.
+    fn waiting_offer(sender: [u8; 16], xfer_id: [u8; 16], at: i64, addr: &str) -> InboundAttach {
+        InboundAttach {
+            friend: sender,
+            peer_pubkey: [0; 32],
+            peer_addr: Some(addr.parse().expect("addr")),
+            offer: AttachOffer {
+                xfer_id,
+                size: 10,
+                root: [0x33; 32],
+                quic_port: 41330,
+                name: "f.bin".into(),
+            },
+            name: "f.bin".into(),
+            received_at: at,
+            requested: false,
+            hold: InboundHold::Unnamed,
+            notes_owed: 0,
+        }
+    }
+
+    /// The receiver's session with `sender`, from `addr`, and what goes down
+    /// it. `waits` is whether the sender sent the empty form on it. Each test
+    /// has a sender of its own: the mark is shared by a friend's live
+    /// sessions.
+    fn session_from(
+        sender: [u8; 16],
+        addr: &str,
+        waits: bool,
+    ) -> (Sessions, tokio::sync::mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let handle = EmberSessionHandle::new_secure(tx, [0x44; 32], sender)
+            .with_peer_addr(Some(addr.parse().expect("addr")));
+        if waits {
+            handle.mark_holds_offers();
+        }
+        (Sessions::from([(sender, handle)]), rx)
+    }
+
+    /// The `EMBER_EXT_ATTACH_WAITS` frames that went down a session, as its
+    /// reader hands them to the loop.
+    fn notes_sent(wire: &mut tokio::sync::mpsc::Receiver<Vec<u8>>) -> Vec<Option<[u8; 16]>> {
+        let mut notes = Vec::new();
+        while let Ok(frame) = wire.try_recv() {
+            match attach_event_from_ext([0; 16], &frame[6..], None) {
+                Some(UploadEventKind::EmberAttachHeld { xfer_id, .. }) => notes.push(xfer_id),
+                _ => panic!("not an EMBER_EXT_ATTACH_WAITS frame"),
+            }
+        }
+        notes
+    }
+
+    /// An offer the receiver named over `sessions` and the sender held at
+    /// `at + 1`, with the echo taken. Returns where the sender's hold ends.
+    fn hold_both_ends(
+        db: &Database,
+        inbound: &mut HashMap<[u8; 16], InboundAttach>,
+        sessions: &Sessions,
+        (sent, xfer_id): (&str, [u8; 16]),
+        (sender, receiver_hex): ([u8; 16], &str),
+        at: i64,
+    ) -> i64 {
+        assert!(name_held_offer(inbound, sessions, &xfer_id), "named");
+        assert_eq!(
+            answer_hold_note(db, sent, receiver_hex, at + 1),
+            HoldAnswer::Echo(OfferHold::Started)
+        );
+        let lapses = confirm_held(inbound, &sender, &xfer_id, at + 1).expect("the echo");
+        db.set_chat_attachment_expiry(&hex::encode(xfer_id), lapses).expect("receiver keeps it");
+        db.chat_attachment_expiry(sent).expect("sender's expiry")
+    }
+
+    /// The whole round, as far as it runs without a network: the receiver
+    /// names the offer it leaves waiting (`hold_for_user`), the sender holds
+    /// it and echoes the note (`on_held`), only the echo gives the receiver
+    /// the day, and an Accept an hour later finds the offer here, the grant
+    /// there, and the session's address to dial (`respond`, `accept_offer`).
+    #[test]
+    fn an_offer_answered_after_an_hour_still_transfers() {
+        let (db, path) = attach_db("hour");
+        let (sender, receiver_hex) = ([0x71; 16], "61".repeat(16));
+        let at = 2_000_000;
+        let (sent, received) = offer_both_ends(&db, ("e1", "f1"), &receiver_hex, at);
+        let xfer_id = id_of(&received);
+        let mut inbound = HashMap::from([(xfer_id, waiting_offer(sender, xfer_id, at, "203.0.113.7:4662"))]);
+        let (sessions, mut wire) = session_from(sender, "203.0.113.7:4662", true);
+
+        assert!(name_held_offer(&mut inbound, &sessions, &xfer_id));
+        assert_eq!(notes_sent(&mut wire), vec![Some(xfer_id)]);
+        assert_eq!(
+            inbound[&xfer_id].lapses_at(),
+            at + ATTACH_OFFER_TTL_SECS,
+            "named is not held: still five minutes"
+        );
+        assert_eq!(
+            answer_hold_note(&db, &sent, &receiver_hex, at + 1),
+            HoldAnswer::Echo(OfferHold::Started)
+        );
+        let lapses = confirm_held(&mut inbound, &sender, &xfer_id, at + 1).expect("the echo");
+        assert_eq!(lapses, at + HELD_OFFER_WAIT_SECS);
+        db.set_chat_attachment_expiry(&received, lapses).expect("receiver keeps it");
+
+        let answered = at + 3_600;
+        assert!(take_lapsed(&mut inbound, answered).is_empty(), "still answerable here");
+        assert!(db.expire_chat_attachments(answered).expect("sweep").is_empty());
+        assert_eq!(db.chat_attachment(&received).expect("row").status, "awaiting");
+        assert!(why_unanswerable(&inbound, &db, &xfer_id).is_none(), "the accept goes out");
+        assert_eq!(
+            session_peer_addr(&sessions, &sender),
+            Some(Some("203.0.113.7:4662".parse().unwrap()))
+        );
+        assert!(
+            db.chat_attachment_grant(&sent, &receiver_hex, answered).is_some(),
+            "the dial that follows the accept is served"
+        );
+        let expiry = db.chat_attachment_expiry(&sent).expect("expiry");
+        assert_eq!(accept_extends_grant("offered", expiry, answered), Some(true));
+        drop_attach_db(db, path);
+    }
+
+    /// The receiver lets go first, so the last accept it can send still finds
+    /// the grant; after that both cards say the offer expired.
+    #[test]
+    fn an_offer_answered_after_the_wait_fails_cleanly_on_both_ends() {
+        let (db, path) = attach_db("lapsed");
+        let (sender, receiver_hex) = ([0x72; 16], "62".repeat(16));
+        let at = 2_000_000;
+        let (sent, received) = offer_both_ends(&db, ("e2", "f2"), &receiver_hex, at);
+        let xfer_id = id_of(&received);
+        let mut inbound = HashMap::from([(xfer_id, waiting_offer(sender, xfer_id, at, "203.0.113.8:4662"))]);
+        let (sessions, _wire) = session_from(sender, "203.0.113.8:4662", true);
+        let sender_expiry = hold_both_ends(
+            &db,
+            &mut inbound,
+            &sessions,
+            (&sent, xfer_id),
+            (sender, &receiver_hex),
+            at,
+        );
+        let lapses = inbound[&xfer_id].lapses_at();
+
+        let in_flight = 60;
+        assert_eq!(
+            accept_extends_grant("offered", sender_expiry, lapses - 1 + in_flight),
+            Some(true)
+        );
+
+        assert_eq!(take_lapsed(&mut inbound, lapses).len(), 1);
+        assert_eq!(db.expire_chat_attachments(lapses).expect("sweep"), vec![received.clone()]);
+        assert_eq!(db.chat_attachment(&received).expect("row").status, "expired");
+        let (why, _) = why_unanswerable(&inbound, &db, &xfer_id).expect("lapsed");
+        assert_eq!(why, not_found(), "answered without a dial");
+
+        assert!(sender_expiry > lapses);
+        assert_eq!(db.expire_chat_attachments(sender_expiry).expect("sweep"), vec![sent.clone()]);
+        assert_eq!(db.chat_attachment(&sent).expect("row").status, "expired");
+        assert!(db.chat_attachment_grant(&sent, &receiver_hex, sender_expiry).is_none());
+        assert_eq!(accept_extends_grant("offered", sender_expiry, sender_expiry), None);
+        drop_attach_db(db, path);
+    }
+
+    /// 1.7.4 sends neither form. An offer from it is never named — its session
+    /// is not marked, so `hold_for_user` sends nothing it would not read — and
+    /// lapses here at five minutes. An offer to it is never named back, so
+    /// nothing holds it there, and our card reads as unanswered.
+    #[test]
+    fn offers_to_and_from_a_build_that_never_said_it_waits_lapse_at_five_minutes() {
+        let (db, path) = attach_db("old-peer");
+        let (sender, receiver_hex) = ([0x73; 16], "63".repeat(16));
+        let at = 2_000_000;
+        let (sent, received) = offer_both_ends(&db, ("e3", "f3"), &receiver_hex, at);
+        let lapsed = at + ATTACH_OFFER_TTL_SECS;
+
+        let xfer_id = id_of(&received);
+        let mut inbound = HashMap::from([(xfer_id, waiting_offer(sender, xfer_id, at, "203.0.113.9:4662"))]);
+        let (sessions, mut wire) = session_from(sender, "203.0.113.9:4662", false);
+        assert!(!name_held_offer(&mut inbound, &sessions, &xfer_id));
+        assert!(notes_sent(&mut wire).is_empty());
+        assert_eq!(inbound[&xfer_id].hold, InboundHold::Unnamed);
+        assert_eq!(confirm_held(&mut inbound, &sender, &xfer_id, at + 1), None, "nor is a stray echo taken");
+        assert!(take_lapsed(&mut inbound, lapsed - 1).is_empty());
+        assert_eq!(take_lapsed(&mut inbound, lapsed).len(), 1);
+
+        assert!(db.chat_attachment_grant(&sent, &receiver_hex, lapsed - 1).is_some());
+        assert!(db.expire_chat_attachments(lapsed).expect("sweep").contains(&sent));
+        let card = ChatAttachmentInfo::from_row(&db.chat_attachment(&sent).expect("row"));
+        assert_eq!((card.direction.as_str(), card.status.as_str()), ("sent", "expired"));
+        assert!(card.retryable, "and the user can send it again");
+        assert!(db.chat_attachment_grant(&sent, &receiver_hex, lapsed).is_none());
+        let late = db
+            .hold_chat_attachment_offer(
+                &sent,
+                &receiver_hex,
+                lapsed + 1,
+                lapsed + 1 + ATTACH_OFFER_TTL_SECS,
+                HELD_OFFER_GRANT_SECS,
+            )
+            .expect("hold");
+        assert!(!late.is_held(), "a late note cannot revive it");
+        drop_attach_db(db, path);
+    }
+
+    /// A sleep or a redial replaces the session an offer was held over, and
+    /// each end hears of the old one's end in its own time. In either order the
+    /// sender's release and the receiver's naming it again leave both holding
+    /// it to where the first hold ended, and the accept dials the new
+    /// session's address, not the one the offer came in on. Driven through
+    /// what `on_session_ended` and `on_friend_waits` run, each end over the
+    /// session it routes through.
+    #[test]
+    fn a_held_offer_survives_a_session_replacement_with_both_ends_agreeing() {
+        let (db, path) = attach_db("replaced");
+        let (sender, receiver_hex) = ([0x75; 16], "65".repeat(16));
+        let receiver = id_of(&receiver_hex);
+        let at = 2_000_000;
+        let (sent, received) = offer_both_ends(&db, ("e6", "f6"), &receiver_hex, at);
+        let xfer_id = id_of(&received);
+        let mut inbound = HashMap::from([(xfer_id, waiting_offer(sender, xfer_id, at, "203.0.113.10:4662"))]);
+        let (old, _old_wire) = session_from(sender, "203.0.113.10:4662", true);
+        let first_end = hold_both_ends(
+            &db,
+            &mut inbound,
+            &old,
+            (&sent, xfer_id),
+            (sender, &receiver_hex),
+            at,
+        );
+        let (new, mut new_wire) = session_from(sender, "198.51.100.4:4662", true);
+        let (to_receiver, mut sender_wire) = session_from(receiver, "203.0.113.20:4662", true);
+        let ended = at + 3_600;
+
+        // The sender hears first: it releases, and asks over the new session.
+        let mut senders_inbound = HashMap::new();
+        assert_eq!(
+            session_ended_at(&db, &mut senders_inbound, &to_receiver, &receiver, ended, true),
+            SessionEnded { released: vec![sent.clone()], ..SessionEnded::default() }
+        );
+        assert_eq!(db.chat_attachment_expiry(&sent), Some(ended + ATTACH_OFFER_TTL_SECS));
+        assert_eq!(notes_sent(&mut sender_wire), vec![None], "the empty form");
+        assert!(friend_waits_at(&db, &mut inbound, &new, &sender, ended).is_empty());
+        assert_eq!(inbound[&xfer_id].hold, InboundHold::Named { since: ended });
+        assert_eq!(db.chat_attachment_expiry(&received), Some(ended + ATTACH_OFFER_TTL_SECS));
+        assert_eq!(notes_sent(&mut new_wire), vec![Some(xfer_id)]);
+        assert_eq!(
+            answer_hold_note(&db, &sent, &receiver_hex, ended + 1),
+            HoldAnswer::Echo(OfferHold::Resumed)
+        );
+        assert_eq!(db.chat_attachment_expiry(&sent), Some(first_end), "to where the first hold ended");
+        assert_eq!(
+            confirm_held(&mut inbound, &sender, &xfer_id, ended + 1),
+            Some(at + HELD_OFFER_WAIT_SECS)
+        );
+
+        // Then the receiver hears of it: back on five minutes and named again
+        // over the new session, and the sender, still holding it, says so.
+        assert_eq!(
+            session_ended_at(&db, &mut inbound, &new, &sender, ended + 5, true),
+            SessionEnded::default(),
+            "nothing of its own to release, so no empty form"
+        );
+        assert_eq!(inbound[&xfer_id].hold, InboundHold::Named { since: ended + 5 });
+        assert_eq!(notes_sent(&mut new_wire), vec![Some(xfer_id)]);
+        assert_eq!(
+            answer_hold_note(&db, &sent, &receiver_hex, ended + 6),
+            HoldAnswer::Echo(OfferHold::Standing)
+        );
+        assert_eq!(
+            confirm_held(&mut inbound, &sender, &xfer_id, ended + 6),
+            Some(at + HELD_OFFER_WAIT_SECS)
+        );
+        assert!(inbound[&xfer_id].lapses_at() < first_end, "the receiver still lets go first");
+
+        let answered = at + 5 * 3_600;
+        assert!(take_lapsed(&mut inbound, answered).is_empty());
+        assert!(why_unanswerable(&inbound, &db, &xfer_id).is_none());
+        assert!(db.chat_attachment_grant(&sent, &receiver_hex, answered).is_some());
+        let dial = session_peer_addr(&new, &sender).expect("a session").expect("direct");
+        assert_eq!(dial, "198.51.100.4:4662".parse().unwrap());
+        assert_ne!(Some(dial), inbound[&xfer_id].peer_addr);
+        drop_attach_db(db, path);
+    }
+
+    /// Each end of a crossed pair of dials routes through the connection it
+    /// dialled and reads the friend's frames on the other. The sender's dies:
+    /// its own slot there, a duplicate at the receiver. The sender has no
+    /// session left to ask over; the receiver hears of the end too, puts the
+    /// offer back on five minutes and names it over its own dial, so the
+    /// sender, which let it go, holds it again.
+    #[test]
+    fn a_duplicate_sessions_end_puts_both_ends_of_a_crossed_pair_back_in_step() {
+        let (db, path) = attach_db("crossed");
+        let (sender, receiver_hex) = ([0x7d; 16], "6f".repeat(16));
+        let receiver = id_of(&receiver_hex);
+        let at = 2_000_000;
+        let (sent, received) = offer_both_ends(&db, ("e0", "f0"), &receiver_hex, at);
+        let xfer_id = id_of(&received);
+        let mut inbound = HashMap::from([(xfer_id, waiting_offer(sender, xfer_id, at, "203.0.113.60:4662"))]);
+        let (receivers_dial, mut receivers_wire) = session_from(sender, "203.0.113.60:4662", true);
+        let first_end = hold_both_ends(
+            &db,
+            &mut inbound,
+            &receivers_dial,
+            (&sent, xfer_id),
+            (sender, &receiver_hex),
+            at,
+        );
+        assert_eq!(notes_sent(&mut receivers_wire), vec![Some(xfer_id)]);
+
+        let ended = at + 3_600;
+        assert_eq!(
+            session_ended_at(&db, &mut HashMap::new(), &Sessions::new(), &receiver, ended, false),
+            SessionEnded { released: vec![sent.clone()], ..SessionEnded::default() },
+            "nothing to ask over"
+        );
+        assert_eq!(
+            session_ended_at(&db, &mut inbound, &receivers_dial, &sender, ended + 1, true),
+            SessionEnded::default()
+        );
+        assert_eq!(inbound[&xfer_id].hold, InboundHold::Named { since: ended + 1 });
+        assert_eq!(db.chat_attachment_expiry(&received), Some(ended + 1 + ATTACH_OFFER_TTL_SECS));
+        assert_eq!(notes_sent(&mut receivers_wire), vec![Some(xfer_id)]);
+        assert_eq!(
+            answer_hold_note(&db, &sent, &receiver_hex, ended + 2),
+            HoldAnswer::Echo(OfferHold::Resumed)
+        );
+        assert_eq!(db.chat_attachment_expiry(&sent), Some(first_end));
+        assert_eq!(
+            confirm_held(&mut inbound, &sender, &xfer_id, ended + 2),
+            Some(at + HELD_OFFER_WAIT_SECS)
+        );
+        drop_attach_db(db, path);
+    }
+
+    /// An offer that lapsed here is not named again when a new session says
+    /// it waits or a session ends: the sender would hold for a day an offer
+    /// both cards already call expired. It is settled instead.
+    #[test]
+    fn a_lapsed_offer_is_settled_rather_than_named_again() {
+        let (db, path) = attach_db("lapsed-rename");
+        let (sender, receiver_hex) = ([0x7b; 16], "6d".repeat(16));
+        let at = 2_000_000;
+        let (sent, received) = offer_both_ends(&db, ("ee", "fe"), &receiver_hex, at);
+        let xfer_id = id_of(&received);
+        let mut inbound = HashMap::from([(xfer_id, waiting_offer(sender, xfer_id, at, "203.0.113.40:4662"))]);
+        let (sessions, mut wire) = session_from(sender, "203.0.113.40:4662", true);
+        assert!(name_held_offer(&mut inbound, &sessions, &xfer_id));
+        assert_eq!(notes_sent(&mut wire), vec![Some(xfer_id)]);
+
+        let lapsed = at + ATTACH_OFFER_TTL_SECS;
+        let swept = db.expire_chat_attachments(lapsed + 10).expect("sweep");
+        assert!(swept.contains(&sent) && swept.contains(&received), "the echo never came");
+        assert_eq!(name_unheld(&mut inbound, &sessions, &sender, lapsed + 10), 0);
+        assert_eq!(friend_waits_at(&db, &mut inbound, &sessions, &sender, lapsed + 20), vec![xfer_id]);
+        assert!(inbound.is_empty());
+        assert!(notes_sent(&mut wire).is_empty(), "not named again");
+        assert_eq!(db.chat_attachment(&received).expect("row").status, "expired");
+        assert_eq!(
+            answer_hold_note(&db, &sent, &receiver_hex, lapsed + 21),
+            HoldAnswer::Cancel(AttachCancel::User)
+        );
+
+        let mut held = waiting_offer(sender, xfer_id, at, "203.0.113.40:4662");
+        held.hold = InboundHold::Held;
+        inbound.insert(xfer_id, held);
+        let day = at + HELD_OFFER_WAIT_SECS;
+        let ended = session_ended_at(&db, &mut inbound, &sessions, &sender, day, true);
+        assert_eq!(ended.lapsed, vec![xfer_id], "past its day");
+        assert!(inbound.is_empty());
+        assert!(notes_sent(&mut wire).is_empty());
+        drop_attach_db(db, path);
+    }
+
+    /// A session to `peer` whose queue is full, as a stalled writer leaves
+    /// it, marked as holding offers, and the wire that empties it.
+    fn full_session(peer: [u8; 16], addr: &str) -> (Sessions, tokio::sync::mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(Vec::new()).expect("fill");
+        let handle = EmberSessionHandle::new_secure(tx, [0x44; 32], peer)
+            .with_peer_addr(Some(addr.parse().expect("addr")));
+        handle.mark_holds_offers();
+        (Sessions::from([(peer, handle)]), rx)
+    }
+
+    /// A note or an empty form the session had no room for goes again on the
+    /// next ticks, and is given up after `OWED_HOLD_TRIES` of them, which
+    /// leaves the next session's empty form to start the round again.
+    #[test]
+    fn a_note_or_empty_form_that_found_no_room_is_sent_again_a_few_times() {
+        let (db, path) = attach_db("owed");
+        let (sender, receiver_hex) = ([0x7a; 16], "6c".repeat(16));
+        let receiver = id_of(&receiver_hex);
+        let at = 2_000_000;
+        let (sent, received) = offer_both_ends(&db, ("ed", "fd"), &receiver_hex, at);
+        let xfer_id = id_of(&received);
+        let mut inbound = HashMap::from([(xfer_id, waiting_offer(sender, xfer_id, at, "203.0.113.30:4662"))]);
+        let mut waits_owed = HashMap::new();
+
+        let (full, mut wire) = full_session(sender, "203.0.113.30:4662");
+        assert!(!name_held_offer(&mut inbound, &full, &xfer_id));
+        assert_eq!((inbound[&xfer_id].notes_owed, inbound[&xfer_id].hold), (OWED_HOLD_TRIES, InboundHold::Unnamed));
+        retry_owed_at(&mut waits_owed, &mut inbound, &full, at + 30);
+        assert_eq!(inbound[&xfer_id].notes_owed, OWED_HOLD_TRIES - 1);
+        assert_eq!(wire.try_recv().expect("what filled it"), Vec::<u8>::new());
+        retry_owed_at(&mut waits_owed, &mut inbound, &full, at + 60);
+        assert_eq!(notes_sent(&mut wire), vec![Some(xfer_id)]);
+        assert_eq!((inbound[&xfer_id].notes_owed, inbound[&xfer_id].hold), (0, InboundHold::Named { since: at }));
+        retry_owed_at(&mut waits_owed, &mut inbound, &full, at + 90);
+        assert!(notes_sent(&mut wire).is_empty(), "nothing more is owed");
+
+        assert_eq!(
+            answer_hold_note(&db, &sent, &receiver_hex, at + 61),
+            HoldAnswer::Echo(OfferHold::Started)
+        );
+        let (to_receiver, mut sender_wire) = full_session(receiver, "203.0.113.31:4662");
+        let mut senders_inbound = HashMap::new();
+        let ended = at + 600;
+        let heard = session_ended_at(&db, &mut senders_inbound, &to_receiver, &receiver, ended, true);
+        assert_eq!((heard.released, heard.waits_owed), (vec![sent.clone()], true));
+        owe_waits(&mut waits_owed, receiver);
+        owe_waits(&mut waits_owed, receiver);
+        for tick in 1..i64::from(OWED_HOLD_TRIES) {
+            retry_owed_at(&mut waits_owed, &mut senders_inbound, &to_receiver, ended + 30 * tick);
+        }
+        assert_eq!(waits_owed.get(&receiver), Some(&1), "owed once, and one try left");
+        assert_eq!(sender_wire.try_recv().expect("what filled it"), Vec::<u8>::new());
+        retry_owed_at(&mut waits_owed, &mut senders_inbound, &to_receiver, ended + 120);
+        assert_eq!(notes_sent(&mut sender_wire), vec![None]);
+        assert!(waits_owed.is_empty());
+
+        let (stuck, _stuck_wire) = full_session(sender, "203.0.113.30:4662");
+        let mut named_again = waiting_offer(sender, xfer_id, ended, "203.0.113.30:4662");
+        named_again.hold = InboundHold::Named { since: ended };
+        inbound.insert(xfer_id, named_again);
+        assert!(!name_held_offer(&mut inbound, &stuck, &xfer_id));
+        owe_waits(&mut waits_owed, sender);
+        for tick in 1..=i64::from(OWED_HOLD_TRIES) {
+            retry_owed_at(&mut waits_owed, &mut inbound, &stuck, ended + 30 * tick);
+        }
+        assert!(waits_owed.is_empty(), "never any room: given up");
+        assert_eq!(inbound[&xfer_id].notes_owed, 0);
+        drop_attach_db(db, path);
+    }
+
+    /// An offer that came before the sender said it waits — its queued files
+    /// go out the moment a session is up, ahead of its empty form — could not
+    /// be named then, and nothing is owed for it. The empty form names it.
+    #[test]
+    fn an_offer_that_came_before_the_senders_empty_form_is_named_by_it() {
+        let (db, path) = attach_db("unnamed");
+        let (sender, receiver_hex) = ([0x7c; 16], "6e".repeat(16));
+        let at = 2_000_000;
+        let (sent, received) = offer_both_ends(&db, ("ef", "ff"), &receiver_hex, at);
+        let xfer_id = id_of(&received);
+        let mut inbound = HashMap::from([(xfer_id, waiting_offer(sender, xfer_id, at, "203.0.113.50:4662"))]);
+        let (sessions, mut wire) = session_from(sender, "203.0.113.50:4662", false);
+        assert!(!name_held_offer(&mut inbound, &sessions, &xfer_id));
+        assert_eq!(inbound[&xfer_id].notes_owed, 0);
+
+        sessions[&sender].mark_holds_offers();
+        assert!(friend_waits_at(&db, &mut inbound, &sessions, &sender, at + 2).is_empty());
+        assert_eq!(notes_sent(&mut wire), vec![Some(xfer_id)]);
+        assert_eq!(inbound[&xfer_id].hold, InboundHold::Named { since: at });
+        assert_eq!(inbound[&xfer_id].lapses_at(), at + ATTACH_OFFER_TTL_SECS, "named is not held");
+        assert_eq!(
+            answer_hold_note(&db, &sent, &receiver_hex, at + 3),
+            HoldAnswer::Echo(OfferHold::Started)
+        );
+        assert_eq!(
+            confirm_held(&mut inbound, &sender, &xfer_id, at + 3),
+            Some(at + HELD_OFFER_WAIT_SECS)
+        );
+        drop_attach_db(db, path);
+    }
+
+    /// Accepting while the session is relayed leaves the offer waiting for a
+    /// direct one, as having no session does; only an address that can never
+    /// be dialled ends it.
+    #[test]
+    fn an_accept_over_a_relayed_session_keeps_the_offer_waiting() {
+        let friend = [0x7e; 16];
+        let offered: SocketAddr = "203.0.113.70:4662".parse().unwrap();
+        let now_at: SocketAddr = "198.51.100.7:4662".parse().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let relayed = Sessions::from([(
+            friend,
+            EmberSessionHandle::new_secure(tx, [0x44; 32], friend).via_relay(true),
+        )]);
+        assert_eq!(
+            accept_dial(session_peer_addr(&relayed, &friend), Some(offered), 41330),
+            AcceptDial::Relayed
+        );
+        assert_eq!(
+            accept_dial(Some(Some(now_at)), Some(offered), 41330),
+            AcceptDial::To("198.51.100.7:41330".parse().unwrap(), Some(now_at))
+        );
+        assert_eq!(
+            accept_dial(None, Some(offered), 41330),
+            AcceptDial::To("203.0.113.70:41330".parse().unwrap(), Some(offered))
+        );
+        assert_eq!(accept_dial(Some(Some(now_at)), Some(offered), 0), AcceptDial::Nowhere);
+        assert_eq!(accept_dial(None, None, 41330), AcceptDial::Nowhere);
+    }
+
+    /// No session back within the five minutes a release leaves: both ends
+    /// let the offer go, and a note naming it on the next session is answered
+    /// with a cancel rather than an accept that would fail.
+    #[test]
+    fn a_held_offer_whose_session_stays_gone_lapses_on_both_ends() {
+        let (db, path) = attach_db("gone-session");
+        let (sender, receiver_hex) = ([0x76; 16], "66".repeat(16));
+        let at = 2_000_000;
+        let (sent, received) = offer_both_ends(&db, ("e7", "f7"), &receiver_hex, at);
+        let xfer_id = id_of(&received);
+        let mut inbound = HashMap::from([(xfer_id, waiting_offer(sender, xfer_id, at, "203.0.113.11:4662"))]);
+        let (sessions, _wire) = session_from(sender, "203.0.113.11:4662", true);
+        hold_both_ends(&db, &mut inbound, &sessions, (&sent, xfer_id), (sender, &receiver_hex), at);
+
+        let ended = at + 600;
+        db.release_held_chat_attachment_offers(Some(&receiver_hex), ended + ATTACH_OFFER_TTL_SECS)
+            .expect("release");
+        unconfirm_held(&mut inbound, &sender, ended);
+        let back = ended + 2 * ATTACH_OFFER_TTL_SECS;
+        assert_eq!(take_lapsed(&mut inbound, back).len(), 1, "the receiver let it go");
+        assert!(db.expire_chat_attachments(back).expect("sweep").contains(&sent), "and so did the sender");
+        assert_eq!(
+            answer_hold_note(&db, &sent, &receiver_hex, back),
+            HoldAnswer::Cancel(AttachCancel::User)
+        );
+        drop_attach_db(db, path);
+    }
+
+    /// A sender that will not hold says so by not echoing, and the receiver
+    /// stays on five minutes. Here a "Try again" re-offer went out already
+    /// accepted, the receiver's accept fell back to asking and named it, and
+    /// the sender, whose row is not `offered`, does not hold it. One that is
+    /// over there is answered with a cancel.
+    #[test]
+    fn a_refused_hold_leaves_the_receiver_on_five_minutes() {
+        let (db, path) = attach_db("refused");
+        let (sender, receiver_hex) = ([0x77; 16], "67".repeat(16));
+        let at = 2_000_000;
+        let (sent, received) = offer_both_ends(&db, ("e8", "f8"), &receiver_hex, at);
+        db.set_chat_attachment_status(&sent, "accepted", None, None).expect("re-offered accepted");
+        db.set_chat_attachment_expiry(&sent, at + ATTACH_GRANT_TTL_SECS).expect("its grant");
+        let xfer_id = id_of(&received);
+        let mut inbound = HashMap::from([(xfer_id, waiting_offer(sender, xfer_id, at, "203.0.113.12:4662"))]);
+        let (sessions, mut wire) = session_from(sender, "203.0.113.12:4662", true);
+
+        assert!(name_held_offer(&mut inbound, &sessions, &xfer_id));
+        assert_eq!(notes_sent(&mut wire).len(), 1);
+        assert_eq!(answer_hold_note(&db, &sent, &receiver_hex, at + 1), HoldAnswer::Quiet);
+        assert_eq!(db.chat_attachment_expiry(&sent), Some(at + ATTACH_GRANT_TTL_SECS), "nothing moved");
+        assert_eq!(inbound[&xfer_id].lapses_at(), at + ATTACH_OFFER_TTL_SECS);
+        assert_eq!(take_lapsed(&mut inbound, at + ATTACH_OFFER_TTL_SECS).len(), 1, "five minutes");
+
+        for (status, reason) in [
+            ("cancelled", AttachCancel::User),
+            ("expired", AttachCancel::User),
+            ("source_gone", AttachCancel::SourceGone),
+        ] {
+            db.set_chat_attachment_status(&sent, status, None, None).expect("status");
+            assert_eq!(
+                answer_hold_note(&db, &sent, &receiver_hex, at + 2),
+                HoldAnswer::Cancel(reason),
+                "{status}"
+            );
+        }
+        assert_eq!(
+            answer_hold_note(&db, &sent, &"68".repeat(16), at + 2),
+            HoldAnswer::Quiet,
+            "not an offer of ours to them: nothing is said"
+        );
+        assert_eq!(answer_hold_note(&db, &received, &receiver_hex, at + 2), HoldAnswer::Quiet);
+        drop_attach_db(db, path);
+    }
+
+    /// No note, however often or late, holds an offer past where its first
+    /// hold ended, and no echo or resync takes the receiver past a day from
+    /// the offer's arrival.
+    #[test]
+    fn repeated_notes_never_extend_a_hold() {
+        let (db, path) = attach_db("repeats");
+        let (sender, receiver_hex) = ([0x78; 16], "69".repeat(16));
+        let at = 2_000_000;
+        let (sent, received) = offer_both_ends(&db, ("e9", "f9"), &receiver_hex, at);
+        let xfer_id = id_of(&received);
+        let mut inbound = HashMap::from([(xfer_id, waiting_offer(sender, xfer_id, at, "203.0.113.13:4662"))]);
+        let (sessions, _wire) = session_from(sender, "203.0.113.13:4662", true);
+        let first_end = hold_both_ends(&db, &mut inbound, &sessions, (&sent, xfer_id), (sender, &receiver_hex), at);
+        assert_eq!(first_end, at + 1 + HELD_OFFER_GRANT_SECS);
+
+        for heard in [at + 2, at + 3_600, first_end - 60] {
+            assert_eq!(
+                answer_hold_note(&db, &sent, &receiver_hex, heard),
+                HoldAnswer::Echo(OfferHold::Standing)
+            );
+            assert_eq!(db.chat_attachment_expiry(&sent), Some(first_end), "at {heard}");
+        }
+        let ended = first_end - 200;
+        db.release_held_chat_attachment_offers(Some(&receiver_hex), ended + ATTACH_OFFER_TTL_SECS)
+            .expect("release");
+        for (heard, hold) in [(ended + 1, OfferHold::Resumed), (ended + 2, OfferHold::Standing)] {
+            assert_eq!(answer_hold_note(&db, &sent, &receiver_hex, heard), HoldAnswer::Echo(hold));
+            assert_eq!(db.chat_attachment_expiry(&sent), Some(first_end));
+        }
+
+        let day = at + HELD_OFFER_WAIT_SECS;
+        assert_eq!(confirm_held(&mut inbound, &sender, &xfer_id, at + 2), None, "held already");
+        unconfirm_held(&mut inbound, &sender, day - 10);
+        assert_eq!(inbound[&xfer_id].lapses_at(), day, "five minutes from then, but not past the day");
+        assert_eq!(confirm_held(&mut inbound, &sender, &xfer_id, day - 5), Some(day));
+        drop_attach_db(db, path);
+    }
+
+    /// The sender's watch on a held offer finds the file edited at the same
+    /// size — only its hash tells — and says so; the friend's waiting card
+    /// turns to "source gone", and Accept on it is answered from the row
+    /// before any dial. One the friend accepted meanwhile is left to its
+    /// stream.
+    #[test]
+    fn an_accept_after_the_file_changed_says_source_gone_without_dialing() {
+        let _own = attach_stream::isolate_hash_cache();
+        let (db, path) = attach_db("source-gone");
+        let (sender, receiver_hex) = ([0x79; 16], "6a".repeat(16));
+        let receiver = id_of(&receiver_hex);
+        let at = 2_000_000;
+        let source = std::env::temp_dir().join(format!(
+            "ember-chat-attach-held-{}-{}.bin",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(&source, b"offered bytes").expect("write");
+        let tree = attach_stream::hash_for_serving(&source).expect("hashed for the offer");
+        let source_str = source.to_string_lossy().into_owned();
+        let (sent, accepted, received) = ("ea".repeat(16), "eb".repeat(16), "fa".repeat(16));
+        for (xfer, direction, status, from) in [
+            (&sent, "sent", "offered", Some(source_str.as_str())),
+            (&accepted, "sent", "accepted", Some(source_str.as_str())),
+            (&received, "received", "awaiting", None),
+        ] {
+            db.upsert_chat_attachment(
+                xfer,
+                &receiver_hex,
+                direction,
+                "f.bin",
+                13,
+                &hex::encode(tree.root_hash),
+                from,
+                status,
+                at,
+                at + ATTACH_OFFER_TTL_SECS,
+            )
+            .expect("insert");
+        }
+        let held = id_of(&sent);
+        assert_eq!(
+            answer_hold_note(&db, &sent, &receiver_hex, at + 1),
+            HoldAnswer::Echo(OfferHold::Started)
+        );
+        let mut sources = HeldSources::from([(held, watching(receiver))]);
+        let mut looking = HashSet::from([held]);
+        let first = look_at_held(&db, &held, None);
+        let HeldLook::Found(HeldSource::Unchanged(stamp)) = &first else {
+            panic!("the first look finds the file as offered: {first:?}");
+        };
+        let stamp = stamp.clone();
+        assert_eq!(note_held_look(&mut sources, &mut looking, held, first), None);
+        assert_eq!(
+            sources[&held],
+            HeldWatch { friend: receiver, last: Some(stamp.clone()), gone_once: false }
+        );
+
+        std::fs::write(&source, b"edited bytes!").expect("same-size edit");
+        std::fs::File::options()
+            .write(true)
+            .open(&source)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now() + Duration::from_secs(10)))
+            .expect("move mtime");
+        let gone = look_at_held(&db, &held, Some(&stamp));
+        assert_eq!(gone, HeldLook::Found(HeldSource::Gone), "the size alone says nothing");
+        looking.insert(held);
+        assert_eq!(note_held_look(&mut sources, &mut looking, held, gone), None, "one look is not enough");
+        let again = look_at_held(&db, &held, Some(&stamp));
+        looking.insert(held);
+        assert_eq!(note_held_look(&mut sources, &mut looking, held, again), Some(receiver), "the next tick's is");
+        assert!(sources.is_empty() && looking.is_empty());
+        assert!(settle_held_source_gone(&db, &sent));
+        assert_eq!(db.chat_attachment(&sent).expect("row").status, "source_gone");
+        assert!(!settle_held_source_gone(&db, &sent), "once");
+        assert!(!settle_held_source_gone(&db, &accepted), "an accepted one is left to its stream");
+        assert_eq!(db.chat_attachment(&accepted).expect("row").status, "accepted");
+        assert_eq!(look_at_held(&db, &id_of(&accepted), None), HeldLook::NotWaiting);
+        let _ = std::fs::remove_file(&source);
+
+        let xfer_id = id_of(&received);
+        let mut inbound = HashMap::from([(xfer_id, waiting_offer(sender, xfer_id, at, "203.0.113.14:4662"))]);
+        let status = cancelled_as("received", "awaiting", AttachCancel::SourceGone);
+        assert_eq!(status, "source_gone");
+        assert!(db.advance_chat_attachment(&received, status, None, None).expect("cancel"));
+        inbound.remove(&xfer_id);
+        let (why, row) = why_unanswerable(&inbound, &db, &xfer_id).expect("no dial");
+        assert!(why.contains("\"peers_attach_source_gone\""), "{why}");
+        assert_eq!(why, source_gone());
+        assert_eq!(row.expect("the card catches up").status, "source_gone");
+
+        for reason in [AttachCancel::User, AttachCancel::Stalled, AttachCancel::Unreachable] {
+            assert_eq!(cancelled_as("received", "awaiting", reason), "cancelled", "{reason:?}");
+        }
+        assert_eq!(cancelled_as("received", "active", AttachCancel::Stalled), "failed");
+        drop_attach_db(db, path);
+    }
+
+    /// A look that did not finish, or found the file out of reach or still
+    /// being read, leaves the offer watched from its last stamp and free to be
+    /// looked at again; only a file that went, or an offer no longer waiting,
+    /// ends the watch.
+    #[test]
+    fn a_held_look_that_settles_nothing_keeps_the_offer_watched() {
+        let (held, friend) = ([0x91u8; 16], [0x92u8; 16]);
+        let mut sources = HeldSources::from([(held, watching(friend))]);
+        let mut looking = HashSet::new();
+        for look in [
+            HeldLook::Failed,
+            HeldLook::Found(HeldSource::Unreadable),
+            HeldLook::Found(HeldSource::Checking),
+        ] {
+            looking.insert(held);
+            assert_eq!(note_held_look(&mut sources, &mut looking, held, look), None);
+            assert!(looking.is_empty(), "free for the next tick");
+            assert_eq!(sources.get(&held), Some(&watching(friend)));
+        }
+        for settles in [None, Some(friend)] {
+            assert_eq!(
+                note_held_look(&mut sources, &mut looking, held, HeldLook::Found(HeldSource::Gone)),
+                settles
+            );
+        }
+        assert!(sources.is_empty());
+        sources.insert(held, watching(friend));
+        assert_eq!(note_held_look(&mut sources, &mut looking, held, HeldLook::NotWaiting), None);
+        assert!(sources.is_empty());
+    }
+
+    fn watching(friend: [u8; 16]) -> HeldWatch {
+        HeldWatch { friend, last: None, gone_once: false }
+    }
+
+    /// A save that deletes and renames, or truncates and writes, can be
+    /// caught midway by one look. A look that finds the file as offered again
+    /// clears it, and one that settles nothing neither counts nor clears: only
+    /// two settling looks in a row that find it gone end the offer.
+    #[test]
+    fn one_look_caught_mid_save_does_not_settle_a_held_offer() {
+        let _own = attach_stream::isolate_hash_cache();
+        let source = std::env::temp_dir().join(format!(
+            "ember-chat-attach-mid-save-{}-{}.bin",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(&source, b"as offered").expect("write");
+        let tree = attach_stream::hash_for_serving(&source).expect("hashed for the offer");
+        let HeldSource::Unchanged(stamp) = attach_stream::check_held_source(&source, 10, &tree.root_hash, None)
+        else {
+            panic!("the file as offered");
+        };
+        let _ = std::fs::remove_file(&source);
+
+        let (held, friend) = ([0x95u8; 16], [0x96u8; 16]);
+        let mut sources = HeldSources::from([(held, watching(friend))]);
+        let mut looking = HashSet::new();
+        let mut look = |found: HeldLook| note_held_look(&mut sources, &mut looking, held, found);
+        assert_eq!(look(HeldLook::Found(HeldSource::Gone)), None, "mid-save");
+        assert_eq!(look(HeldLook::Found(HeldSource::Unchanged(stamp))), None, "saved as it was");
+        assert_eq!(look(HeldLook::Found(HeldSource::Gone)), None, "a second save, mid-way");
+        assert_eq!(look(HeldLook::Failed), None);
+        assert_eq!(look(HeldLook::Found(HeldSource::Gone)), Some(friend));
+        assert!(sources.is_empty());
     }
 
     #[test]

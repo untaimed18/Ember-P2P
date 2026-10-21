@@ -1202,6 +1202,7 @@ pub(super) async fn handle_upload_event(
         | UploadEventKind::EmberBrowseSessionReady { .. }
         | UploadEventKind::EmberBrowseSessionFailed { .. }
         | UploadEventKind::EmberFriendDisconnected { .. }
+        | UploadEventKind::EmberFriendSessionEnded { .. }
         | UploadEventKind::EmberFriendConnected { .. }
         | UploadEventKind::FriendEndpointDiscovered { .. }
         | UploadEventKind::EmberFriendSearchFailed { .. }
@@ -1213,6 +1214,7 @@ pub(super) async fn handle_upload_event(
         | UploadEventKind::EmberAttachOffer { .. }
         | UploadEventKind::EmberAttachReply { .. }
         | UploadEventKind::EmberAttachCancel { .. }
+        | UploadEventKind::EmberAttachHeld { .. }
         | UploadEventKind::EmberRelayOffer { .. }
         | UploadEventKind::EmberDhtContactRequest { .. }
         | UploadEventKind::EmberDhtContacts { .. }

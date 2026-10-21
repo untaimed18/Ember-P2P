@@ -871,9 +871,7 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
             } else if let Some((channel_id, epoch)) =
                 state.ember_channel_epoch_searches.remove(&search_id)
             {
-                state
-                    .ember_pending_channel_epoch
-                    .push((channel_id, epoch, into_blobs(held)));
+                buffer_channel_epoch_records(state, channel_id, epoch, into_blobs(held));
             } else if let Some(channel_id) =
                 state.ember_channel_moderation_searches.remove(&search_id)
             {
@@ -885,6 +883,14 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
                 state
                     .ember_pending_channel_moderation
                     .push((channel_id, into_blobs(held), answered));
+            } else if let Some(channel_id) =
+                state.ember_channel_settings_searches.remove(&search_id)
+            {
+                // Nothing found changes nothing, so only a find is worth the write.
+                let blobs = into_blobs(held);
+                if !blobs.is_empty() {
+                    state.ember_pending_channel_settings.push((channel_id, blobs));
+                }
             } else if let Some(channel_id) =
                 state.ember_channel_handoff_searches.remove(&search_id)
             {

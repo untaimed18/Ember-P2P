@@ -805,6 +805,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let (xfer_finish_tx, mut xfer_finish_rx) = mpsc::unbounded_channel::<XferFinishResult>();
     let (xfer_stream_tx, xfer_stream_rx) = mpsc::unbounded_channel::<StreamFetchOutcome>();
     let (xfer_accept_tx, xfer_accept_rx) = mpsc::unbounded_channel::<XferAcceptPrepared>();
+    let (attach_held_tx, attach_held_rx) = mpsc::unbounded_channel::<chat_attach::HeldLooked>();
 
     // Before anything below can finish a download or sweep where finished
     // files land; `apply_network_settings` keeps it current from here.
@@ -1202,6 +1203,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_pending_channel_moderation: Vec::new(),
         channel_moderation_fetch_at: HashMap::new(),
         channel_moderation_publish_at: HashMap::new(),
+        channel_moderation_passes: HashMap::new(),
+        channel_settings_fetch_owed: HashSet::new(),
+        ember_channel_settings_searches: HashMap::new(),
+        ember_pending_channel_settings: Vec::new(),
+        channel_settings_published: HashMap::new(),
         channel_username_refresh_at: 0,
         rendezvous_url: settings.rendezvous_url.clone(),
         ember_channel_noise_keys: HashMap::new(),
@@ -1238,6 +1244,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         xfer_offer_policy: settings.channel_file_offers.clone(),
         xfer_friend_hashes: friend_hashes.clone(),
         attach_inbound: HashMap::new(),
+        attach_held_sources: HashMap::new(),
+        attach_waits_owed: HashMap::new(),
+        attach_held_looking: HashSet::new(),
+        attach_held_tx,
+        attach_held_rx,
         attach_fetches: HashMap::new(),
         attach_auto_log: HashMap::new(),
         attach_retry_asked: HashMap::new(),
@@ -1245,6 +1256,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         owned_rooms_published: None,
         owned_rooms_published_at: 0,
         ember_channel_epoch_searches: HashMap::new(),
+        ember_channel_epoch_buffer: HashMap::new(),
         ember_pending_channel_epoch: Vec::new(),
         channel_epoch_fetch_at: HashMap::new(),
         ember_channel_claim_searches: HashMap::new(),

@@ -3382,6 +3382,18 @@ async fn handle_command_inner(
             fanout_channel_gossip_body(socket, state, db, body, None).await;
         }
 
+        NetworkCommand::FanoutChannelChat { bodies } => {
+            if !settings.ember_native_enabled {
+                return;
+            }
+            for body in bodies {
+                if let Some(gossip) = ember::channel::ChannelGossip::decode(&body) {
+                    remember_originated_gossip(state, &gossip);
+                }
+                fanout_channel_gossip_body(socket, state, db, body, None).await;
+            }
+        }
+
         NetworkCommand::SendChannelTyping { channel_id, typing } => {
             if !settings.ember_native_enabled {
                 return;
@@ -3399,6 +3411,22 @@ async fn handle_command_inner(
             };
             let now = chrono::Utc::now().timestamp();
             start_channel_presence_fetch(socket, state, db, &ch, channel_id, now).await;
+        }
+
+        NetworkCommand::RefreshChannelOwnerRecords { channel_id } => {
+            refresh_channel_owner_records_now(socket, state, db, settings, channel_id).await;
+        }
+
+        NetworkCommand::ChannelKeysChanged { channel_id } => {
+            state.channel_epoch_fetch_at.remove(&channel_id);
+            let _ = app_handle.emit(
+                "ember:channel-moderation",
+                serde_json::json!({ "channel_id": hex::encode(channel_id) }),
+            );
+        }
+
+        NetworkCommand::PublishOwnedChannelSettings => {
+            maybe_publish_channel_settings(socket, state, db, settings).await;
         }
 
         NetworkCommand::AnnounceChannelPresence {

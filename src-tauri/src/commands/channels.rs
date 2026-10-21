@@ -18,6 +18,7 @@ use crate::network::ember::dht::publish::{
     ModerationTail, SignedRecord, CHANNEL_BAN_LIST_MAX, CHANNEL_MOD_LIST_MAX, CHANNEL_NAME_MAX,
     CHANNEL_PIN_MAX, CHANNEL_WELCOME_MAX,
 };
+use crate::network::channel_membership::{OfferedKey, OfferedKeyOutcome, RotatingRoom};
 use crate::network::ember::crypto;
 use crate::network::{EmberPublishPending, EmberPublishResult, NetworkCommand};
 use crate::storage::database::{
@@ -928,22 +929,24 @@ pub async fn create_channel(
             );
         }
     }
-    let presence = SignedRecord::channel_presence(
+    for presence in SignedRecord::channel_presence_forms(
         &nickname,
         ident.channel_id,
         ident.pubkey,
         &join_secret,
         private,
-        channel::presence_epoch(chrono::Utc::now().timestamp()),
+        false,
         &state.identity.noise_public_key,
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
-    );
-    if let Err(e) = queue_signed_record(&state, presence).await {
-        tracing::warn!(
-            channel_id = %channel_id_hex,
-            error = %e,
-            "room created but its presence record did not publish"
-        );
+        chrono::Utc::now().timestamp(),
+    ) {
+        if let Err(e) = queue_signed_record(&state, presence).await {
+            tracing::warn!(
+                channel_id = %channel_id_hex,
+                error = %e,
+                "room created but its presence record did not publish"
+            );
+        }
     }
     // From the same stamp sequence as every later snapshot, so an edit made in
     // the room's first second still outranks this one.
@@ -1115,14 +1118,36 @@ pub async fn join_channel(
                 "This channel has been deleted",
             ));
         }
-        // The invite's key is not taken for a room already held. An invite is
-        // unauthenticated, nothing signed commits to an epoch's key, and the
-        // store keeps the first key it is given for an epoch: a crafted invite
-        // would have this device seal under a key its author reads, and block
-        // the genuine one when it arrived.
         // Local rows already know `deleted`. A directory round-trip here made
         // re-entry wait on Rendezvous even though membership is local.
-        return enter_stored_channel(&state, &channel_id_hex, &username).await;
+        let channel_id = invite.channel_id;
+        let taken = tokio::task::spawn_blocking({
+            let db = db.clone();
+            move || take_committed_invite_key(&db, &row, &invite)
+        })
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?;
+        let waiting = match taken {
+            Ok(outcome) => {
+                if outcome.rekeyed {
+                    let _ = state
+                        .network_tx
+                        .try_send(NetworkCommand::ChannelKeysChanged { channel_id });
+                }
+                outcome.key == OfferedKey::Held
+            }
+            Err(e) => {
+                tracing::warn!(channel_id = %channel_id_hex, error = %e, "could not take the invite's key");
+                false
+            }
+        };
+        let entered = enter_stored_channel(&state, &channel_id_hex, &username).await?;
+        if waiting {
+            let _ = state
+                .network_tx
+                .try_send(NetworkCommand::RefreshChannelOwnerRecords { channel_id });
+        }
+        return Ok(entered);
     }
 
     refuse_deleted_channel(&state, &channel_id_hex).await?;
@@ -1371,6 +1396,30 @@ pub(crate) async fn enter_stored_channel(
     Ok(refreshed)
 }
 
+/// Take `invite`'s key for `row`, a room this device already holds, when the
+/// owner's commitment checks it, or keep it in memory for the owner's records
+/// to catch up with
+/// ([`crate::network::channel_membership::take_offered_key`]). A public
+/// invite, or one at epoch 0, which does not say which epoch its key is, is
+/// refused.
+fn take_committed_invite_key(
+    db: &Database,
+    row: &StoredChannel,
+    invite: &ChannelInvite,
+) -> anyhow::Result<OfferedKeyOutcome> {
+    let refused = OfferedKeyOutcome {
+        key: OfferedKey::Refused,
+        rekeyed: false,
+    };
+    let Ok(epoch) = i64::try_from(invite.key_epoch) else {
+        return Ok(refused);
+    };
+    if !invite.private || epoch < 1 {
+        return Ok(refused);
+    }
+    crate::network::channel_membership::take_offered_key(db, row, invite.channel_id, epoch, &invite.join_secret)
+}
+
 /// A private room whose current key this device does not hold yet: the owner
 /// has announced a newer epoch, or this is a recovered room of ours still
 /// fetching its key back. A failed read counts as behind.
@@ -1391,22 +1440,24 @@ async fn private_room_key_behind(state: &AppState, row: &StoredChannel) -> bool 
 }
 
 async fn publish_join_presence(state: &AppState, invite: &ChannelInvite, username: &str) {
-    let presence = SignedRecord::channel_presence(
+    for presence in SignedRecord::channel_presence_forms(
         username,
         invite.channel_id,
         invite.pubkey,
         &invite.join_secret,
         invite.private,
-        channel::presence_epoch(chrono::Utc::now().timestamp()),
+        false,
         &state.identity.noise_public_key,
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
-    );
-    if let Err(e) = queue_signed_record(state, presence).await {
-        tracing::warn!(
-            channel_id = %hex::encode(invite.channel_id),
-            error = %e,
-            "join presence did not publish"
-        );
+        chrono::Utc::now().timestamp(),
+    ) {
+        if let Err(e) = queue_signed_record(state, presence).await {
+            tracing::warn!(
+                channel_id = %hex::encode(invite.channel_id),
+                error = %e,
+                "join presence did not publish"
+            );
+        }
     }
     let _ = state
         .network_tx
@@ -1938,15 +1989,23 @@ pub async fn edit_channel_message(
             "Message must be between 1 and 4096 bytes",
         ));
     }
-    let edit_sig = channel::edit_author_signature(
+    let v2_text = channel::chat_v2_outgoing_text(&message, &cleaned, reply_parent.as_ref());
+    let revision = channel::outgoing_chat_edit(
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
-        &sender_pk,
         &channel_id_bytes,
         &msg_id_bytes,
         target.timestamp,
         edited_at,
         &wire_text,
-    );
+        &v2_text,
+        reply_parent.as_ref(),
+    )
+    .ok_or_else(|| {
+        coded(
+            "channels_message_size_invalid",
+            "Message must be between 1 and 4096 bytes",
+        )
+    })?;
 
     // The queue slot is claimed before the row is written, because the write
     // cannot be undone: `apply_channel_message_edit` overwrites the pre-edit
@@ -1962,11 +2021,12 @@ pub async fn edit_channel_message(
     let id_for_edit = channel_id.clone();
     let msg_id_for_edit = target.msg_id.clone();
     let sender_for_edit = sender.clone();
-    let text_for_edit = wire_text.clone();
-    let sig_hex = hex::encode(edit_sig);
+    let text_for_edit = revision.stored_text.clone();
+    let sig_hex = revision.legacy.as_ref().map(|(_, sig)| hex::encode(sig)).unwrap_or_default();
+    let v2_frame = revision.v2.clone();
     let original_ts = target.timestamp;
     let outcome = tokio::task::spawn_blocking(move || {
-        db.apply_channel_message_edit(
+        db.apply_channel_message_edit_with(
             &id_for_edit,
             &msg_id_for_edit,
             &sender_for_edit,
@@ -1975,6 +2035,7 @@ pub async fn edit_channel_message(
             &text_for_edit,
             &sig_hex,
             edited_at,
+            Some(&v2_frame),
         )
     })
     .await
@@ -2002,7 +2063,9 @@ pub async fn edit_channel_message(
                 "Only the author can edit a message",
             ));
         }
-        ChannelEditOutcome::NotNewer => {
+        // A revision of our own at this second is held already, from this or
+        // another of our devices; this one is not newer than it.
+        ChannelEditOutcome::NotNewer | ChannelEditOutcome::Paired { .. } => {
             return Err(coded(
                 "channels_edit_failed",
                 "A newer version of this message is already stored",
@@ -2018,38 +2081,27 @@ pub async fn edit_channel_message(
         }
     }
 
-    let plain = channel::encode_channel_chat_edit_presigned(
-        &sender_pk,
-        &msg_id_bytes,
-        target.timestamp,
-        edited_at,
-        &edit_sig,
-        &wire_text,
-    );
     let mut envelope_id = [0u8; 16];
     OsRng.fill_bytes(&mut envelope_id);
-    let gossip = channel::ChannelGossip::sealed(
+    let frames = chat_gossip_frames(
         channel_id_bytes,
-        envelope_id,
         &channel::content_key(&join_secret),
-        edited_at.max(0) as u64,
-        &plain,
-        channel::CHANNEL_MSG_TTL_DEFAULT,
+        &sender_pk,
+        envelope_id,
         edited_at,
+        &revision,
     );
     // Spends the slot claimed before the write. Nothing between the two can
-    // refuse it, so the revision on disk and the frame on the mesh are one
+    // refuse it, so the revision on disk and the frames on the mesh are one
     // outcome rather than two.
-    permit.send(NetworkCommand::FanoutChannelGossip {
-        body: gossip.encode(),
-    });
+    permit.send(NetworkCommand::FanoutChannelChat { bodies: frames });
     let _ = app.emit(
         "ember:channel-message-edited",
         serde_json::json!({
             "channel_id": channel_id,
             "id": message_id,
             "msg_id": target.msg_id,
-            "message": cleaned,
+            "message": v2_text,
             "edited_at": edited_at,
         }),
     );
@@ -2060,7 +2112,7 @@ pub async fn edit_channel_message(
         reply_to_me: reply_parent_is_mine(reply.parent.as_ref(), &sender),
         sender_pubkey: sender,
         direction: target.direction,
-        message: cleaned,
+        message: v2_text,
         timestamp: target.timestamp,
         read: true,
         edited_at,
@@ -2520,25 +2572,25 @@ pub async fn send_channel_message(
     let sender_pk = state.identity.ed25519_public_key;
     let sent_at = chrono::Utc::now().timestamp();
     let msg_id = channel::new_chat_msg_id(&channel_id_bytes, &sender_pk, sent_at);
-    let author_sig = channel::chat_author_signature(
+    // The v2 frame keeps the emoji joiners the legacy text has to strip.
+    let v2_text = channel::chat_v2_outgoing_text(&message, &cleaned, reply_parent.as_ref());
+    let Some(line) = channel::outgoing_chat_line(
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
-        &sender_pk,
         &channel_id_bytes,
         &msg_id,
         sent_at,
         &wire_text,
-    );
+        &v2_text,
+        reply_parent.as_ref(),
+    ) else {
+        refund_local_send(&channel_id);
+        return Err(coded(
+            "channels_message_size_invalid",
+            "Message must be between 1 and 4096 bytes",
+        ));
+    };
     let key = channel::content_key(&join_secret);
-    let plain = channel::encode_channel_chat_plain_presigned(&sender_pk, &author_sig, &wire_text);
-    let gossip = channel::ChannelGossip::sealed(
-        channel_id_bytes,
-        msg_id,
-        &key,
-        sent_at.max(0) as u64,
-        &plain,
-        channel::CHANNEL_MSG_TTL_DEFAULT,
-        sent_at,
-    );
+    let frames = chat_gossip_frames(channel_id_bytes, &key, &sender_pk, msg_id, sent_at, &line);
     // Stored before it is flooded, which is the order the edit path already
     // uses. The other way round, a failed insert left the line on every peer's
     // disk and on none of ours: the user was told the send failed, and the retry
@@ -2548,12 +2600,14 @@ pub async fn send_channel_message(
     let db = state.db.clone();
     let id = channel_id.clone();
     let sender2 = sender.clone();
-    // Stored as signed, trailer and all, so a catch-up re-serves the same bytes.
-    let text = wire_text.clone();
+    // Stored as signed, trailer and all, so a catch-up re-serves the same
+    // bytes: the v2 text, and beside it both frames' signatures.
+    let text = line.stored_text.clone();
     let msg_id_hex = hex::encode(msg_id);
-    let author_sig_hex = hex::encode(author_sig);
+    let author_sig_hex = line.legacy.as_ref().map(|(_, sig)| hex::encode(sig)).unwrap_or_default();
+    let v2_frame = line.v2.clone();
     let row_id = tokio::task::spawn_blocking(move || {
-        let row_id = db.insert_channel_message(
+        let row_id = db.insert_channel_message_with(
             &id,
             &sender2,
             "sent",
@@ -2562,6 +2616,7 @@ pub async fn send_channel_message(
             sent_at,
             &author_sig_hex,
             true,
+            Some(&v2_frame),
         )?;
         // Queued until the flood finds somebody. The network task flips it to
         // delivered on the same tick in the ordinary case, and to failed when
@@ -2586,9 +2641,7 @@ pub async fn send_channel_message(
 
     if let Err(e) = state
         .network_tx
-        .try_send(NetworkCommand::FanoutChannelGossip {
-            body: gossip.encode(),
-        })
+        .try_send(NetworkCommand::FanoutChannelChat { bodies: frames })
     {
         // Take the row back out. A line nobody was sent is not history, and
         // leaving it would show the sender a transcript the room does not have —
@@ -2620,7 +2673,7 @@ pub async fn send_channel_message(
         reply_to_me: reply_parent_is_mine(reply.parent.as_ref(), &sender),
         sender_pubkey: sender,
         direction: "sent".into(),
-        message: cleaned,
+        message: v2_text,
         timestamp: sent_at,
         read: true,
         edited_at: 0,
@@ -2784,6 +2837,38 @@ async fn load_owned_channel_as(
 /// across the DHT publish too, which is bounded by that call's own timeout.
 static MODERATION_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
 
+/// The sealed frames of one outgoing line or revision, the legacy one first so
+/// that a build reading only it meets it ahead of the frame it cannot read.
+/// `legacy_envelope` and `at` are the legacy frame's envelope id and time; the
+/// v2 frame carries its own.
+fn chat_gossip_frames(
+    channel_id: [u8; 16],
+    key: &[u8; 32],
+    sender: &[u8; 32],
+    legacy_envelope: [u8; 16],
+    at: i64,
+    chat: &channel::OutgoingChat,
+) -> Vec<Vec<u8>> {
+    let seal = |envelope_id: [u8; 16], at: i64, plain: &[u8]| {
+        channel::ChannelGossip::sealed(
+            channel_id,
+            envelope_id,
+            key,
+            at.max(0) as u64,
+            plain,
+            channel::CHANNEL_MSG_TTL_DEFAULT,
+            at,
+        )
+        .encode()
+    };
+    let mut frames = Vec::with_capacity(2);
+    if let Some((plain, _)) = &chat.legacy {
+        frames.push(seal(legacy_envelope, at, plain));
+    }
+    frames.push(seal(chat.v2.frame_id, chat.v2.signed_at, &chat.v2.plain(sender)));
+    frames
+}
+
 /// Our own outbound chat times, per room, for [`LOCAL_SEND_PER_MINUTE`].
 ///
 /// Session-scoped on purpose. A restart is not a loophole that matters here:
@@ -2938,6 +3023,43 @@ async fn owner_moderation_tail(state: &AppState, owned: &OwnedChannel) -> Modera
     }
 }
 
+/// Refuse an owner snapshot of `owned` that does not make one whole record
+/// with `tail`, its pins already fitted.
+///
+/// The `fits` check catches the commoner case, where the record would publish
+/// but the encoder would quietly drop entries past the cap, so the room would
+/// go on believing it had banned someone it had not.
+fn owner_snapshot_fits(
+    owned: &OwnedChannel,
+    topic: &str,
+    welcome: &str,
+    bans: &[[u8; 32]],
+    mods: &[[u8; 32]],
+    tail: &ModerationTail,
+) -> Result<(), String> {
+    let fits = crate::network::ember::dht::publish::moderation_snapshot_fits(topic, welcome, bans, mods, tail)
+        && SignedRecord::channel_moderation(
+            topic,
+            welcome,
+            bans,
+            mods,
+            tail,
+            owned.channel_id,
+            owned.ident.pubkey,
+            owned.row.visibility == CHANNEL_KIND_PRIVATE,
+            &owned.ident.signing_key,
+        )
+        .is_some();
+    if !fits {
+        return Err(coded(
+            "channels_moderation_too_large",
+            "This change does not fit in one published record. Shorten the welcome \
+             message, or remove some bans or moderators.",
+        ));
+    }
+    Ok(())
+}
+
 /// Whether `tail`'s pins all fit a record for this snapshot.
 fn owner_pins_fit(
     topic: &str,
@@ -2974,43 +3096,13 @@ async fn commit_channel_moderation_with(
     let tail = crate::network::ember::dht::publish::fit_moderation_pins(
         topic, welcome, bans, mods, &tail,
     );
-    let record = SignedRecord::channel_moderation(
-        topic,
-        welcome,
-        bans,
-        mods,
-        &tail,
-        owned.channel_id,
-        owned.ident.pubkey,
-        private,
-        &owned.ident.signing_key,
-    );
     // Refuse before touching the database. A moderation record is a full
     // snapshot, so one the network will not accept does not leave the previous
     // state standing — the last good copy simply expires, taking the topic,
     // welcome, both lists, the owner key, the key epoch and any successor
     // nomination with it. Reporting the edit as applied while that happens is
     // the worst of both.
-    //
-    // The `fits` check catches the commoner case, where the record would
-    // publish but the encoder would quietly drop entries past the cap, so the
-    // room would go on believing it had banned someone it had not.
-    if !crate::network::ember::dht::publish::moderation_snapshot_fits(
-        topic, welcome, bans, mods, &tail,
-    ) {
-        return Err(coded(
-            "channels_moderation_too_large",
-            "This change does not fit in one published record. Shorten the welcome \
-             message, or remove some bans or moderators.",
-        ));
-    }
-    if record.is_none() {
-        return Err(coded(
-            "channels_moderation_too_large",
-            "This change does not fit in one published record. Shorten the welcome \
-             message, or remove some bans or moderators.",
-        ));
-    }
+    owner_snapshot_fits(owned, topic, welcome, bans, mods, &tail)?;
     let tail_nominee = tail.successor_nominee;
     let tail_days = tail.claim_after_days;
     let tail_epoch = tail.key_epoch;
@@ -3427,17 +3519,29 @@ async fn join_secret_for_channel(
 /// The `banned` flag is written by `commit_channel_moderation`, which runs
 /// *after* this — reading it from `channel_members` here would still show the
 /// member as present and seal the new key straight to the person being evicted.
+///
+/// The key is stored here; its sealed records are returned for the caller to
+/// queue once the snapshot naming the epoch has committed ([`rotate_and_commit`]).
 async fn rotate_channel_key(
     state: &AppState,
     owned: &OwnedChannel,
     excluded: &[[u8; 32]],
-) -> Result<Option<i64>, String> {
+) -> Result<Option<RotatedKey>, String> {
     if owned.row.visibility != CHANNEL_KIND_PRIVATE {
         return Ok(None);
     }
     let next_epoch = owned.row.key_epoch.saturating_add(1);
     let mut secret = [0u8; 32];
     OsRng.fill_bytes(&mut secret);
+
+    // Members before the key: a failure after the key is stored would leave an
+    // epoch no snapshot announces and no caller rolls back.
+    let db = state.db.clone();
+    let id = owned.row.channel_id.clone();
+    let members = tokio::task::spawn_blocking(move || db.list_channel_members(&id))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_moderation_failed", "Could not load members", e))?;
 
     let db = state.db.clone();
     let id = owned.row.channel_id.clone();
@@ -3449,40 +3553,32 @@ async fn rotate_channel_key(
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_moderation_failed", "Could not rotate the room key", e))?;
 
-    let db = state.db.clone();
-    let id = owned.row.channel_id.clone();
-    let members = tokio::task::spawn_blocking(move || db.list_channel_members(&id))
-        .await
-        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-        .map_err(|e| coded_ctx("channels_moderation_failed", "Could not load members", e))?;
-
     let our_seed = state.identity.ed25519_secret_key;
     let our_hex = hex::encode(state.identity.ed25519_public_key);
+    let mut records = Vec::new();
     // Sealed to ourselves as well, in a member's slot: the key is random, so
     // this copy is the only way a device restored from an older backup gets
     // the room's current key back.
-    if let Some(wrap) = channel::derive_channel_epoch_secret(
-        &our_seed,
-        &state.identity.ed25519_public_key,
-        &owned.channel_id,
-        next_epoch,
+    if let (Some(wrap), Some(blind)) = (
+        channel::derive_channel_epoch_secret(
+            &our_seed,
+            &state.identity.ed25519_public_key,
+            &owned.channel_id,
+            next_epoch,
+        ),
+        channel::epoch_blind(&our_seed, &state.identity.ed25519_public_key, &owned.channel_id),
     ) {
         let sealed = channel::seal_channel_key_epoch(&wrap, &owned.channel_id, next_epoch, &secret);
-        let record = SignedRecord::channel_key_epoch(
+        records.extend(SignedRecord::channel_key_epoch_forms(
             owned.channel_id,
             owned.ident.pubkey,
             &state.identity.ed25519_public_key,
+            true,
             next_epoch,
+            &blind,
             &sealed,
             &owned.ident.signing_key,
-        );
-        if let Err(e) = queue_signed_record(state, record).await {
-            tracing::warn!(
-                channel_id = %owned.row.channel_id,
-                error = %e,
-                "could not queue the owner's own copy of a rotated channel key"
-            );
-        }
+        ));
     }
     for member in members {
         // Banned members are the point of rotating, and we already hold the key
@@ -3499,41 +3595,36 @@ async fn rotate_channel_key(
         if excluded.contains(&member_pk) {
             continue;
         }
-        let Some(wrap) = channel::derive_channel_epoch_secret(
-            &our_seed,
-            &member_pk,
-            &owned.channel_id,
-            next_epoch,
+        let (Some(wrap), Some(blind)) = (
+            channel::derive_channel_epoch_secret(&our_seed, &member_pk, &owned.channel_id, next_epoch),
+            channel::epoch_blind(&our_seed, &member_pk, &owned.channel_id),
         ) else {
             continue;
         };
         let sealed =
             channel::seal_channel_key_epoch(&wrap, &owned.channel_id, next_epoch, &secret);
-        let record = SignedRecord::channel_key_epoch(
+        records.extend(SignedRecord::channel_key_epoch_forms(
             owned.channel_id,
             owned.ident.pubkey,
             &member_pk,
+            false,
             next_epoch,
+            &blind,
             &sealed,
             &owned.ident.signing_key,
-        );
-        // Queued rather than awaited. The STORE result was only ever logged, so
-        // waiting on it bought nothing and cost up to DEFAULT_FIND_TIMEOUT_MS
-        // per member — serially, while holding MODERATION_LOCK. On a sparse DHT
-        // where those lookups time out, one ban in a room of a dozen froze
-        // moderation everywhere for minutes. The walk still starts; a member who
-        // cannot find their record re-asks every minute, and the owner
-        // republishes moderation on a timer.
-        if let Err(e) = queue_signed_record(state, record).await {
-            tracing::warn!(
-                channel_id = %owned.row.channel_id,
-                member = %member.member_pubkey,
-                error = %e,
-                "could not queue a rotated channel key for a member"
-            );
-        }
+        ));
     }
-    Ok(Some(next_epoch))
+    Ok(Some(RotatedKey {
+        epoch: next_epoch,
+        records,
+    }))
+}
+
+/// A content key [`rotate_channel_key`] stored, and the records sealing it to
+/// us and to each member still entitled to it.
+struct RotatedKey {
+    epoch: i64,
+    records: Vec<SignedRecord>,
 }
 
 /// Mint a new content key and publish the snapshot that announces it.
@@ -3542,14 +3633,37 @@ async fn rotate_channel_key(
 /// tells members a new epoch exists, so a rotation whose commit fails has to
 /// come back off — otherwise everything sent afterwards is sealed under a key
 /// nobody will ever go looking for.
+///
+/// The sealed key goes out only once the snapshot has committed. A key taken
+/// back must not reach anyone: a member who fetched it would store it for its
+/// epoch, and the key minted next under the same number would be refused
+/// there until the owner's commitments showed the first one wrong. Nor its
+/// commitment: the settings pass signs nothing for the room until the commit
+/// or the undo is done ([`RotatingRoom`]).
 async fn rotate_and_commit(
     state: &AppState,
     owned: &OwnedChannel,
     bans: &[[u8; 32]],
     mods: &[[u8; 32]],
 ) -> Result<(), String> {
+    let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
+    if private {
+        // The snapshot the commit will sign, naming the epoch about to be
+        // minted, refused for size before the key is stored rather than after.
+        let mut tail = owner_moderation_tail(state, owned).await;
+        tail.key_epoch = Some(owned.row.key_epoch.saturating_add(1).max(0) as u64);
+        let tail = crate::network::ember::dht::publish::fit_moderation_pins(
+            &owned.row.topic,
+            &owned.row.welcome,
+            bans,
+            mods,
+            &tail,
+        );
+        owner_snapshot_fits(owned, &owned.row.topic, &owned.row.welcome, bans, mods, &tail)?;
+    }
+    let rotating = private.then(|| RotatingRoom::begin(&owned.row.channel_id));
     let rotated = rotate_channel_key(state, owned, bans).await?;
-    let Err(error) = commit_channel_moderation(
+    if let Err(error) = commit_channel_moderation(
         state,
         owned,
         &owned.row.topic,
@@ -3558,11 +3672,39 @@ async fn rotate_and_commit(
         mods,
     )
     .await
-    else {
-        return Ok(());
-    };
-    undo_rotation(state, owned, rotated).await;
-    Err(error)
+    {
+        undo_rotation(state, owned, rotated.as_ref().map(|rotated| rotated.epoch)).await;
+        drop(rotating);
+        return Err(error);
+    }
+    drop(rotating);
+    if let Some(rotated) = rotated {
+        hand_out_rotated_key(state, owned, rotated).await;
+    }
+    Ok(())
+}
+
+/// Send a committed rotation's sealed key out, and its commitment with it.
+async fn hand_out_rotated_key(state: &AppState, owned: &OwnedChannel, rotated: RotatedKey) {
+    // Queued rather than awaited. The STORE result was only ever logged, so
+    // waiting on it bought nothing and cost up to DEFAULT_FIND_TIMEOUT_MS per
+    // member — serially, while holding MODERATION_LOCK. On a sparse DHT where
+    // those lookups time out, one ban in a room of a dozen froze moderation
+    // everywhere for minutes. The walk still starts; a member who cannot find
+    // their record re-asks every minute, and the owner republishes moderation
+    // on a timer.
+    for record in rotated.records {
+        if let Err(e) = queue_signed_record(state, record).await {
+            tracing::warn!(
+                channel_id = %owned.row.channel_id,
+                error = %e,
+                "could not queue a rotated channel key"
+            );
+        }
+    }
+    let _ = state
+        .network_tx
+        .try_send(NetworkCommand::PublishOwnedChannelSettings);
 }
 
 /// Take a rotation back off after the snapshot that would have announced it
@@ -3627,32 +3769,34 @@ async fn reseal_current_epoch_to_member(
         );
         return Ok(());
     };
-    let Some(wrap) = channel::derive_channel_epoch_secret(
-        &state.identity.ed25519_secret_key,
-        &member_pk,
-        &owned.channel_id,
-        epoch,
+    let our_seed = state.identity.ed25519_secret_key;
+    let (Some(wrap), Some(blind)) = (
+        channel::derive_channel_epoch_secret(&our_seed, &member_pk, &owned.channel_id, epoch),
+        channel::epoch_blind(&our_seed, &member_pk, &owned.channel_id),
     ) else {
         return Ok(());
     };
     let sealed = channel::seal_channel_key_epoch(&wrap, &owned.channel_id, epoch, &secret);
-    let record = SignedRecord::channel_key_epoch(
+    // Queued rather than awaited, exactly as rotation does: the member re-asks
+    // every minute until they find it, so a slow walk costs nothing but time.
+    for record in SignedRecord::channel_key_epoch_forms(
         owned.channel_id,
         owned.ident.pubkey,
         &member_pk,
+        false,
         epoch,
+        &blind,
         &sealed,
         &owned.ident.signing_key,
-    );
-    // Queued rather than awaited, exactly as rotation does: the member re-asks
-    // every minute until they find it, so a slow walk costs nothing but time.
-    if let Err(e) = queue_signed_record(state, record).await {
-        tracing::warn!(
-            channel_id = %owned.row.channel_id,
-            member = %hex::encode(member_pk),
-            error = %e,
-            "could not queue the current room key for an unbanned member"
-        );
+    ) {
+        if let Err(e) = queue_signed_record(state, record).await {
+            tracing::warn!(
+                channel_id = %owned.row.channel_id,
+                member = %hex::encode(member_pk),
+                error = %e,
+                "could not queue the current room key for an unbanned member"
+            );
+        }
     }
     Ok(())
 }
@@ -5189,7 +5333,11 @@ pub async fn claim_channel_ownership(
             )
             .await
             {
-                Ok(_) if rotated.is_some() || !private => {}
+                Ok(_) if rotated.is_some() || !private => {
+                    if let Some(rotated) = rotated {
+                        hand_out_rotated_key(&state, &owned, rotated).await;
+                    }
+                }
                 // The one rotation this room is owed, and nothing else is going
                 // to mint it: the claim left no mark for the owned-room pass,
                 // whose rotation would have raced this one for the same epoch.
@@ -5197,7 +5345,7 @@ pub async fn claim_channel_ownership(
                 outcome => {
                     if let Err(e) = outcome {
                         tracing::warn!(channel_id = %successor_id_hex, error = %e, "could not publish the claimed room's first record");
-                        undo_rotation(&state, &owned, rotated).await;
+                        undo_rotation(&state, &owned, rotated.as_ref().map(|rotated| rotated.epoch)).await;
                     }
                     let db = state.db.clone();
                     let id = successor_id_hex.clone();
@@ -6585,6 +6733,149 @@ fn parse_xfer_id(hex_str: &str) -> Result<[u8; 16], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A member behind a private room's key takes an invite's key only for an
+    /// epoch the owner's newest settings record commits to, and only when the
+    /// commitment matches. Everything else leaves the stored keys as they
+    /// were; a key naming an epoch past the newest held only waits in memory.
+    ///
+    /// Waiting keys go to the process-wide store, so the rooms are random
+    /// rather than ids another test could also use.
+    #[test]
+    fn an_invite_key_is_taken_for_a_held_room_only_against_the_owners_commitment() {
+        let fresh_id = || {
+            let mut id = [0u8; 16];
+            OsRng.fill_bytes(&mut id);
+            id
+        };
+        let path = std::env::temp_dir().join(format!(
+            "ember-invite-commitment-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let room = fresh_id();
+        let room_hex = hex::encode(room);
+        let uncommitted = fresh_id();
+        let uncommitted_hex = hex::encode(uncommitted);
+        let secret = |epoch: u8| [0x40 + epoch; 32];
+        for id in [&room_hex, &uncommitted_hex] {
+            db.insert_channel(id, &"01".repeat(32), "Den", "private", false, None, Some(&secret(0)))
+                .unwrap();
+            db.insert_channel_key_epoch(id, 1, &secret(1)).unwrap();
+            // The owner has since rotated twice while this device was away.
+            assert!(db
+                .apply_channel_moderation(id, "", "", 10, &[], &[], None, None, None, Some(3), None, None)
+                .unwrap());
+        }
+        let commit = |epoch: i64| {
+            (epoch, channel::key_commitment(&room, epoch, &channel::content_key(&secret(epoch as u8))))
+        };
+        assert!(db
+            .ingest_channel_settings(
+                &room_hex,
+                &crate::storage::database::HeldChannelSettings {
+                    signed_at: 20,
+                    signature: [1; 64],
+                    key_commitments: vec![commit(3), commit(2), commit(1)],
+                    admission: 1,
+                },
+            )
+            .unwrap());
+        let invite = |channel_id: [u8; 16], join_secret: [u8; 32], key_epoch: u64| ChannelInvite {
+            channel_id,
+            pubkey: [0x01; 32],
+            name: "Den".into(),
+            join_secret,
+            private: true,
+            key_epoch,
+        };
+        let row = |id: &str| db.get_channel(id).unwrap().unwrap();
+        let epochs = |id: &str| db.load_channel_key_epochs(id).unwrap();
+
+        for (what, offered, outcome) in [
+            ("a key the owner never committed to", invite(room, [0x99; 32], 3), OfferedKey::Held),
+            ("the right key under the wrong epoch", invite(room, secret(3), 2), OfferedKey::Held),
+            ("an invite that does not say its epoch", invite(room, secret(3), 0), OfferedKey::Refused),
+            ("an epoch the record does not name", invite(room, secret(4), 4), OfferedKey::Held),
+        ] {
+            assert_eq!(take_committed_invite_key(&db, &row(&room_hex), &offered).unwrap().key, outcome, "{what}");
+        }
+        assert_eq!(
+            take_committed_invite_key(&db, &row(&uncommitted_hex), &invite(uncommitted, secret(3), 3)).unwrap().key,
+            OfferedKey::Held,
+            "nothing to check it against without a settings record"
+        );
+        assert_eq!(epochs(&room_hex).len(), 1, "nothing unchecked reached the store");
+        assert_eq!(epochs(&uncommitted_hex).len(), 1);
+        assert_eq!(row(&room_hex).key_epoch, 1);
+
+        assert_eq!(
+            take_committed_invite_key(&db, &row(&room_hex), &invite(room, secret(3), 3)).unwrap(),
+            OfferedKeyOutcome {
+                key: OfferedKey::Taken,
+                rekeyed: true,
+            }
+        );
+        let held = row(&room_hex);
+        assert_eq!((held.key_epoch, held.key_epoch_wanted), (3, 3), "caught up");
+        assert_eq!(epochs(&room_hex)[0], (3, secret(3)));
+
+        // No longer behind, so even a committed key is not taken.
+        assert_eq!(
+            take_committed_invite_key(&db, &held, &invite(room, secret(2), 2)).unwrap().key,
+            OfferedKey::Refused
+        );
+        assert_eq!(epochs(&room_hex).len(), 2);
+
+        // A device whose snapshot is stale is still behind by the epoch the
+        // owner's commitment names, and takes it.
+        let stale = fresh_id();
+        let stale_hex = hex::encode(stale);
+        db.insert_channel(&stale_hex, &"01".repeat(32), "Den", "private", false, None, Some(&secret(0)))
+            .unwrap();
+        db.insert_channel_key_epoch(&stale_hex, 1, &secret(1)).unwrap();
+        let stale_commit = |epoch: i64| {
+            (epoch, channel::key_commitment(&stale, epoch, &channel::content_key(&secret(epoch as u8))))
+        };
+        assert!(db
+            .ingest_channel_settings(
+                &stale_hex,
+                &crate::storage::database::HeldChannelSettings {
+                    signed_at: 20,
+                    signature: [1; 64],
+                    key_commitments: vec![stale_commit(3), stale_commit(2), stale_commit(1)],
+                    admission: 1,
+                },
+            )
+            .unwrap());
+        assert!(row(&stale_hex).key_epoch_wanted <= row(&stale_hex).key_epoch, "no snapshot says it is behind");
+        assert_eq!(
+            take_committed_invite_key(&db, &row(&stale_hex), &invite(stale, secret(3), 3)).unwrap().key,
+            OfferedKey::Taken
+        );
+        assert_eq!(row(&stale_hex).key_epoch, 3);
+
+        // And a public room never takes one.
+        let public = fresh_id();
+        db.insert_channel(&hex::encode(public), &"02".repeat(32), "Hall", "public", false, None, None)
+            .unwrap();
+        let mut open = invite(public, secret(3), 3);
+        open.private = false;
+        assert_eq!(
+            take_committed_invite_key(&db, &row(&hex::encode(public)), &open).unwrap().key,
+            OfferedKey::Refused
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
 
     /// In an announcement-only room the owner and the snapshot's moderators
     /// send; everyone else is refused before anything goes on the wire. A room
