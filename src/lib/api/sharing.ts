@@ -376,6 +376,30 @@ export async function renameLibraryFile(filePath: string, newName: string): Prom
   return invoke('rename_library_file', { filePath, newName });
 }
 
+/** The tag {@link tagLibraryFiles} puts at the start of a name. */
+export const EMBER_NAME_TAG = '[Ember-P2P]';
+
+/** Whether `name` already starts with {@link EMBER_NAME_TAG}, in any capitals. */
+export function hasEmberTag(name: string): boolean {
+  return name.slice(0, EMBER_NAME_TAG.length).toLowerCase() === EMBER_NAME_TAG.toLowerCase();
+}
+
+export interface TagReport {
+  /** Files renamed, old path to new. */
+  renamed: { from: string; to: string }[];
+  /** Files that already had the tag (adding) or never had it (removing). */
+  unchanged: number;
+  /** A coded error for each file that kept its name. */
+  failed: string[];
+}
+
+/** Add `[Ember-P2P] ` to the start of each file's name, or take it off, in
+ *  place. Rows follow their files, so nothing is hashed again; an existing
+ *  file is never replaced. At most 5,000 paths a call. */
+export async function tagLibraryFiles(paths: string[], add: boolean): Promise<TagReport> {
+  return invoke('tag_library_files', { paths, add });
+}
+
 export async function openSharedFolder(filePath: string): Promise<void> {
   return invoke('open_shared_folder', { filePath });
 }

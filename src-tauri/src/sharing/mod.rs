@@ -1,6 +1,7 @@
 pub mod disk;
 pub mod indexer;
 pub mod manager;
+pub mod name_tag;
 pub mod paged_cycle;
 pub mod watcher;
 

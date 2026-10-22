@@ -9,6 +9,7 @@ use tauri_plugin_dialog::DialogExt;
 
 use tokio::sync::RwLock;
 
+use crate::sharing::name_tag::{tagged_name as ember_tagged_name, EMBER_NAME_TAG};
 use crate::storage::share_intent::UnshareOrigin;
 
 /// How long a claim keeps other passes off a path. Comfortably longer than
@@ -1243,6 +1244,96 @@ pub async fn move_files_to_category(
     })
 }
 
+/// `name` if it is already a valid file name. One that would have to be
+/// altered to be safe (a separator, a reserved character) is refused rather
+/// than quietly turned into a different name.
+fn checked_file_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.len() > 255 {
+        return Err(coded_ctx("sharing_rename_invalid_name", "Enter a valid file name", trimmed));
+    }
+    let sanitized = crate::security::sanitize_filename(trimmed);
+    if sanitized != trimmed {
+        return Err(coded_ctx(
+            "sharing_rename_invalid_name",
+            "Enter a valid file name",
+            trimmed,
+        ));
+    }
+    Ok(sanitized)
+}
+
+/// Rename the file at `indexed_path` to `new_name` inside its own folder, on
+/// the blocking pool. Never replaces another file. Returns the new path.
+fn rename_in_place(
+    indexed_path: &str,
+    new_name: &str,
+    allowed_dirs: &[String],
+) -> Result<std::path::PathBuf, String> {
+    let (canonical, opened) = crate::security::filesystem::open_existing_approved(
+        std::path::Path::new(indexed_path),
+        allowed_dirs,
+        false,
+    )
+    .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid or changed path", e))?;
+    let identity = crate::security::filesystem::opened_file_identity(&opened)
+        .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid or changed path", e))?;
+    // Released before the rename: Windows will not rename a file this
+    // call still holds open.
+    drop(opened);
+    let parent = canonical
+        .parent()
+        .ok_or_else(|| coded("sharing_invalid_path", "Invalid or changed path"))?;
+    let destination = parent.join(new_name);
+    let taken = std::fs::symlink_metadata(&destination);
+    if let Ok(taken) = taken {
+        // Only a change of capitals on a case-insensitive file system
+        // lands here legitimately: the name "taken" is this very file.
+        // Not a link to it (canonicalize would follow one, and the
+        // rename below would then replace the link), and resolved on
+        // both sides, since the index may spell the name in other
+        // capitals than the disk does.
+        let same_file = !taken.file_type().is_symlink()
+            && std::fs::canonicalize(&destination)
+                .ok()
+                .zip(std::fs::canonicalize(&canonical).ok())
+                .is_some_and(|(a, b)| a == b)
+            && destination
+                .file_name()
+                .zip(canonical.file_name())
+                .is_some_and(|(a, b)| {
+                    a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+                });
+        if !same_file {
+            return Err(coded_ctx(
+                "sharing_rename_exists",
+                "A file with that name already exists",
+                new_name,
+            ));
+        }
+        std::fs::rename(&canonical, &destination)
+            .map_err(|e| coded_ctx("sharing_rename_failed", "The file could not be renamed", e))?;
+        return Ok(destination);
+    }
+    crate::security::filesystem::rename_approved_no_replace(
+        &canonical,
+        &destination,
+        allowed_dirs,
+        &identity,
+    )
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            coded_ctx(
+                "sharing_rename_exists",
+                "A file with that name already exists",
+                new_name,
+            )
+        } else {
+            coded_ctx("sharing_rename_failed", "The file could not be renamed", e)
+        }
+    })
+}
+
 /// Rename a Library file in place, keeping it in its folder. The row follows
 /// the file as it does for a category move, so nothing is hashed again and
 /// peers and uploads find it under the new name. Returns the file's new path.
@@ -1265,18 +1356,7 @@ pub async fn rename_library_file(
             MAX_PATH_LEN,
         ));
     }
-    let trimmed = new_name.trim();
-    if trimmed.is_empty() || trimmed.len() > 255 {
-        return Err(coded("sharing_rename_invalid_name", "Enter a valid file name"));
-    }
-    let sanitized = crate::security::sanitize_filename(trimmed);
-    if sanitized != trimmed {
-        return Err(coded_ctx(
-            "sharing_rename_invalid_name",
-            "Enter a valid file name",
-            trimmed,
-        ));
-    }
+    let sanitized = checked_file_name(&new_name)?;
 
     let (indexed_path, old_name, hash) = {
         let index = state.local_index.read().await;
@@ -1306,70 +1386,7 @@ pub async fn rename_library_file(
     let new_path = tokio::task::spawn_blocking({
         let indexed_path = indexed_path.clone();
         let sanitized = sanitized.clone();
-        move || -> Result<std::path::PathBuf, String> {
-            let (canonical, opened) = crate::security::filesystem::open_existing_approved(
-                std::path::Path::new(&indexed_path),
-                &allowed_dirs,
-                false,
-            )
-            .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid or changed path", e))?;
-            let identity = crate::security::filesystem::opened_file_identity(&opened)
-                .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid or changed path", e))?;
-            // Released before the rename: Windows will not rename a file this
-            // call still holds open.
-            drop(opened);
-            let parent = canonical
-                .parent()
-                .ok_or_else(|| coded("sharing_invalid_path", "Invalid or changed path"))?;
-            let destination = parent.join(&sanitized);
-            let taken = std::fs::symlink_metadata(&destination);
-            if let Ok(taken) = taken {
-                // Only a change of capitals on a case-insensitive file system
-                // lands here legitimately: the name "taken" is this very file.
-                // Not a link to it (canonicalize would follow one, and the
-                // rename below would then replace the link), and resolved on
-                // both sides, since the index may spell the name in other
-                // capitals than the disk does.
-                let same_file = !taken.file_type().is_symlink()
-                    && std::fs::canonicalize(&destination)
-                        .ok()
-                        .zip(std::fs::canonicalize(&canonical).ok())
-                        .is_some_and(|(a, b)| a == b)
-                    && destination
-                        .file_name()
-                        .zip(canonical.file_name())
-                        .is_some_and(|(a, b)| {
-                            a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
-                        });
-                if !same_file {
-                    return Err(coded_ctx(
-                        "sharing_rename_exists",
-                        "A file with that name already exists",
-                        &sanitized,
-                    ));
-                }
-                std::fs::rename(&canonical, &destination)
-                    .map_err(|e| coded_ctx("sharing_rename_failed", "The file could not be renamed", e))?;
-                return Ok(destination);
-            }
-            crate::security::filesystem::rename_approved_no_replace(
-                &canonical,
-                &destination,
-                &allowed_dirs,
-                &identity,
-            )
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    coded_ctx(
-                        "sharing_rename_exists",
-                        "A file with that name already exists",
-                        &sanitized,
-                    )
-                } else {
-                    coded_ctx("sharing_rename_failed", "The file could not be renamed", e)
-                }
-            })
-        }
+        move || rename_in_place(&indexed_path, &sanitized, &allowed_dirs)
     })
     .await
     .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))??;
@@ -1383,6 +1400,312 @@ pub async fn rename_library_file(
     relocate_library_files(&app, &state, std::slice::from_ref(&mv)).await;
     info!("Renamed library file {old_name:?} to {sanitized:?}");
     Ok(new_path.to_string_lossy().into_owned())
+}
+
+/// The most files one [`tag_library_files`] call renames, as for a category
+/// move: a selection in the Library.
+const MAX_TAG_PATHS: usize = 5_000;
+
+/// One file [`tag_library_files`] renamed.
+#[derive(serde::Serialize)]
+pub struct TaggedFile {
+    from: String,
+    to: String,
+}
+
+/// What [`tag_library_files`] did.
+#[derive(serde::Serialize)]
+pub struct TagReport {
+    /// Files renamed, old path to new, so the caller can follow its selection.
+    renamed: Vec<TaggedFile>,
+    /// Files that already had the tag (adding) or never had it (removing).
+    unchanged: u32,
+    /// One coded error per file that kept its name.
+    failed: Vec<String>,
+}
+
+/// Add `[Ember-P2P] ` to the start of each Library file's name, or with `add`
+/// false take it off, in place. Each file is renamed as [`rename_library_file`]
+/// renames one: nothing is hashed again, an existing file is never replaced,
+/// and a file that cannot be renamed keeps its name and is reported.
+#[tauri::command]
+pub async fn tag_library_files(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    paths: Vec<String>,
+    add: bool,
+) -> Result<TagReport, String> {
+    check_path_batch(&paths, MAX_TAG_PATHS)?;
+    tag_paths(&app, &state, paths, add).await
+}
+
+/// [`tag_library_files`] without the batch check, for callers inside the app.
+pub(crate) async fn tag_paths(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    paths: Vec<String>,
+    add: bool,
+) -> Result<TagReport, String> {
+    let mut failed = Vec::new();
+    let mut unchanged = 0u32;
+    let mut candidates = Vec::new();
+    {
+        let index = state.local_index.read().await;
+        let mut seen = HashSet::new();
+        for path in paths {
+            if !seen.insert(crate::search::index::normalize_path_key(&path)) {
+                continue;
+            }
+            let Some(row) = index.get_by_path(&path) else {
+                failed.push(coded_ctx(
+                    "sharing_file_not_in_index",
+                    "File is not in the shared-file index",
+                    path,
+                ));
+                continue;
+            };
+            if row.hash.is_empty() {
+                failed.push(coded_ctx(
+                    "sharing_rename_not_hashed",
+                    "The file is still being hashed",
+                    &row.name,
+                ));
+                continue;
+            }
+            let Some(new_name) = ember_tagged_name(&row.name, add) else {
+                unchanged += 1;
+                continue;
+            };
+            match checked_file_name(&new_name) {
+                Ok(new_name) => candidates.push((row.path.clone(), new_name, row.hash.clone())),
+                Err(e) => failed.push(e),
+            }
+        }
+    }
+    let allowed_dirs = {
+        let config = state.config.read().await;
+        shared_access_dirs(&config)
+    };
+    let outcome = tokio::task::spawn_blocking(move || {
+        candidates
+            .into_iter()
+            .map(|(path, new_name, hash)| {
+                let result = rename_in_place(&path, &new_name, &allowed_dirs);
+                (path, hash, result)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))?;
+
+    let mut moves = Vec::new();
+    for (path, hash, result) in outcome {
+        match result {
+            Ok(to) => moves.push(FileMove { from: path, to, hash }),
+            Err(e) => failed.push(e),
+        }
+    }
+    for mv in &moves {
+        crate::commands::transfers::follow_renamed_finished_download(state, mv).await;
+    }
+    relocate_library_files(app, state, &moves).await;
+    if !moves.is_empty() {
+        info!(
+            "{} {EMBER_NAME_TAG} on {} library file(s)",
+            if add { "Added" } else { "Removed" },
+            moves.len()
+        );
+    }
+    Ok(TagReport {
+        renamed: moves
+            .into_iter()
+            .map(|mv| TaggedFile { from: mv.from, to: mv.to.to_string_lossy().into_owned() })
+            .collect(),
+        unchanged,
+        failed,
+    })
+}
+
+/// How often the Library looks for files new to a shared folder to tag.
+pub(crate) const IMPORT_TAG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Files tagged in one pass at most. A large folder just shared is worked
+/// through over several passes rather than in one burst of renames.
+const MAX_IMPORT_TAGS_PER_PASS: usize = 500;
+
+/// Whether the normalized path `key` is inside the normalized folder `dir`.
+fn key_is_under(key: &str, dir: &str) -> bool {
+    let dir = dir.trim_end_matches(['/', '\\']);
+    key.strip_prefix(dir)
+        .is_some_and(|rest| rest.starts_with(['/', '\\']))
+}
+
+/// The `name_tag_seen` row that says the files already in the Library were
+/// recorded when `tag_shared_imports` was last turned on.
+const NAME_TAG_SEEDED: &str = "seeded";
+
+/// Bumped whenever `name_tag_seen` is reseeded or reset, so a copy of it
+/// read before is known to be stale.
+static NAME_TAG_SEEN_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The tagging loop's copy of `name_tag_seen`, with the generation it was
+/// read at.
+pub(crate) type NameTagSeenCache = Option<(u64, HashSet<String>)>;
+
+/// The `name_tag_seen` entry for a file still being hashed when the setting
+/// was turned on: it was already there, but has no hash to record yet.
+fn name_tag_seen_path(path: &str) -> String {
+    format!("path:{}", crate::search::index::normalize_path_key(path))
+}
+
+/// Record that every file in the Library now has been decided about, so
+/// turning on `tag_shared_imports` renames only files that arrive afterwards.
+pub(crate) async fn seed_name_tag_seen(state: &AppState) {
+    let mut entries: Vec<String> = {
+        let index = state.local_index.read().await;
+        index
+            .all_files()
+            .iter()
+            .map(|row| {
+                if row.hash.is_empty() {
+                    name_tag_seen_path(&row.path)
+                } else {
+                    row.hash.to_ascii_lowercase()
+                }
+            })
+            .collect()
+    };
+    entries.push(NAME_TAG_SEEDED.to_string());
+    let db = state.db.clone();
+    match tokio::task::spawn_blocking(move || db.mark_name_tag_seen(&entries)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("Could not record the Library's files for the {EMBER_NAME_TAG} tag: {e}"),
+        Err(e) => warn!("Could not record the Library's files for the {EMBER_NAME_TAG} tag: {e}"),
+    }
+    NAME_TAG_SEEN_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Turning `tag_shared_imports` off: the next time it is turned on, the files
+/// added meanwhile are recorded as already there, not renamed.
+pub(crate) async fn unseed_name_tag_seen(state: &AppState) {
+    let db = state.db.clone();
+    if let Ok(Err(e)) =
+        tokio::task::spawn_blocking(move || db.forget_name_tag_seen(&[NAME_TAG_SEEDED.to_string()])).await
+    {
+        warn!("Could not reset the {EMBER_NAME_TAG} tag's record: {e}");
+    }
+    NAME_TAG_SEEN_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// One pass of `tag_shared_imports`: tag hashed files whose content the
+/// Library has not seen before, outside the download folders' `Downloads`
+/// (completed downloads follow `tag_completed_downloads`). Every file looked
+/// at is recorded as seen, renamed or not, so a file that cannot be renamed
+/// is not tried again every pass, and a tag the user takes off stays off.
+///
+/// `cache` is the loop's copy of `name_tag_seen`, read again only when it
+/// was reseeded or reset since, so a pass over an unchanged Library does not
+/// read the whole table.
+pub(crate) async fn tag_new_shared_imports(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    cache: &mut NameTagSeenCache,
+) {
+    let downloads: Vec<String> = {
+        let config = state.config.read().await;
+        if !config.settings.tag_shared_imports {
+            *cache = None;
+            return;
+        }
+        config
+            .settings
+            .download_folders()
+            .roots()
+            .iter()
+            .map(|root| {
+                crate::search::index::normalize_path_key(
+                    &std::path::Path::new(root).join("Downloads").to_string_lossy(),
+                )
+            })
+            .collect()
+    };
+    let generation = NAME_TAG_SEEN_GENERATION.load(Ordering::SeqCst);
+    if cache.as_ref().is_none_or(|(read_at, _)| *read_at != generation) {
+        let db = state.db.clone();
+        match tokio::task::spawn_blocking(move || db.name_tag_seen_hashes()).await {
+            Ok(Ok(read)) => *cache = Some((generation, read)),
+            Ok(Err(e)) => {
+                warn!("Could not read which files the {EMBER_NAME_TAG} tag has seen: {e}");
+                return;
+            }
+            Err(e) => {
+                warn!("Could not read which files the {EMBER_NAME_TAG} tag has seen: {e}");
+                return;
+            }
+        }
+    }
+    // Turned on some way that did not record the Library first (a restored
+    // backup, a hand-edited config): record it now and rename nothing this
+    // pass, rather than take every file already shared for a new one.
+    if !cache.as_ref().is_some_and(|(_, seen)| seen.contains(NAME_TAG_SEEDED)) {
+        seed_name_tag_seen(state).await;
+        return;
+    }
+    let Some((_, seen)) = cache.as_mut() else {
+        return;
+    };
+    let mut decided: Vec<String> = Vec::new();
+    let mut to_tag: Vec<String> = Vec::new();
+    {
+        let index = state.local_index.read().await;
+        for row in index.all_files() {
+            if row.hash.is_empty() || seen.contains(&row.hash.to_ascii_lowercase()) {
+                continue;
+            }
+            let key = crate::search::index::normalize_path_key(&row.path);
+            if downloads.iter().any(|dir| key_is_under(&key, dir)) {
+                continue;
+            }
+            if decided.len() >= MAX_IMPORT_TAGS_PER_PASS {
+                break;
+            }
+            // Here, unhashed, when the setting was turned on.
+            if seen.contains(&format!("path:{key}")) {
+                decided.push(row.hash.to_ascii_lowercase());
+                continue;
+            }
+            decided.push(row.hash.to_ascii_lowercase());
+            if !crate::sharing::name_tag::has_tag(&row.name)
+                && crate::sharing::name_tag::may_auto_tag(&row.name)
+            {
+                to_tag.push(row.path.clone());
+            }
+        }
+    }
+    if decided.is_empty() {
+        return;
+    }
+    if !to_tag.is_empty() {
+        match tag_paths(app, state, to_tag, true).await {
+            Ok(report) => {
+                if !report.renamed.is_empty() {
+                    info!(
+                        "Added {EMBER_NAME_TAG} to {} file(s) new to a shared folder",
+                        report.renamed.len()
+                    );
+                }
+                for failure in &report.failed {
+                    debug!("Could not add {EMBER_NAME_TAG} to a new shared file: {failure}");
+                }
+            }
+            Err(e) => warn!("Could not add {EMBER_NAME_TAG} to new shared files: {e}"),
+        }
+    }
+    seen.extend(decided.iter().cloned());
+    let db = state.db.clone();
+    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || db.mark_name_tag_seen(&decided)).await {
+        warn!("Could not record files the {EMBER_NAME_TAG} tag has seen: {e}");
+    }
 }
 
 /// Open a folder of the Library's tree — a shared folder or one inside it,
@@ -9409,6 +9732,23 @@ pub async fn open_shared_folder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_files_inside_a_downloads_folder_count_as_inside_it() {
+        assert!(key_is_under(r"c:\dl\downloads\a.zip", r"c:\dl\downloads"));
+        assert!(key_is_under("/dl/Downloads/Video/a.mkv", "/dl/Downloads/"));
+        assert!(!key_is_under(r"c:\dl\downloads2\a.zip", r"c:\dl\downloads"));
+        assert!(!key_is_under(r"c:\dl\downloads", r"c:\dl\downloads"));
+    }
+
+    #[test]
+    fn a_tagged_name_is_a_valid_name_and_too_long_is_refused() {
+        let tagged = ember_tagged_name("Linux.zip", true).unwrap();
+        assert_eq!(checked_file_name(&tagged).as_deref(), Ok(tagged.as_str()), "a valid name as is");
+        let long = format!("{}.zip", "a".repeat(250));
+        let too_long = ember_tagged_name(&long, true).unwrap();
+        assert!(checked_file_name(&too_long).is_err(), "past 255 bytes is refused, not cut");
+    }
 
     #[test]
     fn hashes_in_library_matches_case_insensitively_and_skips_unhashed_rows() {

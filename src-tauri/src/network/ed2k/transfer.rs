@@ -3871,8 +3871,25 @@ pub(crate) enum CopyRecovery {
 }
 
 /// `name` in `dir` and every name completion gives it there when that one
-/// is taken (`name (1)`, `name (2)`, …), lowest first. Blocking.
+/// is taken (`name (1)`, `name (2)`, …), lowest first, then the same for the
+/// name with the `[Ember-P2P]` tag, which completion may have given it
+/// instead (see [`crate::sharing::name_tag::completed_download_name`]).
+/// Blocking.
 pub(crate) fn published_names(dir: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
+    let mut names = published_names_of(dir, name);
+    if let Some(tagged) = crate::sharing::name_tag::tagged_name(name, true) {
+        // Only those there: callers read a missing candidate as an unreadable
+        // file, and most downloads were never tagged.
+        names.extend(
+            published_names_of(dir, &tagged)
+                .into_iter()
+                .filter(|path| std::fs::symlink_metadata(path).is_ok()),
+        );
+    }
+    names
+}
+
+fn published_names_of(dir: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
     let base = dir.join(name);
     let mut variants: Vec<(u32, std::path::PathBuf)> = std::fs::read_dir(dir)
         .into_iter()
@@ -4000,6 +4017,8 @@ pub(crate) fn recover_completion_copy(
             }
         }
     }
+    // Not published yet: under the name a completion would give it now.
+    let name = crate::sharing::name_tag::completed_download_name(&name);
     if elsewhere {
         let published = move_part_to_completed(
             path,

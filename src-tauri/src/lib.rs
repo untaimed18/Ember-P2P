@@ -2333,6 +2333,24 @@ pub fn run() {
                 }
             });
 
+            // Files new to a shared folder, tagged `[Ember-P2P]` when the user
+            // asked for that. Polled rather than hooked into each hashing pass:
+            // startup, folder adds, rescans and the watcher all add files, and
+            // one sweep over the index covers every one of them.
+            let tag_handle = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut tick = tokio::time::interval(commands::sharing::IMPORT_TAG_INTERVAL);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut seen: commands::sharing::NameTagSeenCache = None;
+                loop {
+                    tick.tick().await;
+                    let Some(state) = tag_handle.try_state::<AppState>() else {
+                        continue;
+                    };
+                    commands::sharing::tag_new_shared_imports(&tag_handle, &state, &mut seen).await;
+                }
+            });
+
             info!("Ember P2P application started");
             Ok(())
         })
@@ -2454,6 +2472,7 @@ pub fn run() {
             commands::sharing::open_library_folder,
             commands::sharing::move_files_to_category,
             commands::sharing::rename_library_file,
+            commands::sharing::tag_library_files,
             commands::transfers::delete_finished_downloads,
             commands::sharing::delete_shared_file,
             commands::sharing::republish_file,

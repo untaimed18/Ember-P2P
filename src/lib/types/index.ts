@@ -993,6 +993,11 @@ export interface AppSettings {
   /** Friends see Away after this many idle minutes while the status is
    *  Online; 0 is off. One of `AUTO_AWAY_CHOICES`. */
   auto_away_minutes: number;
+  /** Save each download as `[Ember-P2P] <name>` when it completes. */
+  tag_completed_downloads: boolean;
+  /** Rename files new to a shared folder to `[Ember-P2P] <name>` once
+   *  hashed; files already in the Library are left as they are. */
+  tag_shared_imports: boolean;
   /** Maximum number of friends allowed (1–500) */
   max_friends: number;
   /**

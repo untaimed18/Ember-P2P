@@ -5563,6 +5563,58 @@ impl Database {
         Ok(())
     }
 
+    /// Content the Library has already decided about for the `[Ember-P2P]`
+    /// tag on new shared files, by eD2K hash: tagged then, or already there
+    /// when the setting was turned on. A table of its own, as
+    /// [`Self::ensure_credit_ember_links_locked`] explains.
+    fn ensure_name_tag_seen_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS name_tag_seen (
+                hash TEXT PRIMARY KEY
+            );",
+        )?;
+        Ok(())
+    }
+
+    pub fn name_tag_seen_hashes(&self) -> anyhow::Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock();
+        Self::ensure_name_tag_seen_locked(&conn)?;
+        let mut stmt = conn.prepare("SELECT hash FROM name_tag_seen")?;
+        let hashes = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+        Ok(hashes)
+    }
+
+    pub fn mark_name_tag_seen(&self, hashes: &[String]) -> anyhow::Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock();
+        Self::ensure_name_tag_seen_locked(&conn)?;
+        let tx = conn.transaction()?;
+        {
+            let mut insert = tx.prepare("INSERT OR IGNORE INTO name_tag_seen (hash) VALUES (?1)")?;
+            for hash in hashes {
+                insert.execute(params![hash])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn forget_name_tag_seen(&self, entries: &[String]) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_name_tag_seen_locked(&conn)?;
+        for entry in entries {
+            conn.execute(
+                "DELETE FROM name_tag_seen WHERE hash = ?1",
+                params![entry],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn load_credit_ember_links(&self) -> anyhow::Result<Vec<([u8; 16], [u8; 16])>> {
         let conn = self.conn.lock();
         Self::ensure_credit_ember_links_locked(&conn)?;

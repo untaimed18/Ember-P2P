@@ -2555,10 +2555,12 @@ impl MultiSourceDownload {
                     transfer_id: self.transfer_id.clone(),
                 })
                 .await;
-            let zero_name = self
-                .control
-                .seal_pending_rename()
-                .unwrap_or_else(|| self.file_name.clone());
+            let zero_name = crate::sharing::name_tag::completed_download_name(
+                &self
+                    .control
+                    .seal_pending_rename()
+                    .unwrap_or_else(|| self.file_name.clone()),
+            );
             let download_dir = self.download_folders.read().current.clone();
             let zero_final = super::transfer::finalize_zero_ed2k_file(
                 &self.transfer_id,
@@ -5491,7 +5493,9 @@ impl MultiSourceDownload {
                     let mut t = tracker.write().await;
                     t.mark_file_hash_verified();
                     super::transfer::seal_control_rename(&self.control, &mut t);
-                    super::transfer::completed_download_name(t.file_name(), &self.file_name)
+                    crate::sharing::name_tag::completed_download_name(
+                        &super::transfer::completed_download_name(t.file_name(), &self.file_name),
+                    )
                 };
                 // A Pause, Stop or Cancel that arrived after verification: the
                 // verified `.part` stays where it is and the next run completes

@@ -812,6 +812,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // Before anything below can finish a download or sweep where finished
     // files land; `apply_network_settings` keeps it current from here.
     crate::storage::category_folders::set_folders(&settings.download_category_folders);
+    crate::sharing::name_tag::set_tag_completed_downloads(settings.tag_completed_downloads);
 
     let mut state = NetworkState {
         local_id,

@@ -1874,6 +1874,13 @@ pub async fn update_settings(
             return Err(error);
         }
     }
+    // Before the setting takes effect: the next tagging pass reads it from the
+    // config, and must find the files already shared recorded as not new.
+    if settings.tag_shared_imports && !old_settings.tag_shared_imports {
+        crate::commands::sharing::seed_name_tag_seen(&state).await;
+    } else if !settings.tag_shared_imports && old_settings.tag_shared_imports {
+        crate::commands::sharing::unseed_name_tag_seen(&state).await;
+    }
     {
         let mut config = state.config.write().await;
         config.settings = settings.clone();

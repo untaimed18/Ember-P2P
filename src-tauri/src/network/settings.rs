@@ -103,6 +103,7 @@ pub(super) fn apply_network_settings(
     );
     *state.download_folders.write() = new_settings.download_folders();
     crate::storage::category_folders::set_folders(&new_settings.download_category_folders);
+    crate::sharing::name_tag::set_tag_completed_downloads(new_settings.tag_completed_downloads);
     state.filter_incoming_shared.store(
         new_settings.filter_incoming_connections,
         std::sync::atomic::Ordering::Relaxed,

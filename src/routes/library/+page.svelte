@@ -32,6 +32,8 @@
     getFileMediaMetadata,
     moveFilesToCategory,
     renameLibraryFile,
+    tagLibraryFiles,
+    hasEmberTag,
     openLibraryFolder,
     type SharedFolderPick,
   } from '$lib/api/sharing';
@@ -1879,6 +1881,17 @@
     for (const f of files) if (checkedPaths.has(f.path) && f.hash && !f.shared) n++;
     return n;
   });
+  /** Checked, hashed files the tag could go on, and ones it could come off. */
+  let checkedTaggableCount = $derived.by(() => {
+    let n = 0;
+    for (const f of files) if (checkedPaths.has(f.path) && f.hash && !hasEmberTag(f.name)) n++;
+    return n;
+  });
+  let checkedUntaggableCount = $derived.by(() => {
+    let n = 0;
+    for (const f of files) if (checkedPaths.has(f.path) && f.hash && hasEmberTag(f.name)) n++;
+    return n;
+  });
   // Selections persist across filter changes and bulk actions operate on the
   // whole selection, not just the visible rows (see getCheckedFiles, which
   // filters `files`, not `sortedFiles`). Count how many checked files are
@@ -2182,6 +2195,112 @@
     finally {
       bulkProgress = null;
       bulkBusy = false;
+    }
+  }
+
+  /** The backend's cap on one tag request. */
+  const MAX_TAG_BATCH = 5_000;
+
+  /** The files a tag action from `f`'s menu applies to: the checked selection
+   *  when `f` is in it, as for the other bulk actions, less those it would
+   *  not change. */
+  function emberTagTargets(f: FileInfo, add: boolean): FileInfo[] {
+    const rows = checkedCount > 1 && checkedPaths.has(f.path) ? getCheckedFiles() : [f];
+    return rows.filter((row) => !!row.hash && hasEmberTag(row.name) !== add);
+  }
+
+  async function bulkEmberTag(add: boolean) {
+    if (bulkBusy) return;
+    const checked = getCheckedFiles();
+    const targets = checked.filter((f) => !!f.hash && hasEmberTag(f.name) !== add);
+    if (targets.length === 0) {
+      if (checked.some((f) => !f.hash)) toastWarning(m.library_selection_still_hashing());
+      else toastInfo(add ? m.library_tag_none_to_add() : m.library_tag_none_to_remove());
+      return;
+    }
+    await applyEmberTag(targets.map((f) => f.path), add);
+  }
+
+  /** Add or remove the tag on `paths`, follow the selection to the new
+   *  names, and offer Undo, which puts back exactly the names it changed. */
+  async function applyEmberTag(paths: string[], add: boolean) {
+    // Waits on the other bulk actions as they wait on each other: a delete
+    // or move over the same files would find paths already gone.
+    if (paths.length === 0 || bulkBusy) return;
+    bulkBusy = true;
+    const renamed: { from: string; to: string }[] = [];
+    const failed: string[] = [];
+    bulkProgress = { done: 0, total: paths.length };
+    try {
+      for (let i = 0; i < paths.length; i += MAX_TAG_BATCH) {
+        const batch = paths.slice(i, i + MAX_TAG_BATCH);
+        try {
+          const part = await tagLibraryFiles(batch, add);
+          renamed.push(...part.renamed);
+          failed.push(...part.failed);
+        } catch (e: unknown) {
+          // Earlier batches did rename; keep them and go on with the rest.
+          failed.push(typeof e === 'string' ? e : toErr(e));
+        }
+        bulkProgress = { done: Math.min(i + batch.length, paths.length), total: paths.length };
+      }
+      followRenamedPaths(renamed);
+      if (renamed.length > 0) {
+        const count = formatNumber(renamed.length);
+        const message = add
+          ? plural(renamed.length, {
+              one: m.library_tag_added_one,
+              other: () => m.library_tag_added_other({ count }),
+            })
+          : plural(renamed.length, {
+              one: m.library_tag_removed_one,
+              other: () => m.library_tag_removed_other({ count }),
+            });
+        const undoPaths = renamed.map((r) => r.to);
+        addActionToast(
+          'success',
+          message,
+          {
+            label: m.common_undo(),
+            undo: true,
+            // Waits its turn rather than being dropped: an Undo clicked while
+            // another bulk action runs would otherwise do nothing at all.
+            run: () => void whenBulkIdle().then(() => applyEmberTag(undoPaths, !add)),
+          },
+          () => {},
+        );
+      } else if (failed.length === 0) {
+        toastInfo(add ? m.library_tag_none_to_add() : m.library_tag_none_to_remove());
+      }
+      if (failed.length === 1) {
+        toastError(translateError(failed[0], m.transfers_operation_failed()));
+      } else if (failed.length > 1) {
+        toastError(m.library_tag_failed_many({
+          count: formatNumber(failed.length),
+          detail: translateError(failed[0], m.transfers_operation_failed()),
+        }));
+      }
+    } catch (e: unknown) {
+      error = toErr(e);
+      toastError(error);
+    } finally {
+      bulkProgress = null;
+      await refresh();
+      bulkBusy = false;
+    }
+  }
+
+  async function whenBulkIdle(): Promise<void> {
+    while (bulkBusy) await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+
+  /** Keep the open file and the checked rows on files that were renamed. */
+  function followRenamedPaths(renamed: { from: string; to: string }[]) {
+    if (renamed.length === 0) return;
+    const to = new Map(renamed.map((r) => [r.from, r.to]));
+    if (selectedPath && to.has(selectedPath)) selectedPath = to.get(selectedPath) ?? selectedPath;
+    if (renamed.some((r) => checkedPaths.has(r.from))) {
+      checkedPaths = new Set([...checkedPaths].map((p) => to.get(p) ?? p));
     }
   }
 
@@ -3041,6 +3160,8 @@
         case 'open_file': await openSharedFileExternally(f.path); break;
         case 'open_folder': await openSharedFolder(f.path); break;
         case 'rename': openRename(f); break;
+        case 'tag_add': await applyEmberTag(emberTagTargets(f, true).map((t) => t.path), true); break;
+        case 'tag_remove': await applyEmberTag(emberTagTargets(f, false).map((t) => t.path), false); break;
         case 'move_category':
           if (extra !== undefined) await moveToCategory(categoryMoveTargets(f), extra);
           break;
@@ -4896,6 +5017,11 @@
         {:else}
           <button class="tb-btn" disabled={bulkBusy || checkedRestrictCount === 0} onclick={() => bulkFriendsOnly(true)} title={checkedRestrictCount === 0 ? m.library_bulk_need_shared() : m.library_bulk_friends_only_on_title()}>{m.library_bulk_friends_only_on()}</button>
         {/if}
+        {#if checkedUntaggableCount > 0 && checkedTaggableCount === 0}
+          <button class="tb-btn" disabled={bulkBusy} onclick={() => bulkEmberTag(false)} title={m.library_bulk_untag_title()}>{m.library_bulk_untag()}</button>
+        {:else}
+          <button class="tb-btn" disabled={bulkBusy || checkedTaggableCount === 0} onclick={() => bulkEmberTag(true)} title={checkedTaggableCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_tag_title()}>{m.library_bulk_tag()}</button>
+        {/if}
         <button class="tb-btn" disabled={checkedHashedCount === 0} onclick={bulkCopyLinks} title={checkedHashedCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_copy_links_title()}>{m.library_copy_links()}</button>
         <button class="tb-btn" onclick={openCreateDialogFromSelection} title={m.library_bulk_new_collection_title()}>{m.library_bulk_new_collection()}</button>
         <span class="bulk-spacer"></span>
@@ -5368,6 +5494,8 @@
 {#if ctxMenu}
   {@const fileHashed = !!ctxMenu.file.hash}
   {@const moveTargets = categoryMoveTargets(ctxMenu.file)}
+  {@const tagAddTargets = emberTagTargets(ctxMenu.file, true)}
+  {@const tagRemoveTargets = emberTagTargets(ctxMenu.file, false)}
   <div class="ctx-menu" role="menu" bind:this={ctxMenuEl} use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}>
     <div class="ctx-header" role="presentation">
       <bdi dir="auto">{ctxMenu.file.name}</bdi>
@@ -5382,6 +5510,20 @@
       title={fileHashed ? undefined : m.library_rename_not_hashed()}
       onclick={() => ctxAction('rename')}
     >{m.library_rename()}</button>
+    {#if tagAddTargets.length > 0}
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('tag_add')}>
+        {tagAddTargets.length > 1
+          ? m.library_ctx_tag_count({ count: formatNumber(tagAddTargets.length) })
+          : m.library_bulk_tag()}
+      </button>
+    {/if}
+    {#if tagRemoveTargets.length > 0}
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('tag_remove')}>
+        {tagRemoveTargets.length > 1
+          ? m.library_ctx_untag_count({ count: formatNumber(tagRemoveTargets.length) })
+          : m.library_bulk_untag()}
+      </button>
+    {/if}
     {#if moveTargets.length > 0}
       <!-- Only for files a category can move: hashed, and in Downloads. A
            category's destination is shown beside it, so the choice says where

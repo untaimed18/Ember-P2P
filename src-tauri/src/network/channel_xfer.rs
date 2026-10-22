@@ -2166,7 +2166,14 @@ pub(super) fn finish_xfer_recv(state: &mut NetworkState, xfer_id: [u8; 16]) {
             if abandoned.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(std::io::Error::other("cancelled while it was being verified"));
             }
-            let target = unique_download_path(&recv.final_path);
+            // Tagged like an eD2K download when the user asked for that.
+            let wanted = match recv.final_path.file_name().and_then(|name| name.to_str()) {
+                Some(name) => recv
+                    .final_path
+                    .with_file_name(crate::sharing::name_tag::completed_download_name(name)),
+                None => recv.final_path.clone(),
+            };
+            let target = unique_download_path(&wanted);
             let landed = ed2k::transfer::move_part_to_final_approved(
                 &recv.part_path,
                 &target,

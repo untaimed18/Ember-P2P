@@ -3249,6 +3249,18 @@
                 ariaDescribedby="auto-remove-hint"
               />
             </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="tag-downloads-label" for="tag-downloads-switch">{m.settings_tag_downloads()}</label>
+                <span class="hint" id="tag-downloads-hint">{m.settings_tag_downloads_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="tag-downloads-switch"
+                bind:checked={settings.tag_completed_downloads}
+                ariaLabelledby="tag-downloads-label"
+                ariaDescribedby="tag-downloads-hint"
+              />
+            </div>
             <!-- Turning it on raises a native confirmation from the backend;
                  declining it leaves the save holding the Recycle Bin, which
                  the switch then shows again. -->
@@ -3300,6 +3312,18 @@
                 {m.settings_shared_folders_hint()}
                 <a href="/library" onclick={(e) => { e.preventDefault(); void goto('/library'); }}>{m.settings_open_page({ page: m.nav_library() })}</a>
               </span>
+            </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="tag-imports-label" for="tag-imports-switch">{m.settings_tag_imports()}</label>
+                <span class="hint" id="tag-imports-hint">{m.settings_tag_imports_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="tag-imports-switch"
+                bind:checked={settings.tag_shared_imports}
+                ariaLabelledby="tag-imports-label"
+                ariaDescribedby="tag-imports-hint"
+              />
             </div>
             <div class="field toggle-row">
               <div class="toggle-info">

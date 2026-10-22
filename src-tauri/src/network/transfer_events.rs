@@ -110,7 +110,8 @@ pub(super) fn reverify_complete_part_file(
     if control.is_cancelled() {
         anyhow::bail!("cancelled by user");
     }
-    let safe_name = crate::security::sanitize_filename(file_name);
+    let safe_name =
+        crate::sharing::name_tag::completed_download_name(&crate::security::sanitize_filename(file_name));
     let actual_final = ed2k::transfer::move_part_to_completed(
         &part_path,
         part_dir,
@@ -129,6 +130,19 @@ pub(super) fn reverify_complete_part_file(
         "Re-verified and completed restored download {transfer_id} ({file_name}, {file_size} bytes)"
     );
     Ok(actual_final)
+}
+
+/// The name a finished download's row takes when completion saved its file
+/// under the `[Ember-P2P]` tag and the row still has the name without it.
+fn tagged_completion_name(
+    mgr: &crate::sharing::manager::TransferManager,
+    transfer_id: &str,
+    final_path: &str,
+) -> Option<String> {
+    let name = std::path::Path::new(final_path).file_name()?.to_str()?;
+    let row = mgr.get_transfer(transfer_id)?;
+    (crate::sharing::name_tag::has_tag(name) && !crate::sharing::name_tag::has_tag(&row.file_name))
+        .then(|| name.to_string())
 }
 
 /// How long the leftover-partial cleanup waits for the finished download's
@@ -699,6 +713,18 @@ pub(super) async fn handle_download_event(
                 // we wrote rather than reconstructing it from the file name.
                 if let Some(ref fp) = final_path {
                     mgr.set_completed_path(&transfer_id, fp.clone());
+                    // Saved under the `[Ember-P2P]` tag: the row shows the
+                    // name the file has, as it does after a Library rename.
+                    if let Some(tagged) = tagged_completion_name(&mgr, &transfer_id, fp) {
+                        mgr.follow_renamed_file(&transfer_id, &tagged, fp.clone());
+                        let db = db.clone();
+                        let id = transfer_id.clone();
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(e) = db.update_transfer_file_name(&id, &tagged) {
+                                warn!("Could not save the tagged name of finished download {id}: {e}");
+                            }
+                        });
+                    }
                 }
                 mgr.set_ember_verified(&transfer_id, ember_verified);
                 mgr.complete(&transfer_id)

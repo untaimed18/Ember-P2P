@@ -1571,6 +1571,16 @@ pub struct AppSettings {
     /// Automatically remove completed downloads from the list
     #[serde(default)]
     pub remove_finished_downloads: bool,
+    /// Save each download as `[Ember-P2P] <name>` when it completes.
+    #[serde(default)]
+    pub tag_completed_downloads: bool,
+    /// Rename files new to a shared folder to `[Ember-P2P] <name>` once they
+    /// are hashed. Files in the Library when this is turned on are left as
+    /// they are, and so is any file whose content the Library has seen
+    /// before, so a tag taken off by hand is not put back. Completed
+    /// downloads follow `tag_completed_downloads` instead.
+    #[serde(default)]
+    pub tag_shared_imports: bool,
     /// Globally prioritize the first and last part of every download so media
     /// files become previewable as early as possible (eMule's global "preview
     /// priority" preference). When on, every transfer behaves as if its
@@ -2742,6 +2752,8 @@ impl Default for AppSettings {
             max_connections_per_five_secs: 20,
             add_downloads_paused: false,
             remove_finished_downloads: false,
+            tag_completed_downloads: false,
+            tag_shared_imports: false,
             preview_priority_all: false,
             web_sources_enabled: true,
             preview_player: String::new(),

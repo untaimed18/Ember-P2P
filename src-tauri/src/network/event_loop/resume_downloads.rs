@@ -1553,6 +1553,14 @@ mod tests {
             Err("Restored final file hash mismatch".to_string()),
             "an unrelated file of the same name is not this download"
         );
+
+        // Completion saved it under the `[Ember-P2P]` tag.
+        std::fs::write(downloads.join("[Ember-P2P] movie.bin"), &finished).unwrap();
+        let candidates = ed2k::transfer::published_names(&downloads, "movie.bin");
+        assert_eq!(
+            find_published_file(&candidates, &root, 100, &hash, None, None),
+            Ok(downloads.join("[Ember-P2P] movie.bin"))
+        );
     }
 
     #[tokio::test]
