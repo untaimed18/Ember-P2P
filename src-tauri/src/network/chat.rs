@@ -251,6 +251,13 @@ pub(super) async fn send_encrypted_chat_ext(
                             plaintext.first().copied().unwrap_or(0) != 0,
                         )
                     }
+                    ed2k::messages::EMBER_EXT_STATUS => {
+                        crate::network::ember::crypto::encrypt_chat_status(
+                            ed25519_secret_key,
+                            &peer_pubkey,
+                            plaintext.first().copied().unwrap_or(0),
+                        )
+                    }
                     ed2k::messages::EMBER_EXT_CHAT_READ => plaintext.try_into().ok().and_then(
                         |body_hash: [u8; crate::network::ember::crypto::CHAT_BODY_HASH_LEN]| {
                             crate::network::ember::crypto::encrypt_chat_read(

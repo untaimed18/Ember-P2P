@@ -7,6 +7,7 @@ import {
   forgetFriendName,
   friendLabel,
   friendNames,
+  friendPresence,
   friendsList,
   patchFriendsList,
 } from './friends';
@@ -85,6 +86,18 @@ describe('shared friends list ordering', () => {
 
     expect(commitFriendsList(beginFriendsListFetch(), [friend(A, 'Saved')])).toBe(true);
     expect(get(friendNames).get(A)).toBe('Saved');
+  });
+});
+
+describe('friend presence', () => {
+  it('is offline without a session, whatever status was last sent', () => {
+    const statuses = new Map([[A, 'busy' as const]]);
+    expect(friendPresence(A, new Set(), statuses)).toBe('offline');
+    expect(friendPresence(A, new Set([A]), statuses)).toBe('busy');
+  });
+
+  it('is online for a connected friend that never sent a status', () => {
+    expect(friendPresence(B.toUpperCase(), new Set([B]), new Map())).toBe('online');
   });
 });
 

@@ -1123,6 +1123,16 @@ pub(super) struct NetworkState {
     pub(super) firewall_req_cooldown: HashMap<Ipv4Addr, i64>,
     /// Ember friends currently connected (ember_hash -> last_seen_timestamp)
     pub(super) online_friends: HashMap<[u8; 16], i64>,
+    /// The status each friend last sent on their current session. Read only
+    /// for friends in `online_friends`, so an offline friend never shows one;
+    /// dropped when the session ends or the friend is removed. A friend with
+    /// no entry shows online.
+    pub(super) friend_statuses: HashMap<[u8; 16], crate::types::FriendStatus>,
+    /// The user has been idle past `auto_away_minutes`, so friends see Away
+    /// while the chosen status is Online. See `friend_status::on_idle_check`.
+    pub(super) idle_away: bool,
+    /// When idle time was last read; `None` asks for a read on the next tick.
+    pub(super) last_idle_check: Option<std::time::Instant>,
     /// Session-bound FIFO correlation for friend browse requests. See
     /// [`browse::PendingBrowseRequest`] for why a request ID alone is
     /// insufficient.

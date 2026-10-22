@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import * as m from '$lib/paraglide/messages';
-import type { AppSettings, FriendOverrides, WebService } from '$lib/types';
+import type { AppSettings, FriendOverrides, FriendStatus, WebService } from '$lib/types';
 import { flushToastActionsBeforeExit } from '$lib/stores/toast';
 
 export type SettingsUpdateOutcome = 'applied' | 'restart_required' | 'deferred';
@@ -150,6 +150,12 @@ export async function setFriendOverrides(
   overrides: FriendOverrides,
 ): Promise<AppSettings> {
   return invoke('set_friend_overrides', { userHashHex, overrides });
+}
+
+/** Set the status friends see while we are online, and tell the ones connected
+ *  now. Resolves with the settings as saved. */
+export async function setFriendStatus(status: FriendStatus): Promise<AppSettings> {
+  return invoke('set_friend_status', { status });
 }
 
 /** Persist and apply speed limits without a full settings save. Resolves with

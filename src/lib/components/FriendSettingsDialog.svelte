@@ -14,7 +14,7 @@
   import { translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
   import { appSettings, setAppSettings } from '$lib/stores/settings';
-  import { onlineFriends } from '$lib/stores/friends';
+  import { friendPresence, friendPresenceLabel, friendStatuses, onlineFriends } from '$lib/stores/friends';
   import { CHAT_DISAPPEAR_CHOICES, disappearLabel } from '$lib/chatDisappear';
   import { setFriendOverrides } from '$lib/api/settings';
   import {
@@ -95,7 +95,7 @@
   let disappearDefault = $derived($appSettings?.chat_disappear_secs ?? 0);
   let disappearOn = $derived((disappear === 'default' ? disappearDefault : Number(disappear)) > 0);
 
-  let online = $derived($onlineFriends.has(hash));
+  let presence = $derived(friendPresence(hash, $onlineFriends, $friendStatuses));
   let displayName = $derived(name.trim() || opened.self_name || shortId);
 
   let nameTooLong = $derived(friendNameTooLong(name));
@@ -252,12 +252,22 @@
               <circle cx="12" cy="8" r="4" />
               <path d="M4 21c0-4.418 3.582-8 8-8s8 3.582 8 8" />
             </svg>
-            <span class="fs-dot" class:online></span>
+            <span
+              class="fs-dot"
+              class:online={presence === 'online'}
+              class:away={presence === 'away'}
+              class:busy={presence === 'busy'}
+            ></span>
           </span>
           <div class="fs-hero-text">
             <bdi class="fs-name" dir="auto">{displayName}</bdi>
             <div class="fs-meta">
-              <span class="fs-pill" class:online>{online ? m.chat_online_label() : m.chat_offline_label()}</span>
+              <span
+                class="fs-pill"
+                class:online={presence === 'online'}
+                class:away={presence === 'away'}
+                class:busy={presence === 'busy'}
+              >{friendPresenceLabel(presence)}</span>
               {#if !friend.mutual}
                 <span class="fs-pill waiting">{m.friends_status_waiting_accept()}</span>
               {/if}
@@ -499,6 +509,14 @@
     background: var(--success);
   }
 
+  .fs-dot.away {
+    background: var(--warning);
+  }
+
+  .fs-dot.busy {
+    background: var(--danger);
+  }
+
   .fs-hero-text {
     display: flex;
     flex-direction: column;
@@ -533,6 +551,16 @@
   .fs-pill.online {
     color: var(--success);
     background: color-mix(in srgb, var(--success) 14%, transparent);
+  }
+
+  .fs-pill.away {
+    color: var(--warning);
+    background: color-mix(in srgb, var(--warning) 14%, transparent);
+  }
+
+  .fs-pill.busy {
+    color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 14%, transparent);
   }
 
   .fs-pill.waiting {

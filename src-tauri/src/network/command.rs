@@ -3999,6 +3999,20 @@ async fn handle_command_inner(
             let _ = tx.send(online);
         }
 
+        NetworkCommand::GetFriendStatuses { tx } => {
+            let statuses = state
+                .friend_statuses
+                .iter()
+                .filter(|(eh, _)| state.online_friends.contains_key(*eh))
+                .map(|(eh, status)| (hex::encode(eh), *status))
+                .collect();
+            let _ = tx.send(statuses);
+        }
+
+        NetworkCommand::GetIdleAway { tx } => {
+            let _ = tx.send(state.idle_away);
+        }
+
         NetworkCommand::FindNotes {
             file_hash,
             file_size,

@@ -398,6 +398,15 @@ pub const EMBER_EXT_CHAT_ID: u8 = 0x11;
 /// with it.
 pub const EMBER_EXT_ATTACH_WAITS: u8 = 0x12;
 
+/// The status we show a friend while connected: online, away or busy.
+/// Encrypted to the friend like a typing signal
+/// ([`crate::network::ember::crypto::encrypt_chat_status`]). Sent when a
+/// secure session comes up and again whenever the user changes it. The
+/// receiver forgets it when the friend goes offline, so a status never
+/// outlives the session that carried it. A peer that predates this logs and
+/// ignores it, and shows us online.
+pub const EMBER_EXT_STATUS: u8 = 0x13;
+
 const DHT_MEET_FLAG_ANSWER: u8 = 0x01;
 
 /// [`EMBER_EXT_DHT_MEET`] body: `udp_port(2, LE) || flags(1)`.

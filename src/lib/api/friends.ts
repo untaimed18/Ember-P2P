@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import * as m from '$lib/paraglide/messages';
+import type { FriendStatus } from '$lib/types';
 
 export interface FriendInfo {
   user_hash: string;
@@ -368,6 +369,23 @@ export async function isFriendDiscoverable(): Promise<boolean> {
  *  `ember:friend-online` transition. */
 export async function getOnlineFriends(): Promise<string[]> {
   return invoke('get_online_friends');
+}
+
+/** Statuses of online friends that set one, by lowercase hex hash. An online
+ *  friend missing from it is plain online. */
+export async function getFriendStatuses(): Promise<Record<string, FriendStatus>> {
+  return invoke('get_friend_statuses');
+}
+
+export interface IdleAwayInfo {
+  /** Friends see us Away now because we have been idle. */
+  active: boolean;
+  /** This build can tell how long we have been idle at all. */
+  supported: boolean;
+}
+
+export async function getIdleAway(): Promise<IdleAwayInfo> {
+  return invoke('get_idle_away');
 }
 
 export async function browseFriend(

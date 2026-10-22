@@ -1496,6 +1496,47 @@ pub async fn get_online_friends(state: tauri::State<'_, AppState>) -> Result<Vec
     await_reply(rx, "peers_no_response", "No response").await
 }
 
+/// Online friends that set a status, by lowercase hex hash. A friend absent
+/// from the map is online or offline as `get_online_friends` says.
+#[tauri::command]
+pub async fn get_friend_statuses(
+    state: tauri::State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, crate::types::FriendStatus>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::GetFriendStatuses { tx })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    let statuses: Vec<(String, crate::types::FriendStatus)> =
+        await_reply(rx, "peers_no_response", "No response").await?;
+    Ok(statuses.into_iter().collect())
+}
+
+#[derive(serde::Serialize)]
+pub struct IdleAwayInfo {
+    /// Friends see us Away now because we have been idle.
+    pub active: bool,
+    /// This build can tell how long we have been idle at all.
+    pub supported: bool,
+}
+
+/// Never an error: whether this build can read idle time does not depend on
+/// the network loop, and the Settings page would otherwise call a busy loop
+/// an unsupported system. `active` falls back to false, which the next
+/// `ember:idle-away` event corrects.
+#[tauri::command]
+pub async fn get_idle_away(state: tauri::State<'_, AppState>) -> Result<IdleAwayInfo, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let active = match state.network_tx.try_send(NetworkCommand::GetIdleAway { tx }) {
+        Ok(()) => await_reply(rx, "peers_no_response", "No response").await.unwrap_or(false),
+        Err(_) => false,
+    };
+    Ok(IdleAwayInfo {
+        active,
+        supported: crate::idle::supported(),
+    })
+}
+
 #[tauri::command]
 pub async fn retry_friend_search(
     state: tauri::State<'_, AppState>,

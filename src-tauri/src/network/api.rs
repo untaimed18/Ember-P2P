@@ -527,6 +527,15 @@ pub enum NetworkCommand {
     GetOnlineFriends {
         tx: oneshot::Sender<Vec<String>>,
     },
+    /// Online friends that sent a status, by lowercase hex hash. An online
+    /// friend missing from it shows online.
+    GetFriendStatuses {
+        tx: oneshot::Sender<Vec<(String, crate::types::FriendStatus)>>,
+    },
+    /// Whether friends see us Away now because we have been idle.
+    GetIdleAway {
+        tx: oneshot::Sender<bool>,
+    },
     /// Reputation for many peers at once, keyed by lowercase hex user hash.
     ///
     /// The Known Clients tab needs a Trust badge per visible row and refreshes

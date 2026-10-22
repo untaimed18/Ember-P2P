@@ -69,6 +69,8 @@
   import { collectBackupPrefs } from '$lib/backupPrefs';
   import { lastBackupAt, noteBackupMade } from '$lib/backupReminder';
   import { CHAT_DISAPPEAR_CHOICES, disappearLabel } from '$lib/chatDisappear';
+  import { AUTO_AWAY_CHOICES } from '$lib/friendSettings';
+  import { idleAwaySupported } from '$lib/stores/friends';
   import {
     clampInputUtf8Bytes,
     formatDateTime,
@@ -4336,6 +4338,27 @@
                What a "Verified" request means is explained beside the requests
                themselves, on the Friends page. -->
           <p class="hint section-intro">{m.settings_friend_overrides_hint()}</p>
+
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_status()}</h4>
+            <div class="field" class:is-disabled={!$idleAwaySupported}>
+              <label for="auto-away">{m.settings_auto_away_label()}</label>
+              <select
+                id="auto-away"
+                bind:value={settings.auto_away_minutes}
+                disabled={!$idleAwaySupported}
+                aria-describedby="auto-away-hint"
+              >
+                <option value={0}>{m.settings_auto_away_off()}</option>
+                {#each AUTO_AWAY_CHOICES as minutes (minutes)}
+                  <option value={minutes}>{m.settings_auto_away_after({ count: minutes })}</option>
+                {/each}
+              </select>
+              <span id="auto-away-hint" class="hint">
+                {$idleAwaySupported ? m.settings_auto_away_hint() : m.settings_auto_away_unsupported()}
+              </span>
+            </div>
+          </div>
 
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_chat()}</h4>

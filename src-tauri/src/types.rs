@@ -1731,6 +1731,17 @@ pub struct AppSettings {
     /// rather than failing the whole config and resetting every setting.
     #[serde(default, deserialize_with = "deserialize_friend_overrides")]
     pub friend_overrides: std::collections::BTreeMap<String, FriendOverrides>,
+    /// The status friends see while we are online. Offline needs no setting:
+    /// a friend without a session to us shows us offline whatever this says.
+    ///
+    /// Backend-owned: only `set_friend_status` writes it.
+    #[serde(default, deserialize_with = "deserialize_friend_status")]
+    pub friend_status: FriendStatus,
+    /// Show friends Away after this many minutes without keyboard or mouse
+    /// input, while the status is Online; 0 is off. A status set by hand to
+    /// Away or Busy is never changed. See [`AUTO_AWAY_CHOICES`].
+    #[serde(default = "default_auto_away_minutes")]
+    pub auto_away_minutes: u32,
     /// Rendezvous server URL for friend discovery
     #[serde(default = "default_rendezvous_url")]
     pub rendezvous_url: String,
@@ -2353,6 +2364,27 @@ pub fn normalize_chat_disappear_secs(secs: u32) -> u32 {
         .unwrap_or(0)
 }
 
+/// The idle times, in minutes, after which friends see us Away. Off is 0.
+pub const AUTO_AWAY_CHOICES: [u32; 5] = [5, 10, 15, 30, 60];
+
+fn default_auto_away_minutes() -> u32 {
+    10
+}
+
+/// A stored idle time held to the offered choices, as
+/// [`normalize_chat_disappear_secs`] holds a timer: 0 stays off, anything
+/// else becomes the nearest choice.
+pub fn normalize_auto_away_minutes(minutes: u32) -> u32 {
+    if minutes == 0 {
+        return 0;
+    }
+    AUTO_AWAY_CHOICES
+        .iter()
+        .copied()
+        .min_by_key(|choice| choice.abs_diff(minutes))
+        .unwrap_or(0)
+}
+
 /// Friends with overrides kept at most: past the friends list's own ceiling
 /// of 500, so a real list always fits and a hand-edited file cannot grow the
 /// config without bound.
@@ -2408,6 +2440,48 @@ impl FriendOverrides {
         self.disappear_secs = self.disappear_secs.map(normalize_chat_disappear_secs);
         self
     }
+}
+
+/// What a friend shows while connected. Offline is not one of them: it is
+/// what having no session means, and nothing a friend sends can claim it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FriendStatus {
+    #[default]
+    Online,
+    Away,
+    Busy,
+}
+
+impl FriendStatus {
+    /// The byte `EMBER_EXT_STATUS` carries.
+    pub fn wire(self) -> u8 {
+        match self {
+            Self::Online => 0,
+            Self::Away => 1,
+            Self::Busy => 2,
+        }
+    }
+
+    /// A byte from a later build that this one has no name for is still a
+    /// friend who is connected, so it reads as online.
+    pub fn from_wire(byte: u8) -> Self {
+        match byte {
+            1 => Self::Away,
+            2 => Self::Busy,
+            _ => Self::Online,
+        }
+    }
+}
+
+/// Read leniently, so a status a later build wrote reads as online rather
+/// than failing the whole config.
+fn deserialize_friend_status<'de, D>(deserializer: D) -> Result<FriendStatus, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_default())
 }
 
 fn deserialize_friend_overrides<'de, D>(
@@ -2697,6 +2771,8 @@ impl Default for AppSettings {
             channel_file_offers: default_channel_file_offers(),
             chat_attachment_auto_accept_mb: default_chat_attachment_auto_accept_mb(),
             friend_overrides: std::collections::BTreeMap::new(),
+            friend_status: FriendStatus::Online,
+            auto_away_minutes: default_auto_away_minutes(),
             max_friends: default_max_friends(),
             rendezvous_url: default_rendezvous_url(),
             ember_native_enabled: true,

@@ -3343,6 +3343,11 @@ pub enum UploadEventKind {
         ember_hash: [u8; 16],
         typing: bool,
     },
+    /// Friend set the status they show while connected.
+    EmberFriendStatus {
+        ember_hash: [u8; 16],
+        status: crate::types::FriendStatus,
+    },
     /// Friend has read our chat up through the message with this body hash.
     EmberChatRead {
         ember_hash: [u8; 16],
@@ -15115,6 +15120,30 @@ impl UploadHandler {
                                                 kind: UploadEventKind::EmberChatTyping {
                                                     ember_hash: eh,
                                                     typing,
+                                                },
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
+                            Some((super::messages::EMBER_EXT_STATUS, body)) => {
+                                if let Some(pk) = hello_caps.ember_pubkey {
+                                    if let Some(byte) =
+                                        crate::network::ember::crypto::decrypt_chat_status(
+                                            &self.ed25519_secret_key,
+                                            &pk,
+                                            body,
+                                        )
+                                    {
+                                        let _ = self
+                                            .upload_event_tx
+                                            .send(UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: UploadEventKind::EmberFriendStatus {
+                                                    ember_hash: eh,
+                                                    status: crate::types::FriendStatus::from_wire(
+                                                        byte,
+                                                    ),
                                                 },
                                             })
                                             .await;

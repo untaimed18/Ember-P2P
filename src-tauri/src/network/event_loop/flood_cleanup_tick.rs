@@ -79,6 +79,9 @@ pub(in crate::network) async fn on_flood_cleanup_tick(
         for eh in refresh {
             state.online_friends.insert(eh, now);
         }
+        // Their status is kept: it shows only while they are online, and the
+        // session this sweep gave up on can still recover without a new one
+        // that would send it again. A session that ends drops it.
         for eh in &expired {
             state.online_friends.remove(eh);
             let _ = app_handle.emit("ember:friend-offline", serde_json::json!({

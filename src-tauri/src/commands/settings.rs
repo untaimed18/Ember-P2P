@@ -102,6 +102,9 @@ const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
     // holds a copy from whenever it opened, and saving that back would undo a
     // change made since from the friend's card.
     "friend_overrides",
+    // Written by `set_friend_status` from the Friends page, for the same
+    // reason: a Settings page opened earlier would put the old one back.
+    "friend_status",
     "shared_folders",
     "previous_download_folders",
     "default_shared_folder_seeded",
@@ -835,6 +838,12 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
+    let auto_away = crate::types::normalize_auto_away_minutes(settings.auto_away_minutes);
+    if auto_away != settings.auto_away_minutes {
+        settings.auto_away_minutes = auto_away;
+        changed = true;
+    }
+
     // A hand-edited or damaged entry is repaired or dropped, not a reason to
     // reset every other setting.
     let overrides = normalize_friend_overrides(settings.friend_overrides.clone());
@@ -1080,6 +1089,14 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             "settings_chat_attachment_auto_accept_invalid",
             "The automatic download limit is larger than any file a friend can send",
             crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB,
+        ));
+    }
+    if crate::types::normalize_auto_away_minutes(settings.auto_away_minutes)
+        != settings.auto_away_minutes
+    {
+        return Err(coded(
+            "settings_auto_away_invalid",
+            "Choose one of the offered idle times",
         ));
     }
     if normalize_friend_overrides(settings.friend_overrides.clone()) != settings.friend_overrides {
@@ -2692,6 +2709,22 @@ pub async fn set_friend_overrides(
         return Err(coded("peers_not_friend", "That is not one of your friends"));
     }
     Ok(saved)
+}
+
+/// Set the status friends see while we are online. Saved, so it is still
+/// ours after a restart, and sent at once to every friend connected now.
+#[tauri::command]
+pub async fn set_friend_status(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    status: crate::types::FriendStatus,
+) -> Result<AppSettings, String> {
+    save_settings_change(&app, &state, move |settings| {
+        let changed = settings.friend_status != status;
+        settings.friend_status = status;
+        Ok(changed)
+    })
+    .await
 }
 
 /// Forget a removed friend's overrides, so adding them again starts from the

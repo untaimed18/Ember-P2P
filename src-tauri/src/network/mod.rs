@@ -6,6 +6,7 @@ pub(crate) mod channel_membership;
 mod channel_relay;
 mod channel_xfer;
 mod chat;
+mod friend_status;
 pub(crate) mod chat_attach;
 mod chat_mailbox;
 mod command;
@@ -147,6 +148,7 @@ use self::ember_search::*;
 use self::ember_udp::*;
 use self::event_loop::*;
 use self::friend_transfer::*;
+use self::friend_status::*;
 use self::friends::*;
 use self::kad_io::*;
 use self::kad_search::*;
@@ -1075,6 +1077,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         firewall_req_connect_bucket: TokenBucket::new(32, 1.0),
         firewall_req_cooldown: HashMap::new(),
         online_friends: HashMap::new(),
+        friend_statuses: HashMap::new(),
+        idle_away: false,
+        last_idle_check: None,
         pending_browse_requests: HashMap::new(),
         recent_ember_chat: HashMap::new(),
         held_chat_expires: HashMap::new(),
@@ -3741,6 +3746,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // Here rather than an arm of its own: the loop is at
                 // `select!`'s branch limit. It keeps its own cadence.
                 on_chat_mailbox_tick(&mut state, &db, &app_handle, &settings, ed25519_secret_key, ed25519_pubkey);
+                on_idle_check(&mut state, &settings, &app_handle, &ed25519_secret_key).await;
             }
 
             // Buddy system: find a relay buddy if firewalled (always-on, like eMule)

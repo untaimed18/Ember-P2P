@@ -578,6 +578,41 @@ pub fn decrypt_chat_read(
     plain.try_into().ok()
 }
 
+/// Marks the plaintext as a status, so the envelope cannot be taken for any
+/// other chat signal under the same key.
+const CHAT_STATUS_MAGIC: &[u8; 4] = b"STA1";
+/// Largest status envelope decrypted. Room past today's `magic || status` so
+/// a later build can append fields, which this one reads past.
+pub const MAX_CHAT_STATUS_WIRE_LEN: usize = CHAT_ENVELOPE_OVERHEAD + 64;
+
+/// Encrypt our status byte for a live friend session (`EMBER_EXT_STATUS`).
+pub fn encrypt_chat_status(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    status: u8,
+) -> Option<Vec<u8>> {
+    let mut plain = Vec::with_capacity(CHAT_STATUS_MAGIC.len() + 1);
+    plain.extend_from_slice(CHAT_STATUS_MAGIC);
+    plain.push(status);
+    encrypt_chat_for_peer(our_ed25519_seed, peer_ed25519_pubkey, &plain)
+}
+
+/// The status byte in a friend's status envelope. `None` if the envelope is
+/// not ours, too large, or not a status.
+pub fn decrypt_chat_status(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    envelope: &[u8],
+) -> Option<u8> {
+    if envelope.len() > MAX_CHAT_STATUS_WIRE_LEN {
+        return None;
+    }
+    let plain = decrypt_chat_from_peer(our_ed25519_seed, peer_ed25519_pubkey, envelope)?;
+    plain
+        .strip_prefix(CHAT_STATUS_MAGIC.as_slice())
+        .and_then(|rest| rest.first().copied())
+}
+
 /// What an `EMBER_EXT_CHAT_EXPIRE` timer is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChatExpireTarget {
@@ -1439,6 +1474,35 @@ mod tests {
         let off = encrypt_chat_typing(&alice_seed, &bob_pub, false).unwrap();
         assert_eq!(decrypt_chat_typing(&bob_seed, &alice_pub, &off), Some(false));
         assert!(decrypt_chat_typing(&bob_seed, &alice_pub, b"not-an-envelope").is_none());
+    }
+
+    /// A status opens only as a status: never from a typing signal or a chat
+    /// line under the same key, and a later build's extra fields are read past.
+    #[test]
+    fn chat_status_round_trip_and_is_its_own_signal() {
+        let alice_seed = gen_seed();
+        let bob_seed = gen_seed();
+        let alice_pub = signing_key_from_bytes(&alice_seed)
+            .verifying_key()
+            .to_bytes();
+        let bob_pub = signing_key_from_bytes(&bob_seed).verifying_key().to_bytes();
+
+        let away = encrypt_chat_status(&alice_seed, &bob_pub, 1).unwrap();
+        assert_eq!(decrypt_chat_status(&bob_seed, &alice_pub, &away), Some(1));
+        assert!(decrypt_chat_typing(&bob_seed, &alice_pub, &away).is_none());
+
+        let typing = encrypt_chat_typing(&alice_seed, &bob_pub, true).unwrap();
+        assert!(decrypt_chat_status(&bob_seed, &alice_pub, &typing).is_none());
+        let line = encrypt_chat_for_peer(&alice_seed, &bob_pub, b"hello").unwrap();
+        assert!(decrypt_chat_status(&bob_seed, &alice_pub, &line).is_none());
+
+        let later = encrypt_chat_for_peer(&alice_seed, &bob_pub, b"STA1\x02future fields").unwrap();
+        assert_eq!(decrypt_chat_status(&bob_seed, &alice_pub, &later), Some(2));
+        let empty = encrypt_chat_for_peer(&alice_seed, &bob_pub, b"STA1").unwrap();
+        assert!(decrypt_chat_status(&bob_seed, &alice_pub, &empty).is_none());
+
+        let too_big = encrypt_chat_for_peer(&alice_seed, &bob_pub, &[b'S'; 200]).unwrap();
+        assert!(decrypt_chat_status(&bob_seed, &alice_pub, &too_big).is_none());
     }
 
     #[test]

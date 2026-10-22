@@ -18,6 +18,12 @@
   import { plural } from '$lib/plural';
   import {
     onlineFriends as onlineFriendsStore,
+    friendStatuses as friendStatusesStore,
+    idleAway as idleAwayStore,
+    friendPresence as presenceOf,
+    friendPresenceLabel,
+    FRIEND_STATUSES,
+    type FriendPresence,
     unreadCounts as unreadCountsStore,
     friendRequests as friendRequestsStore,
     searchingFriends as searchingFriendsStore,
@@ -46,7 +52,9 @@
     legacyStrandedFriends as legacyStrandedFriendsStore,
   } from '$lib/stores/friends';
   import { minuteClock } from '$lib/stores/clock';
-  import { appSettings } from '$lib/stores/settings';
+  import { appSettings, setAppSettings } from '$lib/stores/settings';
+  import { setFriendStatus } from '$lib/api/settings';
+  import type { FriendStatus } from '$lib/types';
   import { networkStats } from '$lib/stores/network';
   import { menuKeydown } from '$lib/a11y';
   import IconX from '$lib/components/IconX.svelte';
@@ -267,8 +275,8 @@
     return formatCalendarDate(ts, { month: 'short', day: 'numeric' });
   }
 
-  function friendPresence(f: FriendInfo): 'online' | 'offline' {
-    return isFriendOnline(f.user_hash) ? 'online' : 'offline';
+  function friendPresence(f: FriendInfo): FriendPresence {
+    return presenceOf(f.user_hash, onlineFriends, $friendStatusesStore);
   }
 
   async function handleAcceptRequest(req: FriendRequestInfo) {
@@ -527,6 +535,25 @@
 
   function toErr(e: unknown): string {
     return translateError(e, m.error_operation_failed());
+  }
+
+  let myStatus: FriendStatus = $derived($appSettings?.friend_status ?? 'online');
+  /** What friends see: Away replaces Online while we are idle. */
+  let myShownStatus: FriendStatus = $derived(myStatus === 'online' && $idleAwayStore ? 'away' : myStatus);
+  let savingStatus = $state(false);
+  async function changeMyStatus(select: HTMLSelectElement) {
+    const next = FRIEND_STATUSES.find((s) => s === select.value);
+    if (savingStatus || !next || next === myStatus) return;
+    savingStatus = true;
+    try {
+      setAppSettings(await setFriendStatus(next));
+    } catch (e: unknown) {
+      // The select shows what was picked, not what was saved.
+      select.value = myStatus;
+      error = translateError(e, m.friends_my_status_failed());
+    } finally {
+      savingStatus = false;
+    }
   }
 
   let loadFriendsSeq = 0;
@@ -1071,6 +1098,30 @@
           {:else if undiscoverable}
             <span class="my-id-status undiscoverable">{m.friends_status_undiscoverable()}</span>
           {/if}
+          <div class="my-status-row">
+            <span
+              class="my-status-dot"
+              class:dot-online={myShownStatus === 'online'}
+              class:dot-away={myShownStatus === 'away'}
+              class:dot-busy={myShownStatus === 'busy'}
+              aria-hidden="true"
+            ></span>
+            <label for="my-friend-status">{m.friends_my_status_label()}</label>
+            <select
+              id="my-friend-status"
+              value={myStatus}
+              disabled={!$appSettings || savingStatus}
+              aria-describedby="my-friend-status-hint"
+              onchange={(e) => void changeMyStatus(e.currentTarget)}
+            >
+              {#each FRIEND_STATUSES as status (status)}
+                <option value={status}>{friendPresenceLabel(status)}</option>
+              {/each}
+            </select>
+          </div>
+          <span id="my-friend-status-hint" class="my-status-hint">
+            {myShownStatus !== myStatus ? m.friends_my_status_idle() : m.friends_my_status_hint()}
+          </span>
         </div>
       </div>
       <div class="my-id-actions">
@@ -1403,9 +1454,11 @@
           <span
             class="status-dot"
             class:dot-online={presence === 'online'}
+            class:dot-away={presence === 'away'}
+            class:dot-busy={presence === 'busy'}
             class:dot-offline={presence === 'offline'}
             role="img"
-            aria-label={presence === 'online' ? m.chat_online_label() : m.chat_offline_label()}
+            aria-label={friendPresenceLabel(presence)}
           ></span>
         </div>
 
@@ -1430,15 +1483,6 @@
                      the surrounding UI direction. -->
                 {#if f.nickname}<bdi dir="auto">{f.nickname}</bdi>{:else}{m.friends_no_nickname()}{/if}
               </button>
-              <!-- Beside a label, the name they chose stays in view, so a
-                   label never hides who this is and their renames still show. -->
-              {#if f.alias && f.self_name && f.self_name !== f.alias}
-                <bdi
-                  dir="auto"
-                  class="self-name"
-                  title={m.friends_self_name_title({ name: f.self_name })}
-                >{f.self_name}</bdi>
-              {/if}
               {#if f.mutual && isOnline}
                 <!-- Icon only: the encryption guarantee is identical for every
                      mutual online friend, so spelling it out on each card was
@@ -1451,6 +1495,15 @@
                 </span>
               {/if}
             </div>
+            <!-- Under a label, the name they chose stays in view, so a label
+                 never hides who this is and their renames still show. -->
+            {#if f.alias && f.self_name && f.self_name !== f.alias}
+              <bdi
+                dir="auto"
+                class="self-name"
+                title={m.friends_self_name_title({ name: f.self_name })}
+              >{f.self_name}</bdi>
+            {/if}
           {/if}
           <!-- Exactly one status line, highest-priority state wins. -->
           <span class="card-substatus">
@@ -1468,6 +1521,10 @@
               </span>
             {:else if presence === 'online'}
               <span class="status-online">{m.friends_status_online()}</span>
+            {:else if presence === 'away'}
+              <span class="status-away">{m.friends_status_away()}</span>
+            {:else if presence === 'busy'}
+              <span class="status-busy">{m.friends_status_busy()}</span>
             {:else if f.last_seen}
               {m.friends_status_last_seen({ when: formatLastSeen(f.last_seen, $minuteClock) })}
             {:else}
@@ -1806,6 +1863,27 @@
     color: color-mix(in srgb, var(--danger) 85%, var(--text-primary));
   }
 
+  .my-status-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+  }
+
+  .my-status-dot {
+    width: 10px;
+    height: 10px;
+    flex-shrink: 0;
+    border-radius: 50%;
+  }
+
+  .my-status-hint {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+  }
+
   .my-id-copy {
     display: inline-flex;
     align-items: center;
@@ -2062,8 +2140,8 @@
   /* --- Card grid --- */
   .cards-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-    gap: 10px;
+    grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr));
+    gap: 12px;
   }
 
   /* Single row: avatar · identity · controls. No `overflow: hidden` — the
@@ -2074,8 +2152,8 @@
     border-radius: var(--radius-lg);
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 9px 10px;
+    gap: 12px;
+    padding: 12px 14px;
     transition: border-color var(--transition-normal), box-shadow var(--transition-normal);
   }
 
@@ -2090,8 +2168,8 @@
   }
 
   .card-avatar {
-    width: var(--avatar-size);
-    height: var(--avatar-size);
+    width: 40px;
+    height: 40px;
     flex-shrink: 0;
     border-radius: 50%;
     background: var(--accent-dim);
@@ -2102,8 +2180,8 @@
   }
 
   .card-avatar svg {
-    width: 18px;
-    height: 18px;
+    width: 22px;
+    height: 22px;
   }
 
   .card-identity {
@@ -2111,7 +2189,7 @@
     min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 1px;
+    gap: 2px;
   }
 
   .card-name-row {
@@ -2127,10 +2205,7 @@
     flex-shrink: 0;
   }
 
-  /* Gives way before the label does when the card is narrow. */
   .self-name {
-    flex-shrink: 2;
-    min-width: 0;
     font-size: var(--font-size-xs);
     color: var(--text-muted);
     overflow: hidden;
@@ -2159,6 +2234,16 @@
 
   .status-online {
     color: var(--success);
+    font-weight: 600;
+  }
+
+  .status-away {
+    color: var(--warning);
+    font-weight: 600;
+  }
+
+  .status-busy {
+    color: var(--danger);
     font-weight: 600;
   }
 
@@ -2437,6 +2522,14 @@
 
   .dot-online {
     background: var(--success);
+  }
+
+  .dot-away {
+    background: var(--warning);
+  }
+
+  .dot-busy {
+    background: var(--danger);
   }
 
   .dot-offline {

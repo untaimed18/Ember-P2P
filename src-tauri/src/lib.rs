@@ -29,6 +29,7 @@ mod commands;
 mod emule_import;
 mod finish_action;
 mod geoip;
+mod idle;
 mod ipfilter_update;
 mod network;
 mod power;
@@ -2410,6 +2411,7 @@ pub fn run() {
             commands::chat_attachments::cancel_chat_attachment,
             commands::chat_attachments::retry_chat_attachment,
             commands::settings::set_friend_overrides,
+            commands::settings::set_friend_status,
             commands::chat_attachments::list_chat_attachments,
             commands::chat_attachments::open_chat_attachment,
             commands::chat_attachments::open_chat_files_folder,
@@ -2488,6 +2490,8 @@ pub fn run() {
             commands::peers::retry_friend_search,
             commands::peers::is_friend_discoverable,
             commands::peers::get_online_friends,
+            commands::peers::get_friend_statuses,
+            commands::peers::get_idle_away,
             commands::peers::kad_connect,
             commands::peers::kad_bootstrap_ip,
             commands::peers::kad_bootstrap_url,

@@ -219,6 +219,9 @@ pub(super) async fn apply_settings_update(
 ) {
     let old_channel_username = settings.channel_username.clone();
     let old_nickname = settings.nickname.clone();
+    let old_shown_status = effective_friend_status(state, settings);
+    let old_friend_status = settings.friend_status;
+    let old_auto_away_minutes = settings.auto_away_minutes;
     let session_friends: Vec<[u8; 16]> = state.ember_sessions.read().await.keys().copied().collect();
     let collected_before: Vec<bool> = session_friends
         .iter()
@@ -254,6 +257,16 @@ pub(super) async fn apply_settings_update(
     }
     if settings.nickname != old_nickname {
         announce_nickname_to_friends(state, &settings.nickname).await;
+    }
+    // Read idle time afresh first: choosing Online is itself input, and the
+    // last reading may still say Away, which would go out ahead of Online.
+    if settings.friend_status != old_friend_status
+        || settings.auto_away_minutes != old_auto_away_minutes
+    {
+        refresh_idle_away(state, settings, app_handle);
+    }
+    if effective_friend_status(state, settings) != old_shown_status {
+        announce_friend_status(state, settings, &identity.ed25519_secret_key).await;
     }
     source_manager
         .write()

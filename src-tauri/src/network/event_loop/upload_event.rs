@@ -608,6 +608,7 @@ pub(in crate::network) async fn on_upload_event(
             UploadEventKind::EmberChatMessage { ember_hash, .. }
             | UploadEventKind::EmberChatMailboxAware { ember_hash, .. }
             | UploadEventKind::EmberChatTyping { ember_hash, .. }
+            | UploadEventKind::EmberFriendStatus { ember_hash, .. }
             | UploadEventKind::EmberChatRead { ember_hash, .. }
             | UploadEventKind::EmberChatExpire { ember_hash, .. }
             | UploadEventKind::EmberBrowseRequest { ember_hash, .. }
@@ -664,6 +665,7 @@ pub(in crate::network) async fn on_upload_event(
             if still_friend {
                 on_friend_session_for_mailbox(state, settings, *ember_hash).await;
                 chat_attach::on_friend_session(state, *ember_hash).await;
+                send_friend_status(state, settings, &ed25519_secret_key, *ember_hash).await;
             }
             // The session is live, so anything the user typed
             // while this friend was unreachable can go out now —
@@ -833,6 +835,7 @@ pub(in crate::network) async fn on_upload_event(
                 // outbound arm gives.
                 on_friend_session_for_mailbox(state, settings, *ember_hash).await;
                 chat_attach::on_friend_session(state, *ember_hash).await;
+                send_friend_status(state, settings, &ed25519_secret_key, *ember_hash).await;
                 if settings.chat_allowed_with(ember_hash) {
                     flush_pending_chat(
                         db,
@@ -1094,6 +1097,22 @@ pub(in crate::network) async fn on_upload_event(
                 serde_json::json!({
                     "user_hash": hex::encode(typing_eh),
                     "typing": typing,
+                }),
+            );
+        }
+    }
+
+    if let UploadEventKind::EmberFriendStatus { ember_hash: status_eh, status } = event.kind {
+        // The activity block above has just marked them online, so this
+        // status belongs to a session that is up.
+        if friend_hashes.read().await.contains(&status_eh)
+            && state.friend_statuses.insert(status_eh, status) != Some(status)
+        {
+            let _ = app_handle.emit(
+                "ember:friend-status",
+                serde_json::json!({
+                    "user_hash": hex::encode(status_eh),
+                    "status": status,
                 }),
             );
         }
@@ -1600,6 +1619,7 @@ pub(in crate::network) async fn on_upload_event(
             );
         } else {
             state.online_friends.remove(&dc_eh);
+            state.friend_statuses.remove(&dc_eh);
             state.outbound_session_tasks.remove(&dc_eh);
             let _ = app_handle.emit("ember:friend-offline", serde_json::json!({
                 "user_hash": hash_hex,

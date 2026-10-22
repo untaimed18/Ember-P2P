@@ -832,6 +832,11 @@ export interface AntiLeechReplaceResult {
   compile_errors: Array<[string, string]>;
 }
 
+/** What a friend shows while connected. Offline is not one of them: it is
+ *  what having no session means. Mirrors `FriendStatus` in
+ *  `src-tauri/src/types.rs`. */
+export type FriendStatus = 'online' | 'away' | 'busy';
+
 /** One friend's exceptions to the friend settings. A field left out follows
  *  the global setting. Mirrors `FriendOverrides` in `src-tauri/src/types.rs`.
  *  The friend's name is not here: it is their nickname in the friends list. */
@@ -982,6 +987,12 @@ export interface AppSettings {
   /** Per-friend exceptions to the friend settings above, keyed by the friend's
    *  lowercase hex hash. Written only through `setFriendOverrides`. */
   friend_overrides?: Record<string, FriendOverrides>;
+  /** What friends see while we are online. Written only through
+   *  `setFriendStatus`. */
+  friend_status?: FriendStatus;
+  /** Friends see Away after this many idle minutes while the status is
+   *  Online; 0 is off. One of `AUTO_AWAY_CHOICES`. */
+  auto_away_minutes: number;
   /** Maximum number of friends allowed (1–500) */
   max_friends: number;
   /**

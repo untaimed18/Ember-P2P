@@ -1182,6 +1182,22 @@ names no offer. `EMBER_EXT_MAILBOX_AWARE` says nothing about waiting: 1.7.4
 sends it and still drops an offer at five minutes, and 1.7.4 sends neither
 form, so nothing waits with it.
 
+**Friend status, after 1.7.5.** `EMBER_EXT_STATUS` (`0x13`) carries the
+status a user shows friends while connected. Its body is a chat envelope
+(`encrypt_chat_status`) under the friend's chat key, sealing `"STA1" ||
+status(1)`: 0 online, 1 away, 2 busy, and any other value read as online.
+Bytes after the status are read past, so a later build may add fields; an
+envelope over `MAX_CHAT_STATUS_WIRE_LEN` is dropped. Each side sends it when
+a secure session comes up, whatever the status, and again to every live
+session when the user changes it (`send_friend_status`,
+`announce_friend_status`). A sender whose user chose Online sends Away on
+its own while they are idle (`auto_away_minutes`, `friend_status.rs`) and
+Online again when they return; to the receiver that is the same status. The
+receiver shows it only while the friend is online and drops it when their
+session ends, so a friend with no session always shows offline; a friend who
+never sends one shows online.
+Older builds log the sub-type as unknown and ignore it.
+
 ---
 
 ## What freezes at the end of the beta

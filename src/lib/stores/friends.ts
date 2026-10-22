@@ -5,6 +5,8 @@ import { confusableSkeleton, isAppVisible, mixesLookalikeScripts } from '$lib/ut
 import {
   getFriendRequests,
   getFriends,
+  getFriendStatuses,
+  getIdleAway,
   getOnlineFriends,
   getUnreadMessageCounts,
   isFriendDiscoverable,
@@ -13,13 +15,102 @@ import {
   type FriendRequestInfo,
   type IncomingFileOffer,
 } from '$lib/api/friends';
-import type { StartDownloadResponse } from '$lib/types';
+import type { FriendStatus, StartDownloadResponse } from '$lib/types';
 import { toast, toastError, toastSuccess } from '$lib/stores/toast';
 import { notify, shouldNotify } from '$lib/notifications';
 import { chatWindowShows, isChatWindow } from '$lib/windowRole';
 import * as m from '$lib/paraglide/messages';
 
 export const onlineFriends = writable<Set<string>>(new Set());
+/** The status each online friend last sent, by lowercase hash. Only read
+ *  through {@link friendPresence}, which shows offline for a friend not in
+ *  {@link onlineFriends} whatever is here. */
+export const friendStatuses = writable<Map<string, FriendStatus>>(new Map());
+
+/** Friends see us Away now because we have been idle, while our chosen status
+ *  is Online. */
+export const idleAway = writable(false);
+/** This build can tell how long we have been idle at all. */
+export const idleAwaySupported = writable(false);
+
+/** What a friend shows: offline without a session, else the status they set. */
+export type FriendPresence = FriendStatus | 'offline';
+
+export function friendPresence(
+  friendHash: string,
+  online: Set<string>,
+  statuses: Map<string, FriendStatus>,
+): FriendPresence {
+  const hash = friendHash.toLowerCase();
+  if (!online.has(hash)) return 'offline';
+  return statuses.get(hash) ?? 'online';
+}
+
+export function friendPresenceLabel(presence: FriendPresence): string {
+  switch (presence) {
+    case 'away':
+      return m.friends_status_away();
+    case 'busy':
+      return m.friends_status_busy();
+    case 'online':
+      return m.chat_online_label();
+    default:
+      return m.chat_offline_label();
+  }
+}
+
+export const FRIEND_STATUSES: readonly FriendStatus[] = ['online', 'away', 'busy'];
+
+function validFriendStatus(raw: unknown): FriendStatus | null {
+  return FRIEND_STATUSES.find((s) => s === raw) ?? null;
+}
+
+/** Bumped by every status or offline event for a friend, so a fetch begun
+ *  before one cannot put back what it replaced. */
+const statusEventSeq = new Map<string, number>();
+/** Friends to re-read, with the event count each was queued at. */
+let statusRefetch = new Map<string, number>();
+let statusRefetchTimer: ReturnType<typeof setTimeout> | null = null;
+
+function noteStatusEvent(hash: string) {
+  statusEventSeq.set(hash, (statusEventSeq.get(hash) ?? 0) + 1);
+}
+
+/**
+ * Re-read what the backend holds for friends who just came back online. A
+ * session the backend had given up on can recover without sending a status
+ * again, and this side dropped it when they went offline. Coalesced, since
+ * many friends come online together.
+ */
+function refetchFriendStatus(hash: string) {
+  statusRefetch.set(hash, statusEventSeq.get(hash) ?? 0);
+  if (statusRefetchTimer !== null) return;
+  statusRefetchTimer = setTimeout(() => {
+    statusRefetchTimer = null;
+    const queued = statusRefetch;
+    statusRefetch = new Map();
+    const epoch = storeEpoch;
+    getFriendStatuses()
+      .then((all) => {
+        if (epoch !== storeEpoch) return;
+        for (const [friend, seq] of queued) {
+          if ((statusEventSeq.get(friend) ?? 0) !== seq) continue;
+          setFriendStatusEntry(friend, validFriendStatus(all[friend]));
+        }
+      })
+      .catch((e) => console.warn('friends: status refetch failed', e));
+  }, 250);
+}
+
+function setFriendStatusEntry(hash: string, status: FriendStatus | null) {
+  friendStatuses.update((map) => {
+    if (status === null ? !map.has(hash) : map.get(hash) === status) return map;
+    const next = new Map(map);
+    if (status === null) next.delete(hash);
+    else next.set(hash, status);
+    return next;
+  });
+}
 /**
  * Friend hash → nickname, for surfaces that have only a hash in hand.
  *
@@ -345,6 +436,8 @@ const CHAT_SIG_TTL_MS = 10_000;
  */
 interface SeedLive {
   online: Set<string>;
+  statuses: Set<string>;
+  idleAway: boolean;
   requests: Set<string>;
   /** Hash → whether it was cleared, rather than only bumped. */
   unread: Map<string, boolean>;
@@ -484,6 +577,7 @@ export async function initFriendsStore() {
         const wasOnline = get(onlineFriends).has(hash);
         seedLive?.online.add(hash);
         onlineFriends.update((s) => (s.has(hash) ? s : new Set([...s, hash])));
+        if (!wasOnline) refetchFriendStatus(hash);
         searchingFriends.update((s) => { const next = new Set(s); next.delete(hash); return next; });
         clearSearchTimer(hash);
         if (!wasOnline && shouldNotify('friend_online', hash)) {
@@ -496,7 +590,26 @@ export async function initFriendsStore() {
         const hash = validFriendHash(event.payload?.user_hash);
         if (!hash) return;
         seedLive?.online.add(hash);
+        seedLive?.statuses.add(hash);
+        noteStatusEvent(hash);
         onlineFriends.update((s) => { const next = new Set(s); next.delete(hash); return next; });
+        setFriendStatusEntry(hash, null);
+      }),
+    );
+    registered.push(
+      await listen<{ user_hash: string; status: string }>('ember:friend-status', (event) => {
+        const hash = validFriendHash(event.payload?.user_hash);
+        const status = validFriendStatus(event.payload?.status);
+        if (!hash || !status) return;
+        seedLive?.statuses.add(hash);
+        noteStatusEvent(hash);
+        setFriendStatusEntry(hash, status);
+      }),
+    );
+    registered.push(
+      await listen<{ active: boolean }>('ember:idle-away', (event) => {
+        if (seedLive) seedLive.idleAway = true;
+        idleAway.set(event.payload?.active === true);
       }),
     );
     registered.push(
@@ -862,7 +975,14 @@ export async function initFriendsStore() {
   // not let its response repopulate a store that was just reset for the next
   // init cycle. The listeners above are live throughout, so each seed also
   // defers to what they changed meanwhile (see `SeedLive`).
-  const live: SeedLive = { online: new Set(), requests: new Set(), unread: new Map(), discoverable: false };
+  const live: SeedLive = {
+    online: new Set(),
+    statuses: new Set(),
+    idleAway: false,
+    requests: new Set(),
+    unread: new Map(),
+    discoverable: false,
+  };
   seedLive = live;
 
   const seedRequests = async () => {
@@ -960,6 +1080,33 @@ export async function initFriendsStore() {
     }
   };
 
+  const seedStatuses = async () => {
+    try {
+      const statuses = await getFriendStatuses();
+      if (myEpoch !== storeEpoch) return;
+      for (const [raw, rawStatus] of Object.entries(statuses)) {
+        const hash = validFriendHash(raw);
+        const status = validFriendStatus(rawStatus);
+        if (hash && status && !live.statuses.has(hash)) setFriendStatusEntry(hash, status);
+      }
+    } catch (e) {
+      // Not worth the load-failed toast: friends show plain online until the
+      // next status event, which every new session sends.
+      console.warn('friends: seed getFriendStatuses failed', e);
+    }
+  };
+
+  const seedIdleAway = async () => {
+    try {
+      const info = await getIdleAway();
+      if (myEpoch !== storeEpoch) return;
+      idleAwaySupported.set(info.supported);
+      if (!live.idleAway) idleAway.set(info.active);
+    } catch (e) {
+      console.warn('friends: seed getIdleAway failed', e);
+    }
+  };
+
   // Names, so a notification raised before the user has opened /friends can
   // still say who it is about. Ticketed like every other fetch, so a page that
   // loaded the list meanwhile is not rolled back to this one.
@@ -974,7 +1121,15 @@ export async function initFriendsStore() {
     }
   };
 
-  await Promise.all([seedRequests(), seedUnread(), seedDiscoverable(), seedOnline(), seedFriends()]);
+  await Promise.all([
+    seedRequests(),
+    seedUnread(),
+    seedDiscoverable(),
+    seedOnline(),
+    seedStatuses(),
+    seedIdleAway(),
+    seedFriends(),
+  ]);
   if (seedLive === live) seedLive = null;
 }
 
@@ -1037,6 +1192,12 @@ export function cleanupFriendsStore() {
     clearTimeout(friendsListRefreshTimer);
     friendsListRefreshTimer = null;
   }
+  if (statusRefetchTimer !== null) {
+    clearTimeout(statusRefetchTimer);
+    statusRefetchTimer = null;
+  }
+  statusRefetch = new Map();
+  statusEventSeq.clear();
   // Retire every ticket outstanding at teardown without rewinding the
   // counter. Resetting both to zero would hand the next session ticket
   // numbers a fetch from the previous one is still holding, and the page
@@ -1058,6 +1219,8 @@ export function cleanupFriendsStore() {
   searchTimers.clear();
   recentChatSigs.clear();
   onlineFriends.set(new Set());
+  friendStatuses.set(new Map());
+  idleAway.set(false);
   friendNames.set(new Map());
   unreadCounts.set(new Map());
   friendRequests.set([]);

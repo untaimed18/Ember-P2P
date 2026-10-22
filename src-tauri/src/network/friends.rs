@@ -23,6 +23,7 @@ pub(super) async fn forget_friend_network_state(
 ) {
     ed2k::upload::revoke_all_secure_sessions(friend);
     state.online_friends.remove(&friend);
+    state.friend_statuses.remove(&friend);
     let _ = retire_current_ember_session(&state.ember_sessions, friend).await;
     // A remove followed by a re-add must not wait out a stale search slot.
     state.outbound_session_tasks.remove(&friend);

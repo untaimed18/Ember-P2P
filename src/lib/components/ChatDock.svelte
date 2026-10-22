@@ -19,6 +19,10 @@
   import {
     unreadCounts,
     onlineFriends,
+    friendStatuses,
+    friendPresence,
+    friendPresenceLabel,
+    type FriendPresence,
     friendsList,
     fileOffers,
     friendLabel,
@@ -209,11 +213,16 @@
      *  friend's. `name` stays bare for search and for the tab it opens. */
     label: string;
     online: boolean;
+    presence: FriendPresence;
     unread: number;
   };
 
   function isOnline(hash: string): boolean {
     return $onlineFriends.has(hash.toLowerCase());
+  }
+
+  function presenceOf(hash: string) {
+    return friendPresence(hash, $onlineFriends, $friendStatuses);
   }
 
   let openRows = $derived<SwitcherRow[]>(
@@ -223,6 +232,7 @@
       name: tab.name,
       label: friendLabel(tab.hash, tab.name, $friendNames),
       online: isOnline(tab.hash),
+      presence: presenceOf(tab.hash),
       unread: $unreadCounts.get(tab.hash) ?? 0,
     })),
   );
@@ -251,6 +261,7 @@
               name: f.nickname?.trim() || $friendNames.get(hash) || `${hash.slice(0, 8)}\u2026`,
               label: friendLabel(hash, f.nickname, $friendNames),
               online: isOnline(f.user_hash),
+              presence: presenceOf(f.user_hash),
               unread: 0,
             };
           })
@@ -674,18 +685,17 @@
         onclick={toggleSwitcher}
       >
         {#if activeTab}
+          {@const presence = presenceOf(activeTab.hash)}
           <!-- Named, not decorative: the header says nothing else about whether
                the friend is reachable, so hiding the dot hides the state. -->
           <span
             class="dock-presence"
-            class:online={isOnline(activeTab.hash)}
+            class:online={presence === 'online'}
+            class:away={presence === 'away'}
+            class:busy={presence === 'busy'}
             role="img"
-            aria-label={isOnline(activeTab.hash)
-              ? m.chat_online_label()
-              : m.chat_offline_label()}
-            title={isOnline(activeTab.hash)
-              ? m.chat_online_label()
-              : m.chat_offline_label()}
+            aria-label={friendPresenceLabel(presence)}
+            title={friendPresenceLabel(presence)}
           ></span>
           <span class="dock-current-name"><bdi dir="auto">{activeTabLabel}</bdi></span>
         {:else}
@@ -857,9 +867,11 @@
               >
                 <span
                   class="dock-presence"
-                  class:online={row.online}
+                  class:online={row.presence === 'online'}
+                  class:away={row.presence === 'away'}
+                  class:busy={row.presence === 'busy'}
                   role="img"
-                  aria-label={row.online ? m.chat_online_label() : m.chat_offline_label()}
+                  aria-label={friendPresenceLabel(row.presence)}
                 ></span>
                 <span class="dock-row-name"><bdi dir="auto">{row.label}</bdi></span>
                 {#if row.unread > 0}
@@ -909,9 +921,11 @@
               >
                 <span
                   class="dock-presence"
-                  class:online={row.online}
+                  class:online={row.presence === 'online'}
+                  class:away={row.presence === 'away'}
+                  class:busy={row.presence === 'busy'}
                   role="img"
-                  aria-label={row.online ? m.chat_online_label() : m.chat_offline_label()}
+                  aria-label={friendPresenceLabel(row.presence)}
                 ></span>
                 <span class="dock-row-name"><bdi dir="auto">{row.label}</bdi></span>
               </div>
@@ -1123,6 +1137,16 @@
   .dock-presence.online {
     background: var(--status-connected);
     box-shadow: 0 0 0 2px color-mix(in srgb, var(--status-connected) 18%, transparent);
+  }
+
+  .dock-presence.away {
+    background: var(--warning);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--warning) 18%, transparent);
+  }
+
+  .dock-presence.busy {
+    background: var(--danger);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 18%, transparent);
   }
 
   .dock-encrypted {

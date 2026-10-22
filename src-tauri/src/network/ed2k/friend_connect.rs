@@ -967,6 +967,23 @@ pub async fn run_friend_session_over_transport(
                                                 }).await;
                                             }
                                         }
+                                        Some((super::messages::EMBER_EXT_STATUS, body)) => {
+                                            if let Some(byte) =
+                                                crate::network::ember::crypto::decrypt_chat_status(
+                                                    &session_our_ed25519_secret,
+                                                    &session_peer_ember_pubkey,
+                                                    body,
+                                                )
+                                            {
+                                                let _ = session_ul_event_tx.send(UploadEvent {
+                                                    transfer_id: String::new(),
+                                                    kind: UploadEventKind::EmberFriendStatus {
+                                                        ember_hash: peer_ember_hash,
+                                                        status: crate::types::FriendStatus::from_wire(byte),
+                                                    },
+                                                }).await;
+                                            }
+                                        }
                                         Some((super::messages::EMBER_EXT_CHAT_READ, body)) => {
                                             if let Some(body_hash) = decrypt_chat_read(
                                                 &session_our_ed25519_secret,
