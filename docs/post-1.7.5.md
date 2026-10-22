@@ -58,6 +58,98 @@ and answer them; nothing else (friend sessions, file search, publishing a
 library) changes identity; and the per-publisher and per-address budgets
 still bind.
 
+## 2. Private messages between room members
+
+**Why:** two people in a room have no way to talk privately except becoming
+friends first, which is heavy for a quick word and grants browse and file
+sharing along with it. Rooms already carry a message to one member that the
+members relaying it cannot attribute (the room friend request, frame 27), and
+frames encrypted to one recipient (21, 25, 26). A private message is the same
+idea with a body.
+
+**Decided:**
+
+- **Carried by the room, encrypted to the recipient.** A new extension frame,
+  kind 66, relayed through the room like chat. Not a direct connection: that
+  would give each side the other's address and a new kind of session for
+  people who are not friends.
+- **First contact is a request.** The first message from someone arrives as a
+  request to accept or ignore, and nothing about the conversation shows as
+  unread until it is accepted. A setting offers "Ask first" (default), "Allow
+  from anyone" and "Off".
+
+**The frame (kind 66).** An ordinary extension frame, signed by the sender,
+without `EXT_FLAG_DISPLAY`, so 1.7.2 and later relay it under chat's rules
+(the sender's ban, retired-key roster check and chat rate) and no build shows
+a "needs a newer Ember" line for it. Body: `version(1) || tag(16) ||
+nonce(24) || ciphertext`.
+
+- **Tag.** Pairwise and bound to the envelope's `msg_id`, as frame 27's is, so
+  relays cannot group messages by recipient. A receiver derives one pairwise
+  base per sender (cached) and one HMAC per frame to recognise its own.
+- **Key.** `derive_pairwise_capability` with a purpose of its own
+  (`ch-dm-v1 || channel_id`), never `derive_chat_key`: friend chat's key
+  depends on the two identities only, so reusing it would make a room message
+  a valid friend-chat ciphertext and the other way round. XChaCha20-Poly1305,
+  with `channel_id || msg_id || timestamp || sender || tag` as associated
+  data, so a body cannot be lifted into another envelope.
+- **Plaintext.** `type(1) || fields`, one kind for everything so relays cannot
+  tell a message from a receipt: message (`message_id(16) || text`), receipt
+  (`message_id(16)`), accept, decline. Padded to fixed buckets (256, 1024,
+  4096) so length says little. Text capped at `CHAT_TEXT_MAX_BYTES`.
+
+**Delivery.** Extension frames are not stored for catch-up, so a message
+reaches only a recipient online within the 10-minute relay window. The
+recipient answers with a receipt; the sender resends under a fresh envelope
+for a bounded time and then marks it "Not delivered — they may be offline or
+on an older Ember". Offline delivery through the chat mailbox
+(`derive_chat_mailbox_box` already works for any two identities) is a later
+step, not part of the first version.
+
+**Conversations.** One per person, keyed by their member key, carried through
+a room both are in (the one it started in while both remain, else any shared
+room, as `send_room_friend_request` picks). No shared room: sending is
+unavailable and the conversation offers Add friend. Someone already a friend
+gets friend chat instead.
+
+**Safety.**
+
+- **The sender is visible to relays,** since bans and rates need it: members
+  passing a frame learn that someone sent a private message, not to whom or
+  what. The help text says so.
+- **Moderators cannot read them.** A room ban still stops them (relays drop
+  a banned sender), and each message costs the sender a chat-rate charge.
+- **The ignore list moves to the backend.** Today `ignoredMembers` lives in
+  the webview's `localStorage` only; it moves into settings (migrated once
+  from `localStorage`) so an ignored member's message is dropped before it
+  is stored or notified. Ignoring from a request does the same.
+- **Requests are capped** per room per hour, as room friend requests are
+  (`ROOM_FRIEND_REQUESTS_PER_ROOM_HOUR`), and a declined sender cannot ask
+  again for a while.
+- **No forward secrecy:** static keys, as sealed offers and friend chat use.
+
+**Storage.** New tables: threads (`member_pubkey`, state pending / accepted /
+declined, room last used) and messages, the bodies encrypted with the chat
+key like `chat_messages`. Deleting a conversation deletes both. Leaving or
+being banned from a room does not delete history.
+
+**UI.** "Message privately" in a member's menu; a chat tab in the dock,
+labelled with the room; requests listed on the Channels page; notifications
+under the message-notification settings; the new setting under Channels.
+Strings in all nine languages.
+
+**Spec.** Kind 66 goes into `channels-format.md` under Extension frames, and
+into `UNDERSTOOD_EXT_KINDS`, in the release that builds it. Adding a kind is
+what the freeze allows, so no frozen format changes and no cut-over is needed.
+
+**Tests:** only the recipient recognises its tag, and tags differ for two
+messages to the same person; a body does not open under another envelope,
+room or sender; a friend-chat ciphertext does not open as a room message and
+the other way round; 1.7.4's unknown-kind path relays the frame without
+storing or counting it; a banned or ignored sender's message is dropped; the
+first message is held as a request and not notified as unread; receipts stop
+resends; a message to someone with no shared room is refused.
+
 ## Already scheduled for 1.8.0
 
 Decided in 1.7.5 and written into the spec, so that a room has one cut-over to
