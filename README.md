@@ -6,6 +6,8 @@ It also runs a network of its own: the [**Ember Network**](#ember-network) is an
 
 No spyware. No ads. No nonsense.
 
+**Website:** [www.emberp2p.org](https://www.emberp2p.org/)
+
 <a href="docs/screenshots/ember-transfers-light.png">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/ember-transfers-dark.png">

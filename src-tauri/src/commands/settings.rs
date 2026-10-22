@@ -2889,8 +2889,8 @@ pub async fn set_quick_limits(
     apply_quick_limits(&app, &state, patch).await
 }
 
-/// Official Ember project website (GitHub Pages).
-const EMBER_WEBSITE_URL: &str = "https://untaimed18.github.io/Ember-P2P/";
+/// Official Ember project website.
+const EMBER_WEBSITE_URL: &str = "https://www.emberp2p.org/";
 
 /// The source repository: code, releases and issues.
 const EMBER_GITHUB_URL: &str = "https://github.com/untaimed18/Ember-P2P";
