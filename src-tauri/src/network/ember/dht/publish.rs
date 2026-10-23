@@ -995,6 +995,9 @@ pub struct ChannelPresenceMember {
     pub noise_pub: [u8; 32],
     /// True when this is a leave tombstone (`CHANNEL_FLAG_DEPARTED`).
     pub departed: bool,
+    /// The language the member says they speak, from [`CHANNEL_LANGUAGES`].
+    /// `None` when they chose none, or published from a build without it.
+    pub language: Option<&'static str>,
 }
 
 /// Newest-wins across presence records for one publisher.
@@ -1130,17 +1133,24 @@ fn channel_language_wire_id(code: &str) -> u8 {
         .map_or(0, |i| (i + 1) as u8)
 }
 
+fn channel_language_from_wire_id(id: u8) -> Option<&'static str> {
+    usize::from(id)
+        .checked_sub(1)
+        .and_then(|i| CHANNEL_LANGUAGES.get(i).copied())
+}
+
 /// The language a channel record's `file_size` carries in its third byte.
 ///
 /// That byte, like the five above it, was always written as zero and never
 /// read: every build masks `file_size` down to the kind and flag bytes, and
 /// the size filter that reads the whole value only runs for file searches. So
-/// an index or moderation record can carry the language without a byte of
-/// its trailer, and every storer that accepted the record before still does.
-/// The signature covers it like the rest of the header.
+/// an index or moderation record, or a public room's presence record, can
+/// carry a language without a byte of its trailer, and every storer that
+/// accepted the record before still does. The signature covers it like the
+/// rest of the header. A private room's presence keeps its member's language
+/// inside the seal instead, where a storer cannot read it.
 pub fn channel_language_from_file_size(file_size: u64) -> Option<&'static str> {
-    let id = ((file_size >> 16) & 0xff) as usize;
-    id.checked_sub(1).and_then(|i| CHANNEL_LANGUAGES.get(i).copied())
+    channel_language_from_wire_id(((file_size >> 16) & 0xff) as u8)
 }
 
 fn pack_channel_file_size_with_language(kind: u8, flags: u8, language: Option<&str>) -> u64 {
@@ -1345,6 +1355,7 @@ impl SignedRecord {
     ) -> Self {
         Self::channel_presence_v1_at(
             nickname,
+            None,
             channel_id,
             channel_pubkey,
             join_secret,
@@ -1358,9 +1369,13 @@ impl SignedRecord {
     }
 
     /// The v1 presence record, live or departed, stamped `timestamp`.
+    ///
+    /// `language` rides where the nickname does: in the signed header of a
+    /// public room's record, inside the seal of a private room's.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn channel_presence_v1_at(
         nickname: &str,
+        language: Option<&str>,
         channel_id: [u8; 16],
         channel_pubkey: [u8; 32],
         join_secret: &[u8; 32],
@@ -1379,13 +1394,15 @@ impl SignedRecord {
             &channel_id,
             noise_pub,
             nickname,
+            language.map_or(0, channel_language_wire_id),
         );
+        let header_language = if private { None } else { language };
         Self::build_with_media(
             RECORD_TYPE_CHANNEL,
             channel::presence_key(&channel_id, join_secret, epoch),
             channel_id,
             channel_pubkey,
-            pack_channel_file_size(CHANNEL_KIND_PRESENCE, flags),
+            pack_channel_file_size_with_language(CHANNEL_KIND_PRESENCE, flags, header_language),
             &nickname,
             None,
             Some(extra),
@@ -1406,8 +1423,10 @@ impl SignedRecord {
     /// ([`channel::encode_presence_extra_v2`]). A storer still learns the
     /// member from the STORE, which goes out under the member's long-term DHT
     /// identity; it learns no room.
+    #[allow(clippy::too_many_arguments)]
     pub fn channel_presence_v2_at(
         nickname: &str,
+        language: Option<&str>,
         channel_id: [u8; 16],
         join_secret: &[u8; 32],
         departed: bool,
@@ -1427,6 +1446,7 @@ impl SignedRecord {
             &pseudonym_pub,
             noise_pub,
             nickname,
+            language.map_or(0, channel_language_wire_id),
             member,
             epoch,
             departed,
@@ -1455,9 +1475,12 @@ impl SignedRecord {
     ///
     /// The two forms of a private record never share a store slot (publisher
     /// and `file_hash` both differ), so neither replaces the other.
+    ///
+    /// A leave notice carries no `language`: it removes the row it would label.
     #[allow(clippy::too_many_arguments)]
     pub fn channel_presence_forms(
         nickname: &str,
+        language: Option<&str>,
         channel_id: [u8; 16],
         channel_pubkey: [u8; 32],
         join_secret: &[u8; 32],
@@ -1467,15 +1490,17 @@ impl SignedRecord {
         member: &SigningKey,
         now: i64,
     ) -> Vec<Self> {
+        let language = if departed { None } else { language };
         let mut forms = Vec::with_capacity(2);
         if private {
             forms.push(Self::channel_presence_v2_at(
-                nickname, channel_id, join_secret, departed, noise_pub, member, now,
+                nickname, language, channel_id, join_secret, departed, noise_pub, member, now,
             ));
         }
         if !private || channel::PUBLISH_V1_MEMBERSHIP_RECORDS {
             forms.push(Self::channel_presence_v1_at(
                 nickname,
+                language,
                 channel_id,
                 channel_pubkey,
                 join_secret,
@@ -1510,6 +1535,7 @@ impl SignedRecord {
     ) -> Self {
         Self::channel_presence_v1_at(
             nickname,
+            None,
             channel_id,
             channel_pubkey,
             join_secret,
@@ -2262,18 +2288,23 @@ impl SignedRecord {
         if meta.kind != CHANNEL_KIND_PRESENCE {
             return None;
         }
-        let (noise_pub, nickname) = channel::decode_presence_extra(
+        let (noise_pub, nickname, sealed_language) = channel::decode_presence_extra(
             content_key,
             expected_channel_id,
             &meta.extra,
             &rec.file_name,
         )?;
+        let language = match sealed_language {
+            Some(id) => channel_language_from_wire_id(id),
+            None => channel_language_from_file_size(rec.file_size),
+        };
         Some(ChannelPresenceMember {
             publisher_key: rec.publisher_key,
             nickname,
             timestamp: rec.timestamp,
             noise_pub,
             departed: meta.is_departed(),
+            language,
         })
     }
 
@@ -2326,6 +2357,7 @@ impl SignedRecord {
             timestamp: rec.timestamp,
             noise_pub: opened.noise_pub,
             departed: meta.is_departed(),
+            language: channel_language_from_wire_id(opened.language),
         })
     }
 
@@ -4224,6 +4256,7 @@ mod tests {
                 timestamp,
                 noise_pub: [0u8; 32],
                 departed,
+                language: None,
             }
         }
         let pk = [0xAAu8; 32];
@@ -4298,7 +4331,7 @@ mod tests {
         let blind = channel::presence_room_blind(&channel.channel_id, &join);
         for departed in [false, true] {
             let record = SignedRecord::channel_presence_v2_at(
-                "Ada", channel.channel_id, &join, departed, &noise_pub, &member, now,
+                "Ada", None, channel.channel_id, &join, departed, &noise_pub, &member, now,
             );
             assert!(record.channel_store_ok());
             assert_ne!(record.publisher_key, member_pub);
@@ -4360,7 +4393,7 @@ mod tests {
         let epoch = channel::presence_epoch(now);
         let blind = channel::presence_room_blind(&channel.channel_id, &join);
         let genuine = SignedRecord::channel_presence_v2_at(
-            "Ada", channel.channel_id, &join, false, &[0x42; 32], &member, now,
+            "Ada", None, channel.channel_id, &join, false, &[0x42; 32], &member, now,
         );
         let sealed = genuine.channel.as_ref().unwrap().extra.clone();
         let read = |record: &SignedRecord| {
@@ -4451,7 +4484,7 @@ mod tests {
         let member = SigningKey::generate(&mut OsRng);
         let join = [0x77u8; 32];
         let presence = SignedRecord::channel_presence_v2_at(
-            "Ada", channel.channel_id, &join, false, &[0x42; 32], &member, 1_800_000_000,
+            "Ada", Some("ja"), channel.channel_id, &join, false, &[0x42; 32], &member, 1_800_000_000,
         );
         assert!(presence.channel_store_ok());
         let extra = presence.channel.as_ref().unwrap().extra.clone();
@@ -4532,6 +4565,63 @@ mod tests {
         assert_eq!(parsed.slot, member_id);
     }
 
+    /// A member's language reads back from every form of their presence: from
+    /// the signed header in a public room, from inside the seal in a private
+    /// one, where the header says nothing a storer could read. A leave notice
+    /// carries none.
+    #[test]
+    fn a_members_language_rides_every_presence_form() {
+        let channel = channel::ChannelIdentity::generate();
+        let member = SigningKey::generate(&mut OsRng);
+        let now = 1_800_000_000;
+
+        let public_join = channel::public_join_secret(&channel.pubkey);
+        let public = SignedRecord::channel_presence_forms(
+            "Ada", Some("ja"), channel.channel_id, channel.pubkey, &public_join, false, false, &[0x42; 32], &member, now,
+        );
+        assert_eq!(public.len(), 1);
+        assert!(public[0].channel_store_ok());
+        assert_eq!(channel_language_from_file_size(public[0].file_size), Some("ja"));
+        assert_eq!(channel_kind_from_data(&public[0].data), Some(CHANNEL_KIND_PRESENCE));
+        let read = SignedRecord::parse_channel_presence_member(&blob_of(&public[0]), &channel.channel_id, None).unwrap();
+        assert_eq!((read.nickname.as_str(), read.language), ("Ada", Some("ja")));
+
+        let join = [0x77u8; 32];
+        let key = channel::content_key(&join);
+        let blind = channel::presence_room_blind(&channel.channel_id, &join);
+        let private = SignedRecord::channel_presence_forms(
+            "Ada", Some("ja"), channel.channel_id, channel.pubkey, &join, true, false, &[0x42; 32], &member, now,
+        );
+        assert_eq!(private.len(), 2);
+        for record in &private {
+            assert!(record.channel_store_ok());
+            assert_eq!(channel_language_from_file_size(record.file_size), None, "kept out of the header");
+        }
+        let v2 = SignedRecord::parse_channel_presence_member_v2(&blob_of(&private[0]), &channel.channel_id, &join, &blind)
+            .unwrap();
+        assert_eq!(v2.language, Some("ja"));
+        let v1 = SignedRecord::parse_channel_presence_member(&blob_of(&private[1]), &channel.channel_id, Some(&key))
+            .unwrap();
+        assert_eq!(v1.language, Some("ja"));
+
+        let none = SignedRecord::channel_presence_forms(
+            "Ada", None, channel.channel_id, channel.pubkey, &public_join, false, false, &[0x42; 32], &member, now,
+        );
+        let read = SignedRecord::parse_channel_presence_member(&blob_of(&none[0]), &channel.channel_id, None).unwrap();
+        assert_eq!(read.language, None);
+
+        for private in [false, true] {
+            let secret = if private { join } else { public_join };
+            let left = SignedRecord::channel_presence_forms(
+                "Ada", Some("ja"), channel.channel_id, channel.pubkey, &secret, private, true, &[0x42; 32], &member, now,
+            );
+            let last = left.last().unwrap();
+            let read = SignedRecord::parse_channel_presence_member(&blob_of(last), &channel.channel_id, Some(&key)).unwrap();
+            assert!(read.departed);
+            assert_eq!(read.language, None);
+        }
+    }
+
     /// This build publishes both forms of a private room's presence and key
     /// records, stamped alike, and only v1 where v2 would hide nothing.
     #[test]
@@ -4543,7 +4633,7 @@ mod tests {
         let now = 1_800_000_000;
         for departed in [false, true] {
             let forms = SignedRecord::channel_presence_forms(
-                "Ada", channel.channel_id, channel.pubkey, &join, true, departed, &[0x42; 32], &member, now,
+                "Ada", None, channel.channel_id, channel.pubkey, &join, true, departed, &[0x42; 32], &member, now,
             );
             assert_eq!(forms.len(), 2);
             assert_ne!(forms[0].file_hash, channel.channel_id, "v2 first");
@@ -4554,6 +4644,7 @@ mod tests {
         }
         let public = SignedRecord::channel_presence_forms(
             "Ada",
+            None,
             channel.channel_id,
             channel.pubkey,
             &channel::public_join_secret(&channel.pubkey),

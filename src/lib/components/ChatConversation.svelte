@@ -701,6 +701,21 @@
     editFromComposer = fromComposer;
   }
 
+  const utf8 = new TextEncoder();
+
+  /** A revised reply keeps its signed reference, which counts against the cap. */
+  function editMaxBytes(msg: ConvMessage): number {
+    return MAX_MESSAGE_BYTES - (msg.reply_to ? REPLY_REFERENCE_BYTES : 0);
+  }
+
+  /** What the save would send, in the unit the backend caps. */
+  let editBytes = $derived(editingId === null ? 0 : utf8.encode(editDraft.trim()).length);
+
+  /** Seconds left of the backend's edit window, by the same clock as `canEdit`. */
+  function editSecondsLeft(msg: ConvMessage): number {
+    return EDIT_WINDOW_SECS - (editClockNow / 1000 - msg.timestamp);
+  }
+
   function cancelEdit() {
     editingId = null;
     editDraft = '';
@@ -747,13 +762,16 @@
       closeEditor(msg.id);
       return;
     }
+    if (editSecondsLeft(msg) <= 0) {
+      editError = m.channels_edit_window_closed();
+      return;
+    }
     // Same UTF-8 byte guard `handleSend` applies, for the same reason: the
     // textarea's `maxlength` counts characters and the backend counts bytes, so
     // an emoji-heavy revision passed here and came back as a generic failure with
     // nothing to tell the user which limit they had hit.
-    // A revised reply keeps its signed reference, which counts against the cap.
-    const maxBytes = MAX_MESSAGE_BYTES - (msg.reply_to ? REPLY_REFERENCE_BYTES : 0);
-    if (new TextEncoder().encode(text).length > maxBytes) {
+    const maxBytes = editMaxBytes(msg);
+    if (utf8.encode(text).length > maxBytes) {
       editError = m.chat_message_too_long({ max: maxBytes });
       return;
     }
@@ -1019,6 +1037,31 @@
       el.focus();
       el.select();
     });
+    // After the editor has grown to its text, so its buttons come into view too.
+    const raf = requestAnimationFrame(() =>
+      el.closest('.conv-bubble')?.scrollIntoView({ block: 'nearest' }),
+    );
+    return () => cancelAnimationFrame(raf);
+  });
+
+  // Grows the editor with its text up to the CSS max-height, past which it
+  // scrolls, the way the composer grows.
+  $effect(() => {
+    void editDraft;
+    const el = editInputEl;
+    if (!el) return;
+    el.style.height = 'auto';
+    // Border-box sizing: scrollHeight leaves out the border the height includes.
+    el.style.height = `${el.scrollHeight + el.offsetHeight - el.clientHeight}px`;
+  });
+
+  // The window's countdown is shown while editing, so it moves faster than the
+  // minute the Edit buttons are retired on.
+  $effect(() => {
+    if (editingId === null) return;
+    editClockNow = Date.now();
+    const timer = setInterval(() => (editClockNow = Date.now()), 10_000);
+    return () => clearInterval(timer);
   });
 
   // Retires the Edit affordance as the window closes. A minute's granularity on a
@@ -3678,6 +3721,7 @@
           class:received={row.msg.direction === 'received'}
           class:starts-run={startsRun}
           class:fresh={freshIds.has(row.msg.id)}
+          class:editing={editingId === row.msg.id}
         >
         {#if isChannel && row.msg.direction === 'sent'}
           <!-- Blue and on the right already says it is yours; the chip only
@@ -3697,6 +3741,7 @@
           class:ends-run={endsRun}
           class:focused={row.msg.id === focusedId}
           class:mentions-me={row.mentionsMe}
+          class:editing={editingId === row.msg.id}
         >
           <!--
             `<bdi>` isolates the message body from the surrounding UI's
@@ -3745,22 +3790,45 @@
             <!-- Edited in place rather than in the composer at the bottom: that
                  one owns per-conversation drafts, the slow-mode countdown and
                  mention autocomplete, all of which would fight an edit. -->
+            {@const secondsLeft = editSecondsLeft(row.msg)}
+            {@const maxBytes = editMaxBytes(row.msg)}
+            {@const overLimit = editBytes > maxBytes}
             <div class="bubble-edit">
+              <div class="bubble-edit-head">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true">
+                  <path d="M11.5 2.5l2 2L6 12l-3 1 1-3z" />
+                </svg>
+                <span class="bubble-edit-title">{m.channels_editing_title()}</span>
+                <span class="bubble-edit-window" class:closing={secondsLeft <= 120} class:closed={secondsLeft <= 0}>
+                  {secondsLeft <= 0
+                    ? m.channels_edit_window_closed()
+                    : m.channels_edit_time_left({ minutes: Math.ceil(secondsLeft / 60) })}
+                </span>
+              </div>
               <textarea
                 class="bubble-edit-input"
                 bind:value={editDraft}
                 onkeydown={(e) => onEditKeydown(e, row.msg)}
                 maxlength="4096"
-                rows="2"
+                rows="3"
                 disabled={editBusy}
                 aria-label={m.channels_edit_message()}
+                aria-describedby="bubble-edit-hint-{row.msg.id}"
+                aria-invalid={overLimit || undefined}
                 bind:this={editInputEl}
               ></textarea>
               {#if editError}
                 <span class="bubble-edit-error" role="alert">{editError}</span>
               {/if}
               <div class="bubble-edit-actions">
-                <span class="bubble-edit-hint">{m.channels_edit_hint()}</span>
+                <span class="bubble-edit-hint" id="bubble-edit-hint-{row.msg.id}">{m.channels_edit_hint()}</span>
+                <!-- Only near the cap, where it starts to matter. Bytes, not
+                     characters, because that is what the backend counts. -->
+                {#if editBytes > maxBytes * 0.8}
+                  <span class="bubble-edit-count" class:over={overLimit} aria-live="polite">
+                    {m.channels_edit_bytes({ used: editBytes, max: maxBytes })}
+                  </span>
+                {/if}
                 <button type="button" class="bubble-edit-cancel" onclick={() => closeEditor(row.msg.id)} disabled={editBusy}>
                   {m.common_cancel()}
                 </button>
@@ -3768,7 +3836,7 @@
                   type="button"
                   class="bubble-edit-save"
                   onclick={() => commitEdit(row.msg)}
-                  disabled={editBusy || !editDraft.trim()}
+                  disabled={editBusy || !editDraft.trim() || overLimit || secondsLeft <= 0}
                 >
                   {editBusy ? m.chat_loading_short() : m.common_save()}
                 </button>
@@ -5064,6 +5132,12 @@
     opacity: 1;
   }
 
+  /* The editor has its own Cancel and Save; a remove button floating over its
+     header is one wrong click from discarding the line being revised. */
+  .conv-bubble.editing > .bubble-tools {
+    display: none;
+  }
+
   .bubble-edit-btn {
     display: inline-flex;
     align-items: center;
@@ -5428,22 +5502,91 @@
     opacity: 0.85;
   }
 
+  /* The line being edited takes the column's full width whatever its length,
+     so a one-word message is not revised in a box one word wide. */
+  .conversation.channel .conv-msg.editing {
+    width: min(720px, 90%);
+    max-width: min(720px, 90%);
+  }
+
+  /* A neutral card rather than the accent fill: a text field on the blue of a
+     sent bubble read as a box pasted onto it. The accent edge still says whose
+     line it is and that it is open. */
+  .conv-bubble.editing,
+  .conversation.channel .conv-msg.sent .conv-bubble.editing {
+    background: var(--bg-surface);
+    color: var(--text-primary);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-lg);
+    padding: 10px 12px 12px;
+  }
+
   .bubble-edit {
     display: flex;
     flex-direction: column;
-    gap: 5px;
-    min-width: 220px;
+    gap: 8px;
+    width: 100%;
   }
 
+  .bubble-edit-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--font-size-xs);
+    color: var(--accent);
+  }
+
+  .bubble-edit-title {
+    font-weight: 600;
+  }
+
+  .bubble-edit-window {
+    margin-inline-start: auto;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .bubble-edit-window.closing {
+    color: var(--warning);
+  }
+
+  .bubble-edit-window.closed {
+    color: var(--danger);
+    font-weight: 600;
+  }
+
+  /* Three lines to start, growing with the text (see the effect that sizes
+     it) up to half the window, then scrolling. */
   .bubble-edit-input {
+    box-sizing: border-box;
     width: 100%;
-    padding: 5px 7px;
+    min-height: calc(3 * 1.45em + 20px);
+    max-height: min(50vh, 420px);
+    padding: 9px 11px;
     border: 1px solid var(--input-border);
-    border-radius: var(--radius-sm);
-    background: var(--bg-primary);
+    border-radius: var(--radius-md);
+    background: var(--bg-input);
     color: var(--text-primary);
     font: inherit;
-    resize: vertical;
+    font-size: var(--font-size-md);
+    line-height: 1.45;
+    resize: none;
+    overflow-y: auto;
+    transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+  }
+
+  .bubble-edit-input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-halo);
+  }
+
+  .bubble-edit-input[aria-invalid='true'] {
+    border-color: var(--danger);
+  }
+
+  .bubble-edit-input:disabled {
+    opacity: 0.7;
   }
 
   .bubble-edit-error {
@@ -5454,35 +5597,58 @@
   .bubble-edit-actions {
     display: flex;
     align-items: center;
-    gap: 6px;
+    flex-wrap: wrap;
+    gap: 8px;
   }
 
   .bubble-edit-hint {
     flex: 1 1 auto;
-    font-size: var(--font-size-2xs);
-    opacity: 0.7;
+    min-width: 0;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+  }
+
+  .bubble-edit-count {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .bubble-edit-count.over {
+    color: var(--danger);
+    font-weight: 600;
   }
 
   .bubble-edit-cancel,
   .bubble-edit-save {
-    padding: 2px 8px;
+    padding: 5px 14px;
     border: 1px solid var(--border);
-    border-radius: 5px;
-    background: var(--bg-surface);
+    border-radius: var(--radius-md);
+    background: var(--bg-primary);
     color: var(--text-primary);
-    font-size: var(--font-size-xs);
+    font-size: var(--font-size-sm);
+    font-weight: 500;
     cursor: pointer;
+  }
+
+  .bubble-edit-cancel:hover:not(:disabled) {
+    background: var(--bg-hover);
   }
 
   .bubble-edit-save {
     border-color: var(--accent);
     background: var(--accent);
     color: var(--on-accent);
+    font-weight: 600;
+  }
+
+  .bubble-edit-save:hover:not(:disabled) {
+    filter: brightness(1.08);
   }
 
   .bubble-edit-cancel:disabled,
   .bubble-edit-save:disabled {
-    opacity: 0.6;
+    opacity: 0.55;
     cursor: default;
   }
 

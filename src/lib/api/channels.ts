@@ -87,6 +87,9 @@ export interface ChannelMemberInfo {
   moderator: boolean;
   /** BLAKE3(pubkey)[..16] hex, same identity friends use. Empty if the key is invalid. */
   ember_hash: string;
+  /** The language the member publishes, a code from `CHANNEL_LANGUAGES`;
+   *  empty when they publish none or run a build without it. */
+  language: string;
 }
 
 /** The windows the roster's presence dots are drawn with.

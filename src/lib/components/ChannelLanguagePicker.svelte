@@ -16,6 +16,11 @@
     disabled = false,
     describedby,
     onchange,
+    id,
+    noneLabel = m.channels_language_none(),
+    noneAriaLabel = noneLabel,
+    valueLabel = (language: string) => m.channels_language_flag_title({ language }),
+    listLabel = m.channels_language_label(),
   }: {
     value?: ChannelLanguage | null;
     /** Rendered as `aria-disabled`, not `disabled`: a save that disables the
@@ -23,6 +28,15 @@
     disabled?: boolean;
     describedby?: string;
     onchange?: (value: ChannelLanguage | null) => void;
+    /** On the trigger, for a `<label for>`. */
+    id?: string;
+    /** The wording defaults to a room's default language. */
+    noneLabel?: string;
+    /** The trigger's name with nothing chosen, when `noneLabel` alone does
+     *  not say what is not chosen. */
+    noneAriaLabel?: string;
+    valueLabel?: (language: string) => string;
+    listLabel?: string;
   } = $props();
 
   type Option = { code: ChannelLanguage | null; name: string; native: string; search: string };
@@ -31,19 +45,21 @@
   const listId = `channel-lang-list-${uid}`;
   const optionId = (i: number) => `channel-lang-opt-${uid}-${i}`;
 
-  const allOptions: Option[] = [
-    { code: null, name: m.channels_language_none(), native: '', search: '' },
-    ...sortedChannelLanguages().map((code) => {
-      const name = channelLanguageName(code);
-      const native = channelLanguageNativeName(code);
-      return {
-        code,
-        name,
-        native: native === name ? '' : native,
-        search: channelLanguageSearchText(code),
-      };
-    }),
-  ];
+  const languageOptions: Option[] = sortedChannelLanguages().map((code) => {
+    const name = channelLanguageName(code);
+    const native = channelLanguageNativeName(code);
+    return {
+      code,
+      name,
+      native: native === name ? '' : native,
+      search: channelLanguageSearchText(code),
+    };
+  });
+
+  let allOptions: Option[] = $derived([
+    { code: null, name: noneLabel, native: '', search: '' },
+    ...languageOptions,
+  ]);
 
   let open = $state(false);
   let query = $state('');
@@ -66,7 +82,7 @@
     return allOptions.filter((o) => o.code !== null && o.search.includes(q));
   });
 
-  let selectedName = $derived(value ? channelLanguageName(value) : m.channels_language_none());
+  let selectedName = $derived(value ? channelLanguageName(value) : noneLabel);
 
   function place() {
     if (!triggerEl) return;
@@ -188,11 +204,12 @@
 <span class="lang-picker">
 <button
   bind:this={triggerEl}
+  {id}
   type="button"
   class="lang-trigger"
   class:open
   aria-disabled={disabled}
-  aria-label={value ? m.channels_language_flag_title({ language: selectedName }) : m.channels_language_none()}
+  aria-label={value ? valueLabel(selectedName) : noneAriaLabel}
   aria-haspopup="listbox"
   aria-expanded={open}
   aria-controls={open ? listId : undefined}
@@ -254,7 +271,7 @@
           onkeydown={onSearchKeydown}
         />
       </div>
-      <div bind:this={listEl} id={listId} class="lang-list" role="listbox" aria-label={m.channels_language_label()}>
+      <div bind:this={listEl} id={listId} class="lang-list" role="listbox" aria-label={listLabel}>
         {#each options as option, i (option.code ?? 'none')}
           <!-- Keyboard choice happens in the search box, which owns the
                highlight through aria-activedescendant. -->

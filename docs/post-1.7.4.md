@@ -66,6 +66,23 @@ measured against.
   titles; busy labels; a shortcuts sheet that matches the bindings;
   locale-aware decimals (`formatDecimal`) and one file-name order
   (`compareFileNames`).
+- **A member's language beside their name.** Settings > Channels has a
+  language picker beside the Channel username, the same list rooms are
+  marked with, and the member list shows it as a flag. Chosen rather than
+  taken from the app language, which has 9 languages to the rooms' 37 and is
+  not ours to publish unasked; none until picked, with a one-click
+  suggestion from the app or system language (`suggestedChannelLanguage`).
+  It rides the presence record: byte 67 of a public room's, the nickname
+  pad's last byte inside a private room's seal, so storers never read it
+  (`PRESENCE_LANGUAGE_AT`); older builds read none and are read as before.
+  Only the member's own presence record sets or clears the roster's
+  `channel_members.language`, added at open outside the numbered chain.
+  Specified under [DHT channel records](channels-format.md#dht-channel-records).
+  Tests: `a_members_language_rides_every_presence_form` (`publish.rs`),
+  `a_sealed_presence_language_is_invisible_to_older_readers` (`channel.rs`),
+  `presence_reads_v2_first_and_falls_back_to_v1` (`channel_membership.rs`),
+  `channel_member_language_comes_only_from_presence` and
+  `applying_a_handoff_twice_converges_on_the_same_state` (`database.rs`).
 - **Still open from the update report:** a second download location for users
   with no proxy at all. It needs a host reachable from those networks, the
   release workflow uploading to it, a second manifest signed with the same

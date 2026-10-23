@@ -243,6 +243,9 @@ pub struct ChannelMemberInfo {
     /// `BLAKE3(pubkey)[..16]` hex — the Friend ID for this member. Empty when
     /// the stored key is not a valid Ed25519 point.
     pub ember_hash: String,
+    /// The language the member publishes in their presence, a code from
+    /// `CHANNEL_LANGUAGES`; empty when they publish none.
+    pub language: String,
 }
 
 fn ember_hash_for_member_pubkey(hex_pk: &str) -> String {
@@ -268,6 +271,7 @@ impl ChannelMemberInfo {
             is_self,
             moderator: row.moderator,
             ember_hash,
+            language: row.language,
         }
     }
 }
@@ -575,6 +579,37 @@ pub(crate) async fn apply_channel_username_locally(state: &AppState, username: &
     }
 }
 
+/// Relabel our own roster rows with a newly chosen language, so a member list
+/// opened before the next presence publish already shows it. The publish
+/// itself is the network loop's, when it applies `UpdateSettings`, for the
+/// reason [`apply_channel_username_locally`] gives.
+pub(crate) async fn apply_channel_language_locally(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    language: Option<&'static str>,
+) {
+    let pk = hex::encode(state.identity.ed25519_public_key);
+    let db = state.db.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        db.set_self_channel_member_language(&pk, language.unwrap_or(""))
+    })
+    .await;
+    match outcome {
+        Ok(Ok(rooms)) => {
+            for room in rooms {
+                let _ = app.emit("ember:channel-members", serde_json::json!({ "channel_id": room }));
+            }
+        }
+        Ok(Err(e)) => tracing::warn!(error = %e, "could not relabel our own room roster rows"),
+        Err(_) => {}
+    }
+}
+
+/// Our Channel language as the settings hold it now.
+async fn channel_language_setting(state: &AppState) -> Option<&'static str> {
+    state.config.read().await.settings.channel_language_code()
+}
+
 /// Claim `username` on Rendezvous and return the stored display form.
 pub(crate) async fn claim_username_on_registry(
     state: &AppState,
@@ -711,13 +746,21 @@ async fn record_self_member(
     nickname: &str,
     fail_code: &'static str,
 ) -> Result<(), String> {
+    let language = channel_language_setting(state).await;
     let db = state.db.clone();
     let id = channel_id.to_string();
     let pk = hex::encode(state.identity.ed25519_public_key);
     let nick = nickname.to_string();
     tokio::task::spawn_blocking(move || {
-        db.upsert_channel_member(&id, &pk, &nick, chrono::Utc::now().timestamp(), Some(&pk))
-            .map(|_| ())
+        db.upsert_channel_member_with_language(
+            &id,
+            &pk,
+            &nick,
+            Some(language.unwrap_or("")),
+            chrono::Utc::now().timestamp(),
+            Some(&pk),
+        )
+        .map(|_| ())
     })
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
@@ -931,6 +974,7 @@ pub async fn create_channel(
     }
     for presence in SignedRecord::channel_presence_forms(
         &nickname,
+        channel_language_setting(&state).await,
         ident.channel_id,
         ident.pubkey,
         &join_secret,
@@ -1442,6 +1486,7 @@ async fn private_room_key_behind(state: &AppState, row: &StoredChannel) -> bool 
 async fn publish_join_presence(state: &AppState, invite: &ChannelInvite, username: &str) {
     for presence in SignedRecord::channel_presence_forms(
         username,
+        channel_language_setting(state).await,
         invite.channel_id,
         invite.pubkey,
         &invite.join_secret,

@@ -3804,8 +3804,19 @@
                       {/if}
                     </div>
                     <div class="member-identity">
-                      <span class="member-name" title={roomMemberLabel(mem)}>
-                        <bdi dir="auto">{roomMemberLabel(mem)}</bdi>
+                      <span class="member-name-row">
+                        <span class="member-name" title={roomMemberLabel(mem)}>
+                          <bdi dir="auto">{roomMemberLabel(mem)}</bdi>
+                        </span>
+                        {#if isChannelLanguage(mem.language)}
+                          {@const languageName = channelLanguageName(mem.language)}
+                          <img
+                            class="member-flag"
+                            src={channelLanguageFlagSrc(mem.language)}
+                            alt={m.channels_member_language({ language: languageName })}
+                            title={m.channels_member_language({ language: languageName })}
+                          />
+                        {/if}
                       </span>
                       <span class="member-badges">
                         {#if isChannelOwner(mem)}
@@ -6288,12 +6299,30 @@
     gap: 1px;
   }
 
+  .member-name-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+
   .member-name {
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     font-size: var(--font-size-md);
     font-weight: 500;
+  }
+
+  /* Matches the room list's flag, so a member's reads as the same kind of
+     mark as the room's. */
+  .member-flag {
+    flex-shrink: 0;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--text-primary) 14%, transparent);
   }
 
   .member-badges { display: flex; flex-wrap: wrap; gap: 4px; }

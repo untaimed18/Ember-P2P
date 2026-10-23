@@ -332,13 +332,14 @@ mod membership_record_v2_tests {
         let pk = |key: &SigningKey| key.verifying_key().to_bytes();
 
         let ada_v1 = SignedRecord::channel_presence_v1_at(
-            "ada (v1)", room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), false, &[1; 32], &ada, now,
+            "ada (v1)", None, room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), false, &[1; 32], &ada, now,
         );
-        let ada_v2 = SignedRecord::channel_presence_v2_at("ada", room.channel_id, &current, false, &[2; 32], &ada, now);
+        let ada_v2 =
+            SignedRecord::channel_presence_v2_at("ada", Some("ja"), room.channel_id, &current, false, &[2; 32], &ada, now);
         let bob_v1 = SignedRecord::channel_presence_v1_at(
-            "bob", room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), false, &[3; 32], &bob, now,
+            "bob", Some("de"), room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), false, &[3; 32], &bob, now,
         );
-        let cy_v2 = SignedRecord::channel_presence_v2_at("cy", room.channel_id, &retired, false, &[4; 32], &cy, now);
+        let cy_v2 = SignedRecord::channel_presence_v2_at("cy", None, room.channel_id, &retired, false, &[4; 32], &cy, now);
         let storer = SigningKey::generate(&mut OsRng);
         let mut lifted = ada_v2.clone();
         lifted.publisher_key = pk(&storer);
@@ -353,8 +354,11 @@ mod membership_record_v2_tests {
             assert_eq!(latest.len(), 3, "the lifted seal names nobody");
             assert_eq!(latest[&pk(&ada)].nickname, "ada");
             assert_eq!(latest[&pk(&ada)].noise_pub, [2; 32]);
+            assert_eq!(latest[&pk(&ada)].language, Some("ja"), "the v2 copy stands");
             assert_eq!(latest[&pk(&bob)].nickname, "bob");
+            assert_eq!(latest[&pk(&bob)].language, Some("de"));
             assert_eq!(latest[&pk(&cy)].nickname, "cy");
+            assert_eq!(latest[&pk(&cy)].language, None);
             assert!(!latest.contains_key(&pk(&storer)));
             assert!(admits.contains(&pk(&ada)) && admits.contains(&pk(&bob)));
             assert!(!admits.contains(&pk(&cy)), "a retired secret does not admit");
@@ -362,7 +366,7 @@ mod membership_record_v2_tests {
 
         // A newer v1 leave beats an older v2 announce: the merge is by member.
         let ada_left = SignedRecord::channel_presence_v1_at(
-            "ada", room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), true, &[1; 32], &ada, now + 5,
+            "ada", None, room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), true, &[1; 32], &ada, now + 5,
         );
         let (latest, _) =
             merge_channel_presence_blobs(&[blob(&ada_v2), blob(&ada_left)], &room.channel_id, &secrets, true, now + 5);
@@ -1544,6 +1548,7 @@ mod channel_roster_snapshot_tests {
             last_seen,
             banned,
             moderator: false,
+            language: String::new(),
         }
     }
 
@@ -1782,6 +1787,7 @@ pub(super) async fn maybe_publish_channel_presence(
         }
         name.to_string()
     };
+    let language = settings.channel_language_code();
     let refresh_username = !due.is_empty()
         && now.saturating_sub(state.channel_username_refresh_at)
             >= ember::channel::USERNAME_REFRESH_SECS
@@ -1826,6 +1832,7 @@ pub(super) async fn maybe_publish_channel_presence(
         };
         let records = ember::dht::publish::SignedRecord::channel_presence_forms(
             &nickname,
+            language,
             channel_id,
             channel_pubkey,
             &join_secret,
@@ -1845,10 +1852,11 @@ pub(super) async fn maybe_publish_channel_presence(
             // minutes later we had dropped out of our own roster's "fresh" set
             // while still sitting in the room.
             let _ = db.touch_channel_presence(&channel_id_hex, now);
-            let _ = db.upsert_channel_member(
+            let _ = db.upsert_channel_member_with_language(
                 &channel_id_hex,
                 &hex::encode(identity.ed25519_public_key),
                 &nickname,
+                Some(language.unwrap_or("")),
                 now,
                 Some(&hex::encode(identity.ed25519_public_key)),
             );
@@ -1897,20 +1905,42 @@ pub(super) async fn maybe_publish_channel_presence(
 /// the previous handle, consume the newly-due slots, and stamp a ten-minute
 /// silence under the old name. Doing it here means the next publish — and this
 /// one — reads the username that was just applied.
+///
+/// A new Channel language is published the same way, and for the same reason.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn publish_presence_under_new_username(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
     settings: &AppSettings,
     identity: &crate::storage::identity::NodeIdentity,
     old_username: &str,
+    old_language: Option<&'static str>,
 ) {
     let new = settings.channel_username.trim();
-    if new.is_empty() || new == old_username.trim() {
+    let language = settings.channel_language_code();
+    let renamed = new != old_username.trim();
+    if new.is_empty() || (!renamed && language == old_language) {
         return;
     }
     let pk = hex::encode(identity.ed25519_public_key);
-    let _ = db.rename_self_channel_member(&pk, new);
+    if renamed {
+        let _ = db.rename_self_channel_member(&pk, new);
+    }
+    if language != old_language {
+        // The settings save relabelled these rows already, so this usually
+        // finds nothing. It catches a publish that ran on the old settings
+        // in between and wrote the old language back.
+        if let Ok(rooms) = db.set_self_channel_member_language(&pk, language.unwrap_or("")) {
+            for room in rooms {
+                let _ = app_handle.emit(
+                    "ember:channel-members",
+                    serde_json::json!({ "channel_id": room }),
+                );
+            }
+        }
+    }
     let _ = db.due_channel_presence_now();
     maybe_publish_channel_presence(socket, state, db, settings, identity).await;
 }
@@ -1976,6 +2006,7 @@ pub(super) async fn publish_channel_departures(
         };
         let records = ember::dht::publish::SignedRecord::channel_presence_forms(
             &nickname,
+            None,
             cid,
             cpk,
             &join_secret,
@@ -2052,6 +2083,7 @@ async fn publish_owed_channel_departures(
         }
         let records = ember::dht::publish::SignedRecord::channel_presence_forms(
             nickname,
+            None,
             cid,
             departure.channel_pubkey,
             &departure.join_secret,
@@ -6155,10 +6187,15 @@ pub(super) fn ingest_channel_presence_records(
             continue;
         }
         let nick = crate::security::sanitize_display_name(&member.nickname);
-        if let Ok(write) = db.upsert_channel_member(
+        // Our own row's language comes from our settings. A walk can still
+        // return the copy published before a change, and taking it would flip
+        // the flag back until the new one is found.
+        let language = (member.publisher_key != *our_pubkey).then(|| member.language.unwrap_or(""));
+        if let Ok(write) = db.upsert_channel_member_with_language(
             &channel_id_hex,
             &pk_hex,
             &nick,
+            language,
             member.timestamp,
             Some(&our_hex),
         ) {
@@ -6177,7 +6214,8 @@ pub(super) fn ingest_channel_presence_records(
                     }
                     outcome.roster_changed = true;
                 }
-                // The nickname moved, so the row has to be re-read to be drawn.
+                // The nickname or language moved, so the row has to be re-read
+                // to be drawn.
                 ChannelMemberWrite::Updated => {
                     outcome.roster_changed = true;
                 }

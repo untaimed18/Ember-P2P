@@ -210,6 +210,7 @@
       <li><strong>Web Services</strong> &mdash; eMule&rsquo;s right-click &gt; Web services: open a site with a file&rsquo;s details substituted in, most usefully one that reports how many complete sources the network has seen. All six eMule placeholders are supported and an existing <code>webservices.dat</code> can be imported. An availability lookup ships configured; nothing is contacted until you click one, adding a site asks for confirmation, and the list is editable in Settings &gt; Web services.</li>
       <li><strong>Spam Detection</strong> &mdash; Built-in spam detection with Relaxed, Balanced (the default) and Aggressive profiles, each setting how high a score must be to count as spam, and automatic result hiding.</li>
       <li><strong>Library Management</strong> &mdash; Virtual-scrolling tables that handle thousands of files. Sort, filter, bulk-edit priorities, scan for missing files, copy all eD2K links for the current view, and create collections.</li>
+      <li><strong>[Ember-P2P] File Name Tag</strong> &mdash; Tick files in the Library and choose <em>Add [Ember-P2P]</em> to rename them to start with the tag, so <code>Linux.zip</code> becomes <code>[Ember-P2P] Linux.zip</code> and people who find them from you can see they were shared with Ember. Only the name changes; the contents, sharing settings and any downloads stay as they are, and <em>Remove [Ember-P2P]</em> or Undo puts the old name back. Settings &gt; Transfers &gt; File name tag can also tag every download as it finishes, and every file that appears in a shared folder from then on. Files already shared keep their names, and program, settings and hidden files that appear in a shared folder are never renamed automatically. See the <a href="#faq-name-tag">FAQ</a>.</li>
       <li><strong>Copy eD2K Links from Search</strong> &mdash; Copy the link for one result, for every ticked result, or for the whole result list at once, from the context menu, the selection toolbar, or Ctrl+C.</li>
       <li><strong>In-App Media Player</strong> &mdash; Play supported audio and video from the Library detail drawer, with Open Externally still available.</li>
       <li><strong>Comments &amp; Ratings</strong> &mdash; Add metadata to your shared files for other peers to see.</li>
@@ -501,6 +502,10 @@ peer_count    (u16 LE)
       <li>
         <strong>Pick a Channel username</strong><br>
         <span style="color: var(--text-secondary)">Two to twelve letters or numbers, and it has to be free &mdash; the name is claimed in Ember&rsquo;s rendezvous directory so two people in a room are never the same &ldquo;Ada&rdquo;. This is separate from your friend nickname, and you need one before you can create or join anything.</span>
+      </li>
+      <li>
+        <strong>Optionally, say which language you speak</strong><br>
+        <span style="color: var(--text-secondary)">Under Settings &gt; Channels, beside your username. It shows as a small flag next to your name in every room&rsquo;s member list, so people know which language to write to you in. Nothing is shared until you pick one, and a member on an older Ember simply sees no flag.</span>
       </li>
       <li>
         <strong>Create a room, or join one</strong><br>
@@ -845,6 +850,14 @@ npm run tauri build -- --config '{"bundle":{"createUpdaterArtifacts":false}}'</c
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
       <div class="faq-a">Ember checks for a newer version automatically whenever your chosen hourly, daily, weekly or monthly check is due, including while it stays open, and shows a non-blocking notification when one is available. You can install it in-app with one click &mdash; no need to download installers manually &mdash; and Ember restarts into the new version, back on the page and server you were using. You can also check anytime under Settings &gt; About. If you would rather not be asked, turn on <strong>Silent updates</strong> there (not available for the MSI installer or the <code>.deb</code> package, which need administrator approval or your password to install): Ember then installs updates by itself once nothing is transferring and you are away, after a one-minute warning you can cancel. Every release is cryptographically signed, and Ember verifies the signature before installing, including a downloaded update that waited on disk for a quiet moment. Updates are also gated by signed <strong>security epochs</strong> (anti-rollback), so installs only advance when the signed epoch allows it.</div>
+    </div>
+
+    <div class="faq-item" id="faq-name-tag">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        What is the [Ember-P2P] tag, and what does it change?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">It is a prefix Ember can put at the start of a file&rsquo;s name, so <code>Linux.zip</code> becomes <code>[Ember-P2P] Linux.zip</code>. People who find the file from you see that name in their search results and know it was shared with Ember. It renames the file on your disk and nothing else: the contents and hash stay the same, so downloads of it keep working, and its sharing settings and priority are kept. Nothing is tagged unless you ask. In the Library, tick files and choose <em>Add [Ember-P2P]</em> (or right-click a file); <em>Remove [Ember-P2P]</em> or Undo takes it off again. Settings &gt; Transfers &gt; File name tag has two switches, both off by default: one tags each download as it finishes, the other tags files that appear in a shared folder from then on. Files already shared are left alone, a tag you take off by hand is not put back, and the second switch never renames program, settings or hidden files. Leave the second switch off if a shared folder holds files other programs rely on, such as a game or an app.</div>
     </div>
 
     <div class="faq-item">

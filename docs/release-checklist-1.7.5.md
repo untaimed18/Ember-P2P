@@ -96,6 +96,9 @@ Machine A on 1.7.5, machine B on 1.7.4, in the same rooms and mutual friends.
 - [ ] An offer from A to B, unanswered, lapses at five minutes on both, and
       A's card says so.
 - [ ] Room files and friend chat attachments work both ways.
+- [ ] A picks a language under Settings > Channels. In a public room and a
+      private one, B lists A as before with no flag, and A lists B with
+      none. A's flag shows at once on A's own row.
 
 ## 4. Library, backup and Discover
 
@@ -107,6 +110,10 @@ Machine A on 1.7.5, machine B on 1.7.4, in the same rooms and mutual friends.
 - [ ] Copy a new backup to a USB drive: no permission prompt.
 - [ ] Leave Discover open for half an hour: rooms and their language flags
       stay.
+- [ ] Two 1.7.5 machines in a public room and a private one: a language one
+      picks under Settings > Channels shows as a flag beside their name in
+      the other's member list within a presence walk, changes when it is
+      changed, and goes when it is set back to "Not shown".
 
 ## 5. Translation review
 
@@ -127,3 +134,5 @@ All eight non-English locales. List what changed with
       `servers_updating`, `shortcuts_modal_close`, `shortcuts_modal_confirm`,
       `shortcuts_search_copy_links`.
 - [ ] Friends: `error_peers_attach_source_gone`.
+- [ ] Channels language: `settings_channel_language_*`,
+      `channels_member_language`.

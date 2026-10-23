@@ -1431,6 +1431,12 @@ pub struct AppSettings {
     /// friend display name and is not unique.
     #[serde(default)]
     pub channel_username: String,
+    /// The language shown as a flag beside our username in room member
+    /// lists: a code from `CHANNEL_LANGUAGES`, or empty for none. Chosen by
+    /// the user rather than taken from the app language, which is often not
+    /// the language they speak and is not ours to publish unasked.
+    #[serde(default)]
+    pub channel_language: String,
     pub shared_folders: Vec<String>,
     pub download_folder: String,
     /// Earlier download folders whose `Temp` still holds unfinished downloads.
@@ -2038,6 +2044,12 @@ impl AppSettings {
             multisource_retry_rounds: self.multisource_retry_rounds.clamp(1, 20),
             max_download_bytes,
         }
+    }
+
+    /// [`Self::channel_language`] as a registry code, or `None` for none or
+    /// for a code this build does not list.
+    pub fn channel_language_code(&self) -> Option<&'static str> {
+        crate::network::ember::dht::publish::channel_language(self.channel_language.trim())
     }
 
     pub fn download_folders(&self) -> crate::storage::part_folders::DownloadFolders {
@@ -2707,6 +2719,7 @@ impl Default for AppSettings {
         Self {
             nickname: format!("Ember-{}", &uuid::Uuid::new_v4().to_string()[..8]),
             channel_username: String::new(),
+            channel_language: String::new(),
             shared_folders: vec![completed_dir],
             download_folder: download_dir,
             previous_download_folders: Vec::new(),

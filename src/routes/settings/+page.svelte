@@ -22,6 +22,14 @@
     recoverOwnedChannels,
     sanitizeChannelUsernameInput,
   } from '$lib/api/channels';
+  import {
+    type ChannelLanguage,
+    channelLanguageFlagSrc,
+    channelLanguageName,
+    isChannelLanguage,
+    suggestedChannelLanguage,
+  } from '$lib/channelLanguages';
+  import ChannelLanguagePicker from '$lib/components/ChannelLanguagePicker.svelte';
   import { setAppSettings, appSettings } from '$lib/stores/settings';
   import {
     channels as channelsStore,
@@ -2332,6 +2340,36 @@
     if (input.value !== clean) input.value = clean;
   }
 
+  /** Null for none, and for a code from a later build's longer list, which
+   *  stays stored untouched until a language is picked here. */
+  let channelLanguageValue = $derived.by((): ChannelLanguage | null => {
+    const code = settings?.channel_language;
+    return isChannelLanguage(code) ? code : null;
+  });
+
+  /** Offered while no language is set. The app language when one was chosen,
+   *  then the system's, which is the better guess for anyone whose language
+   *  Ember is not translated into. */
+  const channelLanguageSuggestion = suggestedChannelLanguage([
+    ...(hasExplicitLocale() ? [getLocale()] : []),
+    ...(typeof navigator === 'undefined' ? [] : navigator.languages ?? [navigator.language]),
+    getLocale(),
+  ]);
+
+  /** Saves at once, like every other picker on this page. */
+  function setChannelLanguage(code: ChannelLanguage | null) {
+    if (!settings) return;
+    settings.channel_language = code ?? '';
+  }
+
+  /** The suggestion button goes away once a language is set, so focus moves
+   *  to the picker rather than falling back to <body>. */
+  async function applySuggestedChannelLanguage(code: ChannelLanguage) {
+    setChannelLanguage(code);
+    await tick();
+    document.getElementById('channel-language')?.focus();
+  }
+
   function handleRadioGroupKey(
     event: KeyboardEvent,
     values: string[],
@@ -3249,18 +3287,6 @@
                 ariaDescribedby="auto-remove-hint"
               />
             </div>
-            <div class="field toggle-row">
-              <div class="toggle-info">
-                <label class="toggle-title" id="tag-downloads-label" for="tag-downloads-switch">{m.settings_tag_downloads()}</label>
-                <span class="hint" id="tag-downloads-hint">{m.settings_tag_downloads_hint()}</span>
-              </div>
-              <ToggleSwitch
-                id="tag-downloads-switch"
-                bind:checked={settings.tag_completed_downloads}
-                ariaLabelledby="tag-downloads-label"
-                ariaDescribedby="tag-downloads-hint"
-              />
-            </div>
             <!-- Turning it on raises a native confirmation from the backend;
                  declining it leaves the save holding the Recycle Bin, which
                  the switch then shows again. -->
@@ -3315,18 +3341,6 @@
             </div>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <label class="toggle-title" id="tag-imports-label" for="tag-imports-switch">{m.settings_tag_imports()}</label>
-                <span class="hint" id="tag-imports-hint">{m.settings_tag_imports_hint()}</span>
-              </div>
-              <ToggleSwitch
-                id="tag-imports-switch"
-                bind:checked={settings.tag_shared_imports}
-                ariaLabelledby="tag-imports-label"
-                ariaDescribedby="tag-imports-hint"
-              />
-            </div>
-            <div class="field toggle-row">
-              <div class="toggle-info">
                 <label class="toggle-title" id="skip-compress-video-label" for="skip-compress-video-switch">{m.settings_skip_compress_video()}</label>
                 <span class="hint" id="skip-compress-video-hint">{m.settings_skip_compress_video_hint()}</span>
               </div>
@@ -3335,6 +3349,37 @@
                 bind:checked={settings.skip_compress_video}
                 ariaLabelledby="skip-compress-video-label"
                 ariaDescribedby="skip-compress-video-hint"
+              />
+            </div>
+          </div>
+
+          <!-- Both automatic uses of the tag, under one explanation of what the
+               tag is, so neither switch has to be understood on its own. -->
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_name_tag()}</h4>
+            <p class="hint section-intro">{m.settings_name_tag_intro()}</p>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="tag-downloads-label" for="tag-downloads-switch">{m.settings_tag_downloads()}</label>
+                <span class="hint" id="tag-downloads-hint">{m.settings_tag_downloads_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="tag-downloads-switch"
+                bind:checked={settings.tag_completed_downloads}
+                ariaLabelledby="tag-downloads-label"
+                ariaDescribedby="tag-downloads-hint"
+              />
+            </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="tag-imports-label" for="tag-imports-switch">{m.settings_tag_imports()}</label>
+                <span class="hint" id="tag-imports-hint">{m.settings_tag_imports_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="tag-imports-switch"
+                bind:checked={settings.tag_shared_imports}
+                ariaLabelledby="tag-imports-label"
+                ariaDescribedby="tag-imports-hint"
               />
             </div>
           </div>
@@ -4569,6 +4614,32 @@
                 {@render applyButton(['channel_username'], m.settings_channel_username_label())}
               </div>
               <span class="hint">{m.settings_channel_username_hint()}</span>
+            </div>
+            <div class="field">
+              <label for="channel-language">{m.settings_channel_language_label()}</label>
+              <div class="channel-language-row">
+                <ChannelLanguagePicker
+                  id="channel-language"
+                  bind:value={() => channelLanguageValue, setChannelLanguage}
+                  describedby="channel-language-hint"
+                  noneLabel={m.settings_channel_language_none()}
+                  noneAriaLabel={m.settings_channel_language_value({ language: m.settings_channel_language_none() })}
+                  valueLabel={(language) => m.settings_channel_language_value({ language })}
+                  listLabel={m.settings_channel_language_label()}
+                />
+                {#if !channelLanguageValue && channelLanguageSuggestion}
+                  {@const suggestion = channelLanguageSuggestion}
+                  <button
+                    type="button"
+                    class="action-btn channel-language-suggest"
+                    onclick={() => applySuggestedChannelLanguage(suggestion)}
+                  >
+                    <img class="channel-language-suggest-flag" src={channelLanguageFlagSrc(suggestion)} alt="" />
+                    {m.settings_channel_language_suggest({ language: channelLanguageName(suggestion) })}
+                  </button>
+                {/if}
+              </div>
+              <span class="hint" id="channel-language-hint">{m.settings_channel_language_hint()}</span>
             </div>
           </div>
 
@@ -7164,5 +7235,26 @@
   .channel-offers-row select {
     flex: 1;
     min-width: 200px;
+  }
+
+  .channel-language-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .channel-language-suggest {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .channel-language-suggest-flag {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--text-primary) 14%, transparent);
   }
 </style>

@@ -865,6 +865,9 @@ export interface AppSettings {
   nickname: string;
   /** Unique Channels handle claimed on Rendezvous. Empty until chosen. */
   channel_username: string;
+  /** Language shown as a flag beside our username in room member lists: a
+   *  code from `CHANNEL_LANGUAGES` (`$lib/channelLanguages`), empty for none. */
+  channel_language: string;
   /** Backend-owned: listed in `BACKEND_OWNED_SETTINGS_FIELDS`
    *  (`src-tauri/src/commands/settings.rs`), so `update_settings` restores it
    *  from the authoritative in-memory config and any value written here is

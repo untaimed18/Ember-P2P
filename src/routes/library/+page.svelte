@@ -2218,7 +2218,42 @@
       else toastInfo(add ? m.library_tag_none_to_add() : m.library_tag_none_to_remove());
       return;
     }
+    if (add && !(await confirmFirstEmberTag())) return;
     await applyEmberTag(targets.map((f) => f.path), add);
+  }
+
+  // The first time files are tagged, say what that does: it renames them on
+  // disk, which nothing else on this page's toolbar does. Once is enough;
+  // the tooltips say it after that.
+  const TAG_EXPLAINED_KEY = 'library-tag-explained';
+  let tagExplainOpen = $state(false);
+  let tagExplainResolve: ((confirmed: boolean) => void) | null = null;
+
+  function confirmFirstEmberTag(): Promise<boolean> {
+    try {
+      if (localStorage.getItem(TAG_EXPLAINED_KEY) === '1') return Promise.resolve(true);
+    } catch {
+      // No storage: ask every time rather than never.
+    }
+    tagExplainResolve?.(false);
+    tagExplainOpen = true;
+    return new Promise((resolve) => {
+      tagExplainResolve = resolve;
+    });
+  }
+
+  function settleTagExplain(confirmed: boolean) {
+    const resolve = tagExplainResolve;
+    tagExplainResolve = null;
+    tagExplainOpen = false;
+    if (confirmed) {
+      try {
+        localStorage.setItem(TAG_EXPLAINED_KEY, '1');
+      } catch {
+        // Asked again next time; nothing else depends on it.
+      }
+    }
+    resolve?.(confirmed);
   }
 
   /** Add or remove the tag on `paths`, follow the selection to the new
@@ -2965,7 +3000,7 @@
     // panel is an inline collapsible (the file table stays visible and
     // interactive below it), not a modal, and it has no keyboard handling of
     // its own that these shortcuts could conflict with.
-    if (createCollectionOpen || renameDialog.open || addFolderOpen || confirmOpen || confirmDiscardComment || stopConfirmVisible) {
+    if (createCollectionOpen || renameDialog.open || addFolderOpen || confirmOpen || tagExplainOpen || confirmDiscardComment || stopConfirmVisible) {
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
@@ -3160,7 +3195,13 @@
         case 'open_file': await openSharedFileExternally(f.path); break;
         case 'open_folder': await openSharedFolder(f.path); break;
         case 'rename': openRename(f); break;
-        case 'tag_add': await applyEmberTag(emberTagTargets(f, true).map((t) => t.path), true); break;
+        case 'tag_add': {
+          const targets = emberTagTargets(f, true);
+          if (targets.length > 0 && (await confirmFirstEmberTag())) {
+            await applyEmberTag(targets.map((t) => t.path), true);
+          }
+          break;
+        }
         case 'tag_remove': await applyEmberTag(emberTagTargets(f, false).map((t) => t.path), false); break;
         case 'move_category':
           if (extra !== undefined) await moveToCategory(categoryMoveTargets(f), extra);
@@ -3953,6 +3994,15 @@
   danger={true}
   onconfirm={() => settleConfirm(true)}
   oncancel={() => settleConfirm(false)}
+/>
+
+<ConfirmDialog
+  bind:open={tagExplainOpen}
+  title={m.library_tag_explain_title()}
+  message={m.library_tag_explain_message()}
+  confirmLabel={m.library_bulk_tag()}
+  onconfirm={() => settleTagExplain(true)}
+  oncancel={() => settleTagExplain(false)}
 />
 
 <ConfirmDialog
@@ -5511,14 +5561,14 @@
       onclick={() => ctxAction('rename')}
     >{m.library_rename()}</button>
     {#if tagAddTargets.length > 0}
-      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('tag_add')}>
+      <button class="ctx-item" role="menuitem" title={m.library_bulk_tag_title()} onclick={() => ctxAction('tag_add')}>
         {tagAddTargets.length > 1
           ? m.library_ctx_tag_count({ count: formatNumber(tagAddTargets.length) })
           : m.library_bulk_tag()}
       </button>
     {/if}
     {#if tagRemoveTargets.length > 0}
-      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('tag_remove')}>
+      <button class="ctx-item" role="menuitem" title={m.library_bulk_untag_title()} onclick={() => ctxAction('tag_remove')}>
         {tagRemoveTargets.length > 1
           ? m.library_ctx_untag_count({ count: formatNumber(tagRemoveTargets.length) })
           : m.library_bulk_untag()}

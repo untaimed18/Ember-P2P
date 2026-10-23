@@ -468,7 +468,7 @@ fields that matter here sit in the fixed record header (`RECORD_HEADER_LEN`,
 | 1..17 | 16 | `keyword_hash` | the DHT key the record is filed under |
 | 17..33 | 16 | `file_hash` | the channel id (kind 7: the identity's node id; kind 2 v2: the room-blind id) |
 | 33..65 | 32 | `ember_file_hash` | the channel pubkey (kind 7: the identity pubkey; kind 2 v2: the room-blind key) |
-| 65..73 | 8 | `file_size` | byte 65 kind, 66 flags, 67 language (index and moderation only) |
+| 65..73 | 8 | `file_size` | byte 65 kind, 66 flags, 67 language (index, moderation, and from 1.7.5 a public room's presence) |
 | 73..105 | 32 | `publisher_key` | the signer (kind 2 v2: the member's pseudonym for the room) |
 | 105..113 | 8 | `timestamp` | |
 | 113..115 | 2 | `name_len` | then the name |
@@ -514,6 +514,17 @@ but `channel_store_ok` refuses those first. The `extra` each kind carries:
   check it. `CHANNEL_FLAG_DEPARTED` (`0x02`) marks a leave; its TTL must not
   be shorter than a live record's, or a harvested live copy could be
   re-stored after the tombstone lapsed.
+
+  **The member's language** (from 1.7.5), the one they chose to show beside
+  their name, as a `CHANNEL_LANGUAGES` wire id (position plus one, 0 for
+  none), where the nickname is: byte 67 of a public room's record, and the
+  last byte of the 64-byte nickname pad inside a private room's seal, v1 and
+  v2 alike, never the header, so a storer cannot read it. The pad byte counts
+  only while `nick_len` is under 64. Builds before it zero-fill the pad and
+  read only `nick_len` bytes of it, and mask `file_size` to its first two
+  bytes, so their records read as none and ours read to them as before. A
+  leave carries none. A reader takes it only from the member's own record:
+  beacons, chat lines and snapshots never set or clear it.
 - **3, moderation.** The owner's whole governance snapshot (welcome, bans,
   moderators, `ModerationTail`). The storer does not check its shape; readers
   do. Worst case 1164 of 1165 bytes (see
@@ -949,7 +960,8 @@ replaces the live record under the one store key, as in v1.
 | 25..234 | 209 | 193-byte plaintext sealed under `content_key(join_secret)`, and tag |
 
 The plaintext is v1's, then the member: `noise_pub(32) || nick_len(1) ||
-nickname padded to 64 || member_pubkey(32) || binding(64)`. The AAD is
+nickname padded to 64 || member_pubkey(32) || binding(64)`, the pad's last
+byte carrying the member's language as in v1 (see kind 2 above). The AAD is
 `"ember-channel-presence-extra-v2\0" || channel_id || pseudonym_pubkey`
 (`presence_extra_v2_aad`). The binding is the member's long-term key's
 signature over `"ember-channel-presence-binding-v2\0" || channel_id ||
@@ -1249,6 +1261,10 @@ Older builds log the sub-type as unknown and ignore it.
   except the owner's own key copy and rotates every private room once.
   Sending membership traffic under a throwaway DHT identity is not part of
   the format and can come later (`docs/post-1.7.5.md` item 1).
+- A member's language in their presence record: byte 67 in a public room,
+  the nickname pad's last byte in a private room's seal, a
+  `CHANNEL_LANGUAGES` wire id with 0 for none, and the rule that only the
+  member's own presence record sets or clears it.
 - The meaning of `EMBER_EXT_BROWSE_SCOPE_AWARE`, and that it or
   `EMBER_EXT_MAILBOX_AWARE` marks a session as honouring friends-only files.
 - Both forms of `EMBER_EXT_ATTACH_WAITS`: the empty one asking for the named

@@ -1628,6 +1628,21 @@ pub async fn update_settings(
     let username_changed = settings.channel_username != old_settings.channel_username
         && !settings.channel_username.is_empty();
 
+    // Refused only when it changes. A code this build does not list may be a
+    // later build's, kept as it was so a downgrade does not wipe the choice;
+    // it publishes as no language until a build that knows it runs again.
+    settings.channel_language = settings.channel_language.trim().to_string();
+    let language_changed = settings.channel_language != old_settings.channel_language;
+    if language_changed
+        && !settings.channel_language.is_empty()
+        && settings.channel_language_code().is_none()
+    {
+        return Err(coded(
+            "channels_language_invalid",
+            "That is not one of the languages a room can be marked with",
+        ));
+    }
+
     if settings.settings_revision != old_settings.settings_revision {
         return Err(coded(
             "settings_stale_revision",
@@ -1890,6 +1905,14 @@ pub async fn update_settings(
         crate::commands::channels::apply_channel_username_locally(
             &state,
             &settings.channel_username,
+        )
+        .await;
+    }
+    if language_changed {
+        crate::commands::channels::apply_channel_language_locally(
+            &app,
+            &state,
+            settings.channel_language_code(),
         )
         .await;
     }
