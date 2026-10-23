@@ -620,6 +620,9 @@ export interface OwnedRoomScan {
   /** Rooms in the list that could not be settled this time. Ember keeps
    *  looking at them on its own. */
   unsettled: number;
+  /** Rooms this device runs that the registry lists as deleted, waiting on
+   *  the user's answer. */
+  deleted_elsewhere: number;
 }
 
 /** Emitted when rooms this identity owns were put back: `{ count }`. */
@@ -629,6 +632,28 @@ export const CHANNELS_RECOVERED_EVENT = 'ember:channels-recovered';
  *  not hold, and put them back. */
 export async function recoverOwnedChannels(): Promise<OwnedRoomScan> {
   return invoke('recover_owned_channels');
+}
+
+/** Emitted when rooms this device runs turned out to be listed as deleted:
+ *  `{ count }`. */
+export const ROOMS_DELETED_ELSEWHERE_EVENT = 'ember:channels-deleted-elsewhere';
+
+/** A room we own that the name registry lists as deleted while this device
+ *  still runs it: deleted on another device, or after the backup this one was
+ *  restored from. */
+export interface RoomDeletedElsewhere {
+  channel_id: string;
+  name: string;
+}
+
+export async function listRoomsDeletedElsewhere(): Promise<RoomDeletedElsewhere[]> {
+  return invoke('list_rooms_deleted_elsewhere');
+}
+
+/** `delete` purges the room here as deleting it would have; otherwise it is
+ *  kept and never asked about again. */
+export async function confirmRoomDeletedElsewhere(channelId: string, del: boolean): Promise<void> {
+  return invoke('confirm_room_deleted_elsewhere', { channelId, delete: del });
 }
 
 /** Open the folder received room transfers are saved to. It is not shared,

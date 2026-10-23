@@ -846,6 +846,31 @@ pub async fn list_channels(state: tauri::State<'_, AppState>) -> Result<Vec<Chan
     Ok(rows)
 }
 
+/// The tail of a new room's first snapshot. It names us as owner from the
+/// very first record, so a member who joins before any moderation edit already
+/// knows who cannot be banned, and the language, or a member would read the
+/// room as having none. The room's defaults are written out as the owner
+/// loop's republish writes them: the tail stops at its first absent field, so
+/// left out they took the room's name with them, and a device restored before
+/// that republish got the room back unnamed.
+pub(crate) fn new_room_tail(
+    owner: [u8; 32],
+    language: Option<&'static str>,
+    name: &str,
+) -> ModerationTail {
+    ModerationTail {
+        owner_pubkey: Some(owner),
+        key_epoch: Some(0),
+        successor_nominee: Some([0u8; 32]),
+        claim_after_days: Some(0),
+        invites_owner_only: Some(false),
+        language,
+        // What a device restored from the identity names the room by.
+        room_name: Some(name.to_string()),
+        ..Default::default()
+    }
+}
+
 #[tauri::command]
 pub async fn create_channel(
     app: tauri::AppHandle,
@@ -1017,17 +1042,7 @@ pub async fn create_channel(
         "",
         &[],
         &[],
-        // Names us as owner from the very first record, so a member who joins
-        // before any moderation edit already knows who cannot be banned. The
-        // language too, or a member would read the room as having none.
-        &ModerationTail {
-            owner_pubkey: Some(state.identity.ed25519_public_key),
-            key_epoch: Some(0),
-            language,
-            // What a device restored from the identity names the room by.
-            room_name: Some(name.clone()),
-            ..Default::default()
-        },
+        &new_room_tail(state.identity.ed25519_public_key, language, &name),
         ident.channel_id,
         ident.pubkey,
         private,
@@ -1697,6 +1712,15 @@ pub async fn delete_owned_channel(
     ))
     .await
     .map_err(|e| registry_fail(e, "channels_name_taken"))?;
+    retire_deleted_room(&state, &owned).await
+}
+
+/// The local half of deleting a room we own: tell the room we left, purge it
+/// here and drop its transfers. Shared by [`delete_owned_channel`], after the
+/// registry has tombstoned the name, and by
+/// [`confirm_room_deleted_elsewhere`], where it already had.
+async fn retire_deleted_room(state: &AppState, owned: &OwnedChannel) -> Result<(), String> {
+    let channel_id = owned.row.channel_id.clone();
     // Every moderation command holds this from its load to its commit, so
     // taking it here lets one already past its check finish before the purge,
     // instead of signing a fresh record for the room straight after it. Taken
@@ -1732,6 +1756,55 @@ pub async fn delete_owned_channel(
         }
     }
     Ok(())
+}
+
+/// A room we own that the name registry lists as deleted while this device
+/// still runs it: deleted on another device, or after the backup this device
+/// was restored from. The registry's list is the server's word, not the
+/// room key's, so recovery never acts on it alone (see
+/// `channel_recovery::scan_owned_rooms`); the user is asked instead.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RoomDeletedElsewhere {
+    pub channel_id: String,
+    pub name: String,
+}
+
+/// Rooms waiting on the user's answer.
+#[tauri::command]
+pub async fn list_rooms_deleted_elsewhere(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<RoomDeletedElsewhere>, String> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.rooms_deleted_elsewhere())
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_list_failed", "Failed to list channels", e))
+        .map(|rows| {
+            rows.into_iter()
+                .map(|(channel_id, name)| RoomDeletedElsewhere { channel_id, name })
+                .collect()
+        })
+}
+
+/// The user's answer for one such room: `delete` purges it here as deleting
+/// it would have, `keep` keeps running it and stops asking.
+#[tauri::command]
+pub async fn confirm_room_deleted_elsewhere(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+    delete: bool,
+) -> Result<(), String> {
+    let channel_id = parse_channel_id(&channel_id)?;
+    if delete {
+        require_ember(&state).await?;
+        let owned = load_owned_channel_as(&state, &channel_id, true).await?;
+        retire_deleted_room(&state, &owned).await?;
+    }
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.settle_room_deleted_elsewhere(&channel_id, delete))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_delete_failed", "Failed to delete the room", e))
 }
 
 #[tauri::command]
@@ -6864,6 +6937,31 @@ fn parse_xfer_id(hex_str: &str) -> Result<[u8; 16], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A new room's first snapshot carries its name, so a device restored
+    /// before the first republish gets the room back by name.
+    #[test]
+    fn a_new_rooms_first_snapshot_names_it() {
+        let ident = ChannelIdentity::generate();
+        let record = SignedRecord::channel_moderation_at(
+            "",
+            "",
+            &[],
+            &[],
+            &new_room_tail([9; 32], Some("de"), "Stammtisch"),
+            ident.channel_id,
+            ident.pubkey,
+            true,
+            &ident.signing_key,
+            1_700_000_000,
+        )
+        .expect("fits");
+        let blob = [record.data.clone(), record.signature.to_vec()].concat();
+        let parsed = SignedRecord::parse_channel_moderation(&blob, &ident.channel_id).expect("parses");
+        assert_eq!(parsed.tail.room_name.as_deref(), Some("Stammtisch"));
+        assert_eq!(parsed.tail.owner_pubkey, Some([9; 32]));
+        assert_eq!(parsed.tail.key_epoch, Some(0));
+    }
 
     /// Every frame handed to the gossip layer fits a datagram. Near the cap a
     /// line goes out in the legacy form alone; past what the legacy frame can

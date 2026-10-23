@@ -60,6 +60,10 @@
     createChannel,
     isValidChannelUsername,
     deleteOwnedChannel,
+    listRoomsDeletedElsewhere,
+    confirmRoomDeletedElsewhere,
+    ROOMS_DELETED_ELSEWHERE_EVENT,
+    type RoomDeletedElsewhere,
     dismissChannelNewerLines,
     enterChannel,
     forgetChannel,
@@ -1404,6 +1408,44 @@
     error = null;
   }
 
+  /** Rooms this device runs that the registry lists as deleted, each waiting
+   *  on the owner's answer; see `confirm_room_deleted_elsewhere`. */
+  let deletedElsewhere = $state<RoomDeletedElsewhere[]>([]);
+  let answeringDeleted = $state<string | null>(null);
+
+  async function loadDeletedElsewhere() {
+    try {
+      deletedElsewhere = await listRoomsDeletedElsewhere();
+    } catch (e) {
+      console.warn('channels: could not read rooms deleted elsewhere', e);
+    }
+  }
+
+  async function answerDeletedElsewhere(channelId: string, del: boolean) {
+    if (answeringDeleted) return;
+    answeringDeleted = channelId;
+    try {
+      await confirmRoomDeletedElsewhere(channelId, del);
+      deletedElsewhere = deletedElsewhere.filter((room) => room.channel_id !== channelId);
+      if (del) {
+        // What deleting the room from its own menu clears.
+        forgetChannelNotifyLevel(channelId);
+        forgetChannelFavourite(channelId);
+        forgetChannelIgnores(channelId);
+        discovered = discovered.filter((item) => item.channel_id !== channelId);
+        if (selectedId === channelId) clearSelection();
+        await tick();
+        clearDraft(`ch:${channelId}`);
+        setPendingReply(channelId, null);
+        await refreshChannels().catch(() => {});
+      }
+    } catch (e) {
+      error = translateError(e, m.error_operation_failed());
+    } finally {
+      answeringDeleted = null;
+    }
+  }
+
   onMount(() => {
     restoreActiveChannelOnEnter();
     returningToChannels = takeStashedChannelSelection();
@@ -1471,6 +1513,14 @@
         if (!cancelled) presenceConfig = config;
       })
       .catch(() => {});
+    void loadDeletedElsewhere();
+    let unlistenDeletedElsewhere: UnlistenFn | undefined;
+    listen(ROOMS_DELETED_ELSEWHERE_EVENT, () => void loadDeletedElsewhere())
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlistenDeletedElsewhere = fn;
+      })
+      .catch((e) => console.error('Failed to register deleted-elsewhere listener:', e));
     let unlistenMembers: UnlistenFn | undefined;
     listen<{ channel_id: string }>('ember:channel-members', (event) => {
       const id = event.payload.channel_id;
@@ -1601,6 +1651,7 @@
       document.removeEventListener('visibilitychange', onGatherVisibilityChange);
       unlistenMembers?.();
       unlistenPresence?.();
+      unlistenDeletedElsewhere?.();
       unlistenChat?.();
       unlistenModeration?.();
       unlistenNewer?.();
@@ -3022,6 +3073,26 @@
       </div>
     </div>
   {/if}
+
+  {#each deletedElsewhere as room (room.channel_id)}
+    <!-- The registry says this room was deleted, but this device still runs
+         it: a restore from an older backup, or a delete on another device.
+         The registry's word alone never removes it; the owner does. -->
+    <div class="banner deleted-elsewhere-banner" role="status">
+      <span>
+        <strong><bdi dir="auto">{room.name}</bdi></strong>
+        {m.channels_deleted_elsewhere_body()}
+      </span>
+      <div class="banner-actions">
+        <button class="ghost" onclick={() => void answerDeletedElsewhere(room.channel_id, true)} disabled={answeringDeleted !== null}>
+          {answeringDeleted === room.channel_id ? m.common_loading() : m.channels_deleted_elsewhere_delete()}
+        </button>
+        <button class="ghost" onclick={() => void answerDeletedElsewhere(room.channel_id, false)} disabled={answeringDeleted !== null}>
+          {m.channels_deleted_elsewhere_keep()}
+        </button>
+      </div>
+    </div>
+  {/each}
 
   {#if emberOff}
     <div class="banner" role="status">

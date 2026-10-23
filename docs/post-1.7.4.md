@@ -565,7 +565,8 @@ lands.
   relayed reply reaches us as an ordinary `CHANNEL_MSG` from the hop, with
   nothing naming the neighbor asked, so the marker has to go into the relay
   envelope or the gossip frame, both frozen with this release. It costs a
-  range asked for again, never a line.
+  range asked for again, never a line. **Scheduled for 1.8.0:** see
+  `docs/post-1.7.5.md`, "Already scheduled for 1.8.0".
 - **Room transfer key derivation. Done in 1.7.5:** an inbound transfer frame
   is checked under the key its transfer derived at setup
   (`xfer_frame_key`, from `xfer_recv`, `xfer_send` or `xfer_pending` when the
@@ -855,17 +856,34 @@ the release notes.
   is in 1.7.5: the claim rotates straight away and the owner loop retries a
   rotation that failed, so the window is minutes, and closing it means
   recovery overwriting a key it derived with one it fetched.
-- **Old backups keep rooms deleted since.** A room key signature on the
-  deletion, served by the registry, would let it be trusted. Left as it is in
-  1.7.5: it needs the registry to store and serve the signature as well as
-  the client to check it.
+- **Old backups keep rooms deleted since. Done in 1.7.5, by asking:** a
+  room this device runs that the registry lists as deleted (a restore from
+  an older backup, or a delete on another device) is noted in
+  `channel_deleted_elsewhere` during the scan, and the Channels page asks its
+  owner, once per room, "Keep it deleted" or "Keep running it"
+  (`confirm_room_deleted_elsewhere`). The registry's list is still only the
+  server's word, so it never removes a room by itself; with the owner's
+  answer it does, through the same local purge as deleting the room
+  (`retire_deleted_room`). A room key signature on the deletion, served by the
+  registry, would make the question unnecessary; it needs the registry to
+  store and serve it, and is not planned.
 - **The list shows how many rooms an identity owns. Done in 1.7.5:** the list
   is padded to 8, 16, 32 or 48 salts with pads only the identity can tell
   apart, and sorted ([The owned-rooms list](channels-format.md#the-owned-rooms-list-kind-7)).
 - **Older builds don't store record kind 7.** Absence is only concluded after
   four nodes have answered (`MIN_RESPONDERS_FOR_ABSENCE`).
-- **Recovery has no end-to-end test**; item 5's restore run is the only cover
-  for the network flow.
+- **Recovery has no end-to-end test. Done in 1.7.5:** the look runs over a
+  `RecoveryEnv` (the database, the identity, DHT lookups, the registry's
+  deleted list and the steps after a restore), which the app implements and
+  `a_device_with_only_the_identity_gets_every_owned_room_back` fakes with the
+  records another device published. It restores a public room by its
+  snapshot and a private one on the key it rotated to, never looks up the
+  list's padding, leaves a deleted room deleted, and asks about a room the
+  registry later lists as deleted. Writing it found that a new room's first
+  snapshot carried no name (the tail stopped at the unset nominee before
+  reaching it), so a device restored before the first republish got a private
+  room back as "Room 1a2b…"; `new_room_tail` now writes the defaults out.
+  Item 5's restore run still covers the real network.
 
 ### From the 1.7.2 audit
 

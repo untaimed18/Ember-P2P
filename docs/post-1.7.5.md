@@ -461,6 +461,21 @@ yet; v1 cannot be switched off until it is). Whether to renew every retained
 epoch's key records, not just the current one's, is also left to decide then.
 Detail in `docs/post-1.7.4.md` items 2 and 9.
 
+**Also in 1.8.0: relayed catch-up replies move the frontier.** A catch-up
+reply that reaches us through another member's hop arrives as an ordinary
+`CHANNEL_MSG` from that hop, and cannot be told from the hop's own TTL-1
+line, so progress is credited only to a neighbor whose reply came directly
+(`catch_up_progress` in `channel_gossip.rs`). A neighbor whose replies are
+relayed is asked the same range again each round: bandwidth, never a lost
+line. The fix is a marker saying a frame is a relayed catch-up reply and for
+whom, in the relay envelope or the gossip frame. Both formats froze with
+1.7.5, which is why it waits for 1.8.0, the release that changes formats
+anyway. To decide then: where the marker goes (the relay envelope is the
+natural place, since only relays forward a reply), whether it is signed by
+the neighbor that served the reply so a hop cannot forge progress for it, and
+how a 1.7.x member that does not send it is read (as today: not credited).
+Origin: `docs/post-1.7.4.md`, "Channels: smaller follow-ups".
+
 ## Carried from the 1.7.5 plan
 
 What `docs/post-1.7.4.md` leaves open, apart from the item above, which this

@@ -1293,4 +1293,8 @@ freeze was decided in 1.7.5; the decisions are above and in
 already scheduled: **1.8.0** stops sending chat frames 15 and 19 (and sets
 `EXT_FLAG_DISPLAY` on kinds 64 and 65), and stops publishing v1 private
 membership records, rotating every private room once as it does, so a room
-has one cut-over to test.
+has one cut-over to test. It also adds a marker that says a catch-up reply
+was relayed, so such a reply moves the asker's catch-up frontier; today a
+relayed reply cannot be told from the hop's own TTL-1 line, and the range is
+asked for again (see
+[post-1.7.5.md](post-1.7.5.md#already-scheduled-for-180)).

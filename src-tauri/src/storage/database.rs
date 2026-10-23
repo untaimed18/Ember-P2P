@@ -9997,6 +9997,74 @@ impl Database {
         Ok(())
     }
 
+    /// Rooms we own that the name registry lists as deleted while this device
+    /// runs them, and what the user said: `kept` 0 while unanswered, 1 once
+    /// they chose to keep it. Created on first use; outside the numbered chain.
+    fn ensure_rooms_deleted_elsewhere_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_deleted_elsewhere (
+                channel_id TEXT PRIMARY KEY,
+                kept INTEGER NOT NULL DEFAULT 0,
+                noticed_at INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Note a room for the user to decide on. Returns whether it is waiting on
+    /// them now: false for one they already chose to keep.
+    pub fn note_room_deleted_elsewhere(&self, channel_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Self::ensure_rooms_deleted_elsewhere_locked(&conn)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_deleted_elsewhere (channel_id, noticed_at) VALUES (?1, ?2)",
+            params![channel_id, chrono::Utc::now().timestamp()],
+        )?;
+        let kept: i64 = conn.query_row(
+            "SELECT kept FROM channel_deleted_elsewhere WHERE channel_id = ?1",
+            params![channel_id],
+            |row| row.get(0),
+        )?;
+        Ok(kept == 0)
+    }
+
+    /// The rooms still waiting on the user's answer, with their names: only
+    /// rooms this device still runs as owner.
+    pub fn rooms_deleted_elsewhere(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock();
+        Self::ensure_rooms_deleted_elsewhere_locked(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT c.channel_id, c.name FROM channel_deleted_elsewhere d
+             JOIN channels c ON c.channel_id = d.channel_id
+             WHERE d.kept = 0 AND c.is_owner = 1 AND c.deleted = 0 AND c.successor_id = ''
+             ORDER BY d.noticed_at, c.name",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Record the user's answer. A deleted room needs no row any more; a kept
+    /// one keeps its row so it is never asked about again.
+    pub fn settle_room_deleted_elsewhere(&self, channel_id: &str, deleted: bool) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_rooms_deleted_elsewhere_locked(&conn)?;
+        if deleted {
+            conn.execute(
+                "DELETE FROM channel_deleted_elsewhere WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT INTO channel_deleted_elsewhere (channel_id, kept, noticed_at) VALUES (?1, 1, ?2)
+                 ON CONFLICT(channel_id) DO UPDATE SET kept = 1",
+                params![channel_id, chrono::Utc::now().timestamp()],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Stop listing a salt whose room is gone: deleted, or handed on.
     pub fn drop_owned_salt(&self, channel_id: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
@@ -23789,6 +23857,44 @@ mod tests {
     /// The owned-rooms list names the rooms run here as owner and the ones
     /// carried for later, never a room that never came to exist or is gone,
     /// and a restored database publishes none until it has read the network's.
+    /// A room this device runs that the registry lists as deleted waits on the
+    /// owner's answer; keeping it stops the asking for good, and a room only
+    /// held as a member, or already gone, is never asked about.
+    #[test]
+    fn a_room_deleted_elsewhere_waits_on_its_owner_once() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-deleted-elsewhere-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let (mine, other, member) = ("a1".repeat(16), "a2".repeat(16), "a3".repeat(16));
+        db.insert_channel(&mine, &"01".repeat(32), "Mine", "public", true, Some(&[1; 32]), None).unwrap();
+        db.insert_channel(&other, &"02".repeat(32), "Other", "public", true, Some(&[2; 32]), None).unwrap();
+        db.insert_channel(&member, &"03".repeat(32), "Theirs", "public", false, None, None).unwrap();
+
+        assert!(db.rooms_deleted_elsewhere().unwrap().is_empty());
+        for id in [&mine, &other, &member] {
+            assert!(db.note_room_deleted_elsewhere(id).unwrap(), "waiting once noted");
+        }
+        let waiting = db.rooms_deleted_elsewhere().unwrap();
+        assert_eq!(waiting.len(), 2, "only rooms run as owner: {waiting:?}");
+
+        db.settle_room_deleted_elsewhere(&mine, false).unwrap();
+        assert!(!db.note_room_deleted_elsewhere(&mine).unwrap(), "kept: never asked again");
+        assert_eq!(db.rooms_deleted_elsewhere().unwrap(), vec![(other.clone(), "Other".to_string())]);
+
+        db.tombstone_channel(&other).unwrap();
+        db.settle_room_deleted_elsewhere(&other, true).unwrap();
+        assert!(db.rooms_deleted_elsewhere().unwrap().is_empty(), "deleted: nothing left to ask");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
     #[test]
     fn the_owned_rooms_list_names_live_and_carried_rooms_only() {
         use crate::network::ember::channel::{derive_owned_room_seed, ChannelIdentity};

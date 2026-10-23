@@ -2545,6 +2545,8 @@ pub fn run() {
             commands::channels::set_channel_message_pinned,
             commands::channels::get_channel_pins,
             commands::channels::delete_owned_channel,
+            commands::channels::list_rooms_deleted_elsewhere,
+            commands::channels::confirm_room_deleted_elsewhere,
             commands::channels::get_channel_invite,
             commands::channels::list_channel_members,
             commands::channels::channel_presence_config,
