@@ -2277,6 +2277,23 @@ impl SignedRecord {
         expected_channel_id: &[u8; 16],
         content_key: Option<&[u8; 32]>,
     ) -> Option<ChannelPresenceMember> {
+        Self::parse_channel_presence_member_in_room(blob, expected_channel_id, content_key, false)
+    }
+
+    /// [`Self::parse_channel_presence_member`] for a room known to be public or
+    /// private. A private room's v1 presence is flagged private and sealed
+    /// under its content key; one that is neither opens under any key, since
+    /// [`channel::decode_presence_extra`] takes a bare 32-byte extra as the
+    /// public shape, and would pass for proof of the room's current key. Its
+    /// header names only the room's id and pubkey, which anyone can learn, so
+    /// any node answering the lookup could put a fresh identity on the roster
+    /// and be sealed the next key.
+    pub fn parse_channel_presence_member_in_room(
+        blob: &[u8],
+        expected_channel_id: &[u8; 16],
+        content_key: Option<&[u8; 32]>,
+        private_room: bool,
+    ) -> Option<ChannelPresenceMember> {
         let rec = Self::from_value_blob(blob)?;
         if rec.record_type != RECORD_TYPE_CHANNEL || rec.file_hash != *expected_channel_id {
             return None;
@@ -2286,6 +2303,9 @@ impl SignedRecord {
         }
         let meta = rec.channel.as_ref()?;
         if meta.kind != CHANNEL_KIND_PRESENCE {
+            return None;
+        }
+        if private_room && (!meta.is_private() || meta.extra.len() == 32) {
             return None;
         }
         let (noise_pub, nickname, sealed_language) = channel::decode_presence_extra(

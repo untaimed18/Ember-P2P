@@ -95,8 +95,12 @@ nonce(24) || ciphertext`.
   data, so a body cannot be lifted into another envelope.
 - **Plaintext.** `type(1) || fields`, one kind for everything so relays cannot
   tell a message from a receipt: message (`message_id(16) || text`), receipt
-  (`message_id(16)`), accept, decline. Padded to fixed buckets (256, 1024,
-  4096) so length says little. Text capped at `CHAT_TEXT_MAX_BYTES`.
+  (`message_id(16)`), accept, decline. Padded to fixed buckets so length says
+  little: 256, 1024, and a top bucket sized to what one datagram carries once
+  the gossip envelope and the extension frame around the body are counted.
+  That is well under 4096 (a room line's sealed frame stops fitting at about
+  3,760 bytes of text), so the text cap follows from the top bucket, less
+  `type(1) || message_id(16)`, rather than being `CHAT_TEXT_MAX_BYTES`.
 
 **Delivery.** Extension frames are not stored for catch-up, so a message
 reaches only a recipient online within the 10-minute relay window. The

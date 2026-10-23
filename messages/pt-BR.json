@@ -4073,6 +4073,7 @@
   "error_channels_recover_unavailable": "O Ember não conseguiu acessar o Rendezvous para procurar suas salas. Tente mais tarde.",
   "error_channels_chat_locked": "O histórico de conversas está bloqueado. Restaure o arquivo de chave para usar os Canais.",
   "error_channels_message_size_invalid": "A mensagem deve ter entre 1 e 4096 bytes",
+  "error_channels_message_too_long_to_send": "Esta mensagem é longa demais para enviar a uma sala. Encurte-a e tente novamente.",
   "error_channels_ban_protected": "Moderadores não podem banir outros moderadores nem remover um banimento do dono",
   "error_channels_xfer_source_changed": "O arquivo foi alterado ou movido antes de poder ser oferecido",
   "error_channels_reply_target_invalid": "A mensagem à qual você está respondendo não está nesta sala",

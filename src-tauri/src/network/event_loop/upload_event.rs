@@ -666,6 +666,12 @@ pub(in crate::network) async fn on_upload_event(
                 on_friend_session_for_mailbox(state, settings, *ember_hash).await;
                 chat_attach::on_friend_session(state, *ember_hash).await;
                 send_friend_status(state, settings, &ed25519_secret_key, *ember_hash).await;
+                crate::network::settings::announce_nickname_to_friend(
+                    state,
+                    ember_hash,
+                    &settings.nickname,
+                )
+                .await;
             }
             // The session is live, so anything the user typed
             // while this friend was unreachable can go out now —

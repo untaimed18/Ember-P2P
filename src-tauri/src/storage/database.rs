@@ -35,10 +35,26 @@ const CHANNEL_CACHE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 62;
 
 /// A status write keeps the stored failure code only while the row stays
-/// Failed: any other status means it was taken up again.
+/// Failed, or stays Stopped for its part files having been removed (see
+/// [`failure_code_kept`]): any other status means it was taken up again.
 const UPDATE_TRANSFER_STATUS_SQL: &str = "UPDATE transfers
-     SET status = ?1, failure_code = CASE WHEN ?1 = 'failed' THEN failure_code END
+     SET status = ?1, failure_code = CASE
+         WHEN ?1 = 'failed' THEN failure_code
+         WHEN ?1 = 'stopped' AND failure_code = 'part_files_removed' THEN failure_code
+     END
      WHERE id = ?2";
+
+/// Whether a row in `status` keeps `code` across a restart. Failed keeps any.
+/// Stopped keeps only "part files removed": that row was zeroed when its part
+/// files were found gone, and without the code a later start shows a plain
+/// Stopped download at nothing, with no word of where its progress went.
+fn failure_code_kept(status: &TransferStatus, code: TransferFailureCode) -> bool {
+    match status {
+        TransferStatus::Failed => true,
+        TransferStatus::Stopped => code == TransferFailureCode::PartFilesRemoved,
+        _ => false,
+    }
+}
 
 /// The failure a stored `failure_code` names, `None` for one this build does
 /// not know.
@@ -3518,7 +3534,27 @@ impl Database {
         // what the friend calls themselves and follows their own renames. Outside
         // the numbered chain so 1.7.0 still opens the database; it never reads
         // this column and shows `nickname` as before.
+        //
+        // Before it existed, a rename the user gave a friend was written over
+        // `nickname`, which a friend's verified session now refreshes to the
+        // name they chose — so the column starts as a copy of every stored
+        // name, or the first session would wipe each label for good. A friend
+        // never renamed then holds a label equal to their own name, which
+        // `refresh_friend_self_name` drops once their session confirms it.
+        let had_alias = conn
+            .prepare("SELECT 1 FROM pragma_table_info('friends') WHERE name = 'alias'")?
+            .exists([])?;
         Self::add_column_if_missing(&conn, "friends", "alias", "TEXT NOT NULL DEFAULT ''")?;
+        if !had_alias {
+            let has_friends: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'friends')",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_friends {
+                conn.execute("UPDATE friends SET alias = nickname WHERE alias = ''", [])?;
+            }
+        }
         // The language a room member publishes beside their nickname. Outside
         // the numbered chain for the same reason: every older build names the
         // `channel_members` columns it writes, so the default covers its rows.
@@ -4260,6 +4296,27 @@ impl Database {
         Ok(count.max(0) as usize)
     }
 
+    /// The offers we sent `friend_hash` still waiting on an answer at `now`, as
+    /// `(all, held)`: `held` are the ones their side has said it keeps for its
+    /// user (`hold_chat_attachment_offer`), a hold not since released.
+    pub fn count_offered_chat_attachments(
+        &self,
+        friend_hash: &str,
+        now: i64,
+    ) -> anyhow::Result<(usize, usize)> {
+        let conn = self.conn.lock();
+        let (all, held): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN held_at IS NOT NULL AND held_at > 0
+                                       AND hold_released = 0 THEN 1 ELSE 0 END), 0)
+             FROM chat_attachments
+             WHERE friend_hash = ?1 AND direction = 'sent' AND status = 'offered' AND expires_at > ?2",
+            rusqlite::params![friend_hash, now],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((all.max(0) as usize, held.max(0) as usize))
+    }
+
     /// Friends with at least one file queued for them.
     pub fn friends_with_queued_chat_attachments(&self) -> anyhow::Result<Vec<String>> {
         let conn = self.conn.lock();
@@ -4713,11 +4770,12 @@ impl Database {
             TransferStatus::Insufficient => "insufficient",
             TransferStatus::NoneNeeded => "noneneeded",
         };
-        let failure_code = if transfer.status == TransferStatus::Failed {
-            transfer.failure_code.as_deref()
-        } else {
-            None
-        };
+        // A Failed row keeps any code, a newer build's included, as before.
+        let failure_code = transfer.failure_code.as_deref().filter(|code| {
+            transfer.status == TransferStatus::Failed
+                || persisted_failure_code(code)
+                    .is_some_and(|known| failure_code_kept(&transfer.status, known))
+        });
         conn.execute(
             "INSERT INTO transfers (id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich, ember_file_hash, friends_only, failure_code)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
@@ -4870,14 +4928,12 @@ impl Database {
                     if pin_corrupt {
                         status = TransferStatus::Failed;
                     }
-                    let stored_failure = if status == TransferStatus::Failed {
-                        row.get::<_, Option<String>>(17)
-                            .ok()
-                            .flatten()
-                            .and_then(|code| persisted_failure_code(&code))
-                    } else {
-                        None
-                    };
+                    let stored_failure = row
+                        .get::<_, Option<String>>(17)
+                        .ok()
+                        .flatten()
+                        .and_then(|code| persisted_failure_code(&code))
+                        .filter(|code| failure_code_kept(&status, *code));
                     let failure = pin_failure.or(stored_failure);
                     Ok(Transfer {
                         id: row.get(0)?,
@@ -7103,15 +7159,20 @@ impl Database {
     }
 
     /// Record the name a friend calls themselves, as their verified session
-    /// announced it. Never touches the user's label. `Ok(true)` only when the
-    /// stored name changed, so the caller knows whether anything shows it.
+    /// announced it. Leaves the user's label alone unless it is exactly that
+    /// name, which says nothing a label should: that is what a friend carried
+    /// over from before labels existed looks like (see the `alias` column's
+    /// migration), and dropping it lets their later renames show. `Ok(true)`
+    /// only when what the row shows changed, so the caller knows to redraw.
     pub fn refresh_friend_self_name(&self, user_hash: &str, nickname: &str) -> anyhow::Result<bool> {
         if nickname.is_empty() {
             return Ok(false);
         }
         let conn = self.conn.lock();
         let updated = conn.execute(
-            "UPDATE friends SET nickname = ?2 WHERE user_hash = ?1 AND nickname != ?2",
+            "UPDATE friends
+             SET nickname = ?2, alias = CASE WHEN alias = ?2 THEN '' ELSE alias END
+             WHERE user_hash = ?1 AND (nickname != ?2 OR alias = ?2)",
             params![user_hash, nickname],
         )?;
         Ok(updated > 0)
@@ -8909,15 +8970,20 @@ impl Database {
         Ok(())
     }
 
-    /// Rooms an earlier Discover walk found, most recently seen first.
+    /// Rooms an earlier Discover walk found, most recently seen first. The age
+    /// bound is applied here too: the prune runs only when a walk turns
+    /// something up, and a device whose walks keep failing would otherwise go
+    /// on offering rooms nobody has seen for months.
     pub fn list_cached_channels(&self) -> anyhow::Result<Vec<CachedChannel>> {
+        let now = chrono::Utc::now().timestamp();
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT channel_id, pubkey, name, language FROM channel_index_cache
+             WHERE last_seen >= ?1
              ORDER BY last_seen DESC",
         )?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params![now - CHANNEL_CACHE_MAX_AGE_SECS], |row| {
                 Ok(CachedChannel {
                     channel_id: row.get(0)?,
                     pubkey: row.get(1)?,
@@ -16534,6 +16600,51 @@ mod tests {
         assert!(!db.refresh_friend_self_name("zz", "Nobody").expect("missing"));
     }
 
+    /// Upgrading from before labels: a rename the user gave a friend was stored
+    /// as their nickname, and must survive the first session that announces the
+    /// name the friend chose. A friend never renamed loses the copy once their
+    /// session confirms it, so their own later renames show.
+    #[test]
+    fn labels_given_before_the_alias_column_survive_the_upgrade() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-alias-upgrade-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        {
+            let db = Database::open_at(&path).expect("open");
+            let conn = db.conn.lock();
+            conn.execute_batch(
+                "ALTER TABLE friends DROP COLUMN alias;
+                 INSERT INTO friends (user_hash, nickname) VALUES ('aa', 'Mum'), ('bb', 'Brady');",
+            )
+            .expect("an older friends table");
+        }
+        let db = Database::open_at(&path).expect("reopen");
+        let full = |db: &Database| db.get_friends_full().expect("list");
+        let label = |db: &Database, hash: &str| {
+            full(db).into_iter().find(|row| row.0 == hash).map(|row| (row.1, row.7)).unwrap()
+        };
+        assert_eq!(label(&db, "aa"), ("Mum".into(), "Mum".into()), "carried over as a label");
+
+        // Mum's session says she calls herself Jane: the label the user typed stays.
+        assert!(db.refresh_friend_self_name("aa", "Jane").expect("refresh"));
+        assert_eq!(label(&db, "aa"), ("Jane".into(), "Mum".into()));
+        // Brady was never renamed: his session confirms the copy, which goes.
+        assert!(db.refresh_friend_self_name("bb", "Brady").expect("refresh"));
+        assert_eq!(label(&db, "bb"), ("Brady".into(), String::new()));
+        assert!(db.refresh_friend_self_name("bb", "Brady2").expect("refresh"));
+        assert_eq!(label(&db, "bb"), ("Brady2".into(), String::new()), "his own renames show");
+
+        drop(db);
+        let reopened = Database::open_at(&path).expect("again");
+        assert_eq!(label(&reopened, "aa"), ("Jane".into(), "Mum".into()), "copied once, not on every open");
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
     /// Pasting a newer code for someone already listed must not put the typed
     /// stand-in back over the name their session gave us.
     #[test]
@@ -17830,6 +17941,28 @@ mod tests {
         db.save_transfer(&row).unwrap();
         db.update_transfer_status("legacy", "failed").unwrap();
         assert_eq!(code_of(&db.get_incomplete_downloads().unwrap(), "legacy"), None);
+
+        // Stopped because its part files were removed: the notice outlives a
+        // restart and a repeated Stopped write, and Resume drops it. No other
+        // code is kept on a Stopped row.
+        let removed = TransferFailureCode::PartFilesRemoved;
+        row.status = TransferStatus::Stopped;
+        row.failure_code = Some(removed.as_code().into());
+        db.save_transfer(&row).unwrap();
+        db.update_transfer_status("legacy", "stopped").unwrap();
+        let reloaded = db.get_incomplete_downloads().unwrap();
+        let back = reloaded.iter().find(|t| t.id == "legacy").unwrap();
+        assert_eq!(back.failure_code.as_deref(), Some(removed.as_code()));
+        assert_eq!(back.failure_reason.as_deref(), Some(removed.message()));
+        db.update_transfer_status("legacy", "searching").unwrap();
+        assert_eq!(code_of(&db.get_incomplete_downloads().unwrap(), "legacy"), None);
+        row.failure_code = Some(TransferFailureCode::HashMismatch.as_code().into());
+        db.save_transfer(&row).unwrap();
+        assert_eq!(
+            code_of(&db.get_incomplete_downloads().unwrap(), "legacy"),
+            None,
+            "any other failure is not kept on a Stopped row"
+        );
 
         drop(db);
         let _ = std::fs::remove_file(&path);
@@ -20006,6 +20139,9 @@ mod tests {
         assert_eq!(expiry("c1"), first_end, "neither moved it");
         assert_eq!(hold("c3", &other, short), OfferHold::Refused, "not once it has lapsed");
         assert_eq!(hold("c3", &other, now + 5), OfferHold::Started);
+        // What the queue paces itself by: c1 waits, but held, so it leaves room.
+        assert_eq!(db.count_offered_chat_attachments(&friend, now + 2).expect("count"), (1, 1));
+        assert_eq!(db.count_offered_chat_attachments(&other, now + 6).expect("count"), (1, 1));
 
         // Released an hour in, and named again within the five minutes the
         // release leaves: back to the first hold's end, once.
@@ -20015,6 +20151,11 @@ mod tests {
             .expect("release");
         assert_eq!(released, vec!["c1".repeat(16)]);
         assert_eq!(expiry("c1"), ended + 300);
+        assert_eq!(
+            db.count_offered_chat_attachments(&friend, ended).expect("count"),
+            (1, 0),
+            "released, it paces the queue again"
+        );
         assert_eq!(expiry("c3"), now + 5 + day, "another friend's");
         assert_eq!(hold("c1", &friend, ended + 60), OfferHold::Resumed);
         assert_eq!(expiry("c1"), first_end, "not a fresh day from the note");

@@ -2061,6 +2061,16 @@ pub async fn edit_channel_message(
             "Message must be between 1 and 4096 bytes",
         )
     })?;
+    let mut envelope_id = [0u8; 16];
+    OsRng.fill_bytes(&mut envelope_id);
+    let frames = chat_gossip_frames(
+        channel_id_bytes,
+        &channel::content_key(&join_secret),
+        &sender_pk,
+        envelope_id,
+        edited_at,
+        &revision,
+    )?;
 
     // The queue slot is claimed before the row is written, because the write
     // cannot be undone: `apply_channel_message_edit` overwrites the pre-edit
@@ -2136,16 +2146,6 @@ pub async fn edit_channel_message(
         }
     }
 
-    let mut envelope_id = [0u8; 16];
-    OsRng.fill_bytes(&mut envelope_id);
-    let frames = chat_gossip_frames(
-        channel_id_bytes,
-        &channel::content_key(&join_secret),
-        &sender_pk,
-        envelope_id,
-        edited_at,
-        &revision,
-    );
     // Spends the slot claimed before the write. Nothing between the two can
     // refuse it, so the revision on disk and the frames on the mesh are one
     // outcome rather than two.
@@ -2645,7 +2645,13 @@ pub async fn send_channel_message(
         ));
     };
     let key = channel::content_key(&join_secret);
-    let frames = chat_gossip_frames(channel_id_bytes, &key, &sender_pk, msg_id, sent_at, &line);
+    let frames = match chat_gossip_frames(channel_id_bytes, &key, &sender_pk, msg_id, sent_at, &line) {
+        Ok(frames) => frames,
+        Err(e) => {
+            refund_local_send(&channel_id);
+            return Err(e);
+        }
+    };
     // Stored before it is flooded, which is the order the edit path already
     // uses. The other way round, a failed insert left the line on every peer's
     // disk and on none of ours: the user was told the send failed, and the retry
@@ -2896,6 +2902,12 @@ static MODERATION_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync:
 /// that a build reading only it meets it ahead of the frame it cannot read.
 /// `legacy_envelope` and `at` are the legacy frame's envelope id and time; the
 /// v2 frame carries its own.
+///
+/// A sealed frame has to fit one datagram, which a text near the 4096-byte cap
+/// does not. The v2 frame is the larger of the two, so a line whose legacy
+/// frame fits and v2 frame does not goes out in the legacy form alone, which
+/// every build reads; one whose first frame does not fit is refused, before
+/// the callers store anything, rather than kept here and delivered nowhere.
 fn chat_gossip_frames(
     channel_id: [u8; 16],
     key: &[u8; 32],
@@ -2903,7 +2915,7 @@ fn chat_gossip_frames(
     legacy_envelope: [u8; 16],
     at: i64,
     chat: &channel::OutgoingChat,
-) -> Vec<Vec<u8>> {
+) -> Result<Vec<Vec<u8>>, String> {
     let seal = |envelope_id: [u8; 16], at: i64, plain: &[u8]| {
         channel::ChannelGossip::sealed(
             channel_id,
@@ -2916,12 +2928,22 @@ fn chat_gossip_frames(
         )
         .encode()
     };
+    let fits = |frame: &Vec<u8>| {
+        frame.len() <= crate::network::ember::dht::messages::MAX_DELIVERABLE_PAYLOAD
+    };
     let mut frames = Vec::with_capacity(2);
     if let Some((plain, _)) = &chat.legacy {
         frames.push(seal(legacy_envelope, at, plain));
     }
     frames.push(seal(chat.v2.frame_id, chat.v2.signed_at, &chat.v2.plain(sender)));
-    frames
+    if !fits(&frames[0]) {
+        return Err(coded(
+            "channels_message_too_long_to_send",
+            "This message is too long to send to a room. Shorten it and try again.",
+        ));
+    }
+    frames.retain(fits);
+    Ok(frames)
 }
 
 /// Our own outbound chat times, per room, for [`LOCAL_SEND_PER_MINUTE`].
@@ -5371,6 +5393,10 @@ pub async fn claim_channel_ownership(
             // key — so the snapshot goes out either way. What must not survive
             // is the reverse: a rotation the snapshot never announced leaves us
             // sealing traffic under an epoch nobody has been told to fetch.
+            // Held, as `rotate_and_commit` holds it, until the commit or the
+            // undo is done: a settings pass in between would sign a commitment
+            // to a key that may yet be taken back.
+            let rotating = private.then(|| RotatingRoom::begin(&successor_id_hex));
             let rotated = match rotate_channel_key(&state, &owned, &bans).await {
                 Ok(rotated) => rotated,
                 Err(e) => {
@@ -5389,6 +5415,7 @@ pub async fn claim_channel_ownership(
             .await
             {
                 Ok(_) if rotated.is_some() || !private => {
+                    drop(rotating);
                     if let Some(rotated) = rotated {
                         hand_out_rotated_key(&state, &owned, rotated).await;
                     }
@@ -5402,6 +5429,7 @@ pub async fn claim_channel_ownership(
                         tracing::warn!(channel_id = %successor_id_hex, error = %e, "could not publish the claimed room's first record");
                         undo_rotation(&state, &owned, rotated.as_ref().map(|rotated| rotated.epoch)).await;
                     }
+                    drop(rotating);
                     let db = state.db.clone();
                     let id = successor_id_hex.clone();
                     let _ = tokio::task::spawn_blocking(move || db.mark_channel_rotate_pending(&id)).await;
@@ -6788,6 +6816,39 @@ fn parse_xfer_id(hex_str: &str) -> Result<[u8; 16], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every frame handed to the gossip layer fits a datagram. Near the cap a
+    /// line goes out in the legacy form alone; past what the legacy frame can
+    /// carry it is refused, so it is neither stored nor lost on the way.
+    #[test]
+    fn a_line_too_long_for_a_datagram_is_refused_and_its_oversized_twin_dropped() {
+        let key = crypto::signing_key_from_bytes(&[0x31; 32]);
+        let sender = key.verifying_key().to_bytes();
+        let room = [0x5a; 16];
+        let content_key = [0x77; 32];
+        let frames_for = |len: usize| {
+            let text = "a".repeat(len);
+            let line_id = channel::new_chat_msg_id(&room, &sender, 1_700_000_000);
+            let line = channel::outgoing_chat_line(&key, &room, &line_id, 1_700_000_000, &text, &text, None)
+                .expect("under the text cap");
+            chat_gossip_frames(room, &content_key, &sender, line_id, 1_700_000_000, &line)
+        };
+        let max = crate::network::ember::dht::messages::MAX_DELIVERABLE_PAYLOAD;
+        let both = if channel::SEND_LEGACY_CHAT_FRAMES { 2 } else { 1 };
+
+        assert_eq!(frames_for(200).unwrap().len(), both);
+        assert!(frames_for(MAX_CHANNEL_MESSAGE).is_err());
+        let longest = (1..=MAX_CHANNEL_MESSAGE)
+            .rev()
+            .find(|len| frames_for(*len).is_ok())
+            .expect("some line fits");
+        assert!(longest > 3_500, "a long line still goes out: {longest}");
+        let frames = frames_for(longest).unwrap();
+        assert!(frames.iter().all(|frame| frame.len() <= max));
+        if channel::SEND_LEGACY_CHAT_FRAMES {
+            assert_eq!(frames.len(), 1, "only the legacy frame fits at the edge");
+        }
+    }
 
     /// A member behind a private room's key takes an invite's key only for an
     /// epoch the owner's newest settings record commits to, and only when the

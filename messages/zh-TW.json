@@ -4073,6 +4073,7 @@
   "error_channels_recover_unavailable": "Ember 無法連線 Rendezvous 來尋找你擁有的房間。請稍後再試。",
   "error_channels_chat_locked": "聊天記錄已鎖定。請恢復金鑰檔案以使用頻道。",
   "error_channels_message_size_invalid": "訊息長度必須在 1 到 4096 位元組之間",
+  "error_channels_message_too_long_to_send": "此訊息太長，無法傳送到房間。請縮短後再試一次。",
   "error_channels_ban_protected": "版主不能封鎖其他版主，也不能解除擁有者設定的封鎖",
   "error_channels_xfer_source_changed": "檔案在提供之前已被變更或移動",
   "error_channels_reply_target_invalid": "你回覆的訊息不在此房間中",

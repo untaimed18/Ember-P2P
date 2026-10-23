@@ -1515,6 +1515,27 @@ pub(crate) async fn tag_paths(
             if add { "Added" } else { "Removed" },
             moves.len()
         );
+        // Decided about now, by hand or by the import pass, so the pass never
+        // puts back a tag the user took off: not before it reached the file,
+        // not after an Undo, not after the file is edited.
+        let decided: Vec<String> = moves
+            .iter()
+            .flat_map(|mv| {
+                [
+                    mv.hash.to_ascii_lowercase(),
+                    name_tag_seen_path(&mv.from),
+                    name_tag_seen_path(&mv.to.to_string_lossy()),
+                ]
+            })
+            .collect();
+        let db = state.db.clone();
+        match tokio::task::spawn_blocking(move || db.mark_name_tag_seen(&decided)).await {
+            Ok(Ok(())) => {
+                NAME_TAG_SEEN_GENERATION.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(Err(e)) => warn!("Could not record renamed files for the {EMBER_NAME_TAG} tag: {e}"),
+            Err(e) => warn!("Could not record renamed files for the {EMBER_NAME_TAG} tag: {e}"),
+        }
     }
     Ok(TagReport {
         renamed: moves
@@ -1552,30 +1573,75 @@ static NAME_TAG_SEEN_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// read at.
 pub(crate) type NameTagSeenCache = Option<(u64, HashSet<String>)>;
 
-/// The `name_tag_seen` entry for a file still being hashed when the setting
-/// was turned on: it was already there, but has no hash to record yet.
+/// Prefix of the `name_tag_seen` entry holding when `tag_shared_imports` was
+/// last turned on, in Unix seconds. Each time adds one; the newest stands.
+const NAME_TAG_SEEDED_AT: &str = "seeded_at:";
+
+/// The `name_tag_seen` entry for a file's path: it was already there when the
+/// setting was turned on, or has been decided about since. An edit hashes the
+/// file again at the same path, and must not make it new.
 fn name_tag_seen_path(path: &str) -> String {
     format!("path:{}", crate::search::index::normalize_path_key(path))
 }
 
-/// Record that every file in the Library now has been decided about, so
-/// turning on `tag_shared_imports` renames only files that arrive afterwards.
+/// When `tag_shared_imports` was last turned on, from `seen`.
+fn name_tag_seeded_at(seen: &HashSet<String>) -> Option<i64> {
+    seen.iter()
+        .filter_map(|entry| entry.strip_prefix(NAME_TAG_SEEDED_AT)?.parse::<i64>().ok())
+        .max()
+}
+
+/// Whether the file at `path` may be tagged on its own as new: it came into
+/// being at or after `since`, and Windows does not mark it hidden (the name's
+/// leading dot, checked by `may_auto_tag`, is the only mark elsewhere).
+///
+/// "Came into being" is its creation time, or its modification time where the
+/// platform keeps no creation time. A copy or a download into a shared folder
+/// is created then; a file that was already there was not, however late the
+/// Library listed it. Unreadable counts as not new. Blocking.
+fn appeared_since(path: &str, since: i64) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        if meta.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0 {
+            return false;
+        }
+    }
+    meta.created()
+        .or_else(|_| meta.modified())
+        .ok()
+        .and_then(|when| when.duration_since(std::time::UNIX_EPOCH).ok())
+        .is_some_and(|age| i64::try_from(age.as_secs()).is_ok_and(|secs| secs >= since))
+}
+
+/// Record that every file in the Library now has been decided about, and when,
+/// so turning on `tag_shared_imports` renames only files that arrive
+/// afterwards.
+///
+/// The Library is not the record that matters: at launch it is still being
+/// listed, and it never holds a drive that is unplugged or a folder past the
+/// scan's cap, so a file it lacks here may well be one already shared. The
+/// time is what decides — a file created before it is never taken for new
+/// (see [`appeared_since`]) — and the files listed are recorded as well, by
+/// content and by path, so one edited later is not taken for new either.
 pub(crate) async fn seed_name_tag_seen(state: &AppState) {
     let mut entries: Vec<String> = {
         let index = state.local_index.read().await;
         index
             .all_files()
             .iter()
-            .map(|row| {
-                if row.hash.is_empty() {
-                    name_tag_seen_path(&row.path)
-                } else {
-                    row.hash.to_ascii_lowercase()
-                }
+            .flat_map(|row| {
+                let hash = (!row.hash.is_empty()).then(|| row.hash.to_ascii_lowercase());
+                hash.into_iter().chain(std::iter::once(name_tag_seen_path(&row.path)))
             })
             .collect()
     };
     entries.push(NAME_TAG_SEEDED.to_string());
+    entries.push(format!("{NAME_TAG_SEEDED_AT}{}", chrono::Utc::now().timestamp()));
     let db = state.db.clone();
     match tokio::task::spawn_blocking(move || db.mark_name_tag_seen(&entries)).await {
         Ok(Ok(())) => {}
@@ -1645,17 +1711,22 @@ pub(crate) async fn tag_new_shared_imports(
         }
     }
     // Turned on some way that did not record the Library first (a restored
-    // backup, a hand-edited config): record it now and rename nothing this
-    // pass, rather than take every file already shared for a new one.
-    if !cache.as_ref().is_some_and(|(_, seen)| seen.contains(NAME_TAG_SEEDED)) {
+    // backup, a hand-edited config, a seed that failed to save), or seeded by
+    // a build that recorded no time: record it now and rename nothing this
+    // pass. The time it records is what keeps every file already shared out.
+    let seeded_at = cache
+        .as_ref()
+        .filter(|(_, seen)| seen.contains(NAME_TAG_SEEDED))
+        .and_then(|(_, seen)| name_tag_seeded_at(seen));
+    let Some(seeded_at) = seeded_at else {
         seed_name_tag_seen(state).await;
         return;
-    }
+    };
     let Some((_, seen)) = cache.as_mut() else {
         return;
     };
     let mut decided: Vec<String> = Vec::new();
-    let mut to_tag: Vec<String> = Vec::new();
+    let mut candidates: Vec<(String, String)> = Vec::new();
     {
         let index = state.local_index.read().await;
         for row in index.all_files() {
@@ -1666,23 +1737,53 @@ pub(crate) async fn tag_new_shared_imports(
             if downloads.iter().any(|dir| key_is_under(&key, dir)) {
                 continue;
             }
-            if decided.len() >= MAX_IMPORT_TAGS_PER_PASS {
+            if decided.len() >= MAX_IMPORT_TAGS_PER_PASS * 2 {
                 break;
             }
-            // Here, unhashed, when the setting was turned on.
-            if seen.contains(&format!("path:{key}")) {
-                decided.push(row.hash.to_ascii_lowercase());
+            decided.push(row.hash.to_ascii_lowercase());
+            let path_entry = format!("path:{key}");
+            // Here when the setting was turned on, or decided about since and
+            // edited: the same file, not a new one.
+            if seen.contains(&path_entry) {
                 continue;
             }
-            decided.push(row.hash.to_ascii_lowercase());
+            decided.push(path_entry);
             if !crate::sharing::name_tag::has_tag(&row.name)
                 && crate::sharing::name_tag::may_auto_tag(&row.name)
             {
-                to_tag.push(row.path.clone());
+                candidates.push((row.path.clone(), row.hash.to_ascii_lowercase()));
             }
         }
     }
     if decided.is_empty() {
+        return;
+    }
+    // Off the network loop: a look at each file's creation time, which on a
+    // share that is slow to answer is not free, and at the download history.
+    //
+    // A completed download is not a new import even outside today's
+    // `Downloads`: in a download folder since replaced, or under a mapped
+    // drive that its row names by UNC path. Those follow
+    // `tag_completed_downloads`, which is off for anyone who wants them left.
+    let db = state.db.clone();
+    let to_tag: Vec<String> = tokio::task::spawn_blocking(move || {
+        let hashes: Vec<String> = candidates.iter().map(|(_, hash)| hash.clone()).collect();
+        let history = db.get_download_history_batch(&hashes).unwrap_or_default();
+        candidates
+            .into_iter()
+            .filter(|(path, hash)| {
+                history.get(hash).map(String::as_str) != Some("completed")
+                    && appeared_since(path, seeded_at)
+            })
+            .map(|(path, _)| path)
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
+    // Turned off while this pass was deciding: rename nothing, and record
+    // nothing, so turning it on again starts from the Library as it is then.
+    // The next pass drops the cache when it finds the setting off.
+    if !state.config.read().await.settings.tag_shared_imports {
         return;
     }
     if !to_tag.is_empty() {
@@ -9732,6 +9833,45 @@ pub async fn open_shared_folder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a file that came into being once the setting was on counts as new:
+    /// one already shared is older than that however late the Library lists it,
+    /// and one that cannot be read is not new.
+    #[test]
+    fn only_a_file_created_since_the_setting_was_turned_on_is_new() {
+        let dir = std::env::temp_dir().join(format!("ember-name-tag-age-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Linux.zip");
+        std::fs::write(&file, b"x").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let now = chrono::Utc::now().timestamp();
+        assert!(appeared_since(&path, now - 60), "created after the cutoff");
+        assert!(!appeared_since(&path, now + 3600), "created before it");
+        assert!(!appeared_since(&dir.join("missing.zip").to_string_lossy(), 0), "unreadable");
+        #[cfg(windows)]
+        {
+            std::process::Command::new("attrib").arg("+h").arg(&file).status().unwrap();
+            assert!(!appeared_since(&path, now - 60), "hidden on Windows");
+            std::process::Command::new("attrib").arg("-h").arg(&file).status().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Turned off and on again, the newest time it was turned on stands.
+    #[test]
+    fn the_newest_seed_time_stands() {
+        let seen: HashSet<String> = [
+            NAME_TAG_SEEDED.to_string(),
+            format!("{NAME_TAG_SEEDED_AT}100"),
+            format!("{NAME_TAG_SEEDED_AT}300"),
+            "seeded_at:junk".to_string(),
+            "path:c:\\share\\a.zip".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(name_tag_seeded_at(&seen), Some(300));
+        assert_eq!(name_tag_seeded_at(&HashSet::from([NAME_TAG_SEEDED.to_string()])), None);
+    }
 
     #[test]
     fn only_files_inside_a_downloads_folder_count_as_inside_it() {

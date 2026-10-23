@@ -285,12 +285,37 @@ pub(super) async fn apply_settings_update(
 /// without waiting for the next session. The friend request is the frame a
 /// session already opens with to say this, and each side reads it at any
 /// point in a session; a friend's own label for us is theirs to keep.
-async fn announce_nickname_to_friends(state: &NetworkState, nickname: &str) {
+fn nickname_frame(nickname: &str) -> Vec<u8> {
     let mut frame = Vec::with_capacity(6 + nickname.len());
     frame.push(OP_EMULEPROT);
     frame.extend_from_slice(&((1 + nickname.len()) as u32).to_le_bytes());
     frame.push(ed2k::messages::OP_EMBER_FRIEND_REQ);
     frame.extend_from_slice(nickname.as_bytes());
+    frame
+}
+
+/// Tell one friend whose session our dial just opened what we are called now.
+///
+/// A dial copies the nickname as it starts, and with its lookup and NAT
+/// fallback can take a minute or more to connect; a rename meanwhile reached
+/// every session but this one, which was not up yet, so the friend request it
+/// opened with carried the old name. Sent again here, the friend's side takes
+/// an unchanged name as no change.
+pub(in crate::network) async fn announce_nickname_to_friend(
+    state: &NetworkState,
+    friend: &[u8; 16],
+    nickname: &str,
+) {
+    if nickname.is_empty() {
+        return;
+    }
+    if let Some(session) = state.ember_sessions.read().await.get(friend) {
+        let _ = session.tx.try_send(nickname_frame(nickname));
+    }
+}
+
+async fn announce_nickname_to_friends(state: &NetworkState, nickname: &str) {
+    let frame = nickname_frame(nickname);
     let sessions = state.ember_sessions.read().await;
     let mut told = 0usize;
     for session in sessions.values().filter(|h| h.is_fresh()) {

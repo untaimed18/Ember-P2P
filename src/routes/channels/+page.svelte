@@ -323,8 +323,10 @@
   let arrivedMembers = $state<string[]>([]);
   const arrivalTimers = new Set<ReturnType<typeof setTimeout>>();
   /** The welcome card over a room just joined. `key` tells its timer apart
-   *  from one left running by an earlier join of the same room. */
-  let joinWelcome = $state<{ id: string; key: number } | null>(null);
+   *  from one left running by an earlier join of the same room. The room's
+   *  name and language are its own: read from the open room instead, a card
+   *  leaving because another room was opened named that one on its way out. */
+  let joinWelcome = $state<{ id: string; key: number; name: string; language: string } | null>(null);
   let joinWelcomeTimer: ReturnType<typeof setTimeout> | undefined;
   $effect(() => () => {
     clearTimeout(justJoinedTimer);
@@ -360,6 +362,8 @@
   function settleMembersFor(id: string) {
     if (membersFor === id) return;
     membersSettled = false;
+    // Or the count, drawn afresh for this room, plays the last room's bump.
+    memberCountBump = 0;
     clearTimeout(membersSettleTimer);
     membersSettleTimer = setTimeout(() => (membersSettled = true), 800);
   }
@@ -394,14 +398,15 @@
 
   /** Play a room's arrival and bring its new place in the list into view, which
    *  a join from far down Discover would otherwise leave off-screen. */
-  async function markJustJoined(id: string) {
+  async function markJustJoined(room: Pick<ChannelInfo, 'channel_id' | 'name' | 'language'>) {
+    const id = room.channel_id;
     justJoinedId = id;
     clearTimeout(justJoinedTimer);
     justJoinedTimer = setTimeout(() => {
       if (justJoinedId === id) justJoinedId = null;
     }, ARRIVAL_MS);
     const key = Date.now();
-    joinWelcome = { id, key };
+    joinWelcome = { id, key, name: room.name, language: room.language };
     clearTimeout(joinWelcomeTimer);
     joinWelcomeTimer = setTimeout(() => {
       if (joinWelcome?.key === key) joinWelcome = null;
@@ -1946,7 +1951,7 @@
         item.channel_id === joined.channel_id ? { ...item, joined: joined.in_room } : item,
       );
       upsertChannel(joined);
-      if (joined.in_room) void markJustJoined(joined.channel_id);
+      if (joined.in_room) void markJustJoined(joined);
       void refreshChannels().catch(() => {});
       await selectChannel(joined.channel_id);
     } catch (e) {
@@ -2097,7 +2102,7 @@
         item.channel_id === joined.channel_id ? { ...item, joined: joined.in_room } : item,
       );
       upsertChannel(joined);
-      if (joined.in_room) void markJustJoined(joined.channel_id);
+      if (joined.in_room) void markJustJoined(joined);
       void refreshChannels().catch(() => {});
       await selectChannel(joined.channel_id);
     } catch (e) {
@@ -2979,6 +2984,14 @@
 </div>
 
 <div class="page-content channels-page">
+  <!-- The welcome card is drawn with the room it greets, and a live region
+       inserted along with its text is not announced, so the card speaks from
+       here. -->
+  <span class="sr-only" aria-live="polite">
+    {joinWelcome && joinWelcome.id === selected?.channel_id
+      ? `${m.channels_joined_title({ room: joinWelcome.name })} ${m.channels_joined_body()}`
+      : ''}
+  </span>
   {#if joinedCount === 0}
     <details class="how-panel">
       <summary class="how-title">{m.channels_how_title()}</summary>
@@ -3902,14 +3915,7 @@
               {/if}
             {/if}
             <div class="transcript">
-              <!-- Spoken from a region that is always here: one inserted along
-                   with its text is not announced. -->
-              <span class="sr-only" aria-live="polite">
-                {joinWelcome?.id === selected.channel_id
-                  ? `${m.channels_joined_title({ room: selected.name })} ${m.channels_joined_body()}`
-                  : ''}
-              </span>
-              {#if joinWelcome?.id === selected.channel_id}
+              {#if joinWelcome && joinWelcome.id === selected.channel_id}
                 <!-- Floats over the top of the transcript and lets every click
                      through, so it never stands between the reader and the room.
                      Local, so leaving the room takes it at once rather than
@@ -3935,9 +3941,9 @@
                     </div>
                     <div class="join-welcome-text">
                       <strong>
-                        <bdi dir="auto">{m.channels_joined_title({ room: selected.name })}</bdi>
-                        {#if isChannelLanguage(selected.language)}
-                          <img class="join-welcome-flag" src={channelLanguageFlagSrc(selected.language)} alt="" />
+                        <bdi dir="auto">{m.channels_joined_title({ room: joinWelcome?.name ?? '' })}</bdi>
+                        {#if joinWelcome && isChannelLanguage(joinWelcome.language)}
+                          <img class="join-welcome-flag" src={channelLanguageFlagSrc(joinWelcome.language)} alt="" />
                         {/if}
                       </strong>
                       <span>{m.channels_joined_body()}</span>

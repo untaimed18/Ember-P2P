@@ -29,7 +29,7 @@
 </script>
 
 <script lang="ts">
-  import { onDestroy, untrack } from 'svelte';
+  import { onDestroy, tick, untrack } from 'svelte';
   import { goto } from '$app/navigation';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import {
@@ -49,7 +49,7 @@
     type FileTypeFilter,
     type FileTypeKey,
   } from '$lib/fileTypes';
-  import { copyToClipboard, formatClockTime, formatNumber, formatSize } from '$lib/utils';
+  import { compareFileNames, copyToClipboard, formatClockTime, formatNumber, formatSize } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
@@ -151,8 +151,6 @@
     'searching', 'queued', 'active', 'paused', 'stopped',
     'verifying', 'completing', 'hashing', 'insufficient', 'noneneeded',
   ]);
-  const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
-
   let typeByHash = $derived(
     new Map<string, FileTypeKey | ''>(
       files.map((f) => [f.hash, fileTypeKey(extensionFromPath(f.name))]),
@@ -192,8 +190,8 @@
       : textMatchedFiles.filter((f) => typeByHash.get(f.hash) === typeFilter);
     list.sort(
       sortKey === 'size'
-        ? (a, b) => a.size - b.size || collator.compare(a.name, b.name)
-        : (a, b) => collator.compare(a.name, b.name),
+        ? (a, b) => a.size - b.size || compareFileNames(a.name, b.name)
+        : (a, b) => compareFileNames(a.name, b.name),
     );
     if (!sortAsc) list.reverse();
     return list;
@@ -783,7 +781,8 @@
     } finally {
       if (gen === listenerGen) {
         bulkDownloading = false;
-        closeConfirming = false;
+        // The queue finished under the prompt: it has nothing left to ask.
+        if (closeConfirming) keepGoing();
       }
     }
   }
@@ -814,12 +813,24 @@
     }
   }
 
+  /** The close being confirmed was View transfers, so stopping goes there. */
+  let closeThenTransfers = false;
+
   function viewTransfers() {
+    // Leaving closes the dialog and stops the queue like any close, so it is
+    // asked about like one; the banner offering it shows once the first file
+    // of a bulk download is in.
+    if (bulkDownloading && !bulkStopRequested) {
+      closeThenTransfers = true;
+      closeConfirming = true;
+      return;
+    }
     onclose();
     void goto('/transfers');
   }
 
   function requestClose() {
+    closeThenTransfers = false;
     if (bulkDownloading && !bulkStopRequested) {
       closeConfirming = true;
       return;
@@ -832,6 +843,22 @@
     bulkStopRequested = true;
     closeConfirming = false;
     onclose();
+    if (closeThenTransfers) {
+      closeThenTransfers = false;
+      void goto('/transfers');
+    }
+  }
+
+  /** Back to the queue. The prompt held focus and is gone, so focus goes to
+   *  the dialog, where Escape and Tab are handled, rather than to <body>. */
+  function keepGoing() {
+    closeThenTransfers = false;
+    closeConfirming = false;
+    void tick().then(() => {
+      if (open && (!document.activeElement || document.activeElement === document.body)) {
+        modalEl?.focus();
+      }
+    });
   }
 
   function handleKeydown(e: KeyboardEvent) {
@@ -843,7 +870,7 @@
         return;
       }
       if (closeConfirming) {
-        closeConfirming = false;
+        keepGoing();
         return;
       }
       requestClose();
@@ -1039,7 +1066,7 @@
                   <button
                     type="button"
                     class="browse-secondary-btn"
-                    onclick={() => (closeConfirming = false)}
+                    onclick={keepGoing}
                     {@attach (el: HTMLButtonElement) => el.focus()}
                   >{m.browse_keep_going()}</button>
                   <button

@@ -32,14 +32,14 @@
     formatRemaining, formatRelativeTime, formatNumber, formatDecimal, compareFileNames,
     copyToClipboard, readFromClipboard,
   } from '$lib/utils';
-  import { onMount, onDestroy, untrack } from 'svelte';
+  import { onMount, onDestroy, tick, untrack } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
   import { fade } from 'svelte/transition';
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import type {
     Transfer, SourceInfo, UploadQueueClient, KnownClient, KnownClientCounts, DownloadFileDetails,
   } from '$lib/types';
-  import { inertBackground, trapTabKey } from '$lib/a11y';
+  import { inertBackground, menuKeydown, swallowKeyboardContextMenu, trapTabKey } from '$lib/a11y';
   import { scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
@@ -3122,6 +3122,7 @@
     // Raw pointer position: `ctxMenuPosition` measures the rendered panel and
     // keeps it on screen.
     ctxMenu = { x: e.clientX, y: e.clientY, transfer: t, section };
+    ctxReturnFocus = null;
     ctxQueuedIds = null;
     if (section !== 'upload') {
       const menu = ctxMenu;
@@ -3130,6 +3131,12 @@
         .catch((err: unknown) => console.warn('transfers: could not read the download queue', err));
     }
   }
+
+  let ctxMenuEl: HTMLDivElement | undefined = $state(undefined);
+  /** Where focus was when the Menu key opened the row menu, handed back when
+   *  Escape closes it. Not on other closes: a click has put focus where it
+   *  wants. */
+  let ctxReturnFocus: HTMLElement | null = null;
 
   /** The downloads waiting in the queue when the menu opened; `null` until
    *  known. Only those can move in it: a paused row that was running keeps
@@ -5250,7 +5257,13 @@
     // first because the dialog sits above everything else.
     if (renameDialog.open) { closeRename(); e.preventDefault(); e.stopPropagation(); }
     else if (fileDetailsId) { closeFileDetails(); e.preventDefault(); e.stopPropagation(); }
-    else if (ctxMenu) { closeCtx(); e.preventDefault(); e.stopPropagation(); }
+    else if (ctxMenu) {
+      const returnTo = ctxReturnFocus;
+      closeCtx();
+      returnTo?.focus({ preventScroll: true });
+      e.preventDefault();
+      e.stopPropagation();
+    }
     else if (paneCtxMenu) { closePaneCtx(); e.preventDefault(); e.stopPropagation(); }
     else if (uploadsPaneCtxMenu) { closeUploadsPaneCtx(); e.preventDefault(); e.stopPropagation(); }
     else if (knownCtxMenu) { closeKnownCtx(); e.preventDefault(); e.stopPropagation(); }
@@ -5367,6 +5380,35 @@
     focusedDlId = next.id;
     lastClickedDlId = next.id;
     revealDownloadRow(next.id);
+  } else if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
+    // The focused row's menu, beside the row, as Library and Search do.
+    const row = filteredSelectableDownloads[idx >= 0 ? idx : 0];
+    if (!row) return;
+    e.preventDefault();
+    swallowKeyboardContextMenu();
+    revealDownloadRow(row.id);
+    const section = filteredActiveDownloads.some((t) => t.id === row.id) ? 'active' : 'completed';
+    const returnTo = document.activeElement;
+    void tick().then(async () => {
+      const el =
+        downloadsScrollEl?.querySelector<HTMLElement>(`tr[data-transfer-id="${CSS.escape(row.id)}"]`) ??
+        downloadsScrollEl;
+      const rect = el?.getBoundingClientRect();
+      onCtx(
+        new MouseEvent('contextmenu', {
+          cancelable: true,
+          clientX: rect ? rect.left + Math.min(24, rect.width / 2) : 0,
+          clientY: rect ? rect.top + Math.min(16, rect.height / 2) : 0,
+        }),
+        row,
+        section,
+      );
+      ctxReturnFocus = returnTo instanceof HTMLElement && returnTo !== document.body ? returnTo : null;
+      // Drawn at the end of the page, and the row keys stand down while it is
+      // open, so the keyboard could not reach it otherwise.
+      await tick();
+      ctxMenuEl?.querySelector<HTMLElement>('.ctx-item:not([disabled])')?.focus();
+    });
   } else if (e.key === 'Delete' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && selectedDownloadIds.length > 0) {
     // Shift+Delete is Cancel, as a file manager's is the stronger Delete: it
     // also deletes the files of finished downloads, behind Cancel's prompt.
@@ -5623,6 +5665,7 @@
               class:expanded={expandedTransferId === t.id}
               class:selected={focusedDlId === t.id || checkedDlIdSet.has(t.id)}
               class:ctx-target={ctxMenu?.transfer.id === t.id && focusedDlId !== t.id && !checkedDlIdSet.has(t.id)}
+              data-transfer-id={t.id}
               onclick={(e) => onDownloadRowClick(e, t)}
               oncontextmenu={(e) => onCtx(e, t, 'active')}
               ondblclick={() => toggleSourceDetail(t)}
@@ -5827,6 +5870,7 @@
                 class:row-alt={((filteredActiveDownloads.length + dlCompletedWindow.start + i) & 1) === 1}
                 class:selected={focusedDlId === t.id || checkedDlIdSet.has(t.id)}
                 class:ctx-target={ctxMenu?.transfer.id === t.id && focusedDlId !== t.id && !checkedDlIdSet.has(t.id)}
+                data-transfer-id={t.id}
                 onclick={(e) => onDownloadRowClick(e, t)}
                 oncontextmenu={(e) => onCtx(e, t, 'completed')}
               >
@@ -7011,7 +7055,15 @@
 
 {#if ctxMenu && ctxTransfer}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-  <div class="ctx-menu" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }} onclick={(e) => e.stopPropagation()}>
+  <div
+    class="ctx-menu"
+    role="menu"
+    tabindex="-1"
+    bind:this={ctxMenuEl}
+    use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}
+    onclick={(e) => e.stopPropagation()}
+    onkeydown={(e) => menuKeydown(e, e.currentTarget)}
+  >
     <div class="ctx-header" role="presentation">
       {#if ctxMulti}
         {m.transfers_selected_count({ count: ctxTargets.length })}

@@ -4102,6 +4102,7 @@
   "error_channels_recover_unavailable": "Ember couldn't reach Rendezvous to check for rooms you own. Try again later.",
   "error_channels_chat_locked": "Chat history is locked. Restore the key file to use Channels.",
   "error_channels_message_size_invalid": "Message must be between 1 and 4096 bytes",
+  "error_channels_message_too_long_to_send": "This message is too long to send to a room. Shorten it and try again.",
   "error_channels_ban_protected": "Moderators cannot ban other moderators or lift a ban the owner set",
   "error_channels_xfer_source_changed": "The file changed or was moved before it could be offered",
   "error_channels_reply_target_invalid": "The message you are replying to is not in this room",

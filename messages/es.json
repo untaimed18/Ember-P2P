@@ -4073,6 +4073,7 @@
   "error_channels_recover_unavailable": "Ember no pudo conectar con Rendezvous para buscar tus salas. Inténtalo más tarde.",
   "error_channels_chat_locked": "El historial de chat está bloqueado. Restaura el archivo de clave para usar Canales.",
   "error_channels_message_size_invalid": "El mensaje debe tener entre 1 y 4096 bytes",
+  "error_channels_message_too_long_to_send": "Este mensaje es demasiado largo para enviarlo a una sala. Acórtalo e inténtalo de nuevo.",
   "error_channels_ban_protected": "Los moderadores no pueden expulsar a otros moderadores ni levantar una expulsión del propietario",
   "error_channels_xfer_source_changed": "El archivo cambió o se movió antes de poder ofrecerlo",
   "error_channels_reply_target_invalid": "El mensaje al que respondes no está en esta sala",

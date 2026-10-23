@@ -3852,9 +3852,15 @@
               <div class="bubble-edit-actions">
                 <span class="bubble-edit-hint" id="bubble-edit-hint-{row.msg.id}">{m.channels_edit_hint()}</span>
                 <!-- Only near the cap, where it starts to matter. Bytes, not
-                     characters, because that is what the backend counts. -->
+                     characters, because that is what the backend counts. The
+                     count itself is not live, or every keystroke near the cap
+                     is read out; crossing it is, from a region that stays
+                     mounted. -->
+                <span class="sr-only" aria-live="polite">
+                  {overLimit ? m.chat_message_too_long({ max: maxBytes }) : ''}
+                </span>
                 {#if editBytes > maxBytes * 0.8}
-                  <span class="bubble-edit-count" class:over={overLimit} aria-live="polite">
+                  <span class="bubble-edit-count" class:over={overLimit}>
                     {m.channels_edit_bytes({ used: editBytes, max: maxBytes })}
                   </span>
                 {/if}

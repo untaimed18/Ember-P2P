@@ -4102,6 +4102,7 @@
   "error_channels_recover_unavailable": "Ember konnte Rendezvous nicht erreichen, um nach Ihren Räumen zu suchen. Versuchen Sie es später erneut.",
   "error_channels_chat_locked": "Der Chatverlauf ist gesperrt. Stellen Sie die Schlüsseldatei wieder her, um Kanäle zu nutzen.",
   "error_channels_message_size_invalid": "Nachricht muss zwischen 1 und 4096 Bytes liegen",
+  "error_channels_message_too_long_to_send": "Diese Nachricht ist zu lang, um sie in einen Raum zu senden. Kürze sie und versuche es erneut.",
   "error_channels_ban_protected": "Moderatoren können keine anderen Moderatoren sperren und keine Sperre des Besitzers aufheben",
   "error_channels_xfer_source_changed": "Die Datei wurde geändert oder verschoben, bevor sie angeboten werden konnte",
   "error_channels_reply_target_invalid": "Die Nachricht, auf die Sie antworten, ist nicht in diesem Raum",

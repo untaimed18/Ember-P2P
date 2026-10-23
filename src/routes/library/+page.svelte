@@ -3482,8 +3482,10 @@
     reapprovingAll = true;
     try {
       const approved = await reapproveSharedFolders();
-      if (approved.length === 0) return;
-      afterReapproved(approved);
+      if (approved.length > 0) afterReapproved(approved);
+      // Even when none was approved: an empty answer also means the backend
+      // found nothing left to approve (a drive gone since the page loaded),
+      // and the banner should stop offering what it cannot do.
       await refresh();
     } catch (e: unknown) {
       error = toErr(e);

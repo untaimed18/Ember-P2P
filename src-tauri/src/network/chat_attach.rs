@@ -826,10 +826,17 @@ pub(super) async fn send_queued(
 ) {
     let friend_hex = hex::encode(friend);
     let now = chrono::Utc::now().timestamp();
-    let outstanding = db
-        .count_sent_chat_attachments(&friend_hex, "offered", now)
-        .unwrap_or(usize::MAX);
-    let room = MAX_QUEUED_OFFERS_OUTSTANDING.saturating_sub(outstanding);
+    // An offer the friend's side keeps for its user is answered as far as this
+    // pace goes: counting it held the rest of the queue back for up to a day,
+    // under cards saying the friend was not online while they were. Every
+    // offer still counts toward what their side will take at once, or the
+    // ones past it would only come back busy.
+    let (offered, held) = db
+        .count_offered_chat_attachments(&friend_hex, now)
+        .unwrap_or((usize::MAX, 0));
+    let room = MAX_QUEUED_OFFERS_OUTSTANDING
+        .saturating_sub(offered.saturating_sub(held))
+        .min(MAX_PENDING_PER_FRIEND.saturating_sub(offered));
     if room == 0 {
         return;
     }

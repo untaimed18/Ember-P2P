@@ -108,12 +108,15 @@ impl RootListing {
         }
     }
 
-    /// [`Self::read`] for the current folder, whose part files are never
-    /// unknown: when its `Temp` cannot be listed, each download's are looked
-    /// up by name, as they were before there were earlier folders.
+    /// [`Self::read`] for the current folder: when its `Temp` cannot be listed,
+    /// each download's part files are looked up by name, as they were before
+    /// there were earlier folders. Not when the folder cannot be reached at
+    /// all — an unplugged drive — where every name is missing and that would
+    /// read as their having been removed; it stays unknown, like an earlier
+    /// folder that does not answer.
     fn read_current(root: &Path, jobs: &[RestoreJob], copies: bool) -> Self {
         let mut listing = Self::read(root, copies);
-        if listing.parts.is_none() {
+        if listing.parts.is_none() && crate::storage::part_folders::folder_reachable(root) {
             let temp = root.join("Temp");
             listing.parts = Some(
                 jobs.iter()
@@ -230,6 +233,13 @@ fn restore_from_listings(
                     if !answered {
                         restored.unanswered.insert(job.id.clone());
                     }
+                } else if listings
+                    .first()
+                    .is_some_and(|current| current.as_ref().is_none_or(|l| l.parts.is_none()))
+                {
+                    // No record of where it is, so it is taken to be in the
+                    // current folder, and that one did not answer.
+                    restored.unanswered.insert(job.id.clone());
                 }
             }
         }
@@ -737,31 +747,38 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 let part_check = part_path.clone();
                 // Past the budget nothing more is started: each look could
                 // hang on the same dead share and hold a blocking thread.
+                // `None` from the look: its `.part` is there after all.
                 let listing = (tokio::time::Instant::now() < probe_deadline).then(|| {
                     tokio::task::spawn_blocking(move || {
                         if part_check.exists() {
-                            return Vec::new();
+                            return None;
                         }
-                        category_dir
-                            .iter()
-                            .chain(std::iter::once(&downloads))
-                            .flat_map(|dir| ed2k::transfer::published_names(dir, &name))
-                            .filter(|path| path.exists())
-                            .collect::<Vec<_>>()
+                        Some(
+                            category_dir
+                                .iter()
+                                .chain(std::iter::once(&downloads))
+                                .flat_map(|dir| ed2k::transfer::published_names(dir, &name))
+                                .filter(|path| path.exists())
+                                .collect::<Vec<_>>(),
+                        )
                     })
                 });
                 let looked = match listing {
                     Some(listing) => tokio::time::timeout_at(probe_deadline, listing).await.ok(),
                     None => None,
                 };
-                let published: Vec<PathBuf> = match looked {
-                    Some(Ok(found)) => found,
+                // Whether Downloads was actually searched with no `.part`
+                // left: only then is "no finished file" an answer, rather than
+                // a look that ran out of time or found the `.part` after all.
+                let (published, searched_without_part): (Vec<PathBuf>, bool) = match looked {
+                    Some(Ok(Some(found))) => (found, true),
+                    Some(Ok(None)) => (Vec::new(), false),
                     _ => {
                         warn!(
                             "Could not look for {} in {dl_folder}/Downloads in time; resuming it as it was",
                             transfer.id
                         );
-                        Vec::new()
+                        (Vec::new(), false)
                     }
                 };
 
@@ -952,8 +969,10 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 // finished file of it is there: they were removed, most likely
                 // on purpose, as removing them is how eMule drops a download.
                 // Started over, it would download everything again unasked; it
-                // waits Stopped instead, and Resume starts it over.
-                if unrecorded_finish {
+                // waits Stopped instead, and Resume starts it over. Not on a
+                // look that never finished: its progress is wiped here and saved,
+                // so a later start could no longer find the finish it missed.
+                if unrecorded_finish && searched_without_part {
                     info!(
                         "Restored download {} has no part files left; keeping it Stopped",
                         transfer.id
@@ -1194,6 +1213,30 @@ mod tests {
         std::fs::create_dir_all(external.join("Temp")).unwrap();
         std::fs::write(external.join("Temp").join(format!("{paused}.part")), b"progress").unwrap();
         assert_eq!(folders.folder_to_resume_in(&paused), Ok(external));
+    }
+
+    /// The current download folder on a drive that is not plugged in: its
+    /// downloads are held as unanswered, with or without a record of where
+    /// they were, and none reads as its part files having been removed — that
+    /// zeroes the row and asks the user to cancel it, deleting the real parts
+    /// once the drive is back.
+    #[test]
+    fn an_unplugged_current_folder_holds_its_downloads_rather_than_reading_them_as_removed() {
+        let scratch = Scratch::new("unplugged-current");
+        let volume = scratch.0.join("unplugged");
+        let current = volume.join("ember");
+        let folders = scratch.folders(&current, &[]);
+        let (unrecorded, recorded) = (uuid(), uuid());
+        simulate_unplugged(&volume, true);
+        let restored = read_restored_parts(
+            &folders,
+            vec![job(&unrecorded), job(&recorded)],
+            &HashMap::from([(recorded.clone(), current.to_string_lossy().into_owned())]),
+            BUDGET,
+        );
+        assert!(restored.unanswered.contains(&unrecorded), "no record: taken to be in the current folder");
+        assert!(restored.unanswered.contains(&recorded), "on record in the current folder");
+        assert!(restored.found.is_empty());
     }
 
     /// A drive that has not answered within the budget is unknown, exactly

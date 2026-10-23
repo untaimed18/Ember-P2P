@@ -364,6 +364,20 @@ mod membership_record_v2_tests {
             assert!(!admits.contains(&pk(&cy)), "a retired secret does not admit");
         }
 
+        // A v1 record that is neither flagged private nor sealed — a bare
+        // 32-byte extra, which anyone who knows the room's id and pubkey can
+        // sign under a fresh key — is no member of a private room, and above
+        // all no proof of its current key. A public room still reads it.
+        let mallory = SigningKey::generate(&mut OsRng);
+        let forged = SignedRecord::channel_presence_v1_at(
+            "mallory", None, room.channel_id, room.pubkey, &current, false, channel::presence_epoch(now), false, &[9; 32], &mallory, now,
+        );
+        let (latest, admits) = merge_channel_presence_blobs(&[blob(&forged)], &room.channel_id, &secrets, true, now);
+        assert!(latest.is_empty(), "not read in a private room");
+        assert!(!admits.contains(&pk(&mallory)), "and never as holding the current key");
+        let (latest, _) = merge_channel_presence_blobs(&[blob(&forged)], &room.channel_id, &secrets, false, now);
+        assert!(latest.contains_key(&pk(&mallory)), "the public shape, in a public room");
+
         // A newer v1 leave beats an older v2 announce: the merge is by member.
         let ada_left = SignedRecord::channel_presence_v1_at(
             "ada", None, room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), true, &[1; 32], &ada, now + 5,
@@ -6092,7 +6106,12 @@ pub(super) fn merge_channel_presence_blobs(
             Some(None) => {}
             None => {
                 if let Some(found) = ember::channel::open_with_content_keys(&content_keys, |candidate| {
-                    SignedRecord::parse_channel_presence_member(blob, channel_id, Some(candidate))
+                    SignedRecord::parse_channel_presence_member_in_room(
+                        blob,
+                        channel_id,
+                        Some(candidate),
+                        private,
+                    )
                 }) {
                     v1.push(found);
                 }

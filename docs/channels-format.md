@@ -506,7 +506,11 @@ but `channel_store_ok` refuses those first. The `extra` each kind carries:
 - **2, presence.** Public room: the member's 32-byte Noise key, nickname in
   the name. Private room, v1: `PRESENCE_EXTRA_ENC_LEN` (138) bytes led by
   `PRESENCE_EXTRA_ENC_VERSION` (1), nickname and Noise key sealed under the
-  content key, name empty. Private room, v2 (from 1.7.5):
+  content key, name empty. A private room's reader drops a v1 record that is
+  not flagged private or carries the 32-byte public extra: that shape is
+  sealed under nothing, so anyone knowing the room's id and pubkey could sign
+  one, and it must not pass for proof of the current key
+  (`parse_channel_presence_member_in_room`). Private room, v2 (from 1.7.5):
   `PRESENCE_EXTRA_V2_LEN` (234) bytes led by `PRESENCE_EXTRA_V2_VERSION` (2),
   signed by a pseudonym, under
   [Private membership records, v2](#private-membership-records-v2-item-9).

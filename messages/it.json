@@ -4073,6 +4073,7 @@
   "error_channels_recover_unavailable": "Ember non è riuscito a raggiungere Rendezvous per cercare le tue stanze. Riprova più tardi.",
   "error_channels_chat_locked": "La cronologia chat è bloccata. Ripristina il file chiave per usare Canali.",
   "error_channels_message_size_invalid": "Il messaggio deve essere tra 1 e 4096 byte",
+  "error_channels_message_too_long_to_send": "Questo messaggio è troppo lungo per essere inviato in una stanza. Accorcialo e riprova.",
   "error_channels_ban_protected": "I moderatori non possono bannare altri moderatori né revocare un ban del proprietario",
   "error_channels_xfer_source_changed": "Il file è stato modificato o spostato prima di poter essere offerto",
   "error_channels_reply_target_invalid": "Il messaggio a cui stai rispondendo non è in questa stanza",

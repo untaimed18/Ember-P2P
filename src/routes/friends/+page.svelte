@@ -802,6 +802,17 @@
       saveEditPending = false;
       return;
     }
+    // Clicked into and out of unchanged, as their settings dialog does: no
+    // save. `renameFriend` reads a name equal to theirs as "no label", and
+    // until their session says what they are called, theirs is a stand-in
+    // equal to the label — a typed name, or one carried over from before
+    // labels — so saving it unchanged would drop the label for good.
+    const current = (friends.find((f) => f.user_hash === hash)?.nickname ?? '').trim();
+    if (nick === current) {
+      if (editingHash === hash) editingHash = null;
+      saveEditPending = false;
+      return;
+    }
     try {
       await renameFriend(hash, nick);
       // Blur-to-save means the user may already be renaming a different friend

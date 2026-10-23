@@ -698,8 +698,11 @@
           >
             {#if onToggleCheck}
               <td class="col-check" role="gridcell" onclick={(e) => e.stopPropagation()}>
+                <!-- Out of the Tab order: the grid is one stop, Space on its
+                     row checks it, and a stop per row walked every file. -->
                 <input
                   type="checkbox"
+                  tabindex="-1"
                   checked={checkedPaths.has(file.path)}
                   onclick={(e) => {
                     e.stopPropagation();

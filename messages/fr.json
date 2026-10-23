@@ -4073,6 +4073,7 @@
   "error_channels_recover_unavailable": "Ember n’a pas pu joindre Rendezvous pour chercher vos salons. Réessayez plus tard.",
   "error_channels_chat_locked": "L’historique de discussion est verrouillé. Restaurez le fichier de clé pour utiliser les Salons.",
   "error_channels_message_size_invalid": "Le message doit contenir entre 1 et 4096 octets",
+  "error_channels_message_too_long_to_send": "Ce message est trop long pour être envoyé dans un salon. Raccourcissez-le et réessayez.",
   "error_channels_ban_protected": "Les modérateurs ne peuvent ni bannir d'autres modérateurs ni lever un bannissement du propriétaire",
   "error_channels_xfer_source_changed": "Le fichier a été modifié ou déplacé avant de pouvoir être proposé",
   "error_channels_reply_target_invalid": "Le message auquel vous répondez n’est pas dans ce salon",

@@ -41,9 +41,10 @@ pub fn tagged_name(name: &str, add: bool) -> Option<String> {
 /// Library's own Add [Ember-P2P] still renames them, since that is asked for
 /// file by file.
 const NEVER_AUTO_TAG_EXTENSIONS: &[&str] = &[
-    "app", "bash", "bat", "cfg", "cmd", "com", "conf", "cpl", "desktop", "dll", "drv", "dylib",
-    "exe", "inf", "ini", "jar", "lnk", "msi", "msp", "msu", "ocx", "plist", "ps1", "psm1", "reg",
-    "scr", "sh", "so", "sys", "url", "vbs", "wsf",
+    "app", "asar", "bash", "bat", "cfg", "cmd", "com", "conf", "config", "cpl", "db", "desktop",
+    "dll", "drv", "dylib", "exe", "inf", "ini", "jar", "js", "json", "lnk", "msi", "msp", "msu",
+    "ocx", "pak", "plist", "ps1", "psm1", "py", "reg", "scr", "sh", "so", "sqlite", "sys", "toml",
+    "url", "vbs", "wsf", "xml", "yaml", "yml",
 ];
 
 /// Whether a file new to a shared folder may be tagged without being asked

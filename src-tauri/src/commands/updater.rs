@@ -548,23 +548,33 @@ fn remaining(deadline: Instant) -> Result<Duration> {
 /// only way to it. Nothing here rests on the connection being direct: the
 /// manifest is checked against the embedded key, and every installer against
 /// its signature, whoever carried the bytes.
-fn system_proxy_for(url: &Url) -> Option<Url> {
-    let uri: http::Uri = url.as_str().parse().ok()?;
-    let intercept = hyper_util::client::proxy::matcher::Matcher::from_system().intercept(&uri)?;
-    let mut proxy = Url::parse(&intercept.uri().to_string()).ok()?;
-    if !matches!(proxy.scheme(), "http" | "https") {
+///
+/// `Ok(None)` when there is no proxy for `url`, or only one this client cannot
+/// speak (SOCKS).
+fn system_proxy_for(url: &Url) -> Result<Option<reqwest::Proxy>> {
+    let Ok(uri) = url.as_str().parse::<http::Uri>() else {
+        return Ok(None);
+    };
+    let Some(intercept) = hyper_util::client::proxy::matcher::Matcher::from_system().intercept(&uri)
+    else {
+        return Ok(None);
+    };
+    let scheme = intercept.uri().scheme_str().unwrap_or("");
+    if !matches!(scheme, "http" | "https") {
         tracing::warn!(
-            "Ignoring the {} system proxy for updates: only HTTP and HTTPS proxies are supported",
-            proxy.scheme()
+            "Ignoring the {scheme} system proxy for updates: only HTTP and HTTPS proxies are supported"
         );
-        return None;
+        return Ok(None);
     }
-    if let Some((user, password)) = intercept.raw_auth() {
-        if proxy.set_username(user).is_err() || proxy.set_password(Some(password)).is_err() {
-            return None;
-        }
-    }
-    Some(proxy)
+    // The matcher takes an HTTP(S) proxy's `user:password@` out of its URI and
+    // keeps it only as a ready-made Basic header; `raw_auth` is SOCKS-only. So
+    // the header is what carries the credentials, or a proxy that needs them
+    // answers 407 to every update check.
+    let proxy = reqwest::Proxy::all(intercept.uri().to_string()).context("updater proxy is invalid")?;
+    Ok(Some(match intercept.basic_auth() {
+        Some(credentials) => proxy.custom_http_auth(credentials.clone()),
+        None => proxy,
+    }))
 }
 
 async fn client_for_url(
@@ -586,8 +596,8 @@ async fn client_for_url(
         .read_timeout(READ_TIMEOUT);
 
     // Through a proxy the name is resolved there, so there is nothing to pin.
-    if let Some(proxy) = policy.system_proxy.then(|| system_proxy_for(url)).flatten() {
-        let proxy = reqwest::Proxy::all(proxy.as_str()).context("updater proxy is invalid")?;
+    let system_proxy = if policy.system_proxy { system_proxy_for(url)? } else { None };
+    if let Some(proxy) = system_proxy {
         return Ok((
             builder
                 .proxy(proxy)
@@ -1518,10 +1528,7 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
     // one, or a direct connection pinned to the addresses it resolved. Set in
     // `configure_client` rather than the plugin's own `proxy`, which logs the
     // proxy URL and with it any credentials the proxy carries.
-    let final_proxy = system_proxy_for(&manifest_response.final_url)
-        .map(|proxy| reqwest::Proxy::all(proxy.as_str()))
-        .transpose()
-        .context("updater proxy is invalid")?;
+    let final_proxy = system_proxy_for(&manifest_response.final_url)?;
     let updater = app
         .updater_builder()
         .endpoints(vec![manifest_response.final_url.clone()])
