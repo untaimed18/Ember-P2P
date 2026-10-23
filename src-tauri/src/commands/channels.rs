@@ -1223,7 +1223,12 @@ pub async fn join_channel(
                 false,
                 None,
                 if private { Some(&join_secret) } else { None },
-            )
+            )?;
+            // Until the owner's snapshot lands, the language Discover showed.
+            if let Err(e) = db.seed_channel_language_from_listing(&id) {
+                tracing::debug!(channel_id = %id, error = %e, "could not seed the room's language");
+            }
+            Ok::<_, anyhow::Error>(())
         }
     })
     .await
@@ -1334,6 +1339,11 @@ pub(crate) async fn enter_stored_channel(
                     return Err(anyhow::anyhow!("deleted"));
                 }
                 db.set_channel_in_room(&id, true)?;
+                // A room left before the owner's snapshot first landed was
+                // never given its language, and is not looked up while out.
+                if let Err(e) = db.seed_channel_language_from_listing(&id) {
+                    tracing::debug!(channel_id = %id, error = %e, "could not seed the room's language");
+                }
             }
             Ok::<_, anyhow::Error>(row)
         }

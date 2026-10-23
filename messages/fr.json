@@ -3769,6 +3769,8 @@
   "channels_send_placeholder": "Message au salon",
   "channels_send_placeholder_named": "Message dans #{room}",
   "channels_welcome_hide": "Masquer le message d’accueil",
+  "channels_joined_title": "Bienvenue dans {room}",
+  "channels_joined_body": "Vous y êtes. Dites bonjour !",
   "channels_welcome_show": "Afficher le message d’accueil",
   "channels_typing_one": "{name} est en train d’écrire…",
   "channels_typing_two": "{first} et {second} sont en train d’écrire…",

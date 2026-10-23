@@ -3769,6 +3769,8 @@
   "channels_send_placeholder": "Mensaje a la sala",
   "channels_send_placeholder_named": "Mensaje para #{room}",
   "channels_welcome_hide": "Ocultar el mensaje de bienvenida",
+  "channels_joined_title": "Te damos la bienvenida a {room}",
+  "channels_joined_body": "Ya estás dentro. ¡Saluda!",
   "channels_welcome_show": "Mostrar el mensaje de bienvenida",
   "channels_typing_one": "{name} está escribiendo…",
   "channels_typing_two": "{first} y {second} están escribiendo…",

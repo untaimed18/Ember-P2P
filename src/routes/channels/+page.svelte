@@ -2,6 +2,7 @@
   import { onMount, tick, untrack } from 'svelte';
   import { fade, fly, scale, slide } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
+  import { backOut } from 'svelte/easing';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
@@ -313,6 +314,134 @@
   let creating = $state(false);
   let joiningForm = $state(false);
   let joiningIds = $state<string[]>([]);
+  /** The room just walked into, so its row settles into Your rooms rather
+   *  than appearing there in one frame. Cleared once the movement has played. */
+  let justJoinedId = $state<string | null>(null);
+  let justJoinedTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Members who turned up while their room was open, for their arrival in the
+   *  list. A room's first read is not arrivals: everyone would slide in. */
+  let arrivedMembers = $state<string[]>([]);
+  const arrivalTimers = new Set<ReturnType<typeof setTimeout>>();
+  /** The welcome card over a room just joined. `key` tells its timer apart
+   *  from one left running by an earlier join of the same room. */
+  let joinWelcome = $state<{ id: string; key: number } | null>(null);
+  let joinWelcomeTimer: ReturnType<typeof setTimeout> | undefined;
+  $effect(() => () => {
+    clearTimeout(justJoinedTimer);
+    clearTimeout(joinWelcomeTimer);
+    clearTimeout(membersSettleTimer);
+    for (const timer of arrivalTimers) clearTimeout(timer);
+    for (const timer of freshListingTimers) clearTimeout(timer);
+  });
+
+  /** Longest arrival in the list, with room to spare. */
+  const ARRIVAL_MS = 1800;
+
+  /** Unread badges bump when their count climbs, but not as the page first
+   *  draws them: every room with a backlog bouncing at once is noise. */
+  let badgesLive = $state(false);
+  $effect(() => {
+    if (loading || badgesLive) return;
+    const timer = setTimeout(() => (badgesLive = true), 600);
+    return () => clearTimeout(timer);
+  });
+
+  /** Bumped when the open room's roster grows or shrinks, not when another
+   *  room's is shown, so the count only moves for a real change. */
+  let memberCountBump = $state(0);
+
+  /** False while a room's roster is first drawn, so its online dots appear
+   *  still; true after, so one that turns up later pops in. Reset in the same
+   *  write that shows another room's roster (`settleMembersFor`): an effect
+   *  would run after that first draw, still reading the last room's `true`. */
+  let membersSettled = $state(false);
+  let membersSettleTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function settleMembersFor(id: string) {
+    if (membersFor === id) return;
+    membersSettled = false;
+    clearTimeout(membersSettleTimer);
+    membersSettleTimer = setTimeout(() => (membersSettled = true), 800);
+  }
+
+  /** Rooms a Discover walk has just turned up, beyond the ones already
+   *  listed, so they ease in as they are found rather than popping. */
+  let freshListings = $state<string[]>([]);
+  const freshListingTimers = new Set<ReturnType<typeof setTimeout>>();
+
+  function markFreshListings(ids: string[]) {
+    if (ids.length === 0) return;
+    freshListings = [...new Set([...freshListings, ...ids])];
+    const timer = setTimeout(() => {
+      freshListingTimers.delete(timer);
+      freshListings = freshListings.filter((id) => !ids.includes(id));
+    }, ARRIVAL_MS);
+    freshListingTimers.add(timer);
+  }
+
+  /** Long enough to read a room's name and a line under it, short enough that
+   *  it is gone before anyone wonders how to close it. */
+  const JOIN_WELCOME_MS = 3400;
+  /** Where the welcome badge's sparks fly, in degrees, and when each leaves. */
+  const JOIN_SPARKS = [
+    { angle: -90, delay: 0 },
+    { angle: -30, delay: 40 },
+    { angle: 30, delay: 80 },
+    { angle: 90, delay: 20 },
+    { angle: 150, delay: 60 },
+    { angle: 210, delay: 100 },
+  ];
+
+  /** Play a room's arrival and bring its new place in the list into view, which
+   *  a join from far down Discover would otherwise leave off-screen. */
+  async function markJustJoined(id: string) {
+    justJoinedId = id;
+    clearTimeout(justJoinedTimer);
+    justJoinedTimer = setTimeout(() => {
+      if (justJoinedId === id) justJoinedId = null;
+    }, ARRIVAL_MS);
+    const key = Date.now();
+    joinWelcome = { id, key };
+    clearTimeout(joinWelcomeTimer);
+    joinWelcomeTimer = setTimeout(() => {
+      if (joinWelcome?.key === key) joinWelcome = null;
+    }, JOIN_WELCOME_MS);
+    await tick();
+    document
+      .querySelector<HTMLElement>(`.chan-row[data-room-id="${id}"]`)
+      ?.scrollIntoView({ block: 'nearest', behavior: prefersReducedMotion.current ? 'auto' : 'smooth' });
+  }
+
+  function markArrivedMembers(keys: string[]) {
+    if (keys.length === 0) return;
+    arrivedMembers = [...new Set([...arrivedMembers, ...keys])];
+    const timer = setTimeout(() => {
+      arrivalTimers.delete(timer);
+      arrivedMembers = arrivedMembers.filter((key) => !keys.includes(key));
+    }, ARRIVAL_MS);
+    arrivalTimers.add(timer);
+  }
+
+  /**
+   * A newcomer's row opens to its height as it fades in, so the members below
+   * glide down to make room instead of jumping. Instant for everyone else —
+   * the list redraws on every roster change — and with reduced motion.
+   */
+  function memberArrive(node: HTMLElement, { arriving }: { arriving: boolean }) {
+    if (!arriving || prefersReducedMotion.current) return { duration: 0 };
+    const style = getComputedStyle(node);
+    const height = node.offsetHeight;
+    const paddingTop = parseFloat(style.paddingTop);
+    const paddingBottom = parseFloat(style.paddingBottom);
+    return {
+      duration: 360,
+      easing: (t: number) => 1 - Math.pow(1 - t, 3),
+      css: (t: number, u: number) =>
+        `overflow: hidden; height: ${t * height}px;` +
+        `padding-top: ${t * paddingTop}px; padding-bottom: ${t * paddingBottom}px;` +
+        `opacity: ${Math.min(1, t * 1.4)}; transform: translateX(${u * 10}px);`,
+    };
+  }
   /** Which member a handoff offer went to this session, per room. `ChannelInfo`
    *  carries no pending-handoff field, and the backend refuses only a switch to
    *  a different member — re-offering to the same one is the retry path for a
@@ -664,6 +793,38 @@
   /** Discover rows from the last pass, by room id. Plain rather than state:
    *  written from inside `directoryList`, and read only there. */
   let discoverRowCache = new Map<string, ChannelInfo>();
+  /** Stored rows redrawn with a listing's language, from the last pass, kept
+   *  the way `discoverRowCache` is. */
+  let listedLanguageCache = new Map<string, { source: ChannelInfo; row: ChannelInfo }>();
+
+  /**
+   * A stored room with the language its Discover listing carries where the
+   * row's own is missing or out of date.
+   *
+   * A room's stored language comes from the owner's snapshot, which is looked
+   * up only while we are in the room. Left before the first one landed, the
+   * row has none for good, and left after, it keeps whatever the owner had
+   * then; the listing is the owner's too and is heard on every walk. Inside the
+   * room the snapshot is current, so the listing only fills the gap before the
+   * first one lands: after that, an empty language is the owner's "none".
+   */
+  function withListedLanguage(
+    ch: ChannelInfo,
+    listed: string,
+    next: Map<string, { source: ChannelInfo; row: ChannelInfo }>,
+  ): ChannelInfo {
+    // A code from a later build's longer list draws nothing, so it must not
+    // displace one this build can.
+    if (!isChannelLanguage(listed)) listed = '';
+    const language = ch.in_room
+      ? ch.language || (ch.moderation_updated_at === 0 ? listed : '')
+      : listed || ch.language;
+    if (language === ch.language) return ch;
+    const prev = listedLanguageCache.get(ch.channel_id);
+    const row = prev && prev.source === ch && prev.row.language === language ? prev.row : { ...ch, language };
+    next.set(ch.channel_id, { source: ch, row });
+    return row;
+  }
   let directoryList = $derived.by(() => {
     const hidden = new Set(
       $channelsStore.filter((c) => c.deleted).map((c) => c.channel_id),
@@ -672,14 +833,17 @@
     // anything still listed a minute later.
     for (const id of $hiddenChannels) hidden.add(id);
     const byId = new Map<string, ChannelInfo>();
+    const listed = new Map<string, { source: ChannelInfo; row: ChannelInfo }>();
     for (const ch of channelList) {
       // Never hide a room we are standing in. Removal is only offered once
       // you are out, but the conversation pane reads membership straight from
       // the store, so a joined room missing from the list would be a room you
       // are in with no way back to it.
       if (hidden.has(ch.channel_id) && !ch.in_room) continue;
-      byId.set(ch.channel_id, ch);
+      const listing = ch.visibility === 'public' ? discoveredById.get(ch.channel_id) : undefined;
+      byId.set(ch.channel_id, withListedLanguage(ch, listing?.language ?? '', listed));
     }
+    listedLanguageCache = listed;
     const rows = new Map<string, ChannelInfo>();
     for (const item of discoveredById.values()) {
       if (hidden.has(item.channel_id) || byId.has(item.channel_id)) continue;
@@ -1398,6 +1562,10 @@
       const batch = event.payload.channels ?? [];
       if (batch.length === 0) return;
       const byId = new Map(discovered.map((item) => [item.channel_id, item]));
+      // The first rooms of an empty list are the list, not arrivals.
+      if (byId.size > 0) {
+        markFreshListings(batch.filter((item) => !byId.has(item.channel_id)).map((item) => item.channel_id));
+      }
       for (const item of batch) {
         byId.set(item.channel_id, withKnownMemberCount(item, byId.get(item.channel_id)));
       }
@@ -1569,6 +1737,17 @@
     try {
       const mems = await listChannelMembers(id);
       if (gen === membersGen && id === selectedId) {
+        // Only against a roster already on screen for this room.
+        if (membersFor === id && members.length > 0) {
+          const known = new Set(members.map((mem) => mem.member_pubkey));
+          markArrivedMembers(
+            mems
+              .filter((mem) => !mem.is_self && !mem.banned && !known.has(mem.member_pubkey))
+              .map((mem) => mem.member_pubkey),
+          );
+          if (mems.length !== members.length) memberCountBump++;
+        }
+        settleMembersFor(id);
         members = mems;
         membersFor = id;
         membersLoading = false;
@@ -1767,6 +1946,7 @@
         item.channel_id === joined.channel_id ? { ...item, joined: joined.in_room } : item,
       );
       upsertChannel(joined);
+      if (joined.in_room) void markJustJoined(joined.channel_id);
       void refreshChannels().catch(() => {});
       await selectChannel(joined.channel_id);
     } catch (e) {
@@ -1917,6 +2097,7 @@
         item.channel_id === joined.channel_id ? { ...item, joined: joined.in_room } : item,
       );
       upsertChannel(joined);
+      if (joined.in_room) void markJustJoined(joined.channel_id);
       void refreshChannels().catch(() => {});
       await selectChannel(joined.channel_id);
     } catch (e) {
@@ -3079,6 +3260,8 @@
                   class:active={ch.in_room && ch.channel_id === selectedId}
                   class:highlighted={highlightedRow?.channel_id === ch.channel_id}
                   class:joining={joiningIds.includes(ch.channel_id)}
+                  class:just-joined={ch.in_room && ch.channel_id === justJoinedId}
+                  class:fresh-listing={!ch.in_room && freshListings.includes(ch.channel_id)}
                   class:moved={!!ch.successor_id}
                   class:likely-spam={likelySpamIds.has(ch.channel_id)}
                   class:has-unread={ch.in_room
@@ -3190,8 +3373,11 @@
                            own to a screen reader. Grey when the room's level
                            would not interrupt for what it holds; see
                            `unreadBadgeTone`. -->
+                      <!-- Redrawn per count, so a climb plays the bump; see `badgesLive`. -->
+                      {#key ch.unread}
                       <span
                         class="count-pill unread"
+                        class:bump={badgesLive}
                         class:silenced={unreadBadgeTone(notifyLevelOf($effectiveNotifyLevels, ch.channel_id), mentioned) === 'quiet'}
                         aria-label={mentioned
                           ? m.channels_unread_mention_aria({ count: ch.unread })
@@ -3201,6 +3387,7 @@
                               other: () => m.channels_unread_title_other({ count: ch.unread }),
                             })}
                       >{#if mentioned}<span class="unread-at" aria-hidden="true">@</span>{/if}{ch.unread > 99 ? '99+' : ch.unread}</span>
+                      {/key}
                     {/if}
                   </button>
                   <div class="chan-door-col">
@@ -3715,6 +3902,49 @@
               {/if}
             {/if}
             <div class="transcript">
+              <!-- Spoken from a region that is always here: one inserted along
+                   with its text is not announced. -->
+              <span class="sr-only" aria-live="polite">
+                {joinWelcome?.id === selected.channel_id
+                  ? `${m.channels_joined_title({ room: selected.name })} ${m.channels_joined_body()}`
+                  : ''}
+              </span>
+              {#if joinWelcome?.id === selected.channel_id}
+                <!-- Floats over the top of the transcript and lets every click
+                     through, so it never stands between the reader and the room.
+                     Local, so leaving the room takes it at once rather than
+                     holding the pane open for its exit. -->
+                <div class="join-welcome-wrap" aria-hidden="true">
+                  <div
+                    class="join-welcome"
+                    out:fly={{ y: -10, duration: prefersReducedMotion.current ? 0 : 280 }}
+                  >
+                    <div class="join-welcome-badge">
+                      <span class="join-welcome-ring"></span>
+                      {#each JOIN_SPARKS as spark, i (i)}
+                        <span
+                          class="join-spark"
+                          class:alt={i % 2 === 1}
+                          style:--spark-angle="{spark.angle}deg"
+                          style:--spark-delay="{spark.delay}ms"
+                        ></span>
+                      {/each}
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M8.5 3.5L7 20.5M17 3.5l-1.5 17M3.5 9h17M3 15h17"/>
+                      </svg>
+                    </div>
+                    <div class="join-welcome-text">
+                      <strong>
+                        <bdi dir="auto">{m.channels_joined_title({ room: selected.name })}</bdi>
+                        {#if isChannelLanguage(selected.language)}
+                          <img class="join-welcome-flag" src={channelLanguageFlagSrc(selected.language)} alt="" />
+                        {/if}
+                      </strong>
+                      <span>{m.channels_joined_body()}</span>
+                    </div>
+                  </div>
+                </div>
+              {/if}
               <ChatConversation
                 friendHash=""
                 friendName={selectedName}
@@ -3754,7 +3984,9 @@
               <!-- Only once the roster is in hand. Falling back to the stored
                    count put a stale number beside a body that said Loading. -->
               {#if members.length > 0}
-                <span class="members-count">{members.length}</span>
+                {#key memberCountBump}
+                  <span class="members-count" class:bump={memberCountBump > 0}>{members.length}</span>
+                {/key}
               {/if}
               <button
                 class="icon-btn members-close"
@@ -3786,8 +4018,11 @@
                     presence === 'online' ? m.channels_member_online() : m.channels_member_away()}
                   {@const friendRelation = memberFriendRelation(mem)}
                   {@const ignoreScope = ignoreScopeFor($ignoredMembers, mem.member_pubkey, selectedId)}
+                  {@const arriving = arrivedMembers.includes(mem.member_pubkey)}
                   <li
                     class:banned={mem.banned}
+                    class:arrived={arriving}
+                    in:memberArrive={{ arriving }}
                     oncontextmenu={memberHasMenu(mem) ? openCardMenu : undefined}
                   >
                     <div
@@ -3799,8 +4034,17 @@
                         <circle cx="12" cy="8" r="4"/>
                         <path d="M4 21c0-4.418 3.582-8 8-8s8 3.582 8 8"/>
                       </svg>
+                      <!-- Pops in when someone comes online while the list is
+                           open; drawn still as the list itself first appears. -->
                       {#if presence !== 'offline'}
-                        <span class="present-dot" class:away={presence === 'away'} role="img" title={presenceLabel} aria-label={presenceLabel}></span>
+                        <span
+                          class="present-dot"
+                          class:away={presence === 'away'}
+                          role="img"
+                          title={presenceLabel}
+                          aria-label={presenceLabel}
+                          in:scale={{ start: 0, duration: membersSettled && !prefersReducedMotion.current ? 320 : 0, easing: backOut }}
+                        ></span>
                       {/if}
                     </div>
                     <div class="member-identity">
@@ -5004,6 +5248,67 @@
     .chan-row.joining::after { animation: none; }
   }
 
+  /* Joined: the room settles into Your rooms with a small drop and a wash of
+     accent that fades into the selected row's own tint (the keyframes name only
+     a start, so they end on whatever the row's background is). The avatar
+     answers with a nudge and one ring, and the selection bar draws in. Under a
+     second and a half end to end, and once: the class is gone by the next join. */
+  .chan-row.just-joined {
+    animation:
+      chan-row-arrive 420ms cubic-bezier(0.2, 0.9, 0.3, 1.12) both,
+      chan-row-wash 1.5s ease-out;
+  }
+
+  .chan-row.just-joined .chan-avatar {
+    animation: chan-avatar-pop 560ms cubic-bezier(0.34, 1.5, 0.5, 1) 80ms both;
+  }
+
+  .chan-row.just-joined .chan-avatar::after {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    pointer-events: none;
+    animation: chan-avatar-ring 900ms ease-out 180ms both;
+  }
+
+  .chan-row.just-joined.active::before {
+    transform-origin: center;
+    animation: chan-bar-draw 380ms cubic-bezier(0.2, 0.9, 0.3, 1) 140ms both;
+  }
+
+  @keyframes chan-row-arrive {
+    from { opacity: 0; transform: translateY(-6px) scale(0.985); }
+    to   { opacity: 1; transform: none; }
+  }
+
+  @keyframes chan-row-wash {
+    from { background-color: color-mix(in srgb, var(--accent) 26%, transparent); }
+  }
+
+  @keyframes chan-avatar-pop {
+    0%   { transform: scale(0.82); }
+    100% { transform: scale(1); }
+  }
+
+  @keyframes chan-avatar-ring {
+    from { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
+    to   { box-shadow: 0 0 0 9px color-mix(in srgb, var(--accent) 0%, transparent); }
+  }
+
+  @keyframes chan-bar-draw {
+    from { transform: scaleY(0); }
+    to   { transform: scaleY(1); }
+  }
+
+  /* Nothing moves; the wash alone still says which row is new. */
+  @media (prefers-reduced-motion: reduce) {
+    .chan-row.just-joined { animation: chan-row-wash 1.5s ease-out; }
+    .chan-row.just-joined .chan-avatar,
+    .chan-row.just-joined .chan-avatar::after,
+    .chan-row.just-joined.active::before { animation: none; }
+  }
+
   /* One control, centred. The member count used to sit stacked above it, which
      made the column two pills tall and left the row taller than its content. */
   .chan-door-col {
@@ -5258,6 +5563,36 @@
   .chan-moved-badge {
     margin-inline-start: 6px;
     vertical-align: 1px;
+  }
+
+  /* Something new in the room: the badge pops on its first message and gives
+     a small bounce on each one after, so the list says where the conversation
+     moved without anything flashing. */
+  .unread.bump {
+    animation: unread-bump 460ms cubic-bezier(0.34, 1.6, 0.5, 1);
+  }
+
+  @keyframes unread-bump {
+    0%   { transform: scale(0.7); }
+    100% { transform: scale(1); }
+  }
+
+  /* Found by the walk still running: it eases into Discover. */
+  .chan-row.fresh-listing {
+    animation: chan-listing-in 360ms ease-out;
+  }
+
+  @keyframes chan-listing-in {
+    from { opacity: 0; transform: translateY(4px); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .unread.bump { animation: none; }
+    .chan-row.fresh-listing { animation: chan-listing-fade 360ms ease-out; }
+  }
+
+  @keyframes chan-listing-fade {
+    from { opacity: 0; }
   }
 
   /* A silenced room still counts its unread, it just stops shouting about it. */
@@ -6140,6 +6475,152 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
+    /* Anchors the welcome card. */
+    position: relative;
+  }
+
+  /* The welcome on joining a room: a card that rises in a beat after the room
+     has drawn, its badge answering with a ring and a few sparks, then lifts
+     away on its own (`JOIN_WELCOME_MS`). Above the transcript, never in it, and
+     letting every click through. */
+  .join-welcome-wrap {
+    position: absolute;
+    inset-inline: 0;
+    top: 14px;
+    z-index: 5;
+    display: flex;
+    justify-content: center;
+    padding: 0 16px;
+    pointer-events: none;
+  }
+
+  .join-welcome {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    max-width: min(440px, 100%);
+    padding: 10px 18px 10px 10px;
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+    border-radius: var(--radius-pill);
+    background: color-mix(in srgb, var(--accent) 6%, var(--bg-surface));
+    box-shadow: var(--shadow-lg);
+    animation: join-welcome-in 520ms cubic-bezier(0.2, 0.9, 0.3, 1.15) 260ms backwards;
+  }
+
+  .join-welcome-badge {
+    position: relative;
+    flex-shrink: 0;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: var(--on-accent);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: join-badge-pop 600ms cubic-bezier(0.34, 1.5, 0.5, 1) 380ms backwards;
+  }
+
+  .join-welcome-badge svg {
+    width: 17px;
+    height: 17px;
+  }
+
+  .join-welcome-ring {
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    pointer-events: none;
+    animation: join-ring 1s ease-out 520ms both;
+  }
+
+  /* Six small sparks thrown out from the badge's centre. Each is turned to its
+     angle, then carried outward along it while it shrinks and fades. */
+  .join-spark {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 5px;
+    height: 5px;
+    margin: -2.5px 0 0 -2.5px;
+    border-radius: 50%;
+    background: var(--accent);
+    opacity: 0;
+    animation: join-spark 760ms cubic-bezier(0.2, 0.7, 0.3, 1) calc(520ms + var(--spark-delay)) both;
+  }
+
+  .join-spark.alt {
+    background: color-mix(in srgb, var(--accent) 45%, var(--warning));
+  }
+
+  .join-welcome-text {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+
+  .join-welcome-text strong {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .join-welcome-text strong bdi {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .join-welcome-text > span {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+  }
+
+  .join-welcome-flag {
+    flex-shrink: 0;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--text-primary) 14%, transparent);
+  }
+
+  @keyframes join-welcome-in {
+    from { opacity: 0; transform: translateY(-10px) scale(0.96); }
+    to   { opacity: 1; transform: none; }
+  }
+
+  @keyframes join-badge-pop {
+    from { transform: scale(0.6); }
+    to   { transform: scale(1); }
+  }
+
+  @keyframes join-ring {
+    from { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 50%, transparent); }
+    to   { box-shadow: 0 0 0 12px color-mix(in srgb, var(--accent) 0%, transparent); }
+  }
+
+  @keyframes join-spark {
+    0%   { opacity: 0; transform: rotate(var(--spark-angle)) translateX(6px) scale(1); }
+    20%  { opacity: 1; }
+    100% { opacity: 0; transform: rotate(var(--spark-angle)) translateX(30px) scale(0.3); }
+  }
+
+  /* The card still comes and goes, as a fade; the badge stays put and throws
+     nothing. */
+  @media (prefers-reduced-motion: reduce) {
+    .join-welcome { animation: join-welcome-fade 300ms ease 260ms backwards; }
+    .join-welcome-badge,
+    .join-welcome-ring { animation: none; }
+    .join-spark { display: none; }
+  }
+
+  @keyframes join-welcome-fade {
+    from { opacity: 0; }
   }
 
   .members-backdrop {
@@ -6165,8 +6646,21 @@
   }
 
   .members-count {
+    display: inline-block;
     font-size: var(--font-size-xs);
     color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Someone came or went: the number nudges and briefly takes the accent. */
+  .members-count.bump {
+    animation: count-bump 520ms cubic-bezier(0.34, 1.5, 0.5, 1);
+  }
+
+  @keyframes count-bump {
+    0%   { transform: scale(1); color: var(--text-muted); }
+    35%  { transform: scale(1.3); color: var(--accent); }
+    100% { transform: scale(1); color: var(--text-muted); }
   }
 
   .members-empty {
@@ -6208,6 +6702,31 @@
     background: var(--bg-hover);
   }
 
+  /* Someone just joined: their row opens into the list (`memberArrive`), then
+     holds a wash of accent that fades out, and their presence dot lands with a
+     small pop. The same wash the room row gets on a join, so the two read as
+     one gesture. */
+  .member-list li.arrived {
+    animation: member-wash 1.6s ease-out 200ms backwards;
+  }
+
+  .member-list li.arrived .present-dot {
+    animation: member-dot-pop 420ms cubic-bezier(0.34, 1.6, 0.5, 1) 260ms both;
+  }
+
+  @keyframes member-wash {
+    from { background-color: color-mix(in srgb, var(--accent) 18%, transparent); }
+  }
+
+  @keyframes member-dot-pop {
+    from { transform: scale(0); }
+    to   { transform: scale(1); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .member-list li.arrived .present-dot { animation: none; }
+  }
+
   .member-list li.banned { opacity: 0.65; }
 
   .member-avatar {
@@ -6221,6 +6740,10 @@
     align-items: center;
     justify-content: center;
     position: relative;
+    /* Online, away and offline shade into each other rather than switching. */
+    transition:
+      background-color var(--transition-normal) ease,
+      color var(--transition-normal) ease;
   }
 
   .member-avatar svg { width: 14px; height: 14px; }
@@ -6247,6 +6770,9 @@
     border-radius: 50%;
     background: var(--success);
     box-shadow: 0 0 0 2px var(--bg-secondary);
+    transition:
+      background-color var(--transition-normal) ease,
+      border-color var(--transition-normal) ease;
   }
 
   /* Hollow, so the two states stay apart for anyone who cannot separate them

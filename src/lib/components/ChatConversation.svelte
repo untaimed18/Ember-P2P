@@ -109,6 +109,7 @@
   } from '$lib/utils';
   import { formatMessage, type FormatBlock, type InlineNode } from '$lib/messageFormat';
   import { prefersReducedMotion } from 'svelte/motion';
+  import { fade, fly, slide } from 'svelte/transition';
   import { openExternalUrl } from '$lib/api/settings';
   import { toast, toastError, toastSuccess } from '$lib/stores/toast';
   import IconX from '$lib/components/IconX.svelte';
@@ -786,6 +787,7 @@
             : m,
         );
         closeEditor(msg.id);
+        flashEdited([msg.id]);
       }
     } catch (e: unknown) {
       if (channel === channelId) editError = translateError(e, m.channels_edit_failed());
@@ -1170,8 +1172,10 @@
         }>('ember:channel-message-edited', (event) => {
           if (event.payload.channel_id !== room) return;
           const edited = event.payload.msg_id;
+          const revised: number[] = [];
           messages = messages.map((msg) => {
             if (msg.msg_id === edited || msg.id === event.payload.id) {
+              if (msg.message !== event.payload.message) revised.push(msg.id);
               return { ...msg, message: event.payload.message, edited_at: event.payload.edited_at };
             }
             // A reply whose parent is paged out quotes the backend's snapshot,
@@ -1181,6 +1185,7 @@
             }
             return msg;
           });
+          flashEdited(revised);
           // A line we were editing has been revised under us — most likely from
           // this account on another device. Drop the stale draft rather than let
           // it overwrite the newer text.
@@ -2232,6 +2237,23 @@
     freshIds.add(id);
     setTimeout(() => freshIds.delete(id), FRESH_MS);
   }
+
+  /** Lines revised in place a moment ago, so the change is seen rather than
+   *  found: an edit otherwise only swaps words under a reader who may be
+   *  looking straight at them. */
+  let editedFlashIds = $state<number[]>([]);
+  const EDIT_FLASH_MS = 1400;
+
+  function flashEdited(ids: number[]): void {
+    if (ids.length === 0) return;
+    editedFlashIds = [...new Set([...editedFlashIds, ...ids])];
+    setTimeout(() => {
+      editedFlashIds = editedFlashIds.filter((id) => !ids.includes(id));
+    }, EDIT_FLASH_MS);
+  }
+
+  /** How long the bars and pills around the transcript take to come and go. */
+  let barMs = $derived(prefersReducedMotion.current ? 0 : 180);
 
   function markFresh(next: readonly ConvMessage[]): void {
     const known = new Set(messages.map((message) => message.id));
@@ -3578,10 +3600,14 @@
     <!-- Its own row above the transcript rather than floating over it, so the
          first lines are never hidden under it. One pin at a time: the bar is a
          pointer to the message, not a second transcript. -->
-    <div class="conv-pin-bar" role="region" aria-label={m.channels_pinned_label()}>
+    <div class="conv-pin-bar" role="region" aria-label={m.channels_pinned_label()} in:slide={{ duration: barMs }}>
       <svg class="conv-pin-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true">
         <path d="M6 2.5h4M7 2.5v4L4.5 9h7L9 6.5v-4M8 9v4.5"/>
       </svg>
+      <!-- The next pin slides up into place, so cycling reads as moving
+           through a stack rather than the text blinking. -->
+      {#key shownPinIndex}
+      <span class="conv-pin-slot" in:fly={{ y: 6, duration: barMs }}>
       {#if pin.kind === 'message' && isIgnoredSender(pin.senderPubkey)}
         <!-- Still counted, so "1 of 3" stays true, but neither named nor
              quoted, and nothing to jump to: the line itself is not drawn. -->
@@ -3602,6 +3628,8 @@
       {:else}
         <span class="conv-pin-target unavailable">{m.channels_pinned_unavailable()}</span>
       {/if}
+      </span>
+      {/key}
       {#if pinEntries.length > 1}
         <button
           type="button"
@@ -3742,6 +3770,7 @@
           class:focused={row.msg.id === focusedId}
           class:mentions-me={row.mentionsMe}
           class:editing={editingId === row.msg.id}
+          class:just-edited={editedFlashIds.includes(row.msg.id)}
         >
           <!--
             `<bdi>` isolates the message body from the surrounding UI's
@@ -4107,6 +4136,7 @@
     <button
       class="conv-jump conv-jump-unread has-unseen"
       type="button"
+      transition:fly={{ y: -6, duration: barMs }}
       onclick={jumpToFirstUnread}
       title={m.chat_jump_to_unread()}
       aria-label={m.chat_jump_to_unread()}
@@ -4126,6 +4156,7 @@
       class:has-unseen={missedWhileAway || unreadAhead}
       class:above-typing={typingPillShown}
       type="button"
+      transition:fly={{ y: 8, duration: barMs }}
       onclick={jumpToLatest}
       title={missedWhileAway || unreadAhead ? m.chat_new_messages_below() : m.chat_jump_to_latest()}
       aria-label={missedWhileAway || unreadAhead ? m.chat_new_messages_below() : m.chat_jump_to_latest()}
@@ -4146,7 +4177,7 @@
   <div class="conv-typing-anchor">
     <span class="sr-only" role="status" aria-live="polite">{isChannel ? roomTypingAnnouncement : friendTypingAnnouncement}</span>
     {#if typingPillShown}
-      <div class="conv-typing conv-typing-pill">
+      <div class="conv-typing conv-typing-pill" transition:fade={{ duration: barMs }}>
         <span class="conv-typing-text">
           {#if isChannel}
             {#each roomTypingSegments as segment, i (i)}
@@ -4180,7 +4211,7 @@
       {@const target = replyTarget}
       {@const current = messagesByMsgId.get(target.msgId)}
       {@const targetHidden = isIgnoredSender(current?.sender_pubkey ?? target.senderPubkey)}
-      <div class="conv-reply-bar">
+      <div class="conv-reply-bar" in:slide={{ duration: barMs }}>
         <svg class="conv-reply-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true">
           <path d="M6.5 4 2.5 8l4 4"/>
           <path d="M2.5 8h7a4 4 0 0 1 4 4v1"/>
@@ -4622,6 +4653,20 @@
     flex: 1;
     height: 1px;
     background: color-mix(in srgb, var(--accent) 45%, transparent);
+    /* Drawn outward from the label as the room opens. */
+    animation: divider-draw 520ms cubic-bezier(0.2, 0.8, 0.3, 1) 120ms backwards;
+  }
+
+  .conv-unread-divider::before { transform-origin: right; }
+  .conv-unread-divider::after { transform-origin: left; }
+
+  @keyframes divider-draw {
+    from { transform: scaleX(0); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .conv-unread-divider::before,
+    .conv-unread-divider::after { animation: none; }
   }
 
   /* One bubble shape for friends and rooms: the corner, the tighter corner
@@ -4811,11 +4856,45 @@
     border-bottom-left-radius: var(--bubble-tail-radius);
   }
 
-  /* Marks the message a search hit jumped to. A ring rather than a background
-     swap, so it reads the same on a sent bubble as on a received one. */
+  /* Marks the message a jump landed on. A ring rather than a background swap,
+     so it reads the same on a sent bubble as on a received one; it arrives with
+     two soft pulses, so the eye finds it wherever the scroll stopped. */
   .conv-bubble.focused {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
+    animation: bubble-found 900ms ease-out 2;
+  }
+
+  @keyframes bubble-found {
+    from { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent); }
+    to   { box-shadow: 0 0 0 12px color-mix(in srgb, var(--accent) 0%, transparent); }
+  }
+
+  /* Revised in place, by its author on any device: one ring, so the change is
+     seen rather than found. */
+  .conv-bubble.just-edited {
+    animation: bubble-edited 1.2s ease-out;
+  }
+
+  @keyframes bubble-edited {
+    0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent); }
+    20%  { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 40%, transparent); }
+    100% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 0%, transparent); }
+  }
+
+  /* A line naming you, arriving now: its marker glows up and settles into the
+     standing tint, so a mention in a busy room is not one more slide-in. */
+  .conv-msg.fresh .conv-bubble.mentions-me {
+    animation: bubble-mention 1.6s ease-out;
+  }
+
+  @keyframes bubble-mention {
+    from { background-color: color-mix(in srgb, var(--accent) 32%, var(--bg-secondary)); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .conv-bubble.focused,
+    .conv-bubble.just-edited { animation: none; }
   }
 
   .bubble-text {
@@ -5399,6 +5478,13 @@
   .conv-pin-icon {
     flex-shrink: 0;
     color: var(--accent);
+  }
+
+  /* Holds the current pin so cycling can slide it; lays out as the target did. */
+  .conv-pin-slot {
+    display: flex;
+    flex: 1;
+    min-width: 0;
   }
 
   .conv-pin-target {

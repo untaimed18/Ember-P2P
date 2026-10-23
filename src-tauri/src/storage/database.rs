@@ -13720,6 +13720,32 @@ impl Database {
         Ok(changed > 0)
     }
 
+    /// Give a public room the language its signed listing last carried, from
+    /// Discover's cache, while no owner snapshot has been applied to it. Run
+    /// as the room is joined or entered: its language otherwise waits for that
+    /// snapshot, which can be minutes away, and Discover drew a flag right up
+    /// to the join. The listing is the owner's too, and the snapshot overwrites
+    /// this when it lands, saying "none" included. Once one has, an empty
+    /// language is the owner's "none" rather than a gap, and a cached listing
+    /// older than it must not put the old one back. Returns whether it wrote.
+    pub fn seed_channel_language_from_listing(&self, channel_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "UPDATE channels
+             SET language = (SELECT language FROM channel_index_cache WHERE channel_id = ?1)
+             WHERE channel_id = ?1 AND language = '' AND visibility = ?2
+               AND moderation_updated_at = 0
+               AND EXISTS (SELECT 1 FROM channel_index_cache
+                           WHERE channel_id = ?1 AND language <> '')",
+            params![channel_id, crate::network::ember::channel::CHANNEL_KIND_PUBLIC],
+        )?;
+        drop(conn);
+        if changed > 0 {
+            bump_channel_roster_generation(channel_id);
+        }
+        Ok(changed > 0)
+    }
+
     /// [`Self::insert_channel`] for a room we are creating with a default
     /// language, both under one lock. A roster read landing between two
     /// separate writes would cache the row without its language, and the owner
@@ -20689,6 +20715,42 @@ mod tests {
         assert_eq!(db.list_cached_channels().unwrap()[0].language, "ja");
         db.cache_channel_listings(&[cached("")]).unwrap();
         assert_eq!(db.list_cached_channels().unwrap()[0].language, "", "a cleared language clears");
+
+        // A joined room starts from its listing's language until the owner's
+        // snapshot says otherwise, and only fills a gap.
+        let joined = "d1".repeat(16);
+        let listing = |id: &str, language: &str| CachedChannel {
+            channel_id: id.to_string(),
+            pubkey: "02".repeat(32),
+            name: "Lobby".to_string(),
+            language: language.to_string(),
+        };
+        db.insert_channel(&joined, &"02".repeat(32), "Lobby", "public", false, None, None).unwrap();
+        assert!(!db.seed_channel_language_from_listing(&joined).unwrap(), "no listing, nothing to seed");
+        db.cache_channel_listings(&[listing(&joined, "")]).unwrap();
+        assert!(!db.seed_channel_language_from_listing(&joined).unwrap(), "a listing with none seeds none");
+        db.cache_channel_listings(&[listing(&joined, "pt")]).unwrap();
+        assert!(db.seed_channel_language_from_listing(&joined).unwrap());
+        assert_eq!(db.get_channel(&joined).unwrap().unwrap().language, "pt");
+        db.apply_owner_room_policy(&joined, false, &[], Some("es")).unwrap();
+        assert!(!db.seed_channel_language_from_listing(&joined).unwrap(), "never over the room's own");
+        assert_eq!(db.get_channel(&joined).unwrap().unwrap().language, "es");
+
+        // The owner's snapshot said "none": a stale listing does not undo it.
+        db.apply_channel_moderation(&joined, "", "", 1_000, &[], &[], None, None, None, None, None, None)
+            .unwrap();
+        db.apply_owner_room_policy(&joined, false, &[], None).unwrap();
+        assert!(
+            !db.seed_channel_language_from_listing(&joined).unwrap(),
+            "an applied snapshot's empty language is the owner's none"
+        );
+        assert_eq!(db.get_channel(&joined).unwrap().unwrap().language, "");
+
+        let private = "d2".repeat(16);
+        db.insert_channel(&private, &"03".repeat(32), "Den", "private", false, None, Some(&[7u8; 32]))
+            .unwrap();
+        db.cache_channel_listings(&[listing(&private, "pt")]).unwrap();
+        assert!(!db.seed_channel_language_from_listing(&private).unwrap(), "a private room has no listing");
 
         drop(db);
         let _ = std::fs::remove_file(&path);

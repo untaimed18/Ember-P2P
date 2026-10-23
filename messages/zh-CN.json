@@ -3769,6 +3769,8 @@
   "channels_send_placeholder": "向房间发送消息",
   "channels_send_placeholder_named": "发送消息到 #{room}",
   "channels_welcome_hide": "隐藏欢迎消息",
+  "channels_joined_title": "欢迎来到 {room}",
+  "channels_joined_body": "你已加入，打个招呼吧！",
   "channels_welcome_show": "显示欢迎消息",
   "channels_typing_one": "{name} 正在输入…",
   "channels_typing_two": "{first} 和 {second} 正在输入…",

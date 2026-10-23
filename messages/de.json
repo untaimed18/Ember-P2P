@@ -3777,6 +3777,8 @@
   "channels_send_placeholder": "Nachricht an den Raum",
   "channels_send_placeholder_named": "Nachricht an #{room}",
   "channels_welcome_hide": "Begrüßung ausblenden",
+  "channels_joined_title": "Willkommen in {room}",
+  "channels_joined_body": "Sie sind dabei. Sagen Sie Hallo!",
   "channels_welcome_show": "Begrüßung anzeigen",
   "channels_typing_one": "{name} schreibt …",
   "channels_typing_two": "{first} und {second} schreiben …",
