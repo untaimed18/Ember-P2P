@@ -9,6 +9,7 @@ import {
   chatDockOpen,
   chatTabs,
   closeTab,
+  addChatTab,
   openChat,
   reloadChatTabs,
   renameTab,
@@ -62,7 +63,9 @@ const REDOCK_REQUEST_EVENT = 'ember:chat-window-redock';
  *  cannot answer at all. */
 const DRAFT_HANDSHAKE_MS = 800;
 const MAX_DRAFT_CHARS = 20_000;
-const HASH_RE = /^[0-9a-f]{32}$/;
+/** A dock tab key: a friend's hash, or `dm:` and a room member's key for a
+ *  private conversation (`stores/roomDm.ts`). */
+const HASH_RE = /^(?:[0-9a-f]{32}|dm:[0-9a-f]{64})$/;
 
 function readStorage(key: string): string | null {
   try {
@@ -236,6 +239,7 @@ function applyTabOp(raw: unknown) {
   if (!hash) return;
   const name = typeof op.name === 'string' ? op.name.slice(0, 256) : '';
   if (op.kind === 'open') openChat(hash, name);
+  else if (op.kind === 'add') addChatTab(hash, name);
   else if (op.kind === 'rename') renameTab(hash, name);
   else if (op.kind === 'close') closeTab(hash);
 }

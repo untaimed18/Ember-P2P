@@ -23,6 +23,7 @@
   import { initTransferStore, cleanupTransferStore, startTransferPoll } from '$lib/stores/transfers';
   import { initSearchStore, cleanupSearchStore } from '$lib/stores/search';
   import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
+  import { initRoomDmStore, cleanupRoomDmStore } from '$lib/stores/roomDm';
   import { chatDockOpen, closeDock, retainChatTabs } from '$lib/stores/chatTabs';
   import { initChannelsStore, cleanupChannelsStore, refreshChannels } from '$lib/stores/channels';
   import { CHANNELS_RECOVERED_EVENT } from '$lib/api/channels';
@@ -286,6 +287,7 @@
       { init: initSearchStore, essential: false },
       { init: initFriendsStore, essential: false },
       { init: initChannelsStore, essential: false },
+      { init: initRoomDmStore, essential: false },
       { init: loadAppSettings, essential: true },
     ];
     const outcomes = await Promise.allSettled(stores.map((s) => s.init()));
@@ -813,6 +815,7 @@
           cleanupSearchStore();
           cleanupFriendsStore();
           cleanupChannelsStore();
+          cleanupRoomDmStore();
         }
       })
       .catch((e) => {
@@ -821,6 +824,7 @@
         cleanupSearchStore();
         cleanupFriendsStore();
         cleanupChannelsStore();
+        cleanupRoomDmStore();
         initError = translateError(e, m.layout_init_failed());
         initialized = true;
         releaseSplashWhenReady();
@@ -850,6 +854,7 @@
       cleanupSearchStore();
       cleanupFriendsStore();
       cleanupChannelsStore();
+      cleanupRoomDmStore();
       clearAllToasts();
       clearAppSettings();
       if (unlistenClose) unlistenClose();

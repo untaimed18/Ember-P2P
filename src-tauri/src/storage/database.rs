@@ -15,6 +15,9 @@ use crate::network::ember::crypto::chat_body_hash;
 use crate::storage::paths;
 use crate::types::*;
 
+mod room_dm;
+pub use room_dm::{DmIncoming, DmMessage, DmThread};
+
 const MAX_PEERS_ROWS: i64 = 10_000;
 const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
 /// Rooms kept in the Discover cache. Far more than a browse can usefully show,

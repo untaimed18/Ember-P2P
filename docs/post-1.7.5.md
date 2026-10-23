@@ -86,18 +86,22 @@ nonce(24) || ciphertext`.
 
 - **Tag.** Pairwise and bound to the envelope's `msg_id`, as frame 27's is, so
   relays cannot group messages by recipient. A receiver derives one pairwise
-  base per sender (cached) and one HMAC per frame to recognise its own.
+  base per sender (cached) and one keyed BLAKE3 hash per frame to recognise
+  its own.
 - **Key.** `derive_pairwise_capability` with a purpose of its own
   (`ch-dm-v1 || channel_id`), never `derive_chat_key`: friend chat's key
   depends on the two identities only, so reusing it would make a room message
   a valid friend-chat ciphertext and the other way round. XChaCha20-Poly1305,
-  with `channel_id || msg_id || timestamp || sender || tag` as associated
-  data, so a body cannot be lifted into another envelope.
-- **Plaintext.** `type(1) || fields`, one kind for everything so relays cannot
-  tell a message from a receipt: message (`message_id(16) || text`), receipt
-  (`message_id(16)`), accept, decline. Padded to fixed buckets so length says
-  little: 256, 1024, and a top bucket sized to what one datagram carries once
-  the gossip envelope and the extension frame around the body are counted.
+  with `"ember-room-dm-v1\0" || channel_id || msg_id || timestamp || sender
+  || tag` as associated data, so a body cannot be lifted into another
+  envelope.
+- **Plaintext.** `type(1) || fields` (as built, `type || len(2) || fields`),
+  one kind for everything so relays cannot tell a message from a receipt:
+  message (`message_id(16) || text`), receipt (`message_id(16)`), accept,
+  decline. Padded to fixed buckets so length says little: 256, a middle one
+  (built as 960, not 1024, to stay unfragmented), and a top bucket sized to
+  what one datagram carries once the gossip envelope and the extension frame
+  around the body are counted (and, as built, the overlay relay envelope).
   That is well under 4096 (a room line's sealed frame stops fitting at about
   3,760 bytes of text), so the text cap follows from the top bucket, less
   `type(1) || message_id(16)`, rather than being `CHAT_TEXT_MAX_BYTES`.
@@ -122,7 +126,9 @@ gets friend chat instead.
   passing a frame learn that someone sent a private message, not to whom or
   what. The help text says so.
 - **Moderators cannot read them.** A room ban still stops them (relays drop
-  a banned sender), and each message costs the sender a chat-rate charge.
+  a banned sender), and each message costs the sender a chat-rate charge
+  (within the 10-minute relay window, which is also as old as a frame the
+  recipient acts on).
 - **The ignore list moves to the backend.** Today `ignoredMembers` lives in
   the webview's `localStorage` only; it moves into settings (migrated once
   from `localStorage`) so an ignored member's message is dropped before it
@@ -132,10 +138,11 @@ gets friend chat instead.
   again for a while.
 - **No forward secrecy:** static keys, as sealed offers and friend chat use.
 
-**Storage.** New tables: threads (`member_pubkey`, state pending / accepted /
+**Storage.** New tables: threads (`member_pubkey`, state request / open /
 declined, room last used) and messages, the bodies encrypted with the chat
-key like `chat_messages`. Deleting a conversation deletes both. Leaving or
-being banned from a room does not delete history.
+key like `chat_messages`. Deleting a conversation deletes both, except that a
+declined one keeps its bare row while the refusal lasts. Leaving or being
+banned from a room does not delete history.
 
 **UI.** "Message privately" in a member's menu; a chat tab in the dock,
 labelled with the room; requests listed on the Channels page; notifications
@@ -153,6 +160,54 @@ the other way round; 1.7.4's unknown-kind path relays the frame without
 storing or counting it; a banned or ignored sender's message is dropped; the
 first message is held as a request and not notified as unread; receipts stop
 resends; a message to someone with no shared room is refused.
+
+**Built.** As decided above, with these choices made on the way:
+
+- **Code.** `network/ember/room_dm.rs` (the codec), `network/room_dm.rs`
+  (receiving, and the one place frames are sealed and sent, through
+  `NetworkCommand::SendRoomDm`), `storage/database/room_dm.rs` (tables
+  `room_dm_threads` and `room_dm_messages`, created on first use outside the
+  numbered chain) and `commands/room_dm.rs` (commands, room choice, the
+  resend loop). Spec: `channels-format.md`, "Private messages (kind 66)".
+- **Plaintext** carries a two-byte length after the type, so padding is
+  unambiguous. Buckets 256, 960 and 3670 bytes; the text cap is 3651. The top
+  bucket leaves room for the overlay relay envelope, without which a long
+  message never reached a firewalled member.
+- **Resends** every 2 minutes for 20 minutes, under a fresh envelope with the
+  same `message_id`; then "Not delivered", with Try again, which meets the
+  same rules as a new message.
+- **Replies** (receipts, declines) wait a random 10 to 90 seconds, so their
+  timing does not say whom a message was for, and are rationed: 30 and one
+  decline per member per 10 minutes, 2 a second in all, so a member cannot
+  spend our author rate and crowd out our chat.
+- **Caps.** A request holds 20 messages until answered; 120 are kept from
+  one member an hour; a conversation keeps its newest 2000. Past a cap,
+  messages are dropped unanswered.
+- **"Off"** declines everything, an open conversation and resends too, stops
+  what is still being sent, and blocks sending. A message from someone in a
+  conversation we have open clears a decline they sent earlier: writing to
+  us is taking ours. Their decline otherwise lasts 7 days, as ours does, and
+  is recorded only in a conversation we started or accepted, and only if
+  newer than the answer held.
+- **Declining**, or deleting a request, forgets what they sent and refuses
+  them for 7 days, a refusal deleting the conversation does not lift.
+- **The ignore list** is kept in settings (`ignored_members`, owned by the
+  backend, written by `set_ignored_members`). The webview moves its own copy
+  over once, then takes the backend's; an edit made before settings load is
+  pushed rather than lost.
+- **UI.** "Message privately" in a member's menu (not for someone ignored,
+  banned or a friend), a dock tab labelled "(private)" that also works in
+  the popped-out chat window, requests as banners on the Channels page with
+  Accept, Decline and Ignore, and counted on its nav item rather than as
+  unread. A conversation that receives a message gets a tab without opening
+  the dock. The policy is under Settings > Channels. Notifications use the
+  message switch.
+
+**Not yet:** "Add friend" from a conversation with no shared room (the text
+says to), offline delivery through the chat mailbox, "load older" in a
+conversation (the newest 100 show), disappearing-message timers, and an
+end-to-end test over two network loops; the receive path is covered by its
+parts' tests.
 
 ## 3. Follow a publisher (feeds)
 

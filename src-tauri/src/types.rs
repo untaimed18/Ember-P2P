@@ -1767,6 +1767,16 @@ pub struct AppSettings {
     /// against the friends list by its derived Ember hash.
     #[serde(default = "default_channel_file_offers")]
     pub channel_file_offers: String,
+    /// Who may send you a private message through a room you share:
+    /// `"ask"` (the first message from someone waits for you to accept),
+    /// `"anyone"`, or `"off"`.
+    #[serde(default = "default_room_dm_policy")]
+    pub room_dm_policy: String,
+    /// Room members you ignore: their lines are hidden, and their private
+    /// messages dropped before they are stored. `None` until the list the
+    /// webview used to keep to itself has been moved here.
+    #[serde(default)]
+    pub ignored_members: Option<Vec<IgnoredMember>>,
     /// Files a friend sends in chat at or under this many megabytes are
     /// fetched without asking; larger ones wait for an explicit accept. Zero
     /// asks every time.
@@ -2416,6 +2426,40 @@ fn default_channel_file_offers() -> String {
     CHANNEL_FILE_OFFERS_EVERYONE.to_string()
 }
 
+pub const ROOM_DM_POLICY_ASK: &str = "ask";
+pub const ROOM_DM_POLICY_ANYONE: &str = "anyone";
+pub const ROOM_DM_POLICY_OFF: &str = "off";
+
+fn default_room_dm_policy() -> String {
+    ROOM_DM_POLICY_ASK.to_string()
+}
+
+pub fn room_dm_policy_valid(policy: &str) -> bool {
+    [ROOM_DM_POLICY_ASK, ROOM_DM_POLICY_ANYONE, ROOM_DM_POLICY_OFF].contains(&policy)
+}
+
+/// A room member the user ignores.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IgnoredMember {
+    /// Their member key, lowercase hex.
+    pub pubkey: String,
+    /// What they were called when ignored, for the list in Settings.
+    #[serde(default)]
+    pub name: String,
+    /// The rooms they are ignored in; `None` for everywhere.
+    #[serde(default)]
+    pub rooms: Option<Vec<String>>,
+}
+
+impl IgnoredMember {
+    /// Whether this entry ignores them in `channel_id`.
+    pub fn covers(&self, channel_id: &str) -> bool {
+        self.rooms
+            .as_ref()
+            .is_none_or(|rooms| rooms.iter().any(|room| room.eq_ignore_ascii_case(channel_id)))
+    }
+}
+
 fn default_chat_attachment_auto_accept_mb() -> u64 {
     crate::network::ember::attach::ATTACH_AUTO_ACCEPT_DEFAULT_MB
 }
@@ -2866,6 +2910,8 @@ impl Default for AppSettings {
             friend_files_disabled: false,
             friend_session_encryption: true,
             channel_file_offers: default_channel_file_offers(),
+            room_dm_policy: default_room_dm_policy(),
+            ignored_members: None,
             chat_attachment_auto_accept_mb: default_chat_attachment_auto_accept_mb(),
             friend_overrides: std::collections::BTreeMap::new(),
             friend_status: FriendStatus::Online,

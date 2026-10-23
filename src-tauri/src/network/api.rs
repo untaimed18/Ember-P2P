@@ -680,6 +680,13 @@ pub enum NetworkCommand {
     FanoutChannelChat {
         bodies: Vec<Vec<u8>>,
     },
+    /// Seal a private message, receipt or answer to one member and send it
+    /// into a room both are in. See `network::room_dm`.
+    SendRoomDm {
+        channel_id: [u8; 16],
+        member: [u8; 32],
+        payload: crate::network::ember::room_dm::DmPayload,
+    },
     /// Live composing signal for a room, one hop to members we already hold a
     /// session with. Never queued, relayed, or stored; the next keystroke
     /// refreshes it.

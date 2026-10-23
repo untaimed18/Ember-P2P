@@ -9,6 +9,7 @@ pub mod mapping_keepalive;
 pub mod nat;
 pub mod quic;
 pub mod relay;
+pub mod room_dm;
 pub mod udp_mux;
 
 // `dht` is live on the Noise path when `ember_native_enabled` (routing,

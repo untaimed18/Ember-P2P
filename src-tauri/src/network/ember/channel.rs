@@ -2019,11 +2019,25 @@ impl ChannelExtFrame {
 pub const EXT_KIND_CHAT_LINE: u8 = 64;
 /// A revision of a line, version 2, beside [`CHAT_EDIT_PLAIN_VERSION`].
 pub const EXT_KIND_CHAT_EDIT: u8 = 65;
+/// A private message between two members, sealed to the recipient: see
+/// [`super::room_dm`]. Never displayable: an older build has nothing to show
+/// for one, and saying a line needs a newer Ember would tell every member
+/// that a private message passed.
+pub const EXT_KIND_PRIVATE_MESSAGE: u8 = 66;
 
 /// Extension kinds this build reads. A kind is added here by the build that
 /// first gives it a meaning, and every build before that passes it on and, if
 /// it is displayable, says so.
-const UNDERSTOOD_EXT_KINDS: &[u8] = &[EXT_KIND_CHAT_LINE, EXT_KIND_CHAT_EDIT];
+const UNDERSTOOD_EXT_KINDS: &[u8] = &[EXT_KIND_CHAT_LINE, EXT_KIND_CHAT_EDIT, EXT_KIND_PRIVATE_MESSAGE];
+
+/// The most an extension frame's body can hold and still go out in one
+/// datagram, inside a gossip envelope, wrapped for an overlay relay hop too:
+/// a firewalled member is reached only that way.
+pub const EXT_BODY_MAX_BYTES: usize = super::dht::messages::MAX_DELIVERABLE_PAYLOAD
+    - CHANNEL_RELAY_ENVELOPE_HEADER
+    - GOSSIP_HEADER_LEN
+    - GOSSIP_ENVELOPE_OVERHEAD
+    - EXT_HEADER_LEN;
 
 pub fn ext_kind_understood(kind: u8) -> bool {
     UNDERSTOOD_EXT_KINDS.contains(&kind)
@@ -9760,7 +9774,8 @@ mod tests {
         assert_eq!(EXT_KIND_CHAT_LINE, EXT_KIND_MIN, "the first extension kind is the v2 line");
         assert!(ext_kind_understood(EXT_KIND_CHAT_LINE));
         assert!(ext_kind_understood(EXT_KIND_CHAT_EDIT));
-        assert!(!ext_kind_understood(EXT_KIND_CHAT_EDIT + 1));
+        assert!(ext_kind_understood(EXT_KIND_PRIVATE_MESSAGE));
+        assert!(!ext_kind_understood(EXT_KIND_PRIVATE_MESSAGE + 1));
         assert!(!ext_kind_understood(u8::MAX));
     }
 

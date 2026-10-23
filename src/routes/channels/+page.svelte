@@ -22,6 +22,8 @@
     isChannelLanguage,
   } from '$lib/channelLanguages';
   import { appSettings, loadAppSettings } from '$lib/stores/settings';
+  import { dmRequests, keepDmTab, openPrivateChat, refreshDmThreads } from '$lib/stores/roomDm';
+  import { answerRoomDmRequest } from '$lib/api/roomDm';
   import {
     copyToClipboard,
     disambiguatedMemberName,
@@ -1423,6 +1425,23 @@
       if (seq === deletedElsewhereSeq) deletedElsewhere = rooms;
     } catch (e) {
       console.warn('channels: could not read rooms deleted elsewhere', e);
+    }
+  }
+
+  /** A private-message request being answered, by member key. */
+  let answeringDm = $state<string | null>(null);
+
+  async function answerDmRequest(member: string, accept: boolean, name = '') {
+    if (answeringDm) return;
+    answeringDm = member;
+    try {
+      await answerRoomDmRequest(member, accept);
+      if (accept) keepDmTab(member, name);
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      answeringDm = null;
+      void refreshDmThreads();
     }
   }
 
@@ -3086,6 +3105,42 @@
     </div>
   {/if}
 
+  {#each $dmRequests as request (request.member_pubkey)}
+    <!-- Someone in a room wrote privately first. Nothing of it counts as
+         unread until it is accepted. -->
+    {@const requestName = request.name || m.channels_dm_someone()}
+    <div class="banner dm-request-banner" role="region" aria-label={m.channels_dm_request_banner({ name: requestName })}>
+      <span>
+        {m.channels_dm_request_banner({ name: requestName })}
+        {#if request.last_text}
+          <span class="dm-request-preview"><bdi dir="auto">{request.last_text.slice(0, 140)}</bdi></span>
+        {/if}
+      </span>
+      <div class="banner-actions">
+        <button class="ghost" onclick={() => openPrivateChat(request.member_pubkey, request.name)}>
+          {m.channels_dm_open()}
+        </button>
+        <button class="ghost" disabled={answeringDm !== null} onclick={() => void answerDmRequest(request.member_pubkey, true, request.name)}>
+          {m.channels_dm_accept()}
+        </button>
+        <button class="ghost" disabled={answeringDm !== null} onclick={() => void answerDmRequest(request.member_pubkey, false)}>
+          {m.channels_dm_decline()}
+        </button>
+        <!-- Declines, and drops whatever they send next anywhere. -->
+        <button
+          class="ghost"
+          disabled={answeringDm !== null}
+          onclick={() => {
+            ignoreMemberEverywhere(request.member_pubkey, request.name);
+            void answerDmRequest(request.member_pubkey, false);
+          }}
+        >
+          {m.channels_ignore_everywhere()}
+        </button>
+      </div>
+    </div>
+  {/each}
+
   {#each deletedElsewhere as room (room.channel_id)}
     <!-- The registry says this room was deleted, but this device still runs
          it: a restore from an older backup, or a delete on another device.
@@ -4210,6 +4265,24 @@
                             type="button"
                             role="menuitem"
                             tabindex="-1"
+                            disabled={mem.banned || selectedBanned || friendRelation === 'mutual' || ignoreScope !== 'none' || $appSettings?.room_dm_policy === 'off'}
+                            title={selectedBanned
+                              ? m.channels_you_are_banned()
+                              : mem.banned
+                                ? m.channels_dm_member_banned()
+                                : friendRelation === 'mutual'
+                                  ? m.channels_dm_is_friend()
+                                  : ignoreScope !== 'none'
+                                    ? m.channels_dm_ignored()
+                                    : $appSettings?.room_dm_policy === 'off'
+                                      ? m.channels_dm_policy_off()
+                                      : undefined}
+                            onclick={(e) => { closeCardMenu(e.currentTarget); openPrivateChat(mem.member_pubkey, mem.nickname || roomMemberLabel(mem)); }}
+                          >{m.channels_dm_message_privately()}</button>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            tabindex="-1"
                             disabled={addingFriend.includes(mem.member_pubkey) || friendRelation !== 'none'}
                             onclick={(e) => { closeCardMenu(e.currentTarget); handleAddFriend(mem); }}
                           >{friendRelation === 'mutual'
@@ -4959,6 +5032,13 @@
     display: flex;
     gap: 6px;
     flex-shrink: 0;
+  }
+
+  .dm-request-preview {
+    display: block;
+    margin-top: 2px;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
   }
 
   .banner {

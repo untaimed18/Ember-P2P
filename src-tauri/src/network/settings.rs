@@ -92,6 +92,7 @@ pub(super) fn apply_network_settings(
         reset_stun_keepalive_session(state);
     }
     state.xfer_offer_policy = new_settings.channel_file_offers.clone();
+    super::room_dm::set_dm_policy(&new_settings.room_dm_policy, new_settings.ignored_members.as_deref());
     state.obfuscation_enabled = new_settings.obfuscation_enabled;
     state.obfuscation_enabled_shared.store(
         new_settings.obfuscation_enabled,

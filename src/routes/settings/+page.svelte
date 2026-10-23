@@ -4705,6 +4705,15 @@
               </div>
               <span class="hint">{m.settings_channel_file_offers_hint()}</span>
             </div>
+            <div class="field">
+              <label for="room-dm-policy">{m.settings_room_dm_policy()}</label>
+              <select id="room-dm-policy" bind:value={settings.room_dm_policy}>
+                <option value="ask">{m.settings_room_dm_policy_ask()}</option>
+                <option value="anyone">{m.settings_room_dm_policy_anyone()}</option>
+                <option value="off">{m.settings_room_dm_policy_off()}</option>
+              </select>
+              <span class="hint">{m.settings_room_dm_policy_hint()}</span>
+            </div>
           </div>
 
           <div class="settings-group">

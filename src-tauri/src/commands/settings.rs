@@ -105,6 +105,8 @@ const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
     // Written by `set_friend_status` from the Friends page, for the same
     // reason: a Settings page opened earlier would put the old one back.
     "friend_status",
+    // Written by `set_ignored_members` from wherever a member is ignored.
+    "ignored_members",
     "shared_folders",
     "previous_download_folders",
     "default_shared_folder_seeded",
@@ -824,6 +826,15 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
+    let dm_policy = settings.room_dm_policy.trim().to_ascii_lowercase();
+    if !crate::types::room_dm_policy_valid(&dm_policy) {
+        settings.room_dm_policy = crate::types::ROOM_DM_POLICY_ASK.to_string();
+        changed = true;
+    } else if dm_policy != settings.room_dm_policy {
+        settings.room_dm_policy = dm_policy;
+        changed = true;
+    }
+
     // Past the attachment size cap the ceiling means nothing, and a hand-edited
     // config with an absurd value should read as "accept everything a friend can
     // send", not overflow the byte arithmetic that compares against it.
@@ -1082,6 +1093,12 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         return Err(coded(
             "settings_channel_file_offers_invalid",
             "Channel file offers must be 'everyone', 'friends', or 'nobody'",
+        ));
+    }
+    if !crate::types::room_dm_policy_valid(&settings.room_dm_policy) {
+        return Err(coded(
+            "settings_room_dm_policy_invalid",
+            "Private messages must be 'ask', 'anyone', or 'off'",
         ));
     }
     if settings.chat_attachment_auto_accept_mb > crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB {
@@ -1504,6 +1521,7 @@ pub async fn update_settings(
     settings.spam_filter_profile = settings.spam_filter_profile.trim().to_ascii_lowercase();
     settings.close_to_tray_behavior = settings.close_to_tray_behavior.trim().to_ascii_lowercase();
     settings.channel_file_offers = settings.channel_file_offers.trim().to_ascii_lowercase();
+    settings.room_dm_policy = settings.room_dm_policy.trim().to_ascii_lowercase();
     settings.chat_disappear_secs = crate::types::normalize_chat_disappear_secs(settings.chat_disappear_secs);
     // Web services are URL templates the user curates, so they are normalised
     // here rather than trusted: each is checked for a http/https scheme, a host

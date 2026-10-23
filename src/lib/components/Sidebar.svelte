@@ -8,6 +8,7 @@
   import { transfers } from '$lib/stores/transfers';
   import { friendRequests, fileOffers } from '$lib/stores/friends';
   import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
+  import { dmRequests, dmUnread } from '$lib/stores/roomDm';
   import { awaitingChannelOffers, totalChannelUnread } from '$lib/stores/channels';
   import * as m from '$lib/paraglide/messages';
   import { plural } from '$lib/plural';
@@ -243,18 +244,22 @@
   // surfaces this so users can spot new messages from any page —
   // previously the only signal was per-friend badges on /friends,
   // which required navigating there to notice activity.
-  let totalUnreadChats = $derived($totalUnread);
+  // Private conversations with room members count too, once accepted. A
+  // request is not unread: it waits on the Channels page, and counts there.
+  let totalUnreadChats = $derived($totalUnread + [...$dmUnread.values()].reduce((sum, n) => sum + n, 0));
   let totalUnreadChannels = $derived($totalChannelUnread);
   let awaitingChannelOfferCount = $derived($awaitingChannelOffers);
-  let channelInboxCount = $derived(totalUnreadChannels + awaitingChannelOfferCount);
+  let dmRequestCount = $derived($dmRequests.length);
+  let channelInboxCount = $derived(totalUnreadChannels + awaitingChannelOfferCount + dmRequestCount);
 
   /** Every nav count caps the same way; the exact figure is in each title. */
   function navCount(n: number): string {
     return n > 99 ? '99+' : String(n);
   }
 
-  function channelInboxTitle(unread: number, offers: number): string {
+  function channelInboxTitle(unread: number, offers: number, requests = 0): string {
     const parts: string[] = [];
+    if (requests > 0) parts.push(m.channels_dm_requests_title({ count: requests }));
     if (unread > 0) {
       parts.push(
         plural(unread, {
@@ -538,8 +543,8 @@
           {#if item.id === 'channels' && channelInboxCount > 0}
             <span
               class="nav-badge"
-              class:nav-badge-attention={awaitingChannelOfferCount > 0}
-              title={channelInboxTitle(totalUnreadChannels, awaitingChannelOfferCount)}
+              class:nav-badge-attention={awaitingChannelOfferCount > 0 || dmRequestCount > 0}
+              title={channelInboxTitle(totalUnreadChannels, awaitingChannelOfferCount, dmRequestCount)}
             >{navCount(channelInboxCount)}</span>
           {/if}
         </a>

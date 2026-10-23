@@ -1535,7 +1535,10 @@ pub(super) async fn handle_inbound_channel_gossip(
             }
             Some(ext) => {
                 note_gossip_proven(&gossip.msg_id, &plain);
-                handle_inbound_channel_ext(
+                // Relayed under the same rules as any extension frame first:
+                // whether it is to us must make no difference to that.
+                let private = (ext.kind == ember::channel::EXT_KIND_PRIVATE_MESSAGE).then(|| ext.clone());
+                let passed = handle_inbound_channel_ext(
                     socket,
                     state,
                     db,
@@ -1548,6 +1551,18 @@ pub(super) async fn handle_inbound_channel_gossip(
                     dedup_key,
                 )
                 .await;
+                if let Some(ext) = private.filter(|_| passed) {
+                    super::room_dm::on_private_message(
+                        state,
+                        db,
+                        app_handle,
+                        &gossip,
+                        &channel_id_hex,
+                        &ext,
+                        opened,
+                    )
+                    .await;
+                }
             }
             None => debug!(
                 "Ember channel gossip: dropped an extension frame in {channel_id_hex} that did \
@@ -3722,6 +3737,9 @@ pub(super) async fn handle_inbound_channel_reactions(
 ///
 /// A displayable frame of a kind this build cannot read is noted against the
 /// room, so it can tell its user something there needs a newer Ember.
+///
+/// Returns whether the frame met those rules, which a kind this build reads
+/// alongside, a private message ([`super::room_dm`]), has to as well.
 #[allow(clippy::too_many_arguments)]
 async fn handle_inbound_channel_ext(
     socket: &UdpSocket,
@@ -3734,16 +3752,16 @@ async fn handle_inbound_channel_ext(
     from_id: ember::dht::EmberNodeId,
     opened: ember::channel::OpenedUnder,
     dedup_key: [u8; 16],
-) {
+) -> bool {
     if channel_member_banned(state, db, gossip.channel_id, &ext.sender) {
-        return;
+        return false;
     }
     if opened == ember::channel::OpenedUnder::Retired
         && !channel_member_on_roster(state, db, gossip.channel_id, &ext.sender)
     {
         // As for chat: the same frame may yet arrive under the current key.
         forget_channel_gossip(state, &dedup_key);
-        return;
+        return false;
     }
     // Ahead of the relay, so a member flooding a kind nobody here reads is not
     // carried on by us any more than a member flooding chat is. A stale frame
@@ -3755,7 +3773,7 @@ async fn handle_inbound_channel_ext(
     if fresh && !channel_author_gossip_ok(state, gossip.channel_id, &ext.sender) {
         forget_channel_gossip(state, &dedup_key);
         debug!("Ember channel gossip: rate-limited extension frame in {channel_id_hex}");
-        return;
+        return false;
     }
     note_channel_member_alive(
         state,
@@ -3793,6 +3811,7 @@ async fn handle_inbound_channel_ext(
     if let Some(next) = gossip.decremented_ttl().filter(|_| fresh) {
         fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
     }
+    true
 }
 
 pub(super) async fn reply_channel_history_sync(

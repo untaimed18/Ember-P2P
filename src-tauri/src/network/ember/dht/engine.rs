@@ -2152,6 +2152,13 @@ impl EmberDht {
     /// Build a signed `CHANNEL_RELAY` frame for a HighID overlay hop.
     pub fn build_channel_relay(&mut self, body: Vec<u8>) -> (u32, Vec<u8>) {
         let request_id = self.next_request_id();
+        if body.len() > messages::MAX_DELIVERABLE_PAYLOAD {
+            tracing::debug!(
+                "Ember channel relay: a {}-byte envelope does not fit a datagram; not sent",
+                body.len()
+            );
+            return (request_id, Vec::new());
+        }
         let msg = messages::build_channel_relay(self.local_id, request_id, body);
         let bytes = messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub);
         (request_id, bytes)

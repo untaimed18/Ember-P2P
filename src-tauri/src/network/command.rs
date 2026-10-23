@@ -3397,6 +3397,13 @@ async fn handle_command_inner(
             }
         }
 
+        NetworkCommand::SendRoomDm { channel_id, member, payload } => {
+            if !settings.ember_native_enabled {
+                return;
+            }
+            super::room_dm::send_private_frame(socket, state, db, channel_id, member, &payload).await;
+        }
+
         NetworkCommand::SendChannelTyping { channel_id, typing } => {
             if !settings.ember_native_enabled {
                 return;

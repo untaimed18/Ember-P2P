@@ -998,6 +998,12 @@ export interface AppSettings {
   /** Who may offer you a file in a channel. Gates the prompt only — accepting
    *  is always a separate, explicit choice. */
   channel_file_offers: 'everyone' | 'friends' | 'nobody';
+  /** Who may send a private message through a room you share. */
+  room_dm_policy: 'ask' | 'anyone' | 'off';
+  /** Room members you ignore, kept by the backend so their private messages
+   *  are dropped before they are stored. Null until the webview's own list
+   *  has been moved here. Written only through `set_ignored_members`. */
+  ignored_members: { pubkey: string; name: string; rooms?: string[] | null }[] | null;
   /** Files a friend sends in chat at or under this many MB download without
    *  asking; larger ones wait for an accept. 0 always asks. At most 2048. */
   chat_attachment_auto_accept_mb: number;

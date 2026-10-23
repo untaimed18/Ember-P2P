@@ -1178,6 +1178,7 @@ pub fn run() {
             auto_update::scheduler::spawn(app_handle.clone());
             ipfilter_update::spawn(app_handle.clone());
             commands::channel_recovery::spawn_startup_scan(app_handle.clone());
+            commands::room_dm::spawn_resends(app_handle.clone());
 
             // Non-silent recovery notice: if config.json was corrupt at load,
             // tell the user (their settings were reset to defaults; the original
@@ -2547,6 +2548,14 @@ pub fn run() {
             commands::channels::delete_owned_channel,
             commands::channels::list_rooms_deleted_elsewhere,
             commands::channels::confirm_room_deleted_elsewhere,
+            commands::room_dm::list_room_dm_threads,
+            commands::room_dm::get_room_dm_messages,
+            commands::room_dm::send_room_dm,
+            commands::room_dm::answer_room_dm_request,
+            commands::room_dm::mark_room_dm_read,
+            commands::room_dm::delete_room_dm_thread,
+            commands::room_dm::retry_room_dm,
+            commands::room_dm::set_ignored_members,
             commands::channels::get_channel_invite,
             commands::channels::list_channel_members,
             commands::channels::channel_presence_config,

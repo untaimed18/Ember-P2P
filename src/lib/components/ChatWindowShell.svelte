@@ -3,6 +3,7 @@
   import ChatDock from '$lib/components/ChatDock.svelte';
   import Toast from '$lib/components/Toast.svelte';
   import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
+  import { initRoomDmStore, cleanupRoomDmStore } from '$lib/stores/roomDm';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { loadAppSettings, clearAppSettings, setAppSettings } from '$lib/stores/settings';
   import { SETTINGS_CHANGED_EVENT } from '$lib/api/settings';
@@ -54,7 +55,7 @@
     window.addEventListener('focus', onFocus);
 
     void (async () => {
-      const outcomes = await Promise.allSettled([initFriendsStore(), loadAppSettings()]);
+      const outcomes = await Promise.allSettled([initFriendsStore(), loadAppSettings(), initRoomDmStore()]);
       for (const outcome of outcomes) {
         if (outcome.status === 'rejected') console.error('Chat window store failed:', outcome.reason);
       }
@@ -76,6 +77,7 @@
       teardown?.();
       cleanupTheme();
       cleanupFriendsStore();
+      cleanupRoomDmStore();
       clearAllToasts();
       clearAppSettings();
     };

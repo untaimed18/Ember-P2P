@@ -74,6 +74,7 @@ pub mod emule_import;
 pub mod errors;
 pub mod peers;
 pub mod preview;
+pub mod room_dm;
 pub mod search;
 pub mod security;
 pub mod server;

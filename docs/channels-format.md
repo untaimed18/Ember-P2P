@@ -179,6 +179,7 @@ rather than a longer old one.
 | 29 | `HANDOFF_READY_PROVEN_PLAIN_VERSION` | in use | Handoff-ready plus the successor key's signature; 201 bytes |
 | 30–63 | — | unassigned | The code says they "stay unassigned" |
 | 64–255 | `EXT_KIND_MIN` and up | extension | See below |
+| 66 | `EXT_KIND_PRIVATE_MESSAGE` | in use (after 1.7.5) | [Private message](#private-messages-kind-66), sealed to one member |
 
 The transfer frames (9, 10, 11, 13, 14, 21, 25, 26, 28) share a header,
 `version(1) || sender(32) || target(32) || xfer_id(16)` (`XFER_HEADER_LEN`, 81),
@@ -216,7 +217,9 @@ them a meaning.
 **Kinds defined.** From 1.7.5, `UNDERSTOOD_EXT_KINDS` holds 64
 (`EXT_KIND_CHAT_LINE`) and 65 (`EXT_KIND_CHAT_EDIT`), the second version of
 the chat line and of its revision, under [Chat v2](#chat-v2-kinds-64-and-65).
-66–255 are unassigned. A kind is added to that list by the build that first
+The build after 1.7.5 adds 66 (`EXT_KIND_PRIVATE_MESSAGE`), under
+[Private messages](#private-messages-kind-66). 67–255 are unassigned. A kind
+is added to that list by the build that first
 gives it a meaning; `ext_kind_understood` is true for those kinds only, and a
 `channel_newer_frames` row of such a kind stops counting once a build knows it.
 
@@ -455,6 +458,88 @@ builds, and pairs them as above. 1.8.0 is also the release that stops
 publishing v1 membership records
 ([item 9](#the-transition-and-the-cut-over-in-180)), so a room has one
 cut-over to test.
+
+## Private messages (kind 66)
+
+A message from one member to another, carried by the room like chat and
+sealed to the recipient (`network/ember/room_dm.rs`). Added after 1.7.5: an
+extension kind is what the freeze allows, so nothing frozen changes. `flags`
+is always 0, and a frame of this kind with any flag set is dropped unread: a
+displayable one would have older builds tell the room a private message
+passed. A build that cannot read the kind relays it under chat's rules (ban,
+retired-key roster check, author rate) and shows nothing. It is not stored
+for catch-up.
+
+Body: `version(1) = 1 || tag(16) || nonce(24) || ciphertext`.
+
+- **Pairwise secret.** `derive_pairwise_capability(seed, peer, "ch-dm-v1" ||
+  channel_id, 0)`, never `derive_chat_key`, whose key depends on the two
+  identities alone and would make a room message open as friend chat.
+  `tag_key = BLAKE3_derive_key("ember room private message tag v1", secret)`
+  and `seal_key = BLAKE3_derive_key("ember room private message key v1",
+  secret)` (`PairwiseBase`).
+- **Tag.** `BLAKE3_keyed(tag_key, msg_id)[..16]`: only the two members can
+  compute it, and it differs on every envelope, so relays cannot group frames
+  by recipient. A receiver keeps one `PairwiseBase` per sender and room, and
+  derives one only for a sender on the room's roster.
+- **Ciphertext.** XChaCha20-Poly1305 under `seal_key` with a random 24-byte
+  nonce, associated data `"ember-room-dm-v1\0" || channel_id || msg_id ||
+  timestamp (i64 LE) || sender || tag`, so a body cannot be moved into
+  another envelope, room or sender.
+- **Plaintext.** `type(1) || len(2, LE) || fields`, zero-padded to exactly
+  256, 960 or `DM_TOP_BUCKET` bytes. Any other length, a non-zero pad byte, or
+  a body shorter than the smallest bucket's (313 bytes) is refused. 960 keeps
+  a middle-sized frame unfragmented, relay envelope and all.
+  `DM_TOP_BUCKET` is what one datagram leaves once the overlay relay envelope
+  (33), the gossip envelope, the extension header and the body's own 57 bytes
+  are counted (3670); the text cap, `DM_TEXT_MAX_BYTES`, is that less `type ||
+  len || message_id` (3651). Types and their fields, exactly: 1 message
+  (`message_id(16) || UTF-8 text`), 2 receipt (`message_id(16)`), 3 accept
+  (none), 4 decline (none). One kind of frame for all four, so relays cannot
+  tell a message from a receipt.
+
+**Receiving** (`network::room_dm::on_private_message`). Only after the frame
+met the relay rules, only under the room's current key, only within
+`DM_MAX_AGE_SECS` of its envelope time (the 10-minute relay window, inside
+which a frame is also charged to its author; at most 5 minutes ahead), only
+from a sender on the roster, and never our own. A sender the user ignores
+(`settings.ignored_members`, everywhere or in that room) is dropped before
+anything is kept or answered. A message is kept only from a member the room's
+roster has seen and not banned; then `room_dm_policy` decides: `off` declines
+everything, a resend of something already held included; `anyone` opens a
+conversation; `ask` (the default) holds a new one as a request, at most
+`DM_REQUESTS_PER_ROOM_HOUR` (5) new requests per room an hour. A request
+holds at most `DM_REQUEST_MESSAGES_MAX` (20) messages until answered, at most
+`DM_STORED_PER_SENDER_HOUR` (120) are kept from one member an hour, and a
+conversation keeps its newest `DM_THREAD_MESSAGES_KEPT` (2000). A sender the
+user declined, or whose request was deleted, is declined for
+`DM_DECLINE_MEMORY_SECS` (7 days).
+
+A kept message or a resend of one is answered with a receipt, a declined one
+with a decline; anything over a cap is dropped unanswered. Replies wait a
+random 10 to 90 seconds (`queue_reply`): every member sees who sent each
+frame, and a receipt right behind a message would say whom it was for. A
+member draws at most 30 replies and one decline from us in 10 minutes, and at
+most 2 go out a second in all, so nobody can spend our author rate for us and
+crowd out our chat. An accept or decline is recorded only in a conversation
+open on our side (one we wrote in or accepted), and only if its envelope is
+newer than the answer already held, so a replayed old one cannot undo a later
+one. Their decline stops our pending messages and lasts 7 days, as ours does.
+
+**Sending** (`commands::room_dm`). Through a room both are in, the one the
+conversation last used while both remain. Each message keeps its
+`message_id` and is resent under a fresh envelope every 2 minutes until a
+receipt, for 20 minutes, then marked not delivered. Nothing to a friend
+(friend chat is the place), to someone whose decline holds, with no shared
+room, or while `room_dm_policy` is `off`, which also stops what is still
+being sent; Try again meets the same rules.
+
+**Limits.** The ed25519 signature covers the ciphertext, so a message is not
+deniable: a recipient who gives away `seal_key` (which does not give away
+their identity) lets anyone check that the sender wrote that text. There is
+no forward secrecy. Members passing a frame learn that its sender sent a
+private message, and the delayed reply blurs, but does not remove, the link
+to whoever answers.
 
 ## DHT channel records
 

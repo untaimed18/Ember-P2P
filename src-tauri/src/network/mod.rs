@@ -33,6 +33,7 @@ mod persistence;
 mod publishing;
 pub(crate) mod reachability;
 pub mod rendezvous;
+pub(crate) mod room_dm;
 mod search;
 mod server;
 mod settings;
@@ -824,6 +825,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // files land; `apply_network_settings` keeps it current from here.
     crate::storage::category_folders::set_folders(&settings.download_category_folders);
     crate::sharing::name_tag::set_tag_completed_downloads(settings.tag_completed_downloads);
+    room_dm::set_dm_policy(&settings.room_dm_policy, settings.ignored_members.as_deref());
 
     let mut state = NetworkState {
         local_id,
@@ -3778,6 +3780,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // `select!`'s branch limit. It keeps its own cadence.
                 on_chat_mailbox_tick(&mut state, &db, &app_handle, &settings, ed25519_secret_key, ed25519_pubkey);
                 on_idle_check(&mut state, &settings, &app_handle, &ed25519_secret_key).await;
+                if settings.ember_native_enabled {
+                    room_dm::send_due_replies(&udp_socket, &mut state, &db).await;
+                }
             }
 
             // Buddy system: find a relay buddy if firewalled (always-on, like eMule)
