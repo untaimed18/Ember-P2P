@@ -385,6 +385,12 @@ pub struct GatheredChannelInfo {
     pub member_count: Option<i64>,
     /// Default language code from the room's signed listing, empty for none.
     pub language: String,
+    /// How many of those present are on our friends list, when the room's
+    /// size was read. Discover never folds away a room a friend is in.
+    pub friends_present: Option<i64>,
+    /// When this device first saw the listing, if it has seen it before.
+    /// Floods of advertising rooms are new; a room listed for weeks is not.
+    pub listed_since: Option<i64>,
 }
 
 pub(crate) async fn require_ember(state: &AppState) -> Result<(), String> {
@@ -5472,11 +5478,13 @@ const PRESENCE_FRESH_SECS: i64 = channel::PRESENCE_FRESH_SECS;
 /// Only the current epoch is asked for. A member who last announced under the
 /// previous key is missed for up to one republish interval. Rooms that time
 /// out or never answer stay `None`; a completed walk with no fresh live
-/// records is stamped 0.
+/// records is stamped 0. Each count comes with how many of those present are
+/// friends: a public room's presence names each member by the identity key
+/// the friends list holds.
 async fn probe_public_member_counts(
     state: &AppState,
     rooms: &[(String, String)],
-) -> Option<std::collections::HashMap<String, i64>> {
+) -> Option<std::collections::HashMap<String, (i64, i64)>> {
     use std::collections::{HashMap, HashSet};
 
     let now = chrono::Utc::now().timestamp();
@@ -5561,16 +5569,32 @@ async fn probe_public_member_counts(
     // A walked key that completed — including tombstone-only or empty —
     // reports 0 rather than leaving the previous count on screen forever.
     // Timeouts stay absent so the UI does not treat 0 as authoritative.
+    let friend_keys: HashSet<[u8; 32]> = {
+        let db = state.db.clone();
+        tokio::task::spawn_blocking(move || db.get_friend_public_keys())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, key)| key)
+            .collect()
+    };
     let mut out = HashMap::new();
     for id in answered {
-        let count = members.get(&id).map(|seen| {
-            seen.values()
-                .filter(|(ts, departed)| {
-                    !*departed && now.saturating_sub(*ts) <= PRESENCE_FRESH_SECS
-                })
-                .count() as i64
-        }).unwrap_or(0);
-        out.insert(id, count);
+        let present: Vec<&[u8; 32]> = members
+            .get(&id)
+            .map(|seen| {
+                seen.iter()
+                    .filter(|(_, (ts, departed))| {
+                        !*departed && now.saturating_sub(*ts) <= PRESENCE_FRESH_SECS
+                    })
+                    .map(|(key, _)| key)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let friends = present.iter().filter(|key| friend_keys.contains(**key)).count() as i64;
+        out.insert(id, (present.len() as i64, friends));
     }
     Some(out)
 }
@@ -5627,6 +5651,8 @@ fn listings_from_blobs(
                 )
                 .unwrap_or("")
                 .to_string(),
+                friends_present: None,
+                listed_since: None,
             },
             rec.timestamp,
         ));
@@ -5948,6 +5974,8 @@ pub async fn gather_channels(
             private: false,
             member_count: None,
             language,
+            friends_present: None,
+            listed_since: None,
         });
     }
     if !out.is_empty() {
@@ -5989,6 +6017,8 @@ pub async fn gather_channels(
         private: false,
         member_count: None,
         language: c.language,
+        friends_present: None,
+        listed_since: (c.first_seen > 0).then_some(c.first_seen),
     })
     .collect();
     if !unsettled.is_empty() || !directory_read {
@@ -6019,8 +6049,9 @@ pub async fn gather_channels(
     if !probe.is_empty() {
         if let Some(counts) = probe_public_member_counts(&state, &probe).await {
             for item in out.iter_mut() {
-                if let Some(count) = counts.get(&item.channel_id) {
+                if let Some((count, friends)) = counts.get(&item.channel_id) {
                     item.member_count = Some(*count);
+                    item.friends_present = Some(*friends);
                 }
             }
             emit(&out);
@@ -6035,11 +6066,21 @@ pub async fn gather_channels(
             pubkey: c.pubkey.clone(),
             name: c.name.clone(),
             language: c.language.clone(),
+            first_seen: 0,
         })
         .collect();
-    if !listings.is_empty() {
-        let db = state.db.clone();
-        let _ = tokio::task::spawn_blocking(move || db.cache_channel_listings(&listings)).await;
+    let ids: Vec<String> = out.iter().map(|c| c.channel_id.clone()).collect();
+    let db = state.db.clone();
+    let first_seen = tokio::task::spawn_blocking(move || {
+        if !listings.is_empty() {
+            let _ = db.cache_channel_listings(&listings);
+        }
+        db.channel_listings_first_seen(&ids).unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
+    for item in out.iter_mut() {
+        item.listed_since = first_seen.get(&item.channel_id).copied();
     }
 
     Ok(out)
@@ -6083,6 +6124,8 @@ pub async fn cached_channels(
             // walk this cache is standing in for comes back.
             member_count: None,
             language: c.language,
+            friends_present: None,
+            listed_since: (c.first_seen > 0).then_some(c.first_seen),
         })
         .collect())
 }
@@ -7142,6 +7185,8 @@ mod tests {
             joined: false,
             member_count: None,
             language: language.to_string(),
+            friends_present: None,
+            listed_since: None,
         }
     }
 
@@ -7220,6 +7265,7 @@ mod tests {
             pubkey: "00".repeat(32),
             name: format!("Room {first_byte}"),
             language: "de".to_string(),
+            first_seen: 0,
         };
         let rows = || vec![cached(0x03), cached(0x13), cached(0x04), cached(0x05)];
         let ids = |kept: Vec<CachedChannel>| {

@@ -451,6 +451,9 @@ pub struct CachedChannel {
     pub name: String,
     /// Default language code from the listing, empty for none.
     pub language: String,
+    /// When this device first saw the listing, 0 when unknown. Read only:
+    /// [`Database::cache_channel_listings`] sets it itself.
+    pub first_seen: i64,
 }
 
 /// The `channels.pinned_msg_ids` column: comma-separated hex wire ids. Anything
@@ -3533,6 +3536,14 @@ impl Database {
         // The offer behind a received row still waiting on the user, so it can
         // be answered after a restart; see `chat_attach::sweep_interrupted`.
         Self::add_column_if_missing(&conn, "chat_attachments", "inbound_offer", "TEXT")?;
+        // When this device first saw a Discover listing, which Discover's spam
+        // folding reads as the listing's age; 0 for one cached before.
+        Self::add_column_if_missing(
+            &conn,
+            "channel_index_cache",
+            "first_seen",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         // What the user calls a friend, kept apart from `nickname`, which is
         // what the friend calls themselves and follows their own renames. Outside
         // the numbered chain so 1.7.0 still opens the database; it never reads
@@ -8991,13 +9002,14 @@ impl Database {
         let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO channel_index_cache (channel_id, pubkey, name, language, last_seen)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO channel_index_cache (channel_id, pubkey, name, language, last_seen, first_seen)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)
                  ON CONFLICT(channel_id) DO UPDATE SET
                     pubkey = excluded.pubkey,
                     name = excluded.name,
                     language = excluded.language,
-                    last_seen = excluded.last_seen",
+                    last_seen = excluded.last_seen,
+                    first_seen = CASE WHEN first_seen = 0 THEN excluded.first_seen ELSE first_seen END",
             )?;
             for row in rows {
                 stmt.execute(params![row.channel_id, row.pubkey, row.name, row.language, now])?;
@@ -9018,6 +9030,25 @@ impl Database {
         Ok(())
     }
 
+    /// When this device first saw each of `channel_ids` in a Discover walk,
+    /// for those it has a date for.
+    pub fn channel_listings_first_seen(
+        &self,
+        channel_ids: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, i64>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT first_seen FROM channel_index_cache WHERE channel_id = ?1 AND first_seen > 0",
+        )?;
+        let mut out = std::collections::HashMap::new();
+        for id in channel_ids {
+            if let Some(at) = stmt.query_row(params![id], |row| row.get::<_, i64>(0)).optional()? {
+                out.insert(id.clone(), at);
+            }
+        }
+        Ok(out)
+    }
+
     /// Rooms an earlier Discover walk found, most recently seen first. The age
     /// bound is applied here too: the prune runs only when a walk turns
     /// something up, and a device whose walks keep failing would otherwise go
@@ -9026,7 +9057,7 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT channel_id, pubkey, name, language FROM channel_index_cache
+            "SELECT channel_id, pubkey, name, language, first_seen FROM channel_index_cache
              WHERE last_seen >= ?1
              ORDER BY last_seen DESC",
         )?;
@@ -9037,6 +9068,7 @@ impl Database {
                     pubkey: row.get(1)?,
                     name: row.get(2)?,
                     language: row.get(3)?,
+                    first_seen: row.get(4)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -20901,11 +20933,25 @@ mod tests {
             pubkey: "01".repeat(32),
             name: "Tokyo".to_string(),
             language: language.to_string(),
+            first_seen: 0,
         };
         db.cache_channel_listings(&[cached("ja")]).unwrap();
         assert_eq!(db.list_cached_channels().unwrap()[0].language, "ja");
         db.cache_channel_listings(&[cached("")]).unwrap();
         assert_eq!(db.list_cached_channels().unwrap()[0].language, "", "a cleared language clears");
+
+        // When this device first saw it is set once and kept by later walks;
+        // a listing cached before the column existed gets one on its next walk.
+        let first = db.list_cached_channels().unwrap()[0].first_seen;
+        assert!(first > 0);
+        db.conn.lock().execute("UPDATE channel_index_cache SET first_seen = 100", []).unwrap();
+        let seen = |db: &Database| db.channel_listings_first_seen(std::slice::from_ref(&created)).unwrap();
+        db.cache_channel_listings(&[cached("ja")]).unwrap();
+        assert_eq!(seen(&db)[&created], 100);
+        db.conn.lock().execute("UPDATE channel_index_cache SET first_seen = 0", []).unwrap();
+        assert!(seen(&db).is_empty(), "unknown");
+        db.cache_channel_listings(&[cached("ja")]).unwrap();
+        assert!(seen(&db)[&created] >= first);
 
         // A joined room starts from its listing's language until the owner's
         // snapshot says otherwise, and only fills a gap.
@@ -20915,6 +20961,7 @@ mod tests {
             pubkey: "02".repeat(32),
             name: "Lobby".to_string(),
             language: language.to_string(),
+            first_seen: 0,
         };
         db.insert_channel(&joined, &"02".repeat(32), "Lobby", "public", false, None, None).unwrap();
         assert!(!db.seed_channel_language_from_listing(&joined).unwrap(), "no listing, nothing to seed");

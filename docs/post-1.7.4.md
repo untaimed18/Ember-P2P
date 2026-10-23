@@ -783,6 +783,13 @@ they matter.
 - **Discover spam folding.** Member counts come from presence records, which
   anyone can sign; friends in the room, or the listing's age, would be better
   signals. Tune `LIKELY_SPAM_SCORE` and `DUPLICATE_NAME_FLOOD` from real use.
+  **Done in 1.7.5:** both signals. The presence probe counts the present
+  members whose key is on the friends list (`friends_present`), and a room a
+  friend is in is never folded. The Discover cache keeps when this device first
+  saw each listing (`channel_index_cache.first_seen`, added at open), and a
+  listing known for two weeks (`LONG_LISTED_SECS`) drops one point: enough to
+  outlive one quirk of its name, never a link. The thresholds stay as they
+  were until real use says otherwise.
 - **Friends, smaller:**
   - The pop-out chat window runs its own copy of the friends store, so the
     shared offer-accept lock does not reach it; the backend's

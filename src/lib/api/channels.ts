@@ -203,6 +203,10 @@ export interface GatheredChannelInfo {
   member_count: number | null;
   /** Default language code from the room's signed listing, empty for none. */
   language: string;
+  /** How many of those present are friends, when the size was read. */
+  friends_present: number | null;
+  /** Unix seconds this device first saw the listing; null when new to it. */
+  listed_since: number | null;
 }
 
 export async function listChannels(): Promise<ChannelInfo[]> {

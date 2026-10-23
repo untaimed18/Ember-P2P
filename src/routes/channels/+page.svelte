@@ -1795,8 +1795,16 @@
     next: GatheredChannelInfo,
     prev: GatheredChannelInfo | undefined,
   ): GatheredChannelInfo {
-    if (next.member_count !== null || !prev || prev.member_count === null) return next;
-    return { ...next, member_count: prev.member_count };
+    if (!prev) return next;
+    // The friends among them are read with the size, so they stand or go
+    // together; when the listing was first seen does not change.
+    const sized =
+      next.member_count !== null || prev.member_count === null
+        ? next
+        : { ...next, member_count: prev.member_count, friends_present: prev.friends_present ?? null };
+    return sized.listed_since == null && prev.listed_since != null
+      ? { ...sized, listed_since: prev.listed_since }
+      : sized;
   }
 
   async function selectChannel(id: string) {
