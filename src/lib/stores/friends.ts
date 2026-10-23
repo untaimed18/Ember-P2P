@@ -314,9 +314,20 @@ export function beginFriendsListFetch(): number {
   return ++friendsFetchTicket;
 }
 
+/** Whether {@link friendsList} holds a list the backend gave, rather than the
+ *  empty one it starts with. */
+let friendsListWritten = false;
+
 function writeFriendsList(friends: FriendInfo[]): void {
+  friendsListWritten = true;
   friendsList.set(friends);
   rememberFriendNames(friends);
+}
+
+/** True once a fetch has filled {@link friendsList}: an empty list is then
+ *  "no friends", not "not loaded". */
+export function friendsListLoaded(): boolean {
+  return friendsListWritten;
 }
 
 /** Publish a fetch's result unless a newer one already landed. Returns
@@ -441,6 +452,9 @@ interface SeedLive {
   requests: Set<string>;
   /** Hash → whether it was cleared, rather than only bumped. */
   unread: Map<string, boolean>;
+  /** Hash → the row ids of the messages that bumped it; `NaN` for an event
+   *  that carried none. */
+  unreadIds: Map<string, number[]>;
   discoverable: boolean;
 }
 let seedLive: SeedLive | null = null;
@@ -640,7 +654,12 @@ export async function initFriendsStore() {
         const beingRead =
           (isAppVisible() && get(activeChatHash) === hash) || chatWindowShows(hash);
         if (!beingRead) {
-          if (seedLive && !seedLive.unread.has(hash)) seedLive.unread.set(hash, false);
+          if (seedLive) {
+            if (!seedLive.unread.has(hash)) seedLive.unread.set(hash, false);
+            const ids = seedLive.unreadIds.get(hash) ?? [];
+            ids.push(typeof p.id === 'number' && p.id > 0 ? p.id : NaN);
+            seedLive.unreadIds.set(hash, ids);
+          }
           unreadCounts.update((m) => {
             const next = new Map(m);
             next.set(hash, (next.get(hash) || 0) + 1);
@@ -981,6 +1000,7 @@ export async function initFriendsStore() {
     idleAway: false,
     requests: new Set(),
     unread: new Map(),
+    unreadIds: new Map(),
     discoverable: false,
   };
   seedLive = live;
@@ -1011,32 +1031,40 @@ export async function initFriendsStore() {
     try {
       // A message is stored before it is announced, so the snapshot is exact
       // for every friend nothing happened to while it was being read. For one
-      // that did, it may or may not include the change: ask once more, and if
-      // that is not quiet either, a clear (which follows a successful
-      // mark-read) stands, and a bump takes the larger count, which can at
-      // worst miss one message.
-      for (let attempt = 0; ; attempt++) {
-        live.unread = new Map();
-        const counts = await getUnreadMessageCounts();
-        if (myEpoch !== storeEpoch) return;
-        const touched = live.unread;
-        if (touched.size > 0 && attempt === 0) continue;
-        const snapshot = new Map<string, number>();
-        for (const [hash, n] of counts) snapshot.set(hash.toLowerCase(), n);
-        unreadCounts.update((cur) => {
-          const next = new Map<string, number>();
-          for (const [hash, n] of snapshot) {
-            if (n > 0 && !touched.has(hash)) next.set(hash, n);
-          }
-          for (const [hash, cleared] of touched) {
-            const now = cur.get(hash) ?? 0;
-            const n = cleared ? now : Math.max(now, snapshot.get(hash) ?? 0);
-            if (n > 0) next.set(hash, n);
-          }
-          return next;
-        });
-        return;
+      // that was bumped meanwhile, the snapshot holds every message up to its
+      // newest unread id and none after: the bumps with a higher id are the
+      // ones to add, and a friend the snapshot leaves out had nothing unread,
+      // so all of its bumps are new. A clear (which follows a successful
+      // mark-read) stands. Only a bump whose event carried no id falls back to
+      // the larger of the two counts.
+      live.unread = new Map();
+      live.unreadIds = new Map();
+      const counts = await getUnreadMessageCounts();
+      if (myEpoch !== storeEpoch) return;
+      const touched = live.unread;
+      const bumpedIds = live.unreadIds;
+      const snapshot = new Map<string, { count: number; newest: number }>();
+      for (const [hash, count, newest] of counts) {
+        snapshot.set(hash.toLowerCase(), { count, newest: Number(newest) || 0 });
       }
+      unreadCounts.update((cur) => {
+        const next = new Map<string, number>();
+        for (const [hash, { count }] of snapshot) {
+          if (count > 0 && !touched.has(hash)) next.set(hash, count);
+        }
+        for (const [hash, cleared] of touched) {
+          const now = cur.get(hash) ?? 0;
+          const seen = snapshot.get(hash);
+          const ids = bumpedIds.get(hash) ?? [];
+          let n: number;
+          if (cleared) n = now;
+          else if (ids.every(Number.isFinite)) {
+            n = (seen?.count ?? 0) + ids.filter((id) => id > (seen?.newest ?? 0)).length;
+          } else n = Math.max(now, seen?.count ?? 0);
+          if (n > 0) next.set(hash, n);
+        }
+        return next;
+      });
     } catch (e) {
       noteFriendsSeedFailure('getUnreadMessageCounts', e);
     }

@@ -186,7 +186,10 @@ export async function sendChatTyping(userHashHex: string, typing: boolean): Prom
   return invoke('send_chat_typing', { userHashHex, typing });
 }
 
-export async function getUnreadMessageCounts(): Promise<[string, number][]> {
+/** Per friend: `[hash, unread, newest unread row id]`. A message stored after
+ *  the count has a higher id, which is how a live bump is told apart from one
+ *  the count already holds. */
+export async function getUnreadMessageCounts(): Promise<[string, number, number][]> {
   return invoke('get_unread_message_counts');
 }
 

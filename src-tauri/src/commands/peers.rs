@@ -1248,7 +1248,7 @@ pub async fn send_chat_typing(
 #[tauri::command]
 pub async fn get_unread_message_counts(
     state: tauri::State<'_, AppState>,
-) -> Result<Vec<(String, i64)>, String> {
+) -> Result<Vec<(String, i64, i64)>, String> {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.unread_message_counts())
         .await

@@ -300,9 +300,12 @@
     }
     if (fatal.length > 0) throw fatal[0];
     try {
-      const { getFriends } = await import('$lib/api/friends');
-      const list = await getFriends();
-      retainChatTabs(list.map((f) => f.user_hash));
+      // The friends store has just seeded the list; a second `get_friends`
+      // here only raced it. Fetched only when that seed did not land.
+      const { friendsList, friendsListLoaded, refreshFriendsList } = await import('$lib/stores/friends');
+      const { get: getStore } = await import('svelte/store');
+      const list = friendsListLoaded() ? getStore(friendsList) : await refreshFriendsList();
+      if (list) retainChatTabs(list.map((f) => f.user_hash));
     } catch (e) {
       console.warn('friends: chat-tab reconcile failed', e);
     }

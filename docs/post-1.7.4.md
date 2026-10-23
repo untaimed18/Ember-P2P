@@ -776,18 +776,19 @@ they matter.
 - **Friends, smaller:**
   - The pop-out chat window runs its own copy of the friends store, so the
     shared offer-accept lock does not reach it; the backend's
-    `already_queued` answer covers the double accept.
-  - Unread counts on startup can still miss one message if messages arrive
-    during both seed fetches; the backend returning the newest message id
-    with each count would make them exact.
-  - Derive the Friends page's firewall state from `$networkStats` instead of
-    its own fetch and listener, and reuse `friendsList` in the layout instead
-    of a second `getFriends`.
-  - The hash-probe exemption trusts a claimed user hash. A request under a
-    mutual friend's eD2K user hash is not counted toward the probe ban, so
-    someone spoofing that hash can probe without being banned (the answers
-    are the same either way). Matching the friend's live session address
-    would close it.
+    `already_queued` answer covers the double accept. Left as it is.
+  - **Done in 1.7.5:** startup unread counts are exact.
+    `get_unread_message_counts` returns each friend's newest unread row id
+    with the count, and the seed adds only the live bumps with a higher id
+    (all of them for a friend the count left out), in one fetch instead of
+    two. Only an event without a row id falls back to the larger count.
+  - **Done in 1.7.5:** the Friends page reads its firewall state from
+    `$networkStats`, and the layout reconciles chat tabs from the
+    `friendsList` the store seeded (`friendsListLoaded`), fetching only when
+    that seed failed.
+  - **Done before 1.7.5:** the hash-probe exemption no longer trusts a claimed
+    user hash. Only a mutual friend on a secure-v2 session is exempt
+    (`note_unservable_file_request`).
 
 ## Known limits
 

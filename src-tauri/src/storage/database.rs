@@ -8842,7 +8842,11 @@ impl Database {
         Ok(Some(id))
     }
 
-    pub fn unread_message_counts(&self) -> anyhow::Result<Vec<(String, i64)>> {
+    /// Per friend: unread received messages, and the newest one's row id. A
+    /// message stored after the count was taken has a higher id, so a caller
+    /// that also heard of messages live can tell which of them the count
+    /// already holds.
+    pub fn unread_message_counts(&self) -> anyhow::Result<Vec<(String, i64, i64)>> {
         let conn = self.conn.lock();
         // `direction = 'received'` for the same reason the channel tally in
         // `list_channels` carries it: unread means "they said something I have
@@ -8852,11 +8856,11 @@ impl Database {
         // that would surface the omission is a row written by some future path
         // that forgets, and it would surface as a badge the user cannot clear.
         let mut stmt = conn.prepare(
-            "SELECT friend_hash, COUNT(*) FROM chat_messages \
+            "SELECT friend_hash, COUNT(*), MAX(id) FROM chat_messages \
              WHERE read = 0 AND direction = 'received' GROUP BY friend_hash",
         )?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -20412,7 +20416,7 @@ mod tests {
         let db = Database::open_at(&path).expect("open db");
 
         let friend = "ab".repeat(8);
-        db.insert_chat_message(&friend, "received", "hello")
+        let inbound = db.insert_chat_message(&friend, "received", "hello")
             .expect("inbound");
         db.insert_chat_message(&friend, "sent", "mine")
             .expect("outbound");
@@ -20431,8 +20435,8 @@ mod tests {
         let counts = db.unread_message_counts().expect("counts");
         assert_eq!(
             counts,
-            vec![(friend.clone(), 1)],
-            "only the inbound line is unread"
+            vec![(friend.clone(), 1, inbound)],
+            "only the inbound line is unread, and it is the newest"
         );
 
         drop(db);

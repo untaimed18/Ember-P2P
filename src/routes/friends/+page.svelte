@@ -1,7 +1,7 @@
 <script lang="ts">
   import { getFriends, addFriend, removeFriend, blockFriend, unblockFriend, getBlockedFriends, isChatLocked, updateFriendNickname, getMyEmberHash, resetFriendCode, acceptFriendRequest, rejectFriendRequest, retryFriendSearch, type FriendInfo, type FriendRequestInfo, type BlockedInfo } from '$lib/api/friends';
   import { carriesIntroSecret, friendHashFromCode, isAcceptedFriendInput } from '$lib/friendCode';
-  import { getNetworkStats, kadRecheckFirewall } from '$lib/api/kad';
+  import { kadRecheckFirewall } from '$lib/api/kad';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import BrowseFriendDialog from '$lib/components/BrowseFriendDialog.svelte';
   import { openChat as openChatTab, removeChatForFriend, renameTab as renameChatTab, retainChatTabs } from '$lib/stores/chatTabs';
@@ -182,7 +182,9 @@
   });
   let searchingFriends: Set<string> = $derived($searchingFriendsStore);
   let reconnectingFriends = $state(new Set<string>());
-  let isFirewalled = $state(false);
+  // The shared store, which the `firewall-status` event and the app-wide poll
+  // both keep current; a fetch and listener of the page's own duplicated it.
+  let isFirewalled = $derived($networkStats.firewalled);
   // A symmetric NAT re-maps per destination, so hole punching cannot get
   // through and a firewalled friend genuinely cannot be reached without port
   // forwarding. Every other NAT class can be punched, so the advice differs.
@@ -405,6 +407,11 @@
     recheckTimer = setTimeout(() => { recheckingFirewall = false; }, 5000);
   }
 
+  // A recheck that found us reachable is done, whenever the store hears it.
+  $effect(() => {
+    if (!isFirewalled) recheckingFirewall = false;
+  });
+
   $effect(() => {
     const addParam = $page.url.searchParams.get('add');
     if (!addParam) return;
@@ -433,10 +440,6 @@
         console.warn('friends: failed to read chat lock state:', e);
         if (!destroyed) chatLocked = true;
       });
-    getNetworkStats()
-      .then(s => { if (!destroyed) isFirewalled = s.firewalled; })
-      .catch((e) => { console.warn('friends: initial getNetworkStats failed:', e); });
-
     const unlistenFns: (() => void)[] = [];
 
     // Page-local listeners for side effects not already covered by the shared
@@ -448,14 +451,6 @@
     // 'ember:friend-confirmed' is likewise left to the store, whose debounced
     // refresh writes the same `friendsList` this page renders from; a reload
     // here per event doubled the `get_friends` calls of every rediscovery sweep.
-
-    listen<{ firewalled: boolean }>('firewall-status', (event) => {
-      if (destroyed) return;
-      if (typeof event.payload?.firewalled !== 'boolean') return;
-      isFirewalled = event.payload.firewalled;
-      if (!event.payload.firewalled) recheckingFirewall = false;
-    }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); })
-      .catch((e) => console.error('friends: failed to register firewall-status listener', e));
 
     listen<{ user_hash: string; reason?: string; legacy_code?: boolean }>('ember:friend-search-failed', (event) => {
       if (destroyed) return;
