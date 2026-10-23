@@ -58,6 +58,36 @@ and answer them; nothing else (friend sessions, file search, publishing a
 library) changes identity; and the per-publisher and per-address budgets
 still bind.
 
+**Looked into after 1.7.5, and deferred until it can go through a relay.**
+What the code showed:
+
+- **The DHT key alone is not the identity a storer sees.** Every frame rides
+  a Noise session keyed by the node's long-term static Noise key, which is
+  generated apart from the ed25519 identity and is just as linkable. The
+  receiver does not bind the session to the frame's `sender_id`, so a
+  throwaway ed25519 key could ride the existing session, but it would hide
+  nothing: the Noise key ties it back. Hiding the identity needs a fresh
+  Noise key and session too, per throwaway identity.
+- **The address ties it back anyway.** Without a relay, the storer sees the
+  sender's IP address, which for most home connections holds for days or
+  months, so a storer that logs addresses links one member's rooms however
+  often the keys change. A fresh identity and Noise key would only defeat a
+  storer that keeps keys and not addresses, and links across an address
+  change.
+- **No proof of work or verified-contact gate exists** for STORE or
+  FIND_VALUE, and the per-publisher cap is charged to the record's signed
+  author, not the sender, so a throwaway sender is accepted as readily as the
+  long-term one and gets no budget of its own.
+
+Decided: building fresh-key sessions per room for that small gain is not
+worth the complexity in the transport. The version that hides the member is
+the one that also hides the address: membership STOREs and lookups sent
+through a one-hop relay (a HighID peer or the rendezvous relay), under a
+throwaway identity and Noise key, so the storer sees the relay's address and
+a key it has never seen. That is its own project, and feed lookups
+(item 3) would use the same path. Until then the limit stands as described
+under **Why**.
+
 ## 2. Private messages between room members
 
 **Why:** two people in a room have no way to talk privately except becoming
