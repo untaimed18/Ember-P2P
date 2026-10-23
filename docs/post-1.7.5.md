@@ -154,6 +154,264 @@ storing or counting it; a banned or ignored sender's message is dropped; the
 first message is held as a request and not notified as unread; receipts stop
 resends; a message to someone with no shared room is refused.
 
+## 3. Follow a publisher (feeds)
+
+**Why:** on eD2K you find things by searching and hoping: names are
+unreliable, fakes are common, and nothing tells you when someone you trust
+shares something new. Ember already gives every user a signed identity, a DHT
+that stores records signed by it, and collections that carry Ember's content
+hash. A feed puts them together: a publisher keeps a signed, updatable list of
+files under their identity, and anyone can follow it. Followers see what is
+new, and can have it downloaded for them. No eMule-compatible client can offer
+this, because none has identities to sign with.
+
+**Decided:**
+
+- **A feed belongs to an identity.** It is signed by the publisher's Ember
+  identity key, the one their friends and rooms already know. One identity
+  can have several feeds (at most 8), each told apart by a random 16-byte
+  salt, as owned rooms are (`channel::owned_rooms_key`).
+- **Two parts: a small signed head in the DHT, and the list as a file.** A
+  feed can hold far more than a DHT record fits
+  (`MAX_STORE_RECORD_BYTES`), so the record only points at the current list.
+  The list is an ordinary collection file, fetched like any download.
+- **Following is opt-in per feed, and auto-download more so.** A followed
+  feed shows what is new. It downloads nothing until the user turns on
+  auto-download for that feed.
+- **No public directory in the first version.** A feed is found through a
+  link, a friend or a room, never through a global list that spam would
+  fill on day one.
+
+**The head record.** A new record type, `RECORD_TYPE_FEED` (0x04), with the
+header and trailer framing of channel records. It is filed under
+`feed_key = BLAKE3("ember-feed-v1" || publisher_pubkey || salt)[..16]`, which
+storers recompute from the record and refuse when it differs, as they do for
+kind 7. Signed by the identity key. Extra:
+`version(1) || sequence(8) || list_ed2k_hash(16) || list_size(8) ||
+list_blake3(32) || item_count(4) || title_len(1) || title || description_len(2)
+|| description`. Title at most 64 bytes, description at most 256. The highest
+`sequence` wins, with a newer timestamp breaking ties (as
+`moderation_supersedes` does), so a storer never goes back to an older list.
+TTL 30 days, like channel governance records. The publisher republishes
+daily and on every change.
+
+**The list.** A collection file (`network/ed2k/collection.rs`, format v2)
+whose entries carry name, size, eD2K hash, AICH hash and Ember BLAKE3 digest,
+with the feed title as its name and the publisher's nickname as author. The
+head commits to its eD2K and BLAKE3 hashes, so the list needs no signature of
+its own: a list that does not match the signed head is discarded. At most
+2,000 items. Each item may carry a short note (a new tag, at most 256 bytes),
+which eMule's collection reader skips like any unknown tag. The publisher
+keeps the list under the app data folder, not in a shared folder. It is
+shared hidden: it answers download requests and has Ember source records,
+but never appears in the Library, a friend's browse or keyword search.
+Followers keep and serve the latest list for as long as they follow, so it
+stays reachable when the publisher is offline.
+
+**Following.**
+
+- **Links.** `ember-feed:<publisher>/<salt>` in base32, plus an
+  `https://emberp2p.org/feed/...` form the website can later turn into a
+  landing page. Both go through the existing deep-link handler.
+- **Elsewhere.** "Feeds" on a friend's card. A feed link in a room message
+  renders as a card with a Follow button.
+- **Polling.** Followers look up the head on startup and then every 30
+  minutes with jitter. Publishing also pushes the new head to online friends
+  over the friend session, so friends see an update at once.
+- **New items.** When a newer head arrives, the follower fetches the list,
+  works out what is new against the list it holds, and marks the feed
+  unread. Items the publisher removed stay downloaded and are shown as
+  removed.
+
+**Auto-download (off by default, per feed).** Each feed has its own size cap
+per item and per day, plus a category and folder. Files Ember never
+auto-tags (executables, scripts, app data; the `NEVER_AUTO_TAG_EXTENSIONS`
+idea) are never auto-downloaded and have to be started by hand. Nothing is
+started when the file would leave less free space than a headroom like the
+64 MiB friend attachments keep (`ATTACH_DISK_HEADROOM`). Every auto-started
+download is labelled with its feed in Transfers.
+
+**Publishing.** "Add to feed…" on Library rows (the selection or one file),
+and a feed editor with title, description, reordering and removal.
+Publishing bumps `sequence`, rebuilds the list and republishes the head.
+Only files the user shares can be added, so every item has at least one
+source when it is published.
+
+**UI.** A "Following" page in the sidebar listing followed feeds with
+unread counts. Each feed's page shows its items, newest first, with
+Download, Download all new, the auto-download settings and Unfollow. "My
+feeds" sits beside it for publishing. Notifications for new items go under
+the existing notification settings. Strings in all nine languages.
+
+**Safety and privacy.**
+
+- **Names.** Item names and notes go through the same sanitising and spam
+  scoring as search results. A feed whose list fails to parse, or does not
+  match its head, is marked broken rather than shown in part.
+- **Following is not secret.** Storers answering a head lookup learn that
+  someone at this address and identity asked for that feed, and a list's
+  sources learn who fetched it. Item 1's throwaway identity would cover the
+  first, so feed lookups should use it once it exists. The help text says so
+  meanwhile.
+- **Publishing is public by design.** The feed is tied to the publisher's
+  identity, which is the point. The editor says so before the first publish.
+- **Unfollow purges the list and stops serving it.** Downloaded files stay.
+- **A lost identity loses its feeds.** The identity backup already covers
+  this.
+
+**Rollout.** Builds before the one that ships this refuse the new record
+type, as they refuse an unknown channel kind, so heads are stored only on
+nodes that understand them. Early on, with few such nodes, lookups will miss
+more often. The friend-session push and followers republishing the signed
+head they hold (check that storers accept a record whose publisher is not
+the sender, as the proxy-store path does) are the fallbacks. Nothing that
+already exists changes format.
+
+**Questions to settle first:**
+
+- **Who may republish a head.** The publisher only, or any follower
+  re-storing it, which keeps the feed alive while the publisher is away
+  but costs storer budget.
+- **Per-node limits.** Heads per publisher and per address, so a publisher
+  cannot flood the DHT with feeds. 8 feeds per identity is the client's
+  rule, so storers need their own.
+- **Several devices.** Whether one identity on two devices can publish
+  the same feed: the `sequence` race would need the same care as room
+  ownership.
+
+**Tests:**
+- **Keys.** Storers refuse a head whose key does not match its publisher and
+  salt, and keep the highest sequence.
+- **List integrity.** A list that does not hash to the head's hashes is
+  discarded.
+- **New and removed items.** They are computed correctly across sequences,
+  including a removal.
+- **Auto-download limits.** It respects caps, blocked types and free space,
+  and never starts with the switch off.
+- **Hidden list.** It is served but never listed or keyword-published.
+- **Old peers.** A pre-feed build refuses the record cleanly.
+- **Friend push.** A pushed head from a friend is verified like a fetched
+  one.
+- **Unfollow.** It removes the list and its sources.
+
+## 4. Connection doctor
+
+**Why:** LowID and "firewalled" are the most common eD2K support problem, and
+the hardest for a newcomer to fix. Ember already knows most of what is wrong:
+- **Kad firewall checker:** TCP and UDP open or firewalled.
+- **eD2K server:** whether it gave us a LowID (`ed2k_low_id`).
+- **UPnP:** whether ports are mapped, and whether it stood down behind a VPN.
+- **STUN:** NAT type and public ports.
+- **Buddy status.**
+- **Windows Firewall rules:** `security::firewall`.
+
+Today these show only as technical tiles and status dots. Ember also already
+works around much of it with relays, hole punching and buddies, which the user
+never hears about. A doctor puts it into plain words: what works, what does
+not, what Ember is doing about it, and the one thing worth trying next.
+
+**Decided:**
+
+- **One check, one verdict.** Run on demand from Settings > Connection, and
+  offered automatically, once, when a LowID or firewalled state has lasted 10
+  minutes. The result is one of:
+  - **Fully reachable.**
+  - **Reachable through Ember's relays.** Everything works; new
+    connections take a little longer.
+  - **Limited.** Some eMule users cannot download from you, and you reach
+    fewer sources.
+  - **Offline.** The check names what is blocking.
+- **Ember's own help is listed as such.** Relays, hole punching and a Kad
+  buddy appear as things already handled, so a user who cannot change their
+  router knows they are not broken.
+- **Fixes are ranked and concrete.** At most three, most likely first, each
+  with exact steps using the user's own numbers: the ports, the computer's
+  LAN address and the router's address.
+
+**What it checks.** Each check reads state the network loop already holds,
+re-run on demand where that is cheap:
+- **Listen ports:** bound, or taken by another program (often eMule itself,
+  still running).
+- **Windows Firewall:** inbound rules present for the TCP, Kad UDP and QUIC
+  ports (`ensure_firewall_rules`), and whether adding them needs elevation.
+- **UPnP:** off, not found, mapped, refused, or stood down because the
+  router's WAN address is not the one peers see.
+- **Router WAN address:** private or `100.64.0.0/10` (carrier-grade NAT),
+  read from the UPnP gateway. Port forwarding cannot help then; only the
+  ISP or relays can.
+- **Probes from outside:** Kad TCP and UDP firewall results (a fresh cycle
+  on demand), the eD2K server's ID, and the new outside-in probe below.
+- **NAT type:** a symmetric NAT means hole punching to other symmetric
+  peers cannot work, and relays carry those connections.
+- **Ember DHT health:** routing-table contacts and recent lookup answers.
+- **Rendezvous and relays:** whether we are registered, and whether a
+  relay or buddy is available to us now.
+- **Clock skew:** compared with the rendezvous server's `Date`. Signed
+  records and session timestamps go wrong when the clock is far off.
+
+**Outside-in probe.** A new rendezvous endpoint (`POST /v4/reachability`) that
+connects back to the caller's TCP port and sends a short UDP datagram to its
+Kad and QUIC ports, answering with what got through. It is the only check
+that does not depend on finding other peers, so it answers in seconds.
+
+Rules:
+- **Own address only.** It only ever probes the source address of the
+  request, so it cannot be pointed at anyone else.
+- **Rate-limited.** A few probes per address per hour.
+- **What it sends.** A fixed probe that Ember recognises and answers. Any
+  other program on the port sees nothing it would act on.
+- **Optional.** Without the endpoint (an older or third-party rendezvous
+  server), the doctor relies on the Kad and eD2K results and says the
+  check took longer.
+
+**Actions it can take, each after the user confirms:**
+- **Retry UPnP now.**
+- **Add the Windows Firewall rules,** asking for elevation once, through the
+  existing rule code.
+- **Move to free ports** when the configured ones are taken, then
+  restart networking.
+- **Re-run the firewall checks and reconnect the eD2K server.**
+
+It never changes the router, and never turns off a VPN.
+
+**Report.** "Copy report" puts the findings, versions and NAT type on the
+clipboard for support. IP addresses are masked by default, with a switch to
+include them.
+
+**UI.** A "Check connection" button under Settings > Connection. The status
+bar's LowID / firewalled indicator links to it. The results are a short
+list of checks with a passed, failed or skipped mark and a one-line
+explanation each, the verdict on top and the fixes below. Strings in all
+nine languages, with router steps kept generic: "port forwarding", not one
+router brand's menu names.
+
+**Not a client format change.** Everything but the probe is client-side. The
+probe needs the rendezvous server change above, and works without it.
+
+**Questions to settle first:**
+
+- **Probe ports.** Whether the probe also covers the QUIC port when it
+  shares the Kad UDP port (`quic_shares_udp_port`). One datagram may answer
+  both.
+- **IPv6.** Whether to report IPv6 reachability now, or once Ember listens
+  on it.
+- **The automatic offer.** Whether it fits in the first-run flow, or
+  stays a status-bar prompt only.
+
+**Tests:**
+- **Verdicts.** Each one is reached from the right combination of signals,
+  including relayed-but-working and carrier-grade NAT, where port-forwarding
+  advice would be wrong.
+- **Probe scope.** The probe endpoint only ever probes the requester's
+  address, and enforces its rate limit.
+- **Clock skew.** It is reported past the threshold and not under it.
+- **Fixes.** A fix that needs elevation asks once, and reports a refusal
+  plainly.
+- **Missing endpoint.** The doctor still finishes, from Kad and eD2K results
+  alone.
+- **Report.** Copying it masks addresses unless the user chose to include
+  them.
+
 ## Already scheduled for 1.8.0
 
 Decided in 1.7.5 and written into the spec, so that a room has one cut-over to
