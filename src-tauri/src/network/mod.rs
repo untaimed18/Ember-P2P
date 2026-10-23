@@ -648,7 +648,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let buddy_manager = BuddyManager::new(
         local_id,
         user_hash,
-        settings.nickname.clone(),
+        settings.ed2k_nickname(),
         tcp_port,
         udp_port,
         pending_buddy_hashes.clone(),
@@ -873,7 +873,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         stun_sourced_udp_port: None,
         firewalled: !upnp_success,
         firewall_checks_sent: 0,
-        shared_nickname: Arc::new(tokio::sync::RwLock::new(settings.nickname.clone())),
+        shared_nickname: Arc::new(tokio::sync::RwLock::new(settings.ed2k_nickname())),
         peer_nicknames: HashMap::new(),
         publish_pending: HashMap::new(),
         publish_confirmed: 0,

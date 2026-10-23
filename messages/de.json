@@ -2839,6 +2839,8 @@
   "settings_nickname_label": "Spitzname",
   "settings_nickname_placeholder": "Ihr Anzeigename",
   "settings_nickname_hint": "Sichtbar für eMule-Nutzer und eD2K-Server, mit denen Sie verbunden sind, sowie für Ihre Freunde. In Räumen wird stattdessen Ihr Kanal-Benutzername angezeigt.",
+  "settings_nickname_site_tag": "Für eMule-Nutzer die Ember-Website hinter meinem Spitznamen anzeigen",
+  "settings_nickname_site_tag_hint": "eMule-Nutzer und eD2K-Server sehen Sie als „{name}“. Freunde und andere Ember-Nutzer sehen immer nur Ihren Spitznamen.",
   "settings_channel_username_label": "Kanal-Benutzername",
   "settings_channel_username_placeholder": "Ada",
   "settings_channel_username_hint": "2–12 Buchstaben (A–Z) oder Ziffern, ohne Leerzeichen. Wird Personen in Ihren Räumen angezeigt und ist in Ember eindeutig. Getrennt von Ihrem Freundesnamen.",

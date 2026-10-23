@@ -1202,6 +1202,9 @@ pub fn build_emule_info(
 /// - mod_version_len(u16) + mod_version_utf8(...)
 /// - nickname_len(u16) + nickname_utf8(...)
 /// - if flags & 0x01: ed25519_pubkey(32)
+///
+/// `nickname` is the name the Hello carried, site tag and all; an Ember peer
+/// is given it without the tag, which is only for eMule users.
 pub fn build_ember_hello(
     ember_hash: &[u8; 16],
     nickname: &str,
@@ -1209,7 +1212,7 @@ pub fn build_ember_hello(
 ) -> Vec<u8> {
     let mod_version = format!("Ember {}", env!("CARGO_PKG_VERSION"));
     let mod_bytes = mod_version.as_bytes();
-    let nick_bytes = nickname.as_bytes();
+    let nick_bytes = crate::types::without_nickname_site_tag(nickname).as_bytes();
     let mut buf = Vec::with_capacity(2 + 16 + 2 + mod_bytes.len() + 2 + nick_bytes.len() + 32);
 
     buf.write_u8(0x01).unwrap(); // version
@@ -1849,8 +1852,10 @@ pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilit
                 if name_id == 0x01 {
                     const MAX_HELLO_STRING_LEN: usize = 8192;
                     let capped = slen.min(MAX_HELLO_STRING_LEN);
-                    caps.peer_name =
-                        String::from_utf8_lossy(&payload[pos..pos + capped]).to_string();
+                    let name = String::from_utf8_lossy(&payload[pos..pos + capped]);
+                    // Another Ember's name as eMule users see it: the tag is
+                    // for them, and an Ember user knows the client already.
+                    caps.peer_name = crate::types::without_nickname_site_tag(&name).to_string();
                 } else {
                     // CT_MODVERSION / ET_MOD_VERSION. Mods that skip
                     // OP_EMULEINFO still often put VeryCD / easyMule here;
@@ -3605,11 +3610,13 @@ mod tests {
             kad_version: 0x09,
         };
 
+        let tagged = crate::types::ed2k_nickname("ember", true);
         let payload =
-            build_hello_with_buddy_opts(&user_hash, 0x7F00_0001, 4662, "ember", None, &opts);
+            build_hello_with_buddy_opts(&user_hash, 0x7F00_0001, 4662, &tagged, None, &opts);
         let (parsed_hash, caps) = parse_hello_packet(&payload).unwrap();
 
         assert_eq!(parsed_hash, user_hash);
+        assert_eq!(caps.peer_name, "ember", "an Ember reads another's name without the site tag");
         assert_eq!(caps.udp_port, 4672);
         assert_eq!(caps.kad_port, 4672);
         assert!(caps.supports_large_files);
@@ -3741,6 +3748,11 @@ mod tests {
             parsed.mod_version
         );
         assert_eq!(parsed.ed25519_pubkey, Some(pk));
+
+        // Built from the name the Hello carried, but an Ember peer is not
+        // given the site tag that is only there for eMule users.
+        let tagged = crate::types::ed2k_nickname("alice", true);
+        assert_eq!(parse_ember_hello(&build_ember_hello(&hash, &tagged, None)).unwrap().nickname, "alice");
 
         let payload_nopk = build_ember_hello(&hash, "bob", None);
         let parsed_nopk = parse_ember_hello(&payload_nopk).expect("must parse");

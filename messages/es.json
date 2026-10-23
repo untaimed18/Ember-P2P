@@ -2839,6 +2839,8 @@
   "settings_nickname_label": "Apodo",
   "settings_nickname_placeholder": "Tu nombre para mostrar",
   "settings_nickname_hint": "Lo ven los usuarios de eMule y los servidores eD2K con los que te conectas, y también tus amigos. En las salas se muestra en su lugar tu nombre de usuario de Canales.",
+  "settings_nickname_site_tag": "Añadir el sitio web de Ember tras mi apodo para los usuarios de eMule",
+  "settings_nickname_site_tag_hint": "Los usuarios de eMule y los servidores eD2K te ven como «{name}». Tus amigos y otros usuarios de Ember siempre ven solo tu apodo.",
   "settings_launch_at_login_label": "Iniciar al iniciar sesión",
   "settings_launch_at_login_hint": "Inicia Ember automáticamente cuando inicias sesión en el equipo.",
   "settings_start_hidden_at_login_label": "Iniciar en la bandeja",

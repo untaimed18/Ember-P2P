@@ -326,7 +326,8 @@ pub(super) struct NetworkState {
     pub(super) stun_sourced_udp_port: Option<u16>,
     pub(super) firewalled: bool,
     pub(super) firewall_checks_sent: u32,
-    /// Our nickname as Settings has it now. Downloads outlive a rename, so
+    /// Our nickname as Settings has it now, in the form eMule clients are
+    /// given ([`crate::types::AppSettings::ed2k_nickname`]). Downloads outlive a rename, so
     /// they read this per connection: a friend hearing the old name from one
     /// session and the new one from another would see their card flip.
     pub(super) shared_nickname: Arc<tokio::sync::RwLock<String>>,

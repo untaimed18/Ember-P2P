@@ -2839,6 +2839,8 @@
   "settings_nickname_label": "Псевдоним",
   "settings_nickname_placeholder": "Ваше отображаемое имя",
   "settings_nickname_hint": "Его видят пользователи eMule и серверы eD2K, к которым вы подключаетесь, а также ваши друзья. В комнатах вместо него показывается ваше имя пользователя в Каналах.",
+  "settings_nickname_site_tag": "Добавлять сайт Ember после моего ника для пользователей eMule",
+  "settings_nickname_site_tag_hint": "Пользователи eMule и серверы eD2K видят вас как «{name}». Друзья и другие пользователи Ember всегда видят только ваш ник.",
   "settings_launch_at_login_label": "Запускать при входе в систему",
   "settings_launch_at_login_hint": "Автоматически запускать Ember при входе в систему.",
   "settings_start_hidden_at_login_label": "Запускать в трее",

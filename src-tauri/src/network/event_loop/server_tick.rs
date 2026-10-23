@@ -1226,7 +1226,7 @@ pub(in crate::network) async fn on_server_tick(
         if let Some((ip, port, obf_port)) = picked {
             let addr_str = format!("{ip}:{port}");
             let user_hash = state.user_hash;
-            let nickname = settings.nickname.clone();
+            let nickname = settings.ed2k_nickname();
             let tcp_port = login_tcp_port(state);
             // A slow retry after an outage starts over with obfuscation, so an
             // obfuscation-only server does not end up reconnected plain. Nor

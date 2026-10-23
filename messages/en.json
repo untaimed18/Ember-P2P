@@ -2839,6 +2839,8 @@
   "settings_nickname_label": "Nickname",
   "settings_nickname_placeholder": "Your display name",
   "settings_nickname_hint": "Shown to the eMule users and eD2K servers you connect to, and to your friends. Rooms show your channel username instead.",
+  "settings_nickname_site_tag": "Add Ember's website after my nickname for eMule users",
+  "settings_nickname_site_tag_hint": "eMule users and eD2K servers see you as “{name}”. Friends and other Ember users always see your nickname alone.",
   "settings_channel_username_label": "Channel username",
   "settings_channel_username_placeholder": "Ada",
   "settings_channel_username_hint": "2–12 letters (A–Z) or numbers, no spaces. Shown to people in your rooms and unique across Ember. Separate from your friend nickname.",

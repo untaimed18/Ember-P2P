@@ -868,6 +868,9 @@ export interface FriendOverrides {
 
 export interface AppSettings {
   nickname: string;
+  /** Add Ember's website after `nickname` where eMule clients and eD2K
+   *  servers see it. Ember peers are always given the nickname alone. */
+  nickname_site_tag: boolean;
   /** Unique Channels handle claimed on Rendezvous. Empty until chosen. */
   channel_username: string;
   /** Language shown as a flag beside our username in room member lists: a

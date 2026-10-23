@@ -2839,6 +2839,8 @@
   "settings_nickname_label": "昵称",
   "settings_nickname_placeholder": "你的显示名称",
   "settings_nickname_hint": "你连接的 eMule 用户和 eD2K 服务器以及你的好友都能看到它。在房间中显示的是你的频道用户名。",
+  "settings_nickname_site_tag": "为 eMule 用户在我的昵称后附加 Ember 网站",
+  "settings_nickname_site_tag_hint": "eMule 用户和 eD2K 服务器看到的你是“{name}”。好友和其他 Ember 用户始终只看到你的昵称。",
   "settings_launch_at_login_label": "登录时启动",
   "settings_launch_at_login_hint": "登录电脑时自动启动 Ember。",
   "settings_start_hidden_at_login_label": "启动到托盘",

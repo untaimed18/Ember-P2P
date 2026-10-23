@@ -2926,7 +2926,7 @@ pub(super) async fn handle_udp_packet_inner(
 
             if let Ok(permit) = state.firewall_connect_semaphore.clone().try_acquire_owned() {
                 let tcp_addr = SocketAddr::new(peer_ip.into(), peer_tcp_port);
-                let hello = fw_check_hello(state, &settings.nickname);
+                let hello = fw_check_hello(state, &settings.ed2k_nickname());
                 tokio::spawn(async move {
                     let _permit = permit;
                     let result = tokio::time::timeout(
@@ -3093,7 +3093,7 @@ pub(super) async fn handle_udp_packet_inner(
             if let Ok(permit) = state.firewall_connect_semaphore.clone().try_acquire_owned() {
                 let tcp_addr = SocketAddr::new(requester_ip.into(), peer_tcp_port);
                 let allow_obf = state.obfuscation_enabled && (connect_options & 0x01) != 0;
-                let hello = fw_check_hello(state, &settings.nickname);
+                let hello = fw_check_hello(state, &settings.ed2k_nickname());
                 tokio::spawn(async move {
                     let _permit = permit;
                     let connect_result = tokio::time::timeout(
@@ -3336,7 +3336,7 @@ pub(super) async fn handle_udp_packet_inner(
                 let mut mgr_clone = BuddyManager::new(
                     *state.buddy_manager.local_id(),
                     state.user_hash,
-                    settings.nickname.clone(),
+                    settings.ed2k_nickname(),
                     advertised_tcp_port(state),
                     advertised_udp_port(state),
                     state.pending_buddy_hashes.clone(),

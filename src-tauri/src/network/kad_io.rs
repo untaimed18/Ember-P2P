@@ -850,7 +850,7 @@ pub(super) fn dispatch_udp_firewall_probe_requests(
         spawn_udp_firewall_probe_request(
             contact,
             state.user_hash,
-            settings.nickname.clone(),
+            settings.ed2k_nickname(),
             advertised_tcp_port(state),
             advertised_udp_port(state),
             external_udp_port,

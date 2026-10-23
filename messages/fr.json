@@ -2839,6 +2839,8 @@
   "settings_nickname_label": "Pseudo",
   "settings_nickname_placeholder": "Votre nom affiché",
   "settings_nickname_hint": "Visible par les utilisateurs eMule et les serveurs eD2K auxquels vous vous connectez, ainsi que par vos amis. Dans les salons, c’est votre nom d’utilisateur des Salons qui s’affiche.",
+  "settings_nickname_site_tag": "Ajouter le site web d’Ember après mon pseudo pour les utilisateurs eMule",
+  "settings_nickname_site_tag_hint": "Les utilisateurs eMule et les serveurs eD2K vous voient sous le nom « {name} ». Vos amis et les autres utilisateurs d’Ember voient toujours votre pseudo seul.",
   "settings_launch_at_login_label": "Lancer à l’ouverture de session",
   "settings_launch_at_login_hint": "Démarrer Ember automatiquement à l’ouverture de votre session.",
   "settings_start_hidden_at_login_label": "Démarrer dans la zone de notification",

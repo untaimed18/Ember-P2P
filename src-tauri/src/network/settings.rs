@@ -256,8 +256,9 @@ pub(super) async fn apply_settings_update(
         .await
         .set_policy(settings.relay_for_peers, settings.max_relay_sessions);
     {
+        // The eD2K transfer tasks' copy, so the eMule-facing form.
         let mut nick = shared_nickname.write().await;
-        *nick = settings.nickname.clone();
+        *nick = settings.ed2k_nickname();
     }
     if settings.nickname != old_nickname {
         announce_nickname_to_friends(state, &settings.nickname).await;

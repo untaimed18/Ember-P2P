@@ -1436,6 +1436,13 @@ pub enum NetworkStatus {
 // Completely unreadable JSON still falls back to defaults after backup.
 pub struct AppSettings {
     pub nickname: String,
+    /// Add [`NICKNAME_SITE_TAG`] after [`Self::nickname`] where eD2K servers
+    /// and eMule clients see it, as eMule's own default name is its website.
+    /// Ember peers never see it: it is left out of the Ember hello and taken
+    /// off a received name. On by default; the Settings page shows the name as
+    /// eMule users see it, with the switch beside it.
+    #[serde(default = "default_true")]
+    pub nickname_site_tag: bool,
     /// Unique handle used in Channels, claimed on Rendezvous. Empty until
     /// the user chooses one. Distinct from [`Self::nickname`], which is the
     /// friend display name and is not unique.
@@ -2040,7 +2047,36 @@ pub struct Ed2kDownloadLimits {
     pub max_download_bytes: u64,
 }
 
+/// Follows the user's name where eD2K servers and eMule clients see it
+/// ([`AppSettings::nickname_site_tag`]).
+pub const NICKNAME_SITE_TAG: &str = "[https://emberp2p.org]";
+
+/// The name eD2K servers and eMule clients are given: `nickname` and the site
+/// tag, unless the tag is off or the name already names the site. An empty
+/// name stays empty, so the callers that send no name for one still do.
+pub fn ed2k_nickname(nickname: &str, site_tag: bool) -> String {
+    let base = nickname.trim_end();
+    if !site_tag || base.trim().is_empty() || base.to_ascii_lowercase().contains("emberp2p.org") {
+        return nickname.to_string();
+    }
+    format!("{base} {NICKNAME_SITE_TAG}")
+}
+
+/// `name` without the site tag another Ember put after it for eMule. A name
+/// that is nothing but the tag is left as it is.
+pub fn without_nickname_site_tag(name: &str) -> &str {
+    match name.trim_end().strip_suffix(NICKNAME_SITE_TAG) {
+        Some(rest) if !rest.trim().is_empty() => rest.trim_end(),
+        _ => name,
+    }
+}
+
 impl AppSettings {
+    /// [`ed2k_nickname`] for these settings.
+    pub fn ed2k_nickname(&self) -> String {
+        ed2k_nickname(&self.nickname, self.nickname_site_tag)
+    }
+
     pub fn ed2k_download_limits(&self) -> Ed2kDownloadLimits {
         // Standard ED2K wire part counts are u16. The integer GiB setting is
         // capped at 593, then the exact byte ceiling closes the remaining
@@ -2728,6 +2764,7 @@ impl Default for AppSettings {
 
         Self {
             nickname: format!("Ember-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+            nickname_site_tag: true,
             channel_username: String::new(),
             channel_language: String::new(),
             shared_folders: vec![completed_dir],
@@ -2920,6 +2957,41 @@ pub struct TransferSourcesPayload<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// eMule users get the name and the site; a name that already names the
+    /// site, an empty one, or the switch off leaves it as typed. Another
+    /// Ember's tagged name reads back as the name alone.
+    #[test]
+    fn the_site_tag_follows_the_name_for_emule_and_comes_off_for_ember() {
+        assert_eq!(ed2k_nickname("Brady", true), "Brady [https://emberp2p.org]");
+        assert_eq!(ed2k_nickname("Brady  ", true), "Brady [https://emberp2p.org]");
+        assert_eq!(ed2k_nickname("Brady", false), "Brady");
+        assert_eq!(ed2k_nickname("", true), "", "no name is still sent as none");
+        assert_eq!(ed2k_nickname("Brady @ EmberP2P.org", true), "Brady @ EmberP2P.org");
+        assert_eq!(
+            ed2k_nickname("Brady [https://emberp2p.org]", true),
+            "Brady [https://emberp2p.org]",
+            "never twice"
+        );
+
+        assert_eq!(without_nickname_site_tag("Brady [https://emberp2p.org]"), "Brady");
+        assert_eq!(without_nickname_site_tag(&ed2k_nickname("Ana María", true)), "Ana María");
+        assert_eq!(without_nickname_site_tag("Brady"), "Brady");
+        assert_eq!(
+            without_nickname_site_tag("[https://emberp2p.org]"),
+            "[https://emberp2p.org]",
+            "a name that is only the tag keeps it"
+        );
+
+        let mut written_before = serde_json::to_value(AppSettings {
+            nickname_site_tag: false,
+            ..AppSettings::default()
+        })
+        .unwrap();
+        written_before.as_object_mut().unwrap().remove("nickname_site_tag");
+        let old: AppSettings = serde_json::from_value(written_before).unwrap();
+        assert!(old.nickname_site_tag, "on for a config written before the switch");
+    }
 
     #[test]
     fn a_friend_override_wins_over_the_global_setting_and_only_for_that_friend() {

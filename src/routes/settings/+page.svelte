@@ -1226,6 +1226,17 @@
     if (settings) settings.nickname = clampInputUtf8Bytes(event, NICKNAME_MAX_BYTES, settings.nickname);
   }
 
+  /** The name eMule users see, as `ed2k_nickname` in `src-tauri/src/types.rs`
+   *  builds it. */
+  let ed2kNickname = $derived.by(() => {
+    const nickname = settings?.nickname ?? '';
+    const base = nickname.trimEnd();
+    if (!settings?.nickname_site_tag || !base.trim() || base.toLowerCase().includes('emberp2p.org')) {
+      return nickname;
+    }
+    return `${base} [https://emberp2p.org]`;
+  });
+
   /** Validate and clamp numeric fields to the ranges documented in AppSettings.
    *  Returns an error message on hard failure (mutates nothing in that case).
    *  Otherwise mutates `s` in place and reports whether any numeric field was
@@ -2818,6 +2829,20 @@
                 {@render applyButton(['nickname'], m.settings_nickname_label())}
               </div>
               <span class="hint">{m.settings_nickname_hint()}</span>
+            </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="nickname-site-tag-label" for="nickname-site-tag-switch">{m.settings_nickname_site_tag()}</label>
+                <span class="hint" id="nickname-site-tag-hint">
+                  {m.settings_nickname_site_tag_hint({ name: ed2kNickname })}
+                </span>
+              </div>
+              <ToggleSwitch
+                id="nickname-site-tag-switch"
+                bind:checked={settings.nickname_site_tag}
+                ariaLabelledby="nickname-site-tag-label"
+                ariaDescribedby="nickname-site-tag-hint"
+              />
             </div>
           </div>
 
