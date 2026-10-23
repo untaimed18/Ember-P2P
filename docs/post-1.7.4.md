@@ -561,7 +561,11 @@ lands.
   line. Such a neighbor is asked the same range again next round, which costs
   bandwidth but loses nothing. Planned with item 8's marker, but item 8 was
   done without one (admission, not a marker), so this stays open: it needs a
-  marker of its own that says a reply was relayed.
+  marker of its own that says a reply was relayed. Left as it is in 1.7.5: a
+  relayed reply reaches us as an ordinary `CHANNEL_MSG` from the hop, with
+  nothing naming the neighbor asked, so the marker has to go into the relay
+  envelope or the gossip frame, both frozen with this release. It costs a
+  range asked for again, never a line.
 - **Room transfer key derivation. Done in 1.7.5:** an inbound transfer frame
   is checked under the key its transfer derived at setup
   (`xfer_frame_key`, from `xfer_recv`, `xfer_send` or `xfer_pending` when the
@@ -779,7 +783,13 @@ they matter.
 - **No component tests** for the 1.7.3 changes to `ChatConversation.svelte`
   and the Channels page (early delivery, pin cleanup, slow-mode announcements,
   coalesced refreshes); only the store logic is unit tested. A component
-  harness would cover them.
+  harness would cover them. **Done in 1.7.5, the way the rest of the
+  conversation is tested:** pin resolution (`channelPins`) and coalesced
+  refreshes (`channelReactions`) were already modules with tests; early room
+  delivery (`EarlyRoomDeliveries`) and the slow-mode announcements
+  (`stepSlowModeAnnouncer`) now are too, in `conversationState.ts`. Mounting
+  the 4,000-line component would need a DOM environment and a mock of every
+  module it reaches, for less than these cover.
 - **Discover spam folding.** Member counts come from presence records, which
   anyone can sign; friends in the room, or the listing's age, would be better
   signals. Tune `LIKELY_SPAM_SCORE` and `DUPLICATE_NAME_FLOOD` from real use.

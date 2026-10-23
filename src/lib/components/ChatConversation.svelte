@@ -87,6 +87,7 @@
     visibleTypists,
     type Typists,
   } from '$lib/channelTyping';
+  import { EarlyRoomDeliveries, stepSlowModeAnnouncer, type SlowModeAnnouncer } from '$lib/conversationState';
   import { portal } from '$lib/actions/portal';
   import { rovingToolbar } from '$lib/actions/rovingToolbar';
   import { appSettings } from '$lib/stores/settings';
@@ -387,13 +388,10 @@
   const earlyDeliveredIds = new Map<number, number | null>();
   /** The room equivalent, keeping the state itself: a room line can also be
    *  reported failed before the send's response appends it. */
-  const earlyRoomDelivery = new Map<number, 'delivered' | 'queued' | 'failed'>();
+  const earlyRoomDelivery = new EarlyRoomDeliveries();
 
   function withEarlyRoomDelivery(row: ConvMessage): ConvMessage {
-    const early = earlyRoomDelivery.get(row.id);
-    if (early === undefined) return row;
-    earlyRoomDelivery.delete(row.id);
-    return { ...row, delivery: early };
+    return earlyRoomDelivery.apply(row);
   }
 
   const PAGE_SIZE = 100;
@@ -1528,9 +1526,7 @@
           const delivery = event.payload.delivery;
           if (delivery !== 'delivered' && delivery !== 'queued' && delivery !== 'failed') return;
           if (!messages.some((message) => message.id === event.payload.id)) {
-            // Only a send or resend still waiting on its response can be
-            // about to add this row; anything else would sit here unused.
-            if (sending || resendingId !== null) earlyRoomDelivery.set(event.payload.id, delivery);
+            earlyRoomDelivery.hold(event.payload.id, delivery, sending || resendingId !== null);
             return;
           }
           messages = messages.map((message) =>
@@ -3399,26 +3395,17 @@
 
   let slowModeWaiting = $derived(slowModeLeft > 0);
   let slowModeAnnouncement = $state('');
-  let slowModeWasWaiting = false;
-  let slowModeAnnouncedKey = '';
+  let slowModeAnnouncer: SlowModeAnnouncer = { key: '', waiting: false };
 
   $effect(() => {
     const waiting = slowModeWaiting;
     const key = conversationKey;
     untrack(() => {
-      // A switch drops the wait without it having run out, so it is not
-      // announced as over; whatever this run saw is the previous room's.
-      if (key !== slowModeAnnouncedKey) {
-        slowModeAnnouncedKey = key;
-        slowModeWasWaiting = false;
-        slowModeAnnouncement = '';
-        return;
-      }
-      if (waiting === slowModeWasWaiting) return;
-      slowModeWasWaiting = waiting;
-      slowModeAnnouncement = waiting
-        ? m.chat_slow_mode_started({ seconds: slowModeLeft })
-        : m.chat_slow_mode_ready();
+      const { next, say } = stepSlowModeAnnouncer(slowModeAnnouncer, key, waiting);
+      slowModeAnnouncer = next;
+      if (say === 'clear') slowModeAnnouncement = '';
+      else if (say === 'started') slowModeAnnouncement = m.chat_slow_mode_started({ seconds: slowModeLeft });
+      else if (say === 'ready') slowModeAnnouncement = m.chat_slow_mode_ready();
     });
   });
 
