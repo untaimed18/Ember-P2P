@@ -36,16 +36,89 @@
     destroyed = true;
   });
 
-  type MessageFn = (params?: Record<string, unknown>) => string;
-  const messages = m as unknown as Record<string, MessageFn | undefined>;
-  /** A message by key, or `fallback` for one this build has no text for. */
-  function text(key: string, params: Record<string, unknown> = {}, fallback = ''): string {
-    const fn = messages[key];
-    return fn ? fn(params) : fallback;
-  }
+  type FixParams = { tcp: number; udp: number; lan: string };
+  /** The report names checks, outcomes and fixes by id; these say them. An id
+   *  this build has no text for shows as the id itself. */
+  const VERDICT: Record<string, [() => string, () => string]> = {
+    reachable: [m.doctor_verdict_reachable, m.doctor_verdict_reachable_body],
+    relayed: [m.doctor_verdict_relayed, m.doctor_verdict_relayed_body],
+    limited: [m.doctor_verdict_limited, m.doctor_verdict_limited_body],
+    offline: [m.doctor_verdict_offline, m.doctor_verdict_offline_body],
+  };
+  const HELPING: Record<string, () => string> = {
+    relay: m.doctor_helping_relay,
+    buddy: m.doctor_helping_buddy,
+    punch: m.doctor_helping_punch,
+  };
+  const FIX: Record<string, [(p: FixParams) => string, (p: FixParams) => string]> = {
+    port_in_use: [m.doctor_fix_port_in_use, m.doctor_fix_port_in_use_body],
+    windows_firewall: [m.doctor_fix_windows_firewall, m.doctor_fix_windows_firewall_body],
+    carrier_nat: [m.doctor_fix_carrier_nat, m.doctor_fix_carrier_nat_body],
+    vpn: [m.doctor_fix_vpn, m.doctor_fix_vpn_body],
+    enable_upnp: [m.doctor_fix_enable_upnp, m.doctor_fix_enable_upnp_body],
+    router_upnp: [m.doctor_fix_router_upnp, m.doctor_fix_router_upnp_body],
+    forward_ports: [m.doctor_fix_forward_ports, m.doctor_fix_forward_ports_body],
+    offline: [m.doctor_fix_offline, m.doctor_fix_offline_body],
+    clock: [m.doctor_fix_clock, m.doctor_fix_clock_body],
+  };
+  const ACTION: Record<string, () => string> = {
+    move_ports: m.doctor_action_move_ports,
+    add_firewall_rules: m.doctor_action_add_firewall_rules,
+    enable_upnp: m.doctor_action_enable_upnp,
+    retry_upnp: m.doctor_action_retry_upnp,
+    recheck: m.doctor_action_recheck,
+  };
+  const CHECK: Record<string, () => string> = {
+    listen_ports: m.doctor_check_listen_ports,
+    windows_firewall: m.doctor_check_windows_firewall,
+    upnp: m.doctor_check_upnp,
+    router_wan: m.doctor_check_router_wan,
+    outside_tcp: m.doctor_check_outside_tcp,
+    outside_udp: m.doctor_check_outside_udp,
+    kad_firewall: m.doctor_check_kad_firewall,
+    server_id: m.doctor_check_server_id,
+    nat_type: m.doctor_check_nat_type,
+    ember_dht: m.doctor_check_ember_dht,
+    clock: m.doctor_check_clock,
+  };
+  const DETAIL: Record<string, () => string> = {
+    ok: m.doctor_detail_ok,
+    tcp_taken: m.doctor_detail_tcp_taken,
+    udp_moved: m.doctor_detail_udp_moved,
+    missing: m.doctor_detail_missing,
+    not_windows: m.doctor_detail_not_windows,
+    off: m.doctor_detail_off,
+    stood_down: m.doctor_detail_stood_down,
+    mapped: m.doctor_detail_mapped,
+    not_mapped: m.doctor_detail_not_mapped,
+    carrier_nat: m.doctor_detail_carrier_nat,
+    public: m.doctor_detail_public,
+    unknown: m.doctor_detail_unknown,
+    open: m.doctor_detail_open,
+    closed: m.doctor_detail_closed,
+    filtered: m.doctor_detail_filtered,
+    not_run: m.doctor_detail_not_run,
+    checking: m.doctor_detail_checking,
+    firewalled: m.doctor_detail_firewalled,
+    partly: m.doctor_detail_partly,
+    high_id: m.doctor_detail_high_id,
+    low_id: m.doctor_detail_low_id,
+    not_connected: m.doctor_detail_not_connected,
+    symmetric: m.doctor_detail_symmetric,
+    no_contacts: m.doctor_detail_no_contacts,
+    skewed: m.doctor_detail_skewed,
+  };
+  const STATUS: Record<string, () => string> = {
+    pass: m.doctor_status_pass,
+    warn: m.doctor_status_warn,
+    fail: m.doctor_status_fail,
+    skip: m.doctor_status_skip,
+  };
 
-  let params = $derived(
-    report ? { tcp: report.tcp_port, udp: report.udp_port, lan: report.lan_ip || m.doctor_this_computer() } : {},
+  let params: FixParams = $derived(
+    report
+      ? { tcp: report.tcp_port, udp: report.udp_port, lan: report.lan_ip || m.doctor_this_computer() }
+      : { tcp: 0, udp: 0, lan: '' },
   );
 
   async function run() {
@@ -101,12 +174,12 @@
 
   function reportText(r: ConnectionReport): string {
     const lines = [
-      `${m.doctor_title()}: ${text(`doctor_verdict_${r.verdict}`)}`,
+      `${m.doctor_title()}: ${VERDICT[r.verdict]?.[0]() ?? r.verdict}`,
       `TCP ${r.tcp_port}, UDP ${r.udp_port}; LAN ${address(r.lan_ip)}; public ${address(r.public_ip)}`,
       ...r.checks.map(
-        (c) => `[${c.status}] ${text(`doctor_check_${c.id}`, {}, c.id)}: ${text(`doctor_detail_${c.detail}`, {}, c.detail)}`,
+        (c) => `[${c.status}] ${CHECK[c.id]?.() ?? c.id}: ${DETAIL[c.detail]?.() ?? c.detail}`,
       ),
-      ...r.fixes.map((f) => `-> ${text(`doctor_fix_${f.id}`, params, f.id)}`),
+      ...r.fixes.map((f) => `-> ${FIX[f.id]?.[0](params) ?? f.id}`),
     ];
     return lines.join('\n');
   }
@@ -143,8 +216,8 @@
       <p class="doctor-hint">{failure}</p>
     {:else if report}
       <div class="doctor-verdict {report.verdict}">
-        <strong>{text(`doctor_verdict_${report.verdict}`)}</strong>
-        <span>{text(`doctor_verdict_${report.verdict}_body`)}</span>
+        <strong>{VERDICT[report.verdict]?.[0]() ?? report.verdict}</strong>
+        <span>{VERDICT[report.verdict]?.[1]() ?? ''}</span>
       </div>
     {/if}
   </div>
@@ -155,7 +228,7 @@
         <h5>{m.doctor_helping_title()}</h5>
         <ul class="doctor-list">
           {#each report.helping as help (help)}
-            <li>{text(`doctor_helping_${help}`)}</li>
+            <li>{HELPING[help]?.() ?? help}</li>
           {/each}
         </ul>
       </div>
@@ -167,8 +240,8 @@
         <ol class="doctor-fixes">
           {#each report.fixes as fix (fix.id)}
             <li>
-              <strong>{text(`doctor_fix_${fix.id}`, params, fix.id)}</strong>
-              <span>{text(`doctor_fix_${fix.id}_body`, params)}</span>
+              <strong>{FIX[fix.id]?.[0](params) ?? fix.id}</strong>
+              <span>{FIX[fix.id]?.[1](params) ?? ''}</span>
               {#if fix.action && (fix.action !== 'move_ports' || onMovePorts) && (fix.action !== 'enable_upnp' || onEnableUpnp)}
                 <button
                   type="button"
@@ -181,7 +254,7 @@
                   }}
                   disabled={acting !== null}
                 >
-                  {acting === fix.action ? m.doctor_running() : text(`doctor_action_${fix.action}`)}
+                  {acting === fix.action ? m.doctor_running() : (ACTION[fix.action]?.() ?? fix.action)}
                 </button>
               {/if}
             </li>
@@ -195,9 +268,9 @@
       <ul class="doctor-checks">
         {#each report.checks as check (check.id)}
           <li class={check.status}>
-            <span class="doctor-icon" role="img" aria-label={text(`doctor_status_${check.status}`)}>{statusIcon[check.status]}</span>
-            <span class="doctor-check-label">{text(`doctor_check_${check.id}`, {}, check.id)}</span>
-            <span class="doctor-check-detail">{text(`doctor_detail_${check.detail}`, {}, check.detail)}</span>
+            <span class="doctor-icon" role="img" aria-label={STATUS[check.status]?.() ?? check.status}>{statusIcon[check.status]}</span>
+            <span class="doctor-check-label">{CHECK[check.id]?.() ?? check.id}</span>
+            <span class="doctor-check-detail">{DETAIL[check.detail]?.() ?? check.detail}</span>
           </li>
         {/each}
       </ul>
