@@ -2523,7 +2523,28 @@ struct AppState {
     chat_mailbox_rate_limits: RateLimitBucket,
     /// Deposits pooled per [`client_network`].
     chat_mailbox_network_rate_limits: RateLimitBucket,
+    /// `/v4/reachability`, per address and per hour: each one dials out.
+    reachability_rate_limits: RateLimitBucket,
 }
+
+/// A connection check: probe the caller's own `tcp_port` and `udp_port`.
+#[derive(Deserialize)]
+struct ReachabilityRequest {
+    tcp_port: u16,
+    udp_port: u16,
+    /// 16 bytes, hex: carried in the UDP probe so the caller can tell it is
+    /// its own.
+    nonce: String,
+}
+
+/// Connection checks one address may ask for in [`REACHABILITY_WINDOW`].
+const REACHABILITY_PER_WINDOW: u64 = 6;
+const REACHABILITY_WINDOW: Duration = Duration::from_secs(3600);
+/// How long the TCP dial back may take before the port counts as filtered.
+const REACHABILITY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// What the UDP probe starts with; the client's `network::reachability`
+/// recognises exactly this, followed by the nonce.
+const REACHABILITY_PROBE_TAG: &[u8; 16] = b"EMBER-REACH-V1\0\0";
 
 #[derive(Deserialize)]
 struct RegisterRequest {
@@ -3579,7 +3600,83 @@ async fn protocol_v4() -> Json<serde_json::Value> {
         "sealed_intro": true,
         // `/v4/chat-mailbox/*`: sealed chat held for a friend who is offline.
         "chat_mailbox": true,
+        // `/v4/reachability`: the connection doctor's outside-in probe.
+        "reachability": true,
     }))
+}
+
+/// Probe the caller's own ports from outside, for the connection doctor.
+///
+/// Only ever the address the request came from, so the endpoint cannot be
+/// pointed at anyone else, and rate-limited per address because each check
+/// dials out. TCP is a connect and an immediate close; UDP is one short
+/// datagram, sent a few times, that the client recognises and keeps to itself
+/// ([`REACHABILITY_PROBE_TAG`] and the nonce). Whether that arrived only the
+/// client can tell, so the answer says it was sent.
+async fn reachability_v4(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<ReachabilityRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if body.tcp_port == 0 || body.udp_port == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let nonce: [u8; 16] = hex::decode(body.nonce.trim())
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit_bucket_in(
+        &state.reachability_rate_limits,
+        client_ip,
+        REACHABILITY_PER_WINDOW,
+        REACHABILITY_WINDOW,
+    )
+    .await
+    {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let tcp = match tokio::time::timeout(
+        REACHABILITY_CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect(SocketAddr::new(client_ip, body.tcp_port)),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => {
+            drop(stream);
+            "open"
+        }
+        Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionRefused => "closed",
+        _ => "timeout",
+    };
+    let mut probe = Vec::with_capacity(REACHABILITY_PROBE_TAG.len() + nonce.len());
+    probe.extend_from_slice(REACHABILITY_PROBE_TAG);
+    probe.extend_from_slice(&nonce);
+    let bind: SocketAddr = if client_ip.is_ipv4() {
+        SocketAddr::from(([0, 0, 0, 0], 0))
+    } else {
+        SocketAddr::from(([0u16; 8], 0))
+    };
+    let mut udp_sent = false;
+    if let Ok(socket) = tokio::net::UdpSocket::bind(bind).await {
+        let target = SocketAddr::new(client_ip, body.udp_port);
+        for _ in 0..3 {
+            udp_sent |= socket.send_to(&probe, target).await.is_ok();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
+    debug!("reachability check for {client_ip}: tcp {tcp}, udp sent {udp_sent}");
+    let server_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Ok(Json(serde_json::json!({
+        "ip": client_ip.to_string(),
+        "tcp": tcp,
+        "udp_sent": udp_sent,
+        "server_time": server_time,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -6304,6 +6401,7 @@ fn build_router(state: AppState) -> Router {
         .route("/v4/channels/nominee", post(set_channel_nominee_v4))
         .route("/v4/channels/handover", post(handover_channel_name_v4))
         .route("/v4/relay-mailbox/offer", post(relay_mailbox_offer))
+        .route("/v4/reachability", post(reachability_v4))
         .route(
             "/v2/relay-tickets/{ticket_id}/accept",
             post(relay_ticket_accept),
@@ -6403,6 +6501,7 @@ async fn main() {
         chat_mailbox: Arc::new(RwLock::new(chat_mailbox::ChatMailboxStore::default())),
         chat_mailbox_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
         chat_mailbox_network_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+        reachability_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
     };
 
     tokio::spawn(sweep_expired(state.clone()));
@@ -6621,6 +6720,7 @@ mod relay_ticket_tests {
             chat_mailbox: Arc::new(RwLock::new(chat_mailbox::ChatMailboxStore::default())),
             chat_mailbox_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
             chat_mailbox_network_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+            reachability_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
         }
     }
 
@@ -9164,6 +9264,67 @@ mod relay_ticket_tests {
         }
         drop(full);
         assert!(limiter.counts.lock().unwrap().is_empty());
+    }
+
+    /// The connection check dials the caller's own address only: TCP to the
+    /// port it named, and the tagged datagram to its UDP port. Bad input is
+    /// refused, and one address gets a few checks an hour.
+    #[tokio::test]
+    async fn a_reachability_check_probes_the_callers_own_ports() {
+        use tower::ServiceExt;
+
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tcp.local_addr().unwrap().port();
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = udp.local_addr().unwrap().port();
+        let accepted = tokio::spawn(async move { tcp.accept().await.is_ok() });
+
+        let state = test_state();
+        let app = build_router(state.clone());
+        let caller: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let send = |body: serde_json::Value| {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v4/reachability")
+                .header("content-type", "application/json")
+                .extension(ConnectInfo(caller))
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+            let app = app.clone();
+            async move { app.oneshot(request).await.unwrap() }
+        };
+        let nonce = "ab".repeat(16);
+
+        let response = send(serde_json::json!({ "tcp_port": tcp_port, "udp_port": udp_port, "nonce": nonce })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer["tcp"], "open");
+        assert_eq!(answer["udp_sent"], true);
+        assert_eq!(answer["ip"], "127.0.0.1");
+        assert!(accepted.await.unwrap());
+        let mut datagram = [0u8; 64];
+        let (len, _) = udp.recv_from(&mut datagram).await.unwrap();
+        assert_eq!(&datagram[..16], REACHABILITY_PROBE_TAG);
+        assert_eq!(hex::encode(&datagram[16..len]), nonce);
+
+        // A port nothing listens on is refused, not filtered.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let response = send(serde_json::json!({ "tcp_port": closed, "udp_port": udp_port, "nonce": nonce })).await;
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer["tcp"], "closed");
+
+        let bad = send(serde_json::json!({ "tcp_port": tcp_port, "udp_port": udp_port, "nonce": "zz" })).await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        let zero = send(serde_json::json!({ "tcp_port": 0, "udp_port": udp_port, "nonce": nonce })).await;
+        assert_eq!(zero.status(), StatusCode::BAD_REQUEST);
+
+        for _ in 2..REACHABILITY_PER_WINDOW {
+            send(serde_json::json!({ "tcp_port": closed, "udp_port": udp_port, "nonce": nonce })).await;
+        }
+        let limited = send(serde_json::json!({ "tcp_port": closed, "udp_port": udp_port, "nonce": nonce })).await;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

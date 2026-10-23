@@ -24,6 +24,7 @@ pub(in crate::network) async fn on_upnp_maintain_result(
         state.upnp_mapped = mapped;
         state.stats.upnp_mapped = mapped;
         state.stats.upnp_stood_down = upnp_mappings.stood_down();
+        state.stats.upnp_wan_ip = upnp_mappings.wan_ip().map(|ip| ip.to_string()).unwrap_or_default();
         // A live inbound forward is `tcp_port -> tcp_port`, so it
         // is authoritative for what peers should dial. Re-run the
         // publish state whenever that changes so the advertise

@@ -128,6 +128,7 @@
   import { plural } from '$lib/plural';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import PortTest from '$lib/components/PortTest.svelte';
+  import ConnectionDoctor from '$lib/components/ConnectionDoctor.svelte';
   import { highlightMatches } from '$lib/stores/highlight';
   import SpeedInput from '$lib/components/SpeedInput.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
@@ -4051,6 +4052,20 @@
           </div>
         </div>
         <div class="card-body">
+          <div class="settings-group" id="connection-check">
+            <h4 class="subsection-title">{m.doctor_title()}</h4>
+            <ConnectionDoctor
+              onMovePorts={() => {
+                const field = document.getElementById('tcp-port') as HTMLInputElement | null;
+                field?.scrollIntoView({ block: 'center' });
+                field?.focus();
+                field?.select();
+              }}
+              onEnableUpnp={() => {
+                if (settings) settings.upnp_enabled = true;
+              }}
+            />
+          </div>
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_ports()}</h4>
             <div class="field-row">

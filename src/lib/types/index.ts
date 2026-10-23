@@ -337,6 +337,12 @@ export interface NetworkStats {
   ember_dht_verified_contacts?: number;
   /** SecIdent: available | unavailable | broken */
   secident_status?: 'available' | 'unavailable' | 'broken';
+  /** The router's own WAN address from UPnP; empty when it said none. */
+  upnp_wan_ip?: string;
+  /** The TCP listen port is held by another program. */
+  tcp_listen_failed?: boolean;
+  /** The UDP port actually bound. */
+  bound_udp_port?: number;
   stale?: boolean;
   degraded?: boolean;
   /** Stable reason code (localized at render time via

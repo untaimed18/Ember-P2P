@@ -412,6 +412,44 @@ probe needs the rendezvous server change above, and works without it.
 - **Report.** Copying it masks addresses unless the user chose to include
   them.
 
+**Done in 1.7.5.**
+
+- **Backend.** `commands/connection_doctor.rs`: `run_connection_check`
+  gathers the signals and `assess` turns them into the verdict, the checks,
+  what Ember already does and at most three fixes. `assess` is pure and
+  tested for each verdict, carrier-grade NAT, VPN, a taken port, offline,
+  clock skew and a missing probe.
+- **Probe, client side.** `network/reachability.rs` takes the 32-byte UDP
+  probe ahead of STUN, Ember and Kad on the shared socket.
+- **Probe, server side.** `/v4/reachability` in the rendezvous server
+  (`reachability_v4`, advertised as `reachability` on `/v4/protocol`). It
+  probes only the requester's address, at most 6 per hour, and is tested
+  against loopback listeners. The answer carries the server's clock, which
+  is what the skew check reads.
+- **New stats.** `NetworkStats` gained `upnp_wan_ip`, `tcp_listen_failed`
+  and `bound_udp_port`. Windows gained `firewall::rules_in_place` and
+  `add_rules_elevated`: one permission prompt, running `netsh` from an
+  `-EncodedCommand` script.
+- **UI.** `ConnectionDoctor.svelte` sits at the top of Settings > Network,
+  above the port fields. The status bar shows "Check connection" beside a
+  LowID or firewalled state. The automatic offer is a status-bar toast,
+  once a session, after ten unbroken minutes (`connectionDoctorOffer.ts`,
+  tested), not part of the first-run flow.
+
+**How the open questions were settled:**
+
+- **Probe ports.** One datagram to the Kad UDP port. With QUIC sharing that
+  port (the default), it answers for both. A separate QUIC port is not
+  probed.
+- **IPv6.** Not reported until Ember listens on it.
+- **"Move to free ports".** Brings the port field up and selects it rather
+  than choosing ports itself. A port picked unasked could be taken too, and
+  the field's restart badge already says when it applies.
+
+**Deployment.** The probe needs the rendezvous server deployed with this
+change. Until then the doctor reports from the Kad and eD2K results and
+says the outside test did not run.
+
 ## Already scheduled for 1.8.0
 
 Decided in 1.7.5 and written into the spec, so that a room has one cut-over to

@@ -31,6 +31,7 @@ mod kad_search;
 mod nat_mapping;
 mod persistence;
 mod publishing;
+pub(crate) mod reachability;
 pub mod rendezvous;
 mod search;
 mod server;
@@ -44,6 +45,16 @@ mod udp;
 pub mod upnp;
 #[cfg(test)]
 mod tests;
+
+/// The upload listener could not open the TCP port this session: another
+/// program holds it. Read by the connection doctor through the stats.
+pub(crate) static TCP_LISTEN_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The connection doctor asked for UPnP to be tried again now. The loop takes
+/// it the next time no UPnP pass is running.
+pub(crate) static UPNP_RETRY_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Cursor;
@@ -828,6 +839,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // Network page puts us there for the rest of the session — so
             // every gate that checks for it below still earns its place.
             status: NetworkStatus::Connecting,
+            bound_udp_port: udp_port,
             ..Default::default()
         },
         pending_keyword_searches: HashMap::new(),
@@ -1991,6 +2003,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             .await
             {
                 error!("Upload listener error: {e}");
+                TCP_LISTEN_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
                 let _ = ul_app.emit("network-error", serde_json::json!({
                     "message": crate::commands::errors::coded_ctx(
                         "network_tcp_port_in_use",
@@ -2615,6 +2628,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         }
 
         // --- Deferred startup: disk loads, UPnP, transfer resume, offers ------
+        if upnp_enabled
+            && !upnp_maintain_in_flight
+            && UPNP_RETRY_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            pending_upnp_setup = true;
+        }
         if pending_upnp_setup {
             pending_upnp_setup = false;
             if upnp_enabled {
@@ -3055,7 +3074,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 while let Some(datagram) = next {
                     let (data, from) = (&datagram.data, datagram.from);
                     let len = data.len();
-                    if route_stun_binding_packet(
+                    if reachability::note_probe(data) {
+                        // The connection doctor's outside-in probe: consumed
+                        // here, and only recorded for the doctor to ask about.
+                    } else if route_stun_binding_packet(
                         &mut nat_probe_packet_tx,
                         &mut udp_map_ka_packet_tx,
                         data,

@@ -726,6 +726,16 @@ pub struct NetworkStats {
     /// or `"broken"` (cryptkey.dat exists but could not be read).
     #[serde(default)]
     pub secident_status: String,
+    /// The router's own WAN address from UPnP, empty when it said none.
+    #[serde(default)]
+    pub upnp_wan_ip: String,
+    /// The TCP listen port could not be opened: another program holds it.
+    #[serde(default)]
+    pub tcp_listen_failed: bool,
+    /// The UDP port actually bound, which is the configured one unless it
+    /// was taken.
+    #[serde(default)]
+    pub bound_udp_port: u16,
 }
 
 /// Diagnostic counters for the Ember mesh (EPX, LowID broker). Surfaced
@@ -1417,6 +1427,9 @@ impl Default for NetworkStats {
             ember_dht_contacts: 0,
             ember_dht_verified_contacts: 0,
             secident_status: String::from("unavailable"),
+            upnp_wan_ip: String::new(),
+            tcp_listen_failed: false,
+            bound_udp_port: 0,
         }
     }
 }

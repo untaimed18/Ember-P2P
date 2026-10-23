@@ -99,6 +99,8 @@ pub(crate) struct ServerFeatures {
     pub sealed_intro: bool,
     /// Holds sealed chat for a friend who is offline (`/v4/chat-mailbox/*`).
     pub chat_mailbox: bool,
+    /// Probes the caller's own ports from outside (`/v4/reachability`).
+    pub reachability: bool,
 }
 
 type ProtocolCache =
@@ -244,6 +246,7 @@ pub(crate) async fn negotiate_server_features(base_url: &str) -> Result<ServerFe
                 protocol: RendezvousProtocol::IpBoundV4,
                 sealed_intro: body["sealed_intro"].as_bool() == Some(true),
                 chat_mailbox: body["chat_mailbox"].as_bool() == Some(true),
+                reachability: body["reachability"].as_bool() == Some(true),
             };
             remember_v4_server(base_url).await;
             remember_protocol(base_url, features).await;
@@ -269,6 +272,7 @@ pub(crate) async fn negotiate_server_features(base_url: &str) -> Result<ServerFe
             protocol: RendezvousProtocol::LegacyV3,
             sealed_intro: false,
             chat_mailbox: false,
+            reachability: false,
         };
         remember_protocol(base_url, features).await;
         Ok(features)
@@ -2065,6 +2069,7 @@ mod intro_presence_tests {
                 protocol: RendezvousProtocol::IpBoundV4,
                 sealed_intro: true,
                 chat_mailbox: false,
+                reachability: false,
             },
         )
         .await;
@@ -2695,6 +2700,61 @@ pub struct ChatMailboxPage {
     pub items: Vec<ChatMailboxItem>,
     /// More entries are waiting than this page carried.
     pub more: bool,
+}
+
+/// What the server found probing our own ports from outside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReachabilityAnswer {
+    /// The address it probed: ours, as it saw the request.
+    pub ip: String,
+    /// `open`, `closed` (refused) or `timeout`.
+    pub tcp: String,
+    /// It sent the UDP probe; whether it arrived is ours to tell.
+    pub udp_sent: bool,
+    /// The server's clock when it answered, Unix seconds; 0 when absent.
+    pub server_time: i64,
+}
+
+/// Ask the server to connect back to `tcp_port` and send the UDP probe
+/// carrying `nonce` to `udp_port`, on the address the request comes from.
+/// `Ok(None)` when the server does not offer it.
+pub async fn request_reachability(
+    base_url: &str,
+    tcp_port: u16,
+    udp_port: u16,
+    nonce: &[u8; 16],
+) -> Result<Option<ReachabilityAnswer>, String> {
+    require_https(base_url)?;
+    if !negotiate_server_features(base_url).await?.reachability {
+        return Ok(None);
+    }
+    let url = format!("{}/v4/reachability", base_url.trim_end_matches('/'));
+    let body = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let resp = client(base_url)
+            .await?
+            .post(&url)
+            .json(&serde_json::json!({
+                "tcp_port": tcp_port,
+                "udp_port": udp_port,
+                "nonce": hex::encode(nonce),
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("reachability: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("reachability: status {}", resp.status()));
+        }
+        serde_json::from_slice::<serde_json::Value>(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
+            .map_err(|e| format!("reachability bad body: {e}"))
+    })
+    .await
+    .map_err(|_| "reachability timed out".to_string())??;
+    Ok(Some(ReachabilityAnswer {
+        ip: body["ip"].as_str().unwrap_or_default().to_string(),
+        tcp: body["tcp"].as_str().unwrap_or("timeout").to_string(),
+        udp_sent: body["udp_sent"].as_bool() == Some(true),
+        server_time: body["server_time"].as_i64().unwrap_or(0),
+    }))
 }
 
 /// Whether the server holds sealed chat for offline friends.

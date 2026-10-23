@@ -2516,6 +2516,8 @@ pub fn run() {
             commands::peers::kad_bootstrap_url,
             commands::peers::kad_bootstrap_clients,
             commands::peers::kad_recheck_firewall,
+            commands::connection_doctor::run_connection_check,
+            commands::connection_doctor::connection_doctor_action,
             commands::peers::get_kad_contacts,
             commands::peers::get_kad_searches,
             commands::peers::kad_cancel_search,

@@ -258,6 +258,58 @@ fn dedicated_quic_udp_port(quic_udp_port: u16, kad_udp_port: u16) -> Option<u16>
     (quic_udp_port != 0 && quic_udp_port != kad_udp_port).then_some(quic_udp_port)
 }
 
+/// Whether inbound rules for Ember's TCP and Kad UDP ports are in place. For
+/// the connection doctor: a QUIC rule is only needed when QUIC has a port of
+/// its own, and its absence shows up in the probes.
+pub fn rules_in_place(tcp_port: u16, udp_port: u16) -> bool {
+    firewall_rule_has_port(RULE_NAME_TCP, tcp_port) && firewall_rule_has_port(RULE_NAME_UDP, udp_port)
+}
+
+/// Add the TCP and Kad UDP rules from an elevated `netsh`, which is one
+/// Windows permission prompt. Ember does not run elevated, so this is the only
+/// way it can add them after setup; the connection doctor offers it, and only
+/// when the user asks. Returns whether the rules are in place afterwards, so a
+/// declined prompt reads as not done.
+pub fn add_rules_elevated(tcp_port: u16, udp_port: u16) -> bool {
+    use base64::Engine as _;
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let exe = exe.to_string_lossy().replace(['"', '\''], "");
+    let netsh = windows_system_path(NETSH).to_string_lossy().replace(['"', '\''], "");
+    let rule = |name: &str, protocol: &str, port: u16| {
+        format!(
+            "& '{netsh}' advfirewall firewall delete rule name='{name}' | Out-Null\n\
+             & '{netsh}' advfirewall firewall add rule name='{name}' dir=in action=allow \
+             protocol={protocol} localport={port} enable=yes profile=any program='{exe}' | Out-Null\n"
+        )
+    };
+    let script = format!(
+        "{}{}",
+        rule(RULE_NAME_TCP, "TCP", tcp_port),
+        rule(RULE_NAME_UDP, "UDP", udp_port)
+    );
+    // UTF-16LE, as `-EncodedCommand` takes it: nothing in the script has to
+    // survive another round of quoting.
+    let encoded = base64::engine::general_purpose::STANDARD.encode(
+        script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>(),
+    );
+    let powershell = windows_system_path(POWERSHELL).to_string_lossy().replace('\'', "");
+    let launcher = format!(
+        "Start-Process -FilePath '{powershell}' -Verb RunAs -Wait -WindowStyle Hidden \
+         -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{encoded}'"
+    );
+    let ran = Command::new(windows_system_path(POWERSHELL))
+        .args(["-NoProfile", "-NonInteractive", "-Command", &launcher])
+        .creation_flags(0x08000000)
+        .output();
+    if let Err(e) = ran {
+        warn!("Could not ask Windows to add the firewall rules: {e}");
+        return false;
+    }
+    rules_in_place(tcp_port, udp_port)
+}
+
 /// Returns `Some(outcome)` when `add_firewall_rule` actually ran (rule
 /// missing or stale), `None` when no action was needed (rule already
 /// up to date). Lets the caller distinguish "tried and failed" from

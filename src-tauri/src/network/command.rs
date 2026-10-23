@@ -2571,6 +2571,8 @@ async fn handle_command_inner(
             state.stats.ember_dht_contacts = ember_contacts;
             state.stats.ember_dht_verified_contacts = ember_verified;
             state.stats.ed2k_low_id = state.server_connected.then_some(state.low_id);
+            state.stats.tcp_listen_failed =
+                super::TCP_LISTEN_FAILED.load(std::sync::atomic::Ordering::Relaxed);
             let _ = tx.send(state.stats.clone());
         }
 

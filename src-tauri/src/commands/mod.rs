@@ -67,6 +67,7 @@ pub mod channels;
 pub mod chat_attachments;
 pub mod chat_window;
 pub mod collections;
+pub mod connection_doctor;
 pub mod comments;
 pub mod deeplink;
 pub mod emule_import;
