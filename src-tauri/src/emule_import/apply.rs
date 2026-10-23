@@ -472,7 +472,7 @@ fn apply_settings(
     crate::commands::settings::soft_repair_settings(&mut settings);
     crate::commands::settings::validate_settings(&settings).map_err(|e| anyhow::anyhow!(e))?;
     settings.settings_revision = settings.settings_revision.saturating_add(1);
-    let data = serde_json::to_string_pretty(&settings)?;
+    let data = crate::storage::config::settings_json(&settings)?;
     AppConfig::write_to_disk(&data, config_path, config_path)?;
     *current = settings;
     applied.new_roots = new_roots;

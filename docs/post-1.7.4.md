@@ -836,7 +836,9 @@ the release notes.
   silence follows its nominee's claim only in a copy signed before it
   returned, so a re-sign landing just before the owner's first successful
   fetch leaves it running a room its members have left.
-- **Downgrading to 1.7.1 leaves one upload slot.** Auto is stored as
-  `max_concurrent_uploads = 0`, which 1.7.1 repairs to 1 and saves. A separate
-  `upload_slots_auto` flag, with the number kept in 1.7.1's range, would make
-  the downgrade harmless.
+- **Downgrading to 1.7.1 leaves one upload slot. Done in 1.7.5:** Auto is
+  still `max_concurrent_uploads = 0` in memory, but `config.json` stores it as
+  `upload_slots_auto: true` beside a count of 4, eMule's floor, which every
+  build accepts (`storage::config::settings_json`). 1.7.1 now downgrades to
+  four slots rather than one; 1.7.2 to 1.7.4, which read 0 as Auto, see four
+  set by hand.

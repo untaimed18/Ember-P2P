@@ -5,6 +5,39 @@ use tracing::info;
 use crate::storage::paths;
 use crate::types::AppSettings;
 
+/// Marks Auto upload slots in `config.json`. In memory Auto is
+/// `max_concurrent_uploads == 0`, which 1.7.1 and earlier repaired to one slot
+/// and saved, so a downgrade left one upload slot. On disk Auto is this flag
+/// beside a count every build accepts, [`UPLOAD_SLOTS_AUTO_ON_DISK`].
+const UPLOAD_SLOTS_AUTO_KEY: &str = "upload_slots_auto";
+/// The count an older build reads while Auto is on: eMule's own floor of four
+/// slots (`max(MIN_UP_CLIENTS_ALLOWED, 4)`), which Auto never goes under.
+const UPLOAD_SLOTS_AUTO_ON_DISK: u32 = 4;
+
+/// `settings` as `config.json` holds them. Every writer of the file goes
+/// through this, so Auto upload slots are never stored as 0.
+pub(crate) fn settings_json(settings: &AppSettings) -> serde_json::Result<String> {
+    let mut value = serde_json::to_value(settings)?;
+    if settings.max_concurrent_uploads == 0 {
+        if let Some(fields) = value.as_object_mut() {
+            fields.insert("max_concurrent_uploads".into(), UPLOAD_SLOTS_AUTO_ON_DISK.into());
+            fields.insert(UPLOAD_SLOTS_AUTO_KEY.into(), true.into());
+        }
+    }
+    serde_json::to_string_pretty(&value)
+}
+
+/// `config.json` read back, Auto upload slots included.
+fn parse_settings(data: &str) -> serde_json::Result<AppSettings> {
+    let value: serde_json::Value = serde_json::from_str(data)?;
+    let auto = value.get(UPLOAD_SLOTS_AUTO_KEY).and_then(serde_json::Value::as_bool) == Some(true);
+    let mut settings: AppSettings = serde_json::from_value(value)?;
+    if auto {
+        settings.max_concurrent_uploads = 0;
+    }
+    Ok(settings)
+}
+
 /// Move a corrupt or semantically-invalid `config.json` aside so the user's
 /// original settings stay recoverable, returning the backup path on success.
 /// Uses a timestamp + counter so repeated failures within the same wall-clock
@@ -175,7 +208,7 @@ impl AppConfig {
                     None
                 }
             };
-            match data.as_deref().map(serde_json::from_str::<AppSettings>) {
+            match data.as_deref().map(parse_settings) {
                 None => AppSettings::default(),
                 // Parsed cleanly. Soft-repair out-of-range numerics / invalid
                 // enums first so a hand-edited or downgraded config.json does
@@ -308,7 +341,7 @@ impl AppConfig {
         }
 
         if config_changed {
-            let data = serde_json::to_string_pretty(&settings)?;
+            let data = settings_json(&settings)?;
             crate::security::atomic_write(&config_path, data.as_bytes(), true)?;
         }
 
@@ -332,7 +365,7 @@ impl AppConfig {
         &self,
         settings: &AppSettings,
     ) -> anyhow::Result<(String, std::path::PathBuf, std::path::PathBuf)> {
-        let data = serde_json::to_string_pretty(settings)?;
+        let data = settings_json(settings)?;
         Ok((data, self.config_path.clone(), self.config_path.clone()))
     }
 
@@ -359,6 +392,30 @@ impl AppConfig {
 #[cfg(test)]
 mod ember_default_on_tests {
     use super::*;
+
+    /// Auto upload slots go to disk as a flag beside a count an older build
+    /// accepts, and come back as Auto; a number set by hand stays that number.
+    #[test]
+    fn auto_upload_slots_survive_a_round_trip_and_a_downgrade() {
+        let auto = AppSettings { max_concurrent_uploads: 0, ..AppSettings::default() };
+        let on_disk = settings_json(&auto).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(raw["max_concurrent_uploads"], 4, "an older build reads a usable count");
+        assert_eq!(raw["upload_slots_auto"], true);
+        assert_eq!(parse_settings(&on_disk).unwrap().max_concurrent_uploads, 0, "Auto again");
+
+        let manual = AppSettings { max_concurrent_uploads: 7, ..AppSettings::default() };
+        let on_disk = settings_json(&manual).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(raw["max_concurrent_uploads"], 7);
+        assert!(raw.get("upload_slots_auto").is_none());
+        assert_eq!(parse_settings(&on_disk).unwrap().max_concurrent_uploads, 7);
+
+        // A config a build before this one wrote, with Auto stored as 0.
+        let mut old = serde_json::to_value(&auto).unwrap();
+        old.as_object_mut().unwrap().remove("upload_slots_auto");
+        assert_eq!(parse_settings(&old.to_string()).unwrap().max_concurrent_uploads, 0);
+    }
 
     /// A config from the opt-in era stores `false` because that was the
     /// default, not because anyone chose it. Leaving those profiles off would
