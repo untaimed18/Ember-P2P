@@ -763,6 +763,56 @@ pub fn generate_owned_room_salt() -> OwnedRoomSalt {
     salt
 }
 
+/// Context of the salts that pad an owned-rooms list; see
+/// [`pad_owned_rooms_list`].
+const OWNED_ROOMS_PAD_CONTEXT: &str = "ember-identity-owned-rooms-pad-v1";
+
+/// Sizes an owned-rooms list is padded to, smallest first. The last is
+/// `OWNED_ROOMS_MAX`, the most one list carries.
+const OWNED_ROOMS_PAD_SIZES: [usize; 4] = [8, 16, 32, 48];
+
+/// The `index`th salt that pads this identity's owned-rooms list. Derived
+/// from the identity's secret, so they read like any other salt to everyone
+/// else and the identity can tell them apart without a lookup.
+fn owned_rooms_pad_salt(identity_seed: &[u8; 32], index: u8) -> OwnedRoomSalt {
+    let mut material = [0u8; 33];
+    material[..32].copy_from_slice(identity_seed);
+    material[32] = index;
+    let derived = blake3::derive_key(OWNED_ROOMS_PAD_CONTEXT, &material);
+    zeroize::Zeroize::zeroize(&mut material);
+    let mut salt = [0u8; 16];
+    salt.copy_from_slice(&derived[..16]);
+    salt
+}
+
+/// `salts` padded to the next of a few fixed sizes and put in byte order, so
+/// the published list says neither how many rooms the identity owns nor which
+/// of them were carried. Past the last size it is left as it is, for the
+/// signer to refuse.
+pub fn pad_owned_rooms_list(salts: &[OwnedRoomSalt], identity_seed: &[u8; 32]) -> Vec<OwnedRoomSalt> {
+    let mut padded = salts.to_vec();
+    if let Some(&size) = OWNED_ROOMS_PAD_SIZES.iter().find(|&&size| size >= salts.len()) {
+        let mut index = 0u8;
+        while padded.len() < size {
+            let pad = owned_rooms_pad_salt(identity_seed, index);
+            if !padded.contains(&pad) {
+                padded.push(pad);
+            }
+            index = index.wrapping_add(1);
+        }
+    }
+    padded.sort_unstable();
+    padded
+}
+
+/// Whether `salt` is one of this identity's pads, which name no room. A list
+/// never needs more pads than its largest size holds; a few more cover the
+/// odd pad skipped for matching a real salt.
+pub fn is_owned_rooms_pad(salt: &OwnedRoomSalt, identity_seed: &[u8; 32]) -> bool {
+    let tried = OWNED_ROOMS_PAD_SIZES[OWNED_ROOMS_PAD_SIZES.len() - 1] as u8 + 8;
+    (0..tried).any(|index| owned_rooms_pad_salt(identity_seed, index) == *salt)
+}
+
 /// DHT key of the list of rooms `identity_pubkey` owns.
 pub fn owned_rooms_key(identity_pubkey: &[u8; 32]) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
@@ -9544,6 +9594,28 @@ mod tests {
     /// A room this identity owns is found again from the identity and its
     /// salt alone, so the derivation has to be stable, and distinct per salt
     /// and per identity.
+    #[test]
+    fn an_owned_rooms_list_is_padded_to_a_few_sizes_only_its_identity_can_see_through() {
+        let me = [0x11u8; 32];
+        let other = [0x22u8; 32];
+        let real: Vec<OwnedRoomSalt> = (1..=3u8).map(|i| [i; 16]).collect();
+        let padded = pad_owned_rooms_list(&real, &me);
+        assert_eq!(padded.len(), 8, "three rooms read as eight");
+        assert!(padded.windows(2).all(|w| w[0] < w[1]), "in byte order, so carried ones do not show");
+        assert!(real.iter().all(|salt| padded.contains(salt)));
+        let pads: Vec<_> = padded.iter().filter(|salt| !real.contains(salt)).collect();
+        assert!(pads.iter().all(|salt| is_owned_rooms_pad(salt, &me)));
+        assert!(pads.iter().all(|salt| !is_owned_rooms_pad(salt, &other)), "nobody else can tell");
+        assert!(real.iter().all(|salt| !is_owned_rooms_pad(salt, &me)));
+        assert_eq!(pad_owned_rooms_list(&real, &me), padded, "the same list every time");
+
+        assert_eq!(pad_owned_rooms_list(&[], &me).len(), 8, "no rooms reads like a few");
+        let nine: Vec<OwnedRoomSalt> = (1..=9u8).map(|i| [i; 16]).collect();
+        assert_eq!(pad_owned_rooms_list(&nine, &me).len(), 16);
+        let full: Vec<OwnedRoomSalt> = (1..=48u8).map(|i| [i; 16]).collect();
+        assert_eq!(pad_owned_rooms_list(&full, &me).len(), 48, "a full list gains nothing");
+    }
+
     #[test]
     fn an_owned_room_seed_comes_from_the_identity_and_its_salt() {
         let identity = [0x11u8; 32];

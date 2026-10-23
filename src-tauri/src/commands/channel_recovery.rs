@@ -56,6 +56,13 @@ const OWN_EPOCH_LOOKAHEAD: i64 = 4;
 /// counting the owner as gone.
 const UNSETTLED_RETRY_SECS: u64 = 6 * 60 * 60;
 
+/// How often the list is read again once everything in it is settled. The
+/// identity may run on another device too, which publishes a list of its own
+/// on the same six-hour cadence; reading the network's at half that and
+/// carrying what it adds keeps this device's next publish from dropping the
+/// rooms made there.
+const SETTLED_REREAD_SECS: u64 = 3 * 60 * 60;
+
 /// Emitted when a look put rooms back: `{ "count": n }`.
 pub const CHANNELS_RECOVERED_EVENT: &str = "ember:channels-recovered";
 
@@ -558,7 +565,10 @@ async fn read_owned_rooms_list(state: &AppState) -> Option<Vec<OwnedRoomSalt>> {
     let (first, second) = tokio::join!(probe(state, key), probe(state, key));
     let mut records = first.records().to_vec();
     records.extend_from_slice(second.records());
-    if let Some(salts) = merged_lists(&records, &our_pk) {
+    if let Some(mut salts) = merged_lists(&records, &our_pk) {
+        // The padding names no room, and only this identity can tell it apart.
+        let seed = state.identity.ed25519_secret_key;
+        salts.retain(|salt| !channel::is_owned_rooms_pad(salt, &seed));
         return Some(salts);
     }
     // Nothing that is a list: no list yet, but only on enough of the
@@ -744,6 +754,17 @@ pub fn ensure_list_read(app: tauri::AppHandle) {
     }
 }
 
+/// After this identity took on a room this session: keep the read loop going,
+/// so the list is read again on its cadence. Nothing when it already runs.
+pub fn keep_reading_list(app: tauri::AppHandle) {
+    let delay = if crate::network::channel_membership::owned_rooms_list_read() {
+        std::time::Duration::from_secs(SETTLED_REREAD_SECS)
+    } else {
+        std::time::Duration::ZERO
+    };
+    spawn_list_read(app, delay);
+}
+
 /// Lets the read loop start again however it ends.
 struct ReadLoopRunning;
 
@@ -757,7 +778,9 @@ impl Drop for ReadLoopRunning {
 
 /// Read the list until it has been read — every two minutes for a while if
 /// the network cannot be reached well enough yet — and then keep looking at
-/// rooms that could not be settled, every few hours. One such loop at a time.
+/// rooms that could not be settled, every few hours, and at the list itself
+/// while this identity owns rooms (see [`SETTLED_REREAD_SECS`]). One such
+/// loop at a time.
 fn spawn_list_read(app: tauri::AppHandle, delay: std::time::Duration) {
     if READ_LOOP_RUNNING.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return;
@@ -772,7 +795,14 @@ fn spawn_list_read(app: tauri::AppHandle, delay: std::time::Duration) {
                 return;
             };
             let wait = match scan_owned_rooms(&state, Some(&app)).await {
-                Ok(scan) if scan.unsettled == 0 => return,
+                Ok(scan) if scan.unsettled == 0 => {
+                    let owns = !state.db.owned_room_salts().unwrap_or_default().is_empty();
+                    if !owns {
+                        return;
+                    }
+                    failures = 0;
+                    SETTLED_REREAD_SECS
+                }
                 Ok(_) => UNSETTLED_RETRY_SECS,
                 Err(e) => {
                     failures += 1;

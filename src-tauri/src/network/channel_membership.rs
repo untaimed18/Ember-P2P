@@ -4746,9 +4746,10 @@ pub(super) async fn maybe_publish_owned_rooms_list(
         return;
     }
     let signing = crate::network::ember::crypto::signing_key_from_bytes(&identity.ed25519_secret_key);
-    // `owned_room_salts` stops at what one list carries, so this only fails
-    // if the identity key itself is unusable.
-    let Some(record) = ember::dht::publish::SignedRecord::owned_rooms(&salts, &signing) else {
+    let listed = ember::channel::pad_owned_rooms_list(&salts, &identity.ed25519_secret_key);
+    // `owned_room_salts` stops at what one list carries, and padding never
+    // goes past it, so this only fails if the identity key itself is unusable.
+    let Some(record) = ember::dht::publish::SignedRecord::owned_rooms(&listed, &signing) else {
         warn!("Ember: could not sign this identity's list of owned rooms");
         return;
     };

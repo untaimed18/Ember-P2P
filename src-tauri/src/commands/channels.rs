@@ -848,6 +848,7 @@ pub async fn list_channels(state: tauri::State<'_, AppState>) -> Result<Vec<Chan
 
 #[tauri::command]
 pub async fn create_channel(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     name: String,
     private: bool,
@@ -1112,6 +1113,10 @@ pub async fn create_channel(
         // A room that has just been created has never rotated.
         key_epoch: 0,
     };
+    // Now that this identity owns a room, its list is read again on a cadence
+    // (see `channel_recovery::SETTLED_REREAD_SECS`), even if the startup read
+    // had nothing to settle.
+    crate::commands::channel_recovery::keep_reading_list(app);
     Ok(ChannelInviteInfo {
         uri: invite.format(),
         channel_id: channel_id_hex,

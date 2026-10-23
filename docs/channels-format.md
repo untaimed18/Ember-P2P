@@ -570,17 +570,26 @@ empty name and kind flags 0.
   only the record size.
 - Version 0 is refused. An empty list is valid and is published, so a deleted
   last room stops being listed.
+- **Padding (from 1.7.5).** A list is padded to 8, 16, 32 or 48 salts, the
+  smallest that holds it, and put in byte order (`pad_owned_rooms_list`). A
+  pad is `BLAKE3_derive_key("ember-identity-owned-rooms-pad-v1",
+  identity_seed || index)[..16]`, so it reads like any salt to everyone but the
+  identity, whose recovery drops it before any lookup (`is_owned_rooms_pad`).
+  Nothing in the format changes. An earlier build recovering the same identity
+  looks the pads up, finds no room, and carries them for a while.
 
 Publishing (`maybe_publish_owned_rooms_list`) waits until the network's list
 has been read this launch, so an old database cannot overwrite a newer list.
 It repeats every `MODERATION_REPUBLISH_SECS` (6 hours), and once more within
-`OWNED_ROOMS_CONFIRM_SECS` (30 minutes) after the list changes. Recovery
-(`commands/channel_recovery.rs`) merges the salts of every copy the identity
-signed that comes back (`merged_lists`), and takes a lookup that finds
-nothing as "no list" only once `MIN_RESPONDERS_FOR_ABSENCE` (4) nodes have
-answered. Builds older than kind 7 do not store it. The known limits (one
-identity on two devices, the list revealing a room count) are under
-[Owned-room recovery](post-1.7.4.md#owned-room-recovery).
+`OWNED_ROOMS_CONFIRM_SECS` (30 minutes) after the list changes. From 1.7.5 a
+device that owns rooms reads the network's list again every
+`SETTLED_REREAD_SECS` (3 hours) while it runs, so the same identity on another
+device does not have its newer rooms dropped by this one's next publish.
+Recovery (`commands/channel_recovery.rs`) merges the salts of every copy the
+identity signed that comes back (`merged_lists`), and takes a lookup that
+finds nothing as "no list" only once `MIN_RESPONDERS_FOR_ABSENCE` (4) nodes
+have answered. Builds older than kind 7 do not store it. The known limits are
+under [Owned-room recovery](post-1.7.4.md#owned-room-recovery).
 
 ## Room settings (kind 8)
 

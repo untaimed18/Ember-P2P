@@ -832,17 +832,26 @@ the release notes.
 
 ### Owned-room recovery
 
-- **One identity on two devices at once.** Each device publishes its own
-  owned-rooms list and the newer one wins, so the other device's rooms stay
-  recoverable only until its next publish. A fix would read the network's
-  list before every publish and merge it.
+- **One identity on two devices at once. Narrowed in 1.7.5:** each device
+  publishes its own owned-rooms list and the newer one wins. A device that
+  owns rooms now reads the network's list every three hours while it runs
+  (`SETTLED_REREAD_SECS`, half the publish cadence) and carries or restores
+  what the other device added, as every launch already did, so the window in
+  which one device's list can drop the other's new rooms is at most a few
+  hours rather than until the next launch.
 - **A taken-over private room lost before its first rotation.** Recovery
   derives the wrong key and nothing is pending to correct it. Sealing epoch 0
-  to ourselves for rooms we did not create would close the gap.
+  to ourselves for rooms we did not create would close the gap. Left as it
+  is in 1.7.5: the claim rotates straight away and the owner loop retries a
+  rotation that failed, so the window is minutes, and closing it means
+  recovery overwriting a key it derived with one it fetched.
 - **Old backups keep rooms deleted since.** A room key signature on the
-  deletion, served by the registry, would let it be trusted.
-- **The list shows how many rooms an identity owns.** Padding it to a fixed
-  size would hide that.
+  deletion, served by the registry, would let it be trusted. Left as it is in
+  1.7.5: it needs the registry to store and serve the signature as well as
+  the client to check it.
+- **The list shows how many rooms an identity owns. Done in 1.7.5:** the list
+  is padded to 8, 16, 32 or 48 salts with pads only the identity can tell
+  apart, and sorted ([The owned-rooms list](channels-format.md#the-owned-rooms-list-kind-7)).
 - **Older builds don't store record kind 7.** Absence is only concluded after
   four nodes have answered (`MIN_RESPONDERS_FOR_ABSENCE`).
 - **Recovery has no end-to-end test**; item 5's restore run is the only cover
