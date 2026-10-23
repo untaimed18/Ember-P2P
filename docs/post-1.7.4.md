@@ -727,9 +727,19 @@ async wrappers (`on_session_ended`, `on_friend_waits`, `retry_owed_holds`)
 only read the session map and call what these drive; a Standing note starting
 no look is not under test.
 
-**Still open:** saving waiting offers across a restart, which needs
-`AttachOffer`'s fields and the hold on both ends, not just the `awaiting`
-row.
+**Done in 1.7.5: waiting offers survive a restart.** The sender's side
+already lived in `chat_attachments`. The receiver now keeps what its
+`awaiting` row lacks beside it (`inbound_offer`, JSON: the sender's QUIC
+port, the name as offered, the session address, when it arrived, and whether
+the sender ever echoed a hold; `save_inbound`, on arrival and on the echo).
+At startup `sweep_interrupted` brings back every waiting offer still in date
+whose friend still has a key (`restore_inbound`). One the sender held comes
+back named, on an offer's lifetime from the restart, which is the one re-hold
+a sender gives after a session ends; the next session's empty form names it
+and the echo gives the day back. One never held keeps the lifetime it had.
+Anything else is settled `expired` as before. The column is added at open
+outside the numbered chain, so the schema stays at 62. Test:
+`a_waiting_offer_survives_a_restart_on_the_terms_its_sender_allows`.
 
 **Decided when 1.7.4's scope was set:**
 

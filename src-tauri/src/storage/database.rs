@@ -3530,6 +3530,9 @@ impl Database {
             "hold_released",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        // The offer behind a received row still waiting on the user, so it can
+        // be answered after a restart; see `chat_attach::sweep_interrupted`.
+        Self::add_column_if_missing(&conn, "chat_attachments", "inbound_offer", "TEXT")?;
         // What the user calls a friend, kept apart from `nickname`, which is
         // what the friend calls themselves and follows their own renames. Outside
         // the numbered chain so 1.7.0 still opens the database; it never reads
@@ -4050,9 +4053,50 @@ impl Database {
         Ok(moved)
     }
 
+    /// Keep what answering a received offer needs beside its row (see
+    /// [`Self::waiting_inbound_chat_attachments`]). Opaque here.
+    pub fn set_chat_attachment_inbound_offer(&self, xfer_id: &str, offer: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE chat_attachments SET inbound_offer = ?2
+             WHERE xfer_id = ?1 AND direction = 'received'",
+            params![xfer_id, offer],
+        )?;
+        Ok(())
+    }
+
+    /// Every received offer still waiting on the user, with what was kept of
+    /// it: `(xfer_id, friend_hash, file_name, file_size, root_hash,
+    /// expires_at, inbound_offer)`.
+    #[allow(clippy::type_complexity)]
+    pub fn waiting_inbound_chat_attachments(
+        &self,
+    ) -> anyhow::Result<Vec<(String, String, String, u64, String, i64, Option<String>)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT xfer_id, friend_hash, file_name, file_size, root_hash, expires_at, inbound_offer
+             FROM chat_attachments
+             WHERE direction = 'received' AND status = 'awaiting'",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, i64>(3)?.max(0) as u64,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Every received attachment that was waiting or moving when the process
-    /// last stopped. The offer an `awaiting` row needs lives only in memory and
-    /// a receive does not survive a restart, so both are stale on startup.
+    /// last stopped. A receive does not survive a restart, and an `awaiting`
+    /// row is stale unless `chat_attach::sweep_interrupted` restored its offer.
     pub fn interrupted_inbound_chat_attachments(&self) -> anyhow::Result<Vec<(String, String)>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
@@ -16169,7 +16213,8 @@ mod tests {
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL,
                 held_at INTEGER,
-                hold_released INTEGER NOT NULL DEFAULT 0
+                hold_released INTEGER NOT NULL DEFAULT 0,
+                inbound_offer TEXT
             );",
         )
         .expect("create schema");

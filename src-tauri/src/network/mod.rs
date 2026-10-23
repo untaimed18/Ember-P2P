@@ -1272,13 +1272,18 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
     kad::firewall::publish_local_firewall(state.firewalled, state.udp_firewalled);
 
-    // Chat attachments a restart stranded: offers whose details lived only in
-    // memory and receives cut off mid-file. Settled before anything can emit,
-    // so the transcript never shows a transfer that will not move again.
+    // Chat attachments a restart stranded: offers that can no longer be
+    // answered and receives cut off mid-file. Settled before anything can
+    // emit, so the transcript never shows a transfer that will not move again.
     {
         let db = db.clone();
         let folders = settings.download_roots();
-        let _ = tokio::task::spawn_blocking(move || chat_attach::sweep_interrupted(&db, &folders)).await;
+        let restored = tokio::task::spawn_blocking(move || chat_attach::sweep_interrupted(&db, &folders))
+            .await
+            .unwrap_or_default();
+        // Offers still waiting on the user, back from what was kept beside
+        // their rows: their senders hear of them when a session comes up.
+        state.attach_inbound.extend(restored);
     }
     // Web sources downloads were added with, before any of them can start.
     ed2k::web_sources::set_enabled(settings.web_sources_enabled);
