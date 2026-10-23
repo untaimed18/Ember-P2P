@@ -2399,6 +2399,7 @@
   "transfers_parts": "{have}/{total} частей",
   "transfers_parts_peer": "{peer} уже у пира",
   "transfers_parts_swarm": "{peer} есть у источников",
+  "transfers_parts_sent": "отправлено {percent}%",
   "transfers_parts_title": "Части, доступные от этого источника",
   "transfers_failed_sources_hidden_one": "Скрыт 1 неудачный источник",
   "transfers_failed_sources_hidden_other": "Скрыто неудачных источников: {count}",

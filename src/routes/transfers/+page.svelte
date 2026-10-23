@@ -2749,28 +2749,49 @@
    *  the `speedHistory` sweep below, which walks the same live-id set. */
   const uploadTooltipCache: Map<
     string,
-    { served?: string; peer?: string; total: number; text: string }
+    { served?: string; peer?: string; fill?: string; sentPct: number; total: number; text: string }
   > = new Map();
 
-  /** Tooltip for the upload parts bar: parts we've sent this session, plus the
-   *  count the downloader already had (eMule `m_abyUpPartStatus`) when present. */
+  /** Whether some part has bytes sent without being whole (`up_part_fill`
+   *  bytes strictly between 00 and ff). */
+  function hasPartialParts(fill: string | undefined): boolean {
+    if (!fill) return false;
+    for (let i = 0; i + 1 < fill.length; i += 2) {
+      const byte = fill.slice(i, i + 2);
+      if (byte !== '00' && byte !== 'ff') return true;
+    }
+    return false;
+  }
+
+  /** Tooltip for the upload parts bar: whole parts we've sent this session, how
+   *  much of the file has gone out when parts are only partly sent (a peer
+   *  taking the rest of them from other sources, where the whole-part count
+   *  alone reads as nothing sent), and the count the downloader already had
+   *  (eMule `m_abyUpPartStatus`) when present. */
   function uploadPartsTooltip(t: Transfer): string {
     const total = t.up_part_count ?? 0;
+    const sentPct = t.total_size > 0 ? Math.round((Math.min(t.completed_size, t.total_size) / t.total_size) * 100) : 0;
     const cached = uploadTooltipCache.get(t.id);
     if (
       cached
       && cached.total === total
       && cached.served === t.up_part_status
       && cached.peer === t.up_peer_part_status
+      && cached.fill === t.up_part_fill
+      && cached.sentPct === sentPct
     ) {
       return cached.text;
     }
-    const base = m.transfers_parts({ have: countServedParts(t.up_part_status), total });
+    const pieces = [m.transfers_parts({ have: countServedParts(t.up_part_status), total })];
+    if (hasPartialParts(t.up_part_fill)) pieces.push(m.transfers_parts_sent({ percent: sentPct }));
     const peerOnly = countPeerOnlyParts(t.up_peer_part_status, t.up_part_status, total);
-    const text = peerOnly > 0 ? `${base} · ${m.transfers_parts_peer({ peer: peerOnly })}` : base;
+    if (peerOnly > 0) pieces.push(m.transfers_parts_peer({ peer: peerOnly }));
+    const text = pieces.join(' · ');
     uploadTooltipCache.set(t.id, {
       served: t.up_part_status,
       peer: t.up_peer_part_status,
+      fill: t.up_part_fill,
+      sentPct,
       total,
       text,
     });
@@ -6193,6 +6214,7 @@
                           <PartsBar
                             partStatus={t.up_part_status}
                             partCount={t.up_part_count}
+                            partFill={t.up_part_fill}
                             peerPartStatus={t.up_peer_part_status}
                             transferred={t.completed_size}
                             total={t.total_size}

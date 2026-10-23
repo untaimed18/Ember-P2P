@@ -164,6 +164,11 @@ export interface Transfer {
   /** Upload-direction only: total ED2K part count (ceil(total_size / PARTSIZE)),
    *  paired with {@link up_part_status} so the bar renders the right segments. */
   up_part_count?: number;
+  /** Upload-direction only: hex, one byte per part (shares
+   *  {@link up_part_count}), of how much of each part has been sent this
+   *  session — 0 none, 1–254 partly, 255 whole. Draws parts the peer is also
+   *  taking from other sources, which {@link up_part_status} never lights. */
+  up_part_fill?: string;
   /** Upload-direction only: hex bitmap (same packing as {@link up_part_status},
    *  shares {@link up_part_count}) of parts the downloader advertised it already
    *  had at request time — eMule's `m_abyUpPartStatus`. Shaded dark beneath the

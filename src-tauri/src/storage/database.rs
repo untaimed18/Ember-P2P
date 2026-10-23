@@ -4941,6 +4941,7 @@ impl Database {
                         completed_path: None,
                         up_part_status: None,
                         up_part_count: None,
+                        up_part_fill: None,
                         up_peer_part_status: None,
                         // Not persisted (see the `ember_verified` field doc):
                         // completed transfers never come back through this

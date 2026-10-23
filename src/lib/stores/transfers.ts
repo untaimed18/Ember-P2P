@@ -41,6 +41,7 @@ interface ProgressPayload {
   upload_time?: number;
   up_part_status?: string;
   up_part_count?: number;
+  up_part_fill?: string;
   up_peer_part_status?: string;
   /** `'upload'` on upload-direction events; omitted entirely for downloads
    *  (`TransferProgressPayload::direction` is `Option<&'static str>` and is
@@ -591,6 +592,7 @@ function applyProgress(existing: Transfer, p: ProgressPayload): Transfer {
     ...(p.upload_time != null ? { upload_time: p.upload_time } : {}),
     ...(p.up_part_status != null ? { up_part_status: p.up_part_status } : {}),
     ...(p.up_part_count != null ? { up_part_count: p.up_part_count } : {}),
+    ...(p.up_part_fill != null ? { up_part_fill: p.up_part_fill } : {}),
     // Mirrored, absent included: the backend sets the row's bitmap from each
     // upload progress event and clears it when the peer's file no longer
     // matches, and a cleared value is left out of the payload.

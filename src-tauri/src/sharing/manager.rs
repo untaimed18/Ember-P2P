@@ -3042,6 +3042,7 @@ mod tests {
             completed_path: None,
             up_part_status: None,
             up_part_count: None,
+            up_part_fill: None,
             up_peer_part_status: None,
             ember_verified: false,
             friends_only: false,

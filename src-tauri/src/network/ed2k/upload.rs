@@ -2647,6 +2647,49 @@ fn build_up_part_status(served: &[u64], total_size: u64) -> (Option<String>, Opt
     (Some(hex), Some(part_count as u32))
 }
 
+/// How much of each part has been delivered this session, as hex, one byte per
+/// part: 255 for a whole part, and for a partial one its share scaled to
+/// 1..=254, so a part with bytes sent never reads as empty and one still short
+/// never reads as done. Pairs with the bitmap from [`build_up_part_status`],
+/// which only lights whole parts.
+///
+/// The bitmap alone drew nothing for a peer that pulls each part from several
+/// sources: everything we sent it fell inside parts someone else finished, so
+/// hundreds of megabytes went out under a bar at "0 parts". eMule's bar draws
+/// delivered blocks (`m_DoneBlocks_list`), not whole parts, for this reason.
+///
+/// `None` only when the size is unknown. A tally sized for another file — the
+/// bitmap's all-grey case — gives all zeros rather than `None`, because the row
+/// and the UI both keep the last value when the field is absent, and that value
+/// would be the previous file's parts.
+fn build_up_part_fill(served: &[u64], total_size: u64) -> Option<String> {
+    use std::fmt::Write as _;
+    if total_size == 0 {
+        return None;
+    }
+    let part_count = total_size.div_ceil(PARTSIZE).max(1) as usize;
+    if served.len() != part_count {
+        return Some("00".repeat(part_count));
+    }
+    let mut hex = String::with_capacity(part_count * 2);
+    for (i, &s) in served.iter().enumerate() {
+        let part_size = if i + 1 < part_count {
+            PARTSIZE
+        } else {
+            total_size.saturating_sub((part_count as u64 - 1) * PARTSIZE)
+        };
+        let level = if part_size == 0 || s == 0 {
+            0
+        } else if s >= part_size {
+            255
+        } else {
+            (s.saturating_mul(254) / part_size).clamp(1, 254) as u8
+        };
+        let _ = write!(hex, "{level:02x}");
+    }
+    Some(hex)
+}
+
 /// Decode a downloader's advertised ED2K part bitmap (from the
 /// `OP_REQUESTFILENAME` extended-info block — see
 /// [`MultiPacketRequest::req_part_status`]) into the IPC hex bitmap used by the
@@ -3128,6 +3171,7 @@ fn upload_progress_kind(
         total: total_size,
         part_status,
         part_count,
+        part_fill: build_up_part_fill(served, total_size),
         peer_part_status,
     }
 }
@@ -3238,6 +3282,9 @@ pub enum UploadEventKind {
         /// [`crate::types::Transfer::up_part_status`].
         part_status: Option<String>,
         part_count: Option<u32>,
+        /// How much of each part has gone out, one byte per part. See
+        /// [`crate::types::Transfer::up_part_fill`].
+        part_fill: Option<String>,
         /// Hex bitmap of parts the downloader advertised it already has at
         /// request time (eMule `m_abyUpPartStatus`), shading the parts bar
         /// dark. Shares [`part_count`]. See
@@ -16145,6 +16192,35 @@ mod unique_served_tests {
             unique_served_bytes(&served, total) < total,
             "re-requests must not make unique coverage look complete"
         );
+    }
+
+    /// Parts we sent some of draw as partly filled even though no part was sent
+    /// whole — the peer that finishes them from other sources. A partial part
+    /// never reads as empty or done, and the short last part is scaled to its
+    /// own size.
+    #[test]
+    fn the_part_fill_shows_parts_sent_in_part() {
+        let total = PARTSIZE * 2 + PARTSIZE / 2;
+        let served = vec![PARTSIZE / 2, 1, PARTSIZE / 2];
+        let (bitmap, count) = build_up_part_status(&served, total);
+        assert_eq!(count, Some(3));
+        assert_eq!(bitmap.as_deref(), Some("04"), "only the short last part is whole");
+        let fill = build_up_part_fill(&served, total).unwrap();
+        assert_eq!(fill.len(), 6, "one byte per part");
+        let level = |i: usize| u8::from_str_radix(&fill[i * 2..i * 2 + 2], 16).unwrap();
+        assert_eq!(level(0), 127, "half a part");
+        assert_eq!(level(1), 1, "a single byte still shows");
+        assert_eq!(level(2), 255, "the last part, sent whole at its own size");
+
+        assert_eq!(build_up_part_fill(&[PARTSIZE - 1], PARTSIZE).as_deref(), Some("fd"), "short of whole is not whole");
+        assert_eq!(build_up_part_fill(&[0, 0], PARTSIZE * 2).as_deref(), Some("0000"));
+        assert_eq!(build_up_part_fill(&[PARTSIZE], 0), None, "unknown size");
+        assert_eq!(
+            build_up_part_fill(&[PARTSIZE], PARTSIZE * 2).as_deref(),
+            Some("0000"),
+            "a tally for another file clears the bar rather than leaving the last one"
+        );
+        assert_eq!(build_up_part_fill(&[], PARTSIZE * 2).as_deref(), Some("0000"), "nothing sent yet");
     }
 
     #[test]

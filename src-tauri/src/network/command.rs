@@ -2045,6 +2045,7 @@ async fn handle_command_inner(
                                 completed_path: None,
                                 up_part_status: None,
                                 up_part_count: None,
+                                up_part_fill: None,
                                 up_peer_part_status: None,
                                 ember_verified: false,
                                 friends_only: transfer_friends_only,

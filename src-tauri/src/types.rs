@@ -287,6 +287,16 @@ pub struct Transfer {
     /// [`up_part_status`]: Transfer::up_part_status
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub up_part_count: Option<u32>,
+    /// Upload-direction only: hex, one byte per part (shares
+    /// [`up_part_count`]), of how much of each part has been delivered this
+    /// session — 0 none, 1..=254 partly, 255 whole. Lets the parts bar draw
+    /// parts this peer is finishing from other sources too, which
+    /// [`up_part_status`] never lights.
+    ///
+    /// [`up_part_status`]: Transfer::up_part_status
+    /// [`up_part_count`]: Transfer::up_part_count
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up_part_fill: Option<String>,
     /// Upload-direction only: hex bitmap (same packing as [`up_part_status`],
     /// shares [`up_part_count`]) of the ED2K parts the downloader advertised it
     /// already had at request time — eMule's `m_abyUpPartStatus`. Drives the
@@ -2889,6 +2899,9 @@ pub struct TransferProgressPayload<'a> {
     pub up_part_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub up_part_count: Option<u32>,
+    /// Upload-direction only: see [`Transfer::up_part_fill`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub up_part_fill: Option<String>,
     /// Upload-direction only: see [`Transfer::up_peer_part_status`]. Carried on
     /// live progress events so the dark peer-has shading stays in sync between
     /// the 3 s polls.

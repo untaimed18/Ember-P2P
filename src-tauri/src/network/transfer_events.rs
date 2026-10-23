@@ -334,6 +334,7 @@ pub(super) async fn handle_download_event(
                     upload_time: None,
                     up_part_status: None,
                     up_part_count: None,
+                    up_part_fill: None,
                     up_peer_part_status: None,
                 },
             );
@@ -998,6 +999,7 @@ pub(super) async fn handle_upload_event(
                 completed_path: None,
                 up_part_status: None,
                 up_part_count: None,
+                up_part_fill: None,
                 up_peer_part_status: None,
                 ember_verified: false,
                 friends_only: false,
@@ -1039,6 +1041,7 @@ pub(super) async fn handle_upload_event(
             total,
             part_status,
             part_count,
+            part_fill,
             peer_part_status,
         } => {
             // Unique coverage, not session wire bytes. Re-requests inflate
@@ -1096,6 +1099,9 @@ pub(super) async fn handle_upload_event(
                         if part_count.is_some() {
                             t.up_part_count = part_count;
                         }
+                        if part_fill.is_some() {
+                            t.up_part_fill = part_fill.clone();
+                        }
                         // Always assign (Some or None): keyed by file hash on the
                         // session side, so if a row stops matching the advertised
                         // file the dark "peer has" shading clears instead of
@@ -1124,6 +1130,7 @@ pub(super) async fn handle_upload_event(
                     upload_time: Some(upload_time_ms),
                     up_part_status: part_status,
                     up_part_count: part_count,
+                    up_part_fill: part_fill,
                     up_peer_part_status: peer_part_status,
                 },
             );
