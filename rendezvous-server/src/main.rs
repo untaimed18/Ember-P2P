@@ -2525,6 +2525,10 @@ struct AppState {
     chat_mailbox_network_rate_limits: RateLimitBucket,
     /// `/v4/reachability`, per address and per hour: each one dials out.
     reachability_rate_limits: RateLimitBucket,
+    /// Lets `/v4/reachability` probe a loopback caller. Tests only: in
+    /// service, a loopback caller is a local proxy without `TRUST_PROXY`, and
+    /// probing it would map the server's own ports for anyone.
+    reachability_probes_loopback: bool,
 }
 
 /// A connection check: probe the caller's own `tcp_port` and `udp_port`.
@@ -3610,9 +3614,15 @@ async fn protocol_v4() -> Json<serde_json::Value> {
 /// Only ever the address the request came from, so the endpoint cannot be
 /// pointed at anyone else, and rate-limited per address because each check
 /// dials out. TCP is a connect and an immediate close; UDP is one short
-/// datagram, sent a few times, that the client recognises and keeps to itself
+/// datagram, sent three times, that the client recognises and keeps to itself
 /// ([`REACHABILITY_PROBE_TAG`] and the nonce). Whether that arrived only the
 /// client can tell, so the answer says it was sent.
+///
+/// Only a public IPv4 caller is probed, which is all Ember listens on. Any
+/// other is answered `"available": false` without a dial: an IPv6 caller
+/// would be reported closed while its IPv4 ports are open, and a private or
+/// loopback one is a proxy in front of this server, whose own ports are not
+/// anyone's to map.
 async fn reachability_v4(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -3626,7 +3636,21 @@ async fn reachability_v4(
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or(StatusCode::BAD_REQUEST)?;
-    let client_ip = extract_client_ip(&headers, addr);
+    let server_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let client_ip = canonical_ip(extract_client_ip(&headers, addr));
+    let probeable = match client_ip {
+        IpAddr::V4(v4) => is_routable_public_v4(v4) || (state.reachability_probes_loopback && v4.is_loopback()),
+        IpAddr::V6(_) => false,
+    };
+    if !probeable {
+        return Ok(Json(serde_json::json!({
+            "available": false,
+            "server_time": server_time,
+        })));
+    }
     if !check_rate_limit_bucket_in(
         &state.reachability_rate_limits,
         client_ip,
@@ -3653,13 +3677,8 @@ async fn reachability_v4(
     let mut probe = Vec::with_capacity(REACHABILITY_PROBE_TAG.len() + nonce.len());
     probe.extend_from_slice(REACHABILITY_PROBE_TAG);
     probe.extend_from_slice(&nonce);
-    let bind: SocketAddr = if client_ip.is_ipv4() {
-        SocketAddr::from(([0, 0, 0, 0], 0))
-    } else {
-        SocketAddr::from(([0u16; 8], 0))
-    };
     let mut udp_sent = false;
-    if let Ok(socket) = tokio::net::UdpSocket::bind(bind).await {
+    if let Ok(socket) = tokio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await {
         let target = SocketAddr::new(client_ip, body.udp_port);
         for _ in 0..3 {
             udp_sent |= socket.send_to(&probe, target).await.is_ok();
@@ -3667,11 +3686,8 @@ async fn reachability_v4(
         }
     }
     debug!("reachability check for {client_ip}: tcp {tcp}, udp sent {udp_sent}");
-    let server_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
     Ok(Json(serde_json::json!({
+        "available": true,
         "ip": client_ip.to_string(),
         "tcp": tcp,
         "udp_sent": udp_sent,
@@ -6502,6 +6518,7 @@ async fn main() {
         chat_mailbox_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
         chat_mailbox_network_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
         reachability_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+        reachability_probes_loopback: false,
     };
 
     tokio::spawn(sweep_expired(state.clone()));
@@ -6721,6 +6738,7 @@ mod relay_ticket_tests {
             chat_mailbox_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
             chat_mailbox_network_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
             reachability_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+            reachability_probes_loopback: true,
         }
     }
 
@@ -9325,6 +9343,42 @@ mod relay_ticket_tests {
         }
         let limited = send(serde_json::json!({ "tcp_port": closed, "udp_port": udp_port, "nonce": nonce })).await;
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// In service only a public IPv4 caller is probed: loopback and private
+    /// callers are a proxy in front of the server, and an IPv6 one would be
+    /// probed where Ember does not listen. Neither is dialled nor charged.
+    #[tokio::test]
+    async fn a_reachability_check_is_declined_for_any_caller_but_a_public_ipv4_one() {
+        use tower::ServiceExt;
+
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tcp.local_addr().unwrap().port();
+        let mut state = test_state();
+        state.reachability_probes_loopback = false;
+        let app = build_router(state.clone());
+        for caller in ["127.0.0.1:50000", "10.1.2.3:50000", "[2001:db8::1]:50000", "[::ffff:127.0.0.1]:50000"] {
+            for _ in 0..=REACHABILITY_PER_WINDOW {
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v4/reachability")
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo(caller.parse::<SocketAddr>().unwrap()))
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "tcp_port": tcp_port, "udp_port": 4672, "nonce": "ab".repeat(16) })
+                            .to_string(),
+                    ))
+                    .unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{caller}: never charged");
+                let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+                let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(answer["available"], false, "{caller}");
+                assert!(answer.get("tcp").is_none());
+            }
+        }
+        let dialled = tokio::time::timeout(Duration::from_millis(100), tcp.accept()).await;
+        assert!(dialled.is_err(), "nothing was dialled");
     }
 
     #[tokio::test]

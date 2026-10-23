@@ -2715,18 +2715,31 @@ pub struct ReachabilityAnswer {
     pub server_time: i64,
 }
 
+/// How a request for the outside-in probe ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reachability {
+    Probed(ReachabilityAnswer),
+    /// The server does not offer it.
+    Unsupported,
+    /// It does, but not for the address the request came from: IPv6, or
+    /// one behind a proxy in front of the server. `server_time` as in
+    /// [`ReachabilityAnswer`].
+    Declined { server_time: i64 },
+    /// This address has had its checks for the hour.
+    RateLimited,
+}
+
 /// Ask the server to connect back to `tcp_port` and send the UDP probe
 /// carrying `nonce` to `udp_port`, on the address the request comes from.
-/// `Ok(None)` when the server does not offer it.
 pub async fn request_reachability(
     base_url: &str,
     tcp_port: u16,
     udp_port: u16,
     nonce: &[u8; 16],
-) -> Result<Option<ReachabilityAnswer>, String> {
+) -> Result<Reachability, String> {
     require_https(base_url)?;
     if !negotiate_server_features(base_url).await?.reachability {
-        return Ok(None);
+        return Ok(Reachability::Unsupported);
     }
     let url = format!("{}/v4/reachability", base_url.trim_end_matches('/'));
     let body = tokio::time::timeout(std::time::Duration::from_secs(20), async {
@@ -2741,20 +2754,36 @@ pub async fn request_reachability(
             .send()
             .await
             .map_err(|e| format!("reachability: {e}"))?;
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Ok(None);
+        }
         if !resp.status().is_success() {
             return Err(format!("reachability: status {}", resp.status()));
         }
         serde_json::from_slice::<serde_json::Value>(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
+            .map(Some)
             .map_err(|e| format!("reachability bad body: {e}"))
     })
     .await
     .map_err(|_| "reachability timed out".to_string())??;
-    Ok(Some(ReachabilityAnswer {
+    let Some(body) = body else {
+        return Ok(Reachability::RateLimited);
+    };
+    Ok(reachability_from(&body))
+}
+
+fn reachability_from(body: &serde_json::Value) -> Reachability {
+    let server_time = body["server_time"].as_i64().unwrap_or(0);
+    // Servers from before the field probed every caller.
+    if body["available"].as_bool() == Some(false) {
+        return Reachability::Declined { server_time };
+    }
+    Reachability::Probed(ReachabilityAnswer {
         ip: body["ip"].as_str().unwrap_or_default().to_string(),
         tcp: body["tcp"].as_str().unwrap_or("timeout").to_string(),
         udp_sent: body["udp_sent"].as_bool() == Some(true),
-        server_time: body["server_time"].as_i64().unwrap_or(0),
-    }))
+        server_time,
+    })
 }
 
 /// Whether the server holds sealed chat for offline friends.

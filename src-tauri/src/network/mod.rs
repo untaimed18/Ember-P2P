@@ -840,6 +840,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // every gate that checks for it below still earns its place.
             status: NetworkStatus::Connecting,
             bound_udp_port: udp_port,
+            session_tcp_port: tcp_port,
+            session_udp_port: settings.udp_port,
+            session_upnp_enabled: upnp_enabled,
             ..Default::default()
         },
         pending_keyword_searches: HashMap::new(),

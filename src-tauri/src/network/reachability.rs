@@ -1,49 +1,72 @@
 //! The UDP half of the connection doctor's outside-in probe.
 //!
 //! The rendezvous server's `/v4/reachability` connects back to the TCP port it
-//! is given and sends one short datagram to the UDP port: [`PROBE_TAG`]
-//! followed by the 16-byte nonce the request carried. Only we can say whether
-//! it arrived, so the network loop hands every datagram of exactly that shape
-//! to [`note_probe`] before anything else reads it, and the doctor asks
+//! is given and sends a short datagram to the UDP port, three times:
+//! [`PROBE_TAG`] followed by the 16-byte nonce the request carried. Only we can
+//! say whether it arrived, so the doctor registers its nonce before asking
+//! ([`expect_probe`]), the network loop hands every datagram of exactly that
+//! shape to [`note_probe`] before anything else reads it, and the doctor asks
 //! [`probe_received`] for its nonce.
 //!
 //! The shape cannot be mistaken for other traffic on the socket. It is not
 //! QUIC (a short header whose connection id is not one we issued), not STUN
 //! (no magic cookie), not Ember (no transport header), and no KAD or eD2K
-//! packet begins `E` followed by `MBER`.
+//! packet begins `E` followed by `MBER`. Anyone can send one, but only a
+//! nonce the doctor is waiting on counts, so a flood of them can neither
+//! fake an arrival nor push out the real one.
 
-use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// What a probe datagram starts with. Mirrored in the rendezvous server.
 pub const PROBE_TAG: &[u8; 16] = b"EMBER-REACH-V1\0\0";
 /// The tag, then the nonce.
 pub const PROBE_LEN: usize = PROBE_TAG.len() + 16;
 
-/// How long a received nonce is remembered: the doctor waits a few seconds.
-const REMEMBERED_FOR: Duration = Duration::from_secs(120);
-/// Most nonces kept: one per check, and checks are rate-limited server-side.
-const MAX_REMEMBERED: usize = 32;
+/// Checks waited on at once. A check is one at a time from the page; a few
+/// cover one left behind by a closed page.
+const MAX_EXPECTED: usize = 4;
 
-fn received() -> &'static parking_lot::Mutex<VecDeque<([u8; 16], Instant)>> {
-    static RECEIVED: std::sync::OnceLock<parking_lot::Mutex<VecDeque<([u8; 16], Instant)>>> =
-        std::sync::OnceLock::new();
-    RECEIVED.get_or_init(Default::default)
+struct Expected {
+    nonce: [u8; 16],
+    since: Instant,
+    arrived: bool,
 }
 
-/// Whether `data` is a probe datagram, recording its nonce if it is. A probe is
-/// consumed here and goes nowhere else.
+fn expected() -> &'static parking_lot::Mutex<Vec<Expected>> {
+    static EXPECTED: std::sync::OnceLock<parking_lot::Mutex<Vec<Expected>>> = std::sync::OnceLock::new();
+    EXPECTED.get_or_init(Default::default)
+}
+
+/// Waits on the probe carrying `nonce` until dropped.
+pub struct ExpectedProbe([u8; 16]);
+
+impl Drop for ExpectedProbe {
+    fn drop(&mut self) {
+        expected().lock().retain(|e| e.nonce != self.0);
+    }
+}
+
+/// Start waiting on the probe carrying `nonce`, before asking for it.
+pub fn expect_probe(nonce: [u8; 16]) -> ExpectedProbe {
+    let mut waiting = expected().lock();
+    if waiting.len() >= MAX_EXPECTED {
+        if let Some(oldest) = waiting.iter().enumerate().min_by_key(|(_, e)| e.since).map(|(i, _)| i) {
+            waiting.remove(oldest);
+        }
+    }
+    waiting.push(Expected { nonce, since: Instant::now(), arrived: false });
+    ExpectedProbe(nonce)
+}
+
+/// Whether `data` is a probe datagram, noting its arrival if it carries a
+/// nonce being waited on. A probe is consumed here and goes nowhere else.
 pub fn note_probe(data: &[u8]) -> bool {
     let Some(nonce) = probe_nonce(data) else {
         return false;
     };
-    let now = Instant::now();
-    let mut seen = received().lock();
-    seen.retain(|(_, at)| now.duration_since(*at) < REMEMBERED_FOR);
-    if seen.len() >= MAX_REMEMBERED {
-        seen.pop_front();
+    if let Some(waiting) = expected().lock().iter_mut().find(|e| e.nonce == nonce) {
+        waiting.arrived = true;
     }
-    seen.push_back((nonce, now));
     true
 }
 
@@ -54,13 +77,9 @@ fn probe_nonce(data: &[u8]) -> Option<[u8; 16]> {
     data[PROBE_TAG.len()..].try_into().ok()
 }
 
-/// Whether the probe carrying `nonce` arrived recently.
+/// Whether the probe carrying `nonce` has arrived since [`expect_probe`].
 pub fn probe_received(nonce: &[u8; 16]) -> bool {
-    let now = Instant::now();
-    received()
-        .lock()
-        .iter()
-        .any(|(seen, at)| seen == nonce && now.duration_since(*at) < REMEMBERED_FOR)
+    expected().lock().iter().any(|e| e.nonce == *nonce && e.arrived)
 }
 
 /// A probe datagram for `nonce`, as the server sends it.
@@ -77,10 +96,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_probe_of_the_exact_shape_is_taken_and_its_nonce_remembered() {
+    fn only_a_probe_of_the_exact_shape_is_taken_and_only_an_awaited_nonce_counts() {
         let nonce = [0x5Cu8; 16];
-        assert!(!probe_received(&nonce));
         let datagram = probe_datagram(&nonce);
+        assert!(note_probe(&datagram), "taken even when nobody waits");
+        let waiting = expect_probe(nonce);
+        assert!(!probe_received(&nonce), "an arrival before the wait is not this check's");
         assert!(note_probe(&datagram));
         assert!(probe_received(&nonce));
         assert!(!probe_received(&[0x5Du8; 16]));
@@ -92,6 +113,22 @@ mod tests {
         let mut kad = datagram;
         kad[0] = 0xE4;
         assert!(!note_probe(&kad), "another tag");
+
+        drop(waiting);
+        assert!(!probe_received(&nonce), "forgotten once the check is over");
+    }
+
+    #[test]
+    fn a_flood_of_other_nonces_cannot_push_out_the_awaited_one() {
+        let nonce = [0x61u8; 16];
+        let _waiting = expect_probe(nonce);
+        for i in 0..1_000u16 {
+            let mut other = [0u8; 16];
+            other[..2].copy_from_slice(&i.to_le_bytes());
+            note_probe(&probe_datagram(&other));
+        }
+        note_probe(&probe_datagram(&nonce));
+        assert!(probe_received(&nonce));
     }
 
     #[test]

@@ -41,6 +41,10 @@ pub(in crate::network) async fn on_flood_cleanup_tick(
     }
     crate::network::chat_attach::check_held_sources(state, db);
     crate::network::chat_attach::retry_owed_holds(state).await;
+    // When a friend let go of what it held for us, should this process stop
+    // here: a restart counts their offers from it.
+    let db_alive = db.clone();
+    let _ = tokio::task::spawn_blocking(move || db_alive.note_alive(expire_now)).await;
 
     // Prevent unbounded growth of peer_nicknames
     const MAX_NICKNAME_ENTRIES: usize = 500;

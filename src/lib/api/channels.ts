@@ -203,9 +203,13 @@ export interface GatheredChannelInfo {
   member_count: number | null;
   /** Default language code from the room's signed listing, empty for none. */
   language: string;
-  /** How many of those present are friends, when the size was read. */
+  /** How many of those present are friends, when the size was read; null for
+   *  a room whose size was not looked up, which a long directory leaves to
+   *  all but its first rooms. */
   friends_present: number | null;
-  /** Unix seconds this device first saw the listing; null when new to it. */
+  /** Unix seconds this device first saw the listing: the walk's own time for
+   *  one it had not seen before, null when not known (a cached or partial
+   *  result). */
   listed_since: number | null;
 }
 

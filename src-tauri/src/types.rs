@@ -736,6 +736,15 @@ pub struct NetworkStats {
     /// was taken.
     #[serde(default)]
     pub bound_udp_port: u16,
+    /// What this session started with, which a saved change only replaces
+    /// at the next restart: the TCP port it listens on (or tried to), the UDP
+    /// port it was configured with, and whether UPnP runs.
+    #[serde(default)]
+    pub session_tcp_port: u16,
+    #[serde(default)]
+    pub session_udp_port: u16,
+    #[serde(default)]
+    pub session_upnp_enabled: bool,
 }
 
 /// Diagnostic counters for the Ember mesh (EPX, LowID broker). Surfaced
@@ -1430,6 +1439,9 @@ impl Default for NetworkStats {
             upnp_wan_ip: String::new(),
             tcp_listen_failed: false,
             bound_udp_port: 0,
+            session_tcp_port: 0,
+            session_udp_port: 0,
+            session_upnp_enabled: false,
         }
     }
 }

@@ -184,7 +184,9 @@
   let reconnectingFriends = $state(new Set<string>());
   // The shared store, which the `firewall-status` event and the app-wide poll
   // both keep current; a fetch and listener of the page's own duplicated it.
-  let isFirewalled = $derived($networkStats.firewalled);
+  // Not while disconnected: the store marks that firewalled too, and the
+  // banner's advice is about reachability, not about being offline.
+  let isFirewalled = $derived($networkStats.firewalled && $networkStats.status !== 'disconnected');
   // A symmetric NAT re-maps per destination, so hole punching cannot get
   // through and a firewalled friend genuinely cannot be reached without port
   // forwarding. Every other NAT class can be punched, so the advice differs.

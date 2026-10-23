@@ -118,12 +118,21 @@ pub struct Signals {
     pub buddy_connected: bool,
     pub probe_tcp: Option<TcpProbe>,
     pub probe_udp: Option<bool>,
+    /// The server would have probed, but this address had used its checks
+    /// for the hour.
+    pub probe_rate_limited: bool,
     pub clock_skew_secs: Option<i64>,
+    /// Saved ports or UPnP differ from what this session runs on, so a fix
+    /// for them only takes effect at a restart.
+    pub restart_pending: bool,
 }
 
 impl Signals {
+    /// Whatever answers on our TCP port when Ember could not open it is
+    /// another program, often eMule itself, so nothing then says it is open.
     fn tcp_open(&self) -> bool {
-        self.probe_tcp == Some(TcpProbe::Open) || self.kad_tcp == Some(true) || self.low_id == Some(false)
+        !self.tcp_listen_failed
+            && (self.probe_tcp == Some(TcpProbe::Open) || self.kad_tcp == Some(true) || self.low_id == Some(false))
     }
 
     fn udp_open(&self) -> bool {
@@ -179,16 +188,18 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
     } else {
         check("router_wan", Skip, "unknown");
     }
+    let not_run = if s.probe_rate_limited { "rate_limited" } else { "not_run" };
     match s.probe_tcp {
+        Some(TcpProbe::Open) if s.tcp_listen_failed => check("outside_tcp", Warn, "another_program"),
         Some(TcpProbe::Open) => check("outside_tcp", Pass, "open"),
         Some(TcpProbe::Closed) => check("outside_tcp", Fail, "closed"),
         Some(TcpProbe::Timeout) => check("outside_tcp", Fail, "filtered"),
-        None => check("outside_tcp", Skip, "not_run"),
+        None => check("outside_tcp", Skip, not_run),
     }
     match s.probe_udp {
         Some(true) => check("outside_udp", Pass, "open"),
         Some(false) => check("outside_udp", Fail, "filtered"),
-        None => check("outside_udp", Skip, "not_run"),
+        None => check("outside_udp", Skip, not_run),
     }
     match (s.kad_tcp, s.kad_udp) {
         (Some(true), Some(true)) => check("kad_firewall", Pass, "open"),
@@ -233,14 +244,20 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
 
     // Most likely first, at most three. Port forwarding is never suggested
     // where it cannot work: behind a carrier's NAT, or behind a VPN.
+    // A change already saved and waiting on a restart comes first, and the
+    // port and router fixes wait for it: judged against this session, they
+    // would only say again what the saved change is about to change.
     let mut fixes = Vec::new();
-    if s.tcp_listen_failed {
+    if s.restart_pending {
+        fixes.push(Fix { id: "restart", action: None });
+    }
+    if s.tcp_listen_failed && !s.restart_pending {
         fixes.push(Fix { id: "port_in_use", action: Some("move_ports") });
     }
     if s.firewall_rules == Some(false) {
         fixes.push(Fix { id: "windows_firewall", action: Some("add_firewall_rules") });
     }
-    if !(tcp_open && udp_open) && verdict != Verdict::Offline {
+    if !(tcp_open && udp_open) && verdict != Verdict::Offline && !s.restart_pending {
         if s.router_behind_nat {
             fixes.push(Fix { id: "carrier_nat", action: None });
         } else if s.upnp_stood_down {
@@ -264,10 +281,18 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
     (verdict, checks, helping, fixes)
 }
 
-/// Whether the router's WAN address means it is itself behind another NAT.
+/// Whether the router's WAN address means it is itself behind another NAT:
+/// private, carrier-grade (100.64/10), DS-Lite's 192.0.0.0/24, or an address
+/// no public network hands out.
 fn behind_another_nat(wan: Ipv4Addr) -> bool {
-    let [a, b, ..] = wan.octets();
-    wan.is_private() || wan.is_loopback() || wan.is_link_local() || (a == 100 && (64..128).contains(&b))
+    let [a, b, c, _] = wan.octets();
+    wan.is_private()
+        || wan.is_loopback()
+        || wan.is_link_local()
+        || a == 0
+        || (a == 100 && (64..128).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 198 && (18..20).contains(&b))
 }
 
 /// This computer's address on the local network: the source address the OS
@@ -302,18 +327,41 @@ async fn network_stats(state: &AppState) -> Result<NetworkStats, String> {
     await_reply(rx, "doctor_failed", "Could not read the network state").await
 }
 
+/// The ports this session runs on, which a saved change only replaces at a
+/// restart: `(tcp, bound udp, configured udp, upnp)`. Saved settings stand in
+/// for a network loop too old to say.
+fn session_ports(stats: &NetworkStats, settings: &crate::types::AppSettings) -> (u16, u16, u16, bool) {
+    if stats.session_tcp_port == 0 {
+        let bound = if stats.bound_udp_port != 0 { stats.bound_udp_port } else { settings.udp_port };
+        return (settings.tcp_port, bound, settings.udp_port, settings.upnp_enabled);
+    }
+    let bound = if stats.bound_udp_port != 0 { stats.bound_udp_port } else { stats.session_udp_port };
+    (stats.session_tcp_port, bound, stats.session_udp_port, stats.session_upnp_enabled)
+}
+
+/// What gathering found besides the signals.
+struct Gathered {
+    signals: Signals,
+    stats: NetworkStats,
+    /// The ports to forward and to name: the ones this computer listens on.
+    tcp_port: u16,
+    udp_port: u16,
+    probed: bool,
+}
+
 /// Read every signal, running the outside-in probe when `probe` is set.
-async fn gather(state: &AppState, probe: bool) -> Result<(Signals, NetworkStats, u16, u16, bool), String> {
+async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
     let stats = network_stats(state).await?;
     let settings = state.config.read().await.settings.clone();
-    let tcp_port = if stats.public_tcp_port != 0 { stats.public_tcp_port } else { settings.tcp_port };
-    let bound_udp = if stats.bound_udp_port != 0 { stats.bound_udp_port } else { settings.udp_port };
-    let udp_port = if stats.public_udp_port != 0 { stats.public_udp_port } else { bound_udp };
+    let (tcp_port, bound_udp, session_udp, upnp_enabled) = session_ports(&stats, &settings);
+    // The outside sees the ports the NAT maps ours to, when STUN said.
+    let probe_tcp = if stats.public_tcp_port != 0 { stats.public_tcp_port } else { tcp_port };
+    let probe_udp = if stats.public_udp_port != 0 { stats.public_udp_port } else { bound_udp };
     let wan: Option<Ipv4Addr> = stats.upnp_wan_ip.parse().ok();
 
     #[cfg(target_os = "windows")]
     let firewall_rules = {
-        let (tcp, udp) = (settings.tcp_port, bound_udp);
+        let (tcp, udp) = (tcp_port, bound_udp);
         tokio::task::spawn_blocking(move || crate::security::firewall::rules_in_place(tcp, udp))
             .await
             .ok()
@@ -326,9 +374,9 @@ async fn gather(state: &AppState, probe: bool) -> Result<(Signals, NetworkStats,
         server_connected: stats.server_status == "connected",
         dht_contacts: stats.ember_dht_verified_contacts,
         tcp_listen_failed: stats.tcp_listen_failed,
-        udp_port_moved: bound_udp != settings.udp_port,
+        udp_port_moved: bound_udp != session_udp,
         firewall_rules,
-        upnp_enabled: settings.upnp_enabled,
+        upnp_enabled,
         upnp_mapped: stats.upnp_mapped,
         upnp_stood_down: stats.upnp_stood_down,
         router_behind_nat: wan.is_some_and(behind_another_nat),
@@ -338,56 +386,69 @@ async fn gather(state: &AppState, probe: bool) -> Result<(Signals, NetworkStats,
         low_id: stats.ed2k_low_id,
         nat_symmetric: stats.nat_type == "Symmetric",
         nat_known: !stats.nat_type.is_empty() && stats.nat_type != "Unknown",
-        buddy_connected: stats.buddy_status == "connected",
+        // `connected:<buddy id>` once its id is known.
+        buddy_connected: stats.buddy_status.starts_with("connected"),
+        restart_pending: settings.tcp_port != tcp_port
+            || settings.udp_port != session_udp
+            || settings.upnp_enabled != upnp_enabled,
         ..Signals::default()
     };
 
     let mut probed = false;
     if probe {
+        use crate::network::rendezvous::Reachability;
         let url = crate::commands::channels::rendezvous_url(state).await;
         let mut nonce = [0u8; 16];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-        if let Ok(Some(answer)) =
-            crate::network::rendezvous::request_reachability(&url, tcp_port, udp_port, &nonce).await
-        {
-            probed = true;
-            signals.probe_tcp = Some(match answer.tcp.as_str() {
-                "open" => TcpProbe::Open,
-                "closed" => TcpProbe::Closed,
-                _ => TcpProbe::Timeout,
-            });
-            if answer.udp_sent {
-                let deadline = tokio::time::Instant::now() + UDP_PROBE_WAIT;
-                let mut arrived = crate::network::reachability::probe_received(&nonce);
-                while !arrived && tokio::time::Instant::now() < deadline {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    arrived = crate::network::reachability::probe_received(&nonce);
+        let _expecting = crate::network::reachability::expect_probe(nonce);
+        match crate::network::rendezvous::request_reachability(&url, probe_tcp, probe_udp, &nonce).await {
+            // Ember listens on IPv4 only: an answer about another address
+            // says nothing about the ports peers reach.
+            Ok(Reachability::Probed(answer)) if answer.ip.parse::<Ipv4Addr>().is_ok() => {
+                probed = true;
+                signals.probe_tcp = Some(match answer.tcp.as_str() {
+                    "open" => TcpProbe::Open,
+                    "closed" => TcpProbe::Closed,
+                    _ => TcpProbe::Timeout,
+                });
+                if answer.udp_sent {
+                    let deadline = tokio::time::Instant::now() + UDP_PROBE_WAIT;
+                    let mut arrived = crate::network::reachability::probe_received(&nonce);
+                    while !arrived && tokio::time::Instant::now() < deadline {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        arrived = crate::network::reachability::probe_received(&nonce);
+                    }
+                    signals.probe_udp = Some(arrived);
                 }
-                signals.probe_udp = Some(arrived);
+                if answer.server_time > 0 {
+                    signals.clock_skew_secs = Some(chrono::Utc::now().timestamp() - answer.server_time);
+                }
             }
-            if answer.server_time > 0 {
-                signals.clock_skew_secs = Some(chrono::Utc::now().timestamp() - answer.server_time);
+            Ok(Reachability::RateLimited) => signals.probe_rate_limited = true,
+            Ok(Reachability::Declined { server_time }) if server_time > 0 => {
+                signals.clock_skew_secs = Some(chrono::Utc::now().timestamp() - server_time);
             }
+            _ => {}
         }
     }
-    Ok((signals, stats, tcp_port, udp_port, probed))
+    Ok(Gathered { signals, stats, tcp_port, udp_port: bound_udp, probed })
 }
 
 /// Run every check and say what they mean.
 #[tauri::command]
 pub async fn run_connection_check(state: tauri::State<'_, AppState>) -> Result<ConnectionReport, String> {
-    let (signals, stats, tcp_port, udp_port, probed) = gather(&state, true).await?;
-    let (verdict, checks, helping, fixes) = assess(&signals);
+    let gathered = gather(&state, true).await?;
+    let (verdict, checks, helping, fixes) = assess(&gathered.signals);
     Ok(ConnectionReport {
         verdict,
         checks,
         helping,
         fixes,
-        tcp_port,
-        udp_port,
+        tcp_port: gathered.tcp_port,
+        udp_port: gathered.udp_port,
         lan_ip: lan_ip(),
-        public_ip: stats.external_ip,
-        probed,
+        public_ip: gathered.stats.external_ip,
+        probed: gathered.probed,
     })
 }
 
@@ -411,10 +472,10 @@ pub async fn connection_doctor_action(state: tauri::State<'_, AppState>, action:
         }
         #[cfg(target_os = "windows")]
         "add_firewall_rules" => {
-            let (tcp, udp) = {
-                let settings = &state.config.read().await.settings;
-                (settings.tcp_port, settings.udp_port)
-            };
+            // The ports the check looked for: the ones this session listens on.
+            let stats = network_stats(&state).await?;
+            let settings = state.config.read().await.settings.clone();
+            let (tcp, udp, _, _) = session_ports(&stats, &settings);
             tokio::task::spawn_blocking(move || crate::security::firewall::add_rules_elevated(tcp, udp))
                 .await
                 .map_err(|e| coded_ctx("doctor_failed", "Task error", e))
@@ -501,6 +562,42 @@ mod tests {
         assert_eq!(fix_ids(&vpn), vec!["vpn"]);
     }
 
+    /// Whatever answers on a port Ember could not open is another program,
+    /// so the probe, HighID and Kad finding it open say nothing about Ember.
+    #[test]
+    fn a_port_another_program_holds_is_never_called_reachable() {
+        let taken = Signals { tcp_listen_failed: true, ..reachable() };
+        let (verdict, checks, _, fixes) = assess(&taken);
+        assert_eq!(verdict, Verdict::Limited);
+        assert!(checks.iter().any(|c| c.id == "outside_tcp" && c.detail == "another_program"));
+        assert_eq!(fixes[0].id, "port_in_use");
+    }
+
+    /// A saved change waiting on a restart is what to do next, and the port
+    /// and router fixes, judged against this session, wait for it.
+    #[test]
+    fn a_change_waiting_on_a_restart_comes_before_anything_it_would_change() {
+        let closed = Signals {
+            kad_tcp: Some(false),
+            low_id: Some(true),
+            probe_tcp: Some(TcpProbe::Timeout),
+            upnp_enabled: false,
+            restart_pending: true,
+            ..reachable()
+        };
+        assert_eq!(fix_ids(&closed), vec!["restart"]);
+        let taken = Signals { tcp_listen_failed: true, restart_pending: true, ..reachable() };
+        assert_eq!(fix_ids(&taken), vec!["restart"]);
+    }
+
+    #[test]
+    fn a_check_the_server_would_not_run_this_hour_says_so() {
+        let s = Signals { probe_tcp: None, probe_udp: None, probe_rate_limited: true, ..reachable() };
+        let (_, checks, _, _) = assess(&s);
+        assert!(checks.iter().any(|c| c.id == "outside_tcp" && c.detail == "rate_limited"));
+        assert!(checks.iter().any(|c| c.id == "outside_udp" && c.detail == "rate_limited"));
+    }
+
     #[test]
     fn a_taken_port_comes_first_and_offline_is_its_own_verdict() {
         let taken = Signals { tcp_listen_failed: true, ..reachable() };
@@ -537,7 +634,28 @@ mod tests {
         assert!(behind_another_nat("100.127.255.1".parse().unwrap()));
         assert!(behind_another_nat("192.168.0.2".parse().unwrap()));
         assert!(behind_another_nat("10.1.2.3".parse().unwrap()));
+        assert!(behind_another_nat("192.0.0.2".parse().unwrap()), "DS-Lite");
+        assert!(behind_another_nat("0.0.0.0".parse().unwrap()));
+        assert!(behind_another_nat("198.18.0.1".parse().unwrap()));
         assert!(!behind_another_nat("100.128.0.1".parse().unwrap()));
         assert!(!behind_another_nat("203.0.113.5".parse().unwrap()));
+        assert!(!behind_another_nat("192.0.2.1".parse().unwrap()));
+    }
+
+    /// What the doctor judges is what this session runs on; saved settings
+    /// stand in only for a loop too old to say.
+    #[test]
+    fn the_ports_judged_are_the_ones_this_session_listens_on() {
+        let settings = crate::types::AppSettings { tcp_port: 5000, udp_port: 5010, upnp_enabled: true, ..Default::default() };
+        let running = NetworkStats {
+            session_tcp_port: 4662,
+            session_udp_port: 4672,
+            bound_udp_port: 4673,
+            session_upnp_enabled: false,
+            ..Default::default()
+        };
+        assert_eq!(session_ports(&running, &settings), (4662, 4673, 4672, false));
+        let old_loop = NetworkStats { bound_udp_port: 5011, ..Default::default() };
+        assert_eq!(session_ports(&old_loop, &settings), (5000, 5011, 5010, true));
     }
 }

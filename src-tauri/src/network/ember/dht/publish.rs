@@ -2661,15 +2661,17 @@ pub struct ModerationTail {
     /// them the whole record. This way the wire is byte-identical for every
     /// room that never turns it on.
     pub slow_mode_secs: Option<u16>,
-    /// The room's name, carried only once its owner has renamed it.
+    /// The room's name: carried once its owner has renamed it, and from 1.7.5
+    /// in every new room's first snapshot too, which is where recovering the
+    /// room from the identity alone reads it back.
     ///
     /// A member learns the name once, from the invite or listing they joined
     /// through, and nothing else ever corrects it; this is how a rename reaches
-    /// them. Absent for a room that was never renamed, for the same reason as
+    /// them. Absent for an older room never renamed, for the same reason as
     /// [`Self::slow_mode_secs`]: builds from before 1.6.0 refuse tail bytes
     /// they cannot place, and this field forces the one before it onto the
-    /// wire. Those builds lose a renamed room's snapshot until they update,
-    /// and nothing changes for any other room. Encoded as a length byte and
+    /// wire. Those builds lose a renamed or new room's snapshot until they
+    /// update, and nothing changes for any other room. Encoded as a length byte and
     /// at most [`CHANNEL_NAME_MAX`] bytes of UTF-8; a length of zero means no
     /// name is carried, which is how a later field is written without one.
     pub room_name: Option<String>,

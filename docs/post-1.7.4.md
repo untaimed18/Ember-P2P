@@ -734,26 +734,32 @@ no look is not under test.
 
 **Done in 1.7.5: waiting offers survive a restart.** The sender's side
 already lived in `chat_attachments`. The receiver now keeps what its
-`awaiting` row lacks beside it (`inbound_offer`, JSON: the sender's QUIC
-port, the name as offered, the session address, when it arrived, and whether
-the sender ever echoed a hold; `save_inbound`, on arrival and on the echo).
+`awaiting` row lacks beside it (`inbound_offer`: JSON of the sender's QUIC
+port, the session address, when it arrived, whether the sender ever echoed a
+hold and whether our "Try again" asked for it; `save_inbound`, on arrival and
+on the echo). It is sealed with the chat key like the row's file name, since
+it holds the address, and cleared when the row is reused or stops waiting.
 At startup `sweep_interrupted` brings back every waiting offer still in date
-whose friend still has a key (`restore_inbound`). One the sender held comes
-back named, on an offer's lifetime from the restart, which is the one re-hold
-a sender gives after a session ends; the next session's empty form names it
-and the echo gives the day back. One never held keeps the lifetime it had.
-Anything else is settled `expired` as before. The column is added at open
-outside the numbered chain, so the schema stays at 62. Test:
-`a_waiting_offer_survives_a_restart_on_the_terms_its_sender_allows`.
+whose name opens and whose friend still has a key (`restore_inbound`). One
+the sender held comes back named on the clock the sender used: the sender let
+go when our sessions ended, so its five minutes count from when this process
+was last seen running (`app_alive`, written on the half-minute tick), or from
+an earlier release its row already recorded. A restart inside those minutes
+keeps it, and the next session's empty form names it and the echo gives the
+day back; a longer one lets it lapse, as it has on the sender's side. One
+never held keeps the lifetime it had. Anything else is settled `expired` as
+before. The column is added at open outside the numbered chain, so the schema
+stays at 62. Tests:
+`a_waiting_offer_survives_a_restart_on_the_terms_its_sender_allows` and
+`the_startup_sweep_restores_an_offer_from_a_known_friend`.
 
 **Decided when 1.7.4's scope was set:**
 
 - **Session only, first.** The receiver keeps a pending offer in memory
   (`state.attach_inbound`) until the user answers, it lapses (five minutes
   after a session ends unless the sender confirms it again), or
-  `ATTACH_GRANT_TTL_SECS` (a day) passes. A restart still lapses it. Saving
-  offers across restarts (it needs `AttachOffer`'s fields, not just the
-  `awaiting` row) can follow later.
+  `ATTACH_GRANT_TTL_SECS` (a day) passes. (1.7.5 keeps it across a restart:
+  see above.)
 - **A capability signal of its own,** sent when the session comes up, not
   `EMBER_EXT_MAILBOX_AWARE`. 1.7.4 sends that flag and still drops offers at
   `ATTACH_OFFER_TTL_SECS`, so it cannot prove a receiver waits. The sender
@@ -789,14 +795,16 @@ they matter.
   refreshes (`channelReactions`) were already modules with tests; early room
   delivery (`EarlyRoomDeliveries`) and the slow-mode announcements
   (`stepSlowModeAnnouncer`) now are too, in `conversationState.ts`. Mounting
-  the 4,000-line component would need a DOM environment and a mock of every
+  the 6,000-line component would need a DOM environment and a mock of every
   module it reaches, for less than these cover.
 - **Discover spam folding.** Member counts come from presence records, which
   anyone can sign; friends in the room, or the listing's age, would be better
   signals. Tune `LIKELY_SPAM_SCORE` and `DUPLICATE_NAME_FLOOD` from real use.
   **Done in 1.7.5:** both signals. The presence probe counts the present
   members whose key is on the friends list (`friends_present`), and a room a
-  friend is in is never folded. The Discover cache keeps when this device first
+  friend is in is never folded. The probe sizes only a pass's first 24 rooms
+  (`MAX_PRESENCE_PROBE_ROOMS`), so past those a friend in a room is not seen
+  and the room is judged on its name and age alone. The Discover cache keeps when this device first
   saw each listing (`channel_index_cache.first_seen`, added at open), and a
   listing known for two weeks (`LONG_LISTED_SECS`) drops one point: enough to
   outlive one quirk of its name, never a link. The thresholds stay as they
@@ -845,11 +853,16 @@ the release notes.
 
 - **One identity on two devices at once. Narrowed in 1.7.5:** each device
   publishes its own owned-rooms list and the newer one wins. A device that
-  owns rooms now reads the network's list every three hours while it runs
-  (`SETTLED_REREAD_SECS`, half the publish cadence) and carries or restores
-  what the other device added, as every launch already did, so the window in
-  which one device's list can drop the other's new rooms is at most a few
-  hours rather than until the next launch.
+  owns rooms now reads the network's list again while it runs, about ten
+  minutes before it publishes its own and at least every three hours
+  (`settled_reread_wait`), and carries what the other device added, so its
+  next publish names those rooms too. A room the other device made
+  mid-session is carried, not put back: running it on both at once would
+  have two devices signing its snapshots. The next launch, or Settings'
+  look, puts it back as before (`Pass`). The window left is a room made in
+  the ten minutes before this device's publish, which its own device's next
+  publish lists again. The loop keeps running while the identity owns
+  nothing, so a room taken over later is read for too.
 - **A taken-over private room lost before its first rotation.** Recovery
   derives the wrong key and nothing is pending to correct it. Sealing epoch 0
   to ourselves for rooms we did not create would close the gap. Left as it
@@ -860,16 +873,22 @@ the release notes.
   room this device runs that the registry lists as deleted (a restore from
   an older backup, or a delete on another device) is noted in
   `channel_deleted_elsewhere` during the scan, and the Channels page asks its
-  owner, once per room, "Keep it deleted" or "Keep running it"
-  (`confirm_room_deleted_elsewhere`). The registry's list is still only the
+  owner, once per room, "Remove it here" (behind a confirmation) or "Keep it
+  here" (`confirm_room_deleted_elsewhere`). Keeping it keeps its messages here,
+  not the room: the registry's deletion is final, so nobody can join or find
+  it. A database restored from a backup asks again (`owe_scan`). The registry's list is still only the
   server's word, so it never removes a room by itself; with the owner's
   answer it does, through the same local purge as deleting the room
   (`retire_deleted_room`). A room key signature on the deletion, served by the
   registry, would make the question unnecessary; it needs the registry to
   store and serve it, and is not planned.
-- **The list shows how many rooms an identity owns. Done in 1.7.5:** the list
-  is padded to 8, 16, 32 or 48 salts with pads only the identity can tell
-  apart, and sorted ([The owned-rooms list](channels-format.md#the-owned-rooms-list-kind-7)).
+- **The list shows how many rooms an identity owns. Built in 1.7.5, on in
+  1.8.0:** the list can be padded to 8, 16, 32 or 48 salts with pads only the
+  identity can tell apart, and sorted, and 1.7.5 drops its own pads from any
+  list it reads ([The owned-rooms list](channels-format.md#the-owned-rooms-list-kind-7)).
+  It does not publish them yet (`PAD_OWNED_ROOMS_LIST`): a 1.7.4 device on
+  the same identity would take every pad for a room and publish it back. See
+  `docs/post-1.7.5.md`, "Already scheduled for 1.8.0".
 - **Older builds don't store record kind 7.** Absence is only concluded after
   four nodes have answered (`MIN_RESPONDERS_FOR_ABSENCE`).
 - **Recovery has no end-to-end test. Done in 1.7.5:** the look runs over a
@@ -894,6 +913,10 @@ the release notes.
 - **Downgrading to 1.7.1 leaves one upload slot. Done in 1.7.5:** Auto is
   still `max_concurrent_uploads = 0` in memory, but `config.json` stores it as
   `upload_slots_auto: true` beside a count of 4, eMule's floor, which every
-  build accepts (`storage::config::settings_json`). 1.7.1 now downgrades to
-  four slots rather than one; 1.7.2 to 1.7.4, which read 0 as Auto, see four
-  set by hand.
+  build accepts (`storage::config::settings_json`). A config an earlier build
+  wrote with Auto as 0 is rewritten in this form at the first launch, not at
+  the next save. 1.7.1 now downgrades to four slots rather than one. 1.7.2 to
+  1.7.4, which read 0 as Auto, see four set by hand, and drop the flag at
+  their next save, so coming back to 1.7.5 after one keeps four set by hand
+  rather than Auto: the price of 1.7.1 not losing three slots. The flag reads
+  as Auto only beside a count of 4, so a count edited by hand is kept.

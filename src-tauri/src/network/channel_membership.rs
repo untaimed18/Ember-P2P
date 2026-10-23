@@ -4627,6 +4627,17 @@ pub(crate) fn note_owned_rooms_list_read() {
     OWNED_ROOMS_LIST_READ.store(true, std::sync::atomic::Ordering::Release);
 }
 
+/// When this device next publishes its owned-rooms list, as Unix seconds; 0
+/// before its first publish this launch.
+static NEXT_OWNED_ROOMS_PUBLISH_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// When this device next publishes its owned-rooms list, so a read of the
+/// network's can come just before it. `None` until it has published once.
+pub(crate) fn next_owned_rooms_list_publish_at() -> Option<i64> {
+    let at = NEXT_OWNED_ROOMS_PUBLISH_AT.load(std::sync::atomic::Ordering::Acquire);
+    (at > 0).then_some(at)
+}
+
 /// Rooms a recovery is putting back right now. Between the row going in and
 /// the room's snapshot landing on it, the owner loop would otherwise sign a
 /// snapshot of a room with no bans, no topic and an old key, and that
@@ -4746,7 +4757,11 @@ pub(super) async fn maybe_publish_owned_rooms_list(
         return;
     }
     let signing = crate::network::ember::crypto::signing_key_from_bytes(&identity.ed25519_secret_key);
-    let listed = ember::channel::pad_owned_rooms_list(&salts, &identity.ed25519_secret_key);
+    let listed = if ember::channel::PAD_OWNED_ROOMS_LIST {
+        ember::channel::pad_owned_rooms_list(&salts, &identity.ed25519_secret_key)
+    } else {
+        salts.clone()
+    };
     // `owned_room_salts` stops at what one list carries, and padding never
     // goes past it, so this only fails if the identity key itself is unusable.
     let Some(record) = ember::dht::publish::SignedRecord::owned_rooms(&listed, &signing) else {
@@ -4762,6 +4777,10 @@ pub(super) async fn maybe_publish_owned_rooms_list(
         } else {
             now - ember::channel::MODERATION_REPUBLISH_SECS + OWNED_ROOMS_CONFIRM_SECS
         };
+        NEXT_OWNED_ROOMS_PUBLISH_AT.store(
+            state.owned_rooms_published_at + ember::channel::MODERATION_REPUBLISH_SECS,
+            std::sync::atomic::Ordering::Release,
+        );
         state.owned_rooms_published = Some(salts);
         drive_ember_publish(socket, state, publish_id).await;
     }

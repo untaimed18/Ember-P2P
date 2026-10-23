@@ -8,7 +8,7 @@
   import { getSharedFileCount } from '$lib/api/sharing';
   import { formatBytes, formatNumber, formatLiveSpeed } from '$lib/utils';
   import { addActionToast, addToast } from '$lib/stores/toast';
-  import { initialDoctorOffer, stepDoctorOffer } from '$lib/connectionDoctorOffer';
+  import { doctorOfferDueIn, initialDoctorOffer, stepDoctorOffer } from '$lib/connectionDoctorOffer';
   import { emberJoinTimedOut } from '$lib/stores/emberJoin';
   import { isUploadCounterPhase } from '$lib/sharedFileStats';
   import { plural } from '$lib/plural';
@@ -139,17 +139,26 @@
   let doctorOffer = initialDoctorOffer;
   $effect(() => {
     const limited = hardToReach;
-    const { next, offer } = stepDoctorOffer(doctorOffer, limited, Date.now());
-    doctorOffer = next;
-    if (offer) {
-      addActionToast(
-        'info',
-        m.doctor_offer(),
-        { label: m.doctor_statusbar_label(), run: () => openPage('/settings?section=network#connection-check') },
-        () => {},
-        15_000,
-      );
-    }
+    const step = () => {
+      const { next, offer } = stepDoctorOffer(doctorOffer, limited, Date.now());
+      doctorOffer = next;
+      if (offer) {
+        addActionToast(
+          'info',
+          m.doctor_offer(),
+          { label: m.doctor_statusbar_label(), run: () => openPage('/settings?section=network#connection-check') },
+          () => {},
+          15_000,
+        );
+      }
+    };
+    step();
+    // `hardToReach` staying true never runs this again, so the ten minutes
+    // need a timer of their own.
+    const dueIn = doctorOfferDueIn(doctorOffer, Date.now());
+    if (dueIn === null) return;
+    const timer = setTimeout(step, dueIn);
+    return () => clearTimeout(timer);
   });
 
   function ed2kTitle(status: string, id: 'low' | 'high' | null): string {

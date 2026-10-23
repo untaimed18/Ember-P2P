@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { DOCTOR_OFFER_AFTER_MS, initialDoctorOffer, stepDoctorOffer, type DoctorOfferState } from './connectionDoctorOffer';
+import {
+  DOCTOR_OFFER_AFTER_MS,
+  doctorOfferDueIn,
+  initialDoctorOffer,
+  stepDoctorOffer,
+  type DoctorOfferState,
+} from './connectionDoctorOffer';
 
 function run(steps: [boolean, number][]) {
   let state: DoctorOfferState = initialDoctorOffer;
@@ -34,5 +40,21 @@ describe('stepDoctorOffer', () => {
 
   it('never offers to a computer that stays reachable', () => {
     expect(run([[false, 0], [false, DOCTOR_OFFER_AFTER_MS * 3]])).toEqual([false, false]);
+  });
+});
+
+describe('doctorOfferDueIn', () => {
+  it('says when to step again while limited, so the offer fires without a change', () => {
+    const { next } = stepDoctorOffer(initialDoctorOffer, true, 1_000);
+    expect(doctorOfferDueIn(next, 1_000)).toBe(DOCTOR_OFFER_AFTER_MS);
+    const due = 1_000 + DOCTOR_OFFER_AFTER_MS;
+    expect(doctorOfferDueIn(next, due + 5)).toBe(0);
+    const fired = stepDoctorOffer(next, true, due);
+    expect(fired.offer).toBe(true);
+    expect(doctorOfferDueIn(fired.next, due)).toBeNull();
+  });
+
+  it('has nothing pending while reachable', () => {
+    expect(doctorOfferDueIn(initialDoctorOffer, 0)).toBeNull();
   });
 });

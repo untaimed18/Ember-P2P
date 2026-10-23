@@ -1726,8 +1726,9 @@ pub(super) struct NetworkState {
     /// Read-only view of the friends list, for the `"friends"` offer policy.
     pub(super) xfer_friend_hashes: crate::app_state::SharedFriendHashes,
     /// Chat attachments a friend has offered us that nobody has answered yet,
-    /// with what accepting one needs. In memory only: see
-    /// [`chat_attach::sweep_interrupted`] for what a restart does to them.
+    /// with what accepting one needs. What its row does not hold is kept
+    /// beside it, sealed, so a restart can bring it back: see
+    /// [`chat_attach::sweep_interrupted`].
     pub(super) attach_inbound: HashMap<[u8; 16], chat_attach::InboundAttach>,
     /// Receives in flight with the friend each is from, so a cancel from
     /// either side, or removing the friend, can stop one.

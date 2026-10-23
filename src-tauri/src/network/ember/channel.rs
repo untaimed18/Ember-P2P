@@ -767,6 +767,12 @@ pub fn generate_owned_room_salt() -> OwnedRoomSalt {
 /// [`pad_owned_rooms_list`].
 const OWNED_ROOMS_PAD_CONTEXT: &str = "ember-identity-owned-rooms-pad-v1";
 
+/// Whether the owned-rooms list this identity publishes is padded. Off until
+/// 1.8.0: a 1.7.4 device on the same identity cannot tell a pad from a room,
+/// carries every pad as a room it cannot find and publishes them back. Lists
+/// read are stripped of pads either way.
+pub const PAD_OWNED_ROOMS_LIST: bool = false;
+
 /// Sizes an owned-rooms list is padded to, smallest first. The last is
 /// `OWNED_ROOMS_MAX`, the most one list carries.
 const OWNED_ROOMS_PAD_SIZES: [usize; 4] = [8, 16, 32, 48];

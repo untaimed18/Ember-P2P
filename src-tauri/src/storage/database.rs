@@ -3730,7 +3730,8 @@ impl Database {
                 status = excluded.status,
                 expires_at = excluded.expires_at,
                 held_at = NULL,
-                hold_released = 0",
+                hold_released = 0,
+                inbound_offer = NULL",
             rusqlite::params![
                 xfer_id,
                 friend_hash,
@@ -3838,7 +3839,8 @@ impl Database {
                 transferred = 0,
                 expires_at = COALESCE(?3, expires_at),
                 held_at = {held_at},
-                hold_released = {hold_released}
+                hold_released = {hold_released},
+                inbound_offer = NULL
              WHERE xfer_id = ?1 AND status IN ({placeholders})"
         );
         let mut params: Vec<rusqlite::types::Value> = vec![
@@ -4065,24 +4067,44 @@ impl Database {
     }
 
     /// Keep what answering a received offer needs beside its row (see
-    /// [`Self::waiting_inbound_chat_attachments`]). Opaque here.
+    /// [`Self::waiting_inbound_chat_attachments`]), sealed like the row's file
+    /// name: it carries the session address the offer came from. Opaque here.
     pub fn set_chat_attachment_inbound_offer(&self, xfer_id: &str, offer: &str) -> anyhow::Result<()> {
+        let sealed = self.seal_attachment_value(xfer_id, "inbound_offer", offer)?;
         let conn = self.conn.lock();
         conn.execute(
             "UPDATE chat_attachments SET inbound_offer = ?2
              WHERE xfer_id = ?1 AND direction = 'received'",
-            params![xfer_id, offer],
+            params![xfer_id, sealed],
         )?;
         Ok(())
     }
 
+    /// What `inbound_offer` holds for `xfer_id`, as stored.
+    #[cfg(test)]
+    pub fn chat_attachment_inbound_offer_stored(&self, xfer_id: &str) -> Option<String> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT inbound_offer FROM chat_attachments WHERE xfer_id = ?1",
+            params![xfer_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()
+    }
+
     /// Every received offer still waiting on the user, with what was kept of
-    /// it: `(xfer_id, friend_hash, file_name, file_size, root_hash,
-    /// expires_at, inbound_offer)`.
+    /// it, opened: `(xfer_id, friend_hash, file_name, file_size, root_hash,
+    /// expires_at, inbound_offer)`. A row whose name does not open (the chat
+    /// key is missing or another's) is left out: it could not be saved under
+    /// its name.
     #[allow(clippy::type_complexity)]
     pub fn waiting_inbound_chat_attachments(
         &self,
     ) -> anyhow::Result<Vec<(String, String, String, u64, String, i64, Option<String>)>> {
+        let key = self.chat_key.as_deref();
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT xfer_id, friend_hash, file_name, file_size, root_hash, expires_at, inbound_offer
@@ -4092,17 +4114,57 @@ impl Database {
         let rows = stmt
             .query_map([], |row| {
                 Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?.max(0) as u64,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        Ok(rows
+            .into_iter()
+            .filter_map(|(xfer_id, friend, name, size, root, expires_at, offer)| {
+                let name = Self::open_attachment_field(key, &xfer_id, "file_name", &name)?;
+                let offer = offer.and_then(|sealed| {
+                    Self::open_attachment_field(key, &xfer_id, "inbound_offer", &sealed)
+                });
+                Some((xfer_id, friend, name, size, root, expires_at, offer))
+            })
+            .collect())
+    }
+
+    /// When this process was last seen running, to the half minute: what a
+    /// restart counts a friend's held offer from, since the friend let go of
+    /// it when our sessions ended, not when we came back. `None` before the
+    /// first tick ever recorded one.
+    pub fn last_alive_at(&self) -> Option<i64> {
+        let conn = self.conn.lock();
+        Self::ensure_alive_locked(&conn).ok()?;
+        conn.query_row("SELECT at FROM app_alive WHERE id = 0", [], |row| row.get(0))
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Record that this process is running at `now`.
+    pub fn note_alive(&self, now: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_alive_locked(&conn)?;
+        conn.execute(
+            "INSERT INTO app_alive (id, at) VALUES (0, ?1) ON CONFLICT(id) DO UPDATE SET at = excluded.at",
+            params![now],
+        )?;
+        Ok(())
+    }
+
+    fn ensure_alive_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS app_alive (id INTEGER PRIMARY KEY CHECK (id = 0), at INTEGER NOT NULL);",
+        )?;
+        Ok(())
     }
 
     /// Every received attachment that was waiting or moving when the process
@@ -4395,6 +4457,13 @@ impl Database {
              WHERE status NOT IN ('queued', 'offered', 'awaiting', 'accepted', 'active')
                AND expires_at < ?1 AND created_at < ?1",
             rusqlite::params![cutoff],
+        )?;
+        // What a waiting offer kept to survive a restart (the session address
+        // among it) has no use once the offer is answered or over.
+        conn.execute(
+            "UPDATE chat_attachments SET inbound_offer = NULL
+             WHERE inbound_offer IS NOT NULL AND NOT (direction = 'received' AND status = 'awaiting')",
+            [],
         )?;
         // Rows also go with a removed friend, so counts are cleared by what is
         // left rather than by what this pass deleted.
@@ -9019,10 +9088,13 @@ impl Database {
             "DELETE FROM channel_index_cache WHERE last_seen < ?1",
             params![now - CHANNEL_CACHE_MAX_AGE_SECS],
         )?;
+        // One walk stamps every row it saw alike, so a flood of new listings
+        // ties with the rooms listed for months; those are the ones kept. A
+        // `first_seen` of 0 predates the column, which is older still.
         tx.execute(
             "DELETE FROM channel_index_cache WHERE channel_id NOT IN (
                  SELECT channel_id FROM channel_index_cache
-                 ORDER BY last_seen DESC LIMIT ?1
+                 ORDER BY last_seen DESC, first_seen ASC LIMIT ?1
              )",
             params![MAX_CHANNEL_CACHE_ROWS],
         )?;
@@ -9327,6 +9399,11 @@ impl Database {
             Self::ensure_channel_owner_silences_locked(&tx)?;
             tx.execute(
                 "DELETE FROM channel_owner_silences WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+            Self::ensure_rooms_deleted_elsewhere_locked(&tx)?;
+            tx.execute(
+                "DELETE FROM channel_deleted_elsewhere WHERE channel_id = ?1",
                 params![channel_id],
             )?;
             tx.execute(
@@ -10043,6 +10120,20 @@ impl Database {
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Whether `channel_id` is one [`Self::rooms_deleted_elsewhere`] lists.
+    pub fn room_deleted_elsewhere_waiting(&self, channel_id: &str) -> anyhow::Result<bool> {
+        Ok(self.rooms_deleted_elsewhere()?.iter().any(|(id, _)| id == channel_id))
+    }
+
+    /// Ask again about every room the user chose to keep: what they answered
+    /// was about a database that has since come back from a backup.
+    pub fn reask_rooms_deleted_elsewhere(&self) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_rooms_deleted_elsewhere_locked(&conn)?;
+        conn.execute("UPDATE channel_deleted_elsewhere SET kept = 0", [])?;
+        Ok(())
     }
 
     /// Record the user's answer. A deleted room needs no row any more; a kept
@@ -23854,12 +23945,10 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
-    /// The owned-rooms list names the rooms run here as owner and the ones
-    /// carried for later, never a room that never came to exist or is gone,
-    /// and a restored database publishes none until it has read the network's.
     /// A room this device runs that the registry lists as deleted waits on the
-    /// owner's answer; keeping it stops the asking for good, and a room only
-    /// held as a member, or already gone, is never asked about.
+    /// owner's answer; keeping it stops the asking until the database comes
+    /// back from a backup, deleting it clears its row, and a room only held as
+    /// a member, or already gone, is never asked about.
     #[test]
     fn a_room_deleted_elsewhere_waits_on_its_owner_once() {
         let path = std::env::temp_dir().join(format!(
@@ -23882,12 +23971,18 @@ mod tests {
         assert_eq!(waiting.len(), 2, "only rooms run as owner: {waiting:?}");
 
         db.settle_room_deleted_elsewhere(&mine, false).unwrap();
-        assert!(!db.note_room_deleted_elsewhere(&mine).unwrap(), "kept: never asked again");
+        assert!(!db.note_room_deleted_elsewhere(&mine).unwrap(), "kept: not asked again");
+        assert!(!db.room_deleted_elsewhere_waiting(&mine).unwrap());
+        assert!(!db.room_deleted_elsewhere_waiting(&member).unwrap(), "a member's room is not the owner's to remove");
         assert_eq!(db.rooms_deleted_elsewhere().unwrap(), vec![(other.clone(), "Other".to_string())]);
 
         db.tombstone_channel(&other).unwrap();
-        db.settle_room_deleted_elsewhere(&other, true).unwrap();
         assert!(db.rooms_deleted_elsewhere().unwrap().is_empty(), "deleted: nothing left to ask");
+        db.insert_channel(&other, &"02".repeat(32), "Other", "public", true, Some(&[2; 32]), None).ok();
+        assert!(!db.room_deleted_elsewhere_waiting(&other).unwrap(), "its row went with it");
+
+        db.reask_rooms_deleted_elsewhere().unwrap();
+        assert!(db.room_deleted_elsewhere_waiting(&mine).unwrap(), "a restored database asks again");
 
         drop(db);
         let _ = std::fs::remove_file(&path);
@@ -23895,6 +23990,9 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
+    /// The owned-rooms list names the rooms run here as owner and the ones
+    /// carried for later, never a room that never came to exist or is gone,
+    /// and a restored database publishes none until it has read the network's.
     #[test]
     fn the_owned_rooms_list_names_live_and_carried_rooms_only() {
         use crate::network::ember::channel::{derive_owned_room_seed, ChannelIdentity};

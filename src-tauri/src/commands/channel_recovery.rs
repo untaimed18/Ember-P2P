@@ -59,12 +59,63 @@ const OWN_EPOCH_LOOKAHEAD: i64 = 4;
 /// counting the owner as gone.
 const UNSETTLED_RETRY_SECS: u64 = 6 * 60 * 60;
 
-/// How often the list is read again once everything in it is settled. The
+/// The longest the list goes unread once everything in it is settled. The
 /// identity may run on another device too, which publishes a list of its own
-/// on the same six-hour cadence; reading the network's at half that and
-/// carrying what it adds keeps this device's next publish from dropping the
-/// rooms made there.
+/// on the same six-hour cadence; reading the network's shortly before this
+/// device publishes (see [`settled_reread_wait`]) and carrying what it adds
+/// keeps that publish from dropping the rooms made there.
 const SETTLED_REREAD_SECS: u64 = 3 * 60 * 60;
+
+/// How long before this device's next list publish the list is read.
+const REREAD_LEAD_SECS: i64 = 10 * 60;
+
+/// How long a settled loop waits before reading the list again: to just
+/// before this device next publishes its own, or [`SETTLED_REREAD_SECS`] if
+/// that is sooner or not known.
+fn settled_reread_wait(now: i64, next_publish: Option<i64>) -> u64 {
+    let Some(next) = next_publish else {
+        return SETTLED_REREAD_SECS;
+    };
+    let mut target = next - REREAD_LEAD_SECS;
+    if target <= now + 60 {
+        // Read for this one already, or too late to: the one after.
+        target += crate::network::ember::channel::MODERATION_REPUBLISH_SECS;
+    }
+    (target - now).clamp(60, SETTLED_REREAD_SECS as i64) as u64
+}
+
+/// What a look does with a room the network holds and this device does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pass {
+    /// Put it back: the first read of a launch, which is what follows a
+    /// restore, and the user's own look from Settings.
+    Restore,
+    /// Carry it, so this device's list keeps naming it, but leave it to the
+    /// device that runs it, so two devices do not both start running a room
+    /// made on one of them mid-session. A room an earlier look here was
+    /// already trying to put back is still put back.
+    Reread,
+}
+
+/// Rooms a [`Pass::Restore`] look could not put back yet, which later looks
+/// keep trying to.
+fn rooms_owed_back() -> &'static std::sync::Mutex<HashSet<String>> {
+    static ROOMS: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    ROOMS.get_or_init(Default::default)
+}
+
+fn owe_room_back(id_hex: &str, owed: bool) {
+    let mut rooms = rooms_owed_back().lock().unwrap_or_else(|e| e.into_inner());
+    if owed {
+        rooms.insert(id_hex.to_string());
+    } else {
+        rooms.remove(id_hex);
+    }
+}
+
+fn room_owed_back(id_hex: &str) -> bool {
+    rooms_owed_back().lock().unwrap_or_else(|e| e.into_inner()).contains(id_hex)
+}
 
 /// Emitted when a look put rooms back: `{ "count": n }`.
 pub const CHANNELS_RECOVERED_EVENT: &str = "ember:channels-recovered";
@@ -651,14 +702,16 @@ async fn read_owned_rooms_list<E: RecoveryEnv>(env: &E) -> Option<Vec<OwnedRoomS
 pub(crate) async fn scan_owned_rooms(
     state: &AppState,
     app: Option<&tauri::AppHandle>,
+    pass: Pass,
 ) -> Result<OwnedRoomScan, String> {
-    scan_owned_rooms_with(state, app).await
+    scan_owned_rooms_with(state, app, pass).await
 }
 
 /// [`scan_owned_rooms`] over any [`RecoveryEnv`].
 async fn scan_owned_rooms_with<E: RecoveryEnv>(
     env: &E,
     app: Option<&tauri::AppHandle>,
+    pass: Pass,
 ) -> Result<OwnedRoomScan, String> {
     let _single = scan_lock().lock().await;
     if env.db().chat_locked() {
@@ -686,8 +739,9 @@ async fn scan_owned_rooms_with<E: RecoveryEnv>(
             .ok()
             .and_then(|r| r.ok())
             .unwrap_or_default();
+        let seed = env.identity().ed25519_secret_key;
         for salt in known {
-            if !salts.contains(&salt) {
+            if !salts.contains(&salt) && !channel::is_owned_rooms_pad(&salt, &seed) {
                 salts.push(salt);
             }
         }
@@ -730,6 +784,7 @@ async fn scan_owned_rooms_with<E: RecoveryEnv>(
                     if waiting {
                         outcome.deleted_elsewhere += 1;
                     }
+                    owe_room_back(&id_hex, false);
                     if let Some((epoch, since)) = pending {
                         if resume_waiting_room(env, &ident, epoch, since).await {
                             outcome.unsettled += 1;
@@ -737,23 +792,38 @@ async fn scan_owned_rooms_with<E: RecoveryEnv>(
                     }
                 }
                 Slot::Gone => {
+                    owe_room_back(&id_hex, false);
                     let _ = tokio::task::spawn_blocking(move || db.drop_owned_salt(&id_hex)).await;
                 }
                 Slot::Unsettled => {
+                    if pass == Pass::Restore {
+                        owe_room_back(&id_hex, true);
+                    }
                     outcome.unsettled += 1;
                     let _ = tokio::task::spawn_blocking(move || db.carry_owned_salt(&id_hex, &salt))
                         .await;
                 }
                 Slot::Withheld => {
+                    if pass == Pass::Restore {
+                        owe_room_back(&id_hex, true);
+                    }
+                    let _ = tokio::task::spawn_blocking(move || db.carry_owned_salt(&id_hex, &salt))
+                        .await;
+                }
+                Slot::Live(..) if pass == Pass::Reread && !room_owed_back(&id_hex) => {
                     let _ = tokio::task::spawn_blocking(move || db.carry_owned_salt(&id_hex, &salt))
                         .await;
                 }
                 Slot::Live(snapshot, records) => {
                     match restore_room(env, app, salt, seed, &ident, &snapshot, &records).await {
-                        Ok(true) => outcome.recovered += 1,
-                        Ok(false) => {}
+                        Ok(true) => {
+                            owe_room_back(&id_hex, false);
+                            outcome.recovered += 1;
+                        }
+                        Ok(false) => owe_room_back(&id_hex, false),
                         Err(e) => {
                             tracing::warn!(error = %e, "could not restore an owned room");
+                            owe_room_back(&id_hex, true);
                             outcome.unsettled += 1;
                             let _ = tokio::task::spawn_blocking(move || {
                                 db.carry_owned_salt(&id_hex, &salt)
@@ -808,7 +878,7 @@ pub async fn recover_owned_channels(
     state: tauri::State<'_, AppState>,
 ) -> Result<OwnedRoomScan, String> {
     crate::commands::channels::require_ember(&state).await?;
-    scan_owned_rooms(&state, Some(&app)).await
+    scan_owned_rooms(&state, Some(&app), Pass::Restore).await
 }
 
 /// At startup, once the network has had time to come up: read the identity's
@@ -867,8 +937,11 @@ impl Drop for ReadLoopRunning {
 /// Read the list until it has been read — every two minutes for a while if
 /// the network cannot be reached well enough yet — and then keep looking at
 /// rooms that could not be settled, every few hours, and at the list itself
-/// while this identity owns rooms (see [`SETTLED_REREAD_SECS`]). One such
-/// loop at a time.
+/// (see [`settled_reread_wait`]). Only the first read of a launch puts rooms
+/// back; later ones carry what another device added (see [`Pass`]). It keeps
+/// going while this identity owns nothing, every [`SETTLED_REREAD_SECS`], so
+/// a room taken over or handed here later is read for without another start.
+/// One such loop at a time.
 fn spawn_list_read(app: tauri::AppHandle, delay: std::time::Duration) {
     if READ_LOOP_RUNNING.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return;
@@ -882,14 +955,23 @@ fn spawn_list_read(app: tauri::AppHandle, delay: std::time::Duration) {
             let Some(state) = app.try_state::<AppState>() else {
                 return;
             };
-            let wait = match scan_owned_rooms(&state, Some(&app)).await {
+            let pass = if crate::network::channel_membership::owned_rooms_list_read() {
+                Pass::Reread
+            } else {
+                Pass::Restore
+            };
+            let wait = match scan_owned_rooms(&state, Some(&app), pass).await {
                 Ok(scan) if scan.unsettled == 0 => {
-                    let owns = !state.db.owned_room_salts().unwrap_or_default().is_empty();
-                    if !owns {
-                        return;
-                    }
                     failures = 0;
-                    SETTLED_REREAD_SECS
+                    let owns = !state.db.owned_room_salts().unwrap_or_default().is_empty();
+                    if owns {
+                        settled_reread_wait(
+                            chrono::Utc::now().timestamp(),
+                            crate::network::channel_membership::next_owned_rooms_list_publish_at(),
+                        )
+                    } else {
+                        SETTLED_REREAD_SECS
+                    }
                 }
                 Ok(_) => UNSETTLED_RETRY_SECS,
                 Err(e) => {
@@ -916,6 +998,9 @@ fn spawn_list_read(app: tauri::AppHandle, delay: std::time::Duration) {
 pub fn owe_scan(db: &Database) {
     if let Err(e) = db.set_owned_rooms_list_synced(false) {
         tracing::warn!("could not mark the owned-rooms list for a re-read: {e}");
+    }
+    if let Err(e) = db.reask_rooms_deleted_elsewhere() {
+        tracing::warn!("could not ask again about rooms deleted elsewhere: {e}");
     }
 }
 
@@ -1050,7 +1135,7 @@ mod tests {
         }
         net.deleted.insert(hex::encode(gone.channel_id));
 
-        let scan = scan_owned_rooms_with(&net, None).await.expect("the list reads");
+        let scan = scan_owned_rooms_with(&net, None, Pass::Restore).await.expect("the list reads");
         assert!(scan.confirmed);
         assert_eq!(scan.recovered, 2, "{scan:?}");
         assert_eq!(scan.deleted_elsewhere, 0);
@@ -1081,16 +1166,44 @@ mod tests {
         // Later the registry lists the public room as deleted while this
         // device runs it: the owner is asked, and the room keeps running.
         net.deleted.insert(lobby_hex.clone());
-        let again = scan_owned_rooms_with(&net, None).await.expect("the list reads");
+        let again = scan_owned_rooms_with(&net, None, Pass::Reread).await.expect("the list reads");
         assert_eq!(again.deleted_elsewhere, 1);
         assert_eq!(db.rooms_deleted_elsewhere().unwrap(), vec![(lobby_hex.clone(), "Lobby".to_string())]);
         assert!(!db.get_channel(&lobby_hex).unwrap().unwrap().deleted);
+
+        // The other device makes a room mid-session: a re-read carries it, so
+        // this device's list keeps naming it, and leaves it to that device.
+        let annex_salt = [0x44u8; 16];
+        let annex = room(&annex_salt);
+        let annex_hex = hex::encode(annex.channel_id);
+        net.publish(SignedRecord::owned_rooms(&[lobby_salt, den_salt, gone_salt, annex_salt], &signing).unwrap());
+        net.publish(snapshot(&annex, "Annex", false, 0));
+        let reread = scan_owned_rooms_with(&net, None, Pass::Reread).await.expect("the list reads");
+        assert_eq!((reread.recovered, reread.unsettled), (0, 0), "{reread:?}");
+        assert!(db.get_channel(&annex_hex).unwrap().is_none(), "not run here as well");
+        assert!(db.owned_room_salts().unwrap().contains(&annex_salt), "but still listed from here");
+        // The user's own look from Settings puts it back.
+        let asked = scan_owned_rooms_with(&net, None, Pass::Restore).await.expect("the list reads");
+        assert_eq!(asked.recovered, 1, "{asked:?}");
+        assert!(db.get_channel(&annex_hex).unwrap().is_some_and(|row| row.is_owner));
 
         drop(net);
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    /// A settled loop reads the list shortly before this device publishes its
+    /// own, and never goes longer than its cap without reading.
+    #[test]
+    fn the_list_is_read_just_before_this_device_publishes_its_own() {
+        let now = 1_900_000_000;
+        assert_eq!(settled_reread_wait(now, None), SETTLED_REREAD_SECS);
+        assert_eq!(settled_reread_wait(now, Some(now + 3_600)), 3_000, "ten minutes ahead of it");
+        assert_eq!(settled_reread_wait(now, Some(now + 5 * 3_600)), SETTLED_REREAD_SECS, "capped");
+        let after = settled_reread_wait(now, Some(now + 300));
+        assert_eq!(after, SETTLED_REREAD_SECS, "already read for this one: the next");
     }
 
     #[test]

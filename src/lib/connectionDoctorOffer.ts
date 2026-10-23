@@ -32,3 +32,11 @@ export function stepDoctorOffer(
   }
   return { next: { ...prev, limitedSince: since }, offer: false };
 }
+
+/** Milliseconds until the offer falls due, for a timer to step again then;
+ *  null when none is pending (not limited, or offered already). Nothing else
+ *  steps while reachability stays the same. */
+export function doctorOfferDueIn(state: DoctorOfferState, now: number): number | null {
+  if (state.offered || state.limitedSince === null) return null;
+  return Math.max(0, state.limitedSince + DOCTOR_OFFER_AFTER_MS - now);
+}

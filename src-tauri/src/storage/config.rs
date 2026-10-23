@@ -27,15 +27,23 @@ pub(crate) fn settings_json(settings: &AppSettings) -> serde_json::Result<String
     serde_json::to_string_pretty(&value)
 }
 
-/// `config.json` read back, Auto upload slots included.
-fn parse_settings(data: &str) -> serde_json::Result<AppSettings> {
+/// `config.json` read back, Auto upload slots included, and whether the file
+/// should be written again in the current form: one an earlier build wrote
+/// with Auto as 0, which would otherwise stay that way until some other save
+/// and still downgrade to one slot.
+///
+/// The flag reads as Auto only beside [`UPLOAD_SLOTS_AUTO_ON_DISK`], the
+/// count written with it. A count edited by hand beside the flag is the
+/// count: a number set by hand to four is never written with the flag.
+fn parse_settings(data: &str) -> serde_json::Result<(AppSettings, bool)> {
     let value: serde_json::Value = serde_json::from_str(data)?;
-    let auto = value.get(UPLOAD_SLOTS_AUTO_KEY).and_then(serde_json::Value::as_bool) == Some(true);
+    let flagged = value.get(UPLOAD_SLOTS_AUTO_KEY).and_then(serde_json::Value::as_bool) == Some(true);
     let mut settings: AppSettings = serde_json::from_value(value)?;
-    if auto {
+    let old_auto = !flagged && settings.max_concurrent_uploads == 0;
+    if flagged && settings.max_concurrent_uploads == UPLOAD_SLOTS_AUTO_ON_DISK {
         settings.max_concurrent_uploads = 0;
     }
-    Ok(settings)
+    Ok((settings, old_auto))
 }
 
 /// Move a corrupt or semantically-invalid `config.json` aside so the user's
@@ -216,7 +224,10 @@ impl AppConfig {
                 // builds are also soft-fixed. Only if validation still fails
                 // (e.g. forbidden paths) do we backup and reset — last resort.
                 // Completely unreadable JSON is handled in the Err branch below.
-                Some(Ok(mut s)) => {
+                Some(Ok((mut s, old_auto))) => {
+                    // Rewritten now, so a downgrade before any other save
+                    // finds four slots rather than repairing 0 to one.
+                    config_changed |= old_auto;
                     let (deduped, deduped_changed) =
                         crate::commands::settings::dedupe_overlapping_shared_folders(
                             std::mem::take(&mut s.shared_folders),
@@ -402,19 +413,31 @@ mod ember_default_on_tests {
         let raw: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
         assert_eq!(raw["max_concurrent_uploads"], 4, "an older build reads a usable count");
         assert_eq!(raw["upload_slots_auto"], true);
-        assert_eq!(parse_settings(&on_disk).unwrap().max_concurrent_uploads, 0, "Auto again");
+        assert_eq!(slots(&on_disk), (0, false), "Auto again, nothing to rewrite");
 
         let manual = AppSettings { max_concurrent_uploads: 7, ..AppSettings::default() };
         let on_disk = settings_json(&manual).unwrap();
         let raw: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
         assert_eq!(raw["max_concurrent_uploads"], 7);
         assert!(raw.get("upload_slots_auto").is_none());
-        assert_eq!(parse_settings(&on_disk).unwrap().max_concurrent_uploads, 7);
+        assert_eq!(slots(&on_disk), (7, false));
 
-        // A config a build before this one wrote, with Auto stored as 0.
+        // A config a build before this one wrote, with Auto stored as 0: Auto,
+        // and written again in the current form at once.
         let mut old = serde_json::to_value(&auto).unwrap();
         old.as_object_mut().unwrap().remove("upload_slots_auto");
-        assert_eq!(parse_settings(&old.to_string()).unwrap().max_concurrent_uploads, 0);
+        assert_eq!(slots(&old.to_string()), (0, true));
+
+        // A count edited by hand beside the flag is the count.
+        let mut edited: serde_json::Value = serde_json::from_str(&settings_json(&auto).unwrap()).unwrap();
+        edited["max_concurrent_uploads"] = 10.into();
+        assert_eq!(slots(&edited.to_string()), (10, false));
+    }
+
+    /// The upload-slot count a config reads as, and whether it is rewritten.
+    fn slots(data: &str) -> (u32, bool) {
+        let (settings, rewrite) = parse_settings(data).unwrap();
+        (settings.max_concurrent_uploads, rewrite)
     }
 
     /// A config from the opt-in era stores `false` because that was the

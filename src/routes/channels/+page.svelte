@@ -1412,13 +1412,23 @@
    *  on the owner's answer; see `confirm_room_deleted_elsewhere`. */
   let deletedElsewhere = $state<RoomDeletedElsewhere[]>([]);
   let answeringDeleted = $state<string | null>(null);
+  let deletedElsewhereSeq = 0;
+  let removeElsewhereTarget = $state<RoomDeletedElsewhere | null>(null);
+  let removeElsewhereOpen = $state(false);
 
   async function loadDeletedElsewhere() {
+    const seq = ++deletedElsewhereSeq;
     try {
-      deletedElsewhere = await listRoomsDeletedElsewhere();
+      const rooms = await listRoomsDeletedElsewhere();
+      if (seq === deletedElsewhereSeq) deletedElsewhere = rooms;
     } catch (e) {
       console.warn('channels: could not read rooms deleted elsewhere', e);
     }
+  }
+
+  function askRemoveDeletedElsewhere(room: RoomDeletedElsewhere) {
+    removeElsewhereTarget = room;
+    removeElsewhereOpen = true;
   }
 
   async function answerDeletedElsewhere(channelId: string, del: boolean) {
@@ -1443,6 +1453,7 @@
       error = translateError(e, m.error_operation_failed());
     } finally {
       answeringDeleted = null;
+      void loadDeletedElsewhere();
     }
   }
 
@@ -2244,6 +2255,7 @@
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
       deletingOwned = false;
+      void loadDeletedElsewhere();
     }
   }
 
@@ -3084,7 +3096,7 @@
         {m.channels_deleted_elsewhere_body()}
       </span>
       <div class="banner-actions">
-        <button class="ghost" onclick={() => void answerDeletedElsewhere(room.channel_id, true)} disabled={answeringDeleted !== null}>
+        <button class="ghost" onclick={() => askRemoveDeletedElsewhere(room)} disabled={answeringDeleted !== null}>
           {answeringDeleted === room.channel_id ? m.common_loading() : m.channels_deleted_elsewhere_delete()}
         </button>
         <button class="ghost" onclick={() => void answerDeletedElsewhere(room.channel_id, false)} disabled={answeringDeleted !== null}>
@@ -4777,6 +4789,17 @@
   confirmLabel={m.channels_delete()}
   danger
   onconfirm={handleDeleteOwned}
+/>
+
+<ConfirmDialog
+  bind:open={removeElsewhereOpen}
+  title={m.channels_deleted_elsewhere_confirm()}
+  message={m.channels_deleted_elsewhere_confirm_body({ name: removeElsewhereTarget?.name ?? '' })}
+  confirmLabel={m.channels_deleted_elsewhere_delete()}
+  danger
+  onconfirm={() => {
+    if (removeElsewhereTarget) void answerDeletedElsewhere(removeElsewhereTarget.channel_id, true);
+  }}
 />
 
 <style>

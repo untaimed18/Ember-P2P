@@ -418,30 +418,63 @@ probe needs the rendezvous server change above, and works without it.
   gathers the signals and `assess` turns them into the verdict, the checks,
   what Ember already does and at most three fixes. `assess` is pure and
   tested for each verdict, carrier-grade NAT, VPN, a taken port, offline,
-  clock skew and a missing probe.
+  clock skew, a missing or rate-limited probe and a change waiting on a
+  restart. It judges what the session runs on (`session_tcp_port`,
+  `session_udp_port`, `session_upnp_enabled` in `NetworkStats`), not saved
+  settings, and a saved change to them is the first fix, "restart". A TCP
+  port Ember could not open is never called open, whatever answers on it.
 - **Probe, client side.** `network/reachability.rs` takes the 32-byte UDP
-  probe ahead of STUN, Ember and Kad on the shared socket.
+  probe ahead of STUN, Ember and Kad on the shared socket. The doctor
+  registers its nonce before asking (`expect_probe`), and only that nonce
+  counts, so probe-shaped traffic from anyone else neither fakes an arrival
+  nor crowds out the real one. The probe goes to the public ports STUN saw;
+  the report and the forwarding steps name the local ones.
 - **Probe, server side.** `/v4/reachability` in the rendezvous server
   (`reachability_v4`, advertised as `reachability` on `/v4/protocol`). It
-  probes only the requester's address, at most 6 per hour, and is tested
-  against loopback listeners. The answer carries the server's clock, which
-  is what the skew check reads.
-- **New stats.** `NetworkStats` gained `upnp_wan_ip`, `tcp_listen_failed`
-  and `bound_udp_port`. Windows gained `firewall::rules_in_place` and
-  `add_rules_elevated`: one permission prompt, running `netsh` from an
-  `-EncodedCommand` script.
+  probes only the requester's address, at most 6 per hour per IPv4 address,
+  TCP connect then the tagged datagram three times, and is tested against
+  loopback listeners. It probes a routable public IPv4 caller only and
+  answers anyone else `"available": false` without dialling or charging the
+  limit: an IPv6 caller would be probed where Ember does not listen, and a
+  loopback or private one is a proxy in front of the server. The answer
+  carries the server's clock, which is what the skew check reads. A 429
+  shows as "the hourly limit is used up".
+- **New stats.** `NetworkStats` gained `upnp_wan_ip`, `tcp_listen_failed`,
+  `bound_udp_port` and the session's ports. Windows gained
+  `firewall::rules_in_place` and `add_rules_elevated`: one permission prompt,
+  running `netsh` from an `-EncodedCommand` script, with the program path
+  passed base64-encoded so no character in a folder name can end a string.
 - **UI.** `ConnectionDoctor.svelte` sits at the top of Settings > Network,
   above the port fields. The status bar shows "Check connection" beside a
   LowID or firewalled state. The automatic offer is a status-bar toast,
-  once a session, after ten unbroken minutes (`connectionDoctorOffer.ts`,
-  tested), not part of the first-run flow.
+  once a session, after ten unbroken minutes (`connectionDoctorOffer.ts`;
+  the stepper and its timer are tested, the status bar sets the timer), not
+  part of the first-run flow. Retrying UPnP checks again ten seconds later.
+
+**Left as they are:**
+
+- **Firewall rules are judged by name and port.** A disabled or blocking
+  rule of that name passes, and Windows Firewall switched off, or a
+  third-party firewall, reads as missing rules. The outside probe is what
+  says whether traffic gets through.
+- **No QUIC rule from the doctor.** With QUIC on the Kad UDP port (the
+  default) none is needed; on a port of its own, the rule startup adds is
+  the only one.
+- **"Reconnect the eD2K server" is not an action.** "Check again" restarts
+  the Kad firewall checks only, and is offered only when offline.
+- **The TCP probe is a connect.** A SYN-proxying firewall, or a router
+  service on the port, reads as open. Writing the nonce on the connection
+  for the upload listener to recognise would close it; not done.
+- **The permission prompt has no owner window** and may open behind Ember,
+  as a flashing taskbar button.
 
 **How the open questions were settled:**
 
-- **Probe ports.** One datagram to the Kad UDP port. With QUIC sharing that
-  port (the default), it answers for both. A separate QUIC port is not
-  probed.
-- **IPv6.** Not reported until Ember listens on it.
+- **Probe ports.** The tagged datagram to the Kad UDP port. With QUIC
+  sharing that port (the default), it answers for both. A separate QUIC port
+  is not probed, and Ember does not answer the probe: it only notes it.
+- **IPv6.** Not reported until Ember listens on it; the server declines an
+  IPv6 caller and the client ignores an answer about anything but IPv4.
 - **"Move to free ports".** Brings the port field up and selects it rather
   than choosing ports itself. A port picked unasked could be taken too, and
   the field's restart badge already says when it applies.
@@ -475,6 +508,17 @@ natural place, since only relays forward a reply), whether it is signed by
 the neighbor that served the reply so a hop cannot forge progress for it, and
 how a 1.7.x member that does not send it is read (as today: not credited).
 Origin: `docs/post-1.7.4.md`, "Channels: smaller follow-ups".
+
+**Also in 1.8.0: pad the owned-rooms list.** 1.7.5 can pad the identity's
+list (kind 7) to 8, 16, 32 or 48 entries with salts derived from the identity
+secret, so the list says neither how many rooms the identity owns nor which
+were carried (`pad_owned_rooms_list`), and it already drops its own pads when
+it reads a list. It does not publish them yet (`PAD_OWNED_ROOMS_LIST` is
+off): a 1.7.4 device on the same identity reads every pad as a room it cannot
+find, carries it as unsettled, keeps looking every six hours and publishes the
+pads back in its own list, unpadded and in the order it holds them. 1.8.0
+switches it on, once a second device on 1.7.4 or older is no longer expected.
+Origin: `docs/post-1.7.4.md`, "Known limits" of owned-room recovery.
 
 ## Carried from the 1.7.5 plan
 

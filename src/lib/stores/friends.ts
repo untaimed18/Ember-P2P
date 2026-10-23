@@ -1203,6 +1203,10 @@ export function clearFriendSearch(friendHash: string) {
 
 export function cleanupFriendsStore() {
   storeEpoch++;
+  // The list is emptied below; until a fetch fills it again it is not loaded,
+  // or the layout would reconcile chat tabs against an empty list and close
+  // every one.
+  friendsListWritten = false;
   for (const unlisten of unlisteners) {
     try {
       unlisten();

@@ -271,30 +271,17 @@ pub fn rules_in_place(tcp_port: u16, udp_port: u16) -> bool {
 /// when the user asks. Returns whether the rules are in place afterwards, so a
 /// declined prompt reads as not done.
 pub fn add_rules_elevated(tcp_port: u16, udp_port: u16) -> bool {
-    use base64::Engine as _;
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
-    let exe = exe.to_string_lossy().replace(['"', '\''], "");
-    let netsh = windows_system_path(NETSH).to_string_lossy().replace(['"', '\''], "");
-    let rule = |name: &str, protocol: &str, port: u16| {
-        format!(
-            "& '{netsh}' advfirewall firewall delete rule name='{name}' | Out-Null\n\
-             & '{netsh}' advfirewall firewall add rule name='{name}' dir=in action=allow \
-             protocol={protocol} localport={port} enable=yes profile=any program='{exe}' | Out-Null\n"
-        )
-    };
-    let script = format!(
-        "{}{}",
-        rule(RULE_NAME_TCP, "TCP", tcp_port),
-        rule(RULE_NAME_UDP, "UDP", udp_port)
+    let script = elevated_rules_script(
+        &exe.to_string_lossy(),
+        &windows_system_path(NETSH).to_string_lossy(),
+        tcp_port,
+        udp_port,
     );
-    // UTF-16LE, as `-EncodedCommand` takes it: nothing in the script has to
-    // survive another round of quoting.
-    let encoded = base64::engine::general_purpose::STANDARD.encode(
-        script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>(),
-    );
-    let powershell = windows_system_path(POWERSHELL).to_string_lossy().replace('\'', "");
+    let encoded = utf16_base64(&script);
+    let powershell = strip_quotes(&windows_system_path(POWERSHELL).to_string_lossy());
     let launcher = format!(
         "Start-Process -FilePath '{powershell}' -Verb RunAs -Wait -WindowStyle Hidden \
          -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{encoded}'"
@@ -308,6 +295,41 @@ pub fn add_rules_elevated(tcp_port: u16, udp_port: u16) -> bool {
         return false;
     }
     rules_in_place(tcp_port, udp_port)
+}
+
+/// UTF-16LE in base64, as `-EncodedCommand` and `[Text.Encoding]::Unicode`
+/// take it.
+fn utf16_base64(text: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(text.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>())
+}
+
+/// `text` without anything PowerShell reads as a quote: ASCII `'` and `"`,
+/// and the typographic single quotes it treats exactly like `'`. Only for
+/// system paths, which never hold one; the program path is passed encoded.
+fn strip_quotes(text: &str) -> String {
+    text.replace(['"', '\'', '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'], "")
+}
+
+/// The script the elevated PowerShell runs: replace both rules, for `exe`.
+/// The program path is the one value a user or a download folder can name,
+/// so it goes in base64 and is decoded into a variable: no character in it,
+/// quote or otherwise, can end a string and become script.
+fn elevated_rules_script(exe: &str, netsh: &str, tcp_port: u16, udp_port: u16) -> String {
+    let netsh = strip_quotes(netsh);
+    let rule = |name: &str, protocol: &str, port: u16| {
+        format!(
+            "& '{netsh}' advfirewall firewall delete rule name='{name}' | Out-Null\n\
+             & '{netsh}' advfirewall firewall add rule name='{name}' dir=in action=allow \
+             protocol={protocol} localport={port} enable=yes profile=any \"program=$exe\" | Out-Null\n"
+        )
+    };
+    format!(
+        "$exe = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{}'))\n{}{}",
+        utf16_base64(exe),
+        rule(RULE_NAME_TCP, "TCP", tcp_port),
+        rule(RULE_NAME_UDP, "UDP", udp_port)
+    )
 }
 
 /// Returns `Some(outcome)` when `add_firewall_rule` actually ran (rule
@@ -328,7 +350,34 @@ fn ensure_one_rule(rule_name: &str, protocol: &str, port: u16) -> Option<AddRule
 
 #[cfg(test)]
 mod tests {
-    use super::dedicated_quic_udp_port;
+    use super::{dedicated_quic_udp_port, elevated_rules_script, utf16_base64, POWERSHELL};
+
+    /// A program path with any quote PowerShell honours reaches netsh as it
+    /// is, and none of it is ever read as script.
+    #[test]
+    fn the_elevated_script_passes_any_program_path_through_untouched() {
+        for exe in [
+            r"C:\Users\O'Brien\AppData\Local\Ember\ember.exe",
+            "C:\\Users\\O\u{2019}Brien\\Ember\\ember.exe",
+            "C:\\Downloads\\Ember\u{2019};Start-Process calc;\u{2019}\\ember.exe",
+            r#"C:\Program Files\Ember "x"\ember.exe"#,
+        ] {
+            let script = elevated_rules_script(exe, r"C:\Windows\System32\netsh.exe", 4662, 4672);
+            assert!(!script.contains("Brien") && !script.contains("calc"), "{script}");
+            assert!(script.contains("localport=4662") && script.contains("localport=4672"));
+            // What the variable holds once PowerShell decodes it.
+            let decode = format!(
+                "$exe = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{}'))\n\
+                 [Console]::OutputEncoding = [Text.Encoding]::UTF8\n[Console]::Out.Write($exe)",
+                utf16_base64(exe)
+            );
+            let out = std::process::Command::new(crate::security::filesystem::windows_system_path(POWERSHELL))
+                .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &utf16_base64(&decode)])
+                .output()
+                .expect("powershell runs");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), exe);
+        }
+    }
 
     #[test]
     fn dedicated_quic_rule_skipped_when_sharing_kad_udp_port() {

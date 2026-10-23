@@ -386,34 +386,47 @@ impl InboundAttach {
 }
 
 /// What of an [`InboundAttach`] its row does not already hold, kept beside it
-/// (`chat_attachments.inbound_offer`) so the offer can still be answered after
-/// a restart. The size, root and name on disk are the row's own; the friend's
-/// key is the friends list's.
+/// (`chat_attachments.inbound_offer`, sealed with the chat key) so the offer
+/// can still be answered after a restart. The size, root and name are the
+/// row's own; the friend's key is the friends list's.
 #[derive(Debug, serde::Deserialize, Serialize, PartialEq, Eq)]
 struct SavedInbound {
     quic_port: u16,
-    /// The name as offered, before sanitizing.
-    name: String,
     /// The session address the offer came in on.
     from: Option<SocketAddr>,
     received_at: i64,
     /// The sender echoed our note at least once: it held the grant, and will
-    /// hold it once more after a session ends (see [`sweep_interrupted`]).
+    /// hold it once more after a session ends (see [`restore_inbound`]).
     held: bool,
+    /// A re-offer our own "Try again" asked for, which the sender hears
+    /// lapsed when it does.
+    #[serde(default)]
+    requested: bool,
 }
 
 /// Keep `xfer_id`'s offer beside its row, as it stands now.
 fn save_inbound(db: &Database, xfer_id: &[u8; 16], inbound: &InboundAttach) {
     let saved = SavedInbound {
         quic_port: inbound.offer.quic_port,
-        name: inbound.offer.name.clone(),
         from: inbound.peer_addr,
         received_at: inbound.received_at,
         held: inbound.hold == InboundHold::Held,
+        requested: inbound.requested,
     };
     if let Ok(json) = serde_json::to_string(&saved) {
         let _ = db.set_chat_attachment_inbound_offer(&hex::encode(xfer_id), &json);
     }
+}
+
+/// What a restart knows of an offer's row besides what was kept beside it.
+struct WaitingRow<'a> {
+    friend_hash: &'a str,
+    /// Opened, as it is named on disk.
+    file_name: String,
+    file_size: u64,
+    root_hash: &'a str,
+    /// When the row says the offer lapses, as last recorded.
+    expires_at: i64,
 }
 
 /// An offer kept beside a row that was still waiting when the process
@@ -421,29 +434,34 @@ fn save_inbound(db: &Database, xfer_id: &[u8; 16], inbound: &InboundAttach) {
 /// answered: nothing kept (an older build wrote the row), the friend gone or
 /// without a key, or its time up at `now`.
 ///
-/// Every session ended with the process, so the sender let go of a hold it
-/// gave: one it held goes back on an offer's lifetime from `now`, named,
-/// which is the one re-hold a sender allows after a session ends. One never
-/// held keeps the lifetime it had from its arrival.
-#[allow(clippy::too_many_arguments)]
+/// Every session ended with the process, and the sender let go of a hold it
+/// gave then, onto an offer's lifetime from that moment; it holds again once
+/// if named while that lasts. So one it held comes back named on that same
+/// clock: from when this process was last seen running (`last_alive`), and
+/// never later than the row's own expiry, which already records a release
+/// seen before the stop. A restart inside those five minutes keeps the offer
+/// for the next session's notes to hold again; a longer one lets it lapse
+/// here as it did there. One never held keeps the lifetime it had from its
+/// arrival.
 fn restore_inbound(
-    friend_hash: &str,
-    file_name: String,
-    file_size: u64,
-    root_hash: &str,
+    row: WaitingRow<'_>,
     saved: Option<&str>,
     friend_pubkey: impl FnOnce(&[u8; 16]) -> Option<[u8; 32]>,
     xfer_id: [u8; 16],
+    last_alive: Option<i64>,
     now: i64,
 ) -> Option<InboundAttach> {
     let saved: SavedInbound = serde_json::from_str(saved?).ok()?;
     let mut friend = [0u8; 16];
-    hex::decode_to_slice(friend_hash, &mut friend).ok()?;
+    hex::decode_to_slice(row.friend_hash, &mut friend).ok()?;
     let mut root = [0u8; 32];
-    hex::decode_to_slice(root_hash, &mut root).ok()?;
+    hex::decode_to_slice(row.root_hash, &mut root).ok()?;
     let peer_pubkey = friend_pubkey(&friend)?;
     let hold = if saved.held {
-        InboundHold::Named { since: now }
+        let released_at = last_alive.unwrap_or(now).min(now);
+        InboundHold::Named {
+            since: released_at.min(row.expires_at - ATTACH_OFFER_TTL_SECS),
+        }
     } else {
         InboundHold::Unnamed
     };
@@ -453,14 +471,14 @@ fn restore_inbound(
         peer_addr: saved.from,
         offer: AttachOffer {
             xfer_id,
-            size: file_size,
+            size: row.file_size,
             root,
             quic_port: saved.quic_port,
-            name: saved.name,
+            name: row.file_name.clone(),
         },
-        name: file_name,
+        name: row.file_name,
         received_at: saved.received_at,
-        requested: false,
+        requested: saved.requested,
         hold,
         notes_owed: 0,
     };
@@ -3272,26 +3290,32 @@ fn transfers_with(
 /// if it dials again.
 pub(super) fn sweep_interrupted(db: &Database, download_folders: &[String]) -> Vec<([u8; 16], InboundAttach)> {
     let now = chrono::Utc::now().timestamp();
+    let last_alive = db.last_alive_at();
     let _ = db.expire_chat_attachments(now);
     let _ = db.prune_settled_chat_attachments(now);
     let _ = db.release_held_chat_attachment_offers(None, now + ATTACH_OFFER_TTL_SECS);
     let _ = db.requeue_interrupted_outbound_chat_attachments();
     let mut restored = Vec::new();
-    for (xfer_hex, friend_hash, file_name, file_size, root_hash, _, saved) in
+    for (xfer_hex, friend_hash, file_name, file_size, root_hash, expires_at, saved) in
         db.waiting_inbound_chat_attachments().unwrap_or_default()
     {
         let mut xfer_id = [0u8; 16];
         if hex::decode_to_slice(&xfer_hex, &mut xfer_id).is_err() {
             continue;
         }
-        let back = restore_inbound(
-            &friend_hash,
+        let row = WaitingRow {
+            friend_hash: &friend_hash,
             file_name,
             file_size,
-            &root_hash,
+            root_hash: &root_hash,
+            expires_at,
+        };
+        let back = restore_inbound(
+            row,
             saved.as_deref(),
             |friend| db.get_friend_public_key(friend).ok().flatten(),
             xfer_id,
+            last_alive,
             now,
         );
         if let Some(inbound) = back {
@@ -3811,9 +3835,11 @@ mod tests {
     }
 
     /// An offer still waiting on the user comes back after a restart from what
-    /// was kept beside its row: one the sender held is named again on an
-    /// offer's lifetime from the restart, one never held keeps its own, and
-    /// one whose time is up, or with nothing kept or no friend key, does not.
+    /// was kept beside its row, under the name it is saved as: one never held
+    /// keeps its own lifetime, and one the sender held is named again on the
+    /// lifetime the sender gave it when our sessions ended, so a short restart
+    /// keeps it and a long one does not. One whose time is up, or with nothing
+    /// kept or no friend key, does not come back. What is kept is sealed.
     #[test]
     fn a_waiting_offer_survives_a_restart_on_the_terms_its_sender_allows() {
         let (db, path) = attach_db("restore-inbound");
@@ -3821,51 +3847,100 @@ mod tests {
         let friend = hex::encode(sender);
         let now = chrono::Utc::now().timestamp();
         let key = |_: &[u8; 16]| Some([7u8; 32]);
-        let restore = |db: &Database, id: &str, at: i64, pubkey: Option<[u8; 32]>| {
-            let row = db
+        let restore = |db: &Database, id: &str, alive: Option<i64>, pubkey: Option<[u8; 32]>| {
+            let (_, friend_hash, file_name, file_size, root_hash, expires_at, saved) = db
                 .waiting_inbound_chat_attachments()
                 .expect("rows")
                 .into_iter()
                 .find(|row| row.0 == id)
                 .expect("row");
-            restore_inbound(&row.1, row.2, row.3, &row.4, row.6.as_deref(), |_| pubkey, id_of(id), at)
+            let row = WaitingRow {
+                friend_hash: &friend_hash,
+                file_name,
+                file_size,
+                root_hash: &root_hash,
+                expires_at,
+            };
+            restore_inbound(row, saved.as_deref(), |_| pubkey, id_of(id), alive, now)
+        };
+        let held_offer = |db: &Database, ids: (&str, &str), at: i64| {
+            let (_, id) = offer_both_ends(db, ids, &friend, at);
+            let mut offer = waiting_offer(sender, id_of(&id), at, "203.0.113.9:4662");
+            offer.hold = InboundHold::Held;
+            save_inbound(db, &id_of(&id), &offer);
+            db.set_chat_attachment_expiry(&id, at + HELD_OFFER_WAIT_SECS).expect("held");
+            id
         };
 
         // Fresh and never held: back on its own lifetime from its arrival.
         let (_, fresh) = offer_both_ends(&db, ("a1", "b1"), &friend, now - 60);
-        let offer = waiting_offer(sender, id_of(&fresh), now - 60, "203.0.113.9:4662");
+        let mut offer = waiting_offer(sender, id_of(&fresh), now - 60, "203.0.113.9:4662");
+        offer.requested = true;
         save_inbound(&db, &id_of(&fresh), &offer);
-        let back = restore(&db, &fresh, now, key(&sender)).expect("still in date");
+        let back = restore(&db, &fresh, Some(now - 30), key(&sender)).expect("still in date");
         assert_eq!(back.hold, InboundHold::Unnamed);
         assert_eq!(back.lapses_at(), now - 60 + ATTACH_OFFER_TTL_SECS);
+        assert_eq!(back.name, "f.bin", "named as the row is, not as it is sealed");
         assert_eq!(back.offer, offer.offer, "offered as it was");
+        assert!(back.requested, "still the one we asked for");
         assert_eq!((back.peer_addr, back.peer_pubkey), (offer.peer_addr, [7u8; 32]));
-        assert!(restore(&db, &fresh, now, None).is_none(), "no friend key, no offer");
+        assert!(restore(&db, &fresh, Some(now - 30), None).is_none(), "no friend key, no offer");
+        let stored = db.chat_attachment_inbound_offer_stored(&fresh).expect("kept");
+        assert!(!stored.contains("203.0.113.9"), "the session address is not kept in the clear");
 
-        // An hour old and held by the sender: named again, five minutes from now.
-        let (_, held) = offer_both_ends(&db, ("a2", "b2"), &friend, now - 3600);
-        let mut offer = waiting_offer(sender, id_of(&held), now - 3600, "203.0.113.9:4662");
-        offer.hold = InboundHold::Held;
-        save_inbound(&db, &id_of(&held), &offer);
-        let back = restore(&db, &held, now, key(&sender)).expect("the sender holds it once more");
-        assert_eq!(back.hold, InboundHold::Named { since: now });
-        assert_eq!(back.lapses_at(), now + ATTACH_OFFER_TTL_SECS);
+        // An hour old and held, the process stopped a minute ago: the sender
+        // let go of it then, so it is named again on what is left of that.
+        let held = held_offer(&db, ("a2", "b2"), now - 3600);
+        let back = restore(&db, &held, Some(now - 60), key(&sender)).expect("the sender holds it once more");
+        assert_eq!(back.hold, InboundHold::Named { since: now - 60 });
+        assert_eq!(back.lapses_at(), now - 60 + ATTACH_OFFER_TTL_SECS);
+        // Stopped ten minutes ago: the sender's five minutes are over.
+        assert!(restore(&db, &held, Some(now - 600), key(&sender)).is_none());
+        // Released before the stop, which its row recorded: counted from then.
+        let released = held_offer(&db, ("a5", "b5"), now - 3600);
+        db.set_chat_attachment_expiry(&released, now - 120 + ATTACH_OFFER_TTL_SECS).expect("released");
+        let back = restore(&db, &released, Some(now - 30), key(&sender)).expect("still in its five minutes");
+        assert_eq!(back.hold, InboundHold::Named { since: now - 120 });
 
         // An hour old and never held: its time was up long ago.
         let (_, stale) = offer_both_ends(&db, ("a3", "b3"), &friend, now - 3600);
         save_inbound(&db, &id_of(&stale), &waiting_offer(sender, id_of(&stale), now - 3600, "203.0.113.9:4662"));
-        assert!(restore(&db, &stale, now, key(&sender)).is_none());
+        assert!(restore(&db, &stale, Some(now - 30), key(&sender)).is_none());
 
         // Written by a build that kept nothing beside it.
         let (_, bare) = offer_both_ends(&db, ("a4", "b4"), &friend, now - 60);
-        assert!(restore(&db, &bare, now, key(&sender)).is_none());
+        assert!(restore(&db, &bare, Some(now - 30), key(&sender)).is_none());
 
         // The startup sweep: nothing here has a friend key, so every waiting
         // row is settled rather than left to look answerable.
         assert!(sweep_interrupted(&db, &[]).is_empty());
-        for id in [&fresh, &held, &stale, &bare] {
+        for id in [&fresh, &held, &released, &stale, &bare] {
             assert_eq!(db.chat_attachment(id).expect("row").status, "expired");
         }
+        drop_attach_db(db, path);
+    }
+
+    /// The startup sweep hands back an in-date offer from a friend it has a
+    /// key for, opened and named as saved, and keeps its row waiting.
+    #[test]
+    fn the_startup_sweep_restores_an_offer_from_a_known_friend() {
+        let (db, path) = attach_db("sweep-restore");
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let pubkey = signing.verifying_key().to_bytes();
+        let sender = crate::network::ember::crypto::node_id_from_public_key(&signing.verifying_key());
+        let friend = hex::encode(sender);
+        db.add_friend(&friend, "Ada", Some(&pubkey)).expect("friend");
+        let now = chrono::Utc::now().timestamp();
+        let (_, received) = offer_both_ends(&db, ("c1", "d1"), &friend, now - 60);
+        save_inbound(&db, &id_of(&received), &waiting_offer(sender, id_of(&received), now - 60, "203.0.113.9:4662"));
+        db.note_alive(now - 30).expect("alive");
+
+        let restored = sweep_interrupted(&db, &[]);
+        assert_eq!(restored.len(), 1);
+        let (id, inbound) = &restored[0];
+        assert_eq!(*id, id_of(&received));
+        assert_eq!((inbound.name.as_str(), inbound.peer_pubkey), ("f.bin", pubkey));
+        assert_eq!(db.chat_attachment(&received).expect("row").status, "awaiting");
         drop_attach_db(db, path);
     }
 

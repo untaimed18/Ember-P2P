@@ -51,6 +51,7 @@
     punch: m.doctor_helping_punch,
   };
   const FIX: Record<string, [(p: FixParams) => string, (p: FixParams) => string]> = {
+    restart: [m.doctor_fix_restart, m.doctor_fix_restart_body],
     port_in_use: [m.doctor_fix_port_in_use, m.doctor_fix_port_in_use_body],
     windows_firewall: [m.doctor_fix_windows_firewall, m.doctor_fix_windows_firewall_body],
     carrier_nat: [m.doctor_fix_carrier_nat, m.doctor_fix_carrier_nat_body],
@@ -98,6 +99,8 @@
     closed: m.doctor_detail_closed,
     filtered: m.doctor_detail_filtered,
     not_run: m.doctor_detail_not_run,
+    rate_limited: m.doctor_detail_rate_limited,
+    another_program: m.doctor_detail_another_program,
     checking: m.doctor_detail_checking,
     firewalled: m.doctor_detail_firewalled,
     partly: m.doctor_detail_partly,
@@ -155,8 +158,15 @@
         return;
       }
       toast(m.doctor_action_done());
-      // What the fix changed shows in a fresh check, once it has had a moment.
-      if (action !== 'retry_upnp') void run();
+      // What the fix changed shows in a fresh check, once it has had a
+      // moment: a UPnP pass takes several seconds to ask the router.
+      if (action === 'retry_upnp') {
+        setTimeout(() => {
+          if (!destroyed) void run();
+        }, 10_000);
+      } else {
+        void run();
+      }
     } catch (e) {
       if (!destroyed) toast(translateError(e, m.error_operation_failed()));
     } finally {
@@ -169,7 +179,9 @@
   function address(value: string): string {
     if (!value) return '-';
     if (includeAddresses) return value;
-    return value.includes(':') ? value.replace(/[^:]+$/, 'x') : value.replace(/\d+$/, 'x');
+    // IPv6: the first three groups name a provider's /48, never one home.
+    if (value.includes(':')) return `${value.split(':').slice(0, 3).join(':')}:x`;
+    return value.replace(/\d+$/, 'x');
   }
 
   function reportText(r: ConnectionReport): string {

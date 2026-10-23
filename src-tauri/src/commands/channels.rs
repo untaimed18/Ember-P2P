@@ -1787,7 +1787,9 @@ pub async fn list_rooms_deleted_elsewhere(
 }
 
 /// The user's answer for one such room: `delete` purges it here as deleting
-/// it would have, `keep` keeps running it and stops asking.
+/// it would have, `keep` keeps it here and stops asking. Only for a room the
+/// prompt lists: this is not a way to delete any room without its own
+/// confirmation.
 #[tauri::command]
 pub async fn confirm_room_deleted_elsewhere(
     state: tauri::State<'_, AppState>,
@@ -1795,10 +1797,20 @@ pub async fn confirm_room_deleted_elsewhere(
     delete: bool,
 ) -> Result<(), String> {
     let channel_id = parse_channel_id(&channel_id)?;
+    let db = state.db.clone();
+    let id = channel_id.clone();
+    let waiting = tokio::task::spawn_blocking(move || db.room_deleted_elsewhere_waiting(&id))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_list_failed", "Failed to list channels", e))?;
+    if !waiting {
+        return Err(coded("channels_not_found", "Channel not found"));
+    }
     if delete {
         require_ember(&state).await?;
         let owned = load_owned_channel_as(&state, &channel_id, true).await?;
-        retire_deleted_room(&state, &owned).await?;
+        // Its row goes with the room (`tombstone_channel`).
+        return retire_deleted_room(&state, &owned).await;
     }
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.settle_room_deleted_elsewhere(&channel_id, delete))
