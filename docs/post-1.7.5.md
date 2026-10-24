@@ -761,7 +761,9 @@ probe needs the rendezvous server change above, and works without it.
   loopback listeners. It probes a routable public IPv4 caller only and
   answers anyone else `"available": false` without dialling or charging the
   limit: an IPv6 caller would be probed where Ember does not listen, and a
-  loopback or private one is a proxy in front of the server. Every
+  loopback or private one is a proxy in front of the server. The client
+  asks over IPv4 alone (`ipv4_client`), so a dual-stack machine, which
+  would often reach the server over IPv6, is still probed. Every
   well-formed request, probed or not, costs the general per-address budget
   the pre-body gate reads. The answer carries the server's clock, which is
   what the skew check reads. The server also advertises

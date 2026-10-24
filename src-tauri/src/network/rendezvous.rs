@@ -2753,7 +2753,7 @@ pub async fn request_reachability(
     }
     let url = format!("{}/v4/reachability", base_url.trim_end_matches('/'));
     let answer = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        let resp = client(base_url)
+        let resp = ipv4_client(base_url)
             .await?
             .post(&url)
             .json(&serde_json::json!({
@@ -2778,6 +2778,26 @@ pub async fn request_reachability(
     .await
     .map_err(|_| "reachability timed out".to_string())??;
     Ok(answer)
+}
+
+/// A client for `base_url` that reaches it over IPv4 only. The server probes
+/// the address a request comes from and declines an IPv6 one, since Ember
+/// does not listen on IPv6; a dual-stack machine would otherwise often ask
+/// over IPv6 and never be probed. Not cached: it serves one doctor run.
+async fn ipv4_client(base_url: &str) -> Result<reqwest::Client, String> {
+    let (_, host, addrs) = crate::security::validate_fetch_url(base_url)
+        .await
+        .map_err(|e| format!("rendezvous URL rejected: {e}"))?;
+    let v4 = ipv4_only(&addrs);
+    if v4.is_empty() {
+        return Err("reachability: the server has no IPv4 address".to_string());
+    }
+    crate::security::build_pinned_client(&host, &v4)
+        .map_err(|e| format!("failed to build hardened rendezvous HTTP client: {e}"))
+}
+
+fn ipv4_only(addrs: &[std::net::SocketAddr]) -> Vec<std::net::SocketAddr> {
+    addrs.iter().copied().filter(std::net::SocketAddr::is_ipv4).collect()
 }
 
 /// What a 429 from `/v4/reachability` means. A server that advertises
@@ -2831,6 +2851,19 @@ mod reachability_tests {
         for body in [&b""[..], b"Too Many Requests", br#"{"reason":"general"}"#, br#"{"reason":"hourly"}"#] {
             assert_eq!(refusal_from(false, body), Reachability::RateLimited);
         }
+    }
+
+    /// The probe is asked for over IPv4 alone, whatever else the server's
+    /// name resolves to.
+    #[test]
+    fn the_probe_request_is_pinned_to_ipv4_addresses() {
+        let addrs: Vec<std::net::SocketAddr> = ["[2a09:8280:1::1]:443", "66.241.124.1:443", "[::1]:443", "1.2.3.4:443"]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect();
+        let v4 = super::ipv4_only(&addrs);
+        assert_eq!(v4, vec![addrs[1], addrs[3]]);
+        assert!(super::ipv4_only(&addrs[..1]).is_empty());
     }
 }
 
