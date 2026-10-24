@@ -70,6 +70,7 @@
       <span class="toc-heading">Friends</span>
       <a href="#friends" class="toc-link">Ember Friends</a>
       <a href="#friends-features" class="toc-link toc-child">Features</a>
+      <a href="#friends-names" class="toc-link toc-child">Names &amp; status</a>
       <a href="#friends-encryption" class="toc-link toc-child">E2E encryption</a>
       <a href="#friends-privacy" class="toc-link toc-child">Privacy</a>
     </div>
@@ -81,8 +82,17 @@
       <a href="#channels-public" class="toc-link toc-child">Public vs private</a>
       <a href="#channels-owner" class="toc-link toc-child">Running a room</a>
       <a href="#channels-messages" class="toc-link toc-child">Messages</a>
+      <a href="#channels-private" class="toc-link toc-child">Private messages</a>
       <a href="#channels-files" class="toc-link toc-child">Sending files</a>
       <a href="#channels-limits" class="toc-link toc-child">What to expect</a>
+    </div>
+
+    <div class="toc-section">
+      <span class="toc-heading">Feeds</span>
+      <a href="#feeds" class="toc-link">Following a publisher</a>
+      <a href="#feeds-follow" class="toc-link toc-child">Following a feed</a>
+      <a href="#feeds-auto" class="toc-link toc-child">Automatic downloads</a>
+      <a href="#feeds-publish" class="toc-link toc-child">Publishing</a>
     </div>
 
     <div class="toc-section">
@@ -90,6 +100,7 @@
       <a href="#network" class="toc-link">Network compatibility</a>
       <a href="#ports" class="toc-link">Port forwarding</a>
       <a href="#highid" class="toc-link">High ID vs Low ID</a>
+      <a href="#connection-doctor" class="toc-link toc-child">Connection doctor</a>
     </div>
 
     <div class="toc-section">
@@ -172,7 +183,7 @@
     </ol>
 
     <div class="callout">
-      <p><strong>Tip:</strong> For best performance (High ID), forward your TCP and UDP ports on your router, enable UPnP, or leave STUN port keep-alive on in Settings &gt; Network. See the <a href="#highid">High ID vs Low ID</a> section for details.</p>
+      <p><strong>Tip:</strong> For best performance (High ID), forward your TCP and UDP ports on your router, enable UPnP, or leave STUN port keep-alive on in Settings &gt; Network. The <a href="#connection-doctor">connection check</a> at the top of that page says what is in the way. See the <a href="#highid">High ID vs Low ID</a> section for details.</p>
     </div>
   </section>
 
@@ -187,6 +198,7 @@
       <li><strong>KAD Network</strong> &mdash; The decentralized KAD DHT for peer discovery, keyword search, publishing, firewall checks, and buddy relay. Bootstraps at startup with no setting to configure; the KAD Network page can disconnect it for the current session. If KAD will not connect, Settings &gt; Network can fetch fresh <code>nodes.dat</code> bootstrap contacts from emule-security.org.</li>
       <li><strong>ED2K Servers &amp; Peer Exchange</strong> &mdash; Manage servers on the ED2K Servers page, download a community <code>server.met</code> from emule-security.org, and optionally turn on Auto-connect to server (last server, else eMule Sunrise). Once connected, peer exchange helps find sources.</li>
       <li><strong>EPX Source Exchange</strong> &mdash; Ember peers share source lists with each other for faster downloads. Non-Ember clients are unaffected.</li>
+      <li><strong>Connection Doctor</strong> &mdash; Settings &gt; Network checks why other people cannot reach you well, says so in plain words, and fixes what it can. See <a href="#connection-doctor">Connection doctor</a>.</li>
       <li><strong>NAT Traversal</strong> &mdash; UPnP automatic port mapping, firewall detection, KAD buddy relay for LowID peers, and EPX peer-relay (ERAT) for LowID&harr;LowID paths when attestations allow.</li>
       <li><strong>STUN Port Keep-Alive</strong> &mdash; Periodic STUN plus a TCP hold from your listen port keeps NAT mappings alive and advertises the discovered public TCP/UDP ports for High ID. Designed for CGNAT and full-cone NAT when UPnP is unavailable; auto-suspends on symmetric or unstable remapping.</li>
       <li><strong>Protocol Obfuscation</strong> &mdash; RC4-based TCP and UDP header encryption to help with ISP throttling.</li>
@@ -210,7 +222,7 @@
       <li><strong>Web Services</strong> &mdash; eMule&rsquo;s right-click &gt; Web services: open a site with a file&rsquo;s details substituted in, most usefully one that reports how many complete sources the network has seen. All six eMule placeholders are supported and an existing <code>webservices.dat</code> can be imported. An availability lookup ships configured; nothing is contacted until you click one, adding a site asks for confirmation, and the list is editable in Settings &gt; Web services.</li>
       <li><strong>Spam Detection</strong> &mdash; Built-in spam detection with Relaxed, Balanced (the default) and Aggressive profiles, each setting how high a score must be to count as spam, and automatic result hiding.</li>
       <li><strong>Library Management</strong> &mdash; Virtual-scrolling tables that handle thousands of files. Sort, filter, bulk-edit priorities, scan for missing files, copy all eD2K links for the current view, and create collections.</li>
-      <li><strong>[Ember-P2P] File Name Tag</strong> &mdash; Tick files in the Library and choose <em>Add [Ember-P2P]</em> to rename them to start with the tag, so <code>Linux.zip</code> becomes <code>[Ember-P2P] Linux.zip</code> and people who find them from you can see they were shared with Ember. Only the name changes; the contents, sharing settings and any downloads stay as they are, and <em>Remove [Ember-P2P]</em> or Undo puts the old name back. Settings &gt; Transfers &gt; File name tag can also tag every download as it finishes, and every file that appears in a shared folder from then on. Files already shared keep their names, and program, settings and hidden files that appear in a shared folder are never renamed automatically. See the <a href="#faq-name-tag">FAQ</a>.</li>
+      <li><strong>[Ember-P2P] File Name Tag</strong> &mdash; Tick files in the Library and choose <em>Add [Ember-P2P]</em> to rename them to start with the tag, so <code>Linux.zip</code> becomes <code>[Ember-P2P] Linux.zip</code> and people who find them from you can see they were shared with Ember. Only the name changes; the contents, sharing settings and any downloads stay as they are, and <em>Remove [Ember-P2P]</em> or Undo puts the old name back. Settings &gt; Transfers &gt; File name tag can also tag every download as it finishes, and the media, archive, disc image and document files that appear in a shared folder from then on. Files already shared keep their names, and programs, hidden files (names starting with a dot), files with no extension, and anything in a hidden folder or a git repository are never renamed automatically. Nor is a file with companions of the same name that would break if it were renamed: a film&rsquo;s subtitles, an album&rsquo;s cue sheet, the other parts of a split archive, or a DVD or Blu-ray folder. See the <a href="#faq-name-tag">FAQ</a>.</li>
       <li><strong>Copy eD2K Links from Search</strong> &mdash; Copy the link for one result, for every ticked result, or for the whole result list at once, from the context menu, the selection toolbar, or Ctrl+C.</li>
       <li><strong>In-App Media Player</strong> &mdash; Play supported audio and video from the Library detail drawer, with Open Externally still available.</li>
       <li><strong>Comments &amp; Ratings</strong> &mdash; Add metadata to your shared files for other peers to see.</li>
@@ -218,10 +230,11 @@
 
     <h3>Social</h3>
     <ul>
-      <li><strong>Ember Friends</strong> &mdash; Ember-exclusive friend system powered by a rendezvous server. Share a <strong>Friend Code</strong>, exchange mutual requests, then enjoy real-time online status, remote file browsing, friends-only shares, file offers, priority upload slots, durable offline chat, and <strong>end-to-end encrypted</strong> messaging. See the <a href="#friends">Friends section</a> for details.</li>
+      <li><strong>Ember Friends</strong> &mdash; Ember-exclusive friend system powered by a rendezvous server. Share a <strong>Friend Code</strong>, exchange mutual requests, then enjoy live status (Online, Away, Busy or Offline), remote file browsing, friends-only shares, file offers, priority upload slots, durable offline chat, and <strong>end-to-end encrypted</strong> messaging. See the <a href="#friends">Friends section</a> for details.</li>
       <li><strong>E2E Friend Chat</strong> &mdash; Mutual-friend messages use static X25519 ECDH + AEAD end-to-end encryption after session setup. A lock icon in the chat window and on online mutual friends&rsquo; cards marks it; plaintext fallbacks are rejected. Conversation history is encrypted in the local database, and outbound messages queue until the friend is reachable again. Being a static exchange, it provides no forward secrecy and covers message bodies only &mdash; see <a href="#friends-encryption">E2E Encryption</a>.</li>
       <li><strong>Noise-Secured Friend Sessions</strong> &mdash; Friend connections use <strong>Noise IK</strong> secure streams with Ed25519 proof-of-possession before chat, browse, offers, and verified friend privileges unlock. Friend file transfers can also run over the same secure path when ordinary HighID/callback routes are unavailable.</li>
-      <li><strong>Channels</strong> <span class="beta-badge">Beta</span> &mdash; Group rooms carried over the Ember Network itself. Create a public room anyone can find or a private one that needs an invite, moderate it with bans, moderators, owner-only invites and slow mode, edit and react to messages, and send a file to one member at a time &mdash; encrypted to that member, not to the room. Nobody publishes their IP address to the room. See the <a href="#channels">Channels section</a> for details.</li>
+      <li><strong>Channels</strong> <span class="beta-badge">Beta</span> &mdash; Group rooms carried over the Ember Network itself. Create a public room anyone can find or a private one that needs an invite, moderate it with bans, moderators, owner-only invites and slow mode, edit and react to messages, write privately to another member, and send a file to one member at a time &mdash; encrypted to that member, not to the room. Nobody publishes their IP address to the room. See the <a href="#channels">Channels section</a> for details.</li>
+      <li><strong>Feeds</strong> &mdash; Follow a list of files someone keeps up to date under their Ember identity, see what they add, and have it downloaded for you if you choose; or publish your own. See the <a href="#feeds">Feeds section</a>.</li>
       <li><strong>Credits &amp; SecIdent</strong> &mdash; RSA-based Secure Identification prevents credit theft. Upload priority follows the standard credit ratio formula.</li>
     </ul>
 
@@ -246,7 +259,7 @@
       <li><strong>Keyboard Shortcuts</strong> &mdash; Press <strong>?</strong> for a shortcut cheat sheet, Alt+1&ndash;9 then Alt+0 to jump straight to the first ten sidebar pages, and Ctrl+, to open Settings.</li>
       <li><strong>Backup &amp; Restore</strong> &mdash; Settings &gt; Backup saves your whole profile to a single passphrase-encrypted <code>.emberbackup</code> file: identity and SecIdent keys, upload credits, settings, shared-folder list, known files, friends, chat history, transfer list, server and Kad contacts, IP filter, and learned spam data. The files you share and part-finished downloads are <em>not</em> included, so a backup stays small. Encryption is mandatory because the archive contains your private keys, and a lost passphrase cannot be recovered. Your identity keys are unwrapped from this machine&rsquo;s at-rest protection (Windows DPAPI, or on Linux a key tied to the machine and your user) into the encrypted archive and re-wrapped for whichever account restores them, so a restore on a new machine keeps your user hash, credits and friendships instead of silently rotating them. Restores are prepared immediately and applied while Ember next starts (the files being replaced are in use while it runs); the replaced originals are kept in a <code>pre-restore-&lt;timestamp&gt;</code> folder beside them, and a pending restore can be discarded from the same screen before it is applied. A restore that has sat waiting for more than a month is dropped rather than applied on top of the profile you have been using since; the backup file is untouched, so you can simply import it again. After restoring onto a <em>different</em> machine, the restored shared and download folders are approved automatically, so put the files back at the same paths; and if the backup carried the database without <code>chat-history.key</code>, existing chat history stays sealed.</li>
       <li><strong>Statistics</strong> &mdash; Session and cumulative transfer statistics, connection uptime, network health indicators, and a peer reputation snapshot.</li>
-      <li><strong>Automatic Updates</strong> &mdash; Ember checks for new versions on the schedule you choose (hourly, daily, weekly or monthly; daily by default), including while it stays open, and installs cryptographically signed, anti-rollback updates in-app with one click. You can also check manually under Settings &gt; About.</li>
+      <li><strong>Automatic Updates</strong> &mdash; Ember checks for a new version at every launch and then hourly while it stays open, and installs cryptographically signed, anti-rollback updates in-app with one click. The checks go through your system&rsquo;s HTTP or HTTPS proxy when one is set. You can also check manually under Settings &gt; About.</li>
       <li><strong>Silent Updates</strong> &mdash; An optional switch in Settings &gt; About for anyone who leaves Ember running. A new version downloads and verifies in the background, then waits until nothing is transferring and nobody has touched Ember for ten minutes. A one-minute warning appears as a dialog, a desktop notification and a <em>Cancel update</em> entry on the tray icon, and <em>Not now</em> puts it off for a day. Ember then updates and comes back as you left it: hidden in the tray or where the window was, connected to the same eD2K server, on the same page, with your search tabs, and with the peers waiting in your upload queue still in line. If an update ever fails to install, Ember reopens on the version you had and never retries that version silently.</li>
       <li><strong>Languages</strong> &mdash; Full UI localization for English, Spanish, French, Brazilian Portuguese, German, Simplified Chinese, Italian, Russian, and Traditional Chinese, with a Settings language picker and system-language detection.</li>
       <li><strong>GeoIP</strong> &mdash; Country identification for connected peers via the bundled DB-IP Country Lite database (MMDB format).</li>
@@ -452,18 +465,23 @@ peer_count    (u16 LE)
     <ul>
       <li><strong>Friend Codes</strong> &mdash; Share a Friend Code from the Friends page instead of only a raw Friend ID. Codes support privacy-preserving pairwise presence so mutual chat and browse can unlock once both sides have added each other. Codes made by 1.7.0 and later start with <code>ember3:</code>, which 1.6.x cannot read.</li>
       <li><strong>Mutual Friend Requests</strong> &mdash; The recipient sees an incoming request on the Friends page and can accept or reject it. Chat, file browsing, offers, and priority upload features only activate once both sides have accepted <strong>and</strong> a secure friend session is established.</li>
-      <li><strong>Real-Time Online Status</strong> &mdash; Ember detects when a friend comes online and shows a live online/offline indicator on their card. The Friends page also surfaces when you are not currently discoverable on the rendezvous network.</li>
+      <li><strong>Friend Status</strong> &mdash; Each friend shows as Online, Away, Busy or Offline on their card, in the chat dock and in their friend settings. See <a href="#friends-names">Names &amp; status</a>. The Friends page also surfaces when you are not currently discoverable on the rendezvous network.</li>
       <li><strong>End-to-End Encrypted Chat</strong> &mdash; Send and receive messages with mutual friends through a slide-out sidebar. After session setup, messages are encrypted end-to-end, marked by a lock icon in the chat window. Outbound messages queue locally and retry when the friend reconnects. The chat can also pop out into its own window. See <a href="#friends-encryption">E2E Encryption</a>.</li>
-      <li><strong>Send Files in Chat</strong> &mdash; Attach a file to a conversation and it goes directly to that friend, up to 2&nbsp;GB, over QUIC or, when the sender&rsquo;s UDP port is not reachable, an encrypted stream on their TCP upload port. Each piece is checked against the offered hash as it arrives. Received files are saved to a <strong>Chat Files</strong> folder, small ones can download automatically, and programs, scripts and disguised files carry a warning. Both of you need 1.7.0, and files are not sent through relays.</li>
+      <li><strong>Send Files in Chat</strong> &mdash; Attach a file to a conversation and it goes directly to that friend, up to 2&nbsp;GB, over QUIC or, when the sender&rsquo;s UDP port is not reachable, an encrypted stream on their TCP upload port. Each piece is checked against the offered hash as it arrives. Received files are saved to a <strong>Chat Files</strong> folder, small ones can download automatically, and programs, scripts and disguised files carry a warning. Both of you need 1.7.0, and files are not sent through relays. When both of you run 1.7.5, a file waits up to a day for an answer and a quick restart does not lose it; with an older Ember at either end the offer lapses after five minutes. If the file changes or moves before the friend answers, their card says so.</li>
       <li><strong>Remote File Browsing</strong> &mdash; Browse a mutual friend&rsquo;s shared file library while they are online and start downloads directly from the browse results.</li>
       <li><strong>Friends-Only Shares</strong> &mdash; Mark Library files as friends-only so they stay out of public search and only mutual friends can request them.</li>
-      <li><strong>Friend File Offers</strong> &mdash; Push a specific shared file to a mutual friend from the Friends page. Offers appear as actionable notifications the recipient can accept or decline.</li>
+      <li><strong>Friend File Offers</strong> &mdash; Push a specific shared file to a mutual friend from the Library. Offers appear as actionable notifications the recipient can accept or decline.</li>
       <li><strong>Friend Transfers Without HighID</strong> &mdash; Mutual-friend downloads can use the Noise-secured friend session (and optional Ember peer relay) when ordinary HighID or callback paths are unavailable&mdash;useful when both sides are behind difficult NAT.</li>
       <li><strong>Priority Upload Slots</strong> &mdash; Anyone you have added as a friend gets priority in your upload queue on an authenticated Ember friend session, giving them faster access to your shared files. This one is deliberately one-sided: it costs you only queue position, so it does not wait on them adding you back. Friends-only shares and remote browse do.</li>
       <li><strong>Friend Block List</strong> &mdash; Block a Friend ID so future requests, chat, browse, and offers from that identity are rejected. Existing mutual friendships with that identity are removed when you block.</li>
       <li><strong>Optional Peer Relaying</strong> &mdash; <strong>Relay for other peers</strong> (Settings &gt; Network) lets peers who cannot reach each other directly route through you, which is what makes LowID&harr;LowID transfers work behind strict NATs when attestations allow. It spends your upload bandwidth on people you are not trading with, so you can turn it off.</li>
       <li><strong>Discoverable Banner</strong> &mdash; The Friends page shows a confirmation banner when your identity is registered and discoverable, and warns when presence registration failed so friends may not find you.</li>
     </ul>
+
+    <h3 id="friends-names">Names &amp; status</h3>
+    <p><strong>Status.</strong> Set yours on the Friends page: Online, Away or Busy. Friends see it while you are online, and Offline once you are not. Under Settings &gt; Friends, <em>Show me as Away when idle</em> turns an Online status into Away after 5 to 60 minutes without keyboard or mouse input, and back when you return; Busy is left alone. Showing Away on its own is available on Windows only, and both of you need 1.7.5 to see each other&rsquo;s status.</p>
+    <p><strong>Their name and your label.</strong> A friend&rsquo;s card shows the name they chose, and follows it when they rename themselves. In a friend&rsquo;s settings you can give them a name of your own instead; only you see it, and the card then shows your label with the name they chose beside it. Leave it empty to go back to their name.</p>
+    <p><strong>Your name for eMule users.</strong> eMule users and eD2K servers see your nickname followed by <code>[https://emberp2p.org]</code>, the way eMule&rsquo;s own default name carries its website. Friends and other Ember users always see your nickname alone. The switch sits beside your nickname under Settings &gt; General, which also shows the name as eMule users see it; it is on by default. See the <a href="#faq-site-tag">FAQ</a>.</p>
 
     <h3 id="friends-encryption">E2E Encryption</h3>
     <p>Friend chat is designed so the rendezvous server and any on-path observer never see message plaintext after a secure session is up.</p>
@@ -557,6 +575,15 @@ peer_count    (u16 LE)
     </ul>
     <p>Edits and reactions need both sides on 1.6.1 or newer. An older client does not recognise them and drops them rather than passing them on, so in a mixed room they reach only the members who have updated.</p>
 
+    <h3 id="channels-private">Private messages</h3>
+    <p>Two members of a room can write to each other privately without becoming friends. Choose <em>Message privately</em> from a member&rsquo;s menu. The message travels through a room you share, as chat does, but is encrypted to the recipient: members passing it on can see that you sent a private message, not to whom or what it says, and moderators cannot read it. Conversations open in the chat dock as a tab marked (private) and work in the popped-out chat window too; one whose tab you closed is listed under Private conversations in the dock&rsquo;s switcher.</p>
+    <ul>
+      <li><strong>Who may write to you</strong> &mdash; set under Settings &gt; Channels. <em>Ask first</em>, the default, holds someone&rsquo;s first message as a request on the Channels page, with Accept, Decline and Ignore everywhere. <em>Allow from anyone</em> opens the conversation at once. <em>Off</em> declines everything. Messages from members you ignore are always dropped.</li>
+      <li><strong>Declining</strong> forgets what they sent and refuses them for 7 days.</li>
+      <li><strong>Delivery</strong> &mdash; a message shows Delivered once the recipient&rsquo;s Ember confirms it, which takes 10 to 90 seconds on purpose, so the timing does not say whom it was for. Nothing is stored for a member who is away: a message is tried for 20 minutes, then shows Not delivered with Try again.</li>
+      <li><strong>Limits</strong> &mdash; a message holds up to 3,651 bytes. Both of you need 1.7.5; a member on 1.7.4 passes private messages on but cannot read or show them. Someone who is already your friend is written to in friend chat instead, and once you no longer share a room, messages cannot reach them.</li>
+    </ul>
+
     <h3 id="channels-files">Sending files</h3>
     <p>You can send a file to one member of a room at a time, up to <strong>2 GB</strong>, and only after they accept the offer. An offer that goes unanswered lapses after 5 minutes, and up to 4 transfers can run at once. Files go directly between the two of you, not to the whole room, and the payload is encrypted to that member rather than to the room. Transfers count against your upload speed limit like any other upload, and appear in a drawer under the member list with their speed and time left.</p>
     <p>Between two members on 1.7.0 the file moves over a direct QUIC stream, or an encrypted stream on the sender&rsquo;s TCP upload port when their UDP port cannot be reached, and each piece is checked against the offer as it lands. If neither can be opened &mdash; a member on 1.6.x, or two firewalled members who can only meet through a relay &mdash; the transfer falls back to the older block protocol, which is much slower, keeps what was already verified, and is limited to 100&nbsp;MB for a 1.6.x member. Received files are saved to a <strong>Channel Files</strong> folder, which is not shared, and programs, scripts and disguised files carry a warning.</p>
@@ -568,10 +595,31 @@ peer_count    (u16 LE)
     <ul>
       <li><strong>Moderation is local.</strong> A ban stops honest clients from showing that member and stops them being served. It is not a network-level eviction, and someone running a modified client can ignore it.</li>
       <li><strong>Public listings can be spammed.</strong> Discover shows what people published, and nobody vets it.</li>
-      <li><strong>A room holds up to 256 members</strong> and a message up to 4096 bytes.</li>
+      <li><strong>A room holds up to 256 members</strong> and a message up to 3,728 bytes, or 3,592 when it replies to another; an edit holds 32 bytes less (3,696, or 3,560 for a reply). A longer line could not reach members behind a relay, so Ember refuses it rather than delivering it to only some of the room.</li>
       <li><strong>History is what your device kept.</strong> Rooms are not archived anywhere central. When you join, members near you share recent messages; older conversation you were not present for is gone.</li>
       <li><strong>Search inside a room</strong> looks only through the history your device has.</li>
     </ul>
+  </section>
+
+  <hr>
+
+  <section id="feeds">
+    <h2>Feeds</h2>
+
+    <p>A feed is a list of files someone keeps up to date under their Ember identity. Follow one and Ember shows you what they add, and can download it for you. Feeds run on the <a href="#ember">Ember Network</a>: the feed&rsquo;s current version is a small record the publisher signs and stores in the Ember DHT, and the list it names is fetched like any download and checked against that record, so nobody but the publisher can change what a feed holds. Both are on the Feeds page in the sidebar, under Following and My feeds.</p>
+
+    <h3 id="feeds-follow">Following a feed</h3>
+    <p>Paste a feed&rsquo;s <code>ember-feed:</code> link, or the <code>https://www.emberp2p.org/feed/</code> form of it, under Following. A new feed shows as &ldquo;Looking for it&rdquo; until its publisher, or someone following it, is online. After that Ember looks it up about every 30 minutes, or at once with Check now, and marks the files the publisher added since you last looked as New and the ones they took out as Removed. A friend who publishes a feed sends you each new version as soon as they publish it. Files you downloaded stay when the publisher removes them and when you unfollow.</p>
+
+    <h3 id="feeds-auto">Automatic downloads</h3>
+    <p>Each feed can download its new files for you. It is off until you turn it on in the feed&rsquo;s Automatic downloads card, which also sets a category and two limits: the largest file, and the most per day, counted over the last 24 hours. New follows start at 1 GiB per file and 4 GiB per 24 hours; 0 means no limit. Programs, scripts, installers, shortcuts, disc images and other risky file types are never downloaded automatically, whatever the limits, and nothing is started that would leave less than 64 MiB free on the download drive, counting what the downloads already queued there still have to write. Anything held back can still be started with Download.</p>
+
+    <h3 id="feeds-publish">Publishing</h3>
+    <p>Under My feeds, create a feed with a title and an optional description, then add files with <em>Add files from your library</em>. Only files you share with everyone, once hashed, can go in a feed, up to 2,000 a feed and 8 feeds an identity, and each file can carry a short note. The publish button reads <em>Publish</em> for a feed never published, <em>Publish changes</em> once something has changed, and <em>Up to date</em> when nothing has. A publish succeeds only once a node on the Ember Network has stored it; if none can be reached, Ember says so and followers keep the previous version. Ember republishes each feed daily on its own. The list is served to followers without ever appearing in your Library, in a friend&rsquo;s browse, or on KAD or the eD2K servers, and followers serve it too, so it stays available while you are offline.</p>
+
+    <div class="callout-warn callout">
+      <p><strong>Feeds are public, and following is not secret.</strong> A published feed is tied to your Ember identity: anyone with its link can see its title, description and files, and that you publish it. When you follow one, the nodes answering a lookup and whoever serves the list see your address, and while you follow you serve the list too, so anyone with the link can see that you follow it. A feed belongs to your identity, so keep a backup (Settings &gt; Backup): an identity lost is its feeds lost.</p>
+    </div>
   </section>
 
   <hr>
@@ -665,6 +713,7 @@ peer_count    (u16 LE)
     <h3>Troubleshooting Low ID</h3>
     <p>If you're stuck with a Low ID despite correct settings:</p>
     <ul>
+      <li>Run the <a href="#connection-doctor">connection doctor</a> under Settings &gt; Network. It works through most of the list below on its own and says which of it applies to you.</li>
       <li>Verify that ports 4662 (TCP) and 4672 (UDP) are forwarded on your router.</li>
       <li>Check that your OS firewall allows Ember through on both protocols.</li>
       <li>Restart Ember to reconnect to the ED2K server.</li>
@@ -672,6 +721,18 @@ peer_count    (u16 LE)
       <li>Leave STUN port keep-alive enabled (Settings &gt; Network) if you are behind CGNAT or full-cone NAT without UPnP &mdash; Ember will try to hold and advertise remapped public ports.</li>
       <li>If behind symmetric NAT or a VPN that remaps ports unstably, STUN keep-alive suspends automatically; High ID may still require a VPN with a fixed forwarded port or another tunneling solution.</li>
     </ul>
+
+    <h3 id="connection-doctor">Connection doctor</h3>
+    <p>Settings &gt; Network opens with a connection check that does this troubleshooting for you. <em>Check connection</em> looks at the ports on this computer, the Windows Firewall rules, UPnP, your router&rsquo;s internet address, Kad&rsquo;s firewall check, the eD2K server ID, your NAT type, the Ember Network and your clock, and asks Ember&rsquo;s rendezvous server to try your TCP and UDP ports from outside. It then gives one verdict:</p>
+    <ul>
+      <li><strong>Fully reachable</strong> &mdash; nothing to do.</li>
+      <li><strong>Reachable through Ember&rsquo;s relays</strong> &mdash; everything works; some connections go through a relay or a Kad buddy, so they take a little longer to start.</li>
+      <li><strong>Limited</strong> &mdash; eMule users who are firewalled themselves cannot download from you, and you reach fewer sources. Friends and rooms still work through Ember&rsquo;s relays.</li>
+      <li><strong>Still checking</strong> &mdash; nothing has tested your ports from outside yet, which is usual for the first few minutes after Ember connects. Check again shortly.</li>
+      <li><strong>Offline</strong> &mdash; Ember is not connected to any network.</li>
+    </ul>
+    <p>Below the verdict it lists what Ember is already doing about it, and at most three fixes, most likely first, with your own port numbers and addresses filled in. Some it can do for you: try UPnP again, or add the Windows Firewall rules Ember needs after one Windows permission prompt. When your provider shares one address between customers (carrier-grade NAT), it says that port forwarding cannot help rather than suggesting it, and when you have changed the ports or UPnP without restarting, it says the change takes effect after a restart. The outside test only ever tries the address the request came from, a few times an hour at most. <em>Copy report</em> puts the findings on the clipboard for a support request, with IP addresses masked unless you include them.</p>
+    <p>While you have a Low ID or Kad says you are firewalled, the status bar shows <em>Check connection</em>, and after ten minutes in that state Ember offers the check once.</p>
   </section>
 
   <hr>
@@ -849,7 +910,7 @@ npm run tauri build -- --config '{"bundle":{"createUpdaterArtifacts":false}}'</c
         How does Ember update itself?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
-      <div class="faq-a">Ember checks for a newer version automatically whenever your chosen hourly, daily, weekly or monthly check is due, including while it stays open, and shows a non-blocking notification when one is available. You can install it in-app with one click &mdash; no need to download installers manually &mdash; and Ember restarts into the new version, back on the page and server you were using. You can also check anytime under Settings &gt; About. If you would rather not be asked, turn on <strong>Silent updates</strong> there (not available for the MSI installer or the <code>.deb</code> package, which need administrator approval or your password to install): Ember then installs updates by itself once nothing is transferring and you are away, after a one-minute warning you can cancel. Every release is cryptographically signed, and Ember verifies the signature before installing, including a downloaded update that waited on disk for a quiet moment. Updates are also gated by signed <strong>security epochs</strong> (anti-rollback), so installs only advance when the signed epoch allows it.</div>
+      <div class="faq-a">Ember checks for a newer version at every launch and then once an hour while it stays open; there is no setting for how often. When one is available it shows a non-blocking notification, and <em>Later</em> hides it until Ember next starts. The check goes through the HTTP or HTTPS proxy your system names, if there is one, so a proxy also helps where GitHub&rsquo;s download hosts are blocked; when the check cannot get through, Ember says it couldn&rsquo;t reach the update server rather than reporting a security failure. You can install it in-app with one click &mdash; no need to download installers manually &mdash; and Ember restarts into the new version, back on the page and server you were using. You can also check anytime under Settings &gt; About. If you would rather not be asked, turn on <strong>Silent updates</strong> there (not available for the MSI installer or the <code>.deb</code> package, which need administrator approval or your password to install): Ember then installs updates by itself once nothing is transferring and you are away, after a one-minute warning you can cancel. Every release is cryptographically signed, and Ember verifies the signature before installing, including a downloaded update that waited on disk for a quiet moment. Updates are also gated by signed <strong>security epochs</strong> (anti-rollback), so installs only advance when the signed epoch allows it.</div>
     </div>
 
     <div class="faq-item" id="faq-name-tag">
@@ -857,7 +918,15 @@ npm run tauri build -- --config '{"bundle":{"createUpdaterArtifacts":false}}'</c
         What is the [Ember-P2P] tag, and what does it change?
         <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
-      <div class="faq-a">It is a prefix Ember can put at the start of a file&rsquo;s name, so <code>Linux.zip</code> becomes <code>[Ember-P2P] Linux.zip</code>. People who find the file from you see that name in their search results and know it was shared with Ember. It renames the file on your disk and nothing else: the contents and hash stay the same, so downloads of it keep working, and its sharing settings and priority are kept. Nothing is tagged unless you ask. In the Library, tick files and choose <em>Add [Ember-P2P]</em> (or right-click a file); <em>Remove [Ember-P2P]</em> or Undo takes it off again. Settings &gt; Transfers &gt; File name tag has two switches, both off by default: one tags each download as it finishes, the other tags files that appear in a shared folder from then on. Files already shared are left alone, a tag you take off by hand is not put back, and the second switch never renames program, settings or hidden files. Leave the second switch off if a shared folder holds files other programs rely on, such as a game or an app.</div>
+      <div class="faq-a">It is a prefix Ember can put at the start of a file&rsquo;s name, so <code>Linux.zip</code> becomes <code>[Ember-P2P] Linux.zip</code>. People who find the file from you see that name in their search results and know it was shared with Ember. It renames the file on your disk and nothing else: the contents and hash stay the same, so downloads of it keep working, and its sharing settings and priority are kept. Nothing is tagged unless you ask. In the Library, tick files and choose <em>Add [Ember-P2P]</em> (or right-click a file); <em>Remove [Ember-P2P]</em> or Undo takes it off again. Settings &gt; Transfers &gt; File name tag has two switches, both off by default: one tags each download as it finishes, the other tags files that appear in a shared folder from then on. Files already shared are left alone, a tag you take off by hand is not put back, and the second switch renames only media, archive, disc image and document files (not plain text, web pages or other files programs load by name), never programs, hidden files (names starting with a dot), files with no extension, or anything in a hidden folder or a git repository. It also leaves alone a file with companions of the same name, which find it by name and would break: a film&rsquo;s subtitles, an album&rsquo;s cue sheet, the other parts of a split archive, or the files of a DVD or Blu-ray folder. Leave the second switch off if a shared folder holds files other programs rely on, such as a game or an app.</div>
+    </div>
+
+    <div class="faq-item" id="faq-site-tag">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        Why do eMule users see [https://emberp2p.org] after my name?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Ember puts its website after the nickname that eMule clients and eD2K servers see, so <code>Ada</code> reaches them as <code>Ada [https://emberp2p.org]</code>, the way eMule&rsquo;s own default name is its website. Only the eMule side sees it: friends, rooms and other Ember users see your nickname alone, and Ember takes the tag off a name another Ember sent. It is never added twice, or to a name that already mentions the site. It is on by default, existing installs included; the switch is beside your nickname under Settings &gt; General, which shows the name as eMule users see it.</div>
     </div>
 
     <div class="faq-item">
