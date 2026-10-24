@@ -998,7 +998,10 @@ impl TransferManager {
     }
 
     fn occupies_download_slot(transfer: &Transfer) -> bool {
+        // A feed's list is a few KB the user never sees: it must not hold
+        // their downloads back.
         transfer.direction == TransferDirection::Download
+            && !crate::sharing::feed_files::is_internal_fetch(&transfer.id)
             && !matches!(
                 transfer.status,
                 TransferStatus::Paused
@@ -1117,6 +1120,17 @@ impl TransferManager {
             self.queue_changed();
             false
         }
+    }
+
+    /// Start a fetch for the feeds code at once, beside the user's downloads
+    /// rather than queued behind them: it is one small file, and nothing the
+    /// user sees waits on it. `false` if one of that id is already here.
+    pub fn start_internal(&mut self, transfer: Transfer) -> bool {
+        if self.active.contains_key(&transfer.id) || self.queue_position(&transfer.id).is_some() {
+            return false;
+        }
+        self.active.insert(transfer.id.clone(), transfer);
+        true
     }
 
     pub fn has_pending_for_hash(&self, file_hash: &str) -> bool {
@@ -2660,12 +2674,14 @@ impl TransferManager {
     }
 
     /// Every row in `get_all` order, with the live preview flag `get_all`
-    /// overlays.
+    /// overlays. For the Transfers poll, so a fetch for the feeds code is not
+    /// among them.
     fn snapshot_rows(&self) -> impl Iterator<Item = (&Transfer, bool)> {
         self.active
             .values()
             .chain(self.queue.iter())
             .chain(self.completed.iter())
+            .filter(|t| !crate::sharing::feed_files::is_internal_fetch(&t.id))
             .map(|t| {
                 let preview_ready = self
                     .controls

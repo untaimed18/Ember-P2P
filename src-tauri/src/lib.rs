@@ -1179,6 +1179,7 @@ pub fn run() {
             ipfilter_update::spawn(app_handle.clone());
             commands::channel_recovery::spawn_startup_scan(app_handle.clone());
             commands::room_dm::spawn_resends(app_handle.clone());
+            commands::feeds::spawn_feeds(app_handle.clone());
 
             // Non-silent recovery notice: if config.json was corrupt at load,
             // tell the user (their settings were reset to defaults; the original
@@ -2556,6 +2557,20 @@ pub fn run() {
             commands::room_dm::delete_room_dm_thread,
             commands::room_dm::retry_room_dm,
             commands::room_dm::set_ignored_members,
+            commands::feeds::list_my_feeds,
+            commands::feeds::create_feed,
+            commands::feeds::set_feed_details,
+            commands::feeds::set_feed_items,
+            commands::feeds::publish_feed,
+            commands::feeds::delete_feed,
+            commands::feeds::list_followed_feeds,
+            commands::feeds::follow_feed,
+            commands::feeds::refresh_feed,
+            commands::feeds::get_feed_items,
+            commands::feeds::mark_feed_read,
+            commands::feeds::set_feed_auto_download,
+            commands::feeds::download_feed_items,
+            commands::feeds::unfollow_feed,
             commands::channels::get_channel_invite,
             commands::channels::list_channel_members,
             commands::channels::channel_presence_config,

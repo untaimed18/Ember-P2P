@@ -73,14 +73,16 @@ export const navItems: NavItem[] = [
   { href: '/library', label: () => m.nav_library(), id: 'library', group: 'files' },
   { href: '/friends', label: () => m.nav_friends(), id: 'friends', group: 'community' },
   { href: '/channels', label: () => m.nav_channels(), id: 'channels', group: 'community' },
+  { href: '/feeds', label: () => m.nav_feeds(), id: 'feeds', group: 'community' },
   { href: '/statistics', label: () => m.nav_statistics(), id: 'statistics', group: 'system' },
   { href: '/security', label: () => m.nav_security(), id: 'security', group: 'system' },
   { href: '/settings', label: () => m.nav_settings(), id: 'settings', group: 'system' },
 ];
 
 /**
- * The nav as the sidebar actually renders it. Channels is dropped when the
- * Ember overlay is off, because the page has nothing to show without it.
+ * The nav as the sidebar actually renders it. Channels and Feeds are dropped
+ * when the Ember overlay is off, because neither page has anything to show
+ * without it.
  *
  * Exported (rather than derived in the sidebar) because Alt+N is positional:
  * the cheat-sheet has to number the *same* list the shortcut handler walks.
@@ -89,7 +91,7 @@ export const navItems: NavItem[] = [
  */
 export function visibleNavItems(emberNativeEnabled: boolean | undefined): NavItem[] {
   return emberNativeEnabled === false
-    ? navItems.filter((item) => item.id !== 'channels')
+    ? navItems.filter((item) => item.id !== 'channels' && item.id !== 'feeds')
     : navItems;
 }
 

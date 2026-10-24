@@ -5519,21 +5519,38 @@ impl MultiSourceDownload {
                 let finish_tx = event_tx.clone();
                 let finish_id = self.transfer_id.clone();
                 let finish_generation = Some(self.control.generation());
+                // A fetch for the feeds code finishes where it asked, in the
+                // app data folder, never in `Downloads`.
+                let internal_dest = crate::sharing::feed_files::internal_fetch_dest(&self.transfer_id);
                 // Spawned, not awaited in place: Pause and Stop abort this
                 // worker, and `abort` cannot stop the blocking move. Dropped at
                 // its await, the move still finished but nothing after it ran:
                 // no `Completed`, so the row stayed Paused or Stopped with its
                 // `.part` gone, and Resume downloaded the whole file again.
                 let finish = tokio::spawn(async move {
-                    let actual_final = tokio::task::spawn_blocking(move || {
-                        super::transfer::move_part_to_completed(
+                    let actual_final = tokio::task::spawn_blocking(move || match internal_dest {
+                        Some(dest) => {
+                            let dest_root = dest
+                                .parent()
+                                .map(std::path::Path::to_path_buf)
+                                .ok_or_else(|| anyhow::anyhow!("internal fetch has no folder"))?;
+                            std::fs::create_dir_all(&dest_root)?;
+                            super::transfer::move_part_between_roots_approved(
+                                &pp,
+                                &pp_root,
+                                &dest,
+                                &dest_root,
+                                &verified_identity,
+                            )
+                        }
+                        None => super::transfer::move_part_to_completed(
                             &pp,
                             &pp_root,
                             &download_root,
                             &category_subdir,
                             &safe_name,
                             &verified_identity,
-                        )
+                        ),
                     })
                     .await
                     .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;

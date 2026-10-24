@@ -48,7 +48,8 @@ export type NotifyCategory =
   | 'channel_message'
   | 'silent_update'
   | 'finish_action'
-  | 'disk_space';
+  | 'disk_space'
+  | 'feed_update';
 
 const CATEGORY_SETTING: Record<NotifyCategory, keyof AppSettings> = {
   download_complete: 'notify_download_complete',
@@ -70,6 +71,9 @@ const CATEGORY_SETTING: Record<NotifyCategory, keyof AppSettings> = {
   // Has its own switch, the threshold in Settings ("Never warn"), so only the
   // master switch silences it here.
   disk_space: 'notifications_enabled',
+  // A followed feed's new items. Following a feed is the opt-in; unfollowing
+  // or the master switch silences it.
+  feed_update: 'notifications_enabled',
 };
 
 /** Identical notifications inside this window collapse into one. */

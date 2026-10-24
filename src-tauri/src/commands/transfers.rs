@@ -783,7 +783,7 @@ const PARTIAL_CLEANUP_FOLDER_BUDGET: std::time::Duration = std::time::Duration::
 /// them cannot be reached or does not answer in time, they are removed once
 /// it can be (`storage::deferred_removals`), and the folder stays a download
 /// folder until then.
-async fn cleanup_partial_files(db: &Arc<Database>, download_roots: &[String], transfer_id: &str) {
+pub(crate) async fn cleanup_partial_files(db: &Arc<Database>, download_roots: &[String], transfer_id: &str) {
     if uuid::Uuid::parse_str(transfer_id).is_err() {
         tracing::warn!("cleanup_partial_files: invalid transfer_id, skipping");
         return;
@@ -2937,7 +2937,12 @@ pub async fn remove_transfer(
 #[tauri::command]
 pub async fn get_transfers(state: tauri::State<'_, AppState>) -> Result<Vec<Transfer>, String> {
     let manager = state.transfer_manager.read().await;
-    Ok(manager.get_all())
+    // A fetch for the feeds code is not one of the user's downloads.
+    Ok(manager
+        .get_all()
+        .into_iter()
+        .filter(|t| !crate::sharing::feed_files::is_internal_fetch(&t.id))
+        .collect())
 }
 
 /// What changed since the caller's last answer, for the Transfers poll: only

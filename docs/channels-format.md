@@ -1223,6 +1223,54 @@ STOREs and lookups under a throwaway DHT identity, ideally through a relay,
 would close this; it is transport behaviour, not a record format, and is
 planned in [post-1.7.5 item 1](post-1.7.5.md#1-private-room-membership-traffic-under-a-throwaway-dht-identity).
 
+## Feed heads (record type 0x04)
+
+Not a room format, but a DHT record with the same header and trailer framing
+as channel records (`network/ember/feed.rs`, `SignedRecord::feed_head_record`).
+A feed is a signed, updatable list of files under a publisher's identity; the
+head points at the current list, which is an ordinary collection file
+fetched like any download. Design: [post-1.7.5 item 3](post-1.7.5.md#3-follow-a-publisher-feeds).
+
+**Header.** `record_type` `RECORD_TYPE_FEED` (`0x04`), signed by the
+publisher's identity key. The header's own fields carry what fits:
+
+- `keyword_hash` is `feed_key = BLAKE3("ember-feed-v1" || publisher || salt)[..16]`;
+- `file_hash` is the feed's 16-byte salt, so the per-publisher dedupe keeps one
+  head per feed;
+- `ember_file_hash` is the list's BLAKE3 and `file_size` its size;
+- the name is the title, at most 64 bytes.
+
+**Trailer.** Framed as the channel trailer, little-endian: `version(1) = 1 ||
+sequence(8) || list_ed2k_hash(16) || item_count(4) || description_len(2) ||
+description`, with the description at most 256 bytes and nothing after it.
+`sequence` is the publisher's clock in milliseconds, never less than one past
+the last it published (`next_sequence`), so the latest publish wins on any of
+the publisher's devices; a device's daily republish first looks for a newer
+head and leaves it in place. A follower takes the highest `sequence` it has
+seen and never goes back.
+
+**Storers** that know the type (`accept_record`, `feed_store_ok`) refuse a head
+whose `keyword_hash` is not the `feed_key` of its signer and salt, whose
+trailer does not parse, or which names no list. They keep it
+`CHANNEL_GOVERNANCE_TTL` (30 days), replicate it, and among a feed's heads keep
+the newest timestamp. Builds before it file it as an unknown type for
+`KEYWORD_RECORD_TTL` (24 hours) without replicating or reading it. The
+publisher republishes daily and on every publish.
+
+**The list** is a format-v2 collection (`network/ed2k/collection.rs`) of at
+most 2,000 entries, each with name, size, eD2K, AICH and Ember BLAKE3. An entry
+may carry a note, tag `FT_EMBER_NOTE` (`0xE3`, a string of at most 256 bytes),
+which eMule's reader skips as unknown. A follower uses a list only if its size,
+eD2K hash and BLAKE3 all match the head; otherwise the feed is marked broken.
+The list is shared hidden by its publisher and by every follower holding it:
+served to whoever asks for its hash, with Ember source records, and never in
+the Library, a browse answer, a keyword record, KAD or a server.
+
+**Links.** `ember-feed:` followed by `publisher(32) || salt(16)` in lowercase
+unpadded RFC 4648 base32 (77 characters in all), or the same after
+`https://emberp2p.org/feed/`. A link whose publisher is not a valid Ed25519
+key is refused.
+
 ## Friend sessions: `EMBER_EXT_BROWSE_SCOPE_AWARE`
 
 Not a room format, but added by the same audit and frozen with it.
@@ -1312,6 +1360,15 @@ receiver shows it only while the friend is online and drops it when their
 session ends, so a friend with no session always shows offline; a friend who
 never sends one shows online.
 Older builds log the sub-type as unknown and ignore it.
+
+**Feed heads, after 1.7.5.** `EMBER_EXT_FEED_HEAD` (`0x14`) pushes a feed head
+the sender just published, so friends who follow it see the update without
+waiting for their next lookup. Its body is a chat envelope
+(`encrypt_chat_for_peer`) under the friend's chat key, sealing the signed
+record as a DHT value blob; an envelope over `MAX_CHAT_WIRE_LEN` is dropped.
+The receiver checks the record exactly as one found in the DHT and takes it
+only for a feed it follows whose publisher is the friend who sent it; a head
+signed by anyone else, or forwarded, is ignored. Older builds log the sub-type as unknown and ignore it.
 
 ---
 

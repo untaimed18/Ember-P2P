@@ -567,6 +567,11 @@ pub(super) async fn handle_udp_packet_inner(
                         idx.get_by_hash(&hash_hex)
                             .filter(|file| file.is_public_listable())
                             .map(|file| (file.size, Vec::new()))
+                            // A feed's list is served to anyone, unlisted.
+                            .or_else(|| {
+                                crate::sharing::feed_files::hidden_share(&file_hash)
+                                    .map(|share| (share.size, Vec::new()))
+                            })
                     }
                 };
                 let partial_candidate = if local_file.is_none()

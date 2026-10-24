@@ -6697,6 +6697,35 @@ impl UploadHandler {
             }
         }
 
+        // A feed's list: served to anyone, from the feeds folder alone, and
+        // never in the index (see `sharing::feed_files`).
+        if let Some(share) = crate::sharing::feed_files::hidden_share(file_hash) {
+            let root = share.path.parent().map(|dir| dir.to_string_lossy().into_owned())?;
+            let allowed = vec![root];
+            let path = share.path.clone();
+            let allowed_for_open = allowed.clone();
+            let opened = tokio::task::spawn_blocking(move || {
+                crate::security::filesystem::open_existing_approved(&path, &allowed_for_open, false)
+            })
+            .await
+            .ok()?;
+            return match opened {
+                Ok((verified_path, opened)) => Some(ResolvedUploadFile {
+                    name: share.name,
+                    path: verified_path,
+                    opened,
+                    allowed_roots: allowed,
+                    size: share.size,
+                    aich_hash_hex: String::new(),
+                    is_partial: false,
+                }),
+                Err(error) => {
+                    note_upload_refusal(&share.path, &allowed, &error);
+                    None
+                }
+            };
+        }
+
         // Unshared index rows `break` into this `.part` branch, and hashes
         // that exist only in known.met never enter the index branch at all.
         // Either way, friends-only content must not leave for a stranger.
@@ -7093,7 +7122,7 @@ impl UploadHandler {
             hashes
                 .iter()
                 .copied()
-                .filter(|h| index_offers_hash(&index, h))
+                .filter(|h| index_offers_hash(&index, h) || crate::sharing::feed_files::hidden_share(h).is_some())
                 .collect()
         };
         // Short-circuit: if every queued file is still shared there is nothing
@@ -15170,6 +15199,19 @@ impl UploadHandler {
                                                 },
                                             })
                                             .await;
+                                    }
+                                }
+                            }
+                            Some((super::messages::EMBER_EXT_FEED_HEAD, body)) => {
+                                if let Some(pk) = hello_caps.ember_pubkey {
+                                    if body.len() <= crate::network::ember::crypto::MAX_CHAT_WIRE_LEN {
+                                        if let Some(blob) = crate::network::ember::crypto::decrypt_chat_from_peer(
+                                            &self.ed25519_secret_key,
+                                            &pk,
+                                            body,
+                                        ) {
+                                            crate::sharing::feed_files::report_pushed_head(pk, blob);
+                                        }
                                     }
                                 }
                             }

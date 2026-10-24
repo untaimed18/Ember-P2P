@@ -261,7 +261,11 @@ pub(in crate::network) async fn on_download_event(
             let mgr = transfer_manager.read().await;
             mgr.get_transfer(transfer_id).is_some_and(|t| t.friends_only)
         };
-        let restricted = from_restricting_friend || {
+        // A feed's list being fetched is never advertised as the user's
+        // (see `sharing::feed_files`).
+        let restricted = from_restricting_friend
+            || crate::sharing::feed_files::is_internal_fetch(transfer_id)
+            || {
             let index = local_index.read().await;
             !known_files.is_authoritative()
                 || hash16_is_friends_only(file_hash, &index, known_files)
@@ -363,7 +367,11 @@ pub(in crate::network) async fn on_download_event(
         // read lock across them previously stalled the whole
         // network `select!` loop and blocked download workers that
         // need `transfer_manager.write()`.
-        let completed_snapshot = {
+        // A fetch for the feeds code is not the user's file: it goes in no
+        // index, known.met, KAD or server list (see `sharing::feed_files`).
+        let completed_snapshot = if crate::sharing::feed_files::is_internal_fetch(transfer_id) {
+            None
+        } else {
             let mgr = transfer_manager.read().await;
             mgr.get_transfer(transfer_id).map(|t| (
                 t.peer_id.clone(),

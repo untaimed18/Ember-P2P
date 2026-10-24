@@ -20,7 +20,7 @@
   // accidental Escape/overlay dismiss, so OS-delivered actions are not lost.
   import { onMount } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import { goto } from '$app/navigation';
+  import { deepLinkGoto } from '$lib/deepLinkNavigation';
   import { page } from '$app/stores';
   import { get } from 'svelte/store';
   import { parseEd2kLink } from '$lib/api/search';
@@ -88,6 +88,9 @@
     if (preview.kind === 'friend') {
       return m.deeplink_friend_confirm({ hash: preview.hash ?? '' });
     }
+    if (preview.kind === 'feed') {
+      return m.deeplink_feed_confirm({ link: preview.hash ?? '' });
+    }
     return preview.name ?? '';
   }
 
@@ -96,6 +99,7 @@
       case 'file': return m.search_ctx_download();
       case 'server': return m.servers_connect();
       case 'serverList': return m.deeplink_confirm_update_server_list();
+      case 'feed': return m.feeds_follow();
       default: return m.deeplink_confirm_open();
     }
   }
@@ -230,7 +234,7 @@
         const coll = await openPendingCollection(pendingId);
         if (destroyed) return 'defer';
         const presented = presentIncomingCollection(coll);
-        await goto('/library');
+        await deepLinkGoto('/library');
         // A cancelled navigation resolves `goto` rather than rejecting it, so a
         // page that blocks it (Settings' unsaved-changes guard) would leave us
         // awaiting a presentation that can never happen — wedging `drain()` and
@@ -250,13 +254,18 @@
           }));
         }
       } else if (preview.kind === 'channel') {
-        await goto(`/channels?join=${encodeURIComponent(payload)}`);
+        await deepLinkGoto(`/channels?join=${encodeURIComponent(payload)}`);
         if (get(page).url.pathname !== '/channels') {
           return 'defer';
         }
       } else if (preview.kind === 'friend') {
-        await goto(`/friends?add=${encodeURIComponent(payload)}`);
+        await deepLinkGoto(`/friends?add=${encodeURIComponent(payload)}`);
         if (get(page).url.pathname !== '/friends') {
+          return 'defer';
+        }
+      } else if (preview.kind === 'feed') {
+        await deepLinkGoto(`/feeds?follow=${encodeURIComponent(preview.hash ?? payload)}`);
+        if (get(page).url.pathname !== '/feeds') {
           return 'defer';
         }
       }

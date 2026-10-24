@@ -9,7 +9,7 @@ use super::publish::{
     channel_flags_from_data, channel_kind_from_data, CHANNEL_FLAG_DEPARTED, CHANNEL_KIND_CLAIM,
     CHANNEL_KIND_EPOCH, CHANNEL_KIND_HANDOFF, CHANNEL_KIND_INDEX, CHANNEL_KIND_MODERATION,
     CHANNEL_KIND_OWNED_ROOMS, CHANNEL_KIND_PRESENCE, CHANNEL_KIND_SETTINGS, RECORD_TYPE_CHANNEL,
-    RECORD_TYPE_KEYWORD, RECORD_TYPE_SOURCE,
+    RECORD_TYPE_FEED, RECORD_TYPE_KEYWORD, RECORD_TYPE_SOURCE,
 };
 use super::{scale, EmberNodeId};
 
@@ -256,6 +256,9 @@ fn record_ttl(data: &[u8]) -> Duration {
             ) => CHANNEL_GOVERNANCE_TTL,
             _ => KEYWORD_RECORD_TTL,
         },
+        // As long as a room's governance: a feed's publisher may be away for
+        // days, and the head is the only way its followers find the list.
+        Some(&RECORD_TYPE_FEED) => CHANNEL_GOVERNANCE_TTL,
         _ => KEYWORD_RECORD_TTL,
     }
 }
@@ -1840,6 +1843,15 @@ impl DhtStore {
                     continue;
                 }
             }
+            // A feed head gets its key check too, for the same reason.
+            if record.data.first() == Some(&RECORD_TYPE_FEED) {
+                let ok =
+                    super::publish::SignedRecord::parse_unverified(&record.data, record.signature)
+                        .is_some_and(|parsed| parsed.feed_store_ok());
+                if !ok {
+                    continue;
+                }
+            }
             if self.store_record(key, record.data, record.signature, None, true) {
                 accepted += 1;
             }
@@ -2020,7 +2032,7 @@ impl DhtStore {
 /// records that escape every rule tied to a known type.
 fn storer_replicates(data: &[u8]) -> bool {
     match data.first() {
-        Some(&RECORD_TYPE_KEYWORD) => true,
+        Some(&RECORD_TYPE_KEYWORD | &RECORD_TYPE_FEED) => true,
         Some(&RECORD_TYPE_CHANNEL) => channel_kind_from_data(data) != Some(CHANNEL_KIND_PRESENCE),
         _ => false,
     }

@@ -50,6 +50,10 @@ pub const RECORD_TYPE_KEYWORD: u8 = 0x01;
 pub const RECORD_TYPE_SOURCE: u8 = 0x02;
 /// Channel index, presence, or moderation metadata. Never carries an IP.
 pub const RECORD_TYPE_CHANNEL: u8 = 0x03;
+/// A feed's head: the publisher's signed pointer at the current list (see
+/// [`crate::network::ember::feed`]). Builds before feeds store it as a type
+/// they do not know, for a day, and neither replicate nor read it.
+pub const RECORD_TYPE_FEED: u8 = 0x04;
 
 pub const CHANNEL_KIND_INDEX: u8 = 1;
 pub const CHANNEL_KIND_PRESENCE: u8 = 2;
@@ -1800,6 +1804,68 @@ impl SignedRecord {
         Some((decode_owned_rooms_extra(&meta.extra)?, rec.timestamp))
     }
 
+    /// A feed's head, signed by the publisher's identity and filed under
+    /// [`crate::network::ember::feed::feed_key`], stamped `timestamp`. `None`
+    /// for a head with a field out of bounds.
+    pub fn feed_head_record(
+        salt: &crate::network::ember::feed::FeedSalt,
+        head: &crate::network::ember::feed::FeedHead,
+        identity: &SigningKey,
+        timestamp: i64,
+    ) -> Option<Self> {
+        let extra = crate::network::ember::feed::encode_feed_extra(head)?;
+        let pubkey = identity.verifying_key().to_bytes();
+        let record = Self::build_with_media(
+            RECORD_TYPE_FEED,
+            crate::network::ember::feed::feed_key(&pubkey, salt),
+            *salt,
+            head.list_blake3,
+            head.list_size,
+            &head.title,
+            None,
+            Some(extra),
+            None,
+            identity,
+            timestamp,
+        );
+        // The name is clamped to fit the record; a title it cut would no
+        // longer be the head that was asked for.
+        (record.file_name == head.title).then_some(record)
+    }
+
+    /// The salt and head a feed record carries, if it is one and well formed.
+    /// Says nothing about the signature: from a verified record only.
+    pub fn feed_head(&self) -> Option<(crate::network::ember::feed::FeedSalt, crate::network::ember::feed::FeedHead)> {
+        if self.record_type != RECORD_TYPE_FEED {
+            return None;
+        }
+        let name_len = u16::from_le_bytes(self.data.get(113..115)?.try_into().ok()?) as usize;
+        let title = std::str::from_utf8(self.data.get(115..115 + name_len)?).ok()?.to_string();
+        let off = 115 + name_len;
+        let extra_len = u16::from_le_bytes(self.data.get(off + 1..off + 3)?.try_into().ok()?) as usize;
+        let extra = self.data.get(off + 3..off + 3 + extra_len)?;
+        let (sequence, list_ed2k_hash, item_count, description) =
+            crate::network::ember::feed::decode_feed_extra(extra)?;
+        let head = crate::network::ember::feed::FeedHead {
+            sequence,
+            list_ed2k_hash,
+            list_size: self.file_size,
+            list_blake3: self.ember_file_hash,
+            item_count,
+            title,
+            description,
+        };
+        head.valid().then_some((self.file_hash, head))
+    }
+
+    /// Whether a storer should keep this feed head: well formed, and filed
+    /// under the key its publisher and salt give.
+    pub fn feed_store_ok(&self) -> bool {
+        self.record_type == RECORD_TYPE_FEED
+            && self.feed_head().is_some()
+            && self.keyword_hash == crate::network::ember::feed::feed_key(&self.publisher_key, &self.file_hash)
+    }
+
     /// A room's settings, signed by the **channel** key and filed under
     /// [`channel::settings_key`], stamped `timestamp`.
     ///
@@ -2187,12 +2253,14 @@ impl SignedRecord {
         data.extend_from_slice(&media_trailer);
         let media = decode_media_trailer(&media_trailer);
 
+        // A feed head carries the same trailer; only a channel record reads it
+        // as channel metadata.
         let channel = if let Some(extra) = channel_extra {
             let extra_len = extra.len().min(u16::MAX as usize);
             data.push(CHANNEL_TRAILER_VERSION);
             data.write_u16::<LittleEndian>(extra_len as u16).unwrap();
             data.extend_from_slice(&extra[..extra_len]);
-            Some(ChannelRecordMeta {
+            (record_type == RECORD_TYPE_CHANNEL).then(|| ChannelRecordMeta {
                 kind: (file_size & 0xff) as u8,
                 flags: ((file_size >> 8) & 0xff) as u8,
                 extra: extra[..extra_len].to_vec(),
@@ -2475,7 +2543,7 @@ impl SignedRecord {
         if data[0] == RECORD_TYPE_SOURCE && data.len() < 115 + name_len + SOURCE_CONTACT_WIRE_LEN {
             return false;
         }
-        if data[0] == RECORD_TYPE_CHANNEL
+        if (data[0] == RECORD_TYPE_CHANNEL || data[0] == RECORD_TYPE_FEED)
             && !channel_trailer_len(data, name_len)
                 .is_some_and(|n| data.len() == 115 + name_len + n)
         {
@@ -2562,6 +2630,16 @@ impl SignedRecord {
         } else {
             None
         };
+        // A feed head carries the same trailer framing, read on demand by
+        // `feed_head`; its shape is checked here so a malformed one is not a
+        // record at all.
+        if record_type == RECORD_TYPE_FEED {
+            let off = 115 + name_len;
+            let trailer_len = channel_trailer_len(data, name_len)?;
+            if data.len() != off + trailer_len || data[off] != CHANNEL_TRAILER_VERSION {
+                return None;
+            }
+        }
 
         // Keyword records only: on the other types these bytes are the contact
         // block or the channel trailer read above. Absent for every record

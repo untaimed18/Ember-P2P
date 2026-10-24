@@ -6225,7 +6225,7 @@ pub async fn cached_channels(
 /// hold the UI for that lookup (up to [`DEFAULT_FIND_TIMEOUT_MS`]). The
 /// oneshot is dropped: `PublishEmberRecord` still starts the walk, and
 /// `maybe_finish_ember_publish` ignores a gone waiter.
-async fn queue_signed_record(state: &AppState, record: SignedRecord) -> Result<(), String> {
+pub(crate) async fn queue_signed_record(state: &AppState, record: SignedRecord) -> Result<(), String> {
     let (tx, _rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
@@ -6290,7 +6290,7 @@ async fn find_raw_keys_within(
 /// [`find_raw_keys_within`], also saying how many nodes answered the walk.
 /// An empty result is only evidence of absence when enough of them did: a
 /// walk whose contacts have all left finishes just as empty.
-async fn find_raw_keys_counted(
+pub(crate) async fn find_raw_keys_counted(
     state: &AppState,
     keys: Vec<[u8; 16]>,
     timeout_ms: u64,

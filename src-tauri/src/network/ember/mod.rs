@@ -4,6 +4,7 @@ pub mod attach_tcp;
 pub mod broker;
 pub mod channel;
 pub mod crypto;
+pub mod feed;
 pub mod ingest;
 pub mod mapping_keepalive;
 pub mod nat;

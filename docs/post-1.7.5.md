@@ -300,8 +300,7 @@ stays reachable when the publisher is offline.
   landing page. Both go through the existing deep-link handler.
 - **Elsewhere.** "Feeds" on a friend's card. A feed link in a room message
   renders as a card with a Follow button.
-- **Polling.** Followers look up the head on startup and then every 30
-  minutes with jitter. Publishing also pushes the new head to online friends
+- **Polling.** Followers look up the head every 30 minutes with jitter. Publishing also pushes the new head to online friends
   over the friend session, so friends see an update at once.
 - **New items.** When a newer head arrives, the follower fetches the list,
   works out what is new against the list it holds, and marks the feed
@@ -335,8 +334,10 @@ the existing notification settings. Strings in all nine languages.
   match its head, is marked broken rather than shown in part.
 - **Following is not secret.** Storers answering a head lookup learn that
   someone at this address and identity asked for that feed, and a list's
-  sources learn who fetched it. Item 1's throwaway identity would cover the
-  first, so feed lookups should use it once it exists. The help text says so
+  sources learn who fetched it. Every follower also serves the list and
+  publishes source records for it, so anyone with the link can list the
+  followers online. Item 1's throwaway identity would cover the lookups, so
+  feed lookups should use it once it exists. The help text says so
   meanwhile.
 - **Publishing is public by design.** The feed is tied to the publisher's
   identity, which is the point. The editor says so before the first publish.
@@ -344,13 +345,12 @@ the existing notification settings. Strings in all nine languages.
 - **A lost identity loses its feeds.** The identity backup already covers
   this.
 
-**Rollout.** Builds before the one that ships this refuse the new record
-type, as they refuse an unknown channel kind, so heads are stored only on
-nodes that understand them. Early on, with few such nodes, lookups will miss
-more often. The friend-session push and followers republishing the signed
-head they hold (check that storers accept a record whose publisher is not
-the sender, as the proxy-store path does) are the fallbacks. Nothing that
-already exists changes format.
+**Rollout.** Builds before the one that ships this keep the new record type
+for 24 hours as an unknown one, without replicating it (see "Settled before
+building"), so heads live longest on nodes that understand them. Early on,
+with few such nodes, lookups will miss more often. The friend-session push
+is the fallback; followers do not re-store heads (see "Settled before
+building"). Nothing that already exists changes format.
 
 **Questions to settle first:**
 
@@ -364,9 +364,107 @@ already exists changes format.
   the same feed: the `sequence` race would need the same care as room
   ownership.
 
+**Settled before building** (the questions above, and what the code showed):
+
+- **Who may republish a head:** the publisher, daily and on every change, and
+  online friends get each new head pushed over their session. Followers do
+  not re-store it.
+- **Several devices:** allowed by the format. `sequence` is the publisher's
+  clock in milliseconds, never less than one past the last it published, so
+  the latest publish wins on every device. The app has no way yet to carry
+  a feed (its salt and items) to a second device; an identity restored
+  elsewhere does not bring its feeds. That is listed under "Not yet".
+- **Older builds store the head rather than refuse it.** A pre-feed storer
+  takes any record type it does not know for 24 hours (`KEYWORD_RECORD_TTL`)
+  and neither replicates nor reads it. That helps while few nodes know feeds:
+  the daily republish keeps the head on them too. Builds that know feeds keep
+  it 30 days, replicate it, and check its key.
+- **Header fields.** The head uses the record header's own fields where they
+  fit: `keyword_hash` is `feed_key`, `file_hash` is the salt, so a storer's
+  per-publisher dedupe holds one head per feed, `ember_file_hash` is the
+  list's BLAKE3, `file_size` the list's size, and the name the title. The
+  extra carries the rest: `version(1) || sequence(8) || list_ed2k_hash(16) ||
+  item_count(4) || description_len(2) || description`.
+- **Which head wins.** Storers keep the newest timestamp (`resident_gives_way`),
+  which the clock-based sequence agrees with; a follower takes the highest
+  `sequence` it finds and never goes back to a lower one.
+- **Per-node limits.** The storer's existing per-publisher key and byte
+  budgets (`publisher_index`) bound a publisher's feeds; 8 per identity is the
+  client's rule.
+- **The hidden list.** Nothing today serves a file to anyone without listing
+  it, and `friends_only` refuses strangers. A list is a new kind of share: a
+  file under the app data folder, served to anyone who asks for its hash,
+  with Ember source records so followers find it, and never in the Library,
+  a browse answer, a keyword record, KAD or a server.
+
+**Built.** As settled above, with these choices made on the way:
+
+- **Code.** `network/ember/feed.rs` (key, head trailer, links),
+  `RECORD_TYPE_FEED` in `dht/publish.rs` with the storer rules in
+  `dht/engine.rs` and `dht/store.rs`, `sharing/feed_files.rs` (hidden shares
+  and internal fetches), `storage/database/feeds.rs` (tables `feeds_own`,
+  `feeds_own_items`, `feeds_followed`, `feeds_followed_items` and
+  `feeds_auto_bytes`, created on first use outside the numbered chain) and
+  `commands/feeds.rs` (commands and the background loop). Spec:
+  `channels-format.md`, "Feed heads (record type 0x04)".
+- **Hidden shares** answer TCP and UDP requests and get Ember source
+  records, and are found by nothing else. A list being fetched is an
+  internal fetch: it goes through the normal download pipeline but is not in
+  Transfers, is never saved across a restart, never advertised as a partial,
+  and lands under `<data>/feeds/` instead of the incoming folder. An
+  interrupted fetch is started again by the next tick.
+- **Fetching.** A follower holding the list a new head names (another feed
+  of the same publisher, say) copies it instead of downloading it. A fetch
+  that has not finished in 30 minutes is dropped and tried again after a
+  30-minute rest; a newer head drops a fetch of an older list at once. A
+  follower keeps sharing the list it holds until the newer one arrives. A
+  fetch given up on stays marked internal until its transfer ends, so a
+  completion racing it is thrown away in the feeds folder rather than
+  landing in the Library.
+- **Lookups** run every 30 minutes per feed, spread by feed over five more,
+  at most three a minute, the longest unchecked first. When a feed was last
+  looked at is kept across restarts.
+- **Publishing** checks again that every item is still shared with everyone
+  (one since made friends-only or removed is dropped), serves the new list
+  beside the old, and lets the old one go only once the head naming the new
+  one is queued; a failure leaves the previous publish as it was. One
+  publish runs at a time. The daily republish signs the title and
+  description last published, not an edit not yet published, and first
+  looks for the feed's head: when another device of this identity has
+  published a newer one, it does not republish over it (that device's own
+  copy stays behind until it publishes again).
+- **Lists held.** One list can be held by several feeds (identical bytes),
+  so a hidden share counts its holders and stops only when the last lets
+  go, withdrawing its source records then. Removed items shown to a
+  follower are capped at 2,000 per feed; an item listed again after a
+  removal counts as new.
+- **Auto-download** is per feed, off by default, with a per-item and per-day
+  cap in MiB, and a category. It skips types Ember never auto-tags and
+  dangerous extensions, and anything that would leave less than 64 MiB
+  free on the download folder's drive, counting what the same pass started.
+- **Notes** travel as `FT_EMBER_NOTE` (`0xE3`) in the collection.
+- **UI.** "Feeds" in the sidebar, with Following and My feeds tabs: follow
+  by link, items with New, Removed and Downloaded badges, Download and
+  Download all new, auto-download settings, Check now, Copy link and
+  Unfollow; an editor with title, description, notes, reordering, removal
+  and a picker over files shared with everyone, Publish, and a mark on a
+  feed with changes not yet published. `ember-feed:` links open the page
+  through the deep-link handler. Notifications use the master switch. With
+  Ember off the page says so, and following still works but nothing is
+  looked up until it is back on. Feeds sits after Channels, so with Ember on
+  Alt+0 now opens Feeds rather than Statistics.
+
+**Not yet:** "Add to feed…" on Library rows (the editor's picker does the
+same), "Feeds" on a friend's card and feed cards in room messages, a
+per-feed download folder, labelling auto-started downloads with their feed
+in Transfers (the category does it for now), spam scoring of item names,
+carrying a feed to another device of the same identity, and lookups under a
+throwaway identity (item 1).
+
 **Tests:**
 - **Keys.** Storers refuse a head whose key does not match its publisher and
-  salt, and keep the highest sequence.
+  salt, and keep the newest; a follower takes the highest sequence and
+  never goes back.
 - **List integrity.** A list that does not hash to the head's hashes is
   discarded.
 - **New and removed items.** They are computed correctly across sequences,
@@ -374,7 +472,8 @@ already exists changes format.
 - **Auto-download limits.** It respects caps, blocked types and free space,
   and never starts with the switch off.
 - **Hidden list.** It is served but never listed or keyword-published.
-- **Old peers.** A pre-feed build refuses the record cleanly.
+- **Old peers.** A pre-feed build keeps the record only as an unknown type,
+  and never replicates it.
 - **Friend push.** A pushed head from a friend is verified like a fetched
   one.
 - **Unfollow.** It removes the list and its sources.

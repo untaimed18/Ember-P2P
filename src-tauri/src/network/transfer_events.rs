@@ -694,6 +694,50 @@ pub(super) async fn handle_download_event(
             final_path,
             ember_verified,
             ..
+        } if crate::sharing::feed_files::is_internal_fetch(&transfer_id) => {
+            // A fetch for the feeds code: no row, history or event of the
+            // user's, just the file handed over.
+            {
+                let mut mgr = transfer_manager.write().await;
+                if let Some(promoted) = mgr.complete(&transfer_id) {
+                    promoted_out.extend(promoted);
+                }
+                mgr.remove(&transfer_id);
+            }
+            db_progress_last_persist.remove(&transfer_id);
+            let outcome = match final_path {
+                Some(path) if ember_verified => crate::sharing::feed_files::FetchOutcome::Done(path.into()),
+                Some(path) => {
+                    let _ = std::fs::remove_file(path);
+                    crate::sharing::feed_files::FetchOutcome::Failed("not checked against its digest".into())
+                }
+                None => crate::sharing::feed_files::FetchOutcome::Failed("no file".into()),
+            };
+            crate::sharing::feed_files::report_fetch(&transfer_id, outcome);
+        }
+        DownloadEvent::Failed { transfer_id, error, .. }
+            if crate::sharing::feed_files::is_internal_fetch(&transfer_id) =>
+        {
+            {
+                let mut mgr = transfer_manager.write().await;
+                if let Some(promoted) =
+                    mgr.fail(&transfer_id, ed2k::transfer::TransferFailureCode::Cancelled, None, None)
+                {
+                    promoted_out.extend(promoted);
+                }
+                mgr.remove(&transfer_id);
+            }
+            db_progress_last_persist.remove(&transfer_id);
+            crate::sharing::feed_files::report_fetch(
+                &transfer_id,
+                crate::sharing::feed_files::FetchOutcome::Failed(error),
+            );
+        }
+        DownloadEvent::Completed {
+            transfer_id,
+            final_path,
+            ember_verified,
+            ..
         } => {
             // A download reaches Completed only after every part is present
             // and hash-verified, so the terminal row represents the whole

@@ -1600,7 +1600,9 @@ async fn handle_command_inner(
                         if hb.len() >= 16 {
                             let mut raw = [0u8; 16];
                             raw.copy_from_slice(&hb[..16]);
-                            let restricted = transfer_friends_only || {
+                            let restricted = transfer_friends_only
+                                || crate::sharing::feed_files::is_internal_fetch(&transfer_id)
+                                || {
                                 let idx = local_index.read().await;
                                 !known_files.is_authoritative()
                                     || idx
@@ -1982,8 +1984,10 @@ async fn handle_command_inner(
 
                 // Persist download to database for resume across restarts.
                 // Check for an existing DB row first so we don't clobber
-                // progress/priority when a queued download is promoted.
-                {
+                // progress/priority when a queued download is promoted. Not a
+                // fetch for the feeds code: it is not the user's download, and
+                // the feeds code asks again after a restart.
+                if !crate::sharing::feed_files::is_internal_fetch(&transfer_id) {
                     let db_ref = db.clone();
                     let tid = transfer_id.clone();
                     let fname = file_name.clone();
@@ -2112,7 +2116,9 @@ async fn handle_command_inner(
                 if hb.len() >= 16 {
                     let mut raw = [0u8; 16];
                     raw.copy_from_slice(&hb[..16]);
-                    let restricted = transfer_friends_only || {
+                    let restricted = transfer_friends_only
+                        || crate::sharing::feed_files::is_internal_fetch(&transfer_id)
+                        || {
                         let idx = local_index.read().await;
                         idx.get_by_hash(&file_hash.to_ascii_lowercase())
                             .is_some_and(|f| f.friends_only)
@@ -3394,6 +3400,21 @@ async fn handle_command_inner(
                     remember_originated_gossip(state, &gossip);
                 }
                 fanout_channel_gossip_body(socket, state, db, body, None).await;
+            }
+        }
+
+        NetworkCommand::PushFeedHead { blob } => {
+            let friends: Vec<[u8; 16]> = state.ember_sessions.read().await.keys().copied().collect();
+            let seed = state.local_ed25519_seed;
+            for friend in friends {
+                let _ = send_encrypted_chat_ext(
+                    &state.ember_sessions,
+                    &seed,
+                    friend,
+                    ed2k::messages::EMBER_EXT_FEED_HEAD,
+                    &blob,
+                )
+                .await;
             }
         }
 

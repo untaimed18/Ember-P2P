@@ -680,6 +680,11 @@ pub enum NetworkCommand {
     FanoutChannelChat {
         bodies: Vec<Vec<u8>>,
     },
+    /// Push a feed head we just published to every friend connected now
+    /// (`EMBER_EXT_FEED_HEAD`). `blob` is the signed record as a value blob.
+    PushFeedHead {
+        blob: Vec<u8>,
+    },
     /// Seal a private message, receipt or answer to one member and send it
     /// into a room both are in. See `network::room_dm`.
     SendRoomDm {

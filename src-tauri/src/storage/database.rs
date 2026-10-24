@@ -15,7 +15,9 @@ use crate::network::ember::crypto::chat_body_hash;
 use crate::storage::paths;
 use crate::types::*;
 
+mod feeds;
 mod room_dm;
+pub use feeds::{FeedItem, FollowedFeed, FollowedItem, OwnFeed, OwnPublish};
 pub use room_dm::{DmIncoming, DmMessage, DmThread};
 
 const MAX_PEERS_ROWS: i64 = 10_000;

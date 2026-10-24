@@ -967,6 +967,22 @@ pub async fn run_friend_session_over_transport(
                                                 }).await;
                                             }
                                         }
+                                        Some((super::messages::EMBER_EXT_FEED_HEAD, body)) => {
+                                            if body.len() <= crate::network::ember::crypto::MAX_CHAT_WIRE_LEN {
+                                                if let Some(blob) =
+                                                    crate::network::ember::crypto::decrypt_chat_from_peer(
+                                                        &session_our_ed25519_secret,
+                                                        &session_peer_ember_pubkey,
+                                                        body,
+                                                    )
+                                                {
+                                                    crate::sharing::feed_files::report_pushed_head(
+                                                        session_peer_ember_pubkey,
+                                                        blob,
+                                                    );
+                                                }
+                                            }
+                                        }
                                         Some((super::messages::EMBER_EXT_STATUS, body)) => {
                                             if let Some(byte) =
                                                 crate::network::ember::crypto::decrypt_chat_status(

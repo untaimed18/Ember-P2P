@@ -159,6 +159,20 @@ pub(crate) fn preview_deep_link_payload(payload: &str) -> Result<DeepLinkPreview
             host: None,
         });
     }
+    if lower.starts_with("ember-feed:") {
+        let link = crate::network::ember::feed::FeedLink::parse(&payload)
+            .ok_or_else(|| coded("deeplink_terminal_invalid", "Invalid feed link"))?;
+        return Ok(DeepLinkPreview {
+            kind: "feed".into(),
+            name: None,
+            size: None,
+            // The canonical link, for the page that follows it.
+            hash: Some(link.format()),
+            ember: None,
+            endpoint: None,
+            host: None,
+        });
+    }
     if !lower.starts_with("ed2k://") && lower.ends_with(".emulecollection") {
         if is_network_path(&payload) {
             return Err(coded(
@@ -291,6 +305,7 @@ pub fn is_deep_link_payload(arg: &str) -> bool {
         || lower.starts_with("ember3:")
         || lower.starts_with("ember2:")
         || lower.starts_with("ember-channel:")
+        || lower.starts_with("ember-feed:")
 }
 
 /// Split an OS drop into the collection files to open and the paths to share.

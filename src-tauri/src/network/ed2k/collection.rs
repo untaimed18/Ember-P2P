@@ -13,6 +13,10 @@ const FT_AICH_HASH: u8 = 0x27;
 /// Ember BLAKE3 content digest (64 hex chars). Unknown to eMule; skipped by
 /// older parsers the same way any other unfamiliar file tag is.
 const FT_EMBER_FILE_HASH: u8 = 0xE2;
+/// A note on one file, a string (see [`CollectionFile::note`]). A string
+/// rather than a new tag type: eMule's reader skips an unknown tag *id* but
+/// gives up on an unknown tag *type*.
+const FT_EMBER_NOTE: u8 = 0xE3;
 const FT_COLLECTIONAUTHOR: u8 = 0x31;
 const FT_COLLECTIONAUTHORKEY: u8 = 0x32;
 
@@ -34,6 +38,10 @@ pub struct CollectionFile {
     /// predates this field or the source never had a digest.
     #[serde(default)]
     pub ember_file_hash: String,
+    /// A short note on the file, as a feed's publisher writes one; empty for
+    /// none. Its own tag, which eMule's reader skips like any unknown one.
+    #[serde(default)]
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +74,21 @@ impl Collection {
         } else {
             Self::load_text(path)
         }
+    }
+
+    /// A binary collection already in memory: the very bytes a caller has
+    /// checked, rather than the file read again.
+    pub fn from_binary_bytes(data: &[u8]) -> anyhow::Result<Self> {
+        if data.len() as u64 > MAX_COLLECTION_BYTES || data.len() < 8 {
+            return Err(anyhow::anyhow!("Not a binary collection"));
+        }
+        let data = data.to_vec();
+        let mut cursor = Cursor::new(&data);
+        let version = cursor.read_u32::<LittleEndian>()?;
+        if version != COLLECTION_FILE_VERSION1 && version != COLLECTION_FILE_VERSION2_LARGE {
+            return Err(anyhow::anyhow!("Not a binary collection"));
+        }
+        Self::load_binary(&mut cursor, version)
     }
 
     fn load_binary(cursor: &mut Cursor<&Vec<u8>>, _version: u32) -> anyhow::Result<Self> {
@@ -129,6 +152,7 @@ impl Collection {
             let mut fhash = String::new();
             let mut faich = String::new();
             let mut fember = String::new();
+            let mut fnote = String::new();
 
             let file_limit = file_tag_count.min(20);
             for _ in 0..file_limit {
@@ -159,6 +183,11 @@ impl Collection {
                             fember = normalize_ember_file_hash(&s);
                         }
                     }
+                    FT_EMBER_NOTE => {
+                        if let TagValue::String(s) = tag_value {
+                            fnote = sanitize_collection_text(&s);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -172,6 +201,7 @@ impl Collection {
                 hash: fhash,
                 aich_hash: faich,
                 ember_file_hash: fember,
+                note: fnote,
             });
         }
 
@@ -283,6 +313,10 @@ impl Collection {
                 write_string_tag(&mut file_buf, FT_EMBER_FILE_HASH, &file.ember_file_hash)?;
                 file_tags += 1;
             }
+            if !file.note.is_empty() {
+                write_string_tag(&mut file_buf, FT_EMBER_NOTE, &file.note)?;
+                file_tags += 1;
+            }
 
             buf.write_u32::<LittleEndian>(file_tags)?;
             buf.write_all(&file_buf)?;
@@ -333,6 +367,7 @@ fn parse_ed2k_link(link: &str) -> Option<CollectionFile> {
         hash,
         aich_hash: aich.unwrap_or_default(),
         ember_file_hash: ember.unwrap_or_default(),
+        note: String::new(),
     })
 }
 
@@ -611,6 +646,7 @@ mod tests {
                     hash: "00112233445566778899aabbccddeeff".to_string(),
                     aich_hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
                     ember_file_hash: "ab".repeat(32),
+                    note: String::new(),
                 },
                 CollectionFile {
                     name: "large video.mkv".to_string(),
@@ -618,6 +654,7 @@ mod tests {
                     hash: "ffeeddccbbaa99887766554433221100".to_string(),
                     aich_hash: String::new(),
                     ember_file_hash: String::new(),
+                    note: String::new(),
                 },
             ],
         };
@@ -659,6 +696,7 @@ mod tests {
                 hash: "00112233445566778899aabbccddeeff".to_string(),
                 aich_hash: String::new(),
                 ember_file_hash: digest.clone(),
+                note: String::new(),
             }],
         };
         let text = collection.to_text_bytes();
@@ -668,6 +706,28 @@ mod tests {
         );
         let parsed = parse_ed2k_link(text.trim()).expect("parse emitted link");
         assert_eq!(parsed.ember_file_hash, digest);
+    }
+
+    /// A feed's note on an item reads back, cleaned like any text a stranger
+    /// wrote; an item without one writes no tag.
+    #[test]
+    fn a_note_round_trips_and_an_empty_one_writes_nothing() {
+        let file = |note: &str| CollectionFile {
+            name: "a.flac".into(),
+            size: 5,
+            hash: "00112233445566778899aabbccddeeff".into(),
+            aich_hash: String::new(),
+            ember_file_hash: "ab".repeat(32),
+            note: note.into(),
+        };
+        let with = Collection { name: "f".into(), author: String::new(), files: vec![file("Live, 1998\u{202e}")] };
+        let without = Collection { name: "f".into(), author: String::new(), files: vec![file("")] };
+        let path = temp_collection_path("note", "emulecollection");
+        std::fs::write(&path, with.to_binary_bytes().unwrap()).unwrap();
+        let back = Collection::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.files[0].note, "Live, 1998", "the bidi override is stripped");
+        assert!(with.to_binary_bytes().unwrap().len() > without.to_binary_bytes().unwrap().len());
     }
 
     fn temp_collection_path(tag: &str, ext: &str) -> std::path::PathBuf {
@@ -692,6 +752,7 @@ mod tests {
                 hash: "00112233445566778899aabbccddeeff".to_string(),
                 aich_hash: String::new(),
                 ember_file_hash: String::new(),
+                note: String::new(),
             }],
         };
         let path = temp_collection_path("bidi", "emulecollection");

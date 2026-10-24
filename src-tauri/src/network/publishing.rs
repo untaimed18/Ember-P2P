@@ -113,7 +113,9 @@ pub(super) fn transfer_may_advertise_partial(
     restricted: &HashSet<String>,
     transfer: &Transfer,
 ) -> bool {
-    !transfer.friends_only && kad_may_advertise_partial(known_files, restricted, &transfer.file_hash)
+    !transfer.friends_only
+        && !crate::sharing::feed_files::is_internal_fetch(&transfer.id)
+        && kad_may_advertise_partial(known_files, restricted, &transfer.file_hash)
 }
 
 /// Complete shares: must be publicly listable on the index *and* not

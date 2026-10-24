@@ -407,6 +407,13 @@ pub const EMBER_EXT_ATTACH_WAITS: u8 = 0x12;
 /// ignores it, and shows us online.
 pub const EMBER_EXT_STATUS: u8 = 0x13;
 
+/// A feed head the friend just published: its signed record as a value blob
+/// (`data || signature`), sealed to us like a chat message. Pushed so friends
+/// following the feed see an update at once rather than at their next
+/// lookup; verified on arrival exactly as a looked-up head is, and taken only
+/// if signed by the friend who sent it. A peer that predates this ignores it.
+pub const EMBER_EXT_FEED_HEAD: u8 = 0x14;
+
 const DHT_MEET_FLAG_ANSWER: u8 = 0x01;
 
 /// [`EMBER_EXT_DHT_MEET`] body: `udp_port(2, LE) || flags(1)`.

@@ -23,8 +23,8 @@ use tracing::trace;
 
 use super::messages::{self, DhtPayload, VersionRange};
 use super::publish::{
-    source_key, SignedRecord, SourceBuddy, SourceContact, RECORD_TYPE_CHANNEL, RECORD_TYPE_KEYWORD,
-    RECORD_TYPE_SOURCE,
+    source_key, SignedRecord, SourceBuddy, SourceContact, RECORD_TYPE_CHANNEL, RECORD_TYPE_FEED,
+    RECORD_TYPE_KEYWORD, RECORD_TYPE_SOURCE,
 };
 use super::routing::{AddResult, RoutingTable};
 use super::store::{DhtStore, DhtStoreEntry, StoreRejectStats};
@@ -1206,6 +1206,10 @@ impl EmberDht {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
             return StoreOutcome::Rejected;
         }
+        if parsed.record_type == RECORD_TYPE_FEED && !parsed.feed_store_ok() {
+            self.store_reject_verify = self.store_reject_verify.saturating_add(1);
+            return StoreOutcome::Rejected;
+        }
 
         if key != parsed.keyword_hash {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
@@ -1363,7 +1367,7 @@ impl EmberDht {
         // `DhtStore::take_republish_batch`).
         let unknown_type = !matches!(
             parsed.record_type,
-            RECORD_TYPE_KEYWORD | RECORD_TYPE_SOURCE | RECORD_TYPE_CHANNEL
+            RECORD_TYPE_KEYWORD | RECORD_TYPE_SOURCE | RECORD_TYPE_CHANNEL | RECORD_TYPE_FEED
         );
         if self
             .store
@@ -7354,6 +7358,35 @@ mod tests {
             1,
             "a replay is not a second attempt"
         );
+    }
+
+    /// A feed head is a type this build knows: stored under its own key, not
+    /// counted as unknown, and refused under any other.
+    #[test]
+    fn a_feed_head_is_stored_under_its_key_and_refused_elsewhere() {
+        let mut a = dht(57);
+        let mut b = dht(58);
+        let a_noise = a.local_noise_pub;
+        let a_addr = addr(57, 4672);
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[57u8; 32]);
+        let head = crate::network::ember::feed::FeedHead {
+            sequence: 1,
+            list_ed2k_hash: [1; 16],
+            list_size: 100,
+            list_blake3: [2; 32],
+            item_count: 1,
+            title: "Feed".into(),
+            description: String::new(),
+        };
+        let record = SignedRecord::feed_head_record(&[5u8; 16], &head, &sk, chrono::Utc::now().timestamp()).unwrap();
+        let (_rid, frame) = a.build_store(record.keyword_hash, record.data.clone(), record.signature);
+        assert!(b.handle_message(&frame, a_addr, a_noise, 1000).stored_record);
+        assert_eq!(b.unknown_record_types_stored(), 0);
+
+        let mut wrong_key = record.keyword_hash;
+        wrong_key[0] ^= 1;
+        let (_rid, frame) = a.build_store(wrong_key, record.data, record.signature);
+        assert!(!b.handle_message(&frame, a_addr, a_noise, 1001).stored_record);
     }
 
     /// A type byte this build does not know is stored, not refused — refusing
