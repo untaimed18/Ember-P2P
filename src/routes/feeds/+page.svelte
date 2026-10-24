@@ -400,6 +400,8 @@
   let mineFeed = $derived(mine.find((f) => f.salt === mineSelected) ?? null);
   let inFeed = $derived(new Set(editItems.map((i) => i.ed2k.toLowerCase())));
   let editSize = $derived(editItems.reduce((sum, i) => sum + i.size, 0));
+  /** Published, and nothing saved or typed since: nothing to publish. */
+  let upToDate = $derived(!!mineFeed && mineFeed.published_at > 0 && !mineFeed.changed && !dirty);
   let mineShown = $derived.by(() => {
     const q = listQuery.trim().toLowerCase();
     return q ? mine.filter((f) => f.title.toLowerCase().includes(q)) : mine;
@@ -1170,9 +1172,23 @@
             <p class="hint">{m.feeds_publish_public_hint()}</p>
             <div class="editor-foot-actions">
               <button type="button" class="secondary" disabled={!dirty || busy} onclick={() => void save()}>{m.feeds_save()}</button>
-              <button type="button" class="primary" disabled={busy || emberOff} onclick={() => void publish()}>
-                {#if publishing}<span class="spinner xs" aria-hidden="true"></span>{/if}
-                {m.feeds_publish()}
+              <!-- Published and unchanged: publishing again would only bump the
+                   sequence, and the daily republish keeps the head alive. -->
+              <button
+                type="button"
+                class="primary"
+                disabled={busy || emberOff || upToDate}
+                title={upToDate ? m.feeds_publish_up_to_date_title() : undefined}
+                onclick={() => void publish()}
+              >
+                {#if publishing}
+                  <span class="spinner xs" aria-hidden="true"></span>
+                {:else if upToDate}
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <polyline points="3 8 7 12 13 4"/>
+                  </svg>
+                {/if}
+                {upToDate ? m.feeds_publish_up_to_date() : mineFeed.published_at > 0 ? m.feeds_publish_changes() : m.feeds_publish()}
               </button>
             </div>
           </footer>
@@ -2201,6 +2217,11 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
+  }
+
+  .editor-foot-actions .primary svg {
+    width: 13px;
+    height: 13px;
   }
 
   @media (prefers-reduced-motion: reduce) {
