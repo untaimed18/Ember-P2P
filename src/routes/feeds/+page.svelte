@@ -28,8 +28,8 @@
     type FollowedItem,
     type OwnFeed,
   } from '$lib/api/feeds';
-  import { getSharedFilesIfChanged } from '$lib/api/sharing';
   import type { FileInfo } from '$lib/types';
+  import FeedFilePicker from '$lib/components/FeedFilePicker.svelte';
   import { followedFeeds, refreshFollowedFeeds } from '$lib/stores/feeds';
   import { appSettings } from '$lib/stores/settings';
   import { toastError, toastSuccess } from '$lib/stores/toast';
@@ -42,6 +42,7 @@
   const TITLE_MAX = 64;
   const DESCRIPTION_MAX = 256;
   const NOTE_MAX = 256;
+  const FEED_ITEMS_MAX = 2000;
 
   type Tab = 'following' | 'mine';
   let tab = $state<Tab>('following');
@@ -291,35 +292,21 @@
   let saving = $state(false);
   let publishing = $state(false);
   let deleteOpen = $state(false);
-  let library = $state<FileInfo[]>([]);
-  let pickerQuery = $state('');
+  let pickerOpen = $state(false);
   /** What to do once the user agrees to drop unsaved edits. */
   let discardThen = $state<(() => void) | null>(null);
   let leaving = false;
 
   let busy = $derived(saving || publishing || creating);
   let mineFeed = $derived(mine.find((f) => f.salt === mineSelected) ?? null);
-  let pickable = $derived(
-    library
-      .filter((f) => f.shared && !f.friends_only && f.ember_file_hash?.length === 64)
-      .filter((f) => !editItems.some((i) => i.ed2k === f.hash))
-      .filter((f) => !pickerQuery.trim() || f.name.toLowerCase().includes(pickerQuery.trim().toLowerCase()))
-      .slice(0, 50),
-  );
+  let inFeed = $derived(new Set(editItems.map((i) => i.ed2k.toLowerCase())));
+  let editSize = $derived(editItems.reduce((sum, i) => sum + i.size, 0));
 
   async function loadMine() {
     try {
       mine = await listMyFeeds();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
-    }
-  }
-
-  async function loadLibrary() {
-    try {
-      library = (await getSharedFilesIfChanged(null)).files ?? [];
-    } catch (e) {
-      console.warn('feeds: could not read the library', e);
     }
   }
 
@@ -353,10 +340,14 @@
     }
   }
 
-  function addFile(file: FileInfo) {
+  function addFiles(files: FileInfo[]) {
+    const fresh = files
+      .filter((f) => !inFeed.has(f.hash.toLowerCase()))
+      .slice(0, Math.max(0, FEED_ITEMS_MAX - editItems.length));
+    if (fresh.length === 0) return;
     editItems = [
       ...editItems,
-      { ed2k: file.hash, name: file.name, size: file.size, aich: file.aich_hash, blake3: file.ember_file_hash, note: '' },
+      ...fresh.map((f) => ({ ed2k: f.hash, name: f.name, size: f.size, aich: f.aich_hash, blake3: f.ember_file_hash, note: '' })),
     ];
     dirty = true;
   }
@@ -477,7 +468,6 @@
   onMount(() => {
     void refreshFollowedFeeds();
     void loadMine();
-    void loadLibrary();
     let unlisten: UnlistenFn | null = null;
     let alive = true;
     void listen(FEEDS_CHANGED_EVENT, () => void loadMine()).then((fn) => {
@@ -744,6 +734,24 @@
           {/if}
         </div>
 
+        <div class="feeds-items-head">
+          <span>
+            {m.feeds_items_count({ count: editItems.length })}
+            {#if editItems.length > 0}
+              <span aria-hidden="true">·</span>
+              {formatBytes(editSize)}
+            {/if}
+          </span>
+          <button type="button" class="feeds-add-btn" disabled={busy} onclick={() => (pickerOpen = true)}>
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">
+              <line x1="8" y1="3" x2="8" y2="13"/><line x1="3" y1="8" x2="13" y2="8"/>
+            </svg>
+            <span>{m.feeds_add_files()}</span>
+          </button>
+        </div>
+        {#if editItems.length === 0}
+          <p class="feeds-empty">{m.feeds_no_items()}</p>
+        {/if}
         <ul class="feeds-items">
           {#each editItems as item, i (item.ed2k)}
             <li class="feeds-item">
@@ -775,26 +783,14 @@
           {/each}
         </ul>
 
-        <details class="feeds-picker">
-          <summary>{m.feeds_add_files()}</summary>
-          <input type="search" bind:value={pickerQuery} placeholder={m.feeds_add_files_search()} aria-label={m.feeds_add_files_search()} />
-          <ul class="feeds-items">
-            {#each pickable as file (file.hash)}
-              <li class="feeds-item">
-                <div class="feeds-item-main">
-                  <span class="feeds-item-name"><bdi dir="auto">{file.name}</bdi></span>
-                  <span class="feeds-item-meta">{formatBytes(file.size)}</span>
-                </div>
-                <button type="button" class="ghost" disabled={busy} aria-label={m.feeds_add_named({ name: file.name })} onclick={() => addFile(file)}>
-                  {m.feeds_add()}
-                </button>
-              </li>
-            {/each}
-            {#if pickable.length === 0}
-              <li class="feeds-empty">{m.feeds_add_files_none()}</li>
-            {/if}
-          </ul>
-        </details>
+        <FeedFilePicker
+          bind:open={pickerOpen}
+          feedTitle={editTitle || mineFeed.title}
+          {inFeed}
+          room={FEED_ITEMS_MAX - editItems.length}
+          onadd={addFiles}
+          onclose={() => {}}
+        />
       {:else}
         <p class="feeds-empty">{m.feeds_pick_one_mine()}</p>
       {/if}
@@ -960,8 +956,39 @@
     font-size: var(--font-size-sm);
   }
 
-  .feeds-auto,
-  .feeds-picker {
+  .feeds-add-btn {
+    min-height: 30px;
+    padding: 0 12px;
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    font-family: inherit;
+    transition: background var(--transition-fast), border-color var(--transition-fast);
+  }
+
+  .feeds-add-btn:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    border-color: var(--accent);
+  }
+
+  .feeds-add-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .feeds-add-btn svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  .feeds-auto {
     margin: 10px 0;
     padding: 8px 12px;
     border: 1px solid var(--border);
