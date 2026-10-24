@@ -641,6 +641,10 @@ let ignoredSynced = false;
 let ignoredEditedEarly = false;
 let ignoredSubscribed = false;
 let ignoredPushTimer: ReturnType<typeof setTimeout> | null = null;
+/** Saves go one after another, so an older list cannot land after a newer
+ *  one. The last one sent, until it settles. */
+let ignoredSaveChain: Promise<void> = Promise.resolve();
+let ignoredSaving: Promise<void> | null = null;
 
 function sameIgnored(a: IgnoredMember[], b: IgnoredMember[]): boolean {
   const key = (list: IgnoredMember[]) =>
@@ -648,14 +652,44 @@ function sameIgnored(a: IgnoredMember[], b: IgnoredMember[]): boolean {
   return key(a) === key(b);
 }
 
+function saveIgnored(entries: IgnoredMember[]): Promise<void> {
+  const run = ignoredSaveChain
+    .catch(() => {})
+    .then(() => invoke<void>('set_ignored_members', { members: entries }));
+  ignoredSaveChain = run;
+  ignoredSaving = run;
+  run
+    .finally(() => {
+      if (ignoredSaving === run) ignoredSaving = null;
+    })
+    .catch(() => {});
+  return run;
+}
+
 function pushIgnored(entries: IgnoredMember[]) {
   if (ignoredPushTimer) clearTimeout(ignoredPushTimer);
   ignoredPushTimer = setTimeout(() => {
     ignoredPushTimer = null;
-    void invoke('set_ignored_members', { members: entries }).catch((e) =>
-      console.warn('channels: could not save the ignore list', e),
-    );
+    saveIgnored(entries).catch((e) => console.warn('channels: could not save the ignore list', e));
   }, 300);
+}
+
+/** Resolves once the backend holds the list as it stands here, for a caller
+ *  whose next step depends on it; rejects if it could not be saved. Sends a
+ *  change still waiting out the push delay at once, waits for one already on
+ *  its way, and before settings have loaded sends the list here, which is
+ *  the newest word then (see `ignoredEditedEarly`). */
+export async function pushIgnoredNow(): Promise<void> {
+  if (ignoredPushTimer) {
+    clearTimeout(ignoredPushTimer);
+    ignoredPushTimer = null;
+    return saveIgnored(get(ignoredMembers));
+  }
+  if (!ignoredSynced) return saveIgnored(get(ignoredMembers));
+  if (ignoredSaving) return ignoredSaving;
+  if (!sameIgnored(get(ignoredMembers), ignoredFromSettings(get(appSettings)) ?? [])) {
+    return saveIgnored(get(ignoredMembers));
+  }
 }
 
 ignoredMembers.subscribe((entries) => {
@@ -703,7 +737,7 @@ appSettings.subscribe((settings) => {
   }
   ignoredSynced = true;
   // A change of ours still on its way: the backend has not heard it yet.
-  if (ignoredPushTimer) return;
+  if (ignoredPushTimer || ignoredSaving) return;
   if (!sameIgnored(held, get(ignoredMembers))) ignoredMembers.set(held);
 });
 

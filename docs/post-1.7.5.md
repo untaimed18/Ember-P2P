@@ -1,10 +1,15 @@
-# After 1.7.5: planned for later releases
+# Beside the format freeze: shipped in 1.7.5, and planned for later
 
 1.7.5 freezes the Channels formats (`docs/post-1.7.4.md`, "Channels: the
 format freeze"; `docs/channels-format.md`, "What freezes at the end of the
-beta"). What follows changes no frozen format, so none of it is tied to a
-particular release: it can come in whichever release has room. If 1.7.6
-needs no format change, it removes the BETA badge.
+beta"). This plan was written for what could come after the freeze, since
+none of it changes a frozen format. Items 2 to 4 (private messages between
+room members, feeds and the connection doctor) were built in time and ship
+in 1.7.5; each keeps its plan and records what was built and what is left
+under "Not yet" or "Left as they are". Item 1, and the sections after
+item 4, are for later releases and are not tied to a particular one: they
+can come in whichever release has room. If 1.7.6 needs no format change, it
+removes the BETA badge.
 
 ## 1. Private-room membership traffic under a throwaway DHT identity
 
@@ -132,8 +137,12 @@ nonce(24) || ciphertext`.
   (built as 960, not 1024, to stay unfragmented), and a top bucket sized to
   what one datagram carries once the gossip envelope and the extension frame
   around the body are counted (and, as built, the overlay relay envelope).
-  That is well under 4096 (a room line's sealed frame stops fitting at about
-  3,760 bytes of text), so the text cap follows from the top bucket, less
+  That is well under 4096 (a room line's sealed frame stops fitting past
+  3,728 bytes of text, `CHANNEL_LINE_MAX_TEXT_BYTES` in
+  `commands/channels.rs`, since it has to fit a relay hop:
+  `RELAYABLE_GOSSIP_MAX_BYTES` in `network/ember/channel.rs`, which is
+  `MAX_DELIVERABLE_PAYLOAD` less the 33-byte relay envelope header), so the
+  text cap follows from the top bucket, less
   `type(1) || message_id(16)`, rather than being `CHAT_TEXT_MAX_BYTES`.
 
 **Delivery.** Extension frames are not stored for catch-up, so a message
@@ -162,7 +171,8 @@ gets friend chat instead.
 - **The ignore list moves to the backend.** Today `ignoredMembers` lives in
   the webview's `localStorage` only; it moves into settings (migrated once
   from `localStorage`) so an ignored member's message is dropped before it
-  is stored or notified. Ignoring from a request does the same.
+  is stored or notified. Ignoring from a request does the same, and tells
+  the sender nothing.
 - **Requests are capped** per room per hour, as room friend requests are
   (`ROOM_FRIEND_REQUESTS_PER_ROOM_HOUR`), and a declined sender cannot ask
   again for a while.
@@ -203,13 +213,37 @@ resends; a message to someone with no shared room is refused.
   unambiguous. Buckets 256, 960 and 3670 bytes; the text cap is 3651. The top
   bucket leaves room for the overlay relay envelope, without which a long
   message never reached a firewalled member.
-- **Resends** every 2 minutes for 20 minutes, under a fresh envelope with the
-  same `message_id`; then "Not delivered", with Try again, which meets the
-  same rules as a new message.
+- **Resends** 2 minutes after each attempt plus 0 to 30 seconds at random
+  (`DM_RESEND_JITTER_SECS`), so messages written or resent together do not
+  stay together, for 20 minutes, under a fresh envelope with the same
+  `message_id`; then "Not delivered", with Try again, which meets the same
+  rules as a new message.
 - **Replies** (receipts, declines) wait a random 10 to 90 seconds, so their
   timing does not say whom a message was for, and are rationed: 30 and one
-  decline per member per 10 minutes, 2 a second in all, so a member cannot
-  spend our author rate and crowd out our chat.
+  decline per member per 10 minutes, so a member cannot spend our author
+  rate and crowd out our chat. A reply queued that long is checked again
+  before it goes: nothing to a member ignored or banned since, and a decline
+  only while it is still the answer (the policy is Off, or our refusal of
+  them holds; accepting them, writing to them or a change of policy since
+  drops it).
+- **Pacing.** Every kind 66 frame this device sends (new messages, resends,
+  replies and the user's answers alike) goes through one queue: at most 2
+  into a room in any 1.2 seconds (`DM_FRAMES_PER_ROOM_PER_SEC` over
+  `DM_PACE_WINDOW`, a second and a margin for jitter, below the relays'
+  per-author rate, so chat keeps the rest), and a backlog drains one a room
+  per tick of the one-second drain; a frame over it waits its turn
+  rather than going out to be dropped by relays. A room's answers go before
+  its other frames. Past 256 waiting a receipt, decline or message is
+  dropped (a message goes again with its next resend); an answer is never
+  dropped for room, taking the place of the oldest other frame instead. A
+  frame that waited goes only if it still holds: a reply as above, an answer
+  while the member is still on the roster unbanned and not ignored, a
+  message while it is still being sent and the policy is not Off. One that
+  waited over 60 seconds is dropped, and the whole queue, with the replies
+  still delayed, is dropped while Ember is off or chat is locked. New
+  private messages, and Try again, are also limited to 20 a minute per room
+  (`DM_SEND_PER_ROOM_MINUTE`, "You are sending private messages too fast"),
+  which bounds what the resend loop carries.
 - **Caps.** A request holds 20 messages until answered; 120 are kept from
   one member an hour; a conversation keeps its newest 2000. Past a cap,
   messages are dropped unanswered.
@@ -219,8 +253,26 @@ resends; a message to someone with no shared room is refused.
   us is taking ours. Their decline otherwise lasts 7 days, as ours does, and
   is recorded only in a conversation we started or accepted, and only if
   newer than the answer held.
+- **Answers are dated by their timestamp.** A decline stays stored after
+  its 7 days have run out, so a decline sent after that is new and counts
+  again, stopping what we are sending, while a newer copy of the decline in
+  force only dates it and stops nothing again. A message from them dates
+  their implicit accept with its own timestamp, so a decline they sent
+  before that message cannot undo it, and a message they sent before a
+  decline does not undo the decline.
 - **Declining**, or deleting a request, forgets what they sent and refuses
   them for 7 days, a refusal deleting the conversation does not lift.
+- **Ignore sends nothing.** Ignoring someone everywhere, from a request's
+  banner or a member's menu, removes their request and what it held here
+  (`drop_room_dm_request`), drops any receipt or decline still waiting to go
+  to them, and keeps no refusal. The ignore list drops whatever they send
+  next, so to them their messages go "Not delivered" after the resend
+  window, as if we were offline; un-ignored, they can ask again rather than
+  draw a decline. `set_ignored_members` puts the list in force before it
+  returns, and the request is removed only once that save has succeeded, so
+  a message already on its way cannot reopen it; if the save fails, the
+  request stays and the error is shown. A reply or answer waiting on the
+  pace is checked against the ignore list too.
 - **The ignore list** is kept in settings (`ignored_members`, owned by the
   backend, written by `set_ignored_members`). The webview moves its own copy
   over once, then takes the backend's; an edit made before settings load is
@@ -230,8 +282,12 @@ resends; a message to someone with no shared room is refused.
   the popped-out chat window, requests as banners on the Channels page with
   Accept, Decline and Ignore, and counted on its nav item rather than as
   unread. A conversation that receives a message gets a tab without opening
-  the dock. The policy is under Settings > Channels. Notifications use the
-  message switch.
+  the dock, and the dock's switcher lists the accepted private
+  conversations that have no tab (closed, or past the tab cap) under
+  "Private conversations", so their unread counts still lead somewhere;
+  requests stay on their banners. A tab whose conversation was removed
+  (dropped by Ignore, or deleted in the other window) closes. The policy is under
+  Settings > Channels. Notifications use the message switch.
 
 **Not yet:** "Add friend" from a conversation with no shared room (the text
 says to), offline delivery through the chat mailbox, "load older" in a
@@ -423,25 +479,68 @@ building"). Nothing that already exists changes format.
   landing in the Library.
 - **Lookups** run every 30 minutes per feed, spread by feed over five more,
   at most three a minute, the longest unchecked first. When a feed was last
-  looked at is kept across restarts.
+  looked at is kept across restarts. A lookup counts as a check only when a
+  node answered: one that reached no node says nothing about the head, and
+  is tried again after 5 minutes (`LOOKUP_RETRY_SECS`) rather than 30.
 - **Publishing** checks again that every item is still shared with everyone
   (one since made friends-only or removed is dropped), serves the new list
-  beside the old, and lets the old one go only once the head naming the new
-  one is queued; a failure leaves the previous publish as it was. One
+  beside the old, and waits until at least one node has stored the head
+  naming it before letting the old one go. If none does, the publish fails
+  with `feeds_publish_unreachable` ("Could not reach the Ember network to
+  publish the feed"), the new list is withdrawn and the previous publish
+  stays as it was; friends are sent the head only once it is stored. One
   publish runs at a time. The daily republish signs the title and
   description last published, not an edit not yet published, and first
   looks for the feed's head: when another device of this identity has
   published a newer one, it does not republish over it (that device's own
-  copy stays behind until it publishes again).
+  copy stays behind until it publishes again). A daily republish that
+  reached no node is tried again after 10 minutes (`REPUBLISH_RETRY_SECS`),
+  not a day.
+- **Saving** a feed's items leaves out any no longer shared with everyone
+  (made friends-only, or gone from the Library) rather than refusing the
+  save, and says which (`feeds_items_dropped_*`); the editor then shows what
+  was kept.
+- **A published list gone from disk** is written again at startup from its
+  items, which make the same bytes while the items, title and author are
+  unchanged. When they no longer do, the feed is marked changed, to be
+  published again, and its head is not republished meanwhile, so followers
+  are never sent after a list nobody serves.
 - **Lists held.** One list can be held by several feeds (identical bytes),
   so a hidden share counts its holders and stops only when the last lets
   go, withdrawing its source records then. Removed items shown to a
   follower are capped at 2,000 per feed; an item listed again after a
   removal counts as new.
-- **Auto-download** is per feed, off by default, with a per-item and per-day
-  cap in MiB, and a category. It skips types Ember never auto-tags and
-  dangerous extensions, and anything that would leave less than 64 MiB
-  free on the download folder's drive, counting what the same pass started.
+- **Checking a list.** A list whose size, eD2K hash or BLAKE3 does not
+  match its head, that does not parse, whose item count differs from the
+  head's, or that holds an entry no one could fetch is marked broken, not
+  shown in part, and is not fetched again until a newer head; a fetch whose
+  bytes match the eD2K hash but miss the head's BLAKE3 or AICH pin is
+  treated the same way, since no source can change it. A list file that
+  could not be read (held open by a scanner, say) is kept and read again on
+  a later attempt rather than fetched again.
+- **Pushed heads.** A friend's pushed head is taken at most once per feed
+  every 5 minutes (`PUSHED_HEAD_INTERVAL`); the newest pushed meanwhile
+  waits for the next opening, so a friend pushing head after head does not
+  start and drop a fetch for each.
+- **Links.** Both `https://emberp2p.org/feed/...` and
+  `https://www.emberp2p.org/feed/...` are accepted, with whitespace around
+  them and in either case. The base32 must be the one canonical encoding of
+  its bytes (no extra character, padding bits zero), so two texts never
+  name one feed.
+- **Auto-download** is per feed, off by default, with a per-item cap and a
+  cap per rolling 24 hours (`FEED_AUTO_WINDOW_SECS`, not the calendar day,
+  so a cap is not spent twice across midnight), in MiB, and a category.
+  New follows start at 1 GiB per file and 4 GiB per 24 hours
+  (`FEED_AUTO_DEFAULT_ITEM_MIB`, `FEED_AUTO_DEFAULT_DAY_MIB`, also the
+  column defaults); 0 means no limit, and `set_feed_auto_download` saves
+  the caps as given, clamped to 2^30 MiB. It
+  refuses a list of its own (`AUTO_DOWNLOAD_REFUSED`: programs, scripts,
+  installers, shortcuts, disc and disk images, macro-enabled documents)
+  and whatever Ember counts as dangerous anywhere, looking behind a second
+  extension and past trailing dots and spaces. It starts nothing that would
+  leave less than 64 MiB free on the download folder's drive, counting what
+  unfinished downloads on the same drive have still to write and what the
+  same pass started. One pass runs at a time.
 - **Notes** travel as `FT_EMBER_NOTE` (`0xE3`) in the collection.
 - **UI.** "Feeds" in the sidebar, with Following and My feeds tabs: follow
   by link, items with New, Removed and Downloaded badges, Download and
@@ -452,7 +551,9 @@ building"). Nothing that already exists changes format.
   through the deep-link handler. Notifications use the master switch. With
   Ember off the page says so, and following still works but nothing is
   looked up until it is back on. Feeds sits after Channels, so with Ember on
-  Alt+0 now opens Feeds rather than Statistics.
+  Alt+9 now opens Feeds and Alt+0 Statistics, and Security, eleventh of
+  twelve, has no Alt shortcut. With Ember off Channels and Feeds are both
+  hidden, and the shortcuts are as in 1.7.4.
 
 **Not yet:** "Add to feed…" on Library rows (the editor's picker does the
 same), "Feeds" on a friend's card and feed cards in room messages, a
@@ -496,7 +597,7 @@ not, what Ember is doing about it, and the one thing worth trying next.
 
 **Decided:**
 
-- **One check, one verdict.** Run on demand from Settings > Connection, and
+- **One check, one verdict.** Run on demand from Settings > Network, and
   offered automatically, once, when a LowID or firewalled state has lasted 10
   minutes. The result is one of:
   - **Fully reachable.**
@@ -504,6 +605,10 @@ not, what Ember is doing about it, and the one thing worth trying next.
     connections take a little longer.
   - **Limited.** Some eMule users cannot download from you, and you reach
     fewer sources.
+  - **Still checking.** Nothing has tested the ports from outside yet, so
+    nothing is known to be wrong; the doctor offers to check again.
+  - **Not tested.** Nothing has tested it, and nothing will as things
+    stand. Ember says so rather than guess.
   - **Offline.** The check names what is blocking.
 - **Ember's own help is listed as such.** Relays, hole punching and a Kad
   buddy appear as things already handled, so a user who cannot change their
@@ -562,7 +667,7 @@ It never changes the router, and never turns off a VPN.
 clipboard for support. IP addresses are masked by default, with a switch to
 include them.
 
-**UI.** A "Check connection" button under Settings > Connection. The status
+**UI.** A "Check connection" button under Settings > Network. The status
 bar's LowID / firewalled indicator links to it. The results are a short
 list of checks with a passed, failed or skipped mark and a one-line
 explanation each, the verdict on top and the fixes below. Strings in all
@@ -607,12 +712,48 @@ probe needs the rendezvous server change above, and works without it.
   `session_udp_port`, `session_upnp_enabled` in `NetworkStats`), not saved
   settings, and a saved change to them is the first fix, "restart". A TCP
   port Ember could not open is never called open, whatever answers on it.
+- **"Still checking" and "Not tested".** Online with nothing yet tested on
+  TCP from outside (no probe answer, no Kad TCP result, no eD2K server ID),
+  the verdict is "Still checking" (`checking`), not "Limited", while
+  something can still test it with no change from the user: Kad is
+  connected and its check is running, the server was only busy, or the
+  session is younger than 15 minutes (`session_age_secs`, new in
+  `NetworkStats`, read from a monotonic clock). Kad's running check keeps
+  it there for the first 30 minutes only. Its fix is "Check again in a few minutes", whose button
+  restarts the Kad firewall checks. Otherwise the verdict is "Not tested"
+  (`untested`): Ember could not test whether others can reach you, and the
+  fix is to connect to Kad or an eD2K server, either of which tests it.
+  Neither verdict lists anything Ember is doing about it, nor any UPnP or
+  forwarding step: nothing shows the port closed, and with neither network
+  connected no eMule user could say whether they get through. While Kad is
+  not connected its check reads "Not connected", not "Still checking". Any
+  one TCP finding settles the verdict, and a port another program holds is
+  "Limited" without one.
+- **Carrier-grade NAT whatever the verdict.** A router whose own WAN
+  address is private or carrier-grade is behind another NAT for certain, so
+  that fix is offered under any verdict, a change waiting on a restart
+  included, wherever peers do not already reach us.
+- **Smaller readings.** A router WAN address no interface holds (0.0.0.0
+  from a router whose uplink is down or an extender, `0/8`, loopback,
+  multicast, `240/4`) reads as unknown, not as carrier-grade NAT. A Windows
+  Firewall rule check that failed shows as "Could not be checked", not "Not
+  used on this system", and not "Inbound rules missing" with the elevated
+  fix: `rules_in_place` answers `None` when no query could tell. A rule that
+  does not exist is still "missing", told apart from a failed query by
+  PowerShell's `CmdletizationQuery_NotFound` error id; netsh, the fallback,
+  fails alike for both, so its failure is no answer. The copied report is in the user's language
+  throughout, the ports line and the pass/fail marks included.
 - **Probe, client side.** `network/reachability.rs` takes the 32-byte UDP
   probe ahead of STUN, Ember and Kad on the shared socket. The doctor
   registers its nonce before asking (`expect_probe`), and only that nonce
   counts, so probe-shaped traffic from anyone else neither fakes an arrival
-  nor crowds out the real one. The probe goes to the public ports STUN saw;
-  the report and the forwarding steps name the local ones.
+  nor crowds out the real one. The probe goes to the ports Ember advertises
+  to peers (`advertised_tcp_port` and `advertised_udp_port`, new in
+  `NetworkStats`, filled from the same functions the advertisements use):
+  a live UPnP forward before a STUN remap, and only a STUN-confirmed UDP
+  port. The STUN readings in `public_tcp_port` and `public_udp_port` could
+  name a port no peer is told to dial. The report and the forwarding steps
+  name the local ports.
 - **Probe, server side.** `/v4/reachability` in the rendezvous server
   (`reachability_v4`, advertised as `reachability` on `/v4/protocol`). It
   probes only the requester's address, at most 6 per hour per IPv4 address,
@@ -620,20 +761,32 @@ probe needs the rendezvous server change above, and works without it.
   loopback listeners. It probes a routable public IPv4 caller only and
   answers anyone else `"available": false` without dialling or charging the
   limit: an IPv6 caller would be probed where Ember does not listen, and a
-  loopback or private one is a proxy in front of the server. The answer
-  carries the server's clock, which is what the skew check reads. A 429
-  shows as "the hourly limit is used up".
+  loopback or private one is a proxy in front of the server. Every
+  well-formed request, probed or not, costs the general per-address budget
+  the pre-body gate reads. The answer carries the server's clock, which is
+  what the skew check reads. The server also advertises
+  `reachability_hourly_reason`: its hourly limit's 429 says
+  `"reason": "hourly"` and shows as "the hourly limit is used up", and any
+  other 429 from it is the general limit, which shows as "the server is
+  busy; try again in a minute" and keeps the verdict at "Still checking"
+  for the retry. From a server that does not advertise it (an older or
+  self-hosted one), any 429 from the endpoint counts as the hourly limit.
+  The sweep forgets a probe budget after its hour. The server is 0.2.0.
 - **New stats.** `NetworkStats` gained `upnp_wan_ip`, `tcp_listen_failed`,
-  `bound_udp_port` and the session's ports. Windows gained
-  `firewall::rules_in_place` and `add_rules_elevated`: one permission prompt,
+  `bound_udp_port`, the session's ports and `session_age_secs`. Windows
+  gained `firewall::rules_in_place` (`Option<bool>`) and
+  `add_rules_elevated`: one permission prompt,
   running `netsh` from an `-EncodedCommand` script, with the program path
   passed base64-encoded so no character in a folder name can end a string.
 - **UI.** `ConnectionDoctor.svelte` sits at the top of Settings > Network,
   above the port fields. The status bar shows "Check connection" beside a
   LowID or firewalled state. The automatic offer is a status-bar toast,
   once a session, after ten unbroken minutes (`connectionDoctorOffer.ts`;
-  the stepper and its timer are tested, the status bar sets the timer), not
-  part of the first-run flow. Retrying UPnP checks again ten seconds later.
+  the stepper and `runDoctorOffer`, which the status bar runs, are tested),
+  not part of the first-run flow. The ten minutes are timed on
+  `performance.now()`, and a timer that fires before they are up waits
+  again, so a clock change cannot lose the offer. Retrying UPnP checks
+  again ten seconds later.
 
 **Left as they are:**
 
@@ -645,7 +798,8 @@ probe needs the rendezvous server change above, and works without it.
   default) none is needed; on a port of its own, the rule startup adds is
   the only one.
 - **"Reconnect the eD2K server" is not an action.** "Check again" restarts
-  the Kad firewall checks only, and is offered only when offline.
+  the Kad firewall checks only, and is offered only when offline or still
+  checking.
 - **The TCP probe is a connect.** A SYN-proxying firewall, or a router
   service on the port, reads as open. Writing the nonce on the connection
   for the upload listener to recognise would close it; not done.

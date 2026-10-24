@@ -106,6 +106,7 @@ pub(in crate::network) async fn on_cache_refresh_tick(
     let cached_s: Vec<KadSearchInfo> = kad_searches_snapshot(state);
 
     state.stats.ed2k_low_id = state.server_connected.then_some(state.low_id);
+    state.stats.session_age_secs = state.session_started.elapsed().as_secs();
     let stats_snapshot = state.stats.clone();
 
     // Both of these were hand-copied transcriptions too, and the

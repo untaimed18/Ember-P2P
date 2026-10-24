@@ -56,8 +56,12 @@ pub struct EmberPublishPending {
 pub struct EmberPublishResult {
     /// Nodes that acknowledged storing the record.
     pub stored_on: usize,
-    /// Total nodes the record was sent to.
+    /// Nodes the publish meant to store the record on.
     pub targets: usize,
+    /// STOREs handed to the transport, sent or queued behind a handshake.
+    /// An ack lost on the way back leaves `stored_on` short of what was
+    /// stored, so only 0 here means no node can hold the record.
+    pub sent: usize,
 }
 
 /// Tally of work kicked off by one Ember DHT maintenance cycle (slice 6).
@@ -481,6 +485,9 @@ pub(super) struct NetworkState {
     pub(super) last_self_lookup: i64,
     /// When the KAD stack was started (eMule: first self FindNode after MIN2S(3))
     pub(super) kad_started_at: i64,
+    /// When the network loop started, for
+    /// [`crate::types::NetworkStats::session_age_secs`].
+    pub(super) session_started: std::time::Instant,
     /// eMule `CPrefs::m_tLastContact` — updated on each accepted incoming KAD UDP packet.
     pub(super) last_kad_contact: Option<i64>,
     /// Whether UDP is firewalled (separate from TCP, like eMule)
@@ -1720,9 +1727,11 @@ pub(super) struct NetworkState {
     /// Upload allowance taken from the limiter but not yet spent on a block.
     /// See [`xfer_upload_allowance_ok`].
     pub(super) xfer_upload_credit: u64,
-    /// Mirror of `channel_file_offers`, so an inbound offer can be judged
-    /// without reaching back into the settings the command loop owns.
-    pub(super) xfer_offer_policy: String,
+    /// `channel_file_offers` as in force here
+    /// ([`crate::types::channel_file_offers_in_force`]), so an inbound offer
+    /// can be judged without reaching back into the settings the command loop
+    /// owns.
+    pub(super) xfer_offer_policy: &'static str,
     /// Read-only view of the friends list, for the `"friends"` offer policy.
     pub(super) xfer_friend_hashes: crate::app_state::SharedFriendHashes,
     /// Chat attachments a friend has offered us that nobody has answered yet,

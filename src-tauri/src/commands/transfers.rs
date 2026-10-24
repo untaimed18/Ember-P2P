@@ -3130,6 +3130,10 @@ pub struct CategoryChanges {
     /// One coded error per finished download whose file stayed where it was.
     /// Its category is changed regardless.
     move_failed: Vec<String>,
+    /// Coded errors about the moves as a whole rather than any one download:
+    /// the partly shared folders' lists could not follow the files that
+    /// moved, which then leave the Library at its next reload.
+    move_warnings: Vec<String>,
 }
 
 /// A finished download to file under its new category.
@@ -3275,7 +3279,9 @@ pub async fn set_transfers_category(
         }
     }
     changes.moved = u32::try_from(moves.len()).unwrap_or(u32::MAX);
-    crate::commands::sharing::relocate_library_files(&app, &state, &moves).await;
+    changes
+        .move_warnings
+        .extend(crate::commands::sharing::relocate_library_files(&app, &state, &moves).await);
     Ok(changes)
 }
 

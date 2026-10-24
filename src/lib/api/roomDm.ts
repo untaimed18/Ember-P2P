@@ -75,6 +75,12 @@ export function deleteRoomDmThread(member: string): Promise<void> {
   return invoke('delete_room_dm_thread', { member });
 }
 
+/** Remove someone's request here and send them nothing: for a member being
+ *  ignored, who then sees their messages go undelivered. */
+export function dropRoomDmRequest(member: string): Promise<void> {
+  return invoke('drop_room_dm_request', { member });
+}
+
 export function retryRoomDm(member: string, messageId: string): Promise<void> {
   return invoke('retry_room_dm', { member, messageId });
 }

@@ -179,7 +179,7 @@ rather than a longer old one.
 | 29 | `HANDOFF_READY_PROVEN_PLAIN_VERSION` | in use | Handoff-ready plus the successor key's signature; 201 bytes |
 | 30–63 | — | unassigned | The code says they "stay unassigned" |
 | 64–255 | `EXT_KIND_MIN` and up | extension | See below |
-| 66 | `EXT_KIND_PRIVATE_MESSAGE` | in use (after 1.7.5) | [Private message](#private-messages-kind-66), sealed to one member |
+| 66 | `EXT_KIND_PRIVATE_MESSAGE` | in use (from 1.7.5) | [Private message](#private-messages-kind-66), sealed to one member |
 
 The transfer frames (9, 10, 11, 13, 14, 21, 25, 26, 28) share a header,
 `version(1) || sender(32) || target(32) || xfer_id(16)` (`XFER_HEADER_LEN`, 81),
@@ -216,8 +216,8 @@ them a meaning.
 
 **Kinds defined.** From 1.7.5, `UNDERSTOOD_EXT_KINDS` holds 64
 (`EXT_KIND_CHAT_LINE`) and 65 (`EXT_KIND_CHAT_EDIT`), the second version of
-the chat line and of its revision, under [Chat v2](#chat-v2-kinds-64-and-65).
-The build after 1.7.5 adds 66 (`EXT_KIND_PRIVATE_MESSAGE`), under
+the chat line and of its revision, under [Chat v2](#chat-v2-kinds-64-and-65),
+and 66 (`EXT_KIND_PRIVATE_MESSAGE`), under
 [Private messages](#private-messages-kind-66). 67–255 are unassigned. A kind
 is added to that list by the build that first
 gives it a meaning; `ext_kind_understood` is true for those kinds only, and a
@@ -314,6 +314,37 @@ kind 64 mints those). So a v2 line can name only its own author's line, sent
 at its own time, whether or not that line is held here. A kind 65 frame is
 held to what an edit frame is: the editor must be the line's author, or for a
 line not held, the id must bind the editor at tag 4's time.
+
+**Line id derivation** (`chat_msg_id_from_nonce` in `channel.rs`). A bound
+line id is 16 bytes:
+
+```
+nonce(6) || BLAKE3("ember-channel-chat-msg-id-v1\0" || channel_id || author || timestamp || nonce)[..10]
+```
+
+- `nonce` is 6 random bytes, and is also the id's first 6 bytes.
+- The domain string is the 28 ASCII bytes `ember-channel-chat-msg-id-v1`
+  followed by one zero byte, 29 bytes in all.
+- `channel_id` is the room's 16-byte id, the one in the gossip header.
+- `author` is the line author's 32-byte Ed25519 key: the extension frame's
+  `sender` for kind 64 and 65, the signer of a line 15 or edit 19.
+- `timestamp` is the line's send time as an `i64`, 8 bytes little-endian:
+  the time the line is signed and sealed with, which is kind 64's envelope
+  timestamp and kind 65's tag 4.
+- The hash is plain, unkeyed BLAKE3 over the concatenation, and the id takes
+  the first 10 bytes of its 32-byte output.
+
+An id binds an author and a time when recomputing it from its own first 6
+bytes and that author and time gives the whole id. Ids minted by builds
+before the binding are 16 random bytes and bind nobody but by chance
+(2^-80). For kind 65 the check is against the editor and tag 4. When the
+line is held, the editor must also be the held row's author. When it is
+not held, a revision whose id does not bind the editor is refused rather
+than stored under the editor's name. One that binds creates the line from
+the revision, as received, with its edit window judged on the author's
+clock (`apply_channel_message_edit_with`). A held row from another author
+whose id does not bind that author gives way to a revision whose id binds
+the editor.
 
 ### Pairing with the legacy frames
 
@@ -462,8 +493,8 @@ cut-over to test.
 ## Private messages (kind 66)
 
 A message from one member to another, carried by the room like chat and
-sealed to the recipient (`network/ember/room_dm.rs`). Added after 1.7.5: an
-extension kind is what the freeze allows, so nothing frozen changes. `flags`
+sealed to the recipient (`network/ember/room_dm.rs`). From 1.7.5, as an
+extension kind, so nothing else in the format changes for it. `flags`
 is always 0, and a frame of this kind with any flag set is dropped unread: a
 displayable one would have older builds tell the room a private message
 passed. A build that cannot read the kind relays it under chat's rules (ban,
@@ -513,26 +544,52 @@ holds at most `DM_REQUEST_MESSAGES_MAX` (20) messages until answered, at most
 `DM_STORED_PER_SENDER_HOUR` (120) are kept from one member an hour, and a
 conversation keeps its newest `DM_THREAD_MESSAGES_KEPT` (2000). A sender the
 user declined, or whose request was deleted, is declined for
-`DM_DECLINE_MEMORY_SECS` (7 days).
+`DM_DECLINE_MEMORY_SECS` (7 days). Ignoring a sender whose request waits
+removes it and what it held without any reply, and keeps no refusal: nothing
+goes to them, not even a reply already queued, so their messages go
+undelivered as if we were offline.
 
 A kept message or a resend of one is answered with a receipt, a declined one
 with a decline; anything over a cap is dropped unanswered. Replies wait a
 random 10 to 90 seconds (`queue_reply`): every member sees who sent each
 frame, and a receipt right behind a message would say whom it was for. A
-member draws at most 30 replies and one decline from us in 10 minutes, and at
-most 2 go out a second in all, so nobody can spend our author rate for us and
-crowd out our chat. An accept or decline is recorded only in a conversation
-open on our side (one we wrote in or accepted), and only if its envelope is
-newer than the answer already held, so a replayed old one cannot undo a later
-one. Their decline stops our pending messages and lasts 7 days, as ours does.
+member draws at most 30 replies and one decline from us in 10 minutes, so
+nobody can spend our author rate for us and crowd out our chat. When its time
+comes a queued reply is checked again, and again if it then waits on the send
+pace: nothing goes to a member ignored or banned
+since, and a decline goes only while it is still the answer (the
+policy is `off`, or our refusal of them holds). An accept or decline is
+recorded only in a conversation open on our side (one we wrote in or
+accepted), and only if its envelope is newer than the answer already held, so
+a replayed old one cannot undo a later one. Their decline stops our pending
+messages and lasts 7 days, as ours does. Answers are dated by their envelope
+timestamp: a decline stays recorded after its 7 days, so one sent after it
+ran out counts again and stops our pending messages again, while a newer copy
+of the decline in force only dates it. A message from them is their implicit
+accept, dated by its own timestamp, so a decline sent before it cannot undo
+it, and it does not undo an answer dated after it.
 
 **Sending** (`commands::room_dm`). Through a room both are in, the one the
 conversation last used while both remain. Each message keeps its
-`message_id` and is resent under a fresh envelope every 2 minutes until a
-receipt, for 20 minutes, then marked not delivered. Nothing to a friend
-(friend chat is the place), to someone whose decline holds, with no shared
-room, or while `room_dm_policy` is `off`, which also stops what is still
-being sent; Try again meets the same rules.
+`message_id` and is resent under a fresh envelope 2 minutes after each
+attempt plus 0 to 30 seconds at random, until a receipt, for 20 minutes, then
+marked not delivered. A device writes at most 20 new private messages a
+minute through one room, Try again included. Every frame of this kind it
+sends, new messages, resends, replies and the user's answers alike, goes
+through one queue: at most 2 into a room in any 1.2 seconds, a second and a
+margin for jitter, and a backlog drained one a room per tick of its
+one-second drain, below the relays' per-author rate (4 a second, chat
+included); a frame over that waits its turn rather than going out to be
+dropped, a room's answers ahead of its other frames. Past 256 waiting, a
+receipt, decline or message is dropped (a message goes again with its next
+resend), and an answer takes the place of the oldest frame that is not one. A
+frame that waited goes only if it still holds: a reply as above, an answer
+while its member is on the roster unbanned and not ignored, a message while
+it is still being sent and the policy is not `off`. One that waited over 60
+seconds is dropped, and everything queued is dropped while Ember is off or
+chat is locked. Nothing to a friend (friend chat is the place), to someone
+whose decline holds, with no shared room, or while `room_dm_policy` is `off`,
+which also stops what is still being sent; Try again meets the same rules.
 
 **Limits.** The ed25519 signature covers the ciphertext, so a message is not
 deniable: a recipient who gives away `seal_key` (which does not give away
@@ -562,6 +619,29 @@ After the name comes the channel trailer: `CHANNEL_TRAILER_VERSION` (1),
 `extra_len` (`u16`), then `extra`. The body must end exactly there. The
 signature travels beside the body; see the
 [DHT specification](ember-dht-specification.pdf) for the record as a whole.
+
+**Language wire ids** (`CHANNEL_LANGUAGES` in `network/ember/dht/publish.rs`,
+mirrored by `src/lib/channelLanguages.ts`). Byte 67 of `file_size`, and the
+language byte in a private room's presence seal (kind 2 below), carry a
+language as its position in this list plus one; 0 is no language:
+
+| Id | Code | Id | Code | Id | Code | Id | Code |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | `en` | 2 | `es` | 3 | `fr` | 4 | `de` |
+| 5 | `pt` | 6 | `it` | 7 | `ru` | 8 | `zh` |
+| 9 | `ja` | 10 | `ko` | 11 | `ar` | 12 | `hi` |
+| 13 | `tr` | 14 | `pl` | 15 | `nl` | 16 | `sv` |
+| 17 | `uk` | 18 | `vi` | 19 | `id` | 20 | `th` |
+| 21 | `fa` | 22 | `he` | 23 | `el` | 24 | `cs` |
+| 25 | `ro` | 26 | `hu` | 27 | `da` | 28 | `fi` |
+| 29 | `no` | 30 | `bn` | 31 | `ms` | 32 | `fil` |
+| 33 | `bg` | 34 | `hr` | 35 | `sr` | 36 | `sk` |
+| 37 | `ca` | | | | | | |
+
+The list is append-only. An entry is never removed or moved, since that
+would relabel every record carrying a later id; a new language takes the
+next id, and the list stays under 255 entries. A reader with no entry for an
+id, which is a later build's longer list, reads it as no language.
 
 **Storer rule.** A STORE of a channel record is kept only if
 `channel_store_ok` passes (checked on the wire in `engine.rs`'s
@@ -674,7 +754,15 @@ device reads the network's list again while it runs, about ten minutes before
 its own next publish and at least every `SETTLED_REREAD_SECS` (3 hours), and
 carries the salts it did not know, so the same identity on another device does
 not have its newer rooms dropped by this one's next publish. Those rooms are
-carried, not run here, until the next launch or a look from Settings.
+carried, not run here, until the next launch or a look from Settings. Every
+publish, changed or scheduled, goes out only after a look that began within
+the last 15 minutes (`owned_rooms_publish_waits`,
+`OWNED_ROOMS_READ_FRESH_SECS`); without one the publish asks the read loop to
+look at once and goes out when that look ends, whether or not it could read
+the list, or after 10 minutes if none ends (`OWNED_ROOMS_READ_WAIT_SECS`). A
+carried salt is listed for 60 days (`CHANNEL_CARRIED_SALT_SECS`) from when it
+was first carried, or from the latest look that found the room's snapshot,
+so a room another device runs stays listed while it runs there.
 Recovery (`commands/channel_recovery.rs`) merges the salts of every copy the
 identity signed that comes back (`merged_lists`), and takes a lookup that
 finds nothing as "no list" only once `MIN_RESPONDERS_FOR_ABSENCE` (4) nodes
@@ -773,15 +861,22 @@ How a member uses it (`committed_key_epoch` and `take_offered_key` in
 `network/channel_membership.rs`, from `join_channel`): an invite carries a join
 secret and its epoch (`ChannelInvite::key_epoch`). For a private room this
 device already holds, an invite with `key_epoch` above 0 has its secret taken
-for that epoch only if this device is behind the room's key, by the owner's
-announcement (`key_epoch_wanted` beyond the newest epoch it holds) or by the
-invite naming an epoch past the newest it holds, and the newest kind 8 record
-held names that epoch with a matching commitment to the secret's content key.
-It is then stored with `insert_channel_key_epoch`, and joining goes on as a
-re-entry. A public invite is refused, as is one at epoch 0, which does not say
-which epoch its secret belongs to, and one for an epoch below the newest this
-device holds. A first join still takes the invite as it stands, since there is
-nothing yet to check it against.
+for that epoch only if the newest kind 8 record held names that epoch with a
+matching commitment to the secret's content key, and either this device is
+behind the room's key by the owner's announcement (`key_epoch_wanted` beyond
+the newest epoch it holds) or the invite names an epoch past the newest it
+holds. Behind by the announcement, that is any epoch the record commits to,
+one below the newest held included: such a key fills an epoch this device
+never received, which it needs for lines sent under it. It never replaces a
+held key. Held keys the commitments contradict are dropped first
+(`settle_channel_keys`), so a slot still holding a key at that epoch holds
+the committed one; `insert_channel_key_epoch` refuses a slot holding a
+different key, and never moves the room's current epoch back. The key is
+then stored, and joining goes on as a re-entry. A public invite is refused,
+as is one at epoch 0, which does not say which epoch its secret belongs to,
+and, while this device is not behind by the announcement, one for an epoch
+at or below the newest it holds. A first join still takes the invite as it
+stands, since there is nothing yet to check it against.
 
 **Pending invites.** The view an invite is checked against can be stale:
 kind 3 and kind 8 are looked up only while the room is entered, so a member
@@ -991,7 +1086,14 @@ looked up on every third kind 3 pass, the first included, which with
 it, or while this device is behind (`key_epoch_wanted` beyond the newest epoch
 it holds) and the kind 8 it holds does not name `key_epoch_wanted`. The second
 covers a lookup that fell between a rotation's kind 3 and its kind 8: the next
-kind 3 pass asks again rather than leaving it for 15 minutes. A lookup given up
+kind 3 pass asks again rather than leaving it for 15 minutes. Those extra
+lookups back off while the room stays behind on the same epochs and no kind
+8 lands (`settings_lookup_backoff_allows`): the first at once, the next a pass
+later, then each twice as long after the one before, up to 6 hours
+(`SETTINGS_LOOKUP_BACKOFF_MAX_SECS`). An owner on 1.7.4 never publishes kind
+8, and a member behind its key would otherwise look it up after every pass.
+A move of `key_epoch_wanted` or of the newest epoch held, or a kind 8 landing,
+starts over; the lookup on every third pass goes on regardless. A lookup given up
 on before it finished (`release_ember_search_state`) leaves the room owed one,
 and an invite that could not be checked looks both records up at once (pending
 invites, above). This build reads tags 1 and 2, both meaningful only in a private
@@ -1261,15 +1363,20 @@ publisher republishes daily and on every publish.
 most 2,000 entries, each with name, size, eD2K, AICH and Ember BLAKE3. An entry
 may carry a note, tag `FT_EMBER_NOTE` (`0xE3`, a string of at most 256 bytes),
 which eMule's reader skips as unknown. A follower uses a list only if its size,
-eD2K hash and BLAKE3 all match the head; otherwise the feed is marked broken.
+eD2K hash and BLAKE3 all match the head, it parses, it holds `item_count`
+entries and every entry names a file one could fetch; otherwise the feed is
+marked broken.
 The list is shared hidden by its publisher and by every follower holding it:
 served to whoever asks for its hash, with Ember source records, and never in
 the Library, a browse answer, a keyword record, KAD or a server.
 
 **Links.** `ember-feed:` followed by `publisher(32) || salt(16)` in lowercase
 unpadded RFC 4648 base32 (77 characters in all), or the same after
-`https://emberp2p.org/feed/`. A link whose publisher is not a valid Ed25519
-key is refused.
+`https://emberp2p.org/feed/` or `https://www.emberp2p.org/feed/`, read in
+either case and with whitespace around it. Only the one canonical encoding of
+the 48 bytes is accepted (no character more than they need, padding bits
+zero), so two texts never name one feed. A link whose publisher is not a
+valid Ed25519 key is refused.
 
 ## Friend sessions: `EMBER_EXT_BROWSE_SCOPE_AWARE`
 
@@ -1345,7 +1452,7 @@ names no offer. `EMBER_EXT_MAILBOX_AWARE` says nothing about waiting: 1.7.4
 sends it and still drops an offer at five minutes, and 1.7.4 sends neither
 form, so nothing waits with it.
 
-**Friend status, after 1.7.5.** `EMBER_EXT_STATUS` (`0x13`) carries the
+**Friend status, from 1.7.5.** `EMBER_EXT_STATUS` (`0x13`) carries the
 status a user shows friends while connected. Its body is a chat envelope
 (`encrypt_chat_status`) under the friend's chat key, sealing `"STA1" ||
 status(1)`: 0 online, 1 away, 2 busy, and any other value read as online.
@@ -1361,7 +1468,7 @@ session ends, so a friend with no session always shows offline; a friend who
 never sends one shows online.
 Older builds log the sub-type as unknown and ignore it.
 
-**Feed heads, after 1.7.5.** `EMBER_EXT_FEED_HEAD` (`0x14`) pushes a feed head
+**Feed heads, from 1.7.5.** `EMBER_EXT_FEED_HEAD` (`0x14`) pushes a feed head
 the sender just published, so friends who follow it see the update without
 waiting for their next lookup. Its body is a chat envelope
 (`encrypt_chat_for_peer`) under the friend's chat key, sealing the signed
@@ -1425,6 +1532,9 @@ signed by anyone else, or forwarded, is ignored. Older builds log the sub-type a
   the nickname pad's last byte in a private room's seal, a
   `CHANNEL_LANGUAGES` wire id with 0 for none, and the rule that only the
   member's own presence record sets or clears it.
+- The `CHANNEL_LANGUAGES` wire ids 1 to 37 as tabled under
+  [DHT channel records](#dht-channel-records), and the rule that the list
+  only grows at its end.
 - The meaning of `EMBER_EXT_BROWSE_SCOPE_AWARE`, and that it or
   `EMBER_EXT_MAILBOX_AWARE` marks a session as honouring friends-only files.
 - Both forms of `EMBER_EXT_ATTACH_WAITS`: the empty one asking for the named

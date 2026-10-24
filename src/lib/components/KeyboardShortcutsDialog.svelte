@@ -74,9 +74,10 @@
       })),
   );
 
-  // Settings sits past the Alt+1..0 range whenever all eleven entries are
-  // visible, so it carries its own conventional key. Listed only when the
-  // positional map doesn't already reach it, to keep one row per destination.
+  // Settings sits past the Alt+1..0 range whenever all twelve entries are
+  // visible (Ember on), so it carries its own conventional key. With Ember off
+  // ten are, and Alt+0 reaches it. Listed only when the positional map doesn't
+  // already reach it, to keep one row per destination.
   let settingsHasNavDigit = $derived(
     navShortcuts.length >= visibleNavItems($appSettings?.ember_native_enabled).length,
   );

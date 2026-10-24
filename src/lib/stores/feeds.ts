@@ -2,6 +2,7 @@ import { derived, get, writable } from 'svelte/store';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { FEEDS_CHANGED_EVENT, listFollowedFeeds, type FeedsChangedEvent, type FollowedFeed } from '$lib/api/feeds';
 import { notify } from '$lib/notifications';
+import { formatNumber } from '$lib/utils';
 import * as m from '$lib/paraglide/messages';
 
 /** The feeds this identity follows, for the sidebar badge and the page. */
@@ -37,7 +38,7 @@ export async function initFeedsStore(): Promise<void> {
       const { added, title } = event.payload ?? {};
       // `notify` stays quiet while the user is looking at Ember.
       if (added && added > 0) {
-        void notify('feed_update', m.feeds_notify_new({ title: title?.trim() || m.feeds_untitled(), count: added }));
+        void notify('feed_update', m.feeds_notify_new({ title: title?.trim() || m.feeds_untitled(), count: formatNumber(added) }));
       }
     });
   } catch (e) {

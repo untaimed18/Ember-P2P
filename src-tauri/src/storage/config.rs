@@ -15,11 +15,17 @@ const UPLOAD_SLOTS_AUTO_KEY: &str = "upload_slots_auto";
 const UPLOAD_SLOTS_AUTO_ON_DISK: u32 = 4;
 
 /// `settings` as `config.json` holds them. Every writer of the file goes
-/// through this, so Auto upload slots are never stored as 0.
+/// through this, so Auto upload slots are never stored as 0, and the keys
+/// this build does not know ([`AppSettings::extra`]) are written back.
 pub(crate) fn settings_json(settings: &AppSettings) -> serde_json::Result<String> {
     let mut value = serde_json::to_value(settings)?;
-    if settings.max_concurrent_uploads == 0 {
-        if let Some(fields) = value.as_object_mut() {
+    if let Some(fields) = value.as_object_mut() {
+        for (key, kept) in &settings.extra {
+            if key != UPLOAD_SLOTS_AUTO_KEY && !fields.contains_key(key) {
+                fields.insert(key.clone(), kept.clone());
+            }
+        }
+        if settings.max_concurrent_uploads == 0 {
             fields.insert("max_concurrent_uploads".into(), UPLOAD_SLOTS_AUTO_ON_DISK.into());
             fields.insert(UPLOAD_SLOTS_AUTO_KEY.into(), true.into());
         }
@@ -39,6 +45,9 @@ fn parse_settings(data: &str) -> serde_json::Result<(AppSettings, bool)> {
     let value: serde_json::Value = serde_json::from_str(data)?;
     let flagged = value.get(UPLOAD_SLOTS_AUTO_KEY).and_then(serde_json::Value::as_bool) == Some(true);
     let mut settings: AppSettings = serde_json::from_value(value)?;
+    // Written from `max_concurrent_uploads` alone, so a stale flag can never
+    // reach the file beside a count set by hand to four.
+    settings.extra.remove(UPLOAD_SLOTS_AUTO_KEY);
     let old_auto = !flagged && settings.max_concurrent_uploads == 0;
     if flagged && settings.max_concurrent_uploads == UPLOAD_SLOTS_AUTO_ON_DISK {
         settings.max_concurrent_uploads = 0;
@@ -432,6 +441,65 @@ mod ember_default_on_tests {
         let mut edited: serde_json::Value = serde_json::from_str(&settings_json(&auto).unwrap()).unwrap();
         edited["max_concurrent_uploads"] = 10.into();
         assert_eq!(slots(&edited.to_string()), (10, false));
+    }
+
+    /// A key this build does not know is written back as read, under the
+    /// known fields; the Auto flag is written from the count alone.
+    #[test]
+    fn unknown_keys_survive_a_load_and_save() {
+        let mut written_later = serde_json::to_value(AppSettings {
+            max_concurrent_uploads: 0,
+            ..AppSettings::default()
+        })
+        .unwrap();
+        let object = written_later.as_object_mut().unwrap();
+        object.insert("later_setting".into(), serde_json::json!({"on": false}));
+        object.insert("upload_slots_auto".into(), true.into());
+        object.insert("max_concurrent_uploads".into(), UPLOAD_SLOTS_AUTO_ON_DISK.into());
+
+        let (mut settings, _) = parse_settings(&written_later.to_string()).unwrap();
+        assert_eq!(settings.max_concurrent_uploads, 0);
+        assert!(!settings.extra.contains_key(UPLOAD_SLOTS_AUTO_KEY));
+        let saved: serde_json::Value =
+            serde_json::from_str(&settings_json(&settings).unwrap()).unwrap();
+        assert_eq!(saved["later_setting"], serde_json::json!({"on": false}));
+        assert_eq!(saved, written_later, "nothing lost or added");
+
+        // A manual four no longer reads as Auto after the flag came in from
+        // disk, and a known field wins over an extra key of its name.
+        settings.max_concurrent_uploads = UPLOAD_SLOTS_AUTO_ON_DISK;
+        settings.extra.insert("nickname".into(), serde_json::json!("stale"));
+        let saved = settings_json(&settings).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert!(raw.get(UPLOAD_SLOTS_AUTO_KEY).is_none());
+        assert_eq!(raw["nickname"], serde_json::json!(settings.nickname));
+        let (reread, _) = parse_settings(&saved).unwrap();
+        assert_eq!(reread.max_concurrent_uploads, UPLOAD_SLOTS_AUTO_ON_DISK);
+        assert_eq!(reread.extra.keys().collect::<Vec<_>>(), ["later_setting"]);
+    }
+
+    /// One unreadable ignore entry no longer fails the parse, which on load
+    /// meant moving the file aside and resetting every setting.
+    #[test]
+    fn a_bad_ignored_member_keeps_every_other_setting_on_load() {
+        let mut value = serde_json::to_value(AppSettings {
+            max_friends: 77,
+            auto_away_minutes: 120,
+            room_dm_policy: "friends".into(),
+            ..AppSettings::default()
+        })
+        .unwrap();
+        value["ignored_members"] = serde_json::json!([
+            { "pubkey": "ab".repeat(32) },
+            { "rooms": null },
+        ]);
+        let (mut settings, _) = parse_settings(&value.to_string()).expect("still parses");
+        crate::commands::settings::soft_repair_settings(&mut settings);
+        crate::commands::settings::validate_settings(&settings).expect("still valid");
+        assert_eq!(settings.max_friends, 77);
+        assert_eq!(settings.auto_away_minutes, 120, "a later build's idle time is kept");
+        assert_eq!(settings.room_dm_policy, "friends", "and its policy");
+        assert_eq!(settings.ignored_members.map(|list| list.len()), Some(1));
     }
 
     /// The upload-slot count a config reads as, and whether it is rewritten.

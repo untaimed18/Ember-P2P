@@ -23,6 +23,13 @@ use crate::types::NetworkStats;
 const CLOCK_SKEW_WARN_SECS: i64 = 300;
 /// How long the UDP probe may take to arrive after the server says it sent it.
 const UDP_PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long after start a session with no TCP finding is still checking:
+/// time for Kad to connect and run its check, or a server to give an ID.
+const SETTLING_SECS: u64 = 15 * 60;
+/// How long into a session a connected Kad with no TCP answer yet is still
+/// checking. Kad's check answers within minutes when it can; past this it has
+/// nothing more to say, and "checking" would otherwise last all session.
+const KAD_TCP_CHECK_SECS: u64 = 30 * 60;
 
 /// The one-line answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -36,6 +43,14 @@ pub enum Verdict {
     /// eMule users who are themselves firewalled cannot download from us,
     /// and we reach fewer sources. Ember's relays still carry friends and rooms.
     Limited,
+    /// Online, nothing has tested TCP from outside yet, and something still
+    /// can: the Kad check is running, the server was only busy, or the session
+    /// has just started. Too early to say.
+    Checking,
+    /// Online, nothing has tested TCP from outside, and nothing will as
+    /// things stand: no probe answer, Kad not connected, no eD2K server ID,
+    /// past the first minutes. Nothing shows the port closed either.
+    Untested,
     /// Not connected to anything.
     Offline,
 }
@@ -103,6 +118,9 @@ pub struct Signals {
     pub udp_port_moved: bool,
     /// Windows only: whether the inbound rules are in place.
     pub firewall_rules: Option<bool>,
+    /// On Windows, the rule check itself failed, so `firewall_rules` is
+    /// unknown rather than not applicable.
+    pub firewall_check_failed: bool,
     pub upnp_enabled: bool,
     pub upnp_mapped: bool,
     pub upnp_stood_down: bool,
@@ -121,6 +139,10 @@ pub struct Signals {
     /// The server would have probed, but this address had used its checks
     /// for the hour.
     pub probe_rate_limited: bool,
+    /// The server's general limit refused the probe, which passes in a minute.
+    pub probe_busy: bool,
+    /// How long the network loop has run.
+    pub session_secs: u64,
     pub clock_skew_secs: Option<i64>,
     /// Saved ports or UPnP differ from what this session runs on, so a fix
     /// for them only takes effect at a restart.
@@ -137,6 +159,22 @@ impl Signals {
 
     fn udp_open(&self) -> bool {
         self.probe_udp == Some(true) || self.kad_udp == Some(true)
+    }
+
+    /// Nothing has tested the TCP port from outside: no probe, the Kad check
+    /// still running, no server ID. A port Ember could not open needs no test.
+    fn tcp_untested(&self) -> bool {
+        !self.tcp_listen_failed && self.probe_tcp.is_none() && self.kad_tcp.is_none() && self.low_id.is_none()
+    }
+
+    /// Something can still test TCP from outside with no change from the
+    /// user: the Kad check is running in a session young enough for it to
+    /// answer, the probe can run again in a minute, or the session is too
+    /// young for Kad or a server to have answered.
+    fn tcp_test_pending(&self) -> bool {
+        (self.kad_connected && self.kad_tcp.is_none() && self.session_secs < KAD_TCP_CHECK_SECS)
+            || self.probe_busy
+            || self.session_secs < SETTLING_SECS
     }
 
     fn online(&self) -> bool {
@@ -156,9 +194,14 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
         Verdict::Reachable
     } else if tcp_open {
         Verdict::Relayed
+    } else if s.tcp_untested() && s.tcp_test_pending() {
+        Verdict::Checking
+    } else if s.tcp_untested() {
+        Verdict::Untested
     } else {
         Verdict::Limited
     };
+    let settled = matches!(verdict, Verdict::Reachable | Verdict::Relayed | Verdict::Limited);
 
     let mut checks = Vec::new();
     let mut check = |id, status, detail| checks.push(Check { id, status, detail });
@@ -170,6 +213,7 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
     match s.firewall_rules {
         Some(true) => check("windows_firewall", Pass, "ok"),
         Some(false) => check("windows_firewall", Fail, "missing"),
+        None if s.firewall_check_failed => check("windows_firewall", Skip, "check_failed"),
         None => check("windows_firewall", Skip, "not_windows"),
     }
     if !s.upnp_enabled {
@@ -188,7 +232,13 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
     } else {
         check("router_wan", Skip, "unknown");
     }
-    let not_run = if s.probe_rate_limited { "rate_limited" } else { "not_run" };
+    let not_run = if s.probe_rate_limited {
+        "rate_limited"
+    } else if s.probe_busy {
+        "busy"
+    } else {
+        "not_run"
+    };
     match s.probe_tcp {
         Some(TcpProbe::Open) if s.tcp_listen_failed => check("outside_tcp", Warn, "another_program"),
         Some(TcpProbe::Open) => check("outside_tcp", Pass, "open"),
@@ -203,6 +253,7 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
     }
     match (s.kad_tcp, s.kad_udp) {
         (Some(true), Some(true)) => check("kad_firewall", Pass, "open"),
+        (None, None) if !s.kad_connected => check("kad_firewall", Skip, "not_connected"),
         (None, None) => check("kad_firewall", Skip, "checking"),
         (Some(false), _) | (_, Some(false)) => check("kad_firewall", Fail, "firewalled"),
         _ => check("kad_firewall", Warn, "partly"),
@@ -230,9 +281,10 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
         None => check("clock", Skip, "unknown"),
     }
 
-    // What Ember already does when peers cannot reach us directly.
+    // What Ember already does when peers cannot reach us directly, once
+    // something has shown that they cannot.
     let mut helping = Vec::new();
-    if verdict != Verdict::Offline && !(tcp_open && udp_open) {
+    if settled && !(tcp_open && udp_open) {
         helping.push("relay");
         if s.buddy_connected {
             helping.push("buddy");
@@ -243,10 +295,14 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
     }
 
     // Most likely first, at most three. Port forwarding is never suggested
-    // where it cannot work: behind a carrier's NAT, or behind a VPN.
+    // where it cannot work: behind a carrier's NAT, or behind a VPN, nor
+    // before anything has shown that the port is closed.
     // A change already saved and waiting on a restart comes first, and the
     // port and router fixes wait for it: judged against this session, they
     // would only say again what the saved change is about to change.
+    // A router whose own WAN address is private or carrier-grade is behind
+    // another NAT for certain, whatever the verdict and whatever is saved, so
+    // that is said wherever peers do not already reach us.
     let mut fixes = Vec::new();
     if s.restart_pending {
         fixes.push(Fix { id: "restart", action: None });
@@ -257,10 +313,11 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
     if s.firewall_rules == Some(false) {
         fixes.push(Fix { id: "windows_firewall", action: Some("add_firewall_rules") });
     }
-    if !(tcp_open && udp_open) && verdict != Verdict::Offline && !s.restart_pending {
-        if s.router_behind_nat {
-            fixes.push(Fix { id: "carrier_nat", action: None });
-        } else if s.upnp_stood_down {
+    let unreachable = !(tcp_open && udp_open);
+    if unreachable && s.router_behind_nat {
+        fixes.push(Fix { id: "carrier_nat", action: None });
+    } else if unreachable && settled && !s.restart_pending {
+        if s.upnp_stood_down {
             fixes.push(Fix { id: "vpn", action: None });
         } else if !s.upnp_enabled {
             fixes.push(Fix { id: "enable_upnp", action: Some("enable_upnp") });
@@ -271,8 +328,11 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
             fixes.push(Fix { id: "forward_ports", action: None });
         }
     }
-    if verdict == Verdict::Offline {
-        fixes.push(Fix { id: "offline", action: Some("recheck") });
+    match verdict {
+        Verdict::Offline => fixes.push(Fix { id: "offline", action: Some("recheck") }),
+        Verdict::Checking => fixes.push(Fix { id: "checking", action: Some("recheck") }),
+        Verdict::Untested => fixes.push(Fix { id: "untested", action: None }),
+        _ => {}
     }
     if s.clock_skew_secs.is_some_and(|skew| skew.abs() > CLOCK_SKEW_WARN_SECS) {
         fixes.push(Fix { id: "clock", action: None });
@@ -281,15 +341,23 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
     (verdict, checks, helping, fixes)
 }
 
+/// The router's WAN address, when it named one a host can hold. A router
+/// with its own uplink down, or a range extender, reports 0.0.0.0, and
+/// `0/8`, loopback, multicast and `240/4` are no interface's address, so
+/// none of them says anything about the network beyond it.
+fn router_wan(text: &str) -> Option<Ipv4Addr> {
+    let wan: Ipv4Addr = text.parse().ok()?;
+    let a = wan.octets()[0];
+    (a != 0 && !wan.is_loopback() && a < 224).then_some(wan)
+}
+
 /// Whether the router's WAN address means it is itself behind another NAT:
 /// private, carrier-grade (100.64/10), DS-Lite's 192.0.0.0/24, or an address
-/// no public network hands out.
+/// no public network hands out. `wan` is one [`router_wan`] accepted.
 fn behind_another_nat(wan: Ipv4Addr) -> bool {
     let [a, b, c, _] = wan.octets();
     wan.is_private()
-        || wan.is_loopback()
         || wan.is_link_local()
-        || a == 0
         || (a == 100 && (64..128).contains(&b))
         || (a == 192 && b == 0 && c == 0)
         || (a == 198 && (18..20).contains(&b))
@@ -339,6 +407,14 @@ fn session_ports(stats: &NetworkStats, settings: &crate::types::AppSettings) -> 
     (stats.session_tcp_port, bound, stats.session_udp_port, stats.session_upnp_enabled)
 }
 
+/// The ports the outside-in probe dials: the ones peers are told to dial,
+/// since a probe of any other port says nothing about whether they get
+/// through. The local ports stand in for a network loop too old to say.
+fn probe_ports(stats: &NetworkStats, tcp_port: u16, bound_udp: u16) -> (u16, u16) {
+    let or = |advertised: u16, local: u16| if advertised != 0 { advertised } else { local };
+    (or(stats.advertised_tcp_port, tcp_port), or(stats.advertised_udp_port, bound_udp))
+}
+
 /// What gathering found besides the signals.
 struct Gathered {
     signals: Signals,
@@ -354,10 +430,8 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
     let stats = network_stats(state).await?;
     let settings = state.config.read().await.settings.clone();
     let (tcp_port, bound_udp, session_udp, upnp_enabled) = session_ports(&stats, &settings);
-    // The outside sees the ports the NAT maps ours to, when STUN said.
-    let probe_tcp = if stats.public_tcp_port != 0 { stats.public_tcp_port } else { tcp_port };
-    let probe_udp = if stats.public_udp_port != 0 { stats.public_udp_port } else { bound_udp };
-    let wan: Option<Ipv4Addr> = stats.upnp_wan_ip.parse().ok();
+    let (probe_tcp, probe_udp) = probe_ports(&stats, tcp_port, bound_udp);
+    let wan = router_wan(&stats.upnp_wan_ip);
 
     #[cfg(target_os = "windows")]
     let firewall_rules = {
@@ -365,9 +439,11 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
         tokio::task::spawn_blocking(move || crate::security::firewall::rules_in_place(tcp, udp))
             .await
             .ok()
+            .flatten()
     };
     #[cfg(not(target_os = "windows"))]
     let firewall_rules = None;
+    let firewall_check_failed = cfg!(target_os = "windows") && firewall_rules.is_none();
 
     let mut signals = Signals {
         kad_connected: stats.status == crate::types::NetworkStatus::Connected,
@@ -376,6 +452,7 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
         tcp_listen_failed: stats.tcp_listen_failed,
         udp_port_moved: bound_udp != session_udp,
         firewall_rules,
+        firewall_check_failed,
         upnp_enabled,
         upnp_mapped: stats.upnp_mapped,
         upnp_stood_down: stats.upnp_stood_down,
@@ -391,6 +468,7 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
         restart_pending: settings.tcp_port != tcp_port
             || settings.udp_port != session_udp
             || settings.upnp_enabled != upnp_enabled,
+        session_secs: stats.session_age_secs,
         ..Signals::default()
     };
 
@@ -425,6 +503,7 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
                 }
             }
             Ok(Reachability::RateLimited) => signals.probe_rate_limited = true,
+            Ok(Reachability::Busy) => signals.probe_busy = true,
             Ok(Reachability::Declined { server_time }) if server_time > 0 => {
                 signals.clock_skew_secs = Some(chrono::Utc::now().timestamp() - server_time);
             }
@@ -502,6 +581,7 @@ mod tests {
             nat_known: true,
             probe_tcp: Some(TcpProbe::Open),
             probe_udp: Some(true),
+            session_secs: 20 * 60,
             clock_skew_secs: Some(2),
             ..Signals::default()
         }
@@ -635,11 +715,206 @@ mod tests {
         assert!(behind_another_nat("192.168.0.2".parse().unwrap()));
         assert!(behind_another_nat("10.1.2.3".parse().unwrap()));
         assert!(behind_another_nat("192.0.0.2".parse().unwrap()), "DS-Lite");
-        assert!(behind_another_nat("0.0.0.0".parse().unwrap()));
         assert!(behind_another_nat("198.18.0.1".parse().unwrap()));
         assert!(!behind_another_nat("100.128.0.1".parse().unwrap()));
         assert!(!behind_another_nat("203.0.113.5".parse().unwrap()));
         assert!(!behind_another_nat("192.0.2.1".parse().unwrap()));
+    }
+
+    /// A router with its uplink down, or an extender, says 0.0.0.0: that is
+    /// no WAN address, not a carrier's NAT.
+    #[test]
+    fn a_wan_address_no_interface_holds_is_unknown_not_carrier_nat() {
+        for nonsense in ["0.0.0.0", "0.1.2.3", "127.0.0.1", "224.0.0.1", "240.0.0.1", "255.255.255.255", "", "x"] {
+            assert_eq!(router_wan(nonsense), None, "{nonsense}");
+        }
+        assert_eq!(router_wan("100.64.1.2"), Some(Ipv4Addr::new(100, 64, 1, 2)));
+        assert_eq!(router_wan("203.0.113.5"), Some(Ipv4Addr::new(203, 0, 113, 5)));
+
+        let wan_down = Signals { router_wan_known: false, router_behind_nat: false, ..reachable() };
+        let (_, checks, _, _) = assess(&wan_down);
+        assert!(checks.iter().any(|c| c.id == "router_wan" && c.status == CheckStatus::Skip && c.detail == "unknown"));
+    }
+
+    /// With nothing yet tested from outside, the doctor says so instead of
+    /// calling the port closed, and sends no one to their router.
+    #[test]
+    fn with_no_tcp_evidence_yet_the_verdict_is_still_checking_and_no_router_fix_is_offered() {
+        let untested = Signals {
+            server_connected: false,
+            kad_tcp: None,
+            kad_udp: None,
+            low_id: None,
+            probe_tcp: None,
+            probe_udp: None,
+            ..reachable()
+        };
+        let (verdict, _, helping, _) = assess(&untested);
+        assert_eq!(verdict, Verdict::Checking);
+        assert!(helping.is_empty());
+        assert_eq!(assess(&untested).3, vec![Fix { id: "checking", action: Some("recheck") }]);
+
+        for upnp in [
+            Signals { upnp_mapped: false, ..untested.clone() },
+            Signals { upnp_enabled: false, ..untested.clone() },
+        ] {
+            assert_eq!(fix_ids(&upnp), vec!["checking"]);
+        }
+        // UDP already known either way does not settle TCP.
+        assert_eq!(assess(&Signals { probe_udp: Some(true), ..untested.clone() }).0, Verdict::Checking);
+        assert_eq!(assess(&Signals { kad_udp: Some(false), ..untested.clone() }).0, Verdict::Checking);
+        // What is already certain still comes first.
+        let no_rules = Signals { firewall_rules: Some(false), ..untested.clone() };
+        assert_eq!(fix_ids(&no_rules), vec!["windows_firewall", "checking"]);
+    }
+
+    /// Online over the Ember network alone, past the first minutes, with no
+    /// probe answer: nothing will test TCP as things stand.
+    fn nothing_left_to_test() -> Signals {
+        Signals {
+            kad_connected: false,
+            server_connected: false,
+            kad_tcp: None,
+            kad_udp: None,
+            low_id: None,
+            probe_tcp: None,
+            probe_udp: None,
+            ..reachable()
+        }
+    }
+
+    /// "Still checking" lasts only while something can still test TCP
+    /// without the user: Kad connected with its check running in the first
+    /// half hour, a probe the server was only too busy for, or a session in
+    /// its first minutes.
+    #[test]
+    fn checking_lasts_only_while_something_can_still_test_tcp() {
+        let idle = nothing_left_to_test();
+        assert_eq!(assess(&idle).0, Verdict::Untested);
+        for pending in [
+            Signals { kad_connected: true, ..idle.clone() },
+            Signals { kad_connected: true, session_secs: KAD_TCP_CHECK_SECS - 1, ..idle.clone() },
+            Signals { probe_busy: true, ..idle.clone() },
+            Signals { session_secs: 60, ..idle.clone() },
+            Signals { session_secs: SETTLING_SECS - 1, ..idle.clone() },
+        ] {
+            assert_eq!(assess(&pending).0, Verdict::Checking, "{pending:?}");
+        }
+        assert_eq!(assess(&Signals { session_secs: SETTLING_SECS, ..idle.clone() }).0, Verdict::Untested);
+        for late in [KAD_TCP_CHECK_SECS, 6 * 3600] {
+            let kad_silent = Signals { kad_connected: true, session_secs: late, ..idle.clone() };
+            assert_eq!(assess(&kad_silent).0, Verdict::Untested, "a Kad check with no answer by {late} s");
+        }
+        // A UDP finding says nothing about TCP, nor does a used-up probe.
+        assert_eq!(assess(&Signals { kad_udp: Some(true), ..idle.clone() }).0, Verdict::Untested);
+        assert_eq!(assess(&Signals { probe_rate_limited: true, ..idle }).0, Verdict::Untested);
+    }
+
+    /// Untested says so honestly: nothing shows the port closed, so nothing
+    /// is listed as handled and no router step is offered, and the Kad check
+    /// reads as not connected rather than still running.
+    #[test]
+    fn an_untested_connection_gets_no_router_steps_and_is_told_how_to_get_tested() {
+        let idle = nothing_left_to_test();
+        let (verdict, checks, helping, fixes) = assess(&idle);
+        assert_eq!(verdict, Verdict::Untested);
+        assert!(helping.is_empty());
+        assert_eq!(fixes, vec![Fix { id: "untested", action: None }]);
+        assert!(checks.iter().any(|c| c.id == "kad_firewall" && c.detail == "not_connected"));
+        for upnp in [
+            Signals { upnp_mapped: false, ..idle.clone() },
+            Signals { upnp_enabled: false, ..idle.clone() },
+            Signals { upnp_stood_down: true, ..idle.clone() },
+        ] {
+            assert_eq!(fix_ids(&upnp), vec!["untested"]);
+        }
+        let no_rules = Signals { firewall_rules: Some(false), ..idle };
+        assert_eq!(fix_ids(&no_rules), vec!["windows_firewall", "untested"]);
+    }
+
+    /// A router behind another NAT is known for certain, so that is said
+    /// whatever the verdict, except where peers already reach us.
+    #[test]
+    fn carrier_nat_is_said_whatever_the_verdict() {
+        let checking = Signals {
+            server_connected: false,
+            kad_tcp: None,
+            kad_udp: None,
+            low_id: None,
+            probe_tcp: None,
+            probe_udp: None,
+            router_behind_nat: true,
+            ..reachable()
+        };
+        assert_eq!(assess(&checking).0, Verdict::Checking);
+        assert_eq!(fix_ids(&checking), vec!["carrier_nat", "checking"]);
+        let untested = Signals { router_behind_nat: true, ..nothing_left_to_test() };
+        assert_eq!(fix_ids(&untested), vec!["carrier_nat", "untested"]);
+        let offline = Signals { router_behind_nat: true, ..Signals::default() };
+        assert_eq!(fix_ids(&offline), vec!["carrier_nat", "offline"]);
+        let waiting = Signals { kad_tcp: Some(false), router_behind_nat: true, restart_pending: true, ..checking };
+        assert_eq!(fix_ids(&waiting), vec!["restart", "carrier_nat"]);
+        let reachable = Signals { router_behind_nat: true, ..reachable() };
+        assert!(!fix_ids(&reachable).contains(&"carrier_nat"));
+    }
+
+    /// The server's general limit is a passing refusal: the check says the
+    /// server is busy, and the verdict waits for the retry.
+    #[test]
+    fn a_busy_server_is_not_the_hourly_limit_and_keeps_the_verdict_checking() {
+        let busy = Signals { probe_busy: true, ..nothing_left_to_test() };
+        let (verdict, checks, _, fixes) = assess(&busy);
+        assert_eq!(verdict, Verdict::Checking);
+        assert!(checks.iter().any(|c| c.id == "outside_tcp" && c.detail == "busy"));
+        assert!(checks.iter().any(|c| c.id == "outside_udp" && c.detail == "busy"));
+        assert_eq!(fixes, vec![Fix { id: "checking", action: Some("recheck") }]);
+    }
+
+    #[test]
+    fn any_one_tcp_finding_settles_the_verdict() {
+        let untested = Signals { kad_tcp: None, low_id: None, probe_tcp: None, probe_udp: None, ..reachable() };
+        for closed in [
+            Signals { probe_tcp: Some(TcpProbe::Closed), ..untested.clone() },
+            Signals { probe_tcp: Some(TcpProbe::Timeout), ..untested.clone() },
+            Signals { kad_tcp: Some(false), ..untested.clone() },
+            Signals { low_id: Some(true), ..untested.clone() },
+        ] {
+            let (verdict, _, helping, _) = assess(&closed);
+            assert_eq!(verdict, Verdict::Limited, "{closed:?}");
+            assert!(helping.contains(&"relay"));
+            assert_eq!(fix_ids(&closed), vec!["forward_ports"]);
+        }
+        let taken = Signals { tcp_listen_failed: true, ..untested };
+        assert_eq!(assess(&taken).0, Verdict::Limited);
+    }
+
+    #[test]
+    fn a_firewall_check_that_failed_is_not_called_not_applicable() {
+        let failed = Signals { firewall_rules: None, firewall_check_failed: true, ..reachable() };
+        let (_, checks, _, fixes) = assess(&failed);
+        assert!(checks.iter().any(|c| c.id == "windows_firewall" && c.status == CheckStatus::Skip && c.detail == "check_failed"));
+        assert!(fixes.is_empty());
+        let elsewhere = Signals { firewall_rules: None, ..reachable() };
+        let (_, checks, _, _) = assess(&elsewhere);
+        assert!(checks.iter().any(|c| c.id == "windows_firewall" && c.detail == "not_windows"));
+    }
+
+    /// The probe dials what peers are told to dial: the UPnP forward over a
+    /// STUN remap, never a STUN reading that was not confirmed.
+    #[test]
+    fn the_probe_dials_the_advertised_ports_not_the_last_stun_observation() {
+        let stats = NetworkStats {
+            advertised_tcp_port: 4662,
+            advertised_udp_port: 4672,
+            public_tcp_port: 51234,
+            public_udp_port: 51240,
+            ..Default::default()
+        };
+        assert_eq!(probe_ports(&stats, 4662, 4672), (4662, 4672));
+        let remapped = NetworkStats { advertised_tcp_port: 51234, advertised_udp_port: 51240, ..Default::default() };
+        assert_eq!(probe_ports(&remapped, 4662, 4672), (51234, 51240));
+        let old_loop = NetworkStats { public_tcp_port: 51234, public_udp_port: 51240, ..Default::default() };
+        assert_eq!(probe_ports(&old_loop, 4662, 4673), (4662, 4673));
     }
 
     /// What the doctor judges is what this session runs on; saved settings

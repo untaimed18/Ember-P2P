@@ -22,8 +22,8 @@
     isChannelLanguage,
   } from '$lib/channelLanguages';
   import { appSettings, loadAppSettings } from '$lib/stores/settings';
-  import { dmRequests, keepDmTab, openPrivateChat, refreshDmThreads } from '$lib/stores/roomDm';
-  import { answerRoomDmRequest } from '$lib/api/roomDm';
+  import { closeDmTab, dmPreview, dmRequests, keepDmTab, openPrivateChat, refreshDmThreads } from '$lib/stores/roomDm';
+  import { answerRoomDmRequest, dropRoomDmRequest } from '$lib/api/roomDm';
   import {
     copyToClipboard,
     disambiguatedMemberName,
@@ -126,6 +126,7 @@
     ignoreMemberEverywhere,
     ignoreScopeFor,
     forgetChannelIgnores,
+    pushIgnoredNow,
     notifyLevelOf,
     refreshChannels,
     unhideChannel,
@@ -1441,6 +1442,28 @@
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
       answeringDm = null;
+      void refreshDmThreads();
+    }
+  }
+
+  /** Ignore everywhere, and remove any request of theirs here without a word
+   *  to them: a decline would tell them they were refused, where silence
+   *  looks like being offline. The request goes only once the backend holds
+   *  the ignore, so nothing they send meanwhile opens a new one; if the
+   *  ignore could not be saved, the request stays. */
+  async function ignoreEverywhereSilently(member: string, name: string) {
+    const holdsBanner = answeringDm === null;
+    if (holdsBanner) answeringDm = member;
+    const hadRequest = $dmRequests.some((t) => t.member_pubkey === member.toLowerCase());
+    ignoreMemberEverywhere(member, name);
+    try {
+      await pushIgnoredNow();
+      await dropRoomDmRequest(member);
+      if (hadRequest) closeDmTab(member);
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      if (holdsBanner) answeringDm = null;
       void refreshDmThreads();
     }
   }
@@ -3113,7 +3136,7 @@
       <span>
         {m.channels_dm_request_banner({ name: requestName })}
         {#if request.last_text}
-          <span class="dm-request-preview"><bdi dir="auto">{request.last_text.slice(0, 140)}</bdi></span>
+          <span class="dm-request-preview"><bdi dir="auto">{dmPreview(request.last_text)}</bdi></span>
         {/if}
       </span>
       <div class="banner-actions">
@@ -3126,14 +3149,12 @@
         <button class="ghost" disabled={answeringDm !== null} onclick={() => void answerDmRequest(request.member_pubkey, false)}>
           {m.channels_dm_decline()}
         </button>
-        <!-- Declines, and drops whatever they send next anywhere. -->
+        <!-- Sends them nothing: the request goes, and whatever they send
+             next anywhere is dropped. -->
         <button
           class="ghost"
           disabled={answeringDm !== null}
-          onclick={() => {
-            ignoreMemberEverywhere(request.member_pubkey, request.name);
-            void answerDmRequest(request.member_pubkey, false);
-          }}
+          onclick={() => void ignoreEverywhereSilently(request.member_pubkey, request.name)}
         >
           {m.channels_ignore_everywhere()}
         </button>
@@ -4334,7 +4355,7 @@
                             onclick={(e) => {
                               closeCardMenu(e.currentTarget);
                               if (ignoreScope === 'global') toggleMemberIgnore(mem.member_pubkey, mem.nickname);
-                              else ignoreMemberEverywhere(mem.member_pubkey, mem.nickname);
+                              else void ignoreEverywhereSilently(mem.member_pubkey, mem.nickname);
                             }}
                           >{ignoreScope === 'global'
                             ? m.channels_unignore()

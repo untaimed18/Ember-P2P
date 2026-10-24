@@ -1130,7 +1130,7 @@ pub async fn create_channel(
     };
     // Now that this identity owns a room, its list is read again on a cadence
     // (see `channel_recovery::SETTLED_REREAD_SECS`), even if the startup read
-    // had nothing to settle.
+    // had nothing to settle, and before the list naming this room goes out.
     crate::commands::channel_recovery::keep_reading_list(app);
     Ok(ChannelInviteInfo {
         uri: invite.format(),
@@ -2994,16 +2994,40 @@ async fn load_owned_channel_as(
 /// across the DHT publish too, which is bounded by that call's own timeout.
 static MODERATION_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
 
+/// The longest line, in UTF-8 bytes of its text, whose sealed legacy frame
+/// fits [`channel::RELAYABLE_GOSSIP_MAX_BYTES`]: past it, [`chat_gossip_frames`]
+/// refuses the line. A reply's trailer ([`channel::REPLY_TRAILER_BYTES`]) comes
+/// out of the same room.
+///
+/// The frame adds the same overhead whatever the text says, but the text it
+/// carries is what was typed with emoji joiners and the other characters the
+/// outgoing sanitiser drops taken out, so a line typed with those can run a
+/// little longer. Measured on what was typed, this is the most that always goes
+/// out. The send path measures the frame itself; this is the number the
+/// frontend holds (`CHANNEL_LINE_MAX_TEXT_BYTES` in `src/lib/api/channels.ts`).
+/// Once [`channel::SEND_LEGACY_CHAT_FRAMES`] is off the v2 frame sets the
+/// limit instead, and this changes.
+#[cfg(test)]
+const CHANNEL_LINE_MAX_TEXT_BYTES: usize = 3728;
+/// [`CHANNEL_LINE_MAX_TEXT_BYTES`] for a revision, whose legacy frame also
+/// carries the line's id and both its times. A revised reply keeps its
+/// trailer, so it too leaves [`channel::REPLY_TRAILER_BYTES`] less.
+#[cfg(test)]
+const CHANNEL_EDIT_MAX_TEXT_BYTES: usize = 3696;
+
 /// The sealed frames of one outgoing line or revision, the legacy one first so
 /// that a build reading only it meets it ahead of the frame it cannot read.
 /// `legacy_envelope` and `at` are the legacy frame's envelope id and time; the
 /// v2 frame carries its own.
 ///
-/// A sealed frame has to fit one datagram, which a text near the 4096-byte cap
-/// does not. The v2 frame is the larger of the two, so a line whose legacy
-/// frame fits and v2 frame does not goes out in the legacy form alone, which
-/// every build reads; one whose first frame does not fit is refused, before
-/// the callers store anything, rather than kept here and delivered nowhere.
+/// A sealed frame has to fit one datagram inside the overlay relay envelope a
+/// firewalled member's copy goes in ([`channel::RELAYABLE_GOSSIP_MAX_BYTES`]),
+/// which a text near the 4096-byte cap does not. Unless the line is a reply,
+/// whose legacy trailer outweighs the v2 frame's reference, the v2 frame is the
+/// larger of the two, so a line whose legacy frame fits and v2 frame does not
+/// goes out in the legacy form alone, which every build reads; one whose first
+/// frame does not fit is refused, before the callers store anything, rather
+/// than kept here and delivered nowhere.
 fn chat_gossip_frames(
     channel_id: [u8; 16],
     key: &[u8; 32],
@@ -3024,9 +3048,7 @@ fn chat_gossip_frames(
         )
         .encode()
     };
-    let fits = |frame: &Vec<u8>| {
-        frame.len() <= crate::network::ember::dht::messages::MAX_DELIVERABLE_PAYLOAD
-    };
+    let fits = |frame: &Vec<u8>| frame.len() <= channel::RELAYABLE_GOSSIP_MAX_BYTES;
     let mut frames = Vec::with_capacity(2);
     if let Some((plain, _)) = &chat.legacy {
         frames.push(seal(legacy_envelope, at, plain));
@@ -6252,7 +6274,7 @@ async fn start_signed_record(
     await_reply(rx, "channels_publish_failed", "No response from network").await?
 }
 
-async fn publish_signed_record(
+pub(crate) async fn publish_signed_record(
     state: &AppState,
     record: SignedRecord,
 ) -> Result<EmberPublishResult, String> {
@@ -6975,9 +6997,11 @@ mod tests {
         assert_eq!(parsed.tail.key_epoch, Some(0));
     }
 
-    /// Every frame handed to the gossip layer fits a datagram. Near the cap a
-    /// line goes out in the legacy form alone; past what the legacy frame can
-    /// carry it is refused, so it is neither stored nor lost on the way.
+    /// Every frame handed to the gossip layer fits a datagram, wrapped for an
+    /// overlay relay hop too, which is how a firewalled member gets it. Near
+    /// the cap a line goes out in the legacy form alone; past what the legacy
+    /// frame can carry it is refused, so it is neither stored nor lost on the
+    /// way.
     #[test]
     fn a_line_too_long_for_a_datagram_is_refused_and_its_oversized_twin_dropped() {
         let key = crypto::signing_key_from_bytes(&[0x31; 32]);
@@ -7001,10 +7025,99 @@ mod tests {
             .find(|len| frames_for(*len).is_ok())
             .expect("some line fits");
         assert!(longest > 3_500, "a long line still goes out: {longest}");
+        let relayed = |frame: &Vec<u8>| channel::encode_channel_relay_envelope(&room, &[0x42; 16], frame).len();
+        for len in longest.saturating_sub(64)..=longest {
+            let frames = frames_for(len).expect("every shorter line fits too");
+            assert!(
+                frames.iter().all(|frame| relayed(frame) <= max),
+                "a {len}-byte line's frame fits a relay hop's datagram"
+            );
+        }
         let frames = frames_for(longest).unwrap();
-        assert!(frames.iter().all(|frame| frame.len() <= max));
         if channel::SEND_LEGACY_CHAT_FRAMES {
             assert_eq!(frames.len(), 1, "only the legacy frame fits at the edge");
+        }
+        // The first length refused is one whose frame would still fit a direct
+        // datagram, and only a relay hop's would not.
+        let line_id = channel::new_chat_msg_id(&room, &sender, 1_700_000_000);
+        let text = "a".repeat(longest + 1);
+        let line = channel::outgoing_chat_line(&key, &room, &line_id, 1_700_000_000, &text, &text, None).unwrap();
+        let first = channel::ChannelGossip::sealed(
+            room,
+            line_id,
+            &content_key,
+            1_700_000_000,
+            &line.legacy.as_ref().map_or_else(|| line.v2.plain(&sender), |(plain, _)| plain.clone()),
+            channel::CHANNEL_MSG_TTL_DEFAULT,
+            1_700_000_000,
+        )
+        .encode();
+        assert!(first.len() <= max && relayed(&first) > max, "{}", first.len());
+        assert!(frames_for(longest + 1).is_err());
+    }
+
+    /// The limits the frontend holds are exactly where the send path starts
+    /// refusing: for a line and a revision, each with and without a reply,
+    /// built as `send_channel_message` and `edit_channel_message` build them.
+    /// Multi-byte text meets the same edge, and text whose joiners the legacy
+    /// frame drops only ever gets further.
+    #[test]
+    fn the_frontends_line_limits_are_where_the_frames_stop_fitting() {
+        let key = crypto::signing_key_from_bytes(&[0x31; 32]);
+        let sender = key.verifying_key().to_bytes();
+        let room = [0x5a; 16];
+        let content_key = [0x77; 32];
+        let parent = [0xa7; 16];
+        let sent = 1_700_000_000;
+        let line_id = channel::new_chat_msg_id(&room, &sender, sent);
+        let frames_for = |typed: &str, parent: Option<&[u8; 16]>, edit: bool| {
+            let sanitized = crate::security::sanitize_outgoing_message_text(typed).expect("under the character cap");
+            let cleaned = channel::strip_reply_trailers(&sanitized).to_string();
+            let wire_text = channel::with_reply_trailer(&cleaned, parent);
+            let v2_text = channel::chat_v2_outgoing_text(typed, &cleaned, parent);
+            if edit {
+                let revision =
+                    channel::outgoing_chat_edit(&key, &room, &line_id, sent, sent + 60, &wire_text, &v2_text, parent)
+                        .expect("under the text cap");
+                chat_gossip_frames(room, &content_key, &sender, [0x42; 16], sent + 60, &revision)
+            } else {
+                let line = channel::outgoing_chat_line(&key, &room, &line_id, sent, &wire_text, &v2_text, parent)
+                    .expect("under the text cap");
+                chat_gossip_frames(room, &content_key, &sender, line_id, sent, &line)
+            }
+        };
+        let longest = |parent: Option<&[u8; 16]>, edit: bool| {
+            let fits = |len: usize| frames_for(&"a".repeat(len), parent, edit).is_ok();
+            let longest = (1..=MAX_CHANNEL_MESSAGE).rev().find(|len| fits(*len)).expect("some line fits");
+            assert!((1..=longest).step_by(97).all(fits), "every shorter line fits too");
+            longest
+        };
+        let reply = channel::REPLY_TRAILER_BYTES;
+        let cases = [
+            (None, false, CHANNEL_LINE_MAX_TEXT_BYTES),
+            (Some(&parent), false, CHANNEL_LINE_MAX_TEXT_BYTES - reply),
+            (None, true, CHANNEL_EDIT_MAX_TEXT_BYTES),
+            (Some(&parent), true, CHANNEL_EDIT_MAX_TEXT_BYTES - reply),
+        ];
+        for (parent, edit, limit) in cases {
+            let what = format!("edit {edit}, reply {}", parent.is_some());
+            assert_eq!(longest(parent, edit), limit, "{what}");
+
+            // Two-, three- and four-byte characters, padded to the edge.
+            let mixed = "é中😀".repeat(limit / 9);
+            let at_edge = format!("{mixed}{}", "a".repeat(limit - mixed.len()));
+            assert_eq!(at_edge.len(), limit);
+            assert!(frames_for(&at_edge, parent, edit).is_ok(), "{what}: multi-byte text at the edge");
+            assert!(frames_for(&format!("{at_edge}a"), parent, edit).is_err(), "{what}: one byte past it");
+
+            // Each family emoji is 18 bytes typed and 12 once its joiners are
+            // gone, and the edge is measured on the 12.
+            let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}".repeat(10);
+            let legacy_len = crate::security::without_message_text_joiners(&family).len();
+            let joined = format!("{family}{}", "a".repeat(limit - legacy_len));
+            assert_eq!(joined.len(), limit + 60);
+            assert!(frames_for(&joined, parent, edit).is_ok(), "{what}: joiners do not count");
+            assert!(frames_for(&format!("{joined}a"), parent, edit).is_err(), "{what}: past the edge without them");
         }
     }
 

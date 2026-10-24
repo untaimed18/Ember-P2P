@@ -43,6 +43,8 @@
     reachable: [m.doctor_verdict_reachable, m.doctor_verdict_reachable_body],
     relayed: [m.doctor_verdict_relayed, m.doctor_verdict_relayed_body],
     limited: [m.doctor_verdict_limited, m.doctor_verdict_limited_body],
+    checking: [m.doctor_verdict_checking, m.doctor_verdict_checking_body],
+    untested: [m.doctor_verdict_untested, m.doctor_verdict_untested_body],
     offline: [m.doctor_verdict_offline, m.doctor_verdict_offline_body],
   };
   const HELPING: Record<string, () => string> = {
@@ -60,6 +62,8 @@
     router_upnp: [m.doctor_fix_router_upnp, m.doctor_fix_router_upnp_body],
     forward_ports: [m.doctor_fix_forward_ports, m.doctor_fix_forward_ports_body],
     offline: [m.doctor_fix_offline, m.doctor_fix_offline_body],
+    checking: [m.doctor_fix_checking, m.doctor_fix_checking_body],
+    untested: [m.doctor_fix_untested, m.doctor_fix_untested_body],
     clock: [m.doctor_fix_clock, m.doctor_fix_clock_body],
   };
   const ACTION: Record<string, () => string> = {
@@ -87,6 +91,7 @@
     tcp_taken: m.doctor_detail_tcp_taken,
     udp_moved: m.doctor_detail_udp_moved,
     missing: m.doctor_detail_missing,
+    check_failed: m.doctor_detail_check_failed,
     not_windows: m.doctor_detail_not_windows,
     off: m.doctor_detail_off,
     stood_down: m.doctor_detail_stood_down,
@@ -100,6 +105,7 @@
     filtered: m.doctor_detail_filtered,
     not_run: m.doctor_detail_not_run,
     rate_limited: m.doctor_detail_rate_limited,
+    busy: m.doctor_detail_busy,
     another_program: m.doctor_detail_another_program,
     checking: m.doctor_detail_checking,
     firewalled: m.doctor_detail_firewalled,
@@ -187,9 +193,15 @@
   function reportText(r: ConnectionReport): string {
     const lines = [
       `${m.doctor_title()}: ${VERDICT[r.verdict]?.[0]() ?? r.verdict}`,
-      `TCP ${r.tcp_port}, UDP ${r.udp_port}; LAN ${address(r.lan_ip)}; public ${address(r.public_ip)}`,
+      m.doctor_report_ports({
+        tcp: r.tcp_port,
+        udp: r.udp_port,
+        lan: address(r.lan_ip),
+        ip: address(r.public_ip),
+      }),
       ...r.checks.map(
-        (c) => `[${c.status}] ${CHECK[c.id]?.() ?? c.id}: ${DETAIL[c.detail]?.() ?? c.detail}`,
+        (c) =>
+          `[${STATUS[c.status]?.() ?? c.status}] ${CHECK[c.id]?.() ?? c.id}: ${DETAIL[c.detail]?.() ?? c.detail}`,
       ),
       ...r.fixes.map((f) => `-> ${FIX[f.id]?.[0](params) ?? f.id}`),
     ];
@@ -355,7 +367,9 @@
     border-color: color-mix(in srgb, var(--success) 45%, var(--border));
   }
 
-  .doctor-verdict.relayed {
+  .doctor-verdict.relayed,
+  .doctor-verdict.checking,
+  .doctor-verdict.untested {
     border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
   }
 

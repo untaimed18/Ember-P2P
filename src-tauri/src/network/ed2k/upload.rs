@@ -9723,7 +9723,7 @@ impl UploadHandler {
                         &mut writer,
                         OP_EMULEPROT,
                         OP_EMBER_FRIEND_REQ,
-                        nickname.as_bytes(),
+                        super::friend_connect::friend_request_payload(&nickname),
                     )
                     .await
                     .is_ok()
@@ -10161,7 +10161,7 @@ impl UploadHandler {
                             &mut writer,
                             OP_EMULEPROT,
                             OP_EMBER_FRIEND_REQ,
-                            nickname.as_bytes(),
+                            super::friend_connect::friend_request_payload(&nickname),
                         )
                         .await
                         .is_ok()
@@ -14650,7 +14650,7 @@ impl UploadHandler {
                                 &mut writer,
                                 OP_EMULEPROT,
                                 OP_EMBER_FRIEND_REQ,
-                                nickname.as_bytes(),
+                                super::friend_connect::friend_request_payload(&nickname),
                             )
                             .await
                             .is_ok()
@@ -14977,7 +14977,8 @@ impl UploadHandler {
                                     "Sending friend request to verified Ember peer {peer_addr}"
                                 );
                                 let nickname = self.nickname_snapshot().await;
-                                let nick_bytes = nickname.as_bytes();
+                                let nick_bytes =
+                                    super::friend_connect::friend_request_payload(&nickname);
                                 if write_packet_async(
                                     &mut writer,
                                     OP_EMULEPROT,

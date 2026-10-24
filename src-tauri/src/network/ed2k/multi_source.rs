@@ -7592,7 +7592,10 @@ async fn download_parts_from_source(
                                                 friend_seen_emitted = true;
                                             }
                                             if !friend_request_sent {
-                                                let nick_bytes = our_nickname.as_bytes();
+                                                let nick_bytes =
+                                                    super::friend_connect::friend_request_payload(
+                                                        &our_nickname,
+                                                    );
                                                 if write_packet_async_ms(
                                                     &mut *writer,
                                                     OP_EMULEPROT,
@@ -8425,7 +8428,10 @@ async fn download_parts_from_source(
                                             friend_seen_emitted = true;
                                         }
                                         if !friend_request_sent {
-                                            let nick_bytes = our_nickname.as_bytes();
+                                            let nick_bytes =
+                                                super::friend_connect::friend_request_payload(
+                                                    &our_nickname,
+                                                );
                                             if write_packet_async_ms(
                                                 &mut *writer,
                                                 OP_EMULEPROT,

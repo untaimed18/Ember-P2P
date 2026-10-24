@@ -534,14 +534,16 @@ pub(super) async fn known_clients_snapshot(
             let mut map = std::collections::HashMap::new();
             match db_q.get_friends_full() {
                 Ok(rows) => {
-                    for (hash, nick, _added, last_ip, _port, last_seen, _mutual, alias) in rows {
+                    for (hash, nick, _added, last_ip, _port, last_seen, _mutual, _label, _self) in
+                        rows
+                    {
                         let Some(key) = parse_ed2k_hash16(&hash) else {
                             continue;
                         };
                         map.insert(
                             key,
                             FriendMeta {
-                                nickname: if alias.is_empty() { nick } else { alias },
+                                nickname: nick,
                                 last_ip,
                                 last_seen,
                             },

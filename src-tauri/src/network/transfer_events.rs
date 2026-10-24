@@ -730,7 +730,7 @@ pub(super) async fn handle_download_event(
             db_progress_last_persist.remove(&transfer_id);
             crate::sharing::feed_files::report_fetch(
                 &transfer_id,
-                crate::sharing::feed_files::FetchOutcome::Failed(error),
+                crate::sharing::feed_files::FetchOutcome::failed(error),
             );
         }
         DownloadEvent::Completed {

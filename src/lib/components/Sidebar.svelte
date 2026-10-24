@@ -374,10 +374,11 @@
       return;
     }
     // Ctrl/Cmd+, opens Settings — the desktop convention (VS Code, Slack,
-    // browsers). Settings is the eleventh nav entry, past the Alt+1..0 range,
-    // so without this the most-visited page was the only click-only one. Kept
-    // off the positional map on purpose: Settings keeps this key regardless of
-    // whether Channels is hidden and shifts everything up by one.
+    // browsers). Settings is the twelfth nav entry with Ember on, past the
+    // Alt+1..0 range, so without this the most-visited page would be
+    // click-only. Kept off the positional map on purpose: Settings keeps this
+    // key regardless of whether Channels and Feeds are hidden, which leaves ten
+    // entries and moves Settings up to Alt+0.
     if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key === ',') {
       if (isTypingTarget(e.target)) return;
       e.preventDefault();

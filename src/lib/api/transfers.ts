@@ -245,6 +245,9 @@ export interface CategoryChanges {
   /** A coded error for each finished download whose file stayed where it
    *  was; its category is changed regardless. */
   move_failed: string[];
+  /** Coded errors about the moves as a whole rather than any one download:
+   *  the partly shared folders' lists could not follow the files that moved. */
+  move_warnings: string[];
 }
 
 /** One call for a whole selection. `moveFinished: false` relabels finished

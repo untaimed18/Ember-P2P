@@ -30,6 +30,8 @@
     sendChannelTyping,
     setChannelDraft,
     setChannelMessagePinned,
+    CHANNEL_EDIT_MAX_TEXT_BYTES,
+    CHANNEL_LINE_MAX_TEXT_BYTES,
     CHANNEL_PIN_MAX,
     REPLY_REFERENCE_BYTES,
     type ChannelInfo,
@@ -116,10 +118,11 @@
   import IconX from '$lib/components/IconX.svelte';
   import { passiveScroll } from '$lib/actions/passiveScroll';
 
-  // The backend rejects chat messages whose UTF-8 encoding exceeds this many
-  // bytes (`peers.rs`); the textarea `maxlength` only bounds characters, so we
-  // mirror the byte check here to give a clear error instead of a generic
-  // "send failed" on multi-byte/emoji-heavy text.
+  // The backend rejects friend chat messages whose UTF-8 encoding exceeds this
+  // many bytes (`peers.rs`); the textarea `maxlength` only bounds characters, so
+  // we mirror the byte check here to give a clear error instead of a generic
+  // "send failed" on multi-byte/emoji-heavy text. Room lines have the tighter
+  // limits in `$lib/api/channels`.
   const MAX_MESSAGE_BYTES = 4096;
   // Upper bound on messages held in memory at once. "Load older" stops past
   // this so a very long history can't grow the array (and the rendered DOM)
@@ -702,9 +705,9 @@
 
   const utf8 = new TextEncoder();
 
-  /** A revised reply keeps its signed reference, which counts against the cap. */
+  /** A revised reply keeps its signed reference, which counts against the limit. */
   function editMaxBytes(msg: ConvMessage): number {
-    return MAX_MESSAGE_BYTES - (msg.reply_to ? REPLY_REFERENCE_BYTES : 0);
+    return CHANNEL_EDIT_MAX_TEXT_BYTES - (msg.reply_to ? REPLY_REFERENCE_BYTES : 0);
   }
 
   /** What the save would send, in the unit the backend caps. */
@@ -2782,9 +2785,13 @@
     const reply = channel ? replyTarget : null;
     // Guard on UTF-8 byte length to match the backend's limit. `maxlength`
     // only caps characters, so a message of multi-byte glyphs (emoji, CJK)
-    // can be under 4096 chars yet over 4096 bytes and be rejected server-side
-    // with a generic error. A reply's signed reference rides in the same 4096.
-    const maxBytes = MAX_MESSAGE_BYTES - (reply ? REPLY_REFERENCE_BYTES : 0);
+    // can be under 4096 chars yet over the byte limit and be rejected
+    // server-side with a generic error. A room line has to fit one relayed
+    // datagram, which leaves it less than 4096, and a reply's signed reference
+    // rides in the same frame.
+    const maxBytes = channel
+      ? CHANNEL_LINE_MAX_TEXT_BYTES - (reply ? REPLY_REFERENCE_BYTES : 0)
+      : MAX_MESSAGE_BYTES;
     if (new TextEncoder().encode(text).length > maxBytes) {
       sendError = m.chat_message_too_long({ max: maxBytes });
       return;

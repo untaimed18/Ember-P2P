@@ -314,8 +314,22 @@ export async function sendChannelMessage(
 
 /** UTF-8 bytes a reply's signed reference adds to the message on the wire.
  *  Mirrors `REPLY_TRAILER_BYTES` in `src-tauri/src/network/ember/channel.rs`;
- *  the 4096-byte cap counts it, so a reply leaves this much less room. */
+ *  every room line limit counts it, so a reply leaves this much less room. */
 export const REPLY_REFERENCE_BYTES = 136;
+
+/** The longest room line, in UTF-8 bytes of what was typed, that always goes
+ *  out. Its sealed frame has to fit one datagram through a relay hop, which
+ *  stops well short of the 4096-byte text cap, and the backend refuses a
+ *  longer one with `channels_message_too_long_to_send`. Emoji joiners do not
+ *  travel in that frame, so a line typed with them can be slightly longer. A
+ *  reply leaves `REPLY_REFERENCE_BYTES` less. Mirrors
+ *  `CHANNEL_LINE_MAX_TEXT_BYTES` in `src-tauri/src/commands/channels.rs`. */
+export const CHANNEL_LINE_MAX_TEXT_BYTES = 3728;
+
+/** `CHANNEL_LINE_MAX_TEXT_BYTES` for a revision, whose frame also carries the
+ *  line's id and both its times. A revised reply keeps its reference, so it too
+ *  leaves `REPLY_REFERENCE_BYTES` less. Mirrors `CHANNEL_EDIT_MAX_TEXT_BYTES`. */
+export const CHANNEL_EDIT_MAX_TEXT_BYTES = 3696;
 
 export async function markChannelMessagesRead(channelId: string): Promise<void> {
   return invoke('mark_channel_messages_read', { channelId });

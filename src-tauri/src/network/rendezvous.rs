@@ -101,6 +101,10 @@ pub(crate) struct ServerFeatures {
     pub chat_mailbox: bool,
     /// Probes the caller's own ports from outside (`/v4/reachability`).
     pub reachability: bool,
+    /// Its hourly probe budget's 429 says `"reason": "hourly"`, so any other
+    /// 429 from `/v4/reachability` is the general limit. Without this, every
+    /// 429 from it is the hourly budget.
+    pub reachability_hourly_reason: bool,
 }
 
 type ProtocolCache =
@@ -247,6 +251,7 @@ pub(crate) async fn negotiate_server_features(base_url: &str) -> Result<ServerFe
                 sealed_intro: body["sealed_intro"].as_bool() == Some(true),
                 chat_mailbox: body["chat_mailbox"].as_bool() == Some(true),
                 reachability: body["reachability"].as_bool() == Some(true),
+                reachability_hourly_reason: body["reachability_hourly_reason"].as_bool() == Some(true),
             };
             remember_v4_server(base_url).await;
             remember_protocol(base_url, features).await;
@@ -273,6 +278,7 @@ pub(crate) async fn negotiate_server_features(base_url: &str) -> Result<ServerFe
             sealed_intro: false,
             chat_mailbox: false,
             reachability: false,
+            reachability_hourly_reason: false,
         };
         remember_protocol(base_url, features).await;
         Ok(features)
@@ -2070,6 +2076,7 @@ mod intro_presence_tests {
                 sealed_intro: true,
                 chat_mailbox: false,
                 reachability: false,
+                reachability_hourly_reason: false,
             },
         )
         .await;
@@ -2727,6 +2734,8 @@ pub enum Reachability {
     Declined { server_time: i64 },
     /// This address has had its checks for the hour.
     RateLimited,
+    /// The server's general per-address limit, which passes within a minute.
+    Busy,
 }
 
 /// Ask the server to connect back to `tcp_port` and send the UDP probe
@@ -2738,11 +2747,12 @@ pub async fn request_reachability(
     nonce: &[u8; 16],
 ) -> Result<Reachability, String> {
     require_https(base_url)?;
-    if !negotiate_server_features(base_url).await?.reachability {
+    let features = negotiate_server_features(base_url).await?;
+    if !features.reachability {
         return Ok(Reachability::Unsupported);
     }
     let url = format!("{}/v4/reachability", base_url.trim_end_matches('/'));
-    let body = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(20), async {
         let resp = client(base_url)
             .await?
             .post(&url)
@@ -2755,21 +2765,34 @@ pub async fn request_reachability(
             .await
             .map_err(|e| format!("reachability: {e}"))?;
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Ok(None);
+            let refusal = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await.unwrap_or_default();
+            return Ok(refusal_from(features.reachability_hourly_reason, &refusal));
         }
         if !resp.status().is_success() {
             return Err(format!("reachability: status {}", resp.status()));
         }
         serde_json::from_slice::<serde_json::Value>(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
-            .map(Some)
+            .map(|body| reachability_from(&body))
             .map_err(|e| format!("reachability bad body: {e}"))
     })
     .await
     .map_err(|_| "reachability timed out".to_string())??;
-    let Some(body) = body else {
-        return Ok(Reachability::RateLimited);
-    };
-    Ok(reachability_from(&body))
+    Ok(answer)
+}
+
+/// What a 429 from `/v4/reachability` means. A server that advertises
+/// `reachability_hourly_reason` says `"reason": "hourly"` for its hourly probe
+/// budget, and any other 429 from it is the general per-minute limit. One that
+/// does not may refuse for the hour with no body at all, so every 429 from it
+/// is the hourly budget.
+fn refusal_from(hourly_reason_advertised: bool, body: &[u8]) -> Reachability {
+    if !hourly_reason_advertised
+        || serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|v| v["reason"] == "hourly")
+    {
+        Reachability::RateLimited
+    } else {
+        Reachability::Busy
+    }
 }
 
 fn reachability_from(body: &serde_json::Value) -> Reachability {
@@ -2784,6 +2807,31 @@ fn reachability_from(body: &serde_json::Value) -> Reachability {
         udp_sent: body["udp_sent"].as_bool() == Some(true),
         server_time,
     })
+}
+
+#[cfg(test)]
+mod reachability_tests {
+    use super::{refusal_from, Reachability};
+
+    /// From a server that labels its hourly refusal, only that reads as
+    /// "used up for the hour"; the general per-minute limit, which answers
+    /// 429 with no body, is busy and passes.
+    #[test]
+    fn a_labelling_server_is_hourly_only_when_it_says_so() {
+        assert_eq!(refusal_from(true, br#"{"reason":"hourly","server_time":1}"#), Reachability::RateLimited);
+        assert_eq!(refusal_from(true, b""), Reachability::Busy);
+        assert_eq!(refusal_from(true, b"Too Many Requests"), Reachability::Busy);
+        assert_eq!(refusal_from(true, br#"{"reason":"general"}"#), Reachability::Busy);
+    }
+
+    /// A server that does not label its refusals may send the hourly one
+    /// with no body, so any 429 from it is the hourly budget.
+    #[test]
+    fn an_unlabelling_server_is_hourly_whatever_its_429_says() {
+        for body in [&b""[..], b"Too Many Requests", br#"{"reason":"general"}"#, br#"{"reason":"hourly"}"#] {
+            assert_eq!(refusal_from(false, body), Reachability::RateLimited);
+        }
+    }
 }
 
 /// Whether the server holds sealed chat for offline friends.

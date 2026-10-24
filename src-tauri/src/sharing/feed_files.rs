@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// A list kept for a feed and served to whoever asks for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,9 +70,19 @@ pub fn unshare_hidden(ed2k_hash: &[u8; 16], owner: &str) -> bool {
     }
 }
 
+/// The first of `holders` whose file is there, or the first at all: one
+/// holder's copy deleted under it must not stop the others' being served.
+fn served(holders: &[(String, HiddenShare)]) -> Option<&HiddenShare> {
+    holders
+        .iter()
+        .find(|(_, share)| share.path.is_file())
+        .or_else(|| holders.first())
+        .map(|(_, share)| share)
+}
+
 /// The hidden share for `ed2k_hash`, if one is kept.
 pub fn hidden_share(ed2k_hash: &[u8; 16]) -> Option<HiddenShare> {
-    hidden().read().get(ed2k_hash).and_then(|holders| holders.first()).map(|(_, share)| share.clone())
+    hidden().read().get(ed2k_hash).and_then(|holders| served(holders)).cloned()
 }
 
 /// Every hidden share, once per list, for the Ember source publisher.
@@ -79,7 +90,7 @@ pub fn hidden_shares() -> Vec<([u8; 16], HiddenShare)> {
     hidden()
         .read()
         .iter()
-        .filter_map(|(hash, holders)| holders.first().map(|(_, share)| (*hash, share.clone())))
+        .filter_map(|(hash, holders)| served(holders).map(|share| (*hash, share.clone())))
         .collect()
 }
 
@@ -88,10 +99,10 @@ pub fn hidden_shares() -> Vec<([u8; 16], HiddenShare)> {
 pub struct InternalFetch {
     /// Where the finished file goes, by its own name.
     pub dest: PathBuf,
-    /// Given up on by the feeds code while the transfer may still be
+    /// When the feeds code gave up on it, while the transfer may still be
     /// finishing. Still internal, so a late completion lands in the feeds
     /// folder rather than the user's, and is thrown away there.
-    pub cancelled: bool,
+    pub cancelled: Option<Instant>,
 }
 
 fn fetches() -> &'static parking_lot::Mutex<HashMap<String, InternalFetch>> {
@@ -104,24 +115,23 @@ fn fetches() -> &'static parking_lot::Mutex<HashMap<String, InternalFetch>> {
 /// Before it is queued, so nothing that sees it first takes it for the
 /// user's.
 pub fn begin_internal_fetch(id: &str, dest: PathBuf) {
-    fetches().lock().insert(id.to_string(), InternalFetch { dest, cancelled: false });
+    fetches().lock().insert(id.to_string(), InternalFetch { dest, cancelled: None });
 }
 
 /// The feeds code gave up on fetch `id`. It stays internal until its
-/// transfer reports an end, or [`forget_cancelled_fetch`] once it surely
+/// transfer reports an end, or [`forget_cancelled_fetches`] once it surely
 /// will not.
 pub fn cancel_internal_fetch(id: &str) {
     if let Some(fetch) = fetches().lock().get_mut(id) {
-        fetch.cancelled = true;
+        fetch.cancelled.get_or_insert_with(Instant::now);
     }
 }
 
-/// Forget a cancelled fetch whose transfer never reported an end.
-pub fn forget_cancelled_fetch(id: &str) {
-    let mut fetches = fetches().lock();
-    if fetches.get(id).is_some_and(|fetch| fetch.cancelled) {
-        fetches.remove(id);
-    }
+/// Forget the fetches given up on at least `grace` ago whose transfers
+/// never reported an end. One sweep for all of them, rather than a timer
+/// each.
+pub fn forget_cancelled_fetches(grace: Duration) {
+    fetches().lock().retain(|_, fetch| fetch.cancelled.is_none_or(|at| at.elapsed() < grace));
 }
 
 /// Whether transfer `id` is a fetch for the feeds code.
@@ -144,7 +154,24 @@ pub fn end_internal_fetch(id: &str) -> Option<InternalFetch> {
 pub enum FetchOutcome {
     /// Verified and moved to where it asked to finish.
     Done(PathBuf),
+    /// The bytes the eD2K hash names are not what the head pinned (its
+    /// BLAKE3 or AICH): the list does not match its head, and no source can
+    /// change that.
+    Mismatch(String),
     Failed(String),
+}
+
+impl FetchOutcome {
+    /// A failure with `error`: [`FetchOutcome::Mismatch`] for a pin the
+    /// finished file missed, otherwise [`FetchOutcome::Failed`].
+    pub fn failed(error: String) -> Self {
+        use crate::network::ed2k::transfer::{is_ember_blake3_mismatch, is_expected_aich_mismatch};
+        if is_ember_blake3_mismatch(&error) || is_expected_aich_mismatch(&error) {
+            Self::Mismatch(error)
+        } else {
+            Self::Failed(error)
+        }
+    }
 }
 
 type FetchReports = tokio::sync::mpsc::UnboundedSender<(String, FetchOutcome)>;
@@ -164,7 +191,7 @@ pub fn listen_for_fetches() -> tokio::sync::mpsc::UnboundedReceiver<(String, Fet
 /// Tell the feeds code how internal fetch `id` ended, and forget it. A file
 /// a cancelled fetch finished with is deleted instead.
 pub fn report_fetch(id: &str, outcome: FetchOutcome) {
-    if end_internal_fetch(id).is_some_and(|fetch| fetch.cancelled) {
+    if end_internal_fetch(id).is_some_and(|fetch| fetch.cancelled.is_some()) {
         if let FetchOutcome::Done(path) = outcome {
             let _ = std::fs::remove_file(path);
         }
@@ -246,10 +273,41 @@ mod tests {
         assert!(!file.exists());
 
         begin_internal_fetch(id, file.clone());
-        forget_cancelled_fetch(id);
+        forget_cancelled_fetches(Duration::ZERO);
         assert!(is_internal_fetch(id), "only a cancelled fetch is forgotten");
         cancel_internal_fetch(id);
-        forget_cancelled_fetch(id);
+        forget_cancelled_fetches(Duration::from_secs(600));
+        assert!(is_internal_fetch(id), "not before its grace is up");
+        forget_cancelled_fetches(Duration::ZERO);
         assert!(!is_internal_fetch(id));
+    }
+
+    #[test]
+    fn a_pin_the_finished_file_missed_is_a_mismatch_and_anything_else_a_failure() {
+        let pin = crate::network::ed2k::transfer::EMBER_BLAKE3_MISMATCH_MSG.to_string();
+        assert_eq!(FetchOutcome::failed(pin.clone()), FetchOutcome::Mismatch(pin));
+        let aich = "expected AICH hash mismatch for part 3".to_string();
+        assert_eq!(FetchOutcome::failed(aich.clone()), FetchOutcome::Mismatch(aich));
+        let reset = "connection reset by peer".to_string();
+        assert_eq!(FetchOutcome::failed(reset.clone()), FetchOutcome::Failed(reset));
+    }
+
+    #[test]
+    fn a_list_is_served_from_a_holder_whose_file_is_there() {
+        let hash = [0xB3u8; 16];
+        let dir = std::env::temp_dir().join(format!("ember-feed-holders-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (gone, there) = (dir.join("gone"), dir.join("there"));
+        std::fs::write(&there, b"list").unwrap();
+        let share = |path: &Path| HiddenShare { path: path.to_path_buf(), size: 4, name: "n".into(), ember_file_hash: "e".into() };
+        share_hidden(hash, "first", share(&gone));
+        share_hidden(hash, "second", share(&there));
+        assert_eq!(hidden_share(&hash).map(|s| s.path), Some(there.clone()));
+        assert!(hidden_shares().iter().any(|(h, s)| *h == hash && s.path == there));
+        std::fs::remove_file(&there).unwrap();
+        assert_eq!(hidden_share(&hash).map(|s| s.path), Some(gone), "none there: still the first");
+        unshare_hidden(&hash, "first");
+        unshare_hidden(&hash, "second");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -8,7 +8,7 @@
   import { getSharedFileCount } from '$lib/api/sharing';
   import { formatBytes, formatNumber, formatLiveSpeed } from '$lib/utils';
   import { addActionToast, addToast } from '$lib/stores/toast';
-  import { doctorOfferDueIn, initialDoctorOffer, stepDoctorOffer } from '$lib/connectionDoctorOffer';
+  import { initialDoctorOffer, runDoctorOffer } from '$lib/connectionDoctorOffer';
   import { emberJoinTimedOut } from '$lib/stores/emberJoin';
   import { isUploadCounterPhase } from '$lib/sharedFileStats';
   import { plural } from '$lib/plural';
@@ -136,30 +136,20 @@
 
   // Offered once a session, after ten minutes of being hard to reach: by then
   // the checks that settle it have run, and it is not going away by itself.
-  let doctorOffer = initialDoctorOffer;
-  $effect(() => {
-    const limited = hardToReach;
-    const step = () => {
-      const { next, offer } = stepDoctorOffer(doctorOffer, limited, Date.now());
-      doctorOffer = next;
-      if (offer) {
-        addActionToast(
-          'info',
-          m.doctor_offer(),
-          { label: m.doctor_statusbar_label(), run: () => openPage('/settings?section=network#connection-check') },
-          () => {},
-          15_000,
-        );
-      }
-    };
-    step();
-    // `hardToReach` staying true never runs this again, so the ten minutes
-    // need a timer of their own.
-    const dueIn = doctorOfferDueIn(doctorOffer, Date.now());
-    if (dueIn === null) return;
-    const timer = setTimeout(step, dueIn);
-    return () => clearTimeout(timer);
-  });
+  // `hardToReach` staying true never runs the effect again, so the runner
+  // keeps its own timer for the ten minutes.
+  const doctorOffer = { current: initialDoctorOffer };
+  $effect(() =>
+    runDoctorOffer(doctorOffer, hardToReach, () =>
+      addActionToast(
+        'info',
+        m.doctor_offer(),
+        { label: m.doctor_statusbar_label(), run: () => openPage('/settings?section=network#connection-check') },
+        () => {},
+        15_000,
+      ),
+    ),
+  );
 
   function ed2kTitle(status: string, id: 'low' | 'high' | null): string {
     const base = m.statusbar_ed2k_title({ status: statusLabel(status) });

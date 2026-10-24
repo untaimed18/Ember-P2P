@@ -3606,6 +3606,10 @@ async fn protocol_v4() -> Json<serde_json::Value> {
         "chat_mailbox": true,
         // `/v4/reachability`: the connection doctor's outside-in probe.
         "reachability": true,
+        // Its hourly refusal says `"reason": "hourly"`, so clients read any
+        // other 429 from it as the general limit. Clients treat every 429 as
+        // the hourly one from a server that does not advertise this.
+        "reachability_hourly_reason": true,
     }))
 }
 
@@ -3623,24 +3627,32 @@ async fn protocol_v4() -> Json<serde_json::Value> {
 /// would be reported closed while its IPv4 ports are open, and a private or
 /// loopback one is a proxy in front of this server, whose own ports are not
 /// anyone's to map.
+///
+/// Every well-formed request costs the general per-address budget, which the
+/// pre-body gate reads, whether or not it is probed. The hourly probe budget
+/// is charged only for a probe, and its 429 says `"reason": "hourly"` so the
+/// client can tell it from the general one, which passes within a minute.
 async fn reachability_v4(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<ReachabilityRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     if body.tcp_port == 0 || body.udp_port == 0 {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into_response());
     }
     let nonce: [u8; 16] = hex::decode(body.nonce.trim())
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
-        .ok_or(StatusCode::BAD_REQUEST)?;
+        .ok_or_else(|| StatusCode::BAD_REQUEST.into_response())?;
+    let client_ip = canonical_ip(extract_client_ip(&headers, addr));
+    if !check_rate_limit(&state, client_ip).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS.into_response());
+    }
     let server_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let client_ip = canonical_ip(extract_client_ip(&headers, addr));
     let probeable = match client_ip {
         IpAddr::V4(v4) => is_routable_public_v4(v4) || (state.reachability_probes_loopback && v4.is_loopback()),
         IpAddr::V6(_) => false,
@@ -3659,7 +3671,8 @@ async fn reachability_v4(
     )
     .await
     {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
+        let refusal = serde_json::json!({ "reason": "hourly", "server_time": server_time });
+        return Err((StatusCode::TOO_MANY_REQUESTS, Json(refusal)).into_response());
     }
     let tcp = match tokio::time::timeout(
         REACHABILITY_CONNECT_TIMEOUT,
@@ -6239,6 +6252,57 @@ async fn acknowledge_registry_write(
     }
 }
 
+/// Drop every rate-limit window that has run out, each bucket against its
+/// own window, one lock at a time.
+async fn prune_rate_limits(state: &AppState, now: Instant) {
+    state.rate_limits.write().await.prune(now, RATE_WINDOW * 2);
+    state
+        .legacy_identity_rate_limits
+        .write()
+        .await
+        .prune(now, RATE_WINDOW * 2);
+    state
+        .ticket_read_rate_limits
+        .write()
+        .await
+        .prune(now, RATE_WINDOW * 2);
+
+    // Sweep the punch-specific rate-limit map on the same cadence
+    // as the general one so the per-IP entries don't pile up after
+    // a punch burst goes quiet.
+    state.punch_rate_limits.write().await.prune(now, RATE_WINDOW * 2);
+    state
+        .chat_mailbox_rate_limits
+        .write()
+        .await
+        .prune(now, RATE_WINDOW * 2);
+    state
+        .chat_mailbox_network_rate_limits
+        .write()
+        .await
+        .prune(now, RATE_WINDOW * 2);
+
+    // Swept against their own hour-long windows. Using the general one here
+    // would drop entries that are still inside their budget and hand the
+    // creator a fresh six rooms, or the caller a fresh six probes, every
+    // couple of minutes.
+    state
+        .channel_create_rate_limits
+        .write()
+        .await
+        .prune(now, CHANNEL_CREATE_WINDOW);
+    state
+        .channel_create_network_rate_limits
+        .write()
+        .await
+        .prune(now, CHANNEL_CREATE_WINDOW);
+    state
+        .reachability_rate_limits
+        .write()
+        .await
+        .prune(now, REACHABILITY_WINDOW);
+}
+
 async fn sweep_expired(state: AppState) {
     let mut last_registry_reap = Instant::now();
     loop {
@@ -6254,46 +6318,7 @@ async fn sweep_expired(state: AppState) {
         // whole sweep cycle. Scoping keeps the critical sections
         // minimal and lets register/lookup/punch requests interleave
         // with the sweep.
-        state.rate_limits.write().await.prune(now, RATE_WINDOW * 2);
-        state
-            .legacy_identity_rate_limits
-            .write()
-            .await
-            .prune(now, RATE_WINDOW * 2);
-        state
-            .ticket_read_rate_limits
-            .write()
-            .await
-            .prune(now, RATE_WINDOW * 2);
-
-        // Sweep the punch-specific rate-limit map on the same cadence
-        // as the general one so the per-IP entries don't pile up after
-        // a punch burst goes quiet.
-        state.punch_rate_limits.write().await.prune(now, RATE_WINDOW * 2);
-        state
-            .chat_mailbox_rate_limits
-            .write()
-            .await
-            .prune(now, RATE_WINDOW * 2);
-        state
-            .chat_mailbox_network_rate_limits
-            .write()
-            .await
-            .prune(now, RATE_WINDOW * 2);
-
-        // Swept against its own hour-long window. Using the general one here
-        // would drop entries that are still inside their budget and hand the
-        // creator a fresh six rooms every couple of minutes.
-        state
-            .channel_create_rate_limits
-            .write()
-            .await
-            .prune(now, CHANNEL_CREATE_WINDOW);
-        state
-            .channel_create_network_rate_limits
-            .write()
-            .await
-            .prune(now, CHANNEL_CREATE_WINDOW);
+        prune_rate_limits(&state, now).await;
 
         state.replay_guard.write().await.prune(ReplayNow::current());
         {
@@ -7192,6 +7217,15 @@ mod relay_ticket_tests {
         let Json(body) = protocol_v4().await;
         assert_eq!(body["version"], 4);
         assert_eq!(body["sealed_intro"], true);
+    }
+
+    /// Clients only tell the general limit's 429 from the hourly one where
+    /// this is advertised; the reachability tests check both refusals.
+    #[tokio::test]
+    async fn the_protocol_probe_says_reachability_refusals_name_the_hourly_one() {
+        let Json(body) = protocol_v4().await;
+        assert_eq!(body["reachability"], true);
+        assert_eq!(body["reachability_hourly_reason"], true);
     }
 
     #[test]
@@ -9343,6 +9377,77 @@ mod relay_ticket_tests {
         }
         let limited = send(serde_json::json!({ "tcp_port": closed, "udp_port": udp_port, "nonce": nonce })).await;
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(limited.into_body(), 4096).await.unwrap();
+        let refusal: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(refusal["reason"], "hourly");
+    }
+
+    /// Declined callers still cost the general budget the pre-body gate
+    /// reads, so no caller gets unlimited body reads; and a general refusal
+    /// never claims to be the hourly one, which it does not touch.
+    #[tokio::test]
+    async fn every_reachability_request_costs_the_general_budget() {
+        use tower::ServiceExt;
+
+        let mut state = test_state();
+        state.reachability_probes_loopback = false;
+        let app = build_router(state.clone());
+        let send = |caller: SocketAddr| {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v4/reachability")
+                .header("content-type", "application/json")
+                .extension(ConnectInfo(caller))
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "tcp_port": 4662, "udp_port": 4672, "nonce": "ab".repeat(16) }).to_string(),
+                ))
+                .unwrap();
+            let app = app.clone();
+            async move { app.oneshot(request).await.unwrap() }
+        };
+
+        for caller in ["10.1.2.3:50000", "[2001:db8::1]:50000"] {
+            let caller: SocketAddr = caller.parse().unwrap();
+            for _ in 0..MAX_REQUESTS_PER_MINUTE {
+                assert_eq!(send(caller).await.status(), StatusCode::OK, "{caller}");
+            }
+            let refused = send(caller).await;
+            assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS, "{caller}");
+            let body = axum::body::to_bytes(refused.into_body(), 4096).await.unwrap();
+            assert!(
+                serde_json::from_slice::<serde_json::Value>(&body).map_or(true, |v| v["reason"] != "hourly"),
+                "{caller}"
+            );
+        }
+
+        // A public caller over the general budget is refused before any dial,
+        // without spending a probe.
+        let public: SocketAddr = "8.8.8.8:4000".parse().unwrap();
+        for _ in 0..MAX_REQUESTS_PER_MINUTE {
+            assert!(check_rate_limit(&state, public.ip()).await);
+        }
+        let refused = send(public).await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(refused.into_body(), 4096).await.unwrap();
+        assert!(serde_json::from_slice::<serde_json::Value>(&body).map_or(true, |v| v["reason"] != "hourly"));
+        assert!(state.reachability_rate_limits.read().await.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_sweep_forgets_spent_probe_budgets_after_their_hour() {
+        let state = test_state();
+        let caller: IpAddr = "8.8.8.8".parse().unwrap();
+        for _ in 0..REACHABILITY_PER_WINDOW {
+            assert!(check_rate_limit_bucket_in(&state.reachability_rate_limits, caller, REACHABILITY_PER_WINDOW, REACHABILITY_WINDOW).await);
+        }
+        let now = Instant::now();
+        prune_rate_limits(&state, now + RATE_WINDOW * 2).await;
+        assert!(
+            state.reachability_rate_limits.read().await.entries.contains_key(&caller),
+            "still inside its hour"
+        );
+        prune_rate_limits(&state, now + REACHABILITY_WINDOW).await;
+        assert!(state.reachability_rate_limits.read().await.entries.is_empty());
     }
 
     /// In service only a public IPv4 caller is probed: loopback and private

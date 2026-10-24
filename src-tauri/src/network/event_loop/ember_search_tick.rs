@@ -259,13 +259,13 @@ pub(in crate::network) async fn on_ember_search_tick(
         maybe_finish_ember_publish(state, publish_id);
     }
 
-    for publish_id in state.ember_publish.cleanup_expired() {
-        if let Some(tx) = state.ember_dht_pending_publishes.remove(&publish_id) {
-            let _ = tx.send(EmberPublishResult { stored_on: 0, targets: 0 });
+    for op in state.ember_publish.cleanup_expired() {
+        if let Some(tx) = state.ember_dht_pending_publishes.remove(&op.id) {
+            let _ = tx.send(ember_publish_result(&op));
         }
         state
             .ember_dht_publish_requests
-            .retain(|_, r| r.publish_id != publish_id);
+            .retain(|_, r| r.publish_id != op.id);
     }
 
     // 5) Maintenance liveness pings: a PONG would have cleared

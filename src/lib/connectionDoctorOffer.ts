@@ -40,3 +40,46 @@ export function doctorOfferDueIn(state: DoctorOfferState, now: number): number |
   if (state.offered || state.limitedSince === null) return null;
   return Math.max(0, state.limitedSince + DOCTOR_OFFER_AFTER_MS - now);
 }
+
+/** What the runner reads time from and waits with. `now` has to be monotonic:
+ *  a wall clock set back mid-wait would leave the offer not yet due when the
+ *  timer fires. */
+export interface DoctorOfferClock {
+  now(): number;
+  setTimeout(run: () => void, ms: number): unknown;
+  clearTimeout(timer: unknown): void;
+}
+
+const monotonicClock: DoctorOfferClock = {
+  now: () => performance.now(),
+  setTimeout: (run, ms) => setTimeout(run, ms),
+  clearTimeout: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+};
+
+/** Step `state` now, and again each time the offer falls due, until it is
+ *  made: a timer that fires early only waits again. Runs for one value of
+ *  `limited`; returns the stop for when it changes. */
+export function runDoctorOffer(
+  state: { current: DoctorOfferState },
+  limited: boolean,
+  onOffer: () => void,
+  clock: DoctorOfferClock = monotonicClock,
+): () => void {
+  let timer: unknown = null;
+  let stopped = false;
+  const step = () => {
+    timer = null;
+    if (stopped) return;
+    const now = clock.now();
+    const { next, offer } = stepDoctorOffer(state.current, limited, now);
+    state.current = next;
+    if (offer) onOffer();
+    const dueIn = doctorOfferDueIn(next, now);
+    if (dueIn !== null) timer = clock.setTimeout(step, dueIn);
+  };
+  step();
+  return () => {
+    stopped = true;
+    if (timer !== null) clock.clearTimeout(timer);
+  };
+}

@@ -825,7 +825,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // files land; `apply_network_settings` keeps it current from here.
     crate::storage::category_folders::set_folders(&settings.download_category_folders);
     crate::sharing::name_tag::set_tag_completed_downloads(settings.tag_completed_downloads);
-    room_dm::set_dm_policy(&settings.room_dm_policy, settings.ignored_members.as_deref());
+    room_dm::set_dm_policy(
+        crate::types::room_dm_policy_in_force(&settings.room_dm_policy),
+        settings.ignored_members.as_deref(),
+    );
 
     let mut state = NetworkState {
         local_id,
@@ -931,6 +934,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         self_lookup_done: false,
         last_self_lookup: 0,
         kad_started_at: monotonic_secs(),
+        session_started: std::time::Instant::now(),
         last_kad_contact: None,
         udp_firewalled: true,
         udp_fw_verified: false,
@@ -1265,7 +1269,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         xfer_stream_rx,
         xfer_block_times: VecDeque::new(),
         xfer_upload_credit: 0,
-        xfer_offer_policy: settings.channel_file_offers.clone(),
+        xfer_offer_policy: crate::types::channel_file_offers_in_force(&settings.channel_file_offers),
         xfer_friend_hashes: friend_hashes.clone(),
         attach_inbound: HashMap::new(),
         attach_held_sources: HashMap::new(),
@@ -3780,8 +3784,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // `select!`'s branch limit. It keeps its own cadence.
                 on_chat_mailbox_tick(&mut state, &db, &app_handle, &settings, ed25519_secret_key, ed25519_pubkey);
                 on_idle_check(&mut state, &settings, &app_handle, &ed25519_secret_key).await;
-                if settings.ember_native_enabled {
+                if settings.ember_native_enabled && !db.chat_locked() {
                     room_dm::send_due_replies(&udp_socket, &mut state, &db).await;
+                } else {
+                    room_dm::forget_queued_frames();
                 }
             }
 

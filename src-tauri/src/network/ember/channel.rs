@@ -5243,6 +5243,13 @@ pub fn unread_envelope_room(bytes: &[u8], supported: fn(u8) -> bool) -> Option<(
 /// `version(1) + channel_id(16) + target_id(16)` before the inner gossip body.
 pub const CHANNEL_RELAY_ENVELOPE_HEADER: usize = 1 + 16 + 16;
 
+/// The most an encoded gossip frame can be and still go out in one datagram
+/// wrapped for an overlay relay hop, which is the only way a firewalled member
+/// is reached. A frame between this and `MAX_DELIVERABLE_PAYLOAD` reaches every
+/// member but those, and fails for them without a word.
+pub const RELAYABLE_GOSSIP_MAX_BYTES: usize =
+    super::dht::messages::MAX_DELIVERABLE_PAYLOAD - CHANNEL_RELAY_ENVELOPE_HEADER;
+
 /// Overlay-buddy relay envelope. The hop cannot decrypt `inner` (AEAD).
 pub fn encode_channel_relay_envelope(
     channel_id: &[u8; 16],

@@ -25,6 +25,13 @@ fn reusable_secure_friend_session(existing: &EmberSessionHandle, peer_pk: &[u8; 
     existing.is_fresh() && existing.is_secure_v2() && existing.peer_ember_pubkey() == *peer_pk
 }
 
+/// The `OP_EMBER_FRIEND_REQ` payload naming us as `nickname`. Only an Ember
+/// peer reads it, and the friend request is where the name on its card for us
+/// comes from, so it never carries the site tag the eMule-facing name has.
+pub(crate) fn friend_request_payload(nickname: &str) -> &[u8] {
+    crate::types::without_nickname_site_tag(nickname).as_bytes()
+}
+
 /// Result from a successfully established friend session.
 pub struct FriendSessionHandle {
     pub session_id: u64,
@@ -561,7 +568,7 @@ pub async fn run_friend_session_over_transport(
         &mut writer,
         OP_EMULEPROT,
         OP_EMBER_FRIEND_REQ,
-        our_nickname.as_bytes(),
+        friend_request_payload(&our_nickname),
     )
     .await
     {
@@ -2577,6 +2584,23 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// The upload server and download sessions hold our eMule-facing name;
+    /// what reaches a friend's card is the name alone, and a long name is not
+    /// cut into the tag on the way.
+    #[test]
+    fn friend_request_payload_never_carries_the_site_tag() {
+        assert_eq!(
+            friend_request_payload(&crate::types::ed2k_nickname("Ana María", true)),
+            "Ana María".as_bytes()
+        );
+        assert_eq!(friend_request_payload("Brady"), b"Brady");
+        let long = "N".repeat(60);
+        assert_eq!(
+            friend_request_payload(&crate::types::ed2k_nickname(&long, true)),
+            long.as_bytes()
+        );
+    }
+
     #[test]
     fn punch_relay_race_is_delayed_and_fallback_phase_is_bounded() {
         assert_eq!(
@@ -2985,7 +3009,7 @@ mod tests {
             peer_ember_hash,
             [0x11; 16],
             our_ember_hash,
-            "tester".to_string(),
+            crate::types::ed2k_nickname("tester", true),
             0,
             4662,
             4672,
@@ -3045,8 +3069,9 @@ mod tests {
             .await
             .unwrap();
 
-            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
+            let (proto, opcode, payload) = read_packet_inner(&mut server_r).await.unwrap();
             assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMBER_FRIEND_REQ));
+            assert_eq!(payload, b"tester", "a friend is never sent the eMule site tag");
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), mock_peer)
             .await

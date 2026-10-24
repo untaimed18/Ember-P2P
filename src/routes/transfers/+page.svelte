@@ -9,7 +9,7 @@
   import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
   import { categoryDestinationLabel, categorySubdir, normalizeCategoryFolder } from '$lib/categoryFolders';
   import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, holdDownloadRemoved, setLocalCategory, IDLE_STATUSES, effectiveUploadSpeed, resumableFailedDownloads } from '$lib/stores/transfers';
-  import { addActionToast, removeToast, setToastMessage, toastError, toastSuccess } from '$lib/stores/toast';
+  import { addActionToast, removeToast, setToastMessage, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
   import { holdPendingCancel, releasePendingCancel } from '$lib/stores/pendingCancels';
   import { finishAction, setFinishAction, type FinishAction } from '$lib/stores/finishAction';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
@@ -40,6 +40,7 @@
     Transfer, SourceInfo, UploadQueueClient, KnownClient, KnownClientCounts, DownloadFileDetails,
   } from '$lib/types';
   import { inertBackground, menuKeydown, swallowKeyboardContextMenu, trapTabKey } from '$lib/a11y';
+  import { menuKeyDownloadId } from '$lib/transfersMenuKey';
   import { scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
@@ -3021,6 +3022,8 @@
         detail: translateError(firstFailure, m.transfers_operation_failed()),
       }));
     }
+    const [warning] = changes.move_warnings;
+    if (warning) toastWarning(translateError(warning, m.transfers_operation_failed()));
     if (changes.error) throw changes.error;
   }
 
@@ -5382,7 +5385,15 @@
     revealDownloadRow(next.id);
   } else if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
     // The focused row's menu, beside the row, as Library and Search do.
-    const row = filteredSelectableDownloads[idx >= 0 ? idx : 0];
+    const focusRowId = target?.closest<HTMLElement>('tr[data-transfer-id]')?.dataset.transferId ?? null;
+    const rowId = menuKeyDownloadId({
+      focusRowId:
+        focusRowId && filteredSelectableDownloads.some((t) => t.id === focusRowId) ? focusRowId : null,
+      inDownloadsTable: !!(target && downloadsScrollEl?.contains(target)),
+      onPage: !target || target === document.body || target === document.documentElement,
+      currentId: idx >= 0 ? filteredSelectableDownloads[idx].id : null,
+    });
+    const row = rowId ? filteredSelectableDownloads.find((t) => t.id === rowId) : undefined;
     if (!row) return;
     e.preventDefault();
     swallowKeyboardContextMenu();

@@ -33,9 +33,12 @@
     moveFilesToCategory,
     renameLibraryFile,
     tagLibraryFiles,
+    restoreLibraryFileNames,
     hasEmberTag,
     openLibraryFolder,
+    type ReapproveReport,
     type SharedFolderPick,
+    type TagReport,
   } from '$lib/api/sharing';
   import { goto } from '$app/navigation';
   import { BUILTIN_DOWNLOAD_CATEGORIES, downloadCategoryLabel } from '$lib/downloadCategories';
@@ -298,7 +301,7 @@
     renameDialog.busy = true;
     renameDialog.error = null;
     try {
-      const newPath = await renameLibraryFile(path, value);
+      const { path: newPath, warning } = await renameLibraryFile(path, value);
       if (selectedPath === path) selectedPath = newPath;
       if (checkedPaths.has(path)) {
         const next = new Set(checkedPaths);
@@ -310,6 +313,7 @@
       closeRename();
       await refresh();
       toastSuccess(m.library_renamed_named({ oldName, name: value }));
+      if (warning) toastWarning(translateError(warning, m.transfers_operation_failed()));
     } catch (e: unknown) {
       renameDialog.busy = false;
       renameDialog.error = toErr(e);
@@ -1293,7 +1297,7 @@
     bulkBusy = true;
     const folder = categoryDestinationLabel(categorySubdir(category, categoryFolders));
     try {
-      const report = { moved: 0, unchanged: 0, recategorized: 0, failed: [] as string[] };
+      const report = { moved: 0, unchanged: 0, recategorized: 0, failed: [] as string[], warning: null as string | null };
       for (let i = 0; i < targets.length; i += MAX_CATEGORY_MOVE_BATCH) {
         const batch = targets.slice(i, i + MAX_CATEGORY_MOVE_BATCH);
         let part: Awaited<ReturnType<typeof moveFilesToCategory>>;
@@ -1308,6 +1312,8 @@
         report.unchanged += part.unchanged;
         report.recategorized += part.recategorized;
         report.failed.push(...part.failed);
+        // Each batch saves the same lists, so one shown says it for all.
+        report.warning ??= part.warnings[0] ?? null;
       }
       if (report.moved > 0) {
         toastSuccess(
@@ -1331,6 +1337,7 @@
           detail: translateError(report.failed[0], m.transfers_operation_failed()),
         }));
       }
+      if (report.warning) toastWarning(translateError(report.warning, m.transfers_operation_failed()));
     } catch (e: unknown) {
       error = toErr(e);
       toastError(error);
@@ -2259,25 +2266,43 @@
   /** Add or remove the tag on `paths`, follow the selection to the new
    *  names, and offer Undo, which puts back exactly the names it changed. */
   async function applyEmberTag(paths: string[], add: boolean) {
+    await runEmberTagRenames(paths, (batch) => tagLibraryFiles(batch, add), add);
+  }
+
+  /** Undo of {@link applyEmberTag}: each file gets back the exact name it had
+   *  before, rather than the tag being worked out again. `add` is whether
+   *  this puts the tag back on. */
+  async function restoreEmberTagNames(renamed: { from: string; to: string }[], add: boolean) {
+    await runEmberTagRenames(renamed, restoreLibraryFileNames, add);
+  }
+
+  async function runEmberTagRenames<T>(
+    items: T[],
+    rename: (batch: T[]) => Promise<TagReport>,
+    add: boolean,
+  ) {
     // Waits on the other bulk actions as they wait on each other: a delete
     // or move over the same files would find paths already gone.
-    if (paths.length === 0 || bulkBusy) return;
+    if (items.length === 0 || bulkBusy) return;
     bulkBusy = true;
     const renamed: { from: string; to: string }[] = [];
     const failed: string[] = [];
-    bulkProgress = { done: 0, total: paths.length };
+    let warning: string | null = null;
+    bulkProgress = { done: 0, total: items.length };
     try {
-      for (let i = 0; i < paths.length; i += MAX_TAG_BATCH) {
-        const batch = paths.slice(i, i + MAX_TAG_BATCH);
+      for (let i = 0; i < items.length; i += MAX_TAG_BATCH) {
+        const batch = items.slice(i, i + MAX_TAG_BATCH);
         try {
-          const part = await tagLibraryFiles(batch, add);
+          const part = await rename(batch);
           renamed.push(...part.renamed);
           failed.push(...part.failed);
+          // Each batch saves the same lists, so one shown says it for all.
+          warning ??= part.warnings[0] ?? null;
         } catch (e: unknown) {
           // Earlier batches did rename; keep them and go on with the rest.
           failed.push(typeof e === 'string' ? e : toErr(e));
         }
-        bulkProgress = { done: Math.min(i + batch.length, paths.length), total: paths.length };
+        bulkProgress = { done: Math.min(i + batch.length, items.length), total: items.length };
       }
       followRenamedPaths(renamed);
       if (renamed.length > 0) {
@@ -2291,7 +2316,6 @@
               one: m.library_tag_removed_one,
               other: () => m.library_tag_removed_other({ count }),
             });
-        const undoPaths = renamed.map((r) => r.to);
         addActionToast(
           'success',
           message,
@@ -2300,7 +2324,7 @@
             undo: true,
             // Waits its turn rather than being dropped: an Undo clicked while
             // another bulk action runs would otherwise do nothing at all.
-            run: () => void whenBulkIdle().then(() => applyEmberTag(undoPaths, !add)),
+            run: () => void whenBulkIdle().then(() => restoreEmberTagNames(renamed, !add)),
           },
           () => {},
         );
@@ -2315,6 +2339,7 @@
           detail: translateError(failed[0], m.transfers_operation_failed()),
         }));
       }
+      if (warning) toastWarning(translateError(warning, m.transfers_operation_failed()));
     } catch (e: unknown) {
       error = toErr(e);
       toastError(error);
@@ -3470,8 +3495,9 @@
   // answer has to come from somewhere the page cannot answer for the user.
   async function handleReapproveFolder(path: string) {
     try {
-      if (!(await reapproveSharedFolder(path))) return;
-      afterReapproved([path]);
+      const report = await reapproveSharedFolder(path);
+      if (report.approved.length === 0) return;
+      afterReapproved(report);
       await refresh();
     } catch (e: unknown) { error = toErr(e); }
   }
@@ -3481,8 +3507,8 @@
     if (reapprovingAll) return;
     reapprovingAll = true;
     try {
-      const approved = await reapproveSharedFolders();
-      if (approved.length > 0) afterReapproved(approved);
+      const report = await reapproveSharedFolders();
+      if (report.approved.length > 0) afterReapproved(report);
       // Even when none was approved: an empty answer also means the backend
       // found nothing left to approve (a drive gone since the page loaded),
       // and the banner should stop offering what it cannot do.
@@ -3494,10 +3520,18 @@
     }
   }
 
-  /** Re-approving starts a full rescan in the backend, as Reload does, which
-   *  also lifts a Stop; show it the same way rather than wait for the poll. */
-  function afterReapproved(approved: string[]) {
+  /** Re-approving starts a rescan in the backend; show it the way Reload is
+   *  shown rather than wait for the poll. While hashing is stopped the scan
+   *  waits for Resume instead, and the Stop stays as it is. */
+  function afterReapproved({ approved, scanOnResume }: ReapproveReport) {
     const name = (path: string) => path.split(/[\\/]/).filter(Boolean).pop() || path;
+    if (scanOnResume) {
+      toastInfo(plural(approved.length, {
+        one: () => m.library_folder_reapproved_scan_on_resume({ name: name(approved[0]) }),
+        other: () => m.library_folders_reapproved_scan_on_resume_other({ count: formatNumber(approved.length) }),
+      }));
+      return;
+    }
     toastSuccess(plural(approved.length, {
       one: () => m.library_folder_reapproved({ name: name(approved[0]) }),
       other: () => m.library_folders_reapproved_other({ count: formatNumber(approved.length) }),

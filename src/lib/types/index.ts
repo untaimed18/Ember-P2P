@@ -343,6 +343,13 @@ export interface NetworkStats {
   tcp_listen_failed?: boolean;
   /** The UDP port actually bound. */
   bound_udp_port?: number;
+  /** The ports peers are told to dial: a live UPnP forward outranks a STUN
+   *  remap, and an unconfirmed STUN reading does not count, unlike
+   *  `public_tcp_port` / `public_udp_port`. */
+  advertised_tcp_port?: number;
+  advertised_udp_port?: number;
+  /** How long the network loop has run, in seconds, by the monotonic clock. */
+  session_age_secs?: number;
   stale?: boolean;
   degraded?: boolean;
   /** Stable reason code (localized at render time via

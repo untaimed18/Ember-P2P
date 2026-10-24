@@ -1245,15 +1245,15 @@ pub(super) fn member_reads_sealed_offers(
 /// explicit act. So the permissive default costs at most a dialog you dismiss,
 /// and the stricter settings exist for people who do not want even that.
 pub(super) async fn xfer_offer_allowed(state: &NetworkState, peer: &[u8; 32]) -> bool {
-    match state.xfer_offer_policy.as_str() {
-        crate::types::CHANNEL_FILE_OFFERS_NOBODY => false,
+    match state.xfer_offer_policy {
+        crate::types::CHANNEL_FILE_OFFERS_EVERYONE => true,
         crate::types::CHANNEL_FILE_OFFERS_FRIENDS => {
             // Channel members and friends are the same identity keyed two
             // ways: a friend's Ember hash is BLAKE3 of this same pubkey.
             let hash = ember::channel::channel_id_from_pubkey(peer);
             state.xfer_friend_hashes.read().await.contains(&hash)
         }
-        _ => true,
+        _ => false,
     }
 }
 

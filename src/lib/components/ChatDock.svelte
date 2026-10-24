@@ -6,7 +6,7 @@
   import { goto } from '$app/navigation';
   import ChatConversation from '$lib/components/ChatConversation.svelte';
   import RoomDmConversation from '$lib/components/RoomDmConversation.svelte';
-  import { dmMemberOf, dmUnread, refreshDmThreads } from '$lib/stores/roomDm';
+  import { dmMemberOf, dmTabKey, dmThreads, dmThreadsWithoutTab, dmUnread, refreshDmThreads } from '$lib/stores/roomDm';
   import { deleteRoomDmThread } from '$lib/api/roomDm';
   import {
     chatTabs,
@@ -207,9 +207,10 @@
   const LISTBOX_ID = 'chat-dock-switcher-list';
 
   type SwitcherRow = {
-    /** `open` rows are conversations already in the dock; `friend` rows start
+    /** `open` rows are conversations already in the dock; `private` rows are
+     *  conversations with room members that have no tab; `friend` rows start
      *  a new one. The distinction drives the close button and the section. */
-    kind: 'open' | 'friend';
+    kind: 'open' | 'private' | 'friend';
     hash: string;
     name: string;
     /** `name` as drawn: with a short hash when it could pass for another
@@ -249,6 +250,27 @@
     })),
   );
 
+  /** Accepted private conversations without a tab — closed, or never given
+   *  one past the tab cap — so their unread counts still lead somewhere.
+   *  Requests are answered from their banners on the Channels page. */
+  let privateRows = $derived<SwitcherRow[]>(
+    dmThreadsWithoutTab(
+      $dmThreads,
+      $chatTabs.map((tab) => tab.hash),
+    ).map((thread) => {
+      const hash = dmTabKey(thread.member_pubkey);
+      return {
+        kind: 'private' as const,
+        hash,
+        name: thread.name,
+        label: tabLabel({ hash, name: thread.name }),
+        online: false,
+        presence: 'offline' as const,
+        unread: $dmUnread.get(hash) ?? 0,
+      };
+    }),
+  );
+
   /**
    * Friends without an open conversation, so the list never offers to "start"
    * something that is already three rows above under Open.
@@ -285,10 +307,11 @@
 
   let needle = $derived(searchNeedle(query));
   let shownOpen = $derived(filterSwitcherRows(openRows, needle));
+  let shownPrivate = $derived(filterSwitcherRows(privateRows, needle));
   let shownFriends = $derived(filterSwitcherRows(friendRows, needle));
-  /** One index space over both sections, so the arrow keys cross the section
-   *  heading the way the eye does. */
-  let rows = $derived([...shownOpen, ...shownFriends]);
+  /** One index space over every section, so the arrow keys cross the section
+   *  headings the way the eye does. */
+  let rows = $derived([...shownOpen, ...shownPrivate, ...shownFriends]);
   /** Position of the highlight in `rows`, or -1 for none. */
   let activeIndex = $derived(
     activeHash === null ? -1 : rows.findIndex((r) => r.hash === activeHash),
@@ -352,7 +375,7 @@
    * reporting the number, which is what makes it an answer instead of a nag.
    */
   let unreadElsewhere = $derived(
-    openRows.reduce((sum, r) => (r.hash === $activeChatTab ? sum : sum + r.unread), 0),
+    [...openRows, ...privateRows].reduce((sum, r) => (r.hash === $activeChatTab ? sum : sum + r.unread), 0),
   );
   let unreadElsewhereLabel = $derived(
     plural(unreadElsewhere, {
@@ -385,6 +408,8 @@
   function activateRow(row: SwitcherRow) {
     if (row.kind === 'open') {
       setActiveTab(row.hash);
+    } else if (row.kind === 'private') {
+      openChat(row.hash, row.name);
     } else {
       if (!chatAllowedWith($appSettings, row.hash)) return;
       openChat(row.hash, row.name);
@@ -607,7 +632,11 @@
   }
 
   function goToUnread() {
-    if (!focusNextUnread($dmUnread)) return;
+    if (!focusNextUnread($dmUnread)) {
+      const waiting = privateRows.find((row) => row.unread > 0);
+      if (!waiting) return;
+      openChat(waiting.hash, waiting.name);
+    }
     closeSwitcher(false);
   }
 
@@ -929,11 +958,41 @@
               </div>
             {/each}
 
+            {#if shownPrivate.length > 0}
+              <p class="dock-list-section">{m.chat_dock_section_private()}</p>
+            {/if}
+            {#each shownPrivate as row, i (row.hash)}
+              {@const idx = shownOpen.length + i}
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <div
+                class="dock-row"
+                class:active={idx === activeIndex}
+                role="option"
+                id={`${LISTBOX_ID}-option-${idx}`}
+                aria-selected={idx === activeIndex}
+                tabindex="-1"
+                onclick={() => activateRow(row)}
+                onmouseenter={() => (activeHash = row.hash)}
+              >
+                <span class="dock-row-name"><bdi dir="auto">{row.label}</bdi></span>
+                {#if row.unread > 0}
+                  <span
+                    class="count-pill"
+                    aria-label={plural(row.unread, {
+                      one: m.chat_dock_unread_aria_one,
+                      few: () => m.chat_dock_unread_aria_few({ count: row.unread }),
+                      other: () => m.chat_dock_unread_aria_other({ count: row.unread }),
+                    })}
+                  >{row.unread > 99 ? '99+' : row.unread}</span>
+                {/if}
+              </div>
+            {/each}
+
             {#if shownFriends.length > 0}
               <p class="dock-list-section">{m.chat_dock_section_start()}</p>
             {/if}
             {#each shownFriends as row, i (row.hash)}
-              {@const idx = shownOpen.length + i}
+              {@const idx = shownOpen.length + shownPrivate.length + i}
               <!-- svelte-ignore a11y_click_events_have_key_events -->
               <div
                 class="dock-row"

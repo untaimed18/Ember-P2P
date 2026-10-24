@@ -1278,6 +1278,9 @@ pub(super) async fn drive_ember_publish(socket: &UdpSocket, state: &mut NetworkS
             }
             continue;
         }
+        if let Some(op) = state.ember_publish.get_mut(publish_id) {
+            op.sent += 1;
+        }
 
         let budget = if behind_handshake {
             EMBER_SEARCH_QUEUED_QUERY_TIMEOUT
@@ -1296,6 +1299,15 @@ pub(super) async fn drive_ember_publish(socket: &UdpSocket, state: &mut NetworkS
     }
 
     maybe_finish_ember_publish(state, publish_id);
+}
+
+/// What a publish got through, for its waiter.
+pub(super) fn ember_publish_result(op: &ember::dht::publish::PublishOperation) -> EmberPublishResult {
+    EmberPublishResult {
+        stored_on: op.acked.len(),
+        targets: op.targets.len(),
+        sent: op.sent,
+    }
 }
 
 /// Resolve and tear down a publish once every targeted node has acked,
@@ -1325,10 +1337,7 @@ pub(super) fn maybe_finish_ember_publish(state: &mut NetworkState, publish_id: u
                 .ember_diagnostics
                 .ember_dht_publishes_completed
                 .saturating_add(1);
-            EmberPublishResult {
-                stored_on: op.acked.len(),
-                targets: op.targets.len(),
-            }
+            ember_publish_result(op)
         }
         None => return,
     };

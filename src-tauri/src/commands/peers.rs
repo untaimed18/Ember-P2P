@@ -298,7 +298,8 @@ pub struct FriendInfo {
     pub nickname: String,
     /// The user's label for this friend, empty when they set none.
     pub alias: String,
-    /// What the friend calls themselves, as their last verified session said.
+    /// What the friend calls themselves, as their last verified session said;
+    /// the name shown until a session has said it.
     pub self_name: String,
     pub added_at: i64,
     pub last_ip: String,
@@ -330,6 +331,24 @@ pub struct FriendRequestInfo {
     pub verified: bool,
 }
 
+/// The name [`add_friend`] stores, empty for none. Bidi, zero-width and
+/// control formatters come off: the list neutralises them when drawing, but a
+/// stored one comes back whenever the name is copied or exported. A name the
+/// peer goes by (`name_is_theirs`) loses the site tag an Ember adds to it for
+/// eMule, as every name a peer gives does before it is stored.
+fn friend_name_to_store(nickname: &str, name_is_theirs: bool) -> String {
+    let nick = crate::security::sanitize_display_name(nickname);
+    // What `sanitize_display_name` gives for an empty name.
+    if nick == "Anonymous" {
+        return String::new();
+    }
+    if name_is_theirs {
+        crate::types::without_nickname_site_tag(&nick).to_string()
+    } else {
+        nick
+    }
+}
+
 #[tauri::command]
 pub async fn add_friend(
     state: tauri::State<'_, AppState>,
@@ -346,23 +365,8 @@ pub async fn add_friend(
         pubkey: friend_pubkey,
         intro_secret,
     } = parse_friend_code(&user_hash_hex)?;
-    // L20: strip bidi/zero-width/control formatters from
-    // user-supplied nicknames before they're written to the DB.
-    // The friends list uses `<bdi>` to neutralise visual
-    // reordering at render time (M14), but storing the override
-    // character means it comes back the next time the user
-    // exports the friends list, copies a name, or syncs to a
-    // future sibling client.
-    let nick = crate::security::sanitize_display_name(&nickname.unwrap_or_default());
-    // `sanitize_display_name` substitutes "Anonymous" for empty
-    // input; treat that the same as a too-short nickname so
-    // adding a friend without specifying one keeps a sensible
-    // default rather than the literal string "Anonymous".
-    let nick = if nick == "Anonymous" {
-        String::new()
-    } else {
-        nick
-    };
+    let name_is_theirs = name_is_theirs.unwrap_or(false);
+    let nick = friend_name_to_store(&nickname.unwrap_or_default(), name_is_theirs);
     if friend_nickname_too_long(&nick) {
         return Err(coded_ctx(
             "peers_nickname_too_long",
@@ -418,7 +422,7 @@ pub async fn add_friend(
     let db = state.db.clone();
     let db_hash = canonical.clone();
     let db_nick = nick.clone();
-    let db_alias = if name_is_theirs.unwrap_or(false) {
+    let db_alias = if name_is_theirs {
         String::new()
     } else {
         nick.clone()
@@ -752,10 +756,20 @@ pub async fn get_friends(state: tauri::State<'_, AppState>) -> Result<Vec<Friend
     Ok(rows
         .into_iter()
         .map(
-            |(user_hash, self_name, added_at, last_ip, last_port, last_seen, mutual, alias)| {
+            |(
+                user_hash,
+                nickname,
+                added_at,
+                last_ip,
+                last_port,
+                last_seen,
+                mutual,
+                alias,
+                self_name,
+            )| {
                 FriendInfo {
                     user_hash,
-                    nickname: if alias.is_empty() { self_name.clone() } else { alias.clone() },
+                    nickname,
                     alias,
                     self_name,
                     added_at,
@@ -2812,7 +2826,7 @@ pub async fn ember_dht_publish_keyword(
     )
     .await
     {
-        Ok(Ok(EmberPublishResult { stored_on, targets })) => Ok(EmberDhtPublishResult {
+        Ok(Ok(EmberPublishResult { stored_on, targets, .. })) => Ok(EmberDhtPublishResult {
             success: stored_on > 0,
             key,
             stored_on,
@@ -2994,7 +3008,7 @@ mod tests {
 
     use super::{
         chat_failure_is_permanent, code_permanent_chat_failure, format_friend_code,
-        friend_nickname_too_long, parse_friend_code, require_public_ember_peer_ip_for_mode,
+        friend_name_to_store, friend_nickname_too_long, parse_friend_code, require_public_ember_peer_ip_for_mode,
         INTRO_SECRET_LEN,
     };
 
@@ -3008,6 +3022,21 @@ mod tests {
         }
         assert!(!friend_nickname_too_long(&"名".repeat(64)));
         assert!(friend_nickname_too_long(&"名".repeat(65)));
+    }
+
+    /// A name the peer goes by is stored without the site tag their Ember
+    /// gave eMule, however long the name; one the user typed is kept as typed.
+    #[test]
+    fn a_peers_name_is_stored_without_the_site_tag() {
+        let tagged = crate::types::ed2k_nickname("Brady", true);
+        assert_eq!(friend_name_to_store(&tagged, true), "Brady");
+        assert_eq!(friend_name_to_store(&tagged, false), tagged);
+        let long = "B".repeat(60);
+        let stored = friend_name_to_store(&crate::types::ed2k_nickname(&long, true), true);
+        assert_eq!(stored, long);
+        assert!(!friend_nickname_too_long(&stored));
+        assert_eq!(friend_name_to_store("Bra\u{202E}dy", true), "Brady");
+        assert_eq!(friend_name_to_store("  ", true), "");
     }
 
     /// "Copy member ID" in a room yields a bare Ed25519 key. Add Friend has to

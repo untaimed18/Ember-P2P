@@ -845,10 +845,15 @@ mod channel_settings_ingest_tests {
 #[cfg(test)]
 mod channel_settings_schedule_tests {
     use super::{
-        channel_settings_publish_plan, channel_settings_read_due, owner_publishes_channel_settings,
-        read_owned_channel_settings, rearm_abandoned_settings_lookup, settings_fetch_rides_pass,
+        channel_settings_publish_plan, channel_settings_read_due, note_owned_rooms_read_ended,
+        owned_rooms_publish_gate, owned_rooms_publish_waits, owned_rooms_read_asked_at,
+        owned_rooms_read_still_wanted, owned_rooms_read_test_lock, owner_publishes_channel_settings,
+        owner_republish_held_back, read_owned_channel_settings, reset_owned_rooms_read_times,
+        rearm_abandoned_settings_lookup, settings_fetch_rides_pass, settings_lookup_backoff_allows,
         settings_owed_after_pass, ChannelSettingsPublished, OwnedChannelSettingsRead, RestoringRoom,
-        RotatingRoom, CHANNEL_SETTINGS_CONFIRM_SECS, CHANNEL_SETTINGS_HELD_BACK_SECS,
+        RotatingRoom, SettingsLookupBackoff, CHANNEL_SETTINGS_CONFIRM_SECS,
+        CHANNEL_SETTINGS_HELD_BACK_SECS, OWNED_ROOMS_READ_FRESH_SECS, OWNED_ROOMS_READ_WAIT_SECS,
+        SETTINGS_LOOKUP_BACKOFF_MAX_SECS,
     };
     use crate::network::ember::channel::{content_key, key_commitment, ChannelIdentity, MODERATION_REPUBLISH_SECS};
     use crate::network::ember::dht::publish::SignedRecord;
@@ -999,6 +1004,143 @@ mod channel_settings_schedule_tests {
         assert!(searches.contains_key(&8), "other lookups stay");
         rearm_abandoned_settings_lookup(&mut searches, &mut owed, 99);
         assert_eq!(owed.len(), 1, "an unknown search owes nothing");
+    }
+
+    /// A room owed lookups after its passes gets the first at once and the
+    /// next a pass later, then each twice as long after the one before, up to
+    /// the cap; a move of its epochs or a record landing starts over.
+    #[test]
+    fn lookups_owed_after_passes_back_off_while_nothing_answers() {
+        let pass = crate::network::ember::channel::MODERATION_FETCH_SECS;
+        let room = [0x61u8; 16];
+        let mut backoff = SettingsLookupBackoff::default();
+        let now = 1_800_000_000;
+        // A pass every five minutes for two days, each a few seconds late.
+        let asked: Vec<i64> = (0..576)
+            .map(|n| now + n * pass + n % 7)
+            .filter(|at| settings_lookup_backoff_allows(&mut backoff, room, (3, 1), *at))
+            .collect();
+        let gaps: Vec<i64> = asked.windows(2).map(|w| (w[1] - w[0] + pass / 2) / pass * pass).collect();
+        assert_eq!(&gaps[..4], &[pass, 2 * pass, 4 * pass, 8 * pass], "{asked:?}");
+        assert!(gaps.windows(2).all(|w| w[1] >= w[0]), "never sooner than the last wait: {gaps:?}");
+        let last = *gaps.last().unwrap();
+        assert!(
+            (SETTINGS_LOOKUP_BACKOFF_MAX_SECS - pass..=SETTINGS_LOOKUP_BACKOFF_MAX_SECS + pass).contains(&last),
+            "capped at six hours: {gaps:?}"
+        );
+
+        let later = *asked.last().unwrap() + pass;
+        assert!(!settings_lookup_backoff_allows(&mut backoff, room, (3, 1), later));
+        assert!(settings_lookup_backoff_allows(&mut backoff, room, (4, 1), later), "a newer epoch announced");
+        assert!(!settings_lookup_backoff_allows(&mut backoff, room, (4, 1), later + 1));
+        backoff.forget(&room);
+        assert!(settings_lookup_backoff_allows(&mut backoff, room, (4, 1), later + 2), "a record landed");
+        assert!(
+            settings_lookup_backoff_allows(&mut backoff, [0x62u8; 16], (4, 1), later + 2),
+            "each room on its own"
+        );
+
+        backoff.retain_rooms(|id| *id == room);
+        assert!(!settings_lookup_backoff_allows(&mut backoff, room, (4, 1), later + 3), "a room kept keeps its wait");
+        assert_eq!(backoff.0.len(), 1, "a room left is dropped");
+    }
+
+    /// The owned-rooms list goes out only on a recent look at the network's
+    /// copy. Without one it waits, for a look that then ends however it
+    /// ends, or for a bounded time when none does.
+    #[test]
+    fn the_owned_rooms_list_goes_out_only_after_a_recent_look() {
+        let now = 1_800_000_000;
+        assert!(owned_rooms_publish_waits(0, 0, now), "no look this launch");
+        assert!(!owned_rooms_publish_waits(now - 60, 0, now), "the look ahead of a scheduled publish");
+        assert!(!owned_rooms_publish_waits(now - OWNED_ROOMS_READ_FRESH_SECS, 0, now));
+        let stale = now - 3 * 3_600;
+        assert!(owned_rooms_publish_waits(stale, 0, now), "the last look was hours ago: ask for one");
+        let asked = now;
+        assert!(owned_rooms_publish_waits(stale, asked, asked + 30), "the look asked for is under way");
+        assert!(!owned_rooms_publish_waits(asked + 1, asked, asked + 90), "it ended, read or not");
+        assert!(owned_rooms_publish_waits(stale, asked, asked + OWNED_ROOMS_READ_WAIT_SECS - 1));
+        assert!(
+            !owned_rooms_publish_waits(stale, asked, asked + OWNED_ROOMS_READ_WAIT_SECS),
+            "a look that never comes holds it back only so long"
+        );
+        let long_after = asked + OWNED_ROOMS_READ_WAIT_SECS + OWNED_ROOMS_READ_FRESH_SECS;
+        assert!(
+            owned_rooms_publish_waits(stale, asked, long_after),
+            "an ask left by a publish that never went is no ask"
+        );
+    }
+
+    /// A publish that waits asks for a look once. Its ask is dropped when the
+    /// list is no longer due, so a publish due hours later asks for a look of
+    /// its own rather than going out on the old ask.
+    #[test]
+    fn a_publish_no_longer_due_drops_its_ask_for_a_look() {
+        let _serial = owned_rooms_read_test_lock().blocking_lock();
+        reset_owned_rooms_read_times();
+        let now = 1_800_000_000;
+        assert!(!owned_rooms_publish_gate(true, now), "no look this launch");
+        assert_eq!(owned_rooms_read_asked_at(), now);
+        assert!(!owned_rooms_publish_gate(true, now + 30));
+        assert_eq!(owned_rooms_read_asked_at(), now, "asked once");
+
+        // The room that made the list due is deleted within the wait.
+        assert!(!owned_rooms_publish_gate(false, now + 60));
+        assert_eq!(owned_rooms_read_asked_at(), 0);
+        let later = now + 3 * 3_600;
+        assert!(!owned_rooms_publish_gate(true, later), "waits on a look of its own");
+        assert_eq!(owned_rooms_read_asked_at(), later);
+
+        // An ask left behind all the same is too old to let a publish go.
+        reset_owned_rooms_read_times();
+        assert!(!owned_rooms_publish_gate(true, now));
+        let much_later = now + 5 * 3_600;
+        assert!(!owned_rooms_publish_gate(true, much_later));
+        assert_eq!(owned_rooms_read_asked_at(), much_later, "asked again");
+        assert!(owned_rooms_publish_gate(true, much_later + OWNED_ROOMS_READ_WAIT_SECS));
+        assert_eq!(owned_rooms_read_asked_at(), 0, "gone out");
+        reset_owned_rooms_read_times();
+    }
+
+    /// The read loop, woken by a publish, looks only when no recent look has
+    /// ended since: one already under way when the publish asked serves it.
+    #[test]
+    fn a_look_under_way_when_a_publish_asks_serves_it() {
+        let _serial = owned_rooms_read_test_lock().blocking_lock();
+        reset_owned_rooms_read_times();
+        let now = chrono::Utc::now().timestamp();
+        assert!(!owned_rooms_publish_gate(true, now));
+        assert!(owned_rooms_read_still_wanted(now));
+        note_owned_rooms_read_ended(now - 120);
+        assert!(!owned_rooms_read_still_wanted(now + 1));
+        assert!(owned_rooms_publish_gate(true, now + 1));
+        assert!(owned_rooms_read_still_wanted(now + OWNED_ROOMS_READ_FRESH_SECS), "that look has gone stale");
+        reset_owned_rooms_read_times();
+    }
+
+    /// The owner loop signs nothing for a room whose rotation has stored its
+    /// key and not committed yet, nor for one a recovery is putting back.
+    #[test]
+    fn the_owner_loop_leaves_a_rotating_room_alone() {
+        let (path, db) = temp_db("rotating-owner");
+        let ident = owned_room(&db, "private");
+        let id_hex = hex::encode(ident.channel_id);
+        assert!(!owner_republish_held_back(&db, &id_hex));
+
+        let rotating = RotatingRoom::begin(&id_hex);
+        db.insert_channel_key_epoch(&id_hex, 1, &[0x11; 32]).unwrap();
+        assert!(owner_republish_held_back(&db, &id_hex), "the new epoch may yet be taken back");
+        db.rollback_channel_key_epoch(&id_hex, 1).unwrap();
+        drop(rotating);
+        assert!(!owner_republish_held_back(&db, &id_hex), "once the rotation is over");
+
+        let restoring = RestoringRoom::begin(&id_hex);
+        assert!(owner_republish_held_back(&db, &id_hex));
+        drop(restoring);
+        assert!(!owner_republish_held_back(&db, &id_hex));
+
+        drop(db);
+        remove(&path);
     }
 
     /// The owner reads a room's keys only when they have moved or the room is
@@ -2277,32 +2419,55 @@ pub(super) fn channel_roster_snapshot(
     db: &Database,
     channel_id: [u8; 16],
 ) -> Arc<ChannelRosterSnapshot> {
-    let now = std::time::Instant::now();
-    let channel_id_hex = hex::encode(channel_id);
-    let generation = db.channel_roster_generation(&channel_id_hex);
-    if let Some(snapshot) = state
+    if let Some(snapshot) = channel_roster_held(state, db, channel_id) {
+        return snapshot;
+    }
+    let snapshot = Arc::new(read_channel_roster(db, channel_id));
+    hold_channel_roster(state, channel_id, &snapshot);
+    snapshot
+}
+
+/// The room's held roster snapshot while it is still exact. Reads only the
+/// in-memory generation, never the table.
+pub(super) fn channel_roster_held(
+    state: &NetworkState,
+    db: &Database,
+    channel_id: [u8; 16],
+) -> Option<Arc<ChannelRosterSnapshot>> {
+    let generation = db.channel_roster_generation(&hex::encode(channel_id));
+    state
         .channel_view_cache
         .get(&channel_id)
         .and_then(|view| view.roster.as_ref())
-    {
-        if snapshot.valid_at(generation, now) {
-            return snapshot.clone();
-        }
-    }
-    // Not cached, so the next caller reads again. Cached as an empty roster, a
-    // transient error was a room where nobody was banned for the next 30 s.
-    let rows = match db.list_channel_members(&channel_id_hex) {
-        Ok(rows) => rows,
+        .filter(|snapshot| snapshot.valid_at(generation, std::time::Instant::now()))
+        .cloned()
+}
+
+/// Read the room's roster from the table. Blocking: off the loop where the
+/// caller can be.
+pub(super) fn read_channel_roster(db: &Database, channel_id: [u8; 16]) -> ChannelRosterSnapshot {
+    let now = std::time::Instant::now();
+    let channel_id_hex = hex::encode(channel_id);
+    let generation = db.channel_roster_generation(&channel_id_hex);
+    match db.list_channel_members(&channel_id_hex) {
+        Ok(rows) => ChannelRosterSnapshot::from_rows(rows, generation, now),
         Err(e) => {
             debug!("Channel roster read failed for {channel_id_hex}: {e}");
-            return Arc::new(ChannelRosterSnapshot::unreadable(now));
+            ChannelRosterSnapshot::unreadable(now)
         }
-    };
-    let snapshot = Arc::new(ChannelRosterSnapshot::from_rows(rows, generation, now));
+    }
+}
+
+/// Keep a roster read for the room's next callers. An unreadable one is not
+/// kept, so the next caller reads again: kept as an empty roster, a transient
+/// error was a room where nobody was banned for the next 30 s.
+pub(super) fn hold_channel_roster(state: &mut NetworkState, channel_id: [u8; 16], snapshot: &Arc<ChannelRosterSnapshot>) {
+    if snapshot.unreadable {
+        return;
+    }
     if let Some(view) = state.channel_view_cache.get_mut(&channel_id) {
         view.roster = Some(snapshot.clone());
     }
-    snapshot
 }
 
 /// [`channel_member_pubkeys`] from the room's roster snapshot.
@@ -3599,6 +3764,82 @@ fn settings_owed_after_pass(
             }))
 }
 
+/// The longest a room stays without one of the lookups
+/// [`settings_owed_after_pass`] asks for while it is owed them.
+const SETTINGS_LOOKUP_BACKOFF_MAX_SECS: i64 = 6 * 60 * 60;
+
+/// How long each room behind its key waits before the next lookup
+/// [`settings_owed_after_pass`] asks for, and since which epochs.
+#[derive(Default)]
+struct SettingsLookupBackoff(HashMap<[u8; 16], SettingsLookupWait>);
+
+struct SettingsLookupWait {
+    /// `(key_epoch_wanted, key_epoch)` when the room first fell owed.
+    epochs: (i64, i64),
+    wait: i64,
+    next_at: i64,
+}
+
+impl SettingsLookupBackoff {
+    fn forget(&mut self, channel_id: &[u8; 16]) {
+        self.0.remove(channel_id);
+    }
+
+    /// Keep only the rooms `kept` holds to: one left or deleted is never
+    /// looked up again, and would otherwise stay here for the session.
+    fn retain_rooms(&mut self, mut kept: impl FnMut(&[u8; 16]) -> bool) {
+        self.0.retain(|channel_id, _| kept(channel_id));
+    }
+}
+
+fn settings_lookup_backoff() -> &'static std::sync::Mutex<SettingsLookupBackoff> {
+    static BACKOFF: std::sync::OnceLock<std::sync::Mutex<SettingsLookupBackoff>> = std::sync::OnceLock::new();
+    BACKOFF.get_or_init(Default::default)
+}
+
+/// Whether a lookup [`settings_owed_after_pass`] asks for goes out now, for
+/// a room whose `(key_epoch_wanted, key_epoch)` are `epochs`.
+///
+/// The first does, and the next one moderation pass later; after that each
+/// waits twice as long as the one before, up to
+/// [`SETTINGS_LOOKUP_BACKOFF_MAX_SECS`]. An owner on a build before 1.7.5
+/// never publishes kind 8, so a member behind its key may stay owed a lookup
+/// indefinitely, and lookups that never answer must not go out every pass. A
+/// move of either epoch starts over, and so does a settings record landing
+/// (the caller forgets the room). The lookup that rides every third pass is
+/// not held back by this.
+fn settings_lookup_backoff_allows(
+    backoff: &mut SettingsLookupBackoff,
+    channel_id: [u8; 16],
+    epochs: (i64, i64),
+    now: i64,
+) -> bool {
+    // Passes come about MODERATION_FETCH_SECS apart, give or take how long
+    // each lookup took to answer.
+    let slack = ember::channel::MODERATION_FETCH_SECS / 2;
+    match backoff.0.get_mut(&channel_id) {
+        Some(wait) if wait.epochs == epochs => {
+            if now + slack < wait.next_at {
+                return false;
+            }
+            wait.wait = (wait.wait * 2).min(SETTINGS_LOOKUP_BACKOFF_MAX_SECS);
+            wait.next_at = now + wait.wait;
+            true
+        }
+        _ => {
+            backoff.0.insert(
+                channel_id,
+                SettingsLookupWait {
+                    epochs,
+                    wait: ember::channel::MODERATION_FETCH_SECS,
+                    next_at: now + ember::channel::MODERATION_FETCH_SECS,
+                },
+            );
+            true
+        }
+    }
+}
+
 /// Drop the bookkeeping of a settings lookup given up on before it finished,
 /// leaving the room owed one: the walk answered nothing either way.
 pub(super) fn rearm_abandoned_settings_lookup(
@@ -4291,14 +4532,8 @@ pub(super) async fn maybe_publish_owned_channel_records(
         if !ember::channel::schedule_due(last, now, ember::channel::MODERATION_REPUBLISH_SECS) {
             continue;
         }
-        // Recovered, and still without the key the room seals with: a snapshot
-        // from here would announce an older one, and a rotation would mint a
-        // key under a number the room already uses. The key-epoch loop fetches
-        // our own sealed copy and lifts this. Behind the schedule, so only a
-        // room that is due costs the read.
-        if room_being_restored(&ch.channel_id)
-            || db.channel_owner_key_pending(&ch.channel_id).ok().flatten().is_some()
-        {
+        // Behind the schedule, so only a room that is due costs the reads.
+        if owner_republish_held_back(db, &ch.channel_id) {
             continue;
         }
         // A commitment this device did not offer: a record it found stored, or
@@ -4355,6 +4590,12 @@ pub(super) async fn maybe_publish_owned_channel_records(
         };
         if let Ok(Some(fresh)) = db.get_channel_lite(&ch.channel_id) {
             ch = std::borrow::Cow::Owned(fresh);
+        }
+        // Again now that the row is read: a rotation begun since the check
+        // above may have stored its epoch in what was just read.
+        if room_rotating(&ch.channel_id) {
+            undo_owned_rotation(db, &ch.channel_id, rotated);
+            continue;
         }
         let mut bans = db
             .list_banned_channel_pubkeys(&ch.channel_id)
@@ -4627,6 +4868,132 @@ pub(crate) fn note_owned_rooms_list_read() {
     OWNED_ROOMS_LIST_READ.store(true, std::sync::atomic::Ordering::Release);
 }
 
+/// When the latest look at the network's owned-rooms list that has ended
+/// began, as Unix seconds; 0 before one has ended this launch. A look that
+/// failed counts: a publish waits on one, not on its success.
+static OWNED_ROOMS_READ_BEGAN_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// When a publish of the owned-rooms list began waiting on a look, as Unix
+/// seconds; 0 when none is waiting. One older than
+/// [`OWNED_ROOMS_READ_WAIT_SECS`] plus [`OWNED_ROOMS_READ_FRESH_SECS`] counts
+/// as none ([`live_owned_rooms_ask`]).
+static OWNED_ROOMS_READ_ASKED_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// How recent a look has to be for the list to go out on it. The read loop
+/// looks ten minutes ahead of a scheduled publish, and a look walks every
+/// listed room, which takes minutes of its own.
+const OWNED_ROOMS_READ_FRESH_SECS: i64 = 15 * 60;
+
+/// The longest a publish waits on a look it asked for that never ends: the
+/// read loop may not be running.
+const OWNED_ROOMS_READ_WAIT_SECS: i64 = 10 * 60;
+
+/// Note that a look at the network's owned-rooms list that began at
+/// `began_at` has ended, however it ended.
+pub(crate) fn note_owned_rooms_read_ended(began_at: i64) {
+    OWNED_ROOMS_READ_BEGAN_AT.fetch_max(began_at, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Woken when a publish of the owned-rooms list waits on a look; the read
+/// loop looks at once (`channel_recovery`).
+pub(crate) fn owned_rooms_read_wanted() -> &'static tokio::sync::Notify {
+    static WANTED: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    WANTED.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Whether a publish of the owned-rooms list waits for a look at the
+/// network's copy, given when the latest look that ended began (`read_began`),
+/// when this publish asked for one (`asked`; 0 for not yet) and `now`.
+///
+/// Storers keep one list per identity, so a publish replaces whatever the
+/// identity's other device last published there. Going out only after a
+/// recent look — one that carried what that device added — is what keeps a
+/// room made there from being dropped. A look counts when it began within
+/// [`OWNED_ROOMS_READ_FRESH_SECS`], so one the publish asked for counts as
+/// soon as it ends, read or not; one that has not ended is waited on for
+/// [`OWNED_ROOMS_READ_WAIT_SECS`].
+pub(crate) fn owned_rooms_publish_waits(read_began: i64, asked: i64, now: i64) -> bool {
+    if owned_rooms_read_fresh(read_began, now) {
+        return false;
+    }
+    let asked = live_owned_rooms_ask(asked, now);
+    !(asked > 0 && now - asked >= OWNED_ROOMS_READ_WAIT_SECS)
+}
+
+/// Whether a look that began at `read_began` (0 for none) is recent enough
+/// at `now` for the owned-rooms list to go out on it.
+fn owned_rooms_read_fresh(read_began: i64, now: i64) -> bool {
+    read_began > 0 && now - read_began <= OWNED_ROOMS_READ_FRESH_SECS
+}
+
+/// `asked`, or 0 when it is too old to be the ask of a publish still
+/// waiting: a publish goes once [`OWNED_ROOMS_READ_WAIT_SECS`] have passed,
+/// so an ask that outlived that by [`OWNED_ROOMS_READ_FRESH_SECS`] was left
+/// by one that never went, and a publish now asks again.
+fn live_owned_rooms_ask(asked: i64, now: i64) -> i64 {
+    if asked > 0 && now - asked < OWNED_ROOMS_READ_WAIT_SECS + OWNED_ROOMS_READ_FRESH_SECS {
+        asked
+    } else {
+        0
+    }
+}
+
+/// Whether the read loop, woken by a publish of the owned-rooms list
+/// ([`owned_rooms_read_wanted`]), still has to look at `now`. It does not
+/// when a look recent enough for the publish has ended since the publish
+/// asked, as one already under way when it asked does.
+pub(crate) fn owned_rooms_read_still_wanted(now: i64) -> bool {
+    !owned_rooms_read_fresh(OWNED_ROOMS_READ_BEGAN_AT.load(std::sync::atomic::Ordering::Acquire), now)
+}
+
+/// Whether a publish of the owned-rooms list goes out at `now`, given whether
+/// one is due (`due`). One due waits while [`owned_rooms_publish_waits`]
+/// says so, asking the read loop for a look the first time; the ask is
+/// dropped once the list goes out or is no longer due.
+fn owned_rooms_publish_gate(due: bool, now: i64) -> bool {
+    use std::sync::atomic::Ordering;
+    if !due {
+        OWNED_ROOMS_READ_ASKED_AT.store(0, Ordering::Release);
+        return false;
+    }
+    let asked = live_owned_rooms_ask(OWNED_ROOMS_READ_ASKED_AT.load(Ordering::Acquire), now);
+    if owned_rooms_publish_waits(OWNED_ROOMS_READ_BEGAN_AT.load(Ordering::Acquire), asked, now) {
+        if asked == 0 {
+            OWNED_ROOMS_READ_ASKED_AT.store(now, Ordering::Release);
+            owned_rooms_read_wanted().notify_one();
+        }
+        return false;
+    }
+    OWNED_ROOMS_READ_ASKED_AT.store(0, Ordering::Release);
+    true
+}
+
+#[cfg(test)]
+pub(crate) fn owned_rooms_read_began_at() -> i64 {
+    OWNED_ROOMS_READ_BEGAN_AT.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Held by every test that reads or moves the process-wide look and ask
+/// times, which tests running in parallel would otherwise move under it.
+#[cfg(test)]
+pub(crate) fn owned_rooms_read_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// No look ended and no publish waiting, as at launch. Only under
+/// [`owned_rooms_read_test_lock`].
+#[cfg(test)]
+pub(crate) fn reset_owned_rooms_read_times() {
+    OWNED_ROOMS_READ_BEGAN_AT.store(0, std::sync::atomic::Ordering::Release);
+    OWNED_ROOMS_READ_ASKED_AT.store(0, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(test)]
+fn owned_rooms_read_asked_at() -> i64 {
+    OWNED_ROOMS_READ_ASKED_AT.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// When this device next publishes its owned-rooms list, as Unix seconds; 0
 /// before its first publish this launch.
 static NEXT_OWNED_ROOMS_PUBLISH_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
@@ -4693,6 +5060,23 @@ fn room_rotating(channel_id: &str) -> bool {
         .contains_key(channel_id)
 }
 
+/// Whether the owner loop signs nothing for a room of ours this pass.
+///
+/// Recovered, and still without the key the room seals with: a snapshot from
+/// here would announce an older one, and a rotation would mint a key under a
+/// number the room already uses. The key-epoch loop fetches our own sealed
+/// copy and lifts this.
+///
+/// Rotating ([`RotatingRoom`]): the new epoch is stored before the snapshot
+/// that announces it commits, so a snapshot from here would announce it and
+/// the re-seal after it would hand its key to every member, and a rotation
+/// taken back then leaves the members on a key the owner no longer uses.
+fn owner_republish_held_back(db: &Database, channel_id: &str) -> bool {
+    room_being_restored(channel_id)
+        || room_rotating(channel_id)
+        || db.channel_owner_key_pending(channel_id).ok().flatten().is_some()
+}
+
 /// Held from before a rotation stores its key until its snapshot has
 /// committed or the rotation has been taken back. Dropping it moves the
 /// room's key generation, so a settings pass the rotation held back reads the
@@ -4727,35 +5111,50 @@ impl Drop for RotatingRoom {
 
 /// Keep the identity's owned-rooms list on the network: on the owner records'
 /// cadence, and as soon as the set of rooms changes, so a room made or taken
-/// over is in it within a tick rather than within six hours.
+/// over is in it within minutes rather than within six hours.
 ///
 /// Only once the network's list has been read this launch (see
 /// [`owned_rooms_list_read`]): a database from an older time would otherwise
-/// replace a list naming the rooms made since with one that does not. An
-/// empty list is published too, so a deleted last room stops being listed.
+/// replace a list naming the rooms made since with one that does not. And
+/// each time only after a recent look at it ([`owned_rooms_publish_waits`]),
+/// which this asks for when there has been none. An empty list is published
+/// too, so a deleted last room stops being listed.
 pub(super) async fn maybe_publish_owned_rooms_list(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
     identity: &crate::storage::identity::NodeIdentity,
 ) {
-    if !owned_rooms_list_read() || db.chat_locked() {
+    if !owned_rooms_list_read() {
         return;
     }
+    let now = chrono::Utc::now().timestamp();
+    if db.chat_locked() {
+        owned_rooms_publish_gate(false, now);
+        return;
+    }
+    // `Some(unchanged)` when `salts` are due out.
+    let due = |state: &NetworkState, salts: &[ember::channel::OwnedRoomSalt]| {
+        let unchanged = state.owned_rooms_published.as_deref() == Some(salts);
+        (!unchanged
+            || ember::channel::schedule_due(
+                state.owned_rooms_published_at,
+                now,
+                ember::channel::MODERATION_REPUBLISH_SECS,
+            ))
+        .then_some(unchanged)
+    };
+    let due_now = db.owned_room_salts().is_ok_and(|salts| due(state, &salts).is_some());
+    if !owned_rooms_publish_gate(due_now, now) {
+        return;
+    }
+    // Read again: the look stored what it carried.
     let Ok(salts) = db.owned_room_salts() else {
         return;
     };
-    let now = chrono::Utc::now().timestamp();
-    let unchanged = state.owned_rooms_published.as_ref() == Some(&salts);
-    if unchanged
-        && !ember::channel::schedule_due(
-            state.owned_rooms_published_at,
-            now,
-            ember::channel::MODERATION_REPUBLISH_SECS,
-        )
-    {
+    let Some(unchanged) = due(state, &salts) else {
         return;
-    }
+    };
     let signing = crate::network::ember::crypto::signing_key_from_bytes(&identity.ed25519_secret_key);
     let listed = if ember::channel::PAD_OWNED_ROOMS_LIST {
         ember::channel::pad_owned_rooms_list(&salts, &identity.ed25519_secret_key)
@@ -6346,6 +6745,14 @@ pub(super) fn run_channel_ingest(
         results.presence.push((channel_id, ingest));
     }
     let checked_at = chrono::Utc::now().timestamp();
+    if !batch.moderation.is_empty() {
+        let mut backoff = settings_lookup_backoff().lock().unwrap_or_else(|e| e.into_inner());
+        backoff.retain_rooms(|room| match db.get_channel_lite(&hex::encode(room)) {
+            Ok(Some(ch)) => !ch.deleted,
+            Ok(None) => false,
+            Err(_) => true,
+        });
+    }
     for (channel_id, records, answered) in batch.moderation {
         // Only a search some peer actually answered counts as having looked.
         // Finding no owner record because nobody replied is not evidence the
@@ -6365,7 +6772,17 @@ pub(super) fn run_channel_ingest(
             let held = (row.key_epoch_wanted > row.key_epoch)
                 .then(|| db.channel_settings(&channel_id_hex).ok().flatten())
                 .flatten();
-            if settings_owed_after_pass(before.as_ref().map(|ch| ch.key_epoch_wanted), &row, held.as_ref()) {
+            let owed = settings_owed_after_pass(before.as_ref().map(|ch| ch.key_epoch_wanted), &row, held.as_ref());
+            let ask = {
+                let mut backoff = settings_lookup_backoff().lock().unwrap_or_else(|e| e.into_inner());
+                if owed {
+                    settings_lookup_backoff_allows(&mut backoff, channel_id, (row.key_epoch_wanted, row.key_epoch), checked_at)
+                } else {
+                    backoff.forget(&channel_id);
+                    false
+                }
+            };
+            if ask {
                 results.settings_owed.push(channel_id);
             }
             check_held = moderation_pass_rechecks_keys(applied, before.as_ref(), &row);
@@ -6376,6 +6793,12 @@ pub(super) fn run_channel_ingest(
     }
     for (channel_id, records) in batch.settings {
         let landed = ingest_channel_settings_records(db, channel_id, &records);
+        if landed {
+            settings_lookup_backoff()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .forget(&channel_id);
+        }
         if settle_channel_keys(db, channel_id, landed) {
             results.rekeyed.push(channel_id);
         }

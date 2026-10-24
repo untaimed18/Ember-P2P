@@ -61,10 +61,15 @@
   let draftBytes = $derived(encoder.encode(draft).length);
   let tooLong = $derived(draftBytes > DM_TEXT_MAX_BYTES);
   let policyOff = $derived($appSettings?.room_dm_policy === 'off');
+  /** The user declined this request while it was on screen. Opened later,
+   *  a declined conversation offers to write: doing so lifts the refusal. */
+  let declinedHere = $state(false);
+  let justDeclined = $derived(declinedHere && thread?.state === 'declined');
 
   /** Why nothing can be written here, or null when something can. */
   let blocked = $derived.by((): string | null => {
     if (thread?.state === 'request') return null;
+    if (justDeclined) return m.channels_dm_you_declined({ name: shownName });
     if (thread?.is_friend) return m.channels_dm_is_friend();
     if (policyOff) return m.channels_dm_policy_off();
     if (thread?.peer_state === 'declined') return m.channels_dm_peer_declined({ name: shownName });
@@ -94,13 +99,17 @@
   }
 
   let loadSeq = 0;
-  async function load() {
+  /** Read the conversation from storage. `replace` when what is stored may
+   *  have lost rows (declined, deleted): only rows that arrived during the
+   *  read are kept from the screen. */
+  async function load(replace = false) {
     const seq = ++loadSeq;
+    const shownBefore = new Set(messages.map(rowKey));
     loading = true;
     try {
       const rows = await getRoomDmMessages(who);
       if (seq !== loadSeq) return;
-      messages = merged(rows, messages);
+      messages = merged(rows, replace ? messages.filter((row) => !shownBefore.has(rowKey(row))) : messages);
       await scrollToEnd(true);
     } catch (e) {
       if (seq === loadSeq) toastError(translateError(e, m.error_operation_failed()));
@@ -139,7 +148,11 @@
   let seenStateKey: string | null = null;
   $effect(() => {
     const key = stateKey;
-    if (seenStateKey !== null && key !== seenStateKey) untrack(() => void load());
+    if (seenStateKey !== null && key !== seenStateKey) {
+      // Declined from the Channels page counts as declined here too.
+      if (seenStateKey.startsWith('request|') && key.startsWith('declined|')) declinedHere = true;
+      untrack(() => void load(true));
+    }
     seenStateKey = key;
   });
 
@@ -213,6 +226,10 @@
     try {
       await answerRoomDmRequest(who, accept);
       if (accept) keepDmTab(who, shownName);
+      else {
+        declinedHere = true;
+        messages = [];
+      }
       await refreshDmThreads();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
@@ -280,7 +297,7 @@
   >
     {#if loading && messages.length === 0}
       <p class="dm-empty">{m.chat_loading_messages()}</p>
-    {:else if messages.length === 0}
+    {:else if messages.length === 0 && !justDeclined}
       <p class="dm-empty">{m.channels_dm_empty_hint()}</p>
     {/if}
     {#each messages as row (rowKey(row))}

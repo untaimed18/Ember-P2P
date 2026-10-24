@@ -707,6 +707,17 @@ pub(crate) async fn scan_owned_rooms(
     scan_owned_rooms_with(state, app, pass).await
 }
 
+/// Tells the owned-rooms publish, however a look ends, that one that began at
+/// this time has: a publish waiting on a look goes out after it, even after
+/// one that could not read the list.
+struct LookEnded(i64);
+
+impl Drop for LookEnded {
+    fn drop(&mut self) {
+        crate::network::channel_membership::note_owned_rooms_read_ended(self.0);
+    }
+}
+
 /// [`scan_owned_rooms`] over any [`RecoveryEnv`].
 async fn scan_owned_rooms_with<E: RecoveryEnv>(
     env: &E,
@@ -714,6 +725,7 @@ async fn scan_owned_rooms_with<E: RecoveryEnv>(
     pass: Pass,
 ) -> Result<OwnedRoomScan, String> {
     let _single = scan_lock().lock().await;
+    let _ended = LookEnded(chrono::Utc::now().timestamp());
     if env.db().chat_locked() {
         return Err(coded(
             "channels_chat_locked",
@@ -800,18 +812,18 @@ async fn scan_owned_rooms_with<E: RecoveryEnv>(
                         owe_room_back(&id_hex, true);
                     }
                     outcome.unsettled += 1;
-                    let _ = tokio::task::spawn_blocking(move || db.carry_owned_salt(&id_hex, &salt))
+                    let _ = tokio::task::spawn_blocking(move || db.carry_owned_salt(&id_hex, &salt, false))
                         .await;
                 }
                 Slot::Withheld => {
                     if pass == Pass::Restore {
                         owe_room_back(&id_hex, true);
                     }
-                    let _ = tokio::task::spawn_blocking(move || db.carry_owned_salt(&id_hex, &salt))
+                    let _ = tokio::task::spawn_blocking(move || db.carry_owned_salt(&id_hex, &salt, false))
                         .await;
                 }
                 Slot::Live(..) if pass == Pass::Reread && !room_owed_back(&id_hex) => {
-                    let _ = tokio::task::spawn_blocking(move || db.carry_owned_salt(&id_hex, &salt))
+                    let _ = tokio::task::spawn_blocking(move || db.carry_owned_salt(&id_hex, &salt, true))
                         .await;
                 }
                 Slot::Live(snapshot, records) => {
@@ -826,7 +838,7 @@ async fn scan_owned_rooms_with<E: RecoveryEnv>(
                             owe_room_back(&id_hex, true);
                             outcome.unsettled += 1;
                             let _ = tokio::task::spawn_blocking(move || {
-                                db.carry_owned_salt(&id_hex, &salt)
+                                db.carry_owned_salt(&id_hex, &salt, true)
                             })
                             .await;
                         }
@@ -913,7 +925,9 @@ pub fn ensure_list_read(app: tauri::AppHandle) {
 }
 
 /// After this identity took on a room this session: keep the read loop going,
-/// so the list is read again on its cadence. Nothing when it already runs.
+/// so the list is read again on its cadence, and at once when the list that
+/// now names the room is about to go out ([`wait_or_wanted`]). Nothing when
+/// it already runs.
 pub fn keep_reading_list(app: tauri::AppHandle) {
     let delay = if crate::network::channel_membership::owned_rooms_list_read() {
         std::time::Duration::from_secs(SETTLED_REREAD_SECS)
@@ -937,7 +951,8 @@ impl Drop for ReadLoopRunning {
 /// Read the list until it has been read — every two minutes for a while if
 /// the network cannot be reached well enough yet — and then keep looking at
 /// rooms that could not be settled, every few hours, and at the list itself
-/// (see [`settled_reread_wait`]). Only the first read of a launch puts rooms
+/// (see [`settled_reread_wait`]), and whenever a publish of this device's list
+/// waits on a read. Only the first read of a launch puts rooms
 /// back; later ones carry what another device added (see [`Pass`]). It keeps
 /// going while this identity owns nothing, every [`SETTLED_REREAD_SECS`], so
 /// a room taken over or handed here later is read for without another start.
@@ -949,7 +964,7 @@ fn spawn_list_read(app: tauri::AppHandle, delay: std::time::Duration) {
     let running = ReadLoopRunning;
     tauri::async_runtime::spawn(async move {
         let _running = running;
-        tokio::time::sleep(delay).await;
+        wait_or_wanted(delay).await;
         let mut failures = 0u32;
         loop {
             let Some(state) = app.try_state::<AppState>() else {
@@ -988,9 +1003,42 @@ fn spawn_list_read(app: tauri::AppHandle, delay: std::time::Duration) {
                     }
                 }
             };
-            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            wait_or_wanted(std::time::Duration::from_secs(wait)).await;
         }
     });
+}
+
+/// Sleep for `delay`, or until a publish of the owned-rooms list waits on a
+/// look ([`crate::network::channel_membership::owned_rooms_read_wanted`])
+/// that has not been had since it asked.
+async fn wait_or_wanted(delay: std::time::Duration) {
+    wait_or_wanted_with(
+        delay,
+        crate::network::channel_membership::owned_rooms_read_wanted(),
+        || crate::network::channel_membership::owned_rooms_read_still_wanted(chrono::Utc::now().timestamp()),
+    )
+    .await;
+}
+
+/// [`wait_or_wanted`] on `wanted`, waking early only when `still_wanted`
+/// holds. A publish that asks while a look is under way leaves a wake
+/// behind, which that look, once ended, has already served.
+async fn wait_or_wanted_with(
+    delay: std::time::Duration,
+    wanted: &tokio::sync::Notify,
+    still_wanted: impl Fn() -> bool,
+) {
+    let until = tokio::time::Instant::now() + delay;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(until) => return,
+            _ = wanted.notified() => {
+                if still_wanted() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// Mark that the identity's list has to be read again, for a database that
@@ -1066,6 +1114,7 @@ mod tests {
     #[tokio::test]
     async fn a_device_with_only_the_identity_gets_every_owned_room_back() {
         use crate::network::ember::dht::publish::ModerationTail;
+        let _serial = crate::network::channel_membership::owned_rooms_read_test_lock().lock().await;
         let seed = [0x6Bu8; 32];
         let signing = signing_key_from_bytes(&seed);
         let pubkey = signing.verifying_key().to_bytes();
@@ -1178,10 +1227,31 @@ mod tests {
         let annex_hex = hex::encode(annex.channel_id);
         net.publish(SignedRecord::owned_rooms(&[lobby_salt, den_salt, gone_salt, annex_salt], &signing).unwrap());
         net.publish(snapshot(&annex, "Annex", false, 0));
+        // This device's list changed meanwhile and waits on a look before it
+        // goes out; once the look has ended the list names the annex too.
+        crate::network::channel_membership::reset_owned_rooms_read_times();
+        let asked = chrono::Utc::now().timestamp();
+        assert!(crate::network::channel_membership::owned_rooms_publish_waits(
+            crate::network::channel_membership::owned_rooms_read_began_at(),
+            asked,
+            asked,
+        ));
         let reread = scan_owned_rooms_with(&net, None, Pass::Reread).await.expect("the list reads");
         assert_eq!((reread.recovered, reread.unsettled), (0, 0), "{reread:?}");
+        assert!(!crate::network::channel_membership::owned_rooms_publish_waits(
+            crate::network::channel_membership::owned_rooms_read_began_at(),
+            asked,
+            chrono::Utc::now().timestamp(),
+        ));
         assert!(db.get_channel(&annex_hex).unwrap().is_none(), "not run here as well");
         assert!(db.owned_room_salts().unwrap().contains(&annex_salt), "but still listed from here");
+        // Carried long enough to lapse, but the other device still runs it:
+        // each look that finds it live dates it again.
+        db.backdate_carried_salt(&annex_hex, chrono::Utc::now().timestamp() - 61 * 86_400)
+            .unwrap();
+        assert!(!db.owned_room_salts().unwrap().contains(&annex_salt));
+        scan_owned_rooms_with(&net, None, Pass::Reread).await.expect("the list reads");
+        assert!(db.owned_room_salts().unwrap().contains(&annex_salt), "live there, so listed here");
         // The user's own look from Settings puts it back.
         let asked = scan_owned_rooms_with(&net, None, Pass::Restore).await.expect("the list reads");
         assert_eq!(asked.recovered, 1, "{asked:?}");
@@ -1192,6 +1262,98 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    /// A look that cannot read the list ends the wait of a publish that asked
+    /// for it as one that read it does, so a list changed here goes out after
+    /// one attempt.
+    #[tokio::test]
+    async fn a_failed_look_lets_a_waiting_publish_go() {
+        let _serial = crate::network::channel_membership::owned_rooms_read_test_lock().lock().await;
+        crate::network::channel_membership::reset_owned_rooms_read_times();
+        struct Unreachable {
+            db: Arc<Database>,
+            identity: Arc<NodeIdentity>,
+        }
+        impl RecoveryEnv for Unreachable {
+            fn db(&self) -> Arc<Database> {
+                self.db.clone()
+            }
+            fn identity(&self) -> Arc<NodeIdentity> {
+                self.identity.clone()
+            }
+            async fn probe(&self, _key: [u8; 16]) -> Probe {
+                Probe::Unknown
+            }
+            async fn ember_enabled(&self) -> bool {
+                true
+            }
+            async fn deleted_rooms(&self) -> Option<HashSet<String>> {
+                None
+            }
+            async fn enter_room(&self, _id_hex: &str) {}
+            async fn rekey_room(&self, _id_hex: &str, _epoch: i64) -> Result<i64, String> {
+                Err("not in this test".into())
+            }
+            fn refresh_members(&self, _channel_id: [u8; 16]) {}
+        }
+        let seed = [0x6Cu8; 32];
+        let pubkey = signing_key_from_bytes(&seed).verifying_key().to_bytes();
+        let path = std::env::temp_dir().join(format!(
+            "ember-recovery-unreachable-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let env = Unreachable {
+            db: Arc::new(Database::open_at(&path).expect("open db")),
+            identity: Arc::new(NodeIdentity {
+                kad_id: [1; 16],
+                user_hash: [2; 16],
+                udp_key_seed: 3,
+                ember_hash: crate::network::ember::crypto::node_id_from_ed25519_bytes(&pubkey).unwrap(),
+                ed25519_secret_key: seed,
+                ed25519_public_key: pubkey,
+                noise_private_key: [4; 32],
+                noise_public_key: [5; 32],
+                intro_secret: Default::default(),
+            }),
+        };
+
+        let asked = chrono::Utc::now().timestamp();
+        assert!(scan_owned_rooms_with(&env, None, Pass::Reread).await.is_err());
+        let began = crate::network::channel_membership::owned_rooms_read_began_at();
+        assert!(began >= asked, "the failed look is noted");
+        assert!(!crate::network::channel_membership::owned_rooms_publish_waits(
+            began,
+            asked,
+            chrono::Utc::now().timestamp(),
+        ));
+
+        drop(env);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// A wake a publish left while a look was under way is slept through
+    /// once that look has served it; one it still wants ends the sleep.
+    #[tokio::test]
+    async fn a_wake_already_served_is_slept_through() {
+        let wanted = tokio::sync::Notify::new();
+        let delay = std::time::Duration::from_millis(300);
+        wanted.notify_one();
+        let started = std::time::Instant::now();
+        wait_or_wanted_with(delay, &wanted, || false).await;
+        assert!(started.elapsed() >= delay, "slept the whole delay");
+
+        wanted.notify_one();
+        let woke = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_or_wanted_with(std::time::Duration::from_secs(600), &wanted, || true),
+        )
+        .await;
+        assert!(woke.is_ok(), "woken at once");
     }
 
     /// A settled loop reads the list shortly before this device publishes its

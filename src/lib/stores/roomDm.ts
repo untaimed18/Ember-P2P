@@ -8,7 +8,7 @@ import {
   type RoomDmMessageEvent,
   type RoomDmThread,
 } from '$lib/api/roomDm';
-import { activeChatTab, addChatTab, chatDockOpen, openChat } from '$lib/stores/chatTabs';
+import { activeChatTab, addChatTab, chatDockOpen, closeTab, openChat } from '$lib/stores/chatTabs';
 import { notify } from '$lib/notifications';
 import { isAppVisible } from '$lib/utils';
 import { chatWindowShows, isChatWindow } from '$lib/windowRole';
@@ -47,13 +47,54 @@ export const dmUnread = derived(dmThreads, (threads) => {
 /** Conversations someone started that wait on the user's answer. */
 export const dmRequests = derived(dmThreads, (threads) => threads.filter((t) => t.state === 'request'));
 
+/** Accepted conversations with something in them and no dock tab, newest
+ *  first: the dock lists them so one whose tab was closed, or never fitted,
+ *  can be reached again with its unread count. A request is answered from
+ *  its banner on the Channels page, and a declined one holds nothing. */
+export function dmThreadsWithoutTab(threads: RoomDmThread[], tabKeys: Iterable<string>): RoomDmThread[] {
+  const open = new Set(tabKeys);
+  return threads.filter(
+    (t) => t.state === 'open' && (t.last_at > 0 || t.unread > 0) && !open.has(dmTabKey(t.member_pubkey)),
+  );
+}
+
+const graphemes: Intl.Segmenter | null =
+  typeof Intl !== 'undefined' && 'Segmenter' in Intl ? new Intl.Segmenter(undefined, { granularity: 'grapheme' }) : null;
+
+/** The start of a message for a notification or a preview, at most `max`
+ *  characters as a reader counts them, so a family, flag or skin-toned emoji
+ *  is kept whole or left out. Without `Intl.Segmenter`, cut by code point. */
+export function dmPreview(text: string, max = 140): string {
+  if (!graphemes) return Array.from(text).slice(0, max).join('');
+  let out = '';
+  let count = 0;
+  for (const { segment } of graphemes.segment(text)) {
+    if (count === max) break;
+    out += segment;
+    count++;
+  }
+  return out;
+}
+
+/** Close the dock tab of a conversation that is gone. */
+export function closeDmTab(member: string): void {
+  closeTab(dmTabKey(member));
+}
+
 let refreshSeq = 0;
 
 export async function refreshDmThreads(): Promise<void> {
   const seq = ++refreshSeq;
   try {
     const threads = await listRoomDmThreads();
-    if (seq === refreshSeq) dmThreads.set(threads);
+    if (seq !== refreshSeq) return;
+    // A tab can be open on a conversation not started yet, so only one that
+    // was listed and no longer is counts as gone: dropped, or deleted from
+    // the other window.
+    const listed = new Set(threads.map((t) => t.member_pubkey.toLowerCase()));
+    const gone = get(dmThreads).filter((t) => !listed.has(t.member_pubkey.toLowerCase()));
+    dmThreads.set(threads);
+    for (const thread of gone) closeDmTab(thread.member_pubkey);
   } catch (e) {
     console.warn('roomDm: could not read private conversations', e);
   }
@@ -100,10 +141,10 @@ export async function initRoomDmStore(): Promise<void> {
         if (!msg.request) keepDmTab(msg.member_pubkey, msg.name?.trim() ?? '');
         if (viewingDm(msg.member_pubkey)) return;
         if (msg.request) {
-          if (msg.new_thread) void notify('friend_message', m.channels_dm_request_notify({ name }), msg.text.slice(0, 140));
+          if (msg.new_thread) void notify('friend_message', m.channels_dm_request_notify({ name }), dmPreview(msg.text));
           return;
         }
-        void notify('friend_message', m.channels_dm_notify_title({ name }), msg.text.slice(0, 140));
+        void notify('friend_message', m.channels_dm_notify_title({ name }), dmPreview(msg.text));
       }),
     );
     registered.push(await listen(ROOM_DM_STATUS_EVENT, () => void refreshDmThreads()));

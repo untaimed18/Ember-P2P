@@ -856,13 +856,21 @@ the release notes.
   owns rooms now reads the network's list again while it runs, about ten
   minutes before it publishes its own and at least every three hours
   (`settled_reread_wait`), and carries what the other device added, so its
-  next publish names those rooms too. A room the other device made
-  mid-session is carried, not put back: running it on both at once would
-  have two devices signing its snapshots. The next launch, or Settings'
-  look, puts it back as before (`Pass`). The window left is a room made in
-  the ten minutes before this device's publish, which its own device's next
-  publish lists again. The loop keeps running while the identity owns
-  nothing, so a room taken over later is read for too.
+  next publish names those rooms too. No publish goes out without a look
+  begun in the last 15 minutes: a list changed here by a room made or taken
+  over asks for one at once and goes out when it ends, read or not, or after
+  10 minutes if none does (`owned_rooms_publish_waits`). A room the other
+  device made mid-session is carried, not put back: running it on both at
+  once would have two devices signing its snapshots. The next launch, or
+  Settings' look, puts it back as before (`Pass`), and each look that finds
+  it live keeps it listed past the 60 days a carried salt otherwise lasts.
+  The window left is a room made on the other device between this device's
+  look and its publish, at most 15 minutes, or any time while this device
+  cannot look at all: storers keep one list per identity, so that publish
+  replaces the one naming the room until the other device publishes again,
+  within its 30-minute confirm if it is still running and otherwise when it
+  next runs. The loop keeps running while the identity owns nothing, so a
+  room taken over later is read for too.
 - **A taken-over private room lost before its first rotation.** Recovery
   derives the wrong key and nothing is pending to correct it. Sealing epoch 0
   to ourselves for rooms we did not create would close the gap. Left as it

@@ -3491,6 +3491,9 @@ pub struct PublishOperation {
     pub acked: Vec<EmberNodeId>,
     /// Nodes that failed.
     pub failed: Vec<EmberNodeId>,
+    /// STOREs handed to the transport. A target whose STORE could not be
+    /// sent is failed without counting here.
+    pub sent: usize,
     /// Outstanding request IDs mapped to node IDs.
     pub pending_requests: HashMap<u32, EmberNodeId>,
     pub started_at: Instant,
@@ -3512,6 +3515,7 @@ impl PublishOperation {
             targets,
             acked: Vec::new(),
             failed: Vec::new(),
+            sent: 0,
             pending_requests: HashMap::new(),
             started_at: Instant::now(),
             complete: false,
@@ -3638,18 +3642,16 @@ impl PublishManager {
         self.operations.remove(&publish_id)
     }
 
-    /// Clean up timed-out operations.
-    pub fn cleanup_expired(&mut self) -> Vec<u32> {
+    /// Remove and return the operations long past their timeout, with what
+    /// they got through, so their waiters hear it.
+    pub fn cleanup_expired(&mut self) -> Vec<PublishOperation> {
         let expired: Vec<u32> = self
             .operations
             .iter()
             .filter(|(_, op)| op.started_at.elapsed().as_secs() > PUBLISH_TIMEOUT_SECS * 2)
             .map(|(id, _)| *id)
             .collect();
-        for id in &expired {
-            self.operations.remove(id);
-        }
-        expired
+        expired.into_iter().filter_map(|id| self.operations.remove(&id)).collect()
     }
 
     pub fn active_count(&self) -> usize {
@@ -6112,6 +6114,39 @@ mod tests {
                 .is_empty(),
             "the table is empty; the target must have come from start_publish_to"
         );
+    }
+
+    #[test]
+    fn an_expired_publish_is_handed_back_with_what_it_sent() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let target = |i: u8| EmberContact {
+            node_id: EmberNodeId([i; 16]),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, i, 1, 1)), 4662),
+            noise_pub: [i; 32],
+            ed25519_pub: [i; 32],
+            last_seen: chrono::Utc::now().timestamp(),
+            failed_queries: 0,
+        };
+        let sk = SigningKey::generate(&mut OsRng);
+        let record = SignedRecord::keyword("test", [0xAA; 16], [0xBB; 32], 1000, "file.txt", &sk);
+        let mut pm = PublishManager::new();
+        let pub_id = pm
+            .start_publish_to(record, vec![target(1), target(2)])
+            .expect("publish slot");
+        let op = pm.get_mut(pub_id).unwrap();
+        assert_eq!(op.next_to_store().len(), 2);
+        op.sent = 2;
+        assert!(pm.cleanup_expired().is_empty(), "not yet expired");
+
+        let op = pm.get_mut(pub_id).unwrap();
+        op.started_at = Instant::now() - std::time::Duration::from_secs(PUBLISH_TIMEOUT_SECS * 2 + 1);
+        let expired = pm.cleanup_expired();
+        assert_eq!(
+            expired.iter().map(|op| (op.id, op.sent, op.acked.len(), op.targets.len())).collect::<Vec<_>>(),
+            vec![(pub_id, 2, 0, 2)]
+        );
+        assert_eq!(pm.active_count(), 0);
     }
 
     /// A huge filename used to produce a body the STORE decoder accepted and

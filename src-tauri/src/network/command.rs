@@ -2579,6 +2579,9 @@ async fn handle_command_inner(
             state.stats.ed2k_low_id = state.server_connected.then_some(state.low_id);
             state.stats.tcp_listen_failed =
                 super::TCP_LISTEN_FAILED.load(std::sync::atomic::Ordering::Relaxed);
+            state.stats.advertised_tcp_port = advertised_tcp_port(state);
+            state.stats.advertised_udp_port = advertised_udp_port(state);
+            state.stats.session_age_secs = state.session_started.elapsed().as_secs();
             let _ = tx.send(state.stats.clone());
         }
 

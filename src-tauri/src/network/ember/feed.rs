@@ -132,6 +132,8 @@ pub struct FeedLink {
 
 const LINK_SCHEME: &str = "ember-feed:";
 const LINK_WEB_PREFIX: &str = "https://emberp2p.org/feed/";
+/// The same site under `www.`, which browsers and people add.
+const LINK_WEB_PREFIX_WWW: &str = "https://www.emberp2p.org/feed/";
 const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
 impl FeedLink {
@@ -151,13 +153,15 @@ impl FeedLink {
         format!("{LINK_WEB_PREFIX}{}", self.format().trim_start_matches(LINK_SCHEME))
     }
 
-    /// Either form, with whitespace around it and in either case.
+    /// Either form, the website's with or without `www.`, with whitespace
+    /// around it and in either case.
     pub fn parse(text: &str) -> Option<Self> {
         let text = text.trim();
         let lower = text.to_ascii_lowercase();
         let body = lower
             .strip_prefix(LINK_SCHEME)
-            .or_else(|| lower.strip_prefix(LINK_WEB_PREFIX))?
+            .or_else(|| lower.strip_prefix(LINK_WEB_PREFIX))
+            .or_else(|| lower.strip_prefix(LINK_WEB_PREFIX_WWW))?
             .trim_end_matches('/');
         let bytes = base32_decode(body)?;
         if bytes.len() != 48 {
@@ -188,7 +192,13 @@ fn base32_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Only the one encoding [`base32_encode`] gives for some bytes: no
+/// character more than those bytes need, and padding bits zero. Otherwise
+/// two texts would name one feed.
 fn base32_decode(text: &str) -> Option<Vec<u8>> {
+    if text.len() != (text.len() * 5 / 8 * 8).div_ceil(5) {
+        return None;
+    }
     let mut out = Vec::with_capacity(text.len() * 5 / 8);
     let (mut buffer, mut bits) = (0u32, 0u32);
     for c in text.bytes() {
@@ -201,7 +211,6 @@ fn base32_decode(text: &str) -> Option<Vec<u8>> {
         }
         buffer &= (1 << bits) - 1;
     }
-    // Leftover bits are padding, and zero in a link this build wrote.
     (buffer == 0).then_some(out)
 }
 
@@ -218,9 +227,36 @@ mod tests {
         assert_eq!(FeedLink::parse(&text), Some(link));
         assert_eq!(FeedLink::parse(&format!("  {}  ", text.to_uppercase())), Some(link));
         assert_eq!(FeedLink::parse(&link.web()), Some(link));
+        let www = link.web().replace("https://emberp2p.org/", "https://www.emberp2p.org/");
+        assert_eq!(FeedLink::parse(&www), Some(link));
+        assert_eq!(FeedLink::parse(&format!("{}/", www.to_uppercase())), Some(link));
+        assert!(FeedLink::parse(&link.web().replace("emberp2p.org", "emberp2p.org.evil")).is_none());
         assert!(FeedLink::parse(&text[..text.len() - 1]).is_none(), "short");
         assert!(FeedLink::parse("ember-feed:0000").is_none());
         assert!(FeedLink::parse("ember-channel:abc").is_none());
+    }
+
+    #[test]
+    fn only_the_one_base32_spelling_of_some_bytes_is_read() {
+        let bytes: Vec<u8> = (0u8..48).map(|i| i.wrapping_mul(37)).collect();
+        let text = base32_encode(&bytes);
+        assert_eq!(base32_decode(&text), Some(bytes.clone()));
+        assert!(base32_decode(&format!("{text}a")).is_none(), "a character more than the bytes need");
+        assert_eq!(base32_decode(&format!("{text}aa")).map(|b| b.len()), Some(49), "a byte more, spelt as it should be");
+        // The last character of 48 bytes carries four bits and one of padding.
+        let mut padded = text.clone().into_bytes();
+        let last = BASE32.iter().position(|&c| c == *padded.last().unwrap()).unwrap();
+        padded.pop();
+        padded.push(BASE32[last | 1]);
+        assert!(base32_decode(std::str::from_utf8(&padded).unwrap()).is_none(), "padding bits set");
+        for n in 0..12usize {
+            let bytes = vec![0xA5u8; n];
+            assert_eq!(base32_decode(&base32_encode(&bytes)), Some(bytes), "{n} bytes");
+        }
+
+        let publisher = crate::network::ember::crypto::signing_key_from_bytes(&[3u8; 32]).verifying_key().to_bytes();
+        let link = FeedLink { publisher, salt: [0xAB; 16] }.format();
+        assert!(FeedLink::parse(&format!("{link}a")).is_none(), "a trailing character");
     }
 
     fn head() -> FeedHead {

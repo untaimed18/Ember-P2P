@@ -319,14 +319,17 @@ impl Database {
                 params![member, name, state, channel_id, now],
             )?;
         } else {
-            // Writing to us is taking our messages, whatever they said before.
+            // Writing to us is taking our messages, as of the message's date:
+            // an answer dated before it cannot take that back, and it cannot
+            // take back an answer dated after it.
             tx.execute(
                 "UPDATE room_dm_threads SET
                     name = CASE WHEN ?2 = '' THEN name ELSE ?2 END,
-                    peer_state = CASE WHEN state = 'open' THEN 'accepted' ELSE peer_state END,
+                    peer_state = CASE WHEN state = 'open' AND ?5 >= peer_answered_at THEN 'accepted' ELSE peer_state END,
+                    peer_answered_at = CASE WHEN state = 'open' AND ?5 >= peer_answered_at THEN ?5 ELSE peer_answered_at END,
                     channel_id = ?3, updated_at = ?4, unread = unread + 1
                  WHERE member_pubkey = ?1",
-                params![member, name, channel_id, now],
+                params![member, name, channel_id, now, timestamp],
             )?;
         }
         tx.execute(
@@ -382,21 +385,36 @@ impl Database {
     /// `answered_at`. Only in a conversation open on our side, which is one
     /// we wrote in or accepted: an answer to anything else is nobody's to
     /// record. And only if newer than the answer held, so a replayed old one
-    /// cannot undo a later one. Returns whether the answer was new, and the
-    /// messages of ours a decline stopped.
+    /// cannot undo a later one. A decline stays stored once it has run out,
+    /// so a new one after it is told apart from a repeat by its age. Returns
+    /// whether the answer was new, and the messages of ours a decline
+    /// stopped.
     pub fn dm_note_peer_answer(&self, member: &str, accepted: bool, answered_at: i64) -> anyhow::Result<(bool, Vec<String>)> {
         let member = member.to_ascii_lowercase();
         let conn = self.conn.lock();
         Self::ensure_room_dm_locked(&conn)?;
         let answer = if accepted { "accepted" } else { "declined" };
         let tx = conn.unchecked_transaction()?;
-        let n = tx.execute(
-            "UPDATE room_dm_threads SET peer_state = ?2, peer_answered_at = ?3
-             WHERE member_pubkey = ?1 AND state = 'open' AND peer_state != ?2 AND peer_answered_at < ?3",
+        let held: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT peer_state, peer_answered_at FROM room_dm_threads WHERE member_pubkey = ?1 AND state = 'open'",
+                params![member],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((was, was_at)) = held.filter(|(_, at)| *at < answered_at) else {
+            return Ok((false, Vec::new()));
+        };
+        tx.execute(
+            "UPDATE room_dm_threads SET peer_state = ?2, peer_answered_at = ?3 WHERE member_pubkey = ?1",
             params![member, answer, answered_at],
         )?;
+        // A newer copy of the answer in force only dates it; nothing of ours
+        // is stopped again.
+        let lapsed = was == "declined" && answered_at.saturating_sub(was_at) >= DM_DECLINE_MEMORY_SECS;
+        let moved = was != answer || lapsed;
         let mut stopped = Vec::new();
-        if !accepted && n > 0 {
+        if !accepted && moved {
             // Nothing more of ours will be read: stop sending it.
             {
                 let mut stmt = tx.prepare(
@@ -414,7 +432,22 @@ impl Database {
             )?;
         }
         tx.commit()?;
-        Ok((n > 0, stopped))
+        Ok((moved, stopped))
+    }
+
+    /// Whether the user's refusal of `member` holds at `now`: declined, and
+    /// not so long ago that it ran out. Writing to them since lifts it.
+    pub fn dm_declines(&self, member: &str, now: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Self::ensure_room_dm_locked(&conn)?;
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM room_dm_threads WHERE member_pubkey = ?1 AND state = 'declined' AND declined_at > ?2",
+                params![member.to_ascii_lowercase(), now - DM_DECLINE_MEMORY_SECS],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// Stop every message of ours still being sent: private messages were
@@ -440,6 +473,23 @@ impl Database {
         )?;
         tx.commit()?;
         Ok(stopped)
+    }
+
+    /// Whether one of ours is still being sent: not delivered, and not
+    /// stopped by their decline, by private messages being turned off, or by
+    /// running out of time.
+    pub fn dm_still_sending(&self, member: &str, message_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Self::ensure_room_dm_locked(&conn)?;
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM room_dm_messages
+                 WHERE member_pubkey = ?1 AND direction = 'out' AND message_id = ?2 AND status = 'sending'",
+                params![member.to_ascii_lowercase(), message_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// A receipt for one of ours. Returns whether it moved it to delivered.
@@ -680,6 +730,27 @@ impl Database {
         Ok(())
     }
 
+    /// Remove a request and what it holds as if it never came, for a sender
+    /// being ignored. No refusal is kept: the ignore list already drops them,
+    /// and a refusal would answer them with a decline once they are no longer
+    /// ignored. Anything but a request is left alone. Returns whether there
+    /// was one.
+    pub fn dm_forget_request(&self, member: &str) -> anyhow::Result<bool> {
+        let member = member.to_ascii_lowercase();
+        let conn = self.conn.lock();
+        Self::ensure_room_dm_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM room_dm_threads WHERE member_pubkey = ?1 AND state = 'request'",
+            params![member],
+        )?;
+        if removed > 0 {
+            tx.execute("DELETE FROM room_dm_messages WHERE member_pubkey = ?1", params![member])?;
+        }
+        tx.commit()?;
+        Ok(removed > 0)
+    }
+
     /// Forget declined conversations whose refusal has run out: nothing is
     /// left of them but the row that held it.
     pub fn dm_prune_declined(&self, now: i64) -> anyhow::Result<()> {
@@ -838,6 +909,86 @@ mod tests {
         drop_db(db, path);
     }
 
+    #[test]
+    fn a_decline_after_one_ran_out_counts_again_and_a_repeat_stops_nothing() {
+        let (db, path) = db("decline-again");
+        db.dm_record_outgoing(ANN, "Ann", ROOM, "o1", "hi", 100, 160, 1_300).unwrap();
+        assert_eq!(db.dm_note_peer_answer(ANN, false, 120).unwrap(), (true, vec!["o1".to_string()]));
+        assert_eq!(db.dm_note_peer_answer(ANN, false, 120).unwrap(), (false, vec![]), "a replay");
+
+        let day8 = 120 + 8 * 86_400;
+        assert_eq!(db.dm_thread(ANN, day8).unwrap().unwrap().peer_state, "", "the first has run out");
+        db.dm_record_outgoing(ANN, "Ann", ROOM, "o2", "hello again", day8, day8 + 120, day8 + 1_200).unwrap();
+        db.dm_record_outgoing(ANN, "Ann", ROOM, "o3", "still there?", day8, day8 + 120, day8 + 1_200).unwrap();
+        db.dm_note_attempt(ANN, "o3", ROOM, day8 + 120).unwrap();
+        let (moved, mut stopped) = db.dm_note_peer_answer(ANN, false, day8 + 10).unwrap();
+        stopped.sort();
+        assert_eq!((moved, stopped), (true, vec!["o2".to_string(), "o3".to_string()]));
+        assert_eq!(db.dm_thread(ANN, day8 + 20).unwrap().unwrap().peer_state, "declined");
+        assert!(db.dm_due_resends(day8 + 200).unwrap().is_empty());
+
+        assert!(db.dm_retry(ANN, "o2", day8 + 30, day8 + 1_230).unwrap());
+        assert_eq!(
+            db.dm_note_peer_answer(ANN, false, day8 + 40).unwrap(),
+            (false, vec![]),
+            "a newer copy of the decline in force stops nothing again"
+        );
+        assert_eq!(db.dm_thread(ANN, day8 + 10 + DM_DECLINE_MEMORY_SECS).unwrap().unwrap().peer_state, "declined", "but dates it");
+        drop_db(db, path);
+    }
+
+    #[test]
+    fn a_message_from_them_dates_their_accept_so_an_older_decline_cannot_undo_it() {
+        let (db, path) = db("implicit-accept");
+        db.dm_record_outgoing(ANN, "Ann", ROOM, "o1", "hi", 100, 160, 1_300).unwrap();
+        db.dm_record_incoming(ANN, "Ann", ROOM, "m1", "hey you", 300, ROOM_DM_POLICY_ASK, 300).unwrap();
+        assert_eq!(db.dm_note_peer_answer(ANN, false, 250).unwrap(), (false, vec![]), "sent before their message");
+        assert_eq!(db.dm_thread(ANN, 310).unwrap().unwrap().peer_state, "accepted");
+        assert_eq!(db.dm_note_peer_answer(ANN, false, 350).unwrap(), (true, vec!["o1".to_string()]), "sent after it");
+        drop_db(db, path);
+    }
+
+    #[test]
+    fn a_message_dated_before_their_decline_does_not_undo_it() {
+        let (db, path) = db("late-message");
+        db.dm_record_outgoing(ANN, "Ann", ROOM, "o1", "hi", 100, 160, 1_300).unwrap();
+        db.dm_record_incoming(ANN, "Ann", ROOM, "m1", "hey", 200, ROOM_DM_POLICY_ASK, 200).unwrap();
+        assert!(db.dm_note_peer_answer(ANN, false, 300).unwrap().0);
+        db.dm_record_incoming(ANN, "Ann", ROOM, "m2", "sent earlier", 250, ROOM_DM_POLICY_ASK, 310).unwrap();
+        assert_eq!(db.dm_thread(ANN, 320).unwrap().unwrap().peer_state, "declined");
+        db.dm_record_incoming(ANN, "Ann", ROOM, "m3", "sent later", 330, ROOM_DM_POLICY_ASK, 330).unwrap();
+        assert_eq!(db.dm_thread(ANN, 340).unwrap().unwrap().peer_state, "accepted");
+        drop_db(db, path);
+    }
+
+    #[test]
+    fn a_message_is_sending_until_delivered_stopped_or_given_up() {
+        let (db, path) = db("still-sending");
+        db.dm_record_outgoing(ANN, "Ann", ROOM, "o1", "one", 100, 160, 1_300).unwrap();
+        db.dm_record_outgoing(ANN, "Ann", ROOM, "o2", "two", 100, 160, 1_300).unwrap();
+        assert!(db.dm_still_sending(&ANN.to_uppercase(), "o1").unwrap());
+        assert!(db.dm_mark_delivered(ANN, "o1").unwrap());
+        assert!(!db.dm_still_sending(ANN, "o1").unwrap(), "delivered");
+        db.dm_note_peer_answer(ANN, false, 120).unwrap();
+        assert!(!db.dm_still_sending(ANN, "o2").unwrap(), "stopped by their decline");
+        assert!(!db.dm_still_sending(ANN, "nope").unwrap());
+        drop_db(db, path);
+    }
+
+    #[test]
+    fn our_refusal_holds_until_it_runs_out_or_we_write() {
+        let (db, path) = db("refusal");
+        assert!(!db.dm_declines(ANN, 100).unwrap(), "no conversation");
+        db.dm_record_incoming(ANN, "Ann", ROOM, "m1", "psst", 100, ROOM_DM_POLICY_ASK, 100).unwrap();
+        assert!(!db.dm_declines(ANN, 101).unwrap(), "a request waiting");
+        db.dm_answer_request(ANN, false, 110).unwrap();
+        assert!(db.dm_declines(&ANN.to_uppercase(), 111).unwrap());
+        assert!(!db.dm_declines(ANN, 110 + DM_DECLINE_MEMORY_SECS).unwrap(), "run out");
+        db.dm_record_outgoing(ANN, "Ann", ROOM, "o1", "sorry, hi", 120, 240, 1_320).unwrap();
+        assert!(!db.dm_declines(ANN, 121).unwrap(), "we wrote to them");
+        drop_db(db, path);
+    }
+
     /// Someone not yet accepted gets a few lines, and nobody gets more than
     /// a conversation's worth an hour.
     #[test]
@@ -898,6 +1049,31 @@ mod tests {
 
         db.dm_prune_declined(6 + DM_DECLINE_MEMORY_SECS).unwrap();
         assert!(db.dm_thread(ANN, 6 + DM_DECLINE_MEMORY_SECS).unwrap().is_none(), "a refusal run out leaves nothing");
+        drop_db(db, path);
+    }
+
+    /// Forgetting an ignored sender's request keeps no refusal, so nothing is
+    /// ever answered on its account, and touches no other conversation.
+    #[test]
+    fn forgetting_a_request_leaves_nothing_to_answer_with() {
+        let (db, path) = db("forget");
+        db.dm_record_incoming(ANN, "Ann", ROOM, "m1", "psst", 5, ROOM_DM_POLICY_ASK, 5).unwrap();
+        db.dm_record_incoming(ANN, "Ann", ROOM, "m2", "hello?", 6, ROOM_DM_POLICY_ASK, 6).unwrap();
+        assert!(db.dm_forget_request(&ANN.to_uppercase()).unwrap());
+        assert!(db.dm_thread(ANN, 7).unwrap().is_none());
+        assert!(db.dm_messages(ANN, 10, None).unwrap().is_empty());
+        assert!(!db.dm_declines(ANN, 7).unwrap(), "no refusal kept");
+        assert!(!db.dm_forget_request(ANN).unwrap(), "once");
+        assert_eq!(
+            db.dm_record_incoming(ANN, "Ann", ROOM, "m3", "hi", 8, ROOM_DM_POLICY_ASK, 8).unwrap(),
+            DmIncoming::Stored { request: true, new_thread: true },
+            "no longer ignored, they ask again rather than draw a decline"
+        );
+
+        let bob = "bb22";
+        db.dm_record_outgoing(bob, "Bob", ROOM, "o1", "hi", 5, 6, 7).unwrap();
+        assert!(!db.dm_forget_request(bob).unwrap(), "an open conversation is not a request");
+        assert_eq!(db.dm_messages(bob, 10, None).unwrap().len(), 1);
         drop_db(db, path);
     }
 

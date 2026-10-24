@@ -24,18 +24,21 @@
     setFeedItems,
     unfollowFeed,
     type FeedItem,
+    type FeedsChangedEvent,
     type FollowedFeed,
     type FollowedItem,
     type OwnFeed,
   } from '$lib/api/feeds';
+  import { AUTO_MIB_MAX, capMib, concernsFollowed, draftOf, sameDraft, type FeedDraft } from '$lib/feedsPage';
   import type { FileInfo } from '$lib/types';
   import FeedFilePicker from '$lib/components/FeedFilePicker.svelte';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import IconX from '$lib/components/IconX.svelte';
-  import { followedFeeds, refreshFollowedFeeds } from '$lib/stores/feeds';
+  import { followedFeed, followedFeeds, refreshFollowedFeeds } from '$lib/stores/feeds';
   import { appSettings } from '$lib/stores/settings';
-  import { toastError, toastSuccess } from '$lib/stores/toast';
+  import { toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
+  import { plural } from '$lib/plural';
   import { formatBytes, formatNumber, formatRelativeTime } from '$lib/utils';
   import { extensionFromPath, fileTypeFilterLabel, fileTypeKey, type FileTypeKey } from '$lib/fileTypes';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
@@ -142,12 +145,10 @@
     const q = listQuery.trim().toLowerCase();
     return q ? $followedFeeds.filter((f) => feedLabel(f).toLowerCase().includes(q)) : $followedFeeds;
   });
-  /** What a cap field holds, as saved: an emptied or negative one is 0. */
-  const mib = (value: number | null) => Math.max(0, Math.floor(value || 0));
   let autoChanged = $derived(
     !!selected &&
-      (mib(autoItemMib) !== selected.auto_max_item_mib ||
-        mib(autoDayMib) !== selected.auto_max_day_mib ||
+      (capMib(autoItemMib) !== selected.auto_max_item_mib ||
+        capMib(autoDayMib) !== selected.auto_max_day_mib ||
         autoCategory !== selected.auto_category),
   );
   /** New and still listed, downloaded or not: what the New filter shows. */
@@ -162,8 +163,11 @@
     if (f.state === 'waiting') return m.feeds_state_waiting_short();
     if (f.state === 'fetching') return m.feeds_state_fetching_short();
     if (f.state === 'broken') return m.feeds_state_broken_short();
-    return m.feeds_items_count({ count: f.item_count });
+    return m.feeds_items_count({ count: formatNumber(f.item_count) });
   }
+
+  /** A link opened from outside while another follow was running. */
+  let queuedLink: string | null = null;
 
   async function follow(link = followLink) {
     const text = link.trim();
@@ -180,6 +184,9 @@
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
       following = false;
+      const next = queuedLink;
+      queuedLink = null;
+      if (next) void follow(next);
     }
   }
 
@@ -190,7 +197,8 @@
     if (!linked) return;
     untrack(() => {
       setTab('following');
-      void follow(linked);
+      if (following) queuedLink = linked;
+      else void follow(linked);
       const next = new URL(page.url);
       next.searchParams.delete('follow');
       void goto(`${next.pathname}${next.search}${next.hash}`, { replaceState: true, keepFocus: true, noScroll: true }).catch(
@@ -292,10 +300,17 @@
     if (!feed || autoSaving) return false;
     autoSaving = true;
     try {
-      autoItemMib = mib(autoItemMib);
-      autoDayMib = mib(autoDayMib);
+      autoItemMib = capMib(autoItemMib);
+      autoDayMib = capMib(autoDayMib);
       await setFeedAutoDownload(feed.publisher, feed.salt, autoEnabled, autoItemMib, autoDayMib, autoCategory);
       await refreshFollowedFeeds();
+      // The fields show what was saved, which the backend may have clipped.
+      const saved = followedFeed(feed.publisher, feed.salt);
+      if (saved && selectedKey === keyOf(feed)) {
+        autoItemMib = saved.auto_max_item_mib;
+        autoDayMib = saved.auto_max_day_mib;
+        autoCategory = saved.auto_category;
+      }
       return true;
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
@@ -325,7 +340,7 @@
     downloading = true;
     try {
       const started = await downloadFeedItems(feed.publisher, feed.salt, ed2ks);
-      toastSuccess(m.feeds_downloads_started({ count: started }));
+      toastSuccess(m.feeds_downloads_started({ count: formatNumber(started) }));
       // Not if the user has opened another feed meanwhile.
       if (selectedKey === keyOf(feed)) await loadItems(feed);
     } catch (e) {
@@ -380,6 +395,7 @@
   // ── My feeds ─────────────────────────────────────────────────────────
   let mine = $state<OwnFeed[]>([]);
   let mineLoaded = $state(false);
+  let mineFailed = $state(false);
   let newTitle = $state('');
   let newDescription = $state('');
   let creating = $state(false);
@@ -387,7 +403,8 @@
   let editTitle = $state('');
   let editDescription = $state('');
   let editItems = $state<FeedItem[]>([]);
-  let dirty = $state(false);
+  /** The open feed as last loaded or saved, to tell real edits from undone ones. */
+  let savedDraft = $state.raw<FeedDraft>({ title: '', description: '', items: [] });
   let saving = $state(false);
   let publishing = $state(false);
   let deleteOpen = $state(false);
@@ -398,6 +415,9 @@
 
   let busy = $derived(saving || publishing || creating);
   let mineFeed = $derived(mine.find((f) => f.salt === mineSelected) ?? null);
+  let dirty = $derived(
+    !!mineFeed && !sameDraft({ title: editTitle, description: editDescription, items: editItems }, savedDraft),
+  );
   let inFeed = $derived(new Set(editItems.map((i) => i.ed2k.toLowerCase())));
   let editSize = $derived(editItems.reduce((sum, i) => sum + i.size, 0));
   /** Published, and nothing saved or typed since: nothing to publish. */
@@ -407,12 +427,27 @@
     return q ? mine.filter((f) => f.title.toLowerCase().includes(q)) : mine;
   });
 
-  async function loadMine() {
+  let mineSeq = 0;
+  let mineShownSeq = 0;
+  /** The user's feeds, shown unless a later load has answered first.
+   *  Returns what was read either way, or null if it could not be. */
+  async function loadMine(): Promise<OwnFeed[] | null> {
+    const seq = ++mineSeq;
     try {
-      mine = await listMyFeeds();
-      mineLoaded = true;
+      const feeds = await listMyFeeds();
+      if (seq > mineShownSeq) {
+        mineShownSeq = seq;
+        mine = feeds;
+        mineLoaded = true;
+        mineFailed = false;
+      }
+      return feeds;
     } catch (e) {
-      toastError(translateError(e, m.error_operation_failed()));
+      if (seq === mineSeq) {
+        mineFailed = true;
+        toastError(translateError(e, m.error_operation_failed()));
+      }
+      return null;
     }
   }
 
@@ -436,7 +471,7 @@
     editTitle = feed.title;
     editDescription = feed.description;
     editItems = feed.items.map((i) => ({ ...i }));
-    dirty = false;
+    savedDraft = draftOf(feed);
   }
 
   async function create() {
@@ -465,7 +500,6 @@
       ...editItems,
       ...fresh.map((f) => ({ ed2k: f.hash, name: f.name, size: f.size, aich: f.aich_hash, blake3: f.ember_file_hash, note: '' })),
     ];
-    dirty = true;
   }
 
   function move(index: number, step: -1 | 1) {
@@ -474,12 +508,10 @@
     const next = editItems.slice();
     [next[index], next[to]] = [next[to], next[index]];
     editItems = next;
-    dirty = true;
   }
 
   function removeItem(index: number) {
     editItems = editItems.filter((_, i) => i !== index);
-    dirty = true;
   }
 
   interface Draft {
@@ -501,12 +533,32 @@
     };
   }
 
+  /** Files the feed no longer holds because they stopped being shared with everyone. */
+  function droppedText(names: string[]): string {
+    return plural(names.length, {
+      one: () => m.feeds_items_dropped_one({ name: names[0] }),
+      other: () => m.feeds_items_dropped_other({ count: formatNumber(names.length), name: names[0] }),
+    });
+  }
+
   async function saveDraft(d: Draft): Promise<boolean> {
     try {
-      await setFeedDetails(d.salt, d.title, d.description);
-      await setFeedItems(d.salt, d.items);
-      if (mineSelected === d.salt) dirty = false;
-      await loadMine();
+      const details = await setFeedDetails(d.salt, d.title, d.description);
+      const { items, dropped } = await setFeedItems(d.salt, d.items);
+      // What was kept, which leaves out anything dropped and is cleaned as
+      // the backend saves it: as reloaded, or as the save answered when the
+      // reload fails.
+      const saved = (await loadMine())?.find((f) => f.salt === d.salt) ?? { ...details, items };
+      if (mineSelected === d.salt) {
+        // Edits made while the save ran stay in the editor, unsaved.
+        if (sameDraft({ title: editTitle, description: editDescription, items: editItems }, d)) {
+          editTitle = saved.title;
+          editDescription = saved.description;
+          editItems = saved.items.map((i) => ({ ...i }));
+        }
+        savedDraft = draftOf(saved);
+      }
+      if (dropped.length > 0) toastWarning(droppedText(dropped));
       return true;
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
@@ -532,8 +584,7 @@
     try {
       if (dirty && !(await saveDraft(d))) return;
       await publishFeed(d.salt);
-      await loadMine();
-      const feed = mine.find((f) => f.salt === d.salt);
+      const feed = (await loadMine())?.find((f) => f.salt === d.salt);
       if (feed && mineSelected === d.salt) selectMine(feed);
       toastSuccess(m.feeds_published_toast());
     } catch (e) {
@@ -548,10 +599,7 @@
     if (!feed) return;
     try {
       await deleteFeed(feed.salt);
-      if (mineSelected === feed.salt) {
-        mineSelected = null;
-        dirty = false;
-      }
+      if (mineSelected === feed.salt) mineSelected = null;
       await loadMine();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
@@ -586,7 +634,13 @@
     void loadMine();
     let unlisten: UnlistenFn | null = null;
     let alive = true;
-    void listen(FEEDS_CHANGED_EVENT, () => void loadMine()).then((fn) => {
+    void listen<FeedsChangedEvent>(FEEDS_CHANGED_EVENT, (event) => {
+      void loadMine();
+      // Files can change without a new list, as when one is downloaded
+      // automatically.
+      const feed = selected;
+      if (feed && itemsFor === keyOf(feed) && concernsFollowed(event.payload, feed)) void loadItems(feed);
+    }).then((fn) => {
       if (alive) unlisten = fn;
       else fn();
     });
@@ -791,7 +845,7 @@
                 </span>
                 {#if feed.unread > 0}
                   <span class="count-pill" aria-hidden="true">{feed.unread > 99 ? '99+' : feed.unread}</span>
-                  <span class="sr-only">{m.feeds_unread_title({ count: feed.unread })}</span>
+                  <span class="sr-only">{m.feeds_unread_title({ count: formatNumber(feed.unread) })}</span>
                 {/if}
               </button>
             {:else}
@@ -807,7 +861,7 @@
               <div class="detail-title">
                 <h3><bdi dir="auto">{feedLabel(selected)}</bdi></h3>
                 <p class="detail-meta">
-                  <span>{m.feeds_items_count({ count: listedItems.length })}</span>
+                  <span>{m.feeds_items_count({ count: formatNumber(listedItems.length) })}</span>
                   {#if listedSize > 0}<span aria-hidden="true">·</span><span>{formatBytes(listedSize)}</span>{/if}
                   {#if selected.checked_at > 0}
                     <span aria-hidden="true">·</span><span>{m.feeds_checked_at({ when: ago(selected.checked_at) })}</span>
@@ -879,11 +933,11 @@
                   <div class="auto-grid">
                     <label class="field">
                       <span class="field-label">{m.feeds_auto_max_item()}</span>
-                      <input type="number" min="0" bind:value={autoItemMib} />
+                      <input type="number" min="0" max={AUTO_MIB_MAX} bind:value={autoItemMib} onchange={() => (autoItemMib = capMib(autoItemMib))} />
                     </label>
                     <label class="field">
                       <span class="field-label">{m.feeds_auto_max_day()}</span>
-                      <input type="number" min="0" bind:value={autoDayMib} />
+                      <input type="number" min="0" max={AUTO_MIB_MAX} bind:value={autoDayMib} onchange={() => (autoDayMib = capMib(autoDayMib))} />
                     </label>
                     <label class="field">
                       <span class="field-label">{m.feeds_auto_category()}</span>
@@ -922,7 +976,7 @@
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
                   </svg>
-                  {m.feeds_download_all_new({ count: newItems.length })}
+                  {m.feeds_download_all_new({ count: formatNumber(newItems.length) })}
                 </button>
               {/if}
             </div>
@@ -984,7 +1038,20 @@
         </section>
       </div>
     {/if}
-  {:else if mineLoaded && mine.length === 0}
+  {:else if !mineLoaded}
+    <div class="empty-card">
+      {#if mineFailed}
+        <div class="empty-state">
+          <p class="empty-title">{m.feeds_load_failed()}</p>
+          <div class="empty-actions">
+            <button type="button" class="primary empty-action" onclick={() => void loadMine()}>{m.common_retry()}</button>
+          </div>
+        </div>
+      {:else}
+        <span class="spinner xs" aria-hidden="true"></span>
+      {/if}
+    </div>
+  {:else if mine.length === 0}
     <div class="empty-card">
       <div class="empty-state">
         <span class="empty-glyph">{@render feedGlyph()}</span>
@@ -1045,7 +1112,6 @@
                 disabled={busy}
                 oninput={(e) => {
                   if (!composing(e)) editTitle = fitBytes(editTitle, TITLE_MAX);
-                  dirty = true;
                 }}
                 oncompositionend={() => (editTitle = fitBytes(editTitle, TITLE_MAX))}
                 placeholder={m.feeds_title_placeholder()}
@@ -1060,7 +1126,7 @@
                   <span>{m.feeds_badge_draft()}</span>
                 {/if}
                 <span aria-hidden="true">·</span>
-                <span>{m.feeds_items_count({ count: editItems.length })}</span>
+                <span>{m.feeds_items_count({ count: formatNumber(editItems.length) })}</span>
                 {#if editSize > 0}<span aria-hidden="true">·</span><span>{formatBytes(editSize)}</span>{/if}
                 {#if dirty}<span aria-hidden="true">·</span><span class="unsaved">{m.feeds_unsaved()}</span>{/if}
               </p>
@@ -1087,7 +1153,6 @@
             disabled={busy}
             oninput={(e) => {
               if (!composing(e)) editDescription = fitBytes(editDescription, DESCRIPTION_MAX);
-              dirty = true;
             }}
             oncompositionend={() => (editDescription = fitBytes(editDescription, DESCRIPTION_MAX))}
             placeholder={m.feeds_description_placeholder()}
@@ -1148,7 +1213,6 @@
                     aria-label={m.feeds_note_placeholder()}
                     oninput={(e) => {
                       if (!composing(e)) item.note = fitBytes(item.note, NOTE_MAX);
-                      dirty = true;
                     }}
                     oncompositionend={() => (item.note = fitBytes(item.note, NOTE_MAX))}
                   />
@@ -1169,7 +1233,9 @@
           </div>
 
           <footer class="editor-foot">
-            <p class="hint">{m.feeds_publish_public_hint()}</p>
+            <p class="hint" class:up-to-date={upToDate} id="feeds-publish-hint">
+              {upToDate ? m.feeds_publish_up_to_date_title() : m.feeds_publish_public_hint()}
+            </p>
             <div class="editor-foot-actions">
               <button type="button" class="secondary" disabled={!dirty || busy} onclick={() => void save()}>{m.feeds_save()}</button>
               <!-- Published and unchanged: publishing again would only bump the
@@ -1178,7 +1244,7 @@
                 type="button"
                 class="primary"
                 disabled={busy || emberOff || upToDate}
-                title={upToDate ? m.feeds_publish_up_to_date_title() : undefined}
+                aria-describedby={upToDate ? 'feeds-publish-hint' : undefined}
                 onclick={() => void publish()}
               >
                 {#if publishing}
@@ -2238,7 +2304,7 @@
       width: 160px;
     }
 
-    .editor-foot .hint {
+    .editor-foot .hint:not(.up-to-date) {
       display: none;
     }
   }

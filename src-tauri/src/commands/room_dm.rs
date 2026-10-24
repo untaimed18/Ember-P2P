@@ -15,6 +15,13 @@ use crate::types::IgnoredMember;
 
 /// How long after one attempt the next goes out, while unanswered.
 const DM_RESEND_SECS: i64 = 2 * 60;
+/// Up to this much more is added to each wait, at random, so messages
+/// written or resent together do not stay together for every attempt.
+const DM_RESEND_JITTER_SECS: i64 = 30;
+/// New private messages this device writes through one room a minute, as
+/// room chat allows its lines, and counted apart from them. Each is resent
+/// until answered, so this also bounds what the resend loop carries.
+const DM_SEND_PER_ROOM_MINUTE: usize = 20;
 /// How long a message of ours is tried before it is marked not delivered:
 /// a recipient online in that time gets it.
 const DM_GIVE_UP_SECS: i64 = 20 * 60;
@@ -102,6 +109,40 @@ async fn blocking<T: Send + 'static>(
         .await
         .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
         .map_err(|e| coded_ctx(code, message, e))
+}
+
+/// When the next attempt at a message tried at `now` is due.
+fn next_attempt_at(now: i64) -> i64 {
+    now + DM_RESEND_SECS + rand::Rng::gen_range(&mut rand::thread_rng(), 0..=DM_RESEND_JITTER_SECS)
+}
+
+type DmSendTimes = std::collections::HashMap<String, std::collections::VecDeque<std::time::Instant>>;
+
+/// Our own new private messages per room, for [`DM_SEND_PER_ROOM_MINUTE`].
+/// For this session only: it stops a runaway loop or a wall of pastes, both
+/// of which happen inside one.
+fn dm_send_times() -> &'static std::sync::Mutex<DmSendTimes> {
+    static TIMES: std::sync::OnceLock<std::sync::Mutex<DmSendTimes>> = std::sync::OnceLock::new();
+    TIMES.get_or_init(Default::default)
+}
+
+/// Whether `channel_id` has room in its minute for one more message, taking
+/// it if so.
+fn dm_send_allowed(channel_id: &str) -> bool {
+    let window = std::time::Duration::from_secs(60);
+    let now = std::time::Instant::now();
+    let mut map = dm_send_times().lock().unwrap_or_else(|e| e.into_inner());
+    map.retain(|_, times| times.back().is_some_and(|at| now.saturating_duration_since(*at) <= window));
+    let times = map.entry(channel_id.to_string()).or_default();
+    crate::network::ember::channel::rate_window_allow(times, now, window, DM_SEND_PER_ROOM_MINUTE)
+}
+
+/// Hand back the slot a message took when it was not sent after all.
+fn refund_dm_send(channel_id: &str) {
+    let mut map = dm_send_times().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(times) = map.get_mut(channel_id) {
+        times.pop_back();
+    }
 }
 
 fn send_frame(state: &AppState, channel_id: &str, member: [u8; 32], payload: DmPayload) {
@@ -195,17 +236,28 @@ pub async fn send_room_dm(
                 Ok(channel) => channel,
                 Err(refused) => return Ok(Err(refused)),
             };
-            let name = db.dm_member_in_room(&channel, &task_member)?.unwrap_or_default();
-            db.dm_record_outgoing(
-                &task_member,
-                &name,
-                &channel,
-                &task_id,
-                &task_text,
-                now,
-                now + DM_RESEND_SECS,
-                now + DM_GIVE_UP_SECS,
-            )?;
+            if !dm_send_allowed(&channel) {
+                return Ok(Err(coded(
+                    "channels_dm_rate_limited",
+                    "You are sending private messages too fast. Wait a moment and try again.",
+                )));
+            }
+            let recorded = db.dm_member_in_room(&channel, &task_member).and_then(|name| {
+                db.dm_record_outgoing(
+                    &task_member,
+                    &name.unwrap_or_default(),
+                    &channel,
+                    &task_id,
+                    &task_text,
+                    now,
+                    next_attempt_at(now),
+                    now + DM_GIVE_UP_SECS,
+                )
+            });
+            if recorded.is_err() {
+                refund_dm_send(&channel);
+            }
+            recorded?;
             Ok(Ok(channel))
         },
         "channels_dm_failed",
@@ -272,7 +324,8 @@ pub async fn mark_room_dm_read(
 }
 
 /// Delete a conversation and everything in it, here only. A request deleted
-/// is declined, without telling its sender.
+/// is declined, without telling its sender, and that refusal is answered
+/// with a decline if they write again while it holds.
 #[tauri::command]
 pub async fn delete_room_dm_thread(
     app: tauri::AppHandle,
@@ -288,7 +341,32 @@ pub async fn delete_room_dm_thread(
     Ok(())
 }
 
-/// Try a message that was not delivered again, on the terms a new one meets.
+/// Remove someone's request here and send them nothing, not even a reply
+/// already waiting: for a sender being ignored, who sees their messages go
+/// undelivered as if we were offline. Ignore them first, so nothing they
+/// send next opens a new one.
+#[tauri::command]
+pub async fn drop_room_dm_request(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    member: String,
+) -> Result<(), String> {
+    let key = member_key(&member)?;
+    let member = hex::encode(key);
+    let db = state.db.clone();
+    let task_member = member.clone();
+    let removed =
+        blocking(move || db.dm_forget_request(&task_member), "channels_dm_failed", "Could not answer the request").await?;
+    crate::network::room_dm::drop_replies_to(&key);
+    if removed {
+        let _ = app.emit(DM_THREAD_EVENT, serde_json::json!({ "member_pubkey": member }));
+    }
+    Ok(())
+}
+
+/// Try a message that was not delivered again, on the terms a new one meets:
+/// the same refusals, and a place in its room's [`DM_SEND_PER_ROOM_MINUTE`],
+/// handed back if it is not retried after all.
 #[tauri::command]
 pub async fn retry_room_dm(
     app: tauri::AppHandle,
@@ -310,10 +388,21 @@ pub async fn retry_room_dm(
     // Due at once: the resend loop sends it on its next look.
     let retried = blocking(
         move || {
-            if let Err(refused) = send_route(&db, &key, &task_member, &ours, now)? {
-                return Ok(Err(refused));
+            let channel = match send_route(&db, &key, &task_member, &ours, now)? {
+                Ok(channel) => channel,
+                Err(refused) => return Ok(Err(refused)),
+            };
+            if !dm_send_allowed(&channel) {
+                return Ok(Err(coded(
+                    "channels_dm_rate_limited",
+                    "You are sending private messages too fast. Wait a moment and try again.",
+                )));
             }
-            Ok(Ok(db.dm_retry(&task_member, &task_id, now, now + DM_GIVE_UP_SECS)?))
+            let retried = db.dm_retry(&task_member, &task_id, now, now + DM_GIVE_UP_SECS);
+            if !matches!(retried, Ok(true)) {
+                refund_dm_send(&channel);
+            }
+            Ok(Ok(retried?))
         },
         "channels_dm_failed",
         "Could not send the message",
@@ -329,7 +418,9 @@ pub async fn retry_room_dm(
 }
 
 /// Replace the ignore list. The webview keeps a copy to hide lines with; this
-/// is the one private messages are dropped by.
+/// is the one private messages are dropped by. In force when this returns,
+/// not only once the network loop takes up the settings, so a request
+/// dropped next cannot be reopened by a message already on its way.
 #[tauri::command]
 pub async fn set_ignored_members(
     app: tauri::AppHandle,
@@ -343,6 +434,13 @@ pub async fn set_ignored_members(
         Ok(changed)
     })
     .await?;
+    // From the settings as they stand, not as this call left them: a save
+    // since must not be undone here.
+    let config = state.config.read().await;
+    crate::network::room_dm::set_dm_policy(
+        crate::types::room_dm_policy_in_force(&config.settings.room_dm_policy),
+        config.settings.ignored_members.as_deref(),
+    );
     Ok(())
 }
 
@@ -352,7 +450,7 @@ const MAX_IGNORED_ROOMS: usize = 64;
 /// An ignore list as it is kept: valid keys only, once each, lowercase, at
 /// most [`MAX_IGNORED_MEMBERS`]. An entry whose rooms were all invalid is
 /// dropped rather than kept ignoring nowhere, or widened to everywhere.
-fn clean_ignored_members(members: Vec<IgnoredMember>) -> Vec<IgnoredMember> {
+pub(crate) fn clean_ignored_members(members: Vec<IgnoredMember>) -> Vec<IgnoredMember> {
     let mut seen = std::collections::HashSet::new();
     let mut cleaned = Vec::new();
     for mut entry in members {
@@ -416,7 +514,7 @@ pub fn spawn_resends(app: tauri::AppHandle) {
                     .map(|resend| {
                         let room = shared_room(&db, &resend.member_pubkey, &ours, &resend.channel_id);
                         let channel = room.clone().unwrap_or_else(|| resend.channel_id.clone());
-                        let _ = db.dm_note_attempt(&resend.member_pubkey, &resend.message_id, &channel, now + DM_RESEND_SECS);
+                        let _ = db.dm_note_attempt(&resend.member_pubkey, &resend.message_id, &channel, next_attempt_at(now));
                         (resend, room)
                     })
                     .collect::<Vec<_>>();
@@ -478,5 +576,27 @@ mod tests {
 
         let many = (0..MAX_IGNORED_MEMBERS + 10).map(|i| entry(&format!("{i:064x}"), None)).collect();
         assert_eq!(clean_ignored_members(many).len(), MAX_IGNORED_MEMBERS);
+    }
+
+    #[test]
+    fn resends_are_spread_over_a_window_rather_than_kept_together() {
+        let now = 1_900_000_000;
+        let times: std::collections::HashSet<i64> = (0..200).map(|_| next_attempt_at(now)).collect();
+        assert!(times.iter().all(|at| (now + DM_RESEND_SECS..=now + DM_RESEND_SECS + DM_RESEND_JITTER_SECS).contains(at)));
+        assert!(times.len() > 10, "spread, not one time for the batch: {times:?}");
+    }
+
+    #[test]
+    fn a_room_takes_only_so_many_new_messages_a_minute() {
+        let room = format!("{:032x}", rand::random::<u128>());
+        let other = format!("{:032x}", rand::random::<u128>());
+        for i in 0..DM_SEND_PER_ROOM_MINUTE {
+            assert!(dm_send_allowed(&room), "{i}");
+        }
+        assert!(!dm_send_allowed(&room));
+        assert!(dm_send_allowed(&other), "per room");
+        refund_dm_send(&room);
+        assert!(dm_send_allowed(&room), "a message not sent gives its slot back");
+        assert!(!dm_send_allowed(&room));
     }
 }

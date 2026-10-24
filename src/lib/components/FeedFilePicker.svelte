@@ -103,8 +103,8 @@
     return counts;
   });
 
-  let filtered = $derived.by(() => {
-    const list = typeFilter === 'All' ? [...textMatched] : textMatched.filter((f) => typeByHash.get(keyOf(f)) === typeFilter);
+  /** `list` in the table's order. */
+  function sorted(list: FileInfo[]): FileInfo[] {
     list.sort(
       sortKey === 'size'
         ? (a, b) => a.size - b.size || compareFileNames(a.name, b.name)
@@ -112,14 +112,19 @@
     );
     if (!sortAsc) list.reverse();
     return list;
-  });
+  }
+
+  let filtered = $derived(
+    sorted(typeFilter === 'All' ? [...textMatched] : textMatched.filter((f) => typeByHash.get(keyOf(f)) === typeFilter)),
+  );
   let shown = $derived(filtered.slice(0, RENDER_LIMIT));
   let filteredSize = $derived(filtered.reduce((sum, f) => sum + f.size, 0));
   let isFiltered = $derived(Boolean(filterQuery.trim()) || typeFilter !== 'All' || hidingAdded);
 
   /** Selection survives switching type, so files can be picked across
-   *  several; one that joined the feed meanwhile drops out. */
-  let selected = $derived(eligible.filter((f) => selectedHashes.has(keyOf(f)) && !isAdded(f)));
+   *  several; one that joined the feed meanwhile drops out. Kept in the
+   *  table's order, which is the order they join the feed in. */
+  let selected = $derived(sorted(eligible.filter((f) => selectedHashes.has(keyOf(f)) && !isAdded(f))));
   let selectedSize = $derived(selected.reduce((sum, f) => sum + f.size, 0));
   let selectableShown = $derived(shown.filter((f) => !isAdded(f)));
   let allShownSelected = $derived(selectableShown.length > 0 && selectableShown.every((f) => selectedHashes.has(keyOf(f))));
@@ -400,7 +405,7 @@
             <div class="picker-count-row">
               <div class="picker-count">
                 {#if isFiltered}
-                  {m.browse_count_filtered({ filtered: filtered.length, total: eligible.length })}
+                  {m.browse_count_filtered({ filtered: formatNumber(filtered.length), total: formatNumber(eligible.length) })}
                 {:else}
                   {m.feeds_picker_count({ count: formatNumber(eligible.length) })}
                 {/if}

@@ -1,9 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   DOCTOR_OFFER_AFTER_MS,
   doctorOfferDueIn,
   initialDoctorOffer,
+  runDoctorOffer,
   stepDoctorOffer,
+  type DoctorOfferClock,
   type DoctorOfferState,
 } from './connectionDoctorOffer';
 
@@ -56,5 +58,76 @@ describe('doctorOfferDueIn', () => {
 
   it('has nothing pending while reachable', () => {
     expect(doctorOfferDueIn(initialDoctorOffer, 0)).toBeNull();
+  });
+});
+
+/** A clock the test moves by hand, with at most one timer pending. */
+function fakeClock(start = 0) {
+  let now = start;
+  let pending: { run: () => void; ms: number } | null = null;
+  const clock: DoctorOfferClock = {
+    now: () => now,
+    setTimeout: (run, ms) => {
+      pending = { run, ms };
+      return pending;
+    },
+    clearTimeout: (timer) => {
+      if (timer === pending) pending = null;
+    },
+  };
+  return {
+    clock,
+    pending: () => pending,
+    /** Move the clock by `by` and fire the pending timer. */
+    fire(by: number) {
+      now += by;
+      const timer = pending;
+      pending = null;
+      timer?.run();
+    },
+  };
+}
+
+describe('runDoctorOffer', () => {
+  it('offers once the ten minutes have passed, with no change in reachability', () => {
+    const fake = fakeClock();
+    const state = { current: initialDoctorOffer };
+    const onOffer = vi.fn();
+    runDoctorOffer(state, true, onOffer, fake.clock);
+    expect(fake.pending()?.ms).toBe(DOCTOR_OFFER_AFTER_MS);
+    fake.fire(DOCTOR_OFFER_AFTER_MS);
+    expect(onOffer).toHaveBeenCalledOnce();
+    expect(fake.pending()).toBeNull();
+  });
+
+  it('waits again when the timer fires before the offer is due, instead of dropping it', () => {
+    const fake = fakeClock();
+    const state = { current: initialDoctorOffer };
+    const onOffer = vi.fn();
+    runDoctorOffer(state, true, onOffer, fake.clock);
+    fake.fire(DOCTOR_OFFER_AFTER_MS - 1_000);
+    expect(onOffer).not.toHaveBeenCalled();
+    expect(fake.pending()?.ms).toBe(1_000);
+    fake.fire(1_000);
+    expect(onOffer).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the stretch across a re-run with the same reachability, and stops when told', () => {
+    const fake = fakeClock();
+    const state = { current: initialDoctorOffer };
+    const onOffer = vi.fn();
+    const stop = runDoctorOffer(state, true, onOffer, fake.clock);
+    fake.fire(4 * 60_000);
+    stop();
+    expect(fake.pending()).toBeNull();
+    runDoctorOffer(state, true, onOffer, fake.clock);
+    expect(fake.pending()?.ms).toBe(DOCTOR_OFFER_AFTER_MS - 4 * 60_000);
+  });
+
+  it('sets no timer while reachable', () => {
+    const fake = fakeClock();
+    const state = { current: initialDoctorOffer };
+    runDoctorOffer(state, false, () => {}, fake.clock);
+    expect(fake.pending()).toBeNull();
   });
 });

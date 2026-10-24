@@ -70,10 +70,18 @@ export interface FeedsChangedEvent {
 export const listMyFeeds = (): Promise<OwnFeed[]> => invoke('list_my_feeds');
 export const createFeed = (title: string, description: string): Promise<OwnFeed> =>
   invoke('create_feed', { title, description });
-export const setFeedDetails = (salt: string, title: string, description: string): Promise<void> =>
-  invoke('set_feed_details', { salt, title, description });
-export const setFeedItems = (salt: string, items: { ed2k: string; note: string }[]): Promise<number> =>
-  invoke('set_feed_items', { salt, items });
+/** The title and description as saved: cleaned and cut to length. */
+export const setFeedDetails = (
+  salt: string,
+  title: string,
+  description: string,
+): Promise<{ title: string; description: string }> => invoke('set_feed_details', { salt, title, description });
+/** `items`: the files saved, in order, as saved. `dropped`: the names of
+ *  files left out because they are no longer shared with everyone. */
+export const setFeedItems = (
+  salt: string,
+  items: { ed2k: string; note: string }[],
+): Promise<{ items: FeedItem[]; dropped: string[] }> => invoke('set_feed_items', { salt, items });
 export const publishFeed = (salt: string): Promise<OwnFeed> => invoke('publish_feed', { salt });
 export const deleteFeed = (salt: string): Promise<void> => invoke('delete_feed', { salt });
 

@@ -1,6 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
 
-export type ConnectionVerdict = 'reachable' | 'relayed' | 'limited' | 'offline';
+/** `checking`: online, nothing has tested TCP from outside yet, and something
+ *  still can. `untested`: the same, but nothing will as things stand. */
+export type ConnectionVerdict = 'reachable' | 'relayed' | 'limited' | 'checking' | 'untested' | 'offline';
 export type ConnectionCheckStatus = 'pass' | 'warn' | 'fail' | 'skip';
 
 export interface ConnectionCheck {

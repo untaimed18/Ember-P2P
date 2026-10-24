@@ -745,6 +745,20 @@ pub struct NetworkStats {
     pub session_udp_port: u16,
     #[serde(default)]
     pub session_upnp_enabled: bool,
+    /// The ports peers are told to dial (`advertised_tcp_port` and
+    /// `advertised_udp_port` in `network::nat_mapping`), which is where the
+    /// outside has to get through. Unlike `public_tcp_port` and
+    /// `public_udp_port`, a live UPnP forward outranks a STUN remap, and an
+    /// unconfirmed STUN observation does not count.
+    #[serde(default)]
+    pub advertised_tcp_port: u16,
+    #[serde(default)]
+    pub advertised_udp_port: u16,
+    /// How long the network loop has run, in seconds, by the monotonic clock:
+    /// a change to the system clock does not move it. As of the stats
+    /// snapshot it came in.
+    #[serde(default)]
+    pub session_age_secs: u64,
 }
 
 /// Diagnostic counters for the Ember mesh (EPX, LowID broker). Surfaced
@@ -1442,6 +1456,9 @@ impl Default for NetworkStats {
             session_tcp_port: 0,
             session_udp_port: 0,
             session_upnp_enabled: false,
+            advertised_tcp_port: 0,
+            advertised_udp_port: 0,
+            session_age_secs: 0,
         }
     }
 }
@@ -1456,9 +1473,10 @@ pub enum NetworkStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // Do not use `deny_unknown_fields`: a config.json written by a newer Ember
-// build (extra keys) must still load on downgrade. Unknown keys are ignored;
-// missing known fields use `#[serde(default)]` / field defaults where set.
-// Completely unreadable JSON still falls back to defaults after backup.
+// build (extra keys) must still load on downgrade. Unknown keys are kept in
+// `extra` and written back; missing known fields use `#[serde(default)]` /
+// field defaults where set. Completely unreadable JSON still falls back to
+// defaults after backup.
 pub struct AppSettings {
     pub nickname: String,
     /// Add [`NICKNAME_SITE_TAG`] after [`Self::nickname`] where eD2K servers
@@ -1765,17 +1783,28 @@ pub struct AppSettings {
     /// explicit choice, so the permissive default cannot cost more than a
     /// prompt you dismiss. `"friends"` compares the member's Ed25519 key
     /// against the friends list by its derived Ember hash.
+    ///
+    /// A value this build does not offer may be a later build's, so it is
+    /// kept as read rather than reset, and acts as `"nobody"` here (see
+    /// [`channel_file_offers_in_force`]). Settings refuses changing to one.
     #[serde(default = "default_channel_file_offers")]
     pub channel_file_offers: String,
     /// Who may send you a private message through a room you share:
     /// `"ask"` (the first message from someone waits for you to accept),
     /// `"anyone"`, or `"off"`.
+    ///
+    /// A value this build does not offer may be a later build's, so it is
+    /// kept as read rather than reset, and acts as `"ask"` here (see
+    /// [`room_dm_policy_in_force`]). Settings refuses changing to one.
     #[serde(default = "default_room_dm_policy")]
     pub room_dm_policy: String,
     /// Room members you ignore: their lines are hidden, and their private
     /// messages dropped before they are stored. `None` until the list the
     /// webview used to keep to itself has been moved here.
-    #[serde(default)]
+    ///
+    /// Read leniently: an entry this build cannot read is dropped on its own,
+    /// rather than failing the whole config and resetting every setting.
+    #[serde(default, deserialize_with = "deserialize_ignored_members")]
     pub ignored_members: Option<Vec<IgnoredMember>>,
     /// Files a friend sends in chat at or under this many megabytes are
     /// fetched without asking; larger ones wait for an explicit accept. Zero
@@ -1808,6 +1837,10 @@ pub struct AppSettings {
     /// Show friends Away after this many minutes without keyboard or mouse
     /// input, while the status is Online; 0 is off. A status set by hand to
     /// Away or Busy is never changed. See [`AUTO_AWAY_CHOICES`].
+    ///
+    /// A time this build does not offer is kept as read: it may be a later
+    /// build's, and it is a number of minutes whichever build reads it.
+    /// Settings refuses changing to one.
     #[serde(default = "default_auto_away_minutes")]
     pub auto_away_minutes: u32,
     /// Rendezvous server URL for friend discovery
@@ -2033,6 +2066,17 @@ pub struct AppSettings {
     /// space while downloads are running. 0 turns the warning off.
     #[serde(default = "default_low_disk_warning_mb")]
     pub low_disk_warning_mb: u32,
+
+    /// Keys in `config.json` this build does not know, as read, so a save
+    /// here does not drop what a later build stored. A key any field reads,
+    /// alias included, never lands here.
+    ///
+    /// Not serialized: the webview neither sees nor sends it, and
+    /// `update_settings` carries it over from the config in memory. Only
+    /// `storage::config::settings_json` writes it, under the known fields,
+    /// which win over a key of the same name.
+    #[serde(flatten, skip_serializing)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn default_low_disk_warning_mb() -> u32 {
@@ -2426,6 +2470,29 @@ fn default_channel_file_offers() -> String {
     CHANNEL_FILE_OFFERS_EVERYONE.to_string()
 }
 
+pub fn channel_file_offers_valid(offers: &str) -> bool {
+    [CHANNEL_FILE_OFFERS_EVERYONE, CHANNEL_FILE_OFFERS_FRIENDS, CHANNEL_FILE_OFFERS_NOBODY]
+        .contains(&offers)
+}
+
+/// Whether a stored `channel_file_offers` can be kept as read: one this build
+/// offers, or a short lowercase word a later build may offer. Anything else
+/// is damage, and is repaired to the default.
+pub fn channel_file_offers_storable(offers: &str) -> bool {
+    later_choice_storable(offers)
+}
+
+/// Who may offer files here under `offers`: itself when this build offers
+/// it, and `"nobody"` for one it does not, so a later build's choice never
+/// lets anyone further than the user chose there.
+pub fn channel_file_offers_in_force(offers: &str) -> &'static str {
+    match offers {
+        CHANNEL_FILE_OFFERS_EVERYONE => CHANNEL_FILE_OFFERS_EVERYONE,
+        CHANNEL_FILE_OFFERS_FRIENDS => CHANNEL_FILE_OFFERS_FRIENDS,
+        _ => CHANNEL_FILE_OFFERS_NOBODY,
+    }
+}
+
 pub const ROOM_DM_POLICY_ASK: &str = "ask";
 pub const ROOM_DM_POLICY_ANYONE: &str = "anyone";
 pub const ROOM_DM_POLICY_OFF: &str = "off";
@@ -2436,6 +2503,37 @@ fn default_room_dm_policy() -> String {
 
 pub fn room_dm_policy_valid(policy: &str) -> bool {
     [ROOM_DM_POLICY_ASK, ROOM_DM_POLICY_ANYONE, ROOM_DM_POLICY_OFF].contains(&policy)
+}
+
+/// Longest stored choice that may be a later build's.
+const LATER_CHOICE_MAX_LEN: usize = 32;
+
+/// Whether a stored choice this build may not offer still has the shape of
+/// one a later build could: a short lowercase word.
+fn later_choice_storable(choice: &str) -> bool {
+    !choice.is_empty()
+        && choice.len() <= LATER_CHOICE_MAX_LEN
+        && choice
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// Whether a stored `room_dm_policy` can be kept as read: one this build
+/// offers, or a short lowercase word a later build may offer. Anything else
+/// is damage, and is repaired to the default.
+pub fn room_dm_policy_storable(policy: &str) -> bool {
+    later_choice_storable(policy)
+}
+
+/// The policy `policy` acts as here: itself when this build offers it, and
+/// `"ask"` for one it does not, so a later build's choice neither opens
+/// private messages to anyone nor silently turns them off.
+pub fn room_dm_policy_in_force(policy: &str) -> &'static str {
+    match policy {
+        ROOM_DM_POLICY_ANYONE => ROOM_DM_POLICY_ANYONE,
+        ROOM_DM_POLICY_OFF => ROOM_DM_POLICY_OFF,
+        _ => ROOM_DM_POLICY_ASK,
+    }
 }
 
 /// A room member the user ignores.
@@ -2458,6 +2556,26 @@ impl IgnoredMember {
             .as_ref()
             .is_none_or(|rooms| rooms.iter().any(|room| room.eq_ignore_ascii_case(channel_id)))
     }
+}
+
+/// Absent or `null` stays `None`, the list not moved here yet. A list stays a
+/// list, keeping the entries this build can read; anything else reads as
+/// `None`, so the webview's own copy is moved here again.
+fn deserialize_ignored_members<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<IgnoredMember>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(serde_json::Value::Array(raw)) = Option::<serde_json::Value>::deserialize(deserializer)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        raw.into_iter()
+            .filter_map(|entry| serde_json::from_value(entry).ok())
+            .collect(),
+    ))
 }
 
 fn default_chat_attachment_auto_accept_mb() -> u64 {
@@ -2950,6 +3068,7 @@ impl Default for AppSettings {
             remember_window_position: true,
             watch_clipboard_links: false,
             low_disk_warning_mb: default_low_disk_warning_mb(),
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -3339,6 +3458,118 @@ mod tests {
         let parsed: AppSettings = serde_json::from_value(value)
             .expect("unknown keys must not fail AppSettings deserialize");
         assert!(!parsed.nickname.is_empty());
+        assert_eq!(
+            parsed.extra.get("future_setting_from_newer_build"),
+            Some(&serde_json::json!(true)),
+            "kept to be written back"
+        );
+    }
+
+    /// Only keys no field reads are kept aside, so a known one cannot be
+    /// written twice, and an alias is read as its field rather than kept
+    /// beside it. None of them reach the webview.
+    #[test]
+    fn only_keys_no_field_reads_are_kept_aside() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("launch_maximized");
+        object.insert("launch_fullscreen".into(), serde_json::json!(true));
+        object.insert("room_dm_policy".into(), serde_json::json!("off"));
+        object.insert("later_build_list".into(), serde_json::json!([1, 2]));
+
+        let parsed: AppSettings = serde_json::from_value(value).unwrap();
+        assert!(parsed.launch_maximized);
+        assert_eq!(parsed.room_dm_policy, "off");
+        assert_eq!(
+            parsed.extra.keys().collect::<Vec<_>>(),
+            ["later_build_list"],
+            "{:?}",
+            parsed.extra
+        );
+
+        let sent = serde_json::to_value(&parsed).unwrap();
+        assert!(sent.get("later_build_list").is_none());
+        assert!(sent.get("extra").is_none());
+    }
+
+    /// One unreadable entry costs that entry, not every setting. Whether the
+    /// list has been moved here yet survives reading.
+    #[test]
+    fn an_unreadable_ignored_member_is_dropped_without_failing_the_config() {
+        let good = "ab".repeat(32);
+        let mut value = serde_json::to_value(AppSettings {
+            room_dm_policy: ROOM_DM_POLICY_OFF.into(),
+            max_friends: 123,
+            ..AppSettings::default()
+        })
+        .unwrap();
+        value["ignored_members"] = serde_json::json!([
+            { "pubkey": good, "name": "Spam" },
+            { "name": "no key" },
+            { "pubkey": 7 },
+            "just a string",
+            { "pubkey": "cd".repeat(32), "rooms": "not a list" },
+            { "pubkey": "ef".repeat(32), "rooms": ["ab".repeat(16)], "later_field": 1 },
+        ]);
+        let parsed: AppSettings = serde_json::from_str(&value.to_string()).expect("config still loads");
+        assert_eq!(parsed.max_friends, 123, "every other setting still reads");
+        assert_eq!(parsed.room_dm_policy, ROOM_DM_POLICY_OFF);
+        let kept = parsed.ignored_members.expect("still a list");
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].pubkey, good);
+        assert_eq!(kept[0].name, "Spam");
+        assert_eq!(kept[1].rooms, Some(vec!["ab".repeat(16)]));
+
+        value["ignored_members"] = serde_json::json!([{ "name": "no key" }]);
+        let parsed: AppSettings = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.ignored_members, Some(Vec::new()), "a list that lost every entry");
+
+        for not_moved in [serde_json::Value::Null, serde_json::json!({ "a": 1 }), serde_json::json!(5)] {
+            value["ignored_members"] = not_moved;
+            let parsed: AppSettings = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(parsed.ignored_members, None);
+        }
+        value.as_object_mut().unwrap().remove("ignored_members");
+        let parsed: AppSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.ignored_members, None, "absent is not moved here yet");
+    }
+
+    /// A policy a later build offers acts as "ask": it neither opens private
+    /// messages to anyone nor turns them off.
+    #[test]
+    fn a_room_dm_policy_this_build_does_not_offer_acts_as_ask() {
+        assert_eq!(room_dm_policy_in_force(ROOM_DM_POLICY_OFF), ROOM_DM_POLICY_OFF);
+        assert_eq!(room_dm_policy_in_force(ROOM_DM_POLICY_ANYONE), ROOM_DM_POLICY_ANYONE);
+        assert_eq!(room_dm_policy_in_force(ROOM_DM_POLICY_ASK), ROOM_DM_POLICY_ASK);
+        assert_eq!(room_dm_policy_in_force("friends"), ROOM_DM_POLICY_ASK);
+        assert_eq!(room_dm_policy_in_force(""), ROOM_DM_POLICY_ASK);
+
+        assert!(room_dm_policy_storable("friends_only"));
+        assert!(room_dm_policy_storable(ROOM_DM_POLICY_OFF));
+        assert!(!room_dm_policy_storable(""));
+        assert!(!room_dm_policy_storable("Off"));
+        assert!(!room_dm_policy_storable("no way"));
+        assert!(!room_dm_policy_storable(&"a".repeat(33)));
+    }
+
+    /// A file-offer setting a later build offers lets nobody offer, rather
+    /// than anyone a narrower later choice would have kept out.
+    #[test]
+    fn a_channel_file_offers_value_this_build_does_not_offer_acts_as_nobody() {
+        for offered in [CHANNEL_FILE_OFFERS_EVERYONE, CHANNEL_FILE_OFFERS_FRIENDS, CHANNEL_FILE_OFFERS_NOBODY] {
+            assert!(channel_file_offers_valid(offered));
+            assert_eq!(channel_file_offers_in_force(offered), offered);
+        }
+        assert!(!channel_file_offers_valid("mutual_friends"));
+        assert_eq!(channel_file_offers_in_force("mutual_friends"), CHANNEL_FILE_OFFERS_NOBODY);
+        assert_eq!(channel_file_offers_in_force(""), CHANNEL_FILE_OFFERS_NOBODY);
+
+        assert!(channel_file_offers_storable("mutual_friends"));
+        assert!(channel_file_offers_storable(CHANNEL_FILE_OFFERS_EVERYONE));
+        assert!(!channel_file_offers_storable(""));
+        assert!(!channel_file_offers_storable("Friends"));
+        assert!(!channel_file_offers_storable("no one"));
+        assert!(!channel_file_offers_storable(&"a".repeat(33)));
     }
 
     /// A `config.json` written by the intermediate build stores the launch

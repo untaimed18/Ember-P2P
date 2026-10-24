@@ -358,7 +358,7 @@ pub fn check_held_source(
 ) -> HeldSource {
     let stamp = match std::fs::File::open(path).and_then(|file| FileStamp::of(path, &file)) {
         Ok(stamp) => stamp,
-        Err(e) => return held_source_unopened(&e),
+        Err(e) => return held_source_unopened(path, &e),
     };
     if stamp.size != size {
         return HeldSource::Gone;
@@ -375,14 +375,54 @@ pub fn check_held_source(
     }
 }
 
-/// What a held offer's file that could not be opened and stamped says: gone
-/// only when it is not there.
-fn held_source_unopened(error: &std::io::Error) -> HeldSource {
-    if error.kind() == std::io::ErrorKind::NotFound {
+/// What a held offer's file at `path` that could not be opened and stamped
+/// says: gone only when it is not there and the drive or share it was on is.
+/// Windows reports a drive that is unplugged or a mapped share that is
+/// unreachable as not found too, and that comes back; a file whose folder was
+/// deleted from a drive that is there does not.
+fn held_source_unopened(path: &std::path::Path, error: &std::io::Error) -> HeldSource {
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return HeldSource::Unreadable;
+    }
+    let folder = path
+        .parent()
+        .filter(|folder| !folder.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    if std::fs::read_dir(folder).is_ok() || held_source_volume_present(path) {
         HeldSource::Gone
     } else {
         HeldSource::Unreadable
     }
+}
+
+/// Whether the drive or share holding `path` can be listed, `D:\` or
+/// `\\server\share\`. A path with no root, such as a relative one, is judged
+/// by its folder alone.
+#[cfg(windows)]
+fn held_source_volume_present(path: &std::path::Path) -> bool {
+    let root = held_source_volume_root(path);
+    !root.as_os_str().is_empty() && std::fs::read_dir(&root).is_ok()
+}
+
+#[cfg(windows)]
+fn held_source_volume_root(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    path.components()
+        .take_while(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
+        .collect()
+}
+
+/// Where a volume is mounted cannot be told from the path here, so the
+/// nearest folder above `path` that is there stands in for it: anything
+/// below `/` counts as a volume that is there, `/` alone as one that is not
+/// mounted just now.
+#[cfg(not(windows))]
+fn held_source_volume_present(path: &std::path::Path) -> bool {
+    path.ancestors()
+        .skip(1)
+        .map(|folder| if folder.as_os_str().is_empty() { std::path::Path::new(".") } else { folder })
+        .find(|folder| folder.is_dir())
+        .is_some_and(|folder| folder != std::path::Path::new("/"))
 }
 
 /// The finished tree for `stamp`, if the cache has one. Unlike
@@ -1211,9 +1251,90 @@ mod tests {
     #[test]
     fn a_held_source_that_cannot_be_opened_is_gone_only_when_missing() {
         use std::io::{Error, ErrorKind};
-        assert_eq!(held_source_unopened(&Error::from(ErrorKind::NotFound)), HeldSource::Gone);
+        let source = temp_path("src-held-unopened");
+        assert_eq!(
+            held_source_unopened(&source, &Error::from(ErrorKind::NotFound)),
+            HeldSource::Gone
+        );
+        assert_eq!(
+            held_source_unopened(&source.join("offered.bin"), &Error::from(ErrorKind::NotFound)),
+            HeldSource::Gone,
+            "its folder is missing too, on a drive that is there"
+        );
         for kind in [ErrorKind::PermissionDenied, ErrorKind::TimedOut, ErrorKind::Other] {
-            assert_eq!(held_source_unopened(&Error::from(kind)), HeldSource::Unreadable, "{kind:?}");
+            assert_eq!(
+                held_source_unopened(&source, &Error::from(kind)),
+                HeldSource::Unreadable,
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// A file on a drive or share that is not there just now is only
+    /// unreadable, which is no reason to cancel its offer; one missing from a
+    /// drive that is there is gone, with its folder or without.
+    #[test]
+    fn a_held_source_on_a_missing_drive_is_only_unreadable() {
+        let folder = temp_path("src-held-folder");
+        let source = folder.join("Nested").join("offered.bin");
+        assert_eq!(
+            check_held_source(&source, 4, &[0u8; 32], None),
+            HeldSource::Gone,
+            "folder deleted"
+        );
+
+        std::fs::create_dir_all(source.parent().unwrap()).expect("folder");
+        assert_eq!(check_held_source(&source, 4, &[0u8; 32], None), HeldSource::Gone);
+        let _ = std::fs::remove_dir_all(&folder);
+
+        #[cfg(not(windows))]
+        {
+            let unmounted = std::path::Path::new("/").join(format!(
+                "ember-attach-unmounted-{}",
+                rand::random::<u64>()
+            ));
+            assert_eq!(
+                check_held_source(&unmounted.join("offered.bin"), 4, &[0u8; 32], None),
+                HeldSource::Unreadable,
+                "nothing below / is there"
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                held_source_volume_root(std::path::Path::new(r"\\server\share\Folder\offered.bin")),
+                std::path::PathBuf::from(r"\\server\share\")
+            );
+            assert_eq!(
+                held_source_volume_root(std::path::Path::new(r"D:\Folder\offered.bin")),
+                std::path::PathBuf::from(r"D:\")
+            );
+            assert_eq!(
+                held_source_volume_root(std::path::Path::new(r"Folder\offered.bin")),
+                std::path::PathBuf::new()
+            );
+            assert_eq!(
+                held_source_volume_root(std::path::Path::new(r"\\?\C:\Folder\offered.bin")),
+                std::path::PathBuf::from(r"\\?\C:\")
+            );
+            assert_eq!(
+                held_source_volume_root(std::path::Path::new(r"\\?\UNC\server\share\Folder\offered.bin")),
+                std::path::PathBuf::from(r"\\?\UNC\server\share\")
+            );
+            let unmapped = ('D'..='Z')
+                .rev()
+                .map(|letter| std::path::PathBuf::from(format!("{letter}:\\")))
+                .find(|root| !root.exists());
+            if let Some(root) = unmapped {
+                let on_missing_drive = root.join("Shared").join("offered.bin");
+                assert_eq!(
+                    check_held_source(&on_missing_drive, 4, &[0u8; 32], None),
+                    HeldSource::Unreadable,
+                    "{}",
+                    on_missing_drive.display()
+                );
+            }
         }
     }
 

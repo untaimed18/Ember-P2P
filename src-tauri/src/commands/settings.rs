@@ -166,13 +166,17 @@ fn merge_renderer_settings(
             renderer_object.remove(*field);
         }
     }
-    serde_json::from_value(renderer).map_err(|error| {
+    let mut merged: AppSettings = serde_json::from_value(renderer).map_err(|error| {
         coded_ctx(
             "settings_invalid_update",
             "Settings update is invalid",
             error,
         )
-    })
+    })?;
+    // The webview is never sent the keys this build does not know, so any it
+    // names are its own invention, and the ones on disk come from memory.
+    merged.extra = authoritative.extra.clone();
+    Ok(merged)
 }
 
 /// Download roots the OS picker handed us this session.
@@ -814,11 +818,10 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
+    // A file-offer setting this build does not offer is kept: it may be a
+    // later build's, and it acts as "nobody" until that build runs again.
     let offers = settings.channel_file_offers.trim().to_ascii_lowercase();
-    if offers != crate::types::CHANNEL_FILE_OFFERS_EVERYONE
-        && offers != crate::types::CHANNEL_FILE_OFFERS_FRIENDS
-        && offers != crate::types::CHANNEL_FILE_OFFERS_NOBODY
-    {
+    if !crate::types::channel_file_offers_storable(&offers) {
         settings.channel_file_offers = crate::types::CHANNEL_FILE_OFFERS_EVERYONE.to_string();
         changed = true;
     } else if offers != settings.channel_file_offers {
@@ -826,8 +829,10 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
+    // A policy this build does not offer is kept: it may be a later build's,
+    // and it acts as "ask" until that build runs again.
     let dm_policy = settings.room_dm_policy.trim().to_ascii_lowercase();
-    if !crate::types::room_dm_policy_valid(&dm_policy) {
+    if !crate::types::room_dm_policy_storable(&dm_policy) {
         settings.room_dm_policy = crate::types::ROOM_DM_POLICY_ASK.to_string();
         changed = true;
     } else if dm_policy != settings.room_dm_policy {
@@ -849,18 +854,19 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
-    let auto_away = crate::types::normalize_auto_away_minutes(settings.auto_away_minutes);
-    if auto_away != settings.auto_away_minutes {
-        settings.auto_away_minutes = auto_away;
-        changed = true;
-    }
-
     // A hand-edited or damaged entry is repaired or dropped, not a reason to
     // reset every other setting.
     let overrides = normalize_friend_overrides(settings.friend_overrides.clone());
     if overrides != settings.friend_overrides {
         settings.friend_overrides = overrides;
         changed = true;
+    }
+    if let Some(members) = &settings.ignored_members {
+        let cleaned = crate::commands::room_dm::clean_ignored_members(members.clone());
+        if &cleaned != members {
+            settings.ignored_members = Some(cleaned);
+            changed = true;
+        }
     }
 
     // A username stored under the older, looser rule (spaces, punctuation, up
@@ -1086,16 +1092,16 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             "Close behavior must be 'ask', 'tray', or 'exit'",
         ));
     }
-    if settings.channel_file_offers != crate::types::CHANNEL_FILE_OFFERS_EVERYONE
-        && settings.channel_file_offers != crate::types::CHANNEL_FILE_OFFERS_FRIENDS
-        && settings.channel_file_offers != crate::types::CHANNEL_FILE_OFFERS_NOBODY
-    {
+    // Shape only, as for `room_dm_policy` below.
+    if !crate::types::channel_file_offers_storable(&settings.channel_file_offers) {
         return Err(coded(
             "settings_channel_file_offers_invalid",
             "Channel file offers must be 'everyone', 'friends', or 'nobody'",
         ));
     }
-    if !crate::types::room_dm_policy_valid(&settings.room_dm_policy) {
+    // Shape only: a policy this build does not offer is refused when it is
+    // chosen (`refuse_unoffered_choices`), not when it is kept.
+    if !crate::types::room_dm_policy_storable(&settings.room_dm_policy) {
         return Err(coded(
             "settings_room_dm_policy_invalid",
             "Private messages must be 'ask', 'anyone', or 'off'",
@@ -1106,14 +1112,6 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             "settings_chat_attachment_auto_accept_invalid",
             "The automatic download limit is larger than any file a friend can send",
             crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB,
-        ));
-    }
-    if crate::types::normalize_auto_away_minutes(settings.auto_away_minutes)
-        != settings.auto_away_minutes
-    {
-        return Err(coded(
-            "settings_auto_away_invalid",
-            "Choose one of the offered idle times",
         ));
     }
     if normalize_friend_overrides(settings.friend_overrides.clone()) != settings.friend_overrides {
@@ -1481,6 +1479,38 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
     Ok(())
 }
 
+/// Choices this build does not offer, refused only when they change. One
+/// already stored may be a later build's, kept as read so a downgrade does
+/// not reset it, and re-saving the page around it must still work.
+fn refuse_unoffered_choices(settings: &AppSettings, old_settings: &AppSettings) -> Result<(), String> {
+    if settings.channel_file_offers != old_settings.channel_file_offers
+        && !crate::types::channel_file_offers_valid(&settings.channel_file_offers)
+    {
+        return Err(coded(
+            "settings_channel_file_offers_invalid",
+            "Channel file offers must be 'everyone', 'friends', or 'nobody'",
+        ));
+    }
+    if settings.room_dm_policy != old_settings.room_dm_policy
+        && !crate::types::room_dm_policy_valid(&settings.room_dm_policy)
+    {
+        return Err(coded(
+            "settings_room_dm_policy_invalid",
+            "Private messages must be 'ask', 'anyone', or 'off'",
+        ));
+    }
+    if settings.auto_away_minutes != old_settings.auto_away_minutes
+        && crate::types::normalize_auto_away_minutes(settings.auto_away_minutes)
+            != settings.auto_away_minutes
+    {
+        return Err(coded(
+            "settings_auto_away_invalid",
+            "Choose one of the offered idle times",
+        ));
+    }
+    Ok(())
+}
+
 /// Best-effort undo of a registry claim whose settings save then failed, so
 /// the registry and config.json go on naming the same handle. A claim is a
 /// rename, so re-claiming the previous name is the undo; with no previous name
@@ -1596,6 +1626,7 @@ pub async fn update_settings(
             "Choose the download folder with Browse before saving",
         ));
     }
+    refuse_unoffered_choices(&settings, &old_settings)?;
     {
         let settings_for_validation = settings.clone();
         tokio::task::spawn_blocking(move || validate_settings(&settings_for_validation))
@@ -4525,5 +4556,126 @@ mod tests {
             merged.shared_folder_scan_cursors,
             authoritative.shared_folder_scan_cursors
         );
+    }
+
+    /// A save from the Settings page keeps what a later build stored, and the
+    /// webview, which is never sent those keys, cannot add any.
+    #[test]
+    fn a_renderer_save_keeps_the_keys_this_build_does_not_know() {
+        let mut authoritative = AppSettings::default();
+        authoritative
+            .extra
+            .insert("future_setting".into(), serde_json::json!({"level": 3}));
+
+        let mut renderer = serde_json::to_value(&authoritative).unwrap();
+        let object = renderer.as_object_mut().unwrap();
+        assert!(!object.contains_key("future_setting"), "never sent to the webview");
+        assert!(!object.contains_key("extra"));
+        object.insert("nickname".into(), serde_json::json!("Changed"));
+        object.insert("renderer_invented".into(), serde_json::json!(true));
+
+        let merged = merge_renderer_settings(renderer, &authoritative).unwrap();
+        assert_eq!(merged.nickname, "Changed");
+        assert_eq!(merged.extra, authoritative.extra);
+
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&crate::storage::config::settings_json(&merged).unwrap()).unwrap();
+        assert_eq!(on_disk["future_setting"], serde_json::json!({"level": 3}));
+        assert!(on_disk.get("renderer_invented").is_none());
+        assert_eq!(on_disk["nickname"], "Changed");
+    }
+
+    /// A private-message policy or idle time a later build offers is kept on
+    /// load and survives re-saving the page around it, but cannot be chosen
+    /// here. Damage is still repaired.
+    #[test]
+    fn a_later_builds_choice_is_kept_but_cannot_be_chosen() {
+        let mut later = AppSettings {
+            room_dm_policy: " Friends ".into(),
+            auto_away_minutes: 120,
+            ..AppSettings::default()
+        };
+        assert!(soft_repair_settings(&mut later), "trimmed and lowercased");
+        assert_eq!(later.room_dm_policy, "friends");
+        assert_eq!(later.auto_away_minutes, 120);
+        assert!(!soft_repair_settings(&mut later.clone()), "nothing left to repair");
+        validate_settings(&later).expect("a later build's values load");
+        assert_eq!(crate::types::room_dm_policy_in_force(&later.room_dm_policy), "ask");
+
+        refuse_unoffered_choices(&later, &later).expect("re-saving around them works");
+        let chosen_here = AppSettings {
+            room_dm_policy: "off".into(),
+            auto_away_minutes: 30,
+            ..later.clone()
+        };
+        refuse_unoffered_choices(&chosen_here, &later).expect("moving to an offered choice");
+
+        let defaults = AppSettings::default();
+        let err = refuse_unoffered_choices(
+            &AppSettings { room_dm_policy: "friends".into(), ..defaults.clone() },
+            &defaults,
+        )
+        .unwrap_err();
+        assert!(err.contains("settings_room_dm_policy_invalid"), "{err}");
+        let err = refuse_unoffered_choices(
+            &AppSettings { auto_away_minutes: 120, ..defaults.clone() },
+            &defaults,
+        )
+        .unwrap_err();
+        assert!(err.contains("settings_auto_away_invalid"), "{err}");
+
+        let mut damaged = AppSettings {
+            room_dm_policy: "not a policy!".into(),
+            ..AppSettings::default()
+        };
+        assert!(soft_repair_settings(&mut damaged));
+        assert_eq!(damaged.room_dm_policy, "ask");
+        let mut long = AppSettings { room_dm_policy: "a".repeat(64), ..AppSettings::default() };
+        assert!(soft_repair_settings(&mut long));
+        assert_eq!(long.room_dm_policy, "ask");
+    }
+
+    /// A file-offer setting a later build offers is kept on load, lets nobody
+    /// offer here, and survives re-saving the page around it, but cannot be
+    /// chosen here. Damage is still repaired.
+    #[test]
+    fn a_later_builds_file_offer_setting_is_kept_and_lets_nobody_offer() {
+        let mut later = AppSettings {
+            channel_file_offers: " Mutual_Friends ".into(),
+            ..AppSettings::default()
+        };
+        assert!(soft_repair_settings(&mut later), "trimmed and lowercased");
+        assert_eq!(later.channel_file_offers, "mutual_friends");
+        assert!(!soft_repair_settings(&mut later.clone()), "nothing left to repair");
+        validate_settings(&later).expect("a later build's value loads");
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&crate::storage::config::settings_json(&later).unwrap()).unwrap();
+        assert_eq!(on_disk["channel_file_offers"], "mutual_friends");
+        assert_eq!(
+            crate::types::channel_file_offers_in_force(&later.channel_file_offers),
+            crate::types::CHANNEL_FILE_OFFERS_NOBODY
+        );
+
+        refuse_unoffered_choices(&later, &later).expect("re-saving around it works");
+        let chosen_here = AppSettings { channel_file_offers: "friends".into(), ..later.clone() };
+        refuse_unoffered_choices(&chosen_here, &later).expect("moving to an offered choice");
+
+        let defaults = AppSettings::default();
+        let err = refuse_unoffered_choices(
+            &AppSettings { channel_file_offers: "mutual_friends".into(), ..defaults.clone() },
+            &defaults,
+        )
+        .unwrap_err();
+        assert!(err.contains("settings_channel_file_offers_invalid"), "{err}");
+
+        let long = "a".repeat(64);
+        for damage in ["not a choice!", "", long.as_str()] {
+            let mut damaged = AppSettings { channel_file_offers: damage.into(), ..defaults.clone() };
+            assert!(soft_repair_settings(&mut damaged), "{damage:?}");
+            assert_eq!(damaged.channel_file_offers, crate::types::CHANNEL_FILE_OFFERS_EVERYONE);
+            assert!(validate_settings(&AppSettings { channel_file_offers: damage.into(), ..defaults.clone() })
+                .unwrap_err()
+                .contains("settings_channel_file_offers_invalid"));
+        }
     }
 }

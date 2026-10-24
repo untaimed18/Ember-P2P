@@ -46,13 +46,18 @@ fn firewall_rule_exists(rule_name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn firewall_rule_has_port(rule_name: &str, port: u16) -> bool {
+/// Whether the rule named `rule_name` opens `port`: `Some(false)` when it does
+/// not or no such rule exists, `None` when no query could tell.
+fn firewall_rule_has_port(rule_name: &str, port: u16) -> Option<bool> {
     // PowerShell exposes stable object properties regardless of the Windows
-    // display language, unlike netsh's localized column labels.
+    // display language, unlike netsh's localized column labels. A rule that
+    // does not exist is an answer, told apart by its error id from a module
+    // that is missing or a query that failed, which fall through to netsh.
     let escaped_name = rule_name.replace('\'', "''");
     let script = format!(
-        "Get-NetFirewallRule -DisplayName '{escaped_name}' -ErrorAction Stop | \
-         Get-NetFirewallPortFilter | ForEach-Object {{ $_.LocalPort }}"
+        "try {{ Get-NetFirewallRule -DisplayName '{escaped_name}' -ErrorAction Stop | \
+         Get-NetFirewallPortFilter | ForEach-Object {{ $_.LocalPort }} }} \
+         catch {{ if ($_.FullyQualifiedErrorId -like 'CmdletizationQuery_NotFound*') {{ exit 0 }} else {{ exit 1 }} }}"
     );
     if let Ok(output) = Command::new(windows_system_path(POWERSHELL))
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
@@ -61,15 +66,17 @@ fn firewall_rule_has_port(rule_name: &str, port: u16) -> bool {
     {
         if output.status.success() {
             let expected = port.to_string();
-            return String::from_utf8_lossy(&output.stdout)
-                .split(|c: char| c.is_whitespace() || c == ',')
-                .any(|value| value.trim() == expected);
+            return Some(
+                String::from_utf8_lossy(&output.stdout)
+                    .split(|c: char| c.is_whitespace() || c == ',')
+                    .any(|value| value.trim() == expected),
+            );
         }
     }
 
     // Fallback for stripped-down Windows environments without the firewall
-    // PowerShell module. Keep the legacy English parser rather than treating
-    // every rule as stale.
+    // PowerShell module. netsh fails alike for a missing rule and a failed
+    // query, so a failure here is no answer.
     let output = Command::new(windows_system_path(NETSH))
         .args([
             "advfirewall",
@@ -81,25 +88,43 @@ fn firewall_rule_has_port(rule_name: &str, port: u16) -> bool {
         .creation_flags(0x08000000)
         .output();
     match output {
-        Ok(o) if o.status.success() => {
-            let text = String::from_utf8_lossy(&o.stdout);
-            let port_str = port.to_string();
-            for line in text.lines() {
-                let trimmed = line.trim();
-                if let Some((_key, value)) = trimmed.split_once(':') {
-                    let value = value.trim();
-                    if value == port_str {
-                        let key_lower = _key.trim().to_lowercase();
-                        if key_lower.contains("localport") || key_lower.contains("local port") {
-                            return true;
-                        }
-                    }
-                }
-            }
-            false
-        }
-        _ => false,
+        Ok(o) if o.status.success() => netsh_rule_has_port(&String::from_utf8_lossy(&o.stdout), port),
+        _ => None,
     }
+}
+
+/// netsh's label for a rule's local port in the display languages it is
+/// known in, lowercased with the spaces taken out.
+const NETSH_LOCAL_PORT_KEYS: &[&str] = &[
+    "localport",
+    "lokalerport",
+    "portlocal",
+    "puertolocal",
+    "portalocale",
+    "portalocal",
+    "локальныйпорт",
+    "本地端口",
+    "本機連接埠",
+];
+
+/// Whether `netsh advfirewall firewall show rule` output lists `port` as a
+/// local port of a rule. `None` when no line is labelled as a local port at
+/// all: the display language is one the labels are not known in, and the
+/// output says nothing either way.
+fn netsh_rule_has_port(text: &str, port: u16) -> Option<bool> {
+    let expected = port.to_string();
+    let mut labelled = false;
+    for (key, value) in text.lines().filter_map(|line| line.split_once(':')) {
+        let key: String = key.to_lowercase().split_whitespace().collect();
+        if !NETSH_LOCAL_PORT_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        labelled = true;
+        if value.split(',').any(|listed| listed.trim() == expected) {
+            return Some(true);
+        }
+    }
+    labelled.then_some(false)
 }
 
 fn delete_firewall_rule(rule_name: &str) {
@@ -258,11 +283,25 @@ fn dedicated_quic_udp_port(quic_udp_port: u16, kad_udp_port: u16) -> Option<u16>
     (quic_udp_port != 0 && quic_udp_port != kad_udp_port).then_some(quic_udp_port)
 }
 
-/// Whether inbound rules for Ember's TCP and Kad UDP ports are in place. For
-/// the connection doctor: a QUIC rule is only needed when QUIC has a port of
-/// its own, and its absence shows up in the probes.
-pub fn rules_in_place(tcp_port: u16, udp_port: u16) -> bool {
-    firewall_rule_has_port(RULE_NAME_TCP, tcp_port) && firewall_rule_has_port(RULE_NAME_UDP, udp_port)
+/// Whether inbound rules for Ember's TCP and Kad UDP ports are in place, or
+/// `None` when that could not be read. For the connection doctor: a QUIC rule
+/// is only needed when QUIC has a port of its own, and its absence shows up in
+/// the probes.
+pub fn rules_in_place(tcp_port: u16, udp_port: u16) -> Option<bool> {
+    let tcp = firewall_rule_has_port(RULE_NAME_TCP, tcp_port);
+    if tcp == Some(false) {
+        return Some(false);
+    }
+    both_rules(tcp, firewall_rule_has_port(RULE_NAME_UDP, udp_port))
+}
+
+/// Either rule known missing settles it; otherwise both must be known.
+fn both_rules(tcp: Option<bool>, udp: Option<bool>) -> Option<bool> {
+    match (tcp, udp) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
 }
 
 /// Add the TCP and Kad UDP rules from an elevated `netsh`, which is one
@@ -294,7 +333,7 @@ pub fn add_rules_elevated(tcp_port: u16, udp_port: u16) -> bool {
         warn!("Could not ask Windows to add the firewall rules: {e}");
         return false;
     }
-    rules_in_place(tcp_port, udp_port)
+    rules_in_place(tcp_port, udp_port) == Some(true)
 }
 
 /// UTF-16LE in base64, as `-EncodedCommand` and `[Text.Encoding]::Unicode`
@@ -338,7 +377,7 @@ fn elevated_rules_script(exe: &str, netsh: &str, tcp_port: u16, udp_port: u16) -
 /// "didn't need to try" for the single-line consolidated warning above.
 fn ensure_one_rule(rule_name: &str, protocol: &str, port: u16) -> Option<AddRuleOutcome> {
     if firewall_rule_exists(rule_name) {
-        if firewall_rule_has_port(rule_name, port) {
+        if firewall_rule_has_port(rule_name, port) == Some(true) {
             debug!("Windows Firewall {protocol} rule already exists with correct port {port}");
             return None;
         }
@@ -350,7 +389,70 @@ fn ensure_one_rule(rule_name: &str, protocol: &str, port: u16) -> Option<AddRule
 
 #[cfg(test)]
 mod tests {
-    use super::{dedicated_quic_udp_port, elevated_rules_script, utf16_base64, POWERSHELL};
+    use super::{
+        both_rules, dedicated_quic_udp_port, elevated_rules_script, firewall_rule_has_port, netsh_rule_has_port,
+        utf16_base64, POWERSHELL,
+    };
+
+    /// Whether this machine's PowerShell has the firewall cmdlets. Without
+    /// them the query falls back to netsh, which cannot tell a missing rule
+    /// from a failed query.
+    fn netsecurity_module_present() -> bool {
+        std::process::Command::new(crate::security::filesystem::windows_system_path(POWERSHELL))
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "if (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }",
+            ])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    /// A rule that does not exist is missing, which is an answer; only a
+    /// query that could not run is unknown. Runs PowerShell, and says
+    /// nothing on a machine without its NetSecurity module.
+    #[test]
+    fn a_rule_that_does_not_exist_reads_as_missing_not_unknown() {
+        if !netsecurity_module_present() {
+            eprintln!("skipped: PowerShell has no NetSecurity module here");
+            return;
+        }
+        assert_eq!(firewall_rule_has_port("Ember P2P (no such rule)", 4662), Some(false));
+    }
+
+    #[test]
+    fn netsh_output_is_read_in_the_languages_its_labels_are_known_in() {
+        let english = "Rule Name:                            Ember P2P (TCP)\r\n\
+                       Protocol:                             TCP\r\n\
+                       LocalPort:                            4662\r\n\
+                       RemotePort:                           Any\r\n";
+        assert_eq!(netsh_rule_has_port(english, 4662), Some(true));
+        assert_eq!(netsh_rule_has_port(english, 4672), Some(false), "another port");
+        let german = "Regelname:                            Ember P2P (TCP)\n\
+                      Lokaler Port:                         4661,4662\n\
+                      Remoteport:                           Beliebig\n";
+        assert_eq!(netsh_rule_has_port(german, 4662), Some(true));
+        let french = "Nom de la règle :                     Ember P2P (TCP)\n\
+                      Port local :                          4662\n";
+        assert_eq!(netsh_rule_has_port(french, 4662), Some(true));
+        let remote_only = "RemotePort:                           4662\n";
+        assert_eq!(netsh_rule_has_port(remote_only, 4662), None, "no local port label recognised");
+        let unknown = "Kural Adı:                            Ember P2P (TCP)\n\
+                       Yerel Bağlantı Noktası:               4662\n";
+        assert_eq!(netsh_rule_has_port(unknown, 4662), None);
+        assert_eq!(netsh_rule_has_port("", 4662), None);
+    }
+
+    #[test]
+    fn either_rule_missing_settles_it_and_otherwise_both_must_be_known() {
+        assert_eq!(both_rules(Some(true), Some(true)), Some(true));
+        assert_eq!(both_rules(Some(false), None), Some(false));
+        assert_eq!(both_rules(None, Some(false)), Some(false));
+        assert_eq!(both_rules(Some(true), None), None);
+        assert_eq!(both_rules(None, Some(true)), None);
+        assert_eq!(both_rules(None, None), None);
+    }
 
     /// A program path with any quote PowerShell honours reaches netsh as it
     /// is, and none of it is ever read as script.

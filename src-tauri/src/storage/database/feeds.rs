@@ -10,6 +10,16 @@ use super::*;
 /// Items a publisher removed that a follower keeps showing, per feed.
 const REMOVED_ITEMS_KEPT: i64 = 2_000;
 
+/// The window auto-download's per-day cap counts over, in seconds: the last
+/// 24 hours, not the calendar day, so a cap is not spent twice across
+/// midnight.
+pub const FEED_AUTO_WINDOW_SECS: i64 = 24 * 3600;
+
+/// Auto-download's caps for a feed just followed, in MiB, matching the
+/// column defaults of `feeds_followed`.
+const FEED_AUTO_DEFAULT_ITEM_MIB: i64 = 1024;
+const FEED_AUTO_DEFAULT_DAY_MIB: i64 = 4096;
+
 /// A feed this identity publishes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct OwnFeed {
@@ -35,6 +45,11 @@ pub struct OwnFeed {
     pub published_description: String,
     /// Details or items edited since the last publish.
     pub changed: bool,
+    /// A head newer than the last, whose publish ended without knowing
+    /// whether any node stored it. Its list is served all the same, as
+    /// storers may hold the head; at most one per feed.
+    #[serde(skip)]
+    pub pending: Option<OwnPublish>,
 }
 
 /// One file in a feed, published or followed.
@@ -78,9 +93,11 @@ pub struct FollowedFeed {
     pub followed_at: i64,
     pub checked_at: i64,
     pub auto_download: bool,
-    /// Per item, in MiB; 0 for no cap.
+    /// Per item, in MiB; 0 for no cap. [`FEED_AUTO_DEFAULT_ITEM_MIB`] for
+    /// a new follow.
     pub auto_max_item_mib: i64,
-    /// Per day, in MiB; 0 for no cap.
+    /// Per [`FEED_AUTO_WINDOW_SECS`], in MiB; 0 for no cap.
+    /// [`FEED_AUTO_DEFAULT_DAY_MIB`] for a new follow.
     pub auto_max_day_mib: i64,
     pub auto_category: String,
 }
@@ -135,7 +152,14 @@ impl Database {
                 published_at INTEGER NOT NULL DEFAULT 0,
                 published_title TEXT NOT NULL DEFAULT '',
                 published_description TEXT NOT NULL DEFAULT '',
-                changed INTEGER NOT NULL DEFAULT 0
+                changed INTEGER NOT NULL DEFAULT 0,
+                pending_sequence INTEGER NOT NULL DEFAULT 0,
+                pending_ed2k TEXT NOT NULL DEFAULT '',
+                pending_blake3 TEXT NOT NULL DEFAULT '',
+                pending_size INTEGER NOT NULL DEFAULT 0,
+                pending_item_count INTEGER NOT NULL DEFAULT 0,
+                pending_title TEXT NOT NULL DEFAULT '',
+                pending_description TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS feeds_own_items (
                 salt TEXT NOT NULL,
@@ -167,8 +191,8 @@ impl Database {
                 followed_at INTEGER NOT NULL,
                 checked_at INTEGER NOT NULL DEFAULT 0,
                 auto_download INTEGER NOT NULL DEFAULT 0,
-                auto_max_item_mib INTEGER NOT NULL DEFAULT 0,
-                auto_max_day_mib INTEGER NOT NULL DEFAULT 0,
+                auto_max_item_mib INTEGER NOT NULL DEFAULT 1024,
+                auto_max_day_mib INTEGER NOT NULL DEFAULT 4096,
                 auto_category TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (publisher, salt)
             );
@@ -187,13 +211,15 @@ impl Database {
                 downloaded INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (publisher, salt, ed2k)
             );
-            CREATE TABLE IF NOT EXISTS feeds_auto_bytes (
+            CREATE TABLE IF NOT EXISTS feeds_auto_started (
                 publisher TEXT NOT NULL,
                 salt TEXT NOT NULL,
-                day INTEGER NOT NULL,
-                bytes INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (publisher, salt, day)
-            );",
+                at INTEGER NOT NULL,
+                bytes INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS feeds_auto_started_feed ON feeds_auto_started (publisher, salt, at);
+            -- Per-day counts a development build kept before the rolling window.
+            DROP TABLE IF EXISTS feeds_auto_bytes;",
         )?;
         // A table made by a development build before these columns. Each is
         // checked on its own, so one added before a crash is not added twice.
@@ -201,6 +227,13 @@ impl Database {
             ("published_title", "TEXT NOT NULL DEFAULT ''"),
             ("published_description", "TEXT NOT NULL DEFAULT ''"),
             ("changed", "INTEGER NOT NULL DEFAULT 0"),
+            ("pending_sequence", "INTEGER NOT NULL DEFAULT 0"),
+            ("pending_ed2k", "TEXT NOT NULL DEFAULT ''"),
+            ("pending_blake3", "TEXT NOT NULL DEFAULT ''"),
+            ("pending_size", "INTEGER NOT NULL DEFAULT 0"),
+            ("pending_item_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("pending_title", "TEXT NOT NULL DEFAULT ''"),
+            ("pending_description", "TEXT NOT NULL DEFAULT ''"),
         ] {
             let present: bool = conn.query_row(
                 "SELECT COUNT(*) > 0 FROM pragma_table_info('feeds_own') WHERE name = ?1",
@@ -221,11 +254,27 @@ impl Database {
         Self::ensure_feeds_locked(&conn)?;
         let mut stmt = conn.prepare(
             "SELECT salt, title, description, sequence, list_ed2k, list_blake3, list_size, item_count,
-                    created_at, published_at, published_title, published_description, changed
+                    created_at, published_at, published_title, published_description, changed,
+                    pending_sequence, pending_ed2k, pending_blake3, pending_size, pending_item_count,
+                    pending_title, pending_description
              FROM feeds_own ORDER BY created_at",
         )?;
         let rows = stmt
             .query_map([], |row| {
+                let pending_sequence: i64 = row.get(13)?;
+                let pending = if pending_sequence > 0 {
+                    Some(OwnPublish {
+                        sequence: pending_sequence,
+                        list_ed2k: row.get(14)?,
+                        list_blake3: row.get(15)?,
+                        list_size: row.get(16)?,
+                        item_count: row.get(17)?,
+                        title: row.get(18)?,
+                        description: row.get(19)?,
+                    })
+                } else {
+                    None
+                };
                 Ok(OwnFeed {
                     salt: row.get(0)?,
                     title: row.get(1)?,
@@ -240,6 +289,7 @@ impl Database {
                     published_title: row.get(10)?,
                     published_description: row.get(11)?,
                     changed: row.get::<_, i64>(12)? != 0,
+                    pending,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -280,6 +330,10 @@ impl Database {
     pub fn feed_own_items(&self, salt: &str) -> anyhow::Result<Vec<FeedItem>> {
         let conn = self.conn.lock();
         Self::ensure_feeds_locked(&conn)?;
+        Self::feed_own_items_locked(&conn, salt)
+    }
+
+    fn feed_own_items_locked(conn: &Connection, salt: &str) -> anyhow::Result<Vec<FeedItem>> {
         let mut stmt = conn.prepare(
             "SELECT ed2k, name, size, aich, blake3, note FROM feeds_own_items
              WHERE salt = ?1 ORDER BY position",
@@ -300,14 +354,22 @@ impl Database {
     }
 
     /// Replace a feed's items with `items`, in that order. `false` when
-    /// there is no such feed.
+    /// there is no such feed. The feed counts as changed only when the items
+    /// differ from those held, in order or in any field: saving the same
+    /// list again leaves an up-to-date feed up to date.
     pub fn feed_own_set_items(&self, salt: &str, items: &[FeedItem]) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         Self::ensure_feeds_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
-        if tx.execute("UPDATE feeds_own SET changed = 1 WHERE salt = ?1", params![salt])? == 0 {
+        let found: bool =
+            tx.query_row("SELECT COUNT(*) > 0 FROM feeds_own WHERE salt = ?1", params![salt], |row| row.get(0))?;
+        if !found {
             return Ok(false);
         }
+        if Self::feed_own_items_locked(&tx, salt)? == items {
+            return Ok(true);
+        }
+        tx.execute("UPDATE feeds_own SET changed = 1 WHERE salt = ?1", params![salt])?;
         tx.execute("DELETE FROM feeds_own_items WHERE salt = ?1", params![salt])?;
         {
             let mut insert = tx.prepare(
@@ -332,15 +394,31 @@ impl Database {
     }
 
     /// Record a head published for `salt`: its list, and the title and
-    /// description it carried. `false`, changing nothing, when a later
-    /// sequence is recorded already.
-    pub fn feed_own_published(&self, salt: &str, published: &OwnPublish, now: i64) -> anyhow::Result<bool> {
+    /// description it carried, in place of any pending head. `items` are
+    /// those its list was made from, compared with the items held now so an
+    /// edit saved while the head was out still counts as unpublished; `None`
+    /// when they are not known, and the feed counts as changed. `false`,
+    /// changing nothing, when a later sequence is recorded already.
+    pub fn feed_own_published(
+        &self,
+        salt: &str,
+        published: &OwnPublish,
+        items: Option<&[FeedItem]>,
+        now: i64,
+    ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         Self::ensure_feeds_locked(&conn)?;
-        Ok(conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        let items_changed = match items {
+            Some(items) => Self::feed_own_items_locked(&tx, salt)? != items,
+            None => true,
+        };
+        let recorded = tx.execute(
             "UPDATE feeds_own SET sequence = ?2, list_ed2k = ?3, list_blake3 = ?4, list_size = ?5,
                     item_count = ?6, published_at = ?7, published_title = ?8, published_description = ?9,
-                    changed = (title != ?8 OR description != ?9)
+                    changed = (title != ?8 OR description != ?9 OR ?10),
+                    pending_sequence = 0, pending_ed2k = '', pending_blake3 = '', pending_size = 0,
+                    pending_item_count = 0, pending_title = '', pending_description = ''
              WHERE salt = ?1 AND sequence < ?2",
             params![
                 salt,
@@ -352,8 +430,43 @@ impl Database {
                 now,
                 published.title,
                 published.description,
+                items_changed,
             ],
-        )? > 0)
+        )? > 0;
+        tx.commit()?;
+        Ok(recorded)
+    }
+
+    /// Keep `pending` as `salt`'s pending head, in place of any before it,
+    /// or with `None` forget the one kept. `false`, changing nothing, when
+    /// `pending` is no newer than the head published.
+    pub fn feed_own_set_pending(&self, salt: &str, pending: Option<&OwnPublish>) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Self::ensure_feeds_locked(&conn)?;
+        let changed = match pending {
+            Some(pending) => conn.execute(
+                "UPDATE feeds_own SET pending_sequence = ?2, pending_ed2k = ?3, pending_blake3 = ?4,
+                        pending_size = ?5, pending_item_count = ?6, pending_title = ?7, pending_description = ?8
+                 WHERE salt = ?1 AND sequence < ?2",
+                params![
+                    salt,
+                    pending.sequence,
+                    pending.list_ed2k,
+                    pending.list_blake3,
+                    pending.list_size,
+                    pending.item_count,
+                    pending.title,
+                    pending.description,
+                ],
+            )?,
+            None => conn.execute(
+                "UPDATE feeds_own SET pending_sequence = 0, pending_ed2k = '', pending_blake3 = '', pending_size = 0,
+                        pending_item_count = 0, pending_title = '', pending_description = ''
+                 WHERE salt = ?1",
+                params![salt],
+            )?,
+        };
+        Ok(changed > 0)
     }
 
     /// Record that head `sequence` of `salt` was signed and sent again.
@@ -364,6 +477,15 @@ impl Database {
             "UPDATE feeds_own SET published_at = ?3 WHERE salt = ?1 AND sequence = ?2",
             params![salt, sequence, now],
         )?;
+        Ok(())
+    }
+
+    /// The list the last head names is gone and its items no longer make
+    /// it: the feed needs publishing again.
+    pub fn feed_own_mark_changed(&self, salt: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_feeds_locked(&conn)?;
+        conn.execute("UPDATE feeds_own SET changed = 1 WHERE salt = ?1", params![salt])?;
         Ok(())
     }
 
@@ -379,13 +501,16 @@ impl Database {
 
     // ── Following ───────────────────────────────────────────────────────
 
-    /// Follow a feed. `false` when it is followed already.
+    /// Follow a feed, with auto-download off and its default caps. `false`
+    /// when it is followed already. The caps are written out because a
+    /// table made by a development build has column defaults of 0.
     pub fn feed_follow(&self, publisher: &str, salt: &str, now: i64) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         Self::ensure_feeds_locked(&conn)?;
         Ok(conn.execute(
-            "INSERT OR IGNORE INTO feeds_followed (publisher, salt, followed_at) VALUES (?1, ?2, ?3)",
-            params![publisher, salt, now],
+            "INSERT OR IGNORE INTO feeds_followed (publisher, salt, followed_at, auto_max_item_mib, auto_max_day_mib)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![publisher, salt, now, FEED_AUTO_DEFAULT_ITEM_MIB, FEED_AUTO_DEFAULT_DAY_MIB],
         )? > 0)
     }
 
@@ -692,32 +817,34 @@ impl Database {
         )? > 0)
     }
 
-    /// Bytes auto-download has started for a feed on `day` (days since the
-    /// epoch, UTC).
-    pub fn feed_auto_bytes(&self, publisher: &str, salt: &str, day: i64) -> anyhow::Result<i64> {
+    /// Bytes auto-download has started for a feed in the
+    /// [`FEED_AUTO_WINDOW_SECS`] up to `now`.
+    pub fn feed_auto_bytes(&self, publisher: &str, salt: &str, now: i64) -> anyhow::Result<i64> {
         let conn = self.conn.lock();
         Self::ensure_feeds_locked(&conn)?;
-        Ok(conn
-            .query_row(
-                "SELECT bytes FROM feeds_auto_bytes WHERE publisher = ?1 AND salt = ?2 AND day = ?3",
-                params![publisher, salt, day],
-                |row| row.get(0),
-            )
-            .optional()?
-            .unwrap_or(0))
+        Ok(conn.query_row(
+            "SELECT COALESCE(SUM(bytes), 0) FROM feeds_auto_started
+             WHERE publisher = ?1 AND salt = ?2 AND at > ?3",
+            params![publisher, salt, now - FEED_AUTO_WINDOW_SECS],
+            |row| row.get(0),
+        )?)
     }
 
-    pub fn feed_add_auto_bytes(&self, publisher: &str, salt: &str, day: i64, bytes: i64) -> anyhow::Result<()> {
+    /// Count `bytes` auto-download started for a feed at `now`. Entries out
+    /// of every feed's window go, so the log holds a day at most; so do
+    /// entries a day ahead of `now`, left by a clock set back.
+    pub fn feed_add_auto_bytes(&self, publisher: &str, salt: &str, now: i64, bytes: i64) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         Self::ensure_feeds_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO feeds_auto_bytes (publisher, salt, day, bytes) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(publisher, salt, day) DO UPDATE SET bytes = bytes + excluded.bytes",
-            params![publisher, salt, day, bytes],
+            "INSERT INTO feeds_auto_started (publisher, salt, at, bytes) VALUES (?1, ?2, ?3, ?4)",
+            params![publisher, salt, now, bytes],
         )?;
-        // Only today's and yesterday's counts are ever read.
-        tx.execute("DELETE FROM feeds_auto_bytes WHERE day < ?1", params![day - 1])?;
+        tx.execute(
+            "DELETE FROM feeds_auto_started WHERE at <= ?1 OR at > ?2",
+            params![now - FEED_AUTO_WINDOW_SECS, now + FEED_AUTO_WINDOW_SECS],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -728,7 +855,7 @@ impl Database {
         let conn = self.conn.lock();
         Self::ensure_feeds_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
-        for table in ["feeds_followed_items", "feeds_auto_bytes", "feeds_followed"] {
+        for table in ["feeds_followed_items", "feeds_auto_started", "feeds_followed"] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE publisher = ?1 AND salt = ?2"),
                 params![publisher, salt],
@@ -847,8 +974,8 @@ mod tests {
     fn a_publish_never_goes_back_and_an_edit_waits_for_the_next() {
         let (db, path) = db("publish");
         db.feed_own_create("s", "One", "", 1, 8).unwrap();
-        assert!(db.feed_own_published("s", &publish(20, "One"), 5).unwrap());
-        assert!(!db.feed_own_published("s", &publish(10, "One"), 6).unwrap(), "an older publish finishing late");
+        assert!(db.feed_own_published("s", &publish(20, "One"), Some(&[]), 5).unwrap());
+        assert!(!db.feed_own_published("s", &publish(10, "One"), Some(&[]), 6).unwrap(), "an older publish finishing late");
         let feed = db.feed_own("s").unwrap().unwrap();
         assert_eq!((feed.sequence, feed.published_at, feed.changed), (20, 5, false));
 
@@ -859,8 +986,75 @@ mod tests {
 
         db.feed_own_republished("s", 20, 9).unwrap();
         assert_eq!(db.feed_own("s").unwrap().unwrap().published_at, 9);
-        assert!(db.feed_own_published("s", &publish(30, "Two"), 10).unwrap());
+        assert!(db.feed_own_published("s", &publish(30, "Two"), Some(&[]), 10).unwrap());
         assert!(!db.feed_own("s").unwrap().unwrap().changed);
+        drop_db(db, path);
+    }
+
+    #[test]
+    fn items_saved_while_a_head_was_out_stay_unpublished() {
+        let (db, path) = db("midpublish");
+        db.feed_own_create("s", "One", "", 1, 8).unwrap();
+        let sent = vec![item("a", "A")];
+        db.feed_own_set_items("s", &sent).unwrap();
+        db.feed_own_set_items("s", &[item("a", "A"), item("b", "B")]).unwrap();
+        assert!(db.feed_own_published("s", &publish(20, "One"), Some(&sent), 5).unwrap());
+        assert!(db.feed_own("s").unwrap().unwrap().changed, "saved after the list was made");
+        assert!(db.feed_own_published("s", &publish(30, "One"), None, 6).unwrap());
+        assert!(db.feed_own("s").unwrap().unwrap().changed, "items not known");
+        drop_db(db, path);
+    }
+
+    #[test]
+    fn a_pending_head_is_kept_until_a_head_is_recorded() {
+        let (db, path) = db("pending");
+        db.feed_own_create("s", "One", "", 1, 8).unwrap();
+        assert!(db.feed_own_published("s", &publish(20, "One"), Some(&[]), 5).unwrap());
+        assert!(!db.feed_own_set_pending("s", Some(&publish(20, "One"))).unwrap(), "no newer than the head");
+        assert!(db.feed_own("s").unwrap().unwrap().pending.is_none());
+
+        let pending = OwnPublish { list_ed2k: "f".into(), ..publish(25, "One") };
+        assert!(db.feed_own_set_pending("s", Some(&pending)).unwrap());
+        let feed = db.feed_own("s").unwrap().unwrap();
+        assert_eq!((feed.sequence, feed.pending), (20, Some(pending.clone())));
+        let replaced = publish(27, "One");
+        db.feed_own_set_pending("s", Some(&replaced)).unwrap();
+        assert_eq!(db.feed_own("s").unwrap().unwrap().pending, Some(replaced.clone()), "one per feed");
+
+        assert!(db.feed_own_published("s", &replaced, Some(&[]), 6).unwrap());
+        let feed = db.feed_own("s").unwrap().unwrap();
+        assert_eq!((feed.sequence, feed.pending), (27, None));
+
+        db.feed_own_set_pending("s", Some(&publish(30, "One"))).unwrap();
+        assert!(db.feed_own_set_pending("s", None).unwrap());
+        assert!(db.feed_own("s").unwrap().unwrap().pending.is_none());
+        drop_db(db, path);
+    }
+
+    #[test]
+    fn saving_the_same_items_again_leaves_a_published_feed_up_to_date() {
+        let (db, path) = db("unchanged");
+        db.feed_own_create("s", "One", "", 1, 8).unwrap();
+        let items = vec![item("a", "A"), item("b", "B")];
+        db.feed_own_set_items("s", &items).unwrap();
+        assert!(db.feed_own_published("s", &publish(20, "One"), Some(&items), 5).unwrap());
+        assert!(!db.feed_own("s").unwrap().unwrap().changed);
+
+        assert!(db.feed_own_set_items("s", &items).unwrap());
+        assert!(!db.feed_own("s").unwrap().unwrap().changed, "the same items");
+
+        let reordered = vec![item("b", "B"), item("a", "A")];
+        db.feed_own_set_items("s", &reordered).unwrap();
+        assert!(db.feed_own("s").unwrap().unwrap().changed, "another order");
+
+        assert!(db.feed_own_published("s", &publish(30, "One"), Some(&reordered), 6).unwrap());
+        let noted = vec![FeedItem { note: "listen".into(), ..item("b", "B") }, item("a", "A")];
+        db.feed_own_set_items("s", &noted).unwrap();
+        assert!(db.feed_own("s").unwrap().unwrap().changed, "a note");
+
+        assert!(db.feed_own_published("s", &publish(40, "One"), Some(&noted), 7).unwrap());
+        db.feed_own_mark_changed("s").unwrap();
+        assert!(db.feed_own("s").unwrap().unwrap().changed);
         drop_db(db, path);
     }
 
@@ -889,14 +1083,45 @@ mod tests {
     }
 
     #[test]
-    fn auto_download_counts_bytes_per_day_and_unfollow_forgets_everything() {
+    fn a_new_follow_has_the_default_caps_and_a_cap_of_0_is_kept() {
+        let (db, path) = db("caps");
+        db.feed_follow(PUB, SALT, 1).unwrap();
+        let feed = db.feed_followed(PUB, SALT).unwrap().unwrap();
+        assert!(!feed.auto_download);
+        assert_eq!(
+            (feed.auto_max_item_mib, feed.auto_max_day_mib),
+            (FEED_AUTO_DEFAULT_ITEM_MIB, FEED_AUTO_DEFAULT_DAY_MIB)
+        );
+
+        db.conn.lock().execute("INSERT INTO feeds_followed (publisher, salt, followed_at) VALUES ('q', 's', 1)", []).unwrap();
+        let bare = db.feed_followed("q", "s").unwrap().unwrap();
+        assert_eq!(
+            (bare.auto_max_item_mib, bare.auto_max_day_mib),
+            (FEED_AUTO_DEFAULT_ITEM_MIB, FEED_AUTO_DEFAULT_DAY_MIB),
+            "the column defaults"
+        );
+
+        db.feed_set_auto_download(PUB, SALT, true, 0, 0, "").unwrap();
+        let feed = db.feed_followed(PUB, SALT).unwrap().unwrap();
+        assert_eq!((feed.auto_download, feed.auto_max_item_mib, feed.auto_max_day_mib), (true, 0, 0));
+        drop_db(db, path);
+    }
+
+    #[test]
+    fn auto_download_counts_bytes_over_the_last_day_and_unfollow_forgets_everything() {
         let (db, path) = db("auto");
         db.feed_follow(PUB, SALT, 1).unwrap();
-        db.feed_add_auto_bytes(PUB, SALT, 100, 5).unwrap();
-        db.feed_add_auto_bytes(PUB, SALT, 100, 7).unwrap();
-        assert_eq!(db.feed_auto_bytes(PUB, SALT, 100).unwrap(), 12);
-        db.feed_add_auto_bytes(PUB, SALT, 103, 1).unwrap();
-        assert_eq!(db.feed_auto_bytes(PUB, SALT, 100).unwrap(), 0, "old days are dropped");
+        // Late on one UTC day, then early the next: one window, not two.
+        let evening = 86_400 * 100 + 23 * 3600;
+        db.feed_add_auto_bytes(PUB, SALT, evening, 5).unwrap();
+        db.feed_add_auto_bytes(PUB, SALT, evening + 2 * 3600, 7).unwrap();
+        assert_eq!(db.feed_auto_bytes(PUB, SALT, evening + 2 * 3600).unwrap(), 12);
+        db.feed_add_auto_bytes("other", SALT, evening, 100).unwrap();
+        assert_eq!(db.feed_auto_bytes(PUB, SALT, evening + 2 * 3600).unwrap(), 12, "per feed");
+        assert_eq!(db.feed_auto_bytes(PUB, SALT, evening + FEED_AUTO_WINDOW_SECS).unwrap(), 7, "the first has aged out");
+        db.feed_add_auto_bytes(PUB, SALT, evening + 3 * FEED_AUTO_WINDOW_SECS, 1).unwrap();
+        let rows: i64 = db.conn.lock().query_row("SELECT COUNT(*) FROM feeds_auto_started", [], |row| row.get(0)).unwrap();
+        assert_eq!(rows, 1, "the log keeps a day at most");
         db.feed_unfollow(PUB, SALT).unwrap();
         assert!(db.feed_followed(PUB, SALT).unwrap().is_none());
         drop_db(db, path);
