@@ -17,7 +17,7 @@ use crate::types::*;
 
 mod feeds;
 mod room_dm;
-pub use feeds::{FeedItem, FollowedFeed, FollowedItem, OwnFeed, OwnPublish};
+pub use feeds::{DiscoveredFeed, DueListing, FeedItem, FollowedFeed, FollowedItem, OwnFeed, OwnPublish};
 pub use room_dm::{DmIncoming, DmMessage, DmThread};
 
 const MAX_PEERS_ROWS: i64 = 10_000;
@@ -5339,7 +5339,60 @@ impl Database {
             "DELETE FROM transfer_part_folders WHERE transfer_id = ?1",
             params![transfer_id],
         )?;
+        Self::ensure_transfer_feed_folders_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM transfer_feed_folders WHERE transfer_id = ?1",
+            params![transfer_id],
+        )?;
         Ok(())
+    }
+
+    /// Record that the download `transfer_id` is from a feed, and finishes in
+    /// its `folder` (see `sharing::feed_downloads`). Written before the
+    /// download's own row, so it is never saved without it.
+    pub fn set_transfer_feed_folder(&self, transfer_id: &str, folder: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_transfer_feed_folders_locked(&conn)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO transfer_feed_folders (transfer_id, folder) VALUES (?1, ?2)",
+            params![transfer_id, folder],
+        )?;
+        Ok(())
+    }
+
+    /// Undo [`Self::set_transfer_feed_folder`] for a download that did not
+    /// start after all.
+    pub fn clear_transfer_feed_folder(&self, transfer_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_transfer_feed_folders_locked(&conn)?;
+        conn.execute("DELETE FROM transfer_feed_folders WHERE transfer_id = ?1", params![transfer_id])?;
+        Ok(())
+    }
+
+    /// The downloads from feeds, each with its feed folder. Those no download
+    /// row has (one whose start did not get as far as saving it, or one
+    /// removed by a build without this table) are dropped after the read, and
+    /// a failure to drop them costs nothing but the rows.
+    pub fn transfer_feed_folders(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock();
+        Self::ensure_transfer_feed_folders_locked(&conn)?;
+        let rows = {
+            let mut stmt = conn.prepare(
+                "SELECT transfer_id, folder FROM transfer_feed_folders
+                  WHERE transfer_id IN (SELECT id FROM transfers)",
+            )?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        if let Err(error) = conn.execute(
+            "DELETE FROM transfer_feed_folders WHERE transfer_id NOT IN (SELECT id FROM transfers)",
+            [],
+        ) {
+            tracing::warn!("Could not drop feed folders of downloads that are gone: {error}");
+        }
+        Ok(rows)
     }
 
     /// Delete many transfers in one transaction.
@@ -5356,13 +5409,16 @@ impl Database {
         }
         let mut conn = self.conn.lock();
         Self::ensure_transfer_part_folders_locked(&conn)?;
+        Self::ensure_transfer_feed_folders_locked(&conn)?;
         let tx = conn.transaction()?;
         {
             let mut stmt = tx.prepare("DELETE FROM transfers WHERE id = ?1")?;
             let mut folders = tx.prepare("DELETE FROM transfer_part_folders WHERE transfer_id = ?1")?;
+            let mut feed_folders = tx.prepare("DELETE FROM transfer_feed_folders WHERE transfer_id = ?1")?;
             for id in transfer_ids {
                 stmt.execute(params![id])?;
                 folders.execute(params![id])?;
+                feed_folders.execute(params![id])?;
             }
         }
         tx.commit()?;
@@ -12859,6 +12915,18 @@ impl Database {
         Ok(())
     }
 
+    /// Created on first use for the same reason as
+    /// [`Self::ensure_transfer_part_folders_locked`].
+    fn ensure_transfer_feed_folders_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS transfer_feed_folders (
+                transfer_id TEXT PRIMARY KEY,
+                folder TEXT NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
     /// Files whose removal failed or had to wait for their folder, created on
     /// first use for the same reason as [`Self::ensure_transfer_part_folders_locked`].
     fn ensure_deferred_file_removals_locked(conn: &Connection) -> anyhow::Result<()> {
@@ -18451,6 +18519,43 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("AICH")));
         }
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A feed's download keeps its folder across a restart, and loses it with
+    /// its row; one whose row was never saved is dropped on load.
+    #[test]
+    fn a_feed_downloads_folder_lives_and_dies_with_its_row() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-feed-folders-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).unwrap();
+        for id in ["kept", "removed"] {
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO transfers (
+                        id, file_name, file_hash, peer_id, peer_name, direction, status,
+                        progress, speed, total_size, transferred, started_at, priority, category
+                     ) VALUES (?1, 'file.bin', ?2, '', '', 'download', 'queued', 0, 0, 4, 0, 1, 'normal', '')",
+                    params![id, "11".repeat(16)],
+                )
+                .unwrap();
+        }
+        db.set_transfer_feed_folder("kept", "Mixes").unwrap();
+        db.set_transfer_feed_folder("removed", "Mixes").unwrap();
+        db.set_transfer_feed_folder("never-saved", "Mixes").unwrap();
+        db.set_transfer_feed_folder("undone", "Mixes").unwrap();
+        db.clear_transfer_feed_folder("undone").unwrap();
+        db.remove_transfer("removed").unwrap();
+        assert_eq!(db.transfer_feed_folders().unwrap(), vec![("kept".to_string(), "Mixes".to_string())]);
+        db.remove_transfers(&["kept".to_string()]).unwrap();
+        assert!(db.transfer_feed_folders().unwrap().is_empty());
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));

@@ -2437,6 +2437,7 @@ impl TransferManager {
         self.speed_history.remove(id);
         self.source_details.remove(id);
         crate::storage::category_folders::forget(id);
+        crate::sharing::feed_downloads::forget(id);
         if was_active {
             self.promote_next()
         } else {

@@ -95,12 +95,13 @@ impl RootListing {
         LISTED_ROOTS.lock().push(root.to_path_buf());
         Self {
             parts: crate::storage::part_folders::part_names(root),
-            // Category folders too: a completion copy is made beside where the
-            // file is published.
+            // Category and feed folders too: a completion copy is made beside
+            // where the file is published.
             copies: if copies {
                 crate::storage::category_folders::finished_download_dirs(root)
-                    .iter()
-                    .flat_map(|dir| ed2k::transfer::earlier_completion_copies(dir))
+                    .into_iter()
+                    .chain(crate::sharing::feed_downloads::finished_dirs(root))
+                    .flat_map(|dir| ed2k::transfer::earlier_completion_copies(&dir))
                     .collect()
             } else {
                 Vec::new()
@@ -739,10 +740,21 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 let downloads = PathBuf::from(&dl_folder).join("Downloads");
                 // Its category's folder first, where completion put it, then
                 // Downloads itself, where it went before it had one or when
-                // that folder could not be made.
-                let subdir = crate::storage::category_folders::completion_subdir(&transfer.id);
-                let category_dir = (!subdir.is_empty())
-                    .then(|| subdir.iter().fold(downloads.clone(), |dir, s| dir.join(s)));
+                // that folder could not be made. A feed's download looks in
+                // its feed folder, then `Feeds`, and never in Downloads.
+                let feed_folder = crate::sharing::feed_downloads::folder_of(&transfer.id);
+                let (category_dir, downloads) = match &feed_folder {
+                    Some(folder) => {
+                        let feeds = crate::sharing::feed_downloads::feeds_dir(std::path::Path::new(&dl_folder));
+                        (Some(feeds.join(folder)), feeds)
+                    }
+                    None => {
+                        let subdir = crate::storage::category_folders::completion_subdir(&transfer.id);
+                        let category_dir = (!subdir.is_empty())
+                            .then(|| subdir.iter().fold(downloads.clone(), |dir, s| dir.join(s)));
+                        (category_dir, downloads)
+                    }
+                };
                 let name = safe_name.clone();
                 let part_check = part_path.clone();
                 // Past the budget nothing more is started: each look could

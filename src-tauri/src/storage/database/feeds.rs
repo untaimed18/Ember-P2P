@@ -50,6 +50,43 @@ pub struct OwnFeed {
     /// storers may hold the head; at most one per feed.
     #[serde(skip)]
     pub pending: Option<OwnPublish>,
+    /// Listed in the public feed index, for anyone to find in Discover, as
+    /// well as by its link.
+    pub listed: bool,
+    /// The stamp of the last listing of it sent, not a withdrawal; 0 if none
+    /// ever was. Once it is taken out, its withdrawal is sent until that
+    /// listing has lapsed, and never for a feed no listing named.
+    #[serde(skip)]
+    pub listing_sent_at: i64,
+}
+
+/// A listing or withdrawal of a feed of ours to sign and send now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueListing {
+    pub salt: String,
+    pub withdrawn: bool,
+    /// Its timestamp: past every one sent for the feed before, so it
+    /// outranks them.
+    pub stamp: i64,
+}
+
+/// A public feed the index listed, as Discover last found it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DiscoveredFeed {
+    pub publisher: String,
+    pub salt: String,
+    pub title: String,
+    pub description: String,
+    pub item_count: i64,
+    pub list_size: i64,
+    /// The head's sequence: the publisher's clock, in milliseconds, at its
+    /// last publish.
+    pub sequence: i64,
+    /// When the publisher last signed its listing, which it does with every
+    /// publish and daily while it runs.
+    pub listed_at: i64,
+    /// When this side first found it in the index.
+    pub first_seen: i64,
 }
 
 /// One file in a feed, published or followed.
@@ -100,6 +137,9 @@ pub struct FollowedFeed {
     /// [`FEED_AUTO_DEFAULT_DAY_MIB`] for a new follow.
     pub auto_max_day_mib: i64,
     pub auto_category: String,
+    /// The folder in `Feeds` its files finish in, fixed by the first one
+    /// downloaded; empty before.
+    pub folder: String,
 }
 
 /// An item of a followed feed's list, with what this side knows of it.
@@ -218,30 +258,62 @@ impl Database {
                 bytes INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS feeds_auto_started_feed ON feeds_auto_started (publisher, salt, at);
+            CREATE TABLE IF NOT EXISTS feeds_discovered (
+                publisher TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                item_count INTEGER NOT NULL DEFAULT 0,
+                list_size INTEGER NOT NULL DEFAULT 0,
+                sequence INTEGER NOT NULL DEFAULT 0,
+                listed_at INTEGER NOT NULL DEFAULT 0,
+                first_seen INTEGER NOT NULL,
+                PRIMARY KEY (publisher, salt)
+            );
+            -- Deleted feeds of ours whose last listing may still be live: their
+            -- withdrawal is sent daily until it lapses.
+            CREATE TABLE IF NOT EXISTS feeds_own_withdrawn (
+                salt TEXT PRIMARY KEY,
+                listing_sent_at INTEGER NOT NULL,
+                listing_stamp INTEGER NOT NULL,
+                sent_at INTEGER NOT NULL DEFAULT 0
+            );
+            -- Feeds and publishers the user hid from Discover; an empty salt
+            -- hides every feed of the publisher.
+            CREATE TABLE IF NOT EXISTS feeds_hidden (
+                publisher TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                PRIMARY KEY (publisher, salt)
+            );
             -- Per-day counts a development build kept before the rolling window.
             DROP TABLE IF EXISTS feeds_auto_bytes;",
         )?;
         // A table made by a development build before these columns. Each is
         // checked on its own, so one added before a crash is not added twice.
-        for (column, kind) in [
-            ("published_title", "TEXT NOT NULL DEFAULT ''"),
-            ("published_description", "TEXT NOT NULL DEFAULT ''"),
-            ("changed", "INTEGER NOT NULL DEFAULT 0"),
-            ("pending_sequence", "INTEGER NOT NULL DEFAULT 0"),
-            ("pending_ed2k", "TEXT NOT NULL DEFAULT ''"),
-            ("pending_blake3", "TEXT NOT NULL DEFAULT ''"),
-            ("pending_size", "INTEGER NOT NULL DEFAULT 0"),
-            ("pending_item_count", "INTEGER NOT NULL DEFAULT 0"),
-            ("pending_title", "TEXT NOT NULL DEFAULT ''"),
-            ("pending_description", "TEXT NOT NULL DEFAULT ''"),
+        for (table, column, kind) in [
+            ("feeds_own", "published_title", "TEXT NOT NULL DEFAULT ''"),
+            ("feeds_own", "published_description", "TEXT NOT NULL DEFAULT ''"),
+            ("feeds_own", "changed", "INTEGER NOT NULL DEFAULT 0"),
+            ("feeds_own", "pending_sequence", "INTEGER NOT NULL DEFAULT 0"),
+            ("feeds_own", "pending_ed2k", "TEXT NOT NULL DEFAULT ''"),
+            ("feeds_own", "pending_blake3", "TEXT NOT NULL DEFAULT ''"),
+            ("feeds_own", "pending_size", "INTEGER NOT NULL DEFAULT 0"),
+            ("feeds_own", "pending_item_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("feeds_own", "pending_title", "TEXT NOT NULL DEFAULT ''"),
+            ("feeds_own", "pending_description", "TEXT NOT NULL DEFAULT ''"),
+            ("feeds_own", "listed", "INTEGER NOT NULL DEFAULT 0"),
+            ("feeds_own", "listing_sent_at", "INTEGER NOT NULL DEFAULT 0"),
+            ("feeds_own", "listing_stamp", "INTEGER NOT NULL DEFAULT 0"),
+            // The folder in `Feeds` its files finish in; empty until the first.
+            ("feeds_followed", "folder", "TEXT NOT NULL DEFAULT ''"),
         ] {
             let present: bool = conn.query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('feeds_own') WHERE name = ?1",
-                params![column],
+                "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2",
+                params![table, column],
                 |row| row.get(0),
             )?;
             if !present {
-                conn.execute_batch(&format!("ALTER TABLE feeds_own ADD COLUMN {column} {kind};"))?;
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind};"))?;
             }
         }
         Ok(())
@@ -256,7 +328,7 @@ impl Database {
             "SELECT salt, title, description, sequence, list_ed2k, list_blake3, list_size, item_count,
                     created_at, published_at, published_title, published_description, changed,
                     pending_sequence, pending_ed2k, pending_blake3, pending_size, pending_item_count,
-                    pending_title, pending_description
+                    pending_title, pending_description, listed, listing_sent_at
              FROM feeds_own ORDER BY created_at",
         )?;
         let rows = stmt
@@ -290,6 +362,8 @@ impl Database {
                     published_description: row.get(11)?,
                     changed: row.get::<_, i64>(12)? != 0,
                     pending,
+                    listed: row.get::<_, i64>(20)? != 0,
+                    listing_sent_at: row.get(21)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -301,7 +375,15 @@ impl Database {
     }
 
     /// Start a feed. `false` when the identity already has as many as it may.
-    pub fn feed_own_create(&self, salt: &str, title: &str, description: &str, now: i64, max: usize) -> anyhow::Result<bool> {
+    pub fn feed_own_create(
+        &self,
+        salt: &str,
+        title: &str,
+        description: &str,
+        listed: bool,
+        now: i64,
+        max: usize,
+    ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         Self::ensure_feeds_locked(&conn)?;
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM feeds_own", [], |row| row.get(0))?;
@@ -309,8 +391,8 @@ impl Database {
             return Ok(false);
         }
         conn.execute(
-            "INSERT INTO feeds_own (salt, title, description, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![salt, title, description, now],
+            "INSERT INTO feeds_own (salt, title, description, created_at, listed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![salt, title, description, now, listed],
         )?;
         Ok(true)
     }
@@ -489,14 +571,101 @@ impl Database {
         Ok(())
     }
 
-    pub fn feed_own_delete(&self, salt: &str) -> anyhow::Result<()> {
+    /// Delete a feed of ours. One whose last listing, sent at most
+    /// `listing_ttl` seconds before `now`, may still be live is kept as a
+    /// withdrawal to send (see [`Self::feed_withdrawals_due`]).
+    pub fn feed_own_delete(&self, salt: &str, now: i64, listing_ttl: i64) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         Self::ensure_feeds_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO feeds_own_withdrawn (salt, listing_sent_at, listing_stamp, sent_at)
+             SELECT salt, listing_sent_at, listing_stamp, 0 FROM feeds_own
+             WHERE salt = ?1 AND listing_sent_at > 0 AND listing_sent_at >= ?2",
+            params![salt, now - listing_ttl],
+        )?;
         tx.execute("DELETE FROM feeds_own_items WHERE salt = ?1", params![salt])?;
         tx.execute("DELETE FROM feeds_own WHERE salt = ?1", params![salt])?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// List a feed of ours in the public index, or take it out. `false` when
+    /// there is no such feed.
+    pub fn feed_own_set_listed(&self, salt: &str, listed: bool) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Self::ensure_feeds_locked(&conn)?;
+        Ok(conn.execute("UPDATE feeds_own SET listed = ?2 WHERE salt = ?1", params![salt, listed])? > 0)
+    }
+
+    /// What to send of feed `salt` in the public index at `now`, stamped and
+    /// recorded as sent in one step, so a listing and a withdrawal decided
+    /// apart can never be stamped out of order: its listing while it is
+    /// listed and `published`, or its withdrawal while one it was listed
+    /// under, sent at most `listing_ttl` seconds before, may be live.
+    /// `None` when there is nothing to send.
+    pub fn feed_own_take_listing(
+        &self,
+        salt: &str,
+        published: bool,
+        now: i64,
+        listing_ttl: i64,
+    ) -> anyhow::Result<Option<DueListing>> {
+        let conn = self.conn.lock();
+        Self::ensure_feeds_locked(&conn)?;
+        let row: Option<(bool, i64, i64)> = conn
+            .query_row(
+                "SELECT listed, listing_sent_at, listing_stamp FROM feeds_own WHERE salt = ?1",
+                params![salt],
+                |row| Ok((row.get::<_, i64>(0)? != 0, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((listed, sent_at, last_stamp)) = row else {
+            return Ok(None);
+        };
+        let withdrawn = match (listed, published) {
+            (true, true) => false,
+            (false, _) if sent_at > 0 && now - sent_at <= listing_ttl => true,
+            _ => return Ok(None),
+        };
+        let stamp = now.max(last_stamp.saturating_add(1));
+        conn.execute(
+            "UPDATE feeds_own SET listing_stamp = ?2,
+                    listing_sent_at = CASE WHEN ?3 THEN listing_sent_at ELSE ?2 END
+             WHERE salt = ?1",
+            params![salt, stamp, withdrawn],
+        )?;
+        Ok(Some(DueListing { salt: salt.to_string(), withdrawn, stamp }))
+    }
+
+    /// The withdrawals of deleted feeds due at `now`, stamped and recorded as
+    /// sent: each is sent at once, then every `interval` seconds, until the
+    /// listing it displaces has lapsed, `listing_ttl` after it was sent.
+    pub fn feed_withdrawals_due(&self, now: i64, interval: i64, listing_ttl: i64) -> anyhow::Result<Vec<DueListing>> {
+        let conn = self.conn.lock();
+        Self::ensure_feeds_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM feeds_own_withdrawn WHERE listing_sent_at < ?1", params![now - listing_ttl])?;
+        let due: Vec<(String, i64)> = {
+            let mut stmt = tx.prepare(
+                "SELECT salt, listing_stamp FROM feeds_own_withdrawn WHERE sent_at = 0 OR sent_at <= ?1",
+            )?;
+            let rows = stmt
+                .query_map(params![now - interval], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        let mut out = Vec::with_capacity(due.len());
+        for (salt, last_stamp) in due {
+            let stamp = now.max(last_stamp.saturating_add(1));
+            tx.execute(
+                "UPDATE feeds_own_withdrawn SET listing_stamp = ?2, sent_at = ?3 WHERE salt = ?1",
+                params![salt, stamp, now],
+            )?;
+            out.push(DueListing { salt, withdrawn: true, stamp });
+        }
+        tx.commit()?;
+        Ok(out)
     }
 
     // ── Following ───────────────────────────────────────────────────────
@@ -527,7 +696,7 @@ impl Database {
         Self::ensure_feeds_locked(&conn)?;
         let select = "SELECT publisher, salt, title, description, sequence, list_ed2k, list_blake3, list_size,
                     item_count, state, list_sequence, unread, followed_at, checked_at, auto_download,
-                    auto_max_item_mib, auto_max_day_mib, auto_category, held_ed2k, held_blake3, held_size
+                    auto_max_item_mib, auto_max_day_mib, auto_category, held_ed2k, held_blake3, held_size, folder
              FROM feeds_followed";
         let map = |row: &rusqlite::Row<'_>| {
             Ok(FollowedFeed {
@@ -552,6 +721,7 @@ impl Database {
                 held_ed2k: row.get(18)?,
                 held_blake3: row.get(19)?,
                 held_size: row.get(20)?,
+                folder: row.get(21)?,
             })
         };
         let rows = match key {
@@ -864,6 +1034,163 @@ impl Database {
         tx.commit()?;
         Ok(())
     }
+
+    /// The folder in `Feeds` the followed feed's files finish in: the one it
+    /// was given by its first download, or, for that first, one named after
+    /// `title` and unlike every other feed's. `None` when it is not followed.
+    pub fn feed_followed_folder(&self, publisher: &str, salt: &str, title: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock();
+        Self::ensure_feeds_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let held: Option<String> = tx
+            .query_row(
+                "SELECT folder FROM feeds_followed WHERE publisher = ?1 AND salt = ?2",
+                params![publisher, salt],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(held) = held else {
+            return Ok(None);
+        };
+        if !held.is_empty() {
+            return Ok(Some(held));
+        }
+        let taken: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT folder FROM feeds_followed WHERE folder != ''")?;
+            let rows = stmt.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        let folder = crate::sharing::feed_downloads::unique_folder_name(title, salt, &taken);
+        tx.execute(
+            "UPDATE feeds_followed SET folder = ?3 WHERE publisher = ?1 AND salt = ?2",
+            params![publisher, salt, folder],
+        )?;
+        tx.commit()?;
+        Ok(Some(folder))
+    }
+
+    // ── Discover ────────────────────────────────────────────────────────
+
+    /// The feeds the last Discover walks found, newest publish first,
+    /// leaving out any found more than `max_age` seconds before `now`.
+    pub fn feeds_discovered(&self, now: i64, max_age: i64) -> anyhow::Result<Vec<DiscoveredFeed>> {
+        let conn = self.conn.lock();
+        Self::ensure_feeds_locked(&conn)?;
+        conn.execute("DELETE FROM feeds_discovered WHERE listed_at < ?1", params![now - max_age])?;
+        let mut stmt = conn.prepare(
+            "SELECT publisher, salt, title, description, item_count, list_size, sequence, listed_at, first_seen
+             FROM feeds_discovered ORDER BY sequence DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(DiscoveredFeed {
+                    publisher: row.get(0)?,
+                    salt: row.get(1)?,
+                    title: row.get(2)?,
+                    description: row.get(3)?,
+                    item_count: row.get(4)?,
+                    list_size: row.get(5)?,
+                    sequence: row.get(6)?,
+                    listed_at: row.get(7)?,
+                    first_seen: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Record what a Discover walk found, and forget each feed of `forget`
+    /// listed no later than the time given with it: one found withdrawn, as
+    /// of its withdrawal, or one whose listing lapsed, as of any time. A feed
+    /// already known keeps when it was first found, and is replaced only by
+    /// a listing signed later. Returns each written feed's first-seen time,
+    /// by `(publisher, salt)`.
+    pub fn feeds_discovered_put(
+        &self,
+        found: &[DiscoveredFeed],
+        forget: &[(String, String, i64)],
+        now: i64,
+    ) -> anyhow::Result<std::collections::HashMap<(String, String), i64>> {
+        let conn = self.conn.lock();
+        Self::ensure_feeds_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let mut first_seen = std::collections::HashMap::new();
+        {
+            let mut upsert = tx.prepare(
+                "INSERT INTO feeds_discovered
+                    (publisher, salt, title, description, item_count, list_size, sequence, listed_at, first_seen)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(publisher, salt) DO UPDATE SET
+                    title = excluded.title, description = excluded.description,
+                    item_count = excluded.item_count, list_size = excluded.list_size,
+                    sequence = excluded.sequence, listed_at = excluded.listed_at
+                 WHERE excluded.listed_at > feeds_discovered.listed_at",
+            )?;
+            let mut seen = tx.prepare("SELECT first_seen FROM feeds_discovered WHERE publisher = ?1 AND salt = ?2")?;
+            for feed in found {
+                upsert.execute(params![
+                    feed.publisher,
+                    feed.salt,
+                    feed.title,
+                    feed.description,
+                    feed.item_count,
+                    feed.list_size,
+                    feed.sequence,
+                    feed.listed_at,
+                    now,
+                ])?;
+                let at: i64 = seen.query_row(params![feed.publisher, feed.salt], |row| row.get(0))?;
+                first_seen.insert((feed.publisher.clone(), feed.salt.clone()), at);
+            }
+            let mut delete = tx.prepare(
+                "DELETE FROM feeds_discovered WHERE publisher = ?1 AND salt = ?2 AND listed_at <= ?3",
+            )?;
+            for (publisher, salt, at) in forget {
+                delete.execute(params![publisher, salt, at])?;
+            }
+        }
+        tx.commit()?;
+        Ok(first_seen)
+    }
+
+    /// The feeds hidden from Discover, as `(publisher, salt)`; an empty salt
+    /// hides the publisher.
+    pub fn feeds_hidden(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock();
+        Self::ensure_feeds_locked(&conn)?;
+        let mut stmt = conn.prepare("SELECT publisher, salt FROM feeds_hidden")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Hide a feed from Discover, or with an empty `salt` every feed of its
+    /// publisher; with `hidden` false, show it again.
+    pub fn feed_set_hidden(&self, publisher: &str, salt: &str, hidden: bool) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_feeds_locked(&conn)?;
+        if hidden {
+            conn.execute(
+                "INSERT OR IGNORE INTO feeds_hidden (publisher, salt) VALUES (?1, ?2)",
+                params![publisher, salt],
+            )?;
+        } else {
+            conn.execute(
+                "DELETE FROM feeds_hidden WHERE publisher = ?1 AND salt = ?2",
+                params![publisher, salt],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Show every hidden feed and publisher in Discover again.
+    pub fn feeds_hidden_clear(&self) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_feeds_locked(&conn)?;
+        conn.execute("DELETE FROM feeds_hidden", [])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -945,16 +1272,131 @@ mod tests {
     #[test]
     fn own_feeds_are_capped_and_keep_their_order() {
         let (db, path) = db("own");
-        assert!(db.feed_own_create("s1", "One", "", 1, 2).unwrap());
-        assert!(db.feed_own_create("s2", "Two", "", 2, 2).unwrap());
-        assert!(!db.feed_own_create("s3", "Three", "", 3, 2).unwrap(), "past the cap");
+        assert!(db.feed_own_create("s1", "One", "", false, 1, 2).unwrap());
+        assert!(db.feed_own_create("s2", "Two", "", false, 2, 2).unwrap());
+        assert!(!db.feed_own_create("s3", "Three", "", false, 3, 2).unwrap(), "past the cap");
         db.feed_own_set_items("s1", &[item("b", "B"), item("a", "A")]).unwrap();
         let names: Vec<String> = db.feed_own_items("s1").unwrap().into_iter().map(|i| i.name).collect();
         assert_eq!(names, vec!["B", "A"]);
         assert!(!db.feed_own_set_items("nope", &[item("a", "A")]).unwrap(), "no such feed");
-        db.feed_own_delete("s1").unwrap();
+        db.feed_own_delete("s1", 10, 100).unwrap();
         assert!(db.feed_own("s1").unwrap().is_none());
         assert!(db.feed_own_items("s1").unwrap().is_empty());
+        drop_db(db, path);
+    }
+
+    const TTL: i64 = 1000;
+
+    fn take(db: &Database, published: bool, now: i64) -> Option<(bool, i64)> {
+        db.feed_own_take_listing("s", published, now, TTL).unwrap().map(|due| (due.withdrawn, due.stamp))
+    }
+
+    #[test]
+    fn a_feed_never_listed_sends_no_withdrawal() {
+        let (db, path) = db("never-listed");
+        db.feed_own_create("s", "One", "", true, 1, 8).unwrap();
+        assert!(db.feed_own("s").unwrap().unwrap().listed);
+        assert_eq!(take(&db, false, 10), None, "not published, so not listed yet");
+        assert!(db.feed_own_set_listed("s", false).unwrap());
+        assert_eq!(take(&db, true, 20), None, "no listing named it, so none to withdraw");
+        assert!(!db.feed_own_set_listed("nope", true).unwrap(), "no such feed");
+        drop_db(db, path);
+    }
+
+    #[test]
+    fn a_listed_feed_is_withdrawn_until_its_listing_lapses() {
+        let (db, path) = db("withdrawn");
+        db.feed_own_create("s", "One", "", true, 1, 8).unwrap();
+        assert_eq!(take(&db, true, 100), Some((false, 100)));
+        assert_eq!(take(&db, true, 100), Some((false, 101)), "the same second again goes a second on");
+        assert_eq!(db.feed_own("s").unwrap().unwrap().listing_sent_at, 101);
+        db.feed_own_set_listed("s", false).unwrap();
+        assert_eq!(take(&db, true, 50), Some((true, 102)), "past the last, whatever the clock says");
+        assert_eq!(db.feed_own("s").unwrap().unwrap().listing_sent_at, 101, "a withdrawal is not a listing");
+        assert_eq!(take(&db, true, 101 + TTL), Some((true, 101 + TTL)));
+        assert_eq!(take(&db, true, 102 + TTL), None, "the listing it displaces has lapsed");
+        drop_db(db, path);
+    }
+
+    #[test]
+    fn a_deleted_feed_is_withdrawn_daily_until_its_listing_lapses() {
+        let (db, path) = db("tombstone");
+        db.feed_own_create("s", "One", "", true, 1, 8).unwrap();
+        db.feed_own_create("t", "Two", "", false, 1, 8).unwrap();
+        assert_eq!(take(&db, true, 100), Some((false, 100)));
+        db.feed_own_delete("s", 200, TTL).unwrap();
+        db.feed_own_delete("t", 200, TTL).unwrap();
+        let due = db.feed_withdrawals_due(200, 50, TTL).unwrap();
+        assert_eq!(due, vec![DueListing { salt: "s".into(), withdrawn: true, stamp: 200 }], "only the one listed");
+        assert!(db.feed_withdrawals_due(240, 50, TTL).unwrap().is_empty(), "not due again yet");
+        assert_eq!(db.feed_withdrawals_due(250, 50, TTL).unwrap().len(), 1);
+        assert!(db.feed_withdrawals_due(101 + TTL, 50, TTL).unwrap().is_empty(), "lapsed, and forgotten");
+        assert!(db.feed_withdrawals_due(2000 + TTL, 0, TTL).unwrap().is_empty());
+        drop_db(db, path);
+    }
+
+    fn discovered(salt: &str, listed_at: i64, title: &str) -> DiscoveredFeed {
+        DiscoveredFeed {
+            publisher: PUB.into(),
+            salt: salt.into(),
+            title: title.into(),
+            description: String::new(),
+            item_count: 1,
+            list_size: 10,
+            sequence: listed_at * 1000,
+            listed_at,
+            first_seen: 0,
+        }
+    }
+
+    #[test]
+    fn discovered_feeds_keep_when_first_found_and_the_newest_listing() {
+        let (db, path) = db("discovered");
+        let seen = db.feeds_discovered_put(&[discovered("a", 100, "A"), discovered("b", 100, "B")], &[], 1000).unwrap();
+        assert_eq!(seen[&(PUB.to_string(), "a".to_string())], 1000);
+        let seen = db.feeds_discovered_put(&[discovered("a", 200, "A2"), discovered("b", 50, "Older")], &[], 2000).unwrap();
+        assert_eq!(seen[&(PUB.to_string(), "a".to_string())], 1000, "first found at 1000");
+        let feeds = db.feeds_discovered(2000, 10_000).unwrap();
+        let title = |salt: &str| feeds.iter().find(|f| f.salt == salt).map(|f| f.title.clone());
+        assert_eq!(title("a").as_deref(), Some("A2"));
+        assert_eq!(title("b").as_deref(), Some("B"), "an older listing does not replace a newer");
+
+        db.feeds_discovered_put(&[], &[(PUB.into(), "a".into(), 150), (PUB.into(), "b".into(), 150)], 3000).unwrap();
+        let feeds = db.feeds_discovered(3000, 10_000).unwrap();
+        assert_eq!(feeds.iter().map(|f| f.salt.as_str()).collect::<Vec<_>>(), vec!["a"], "listed again after it was withdrawn");
+        assert!(db.feeds_discovered(200 + 10_001, 10_000).unwrap().is_empty(), "lapsed with its listing");
+        drop_db(db, path);
+    }
+
+    #[test]
+    fn a_feed_keeps_the_folder_its_first_download_gave_it() {
+        let (db, path) = db("folder");
+        assert_eq!(db.feed_followed_folder(PUB, SALT, "Mixes").unwrap(), None, "not followed");
+        db.feed_follow(PUB, SALT, 1).unwrap();
+        db.feed_follow(PUB, "other-salt", 1).unwrap();
+        assert_eq!(db.feed_followed(PUB, SALT).unwrap().unwrap().folder, "");
+        assert_eq!(db.feed_followed_folder(PUB, SALT, "Mixes").unwrap().as_deref(), Some("Mixes"));
+        assert_eq!(db.feed_followed_folder(PUB, SALT, "Renamed").unwrap().as_deref(), Some("Mixes"), "kept");
+        assert_eq!(
+            db.feed_followed_folder(PUB, "other-salt", "mixes").unwrap().as_deref(),
+            Some("mixes (other-sa)"),
+            "another feed of that name"
+        );
+        assert_eq!(db.feed_followed(PUB, SALT).unwrap().unwrap().folder, "Mixes");
+        drop_db(db, path);
+    }
+
+    #[test]
+    fn feeds_and_publishers_are_hidden_and_shown_again() {
+        let (db, path) = db("hidden");
+        db.feed_set_hidden(PUB, "a", true).unwrap();
+        db.feed_set_hidden(PUB, "", true).unwrap();
+        db.feed_set_hidden(PUB, "", true).unwrap();
+        assert_eq!(db.feeds_hidden().unwrap().len(), 2);
+        db.feed_set_hidden(PUB, "a", false).unwrap();
+        assert_eq!(db.feeds_hidden().unwrap(), vec![(PUB.to_string(), String::new())]);
+        db.feeds_hidden_clear().unwrap();
+        assert!(db.feeds_hidden().unwrap().is_empty());
         drop_db(db, path);
     }
 
@@ -973,7 +1415,7 @@ mod tests {
     #[test]
     fn a_publish_never_goes_back_and_an_edit_waits_for_the_next() {
         let (db, path) = db("publish");
-        db.feed_own_create("s", "One", "", 1, 8).unwrap();
+        db.feed_own_create("s", "One", "", false, 1, 8).unwrap();
         assert!(db.feed_own_published("s", &publish(20, "One"), Some(&[]), 5).unwrap());
         assert!(!db.feed_own_published("s", &publish(10, "One"), Some(&[]), 6).unwrap(), "an older publish finishing late");
         let feed = db.feed_own("s").unwrap().unwrap();
@@ -994,7 +1436,7 @@ mod tests {
     #[test]
     fn items_saved_while_a_head_was_out_stay_unpublished() {
         let (db, path) = db("midpublish");
-        db.feed_own_create("s", "One", "", 1, 8).unwrap();
+        db.feed_own_create("s", "One", "", false, 1, 8).unwrap();
         let sent = vec![item("a", "A")];
         db.feed_own_set_items("s", &sent).unwrap();
         db.feed_own_set_items("s", &[item("a", "A"), item("b", "B")]).unwrap();
@@ -1008,7 +1450,7 @@ mod tests {
     #[test]
     fn a_pending_head_is_kept_until_a_head_is_recorded() {
         let (db, path) = db("pending");
-        db.feed_own_create("s", "One", "", 1, 8).unwrap();
+        db.feed_own_create("s", "One", "", false, 1, 8).unwrap();
         assert!(db.feed_own_published("s", &publish(20, "One"), Some(&[]), 5).unwrap());
         assert!(!db.feed_own_set_pending("s", Some(&publish(20, "One"))).unwrap(), "no newer than the head");
         assert!(db.feed_own("s").unwrap().unwrap().pending.is_none());
@@ -1034,7 +1476,7 @@ mod tests {
     #[test]
     fn saving_the_same_items_again_leaves_a_published_feed_up_to_date() {
         let (db, path) = db("unchanged");
-        db.feed_own_create("s", "One", "", 1, 8).unwrap();
+        db.feed_own_create("s", "One", "", false, 1, 8).unwrap();
         let items = vec![item("a", "A"), item("b", "B")];
         db.feed_own_set_items("s", &items).unwrap();
         assert!(db.feed_own_published("s", &publish(20, "One"), Some(&items), 5).unwrap());

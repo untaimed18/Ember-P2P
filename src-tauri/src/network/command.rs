@@ -1602,6 +1602,7 @@ async fn handle_command_inner(
                             raw.copy_from_slice(&hb[..16]);
                             let restricted = transfer_friends_only
                                 || crate::sharing::feed_files::is_internal_fetch(&transfer_id)
+                                || crate::sharing::feed_downloads::is_private(&transfer_id)
                                 || {
                                 let idx = local_index.read().await;
                                 !known_files.is_authoritative()
@@ -2118,6 +2119,7 @@ async fn handle_command_inner(
                     raw.copy_from_slice(&hb[..16]);
                     let restricted = transfer_friends_only
                         || crate::sharing::feed_files::is_internal_fetch(&transfer_id)
+                        || crate::sharing::feed_downloads::is_private(&transfer_id)
                         || {
                         let idx = local_index.read().await;
                         idx.get_by_hash(&file_hash.to_ascii_lowercase())

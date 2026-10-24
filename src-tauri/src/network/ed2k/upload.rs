@@ -6746,20 +6746,20 @@ impl UploadHandler {
             return None;
         }
 
+        // A feed's download is private, its partial served to nobody (see
+        // `sharing::feed_downloads`).
+        let servable = |t: &&crate::types::Transfer| {
+            t.direction == TransferDirection::Download
+                && t.file_hash == hash_hex
+                && !crate::sharing::feed_downloads::is_private(&t.id)
+        };
         let transfer = {
             let mgr = self.transfer_manager.read().await;
             mgr.active
                 .values()
-                .find(|t| t.direction == TransferDirection::Download && t.file_hash == hash_hex)
+                .find(servable)
                 .cloned()
-                .or_else(|| {
-                    mgr.queue
-                        .iter()
-                        .find(|t| {
-                            t.direction == TransferDirection::Download && t.file_hash == hash_hex
-                        })
-                        .cloned()
-                })
+                .or_else(|| mgr.queue.iter().find(servable).cloned())
         }?;
 
         let folders = self.download_folders.read().clone();
@@ -6877,9 +6877,12 @@ impl UploadHandler {
             mgr.active
                 .values()
                 .chain(mgr.queue.iter())
+                // A feed's download is private: asking for its sources is
+                // refused as for a file we do not have.
                 .find(|t| {
                     t.direction == TransferDirection::Download
                         && t.file_hash == hash_hex
+                        && !crate::sharing::feed_downloads::is_private(&t.id)
                         && !matches!(
                             t.status,
                             TransferStatus::Completed | TransferStatus::Failed

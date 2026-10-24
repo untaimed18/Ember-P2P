@@ -25,6 +25,9 @@ export interface OwnFeed {
   published_at: number;
   /** Details or items edited since the last publish. */
   changed: boolean;
+  /** Listed in the public index, for anyone to find in Discover, as well as
+   *  by its link. */
+  listed: boolean;
   link: string;
   items: FeedItem[];
 }
@@ -48,6 +51,8 @@ export interface FollowedFeed {
   auto_max_item_mib: number;
   auto_max_day_mib: number;
   auto_category: string;
+  /** The folder in Feeds its files finish in; empty before the first. */
+  folder: string;
   link: string;
 }
 
@@ -56,9 +61,33 @@ export interface FollowedItem extends FeedItem {
   is_new: boolean;
   removed: boolean;
   downloaded: boolean;
+  /** A type that can run code or change settings: asked about before it is
+   *  downloaded, and never downloaded automatically. */
+  risky: boolean;
+}
+
+/** A feed listed in the public index. */
+export interface DiscoveredFeed {
+  publisher: string;
+  salt: string;
+  title: string;
+  description: string;
+  item_count: number;
+  list_size: number;
+  /** The publisher's clock, in milliseconds, at its last publish. */
+  sequence: number;
+  /** When the publisher last signed its listing, in seconds. */
+  listed_at: number;
+  first_seen: number;
+  link: string;
+  /** Its publisher signed the listing in the last day or so: running. */
+  active: boolean;
+  following: boolean;
+  own: boolean;
 }
 
 export const FEEDS_CHANGED_EVENT = 'ember:feeds-changed';
+export const FEEDS_FOUND_EVENT = 'ember:feeds-found';
 
 export interface FeedsChangedEvent {
   publisher?: string;
@@ -67,15 +96,25 @@ export interface FeedsChangedEvent {
   title?: string;
 }
 
+/** One shard of a Discover walk: feeds it found or changed, and those it
+ *  found withdrawn, as of `listed_at`: a listing signed later stands. */
+export interface FeedsFoundEvent {
+  walk: string;
+  feeds: DiscoveredFeed[];
+  gone: { publisher: string; salt: string; listed_at: number }[];
+}
+
 export const listMyFeeds = (): Promise<OwnFeed[]> => invoke('list_my_feeds');
-export const createFeed = (title: string, description: string): Promise<OwnFeed> =>
-  invoke('create_feed', { title, description });
+export const createFeed = (title: string, description: string, listed: boolean): Promise<OwnFeed> =>
+  invoke('create_feed', { title, description, listed });
 /** The title and description as saved: cleaned and cut to length. */
 export const setFeedDetails = (
   salt: string,
   title: string,
   description: string,
 ): Promise<{ title: string; description: string }> => invoke('set_feed_details', { salt, title, description });
+export const setFeedListed = (salt: string, listed: boolean): Promise<OwnFeed> =>
+  invoke('set_feed_listed', { salt, listed });
 /** `items`: the files saved, in order, as saved. `dropped`: the names of
  *  files left out because they are no longer shared with everyone. */
 export const setFeedItems = (
@@ -106,3 +145,17 @@ export const downloadFeedItems = (publisher: string, salt: string, ed2ks: string
   invoke('download_feed_items', { publisher, salt, ed2ks });
 export const unfollowFeed = (publisher: string, salt: string): Promise<void> =>
   invoke('unfollow_feed', { publisher, salt });
+/** Open the folder in Feeds a followed feed's files finish in. */
+export const openFeedFolder = (publisher: string, salt: string): Promise<void> =>
+  invoke('open_feed_folder', { publisher, salt });
+
+/** Walk the public feed index. Shards arrive on {@link FEEDS_FOUND_EVENT}
+ *  tagged `walk` as they land; the result is the whole set. */
+export const discoverFeeds = (walk: string): Promise<DiscoveredFeed[]> => invoke('discover_feeds', { walk });
+/** What the last walk found, without the network. */
+export const cachedDiscoveredFeeds = (): Promise<DiscoveredFeed[]> => invoke('cached_discovered_feeds');
+/** Hide a feed from Discover, or with no `salt` all of its publisher's. */
+export const setDiscoveredFeedHidden = (publisher: string, salt: string | null, hidden: boolean): Promise<void> =>
+  invoke('set_discovered_feed_hidden', { publisher, salt, hidden });
+export const hiddenDiscoveredFeedCount = (): Promise<number> => invoke('hidden_discovered_feed_count');
+export const clearHiddenDiscoveredFeeds = (): Promise<void> => invoke('clear_hidden_discovered_feeds');

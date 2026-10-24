@@ -5509,15 +5509,12 @@ impl MultiSourceDownload {
                 let pp = part_path.clone();
                 let pp_root = part_root.clone();
                 let download_root = self.download_folders.read().current.clone();
-                // The category it has now, not when it started, as with the
-                // download folder above.
-                let category_subdir =
-                    crate::storage::category_folders::completion_subdir(&self.transfer_id);
                 let met_roots = allowed_roots.clone();
                 let finish_tracker = tracker.clone();
                 let finish_part_hashes = part_hashes.clone();
                 let finish_tx = event_tx.clone();
                 let finish_id = self.transfer_id.clone();
+                let finish_id_for_move = self.transfer_id.clone();
                 let finish_generation = Some(self.control.generation());
                 // A fetch for the feeds code finishes where it asked, in the
                 // app data folder, never in `Downloads`.
@@ -5543,11 +5540,13 @@ impl MultiSourceDownload {
                                 &verified_identity,
                             )
                         }
-                        None => super::transfer::move_part_to_completed(
+                        // The category it has now, not when it started, as
+                        // with the download folder above.
+                        None => super::transfer::move_part_to_its_folder(
+                            &finish_id_for_move,
                             &pp,
                             &pp_root,
                             &download_root,
-                            &category_subdir,
                             &safe_name,
                             &verified_identity,
                         ),
@@ -7748,17 +7747,21 @@ async fn download_parts_from_source(
     let wire_part_count = ed2k_wire_part_count(file_size);
     let single_part = part_count <= 1;
     let completed_bitmap = if peer_extended_requests_ver > 0 {
-        let t = tracker.read().await;
-        // Advertise only parts we will actually serve (complete AND
-        // MD4-verified). Using bare `completed_parts()` here advertised
-        // unverified parts that the serve gate then rejected, freezing the
-        // peer's download on a part it kept re-requesting.
-        let completed = t.serveable_parts();
         let bitmap_len = (wire_part_count + 7) / 8;
         let mut bitmap = vec![0u8; bitmap_len];
-        for (i, &done) in completed.iter().enumerate() {
-            if done {
-                bitmap[i / 8] |= 1 << (i % 8);
+        // A feed's download is private: it says it holds nothing, so the
+        // uploader does not pass us on as a source of it.
+        if !crate::sharing::feed_downloads::is_private(&transfer_id) {
+            let t = tracker.read().await;
+            // Advertise only parts we will actually serve (complete AND
+            // MD4-verified). Using bare `completed_parts()` here advertised
+            // unverified parts that the serve gate then rejected, freezing the
+            // peer's download on a part it kept re-requesting.
+            let completed = t.serveable_parts();
+            for (i, &done) in completed.iter().enumerate() {
+                if done {
+                    bitmap[i / 8] |= 1 << (i % 8);
+                }
             }
         }
         bitmap

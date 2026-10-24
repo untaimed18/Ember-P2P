@@ -12,6 +12,12 @@
 //! per-publisher dedupe keeps one head per feed; the list's BLAKE3 is
 //! `ember_file_hash`, its size `file_size`, the title the name. The record's
 //! trailer carries the rest ([`encode_feed_extra`]).
+//!
+//! A publisher may also list a feed in the public index, for anyone to find
+//! without its link: a **listing** (`RECORD_TYPE_FEED_LISTING`) is a copy of
+//! the head, flagged ([`encode_feed_listing_extra`]), filed under one of
+//! [`FEED_INDEX_SHARDS`] shared keys ([`feed_index_key`]). Taking a feed out
+//! of the index is a listing flagged withdrawn, which displaces the last.
 
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -46,6 +52,77 @@ pub fn feed_key(publisher: &[u8; 32], salt: &FeedSalt) -> [u8; 16] {
     let mut key = [0u8; 16];
     key.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
     key
+}
+
+/// What tells a feed-index key apart from every other key. Changing it would
+/// move every listing.
+const FEED_INDEX_KEY_PREFIX: &[u8] = b"ember-feed-index-v1";
+/// Shards of the public feed index, as rooms' Discover has.
+pub const FEED_INDEX_SHARDS: u8 = 16;
+/// A listing's flag that takes its feed out of the index. Every newer listing
+/// of the feed outranks the one it replaces, so this one, kept as long as a
+/// listing, displaces the copies storers still hold.
+pub const FEED_LISTING_WITHDRAWN: u8 = 0x01;
+/// How long storers keep a listing, or a withdrawal, after it was signed:
+/// the governance record lifetime in `dht::store`.
+pub const FEED_LISTING_TTL_SECS: i64 = 30 * 24 * 3600;
+/// A listing signed this recently says its publisher is running: one
+/// signs it anew with every publish and daily republish.
+pub const FEED_LISTING_ACTIVE_SECS: i64 = 26 * 3600;
+
+/// The index shard the feed `salt` of `publisher` is listed in.
+pub fn feed_index_shard(publisher: &[u8; 32], salt: &FeedSalt) -> u8 {
+    feed_key(publisher, salt)[0] % FEED_INDEX_SHARDS
+}
+
+/// DHT key of one shard of the public feed index.
+pub fn feed_index_key(shard: u8) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(FEED_INDEX_KEY_PREFIX);
+    hasher.update(&[shard % FEED_INDEX_SHARDS]);
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    key
+}
+
+/// Every shard's key, in shard order, for a Discover walk.
+pub fn all_feed_index_keys() -> [[u8; 16]; FEED_INDEX_SHARDS as usize] {
+    std::array::from_fn(|shard| feed_index_key(shard as u8))
+}
+
+/// The head a withdrawal carries in place of its feed's: a fixed one that
+/// says nothing of the feed, as only its publisher and salt are needed to
+/// displace the last listing. Its hashes are not zero, as a storer keeps a
+/// record with a digest over a later one without.
+pub fn withdrawal_head() -> FeedHead {
+    FeedHead {
+        sequence: 0,
+        list_ed2k_hash: [0xFF; 16],
+        list_size: 1,
+        list_blake3: [0xFF; 32],
+        item_count: 0,
+        title: "-".into(),
+        description: String::new(),
+    }
+}
+
+/// A listing's trailer: `flags(1)`, then the head's own trailer
+/// ([`encode_feed_extra`]). `None` for a head with a field out of bounds.
+pub fn encode_feed_listing_extra(head: &FeedHead, withdrawn: bool) -> Option<Vec<u8>> {
+    let head_extra = encode_feed_extra(head)?;
+    let mut out = Vec::with_capacity(1 + head_extra.len());
+    out.push(if withdrawn { FEED_LISTING_WITHDRAWN } else { 0 });
+    out.extend_from_slice(&head_extra);
+    Some(out)
+}
+
+/// A listing trailer's flags and head fields, as [`decode_feed_extra`] reads
+/// them. Flag bits this build does not know are kept, for a later build's
+/// listings to pass through it.
+#[allow(clippy::type_complexity)]
+pub fn decode_feed_listing_extra(extra: &[u8]) -> Option<(u8, (u64, [u8; 16], u32, String))> {
+    let (&flags, head) = extra.split_first()?;
+    Some((flags, decode_feed_extra(head)?))
 }
 
 /// A fresh salt for a new feed.
@@ -331,6 +408,69 @@ mod tests {
         cut.pop();
         assert!(SignedRecord::parse_unverified(&cut, record.signature).is_none(), "a short trailer is not a record");
         assert!(SignedRecord::feed_head_record(&salt, &FeedHead { title: String::new(), ..head() }, &identity, 1).is_none());
+    }
+
+    /// A listing reads back with its head and withdrawal flag, is filed under
+    /// the index shard its publisher and salt give, and a storer refuses it
+    /// under any other key.
+    #[test]
+    fn a_signed_listing_reads_back_and_is_checked_against_its_shard() {
+        use crate::network::ember::dht::publish::SignedRecord;
+        let identity = crate::network::ember::crypto::signing_key_from_bytes(&[11u8; 32]);
+        let publisher = identity.verifying_key().to_bytes();
+        let salt = [3u8; 16];
+        let shard = feed_index_shard(&publisher, &salt);
+        assert!(shard < FEED_INDEX_SHARDS);
+
+        for withdrawn in [false, true] {
+            let record = SignedRecord::feed_listing_record(&salt, &head(), withdrawn, &identity, 1_900_000_000).unwrap();
+            assert_eq!(record.keyword_hash, feed_index_key(shard));
+            assert!(record.feed_listing_store_ok());
+            assert!(!record.feed_store_ok(), "not a head");
+            let blob = [record.data.clone(), record.signature.to_vec()].concat();
+            assert!(SignedRecord::value_blob_is_authentic(&blob));
+            let back = SignedRecord::from_value_blob(&blob).unwrap();
+            assert_eq!(back.feed_listing(), Some((salt, head(), withdrawn)));
+            assert_eq!(back.feed_head(), None, "a listing is not read as a head");
+        }
+
+        let record = SignedRecord::feed_listing_record(&salt, &head(), false, &identity, 1).unwrap();
+        let mut elsewhere = record.data.clone();
+        let other = feed_index_key((shard + 1) % FEED_INDEX_SHARDS);
+        elsewhere[1..17].copy_from_slice(&other);
+        let elsewhere = SignedRecord::from_wire(&elsewhere, crate::network::ember::crypto::sign(&identity, &elsewhere)).unwrap();
+        assert!(!elsewhere.feed_listing_store_ok(), "filed under another shard");
+        assert!(SignedRecord::feed_listing_record(&salt, &FeedHead { list_size: 0, ..head() }, false, &identity, 1).is_none());
+    }
+
+    #[test]
+    fn the_index_has_sixteen_distinct_shard_keys() {
+        let keys = all_feed_index_keys();
+        let unique: std::collections::HashSet<_> = keys.iter().collect();
+        assert_eq!(unique.len(), FEED_INDEX_SHARDS as usize);
+        assert_eq!(feed_index_key(FEED_INDEX_SHARDS), feed_index_key(0));
+        let room_keys = crate::network::ember::channel::all_index_keys();
+        assert!(keys.iter().all(|key| !room_keys.contains(key)), "apart from the room index");
+    }
+
+    #[test]
+    fn a_withdrawal_carries_nothing_of_its_feed() {
+        use crate::network::ember::dht::publish::SignedRecord;
+        let identity = crate::network::ember::crypto::signing_key_from_bytes(&[11u8; 32]);
+        assert!(withdrawal_head().valid());
+        let record = SignedRecord::feed_listing_record(&[3u8; 16], &withdrawal_head(), true, &identity, 5).unwrap();
+        assert!(record.feed_listing_store_ok());
+        assert_ne!(record.ember_file_hash, [0u8; 32], "a storer would keep the listing it is to displace");
+        assert_eq!(record.feed_listing(), Some(([3u8; 16], withdrawal_head(), true)));
+    }
+
+    #[test]
+    fn a_listing_keeps_flags_a_later_build_sets() {
+        let mut extra = encode_feed_listing_extra(&head(), true).unwrap();
+        extra[0] |= 0x80;
+        let (flags, _) = decode_feed_listing_extra(&extra).unwrap();
+        assert_eq!(flags & FEED_LISTING_WITHDRAWN, FEED_LISTING_WITHDRAWN);
+        assert!(decode_feed_listing_extra(&[]).is_none());
     }
 
     #[test]

@@ -149,7 +149,8 @@ All eight non-English locales. List what changed with
       "port forwarding", not one router brand's menu names).
 - [ ] Private messages: `channels_dm_*`, `error_channels_dm_*`,
       `settings_room_dm_policy*`, `chat_dock_section_private`.
-- [ ] Feeds: `feeds_*`, `error_feeds_*`, `nav_feeds`, `deeplink_feed*`.
+- [ ] Feeds: `feeds_*` (Discover, visibility, the Feeds folder and risky
+      files included), `error_feeds_*`, `nav_feeds`, `deeplink_feed*`.
 - [ ] Friend status and names: `friends_status_*` (Away and Busy are new),
       `friends_my_status_*`, `friends_self_name_title`,
       `friend_settings_name_hint`, `settings_auto_away_*`,
@@ -192,7 +193,24 @@ friends unless a step says otherwise, and C a follower who is not A's friend.
       and saved stay 0, and nothing is held back by size.
 - [ ] Risky types (`.exe`, `.msi`, `.bat`, `.ps1`, `.lnk`, `.iso`, `.docm`,
       and `video.mp4.exe`) are never started automatically, whatever the
-      caps; Download starts them by hand.
+      caps. They carry a "Can run code" badge, and Download (one, or
+      Download all new with one among them) asks first; Download anyway
+      starts them, Cancel starts nothing.
+- [ ] Feeds folder: a file B downloads from A's feed, by hand or
+      automatically, finishes in `<download folder>\Feeds\<feed title>\`,
+      not in `Downloads`. The feed's header button opens that folder (or
+      `Feeds` before the first download). A second followed feed with the
+      same title gets `<title> (<8 hex>)`; A renaming the feed later does not
+      move B's folder.
+- [ ] Feed files stay private, with `Downloads` and the whole download
+      folder shared: the file is not in B's Library, not in a friend's
+      Browse, not found by C in a KAD, eD2K server or Ember search, and C,
+      queued on B for it while it downloads, is never served a part of it.
+      Restart B mid-download and after it finishes: still private, and it
+      finishes in its feed folder. Changing its category in Transfers does
+      not move it into `Downloads`. Sharing `Feeds` itself on purpose does
+      share it.
+- [ ] Transfers: Open and Show in folder work for a finished feed download.
 - [ ] Free space: B's download folder on a small drive with a large
       download already queued there. Auto-download starts nothing that
       would leave less than 64 MiB free once the queued download finishes.
@@ -218,6 +236,22 @@ friends unless a step says otherwise, and C a follower who is not A's friend.
       followers still fetch it.
 - [ ] Unfollow: the feed and its list go, the list is no longer served, and
       files already downloaded stay.
+- [ ] Discover: A creates one feed Listed in Discover and one Link only, and
+      publishes both. Within a minute or so of Search again, C's Discover
+      shows the listed one (Publisher active), never the link-only one, and
+      A sees its own marked Yours. C follows from the card; it opens under
+      Following with Open.
+- [ ] A turns List in Discover off: C's next search no longer shows it. A
+      turns it on again: it comes back. A deletes a listed feed, also once
+      with Ember off and then turned on: it leaves C's Discover. A feed
+      created listed and switched to link only before its first publish is
+      never shown.
+- [ ] C hides one feed, then everything from its publisher, including
+      during a search; neither comes back when the search ends. Show hidden
+      again brings them back. The publisher ID on a card filters to that
+      publisher's feeds; the chip's x clears it.
+- [ ] With A closed for two days, C still lists A's feed, now "Publisher
+      last seen 2 days ago", and the Active filter leaves it out.
 - [ ] With Ember on, Alt+9 opens Feeds, Alt+0 Statistics, Security has no
       Alt key, and the shortcuts sheet (?) says the same. With Ember off,
       Channels and Feeds leave the sidebar and Alt+0 opens Settings.

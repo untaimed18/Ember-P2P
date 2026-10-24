@@ -583,6 +583,7 @@ pub(super) async fn handle_udp_packet_inner(
                         if t.direction != TransferDirection::Download
                             || t.file_hash != hash_hex
                             || t.friends_only
+                            || crate::sharing::feed_downloads::is_private(&t.id)
                             || matches!(
                                 t.status,
                                 TransferStatus::Completed | TransferStatus::Failed

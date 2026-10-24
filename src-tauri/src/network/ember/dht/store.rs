@@ -9,7 +9,7 @@ use super::publish::{
     channel_flags_from_data, channel_kind_from_data, CHANNEL_FLAG_DEPARTED, CHANNEL_KIND_CLAIM,
     CHANNEL_KIND_EPOCH, CHANNEL_KIND_HANDOFF, CHANNEL_KIND_INDEX, CHANNEL_KIND_MODERATION,
     CHANNEL_KIND_OWNED_ROOMS, CHANNEL_KIND_PRESENCE, CHANNEL_KIND_SETTINGS, RECORD_TYPE_CHANNEL,
-    RECORD_TYPE_FEED, RECORD_TYPE_KEYWORD, RECORD_TYPE_SOURCE,
+    RECORD_TYPE_FEED, RECORD_TYPE_FEED_LISTING, RECORD_TYPE_KEYWORD, RECORD_TYPE_SOURCE,
 };
 use super::{scale, EmberNodeId};
 
@@ -60,6 +60,12 @@ const MAX_RECORDS_PER_KEY: usize = 1000;
 /// record is still published to the nodes closest to the key, which is where
 /// searchers look — and it is the same allowance we grant everyone else.
 const MAX_RECORDS_PER_PUBLISHER_PER_KEY: usize = 150;
+/// [`MAX_RECORDS_PER_PUBLISHER_PER_KEY`] for feed listings, which share
+/// sixteen index keys among every publisher. One identity keeps at most
+/// `feed::FEEDS_PER_IDENTITY` feeds, so twice that leaves room for the
+/// withdrawals of feeds it deleted, and a shard takes sixty identities, not
+/// seven, to fill.
+const MAX_FEED_LISTINGS_PER_PUBLISHER_PER_KEY: usize = 2 * crate::network::ember::feed::FEEDS_PER_IDENTITY;
 /// Maximum total keys stored.
 const MAX_KEYS: usize = 50_000;
 /// Ceiling on resident record bytes.
@@ -258,7 +264,9 @@ fn record_ttl(data: &[u8]) -> Duration {
         },
         // As long as a room's governance: a feed's publisher may be away for
         // days, and the head is the only way its followers find the list.
-        Some(&RECORD_TYPE_FEED) => CHANNEL_GOVERNANCE_TTL,
+        // Its listing lives as long, so a feed stays discoverable while it is
+        // followable, and a withdrawal outlives every listing it displaces.
+        Some(&RECORD_TYPE_FEED | &RECORD_TYPE_FEED_LISTING) => CHANNEL_GOVERNANCE_TTL,
         _ => KEYWORD_RECORD_TTL,
     }
 }
@@ -1401,7 +1409,12 @@ impl DhtStore {
             .iter()
             .filter(|r| r.publisher_key == publisher_key)
             .count();
-        if mine >= MAX_RECORDS_PER_PUBLISHER_PER_KEY {
+        let publisher_cap = if record.data.first() == Some(&RECORD_TYPE_FEED_LISTING) {
+            MAX_FEED_LISTINGS_PER_PUBLISHER_PER_KEY
+        } else {
+            MAX_RECORDS_PER_PUBLISHER_PER_KEY
+        };
+        if mine >= publisher_cap {
             self.publisher_cap_rejections = self.publisher_cap_rejections.saturating_add(1);
             debug!(
                 "Key {} already holds {mine} record(s) from publisher {}, rejecting",
@@ -1843,11 +1856,20 @@ impl DhtStore {
                     continue;
                 }
             }
-            // A feed head gets its key check too, for the same reason.
+            // A feed head and a feed listing get their key check too, for the
+            // same reason.
             if record.data.first() == Some(&RECORD_TYPE_FEED) {
                 let ok =
                     super::publish::SignedRecord::parse_unverified(&record.data, record.signature)
                         .is_some_and(|parsed| parsed.feed_store_ok());
+                if !ok {
+                    continue;
+                }
+            }
+            if record.data.first() == Some(&RECORD_TYPE_FEED_LISTING) {
+                let ok =
+                    super::publish::SignedRecord::parse_unverified(&record.data, record.signature)
+                        .is_some_and(|parsed| parsed.feed_listing_store_ok());
                 if !ok {
                     continue;
                 }
@@ -2032,7 +2054,7 @@ impl DhtStore {
 /// records that escape every rule tied to a known type.
 fn storer_replicates(data: &[u8]) -> bool {
     match data.first() {
-        Some(&RECORD_TYPE_KEYWORD | &RECORD_TYPE_FEED) => true,
+        Some(&RECORD_TYPE_KEYWORD | &RECORD_TYPE_FEED | &RECORD_TYPE_FEED_LISTING) => true,
         Some(&RECORD_TYPE_CHANNEL) => channel_kind_from_data(data) != Some(CHANNEL_KIND_PRESENCE),
         _ => false,
     }
@@ -2952,6 +2974,49 @@ mod tests {
     /// keyword bare and then locked it, because once every holder had one slot
     /// nobody outranked anybody and the key admitted no one. A full key must
     /// refuse, never displace.
+    /// One identity holds few listings in a feed index shard, but may still
+    /// replace those it holds, as a withdrawal does.
+    #[test]
+    fn a_publisher_holds_few_listings_in_a_feed_index_shard() {
+        use super::super::publish::SignedRecord;
+        use crate::network::ember::feed::{feed_index_shard, FeedHead};
+
+        let mut store = DhtStore::new();
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let publisher = sk.verifying_key().to_bytes();
+        let head = FeedHead {
+            sequence: 1,
+            list_ed2k_hash: [1; 16],
+            list_size: 10,
+            list_blake3: [2; 32],
+            item_count: 1,
+            title: "T".into(),
+            description: String::new(),
+        };
+        let salts: Vec<[u8; 16]> = (0..=u16::MAX)
+            .map(|n| {
+                let mut salt = [0u8; 16];
+                salt[..2].copy_from_slice(&n.to_le_bytes());
+                salt
+            })
+            .filter(|salt| feed_index_shard(&publisher, salt) == 0)
+            .take(MAX_FEED_LISTINGS_PER_PUBLISHER_PER_KEY + 1)
+            .collect();
+        let now = chrono::Utc::now().timestamp();
+        let listing = |salt: &[u8; 16], withdrawn: bool, at: i64| {
+            SignedRecord::feed_listing_record(salt, &head, withdrawn, &sk, at).unwrap()
+        };
+        for salt in &salts[..MAX_FEED_LISTINGS_PER_PUBLISHER_PER_KEY] {
+            let rec = listing(salt, false, now);
+            assert!(store.store(rec.keyword_hash, rec.data, rec.signature));
+        }
+        let over = listing(&salts[MAX_FEED_LISTINGS_PER_PUBLISHER_PER_KEY], false, now);
+        assert!(!store.store(over.keyword_hash, over.data, over.signature), "past the cap");
+        let withdrawal = listing(&salts[0], true, now + 1);
+        assert!(store.store(withdrawal.keyword_hash, withdrawal.data, withdrawal.signature), "a replacement");
+        assert_eq!(store.get(&withdrawal.keyword_hash).map(|r| r.len()), Some(MAX_FEED_LISTINGS_PER_PUBLISHER_PER_KEY));
+    }
+
     #[test]
     fn a_full_keyword_never_evicts_an_incumbent() {
         use super::super::publish::SignedRecord;

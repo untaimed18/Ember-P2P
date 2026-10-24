@@ -335,6 +335,7 @@ pub fn is_excluded_share_file_name(path: &Path) -> bool {
         // archives written before this rule are dropped on the next scan too.
         || name.ends_with(".emberbackup")
         || name.ends_with(".partial")
+        || name == crate::sharing::feed_downloads::MARKER
 }
 
 /// App-created copies of a denylisted base (`-wal`, `.*.corrupt`,
@@ -501,8 +502,10 @@ fn private_receive_dir_on_the_way(below: &Path) -> bool {
 /// passes through a folder of private receives on the way, so would never
 /// find it. For records re-admitted without a walk.
 pub fn under_private_receive_dir(roots: &[String], path: &Path) -> bool {
-    innermost_root(roots, &path.to_string_lossy())
-        .is_some_and(|root| private_receive_dir_on_the_way(&components_below(root, path)))
+    innermost_root(roots, &path.to_string_lossy()).is_some_and(|root| {
+        private_receive_dir_on_the_way(&components_below(root, path))
+            || crate::sharing::feed_downloads::walk_passes_feeds_dir(root, path)
+    })
 }
 
 /// One path a filesystem event named, resolved for a scoped rescan.
@@ -637,7 +640,10 @@ impl FileIndexer {
                 files: result.files,
             };
         }
-        if private_receive_dir_on_the_way(&below) || is_excluded_share_location(path) {
+        if private_receive_dir_on_the_way(&below)
+            || crate::sharing::feed_downloads::walk_passes_feeds_dir(root, path)
+            || is_excluded_share_location(path)
+        {
             return ScopedDiscovery::Removed;
         }
         let key = normalize_path_key(&path.to_string_lossy());
@@ -669,7 +675,8 @@ impl FileIndexer {
         if metadata.is_dir() {
             let private = path
                 .file_name()
-                .is_some_and(|name| crate::sharing::is_private_receive_dir_name(&name.to_string_lossy()));
+                .is_some_and(|name| crate::sharing::is_private_receive_dir_name(&name.to_string_lossy()))
+                || crate::sharing::feed_downloads::is_feeds_dir(path);
             if private || scope.is_some_and(|scope| !scope.admits_dir(&key)) {
                 return ScopedDiscovery::Removed;
             }
@@ -836,6 +843,7 @@ impl FileIndexer {
                     let dir_name = entry.file_name().to_string_lossy().into_owned();
                     if crate::sharing::is_index_skip_dir_name(&dir_name)
                         || crate::sharing::is_private_receive_dir_name(&dir_name)
+                        || crate::sharing::feed_downloads::is_feeds_dir(&entry_path)
                     {
                         continue;
                     }
@@ -1075,6 +1083,7 @@ impl FileIndexer {
                     let dir_name = entry.file_name().to_string_lossy().into_owned();
                     if crate::sharing::is_index_skip_dir_name(&dir_name)
                         || crate::sharing::is_private_receive_dir_name(&dir_name)
+                        || crate::sharing::feed_downloads::is_feeds_dir(&entry_path)
                     {
                         continue;
                     }

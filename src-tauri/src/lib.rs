@@ -867,6 +867,13 @@ pub fn run() {
             let emule_import = emule_import::apply::apply_pending(&data_dir, &db, &mut config);
             storage::part_folders::forget_finished_previous_folders(&db, &mut config);
             let settings = config.settings.clone();
+            // Before the library is scanned or a download restored: both must
+            // know which downloads, and which folders, are feeds' and private.
+            sharing::feed_downloads::set_roots(&settings.download_roots());
+            match db.transfer_feed_folders() {
+                Ok(rows) => sharing::feed_downloads::load(rows),
+                Err(error) => tracing::error!("Could not read which downloads are from feeds: {error}"),
+            }
             // Best-effort, never fatal. A download folder on an unplugged USB
             // drive, an offline NAS or an unmapped share makes these fail, and
             // propagating that out of `setup` returns Err from `build()` — which
@@ -2581,6 +2588,7 @@ pub fn run() {
             commands::feeds::list_my_feeds,
             commands::feeds::create_feed,
             commands::feeds::set_feed_details,
+            commands::feeds::set_feed_listed,
             commands::feeds::set_feed_items,
             commands::feeds::publish_feed,
             commands::feeds::delete_feed,
@@ -2592,6 +2600,12 @@ pub fn run() {
             commands::feeds::set_feed_auto_download,
             commands::feeds::download_feed_items,
             commands::feeds::unfollow_feed,
+            commands::feeds::open_feed_folder,
+            commands::feed_discover::discover_feeds,
+            commands::feed_discover::cached_discovered_feeds,
+            commands::feed_discover::set_discovered_feed_hidden,
+            commands::feed_discover::hidden_discovered_feed_count,
+            commands::feed_discover::clear_hidden_discovered_feeds,
             commands::channels::get_channel_invite,
             commands::channels::list_channel_members,
             commands::channels::channel_presence_config,

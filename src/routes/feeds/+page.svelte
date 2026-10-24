@@ -9,22 +9,32 @@
   import { navigatingForDeepLink } from '$lib/deepLinkNavigation';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import {
+    cachedDiscoveredFeeds,
+    clearHiddenDiscoveredFeeds,
     createFeed,
     deleteFeed,
+    discoverFeeds,
     downloadFeedItems,
     FEEDS_CHANGED_EVENT,
+    FEEDS_FOUND_EVENT,
     followFeed,
     getFeedItems,
+    hiddenDiscoveredFeedCount,
     listMyFeeds,
     markFeedRead,
+    openFeedFolder,
     publishFeed,
     refreshFeed,
+    setDiscoveredFeedHidden,
     setFeedAutoDownload,
     setFeedDetails,
     setFeedItems,
+    setFeedListed,
     unfollowFeed,
+    type DiscoveredFeed,
     type FeedItem,
     type FeedsChangedEvent,
+    type FeedsFoundEvent,
     type FollowedFeed,
     type FollowedItem,
     type OwnFeed,
@@ -52,7 +62,7 @@
   /** Past this many feeds the list gets a search box. */
   const LIST_SEARCH_FROM = 6;
 
-  type Tab = 'following' | 'mine';
+  type Tab = 'following' | 'discover' | 'mine';
   let tab = $state<Tab>('following');
   let emberOff = $derived($appSettings?.ember_native_enabled === false);
   /** The inline card for following a link or starting a feed. */
@@ -66,6 +76,8 @@
     tab = next;
     compose = null;
     listQuery = '';
+    menuFor = null;
+    if (next === 'discover') void openDiscover();
   }
 
   function toggleCompose(kind: 'follow' | 'create') {
@@ -334,6 +346,34 @@
     if (await saveAuto()) toastSuccess(m.feeds_auto_saved());
   }
 
+  /** Downloads waiting on the user's word, because some can run code. */
+  let riskyAsk = $state<{ ed2ks: string[]; names: string[] } | null>(null);
+
+  function riskyText(names: string[]): string {
+    return plural(names.length, {
+      one: () => m.feeds_risky_confirm_body_one({ name: names[0] }),
+      other: () => m.feeds_risky_confirm_body_other({ count: formatNumber(names.length), name: names[0] }),
+    });
+  }
+
+  /** Download, after asking when any of them can run code. */
+  function askDownload(ed2ks: string[]) {
+    const wanted = new Set(ed2ks);
+    const risky = items.filter((i) => wanted.has(i.ed2k) && i.risky).map((i) => i.name);
+    if (risky.length > 0) riskyAsk = { ed2ks, names: risky };
+    else void download(ed2ks);
+  }
+
+  async function openFolder() {
+    const feed = selected;
+    if (!feed) return;
+    try {
+      await openFeedFolder(feed.publisher, feed.salt);
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    }
+  }
+
   async function download(ed2ks: string[]) {
     const feed = selected;
     if (!feed || ed2ks.length === 0 || downloading) return;
@@ -391,13 +431,193 @@
     return null;
   }
 
+  // ── Discover ─────────────────────────────────────────────────────────
+  /** Cards shown at first, and added by each Show more. */
+  const DISCOVER_PAGE = 60;
+  /** Opening the tab again walks the index again after this long. */
+  const DISCOVER_STALE_MS = 10 * 60_000;
+  let discovered = $state<DiscoveredFeed[]>([]);
+  /** The cache or a walk has answered. */
+  let discoverLoaded = $state(false);
+  let discovering = $state(false);
+  let discoverQuery = $state('');
+  let discoverFilter = $state<'all' | 'active'>('all');
+  let discoverLimit = $state(DISCOVER_PAGE);
+  let hiddenCount = $state(0);
+  /** The card whose menu is open. */
+  let menuFor = $state<string | null>(null);
+  /** Feeds being followed from Discover. */
+  let followingFromDiscover = $state<Set<string>>(new Set());
+  /** The walk whose shards are taken; any other's are stale. */
+  let discoverWalk = '';
+  let discoverOpened = false;
+  let lastWalkAt = 0;
+
+  /** Show only this publisher's feeds. */
+  let discoverPublisher = $state<string | null>(null);
+  let discoverMatches = $derived.by(() => {
+    const q = discoverQuery.trim().toLowerCase();
+    return discovered.filter(
+      (f) =>
+        (discoverFilter === 'all' || f.active) &&
+        (!discoverPublisher || f.publisher === discoverPublisher) &&
+        (!q || f.title.toLowerCase().includes(q) || f.description.toLowerCase().includes(q)),
+    );
+  });
+
+  /** A publisher's key, short, as Discover shows it: enough to tell two
+   *  publishers of one name apart. */
+  const shortKey = (publisher: string) => publisher.slice(0, 8);
+  let discoverShown = $derived(discoverMatches.slice(0, discoverLimit));
+  let activeDiscovered = $derived(discovered.filter((f) => f.active).length);
+  let followedKeys = $derived(new Set($followedFeeds.map(keyOf)));
+
+  // A new search or filter starts from the first page again.
+  $effect(() => {
+    void discoverQuery;
+    void discoverFilter;
+    void discoverPublisher;
+    untrack(() => (discoverLimit = DISCOVER_PAGE));
+  });
+
+  /** Running publishers first, then the most lately published. */
+  function sortDiscovered(feeds: DiscoveredFeed[]): DiscoveredFeed[] {
+    return feeds.slice().sort((a, b) => Number(b.active) - Number(a.active) || b.sequence - a.sequence);
+  }
+
+  /** Feeds, as `publisher/salt`, and publishers, as `publisher/`, hidden
+   *  since the last walk began, which may still bring them in. */
+  let hiddenMeanwhile = new Set<string>();
+  const hiddenNow = (f: DiscoveredFeed) => hiddenMeanwhile.has(keyOf(f)) || hiddenMeanwhile.has(`${f.publisher}/`);
+
+  function takeFound(feeds: DiscoveredFeed[], gone: FeedsFoundEvent['gone']) {
+    const byKey = new Map(discovered.map((f) => [keyOf(f), f]));
+    for (const g of gone) {
+      const held = byKey.get(keyOf(g));
+      if (held && held.listed_at <= g.listed_at) byKey.delete(keyOf(g));
+    }
+    for (const f of feeds) {
+      const held = byKey.get(keyOf(f));
+      if (!hiddenNow(f) && (!held || held.listed_at <= f.listed_at)) byKey.set(keyOf(f), f);
+    }
+    discovered = sortDiscovered([...byKey.values()]);
+  }
+
+  function newWalk(): string {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+    return `w-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+  }
+
+  async function refreshHiddenCount() {
+    try {
+      hiddenCount = await hiddenDiscoveredFeedCount();
+    } catch (e) {
+      console.warn('feeds: could not count hidden feeds', e);
+    }
+  }
+
+  async function openDiscover() {
+    if (!discoverOpened) {
+      discoverOpened = true;
+      try {
+        const cached = await cachedDiscoveredFeeds();
+        // A walk's shards may have landed first; they are newer.
+        if (discovered.length === 0) discovered = sortDiscovered(cached);
+      } catch (e) {
+        console.warn('feeds: could not read the Discover cache', e);
+      }
+      discoverLoaded = true;
+      void refreshHiddenCount();
+    }
+    if (Date.now() - lastWalkAt >= DISCOVER_STALE_MS) void walkDiscover();
+  }
+
+  async function walkDiscover() {
+    if (discovering || emberOff) return;
+    const walk = newWalk();
+    discoverWalk = walk;
+    discovering = true;
+    lastWalkAt = Date.now();
+    try {
+      const feeds = await discoverFeeds(walk);
+      if (discoverWalk === walk) discovered = sortDiscovered(feeds.filter((f) => !hiddenNow(f)));
+    } catch (e) {
+      if (discoverWalk === walk) toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      if (discoverWalk === walk) {
+        discovering = false;
+        discoverLoaded = true;
+        // The walk read them hidden as it ended.
+        hiddenMeanwhile = new Set();
+      }
+    }
+  }
+
+  async function followDiscovered(feed: DiscoveredFeed) {
+    const key = keyOf(feed);
+    if (followingFromDiscover.has(key)) return;
+    followingFromDiscover = new Set([...followingFromDiscover, key]);
+    try {
+      await followFeed(feed.link);
+      await refreshFollowedFeeds();
+      toastSuccess(m.feeds_followed_toast());
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      const next = new Set(followingFromDiscover);
+      next.delete(key);
+      followingFromDiscover = next;
+    }
+  }
+
+  function openFollowed(feed: DiscoveredFeed) {
+    selectedKey = keyOf(feed);
+    setTab('following');
+  }
+
+  async function hideDiscovered(feed: DiscoveredFeed, wholePublisher: boolean) {
+    menuFor = null;
+    try {
+      await setDiscoveredFeedHidden(feed.publisher, wholePublisher ? null : feed.salt, true);
+      if (discovering) hiddenMeanwhile.add(wholePublisher ? `${feed.publisher}/` : keyOf(feed));
+      if (wholePublisher && discoverPublisher === feed.publisher) discoverPublisher = null;
+      discovered = discovered.filter((f) =>
+        wholePublisher ? f.publisher !== feed.publisher : keyOf(f) !== keyOf(feed),
+      );
+      hiddenCount += 1;
+      toastSuccess(m.feeds_discover_hidden_toast());
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    }
+  }
+
+  /** Not during a walk, whose result leaves out what it read hidden. */
+  async function showHidden() {
+    if (discovering) return;
+    try {
+      await clearHiddenDiscoveredFeeds();
+      hiddenCount = 0;
+      discovered = sortDiscovered(await cachedDiscoveredFeeds());
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    }
+  }
+
+  /** The line saying when a listed feed's publisher was last running. */
+  function seenText(feed: DiscoveredFeed): string {
+    return feed.active ? m.feeds_discover_active() : m.feeds_discover_seen({ when: ago(feed.listed_at) });
+  }
+
   // ── My feeds ─────────────────────────────────────────────────────────
   let mine = $state<OwnFeed[]>([]);
   let mineLoaded = $state(false);
   let mineFailed = $state(false);
   let newTitle = $state('');
   let newDescription = $state('');
+  /** Whether a new feed is listed in Discover; link only unless chosen. */
+  let newListed = $state(false);
   let creating = $state(false);
+  let listing = $state(false);
   let mineSelected = $state<string | null>(null);
   let editTitle = $state('');
   let editDescription = $state('');
@@ -477,9 +697,10 @@
     if (creating || !newTitle.trim()) return;
     creating = true;
     try {
-      const feed = await createFeed(newTitle, newDescription);
+      const feed = await createFeed(newTitle, newDescription, newListed);
       newTitle = '';
       newDescription = '';
+      newListed = false;
       compose = null;
       await loadMine();
       selectMine(feed);
@@ -599,6 +820,31 @@
     }
   }
 
+  /** What the listing switch shows: the open feed's, or the user's choice
+   *  while it saves. */
+  let listedSwitch = $state(false);
+  $effect(() => {
+    listedSwitch = mineFeed?.listed ?? false;
+  });
+
+  /** Listing goes out at once, apart from the editor's Save and Publish. */
+  async function toggleListed(on: boolean) {
+    const feed = mineFeed;
+    if (!feed || listing) return;
+    listedSwitch = on;
+    listing = true;
+    try {
+      const saved = await setFeedListed(feed.salt, on);
+      mine = mine.map((f) => (f.salt === saved.salt ? { ...f, listed: saved.listed } : f));
+      if (saved.published_at > 0) toastSuccess(on ? m.feeds_listed_on_toast() : m.feeds_listed_off_toast());
+    } catch (e) {
+      if (mineSelected === feed.salt) listedSwitch = !on;
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      listing = false;
+    }
+  }
+
   async function doDelete() {
     const feed = mineFeed;
     if (!feed) return;
@@ -649,17 +895,36 @@
       if (alive) unlisten = fn;
       else fn();
     });
+    let unlistenFound: UnlistenFn | null = null;
+    void listen<FeedsFoundEvent>(FEEDS_FOUND_EVENT, (event) => {
+      if (discovering && event.payload.walk === discoverWalk) takeFound(event.payload.feeds, event.payload.gone);
+    }).then((fn) => {
+      if (alive) unlistenFound = fn;
+      else fn();
+    });
     // Seen once the user comes back to Ember.
     const onFocus = () => void markShownRead();
     window.addEventListener('focus', onFocus);
     document.addEventListener('visibilitychange', onFocus);
+    // A card's menu closes on a click anywhere else, or Escape.
+    const closeMenu = (e: Event) => {
+      if (menuFor === null) return;
+      if (e instanceof KeyboardEvent ? e.key === 'Escape' : !(e.target as Element | null)?.closest?.('.card-menu-wrap')) {
+        menuFor = null;
+      }
+    };
+    window.addEventListener('pointerdown', closeMenu);
+    window.addEventListener('keydown', closeMenu);
     const clock = setInterval(() => (now = Math.floor(Date.now() / 1000)), 60_000);
     return () => {
       alive = false;
       unlisten?.();
+      unlistenFound?.();
       clearInterval(clock);
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onFocus);
+      window.removeEventListener('pointerdown', closeMenu);
+      window.removeEventListener('keydown', closeMenu);
     };
   });
 </script>
@@ -720,6 +985,9 @@
         {m.feeds_tab_following()}
         {#if $followedFeeds.length > 0}<span class="seg-count">{formatNumber($followedFeeds.length)}</span>{/if}
       </button>
+      <button type="button" aria-pressed={tab === 'discover'} class:active={tab === 'discover'} onclick={() => setTab('discover')}>
+        {m.feeds_tab_discover()}
+      </button>
       <button type="button" aria-pressed={tab === 'mine'} class:active={tab === 'mine'} onclick={() => setTab('mine')}>
         {m.feeds_tab_mine()}
         {#if mine.length > 0}<span class="seg-count">{formatNumber(mine.length)}</span>{/if}
@@ -728,6 +996,18 @@
     {#if tab === 'following'}
       <button type="button" class="primary" aria-expanded={compose === 'follow'} onclick={() => toggleCompose('follow')}>
         {compose === 'follow' ? m.common_cancel() : m.feeds_follow_a_feed()}
+      </button>
+    {:else if tab === 'discover'}
+      <button type="button" class="secondary refresh-btn" disabled={discovering || emberOff} onclick={() => void walkDiscover()}>
+        {#if discovering}
+          <span class="spinner xs" aria-hidden="true"></span>
+          {m.feeds_discover_searching()}
+        {:else}
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><polyline points="13.5 2.5 13.5 5.5 10.5 5.5"/>
+          </svg>
+          {m.feeds_discover_refresh()}
+        {/if}
       </button>
     {:else}
       <button type="button" class="primary" aria-expanded={compose === 'create'} disabled={busy} onclick={() => toggleCompose('create')}>
@@ -808,6 +1088,23 @@
         />
         <button type="submit" class="primary" disabled={creating || !newTitle.trim()}>{m.feeds_create()}</button>
       </div>
+      <fieldset class="visibility">
+        <legend class="visibility-legend">{m.feeds_visibility_label()}</legend>
+        <label class="visibility-option" class:chosen={!newListed}>
+          <input type="radio" name="feed-visibility" checked={!newListed} onchange={() => (newListed = false)} />
+          <span class="visibility-text">
+            <span class="visibility-name">{m.feeds_visibility_link()}</span>
+            <span class="visibility-hint">{m.feeds_visibility_link_hint()}</span>
+          </span>
+        </label>
+        <label class="visibility-option" class:chosen={newListed}>
+          <input type="radio" name="feed-visibility" checked={newListed} onchange={() => (newListed = true)} />
+          <span class="visibility-text">
+            <span class="visibility-name">{m.feeds_visibility_public()}</span>
+            <span class="visibility-hint">{m.feeds_visibility_public_hint()}</span>
+          </span>
+        </label>
+      </fieldset>
       <p class="compose-hint">{m.feeds_publish_public_hint()}</p>
     </form>
   {/if}
@@ -887,6 +1184,11 @@
                     <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><polyline points="13.5 2.5 13.5 5.5 10.5 5.5"/>
                   </svg>
                 </button>
+                <button type="button" class="icon-btn" title={m.feeds_open_folder()} aria-label={m.feeds_open_folder()} onclick={() => void openFolder()}>
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M2 4.5V12.5h12V6H7.5L6 4.5z"/>
+                  </svg>
+                </button>
                 <button type="button" class="icon-btn" title={m.feeds_copy_link()} aria-label={m.feeds_copy_link()} onclick={() => void copy(selected!.link)}>
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="M6.5 9.5a3 3 0 0 0 4.2 0l2.1-2.1a3 3 0 0 0-4.2-4.2l-.7.7"/><path d="M9.5 6.5a3 3 0 0 0-4.2 0L3.2 8.6a3 3 0 0 0 4.2 4.2l.7-.7"/>
@@ -898,6 +1200,12 @@
             {#if selected.description}
               <p class="detail-description"><bdi dir="auto">{selected.description}</bdi></p>
             {/if}
+            <p class="private-note">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="3.5" y="7" width="9" height="6.5" rx="1"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/>
+              </svg>
+              <span>{m.feeds_private_note()}</span>
+            </p>
 
             {#if stateText(selected)}
               <div class="state-strip" class:tone-warning={selected.state === 'broken'} role="status">
@@ -977,7 +1285,7 @@
               {/if}
               <span class="toolbar-spacer"></span>
               {#if newItems.length > 0}
-                <button type="button" class="primary sm-btn" disabled={downloading} onclick={() => void download(newItems.map((i) => i.ed2k))}>
+                <button type="button" class="primary sm-btn" disabled={downloading} onclick={() => askDownload(newItems.map((i) => i.ed2k))}>
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
                   </svg>
@@ -1003,6 +1311,7 @@
                       <bdi dir="auto">{item.name}</bdi>
                       {#if item.is_new && !item.removed}<span class="badge sm tone-accent">{m.feeds_badge_new()}</span>{/if}
                       {#if item.removed}<span class="badge sm tone-muted">{m.feeds_badge_removed()}</span>{/if}
+                      {#if item.risky}<span class="badge sm tone-warning" title={m.common_risky_file()}>{m.feeds_badge_risky()}</span>{/if}
                     </span>
                     <span class="file-meta">
                       <span>{formatBytes(item.size)}</span>
@@ -1026,7 +1335,7 @@
                       class="row-btn"
                       disabled={downloading}
                       aria-label={m.feeds_download_named({ name: item.name })}
-                      onclick={() => void download([item.ed2k])}
+                      onclick={() => askDownload([item.ed2k])}
                     >
                       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
@@ -1041,6 +1350,158 @@
             <div class="empty-state compact"><p class="empty-sub">{m.feeds_pick_one()}</p></div>
           {/if}
         </section>
+      </div>
+    {/if}
+  {:else if tab === 'discover'}
+    {#if !discoverLoaded}
+      <div class="empty-card"><span class="spinner xs" aria-hidden="true"></span></div>
+    {:else if discovered.length === 0}
+      <div class="empty-card">
+        <div class="empty-state">
+          <span class="empty-glyph">{@render feedGlyph()}</span>
+          <p class="empty-title">{discovering ? m.feeds_discover_searching() : m.feeds_discover_empty_title()}</p>
+          <p class="empty-sub">{m.feeds_discover_empty_body()}</p>
+          {#if hiddenCount > 0 && !discovering}
+            <div class="empty-actions">
+              <button type="button" class="secondary empty-action" onclick={() => void showHidden()}>
+                {m.feeds_discover_show_hidden({ count: formatNumber(hiddenCount) })}
+              </button>
+            </div>
+          {/if}
+        </div>
+      </div>
+    {:else}
+      <div class="discover-pane">
+        <div class="discover-toolbar">
+          <div class="discover-search">
+            {@render searchBox(discoverQuery, (v) => (discoverQuery = v), m.feeds_discover_search())}
+          </div>
+          <div class="segmented small" role="group" aria-label={m.feeds_tab_discover()}>
+            <button type="button" aria-pressed={discoverFilter === 'all'} class:active={discoverFilter === 'all'} onclick={() => (discoverFilter = 'all')}>
+              {m.feeds_filter_all()}
+              <span class="seg-count">{formatNumber(discovered.length)}</span>
+            </button>
+            <button type="button" aria-pressed={discoverFilter === 'active'} class:active={discoverFilter === 'active'} onclick={() => (discoverFilter = 'active')}>
+              {m.feeds_discover_filter_active()}
+              <span class="seg-count">{formatNumber(activeDiscovered)}</span>
+            </button>
+          </div>
+          {#if discoverPublisher}
+            <span class="filter-chip">
+              <span title={discoverPublisher}>{m.feeds_discover_publisher_filter({ id: shortKey(discoverPublisher) })}</span>
+              <button type="button" title={m.common_clear()} aria-label={m.common_clear()} onclick={() => (discoverPublisher = null)}>
+                <IconX size={11} />
+              </button>
+            </span>
+          {/if}
+          <span class="toolbar-spacer"></span>
+          {#if hiddenCount > 0}
+            <button type="button" class="link-btn" disabled={discovering} onclick={() => void showHidden()}>
+              {m.feeds_discover_show_hidden({ count: formatNumber(hiddenCount) })}
+            </button>
+          {/if}
+        </div>
+        <p class="discover-hint">{m.feeds_discover_hint()}</p>
+
+        <div class="discover-scroll">
+          {#if discoverMatches.length === 0}
+            <p class="list-empty">{m.feeds_no_matches()}</p>
+          {/if}
+          <div class="discover-grid">
+            {#each discoverShown as feed (keyOf(feed))}
+              {@const key = keyOf(feed)}
+              {@const isFollowed = followedKeys.has(key)}
+              <article class="discover-card" class:menu-open={menuFor === key}>
+                <header class="discover-card-head">
+                  <span class="feed-avatar" style:--feed-hue={hueOf(feed.publisher)}>{@render feedGlyph()}</span>
+                  <div class="discover-card-title">
+                    <h3><bdi dir="auto">{feed.title}</bdi></h3>
+                    <p class="discover-seen" class:active={feed.active}>
+                      <span class="status-dot" class:published={feed.active} aria-hidden="true"></span>
+                      <span title={feed.active ? m.feeds_discover_active_title() : undefined}>{seenText(feed)}</span>
+                    </p>
+                  </div>
+                  <div class="card-menu-wrap">
+                    <button
+                      type="button"
+                      class="icon-btn sm"
+                      aria-haspopup="menu"
+                      aria-expanded={menuFor === key}
+                      title={m.feeds_discover_more()}
+                      aria-label={m.feeds_discover_more()}
+                      onclick={() => (menuFor = menuFor === key ? null : key)}
+                    >
+                      <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                        <circle cx="3.5" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="12.5" cy="8" r="1.3"/>
+                      </svg>
+                    </button>
+                    {#if menuFor === key}
+                      <div class="card-menu" role="menu">
+                        <button type="button" role="menuitem" onclick={() => { menuFor = null; void copy(feed.link); }}>
+                          {m.feeds_copy_link()}
+                        </button>
+                        {#if discoverPublisher !== feed.publisher}
+                          <button type="button" role="menuitem" onclick={() => { menuFor = null; discoverPublisher = feed.publisher; }}>
+                            {m.feeds_discover_by_publisher()}
+                          </button>
+                        {/if}
+                        {#if !feed.own}
+                          <button type="button" role="menuitem" onclick={() => void hideDiscovered(feed, false)}>
+                            {m.feeds_discover_hide()}
+                          </button>
+                          <button type="button" role="menuitem" onclick={() => void hideDiscovered(feed, true)}>
+                            {m.feeds_discover_hide_publisher()}
+                          </button>
+                        {/if}
+                      </div>
+                    {/if}
+                  </div>
+                </header>
+                {#if feed.description}
+                  <p class="discover-description"><bdi dir="auto">{feed.description}</bdi></p>
+                {/if}
+                <footer class="discover-card-foot">
+                  <span class="discover-meta">
+                    <button
+                      type="button"
+                      class="publisher-key"
+                      title={feed.publisher}
+                      aria-label={m.feeds_discover_by_publisher()}
+                      onclick={() => (discoverPublisher = feed.publisher)}
+                    >{m.feeds_discover_publisher({ id: shortKey(feed.publisher) })}</button>
+                    <span aria-hidden="true">·</span>
+                    <span>{m.feeds_items_count({ count: formatNumber(feed.item_count) })}</span>
+                    {#if feed.sequence > 0}
+                      <span aria-hidden="true">·</span>
+                      <span>{m.feeds_discover_updated({ when: ago(Math.floor(feed.sequence / 1000)) })}</span>
+                    {/if}
+                  </span>
+                  {#if feed.own}
+                    <span class="badge sm tone-muted">{m.feeds_badge_yours()}</span>
+                  {:else if isFollowed}
+                    <button type="button" class="secondary sm-btn" onclick={() => openFollowed(feed)}>{m.feeds_discover_open()}</button>
+                  {:else}
+                    <button
+                      type="button"
+                      class="primary sm-btn"
+                      disabled={emberOff || followingFromDiscover.has(key)}
+                      onclick={() => void followDiscovered(feed)}
+                    >
+                      {m.feeds_follow()}
+                    </button>
+                  {/if}
+                </footer>
+              </article>
+            {/each}
+          </div>
+          {#if discoverMatches.length > discoverShown.length}
+            <div class="discover-more">
+              <button type="button" class="secondary" onclick={() => (discoverLimit += DISCOVER_PAGE)}>
+                {m.feeds_discover_show_more({ count: formatNumber(discoverMatches.length - discoverShown.length) })}
+              </button>
+            </div>
+          {/if}
+        </div>
       </div>
     {/if}
   {:else if !mineLoaded}
@@ -1163,6 +1624,32 @@
             placeholder={m.feeds_description_placeholder()}
             aria-label={m.feeds_description_placeholder()}
           ></textarea>
+
+          <div class="listed-row" class:on={mineFeed.listed}>
+            <span class="auto-icon" aria-hidden="true">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="8" cy="8" r="6"/><path d="M2 8h12"/><path d="M8 2a9 9 0 0 1 0 12a9 9 0 0 1 0-12"/>
+              </svg>
+            </span>
+            <span class="listed-text">
+              <span class="auto-name">{m.feeds_listed_toggle()}</span>
+              <span class="hint">
+                {#if !mineFeed.listed}
+                  {m.feeds_visibility_link_hint()}
+                {:else if mineFeed.published_at === 0}
+                  {m.feeds_listed_hint_unpublished()}
+                {:else}
+                  {m.feeds_visibility_public_hint()}
+                {/if}
+              </span>
+            </span>
+            <ToggleSwitch
+              checked={listedSwitch}
+              disabled={listing || busy || (emberOff && mineFeed.published_at > 0)}
+              ariaLabel={m.feeds_listed_toggle()}
+              onchange={(on) => void toggleListed(on)}
+            />
+          </div>
 
           {#if mineFeed.published_at === 0}
             <div class="state-strip" role="status">
@@ -1287,6 +1774,21 @@
   confirmLabel={m.feeds_unfollow()}
   danger
   onconfirm={() => void doUnfollow()}
+/>
+
+<ConfirmDialog
+  open={riskyAsk !== null}
+  title={m.feeds_risky_confirm_title()}
+  message={riskyAsk ? riskyText(riskyAsk.names) : ''}
+  confirmLabel={m.feeds_risky_confirm()}
+  danger
+  onconfirm={() => {
+    const ask = riskyAsk;
+    riskyAsk = null;
+    if (ask) void download(ask.ed2ks);
+  }}
+  oncancel={() => (riskyAsk = null)}
+  ondismiss={() => (riskyAsk = null)}
 />
 
 <ConfirmDialog
@@ -2295,6 +2797,361 @@
     height: 13px;
   }
 
+  /* ── Visibility (new feed, editor) ────────────────────────────────── */
+  .visibility {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 8px;
+    margin: 10px 0 0;
+    padding: 0;
+    border: 0;
+  }
+
+  .visibility-legend {
+    margin-bottom: 6px;
+    padding: 0;
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+
+  .visibility-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-primary);
+    cursor: pointer;
+    transition: border-color var(--transition-fast), background var(--transition-fast);
+  }
+
+  .visibility-option.chosen {
+    border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+    background: color-mix(in srgb, var(--accent) 7%, var(--bg-primary));
+  }
+
+  .visibility-option input {
+    margin-top: 2px;
+    accent-color: var(--accent);
+  }
+
+  .visibility-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .visibility-name {
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+  }
+
+  .visibility-hint {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    line-height: 1.45;
+  }
+
+  .listed-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 0 18px 12px;
+    padding: 8px 10px 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-primary);
+    transition: border-color var(--transition-fast);
+  }
+
+  .listed-row.on {
+    border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
+  }
+
+  .listed-row.on .auto-icon {
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+
+  .listed-text {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  /* ── Discover ─────────────────────────────────────────────────────── */
+  .refresh-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .refresh-btn svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  .discover-pane {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: inset 0 1px 0 var(--surface-highlight);
+  }
+
+  .discover-toolbar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px 14px 0;
+  }
+
+  .discover-search {
+    width: 280px;
+  }
+
+  .discover-search .search-wrap {
+    margin: 0;
+  }
+
+  .link-btn {
+    padding: 2px 4px;
+    border: 0;
+    background: none;
+    color: var(--text-accent);
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+  }
+
+  .link-btn:hover:not(:disabled) {
+    background: none;
+    text-decoration: underline;
+  }
+
+  .link-btn:disabled {
+    background: none;
+    color: var(--text-muted);
+    cursor: default;
+  }
+
+  .discover-hint {
+    margin: 8px 14px 0;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    line-height: 1.5;
+  }
+
+  .discover-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 10px 14px 14px;
+  }
+
+  .discover-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 10px;
+  }
+
+  .discover-card {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-primary);
+    transition: border-color var(--transition-fast);
+  }
+
+  .discover-card:hover,
+  .discover-card.menu-open {
+    border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+  }
+
+  .discover-card.menu-open {
+    z-index: 2;
+  }
+
+  .discover-card-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+  }
+
+  .discover-card-title {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .discover-card-title h3 {
+    margin: 0;
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .discover-seen {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 2px 0 0;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+  }
+
+  .discover-seen.active {
+    color: var(--success);
+  }
+
+  .card-menu-wrap {
+    position: relative;
+    flex-shrink: 0;
+    align-self: flex-start;
+  }
+
+  .card-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    inset-inline-end: 0;
+    min-width: 220px;
+    display: flex;
+    flex-direction: column;
+    padding: 4px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-secondary);
+    box-shadow: var(--shadow-md, 0 6px 20px rgba(0, 0, 0, 0.3));
+  }
+
+  .card-menu button {
+    padding: 7px 10px;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--text-primary);
+    font-size: var(--font-size-sm);
+    text-align: start;
+    cursor: pointer;
+  }
+
+  .card-menu button:hover {
+    background: var(--bg-hover);
+  }
+
+  .discover-description {
+    margin: 0;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    line-height: 1.45;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+  }
+
+  .discover-card-foot {
+    margin-top: auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .discover-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    min-width: 0;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .discover-more {
+    display: flex;
+    justify-content: center;
+    padding-top: 12px;
+  }
+
+  .publisher-key {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    font-family: var(--font-mono, monospace);
+    cursor: pointer;
+  }
+
+  .publisher-key:hover {
+    background: none;
+    color: var(--text-accent);
+    text-decoration: underline;
+  }
+
+  .filter-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 4px 2px 10px;
+    border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+    border-radius: var(--radius-pill);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    color: var(--text-accent);
+    font-size: var(--font-size-xs);
+  }
+
+  .filter-chip button {
+    display: grid;
+    place-items: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: none;
+    color: inherit;
+    cursor: pointer;
+  }
+
+  .filter-chip button:hover {
+    background: color-mix(in srgb, var(--accent) 20%, transparent);
+  }
+
+  .private-note {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0 18px 12px;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    line-height: 1.45;
+  }
+
+  .private-note svg {
+    flex-shrink: 0;
+    width: 13px;
+    height: 13px;
+  }
+
   @media (prefers-reduced-motion: reduce) {
     .compose-card { animation: none; }
     .icon-btn.spinning svg { animation: none; }
@@ -2320,7 +3177,8 @@
       grid-template-rows: minmax(120px, 32%) minmax(0, 1fr);
     }
 
-    .files-search {
+    .files-search,
+    .discover-search {
       width: 100%;
     }
   }

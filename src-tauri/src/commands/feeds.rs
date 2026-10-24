@@ -19,13 +19,13 @@ use crate::commands::errors::{bounded_send, coded, coded_ctx};
 use crate::network::ed2k::collection::{Collection, CollectionFile};
 use crate::network::ember::dht::publish::SignedRecord;
 use crate::network::ember::feed::{
-    feed_key, generate_feed_salt, next_sequence, FeedHead, FeedLink, FeedSalt, FEEDS_PER_IDENTITY,
-    FEED_DESCRIPTION_MAX, FEED_ITEMS_MAX, FEED_NOTE_MAX, FEED_TITLE_MAX,
+    feed_key, generate_feed_salt, next_sequence, withdrawal_head, FeedHead, FeedLink, FeedSalt, FEEDS_PER_IDENTITY,
+    FEED_DESCRIPTION_MAX, FEED_ITEMS_MAX, FEED_LISTING_TTL_SECS, FEED_NOTE_MAX, FEED_TITLE_MAX,
 };
 use crate::network::{EmberPublishResult, NetworkCommand};
 use crate::sharing::feed_files::{self, FetchOutcome, HiddenShare};
 use crate::sharing::manager::TransferControl;
-use crate::storage::database::{FeedItem, FollowedFeed, FollowedItem, OwnFeed, OwnPublish};
+use crate::storage::database::{DueListing, FeedItem, FollowedFeed, FollowedItem, OwnFeed, OwnPublish};
 use crate::storage::part_folders::DownloadFolders;
 use crate::types::{Transfer, TransferDirection, TransferStatus};
 
@@ -188,7 +188,7 @@ fn link_for(publisher: &[u8; 32], salt: &FeedSalt) -> String {
 }
 
 /// `text` cut to at most `max` bytes, at a character boundary.
-fn clip(text: &str, max: usize) -> String {
+pub(crate) fn clip(text: &str, max: usize) -> String {
     let text = text.trim();
     if text.len() <= max {
         return text.to_string();
@@ -257,12 +257,14 @@ fn checked_details(title: &str, description: &str) -> Result<(String, String), S
     Ok((title, description))
 }
 
-/// Start a feed. Nothing is published until [`publish_feed`].
+/// Start a feed, `listed` in the public index or found only by its link.
+/// Nothing is published until [`publish_feed`].
 #[tauri::command]
 pub async fn create_feed(
     state: tauri::State<'_, AppState>,
     title: String,
     description: String,
+    listed: bool,
 ) -> Result<OwnFeedInfo, String> {
     let (title, description) = checked_details(&title, &description)?;
     let salt = hex::encode(generate_feed_salt());
@@ -270,7 +272,7 @@ pub async fn create_feed(
     let now = chrono::Utc::now().timestamp();
     let key = salt.clone();
     let made = blocking(
-        move || db.feed_own_create(&key, &title, &description, now, FEEDS_PER_IDENTITY),
+        move || db.feed_own_create(&key, &title, &description, listed, now, FEEDS_PER_IDENTITY),
         "feeds_failed",
         "Could not create the feed",
     )
@@ -313,6 +315,84 @@ pub async fn set_feed_details(
         return Err(coded("feeds_not_found", "That feed could not be found"));
     }
     Ok(FeedDetails { title, description })
+}
+
+/// List a feed of ours in the public index, or take it out. A published
+/// feed's listing, or its withdrawal, goes out at once; one not yet
+/// published is listed when it is.
+#[tauri::command]
+pub async fn set_feed_listed(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    salt: String,
+    listed: bool,
+) -> Result<OwnFeedInfo, String> {
+    let salt = hex::encode(hex_salt(&salt)?);
+    let (db, key) = (state.db.clone(), salt.clone());
+    let feed = blocking(
+        move || {
+            if !db.feed_own_set_listed(&key, listed)? {
+                return Ok(None);
+            }
+            db.feed_own(&key)
+        },
+        "feeds_failed",
+        "Could not save the feed",
+    )
+    .await?
+    .ok_or_else(|| coded("feeds_not_found", "That feed could not be found"))?;
+    send_listing(&state, &feed, chrono::Utc::now().timestamp()).await;
+    let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "salt": salt }));
+    own_feed_info(&state, feed).await
+}
+
+/// Sign and send `feed`'s listing in the public index, as last published,
+/// or, while a listing of it may live on at storers, its withdrawal. Whether
+/// it is listed is read again as the listing is stamped, so a listing
+/// decided before the user took the feed out cannot outrank the withdrawal.
+/// Not waited on: one that does not get out goes again with the next
+/// publish or republish.
+async fn send_listing(state: &AppState, feed: &OwnFeed, now: i64) {
+    let head = own_head(feed);
+    let (db, key, published) = (state.db.clone(), feed.salt.clone(), head.is_some());
+    let due = tokio::task::spawn_blocking(move || db.feed_own_take_listing(&key, published, now, FEED_LISTING_TTL_SECS))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
+    if let Some(due) = due {
+        queue_listing(state, &due, &head.unwrap_or_else(withdrawal_head)).await;
+    }
+}
+
+/// Sign and queue `due`: the feed's listing naming `head`, or its
+/// withdrawal, which names nothing of the feed.
+async fn queue_listing(state: &AppState, due: &DueListing, head: &FeedHead) {
+    let Ok(salt) = hex_to16(&due.salt) else {
+        return;
+    };
+    let head = if due.withdrawn { withdrawal_head() } else { head.clone() };
+    let signing = crate::network::ember::crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key);
+    let Some(record) = SignedRecord::feed_listing_record(&salt, &head, due.withdrawn, &signing, due.stamp) else {
+        return;
+    };
+    if let Err(error) = crate::commands::channels::queue_signed_record(state, record).await {
+        tracing::info!("feed {}: its listing was not sent: {error}", due.salt);
+    }
+}
+
+/// Send the withdrawals of deleted feeds that are due: at once, and daily
+/// until each listing they displace has lapsed.
+async fn send_due_withdrawals(state: &AppState, now: i64) {
+    let db = state.db.clone();
+    let due = tokio::task::spawn_blocking(move || db.feed_withdrawals_due(now, REPUBLISH_SECS, FEED_LISTING_TTL_SECS))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    for withdrawal in due {
+        queue_listing(state, &withdrawal, &withdrawal_head()).await;
+    }
 }
 
 /// One item as the editor sends it: a file from the Library, and a note.
@@ -580,10 +660,11 @@ pub async fn publish_feed(
     }
     let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "salt": salt }));
     let db = state.db.clone();
-    let feed = blocking(move || db.feed_own(&salt), "feeds_failed", "Could not read feeds")
-        .await?
-        .unwrap_or(feed);
-    own_feed_info(&state, feed).await
+    let recorded = blocking(move || db.feed_own(&salt), "feeds_failed", "Could not read feeds").await?;
+    if let Some(feed) = &recorded {
+        send_listing(&state, feed, now).await;
+    }
+    own_feed_info(&state, recorded.unwrap_or(feed)).await
 }
 
 fn hex_to16(text: &str) -> anyhow::Result<[u8; 16]> {
@@ -804,7 +885,8 @@ fn head_of(published: &OwnPublish) -> Option<FeedHead> {
 }
 
 /// Stop publishing a feed. Its head lapses from the DHT within its lifetime;
-/// followers keep what they hold.
+/// followers keep what they hold. A feed listed in the public index is
+/// withdrawn from it by the service's tick, daily until its listing lapses.
 #[tauri::command]
 pub async fn delete_feed(app: tauri::AppHandle, state: tauri::State<'_, AppState>, salt: String) -> Result<(), String> {
     let salt = hex::encode(hex_salt(&salt)?);
@@ -812,13 +894,14 @@ pub async fn delete_feed(app: tauri::AppHandle, state: tauri::State<'_, AppState
     let dir = feeds_dir(&app);
     let db = state.db.clone();
     let key = salt.clone();
+    let now = chrono::Utc::now().timestamp();
     let released = blocking(
         move || {
             let mut released = Vec::new();
             if let Some(feed) = db.feed_own(&key)? {
                 released = swap_own_lists(&own_owner(&key), &own_lists(&dir, &feed), &[]);
             }
-            db.feed_own_delete(&key)?;
+            db.feed_own_delete(&key, now, FEED_LISTING_TTL_SECS)?;
             Ok(released)
         },
         "feeds_failed",
@@ -904,10 +987,24 @@ pub async fn get_feed_items(
     state: tauri::State<'_, AppState>,
     publisher: String,
     salt: String,
-) -> Result<Vec<FollowedItem>, String> {
+) -> Result<Vec<FollowedItemInfo>, String> {
     let (publisher, salt) = (hex::encode(hex_publisher(&publisher)?), hex::encode(hex_salt(&salt)?));
     let db = state.db.clone();
-    blocking(move || db.feed_followed_items(&publisher, &salt), "feeds_failed", "Could not read feeds").await
+    let items = blocking(move || db.feed_followed_items(&publisher, &salt), "feeds_failed", "Could not read feeds").await?;
+    Ok(items
+        .into_iter()
+        .map(|item| FollowedItemInfo { risky: auto_download_refuses(&item.item.name), item })
+        .collect())
+}
+
+/// An item of a followed feed, as the page shows it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FollowedItemInfo {
+    #[serde(flatten)]
+    pub item: FollowedItem,
+    /// A type that can run code or change settings, which automatic
+    /// downloads never take: the page asks before downloading it.
+    pub risky: bool,
 }
 
 #[tauri::command]
@@ -1004,10 +1101,21 @@ pub async fn download_feed_items(
     }
 }
 
-/// Start one item's download, in the feed's category, and mark it so.
+/// Start one item's download, in the feed's category, and mark it so. It
+/// finishes in the feed's folder in `Feeds`, kept private (see
+/// `sharing::feed_downloads`).
 async fn start_item_download(app: &tauri::AppHandle, feed: &FollowedFeed, item: &FeedItem) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let started = crate::commands::transfers::start_download(
+    let db = state.db.clone();
+    let (publisher, salt, title) = (feed.publisher.clone(), feed.salt.clone(), feed.title.clone());
+    let folder = blocking(
+        move || db.feed_followed_folder(&publisher, &salt, &title),
+        "feeds_failed",
+        "Could not read feeds",
+    )
+    .await?
+    .ok_or_else(|| coded("feeds_not_found", "That feed could not be found"))?;
+    let started = crate::commands::transfers::start_download_to(
         app.clone(),
         state.clone(),
         item.ed2k.clone(),
@@ -1020,6 +1128,7 @@ async fn start_item_download(app: &tauri::AppHandle, feed: &FollowedFeed, item: 
         (!item.aich.is_empty()).then(|| item.aich.clone()),
         None,
         None,
+        Some(folder),
     )
     .await?;
     if !feed.auto_category.trim().is_empty() && !started.already_queued {
@@ -1036,6 +1145,37 @@ async fn start_item_download(app: &tauri::AppHandle, feed: &FollowedFeed, item: 
     let (publisher, salt, ed2k) = (feed.publisher.clone(), feed.salt.clone(), item.ed2k.clone());
     let _ = tokio::task::spawn_blocking(move || db.feed_mark_downloaded(&publisher, &salt, &ed2k)).await;
     Ok(())
+}
+
+/// Open the folder a followed feed's files finish in, or `Feeds` before the
+/// first has been downloaded.
+#[tauri::command]
+pub async fn open_feed_folder(state: tauri::State<'_, AppState>, publisher: String, salt: String) -> Result<(), String> {
+    let (publisher, salt) = (hex::encode(hex_publisher(&publisher)?), hex::encode(hex_salt(&salt)?));
+    let db = state.db.clone();
+    let feed = blocking(move || db.feed_followed(&publisher, &salt), "feeds_failed", "Could not read feeds")
+        .await?
+        .ok_or_else(|| coded("feeds_not_found", "That feed could not be found"))?;
+    let root = state.config.read().await.settings.download_folder.clone();
+    tokio::task::spawn_blocking(move || {
+        let root = Path::new(&root);
+        let dir = if feed.folder.is_empty() {
+            crate::security::filesystem::prepare_approved_subdir(
+                root,
+                crate::sharing::feed_downloads::FEEDS_DIR,
+                &[root.to_string_lossy().into_owned()],
+            )
+            .inspect(|feeds| crate::sharing::feed_downloads::mark_feeds_dir(feeds))
+            .map_err(anyhow::Error::from)
+        } else {
+            crate::network::ed2k::transfer::prepare_feed_completed_dir(root, &feed.folder)
+        }
+        .map_err(|e| coded_ctx("transfers_invalid_path", "Invalid or changed download path", e))?;
+        crate::security::filesystem::open_with_default_app(&dir)
+            .map_err(|e| coded_ctx("transfers_open_explorer_failed", "Failed to open the folder", e))
+    })
+    .await
+    .map_err(|e| coded_ctx("feeds_task_error", "Task error", e))?
 }
 
 /// Stop following a feed: its list stops being served and is deleted, and
@@ -1804,12 +1944,19 @@ async fn auto_download(app: &tauri::AppHandle, state: &AppState, publisher: &str
     let read = tokio::task::spawn_blocking(move || {
         let feed = db.feed_followed(&key_pub, &key_salt).ok().flatten()?;
         let spent = db.feed_auto_bytes(&key_pub, &key_salt, now).unwrap_or(0);
-        Some((feed, spent))
+        let downloaded: std::collections::HashSet<String> = db
+            .feed_followed_items(&key_pub, &key_salt)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|item| item.downloaded)
+            .map(|item| item.item.ed2k)
+            .collect();
+        Some((feed, spent, downloaded))
     })
     .await
     .ok()
     .flatten();
-    let Some((feed, mut spent)) = read.filter(|(feed, _)| feed.auto_download) else {
+    let Some((feed, mut spent, downloaded)) = read.filter(|(feed, _, _)| feed.auto_download) else {
         return 0;
     };
     // Measured once: what this pass starts is not on disk yet, so it is
@@ -1820,8 +1967,10 @@ async fn auto_download(app: &tauri::AppHandle, state: &AppState, publisher: &str
         if !auto_download_allows(&feed, item, spent) {
             continue;
         }
-        // Held already, or on its way: nothing to start.
-        if state.local_index.read().await.get_by_hash(&item.ed2k).is_some()
+        // Held already, or on its way: nothing to start. A feed's files are
+        // in no library, so one this feed started before counts as held.
+        if downloaded.contains(&item.ed2k)
+            || state.local_index.read().await.get_by_hash(&item.ed2k).is_some()
             || state.transfer_manager.read().await.has_pending_for_hash(&item.ed2k)
         {
             continue;
@@ -2237,14 +2386,16 @@ async fn republish(app: &tauri::AppHandle, state: &AppState, salt: &str, now: i6
         republish_retry().lock().remove(salt);
         let (db, key, sequence) = (state.db.clone(), salt.to_string(), current.sequence);
         let _ = tokio::task::spawn_blocking(move || db.feed_own_republished(&key, sequence, now)).await;
+        send_listing(state, &current, now).await;
         return;
     }
     let adopted = match (outcome, sent_pending) {
         (Republished::Adopted, Some(pending)) => adopt_pending(state, &dir, &current, &pending, now).await,
         _ => None,
     };
-    if adopted.is_some() {
+    if let Some(adopted) = adopted {
         republish_retry().lock().remove(salt);
+        send_listing(state, &adopted, now).await;
         let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "salt": salt }));
     } else {
         retry();
@@ -2281,6 +2432,7 @@ async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
     if crate::commands::channels::require_ember(state).await.is_err() || state.db.chat_locked() {
         return;
     }
+    send_due_withdrawals(state, now).await;
     // Our own heads, republished before they age: the longest due, off the
     // tick, unless one is being republished now.
     let db = state.db.clone();
@@ -2400,6 +2552,7 @@ mod tests {
             auto_max_item_mib: auto_item,
             auto_max_day_mib: auto_day,
             auto_category: String::new(),
+            folder: String::new(),
         }
     }
 
@@ -2643,6 +2796,8 @@ mod tests {
             published_description: "old words".into(),
             changed: true,
             pending: None,
+            listed: false,
+            listing_sent_at: 0,
         };
         let head = own_head(&feed).unwrap();
         assert_eq!((head.title.as_str(), head.description.as_str(), head.sequence), ("Published", "old words", 7));
@@ -2666,6 +2821,8 @@ mod tests {
             published_description: String::new(),
             changed: false,
             pending,
+            listed: false,
+            listing_sent_at: 0,
         }
     }
 

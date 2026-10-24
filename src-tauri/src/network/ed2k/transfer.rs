@@ -1350,6 +1350,92 @@ pub(crate) fn move_part_to_completed(
     })
 }
 
+/// The folder a finished download from a feed lands in:
+/// `<download_root>/Feeds/<folder>`, each made inside the approved root as
+/// `Downloads` is. When the feed's own folder cannot be made, `Feeds` itself:
+/// never `Downloads`, which may be shared. Blocking.
+pub(crate) fn prepare_feed_completed_dir(
+    download_root: &std::path::Path,
+    folder: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let allowed = vec![download_root.to_string_lossy().into_owned()];
+    let feeds = crate::security::filesystem::prepare_approved_subdir(
+        download_root,
+        crate::sharing::feed_downloads::FEEDS_DIR,
+        &allowed,
+    )
+    .map_err(|e| download_folder_error("preparing Feeds", download_root, e))?;
+    crate::sharing::feed_downloads::mark_feeds_dir(&feeds);
+    match crate::security::filesystem::prepare_approved_subdir_like_parent(&feeds, folder, &allowed) {
+        Ok(dir) => Ok(dir),
+        Err(e) => {
+            tracing::warn!(
+                "Could not use the feed folder {folder} in {}: {e}. Finishing into Feeds.",
+                feeds.display()
+            );
+            Ok(feeds)
+        }
+    }
+}
+
+/// [`move_part_to_completed`] for a download from a feed, into its feed
+/// folder (see [`prepare_feed_completed_dir`]). Blocking.
+pub(crate) fn move_part_to_feed_folder(
+    part_path: &std::path::Path,
+    part_root: &std::path::Path,
+    download_root: &std::path::Path,
+    folder: &str,
+    file_name: &str,
+    expected_source_identity: &crate::security::filesystem::ObjectIdentity,
+) -> anyhow::Result<std::path::PathBuf> {
+    let completed_dir = prepare_feed_completed_dir(download_root, folder)?;
+    move_part_between_roots_approved(
+        part_path,
+        part_root,
+        &completed_dir.join(file_name),
+        download_root,
+        expected_source_identity,
+    )
+    .map_err(|e| {
+        let error = format!("{e:#}");
+        if is_disk_full_error(&error) || is_download_folder_error(&error) {
+            e
+        } else {
+            anyhow::anyhow!("{COMPLETION_MOVE_STAGE}: {error}")
+        }
+    })
+}
+
+/// Where a finished download lands, by what kind it is: a feed's in its feed
+/// folder, any other in its category's folder in `Downloads`.
+pub(crate) fn move_part_to_its_folder(
+    transfer_id: &str,
+    part_path: &std::path::Path,
+    part_root: &std::path::Path,
+    download_root: &std::path::Path,
+    file_name: &str,
+    expected_source_identity: &crate::security::filesystem::ObjectIdentity,
+) -> anyhow::Result<std::path::PathBuf> {
+    match crate::sharing::feed_downloads::folder_of(transfer_id) {
+        Some(folder) => move_part_to_feed_folder(
+            part_path,
+            part_root,
+            download_root,
+            &folder,
+            file_name,
+            expected_source_identity,
+        ),
+        None => move_part_to_completed(
+            part_path,
+            part_root,
+            download_root,
+            &crate::storage::category_folders::completion_subdir(transfer_id),
+            file_name,
+            expected_source_identity,
+        ),
+    }
+}
+
 /// Prefix on a failure to move a verified `.part` into `Downloads`. Every
 /// retry reads the whole file again to verify it, so the event loop retries
 /// such a failure once and then leaves the download Failed, `.part` kept, for
@@ -3788,7 +3874,8 @@ pub(crate) fn settle_stale_completion_copies(
     let dirs = finished_file_dirs()
         .into_iter()
         .map(|dir| std::path::Path::new(root).join(dir))
-        .chain(category_dirs);
+        .chain(category_dirs)
+        .chain(crate::sharing::feed_downloads::finished_dirs(std::path::Path::new(root)));
     for dir in dirs {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -4011,12 +4098,18 @@ pub(crate) fn recover_completion_copy(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("completion copy has no folder"))?;
     let elsewhere = !crate::storage::part_folders::same_folder(root, download_root);
-    // Its category's folder, when the download it names still has one; a
-    // finished download's no longer does, and lands in Downloads.
-    let subdir = path
+    let stem = path
         .file_name()
         .and_then(|name| name.to_str())
-        .and_then(parse_completion_copy_name)
+        .and_then(parse_completion_copy_name);
+    // A feed's download is published in its feed folder, and looked for
+    // there and in `Feeds`, never in Downloads.
+    if let Some(folder) = stem.and_then(crate::sharing::feed_downloads::folder_of) {
+        return recover_feed_completion_copy(copy, &allowed, dir, root, download_root, elsewhere, &folder, &name, size, is_the_file);
+    }
+    // Its category's folder, when the download it names still has one; a
+    // finished download's no longer does, and lands in Downloads.
+    let subdir = stem
         .map(crate::storage::category_folders::completion_subdir)
         .unwrap_or_default();
     let downloads = std::path::Path::new(download_root).join("Downloads");
@@ -4051,12 +4144,23 @@ pub(crate) fn recover_completion_copy(
         )?;
         return Ok(CopyRecovery::Published(published));
     }
-    let target = dir.join(&name);
+    publish_copy_beside(&copy, &allowed, dir, &name)
+}
+
+/// Publish `copy` in `dir`, where it is, under the first free name from
+/// `name`. Blocking.
+fn publish_copy_beside(
+    copy: &CompletionCopy,
+    allowed: &[String],
+    dir: &std::path::Path,
+    name: &str,
+) -> anyhow::Result<CopyRecovery> {
+    let target = dir.join(name);
     for suffix in 0..=10_000u32 {
         let final_path = dedup_candidate(&target, suffix);
-        match copy.publish(&final_path, &allowed) {
+        match copy.publish(&final_path, allowed) {
             Ok(published) => {
-                sync_published(&published, &allowed);
+                sync_published(&published, allowed);
                 return Ok(CopyRecovery::Published(published));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || final_path.exists() => {}
@@ -4064,6 +4168,54 @@ pub(crate) fn recover_completion_copy(
         }
     }
     anyhow::bail!("no free name for {}", target.display())
+}
+
+/// [`recover_completion_copy`] for a copy of a download from a feed, whose
+/// file is published in its feed `folder`. The copy is made beside where its
+/// file is published, so when it lies in this download folder it is
+/// published there; otherwise in the current one's feed folder.
+#[allow(clippy::too_many_arguments)]
+fn recover_feed_completion_copy(
+    copy: CompletionCopy,
+    allowed: &[String],
+    dir: &std::path::Path,
+    root: &str,
+    download_root: &str,
+    elsewhere: bool,
+    folder: &str,
+    name: &str,
+    size: u64,
+    is_the_file: &dyn Fn(&mut std::fs::File) -> anyhow::Result<bool>,
+) -> anyhow::Result<CopyRecovery> {
+    let current = std::path::Path::new(download_root);
+    let feeds = crate::sharing::feed_downloads::feeds_dir(current);
+    let places = std::iter::once((dir.to_path_buf(), root)).chain(
+        elsewhere
+            .then(|| [(feeds.join(folder), download_root), (feeds.clone(), download_root)])
+            .into_iter()
+            .flatten(),
+    );
+    for (dir, dir_root) in places {
+        for published in published_names(&dir, name) {
+            if is_published_copy(&published, dir_root, &copy.identity, size, is_the_file) {
+                copy.discard(allowed);
+                return Ok(CopyRecovery::AlreadyPublished(published));
+            }
+        }
+    }
+    let name = crate::sharing::name_tag::completed_download_name(name);
+    if elsewhere {
+        let published = move_part_to_feed_folder(
+            &copy.path,
+            std::path::Path::new(root),
+            current,
+            folder,
+            &name,
+            &copy.identity,
+        )?;
+        return Ok(CopyRecovery::Published(published));
+    }
+    publish_copy_beside(&copy, allowed, dir, &name)
 }
 
 /// Approved-root wrapper used by production completion/recovery paths. The

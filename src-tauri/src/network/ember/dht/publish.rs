@@ -54,6 +54,11 @@ pub const RECORD_TYPE_CHANNEL: u8 = 0x03;
 /// [`crate::network::ember::feed`]). Builds before feeds store it as a type
 /// they do not know, for a day, and neither replicate nor read it.
 pub const RECORD_TYPE_FEED: u8 = 0x04;
+/// A public feed's listing in the feed index: the head's fields, signed by
+/// the publisher and filed under a shard of the index (see
+/// [`crate::network::ember::feed::feed_index_key`]) so Discover can find feeds
+/// nobody has a link to. Builds before it keep it as an unknown type for a day.
+pub const RECORD_TYPE_FEED_LISTING: u8 = 0x05;
 
 pub const CHANNEL_KIND_INDEX: u8 = 1;
 pub const CHANNEL_KIND_PRESENCE: u8 = 2;
@@ -1839,13 +1844,27 @@ impl SignedRecord {
         if self.record_type != RECORD_TYPE_FEED {
             return None;
         }
+        let (title, extra) = self.name_and_trailer_extra()?;
+        let fields = crate::network::ember::feed::decode_feed_extra(extra)?;
+        self.feed_head_from(title, fields).map(|head| (self.file_hash, head))
+    }
+
+    /// The title (the record's name) and the trailer's extra bytes of a record
+    /// framed with the channel trailer.
+    fn name_and_trailer_extra(&self) -> Option<(String, &[u8])> {
         let name_len = u16::from_le_bytes(self.data.get(113..115)?.try_into().ok()?) as usize;
         let title = std::str::from_utf8(self.data.get(115..115 + name_len)?).ok()?.to_string();
         let off = 115 + name_len;
         let extra_len = u16::from_le_bytes(self.data.get(off + 1..off + 3)?.try_into().ok()?) as usize;
-        let extra = self.data.get(off + 3..off + 3 + extra_len)?;
-        let (sequence, list_ed2k_hash, item_count, description) =
-            crate::network::ember::feed::decode_feed_extra(extra)?;
+        Some((title, self.data.get(off + 3..off + 3 + extra_len)?))
+    }
+
+    /// A head from a feed record's header and decoded trailer fields, if valid.
+    fn feed_head_from(
+        &self,
+        title: String,
+        (sequence, list_ed2k_hash, item_count, description): (u64, [u8; 16], u32, String),
+    ) -> Option<crate::network::ember::feed::FeedHead> {
         let head = crate::network::ember::feed::FeedHead {
             sequence,
             list_ed2k_hash,
@@ -1855,7 +1874,7 @@ impl SignedRecord {
             title,
             description,
         };
-        head.valid().then_some((self.file_hash, head))
+        head.valid().then_some(head)
     }
 
     /// Whether a storer should keep this feed head: well formed, and filed
@@ -1864,6 +1883,64 @@ impl SignedRecord {
         self.record_type == RECORD_TYPE_FEED
             && self.feed_head().is_some()
             && self.keyword_hash == crate::network::ember::feed::feed_key(&self.publisher_key, &self.file_hash)
+    }
+
+    /// A public feed's listing: the head `head` of the feed `salt`, signed by
+    /// the publisher's identity and filed under its shard of the feed index,
+    /// stamped `timestamp`. `withdrawn` takes the feed out of the index. `None`
+    /// for a head with a field out of bounds.
+    pub fn feed_listing_record(
+        salt: &crate::network::ember::feed::FeedSalt,
+        head: &crate::network::ember::feed::FeedHead,
+        withdrawn: bool,
+        identity: &SigningKey,
+        timestamp: i64,
+    ) -> Option<Self> {
+        let extra = crate::network::ember::feed::encode_feed_listing_extra(head, withdrawn)?;
+        let pubkey = identity.verifying_key().to_bytes();
+        let shard = crate::network::ember::feed::feed_index_shard(&pubkey, salt);
+        let record = Self::build_with_media(
+            RECORD_TYPE_FEED_LISTING,
+            crate::network::ember::feed::feed_index_key(shard),
+            *salt,
+            head.list_blake3,
+            head.list_size,
+            &head.title,
+            None,
+            Some(extra),
+            None,
+            identity,
+            timestamp,
+        );
+        (record.file_name == head.title).then_some(record)
+    }
+
+    /// The salt, head and whether it is withdrawn, of a feed listing that is
+    /// one and well formed. From a verified record only, as [`Self::feed_head`].
+    pub fn feed_listing(
+        &self,
+    ) -> Option<(crate::network::ember::feed::FeedSalt, crate::network::ember::feed::FeedHead, bool)> {
+        if self.record_type != RECORD_TYPE_FEED_LISTING {
+            return None;
+        }
+        let (title, extra) = self.name_and_trailer_extra()?;
+        let (flags, fields) = crate::network::ember::feed::decode_feed_listing_extra(extra)?;
+        let head = self.feed_head_from(title, fields)?;
+        let withdrawn = flags & crate::network::ember::feed::FEED_LISTING_WITHDRAWN != 0;
+        Some((self.file_hash, head, withdrawn))
+    }
+
+    /// Whether a storer should keep this listing: well formed, and filed under
+    /// the index shard its publisher and salt give, so a listing cannot be
+    /// aimed at whichever shard key is nearest a storer.
+    pub fn feed_listing_store_ok(&self) -> bool {
+        self.record_type == RECORD_TYPE_FEED_LISTING
+            && self.feed_listing().is_some()
+            && self.keyword_hash
+                == crate::network::ember::feed::feed_index_key(crate::network::ember::feed::feed_index_shard(
+                    &self.publisher_key,
+                    &self.file_hash,
+                ))
     }
 
     /// A room's settings, signed by the **channel** key and filed under
@@ -2543,7 +2620,7 @@ impl SignedRecord {
         if data[0] == RECORD_TYPE_SOURCE && data.len() < 115 + name_len + SOURCE_CONTACT_WIRE_LEN {
             return false;
         }
-        if (data[0] == RECORD_TYPE_CHANNEL || data[0] == RECORD_TYPE_FEED)
+        if matches!(data[0], RECORD_TYPE_CHANNEL | RECORD_TYPE_FEED | RECORD_TYPE_FEED_LISTING)
             && !channel_trailer_len(data, name_len)
                 .is_some_and(|n| data.len() == 115 + name_len + n)
         {
@@ -2630,10 +2707,10 @@ impl SignedRecord {
         } else {
             None
         };
-        // A feed head carries the same trailer framing, read on demand by
-        // `feed_head`; its shape is checked here so a malformed one is not a
-        // record at all.
-        if record_type == RECORD_TYPE_FEED {
+        // A feed head and a feed listing carry the same trailer framing, read
+        // on demand by `feed_head` and `feed_listing`; its shape is checked
+        // here so a malformed one is not a record at all.
+        if record_type == RECORD_TYPE_FEED || record_type == RECORD_TYPE_FEED_LISTING {
             let off = 115 + name_len;
             let trailer_len = channel_trailer_len(data, name_len)?;
             if data.len() != off + trailer_len || data[off] != CHANNEL_TRAILER_VERSION {

@@ -214,6 +214,7 @@ pub const CHAT_WINDOW_DENIED_COMMANDS: &[&str] = &[
     "set_antileech_patterns",
     "set_block_private_ips",
     "set_feed_items",
+    "set_feed_listed",
     "set_files_friends_only",
     "set_finish_action",
     "set_ip_filter_auto_update",

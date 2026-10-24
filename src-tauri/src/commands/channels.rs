@@ -5851,21 +5851,22 @@ fn inside_ids(rows: &[StoredChannel]) -> std::collections::HashSet<String> {
 const INDEX_SHARD_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// What one public-index shard walk turned up.
-struct ShardWalk {
-    shard: u8,
-    blobs: Vec<Vec<u8>>,
-    /// Enough of the network answered that a room missing from `blobs` can
-    /// be taken as gone. A refused, timed-out or barely answered walk says
-    /// nothing about the rooms it did not return.
-    settled: bool,
+pub(crate) struct ShardWalk {
+    pub(crate) shard: u8,
+    pub(crate) blobs: Vec<Vec<u8>>,
+    /// Enough of the network answered that a listing missing from `blobs`
+    /// can be taken as gone. A refused, timed-out or barely answered walk
+    /// says nothing about the listings it did not return.
+    pub(crate) settled: bool,
 }
 
-/// Walk one shard, asking once more if the network task refused it.
+/// Walk one shard of a public index (rooms' or feeds'), asking once more if
+/// the network task refused it.
 ///
 /// Discover asks for all sixteen shards at once on a pool other automatic
 /// work shares, so a refusal is routine; a timeout has already spent the
 /// whole budget and is not repeated.
-async fn walk_index_shard(state: &AppState, shard: u8, key: [u8; 16]) -> ShardWalk {
+pub(crate) async fn walk_index_shard(state: &AppState, shard: u8, key: [u8; 16]) -> ShardWalk {
     let mut walk = find_raw_keys_counted(state, vec![key], DEFAULT_FIND_TIMEOUT_MS).await;
     if walk.is_err() {
         tokio::time::sleep(INDEX_SHARD_RETRY_DELAY).await;
@@ -5878,11 +5879,11 @@ async fn walk_index_shard(state: &AppState, shard: u8, key: [u8; 16]) -> ShardWa
             settled: responded >= crate::commands::channel_recovery::MIN_RESPONDERS_FOR_ABSENCE,
         },
         Ok(None) => {
-            tracing::debug!(shard, "channel index shard walk timed out");
+            tracing::debug!(shard, "index shard walk timed out");
             ShardWalk { shard, blobs: Vec::new(), settled: false }
         }
         Err(error) => {
-            tracing::debug!(shard, %error, "channel index shard walk refused twice");
+            tracing::debug!(shard, %error, "index shard walk refused twice");
             ShardWalk { shard, blobs: Vec::new(), settled: false }
         }
     }

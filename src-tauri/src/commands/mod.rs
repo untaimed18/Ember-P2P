@@ -72,6 +72,7 @@ pub mod comments;
 pub mod deeplink;
 pub mod emule_import;
 pub mod errors;
+pub mod feed_discover;
 pub mod feeds;
 pub mod peers;
 pub mod preview;

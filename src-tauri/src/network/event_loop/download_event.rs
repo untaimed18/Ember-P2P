@@ -265,6 +265,7 @@ pub(in crate::network) async fn on_download_event(
         // (see `sharing::feed_files`).
         let restricted = from_restricting_friend
             || crate::sharing::feed_files::is_internal_fetch(transfer_id)
+            || crate::sharing::feed_downloads::is_private(transfer_id)
             || {
             let index = local_index.read().await;
             !known_files.is_authoritative()
@@ -441,7 +442,13 @@ pub(in crate::network) async fn on_download_event(
                 .unwrap_or(now)
             };
 
-            if let Ok(hash_bytes) = hex::decode(&file_hash) {
+            // A feed's download is private: it goes in no index, known.met,
+            // KAD or server list (see `sharing::feed_downloads`).
+            let private = crate::sharing::feed_downloads::is_private(transfer_id);
+            if private {
+                info!("Completed download {transfer_id} is from a feed: kept private, out of the library");
+            }
+            if let Some(hash_bytes) = hex::decode(&file_hash).ok().filter(|_| !private) {
                 if hash_bytes.len() == 16 {
                     let mut fh = [0u8; 16];
                     fh.copy_from_slice(&hash_bytes);

@@ -1,4 +1,5 @@
 pub mod disk;
+pub mod feed_downloads;
 pub mod feed_files;
 pub mod indexer;
 pub mod manager;
