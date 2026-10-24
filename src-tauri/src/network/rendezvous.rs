@@ -3031,13 +3031,19 @@ pub async fn poll_friend_relay_tickets(
     Err(last_error.unwrap_or_else(|| "relay ticket poll failed".to_string()))
 }
 
+/// A relay mailbox page: up to eight tickets whose envelopes the server takes
+/// at up to 2 KiB each, hex-encoded. Read under [`MAX_RESPONSE_BYTES`], two
+/// oversized offers anyone holding our intro capability can send made every
+/// poll fail, real friends' tickets with it.
+const MAX_RELAY_MAILBOX_RESPONSE_BYTES: usize = 48 * 1024;
+
 async fn parse_friend_relay_mailbox_response(
     resp: reqwest::Response,
     responder_ember_hash: &[u8; 16],
     secret_key: &[u8; 32],
 ) -> Result<FriendRelayTicketPollPage, String> {
     let body: serde_json::Value =
-        serde_json::from_slice(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
+        serde_json::from_slice(&read_bounded_bytes(resp, MAX_RELAY_MAILBOX_RESPONSE_BYTES).await?)
             .map_err(|e| format!("relay mailbox poll bad body: {e}"))?;
     let items = body["tickets"]
         .as_array()

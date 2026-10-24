@@ -41,6 +41,17 @@ primary_region = 'iad'
     hard_limit = 440
     soft_limit = 400
 
+  # The server keeps connections aside for /health. A failing check takes the
+  # machine out of routing and shows in `fly status` and `fly checks list`, so a
+  # wedged process (an accept loop that stalls without exiting) is seen rather
+  # than silently serving nothing; it does not restart the machine by itself.
+  [[http_service.checks]]
+    grace_period = '10s'
+    interval = '30s'
+    method = 'GET'
+    path = '/health'
+    timeout = '5s'
+
 [[vm]]
   memory = '256mb'
   cpu_kind = 'shared'

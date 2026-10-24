@@ -1949,12 +1949,33 @@ async fn fetch_bootstrap_contacts(
         // and the pid distinguishes concurrent instances.
         static NEXT_TMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = NEXT_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // A random part too: on Linux the temp dir is shared, and a name
+        // another local user could predict they could also create first.
         let tmp_path = std::env::temp_dir().join(format!(
-            "ember-nodes-{}-{unique}.dat",
-            std::process::id()
+            "ember-nodes-{}-{unique}-{:016x}.dat",
+            std::process::id(),
+            rand::random::<u64>()
         ));
-        std::fs::write(&tmp_path, &body)
-            .map_err(|e| format!("failed to write temp nodes.dat: {e}"))?;
+        // Created exclusively, so a symlink planted at the name is refused
+        // rather than followed.
+        {
+            use std::io::Write as _;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&tmp_path)
+                .map_err(|e| format!("failed to create temp nodes.dat: {e}"))?;
+            if let Err(e) = file.write_all(&body) {
+                drop(file);
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(format!("failed to write temp nodes.dat: {e}"));
+            }
+        }
         let parsed = crate::network::kad::bootstrap::load_nodes_dat(&tmp_path);
         let _ = std::fs::remove_file(&tmp_path);
         parsed.map_err(|e| format!("parsed {downloaded} bytes but the file is not a valid nodes.dat: {e}"))

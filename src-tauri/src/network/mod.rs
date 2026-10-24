@@ -972,6 +972,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         active_established_senders: HashMap::new(),
         active_source_overflow: HashMap::new(),
         transfer_friend_hint: HashMap::new(),
+        chat_flush_due: HashMap::new(),
+        chat_session_flushed: HashMap::new(),
         friend_xfer_attempts: HashMap::new(),
         friend_xfer_waiting: HashMap::new(),
         friend_xfer_inbound_last: HashMap::new(),
@@ -2424,6 +2426,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let geoip_for_load = geoip.clone();
         let geoip_dir = geoip_resource_dir.clone();
         Some(tokio::task::spawn_blocking(move || {
+            // An empty file means no ranges, as an absent one does; read as a
+            // damaged list it would block every peer.
+            if std::fs::metadata(&ipfilter_path).is_ok_and(|meta| meta.is_file() && meta.len() == 0) {
+                crate::security::recover_interrupted_replace(&ipfilter_path);
+                if std::fs::metadata(&ipfilter_path).is_ok_and(|meta| meta.len() == 0) {
+                    match std::fs::remove_file(&ipfilter_path) {
+                        Ok(()) => info!("Removed an empty ipfilter.dat: no ranges to load"),
+                        Err(e) => warn!("Could not remove the empty ipfilter.dat: {e}"),
+                    }
+                }
+            }
             let mut filter = IpFilter::new(ipf_enabled, ipf_block_private);
             // Only clear the fail-closed gate when the load succeeded or the
             // file is absent (intentional empty). Mid-file I/O failure returns
@@ -2438,6 +2451,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             filter.blocks_private(),
                             n,
                         );
+                        true
+                    }
+                    // Readable rows that all permit: a list that blocks
+                    // nothing, not a damaged one.
+                    Some(0) if filter.has_permit_ranges() => {
+                        info!("IP filter at {} blocks no ranges", ipfilter_path.display());
                         true
                     }
                     Some(0) => {
@@ -3783,6 +3802,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // Here rather than an arm of its own: the loop is at
                 // `select!`'s branch limit. It keeps its own cadence.
                 on_chat_mailbox_tick(&mut state, &db, &app_handle, &settings, ed25519_secret_key, ed25519_pubkey);
+                chat::flush_due_chat(&mut state, &db, &app_handle, &settings, &ed25519_secret_key).await;
                 on_idle_check(&mut state, &settings, &app_handle, &ed25519_secret_key).await;
                 if settings.ember_native_enabled && !db.chat_locked() {
                     room_dm::send_due_replies(&udp_socket, &mut state, &db).await;
@@ -4961,6 +4981,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         &mut stats_save_in_flight,
         upnp_enabled,
         &mut upnp_mappings,
+        &mut upnp_maintain_handle,
+        &mut upnp_maintain_result_rx,
         &mut xfer_finish_rx,
         &upload_queue_handle,
     )

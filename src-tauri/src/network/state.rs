@@ -639,6 +639,15 @@ pub(super) struct NetworkState {
     /// eD2K/KAD callback paths that fallback needs neither a server login nor
     /// a HighID.
     pub(super) transfer_friend_hint: HashMap<String, [u8; 16]>,
+    /// Friends whose queued chat is to be flushed again while their session is
+    /// up, with when and how many tries it has had. See
+    /// `chat::schedule_chat_flush`.
+    pub(super) chat_flush_due: HashMap<[u8; 16], (std::time::Instant, u32)>,
+    /// The chat rows the flush at a friend's latest session start delivered,
+    /// and when. A friend re-sends their last read receipt as a session
+    /// starts, and it names a line by its text alone; see
+    /// `chat::receipt_excludes`.
+    pub(super) chat_session_flushed: HashMap<[u8; 16], (std::time::Instant, Vec<i64>)>,
     /// In-flight friend transfer requests, keyed by `(friend, file hash)`.
     /// Bounds retries and lets an `OP_EMBER_XFER_ACK` be matched to the
     /// request it answers.

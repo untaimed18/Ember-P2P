@@ -2581,6 +2581,7 @@ async fn handle_command_inner(
                 super::TCP_LISTEN_FAILED.load(std::sync::atomic::Ordering::Relaxed);
             state.stats.advertised_tcp_port = advertised_tcp_port(state);
             state.stats.advertised_udp_port = advertised_udp_port(state);
+            state.stats.quic_udp_port = state.quic_port.unwrap_or(0);
             state.stats.session_age_secs = state.session_started.elapsed().as_secs();
             let _ = tx.send(state.stats.clone());
         }
@@ -4488,6 +4489,8 @@ async fn handle_command_inner(
                                 );
                                 Some(fresh)
                             }
+                            // Rows that all permit: a list that blocks nothing.
+                            Some(0) if fresh.has_permit_ranges() => Some(fresh),
                             Some(0) => {
                                 fresh.mark_ranges_not_ready();
                                 warn!(
@@ -6292,6 +6295,23 @@ async fn handle_command_inner(
                                     return;
                                 }
                             };
+                            // An older message still queued goes first. Sent
+                            // live, this one would overtake it; the flush sends
+                            // both, oldest first.
+                            let (db_first, hex_first) = (db.clone(), hash_hex.clone());
+                            let older_queued = tokio::task::spawn_blocking(move || {
+                                db_first.pending_chat_messages(&hex_first, 1)
+                            })
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .and_then(|rows| rows.first().map(|(id, _, _)| *id))
+                            .is_some_and(|first| first != pending_id);
+                            if older_queued {
+                                schedule_chat_flush(state, friend_eh, std::time::Duration::ZERO);
+                                let _ = tx.send(Err(format!("ChatAlreadyQueued:{pending_id}")));
+                                return;
+                            }
                             let db_ids = db.clone();
                             let hex_ids = hash_hex.clone();
                             let mailbox_id = tokio::task::spawn_blocking(move || {
@@ -6334,6 +6354,7 @@ async fn handle_command_inner(
                                     Some(frame) => frames.push(frame),
                                     None => {
                                         debug!("Chat {pending_id} stays queued: its disappearing timer could not be sealed");
+                                        schedule_chat_flush(state, friend_eh, CHAT_RETRY_AFTER);
                                         let _ = tx.send(Err(format!("ChatAlreadyQueued:{pending_id}")));
                                         return;
                                     }
@@ -6358,6 +6379,8 @@ async fn handle_command_inner(
                                             let _ = tx.send(Ok(()));
                                         }
                                         Err(error) => {
+                                            // Sent, so not retried: a flush would
+                                            // send it a second time.
                                             warn!(
                                                 "Sent chat message remains queued because delivery persistence failed: {error}"
                                             );
@@ -6368,6 +6391,7 @@ async fn handle_command_inner(
                                     }
                                 }
                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    schedule_chat_flush(state, friend_eh, CHAT_RETRY_AFTER);
                                     let _ = tx.send(Err(format!("ChatAlreadyQueued:{pending_id}")));
                                 }
                                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {

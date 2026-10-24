@@ -39,7 +39,7 @@
   import { toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
-  import { formatBytes, formatNumber, formatRelativeTime } from '$lib/utils';
+  import { copyToClipboard, formatBytes, formatNumber, formatRelativeTime } from '$lib/utils';
   import { extensionFromPath, fileTypeFilterLabel, fileTypeKey, type FileTypeKey } from '$lib/fileTypes';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import * as m from '$lib/paraglide/messages';
@@ -377,10 +377,9 @@
   }
 
   async function copy(text: string) {
-    try {
-      await navigator.clipboard.writeText(text);
+    if (await copyToClipboard(text)) {
       toastSuccess(m.feeds_link_copied());
-    } catch {
+    } else {
       toastError(m.error_operation_failed());
     }
   }
@@ -492,8 +491,14 @@
   }
 
   function addFiles(files: FileInfo[]) {
+    const taken = new Set(inFeed);
     const fresh = files
-      .filter((f) => !inFeed.has(f.hash.toLowerCase()))
+      .filter((f) => {
+        const key = f.hash.toLowerCase();
+        if (taken.has(key)) return false;
+        taken.add(key);
+        return true;
+      })
       .slice(0, Math.max(0, FEED_ITEMS_MAX - editItems.length));
     if (fresh.length === 0) return;
     editItems = [

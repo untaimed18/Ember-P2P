@@ -14,6 +14,7 @@
   } from '$lib/api/connectionDoctor';
   import { translateError } from '$lib/i18n';
   import { toast } from '$lib/stores/toast';
+  import { copyToClipboard } from '$lib/utils';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import * as m from '$lib/paraglide/messages';
 
@@ -210,12 +211,7 @@
 
   async function copyReport() {
     if (!report) return;
-    try {
-      await navigator.clipboard.writeText(reportText(report));
-      toast(m.doctor_copied());
-    } catch {
-      toast(m.error_operation_failed());
-    }
+    toast((await copyToClipboard(reportText(report))) ? m.doctor_copied() : m.error_operation_failed());
   }
 
   const statusIcon: Record<string, string> = { pass: '✓', warn: '!', fail: '✕', skip: '–' };

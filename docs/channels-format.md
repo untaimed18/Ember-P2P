@@ -972,7 +972,7 @@ it:
 | --- | --- | --- |
 | Live chat line | `chat_author_joins_gossip_roster`, from `chat_line_admits_author` in `channel_gossip.rs`, the chat handler's one roster write | closed; a member already held is still refreshed (`note_channel_member_alive`) |
 | Presence beacon | `apply_channel_presence_beacons`, `beacon_admits_newcomer` | unchanged: a newcomer needs their own `PresenceBeacon::proves_key` against the current key whatever the rule, as since 1.7.0 |
-| DHT presence record (kind 2) | `ingest_channel_presence_records` | unchanged: a member not held is admitted only by a record that opens under the current key (v2: and whose binding verifies) |
+| DHT presence record (kind 2) | `ingest_channel_presence_records` | a member not held is admitted only by a v2 record that opens under the current key and whose binding verifies; a v1 record refreshes a member already held and admits nobody |
 | Our own row | `record_self_member`, `maybe_publish_channel_presence` | unchanged; only ever our own key |
 | Owner's snapshot (kind 3) | `apply_channel_moderation` | unchanged: banned and moderator rows on the owner's signature |
 | Moderator's ban or unban | `apply_channel_ban_action` | unchanged: a moderator the owner named is an authority over who is in the room |
@@ -985,12 +985,16 @@ it has to stay: it is how a newcomer finds the room's members and how they
 find the newcomer, before either has anyone to send a beacon to. In v1 the
 seal's AAD names the room but not the member (`presence_extra_aad`), so a
 storer holding a current member's record could copy the sealed extra into a
-record it signs itself. That needs the storer to hold such a record for the
-room, which a lagging member's re-serve does not provide. The v2 form from
-[item 9](#private-membership-records-v2-item-9) closes it: the AAD names the
-pseudonym that signs the record and the seal carries the member's signature
-binding them. v1 is still read, and still admits, for members on 1.7.4, so
-the limit stands for their records.
+record it signs itself, and every device that counted it would put the
+storer's key on the roster for the owner to seal the next epoch to. Every
+member publishes a v1 copy until 1.8.0, not only members on 1.7.4, so any
+storer of the room's presence slot holds one. Only the v2 form from
+[item 9](#private-membership-records-v2-item-9) counts in a private room: its
+AAD names the pseudonym that signs the record and the seal carries the
+member's signature binding them. A v1 record is still read, refreshing a
+member already held, and admits nobody (`merge_channel_presence_blobs`). A
+newcomer on 1.7.0 to 1.7.4 publishes only v1 and is admitted by the key proof
+in their own beacon instead, which room digests carry to every member.
 
 **Older members.** Builds before 1.7.0 send no key proofs. In a room whose
 owner runs 1.7.5 they are no longer admitted through their chat lines, but
@@ -1185,7 +1189,7 @@ copied into a record another key signs fails the AAD; a seal re-made for
 another pseudonym by someone holding the content key opens, and fails the
 binding, which names the member's own pseudonym. The record opened under the
 current secret counts as proof of the current key for
-[admission](#admission-item-8), as v1 does.
+[admission](#admission-item-8); in a private room a v1 record does not.
 
 ### Key epochs, v2
 

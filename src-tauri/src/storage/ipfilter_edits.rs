@@ -54,12 +54,14 @@ impl IpFilterEdits {
         }
     }
 
-    /// The user removed `start..=end`: one they had added is simply forgotten,
-    /// one from the list is taken out of every new list too.
+    /// The user removed the row `start..=end`. The Security page shows ranges
+    /// merged, so the row may hold several: every range they added inside it
+    /// is forgotten, and unless the row was exactly one of those, whatever the
+    /// list had inside it is taken out of every new list too.
     pub fn record_remove(&mut self, start: u32, end: u32) {
-        let before = self.added.len();
-        self.added.retain(|r| !Self::same(r, start, end));
-        if self.added.len() < before {
+        let exactly_added = self.added.iter().any(|r| Self::same(r, start, end));
+        self.added.retain(|r| r.start < start || r.end > end);
+        if exactly_added {
             return;
         }
         if !self.removed.iter().any(|r| Self::same(r, start, end)) && self.removed.len() < MAX_EDITS {
@@ -70,10 +72,7 @@ impl IpFilterEdits {
     /// Re-apply the edits to a freshly loaded list.
     pub fn apply(&self, filter: &mut IpFilter) {
         for range in &self.removed {
-            filter.remove_range(
-                &Ipv4Addr::from(range.start).to_string(),
-                &Ipv4Addr::from(range.end).to_string(),
-            );
+            filter.remove_ranges_within(range.start, range.end);
         }
         for range in &self.added {
             filter.add_range(
@@ -154,5 +153,41 @@ mod tests {
         let bytes = String::from_utf8(list.canonical_dat_bytes()).unwrap();
         assert!(bytes.contains("9.9.9.0"));
         assert!(!bytes.contains("1.0.0.0"));
+    }
+
+    /// The page shows a list range and an adjacent added one as one merged
+    /// row. Removing that row unblocks both, and a new list must not bring
+    /// either back.
+    #[test]
+    fn removing_a_merged_row_stays_removed_in_the_next_list() {
+        let ip = |a, b, c, d| u32::from(Ipv4Addr::new(a, b, c, d));
+        let list = |filter: &mut IpFilter| {
+            filter.add_range(Ipv4Addr::new(5, 6, 7, 0), Ipv4Addr::new(5, 6, 7, 255), "list".into());
+            filter.add_range(Ipv4Addr::new(8, 8, 8, 0), Ipv4Addr::new(8, 8, 8, 255), "elsewhere".into());
+        };
+        let mut edits = IpFilterEdits::default();
+        edits.record_add(ip(5, 6, 8, 0), ip(5, 6, 8, 255), "mine".into());
+        // The merged row 5.6.7.0 - 5.6.8.255 is what the page offers to remove.
+        edits.record_remove(ip(5, 6, 7, 0), ip(5, 6, 8, 255));
+        assert!(edits.added.is_empty(), "the added range inside the row is forgotten");
+
+        let mut next = IpFilter::new(true, false);
+        list(&mut next);
+        next.mark_ranges_ready();
+        edits.apply(&mut next);
+        assert!(!next.is_blocked(Ipv4Addr::new(5, 6, 8, 1)));
+        assert!(!next.is_blocked(Ipv4Addr::new(5, 6, 7, 1)));
+        assert!(next.is_blocked(Ipv4Addr::new(8, 8, 8, 1)), "ranges outside the row stay");
+
+        // A later list whose range reaches past the removed row on both sides
+        // keeps blocking only what lies outside it.
+        let mut wider = IpFilter::new(true, false);
+        wider.add_range(Ipv4Addr::new(5, 6, 6, 0), Ipv4Addr::new(5, 6, 9, 255), "wider".into());
+        wider.mark_ranges_ready();
+        edits.apply(&mut wider);
+        assert!(!wider.is_blocked(Ipv4Addr::new(5, 6, 7, 1)));
+        assert!(!wider.is_blocked(Ipv4Addr::new(5, 6, 8, 255)));
+        assert!(wider.is_blocked(Ipv4Addr::new(5, 6, 6, 255)));
+        assert!(wider.is_blocked(Ipv4Addr::new(5, 6, 9, 0)));
     }
 }

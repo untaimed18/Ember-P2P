@@ -1130,7 +1130,7 @@ pub(super) async fn handle_inbound_channel_gossip(
             if opened == ember::channel::OpenedUnder::Current
                 || channel_member_on_roster(state, db, gossip.channel_id, &sender)
             {
-                apply_xfer_offer(socket, state, db, app_handle, &ch, &gossip, offer, key, sealed)
+                apply_xfer_offer(socket, state, db, app_handle, &ch, &gossip, offer, key, sealed, dedup_key)
                     .await;
             } else {
                 debug!("Ember Transfer: ignored an offer in {channel_id_hex} under a retired key");
@@ -1210,7 +1210,7 @@ pub(super) async fn handle_inbound_channel_gossip(
     ) {
         note_gossip_proven(&gossip.msg_id, &plain);
         apply_room_friend_request(
-            socket, state, db, app_handle, &gossip, from_id, opened, sender_pk, tag,
+            socket, state, db, app_handle, &gossip, from_id, opened, sender_pk, tag, dedup_key,
         )
         .await;
         return;
@@ -1264,6 +1264,7 @@ pub(super) async fn handle_inbound_channel_gossip(
             successor_pk,
             version,
             proven,
+            dedup_key,
         )
         .await;
         return;
@@ -1304,7 +1305,7 @@ pub(super) async fn handle_inbound_channel_gossip(
         if !channel_history_sync_ok(state, gossip.channel_id, &sender_pk) {
             // Refused for rate, not validity, so the dedup slot goes back and a
             // genuine retry once the window rolls off is still admissible.
-            forget_channel_gossip(state, &gossip.msg_id);
+            forget_channel_gossip(state, &dedup_key);
             debug!("Ember channel gossip: rate-limited history sync in {channel_id_hex}");
             return;
         }
@@ -1314,7 +1315,7 @@ pub(super) async fn handle_inbound_channel_gossip(
         // allowance all of our rooms share. Any other member can answer the
         // same request, so one refused here is not left without history.
         if !channel_history_replies_ok(gossip.channel_id) {
-            forget_channel_gossip(state, &gossip.msg_id);
+            forget_channel_gossip(state, &dedup_key);
             debug!("Ember channel gossip: history sync replies for {channel_id_hex} at the room ceiling");
             return;
         }
@@ -1365,7 +1366,7 @@ pub(super) async fn handle_inbound_channel_gossip(
             chrono::Utc::now().timestamp(),
         );
         if fresh && !channel_author_gossip_ok(state, gossip.channel_id, &sender_pk) {
-            forget_channel_gossip(state, &gossip.msg_id);
+            forget_channel_gossip(state, &dedup_key);
             debug!("Ember channel gossip: rate-limited mod action in {channel_id_hex}");
             return;
         }
@@ -1458,6 +1459,7 @@ pub(super) async fn handle_inbound_channel_gossip(
             None,
             from_id,
             opened,
+            dedup_key,
         )
         .await;
         return;
@@ -1530,6 +1532,7 @@ pub(super) async fn handle_inbound_channel_gossip(
                     Some(frame),
                     from_id,
                     opened,
+                    dedup_key,
                 )
                 .await;
             }
@@ -2315,6 +2318,7 @@ async fn apply_room_friend_request(
     opened: ember::channel::OpenedUnder,
     sender_pk: [u8; 32],
     tag: [u8; 16],
+    dedup_key: [u8; 16],
 ) {
     let channel_id = gossip.channel_id;
     let now = chrono::Utc::now().timestamp();
@@ -2330,7 +2334,7 @@ async fn apply_room_friend_request(
         return;
     }
     if !channel_author_gossip_ok(state, channel_id, &sender_pk) {
-        forget_channel_gossip(state, &gossip.msg_id);
+        forget_channel_gossip(state, &dedup_key);
         return;
     }
     // Signed by its sender, and v1.6.x has no room friend request.
@@ -2538,6 +2542,7 @@ pub(super) async fn apply_channel_handoff_ready(
     successor_pk: [u8; 32],
     version: u64,
     proven: bool,
+    dedup_key: [u8; 16],
 ) {
     let mut offer_known = handoff_offers_seen()
         .lock()
@@ -2663,7 +2668,7 @@ pub(super) async fn apply_channel_handoff_ready(
         // answers may be a flood behind it, or have crossed this node before a
         // restart, and a copy arriving once we have seen it must still pass.
         if !offer_known || relay {
-            forget_channel_gossip(state, &gossip.msg_id);
+            forget_channel_gossip(state, &dedup_key);
         }
         debug!(
             "Ember channel handoff: not relaying a ready in {} (banned sender, unknown or \
@@ -3416,6 +3421,7 @@ pub(super) async fn handle_inbound_channel_edit(
     v2: Option<ember::channel::ChatV2Frame>,
     from_id: ember::dht::EmberNodeId,
     opened: ember::channel::OpenedUnder,
+    dedup_key: [u8; 16],
 ) {
     let form = if v2.is_some() {
         ember::channel::ChatForm::V2
@@ -3436,7 +3442,7 @@ pub(super) async fn handle_inbound_channel_edit(
             form,
         )
     {
-        forget_channel_gossip(state, &gossip.msg_id);
+        forget_channel_gossip(state, &dedup_key);
         debug!("Ember channel edit: rate-limited author in {channel_id_hex}");
         return;
     }
@@ -3449,7 +3455,7 @@ pub(super) async fn handle_inbound_channel_edit(
     if opened == ember::channel::OpenedUnder::Retired
         && !channel_member_on_roster(state, db, gossip.channel_id, &edit.sender)
     {
-        forget_channel_gossip(state, &gossip.msg_id);
+        forget_channel_gossip(state, &dedup_key);
         return;
     }
     let Some(cleaned) = crate::security::sanitize_message_text(&edit.text) else {

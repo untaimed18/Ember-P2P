@@ -1416,6 +1416,7 @@ pub(super) async fn apply_xfer_offer(
     offer: ember::channel::XferOffer,
     key: [u8; 32],
     sealed: bool,
+    dedup_key: [u8; 16],
 ) {
     let sender_hex = hex::encode(offer.sender);
     let channel_id = gossip.channel_id;
@@ -1433,7 +1434,7 @@ pub(super) async fn apply_xfer_offer(
     match gate {
         XferOfferGate::Refused => return,
         XferOfferGate::Shed => {
-            forget_channel_gossip(state, &gossip.msg_id);
+            forget_channel_gossip(state, &dedup_key);
             return;
         }
         // At once, and ahead of the checks below: the sender only needs to

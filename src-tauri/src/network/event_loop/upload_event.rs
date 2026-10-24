@@ -678,7 +678,7 @@ pub(in crate::network) async fn on_upload_event(
             // unless chat with them was turned off since, which
             // holds it until it is back on or ages out.
             if still_friend && settings.chat_allowed_with(ember_hash) {
-                flush_pending_chat(
+                let delivered = flush_pending_chat(
                     db,
                     app_handle,
                     &state.ember_sessions,
@@ -686,6 +686,10 @@ pub(in crate::network) async fn on_upload_event(
                     *ember_hash,
                 )
                 .await;
+                note_session_flush(state, *ember_hash, delivered);
+                // For whatever one flush left: past its cap, or a queue that
+                // filled.
+                schedule_chat_flush(state, *ember_hash, CHAT_RETRY_AFTER);
                 if settings.read_receipts_with(ember_hash) {
                     flush_pending_read_receipt(
                         db,
@@ -843,7 +847,7 @@ pub(in crate::network) async fn on_upload_event(
                 chat_attach::on_friend_session(state, *ember_hash).await;
                 send_friend_status(state, settings, &ed25519_secret_key, *ember_hash).await;
                 if settings.chat_allowed_with(ember_hash) {
-                    flush_pending_chat(
+                    let delivered = flush_pending_chat(
                         db,
                         app_handle,
                         &state.ember_sessions,
@@ -851,6 +855,10 @@ pub(in crate::network) async fn on_upload_event(
                         *ember_hash,
                     )
                     .await;
+                    note_session_flush(state, *ember_hash, delivered);
+                    // For whatever one flush left: past its cap, or a queue
+                    // that filled.
+                    schedule_chat_flush(state, *ember_hash, CHAT_RETRY_AFTER);
                     chat_attach::send_queued(state, db, app_handle, settings, *ember_hash).await;
                 }
                 if settings.read_receipts_with(ember_hash) {
@@ -1139,8 +1147,9 @@ pub(in crate::network) async fn on_upload_event(
         let body_hex = hex::encode(body_hash);
         let db_seen = db.clone();
         let hash_for_db = hash_hex.clone();
+        let exclude = receipt_excludes(state, &read_eh);
         match tokio::task::spawn_blocking(move || {
-            db_seen.mark_sent_seen_by_hash(&hash_for_db, &body_hex)
+            db_seen.mark_sent_seen_by_hash(&hash_for_db, &body_hex, &exclude)
         })
         .await
         {

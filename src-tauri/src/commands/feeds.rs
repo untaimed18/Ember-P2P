@@ -380,6 +380,9 @@ pub async fn set_feed_items(
             });
         }
     }
+    if !saved.dropped.is_empty() && crate::commands::sharing::startup_library_loading() {
+        return Err(library_loading());
+    }
     // Not while a Publish reads the items and drops those no longer shared.
     let _editing = edit_lock().lock().await;
     let db = state.db.clone();
@@ -389,6 +392,17 @@ pub async fn set_feed_items(
     }
     saved.items = out;
     Ok(saved)
+}
+
+/// Refusal for a save or publish that would drop items while the startup scan
+/// is still putting last session's files back in the Library: missing from
+/// the index then is not gone, and a dropped item is gone from the feed for
+/// good.
+fn library_loading() -> String {
+    coded(
+        "feeds_library_loading",
+        "The Library is still loading its files; try again in a moment",
+    )
 }
 
 /// Whether `item` is still a file the user shares with everyone, as it was
@@ -446,6 +460,9 @@ pub async fn publish_feed(
             items.iter().filter(|item| still_public(&index, item)).cloned().collect()
         };
         if kept.len() != items.len() {
+            if crate::commands::sharing::startup_library_loading() {
+                return Err(library_loading());
+            }
             let db = state.db.clone();
             let (key, kept) = (salt.clone(), kept.clone());
             blocking(move || db.feed_own_set_items(&key, &kept), "feeds_failed", "Could not save the feed").await?;

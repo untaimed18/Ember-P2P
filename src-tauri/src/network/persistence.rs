@@ -350,7 +350,13 @@ pub(super) fn spawn_save_ipfilter_dat(ip_filter: &IpFilter, path: PathBuf) {
         warn!("Not writing ipfilter.dat: the persisted list was never loaded this session");
         return;
     }
-    let bytes = ip_filter.canonical_dat_bytes();
+    // Permit rows block nothing, and a file of them alone loads as a list with
+    // no ranges: no blocked range left is no file.
+    let bytes = if ip_filter.range_count() == 0 {
+        Vec::new()
+    } else {
+        ip_filter.canonical_dat_bytes()
+    };
     spawn_ordered_ipfilter_write(path, bytes);
 }
 
@@ -370,6 +376,19 @@ fn spawn_ordered_ipfilter_write(path: PathBuf, bytes: Vec<u8>) -> tokio::task::J
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if IPFILTER_SAVE_GENERATION.load(Ordering::Relaxed) != gen {
+            return;
+        }
+        // No ranges left: an absent file is "nothing to filter", where an
+        // empty one reads at startup as a damaged list and fails closed.
+        if bytes.is_empty() {
+            // Settle a parked replace first, or it would be restored over the
+            // absent file and bring the old list back.
+            crate::security::recover_interrupted_replace(&path);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!("Failed to remove the emptied ipfilter.dat: {e}"),
+            }
             return;
         }
         if let Err(e) = crate::security::atomic_write(&path, &bytes, false) {
@@ -456,6 +475,7 @@ pub(super) async fn load_ipfilter_on_enable(state: &mut NetworkState) {
                 info!("Loaded {n} IP filter entries on enable");
                 Some(fresh)
             }
+            Some(0) if fresh.has_permit_ranges() => Some(fresh),
             Some(0) => {
                 warn!(
                     "ipfilter.dat contained no valid ranges on enable; leaving fail-closed until a successful reload"
@@ -563,6 +583,38 @@ mod tests {
         import.await.unwrap().unwrap();
         edit.await.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"imported list");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Removing the last range must not leave an empty `ipfilter.dat`: startup
+    /// reads an empty list as damaged and blocks every peer.
+    #[tokio::test]
+    async fn removing_the_last_range_removes_the_file() {
+        let _serial = serial().await;
+        let dir = std::env::temp_dir().join(format!(
+            "ember-ipfilter-empty-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ipfilter.dat");
+        let mut filter = IpFilter::new(true, false);
+        filter.mark_loaded_from_disk();
+        filter.add_range(
+            std::net::Ipv4Addr::new(5, 6, 7, 0),
+            std::net::Ipv4Addr::new(5, 6, 7, 255),
+            "leecher".into(),
+        );
+        spawn_ordered_ipfilter_write(path.clone(), filter.canonical_dat_bytes())
+            .await
+            .unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+
+        assert!(filter.remove_range("5.6.7.0", "5.6.7.255"));
+        spawn_ordered_ipfilter_write(path.clone(), filter.canonical_dat_bytes())
+            .await
+            .unwrap();
+        assert!(!path.exists(), "an empty list is no file, which loads as no ranges");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

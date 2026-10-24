@@ -344,6 +344,14 @@ pub(crate) async fn run_graceful_shutdown(
         );
     }
 
+    // While the manager still holds the session's order: the network
+    // shutdown below stops the running downloads. Once, as a second pass
+    // runs after that and would save what it left.
+    static ORDER_SAVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !ORDER_SAVED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        commands::transfers::persist_download_order(&state).await;
+    }
+
     let tx = state.network_tx.clone();
     const SHUTDOWN_SEND_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
     let start = std::time::Instant::now();
@@ -1394,7 +1402,17 @@ pub fn run() {
             let net_tx = startup_network_tx;
             let startup_cancel_flags = hash_cancel_flags.clone();
             let startup_fresh_part_hashes = fresh_part_hashes.clone();
+            commands::sharing::STARTUP_LIBRARY_LOADING.store(true, std::sync::atomic::Ordering::Release);
             let startup_scan_handle = tauri::async_runtime::handle().inner().spawn(async move {
+                // However the scan ends, the index stops being a partial one.
+                struct LibraryLoaded;
+                impl Drop for LibraryLoaded {
+                    fn drop(&mut self) {
+                        commands::sharing::STARTUP_LIBRARY_LOADING
+                            .store(false, std::sync::atomic::Ordering::Release);
+                    }
+                }
+                let library_loaded = LibraryLoaded;
                 if shared_folders.is_empty() {
                     info!("Indexed 0 files from 0 shared folders");
                     let _ = net_tx.send(network::NetworkCommand::StartupLibraryIndexed).await;
@@ -1876,6 +1894,7 @@ pub fn run() {
                 commands::sharing::refresh_file_cache(&index_clone, &csf).await;
                 // Every file known from last session is in the index now, with
                 // its hash; only new ones wait for hashing.
+                drop(library_loaded);
                 let _ = net_tx.send(network::NetworkCommand::StartupLibraryIndexed).await;
 
                 let _ = startup_app.emit("shared-files-changed", serde_json::json!({
@@ -2711,23 +2730,38 @@ pub fn run() {
             // callable IPC. `ember_ping_peer` and `ember_request_sources` were
             // registered unconditionally while the rest of this list was
             // already gated; that was an oversight rather than a decision.
-            #[cfg(debug_assertions)]
-            {
-                ember_invoke_handler![
-                    commands::peers::ember_ping_peer,
-                    commands::peers::ember_request_sources,
-                    commands::peers::add_ember_dht_contact,
-                    commands::peers::ember_dht_ping_peer,
-                    commands::peers::ember_dht_find_node,
-                    commands::peers::ember_dht_iterative_find_node,
-                    commands::peers::ember_dht_publish_keyword,
-                    commands::peers::ember_dht_find_value,
-                    commands::peers::ember_dht_run_maintenance,
-                ]
+            // Names the handler's type, which passing it straight to
+            // `invoke_handler` used to supply.
+            fn typed<F: Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static>(handler: F) -> F {
+                handler
             }
+            #[cfg(debug_assertions)]
+            let handler = typed(ember_invoke_handler![
+                commands::peers::ember_ping_peer,
+                commands::peers::ember_request_sources,
+                commands::peers::add_ember_dht_contact,
+                commands::peers::ember_dht_ping_peer,
+                commands::peers::ember_dht_find_node,
+                commands::peers::ember_dht_iterative_find_node,
+                commands::peers::ember_dht_publish_keyword,
+                commands::peers::ember_dht_find_value,
+                commands::peers::ember_dht_run_maintenance,
+            ]);
             #[cfg(not(debug_assertions))]
-            {
-                ember_invoke_handler![]
+            let handler = typed(ember_invoke_handler![]);
+            // App commands are not covered by the capability files, so the
+            // chat window could otherwise call every one of them.
+            move |invoke: tauri::ipc::Invoke| {
+                if invoke.message.webview_ref().label() == commands::chat_window::CHAT_WINDOW_LABEL
+                    && !commands::chat_window::chat_window_may_invoke(invoke.message.command())
+                {
+                    invoke.resolver.reject(commands::errors::coded(
+                        "chat_window_command_denied",
+                        "The chat window cannot do that; use the main window",
+                    ));
+                    return true;
+                }
+                handler(invoke)
             }
         })
         .on_window_event(|window, event| {

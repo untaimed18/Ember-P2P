@@ -294,9 +294,14 @@ fn canonical_ip(ip: IpAddr) -> IpAddr {
 /// smallest IPv4 block routed on the internet, and a /64 is one IPv6 subnet,
 /// which a single host usually controls in its entirety. Keying on the exact
 /// address let one operator multiply every per-client cap by rotating
-/// addresses inside a block it already holds.
+/// addresses inside a block it already holds. Not wider: an ISP hands its
+/// customers /56s and /60s out of one /48, so a /48 cap would be one any
+/// neighbour could spend for the rest.
 const CLIENT_NETWORK_V4_PREFIX: u32 = 24;
 const CLIENT_NETWORK_V6_PREFIX: u32 = 64;
+/// The IPv6 prefix [`MAX_NEW_KEYS_PER_V6_SITE_PER_HOUR`] pools: what one site
+/// (or a free tunnel broker account) holds, 65,536 /64s.
+const NEW_KEY_V6_SITE_PREFIX: u32 = 48;
 
 fn client_network(ip: IpAddr) -> IpAddr {
     match canonical_ip(ip) {
@@ -1001,6 +1006,17 @@ const MAX_CHANNEL_CREATES_PER_HOUR: u64 = 6;
 /// it. For IPv6 both tiers key on the /64, so this adds nothing there.
 const MAX_CHANNEL_CREATES_PER_NETWORK_PER_HOUR: u64 = 24;
 const CHANNEL_CREATE_WINDOW: Duration = Duration::from_secs(3600);
+/// Signing keys one IPv6 /48 may introduce per hour once a global table they
+/// fill is half full: presence registrations for ids the store does not hold,
+/// and signed requests from keys the replay guard does not track. Both tables
+/// refuse newcomers when full and keys are free, so without this one /48 could
+/// fill them through its 65,536 per-/64 budgets. Only under that pressure,
+/// because ISPs put many customers in one /48 and an hourly pool any of them
+/// could spend would otherwise lock out the rest. IPv4 is exempt: carrier-
+/// grade NAT puts unrelated subscribers in one /24, and its addresses cost
+/// money.
+const MAX_NEW_KEYS_PER_V6_SITE_PER_HOUR: u64 = 1024;
+const NEW_KEY_WINDOW: Duration = Duration::from_secs(3600);
 /// Cap on simultaneous pending punch entries per `target_id`. Bounds
 /// the impact of `punch_register` spam against a victim once the
 /// per-IP rate limit is exhausted (the attacker would have to source
@@ -1104,7 +1120,17 @@ const MAX_RELAY_QUEUE_BYTES: usize = 256 * 1024;
 /// one-second self-mailbox polls, while remaining brief enough that an
 /// abandoned offer cannot become a reusable relay capability later.
 const RELAY_TICKET_TTL: Duration = Duration::from_secs(90);
-const MAX_RELAY_TICKETS: usize = 100_000;
+/// Pending and accepted tickets held at once. A ticket costs about a kilobyte
+/// in its record and indexes before its envelope, so this and
+/// [`MAX_RELAY_TICKET_ENVELOPE_BYTES`] keep the store within the machine's
+/// 256 MB; at 100,000 tickets of 2 KiB envelopes it was larger than that, and
+/// running out takes every table in memory down with it. Honest offers live
+/// 90 seconds, so this is over 500 a second.
+const MAX_RELAY_TICKETS: usize = 50_000;
+/// Envelope bytes all held tickets may take together. Honest envelopes are
+/// about 400 bytes, a fifth of the 2 KiB an offer may carry, so this binds
+/// only on oversized ones.
+const MAX_RELAY_TICKET_ENVELOPE_BYTES: usize = 24 * 1024 * 1024;
 /// Served mailbox pages retained for idempotent re-reads. Bounded like every
 /// other map here; see `RelayTicketStore::store_mailbox_page`.
 const MAX_MAILBOX_PAGE_CACHE: usize = 10_000;
@@ -1117,9 +1143,16 @@ const MAX_PENDING_RELAY_TICKETS_PER_INITIATOR: usize = 16;
 /// arbitrary non-friends block a legitimate friend from ever reaching the
 /// responder's local authorization check.
 const MAX_ACCEPTED_RELAY_TICKETS_PER_RESPONDER: usize = 8;
-/// Encrypted envelopes are hex-encoded and relatively large;
-/// eight keep the complete JSON response below the client's 8 KiB cap.
+/// Encrypted envelopes are hex-encoded and relatively large; eight honest
+/// ones fit the client's 8 KiB response cap, and
+/// [`MAX_RELAY_MAILBOX_PAGE_BYTES`] keeps larger ones from overrunning it.
 const MAX_RELAY_MAILBOX_RESULTS: usize = 8;
+/// What a mailbox page's tickets may take as JSON, leaving room under the
+/// 8 KiB clients up to 1.7.5 read for the `{"tickets":[]}` around them. An
+/// envelope may be up to 2 KiB (4 KiB as hex), so a count alone let two
+/// oversized offers make every poll unreadable and cut the responder off from
+/// its friends' tickets. One ticket always fits, so no page is ever empty.
+const MAX_RELAY_MAILBOX_PAGE_BYTES: usize = 8 * 1024 - 64;
 /// Bound work per poll while advancing a persistent round-robin cursor.
 /// Walks only the pending-offer index, so accepted tickets cannot consume budget.
 const MAX_RELAY_MAILBOX_SCAN_PER_POLL: usize = 512;
@@ -1128,7 +1161,9 @@ const PUNCH_LEASE: Duration = Duration::from_secs(5);
 const POLL_READ_NONCE_TTL: Duration = Duration::from_secs(10 * 60);
 const STATUS_READ_NONCE_TTL: Duration = RELAY_TICKET_TTL;
 const MAX_POLL_READ_NONCES: usize = 100_000;
-const MAX_STATUS_READ_NONCES: usize = MAX_RELAY_TICKETS;
+/// Not tied to [`MAX_RELAY_TICKETS`]: a nonce outlives its ticket by up to
+/// the ticket TTL, so under churn more are live than tickets are.
+const MAX_STATUS_READ_NONCES: usize = 100_000;
 const MAX_LEGACY_IDENTITY_LOOKUPS_PER_MINUTE: u64 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1531,6 +1566,8 @@ struct RelayTicket {
 #[derive(Default)]
 struct RelayTicketStore {
     tickets: HashMap<String, RelayTicket>,
+    /// Sum of `mailbox_envelope` lengths over `tickets`.
+    envelope_bytes: usize,
     by_responder: HashMap<String, BTreeMap<String, String>>,
     /// Pending (unaccepted) offers only — mailbox rotation never scans accepted slots.
     pending_by_responder: HashMap<String, BTreeMap<String, String>>,
@@ -1551,6 +1588,22 @@ struct MailboxServedPage {
     expires_at: Instant,
 }
 
+/// Bytes one ticket takes in a mailbox poll response: its
+/// [`RelayMailboxPollItem`] as JSON, and the comma before it.
+fn mailbox_item_json_len(ticket_id: &str, ticket: &RelayTicket) -> usize {
+    const FRAME: usize = r#",{"ticket_id":"","capability":"","epoch":,"envelope":""}"#.len();
+    FRAME
+        + ticket_id.len()
+        + 2 * ticket.capability.len()
+        + ticket.epoch.to_string().len()
+        + 2 * ticket.mailbox_envelope.len()
+}
+
+/// `selected` is the page so far and `page_bytes` its size by
+/// [`mailbox_item_json_len`]. A ticket that would take the page past
+/// [`MAX_RELAY_MAILBOX_PAGE_BYTES`] ends it unscanned, so the cursor leaves it
+/// first in line for the next poll.
+#[allow(clippy::too_many_arguments)]
 fn select_mailbox_candidate(
     tickets: &HashMap<String, RelayTicket>,
     initiator: &str,
@@ -1559,18 +1612,27 @@ fn select_mailbox_candidate(
     scanned: &mut usize,
     last_scanned: &mut Option<String>,
     selected: &mut Vec<String>,
+    page_bytes: &mut usize,
 ) -> bool {
     if *scanned >= MAX_RELAY_MAILBOX_SCAN_PER_POLL || selected.len() >= MAX_RELAY_MAILBOX_RESULTS {
         return false;
     }
-    *scanned += 1;
-    *last_scanned = Some(initiator.to_owned());
-    if tickets
+    let candidate = tickets
         .get(ticket_id)
-        .is_some_and(|ticket| !ticket.accepted && ticket.expires_at > now)
-    {
+        .filter(|ticket| !ticket.accepted && ticket.expires_at > now);
+    if let Some(ticket) = candidate {
+        let bytes = mailbox_item_json_len(ticket_id, ticket);
+        if !selected.is_empty() && *page_bytes + bytes > MAX_RELAY_MAILBOX_PAGE_BYTES {
+            // The page is done: neither pass may go on to fill it from
+            // further round, which would move the cursor past this ticket.
+            *scanned = MAX_RELAY_MAILBOX_SCAN_PER_POLL;
+            return false;
+        }
+        *page_bytes += bytes;
         selected.push(ticket_id.clone());
     }
+    *scanned += 1;
+    *last_scanned = Some(initiator.to_owned());
     true
 }
 
@@ -1598,11 +1660,15 @@ impl RelayTicketStore {
         }
         self.expirations
             .push_back((ticket.expires_at, ticket_id.clone()));
-        self.tickets.insert(ticket_id, ticket);
+        self.envelope_bytes += ticket.mailbox_envelope.len();
+        if let Some(replaced) = self.tickets.insert(ticket_id, ticket) {
+            self.envelope_bytes -= replaced.mailbox_envelope.len();
+        }
     }
 
     fn remove(&mut self, ticket_id: &str) -> Option<RelayTicket> {
         let ticket = self.tickets.remove(ticket_id)?;
+        self.envelope_bytes -= ticket.mailbox_envelope.len();
         if let Some(by_initiator) = self.by_responder.get_mut(&ticket.responder_id) {
             if by_initiator
                 .get(&ticket.initiator_id)
@@ -1715,6 +1781,7 @@ impl RelayTicketStore {
         let mut selected = Vec::with_capacity(MAX_RELAY_MAILBOX_RESULTS);
         let mut last_scanned = None;
         let mut scanned = 0usize;
+        let mut page_bytes = 0usize;
 
         if let Some(cursor) = cursor {
             use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -1728,6 +1795,7 @@ impl RelayTicketStore {
                     &mut scanned,
                     &mut last_scanned,
                     &mut selected,
+                    &mut page_bytes,
                 ) {
                     break;
                 }
@@ -1744,6 +1812,7 @@ impl RelayTicketStore {
                         &mut scanned,
                         &mut last_scanned,
                         &mut selected,
+                        &mut page_bytes,
                     ) {
                         break;
                     }
@@ -1759,6 +1828,7 @@ impl RelayTicketStore {
                     &mut scanned,
                     &mut last_scanned,
                     &mut selected,
+                    &mut page_bytes,
                 ) {
                     break;
                 }
@@ -1783,6 +1853,7 @@ impl RelayTicketStore {
         let mut selected = Vec::with_capacity(MAX_RELAY_MAILBOX_RESULTS);
         let mut last_scanned = None;
         let mut scanned = 0usize;
+        let mut page_bytes = 0usize;
 
         if let Some(cursor) = cursor {
             use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -1796,6 +1867,7 @@ impl RelayTicketStore {
                     &mut scanned,
                     &mut last_scanned,
                     &mut selected,
+                    &mut page_bytes,
                 ) {
                     break;
                 }
@@ -1812,6 +1884,7 @@ impl RelayTicketStore {
                         &mut scanned,
                         &mut last_scanned,
                         &mut selected,
+                        &mut page_bytes,
                     ) {
                         break;
                     }
@@ -1827,6 +1900,7 @@ impl RelayTicketStore {
                     &mut scanned,
                     &mut last_scanned,
                     &mut selected,
+                    &mut page_bytes,
                 ) {
                     break;
                 }
@@ -2039,6 +2113,17 @@ impl ReplayGuard {
 
     fn fresh(&self, ts: i64, now: ReplayNow) -> bool {
         fresh_at(ts, now.wall) && ts > self.dropped_through
+    }
+
+    /// Whether `key` already holds replay state, so admitting it takes no
+    /// new slot.
+    fn knows(&self, key: &[u8; 32]) -> bool {
+        self.keys.contains_key(key)
+    }
+
+    /// Whether either bound a new key competes for is at least half used.
+    fn half_full(&self) -> bool {
+        self.keys.len() * 2 >= self.max_keys || self.marks * 2 >= self.max_marks
     }
 
     /// Evict every key whose horizon has left the freshness window.
@@ -2454,6 +2539,8 @@ struct AppState {
     /// endpoints — earlier this map was shared, and a single LowID
     /// peer's punch retries could 429 lookup/register for the same IP.
     rate_limits: RateLimitBucket,
+    /// [`MAX_NEW_KEYS_PER_V6_SITE_PER_HOUR`], keyed by [`new_key_site`].
+    new_key_network_rate_limits: RateLimitBucket,
     /// Temporary unauthenticated v3 identity oracle budget. It must not share
     /// counters with authenticated registration/lookup traffic: otherwise a
     /// normal rollout registration burst can consume the tighter legacy cap
@@ -2862,6 +2949,32 @@ async fn check_rate_limit(state: &AppState, ip: IpAddr) -> bool {
     check_rate_limit_bucket(&state.rate_limits, ip, MAX_REQUESTS_PER_MINUTE).await
 }
 
+/// The /48 an IPv6 address belongs to, for [`new_key_budget_ok`].
+fn new_key_site(v6: Ipv6Addr) -> IpAddr {
+    IpAddr::V6(Ipv6Addr::from(
+        u128::from(v6) & (u128::MAX << (128 - NEW_KEY_V6_SITE_PREFIX)),
+    ))
+}
+
+/// Charge one new signing key to `ip`'s /48 when `under_pressure` (the table
+/// it would take a slot in is at least half full). See
+/// [`MAX_NEW_KEYS_PER_V6_SITE_PER_HOUR`]; IPv4 always passes.
+async fn new_key_budget_ok(state: &AppState, ip: IpAddr, under_pressure: bool) -> bool {
+    let IpAddr::V6(v6) = canonical_ip(ip) else {
+        return true;
+    };
+    if !under_pressure {
+        return true;
+    }
+    state.new_key_network_rate_limits.write().await.charge(
+        new_key_site(v6),
+        MAX_NEW_KEYS_PER_V6_SITE_PER_HOUR,
+        NEW_KEY_WINDOW,
+        Instant::now(),
+        MAX_RATE_ENTRIES,
+    )
+}
+
 /// Read-only counterpart of [`check_rate_limit_bucket`]: whether `ip` has
 /// already spent this window's budget. Never charges the bucket.
 async fn rate_budget_exhausted(limits: &RateLimitBucket, ip: IpAddr, max_requests: u64) -> bool {
@@ -2990,8 +3103,10 @@ fn admit_channel_create(
 }
 
 /// Admit one signed request into its replay scope. See [`ReplayGuard`].
+#[allow(clippy::too_many_arguments)]
 async fn admit_signed_request(
     state: &AppState,
+    client_ip: IpAddr,
     signer: &[u8; 32],
     scope: u64,
     ts: i64,
@@ -2999,6 +3114,14 @@ async fn admit_signed_request(
     sig: &[u8; 64],
     mode: ReplayMode,
 ) -> Result<(), StatusCode> {
+    // A key the guard does not track takes one of its slots, which are global.
+    let (known, under_pressure) = {
+        let guard = state.replay_guard.read().await;
+        (guard.knows(signer), guard.half_full())
+    };
+    if !known && !new_key_budget_ok(state, client_ip, under_pressure).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
     let digest = signed_request_digest(message, sig);
     let admission = state.replay_guard.write().await.admit(
         *signer,
@@ -3559,17 +3682,23 @@ async fn register(
         if existing.pubkey != pubkey {
             return StatusCode::FORBIDDEN;
         }
-    } else if store.len() >= MAX_STORE_ENTRIES {
-        // Before failing closed on a brand-new id, purge already-expired
-        // entries — a map that's merely full of stale junk (normal churn
-        // between sweep cycles) shouldn't lock out legitimate new
-        // registrants the same way a genuine sustained flood would.
-        let now = Instant::now();
-        if state.store_purge.try_begin(now) {
-            store.retain(|_, e| e.expires_at > now);
-        }
+    } else {
         if store.len() >= MAX_STORE_ENTRIES {
-            return StatusCode::SERVICE_UNAVAILABLE;
+            // Before failing closed on a brand-new id, purge already-expired
+            // entries — a map that's merely full of stale junk (normal churn
+            // between sweep cycles) shouldn't lock out legitimate new
+            // registrants the same way a genuine sustained flood would.
+            let now = Instant::now();
+            if state.store_purge.try_begin(now) {
+                store.retain(|_, e| e.expires_at > now);
+            }
+            if store.len() >= MAX_STORE_ENTRIES {
+                return StatusCode::SERVICE_UNAVAILABLE;
+            }
+        }
+        let under_pressure = store.len() * 2 >= MAX_STORE_ENTRIES;
+        if !new_key_budget_ok(&state, client_ip, under_pressure).await {
+            return StatusCode::TOO_MANY_REQUESTS;
         }
     }
     store.insert(key, entry);
@@ -3789,6 +3918,7 @@ async fn claim_channel_username_v4(
     // take it back.
     if let Err(status) = admit_signed_request(
         &state,
+        client_ip,
         &pubkey,
         replay_scope(OP_CHANNEL_USERNAME_V4, &[]),
         body.ts,
@@ -3876,6 +4006,7 @@ async fn claim_channel_name_v4(
     // Replaying an older claim would flip `private` or the display name back.
     if let Err(status) = admit_signed_request(
         &state,
+        client_ip,
         &pubkey,
         replay_scope(OP_CHANNEL_NAME_V4, &[]),
         body.ts,
@@ -3944,6 +4075,7 @@ async fn rename_channel_name_v4(
     // registry answers as a refresh, so a retry after a lost answer succeeds.
     if let Err(status) = admit_signed_request(
         &state,
+        client_ip,
         &pubkey,
         replay_scope(OP_CHANNEL_RENAME_V4, &[]),
         body.ts,
@@ -4072,6 +4204,7 @@ async fn set_channel_nominee_v4(
     // Replaying a nomination after its withdrawal would re-grant succession.
     if let Err(status) = admit_signed_request(
         &state,
+        client_ip,
         &pubkey,
         replay_scope(OP_CHANNEL_NOMINEE_V4, &[]),
         body.ts,
@@ -4139,6 +4272,7 @@ async fn handover_channel_name_v4(
     }
     if let Err(status) = admit_signed_request(
         &state,
+        client_ip,
         &signer,
         replay_scope(OP_CHANNEL_HANDOVER_V4, &old_channel_id),
         body.ts,
@@ -5011,6 +5145,7 @@ async fn punch_register_impl(
     // a replay from another host would have the target punch toward it.
     if let Err(status) = admit_signed_request(
         &state,
+        observed_ip,
         &signer,
         replay_scope(OP_PUNCH_REGISTER_V4, &target_raw),
         body.ts,
@@ -5119,6 +5254,7 @@ async fn punch_poll_impl(
         verify_signed_relay_identity_signature(&state, &body.target_id, &signed, &sig).await?;
     admit_signed_request(
         &state,
+        client_ip,
         &signer,
         replay_scope(OP_PUNCH_POLL_V4, &[]),
         body.ts,
@@ -5337,6 +5473,7 @@ async fn relay_mailbox_offer(
     // from that id, so the replayer would be handed the initiator token.
     admit_signed_request(
         &state,
+        client_ip,
         &signer,
         replay_scope(OP_RELAY_MAILBOX_OFFER, &responder_raw),
         body.ts,
@@ -5367,7 +5504,9 @@ async fn relay_mailbox_offer(
     };
     let mut tickets = state.relay_tickets.write().await;
     prune_expired_relay_tickets(&mut tickets, now);
-    if tickets.tickets.len() >= MAX_RELAY_TICKETS {
+    if tickets.tickets.len() >= MAX_RELAY_TICKETS
+        || tickets.envelope_bytes + ticket.mailbox_envelope.len() > MAX_RELAY_TICKET_ENVELOPE_BYTES
+    {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     if tickets.tickets.contains_key(&ticket_id)
@@ -6301,6 +6440,11 @@ async fn prune_rate_limits(state: &AppState, now: Instant) {
         .write()
         .await
         .prune(now, REACHABILITY_WINDOW);
+    state
+        .new_key_network_rate_limits
+        .write()
+        .await
+        .prune(now, NEW_KEY_WINDOW);
 }
 
 async fn sweep_expired(state: AppState) {
@@ -6514,6 +6658,7 @@ async fn main() {
         store: Arc::new(RwLock::new(HashMap::new())),
         capability_store: Arc::new(RwLock::new(HashMap::new())),
         rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+        new_key_network_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
         legacy_identity_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
         ticket_read_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
         punch_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
@@ -6738,6 +6883,7 @@ mod relay_ticket_tests {
             store: Arc::new(RwLock::new(HashMap::new())),
             capability_store: Arc::new(RwLock::new(HashMap::new())),
             rate_limits: Arc::new(RwLock::new(RateBucket::default())),
+            new_key_network_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
             legacy_identity_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
             ticket_read_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
             punch_rate_limits: Arc::new(RwLock::new(RateBucket::default())),
@@ -8627,6 +8773,78 @@ mod relay_ticket_tests {
             Some(&format!("{:064x}", 108)),
             "the ninth offer must not remain hidden behind the first page"
         );
+    }
+
+    /// Two offers carrying the largest envelope the server takes must not push
+    /// a page past what a client reads, and the one left off comes first on the
+    /// next page rather than being skipped.
+    #[test]
+    fn mailbox_pages_stay_under_the_clients_response_cap() {
+        let responder_id = "46".repeat(32);
+        let mut tickets = RelayTicketStore::default();
+        for index in 0..8u8 {
+            let mut ticket = ticket_with_parties(&format!("{index:064x}"), &responder_id, false);
+            ticket.mailbox_envelope = vec![0xAB; if index < 2 { 2 * 1024 } else { 400 }];
+            tickets.insert(format!("{:064x}", u64::from(index) + 200), ticket);
+        }
+        let page_json = |ids: &[String], tickets: &RelayTicketStore| {
+            let items = ids
+                .iter()
+                .map(|id| {
+                    let ticket = &tickets.tickets[id];
+                    RelayMailboxPollItem {
+                        ticket_id: id.clone(),
+                        capability: hex::encode(ticket.capability),
+                        epoch: ticket.epoch,
+                        envelope: hex::encode(&ticket.mailbox_envelope),
+                    }
+                })
+                .collect();
+            serde_json::to_vec(&RelayMailboxPollResponse { tickets: items }).unwrap().len()
+        };
+        let now = Instant::now();
+        let mut served = Vec::new();
+        for _ in 0..3 {
+            let page = tickets.mailbox_page_ids(&responder_id, now);
+            assert!(!page.is_empty());
+            let bytes = page_json(&page, &tickets);
+            assert!(bytes <= 8 * 1024, "{bytes} bytes");
+            served.extend(page);
+        }
+        // Round robin: every offer is served before any comes round again.
+        assert!(served.len() >= 8, "{served:?}");
+        served.truncate(8);
+        served.sort();
+        served.dedup();
+        assert_eq!(served.len(), 8, "an offer came round twice before one was served at all");
+    }
+
+    #[test]
+    fn ticket_envelope_bytes_follow_inserts_and_removals() {
+        let responder_id = "47".repeat(32);
+        let mut tickets = RelayTicketStore::default();
+        let mut ticket = ticket_with_parties(&"01".repeat(32), &responder_id, false);
+        ticket.mailbox_envelope = vec![0; 700];
+        tickets.insert("a1".repeat(32), ticket);
+        assert_eq!(tickets.envelope_bytes, 700);
+        tickets.remove(&"a1".repeat(32));
+        assert_eq!(tickets.envelope_bytes, 0);
+    }
+
+    /// Under table pressure one /48 introduces a bounded number of keys through
+    /// all of its /64s; without pressure, and over IPv4, nothing is charged, so
+    /// a neighbour in the same ISP /48 cannot lock the rest out.
+    #[tokio::test]
+    async fn an_ipv6_site_introduces_a_bounded_number_of_keys_under_pressure() {
+        let state = test_state();
+        let site = |n: u16| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x55, n, 0, 0, 0, 1));
+        for n in 0..MAX_NEW_KEYS_PER_V6_SITE_PER_HOUR {
+            assert!(new_key_budget_ok(&state, site(n as u16), true).await);
+        }
+        assert!(!new_key_budget_ok(&state, site(9), true).await, "every /64 of the /48 shares it");
+        assert!(new_key_budget_ok(&state, site(9), false).await, "only enforced under pressure");
+        assert!(new_key_budget_ok(&state, "2001:db8:56::1".parse().unwrap(), true).await);
+        assert!(new_key_budget_ok(&state, "203.0.113.9".parse().unwrap(), true).await, "IPv4 is exempt");
     }
 
     #[test]

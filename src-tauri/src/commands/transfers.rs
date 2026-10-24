@@ -1954,6 +1954,7 @@ pub async fn pause_transfers_batch(
     hold: Option<bool>,
 ) -> Result<(), String> {
     check_batch_size(&transfer_ids)?;
+    let transfer_ids = without_completing(&state, transfer_ids).await;
     let (paused, promoted) = {
         let mut manager = state.transfer_manager.write().await;
         for transfer_id in &transfer_ids {
@@ -2174,6 +2175,7 @@ pub async fn stop_transfers_batch(
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
     check_batch_size(&transfer_ids)?;
+    let transfer_ids = without_completing(&state, transfer_ids).await;
     let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
     let mut send_error = None;
     for transfer_id in transfer_ids {
@@ -2214,12 +2216,41 @@ pub async fn stop_transfers_batch(
     }
 }
 
+/// Whether `transfer_id`'s finished file is being moved into place. That move
+/// runs on a task of its own that no pause, stop or cancel reaches: aborting
+/// the worker only stops waiting on it. A resume would then verify and move
+/// the file a second time beside it, and a cancel would delete the `.part`
+/// the move is still copying from while the copy is published regardless. So
+/// a row in that state is left to finish, which it does by itself.
+async fn is_completing(state: &AppState, transfer_id: &str) -> bool {
+    state
+        .transfer_manager
+        .read()
+        .await
+        .get_transfer(transfer_id)
+        .is_some_and(|t| t.status == TransferStatus::Completing)
+}
+
+/// `transfer_ids` without those [`is_completing`].
+async fn without_completing(state: &AppState, transfer_ids: Vec<String>) -> Vec<String> {
+    let manager = state.transfer_manager.read().await;
+    transfer_ids
+        .into_iter()
+        .filter(|id| {
+            !manager
+                .get_transfer(id)
+                .is_some_and(|t| t.status == TransferStatus::Completing)
+        })
+        .collect()
+}
+
 #[tauri::command]
 pub async fn cancel_transfers_batch(
     state: tauri::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
     check_batch_size(&transfer_ids)?;
+    let transfer_ids = without_completing(&state, transfer_ids).await;
     let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
     let mut pending_acks = Vec::with_capacity(transfer_ids.len());
     let mut cancelled_ids = Vec::with_capacity(transfer_ids.len());
@@ -2332,6 +2363,9 @@ pub async fn pause_transfer(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
+    if is_completing(&state, &transfer_id).await {
+        return Ok(());
+    }
     let (status, promoted) = {
         let mut manager = state.transfer_manager.write().await;
         if let Some(control) = manager.get_control(&transfer_id) {
@@ -2380,6 +2414,9 @@ pub async fn stop_transfer(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
+    if is_completing(&state, &transfer_id).await {
+        return Ok(());
+    }
     let (stopped, promoted) = {
         let mut manager = state.transfer_manager.write().await;
         if let Some(control) = manager.get_control(&transfer_id) {
@@ -2544,9 +2581,11 @@ pub async fn open_downloads_folder(state: tauri::State<'_, AppState>) -> Result<
 
 #[tauri::command]
 pub async fn open_file(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     let (transfer, dl_folders) = {
         let (mgr, cfg) = tokio::join!(state.transfer_manager.read(), state.config.read(),);
         (
@@ -2706,9 +2745,11 @@ pub struct FinishedDeleteReport {
 #[tauri::command]
 pub async fn delete_finished_downloads(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<FinishedDeleteReport, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     check_batch_size(&transfer_ids)?;
     let (rows, dl_folders, permanently) = {
         let (mgr, cfg) = tokio::join!(state.transfer_manager.read(), state.config.read());
@@ -2835,6 +2876,9 @@ pub async fn remove_transfer(
         let manager = state.transfer_manager.read().await;
         manager.get_transfer(&transfer_id).cloned()
     };
+    if snapshot.as_ref().is_some_and(|t| t.status == TransferStatus::Completing) {
+        return Ok(());
+    }
     let dl_folders = state.config.read().await.settings.download_folders();
     // A failed download's bytes are kept: moved into Downloads before
     // anything else, since the cancel below deletes its `.part.met`. Until
@@ -3112,7 +3156,38 @@ pub async fn move_transfers_in_queue(
         .write()
         .await
         .move_queued(&transfer_ids, to_front);
+    if moved > 0 {
+        persist_download_order(&state).await;
+    }
     Ok(u32::try_from(moved).unwrap_or(u32::MAX))
+}
+
+/// Save the order downloads resume in: those running first, oldest first,
+/// then the queue as it stands. Without it a restart reloads by `started_at`,
+/// undoing every "move to front" or "to back". Saved on a move and again at
+/// shutdown, when the queue has had a session to change.
+pub(crate) async fn persist_download_order(state: &AppState) {
+    let order: Vec<String> = {
+        let manager = state.transfer_manager.read().await;
+        let mut running: Vec<&Transfer> = manager
+            .active
+            .values()
+            .filter(|t| t.direction == TransferDirection::Download)
+            .collect();
+        running.sort_by(|a, b| a.started_at.cmp(&b.started_at).then_with(|| a.id.cmp(&b.id)));
+        running
+            .into_iter()
+            .chain(manager.queue.iter().filter(|t| t.direction == TransferDirection::Download))
+            .map(|t| t.id.clone())
+            .collect()
+    };
+    let db = state.db.clone();
+    db_blocking(move || {
+        if let Err(e) = db.set_download_queue_order(&order) {
+            tracing::warn!("Could not save the download queue order: {e}");
+        }
+    })
+    .await;
 }
 
 /// What changing downloads' category did. A finished download's file moves to
@@ -3593,10 +3668,14 @@ pub async fn pause_all_transfers(
 ) -> Result<(), String> {
     let (paused, pause_ids) = {
         let mut manager = state.transfer_manager.write().await;
+        // A row moving its finished file into place is left to finish; see
+        // `is_completing`.
         let active_ids: Vec<String> = manager
             .active
             .iter()
-            .filter(|(_, t)| t.direction == TransferDirection::Download)
+            .filter(|(_, t)| {
+                t.direction == TransferDirection::Download && t.status != TransferStatus::Completing
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in &active_ids {

@@ -435,8 +435,8 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
 
     #[cfg(target_os = "windows")]
     let firewall_rules = {
-        let (tcp, udp) = (tcp_port, bound_udp);
-        tokio::task::spawn_blocking(move || crate::security::firewall::rules_in_place(tcp, udp))
+        let (tcp, udp, quic) = (tcp_port, bound_udp, stats.quic_udp_port);
+        tokio::task::spawn_blocking(move || crate::security::firewall::rules_in_place(tcp, udp, quic))
             .await
             .ok()
             .flatten()
@@ -534,7 +534,12 @@ pub async fn run_connection_check(state: tauri::State<'_, AppState>) -> Result<C
 /// Do one of the fixes a report offered. `move_ports` and `enable_upnp` are
 /// settings the page changes itself; these are the ones that need the backend.
 #[tauri::command]
-pub async fn connection_doctor_action(state: tauri::State<'_, AppState>, action: String) -> Result<bool, String> {
+pub async fn connection_doctor_action(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, AppState>,
+    action: String,
+) -> Result<bool, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     match action.as_str() {
         "retry_upnp" => {
             crate::network::UPNP_RETRY_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -555,7 +560,8 @@ pub async fn connection_doctor_action(state: tauri::State<'_, AppState>, action:
             let stats = network_stats(&state).await?;
             let settings = state.config.read().await.settings.clone();
             let (tcp, udp, _, _) = session_ports(&stats, &settings);
-            tokio::task::spawn_blocking(move || crate::security::firewall::add_rules_elevated(tcp, udp))
+            let quic = stats.quic_udp_port;
+            tokio::task::spawn_blocking(move || crate::security::firewall::add_rules_elevated(tcp, udp, quic))
                 .await
                 .map_err(|e| coded_ctx("doctor_failed", "Task error", e))
         }

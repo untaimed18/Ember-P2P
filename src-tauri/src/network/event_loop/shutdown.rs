@@ -32,6 +32,8 @@ pub(in crate::network) async fn save_on_shutdown(
     stats_save_in_flight: &mut bool,
     upnp_enabled: bool,
     upnp_mappings: &mut upnp::UpnpMappings,
+    upnp_maintain_handle: &mut Option<tokio::task::JoinHandle<()>>,
+    upnp_maintain_result_rx: &mut mpsc::UnboundedReceiver<UpnpMaintainResult>,
     xfer_finish_rx: &mut mpsc::UnboundedReceiver<XferFinishResult>,
     upload_queue: &ed2k::upload::UploadQueueRef,
 ) {
@@ -922,13 +924,36 @@ pub(in crate::network) async fn save_on_shutdown(
     }
 
     if upnp_enabled {
+        // A setup or maintenance pass works on a copy of the mappings, and
+        // what it maps is only ours to remove once its result is adopted. Let
+        // a pass in flight finish, briefly, rather than quit beside a forward
+        // it is still adding.
+        if let Some(mut handle) = upnp_maintain_handle.take() {
+            let wait = shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(5));
+            if tokio::time::timeout_at(wait, &mut handle).await.is_err() {
+                handle.abort();
+            }
+        }
+        let mut superseded = Vec::new();
+        while let Ok(result) = upnp_maintain_result_rx.try_recv() {
+            if result.revision == upnp_mappings.revision() {
+                upnp_mappings.adopt(result.mappings);
+            } else {
+                superseded.push(result.mappings);
+            }
+        }
         // Best-effort removal; don't let an unresponsive gateway stall app
         // shutdown on TCP connect timeouts. Timed leases expire on their own
         // within the hour, and permanent-lease mappings (the error-725
         // fallback) are reclaimed by the next session's conflict handling.
         let _ = tokio::time::timeout_at(
             shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(5)),
-            upnp_mappings.teardown(),
+            async {
+                upnp_mappings.teardown().await;
+                for mut mappings in superseded {
+                    mappings.teardown().await;
+                }
+            },
         )
         .await;
     }

@@ -2859,12 +2859,66 @@ fn unshare_target_is_shared(shared_folders: &[String], requested: &str) -> bool 
         .any(|stored| crate::security::path_within_dir(requested, stored))
 }
 
+/// Set while the startup scan has not yet put last session's files back in
+/// the Library index: until then the index holds only part of what is shared,
+/// and a file missing from it is not gone.
+pub(crate) static STARTUP_LIBRARY_LOADING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn startup_library_loading() -> bool {
+    STARTUP_LIBRARY_LOADING.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static FILE_SNAPSHOT_TICKETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The ticket of the snapshot each Library cache holds, by the cache's
+/// address. An entry is only read and written under its cache's write lock.
+/// Tickets only grow, so an entry left by a dropped cache is below anything a
+/// new cache at that address is handed.
+fn file_cache_tickets() -> &'static parking_lot::Mutex<std::collections::HashMap<usize, u64>> {
+    static TICKETS: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<usize, u64>>> =
+        std::sync::OnceLock::new();
+    TICKETS.get_or_init(Default::default)
+}
+
+/// Number a snapshot of the Library index. Take it while holding the index
+/// lock the snapshot is read under, so tickets order snapshots as the index
+/// changed.
+pub(crate) fn file_snapshot_ticket() -> u64 {
+    FILE_SNAPSHOT_TICKETS.fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+}
+
+/// Put `snap`, numbered `ticket`, in the Library cache and return the list it
+/// replaced, unless the cache already holds a later snapshot: then `snap`
+/// comes back as the error. Writers take their snapshot, then do other work
+/// before this, and an older list landing last would stand until something
+/// else rebuilt it.
+pub(crate) async fn store_file_snapshot(
+    cache: &RwLock<Vec<FileInfo>>,
+    snap: Vec<FileInfo>,
+    ticket: u64,
+) -> Result<Vec<FileInfo>, Vec<FileInfo>> {
+    let mut cached = cache.write().await;
+    {
+        let mut tickets = file_cache_tickets().lock();
+        let held = tickets.entry(cache as *const RwLock<Vec<FileInfo>> as usize).or_insert(0);
+        if ticket <= *held {
+            return Err(snap);
+        }
+        *held = ticket;
+    }
+    Ok(std::mem::replace(&mut *cached, snap))
+}
+
 pub(crate) async fn refresh_file_cache(
     index: &Arc<RwLock<LocalIndex>>,
     cache: &Arc<RwLock<Vec<FileInfo>>>,
 ) {
-    let (snap_raw, previous_flags) =
-        tokio::join!(async { index.read().await.all_files().to_vec() }, async {
+    let ((snap_raw, ticket), previous_flags) =
+        tokio::join!(async {
+            let index = index.read().await;
+            (index.all_files().to_vec(), file_snapshot_ticket())
+        }, async {
             let cached = cache.read().await;
             cached
                 .iter()
@@ -2892,7 +2946,8 @@ pub(crate) async fn refresh_file_cache(
             file.shared_ember = listable && *shared_ember;
         }
     }
-    *cache.write().await = snap;
+    // Refused only for a later snapshot, which already shows this change.
+    let _ = store_file_snapshot(cache, snap, ticket).await;
 }
 
 /// Undo a priority or friends-only mutation that could not be persisted. Only
@@ -10355,6 +10410,20 @@ pub async fn open_shared_folder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A snapshot taken earlier never replaces one taken later, whichever
+    /// writer reaches the cache last; each cache keeps its own order.
+    #[tokio::test]
+    async fn an_older_library_snapshot_does_not_replace_a_later_one() {
+        let cache = RwLock::new(Vec::new());
+        let older = file_snapshot_ticket();
+        let newer = file_snapshot_ticket();
+        assert!(store_file_snapshot(&cache, Vec::new(), newer).await.is_ok());
+        assert!(store_file_snapshot(&cache, Vec::new(), older).await.is_err());
+        assert!(store_file_snapshot(&cache, Vec::new(), file_snapshot_ticket()).await.is_ok());
+        let other = RwLock::new(Vec::new());
+        assert!(store_file_snapshot(&other, Vec::new(), older).await.is_ok());
+    }
 
     /// Only a file that came into being once the setting was on counts as new:
     /// one already shared is older than that however late the Library lists it,

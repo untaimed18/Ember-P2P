@@ -360,9 +360,27 @@ mod membership_record_v2_tests {
             assert_eq!(latest[&pk(&cy)].nickname, "cy");
             assert_eq!(latest[&pk(&cy)].language, None);
             assert!(!latest.contains_key(&pk(&storer)));
-            assert!(admits.contains(&pk(&ada)) && admits.contains(&pk(&bob)));
+            assert!(admits.contains(&pk(&ada)));
+            assert!(!admits.contains(&pk(&bob)), "a v1 record is read but admits nobody in a private room");
             assert!(!admits.contains(&pk(&cy)), "a retired secret does not admit");
         }
+
+        // A v1 seal lifted into a record another key signs opens under the
+        // current key, since its AAD names only the room. It must not admit
+        // that key, or the owner would seal the next epoch to it.
+        let mut lifted_v1 = SignedRecord::channel_presence_v1_at(
+            "ada (v1)", None, room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), false, &[1; 32], &storer, now,
+        );
+        lifted_v1.data = ada_v1.data.clone();
+        lifted_v1.publisher_key = pk(&storer);
+        lifted_v1.data[73..105].copy_from_slice(&lifted_v1.publisher_key);
+        lifted_v1.signature = crate::network::ember::crypto::sign(&storer, &lifted_v1.data);
+        let (latest, admits) =
+            merge_channel_presence_blobs(&[blob(&lifted_v1)], &room.channel_id, &secrets, true, now);
+        assert!(latest.contains_key(&pk(&storer)), "the copied seal still opens");
+        assert!(!admits.contains(&pk(&storer)), "but proves nothing about its signer");
+        let (_, admits) = merge_channel_presence_blobs(&[blob(&bob_v1)], &room.channel_id, &secrets, false, now);
+        assert!(admits.contains(&pk(&bob)), "a public room's v1 record still admits");
 
         // A v1 record that is neither flagged private nor sealed — a bare
         // 32-byte extra, which anyone who knows the room's id and pubkey can
@@ -6466,6 +6484,13 @@ impl ChannelPresenceIngest {
 /// rotation's evicted member holds, and a record under one from a key the
 /// roster has never seen is that member under a new name.
 ///
+/// In a private room only a v2 record counts. A v1 seal binds the room but not
+/// the member, so a node storing any member's v1 copy can sign the same seal
+/// under a key of its own; counting it would put that key on the roster and
+/// have the owner seal it the next epoch. A v1 record still refreshes a member
+/// already held, and a newcomer on an older build is admitted by the key proof
+/// in their beacon.
+///
 /// Current and previous epoch are two FIND_VALUE walks. Newest-wins has to see
 /// both before any row is written, or a prev-epoch live announce re-inserts
 /// after the current tombstone and a prev-epoch tombstone deletes a rejoiner.
@@ -6539,8 +6564,10 @@ pub(super) fn merge_channel_presence_blobs(
     }
     let mut latest = HashMap::new();
     let mut current = HashSet::new();
-    for (member, opened) in v1.into_iter().chain(v2) {
-        if opened == ember::channel::OpenedUnder::Current {
+    let v1 = v1.into_iter().map(|(member, opened)| (member, opened, !private));
+    let v2 = v2.into_iter().map(|(member, opened)| (member, opened, true));
+    for (member, opened, may_admit) in v1.chain(v2) {
+        if may_admit && opened == ember::channel::OpenedUnder::Current {
             current.insert(member.publisher_key);
         }
         let Some(ts) = ember::channel::clamp_presence_timestamp(member.timestamp, now) else {

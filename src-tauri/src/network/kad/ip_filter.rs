@@ -553,6 +553,12 @@ impl IpFilter {
         self.blocked_ranges.len()
     }
 
+    /// Whether the last load read rows at or above the blocking level, which
+    /// are kept to write back but block nothing.
+    pub fn has_permit_ranges(&self) -> bool {
+        !self.permit_ranges.is_empty()
+    }
+
     /// Serialize the active ranges into the canonical text format used by
     /// `ipfilter.dat`. Binary `.p2b` imports must be converted before they
     /// replace that stable startup path; otherwise the next launch would
@@ -817,6 +823,37 @@ impl IpFilter {
         let before = self.blocked_ranges.len();
         self.blocked_ranges.retain(|r| r.start != s || r.end != e);
         self.blocked_ranges.len() < before
+    }
+
+    /// Stop blocking `start..=end`, which is what unblocking a merged row did.
+    /// A range wholly inside goes; one reaching past either end keeps only
+    /// what lies outside, as a new list merging the old row with a neighbour
+    /// must not bring the unblocked addresses back.
+    pub fn remove_ranges_within(&mut self, start: u32, end: u32) -> bool {
+        if start > end {
+            return false;
+        }
+        let mut changed = false;
+        let mut kept = Vec::with_capacity(self.blocked_ranges.len() + 1);
+        for range in self.blocked_ranges.drain(..) {
+            if range.end < start || range.start > end {
+                kept.push(range);
+                continue;
+            }
+            changed = true;
+            if range.start < start {
+                let mut left = range.clone();
+                left.end = start - 1;
+                kept.push(left);
+            }
+            if range.end > end {
+                let mut right = range.clone();
+                right.start = end + 1;
+                kept.push(right);
+            }
+        }
+        self.blocked_ranges = kept;
+        changed
     }
 
     /// Load a PeerGuardian .p2p text file (format: "Description: IP1 - IP2")

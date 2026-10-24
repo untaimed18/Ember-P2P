@@ -267,6 +267,17 @@ pub struct SearchResultEntry {
     pub tags: Vec<KadTag>,
 }
 
+impl SearchResultEntry {
+    /// Bytes this entry takes in an uncompressed `SEARCH_RES`, or `None` when
+    /// it cannot be written at all.
+    pub fn wire_len(&self) -> Option<usize> {
+        let mut buf = Vec::new();
+        self.id.write_to(&mut buf).ok()?;
+        write_tag_list(&mut buf, &self.tags).ok()?;
+        Some(buf.len())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PublishEntry {
     pub id: KadId,
@@ -1913,6 +1924,28 @@ mod buddy_hash_wire_tests {
         let mut packet = vec![OP_KADEMLIAPACKEDPROT, opcode];
         packet.extend_from_slice(&compressed);
         packet
+    }
+
+    /// The batcher in `send_kad_search_results` sizes entries with this, so it
+    /// has to count blob payloads and tag names, not just string values.
+    #[test]
+    fn search_result_wire_len_counts_blobs_and_tag_names() {
+        let entry = SearchResultEntry {
+            id: KadId([0x55; 16]),
+            tags: vec![KadTag {
+                name: TagName::Str("x".repeat(200)),
+                value: TagValue::Blob(vec![0xA5; 1500]),
+            }],
+        };
+        // id, tag count, then type, u16 name length, name, u32 blob length, blob.
+        assert_eq!(entry.wire_len(), Some(16 + 1 + 1 + 2 + 200 + 4 + 1500));
+        let single = encode_packet(&KadMessage::SearchRes {
+            sender_id: KadId([1; 16]),
+            target: KadId([2; 16]),
+            results: vec![SearchResultEntry { id: KadId([0x56; 16]), tags: vec![] }],
+        })
+        .unwrap();
+        assert_eq!(single.len(), 2 + 16 + 16 + 2 + 17, "header plus one bare entry");
     }
 
     #[test]

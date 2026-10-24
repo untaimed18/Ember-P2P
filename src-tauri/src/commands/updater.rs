@@ -2002,6 +2002,7 @@ async fn install_locked(
     crate::auto_update::watchdog::spawn_for_install();
     if let Err(error) = update.update.install(&artifact) {
         tracing::warn!("Secure updater install failed: {error}");
+        mark_session_running(app);
         // A manual install that failed leaves this Ember running and the user
         // in charge of it; the watchdog must not relaunch it after they quit.
         // A silent one restarts itself, which the watchdog then sees.
@@ -2021,6 +2022,15 @@ async fn install_locked(
     discard_staged(app);
     pending.take();
     Ok(())
+}
+
+/// After a graceful shutdown that did not end the process: it marked the
+/// database closed cleanly, but this process keeps running and writing to it
+/// until the user restarts, and a crash meanwhile must still be unclean.
+fn mark_session_running(app: &AppHandle) {
+    if let Some(state) = tauri::Manager::try_state::<crate::app_state::AppState>(app) {
+        state.db.mark_session_running();
+    }
 }
 
 /// Which updater operation a failure is being reported for.
@@ -2631,6 +2641,7 @@ pub async fn secure_updater_run_saved_installer(
     // either way: `msiexec` elevates through the Windows Installer service.
     let installer = verified_installer_path(&app, &claim).map_err(|error| {
         tracing::warn!("Refusing to run the staged installer: {error:#}");
+        mark_session_running(&app);
         coded(
             "updater_staged_installer_changed",
             "The staged installer changed while Ember was closing down. Check for updates again.",
@@ -2660,6 +2671,7 @@ pub async fn secure_updater_run_saved_installer(
         }
         Err(error) => {
             tracing::warn!("Could not launch the staged installer: {error}");
+            mark_session_running(&app);
             // The teardown above already stopped Ember's network services, so the
             // window is still up but nothing is transferring. Saying only where
             // the file is would send the user off to run it by hand from an app

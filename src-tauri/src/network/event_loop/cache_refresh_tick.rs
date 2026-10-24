@@ -186,12 +186,9 @@ pub(in crate::network) async fn on_cache_refresh_tick(
         // snapshot the file list for frontend IPC reads.
         // IMPORTANT: release the local_index lock before acquiring
         // cached_shared_files -- never nest these two locks.
-        let file_snap = if file_snapshot_stale {
-            let mut index = li_ref.write().await;
-            index.update_alltime_stats_bulk(&known_stats);
-            let mut snap = index.all_files().to_vec();
+        let badge = |snap: &mut Vec<FileInfo>| {
             apply_publish_badges(
-                &mut snap,
+                snap,
                 kad_connected,
                 srv_connected,
                 ember_live,
@@ -199,7 +196,15 @@ pub(in crate::network) async fn on_cache_refresh_tick(
                 &ed2k_offered,
                 &ember_published,
             );
-            Some(snap)
+        };
+        let file_snap = if file_snapshot_stale {
+            let mut index = li_ref.write().await;
+            index.update_alltime_stats_bulk(&known_stats);
+            let mut snap = index.all_files().to_vec();
+            let ticket = crate::commands::sharing::file_snapshot_ticket();
+            drop(index);
+            badge(&mut snap);
+            Some((snap, ticket))
         } else {
             None
         };
@@ -266,10 +271,29 @@ pub(in crate::network) async fn on_cache_refresh_tick(
         // waiting on unrelated activity and without reloading the
         // whole list on a five-second clock.
         let badges_changed = match file_snap {
-            Some(file_snap) => {
-                let mut cache = s_files.write().await;
-                let changed = badge_counts(&file_snap) != badge_counts(&cache);
-                *cache = file_snap;
+            Some((mut snap, mut ticket)) => {
+                let mut changed = false;
+                for attempt in 0..3 {
+                    let counts = badge_counts(&snap);
+                    match crate::commands::sharing::store_file_snapshot(&s_files, snap, ticket).await {
+                        Ok(previous) => {
+                            changed = counts != badge_counts(&previous);
+                            break;
+                        }
+                        // A later list landed while this task worked, and is
+                        // what the cache keeps. It carries the badges the
+                        // cache had before, so take another with these, or
+                        // they wait for the next change to show.
+                        Err(_) if attempt < 2 => {
+                            let index = li_ref.read().await;
+                            snap = index.all_files().to_vec();
+                            ticket = crate::commands::sharing::file_snapshot_ticket();
+                            drop(index);
+                            badge(&mut snap);
+                        }
+                        Err(_) => break,
+                    }
+                }
                 changed
             }
             // Neither the known.met counters nor any badge input

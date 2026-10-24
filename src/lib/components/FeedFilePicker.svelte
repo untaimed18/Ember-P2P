@@ -74,8 +74,17 @@
   const isEligible = (f: FileInfo) => f.shared && !f.friends_only && f.ember_file_hash?.length === 64;
   const isAdded = (f: FileInfo) => inFeed.has(keyOf(f));
 
-  let eligible = $derived(library.filter(isEligible));
-  let notShown = $derived(library.length - eligible.length);
+  // The Library has a row per path, so copies of one file share a hash; the
+  // table keys on it, and Svelte throws on a repeated key.
+  let eligible = $derived([...new Map(library.filter(isEligible).map((f) => [keyOf(f), f])).values()]);
+  /** Files, not rows, that cannot go in: a file with an eligible copy is in
+   *  the table, and an unhashed one counts once per path. */
+  let notShown = $derived.by(() => {
+    const listed = new Set(eligible.map(keyOf));
+    return new Set(
+      library.filter((f) => !isEligible(f) && !listed.has(keyOf(f))).map((f) => keyOf(f) || f.path),
+    ).size;
+  });
   let addedCount = $derived(eligible.filter(isAdded).length);
   let hidingAdded = $derived(hideAdded && addedCount > 0);
 

@@ -1920,20 +1920,41 @@ mod tests {
     }
 
     #[test]
-    fn hashset2_aich_requires_two_sources_when_expected_is_unknown() {
+    fn hashset2_aich_requires_emules_quorum_when_expected_is_unknown() {
         let root = [0xBBu8; 20];
         let mut pinned = None;
         let mut votes: HashMap<[u8; 20], HashSet<String>> = HashMap::new();
-        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), "203.0.113.5", root);
-        assert!(pinned.is_none());
-        // A reconnect gets a new worker index but is still the same peer.
-        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), "203.0.113.5", root);
-        assert!(
-            pinned.is_none(),
-            "the same source repeating a root is still one vote"
-        );
-        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), "198.51.100.9", root);
-        assert_eq!(pinned, Some(root));
+        let vote = |pinned: &mut Option<[u8; 20]>, votes: &mut HashMap<_, _>, ip: &str, root| {
+            consider_hashset2_aich_pin(pinned, None, Some(votes), ip, root);
+        };
+        vote(&mut pinned, &mut votes, "203.0.113.5", root);
+        // A reconnect gets a new worker index but is still the same peer, and
+        // a neighbour in the same /20 is the same network.
+        vote(&mut pinned, &mut votes, "203.0.113.5", root);
+        vote(&mut pinned, &mut votes, "203.0.118.9", root);
+        for n in 1..=8u8 {
+            vote(&mut pinned, &mut votes, &format!("198.{n}.100.9"), root);
+        }
+        assert!(pinned.is_none(), "nine networks are not enough, two colluding peers far less");
+        vote(&mut pinned, &mut votes, "192.0.2.1", root);
+        assert_eq!(pinned, Some(root), "ten networks and every vote agreeing");
+    }
+
+    #[test]
+    fn hashset2_aich_needs_ninety_two_percent_agreement() {
+        let honest = [0xBBu8; 20];
+        let forged = [0xCCu8; 20];
+        let mut pinned = None;
+        let mut votes: HashMap<[u8; 20], HashSet<String>> = HashMap::new();
+        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), "10.1.0.1", forged);
+        for n in 1..=10u8 {
+            consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), &format!("198.{n}.100.9"), honest);
+        }
+        assert!(pinned.is_none(), "10 of 11 is under 92%");
+        for n in 11..=12u8 {
+            consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), &format!("198.{n}.100.9"), honest);
+        }
+        assert_eq!(pinned, Some(honest), "12 of 13 clears it");
     }
 
     #[test]
@@ -4331,16 +4352,37 @@ pub(crate) fn verify_hashset(
     computed == *file_hash
 }
 
+/// Source networks that must advertise one AICH root before it is trusted
+/// without a catalog value (eMule `MINUNIQUEIPS_TOTRUST`).
+const AICH_TRUST_MIN_NETWORKS: usize = 10;
+/// Share of all advertising networks that root must hold, in percent (eMule
+/// `MINPERCENTAGE_TOTRUST`).
+const AICH_TRUST_MIN_PERCENT: usize = 92;
+
+/// The network a vote counts for: an IPv4 address masked to its /20, as eMule
+/// masks `0x00F0FFFF`, so one operator's neighbouring addresses count once.
+fn aich_voter_network(voter: &str) -> String {
+    match voter.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) => {
+            let [a, b, c, _] = ip.octets();
+            format!("{a}.{b}.{}", c & 0xF0)
+        }
+        Err(_) => voter.to_string(),
+    }
+}
+
 /// Pin an AICH master from a HashSet2 whose MD4 hashset already verified.
 ///
 /// Whole-file ed2k still gates completion, but a first-wins pin poisons
-/// recovery: later AICH answers are ignored if they disagree with the pin.
-/// Catalog `expected` is enough on its own. Otherwise a single source is
-/// not: two distinct peer addresses must advertise the same root. Keyed on
-/// the address rather than the worker's index, which is new each time a peer
-/// is re-injected or calls back, so one client voted twice by reconnecting
-/// and pinned a root nothing could replace. When `expected` is already known,
-/// a conflicting HashSet2 root is ignored even if several sources repeat it.
+/// recovery: later AICH answers are ignored if they disagree with the pin, and
+/// a forged root steers which blocks recovery throws away. Catalog `expected`
+/// is enough on its own. Otherwise the root needs eMule's quorum: at least
+/// [`AICH_TRUST_MIN_NETWORKS`] source networks behind it and
+/// [`AICH_TRUST_MIN_PERCENT`] of every network that advertised any root.
+/// Keyed on the address rather than the worker's index, which is new each
+/// time a peer is re-injected or calls back, so reconnecting earns no second
+/// vote. When `expected` is already known, a conflicting HashSet2 root is
+/// ignored however many sources repeat it.
 pub(super) fn consider_hashset2_aich_pin(
     pinned: &mut Option<[u8; 20]>,
     expected: Option<[u8; 20]>,
@@ -4361,8 +4403,10 @@ pub(super) fn consider_hashset2_aich_pin(
     let Some(votes) = votes else {
         return;
     };
-    votes.entry(root).or_default().insert(voter.to_string());
-    if votes.get(&root).map(|s| s.len()).unwrap_or(0) >= 2 {
+    votes.entry(root).or_default().insert(aich_voter_network(voter));
+    let total: usize = votes.values().map(HashSet::len).sum();
+    let behind = votes.get(&root).map_or(0, HashSet::len);
+    if behind >= AICH_TRUST_MIN_NETWORKS && behind * 100 >= total * AICH_TRUST_MIN_PERCENT {
         *pinned = Some(root);
     }
 }

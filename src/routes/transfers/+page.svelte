@@ -54,6 +54,7 @@
   import { BUILTIN_DOWNLOAD_CATEGORIES, downloadCategoryLabel } from '$lib/downloadCategories';
   import { categoriesDialogRequested } from '$lib/stores/categoriesDialog';
   import {
+    codedErrorOf,
     translateError,
     transferFailureKindText,
     transferFailureReasonText,
@@ -2838,8 +2839,10 @@
     return t.status === 'active' || t.status === 'searching' || t.status === 'queued';
   }
 
+  // Not while the finished file is moved into place: nothing stops that move,
+  // and the backend leaves such a row to finish.
   function canStop(t: Transfer): boolean {
-    return t.status !== 'completed' && t.status !== 'failed' && t.status !== 'stopped';
+    return t.status !== 'completed' && t.status !== 'failed' && t.status !== 'stopped' && t.status !== 'completing';
   }
 
   function isPausedState(t: Transfer): boolean {
@@ -4086,15 +4089,20 @@
     if (cancelIds.length > 0) {
       const pending = new Set(cancelIds);
       try {
+        const fresh = await getTransfers();
         const finished = new Set(
-          (await getTransfers())
-            .filter((t) => pending.has(t.id) && t.status === 'completed')
-            .map((t) => t.id),
+          fresh.filter((t) => pending.has(t.id) && t.status === 'completed').map((t) => t.id),
         );
-        if (finished.size > 0) {
-          cancel = cancelIds.filter((id) => !finished.has(id));
+        // Still moving its file into Downloads: nothing can stop that, and the
+        // backend leaves the row to finish, so it goes back in the list.
+        const moving = new Set(
+          fresh.filter((t) => pending.has(t.id) && t.status === 'completing').map((t) => t.id),
+        );
+        if (finished.size > 0 || moving.size > 0) {
+          cancel = cancelIds.filter((id) => !finished.has(id) && !moving.has(id));
           remove = [...removeIds, ...finished];
         }
+        if (moving.size > 0) restore(moving);
       } catch (e: unknown) {
         console.warn('transfers: could not re-check rows before a deferred cancel', e);
       }
@@ -4122,12 +4130,29 @@
       });
       const failed = remove.flatMap((id, i) => {
         const r = results[i];
-        return r.status === 'rejected' ? [{ id, error: toErrorMsg(r.reason) }] : [];
+        return r.status === 'rejected'
+          ? [{ id, error: toErrorMsg(r.reason), kept: codedErrorOf(r.reason)?.code === 'transfers_preserve_partial_failed' }]
+          : [];
       });
       if (failed.length > 0) {
         restore(new Set(failed.map((f) => f.id)));
-        const more = failed.length > 1 ? m.transfers_batch_failed_more({ count: failed.length - 1 }) : '';
-        toastError(`${failed[0].error}${more}`);
+        // A failed download is removed only once its progress is safe in
+        // Downloads. When that move cannot be made, deleting is the one way
+        // left to clear the row, so it is offered rather than a dead end.
+        const kept = failed.filter((f) => f.kept).map((f) => f.id);
+        if (kept.length > 0) {
+          addActionToast(
+            'error',
+            m.transfers_keep_progress_failed(),
+            { label: m.common_delete(), run: () => void deleteInstead(kept, restore) },
+            () => {},
+          );
+        }
+        const others = failed.filter((f) => !f.kept);
+        if (others.length > 0) {
+          const more = others.length > 1 ? m.transfers_batch_failed_more({ count: others.length - 1 }) : '';
+          toastError(`${others[0].error}${more}`);
+        }
       }
       return;
     }
@@ -4135,6 +4160,21 @@
       await clearCompleted(remove);
     } catch (e: unknown) {
       restore(new Set(remove));
+      toastError(toErrorMsg(e));
+    }
+  }
+
+  /** Delete failed downloads whose progress could not be kept, with it. */
+  async function deleteInstead(ids: string[], restore: (ids: ReadonlySet<string>) => void) {
+    for (const id of ids) {
+      markDownloadRemoved(id);
+      speedHistory.delete(id);
+      forgetTransfer(id);
+    }
+    try {
+      await cancelTransfersBatch(ids);
+    } catch (e: unknown) {
+      restore(new Set(ids));
       toastError(toErrorMsg(e));
     }
   }

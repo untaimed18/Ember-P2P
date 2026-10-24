@@ -2893,8 +2893,8 @@ impl MultiSourceDownload {
         };
         let part_hashes: Arc<RwLock<Vec<[u8; 16]>>> = Arc::new(RwLock::new(resumed_part_hashes));
         // Seed from EPX/cache when available. HashSet2 pins only when the
-        // catalog expected root matches, or two distinct sources agree
-        // (see `consider_hashset2_aich_pin`).
+        // catalog expected root matches, or eMule's quorum of source networks
+        // agrees (see `consider_hashset2_aich_pin`).
         let shared_aich_master =
             SharedAichPin::new(self.trusted_aich_master, self.expected_aich_master);
         if self.trusted_aich_master.is_some() {

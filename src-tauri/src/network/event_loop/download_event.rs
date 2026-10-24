@@ -744,7 +744,10 @@ pub(in crate::network) async fn on_download_event(
                             .unwrap_or(shared_file)
                     };
                     {
-                        let mut snap = local_index.read().await.all_files().to_vec();
+                        let (mut snap, ticket) = {
+                            let index = local_index.read().await;
+                            (index.all_files().to_vec(), crate::commands::sharing::file_snapshot_ticket())
+                        };
                         let kad_connected =
                             state.stats.status == NetworkStatus::Connected;
                         let kad_published =
@@ -759,7 +762,7 @@ pub(in crate::network) async fn on_download_event(
                             &state.offered_ed2k_hashes,
                             &state.ember_published_sources,
                         );
-                        *shared_files.write().await = snap;
+                        let _ = crate::commands::sharing::store_file_snapshot(shared_files, snap, ticket).await;
                     }
 
                     if kad_may_advertise_complete(

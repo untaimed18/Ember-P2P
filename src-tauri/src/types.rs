@@ -736,6 +736,10 @@ pub struct NetworkStats {
     /// was taken.
     #[serde(default)]
     pub bound_udp_port: u16,
+    /// The UDP port QUIC is bound to, 0 before it binds. The same as
+    /// `bound_udp_port` when QUIC shares that socket.
+    #[serde(default)]
+    pub quic_udp_port: u16,
     /// What this session started with, which a saved change only replaces
     /// at the next restart: the TCP port it listens on (or tried to), the UDP
     /// port it was configured with, and whether UPnP runs.
@@ -1453,6 +1457,7 @@ impl Default for NetworkStats {
             upnp_wan_ip: String::new(),
             tcp_listen_failed: false,
             bound_udp_port: 0,
+            quic_udp_port: 0,
             session_tcp_port: 0,
             session_udp_port: 0,
             session_upnp_enabled: false,

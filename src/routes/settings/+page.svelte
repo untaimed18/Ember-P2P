@@ -1353,7 +1353,8 @@
   }
 
   // `uss_enabled` too: an Unlimited upload set there turns USS off.
-  // `friend_overrides` is saved only from a friend's settings dialog.
+  // `friend_overrides` is saved only from a friend's settings dialog, and
+  // `close_to_tray_behavior` also by "Remember my choice" in the close dialog.
   const QUICK_LIMIT_KEYS = [
     'alt_speed_enabled',
     'max_upload_speed',
@@ -1362,11 +1363,12 @@
     'alt_max_download_speed',
     'uss_enabled',
     'friend_overrides',
+    'close_to_tray_behavior',
   ] as const;
 
-  /** The tray, the status bar or a friend's settings dialog saved while this
-   *  page was open. Show it, except in a field already edited here, which
-   *  stays a change to apply. */
+  /** The tray, the status bar, a friend's settings dialog or the close dialog
+   *  saved while this page was open. Show it, except in a field already edited
+   *  here, which stays a change to apply. */
   function foldQuickLimits(saved: AppSettings): void {
     if (!settings || !originalSettings) return;
     let baseline: AppSettings;

@@ -1084,6 +1084,19 @@ impl Database {
         std::path::PathBuf::from(marker)
     }
 
+    /// Undo [`Self::mark_clean_shutdown`] for a session that turned out to go
+    /// on, such as one whose update install failed after the shutdown ran: a
+    /// crash from here on is as unclean as any other.
+    pub fn mark_session_running(&self) {
+        let marker = Self::session_marker_path(&self.path);
+        if let Err(error) = std::fs::write(&marker, b"") {
+            tracing::warn!(
+                "Could not record the session marker at {}: {error}",
+                marker.display()
+            );
+        }
+    }
+
     /// Record that this session reached its shutdown, so the next launch can
     /// skip the full integrity check.
     pub fn mark_clean_shutdown(&self) {
@@ -3527,6 +3540,10 @@ impl Database {
         // chain: 1.7.0 has to open this database, and it names every
         // `transfers` column it reads or writes, so one more is invisible to it.
         Self::add_column_if_missing(&conn, "transfers", "failure_code", "TEXT")?;
+        // Where a download stands in the queue, as the user arranged it; NULL
+        // for one never placed, which keeps its `started_at` order. Outside
+        // the numbered chain for the same reason.
+        Self::add_column_if_missing(&conn, "transfers", "queue_order", "INTEGER")?;
         // When a friend's note first held an offer we sent, and whether a
         // session ending has let it go since; see
         // `hold_chat_attachment_offer`. Outside the numbered chain for the
@@ -5017,7 +5034,7 @@ impl Database {
              WHERE status NOT IN ('completed', 'noneneeded')
                AND status NOT LIKE 'queue_overflow%'
                AND direction = 'download'
-             ORDER BY started_at ASC, id ASC
+             ORDER BY queue_order IS NULL, queue_order ASC, started_at ASC, id ASC
              LIMIT ?1 OFFSET ?2"
         )?;
 
@@ -5346,6 +5363,26 @@ impl Database {
             for id in transfer_ids {
                 stmt.execute(params![id])?;
                 folders.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record the download queue's order: `ordered_ids` take positions 0, 1,
+    /// … and every other download forgets its place, so one added after this
+    /// falls back to its `started_at` order behind them. One transaction.
+    pub fn set_download_queue_order(&self, ordered_ids: &[String]) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE transfers SET queue_order = NULL WHERE direction = 'download' AND queue_order IS NOT NULL",
+            [],
+        )?;
+        {
+            let mut stmt = tx.prepare("UPDATE transfers SET queue_order = ?1 WHERE id = ?2")?;
+            for (position, id) in ordered_ids.iter().enumerate() {
+                stmt.execute(params![i64::try_from(position).unwrap_or(i64::MAX), id])?;
             }
         }
         tx.commit()?;
@@ -9016,26 +9053,39 @@ impl Database {
     /// its body alone, and short replies repeat — "ok" sent twice, the second
     /// still queued, would otherwise resolve to the queued copy and flag it and
     /// everything before it as read by someone who has not received it yet.
+    ///
+    /// `passed_over` are rows the receipt resolves to only when no other
+    /// delivered row matches: those just delivered as a session started, when
+    /// the receipt may be the friend re-sending one about an older copy.
     pub fn mark_sent_seen_by_hash(
         &self,
         friend_hash: &str,
         body_hash: &str,
+        passed_over: &[i64],
     ) -> anyhow::Result<Option<i64>> {
         if body_hash.is_empty() {
             return Ok(None);
         }
         let conn = self.conn.lock();
-        let id: Option<i64> = conn
-            .query_row(
+        let matches: Vec<i64> = {
+            let mut stmt = conn.prepare(
                 "SELECT id FROM chat_messages \
                  WHERE friend_hash = ?1 AND direction = 'sent' AND body_hash = ?2 \
                    AND delivery = ?3 \
-                 ORDER BY id DESC LIMIT 1",
-                params![friend_hash, body_hash, CHAT_DELIVERED],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(id) = id else {
+                 ORDER BY id DESC LIMIT ?4",
+            )?;
+            let limit = i64::try_from(passed_over.len()).unwrap_or(i64::MAX).saturating_add(1);
+            let rows = stmt.query_map(params![friend_hash, body_hash, CHAT_DELIVERED, limit], |row| {
+                row.get::<_, i64>(0)
+            })?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let Some(id) = matches
+            .iter()
+            .copied()
+            .find(|id| !passed_over.contains(id))
+            .or_else(|| matches.first().copied())
+        else {
             return Ok(None);
         };
         conn.execute(
@@ -18407,6 +18457,49 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
+    /// The queue order the user arranged is what a restart reloads; a download
+    /// never placed follows by `started_at`, and a status write keeps the place.
+    #[test]
+    fn the_download_queue_order_survives_a_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-queue-order-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).unwrap();
+        for (id, started_at) in [("a", 1), ("b", 2), ("c", 3), ("d", 4)] {
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO transfers (
+                        id, file_name, file_hash, peer_id, peer_name, direction, status,
+                        progress, speed, total_size, transferred, started_at, priority, category
+                     ) VALUES (?1, 'file.bin', ?2, '', '', 'download', 'queued', 0, 0, 4, 0, ?3, 'normal', '')",
+                    params![id, "11".repeat(16), started_at],
+                )
+                .unwrap();
+        }
+        let order = |db: &Database| -> Vec<String> {
+            db.get_incomplete_downloads().unwrap().into_iter().map(|t| t.id).collect()
+        };
+        assert_eq!(order(&db), ["a", "b", "c", "d"], "unplaced rows keep started_at order");
+
+        db.set_download_queue_order(&["c".into(), "a".into(), "b".into()]).unwrap();
+        assert_eq!(order(&db), ["c", "a", "b", "d"]);
+        db.update_transfer_status("c", "paused").unwrap();
+        let row = db.get_incomplete_downloads().unwrap().into_iter().find(|t| t.id == "a").unwrap();
+        db.save_transfer(&row).unwrap();
+        assert_eq!(order(&db), ["c", "a", "b", "d"], "status writes keep the place");
+
+        db.set_download_queue_order(&["b".into()]).unwrap();
+        assert_eq!(order(&db), ["b", "a", "c", "d"], "a new order replaces the old one whole");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
     /// Why a Failed download failed is read back after a restart, so a
     /// failure Resume must not continue stays one; any other status drops it.
     #[test]
@@ -27463,7 +27556,7 @@ mod tests {
         db.mark_messages_read(&friend).unwrap();
         let hash = db.latest_read_received_hash(&friend).unwrap().expect("hash");
         let until = db
-            .mark_sent_seen_by_hash(&friend, &hash)
+            .mark_sent_seen_by_hash(&friend, &hash, &[])
             .unwrap()
             .expect("matched our sent copy of the same body");
         assert_eq!(until, second);
@@ -27502,7 +27595,7 @@ mod tests {
         let hash = Database::friend_chat_body_hash_hex("ok");
 
         let until = db
-            .mark_sent_seen_by_hash(&friend, &hash)
+            .mark_sent_seen_by_hash(&friend, &hash, &[])
             .unwrap()
             .expect("the delivered copy matches");
         assert_eq!(until, delivered_ok, "the queued copy is not a candidate");
@@ -27520,9 +27613,50 @@ mod tests {
         // Nothing but outbox copies of a body: no watermark at all.
         let only_queued = Database::friend_chat_body_hash_hex("did you get that?");
         assert_eq!(
-            db.mark_sent_seen_by_hash(&friend, &only_queued).unwrap(),
+            db.mark_sent_seen_by_hash(&friend, &only_queued, &[]).unwrap(),
             None
         );
+        drop(db);
+        remove_test_database(&path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A friend re-sends their last receipt as a session starts. When that
+    /// session's flush just delivered another copy of the same text, the
+    /// receipt is for the older copy, and the new one and the lines before it
+    /// stay unseen; with no older copy, the new one is what they read.
+    #[test]
+    fn a_resent_receipt_passes_over_a_copy_the_session_start_just_delivered() {
+        let dir = std::env::temp_dir().join(format!(
+            "ember-chat-seen-resend-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ember.db");
+        let friend = "ac".repeat(16);
+        let db = Database::open_at(&path).unwrap();
+        let read_ok = db.insert_chat_message(&friend, "sent", "ok").unwrap();
+        let between = db.insert_chat_message(&friend, "sent", "see you").unwrap();
+        let flushed_ok = db.insert_chat_message(&friend, "sent", "ok").unwrap();
+        let hash = Database::friend_chat_body_hash_hex("ok");
+
+        let until = db.mark_sent_seen_by_hash(&friend, &hash, &[flushed_ok]).unwrap();
+        assert_eq!(until, Some(read_ok));
+        let seen = |id: i64| {
+            db.get_chat_messages(&friend, 10, None)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .seen
+        };
+        assert!(seen(read_ok));
+        assert!(!seen(between) && !seen(flushed_ok), "nothing past the line they read");
+
+        let fresh = Database::friend_chat_body_hash_hex("see you");
+        let until = db.mark_sent_seen_by_hash(&friend, &fresh, &[between]).unwrap();
+        assert_eq!(until, Some(between), "no older copy: the delivered one is what they read");
         drop(db);
         remove_test_database(&path);
         let _ = std::fs::remove_dir_all(dir);

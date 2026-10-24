@@ -1014,6 +1014,73 @@ pub(crate) fn resolved_download_folder_refused(path: &std::path::Path) -> bool {
     is_filesystem_root(path) || crate::sharing::path_has_sensitive_component(path)
 }
 
+/// Whether `folder` may be the download folder, as [`validate_settings`]
+/// decides it. Also for callers that are about to choose one on the user's
+/// behalf, such as an eMule import taking eMule's Incoming folder, so a folder
+/// refused here is refused when it is chosen rather than at the next launch.
+pub(crate) fn validate_download_folder(folder: &str) -> Result<(), String> {
+    // Rejected rather than skipped. An empty value used to bypass the whole
+    // path-safety block below, then compose the *relative* path `Downloads`
+    // against the process CWD, while `lib.rs` skipped both `create_dir_all` and
+    // the approved-root registration for it — leaving `open_or_create_approved`
+    // with no root to admit and every download failing with nothing to point at.
+    // The picker code is reused because an empty value means no folder has been
+    // chosen, which is the same remedy.
+    if folder.is_empty() {
+        return Err(coded(
+            "settings_download_folder_not_picked",
+            "Choose the download folder with Browse before saving",
+        ));
+    }
+    if folder.len() > MAX_PATH_LEN {
+        return Err(coded_ctx(
+            "settings_download_folder_too_long",
+            format!("Download folder path exceeds {MAX_PATH_LEN} bytes"),
+            MAX_PATH_LEN,
+        ));
+    }
+    let path = std::path::Path::new(folder);
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(coded(
+            "settings_download_folder_parent_dir",
+            "Download folder must not contain '..' path components",
+        ));
+    }
+    if is_filesystem_root(path)
+        || path
+            .canonicalize()
+            .ok()
+            .as_deref()
+            .is_some_and(is_filesystem_root)
+    {
+        return Err(coded_ctx(
+            "settings_download_folder_root",
+            "Download folder must not be a filesystem root",
+            folder,
+        ));
+    }
+    // Scan the literal path AND (best-effort) its canonical form. A
+    // junction/symlink can point a benign-looking folder at a blocked
+    // system directory; canonicalizing resolves the reparse point so the
+    // segment check can't be bypassed. A not-yet-created folder won't
+    // canonicalize — fall back to the literal check in that case.
+    let canonical = path.canonicalize().ok();
+    let scan_paths = std::iter::once(path.to_path_buf()).chain(canonical);
+    for scan_path in scan_paths {
+        if crate::sharing::path_has_sensitive_component(&scan_path) {
+            return Err(coded_ctx(
+                "settings_download_folder_system_dir",
+                "Cannot use system directory as download folder",
+                folder,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The download folder's checks that need only its text: set, within the
 /// length limit, no `..`, and not refused as written.
 fn download_folder_text_acceptable(folder: &str) -> bool {
@@ -1325,62 +1392,7 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
     if !settings.channel_username.is_empty() {
         crate::commands::channels::sanitize_channel_username(&settings.channel_username)?;
     }
-    // Rejected rather than skipped. An empty value used to bypass the whole
-    // path-safety block below, then compose the *relative* path `Downloads`
-    // against the process CWD, while `lib.rs` skipped both `create_dir_all` and
-    // the approved-root registration for it — leaving `open_or_create_approved`
-    // with no root to admit and every download failing with nothing to point at.
-    // The picker code is reused because an empty value means no folder has been
-    // chosen, which is the same remedy.
-    if settings.download_folder.is_empty() {
-        return Err(coded(
-            "settings_download_folder_not_picked",
-            "Choose the download folder with Browse before saving",
-        ));
-    }
-    // Braced to keep `path`/`canonical` out of the shared-folder loop below,
-    // which binds the same names.
-    {
-        let path = std::path::Path::new(&settings.download_folder);
-        if path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return Err(coded(
-                "settings_download_folder_parent_dir",
-                "Download folder must not contain '..' path components",
-            ));
-        }
-        if is_filesystem_root(path)
-            || path
-                .canonicalize()
-                .ok()
-                .as_deref()
-                .is_some_and(is_filesystem_root)
-        {
-            return Err(coded_ctx(
-                "settings_download_folder_root",
-                "Download folder must not be a filesystem root",
-                &settings.download_folder,
-            ));
-        }
-        // Scan the literal path AND (best-effort) its canonical form. A
-        // junction/symlink can point a benign-looking folder at a blocked
-        // system directory; canonicalizing resolves the reparse point so the
-        // segment check can't be bypassed. A not-yet-created folder won't
-        // canonicalize — fall back to the literal check in that case.
-        let canonical = path.canonicalize().ok();
-        let scan_paths = std::iter::once(path.to_path_buf()).chain(canonical);
-        for scan_path in scan_paths {
-            if crate::sharing::path_has_sensitive_component(&scan_path) {
-                return Err(coded_ctx(
-                    "settings_download_folder_system_dir",
-                    "Cannot use system directory as download folder",
-                    &settings.download_folder,
-                ));
-            }
-        }
-    }
+    validate_download_folder(&settings.download_folder)?;
     if !settings.rendezvous_url.is_empty() {
         let url_lower = settings.rendezvous_url.to_ascii_lowercase();
         if !url_lower.starts_with("https://") {
@@ -1532,11 +1544,15 @@ async fn restore_previous_username_claim(state: &AppState, previous: &str) {
 #[tauri::command]
 pub async fn update_settings(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     settings: serde_json::Value,
     // Absent for every background/partial save; see the re-approval block below.
     reapprove_download_root: Option<bool>,
 ) -> Result<UpdateSettingsResult, String> {
+    // Turns the IP filter, private-address blocking and anti-leech on and off
+    // live, which the chat window is refused one by one.
+    crate::commands::chat_window::require_main_window(&window)?;
     let reapprove_download_root = reapprove_download_root.unwrap_or(false);
     // Serialize the read/merge/write transaction before deserializing the
     // renderer payload. Internal cursor/pending maps can advance without
@@ -2629,6 +2645,7 @@ pub fn take_pending_known_met_notice() -> Result<Option<KnownMetNotice>, String>
 
 #[tauri::command]
 pub async fn set_close_behavior(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     behavior: String,
 ) -> Result<(), String> {
@@ -2665,9 +2682,14 @@ pub async fn set_close_behavior(
     .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?;
     {
         let mut config = state.config.write().await;
-        config.settings = new_settings;
+        config.settings = new_settings.clone();
     }
     *state.close_behavior.write() = normalized;
+    // An open Settings page holds its own copy, and would otherwise save the
+    // old choice back, or take picking it again for no change.
+    if let Err(error) = app.emit(SETTINGS_CHANGED_EVENT, &new_settings) {
+        tracing::debug!("Could not emit the settings change: {error}");
+    }
     Ok(())
 }
 
