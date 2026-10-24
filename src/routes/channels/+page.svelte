@@ -3352,30 +3352,48 @@
             </div>
           {/if}
           <div class="list-scroll" bind:this={listScrollEl}>
-            <!-- The header stays while a search hides every joined room, so
-                 "Mark all rooms as read" — which covers them all regardless —
-                 does not come and go with the query. -->
-            {#if roomSections.yours.length > 0 || unreadJoinedIds.length > 0}
-              <div class="list-section">
-                <h3 class="list-section-label" id="rooms-section-yours">{m.channels_section_yours()}</h3>
-                {#if unreadJoinedIds.length > 0}
-                  <button
-                    type="button"
-                    class="list-section-action"
-                    title={m.channels_mark_all_read_title()}
-                    disabled={markingAllRead}
-                    aria-busy={markingAllRead ? 'true' : undefined}
-                    onclick={markAllRead}
-                  >{markingAllRead ? m.channels_marking_all_read() : m.channels_mark_all_read()}</button>
-                {/if}
-              </div>
-              {#if roomSections.yours.length > 0}
-                <div role="list" aria-labelledby="rooms-section-yours">
-                  {#each roomSections.yours as ch (ch.channel_id)}
-                    {@render roomRow(ch)}
-                  {/each}
-                </div>
+            {#snippet markAllReadAction()}
+              {#if unreadJoinedIds.length > 0}
+                <button
+                  type="button"
+                  class="list-section-action"
+                  title={m.channels_mark_all_read_title()}
+                  disabled={markingAllRead}
+                  aria-busy={markingAllRead ? 'true' : undefined}
+                  onclick={markAllRead}
+                >{markingAllRead ? m.channels_marking_all_read() : m.channels_mark_all_read()}</button>
               {/if}
+            {/snippet}
+            <!-- "Mark all rooms as read" rides on the first of your sections.
+                 While a search hides every joined room, a plain "Your rooms"
+                 header keeps it, so it does not come and go with the query. -->
+            {#if roomSections.yoursPublic.length > 0}
+              <div class="list-section">
+                <h3 class="list-section-label" id="rooms-section-yours-public">{m.channels_section_yours_public()}</h3>
+                {@render markAllReadAction()}
+              </div>
+              <div role="list" aria-labelledby="rooms-section-yours-public">
+                {#each roomSections.yoursPublic as ch (ch.channel_id)}
+                  {@render roomRow(ch)}
+                {/each}
+              </div>
+            {/if}
+            {#if roomSections.yoursPrivate.length > 0}
+              <div class="list-section">
+                <h3 class="list-section-label" id="rooms-section-yours-private">{m.channels_section_yours_private()}</h3>
+                {#if roomSections.yoursPublic.length === 0}{@render markAllReadAction()}{/if}
+              </div>
+              <div role="list" aria-labelledby="rooms-section-yours-private">
+                {#each roomSections.yoursPrivate as ch (ch.channel_id)}
+                  {@render roomRow(ch)}
+                {/each}
+              </div>
+            {/if}
+            {#if roomSections.yours.length === 0 && unreadJoinedIds.length > 0}
+              <div class="list-section">
+                <h3 class="list-section-label">{m.channels_section_yours()}</h3>
+                {@render markAllReadAction()}
+              </div>
             {/if}
             {#if roomSections.discover.length > 0}
               <div class="list-section">

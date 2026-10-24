@@ -124,7 +124,22 @@ describe('sectionRooms', () => {
   });
 
   it('hands back empty sections for an empty list', () => {
-    expect(sectionRooms([], ['a'])).toEqual({ yours: [], discover: [] });
+    expect(sectionRooms([], ['a'])).toEqual({ yours: [], yoursPublic: [], yoursPrivate: [], discover: [] });
+  });
+
+  it('puts joined public rooms before joined private ones, favourites leading each', () => {
+    const room = (channel_id: string, visibility: string) => ({ channel_id, in_room: true, visibility });
+    const ranked = [room('p1', 'private'), room('a', 'public'), room('p2', 'private'), room('b', 'public')];
+    const { yours, yoursPublic, yoursPrivate } = sectionRooms(ranked, ['p2', 'b']);
+    expect(yoursPublic.map((r) => r.channel_id)).toEqual(['b', 'a']);
+    expect(yoursPrivate.map((r) => r.channel_id)).toEqual(['p2', 'p1']);
+    expect(yours.map((r) => r.channel_id), 'the order the list draws them').toEqual(['b', 'a', 'p2', 'p1']);
+  });
+
+  it('counts a room of unknown visibility as public', () => {
+    const { yoursPublic, yoursPrivate } = sectionRooms([{ channel_id: 'x', in_room: true, visibility: 'later' }], []);
+    expect(yoursPublic.map((r) => r.channel_id)).toEqual(['x']);
+    expect(yoursPrivate).toEqual([]);
   });
 });
 

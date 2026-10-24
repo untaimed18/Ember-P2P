@@ -4038,6 +4038,8 @@
   "channels_notify_desktop_off_action": "Включите «{setting}» в разделе Настройки › Уведомления",
   "channels_unread_mention_aria": "Непрочитанных: {count}, есть упоминание вас",
   "channels_section_yours": "Ваши комнаты",
+  "channels_section_yours_public": "Ваши открытые комнаты",
+  "channels_section_yours_private": "Ваши приватные комнаты",
   "channels_section_discover": "Обзор",
   "channels_mark_all_read": "Отметить все комнаты как прочитанные",
   "channels_marking_all_read": "Отмечаем как прочитанные…",

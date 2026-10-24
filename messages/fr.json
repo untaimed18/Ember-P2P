@@ -4038,6 +4038,8 @@
   "channels_notify_desktop_off_action": "Activez « {setting} » dans Paramètres › Notifications",
   "channels_unread_mention_aria": "Non lus : {count}, dont une mention de vous",
   "channels_section_yours": "Vos salons",
+  "channels_section_yours_public": "Vos salons publics",
+  "channels_section_yours_private": "Vos salons privés",
   "channels_section_discover": "Découvrir",
   "channels_mark_all_read": "Marquer tous les salons comme lus",
   "channels_marking_all_read": "Marquage comme lus…",

@@ -4056,6 +4056,8 @@
   "channels_notify_desktop_off_action": "„{setting}“ unter Einstellungen › Benachrichtigungen einschalten",
   "channels_unread_mention_aria": "{count} ungelesen, darunter eine Erwähnung von Ihnen",
   "channels_section_yours": "Ihre Räume",
+  "channels_section_yours_public": "Ihre öffentlichen Räume",
+  "channels_section_yours_private": "Ihre privaten Räume",
   "channels_section_discover": "Entdecken",
   "channels_mark_all_read": "Alle Räume als gelesen markieren",
   "channels_marking_all_read": "Wird als gelesen markiert…",

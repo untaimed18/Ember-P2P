@@ -4056,6 +4056,8 @@
   "channels_notify_desktop_off_action": "Turn on “{setting}” in Settings › Notifications",
   "channels_unread_mention_aria": "{count} unread, including a mention of you",
   "channels_section_yours": "Your rooms",
+  "channels_section_yours_public": "Your public rooms",
+  "channels_section_yours_private": "Your private rooms",
   "channels_section_discover": "Discover",
   "channels_mark_all_read": "Mark all rooms as read",
   "channels_marking_all_read": "Marking as read…",

@@ -4038,6 +4038,8 @@
   "channels_notify_desktop_off_action": "Attiva «{setting}» in Impostazioni › Notifiche",
   "channels_unread_mention_aria": "Non letti: {count}, inclusa una tua menzione",
   "channels_section_yours": "Le tue stanze",
+  "channels_section_yours_public": "Le tue stanze pubbliche",
+  "channels_section_yours_private": "Le tue stanze private",
   "channels_section_discover": "Scopri",
   "channels_mark_all_read": "Segna tutte le stanze come lette",
   "channels_marking_all_read": "Segno come lette…",

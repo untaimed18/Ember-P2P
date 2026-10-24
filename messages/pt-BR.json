@@ -4038,6 +4038,8 @@
   "channels_notify_desktop_off_action": "Ative “{setting}” em Configurações › Notificações",
   "channels_unread_mention_aria": "Não lidas: {count}, incluindo uma menção a você",
   "channels_section_yours": "Suas salas",
+  "channels_section_yours_public": "Suas salas públicas",
+  "channels_section_yours_private": "Suas salas privadas",
   "channels_section_discover": "Descobrir",
   "channels_mark_all_read": "Marcar todas as salas como lidas",
   "channels_marking_all_read": "Marcando como lidas…",

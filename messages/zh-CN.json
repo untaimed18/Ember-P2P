@@ -4038,6 +4038,8 @@
   "channels_notify_desktop_off_action": "在 设置 › 通知 中开启“{setting}”",
   "channels_unread_mention_aria": "{count} 条未读，其中有提及你的消息",
   "channels_section_yours": "你的房间",
+  "channels_section_yours_public": "你的公开房间",
+  "channels_section_yours_private": "你的私密房间",
   "channels_section_discover": "发现",
   "channels_mark_all_read": "将所有房间标为已读",
   "channels_marking_all_read": "正在标为已读…",
