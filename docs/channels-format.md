@@ -1351,7 +1351,7 @@ sequence(8) || list_ed2k_hash(16) || item_count(4) || description_len(2) ||
 description`, with the description at most 256 bytes and nothing after it.
 `sequence` is the publisher's clock in milliseconds, never less than one past
 the last it published (`next_sequence`), so the latest publish wins on any of
-the publisher's devices; a device's daily republish first looks for a newer
+the publisher's devices; a device's republish first looks for a newer
 head and leaves it in place. A follower takes the highest `sequence` it has
 seen and never goes back.
 
@@ -1361,7 +1361,16 @@ trailer does not parse, or which names no list. They keep it
 `CHANNEL_GOVERNANCE_TTL` (30 days), replicate it, and among a feed's heads keep
 the newest timestamp. Builds before it file it as an unknown type for
 `KEYWORD_RECORD_TTL` (24 hours) without replicating or reading it. The
-publisher republishes daily and on every publish.
+publisher republishes hourly while it runs, and on every publish: while most
+storers are such builds, a head stored a day ago has often lost every node
+that held it. Each republish is also pushed to friends with a session, as a
+publish is, so a friend who followed since takes it whatever the DHT holds.
+
+**Followers** look a feed up every 30 minutes, and every 3 minutes while it
+has never been found, for a day after following it. A lookup whose key gives
+no head reads the feed's index shard (below), at most every 15 minutes, and
+takes the head the newest listing of the feed carries, unless it withdraws
+it.
 
 **The list** is a format-v2 collection (`network/ed2k/collection.rs`) of at
 most 2,000 entries, each with name, size, eD2K, AICH and Ember BLAKE3. An entry
@@ -1421,13 +1430,13 @@ keeps, for withdrawals of deleted ones), against 150 under other keys; a
 replacement of one it holds is always taken. Older builds file it as an
 unknown type for 24 hours.
 
-**The publisher** signs its listing anew with every publish and every daily
+**The publisher** signs its listing anew with every publish and every hourly
 republish while the feed is listed. Each listing or withdrawal of a feed is
 stamped at least a second after the last, a stamp kept in the database across
 restarts, and whether the feed is listed is read as it is stamped, so a
 change of mind is never a tie nor outranked by a listing decided before it.
 Taking a feed out of the index sends a withdrawal, the listing with flag
-`0x01`, which displaces the last at each storer, and again with each daily
+`0x01`, which displaces the last at each storer, and again with each
 republish until 30 days after the last listing sent, by when it has lapsed. A
 feed never listed while published sends none: no listing named it. Deleting a
 listed feed keeps its salt as a tombstone, whose withdrawal the feeds service
@@ -1441,7 +1450,7 @@ local clock. A head's `sequence` past the listing's own time is cut to it, as a
 head is published before its listing is signed. Discover drops withdrawn feeds,
 takes at most eight listed feeds from one publisher (the most one identity
 keeps), the last listed, and cleans titles and descriptions as any remote
-text. A listing signed in the last 26 hours shows its publisher as active.
+text. A listing signed in the last 3 hours shows its publisher as active.
 What a walk finds is cached: a shard that too few nodes answered keeps its
 cached feeds, and one that settled without a cached feed forgets it. The user
 can hide a feed or a publisher from Discover, locally.

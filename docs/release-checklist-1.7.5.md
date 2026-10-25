@@ -177,6 +177,11 @@ friends unless a step says otherwise, and C a follower who is not A's friend.
       forms. The feed and its files appear within a few minutes of a lookup
       or Check now; the feed shows "Looking for it…" until then, not an
       error.
+- [ ] A feed published more than a day ago, untouched since and with A
+      running all along: B, a friend, follows it fresh and has it within an
+      hour (the hourly republish pushes it) and C, not a friend, within a few
+      minutes of a lookup. "Published" in A's editor still shows when A
+      published, not the last republish.
 - [ ] A adds one file and removes another; the button reads Publish changes.
       After publishing, C sees the new file marked New and the removed one
       marked Removed (a file C downloaded from it stays on disk).
@@ -220,7 +225,7 @@ friends unless a step says otherwise, and C a follower who is not A's friend.
       list's file name.
 - [ ] Two devices on one identity: restore A's backup on a second machine
       A2, which then holds the same feed. Publish a change on A2. Leave A
-      running past its daily republish: it does not put its older list back,
+      running past its next hourly republish: it does not put its older list back,
       and followers keep A2's.
 - [ ] Publish with the Ember network unreachable (block Ember's UDP port in
       the firewall, or disconnect after Ember has started). Publish says

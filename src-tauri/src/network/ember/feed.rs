@@ -67,8 +67,9 @@ pub const FEED_LISTING_WITHDRAWN: u8 = 0x01;
 /// the governance record lifetime in `dht::store`.
 pub const FEED_LISTING_TTL_SECS: i64 = 30 * 24 * 3600;
 /// A listing signed this recently says its publisher is running: one
-/// signs it anew with every publish and daily republish.
-pub const FEED_LISTING_ACTIVE_SECS: i64 = 26 * 3600;
+/// signs it anew with every publish and hourly republish, and a republish
+/// that does not get through is tried again within minutes.
+pub const FEED_LISTING_ACTIVE_SECS: i64 = 3 * 3600;
 
 /// The index shard the feed `salt` of `publisher` is listed in.
 pub fn feed_index_shard(publisher: &[u8; 32], salt: &FeedSalt) -> u8 {

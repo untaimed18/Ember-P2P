@@ -3,7 +3,7 @@
 //! for how a list is served and fetched without being the user's file.
 //!
 //! Publishing writes the list into the feeds folder, serves it hidden, and
-//! signs and publishes the head; heads are republished daily. Following looks
+//! signs and publishes the head; heads are republished hourly. Following looks
 //! the head up every half hour, fetches a newer list through the download
 //! pipeline (pinned to the head's BLAKE3), checks it against the head, works
 //! out what is new, and starts what auto-download allows.
@@ -19,8 +19,9 @@ use crate::commands::errors::{bounded_send, coded, coded_ctx};
 use crate::network::ed2k::collection::{Collection, CollectionFile};
 use crate::network::ember::dht::publish::SignedRecord;
 use crate::network::ember::feed::{
-    feed_key, generate_feed_salt, next_sequence, withdrawal_head, FeedHead, FeedLink, FeedSalt, FEEDS_PER_IDENTITY,
-    FEED_DESCRIPTION_MAX, FEED_ITEMS_MAX, FEED_LISTING_TTL_SECS, FEED_NOTE_MAX, FEED_TITLE_MAX,
+    feed_index_key, feed_index_shard, feed_key, generate_feed_salt, next_sequence, withdrawal_head, FeedHead, FeedLink,
+    FeedSalt, FEEDS_PER_IDENTITY, FEED_DESCRIPTION_MAX, FEED_ITEMS_MAX, FEED_LISTING_TTL_SECS, FEED_NOTE_MAX,
+    FEED_TITLE_MAX,
 };
 use crate::network::{EmberPublishResult, NetworkCommand};
 use crate::sharing::feed_files::{self, FetchOutcome, HiddenShare};
@@ -46,8 +47,21 @@ const LOOKUP_TIMEOUT_MS: u64 = 20_000;
 const LOOKUPS_PER_TICK: usize = 3;
 /// How soon a lookup that reached no node is tried again.
 const LOOKUP_RETRY_SECS: i64 = 5 * 60;
-/// How often the publisher republishes a head nothing has changed.
-const REPUBLISH_SECS: i64 = 24 * 3600 - 15 * 60;
+/// How often a feed whose head has never been found is looked up, for
+/// [`WAITING_FAST_FOR_SECS`] after it was followed: the user is waiting on
+/// it, and its publisher may be about to republish.
+const WAITING_POLL_SECS: i64 = 3 * 60;
+const WAITING_FAST_FOR_SECS: i64 = 24 * 3600;
+/// How long after a feed's own key gave nothing its index shard is read for
+/// a listing of it, which carries the same head: a shard is many records.
+const LISTING_FALLBACK_SECS: i64 = 15 * 60;
+/// How often the publisher republishes a head nothing has changed, and its
+/// listing with it. Most storers are builds that keep a head they cannot
+/// read for a day and never hand it on when they leave, so a day between
+/// republishes let a head vanish as its storers came and went.
+const REPUBLISH_SECS: i64 = 60 * 60;
+/// How often a deleted feed's withdrawal is sent again.
+const WITHDRAWAL_RESEND_SECS: i64 = 24 * 3600;
 /// How soon a republish that reached no node is tried again.
 const REPUBLISH_RETRY_SECS: i64 = 10 * 60;
 /// Pushed heads taken for one feed: one per this long. The newest of those
@@ -385,7 +399,7 @@ async fn queue_listing(state: &AppState, due: &DueListing, head: &FeedHead) {
 /// until each listing they displace has lapsed.
 async fn send_due_withdrawals(state: &AppState, now: i64) {
     let db = state.db.clone();
-    let due = tokio::task::spawn_blocking(move || db.feed_withdrawals_due(now, REPUBLISH_SECS, FEED_LISTING_TTL_SECS))
+    let due = tokio::task::spawn_blocking(move || db.feed_withdrawals_due(now, WITHDRAWAL_RESEND_SECS, FEED_LISTING_TTL_SECS))
         .await
         .ok()
         .and_then(Result::ok)
@@ -1235,16 +1249,30 @@ async fn look_up_head(app: &tauri::AppHandle, state: &AppState, publisher: &str,
         return;
     }
     let key = feed_key(&publisher_key, &salt_bytes);
-    let found = {
-        let _done = LookedAt(looking_at.clone());
-        crate::commands::channels::find_raw_keys_counted(state, vec![key], LOOKUP_TIMEOUT_MS)
+    let looked = LookedAt(looking_at.clone());
+    let found = crate::commands::channels::find_raw_keys_counted(state, vec![key], LOOKUP_TIMEOUT_MS)
+        .await
+        .ok()
+        .flatten();
+    let (blobs, mut responded) = found.unwrap_or_default();
+    let mut best = best_head(&blobs, &publisher_key, &salt_bytes);
+    let now = chrono::Utc::now().timestamp();
+    // A listed feed's listing carries its head, signed alike, and lives
+    // under another key: found there when its own key's storers are gone.
+    if best.is_none() && listing_fallback_due(&looking_at, now) {
+        let shard = feed_index_key(feed_index_shard(&publisher_key, &salt_bytes));
+        let listed = crate::commands::channels::find_raw_keys_counted(state, vec![shard], LOOKUP_TIMEOUT_MS)
             .await
             .ok()
-            .flatten()
-    };
-    let (blobs, responded) = found.unwrap_or_default();
-    let best = best_head(&blobs, &publisher_key, &salt_bytes);
-    let now = chrono::Utc::now().timestamp();
+            .flatten();
+        if let Some((blobs, shard_responded)) = listed {
+            responded = responded.max(shard_responded);
+            best = best_listed_head(&blobs, &publisher_key, &salt_bytes);
+            if best.is_some() {
+                tracing::info!("feed {salt}: its head was not at its key; taken from its Discover listing");
+            }
+        }
+    }
     // A lookup no node answered says nothing about the head: it is not a
     // check, and is tried again sooner than the next one would be.
     if responded > 0 {
@@ -1254,9 +1282,35 @@ async fn look_up_head(app: &tauri::AppHandle, state: &AppState, publisher: &str,
     } else {
         missed_lookups().lock().insert(looking_at, now);
     }
+    drop(looked);
     if let Some(head) = best {
         take_head(app, state, publisher, salt, head).await;
     }
+}
+
+/// Whether a lookup of the feed `key` whose own key gave nothing may read its
+/// index shard now, at most every [`LISTING_FALLBACK_SECS`]; noted as read.
+fn listing_fallback_due(key: &(String, String), now: i64) -> bool {
+    static LAST: std::sync::OnceLock<parking_lot::Mutex<HashMap<(String, String), i64>>> = std::sync::OnceLock::new();
+    let mut last = LAST.get_or_init(Default::default).lock();
+    if last.get(key).is_some_and(|at| now - at < LISTING_FALLBACK_SECS) {
+        return false;
+    }
+    last.insert(key.clone(), now);
+    true
+}
+
+/// The newest head among `blobs` that a listing of this feed by its
+/// publisher carries, unless the newest listing withdraws it.
+fn best_listed_head(blobs: &[Vec<u8>], publisher: &[u8; 32], salt: &FeedSalt) -> Option<FeedHead> {
+    blobs
+        .iter()
+        .filter_map(|blob| SignedRecord::from_value_blob(blob))
+        .filter(|record| record.publisher_key == *publisher && record.feed_listing_store_ok())
+        .filter_map(|record| record.feed_listing().map(|listing| (record.timestamp, listing)))
+        .filter(|(_, (found_salt, _, _))| found_salt == salt)
+        .max_by_key(|(at, _)| *at)
+        .and_then(|(_, (_, head, withdrawn))| (!withdrawn && head.list_size <= MAX_LIST_BYTES).then_some(head))
 }
 
 /// When a followed feed's last lookup reached no node.
@@ -2181,11 +2235,16 @@ fn republish_retry() -> &'static parking_lot::Mutex<HashMap<String, i64>> {
     RETRY.get_or_init(Default::default)
 }
 
-/// Whether `feed` is due a republish at `now`: a day after its last, or at
-/// once while it has a pending head, which the user published and no node
-/// is known to hold. Either waits for a retry set after a try.
+/// When `feed`'s head was last sent, by a publish or a republish.
+fn last_sent(feed: &OwnFeed) -> i64 {
+    feed.published_at.max(feed.refreshed_at)
+}
+
+/// Whether `feed` is due a republish at `now`: [`REPUBLISH_SECS`] after its
+/// last, or at once while it has a pending head, which the user published
+/// and no node is known to hold. Either waits for a retry set after a try.
 fn republish_due(feed: &OwnFeed, now: i64) -> bool {
-    let published = feed.published_at > 0 && now - feed.published_at >= REPUBLISH_SECS;
+    let published = feed.published_at > 0 && now - last_sent(feed) >= REPUBLISH_SECS;
     (published || feed.pending.is_some()) && republish_retry().lock().get(&feed.salt).is_none_or(|at| now >= *at)
 }
 
@@ -2280,7 +2339,7 @@ async fn adopt_pending(state: &AppState, dir: &Path, feed: &OwnFeed, pending: &O
 /// What a republish records of its send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Republished {
-    /// The published head is stored again: due again in a day.
+    /// The published head is stored again: due again in [`REPUBLISH_SECS`].
     Refreshed,
     /// The pending head is stored: recorded as published, and the list it
     /// replaces no longer served.
@@ -2305,9 +2364,9 @@ fn republished(placed: Placed, sent_pending: bool) -> Republished {
 /// while there is one (see [`republish_head`]). Waits on the network for the
 /// lookup and the send without [`publish_lock`]; reads the feed and signs,
 /// and records what came of it, with it held, and a publish or delete in
-/// between wins. A feed with no head to send is not looked up, and waits a
-/// day or a publish. One that does not get through is tried again after
-/// [`REPUBLISH_RETRY_SECS`], not a day.
+/// between wins. A feed with no head to send is not looked up, and waits
+/// [`REPUBLISH_SECS`] or a publish. One that does not get through is tried
+/// again after [`REPUBLISH_RETRY_SECS`].
 async fn republish(app: &tauri::AppHandle, state: &AppState, salt: &str, now: i64) {
     let retry = || republish_retry().lock().insert(salt.to_string(), now + REPUBLISH_RETRY_SECS);
     let Ok(salt_bytes) = hex_to16(salt) else {
@@ -2371,7 +2430,9 @@ async fn republish(app: &tauri::AppHandle, state: &AppState, salt: &str, now: i6
         (record, blob, sent_pending, feed)
     };
     let placed = send_head(state, &salt_bytes, record).await;
-    if placed == Placed::Stored && sent_pending.is_some() {
+    // Friends who follow and hold it already ignore it; one who followed
+    // since, and whose lookup found nothing, takes it.
+    if placed == Placed::Stored {
         let _ = state.network_tx.try_send(NetworkCommand::PushFeedHead { blob });
     }
     let _publishing = publish_lock().lock().await;
@@ -2404,14 +2465,17 @@ async fn republish(app: &tauri::AppHandle, state: &AppState, salt: &str, now: i6
 
 /// When `feed` is next due a lookup, spread by feed so they do not all come
 /// at once. One whose last lookup reached no node is due again
-/// [`LOOKUP_RETRY_SECS`] after it.
+/// [`LOOKUP_RETRY_SECS`] after it, and one never found every
+/// [`WAITING_POLL_SECS`] for its first day.
 fn lookup_due(feed: &FollowedFeed, now: i64) -> bool {
     let spread = i64::from(u16::from_str_radix(feed.salt.get(..4).unwrap_or("0"), 16).unwrap_or(0)) % POLL_JITTER_SECS;
     let missed = missed_lookups()
         .lock()
         .get(&(feed.publisher.clone(), feed.salt.clone()))
         .is_some_and(|at| now - at < LOOKUP_RETRY_SECS);
-    !missed && now - feed.checked_at >= POLL_SECS + spread
+    let waiting = feed.sequence == 0 && now - feed.followed_at < WAITING_FAST_FOR_SECS;
+    let interval = if waiting { WAITING_POLL_SECS } else { POLL_SECS + spread };
+    !missed && now - feed.checked_at >= interval
 }
 
 async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
@@ -2437,7 +2501,7 @@ async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
     // tick, unless one is being republished now.
     let db = state.db.clone();
     let own = tokio::task::spawn_blocking(move || db.feeds_own().unwrap_or_default()).await.unwrap_or_default();
-    let due = own.iter().filter(|feed| republish_due(feed, now)).min_by_key(|feed| feed.published_at);
+    let due = own.iter().filter(|feed| republish_due(feed, now)).min_by_key(|feed| last_sent(feed));
     if let Some(feed) = due {
         if !republishing().swap(true, std::sync::atomic::Ordering::AcqRel) {
             let (app, salt) = (app.clone(), feed.salt.clone());
@@ -2792,6 +2856,7 @@ mod tests {
             item_count: 1,
             created_at: 0,
             published_at: 1,
+            refreshed_at: 0,
             published_title: "Published".into(),
             published_description: "old words".into(),
             changed: true,
@@ -2817,6 +2882,7 @@ mod tests {
             item_count: 1,
             created_at: 0,
             published_at: 1,
+            refreshed_at: 0,
             published_title: "T".into(),
             published_description: String::new(),
             changed: false,
@@ -2922,6 +2988,81 @@ mod tests {
         feed.published_at = 0;
         assert!(republish_due(&feed, now + REPUBLISH_RETRY_SECS), "never published, its first head pending");
         republish_retry().lock().remove(&feed.salt);
+    }
+
+    /// A republish is due an interval after the last send, whether that was
+    /// the user's publish or a republish, and does not move the publish.
+    #[test]
+    fn a_republish_is_due_an_interval_after_the_last_send() {
+        let now = 10 * REPUBLISH_SECS;
+        let mut feed = own(7, None);
+        feed.salt = format!("{:032x}", rand::random::<u128>());
+        feed.published_at = now - 2 * REPUBLISH_SECS;
+        assert!(republish_due(&feed, now));
+        feed.refreshed_at = now - 60;
+        assert!(!republish_due(&feed, now), "republished a minute ago");
+        assert!(republish_due(&feed, now - 60 + REPUBLISH_SECS));
+        assert_eq!(last_sent(&feed), now - 60);
+    }
+
+    /// A feed never found is looked for every few minutes for a day, then as
+    /// any other.
+    #[test]
+    fn a_feed_never_found_is_looked_for_often_at_first() {
+        let now = 100 * POLL_SECS;
+        let mut feed = followed(0, 0);
+        feed.salt = format!("{:032x}", rand::random::<u128>());
+        feed.sequence = 0;
+        feed.followed_at = now - 600;
+        feed.checked_at = now - WAITING_POLL_SECS;
+        assert!(lookup_due(&feed, now));
+        feed.checked_at = now - WAITING_POLL_SECS + 1;
+        assert!(!lookup_due(&feed, now));
+        feed.followed_at = now - WAITING_FAST_FOR_SECS;
+        feed.checked_at = now - WAITING_POLL_SECS;
+        assert!(!lookup_due(&feed, now), "past its first day");
+        feed.followed_at = now - 600;
+        feed.sequence = 5;
+        assert!(!lookup_due(&feed, now), "found once: every half hour");
+    }
+
+    /// A listing of the feed carries its head, unless the newest withdraws it;
+    /// another feed's or another publisher's does not count.
+    #[test]
+    fn a_feeds_listing_stands_in_for_its_head() {
+        let identity = crate::network::ember::crypto::signing_key_from_bytes(&[21u8; 32]);
+        let publisher = identity.verifying_key().to_bytes();
+        let salt = [4u8; 16];
+        let head = FeedHead {
+            sequence: 7,
+            list_ed2k_hash: [1; 16],
+            list_size: 100,
+            list_blake3: [2; 32],
+            item_count: 1,
+            title: "T".into(),
+            description: String::new(),
+        };
+        let blob = |salt: &FeedSalt, head: &FeedHead, withdrawn: bool, at: i64| {
+            let record = SignedRecord::feed_listing_record(salt, head, withdrawn, &identity, at).unwrap();
+            [record.data, record.signature.to_vec()].concat()
+        };
+        let listed = blob(&salt, &head, false, 100);
+        let other = blob(&[5u8; 16], &head, false, 200);
+        assert_eq!(best_listed_head(&[listed.clone(), other.clone()], &publisher, &salt), Some(head.clone()));
+        assert_eq!(best_listed_head(std::slice::from_ref(&other), &publisher, &salt), None, "another feed's");
+        assert_eq!(best_listed_head(std::slice::from_ref(&listed), &[9u8; 32], &salt), None, "another publisher's");
+        let withdrawn = blob(&salt, &crate::network::ember::feed::withdrawal_head(), true, 300);
+        assert_eq!(best_listed_head(&[listed.clone(), withdrawn.clone()], &publisher, &salt), None);
+        let relisted = blob(&salt, &head, false, 400);
+        assert_eq!(best_listed_head(&[withdrawn, relisted], &publisher, &salt), Some(head));
+    }
+
+    #[test]
+    fn listing_fallback_is_read_at_most_every_so_often() {
+        let key = (format!("{:064x}", rand::random::<u128>()), "s".to_string());
+        assert!(listing_fallback_due(&key, 1000));
+        assert!(!listing_fallback_due(&key, 1000 + LISTING_FALLBACK_SECS - 1));
+        assert!(listing_fallback_due(&key, 1000 + LISTING_FALLBACK_SECS));
     }
 
     #[test]

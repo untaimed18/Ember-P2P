@@ -36,9 +36,14 @@ pub struct OwnFeed {
     pub list_size: i64,
     pub item_count: i64,
     pub created_at: i64,
+    /// When the user last published it.
     pub published_at: i64,
-    /// The title and description the last head carried, which the daily
-    /// republish signs again: an edit not yet published stays unpublished.
+    /// When the service last signed and sent its head again; 0 if not since
+    /// it was published.
+    #[serde(skip)]
+    pub refreshed_at: i64,
+    /// The title and description the last head carried, which a republish
+    /// signs again: an edit not yet published stays unpublished.
     #[serde(skip)]
     pub published_title: String,
     #[serde(skip)]
@@ -304,6 +309,7 @@ impl Database {
             ("feeds_own", "listed", "INTEGER NOT NULL DEFAULT 0"),
             ("feeds_own", "listing_sent_at", "INTEGER NOT NULL DEFAULT 0"),
             ("feeds_own", "listing_stamp", "INTEGER NOT NULL DEFAULT 0"),
+            ("feeds_own", "refreshed_at", "INTEGER NOT NULL DEFAULT 0"),
             // The folder in `Feeds` its files finish in; empty until the first.
             ("feeds_followed", "folder", "TEXT NOT NULL DEFAULT ''"),
         ] {
@@ -328,7 +334,7 @@ impl Database {
             "SELECT salt, title, description, sequence, list_ed2k, list_blake3, list_size, item_count,
                     created_at, published_at, published_title, published_description, changed,
                     pending_sequence, pending_ed2k, pending_blake3, pending_size, pending_item_count,
-                    pending_title, pending_description, listed, listing_sent_at
+                    pending_title, pending_description, listed, listing_sent_at, refreshed_at
              FROM feeds_own ORDER BY created_at",
         )?;
         let rows = stmt
@@ -364,6 +370,7 @@ impl Database {
                     pending,
                     listed: row.get::<_, i64>(20)? != 0,
                     listing_sent_at: row.get(21)?,
+                    refreshed_at: row.get(22)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -551,12 +558,13 @@ impl Database {
         Ok(changed > 0)
     }
 
-    /// Record that head `sequence` of `salt` was signed and sent again.
+    /// Record that head `sequence` of `salt` was signed and sent again. When
+    /// the user last published stays as it was.
     pub fn feed_own_republished(&self, salt: &str, sequence: i64, now: i64) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         Self::ensure_feeds_locked(&conn)?;
         conn.execute(
-            "UPDATE feeds_own SET published_at = ?3 WHERE salt = ?1 AND sequence = ?2",
+            "UPDATE feeds_own SET refreshed_at = ?3 WHERE salt = ?1 AND sequence = ?2",
             params![salt, sequence, now],
         )?;
         Ok(())
@@ -1427,7 +1435,8 @@ mod tests {
         assert_eq!(feed.published_title, "One", "the republish keeps what was published");
 
         db.feed_own_republished("s", 20, 9).unwrap();
-        assert_eq!(db.feed_own("s").unwrap().unwrap().published_at, 9);
+        let feed = db.feed_own("s").unwrap().unwrap();
+        assert_eq!((feed.published_at, feed.refreshed_at), (5, 9), "a republish is not the user's publish");
         assert!(db.feed_own_published("s", &publish(30, "Two"), Some(&[]), 10).unwrap());
         assert!(!db.feed_own("s").unwrap().unwrap().changed);
         drop_db(db, path);
