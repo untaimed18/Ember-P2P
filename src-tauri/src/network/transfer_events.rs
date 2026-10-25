@@ -803,6 +803,12 @@ pub(super) async fn handle_download_event(
                 mgr.get_transfer(&transfer_id)
                     .map(|t| (t.file_hash.clone(), t.file_name.clone(), t.total_size))
             };
+            // For the notification of a download the Transfers page does not
+            // list, a feed's, which the page has no row to name it from.
+            let (file_name, total_size) = history_row
+                .as_ref()
+                .map(|(_, name, size)| (name.clone(), *size))
+                .unwrap_or_default();
             let db_for_completion = db.clone();
             let completion_transfer_id = transfer_id.clone();
             let completed_seq = status_writes.next_seq();
@@ -824,6 +830,8 @@ pub(super) async fn handle_download_event(
                 serde_json::json!({
                     "id": transfer_id,
                     "ember_verified": ember_verified,
+                    "file_name": file_name,
+                    "total_size": total_size,
                 }),
             );
 
@@ -857,9 +865,11 @@ pub(super) async fn handle_download_event(
             {
                 return;
             }
-            let current_status = {
+            let (current_status, file_name) = {
                 let mgr = transfer_manager.read().await;
-                mgr.get_transfer(&transfer_id).map(|t| t.status.clone())
+                mgr.get_transfer(&transfer_id)
+                    .map(|t| (Some(t.status.clone()), t.file_name.clone()))
+                    .unwrap_or_default()
             };
             // `Completed` belongs here for the same reason the upload path
             // returns early when `fail()` finds nothing: once the row has moved
@@ -950,6 +960,7 @@ pub(super) async fn handle_download_event(
                     "failure_code": failure_code.as_code(),
                     "failure_kind": failure_kind_name,
                     "failure_stage": failure_stage,
+                    "file_name": file_name,
                 }),
             );
         }

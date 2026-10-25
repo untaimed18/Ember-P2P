@@ -17,7 +17,7 @@ use crate::types::*;
 
 mod feeds;
 mod room_dm;
-pub use feeds::{DiscoveredFeed, DueListing, FeedItem, FollowedFeed, FollowedItem, OwnFeed, OwnPublish};
+pub use feeds::{DiscoveredFeed, DueListing, ElsewhereCopy, FeedItem, FollowedFeed, FollowedItem, OwnFeed, OwnPublish};
 pub use room_dm::{DmIncoming, DmMessage, DmThread};
 
 const MAX_PEERS_ROWS: i64 = 10_000;

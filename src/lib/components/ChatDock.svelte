@@ -44,6 +44,7 @@
   import { formatBytes } from '$lib/utils';
   import { translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
+  import { alreadyQueuedText } from '$lib/alreadyQueued';
   import { plural } from '$lib/plural';
   import IconX from '$lib/components/IconX.svelte';
   import { shortcutModAria } from '$lib/platform';
@@ -646,7 +647,7 @@
       if (!res) return;
       toastSuccess(
         res.already_queued
-          ? m.search_already_queued_name({ name: offer.file_name })
+          ? alreadyQueuedText(res, offer.file_name)
           : m.friends_offer_accepted({ name: offer.file_name }),
       );
     } catch (e) {

@@ -806,6 +806,10 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
                     &established,
                     &mut state.ember_content_hashes,
                 );
+                // A feed download waiting on its publisher takes only theirs.
+                let sources = super::feed_direct::take_lookup(file_hash, sources, |id| {
+                    state.online_friends.contains_key(id)
+                });
                 if !sources.is_empty() {
                     state
                         .ember_pending_source_injections

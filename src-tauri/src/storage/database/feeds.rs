@@ -20,6 +20,10 @@ pub const FEED_AUTO_WINDOW_SECS: i64 = 24 * 3600;
 const FEED_AUTO_DEFAULT_ITEM_MIB: i64 = 1024;
 const FEED_AUTO_DEFAULT_DAY_MIB: i64 = 4096;
 
+/// `feeds_followed_items.downloaded` for an item whose download the user
+/// cancelled from the feed: still nonzero, so it reads as asked for.
+const DOWNLOAD_CANCELLED: i64 = 2;
+
 /// A feed this identity publishes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct OwnFeed {
@@ -148,6 +152,9 @@ pub struct FollowedFeed {
     /// When auto-download was last turned on: it takes the files first seen
     /// since. 0 when it was turned on before this was kept.
     pub auto_since: i64,
+    /// When a head of the feed was last found, newer or not: by a lookup or
+    /// pushed by a friend. 0 before the first.
+    pub seen_at: i64,
 }
 
 /// An item of a followed feed's list, with what this side knows of it.
@@ -163,6 +170,20 @@ pub struct FollowedItem {
     pub removed: bool,
     /// Started here, by hand or by auto-download.
     pub downloaded: bool,
+    /// Its download was cancelled from the feed since. Still `downloaded`, so
+    /// auto-download does not start it again.
+    pub cancelled: bool,
+}
+
+/// A file another followed feed downloaded, as
+/// [`Database::feed_downloaded_elsewhere`] finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElsewhereCopy {
+    pub ed2k: String,
+    pub folder: String,
+    pub title: String,
+    pub name: String,
+    pub size: i64,
 }
 
 /// A head just published, as [`Database::feed_own_published`] records it.
@@ -317,6 +338,8 @@ impl Database {
             ("feeds_followed", "folder", "TEXT NOT NULL DEFAULT ''"),
             // When auto-download was last turned on; 0 if not since this column.
             ("feeds_followed", "auto_since", "INTEGER NOT NULL DEFAULT 0"),
+            // When a head was last found.
+            ("feeds_followed", "seen_at", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             let present: bool = conn.query_row(
                 "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2",
@@ -325,6 +348,15 @@ impl Database {
             )?;
             if !present {
                 conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind};"))?;
+                // Feeds followed before it was kept count as seen now: one
+                // already gone says so once it has been missed long enough,
+                // not on the first start after the update.
+                if column == "seen_at" {
+                    conn.execute(
+                        "UPDATE feeds_followed SET seen_at = ?1 WHERE list_sequence != 0",
+                        params![chrono::Utc::now().timestamp()],
+                    )?;
+                }
             }
         }
         Ok(())
@@ -710,7 +742,7 @@ impl Database {
         let select = "SELECT publisher, salt, title, description, sequence, list_ed2k, list_blake3, list_size,
                     item_count, state, list_sequence, unread, followed_at, checked_at, auto_download,
                     auto_max_item_mib, auto_max_day_mib, auto_category, held_ed2k, held_blake3, held_size, folder,
-                    auto_since
+                    auto_since, seen_at
              FROM feeds_followed";
         let map = |row: &rusqlite::Row<'_>| {
             Ok(FollowedFeed {
@@ -737,6 +769,7 @@ impl Database {
                 held_size: row.get(20)?,
                 folder: row.get(21)?,
                 auto_since: row.get(22)?,
+                seen_at: row.get(23)?,
             })
         };
         let rows = match key {
@@ -781,6 +814,17 @@ impl Database {
         )? > 0)
     }
 
+    /// Note that a head of the feed was found, newer or not.
+    pub fn feed_seen(&self, publisher: &str, salt: &str, now: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_feeds_locked(&conn)?;
+        conn.execute(
+            "UPDATE feeds_followed SET seen_at = MAX(seen_at, ?3) WHERE publisher = ?1 AND salt = ?2",
+            params![publisher, salt, now],
+        )?;
+        Ok(())
+    }
+
     /// Note a look for the head that found nothing newer.
     pub fn feed_checked(&self, publisher: &str, salt: &str, now: i64) -> anyhow::Result<()> {
         let conn = self.conn.lock();
@@ -804,6 +848,28 @@ impl Database {
             params![publisher, salt],
         )?;
         Ok(())
+    }
+
+    /// Take a broken list as owed again, for the user to have it fetched once
+    /// more. The sequence whose list was broken, or `None` if none was.
+    pub fn feed_clear_broken(&self, publisher: &str, salt: &str) -> anyhow::Result<Option<i64>> {
+        let conn = self.conn.lock();
+        Self::ensure_feeds_locked(&conn)?;
+        let sequence: Option<i64> = conn
+            .query_row(
+                "SELECT sequence FROM feeds_followed WHERE publisher = ?1 AND salt = ?2 AND state = 'broken'",
+                params![publisher, salt],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if sequence.is_some() {
+            conn.execute(
+                "UPDATE feeds_followed SET state = CASE WHEN list_sequence = 0 THEN 'waiting' ELSE 'fetching' END
+                 WHERE publisher = ?1 AND salt = ?2 AND state = 'broken'",
+                params![publisher, salt],
+            )?;
+        }
+        Ok(sequence)
     }
 
     /// The list for `sequence` did not match its head, or did not parse.
@@ -959,6 +1025,7 @@ impl Database {
                     is_new: row.get::<_, i64>(7)? != 0,
                     removed: row.get::<_, i64>(8)? != 0,
                     downloaded: row.get::<_, i64>(9)? != 0,
+                    cancelled: row.get::<_, i64>(9)? == DOWNLOAD_CANCELLED,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -988,6 +1055,44 @@ impl Database {
             "UPDATE feeds_followed_items SET downloaded = 1
              WHERE publisher = ?1 AND salt = ?2 AND ed2k = ?3",
             params![publisher, salt, ed2k],
+        )?;
+        Ok(())
+    }
+
+    /// What other followed feeds downloaded, to find copies a feed already
+    /// has elsewhere: each file's eD2K hash, the folder in `Feeds` it went to,
+    /// that feed's title, and the file's name and size there.
+    pub fn feed_downloaded_elsewhere(&self, publisher: &str, salt: &str) -> anyhow::Result<Vec<ElsewhereCopy>> {
+        let conn = self.conn.lock();
+        Self::ensure_feeds_locked(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT i.ed2k, f.folder, f.title, i.name, i.size
+             FROM feeds_followed_items i
+             JOIN feeds_followed f ON f.publisher = i.publisher AND f.salt = i.salt
+             WHERE i.downloaded = 1 AND f.folder != '' AND NOT (i.publisher = ?1 AND i.salt = ?2)",
+        )?;
+        let rows = stmt
+            .query_map(params![publisher, salt], |row| {
+                Ok(ElsewhereCopy {
+                    ed2k: row.get(0)?,
+                    folder: row.get(1)?,
+                    title: row.get(2)?,
+                    name: row.get(3)?,
+                    size: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Record that the user cancelled an item's download from the feed.
+    pub fn feed_mark_cancelled(&self, publisher: &str, salt: &str, ed2k: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_feeds_locked(&conn)?;
+        conn.execute(
+            "UPDATE feeds_followed_items SET downloaded = ?4
+             WHERE publisher = ?1 AND salt = ?2 AND ed2k = ?3",
+            params![publisher, salt, ed2k, DOWNLOAD_CANCELLED],
         )?;
         Ok(())
     }
@@ -1307,6 +1412,57 @@ mod tests {
         assert_eq!(db.feed_followed(PUB, SALT).unwrap().unwrap().state, "waiting");
         db.feed_mark_broken(PUB, SALT, 20).unwrap();
         assert_eq!(db.feed_followed(PUB, SALT).unwrap().unwrap().state, "broken");
+        assert_eq!(db.feed_clear_broken(PUB, SALT).unwrap(), Some(20), "Retry takes it as owed again");
+        assert_eq!(db.feed_followed(PUB, SALT).unwrap().unwrap().state, "waiting");
+        assert_eq!(db.feed_clear_broken(PUB, SALT).unwrap(), None, "nothing broken now");
+        drop_db(db, path);
+    }
+
+    #[test]
+    fn a_file_another_feed_downloaded_is_found_for_this_one() {
+        let (db, path) = db("elsewhere");
+        for salt in [SALT, "other"] {
+            db.feed_follow(PUB, salt, 1).unwrap();
+            db.feed_take_head(PUB, salt, 20, "T", "", "l", "b", 5, 1, 100).unwrap();
+            db.feed_take_list(PUB, salt, 20, &[item("a", "A")], 100).unwrap().unwrap();
+        }
+        assert!(db.feed_downloaded_elsewhere(PUB, SALT).unwrap().is_empty(), "nothing downloaded yet");
+        db.feed_mark_downloaded(PUB, "other", "a").unwrap();
+        assert!(db.feed_downloaded_elsewhere(PUB, SALT).unwrap().is_empty(), "no folder before the first");
+        let folder = db.feed_followed_folder(PUB, "other", "Other").unwrap().unwrap();
+        let found = db.feed_downloaded_elsewhere(PUB, SALT).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].ed2k.as_str(), found[0].folder.as_str(), found[0].name.as_str()), ("a", folder.as_str(), "A"));
+        assert!(db.feed_downloaded_elsewhere(PUB, "other").unwrap().is_empty(), "not its own");
+        db.feed_mark_cancelled(PUB, "other", "a").unwrap();
+        assert!(db.feed_downloaded_elsewhere(PUB, SALT).unwrap().is_empty(), "cancelled there");
+        drop_db(db, path);
+    }
+
+    #[test]
+    fn a_head_found_again_counts_as_seen() {
+        let (db, path) = db("seen");
+        db.feed_follow(PUB, SALT, 1).unwrap();
+        assert_eq!(db.feed_followed(PUB, SALT).unwrap().unwrap().seen_at, 0);
+        db.feed_seen(PUB, SALT, 500).unwrap();
+        db.feed_seen(PUB, SALT, 400).unwrap();
+        assert_eq!(db.feed_followed(PUB, SALT).unwrap().unwrap().seen_at, 500, "never moved back");
+        drop_db(db, path);
+    }
+
+    #[test]
+    fn a_cancelled_download_stays_asked_for() {
+        let (db, path) = db("cancelled");
+        db.feed_follow(PUB, SALT, 1).unwrap();
+        assert!(take_head(&db, 20));
+        db.feed_take_list(PUB, SALT, 20, &[item("a", "A")], 100).unwrap().unwrap();
+        let read = |db: &Database| db.feed_followed_items(PUB, SALT).unwrap().remove(0);
+        db.feed_mark_downloaded(PUB, SALT, "a").unwrap();
+        assert!(read(&db).downloaded && !read(&db).cancelled);
+        db.feed_mark_cancelled(PUB, SALT, "a").unwrap();
+        assert!(read(&db).downloaded && read(&db).cancelled, "auto-download must not take it again");
+        db.feed_mark_downloaded(PUB, SALT, "a").unwrap();
+        assert!(!read(&db).cancelled, "downloading it again clears it");
         drop_db(db, path);
     }
 

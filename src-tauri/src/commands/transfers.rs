@@ -567,7 +567,9 @@ async fn revive_failed_download(
         transfer_id_short(transfer_id)
     );
     persist_transfer_status(state, transfer_id, &row.status).await;
-    let _ = app.emit("transfer-started", &row);
+    if !crate::sharing::feed_downloads::is_private(transfer_id) {
+        let _ = app.emit("transfer-started", &row);
+    }
     let Some(link) = link else {
         if active_now {
             start_promoted_downloads(state, std::slice::from_ref(&row)).await;
@@ -1557,10 +1559,29 @@ async fn unmark_feed_download(state: &AppState, transfer_id: &str) {
     let _ = tokio::task::spawn_blocking(move || db.clear_transfer_feed_folder(&id)).await;
 }
 
-/// [`start_download`], for a download from a feed when `feed_folder` names
-/// the folder it finishes in, in `Feeds`. Such a download is private (see
-/// `sharing::feed_downloads`), marked before its row is saved or the network
-/// hears of it. One already in the list is left as it is: the user's own.
+/// A download from a feed: the folder in `Feeds` it finishes in, and the
+/// feed's publisher, who is asked for it before anyone else.
+pub(crate) struct FeedStart {
+    pub folder: String,
+    /// The publisher's node id.
+    pub publisher: [u8; 16],
+    /// The publisher is a friend, reached over the friends' path.
+    pub friend: bool,
+}
+
+/// Hold a feed's download for its publisher before the network hears of it.
+fn hold_for_publisher(feed: Option<&FeedStart>, transfer_id: &str, file_hash: &str) {
+    let mut hash = [0u8; 16];
+    if let Some(feed) = feed.filter(|_| hex::decode_to_slice(file_hash, &mut hash).is_ok()) {
+        crate::network::feed_direct::begin(transfer_id, hash, feed.publisher, feed.friend);
+    }
+}
+
+/// [`start_download`], for a download from a feed when `feed` says which.
+/// Such a download is private (see `sharing::feed_downloads`), marked before
+/// its row is saved or the network hears of it, kept off the Transfers page,
+/// and held for its publisher (see `network::feed_direct`). One already in
+/// the list is left as it is: the user's own.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_download_to(
     app: tauri::AppHandle,
@@ -1575,8 +1596,9 @@ pub(crate) async fn start_download_to(
     expected_aich: Option<String>,
     friend_ember_hash: Option<String>,
     web_sources: Option<Vec<String>>,
-    feed_folder: Option<String>,
+    feed: Option<FeedStart>,
 ) -> Result<StartDownloadResponse, String> {
+    let feed_folder = feed.as_ref().map(|feed| feed.folder.clone());
     let _download_admission = state.download_admission.lock().await;
     let file_name = crate::security::sanitize_filename(&file_name);
 
@@ -1796,11 +1818,16 @@ pub(crate) async fn start_download_to(
                 if let Some(folder) = &feed_folder {
                     mark_feed_download(&state, &failed_id, folder).await?;
                 }
+                hold_for_publisher(feed.as_ref(), &failed_id, &file_hash);
                 let revived = revive_failed_download(&app, &state, &failed_id, Some(link)).await;
+                if !matches!(revived, Ok(Some(_))) {
+                    crate::network::feed_direct::forget(&failed_id);
+                }
                 if let Ok(Some(_)) = revived {
                     return Ok(StartDownloadResponse {
                         transfer_id: failed_id,
                         already_queued: false,
+                        in_feed: false,
                     });
                 }
                 // Not revived: the user's own download stays as it was.
@@ -1855,9 +1882,11 @@ pub(crate) async fn start_download_to(
     let (active_now, existing_id) = queued?;
     if let Some(existing_id) = existing_id {
         attach_link_web_sources(&state, &file_hash, web_sources).await;
+        let in_feed = crate::sharing::feed_downloads::is_private(&existing_id);
         return Ok(StartDownloadResponse {
             transfer_id: existing_id,
             already_queued: true,
+            in_feed,
         });
     }
 
@@ -1879,12 +1908,15 @@ pub(crate) async fn start_download_to(
     // Before the network task is told, so the download's first run has them.
     attach_link_web_sources(&state, &file_hash, web_sources).await;
 
-    let _ = app.emit("transfer-started", &persisted_transfer);
+    if feed.is_none() {
+        let _ = app.emit("transfer-started", &persisted_transfer);
+    }
 
     // Always hand the download to the network task: active starts run
     // MultiSource workers; queued / add-paused use discovery_only so
     // KAD + TCP + UDP source asking still runs (matching restore).
     let discovery_only = !active_now || add_paused;
+    hold_for_publisher(feed.as_ref(), &transfer_id, &file_hash);
 
     if let Err(e) = bounded_send(
         &state.network_tx,
@@ -1905,6 +1937,7 @@ pub(crate) async fn start_download_to(
     )
     .await
     {
+        crate::network::feed_direct::forget(&transfer_id);
         // The network channel is gone, so this transfer will never start.
         // It was already enqueued as active and occupies a download slot;
         // roll it back to Failed so it doesn't pin that slot forever and
@@ -1940,6 +1973,7 @@ pub(crate) async fn start_download_to(
     Ok(StartDownloadResponse {
         transfer_id,
         already_queued: false,
+        in_feed: false,
     })
 }
 
@@ -3076,11 +3110,15 @@ pub async fn remove_transfer(
 #[tauri::command]
 pub async fn get_transfers(state: tauri::State<'_, AppState>) -> Result<Vec<Transfer>, String> {
     let manager = state.transfer_manager.read().await;
-    // A fetch for the feeds code is not one of the user's downloads.
+    // A fetch for the feeds code is not one of the user's downloads, and a
+    // feed's files are shown on the Feeds page instead.
     Ok(manager
         .get_all()
         .into_iter()
-        .filter(|t| !crate::sharing::feed_files::is_internal_fetch(&t.id))
+        .filter(|t| {
+            !crate::sharing::feed_files::is_internal_fetch(&t.id)
+                && !crate::sharing::feed_downloads::is_private(&t.id)
+        })
         .collect())
 }
 

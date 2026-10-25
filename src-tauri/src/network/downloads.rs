@@ -107,7 +107,8 @@ pub(super) fn kad_source_search_may_start(
     // A tick of slack, so a check landing just short of the interval on the
     // periodic sweep does not wait a whole extra sweep.
     const SLACK: std::time::Duration = std::time::Duration::from_secs(1);
-    !state.download_source_searches.values().any(|(t, _)| t == tid)
+    !super::feed_direct::holds(tid)
+        && !state.download_source_searches.values().any(|(t, _)| t == tid)
         && state.active_kad_search_state.get(tid).is_none_or(|&(at, count)| {
             now.saturating_duration_since(at) + SLACK >= kad_source_search_interval(count)
         })

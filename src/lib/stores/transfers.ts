@@ -285,6 +285,10 @@ interface TransferEventPayload extends StatusEventPayload {
    *  upload sessions disappear from the active list). Falls back to
    *  the in-store row's `direction` when the payload doesn't carry it. */
   direction?: string;
+  /** The download's file, for a notification about one this store does not
+   *  list (a feed's). */
+  file_name?: string;
+  total_size?: number;
 }
 
 export const transfers = writable<Transfer[]>([]);
@@ -628,28 +632,40 @@ const announcedTerminal = new Set<string>();
  * those endings is news. The direction comes from the event when the backend
  * sent one and from the stored row otherwise, exactly as the listeners do.
  */
-function finishedDownloadRow(id: string, direction?: string): Transfer | null {
+function finishedDownloadRow(
+  id: string,
+  direction: string | undefined,
+  named: NamedDownload,
+): NamedDownload | null {
   if (announcedTerminal.has(id)) return null;
   const existing = get(transfers).find((t) => t.id === id);
   const isUpload = direction === 'upload' || existing?.direction === 'upload';
-  if (isUpload || !existing) return null;
+  // A feed's download is not listed here; the event names it instead.
+  const row = existing ?? (named.file_name ? named : null);
+  if (isUpload || !row) return null;
   // Claimed only once the row is one we would actually announce, so an event
   // that arrives before the row exists does not burn the id.
   announcedTerminal.add(id);
-  return existing;
+  return row;
+}
+
+/** What a download's terminal event says of its file. */
+interface NamedDownload {
+  file_name?: string;
+  total_size?: number;
 }
 
 /** Announce a finished download. */
-function notifyDownloadFinished(id: string, direction?: string): void {
+function notifyDownloadFinished(id: string, direction: string | undefined, named: NamedDownload): void {
   if (!shouldNotify('download_complete')) return;
-  const row = finishedDownloadRow(id, direction);
+  const row = finishedDownloadRow(id, direction, named);
   if (!row) return;
   void notify(
     'download_complete',
     m.notify_download_complete_title(),
     m.notify_download_complete_body({
-      name: row.file_name,
-      size: formatBytes(row.total_size),
+      name: row.file_name ?? '',
+      size: formatBytes(row.total_size ?? 0),
     }),
   );
 }
@@ -660,18 +676,19 @@ function notifyDownloadFailed(
   direction: string | undefined,
   error: string | undefined,
   failureCode: string | undefined,
+  named: NamedDownload,
 ): void {
   // A cancel is a user action with its own visible outcome — the row leaves the
   // list — so reporting it back as a failure would be telling someone what they
   // just did.
   if (failureCode === 'cancelled') return;
   if (!shouldNotify('download_failed')) return;
-  const row = finishedDownloadRow(id, direction);
+  const row = finishedDownloadRow(id, direction, named);
   if (!row) return;
   const reason = transferFailureReasonText(error, failureCode);
   void notify(
     'download_failed',
-    m.notify_download_failed_title({ name: row.file_name }),
+    m.notify_download_failed_title({ name: row.file_name ?? '' }),
     reason,
   );
 }
@@ -760,7 +777,7 @@ export async function initTransferStore() {
       // must stay a pure function of its input, and the download branch below
       // is unreachable for uploads (they return early), so there is nowhere
       // inside to hang this without duplicating the direction check.
-      notifyDownloadFinished(id, direction);
+      notifyDownloadFinished(id, direction, event.payload);
       // Row is terminal from here on — reversible-state tracking no longer
       // applies (a stale entry wouldn't cause wrong merges, since a terminal
       // event status already wins on its own, but there's no reason to keep it).
@@ -817,7 +834,7 @@ export async function initTransferStore() {
       markEventUpdate();
       flushPendingTransfers();
       const { id, error, failure_code, failure_kind, failure_stage, direction } = event.payload;
-      notifyDownloadFailed(id, direction, error, failure_code);
+      notifyDownloadFailed(id, direction, error, failure_code, event.payload);
       reversibleStateEnteredAt.delete(id);
       reversibleStateLeftAt.delete(id);
       {

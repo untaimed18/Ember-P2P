@@ -41,6 +41,7 @@
   import { plural } from '$lib/plural';
   import { formatBytes, formatNumber } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
+  import { alreadyQueuedText } from '$lib/alreadyQueued';
 
   type ConfirmDecision = 'accept' | 'reject' | 'defer';
   type HandleResult = 'done' | 'defer' | 'fail';
@@ -172,7 +173,7 @@
           const displayName = preview.name ?? info.name;
           toastSuccess(
             res.already_queued
-              ? m.search_already_queued_name({ name: displayName })
+              ? alreadyQueuedText(res, displayName)
               : m.search_queued_name({ name: displayName }),
           );
         }

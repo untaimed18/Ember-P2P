@@ -18,6 +18,7 @@ pub(in crate::network) async fn on_broker_tick(
     if let Some(ref mut broker) = state.connection_broker {
         broker.tick().await;
     }
+    dial_feed_publishers(state, settings, ed25519_secret_key, kad_callback_tx);
 
     if let Some(ref mut rx) = state.broker_event_rx {
         while let Ok(event) = rx.try_recv() {
@@ -321,5 +322,87 @@ pub(in crate::network) async fn on_broker_tick(
                 }
             }
         }
+    }
+}
+
+/// Dial the publishers `feed_direct` found for feed downloads: over QUIC,
+/// pinned to the feed's key, greeted with our Hello as the downloader, and
+/// handed to the download the way a callback is. The publisher's QUIC accept
+/// loop takes an eD2K stream from anyone, so no build of its needs to know.
+fn dial_feed_publishers(
+    state: &mut NetworkState,
+    settings: &AppSettings,
+    ed25519_secret_key: [u8; 32],
+    kad_callback_tx: &mpsc::Sender<upload_server::KadCallbackParts>,
+) {
+    let jobs = crate::network::feed_direct::take_dials();
+    if jobs.is_empty() {
+        return;
+    }
+    let endpoint = crate::network::chat_attach::quic_endpoint(state);
+    // As `on_broker_tick` greets a relayed stream.
+    let user_hash = state.user_hash;
+    let client_id = state.external_ip.map(|ip| u32::from_le_bytes(ip.octets())).unwrap_or(0);
+    let tcp_port = state.external_tcp_port.filter(|port| *port != 0).unwrap_or(state.tcp_port);
+    let udp_port = state.external_udp_port.filter(|port| *port != 0).unwrap_or(state.udp_port);
+    let nickname = settings.ed2k_nickname();
+    for job in jobs {
+        let refused = state.ip_filter.is_blocked(job.ip) || state.banned_ips.contains(&job.ip);
+        let Some(endpoint) = endpoint.clone().filter(|_| !refused) else {
+            crate::network::feed_direct::dial_finished(&job.transfer_id, false);
+            continue;
+        };
+        let (tx, nickname) = (kad_callback_tx.clone(), nickname.clone());
+        tokio::spawn(async move {
+            let addr = SocketAddr::new(std::net::IpAddr::V4(job.ip), job.quic_port);
+            let greeted = tokio::time::timeout(crate::network::feed_direct::DIAL_TIMEOUT, async {
+                let (send, recv) =
+                    ember::broker::punch_quic_pinned(&endpoint, addr, &ed25519_secret_key, job.publisher)
+                        .await
+                        .map_err(anyhow::Error::msg)?;
+                let mut reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(recv);
+                let mut writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(send);
+                let (peer_user_hash, peer_caps) = ed2k::multi_source::perform_outbound_hello(
+                    &mut *reader,
+                    &mut *writer,
+                    &user_hash,
+                    client_id,
+                    tcp_port,
+                    udp_port,
+                    &nickname,
+                )
+                .await?;
+                anyhow::Ok((reader, writer, peer_user_hash, peer_caps))
+            })
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("no answer in time")));
+            let (reader, writer, peer_user_hash, peer_caps) = match greeted {
+                Ok(greeted) => greeted,
+                Err(e) => {
+                    tracing::info!("Feed download {}: the publisher could not be reached directly: {e}", job.transfer_id);
+                    crate::network::feed_direct::dial_finished(&job.transfer_id, false);
+                    return;
+                }
+            };
+            tracing::info!("Feed download {}: connected to the publisher directly at {addr}", job.transfer_id);
+            let parts = upload_server::KadCallbackParts {
+                peer_ip: job.ip,
+                peer_port: job.tcp_port,
+                // Only a reachable record is dialled, so its port stays one
+                // the publisher can be reached at again.
+                peer_hello_port: job.tcp_port,
+                peer_user_hash,
+                file_hash: job.file_hash,
+                reader,
+                writer,
+                emule_info_done: false,
+                peer_caps,
+                friend_ember_hash: None,
+                origin: Some(crate::types::SourceOrigin::Ember),
+                answers_server_callback: false,
+            };
+            let handed = tx.send(parts).await.is_ok();
+            crate::network::feed_direct::dial_finished(&job.transfer_id, handed);
+        });
     }
 }

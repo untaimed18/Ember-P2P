@@ -14,6 +14,7 @@
   import { toastError, toastWarning } from '$lib/stores/toast';
   import { copyToClipboard, formatBytes, formatCalendarDate } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
+  import { alreadyQueuedText } from '$lib/alreadyQueued';
   import { translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
   import {
@@ -160,7 +161,7 @@
       // new started when nothing did.
       flash(
         res.already_queued
-          ? m.search_already_queued_name({ name: offer.file_name })
+          ? alreadyQueuedText(res, offer.file_name)
           : m.friends_offer_accepted({ name: offer.file_name }),
       );
     } catch (e: unknown) {

@@ -20,6 +20,7 @@ mod ember_publishing;
 mod ember_search;
 mod ember_udp;
 mod event_loop;
+pub(crate) mod feed_direct;
 pub(crate) mod friend_intro;
 mod friend_transfer;
 mod friends;

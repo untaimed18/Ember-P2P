@@ -2603,6 +2603,7 @@ pub fn run() {
             commands::feeds::mark_feed_read,
             commands::feeds::set_feed_auto_download,
             commands::feeds::download_feed_items,
+            commands::feeds::cancel_feed_download,
             commands::feeds::unfollow_feed,
             commands::feeds::open_feed_folder,
             commands::feed_discover::discover_feeds,

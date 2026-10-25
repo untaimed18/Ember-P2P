@@ -28,6 +28,8 @@ export interface OwnFeed {
   /** Listed in the public index, for anyone to find in Discover, as well as
    *  by its link. */
   listed: boolean;
+  /** This identity's key: with the salt, what followers know the feed by. */
+  publisher: string;
   link: string;
   items: FeedItem[];
 }
@@ -53,6 +55,9 @@ export interface FollowedFeed {
   auto_category: string;
   /** When auto-download was last turned on; it takes files first seen since. */
   auto_since: number;
+  /** When a head of the feed was last found on the network, newer or not;
+   *  0 before the first. */
+  seen_at: number;
   /** The folder in Feeds its files finish in; empty before the first. */
   folder: string;
   link: string;
@@ -86,7 +91,10 @@ export type FeedItemStatus =
   | 'failed'
   | 'done'
   | 'in_library'
-  | 'missing';
+  | 'missing'
+  | 'cancelled'
+  /** Not in this feed's folder, but in another followed feed's. */
+  | 'elsewhere';
 
 export interface FollowedItem extends FeedItem {
   first_seen: number;
@@ -101,7 +109,32 @@ export interface FollowedItem extends FeedItem {
   /** 0 to 100, for one on its way. */
   progress: number;
   /** Why auto-download has not started it. */
-  held: 'risky' | 'too_large' | 'day_limit' | null;
+  held: 'risky' | 'too_large' | 'day_limit' | 'disk' | null;
+  /** Its download, while it is in the transfer list. */
+  transfer: FeedItemTransfer | null;
+  /** For one held in another followed feed's folder: that feed's title. */
+  elsewhere: string | null;
+}
+
+/** The download of a feed's file, for the controls the Feeds page gives it. */
+export interface FeedItemTransfer {
+  id: string;
+  /** Bytes per second. */
+  speed: number;
+  sources: number;
+  active_sources: number;
+  /** Bytes of the file held so far. */
+  done: number;
+  /** Still asked of the publisher alone, before the rest of the network. */
+  from_publisher: boolean;
+  /** The user's own download, started outside the feed: on the Transfers
+   *  page, and controlled there. */
+  in_transfers: boolean;
+  /** Another followed feed's download of the same file, controlled there. */
+  other_feed: boolean;
+  /** Why it failed, for one that did. */
+  failure_reason: string | null;
+  failure_code: string | null;
 }
 
 /** A feed listed in the public index. */
@@ -182,6 +215,9 @@ export const setFeedAutoDownload = (
   invoke('set_feed_auto_download', { publisher, salt, enabled, maxItemMib, maxDayMib, category });
 export const downloadFeedItems = (publisher: string, salt: string, ed2ks: string[]): Promise<number> =>
   invoke('download_feed_items', { publisher, salt, ed2ks });
+/** Cancel the feed's download of a file: what has arrived is deleted. */
+export const cancelFeedDownload = (publisher: string, salt: string, ed2k: string): Promise<void> =>
+  invoke('cancel_feed_download', { publisher, salt, ed2k });
 export const unfollowFeed = (publisher: string, salt: string): Promise<void> =>
   invoke('unfollow_feed', { publisher, salt });
 /** Open the folder in Feeds a followed feed's files finish in. */

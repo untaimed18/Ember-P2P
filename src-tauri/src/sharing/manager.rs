@@ -2676,13 +2676,16 @@ impl TransferManager {
 
     /// Every row in `get_all` order, with the live preview flag `get_all`
     /// overlays. For the Transfers poll, so a fetch for the feeds code is not
-    /// among them.
+    /// among them, nor a feed's files, which the Feeds page shows.
     fn snapshot_rows(&self) -> impl Iterator<Item = (&Transfer, bool)> {
         self.active
             .values()
             .chain(self.queue.iter())
             .chain(self.completed.iter())
-            .filter(|t| !crate::sharing::feed_files::is_internal_fetch(&t.id))
+            .filter(|t| {
+                !crate::sharing::feed_files::is_internal_fetch(&t.id)
+                    && !crate::sharing::feed_downloads::is_private(&t.id)
+            })
             .map(|t| {
                 let preview_ready = self
                     .controls

@@ -368,8 +368,17 @@ per item and per day, plus a category and folder. Files Ember never
 auto-tags (executables, scripts, app data; the `NEVER_AUTO_TAG_EXTENSIONS`
 idea) are never auto-downloaded and have to be started by hand. Nothing is
 started when the file would leave less free space than a headroom like the
-64 MiB friend attachments keep (`ATTACH_DISK_HEADROOM`). Every auto-started
-download is labelled with its feed in Transfers.
+64 MiB friend attachments keep (`ATTACH_DISK_HEADROOM`). Feed downloads are
+kept off the Transfers page and controlled from the Feeds page.
+
+**Publisher first.** A feed download is held for its publisher before the
+rest of the network is asked (`network::feed_direct`): KAD, server and other
+publishers' Ember sources wait while the Ember lookup for the file is taken
+for the publisher's own signed record, which is dialled over QUIC pinned to
+the feed key and greeted as an eD2K download. A friend publisher goes the
+friend-transfer way instead. The hold ends when the lookup finds no record of
+theirs, the dial fails, or 45 s pass with no byte, and every network is then
+asked at once (`FindSources`).
 
 **Publishing.** "Add to feed…" on Library rows (the selection or one file),
 and a feed editor with title, description, reordering and removal.

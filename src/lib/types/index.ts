@@ -250,6 +250,9 @@ export interface SearchResult {
 export interface StartDownloadResponse {
   transfer_id: string;
   already_queued: boolean;
+  /** The download already queued is a feed's, on the Feeds page rather than
+   *  in Transfers. */
+  in_feed?: boolean;
 }
 
 export interface SpamStats {

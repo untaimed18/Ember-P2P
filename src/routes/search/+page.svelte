@@ -72,6 +72,7 @@
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
   import * as m from '$lib/paraglide/messages';
+  import { alreadyQueuedText } from '$lib/alreadyQueued';
   import {
     translateError,
     degradedReasonText,
@@ -3509,7 +3510,7 @@
         result.file.ember_file_hash,
         result.file.aich_hash,
       );
-      addToast('success', res.already_queued ? m.search_already_in_queue() : m.search_download_queued());
+      addToast('success', res.already_queued ? alreadyQueuedText(res) : m.search_download_queued());
     } catch (e: unknown) {
       console.error('Download failed:', e);
       const msg = translateError(e, m.browse_download_failed());

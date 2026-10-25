@@ -212,12 +212,53 @@ friends unless a step says otherwise, and C a follower who is not A's friend.
       stay 0, and nothing is held back by size. Turning it off and on again
       takes only files added after the second time.
 - [ ] Item states: a file B downloads shows Queued, then its percentage
-      with a bar, then Done; pausing it in Transfers shows Paused, and a
-      failed one shows Retry, which starts it again. A file B already has in
-      its Library shows "In your Library". B removes a finished one from
-      Transfers and deletes it from the feed folder: it shows "No longer on
-      disk" and Download starts it again. "Download all new" shows the count
-      and total size, and its toast's "Show in Transfers" opens Transfers.
+      with a bar, how much has arrived, its speed and time left, then Done;
+      its Pause button shows Paused and Resume carries on, and a failed one
+      shows why with Retry, which starts it again. Cancel asks first, then
+      deletes what arrived; the row says Cancelled, auto-download and
+      Download all leave it alone, and its own Download starts it again.
+      A file removed by the publisher has no Download button. A file B already
+      has in its Library shows "In your Library". B deletes a finished one
+      from the feed folder: it shows "No longer on disk" and Download starts
+      it again. "Download all new" shows the count and total size.
+- [ ] Not in Transfers: none of B's feed downloads, running, paused,
+      failed or finished, appear on the Transfers page, before or after a
+      restart. Pause all and Resume all there still pause and resume them.
+      A file B was already downloading from Transfers stays there, and its
+      feed row shows its state with a link to Transfers instead of buttons.
+      Downloading from Search a file a feed is downloading says "already
+      downloading in Feeds". Unfollowing a feed with a download running asks
+      first, cancels it and keeps finished files, and focus moves to the
+      next feed. The same file in two followed feeds: the second shows it
+      greyed while it downloads for the other, then "Already downloaded for
+      <other>"; auto-download and Download all do not fetch it again, its
+      own Download does. Delete it from the other feed's folder: Download
+      all takes it again.
+- [ ] A feed A deleted (or stopped running for two days): B's row and strip
+      say when it was last found; Retry looks again. Not shown while B is
+      offline or the Ember Network is off.
+- [ ] Change B's download folder after a feed download finished: the
+      feed's folder button opens the old one, where the files are.
+- [ ] Escape in the follow or new-feed card closes it and focus returns to
+      its button; following or creating a feed focuses its row.
+- [ ] A feed's colour is the same on Discover and My feeds.
+- [ ] Broken list: a feed whose list did not match shows Retry, and Retry
+      or Check now fetches it again from the network.
+- [ ] Auto-download on a nearly full disk: the held file says it waits for
+      disk space.
+- [ ] Following your own feed's link opens it under My feeds.
+- [ ] With the Ember Network off, a feed waiting on its list says Paused,
+      with no spinner.
+- [ ] Publisher first, A online and not B's friend: B's row says "From
+      the publisher" and B's log has "connected to the publisher directly";
+      no KAD or server source search runs for it while A keeps sending. A online but
+      sending nothing (paused upload, full queue): after about 45 seconds
+      the row shows sources instead, and C, who has the file too, is used.
+- [ ] Publisher offline: with A closed and C sharing the file, B's
+      download finds C within seconds of the lookup finishing, without
+      waiting out the 45 seconds.
+- [ ] Friend publisher: A and B friends, both behind NAT. B's download goes
+      to A over the friend path (connect-back or punch).
 - [ ] Risky types (`.exe`, `.msi`, `.bat`, `.ps1`, `.lnk`, `.iso`, `.docm`,
       and `video.mp4.exe`) are never started automatically, whatever the
       caps. They carry a "Can run code" badge, and Download (one, or
@@ -236,10 +277,8 @@ friends unless a step says otherwise, and C a follower who is not A's friend.
       Browse, not found by C in a KAD, eD2K server or Ember search, and C,
       queued on B for it while it downloads, is never served a part of it.
       Restart B mid-download and after it finishes: still private, and it
-      finishes in its feed folder. Changing its category in Transfers does
-      not move it into `Downloads`. Sharing `Feeds` itself on purpose does
-      share it.
-- [ ] Transfers: Open and Show in folder work for a finished feed download.
+      finishes in its feed folder. An auto-download category does not move
+      it into `Downloads`. Sharing `Feeds` itself on purpose does share it.
 - [ ] Free space: B's download folder on a small drive with a large
       download already queued there. Auto-download starts nothing that
       would leave less than 64 MiB free once the queued download finishes.

@@ -3,7 +3,7 @@
    * Feeds: follow a publisher's signed list of files and see what is new, or
    * publish lists of your own. See `commands/feeds.rs`.
    */
-  import { onMount, untrack } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { page } from '$app/state';
   import { beforeNavigate, goto } from '$app/navigation';
   import { navigatingForDeepLink } from '$lib/deepLinkNavigation';
@@ -11,6 +11,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import {
     cachedDiscoveredFeeds,
+    cancelFeedDownload,
     clearHiddenDiscoveredFeeds,
     createFeed,
     deleteFeed,
@@ -50,10 +51,10 @@
   import { appSettings } from '$lib/stores/settings';
   import { addActionToast, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
   import { menuKeydown } from '$lib/a11y';
-  import { BUILTIN_DOWNLOAD_CATEGORIES } from '$lib/downloadCategories';
-  import { translateError } from '$lib/i18n';
+  import { codedErrorOf, transferFailureReasonText, translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
-  import { copyToClipboard, formatBytes, formatNumber, formatRelativeTime } from '$lib/utils';
+  import { copyToClipboard, formatBytes, formatDurationSecs, formatNumber, formatRelativeTime, formatSpeed } from '$lib/utils';
+  import { pauseTransfer, resumeTransfer } from '$lib/api/transfers';
   import { extensionFromPath, fileTypeFilterLabel, fileTypeKey, type FileTypeKey } from '$lib/fileTypes';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import * as m from '$lib/paraglide/messages';
@@ -88,6 +89,31 @@
 
   function toggleCompose(kind: 'follow' | 'create') {
     compose = compose === kind ? null : kind;
+  }
+
+  /** The header button that opens the inline card, for focus to go back to
+   *  once the card closes: its input had it, and goes with it. */
+  let composeTrigger = $state<HTMLButtonElement | null>(null);
+
+  async function closeCompose() {
+    compose = null;
+    await tick();
+    composeTrigger?.focus();
+  }
+
+  /** Focus the list's open row: where a card that just added a feed, or
+   *  the Unfollow button that just removed one, leaves the user. */
+  async function focusActiveRow() {
+    await tick();
+    document.querySelector<HTMLElement>('.feed-row.active')?.focus();
+  }
+
+  /** Escape anywhere in the card closes it; not while an IME is composing,
+   *  whose Escape cancels the composition. */
+  function composeKeydown(e: KeyboardEvent) {
+    if (e.key !== 'Escape' || e.isComposing) return;
+    e.preventDefault();
+    void closeCompose();
   }
 
   /** `text` cut to `max` UTF-8 bytes at a character boundary. */
@@ -137,8 +163,12 @@
   let items = $state<FollowedItem[]>([]);
   let itemsLoading = $state(false);
   let unfollowOpen = $state(false);
-  let refreshing = $state(false);
-  let downloading = $state(false);
+  /** Feeds a Check now or a Download is running for, by key: another feed
+   *  opened meanwhile has its own buttons. */
+  let refreshingFor = $state<ReadonlySet<string>>(new Set());
+  let downloadingFor = $state<ReadonlySet<string>>(new Set());
+  let refreshing = $derived(selectedKey !== null && refreshingFor.has(selectedKey));
+  let downloading = $derived(selectedKey !== null && downloadingFor.has(selectedKey));
   let autoEnabled = $state(false);
   let autoItemMib = $state(0);
   let autoDayMib = $state(0);
@@ -153,10 +183,17 @@
   let itemsFailed = $state(false);
   /** Whether a file can be downloaded now: not on its way, nor here. */
   const canDownload = (i: FollowedItem) =>
-    !i.removed && (i.status === 'none' || i.status === 'missing' || i.status === 'failed');
+    !i.removed &&
+    (i.status === 'none' ||
+      i.status === 'missing' ||
+      i.status === 'cancelled' ||
+      i.status === 'elsewhere' ||
+      i.status === 'failed');
   /** What the Download all buttons take: not a file had and deleted since,
-   *  which its own Download brings back. */
-  const bulkTakes = (i: FollowedItem) => canDownload(i) && i.status !== 'missing';
+   *  one cancelled, or one another feed already has, which its own Download
+   *  brings here. */
+  const bulkTakes = (i: FollowedItem) =>
+    canDownload(i) && i.status !== 'missing' && i.status !== 'cancelled' && i.status !== 'elsewhere';
   let newItems = $derived(items.filter((i) => i.is_new && bulkTakes(i)));
   /** Every file that can be downloaded, for a feed just followed, whose first
    *  list brings nothing marked new. */
@@ -203,10 +240,21 @@
   const resting = (f: FollowedFeed) =>
     f.activity.fetching === null && f.sequence > 0 && f.list_sequence !== f.sequence && f.activity.retry_at > now;
 
+  /** How long lookups that reached the network may miss a feed whose list
+   *  is held before it is said to be gone: its head lives a day after the
+   *  publisher's last republish. */
+  const NOT_SEEN_SECS = 2 * 24 * 3600;
+  /** Lookups that reached the network have not found it for a long while:
+   *  its publisher may have stopped publishing it. Not while we were the
+   *  ones offline, which `checked_at` (an answered lookup) rules out. */
+  const notSeen = (f: FollowedFeed) =>
+    !emberOff && !noList(f) && f.seen_at > 0 && f.checked_at - f.seen_at >= NOT_SEEN_SECS;
+
   /** The line under a followed feed's name in the list. */
   function followedSub(f: FollowedFeed): string {
     if (f.activity.too_large) return m.feeds_state_too_large_short();
     if (f.state === 'broken') return m.feeds_state_broken_short();
+    if (notSeen(f)) return m.feeds_state_not_seen_short({ when: ago(f.seen_at) });
     if (f.activity.fetching) return m.feeds_state_fetching_short();
     if (resting(f)) return m.feeds_state_list_waiting_short();
     if (f.state === 'fetching' || (noList(f) && f.sequence > 0)) return m.feeds_state_fetching_short();
@@ -214,6 +262,20 @@
       return f.activity.unreachable ? m.feeds_state_unreachable_short() : m.feeds_state_waiting_short();
     }
     return m.feeds_items_count({ count: formatNumber(f.item_count) });
+  }
+
+  /** A feed link's own part: the same in an `ember-feed:` link and the
+   *  website's address. */
+  const linkBody = (link: string) => link.trim().toLowerCase().replace(/\/+$/, '').split(/[:/]/).pop() ?? '';
+
+  /** The link named one of the user's own feeds: open it there, rather than
+   *  only saying it cannot be followed. */
+  async function openOwnFeed(link: string) {
+    setTab('mine');
+    const feeds = mineLoaded ? mine : ((await loadMine()) ?? []);
+    const own = feeds.find((f) => linkBody(f.link) === linkBody(link));
+    if (own && mineSelected !== own.salt) unlessDirty(() => selectMine(own));
+    toastSuccess(m.feeds_own_opened());
   }
 
   /** A link opened from outside while another follow was running. */
@@ -230,8 +292,15 @@
       await refreshFollowedFeeds();
       selectFollowed(keyOf(feed));
       toastSuccess(feed.already_following ? m.feeds_already_following() : m.feeds_followed_toast());
+      await focusActiveRow();
     } catch (e) {
-      toastError(translateError(e, m.error_operation_failed()));
+      if (codedErrorOf(e)?.code === 'feeds_own') {
+        followLink = '';
+        compose = null;
+        await openOwnFeed(text);
+      } else {
+        toastError(translateError(e, m.error_operation_failed()));
+      }
     } finally {
       following = false;
       const next = queuedLink;
@@ -427,16 +496,11 @@
     return m.feeds_auto_summary({ item: mibText(itemMib), day: mibText(dayMib) });
   }
 
-  /** The categories offered for auto-download: the user's own and the
-   *  built-in ones. Any other text is still taken. */
-  let categoryChoices = $derived([
-    ...new Set([...($appSettings?.download_categories ?? []), ...BUILTIN_DOWNLOAD_CATEGORIES]),
-  ]);
-
   /** Why auto-download has left a file for the user to start. */
   function heldText(held: NonNullable<FollowedItem['held']>): string {
     if (held === 'risky') return m.feeds_held_risky();
     if (held === 'too_large') return m.feeds_held_too_large();
+    if (held === 'disk') return m.feeds_held_disk();
     return m.feeds_held_day_limit();
   }
 
@@ -473,40 +537,101 @@
     }
   }
 
+  /** `text`, naming the feed it is about when another one is open now. */
+  function aboutFeed(feed: FollowedFeed, text: string): string {
+    return selectedKey === keyOf(feed) ? text : m.feeds_toast_in_feed({ feed: feedLabel(feed), text });
+  }
+
   async function download(ed2ks: string[]) {
     const feed = selected;
-    if (!feed || ed2ks.length === 0 || downloading) return;
-    downloading = true;
+    if (!feed || ed2ks.length === 0) return;
+    const key = keyOf(feed);
+    if (downloadingFor.has(key)) return;
+    downloadingFor = new Set([...downloadingFor, key]);
     try {
       const started = await downloadFeedItems(feed.publisher, feed.salt, ed2ks);
-      addActionToast(
-        'success',
-        m.feeds_downloads_started({ count: formatNumber(started) }),
-        { label: m.feeds_show_in_transfers(), run: () => void goto('/transfers') },
-        () => {},
+      toastSuccess(
+        aboutFeed(
+          feed,
+          plural(started, {
+            one: () => m.feeds_download_started_one(),
+            other: () => m.feeds_downloads_started({ count: formatNumber(started) }),
+          }),
+        ),
       );
       // Not if the user has opened another feed meanwhile.
+      if (selectedKey === key) await loadItems(feed, true);
+    } catch (e) {
+      toastError(aboutFeed(feed, translateError(e, m.error_operation_failed())));
+    } finally {
+      downloadingFor = new Set([...downloadingFor].filter((other) => other !== key));
+    }
+  }
+
+  /** Downloads whose pause, resume or cancel is on its way. */
+  let controlling = $state<ReadonlySet<string>>(new Set());
+  /** The download waiting on the user's word before it is cancelled. */
+  let cancelAsk = $state<FollowedItem | null>(null);
+
+  /** Pause, resume or cancel an item's download, then show what it does now. */
+  async function controlItem(item: FollowedItem, run: (transferId: string) => Promise<void>) {
+    const feed = selected;
+    const id = item.transfer?.id;
+    if (!feed || !id || controlling.has(id)) return;
+    controlling = new Set([...controlling, id]);
+    try {
+      await run(id);
       if (selectedKey === keyOf(feed)) await loadItems(feed, true);
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
-      downloading = false;
+      controlling = new Set([...controlling].filter((other) => other !== id));
     }
+  }
+
+  /** Where an item's download is getting it from, and how fast. */
+  function transferText(item: FollowedItem): string {
+    const t = item.transfer;
+    if (!t) return '';
+    const parts: string[] = [m.feeds_item_done_of({ done: formatBytes(t.done), size: formatBytes(item.size) })];
+    if (item.status === 'downloading' && t.speed > 0) {
+      parts.push(formatSpeed(t.speed));
+      const left = Math.max(0, item.size - t.done);
+      if (left > 0) parts.push(m.feeds_item_time_left({ time: formatDurationSecs(Math.ceil(left / t.speed)) }));
+    }
+    if (item.status !== 'paused') {
+      if (t.from_publisher) {
+        parts.push(m.feeds_item_from_publisher());
+      } else if (t.sources > 0) {
+        const active = formatNumber(t.active_sources);
+        parts.push(
+          plural(t.sources, {
+            one: () => m.feeds_item_sources_one({ active }),
+            other: () => m.feeds_item_sources({ active, total: formatNumber(t.sources) }),
+          }),
+        );
+      }
+    }
+    return parts.join(' · ');
   }
 
   async function refreshSelected() {
     const feed = selected;
-    if (!feed || refreshing) return;
-    refreshing = true;
+    if (!feed) return;
+    const key = keyOf(feed);
+    if (refreshingFor.has(key)) return;
+    refreshingFor = new Set([...refreshingFor, key]);
     try {
       const outcome = await refreshFeed(feed.publisher, feed.salt);
       await refreshFollowedFeeds();
       const said = outcomeText(outcome, feed);
-      if (said) (outcome === 'unreachable' || outcome === 'too_large' ? toastWarning : toastSuccess)(said);
+      if (said) {
+        (outcome === 'unreachable' || outcome === 'too_large' ? toastWarning : toastSuccess)(aboutFeed(feed, said));
+      }
     } catch (e) {
-      toastError(translateError(e, m.error_operation_failed()));
+      toastError(aboutFeed(feed, translateError(e, m.error_operation_failed())));
     } finally {
-      refreshing = false;
+      refreshingFor = new Set([...refreshingFor].filter((other) => other !== key));
     }
   }
 
@@ -533,13 +658,31 @@
   async function doUnfollow() {
     const feed = selected;
     if (!feed) return;
+    const key = keyOf(feed);
     try {
       await unfollowFeed(feed.publisher, feed.salt);
-      selectedKey = null;
-      await refreshFollowedFeeds();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
+      return;
     }
+    // Gone at once, so a reload that fails cannot leave it listed and opened
+    // again. Its neighbour in the list opens in its place.
+    const list = $followedFeeds;
+    const at = list.findIndex((f) => keyOf(f) === key);
+    const next = list[at + 1] ?? list[at - 1] ?? null;
+    followedFeeds.update((feeds) => feeds.filter((f) => keyOf(f) !== key));
+    if (next) selectFollowed(keyOf(next));
+    else selectedKey = null;
+    toastSuccess(m.feeds_unfollowed_toast({ feed: feedLabel(feed) }));
+    // The Unfollow button went with the feed: focus goes to the one opened,
+    // or to Follow a feed when none is left.
+    if (next) {
+      await focusActiveRow();
+    } else {
+      await tick();
+      composeTrigger?.focus();
+    }
+    void refreshFollowedFeeds();
   }
 
   async function copy(text: string) {
@@ -552,12 +695,22 @@
 
   /** The strip above a followed feed's files, saying what it waits on,
    *  whether that is a fault (`warn`), and whether Retry would do anything. */
-  function stateText(
-    f: FollowedFeed,
-  ): { text: string; spoken?: string; warn: boolean; busy: boolean; retry: boolean } | null {
+  function stateText(f: FollowedFeed): StripState | null {
+    const strip = feedState(f);
+    // Nothing runs while the network is off: no spinner promising otherwise.
+    if (strip?.busy && emberOff) return { text: m.feeds_state_paused_off(), warn: true, busy: false, retry: false };
+    return strip;
+  }
+
+  /** `spoken`, when set, is what a screen reader is told instead of `text`:
+   *  the strip is a live region, and a count or a time in it would have the
+   *  whole sentence read out again each time it moves. */
+  type StripState = { text: string; spoken?: string; warn: boolean; busy: boolean; retry: boolean };
+
+  function feedState(f: FollowedFeed): StripState | null {
     const fetch = f.activity.fetching;
     if (f.activity.too_large) return { text: m.feeds_state_too_large(), warn: true, busy: false, retry: false };
-    if (f.state === 'broken') return { text: m.feeds_state_broken(), warn: true, busy: false, retry: false };
+    if (f.state === 'broken') return { text: m.feeds_state_broken(), warn: true, busy: false, retry: true };
     if (fetch) {
       // The source count changes as the poll runs: a screen reader is told
       // the fetch, not each count.
@@ -575,6 +728,7 @@
       const minutes = Math.max(1, Math.ceil((f.activity.retry_at - now) / 60));
       return {
         text: m.feeds_state_list_waiting({ minutes: formatNumber(minutes) }),
+        spoken: m.feeds_state_list_waiting_spoken(),
         warn: true,
         busy: false,
         retry: true,
@@ -583,10 +737,25 @@
     if (f.state === 'fetching' || (f.sequence > 0 && noList(f))) {
       return { text: m.feeds_state_fetching(), warn: false, busy: true, retry: false };
     }
+    if (notSeen(f)) {
+      return {
+        text: m.feeds_state_not_seen({ when: ago(f.seen_at) }),
+        spoken: m.feeds_state_not_seen_spoken(),
+        warn: true,
+        busy: false,
+        retry: true,
+      };
+    }
     if (noList(f)) {
       if (f.activity.unreachable) return { text: m.feeds_state_unreachable(), warn: true, busy: false, retry: true };
       const checked = f.checked_at > 0 ? ` ${m.feeds_checked_at({ when: ago(f.checked_at) })}.` : '';
-      return { text: `${m.feeds_state_waiting()}${checked}`, warn: false, busy: true, retry: false };
+      return {
+        text: `${m.feeds_state_waiting()}${checked}`,
+        spoken: m.feeds_state_waiting(),
+        warn: false,
+        busy: true,
+        retry: false,
+      };
     }
     return null;
   }
@@ -949,6 +1118,7 @@
       compose = null;
       await loadMine();
       selectMine(feed);
+      await focusActiveRow();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
@@ -1269,7 +1439,13 @@
       </button>
     </div>
     {#if tab === 'following'}
-      <button type="button" class="primary" aria-expanded={compose === 'follow'} onclick={() => toggleCompose('follow')}>
+      <button
+        type="button"
+        class="primary"
+        aria-expanded={compose === 'follow'}
+        bind:this={composeTrigger}
+        onclick={() => toggleCompose('follow')}
+      >
         {compose === 'follow' ? m.common_cancel() : m.feeds_follow_a_feed()}
       </button>
     {:else if tab === 'discover'}
@@ -1296,6 +1472,7 @@
         aria-expanded={compose === 'create'}
         disabled={busy || (compose !== 'create' && mine.length >= FEEDS_MAX)}
         title={compose !== 'create' && mine.length >= FEEDS_MAX ? m.feeds_quota_full({ max: formatNumber(FEEDS_MAX) }) : undefined}
+        bind:this={composeTrigger}
         onclick={() => toggleCompose('create')}
       >
         {compose === 'create' ? m.common_cancel() : m.feeds_new_feed()}
@@ -1312,7 +1489,8 @@
 
 <div class="page-content feeds-page">
   {#if compose === 'follow' && tab === 'following'}
-    <form class="compose-card" onsubmit={(e) => { e.preventDefault(); void follow(); }}>
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions (Escape from any of its fields) -->
+    <form class="compose-card" onsubmit={(e) => { e.preventDefault(); void follow(); }} onkeydown={composeKeydown}>
       <div class="compose-row">
         <div class="compose-input-wrap">
           <span class="compose-input-icon" aria-hidden="true">
@@ -1328,12 +1506,6 @@
             aria-label={m.feeds_follow_placeholder()}
             spellcheck="false"
             autocomplete="off"
-            onkeydown={(e) => {
-              if (e.key === 'Escape') {
-                e.preventDefault();
-                compose = null;
-              }
-            }}
             {@attach (el: HTMLInputElement) => el.focus()}
           />
         </div>
@@ -1342,7 +1514,8 @@
       <p class="compose-hint">{m.feeds_follow_privacy()}</p>
     </form>
   {:else if compose === 'create' && tab === 'mine'}
-    <form class="compose-card" onsubmit={(e) => { e.preventDefault(); unlessDirty(() => void create()); }}>
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions (Escape from any of its fields) -->
+    <form class="compose-card" onsubmit={(e) => { e.preventDefault(); unlessDirty(() => void create()); }} onkeydown={composeKeydown}>
       <div class="compose-row">
         <input
           type="text"
@@ -1352,12 +1525,6 @@
             if (!composing(e)) newTitle = fitBytes(newTitle, TITLE_MAX);
           }}
           oncompositionend={() => (newTitle = fitBytes(newTitle, TITLE_MAX))}
-          onkeydown={(e) => {
-            if (e.key === 'Escape') {
-              e.preventDefault();
-              compose = null;
-            }
-          }}
           placeholder={m.feeds_title_placeholder()}
           aria-label={m.feeds_title_placeholder()}
           {@attach (el: HTMLInputElement) => el.focus()}
@@ -1437,6 +1604,7 @@
                 class:active
                 class:has-unread={feed.unread > 0}
                 aria-current={active ? 'true' : undefined}
+                title={feedLabel(feed)}
                 onclick={() => selectFollowed(keyOf(feed))}
               >
                 <span class="feed-avatar" style:--feed-hue={hueOf(feed.publisher + feed.salt)}>{@render feedGlyph()}</span>
@@ -1445,7 +1613,7 @@
                     <bdi dir="auto">{feedLabel(feed)}</bdi>
                     {#if !feed.title.trim()}<span class="row-key">{shortKey(feed.publisher)}</span>{/if}
                   </span>
-                  <span class="feed-row-sub" class:warn={feed.state === 'broken' || feed.activity.too_large}>{followedSub(feed)}</span>
+                  <span class="feed-row-sub" class:warn={feed.state === 'broken' || feed.activity.too_large || notSeen(feed)}>{followedSub(feed)}</span>
                 </span>
                 {#if feed.unread > 0}
                   <span class="count-pill" aria-hidden="true">{feed.unread > 99 ? '99+' : feed.unread}</span>
@@ -1463,7 +1631,7 @@
             <header class="detail-head">
               <span class="feed-avatar lg" style:--feed-hue={hueOf(selected.publisher + selected.salt)}>{@render feedGlyph()}</span>
               <div class="detail-title">
-                <h3><bdi dir="auto">{feedLabel(selected)}</bdi></h3>
+                <h3 title={feedLabel(selected)}><bdi dir="auto">{feedLabel(selected)}</bdi></h3>
                 <p class="detail-meta">
                   <span title={m.feeds_discover_publisher({ id: selected.publisher })}>{m.feeds_discover_publisher({ id: shortKey(selected.publisher) })}</span>
                   <span aria-hidden="true">·</span>
@@ -1580,14 +1748,6 @@
                       <input type="number" min="0" max={AUTO_MIB_MAX} bind:value={autoDayMib} onchange={() => (autoDayMib = capMib(autoDayMib))} />
                       <span class="field-hint">{mibText(autoDayMib)}</span>
                     </label>
-                    <label class="field">
-                      <span class="field-label">{m.feeds_auto_category()}</span>
-                      <input type="text" list="feeds-auto-categories" bind:value={autoCategory} maxlength="256" />
-                      <datalist id="feeds-auto-categories">
-                        {#each categoryChoices as category (category)}<option value={category}></option>{/each}
-                      </datalist>
-                      <span class="field-hint">{m.feeds_auto_category_hint()}</span>
-                    </label>
                   </div>
                   <div class="auto-foot">
                     <p class="hint">{m.feeds_auto_hint()}</p>
@@ -1651,7 +1811,7 @@
                 <div class="file-row" class:removed={item.removed} class:is-new={item.is_new && !item.removed}>
                   {@render fileIcon(type)}
                   <div class="file-main">
-                    <span class="file-name">
+                    <span class="file-name" title={item.name}>
                       <bdi dir="auto">{item.name}</bdi>
                       {#if item.is_new && !item.removed}<span class="badge sm tone-accent">{m.feeds_badge_new()}</span>{/if}
                       {#if item.removed}<span class="badge sm tone-muted">{m.feeds_badge_removed()}</span>{/if}
@@ -1663,12 +1823,24 @@
                       {#if item.first_seen > 0}<span aria-hidden="true">·</span><span>{m.feeds_item_added_at({ when: ago(item.first_seen) })}</span>{/if}
                       {#if item.held}<span aria-hidden="true">·</span><span class="held">{heldText(item.held)}</span>{/if}
                       {#if item.status === 'missing'}<span aria-hidden="true">·</span><span>{m.feeds_item_missing()}</span>{/if}
+                      {#if item.status === 'cancelled'}<span aria-hidden="true">·</span><span>{m.feeds_item_cancelled()}</span>{/if}
+                      {#if item.status === 'elsewhere'}
+                        <span aria-hidden="true">·</span>
+                        <span>{m.feeds_item_elsewhere({ feed: item.elsewhere?.trim() || m.feeds_untitled() })}</span>
+                      {/if}
+                      {#if item.status === 'failed' && item.transfer && (item.transfer.failure_reason || item.transfer.failure_code)}
+                        <span aria-hidden="true">·</span>
+                        <span class="failed">{transferFailureReasonText(item.transfer.failure_reason, item.transfer.failure_code)}</span>
+                      {/if}
                     </span>
                     {#if item.note}
                       <span class="file-note"><bdi dir="auto">{item.note}</bdi></span>
                     {/if}
                     {#if item.status === 'downloading' || item.status === 'queued' || item.status === 'paused'}
                       <span class="row-progress" aria-hidden="true"><span style:width={`${Math.min(100, Math.max(0, item.progress))}%`}></span></span>
+                      {#if item.transfer}
+                        <span class="file-meta transfer-meta">{transferText(item)}</span>
+                      {/if}
                     {/if}
                   </div>
                   {#if item.status === 'done' || item.status === 'in_library'}
@@ -1679,22 +1851,69 @@
                       <span>{item.status === 'done' ? m.feeds_badge_downloaded() : m.feeds_item_in_library()}</span>
                     </span>
                   {:else if item.status === 'downloading' || item.status === 'queued' || item.status === 'paused'}
-                    <a class="row-state" href="/transfers" title={m.feeds_show_in_transfers()}>
-                      {#if item.status === 'downloading'}
-                        {m.feeds_item_downloading({ percent: formatNumber(Math.floor(item.progress)) })}
-                      {:else if item.status === 'queued'}
-                        {m.feeds_item_queued()}
-                      {:else}
-                        {m.feeds_item_paused()}
-                      {/if}
-                    </a>
-                  {:else}
+                    {@const stateText =
+                      item.status === 'downloading'
+                        ? m.feeds_item_downloading({ percent: formatNumber(Math.floor(item.progress)) })
+                        : item.status === 'queued'
+                          ? m.feeds_item_queued()
+                          : m.feeds_item_paused()}
+                    {#if item.transfer?.other_feed}
+                      <span class="row-state muted" title={m.feeds_item_other_feed()}>{stateText}</span>
+                    {:else if !item.transfer || item.transfer.in_transfers}
+                      <a
+                        class="row-state"
+                        href="/transfers"
+                        title={m.feeds_show_in_transfers()}
+                        aria-label={m.feeds_item_in_transfers_named({ name: item.name, state: stateText })}
+                      >{stateText}</a>
+                    {:else}
+                      {@const busy = controlling.has(item.transfer.id)}
+                      <div class="row-controls">
+                        <span class="row-state">{stateText}</span>
+                        {#if item.status === 'paused'}
+                          <button
+                            type="button"
+                            class="icon-btn"
+                            disabled={busy}
+                            title={m.feeds_item_resume()}
+                            aria-label={m.feeds_item_resume_named({ name: item.name })}
+                            onclick={() => void controlItem(item, resumeTransfer)}
+                          >
+                            <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M5 3.5v9l7-4.5z"/></svg>
+                          </button>
+                        {:else}
+                          <button
+                            type="button"
+                            class="icon-btn"
+                            disabled={busy}
+                            title={m.feeds_item_pause()}
+                            aria-label={m.feeds_item_pause_named({ name: item.name })}
+                            onclick={() => void controlItem(item, pauseTransfer)}
+                          >
+                            <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><rect x="4" y="3.5" width="2.6" height="9" rx="0.6"/><rect x="9.4" y="3.5" width="2.6" height="9" rx="0.6"/></svg>
+                          </button>
+                        {/if}
+                        <button
+                          type="button"
+                          class="icon-btn danger"
+                          disabled={busy}
+                          title={m.feeds_item_cancel()}
+                          aria-label={m.feeds_item_cancel_named({ name: item.name })}
+                          onclick={() => (cancelAsk = item)}
+                        >
+                          <IconX />
+                        </button>
+                      </div>
+                    {/if}
+                  {:else if canDownload(item)}
                     <button
                       type="button"
                       class="row-btn"
                       class:retry={item.status === 'failed'}
                       disabled={downloading}
-                      aria-label={m.feeds_download_named({ name: item.name })}
+                      aria-label={item.status === 'failed'
+                        ? m.feeds_item_retry_named({ name: item.name })
+                        : m.feeds_download_named({ name: item.name })}
                       onclick={() => askDownload([item.ed2k])}
                     >
                       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1714,7 +1933,7 @@
     {/if}
   {:else if tab === 'discover'}
     {#if !discoverLoaded}
-      <div class="empty-card"><span class="spinner xs" aria-hidden="true"></span></div>
+      <div class="empty-card"><span class="spinner xs" aria-hidden="true"></span><span class="sr-only">{m.common_loading()}</span></div>
     {:else if discovered.length === 0}
       <div class="empty-card">
         <div class="empty-state">
@@ -1784,7 +2003,7 @@
                 <header class="discover-card-head">
                   <span class="feed-avatar" style:--feed-hue={hueOf(feed.publisher + feed.salt)}>{@render feedGlyph()}</span>
                   <div class="discover-card-title">
-                    <h3 title={feed.title}><bdi dir="auto">{feed.title}</bdi></h3>
+                    <h3 title={feed.title}><bdi dir="auto">{feed.title.trim() || m.feeds_untitled()}</bdi></h3>
                     <p class="discover-seen">
                       <span class="seen-state" class:active={feed.active} title={feed.active ? m.feeds_discover_active_title() : undefined}>
                         <span class="status-dot" class:published={feed.active} aria-hidden="true"></span>
@@ -1900,6 +2119,7 @@
         </div>
       {:else}
         <span class="spinner xs" aria-hidden="true"></span>
+        <span class="sr-only">{m.common_loading()}</span>
       {/if}
     </div>
   {:else if mine.length === 0}
@@ -1932,7 +2152,7 @@
               disabled={busy}
               onclick={() => !active && unlessDirty(() => selectMine(feed))}
             >
-              <span class="feed-avatar" style:--feed-hue={hueOf(feed.salt)}>{@render feedGlyph()}</span>
+              <span class="feed-avatar" style:--feed-hue={hueOf(feed.publisher + feed.salt)}>{@render feedGlyph()}</span>
               <span class="feed-row-text">
                 <span class="feed-row-title"><bdi dir="auto">{feed.title}</bdi></span>
                 <span class="feed-row-sub">
@@ -1957,7 +2177,7 @@
       <section class="detail-pane">
         {#if mineFeed}
           <header class="detail-head">
-            <span class="feed-avatar lg" style:--feed-hue={hueOf(mineFeed.salt)}>{@render feedGlyph()}</span>
+            <span class="feed-avatar lg" style:--feed-hue={hueOf(mineFeed.publisher + mineFeed.salt)}>{@render feedGlyph()}</span>
             <div class="detail-title">
               <input
                 type="text"
@@ -2136,7 +2356,7 @@
             <div class="editor-foot-actions">
               <button type="button" class="secondary" disabled={!dirty || busy} onclick={() => void save()}>{m.feeds_save()}</button>
               <!-- Published and unchanged: publishing again would only bump the
-                   sequence, and the daily republish keeps the head alive. -->
+                   sequence, and the hourly republish keeps the head alive. -->
               <button
                 type="button"
                 class="primary"
@@ -2208,6 +2428,21 @@
   }}
   oncancel={() => (riskyAsk = null)}
   ondismiss={() => (riskyAsk = null)}
+/>
+
+<ConfirmDialog
+  open={cancelAsk !== null}
+  title={m.feeds_item_cancel_title()}
+  message={cancelAsk ? m.feeds_item_cancel_body({ name: cancelAsk.name }) : ''}
+  confirmLabel={m.feeds_item_cancel()}
+  danger
+  onconfirm={() => {
+    const item = cancelAsk;
+    const feed = selected;
+    cancelAsk = null;
+    if (item && feed) void controlItem(item, () => cancelFeedDownload(feed.publisher, feed.salt, item.ed2k));
+  }}
+  oncancel={() => (cancelAsk = null)}
 />
 
 <ConfirmDialog
@@ -2697,6 +2932,7 @@
     margin: 0 18px 12px;
     color: var(--text-secondary);
     line-height: 1.5;
+    overflow-wrap: anywhere;
   }
 
   .icon-btn {
@@ -3118,6 +3354,7 @@
     font-size: var(--font-size-sm);
     color: var(--text-secondary);
     line-height: 1.45;
+    overflow-wrap: anywhere;
   }
 
   .note-input {
@@ -3368,6 +3605,14 @@
     color: var(--badge-warning-text);
   }
 
+  .file-meta .failed {
+    color: var(--danger);
+  }
+
+  .row-state.muted {
+    color: var(--text-muted);
+  }
+
   .row-progress {
     display: block;
     height: 3px;
@@ -3398,8 +3643,27 @@
     text-decoration: none;
   }
 
-  .row-state:hover {
+  a.row-state:hover {
     text-decoration: underline;
+  }
+
+  .row-controls {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+  }
+
+  .row-controls .row-state {
+    padding-inline-end: 4px;
+  }
+
+  .icon-btn.danger:hover:not(:disabled) {
+    color: var(--danger);
+  }
+
+  .transfer-meta {
+    margin-top: 4px;
   }
 
   .row-btn.retry {
@@ -3585,6 +3849,9 @@
     align-items: center;
     gap: 5px;
     min-width: 0;
+    /* Room for the status dot's ring, which `overflow` would clip. */
+    padding-inline-start: 3px;
+    margin-inline-start: -3px;
     overflow: hidden;
     text-overflow: ellipsis;
   }

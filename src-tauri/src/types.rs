@@ -653,6 +653,10 @@ pub struct StartDownloadResponse {
     pub transfer_id: String,
     /// True when this file was already in the active download queue (same ed2k hash).
     pub already_queued: bool,
+    /// The download already queued is a feed's, shown on the Feeds page
+    /// rather than in Transfers.
+    #[serde(default)]
+    pub in_feed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
