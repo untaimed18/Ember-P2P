@@ -1360,6 +1360,8 @@
   "library_chat_files_title": "Abre la carpeta con los archivos que tus amigos te enviaron por chat. No se comparte.",
   "library_channel_files": "Channel Files",
   "library_channel_files_title": "Abre la carpeta con los archivos que los miembros te enviaron en las salas. No se comparte.",
+  "library_feed_files": "Feed Files",
+  "library_feed_files_title": "Abre la carpeta con los archivos descargados de los feeds que sigues. No se comparte.",
   "library_create_collection": "Crear colección",
   "library_reload": "Recargar",
   "library_add_folder": "+ Añadir carpeta",

@@ -1360,6 +1360,8 @@
   "library_chat_files_title": "打开好友在聊天中发给你的文件所在的文件夹。该文件夹不会共享。",
   "library_channel_files": "Channel Files",
   "library_channel_files_title": "打开成员在房间中发给你的文件所在的文件夹。该文件夹不会共享。",
+  "library_feed_files": "Feed Files",
+  "library_feed_files_title": "打开从你关注的订阅源下载的文件所在的文件夹。该文件夹不会共享。",
   "library_create_collection": "创建合集",
   "library_reload": "重新加载",
   "library_add_folder": "+ 添加文件夹",

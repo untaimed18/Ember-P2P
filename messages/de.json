@@ -1360,6 +1360,8 @@
   "library_chat_files_title": "Öffnet den Ordner mit Dateien, die Ihnen Freunde im Chat geschickt haben. Er wird nicht geteilt.",
   "library_channel_files": "Channel Files",
   "library_channel_files_title": "Öffnet den Ordner mit Dateien, die Ihnen Mitglieder in Räumen geschickt haben. Er wird nicht geteilt.",
+  "library_feed_files": "Feed Files",
+  "library_feed_files_title": "Öffnet den Ordner mit Dateien, die aus abonnierten Feeds heruntergeladen wurden. Er wird nicht geteilt.",
   "library_create_collection": "Sammlung erstellen",
   "library_reload": "Neu laden",
   "library_add_folder": "+ Ordner hinzufügen",

@@ -1360,6 +1360,8 @@
   "library_chat_files_title": "Open the folder with files friends sent you in chat. It is not shared.",
   "library_channel_files": "Channel Files",
   "library_channel_files_title": "Open the folder with files members sent you in rooms. It is not shared.",
+  "library_feed_files": "Feed Files",
+  "library_feed_files_title": "Open the folder with files downloaded from feeds you follow. It is not shared.",
   "library_create_collection": "Create Collection",
   "library_reload": "Reload",
   "library_add_folder": "+ Add Folder",

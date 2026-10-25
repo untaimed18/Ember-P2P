@@ -1726,6 +1726,26 @@ pub async fn open_feed_folder(state: tauri::State<'_, AppState>, publisher: Stri
     .map_err(|e| coded_ctx("feeds_task_error", "Task error", e))?
 }
 
+/// Open the Feeds folder of the current download folder, creating it if
+/// nothing has landed there yet.
+#[tauri::command]
+pub async fn open_feed_files_folder(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let root = state.config.read().await.settings.download_folders().current;
+    tokio::task::spawn_blocking(move || {
+        let dir = crate::security::filesystem::prepare_approved_subdir(
+            &root,
+            crate::sharing::feed_downloads::FEEDS_DIR,
+            &[root.to_string_lossy().into_owned()],
+        )
+        .inspect(|feeds| crate::sharing::feed_downloads::mark_feeds_dir(feeds))
+        .map_err(|e| coded_ctx("transfers_invalid_path", "Invalid or changed download path", e))?;
+        crate::security::filesystem::open_with_default_app(&dir)
+            .map_err(|e| coded_ctx("transfers_open_explorer_failed", "Failed to open the Feed Files folder", e))
+    })
+    .await
+    .map_err(|e| coded_ctx("feeds_task_error", "Task error", e))?
+}
+
 /// Stop following a feed: its list stops being served and is deleted, and
 /// its items are forgotten. Downloaded files stay.
 #[tauri::command]

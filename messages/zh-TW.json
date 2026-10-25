@@ -1360,6 +1360,8 @@
   "library_chat_files_title": "開啟好友在聊天中傳給你的檔案所在的資料夾。此資料夾不會分享。",
   "library_channel_files": "Channel Files",
   "library_channel_files_title": "開啟成員在房間中傳給你的檔案所在的資料夾。此資料夾不會分享。",
+  "library_feed_files": "Feed Files",
+  "library_feed_files_title": "開啟從你追蹤的訂閱源下載的檔案所在的資料夾。此資料夾不會分享。",
   "library_create_collection": "建立合集",
   "library_reload": "重新載入",
   "library_add_folder": "+ 新增資料夾",

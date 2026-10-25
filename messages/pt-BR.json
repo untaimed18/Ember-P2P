@@ -1360,6 +1360,8 @@
   "library_chat_files_title": "Abre a pasta com os arquivos que seus amigos enviaram no chat. Ela não é compartilhada.",
   "library_channel_files": "Channel Files",
   "library_channel_files_title": "Abre a pasta com os arquivos que membros enviaram nas salas. Ela não é compartilhada.",
+  "library_feed_files": "Feed Files",
+  "library_feed_files_title": "Abre a pasta com os arquivos baixados dos feeds que você segue. Ela não é compartilhada.",
   "library_create_collection": "Criar Coleção",
   "library_reload": "Recarregar",
   "library_add_folder": "+ Adicionar Pasta",

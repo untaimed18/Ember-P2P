@@ -2606,6 +2606,7 @@ pub fn run() {
             commands::feeds::cancel_feed_download,
             commands::feeds::unfollow_feed,
             commands::feeds::open_feed_folder,
+            commands::feeds::open_feed_files_folder,
             commands::feed_discover::discover_feeds,
             commands::feed_discover::cached_discovered_feeds,
             commands::feed_discover::set_discovered_feed_hidden,

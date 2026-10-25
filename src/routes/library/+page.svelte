@@ -101,6 +101,7 @@
   import { plural } from '$lib/plural';
   import { openChatFilesFolder } from '$lib/api/friends';
   import { openChannelFilesFolder } from '$lib/api/channels';
+  import { openFeedFilesFolder } from '$lib/api/feeds';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { hoverSubmenus } from '$lib/hoverSubmenus';
@@ -4080,6 +4081,17 @@
         <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
       </svg>
       {m.library_channel_files()}
+    </button>
+    <button
+      type="button"
+      class="ghost folder-btn"
+      title={m.library_feed_files_title()}
+      onclick={() => void openFeedFilesFolder().catch((e) => toastError(translateError(e)))}
+    >
+      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
+      </svg>
+      {m.library_feed_files()}
     </button>
     <span class="header-divider" aria-hidden="true"></span>
     <button class="ghost" onclick={handleOpenCollection} disabled={collectionLoading}>

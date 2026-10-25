@@ -223,6 +223,9 @@ export const unfollowFeed = (publisher: string, salt: string): Promise<void> =>
 /** Open the folder in Feeds a followed feed's files finish in. */
 export const openFeedFolder = (publisher: string, salt: string): Promise<void> =>
   invoke('open_feed_folder', { publisher, salt });
+/** Open `Feeds`, where every followed feed's folder is. It is not shared,
+ *  unlike `Downloads`. */
+export const openFeedFilesFolder = (): Promise<void> => invoke('open_feed_files_folder');
 
 /** Walk the public feed index. Shards arrive on {@link FEEDS_FOUND_EVENT}
  *  tagged `walk` as they land; the result is the whole set. */

@@ -1360,6 +1360,8 @@
   "library_chat_files_title": "Открыть папку с файлами, которые друзья прислали вам в чате. Она не раздаётся.",
   "library_channel_files": "Channel Files",
   "library_channel_files_title": "Открыть папку с файлами, которые участники прислали вам в комнатах. Она не раздаётся.",
+  "library_feed_files": "Feed Files",
+  "library_feed_files_title": "Открыть папку с файлами, загруженными из лент, на которые вы подписаны. Она не раздаётся.",
   "library_create_collection": "Создать коллекцию",
   "library_reload": "Обновить",
   "library_add_folder": "+ Добавить папку",

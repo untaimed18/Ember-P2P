@@ -1360,6 +1360,8 @@
   "library_chat_files_title": "Ouvre le dossier des fichiers que vos amis vous ont envoyés en discussion. Il n’est pas partagé.",
   "library_channel_files": "Channel Files",
   "library_channel_files_title": "Ouvre le dossier des fichiers que des membres vous ont envoyés dans les salons. Il n’est pas partagé.",
+  "library_feed_files": "Feed Files",
+  "library_feed_files_title": "Ouvre le dossier des fichiers téléchargés depuis les flux que vous suivez. Il n’est pas partagé.",
   "library_create_collection": "Créer une collection",
   "library_reload": "Recharger",
   "library_add_folder": "+ Ajouter un dossier",
