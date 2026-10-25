@@ -18,8 +18,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::attach::{
     attach_chunk_count, attach_file_info_len, attach_stream_tag, attach_tags_match,
-    decode_attach_file_info, encode_attach_file_info, AttachFileInfo, AttachRequest,
-    AttachStreamStatus, ATTACH_CHUNK_SIZE, ATTACH_REQUEST_TAIL_LEN,
+    chunk_count_up_to, decode_attach_file_info, decode_file_info_up_to, encode_attach_file_info,
+    file_info_len_up_to, stream_max_bytes, AttachFileInfo, AttachRequest, AttachStreamStatus,
+    ATTACH_CHUNK_SIZE, ATTACH_REQUEST_TAIL_LEN,
 };
 use super::transfer::HashTree;
 
@@ -203,6 +204,50 @@ fn lookup_hash(stamp: &FileStamp) -> HashLookup {
     HashLookup::Start(tx, rx)
 }
 
+/// Whether the tree for `stamp` is cached or being built: a stream for it
+/// reads nothing more of the file to answer.
+fn tree_known(stamp: &FileStamp) -> bool {
+    let cache = hash_cache().lock().unwrap_or_else(|e| e.into_inner());
+    match cache.get(stamp) {
+        Some(HashSlot::Ready { used, .. }) => used.elapsed() < HASH_CACHE_IDLE,
+        Some(HashSlot::Hashing(_)) => true,
+        None => false,
+    }
+}
+
+/// Bytes of feed files hashed for followers per [`FEED_HASH_WINDOW`]. The
+/// first stream for a file reads all of it, and the job outlives the stream,
+/// so without a bound a follower asking for each file of a feed in turn, and
+/// hanging up, would keep the publisher's disk reading for as long as they
+/// liked. Past it a follower fetches over eD2K, which reads only what it sends.
+const FEED_HASH_BUDGET: u64 = 32 * 1024 * 1024 * 1024;
+const FEED_HASH_WINDOW: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+fn feed_hash_gate() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
+}
+
+fn feed_hash_spent() -> &'static std::sync::Mutex<(std::time::Instant, u64)> {
+    static SPENT: std::sync::OnceLock<std::sync::Mutex<(std::time::Instant, u64)>> = std::sync::OnceLock::new();
+    SPENT.get_or_init(|| std::sync::Mutex::new((std::time::Instant::now(), 0)))
+}
+
+/// Leave to hash a feed file of `size` bytes for a follower: one at a time,
+/// and `None` once the hour's budget would be passed.
+async fn feed_hash_permit(size: u64) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let permit = feed_hash_gate().clone().acquire_owned().await.ok()?;
+    let mut spent = feed_hash_spent().lock().unwrap_or_else(|e| e.into_inner());
+    if spent.0.elapsed() >= FEED_HASH_WINDOW {
+        *spent = (std::time::Instant::now(), 0);
+    }
+    if spent.1.saturating_add(size) > FEED_HASH_BUDGET {
+        return None;
+    }
+    spent.1 = spent.1.saturating_add(size);
+    Some(permit)
+}
+
 /// Hash the file `stamp` names and publish the result. Blocking: a read of the
 /// whole file.
 fn run_hash_job(stamp: FileStamp, tx: tokio::sync::watch::Sender<HashOutcome>) {
@@ -262,12 +307,21 @@ fn forget_cached_tree(stamp: &FileStamp, tree: &std::sync::Arc<HashTree>) {
 /// The job is detached from the caller. A stream whose receiver gave up while
 /// it waited does not take the work with it, which is what makes the
 /// receiver's retry cheap.
-async fn attachment_tree(stamp: FileStamp) -> Result<(std::sync::Arc<HashTree>, bool), String> {
+///
+/// `permit`, a feed stream's leave to hash, is held by the job it starts, so
+/// the next waits for the read to end rather than for the stream to.
+async fn attachment_tree(
+    stamp: FileStamp,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<(std::sync::Arc<HashTree>, bool), String> {
     let mut rx = match lookup_hash(&stamp) {
         HashLookup::Ready(tree) => return Ok((tree, true)),
         HashLookup::Wait(rx) => rx,
         HashLookup::Start(tx, rx) => {
-            tokio::task::spawn_blocking(move || run_hash_job(stamp, tx));
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                run_hash_job(stamp, tx)
+            });
             rx
         }
     };
@@ -579,7 +633,49 @@ where
         recv,
         send,
         prefix,
-        capability_for,
+        with_root(capability_for),
+        on_progress,
+        limiter,
+        true,
+    )
+    .await
+}
+
+/// A grant whose root is known, as a chat or room offer's is.
+fn with_root<F>(capability_for: F) -> impl FnOnce(&[u8; 16]) -> Option<(PathBuf, u64, Option<[u8; 32]>, [u8; 32])>
+where
+    F: FnOnce(&[u8; 16]) -> Option<(PathBuf, u64, [u8; 32], [u8; 32])>,
+{
+    move |xfer_id| capability_for(xfer_id).map(|(path, size, root, capability)| (path, size, Some(root), capability))
+}
+
+/// Serve a file of a feed we publish to a follower who asked for it under
+/// [`super::attach::FEED_STREAM_MSG_TYPE`].
+///
+/// No root is offered ahead of a feed stream: a feed's list names a file by
+/// its whole-file digests, not by its chunk tree. The tree is whatever the
+/// file on disk hashes to, and the follower checks the finished file against
+/// the list. Served as a priority upload, as a chat file is.
+pub async fn serve_feed_stream<R, W, F, P>(
+    recv: &mut R,
+    send: &mut W,
+    prefix: &[u8; 7],
+    resolve: F,
+    on_progress: P,
+    limiter: Option<&crate::bandwidth::limiter::BandwidthLimiter>,
+) -> anyhow::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+    F: FnOnce(&[u8; 16]) -> Option<(PathBuf, u64, [u8; 32])>,
+    P: FnMut(&[u8; 16], u64, u64) -> bool,
+{
+    serve_paced(
+        super::attach::FEED_STREAM_MSG_TYPE,
+        recv,
+        send,
+        prefix,
+        move |xfer_id: &[u8; 16]| resolve(xfer_id).map(|(path, size, capability)| (path, size, None, capability)),
         on_progress,
         limiter,
         true,
@@ -605,7 +701,7 @@ where
     F: FnOnce(&[u8; 16]) -> Option<(PathBuf, u64, [u8; 32], [u8; 32])>,
     P: FnMut(&[u8; 16], u64, u64) -> bool,
 {
-    serve_paced(stream_type, recv, send, prefix, capability_for, on_progress, limiter, false).await
+    serve_paced(stream_type, recv, send, prefix, with_root(capability_for), on_progress, limiter, false).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -622,7 +718,7 @@ async fn serve_paced<R, W, F, P>(
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
-    F: FnOnce(&[u8; 16]) -> Option<(PathBuf, u64, [u8; 32], [u8; 32])>,
+    F: FnOnce(&[u8; 16]) -> Option<(PathBuf, u64, Option<[u8; 32]>, [u8; 32])>,
     P: FnMut(&[u8; 16], u64, u64) -> bool,
 {
     let mut tail = [0u8; ATTACH_REQUEST_TAIL_LEN];
@@ -653,7 +749,7 @@ where
         anyhow::bail!("attachment stream tag did not verify");
     }
 
-    let Some(chunk_count) = attach_chunk_count(size) else {
+    let Some(chunk_count) = chunk_count_up_to(size, stream_max_bytes(stream_type)) else {
         refuse(send, AttachStreamStatus::SourceGone).await?;
         anyhow::bail!("granted attachment has an impossible size");
     };
@@ -697,15 +793,30 @@ where
         refuse(send, AttachStreamStatus::SourceGone).await?;
         anyhow::bail!("attachment on disk no longer matches the offer");
     }
-    let matches = |tree: &HashTree| tree.file_size == size && tree.root_hash == root;
-    let mut hashed = attachment_tree(stamp.clone()).await;
+    let matches = |tree: &HashTree| tree.file_size == size && root.is_none_or(|root| tree.root_hash == root);
+    // Anyone with a feed's link may ask, so a feed file read for its list waits
+    // its turn and its share of an hour's budget; past that it is refused,
+    // and the follower fetches it over eD2K.
+    let permit = if stream_type == super::attach::FEED_STREAM_MSG_TYPE && !tree_known(&stamp) {
+        match tokio::time::timeout(ATTACH_STATUS_TIMEOUT, feed_hash_permit(size)).await {
+            Ok(Some(permit)) => Some(permit),
+            _ => {
+                refuse(send, AttachStreamStatus::Unknown).await?;
+                anyhow::bail!("no budget left to hash a feed file for a follower");
+            }
+        }
+    } else {
+        None
+    };
+    let mut hashed = attachment_tree(stamp.clone(), permit).await;
     // A cached tree that disagrees with the grant may be describing bytes the
     // stamp could not tell apart from the current ones. One fresh read settles
-    // it before the file is refused.
+    // it before the file is refused. With no root granted, only a size can
+    // disagree, which a read of the same stamp would not change.
     if let Ok((tree, true)) = &hashed {
-        if !matches(tree) {
+        if !matches(tree) && root.is_some() {
             forget_cached_tree(&stamp, tree);
-            hashed = attachment_tree(stamp).await;
+            hashed = attachment_tree(stamp, None).await;
         }
     }
     let tree = match hashed {
@@ -978,6 +1089,90 @@ where
     })
 }
 
+/// Ask for a file from `start_chunk` on under `stream_type`, and read the
+/// sender's answer: its chunk list, once it has one.
+///
+/// For a fetch that keeps the bytes itself, as a feed's download does in its
+/// part file: [`read_verified_chunk`] then reads each chunk in turn. Nothing
+/// here checks the list against a root; the caller does, against the root it
+/// was offered or the one it saw first.
+#[allow(clippy::too_many_arguments)]
+pub async fn request_chunks<R, W>(
+    stream_type: u8,
+    recv: &mut R,
+    send: &mut W,
+    xfer_id: &[u8; 16],
+    capability: &[u8; 32],
+    size: u64,
+    start_chunk: u32,
+    status_wait: std::time::Duration,
+) -> Result<AttachFileInfo, FetchError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let max = stream_max_bytes(stream_type);
+    let chunk_count = chunk_count_up_to(size, max)
+        .ok_or_else(|| FetchError::Corrupt("stream size out of range".into()))?;
+    if start_chunk >= chunk_count {
+        return Err(FetchError::Corrupt("stream cursor past the end of the file".into()));
+    }
+    let request = AttachRequest {
+        xfer_id: *xfer_id,
+        tag: attach_stream_tag(capability, xfer_id),
+        start_chunk,
+    };
+    tokio::time::timeout(
+        ATTACH_IO_TIMEOUT,
+        send.write_all(&super::attach::encode_stream_request(stream_type, &request)),
+    )
+    .await??;
+    tokio::time::timeout(ATTACH_IO_TIMEOUT, send.flush()).await??;
+
+    let mut status_byte = [0u8; 1];
+    tokio::time::timeout(status_wait, recv.read_exact(&mut status_byte)).await??;
+    let status = AttachStreamStatus::from_byte(status_byte[0])
+        .ok_or_else(|| FetchError::Corrupt("stream peer sent an unknown status".into()))?;
+    if status != AttachStreamStatus::Ok {
+        return Err(FetchError::Refused(status));
+    }
+    let info_len = file_info_len_up_to(size, max)
+        .ok_or_else(|| FetchError::Corrupt("stream size out of range".into()))?;
+    let mut info_bytes = vec![0u8; info_len];
+    info_bytes[0] = AttachStreamStatus::Ok.to_byte();
+    read_full(recv, &mut info_bytes[1..], |_| {}).await?;
+    let info = decode_file_info_up_to(&info_bytes, max)
+        .map_err(|s| FetchError::Corrupt(format!("stream header refused: {s:?}")))?;
+    if info.size != size {
+        return Err(FetchError::Corrupt("stream header names another size".into()));
+    }
+    Ok(info)
+}
+
+/// Read chunk `index` of the file `info` lists into the front of `buf`, and
+/// check it against its hash. Returns its length. `on_read` is told the bytes
+/// of it read so far, after every read.
+pub async fn read_verified_chunk<R>(
+    recv: &mut R,
+    info: &AttachFileInfo,
+    index: usize,
+    buf: &mut [u8],
+    on_read: impl FnMut(usize),
+) -> Result<usize, FetchError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let len = info
+        .chunk_len(index)
+        .filter(|len| *len <= buf.len())
+        .ok_or_else(|| FetchError::Corrupt("chunk index past the end".into()))?;
+    read_full(recv, &mut buf[..len], on_read).await?;
+    if blake3::hash(&buf[..len]).as_bytes() != &info.chunk_hashes[index] {
+        return Err(FetchError::Corrupt(format!("chunk {index} did not match its hash")));
+    }
+    Ok(len)
+}
+
 use tokio::io::AsyncSeekExt;
 
 #[cfg(test)]
@@ -1131,7 +1326,7 @@ mod tests {
         std::fs::write(&source, &data).expect("write");
         let stamp = FileStamp::of(&source, &std::fs::File::open(&source).expect("open"))
             .expect("stamp");
-        let (a, b) = tokio::join!(attachment_tree(stamp.clone()), attachment_tree(stamp));
+        let (a, b) = tokio::join!(attachment_tree(stamp.clone(), None), attachment_tree(stamp, None));
         let expected = HashTree::from_data(&data).root_hash;
         assert_eq!(a.expect("first").0.root_hash, expected);
         assert_eq!(b.expect("second").0.root_hash, expected);
@@ -2158,5 +2353,111 @@ mod tests {
         assert!(outcome.complete);
         assert_eq!(std::fs::read(&part).expect("part"), data);
         let _ = std::fs::remove_file(&part);
+    }
+
+    /// Serve `source` as a feed file once, under `capability`, and ask for it
+    /// from `start_chunk` under `asked_with`. The chunk list and the chunks
+    /// read, or why the request failed.
+    async fn feed_round_trip(
+        source: Option<&Path>,
+        size: u64,
+        capability: [u8; 32],
+        asked_with: [u8; 32],
+        start_chunk: u32,
+    ) -> Result<(AttachFileInfo, Vec<u8>), FetchError> {
+        let (mut client_w, mut server_r) = tokio::io::duplex(1 << 20);
+        let (mut server_w, mut client_r) = tokio::io::duplex(1 << 20);
+        let served = source.map(Path::to_path_buf);
+        let server = tokio::spawn(async move {
+            let mut prefix = [0u8; 7];
+            server_r.read_exact(&mut prefix).await?;
+            serve_feed_stream(
+                &mut server_r,
+                &mut server_w,
+                &prefix,
+                |_| served.map(|path| (path, size, capability)),
+                |_, _, _| true,
+                None,
+            )
+            .await
+        });
+        let fetched = async {
+            let info = request_chunks(
+                super::super::attach::FEED_STREAM_MSG_TYPE,
+                &mut client_r,
+                &mut client_w,
+                &[5u8; 16],
+                &asked_with,
+                size,
+                start_chunk,
+                ATTACH_STATUS_TIMEOUT,
+            )
+            .await?;
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; ATTACH_CHUNK_SIZE];
+            for index in start_chunk as usize..info.chunk_count() {
+                let len = read_verified_chunk(&mut client_r, &info, index, &mut buf, |_| {}).await?;
+                got.extend_from_slice(&buf[..len]);
+            }
+            Ok((info, got))
+        }
+        .await;
+        drop((client_r, client_w));
+        let _ = server.await;
+        fetched
+    }
+
+    /// Anyone holding the link is served, from the chunk asked for, with the
+    /// list the file on disk hashes to: no root was offered ahead.
+    #[tokio::test]
+    async fn a_feed_file_is_served_from_the_chunk_asked_for() {
+        let data: Vec<u8> = (0..ATTACH_CHUNK_SIZE * 3 + 5).map(|i| (i % 13) as u8).collect();
+        let source = temp_path("feed-src");
+        std::fs::write(&source, &data).expect("write");
+        let (info, got) = feed_round_trip(Some(&source), data.len() as u64, [8; 32], [8; 32], 1)
+            .await
+            .expect("served");
+        assert!(info.matches_root(&HashTree::from_data(&data).root_hash));
+        assert_eq!(got, data[ATTACH_CHUNK_SIZE..]);
+        let _ = std::fs::remove_file(&source);
+    }
+
+    #[tokio::test]
+    async fn a_feed_request_without_its_capability_is_refused() {
+        let source = temp_path("feed-cap");
+        std::fs::write(&source, b"feed file").expect("write");
+        let refused = feed_round_trip(Some(&source), 9, [8; 32], [9; 32], 0).await;
+        assert!(matches!(refused, Err(FetchError::Refused(AttachStreamStatus::Unauthorized))));
+        let _ = std::fs::remove_file(&source);
+    }
+
+    #[tokio::test]
+    async fn a_file_no_feed_of_ours_lists_is_refused() {
+        let refused = feed_round_trip(None, 9, [8; 32], [8; 32], 0).await;
+        assert!(matches!(refused, Err(FetchError::Refused(AttachStreamStatus::Unknown))));
+    }
+
+    /// Past the 2 GiB a chat file may be, which a feed's film can be.
+    #[test]
+    fn a_feed_stream_carries_files_a_chat_cannot() {
+        use super::super::attach::{stream_max_bytes, ATTACH_MAX_BYTES, FEED_STREAM_MAX_BYTES, FEED_STREAM_MSG_TYPE};
+        let large = ATTACH_MAX_BYTES + 1;
+        assert!(attach_chunk_count(large).is_none());
+        assert!(chunk_count_up_to(large, stream_max_bytes(FEED_STREAM_MSG_TYPE)).is_some());
+        assert!(chunk_count_up_to(FEED_STREAM_MAX_BYTES + 1, stream_max_bytes(FEED_STREAM_MSG_TYPE)).is_none());
+        assert_eq!(stream_max_bytes(super::super::attach::ROOM_XFER_STREAM_MSG_TYPE), ATTACH_MAX_BYTES);
+    }
+
+    /// A chunk that is not the one the list hashes is refused before it is
+    /// handed on to be written.
+    #[tokio::test]
+    async fn a_chunk_that_does_not_match_its_hash_is_refused() {
+        let data = vec![1u8; 100];
+        let info = AttachFileInfo { size: 100, chunk_hashes: HashTree::from_data(&data).chunk_hashes };
+        let (mut tx, mut rx) = tokio::io::duplex(1024);
+        tx.write_all(&[2u8; 100]).await.expect("write");
+        let mut buf = vec![0u8; ATTACH_CHUNK_SIZE];
+        let read = read_verified_chunk(&mut rx, &info, 0, &mut buf, |_| {}).await;
+        assert!(matches!(read, Err(FetchError::Corrupt(_))));
     }
 }

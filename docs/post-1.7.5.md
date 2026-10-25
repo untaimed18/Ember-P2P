@@ -374,11 +374,15 @@ kept off the Transfers page and controlled from the Feeds page.
 **Publisher first.** A feed download is held for its publisher before the
 rest of the network is asked (`network::feed_direct`): KAD, server and other
 publishers' Ember sources wait while the Ember lookup for the file is taken
-for the publisher's own signed record, which is dialled over QUIC pinned to
-the feed key and greeted as an eD2K download. A friend publisher goes the
-friend-transfer way instead. The hold ends when the lookup finds no record of
-theirs, the dial fails, or 45 s pass with no byte, and every network is then
-asked at once (`FindSources`).
+for the publisher's own signed record. The file then comes over the feed
+stream (type `0x09`), the chat attachment's request, chunk list and
+BLAKE3-checked chunks, on QUIC pinned to the publisher's identity or a secure
+stream on its TCP port, as a source inside the download's worker
+(`multi_source::feed_worker`). A friend publisher's last address is streamed
+from at once. The publisher serves it as a priority upload, up to 8 at once,
+for files up to 8 GiB. The hold ends when the lookup finds no record of
+theirs, the stream fails or is refused, or 45 s pass with no byte, and every
+network is then asked at once (`FindSources`).
 
 **Publishing.** "Add to feed…" on Library rows (the selection or one file),
 and a feed editor with title, description, reordering and removal.

@@ -117,27 +117,29 @@ pub(super) struct WebWorker {
     pub banned_ips: Option<super::super::upload::SharedBannedIps>,
 }
 
-/// Counts its worker in `WebWorker::working` while held.
-struct Working {
+/// Counts its worker in `WebWorker::working` while held. A feed's publisher
+/// stream (`super::feed_worker`) counts in the same, so the download waits on
+/// it as on a mirror.
+pub(super) struct Working {
     count: Arc<std::sync::atomic::AtomicUsize>,
     held: bool,
 }
 
 impl Working {
-    fn new(count: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+    pub(super) fn new(count: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
         let mut working = Self { count: count.clone(), held: false };
         working.hold();
         working
     }
 
-    fn hold(&mut self) {
+    pub(super) fn hold(&mut self) {
         if !self.held {
             self.count.fetch_add(1, Ordering::Relaxed);
             self.held = true;
         }
     }
 
-    fn release(&mut self) {
+    pub(super) fn release(&mut self) {
         if self.held {
             self.count.fetch_sub(1, Ordering::Relaxed);
             self.held = false;
@@ -154,10 +156,10 @@ impl Drop for Working {
 /// Counts a request in the download's active sources while its body streams.
 /// A guard rather than a pair of calls: the worker is aborted mid-await on
 /// every early exit of the download, which would skip the decrement.
-struct ActiveRequest(Arc<AtomicU32>);
+pub(super) struct ActiveRequest(Arc<AtomicU32>);
 
 impl ActiveRequest {
-    fn new(count: &Arc<AtomicU32>) -> Self {
+    pub(super) fn new(count: &Arc<AtomicU32>) -> Self {
         count.fetch_add(1, Ordering::Relaxed);
         Self(count.clone())
     }

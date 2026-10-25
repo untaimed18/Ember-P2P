@@ -255,8 +255,9 @@ pub(super) async fn handle_download_event(
             } else {
                 downloaded
             };
-            let speed = {
+            let (speed, became_active) = {
                 let mut mgr = transfer_manager.write().await;
+                let before = mgr.active.get(&transfer_id).map(|t| t.completed_size);
                 // eMule's split: `transferred` is the wire counter behind its
                 // Transferred column, `capped_downloaded` the on-disk figure
                 // behind Completed, and progress comes from the latter
@@ -268,12 +269,29 @@ pub(super) async fn handle_download_event(
                     transferred.unwrap_or(capped_downloaded),
                     Some(capped_downloaded),
                 );
-                if let Some(t) = mgr.active.get(&transfer_id) {
-                    t.speed
-                } else {
-                    0
+                // Bytes landing are a download under way, whatever the row
+                // was left reading: a worker started with a peer in hand, or
+                // a source no peer count covers (a mirror, a feed's
+                // publisher), never passes through the paths that set it.
+                let became_active = before.is_some_and(|before| capped_downloaded > before)
+                    && mgr.active.get(&transfer_id).is_some_and(|t| {
+                        matches!(
+                            t.status,
+                            crate::types::TransferStatus::Queued | crate::types::TransferStatus::Searching
+                        )
+                    });
+                if became_active {
+                    mgr.update_status(&transfer_id, crate::types::TransferStatus::Active);
                 }
+                let speed = mgr.active.get(&transfer_id).map_or(0, |t| t.speed);
+                (speed, became_active)
             };
+            if became_active {
+                let _ = app_handle.emit(
+                    "transfer-status",
+                    serde_json::json!({ "id": transfer_id, "status": "active" }),
+                );
+            }
             let progress = if total > 0 {
                 ((capped_downloaded as f64 / total as f64) * 100.0).min(100.0)
             } else {

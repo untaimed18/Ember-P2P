@@ -250,15 +250,29 @@ friends unless a step says otherwise, and C a follower who is not A's friend.
 - [ ] With the Ember Network off, a feed waiting on its list says Paused,
       with no spinner.
 - [ ] Publisher first, A online and not B's friend: B's row says "From
-      the publisher" and B's log has "connected to the publisher directly";
-      no KAD or server source search runs for it while A keeps sending. A online but
-      sending nothing (paused upload, full queue): after about 45 seconds
-      the row shows sources instead, and C, who has the file too, is used.
+      the publisher", turns Downloading with its percentage as the first
+      bytes land, and finishes Done; no KAD or server source search runs for
+      it while A keeps sending. A's eMule upload queue is full: B's file still
+      starts at once (the feed stream goes ahead of the queue), and A's
+      Transfers page shows no upload row for it.
+- [ ] The stream's carriers: with A's QUIC (UDP) port blocked but its TCP
+      port forwarded, B's download starts within about 4 seconds over TCP.
+      With both blocked, the row shows sources from every network after the
+      stream gives up.
+- [ ] Nine followers at once on A: eight stream from A, the ninth fetches
+      over eD2K, and all finish.
+- [ ] Pause B's download mid-stream and resume it: it carries on from where
+      it was, not from the start. Remove a file from A's feed and publish
+      while B's download of it is still queued: A refuses it, and B fetches
+      it from C over eD2K.
+- [ ] A file over 8 GiB in A's feed downloads over eD2K, from A among others.
 - [ ] Publisher offline: with A closed and C sharing the file, B's
       download finds C within seconds of the lookup finishing, without
       waiting out the 45 seconds.
-- [ ] Friend publisher: A and B friends, both behind NAT. B's download goes
-      to A over the friend path (connect-back or punch).
+- [ ] Friend publisher, both reachable: B's download streams from A at
+      once, before any lookup, and A's log shows no eD2K upload session for
+      it. Both behind NAT: the stream fails and the download goes to A over
+      the friend path (connect-back or punch) with the other networks.
 - [ ] Risky types (`.exe`, `.msi`, `.bat`, `.ps1`, `.lnk`, `.iso`, `.docm`,
       and `video.mp4.exe`) are never started automatically, whatever the
       caps. They carry a "Can run code" badge, and Download (one, or

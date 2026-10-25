@@ -33,6 +33,7 @@ use super::transfer::{
     PacketStreamDesynced,
 };
 
+mod feed_worker;
 mod web_worker;
 
 /// Shared registry of active download trackers so the shutdown path can
@@ -3431,6 +3432,35 @@ impl MultiSourceDownload {
             source_aborts.track(&handle);
             web_handles.push(handle);
         }
+        // A feed's publisher, streamed from as a mirror is fetched from, and
+        // waited on, stopped and counted with them.
+        {
+            let template = feed_worker::FeedWorker {
+                worker: FEED_WORKER_INDEX,
+                transfer_id: self.transfer_id.clone(),
+                file_size: self.file_size,
+                tracker: tracker.clone(),
+                output: shared_part_file.clone(),
+                bandwidth: self.bandwidth_limiter.clone(),
+                control: self.control.clone(),
+                progress_tx: web_progress_tx.clone(),
+                event_tx: event_tx.clone(),
+                drop_tx: drop_tx.clone(),
+                active_count: active_count.clone(),
+                disk_full: disk_full.clone(),
+                working: web_working.clone(),
+                our_hash: self.ember_hash,
+                our_public_key: self.ed25519_public_key,
+                our_secret_key: self.ed25519_secret_key,
+                ip_filter: self.ip_filter.clone(),
+                banned_ips: self.banned_ips.clone(),
+            };
+            let first = crate::network::feed_direct::stream_ready(&self.transfer_id)
+                .then(|| web_worker::Working::new(&web_working));
+            let handle = tokio::spawn(feed_worker::dispatch(template, first, total_sources.clone()));
+            source_aborts.track(&handle);
+            web_handles.push(handle);
+        }
         // Held only by the workers from here, so the aggregator ends with them.
         drop(web_progress_tx);
 
@@ -5768,6 +5798,10 @@ async fn install_verified_part_hashes(
 /// download never has a million peers), so their claims and log lines can
 /// never be mistaken for a peer's.
 const WEB_WORKER_INDEX_BASE: usize = 1_000_000;
+
+/// The worker index of a feed's publisher stream, below every web worker's
+/// and above any peer's.
+const FEED_WORKER_INDEX: usize = WEB_WORKER_INDEX_BASE - 1;
 
 /// How often a transfer runs [`rehash_unverified_parts`].
 const UNVERIFIED_PART_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);

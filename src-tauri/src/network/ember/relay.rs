@@ -2314,6 +2314,49 @@ where
     served
 }
 
+/// Serve a follower's request for a file of a feed we publish (see
+/// `network::feed_direct`). Anyone may ask, friend or not: a feed is public to
+/// whoever has its link, and the request names the file by an id only the
+/// link and the list let one compute. A few at a time; past that the request
+/// is refused, and the follower fetches over eD2K instead.
+pub async fn serve_feed_stream<R, W>(
+    recv: &mut R,
+    send: &mut W,
+    header: &[u8; 7],
+    limiter: &crate::bandwidth::limiter::BandwidthLimiter,
+) -> anyhow::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    // Taken once the request names a file of ours, so a dialer that sends
+    // nothing, or asks for nothing we serve, holds none.
+    let mut slot = None;
+    let mut busy = false;
+    let served = super::attach_stream::serve_feed_stream(
+        recv,
+        send,
+        header,
+        |xfer_id| {
+            let file = crate::network::feed_direct::served(xfer_id)?;
+            slot = crate::network::feed_direct::serve_slot();
+            busy = slot.is_none();
+            slot.as_ref().map(|_| file)
+        },
+        |_, _, _| true,
+        Some(limiter),
+    )
+    .await;
+    drop(slot);
+    match &served {
+        Ok(0) if busy => debug!("Feed stream refused: as many as we serve at once are running"),
+        Ok(0) => debug!("No feed file of ours under the id a follower asked for"),
+        Ok(bytes) => debug!("Feed stream: served {bytes} byte(s)"),
+        Err(e) => debug!("Feed stream failed: {e}"),
+    }
+    served
+}
+
 /// How long a sender holds an attachment connection open after the last chunk,
 /// waiting for the friend to confirm it has every byte.
 const ATTACH_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2342,7 +2385,7 @@ async fn accept_or_wait(endpoint: Option<&quinn::Endpoint>) -> Option<quinn::Inc
     }
 }
 
-/// Run the QUIC accept loop. Handles five kinds of inbound QUIC connections:
+/// Run the QUIC accept loop. Handles six kinds of inbound QUIC connections:
 ///   4. **Chat attachment** — a friend is fetching a file we offered them in
 ///      chat. Dispatched on [`super::attach::ATTACH_STREAM_MSG_TYPE`] and
 ///      authorized by the certificate identity plus the grant; see
@@ -2350,6 +2393,9 @@ async fn accept_or_wait(endpoint: Option<&quinn::Endpoint>) -> Option<quinn::Inc
 ///   5. **Room transfer** — a room member is fetching a file we offered them.
 ///      Dispatched on [`super::attach::ROOM_XFER_STREAM_MSG_TYPE`] and
 ///      authorized the same way against [`RoomXferServeContext::grants`].
+///   6. **Feed file** — a follower is fetching a file of a feed we publish.
+///      Dispatched on [`super::attach::FEED_STREAM_MSG_TYPE`] and authorized
+///      by the file being in one; see [`serve_feed_stream`].
 ///
 /// The original three:
 ///   1. **RELAY_REQUEST** — peer wants us to relay a LowID transfer (existing relay logic)
@@ -2643,6 +2689,15 @@ pub async fn run_quic_accept_loop(
                 .await;
                 // As for an attachment: returning drops the connection, and
                 // quinn would discard whatever is still queued.
+                let _ = init_send.finish();
+                let _ = attachment_delivered(&init_send).await;
+                return;
+            }
+
+            if msg_type == super::attach::FEED_STREAM_MSG_TYPE {
+                // A follower fetching a file of a feed we publish. No identity
+                // check: a feed is public, and the request's id is the grant.
+                let _ = serve_feed_stream(&mut init_recv, &mut init_send, &header, limiter.as_ref()).await;
                 let _ = init_send.finish();
                 let _ = attachment_delivered(&init_send).await;
                 return;

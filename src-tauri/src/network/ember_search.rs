@@ -806,11 +806,12 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
                     &established,
                     &mut state.ember_content_hashes,
                 );
-                // A feed download waiting on its publisher takes only theirs.
-                let sources = super::feed_direct::take_lookup(file_hash, sources, |id| {
-                    state.online_friends.contains_key(id)
-                });
-                if !sources.is_empty() {
+                // A feed download waiting on its publisher takes only theirs,
+                // and starts on its stream alone: queued even empty, the
+                // injection sweep starts it.
+                let endpoint = super::chat_attach::quic_endpoint(state);
+                let sources = super::feed_direct::take_lookup(file_hash, sources, endpoint);
+                if !sources.is_empty() || super::feed_direct::stream_ready_for_file(&file_hash) {
                     state
                         .ember_pending_source_injections
                         .push((file_hash, sources));

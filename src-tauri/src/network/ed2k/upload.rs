@@ -6228,9 +6228,10 @@ pub async fn start_upload_server(
 }
 
 impl UploadHandler {
-    /// A secure stream that asked for a chat attachment or a room transfer
-    /// instead of an eD2K session: the fallback for a recipient that could not
-    /// reach our QUIC port. `first` is the stream type it opened with.
+    /// A secure stream that asked for a chat attachment, a room transfer or a
+    /// feed's file instead of an eD2K session: the fallback for a recipient
+    /// that could not reach our QUIC port. `first` is the stream type it
+    /// opened with.
     ///
     /// Never over a relay. A relay operator forwards sessions as a favour to
     /// friends, and a file would turn that into carrying gigabytes for them.
@@ -6248,6 +6249,22 @@ impl UploadHandler {
             debug!("Refusing a file stream over a relayed session");
             return Ok(());
         }
+        let mut header = [0u8; 7];
+        header[0] = first;
+        if first == attach::FEED_STREAM_MSG_TYPE {
+            // Anyone's: a feed is public, and the request's id is the grant.
+            if !matches!(
+                tokio::time::timeout_at(deadline, reader.read_exact(&mut header[1..])).await,
+                Ok(Ok(_))
+            ) {
+                return Ok(());
+            }
+            let served = relay::serve_feed_stream(&mut reader, &mut writer, &header, &self.bandwidth_limiter).await;
+            if matches!(served, Ok(bytes) if bytes > 0) {
+                let _ = attach_tcp::tcp_stream_delivered(&mut reader, &mut writer).await;
+            }
+            return Ok(());
+        }
         let Some(serve) = self.file_stream_serve.clone() else {
             return Ok(());
         };
@@ -6260,8 +6277,6 @@ impl UploadHandler {
             debug!("Refusing a chat attachment stream from a non-friend");
             return Ok(());
         }
-        let mut header = [0u8; 7];
-        header[0] = first;
         if !matches!(
             tokio::time::timeout_at(deadline, reader.read_exact(&mut header[1..])).await,
             Ok(Ok(_))
@@ -6286,7 +6301,7 @@ impl UploadHandler {
             let delivered =
                 served.is_ok() && attach_tcp::tcp_stream_delivered(&mut reader, &mut writer).await;
             progress.finish(&serve.chat.db, &serve.chat.app_handle, delivered);
-        } else {
+        } else if first == attach::ROOM_XFER_STREAM_MSG_TYPE {
             let served = relay::serve_room_transfer_stream(
                 &serve.room,
                 peer.ed25519_public_key,
@@ -8190,6 +8205,7 @@ impl UploadHandler {
                     // stream's type byte cannot be mistaken for a session.
                     if first == crate::network::ember::attach::ATTACH_STREAM_MSG_TYPE
                         || first == crate::network::ember::attach::ROOM_XFER_STREAM_MSG_TYPE
+                        || first == crate::network::ember::attach::FEED_STREAM_MSG_TYPE
                     {
                         if let Some(socket) = socket {
                             let _ = socket.set_send_buffer_size(FILE_STREAM_SEND_BUFFER_BYTES);

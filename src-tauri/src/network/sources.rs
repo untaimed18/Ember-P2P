@@ -1282,7 +1282,7 @@ pub(super) async fn ask_networks_for_sources(
     // A feed download held for a publisher this cannot look for: the legs
     // below are asked now rather than after the hold idles out.
     if !outcome.ember {
-        super::feed_direct::lookup_unavailable(transfer_id, |id| state.online_friends.contains_key(id));
+        super::feed_direct::lookup_unavailable(transfer_id);
     }
 
     // The connected eD2K server, over TCP: in line for its next source frame,

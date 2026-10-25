@@ -897,9 +897,11 @@ async fn start_pending_download_worker(
         .collect();
 
     if live_sources.is_empty() && !callback_stream_in_hand {
-        // A mirror from the link is a source too, and needs no peer to start.
+        // A mirror from the link is a source too, and needs no peer to start;
+        // so is a feed's publisher, streamed from.
         if !pending_download_has_parked_ember_sources(state, transfer_id)
             && !ed2k::web_sources::has_ready(&hash_bytes)
+            && !super::feed_direct::stream_ready(transfer_id)
         {
             state
                 .pending_downloads

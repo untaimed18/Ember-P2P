@@ -1463,6 +1463,60 @@ What a walk finds is cached: a shard that too few nodes answered keeps its
 cached feeds, and one that settled without a cached feed forgets it. The user
 can hide a feed or a publisher from Discover, locally.
 
+## Feed file stream (type 0x09)
+
+A follower fetches a feed's file from its publisher first over the file
+stream chat attachments (`0x07`) and room transfers (`0x08`) use
+(`network/ember/attach.rs`, `attach_stream.rs`), under a first byte of its
+own, `FEED_STREAM_MSG_TYPE` (`0x09`). Neither side need be the other's friend
+or share a room with it (`network/feed_direct.rs`).
+
+**Carriers.** The follower dials QUIC to the publisher, with the
+publisher's node id pinned in the TLS verifier, at the address and QUIC port
+of the publisher's own signed Ember source record for the file, a reachable
+one (not firewalled, a TCP port set, not a special-use address; TCP alone when
+it names no QUIC port), or for a
+friend publisher at the address of their last session, at once. After 3
+seconds without QUIC (`TCP_HEAD_START`) it dials the publisher's TCP upload
+port beside it, as a Noise secure stream that must prove the same node id,
+whose first byte after the handshake is `0x09`. Never over a relay.
+
+**Request.** The shared 46-byte request: `0x09 || version(1) = 1 ||
+reserved(4) || xfer_id(16) || tag(16) || start_chunk(4, LE)`, where
+`xfer_id = BLAKE3_derive_key("Ember feed stream id v1", publisher(32) ||
+salt(16) || ed2k(16))[..16]`, the tag is `BLAKE3_keyed(capability,
+"ember-attach-stream-tag-v1" || xfer_id)[..16]`, and `capability =
+BLAKE3_derive_key("Ember feed stream capability v1", publisher || salt ||
+ed2k)`. Both are public to whoever holds the feed's link and list; what they
+show is that the dialer does, and they name one file of one feed.
+
+**Answer.** A status byte (`0` ok, `1` unknown, `2` unauthorized, `3`
+source gone, `4` bad cursor), then for `0` the file's size (8, LE), its chunk
+count (4, LE) and the BLAKE3 of each 256 KiB chunk, then the chunks from
+`start_chunk` to the end. A file may be up to 8 GiB (`FEED_STREAM_MAX_BYTES`)
+here, against 2 GiB for the other two types; a larger one is fetched over
+eD2K. No root is agreed ahead, as a feed's list names its files by whole-file
+digests: the follower checks each chunk against the list, every later stream
+of the download against the first one's list, and the finished file against
+the list's eD2K, AICH and BLAKE3. Once it has read the last chunk it closes
+QUIC with `attach done`, or writes `0x01` on TCP.
+
+**The publisher** serves a file under its `xfer_id` while the file is in a
+feed it has published, is still shared with everyone and has the BLAKE3 the
+feed names; the table is rebuilt each minute and on every publish or delete.
+It answers `1` to an id it does not serve, and to any request while 8 feed
+streams already run (`MAX_SERVES`). A file whose chunk list is not cached is
+hashed for followers one at a time, at most 32 GiB of such reads an hour
+(`FEED_HASH_BUDGET`), since anyone with the link may ask for any of a feed's
+files; past that it answers `1` too. A stream is a priority upload, ahead of
+the eD2K slots, within the upload limit.
+
+**The follower** writes each verified chunk's missing bytes into the
+download's part file, as any source does, and asks again from the next missing
+chunk when the next four are held already. Three failed dials or streams in a
+row, a refusal or a chunk that does not verify end it, and every network is
+asked for the file.
+
 ## Friend sessions: `EMBER_EXT_BROWSE_SCOPE_AWARE`
 
 Not a room format, but added by the same audit and frozen with it.

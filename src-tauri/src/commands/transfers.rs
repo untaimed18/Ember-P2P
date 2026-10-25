@@ -1563,17 +1563,15 @@ async fn unmark_feed_download(state: &AppState, transfer_id: &str) {
 /// feed's publisher, who is asked for it before anyone else.
 pub(crate) struct FeedStart {
     pub folder: String,
-    /// The publisher's node id.
-    pub publisher: [u8; 16],
-    /// The publisher is a friend, reached over the friends' path.
-    pub friend: bool,
+    /// Who publishes the feed, and a friend publisher's last address.
+    pub publisher: crate::network::feed_direct::Publisher,
 }
 
 /// Hold a feed's download for its publisher before the network hears of it.
-fn hold_for_publisher(feed: Option<&FeedStart>, transfer_id: &str, file_hash: &str) {
+fn hold_for_publisher(feed: Option<&FeedStart>, transfer_id: &str, file_hash: &str, file_size: u64) {
     let mut hash = [0u8; 16];
     if let Some(feed) = feed.filter(|_| hex::decode_to_slice(file_hash, &mut hash).is_ok()) {
-        crate::network::feed_direct::begin(transfer_id, hash, feed.publisher, feed.friend);
+        crate::network::feed_direct::begin(transfer_id, hash, file_size, feed.publisher);
     }
 }
 
@@ -1818,7 +1816,7 @@ pub(crate) async fn start_download_to(
                 if let Some(folder) = &feed_folder {
                     mark_feed_download(&state, &failed_id, folder).await?;
                 }
-                hold_for_publisher(feed.as_ref(), &failed_id, &file_hash);
+                hold_for_publisher(feed.as_ref(), &failed_id, &file_hash, file_size);
                 let revived = revive_failed_download(&app, &state, &failed_id, Some(link)).await;
                 if !matches!(revived, Ok(Some(_))) {
                     crate::network::feed_direct::forget(&failed_id);
@@ -1916,7 +1914,7 @@ pub(crate) async fn start_download_to(
     // MultiSource workers; queued / add-paused use discovery_only so
     // KAD + TCP + UDP source asking still runs (matching restore).
     let discovery_only = !active_now || add_paused;
-    hold_for_publisher(feed.as_ref(), &transfer_id, &file_hash);
+    hold_for_publisher(feed.as_ref(), &transfer_id, &file_hash, file_size);
 
     if let Err(e) = bounded_send(
         &state.network_tx,
