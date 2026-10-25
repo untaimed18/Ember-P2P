@@ -159,6 +159,36 @@ pub(crate) fn test_registry_lock() -> parking_lot::MutexGuard<'static, ()> {
         .lock()
 }
 
+/// Folders under Ember's own data directory that it serves and writes files
+/// in for itself, such as feeds' lists: the user never picks them and keeps
+/// nothing of theirs there, so they are not in the approval registry, whose
+/// records are the user's choices. Matched by exact path, and checked on
+/// each use to be a real directory rather than a link to elsewhere.
+fn internal_roots() -> &'static parking_lot::RwLock<HashSet<String>> {
+    static INTERNAL: OnceLock<parking_lot::RwLock<HashSet<String>>> = OnceLock::new();
+    INTERNAL.get_or_init(Default::default)
+}
+
+/// Let `dir`, a folder of Ember's own under its data directory, be used as
+/// an approved root (see [`internal_roots`]).
+pub fn add_internal_root(dir: &Path) {
+    internal_roots().write().insert(path_key(dir));
+}
+
+/// [`ApprovedRootRegistry::verify_root`] for an internal root: its canonical
+/// form, when it is a directory and not a reparse point.
+fn verify_internal_root(configured: &Path) -> io::Result<PathBuf> {
+    ensure_not_reparse(configured)?;
+    let canonical = configured.canonicalize()?;
+    if !canonical.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("internal root is not a directory: {}", configured.display()),
+        ));
+    }
+    Ok(canonical)
+}
+
 fn path_key(path: &Path) -> String {
     let mut value = path.to_string_lossy().replace('\\', "/");
     if cfg!(windows) {
@@ -532,12 +562,16 @@ impl ApprovedRootRegistry {
 
     pub fn verify_root(&self, configured: &Path) -> io::Result<PathBuf> {
         let key = path_key(configured);
-        let record = self.roots.read().get(&key).cloned().ok_or_else(|| {
-            io::Error::new(
+        let record = self.roots.read().get(&key).cloned();
+        let Some(record) = record else {
+            if internal_roots().read().contains(&key) {
+                return verify_internal_root(configured);
+            }
+            return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("path is not an approved root: {}", configured.display()),
-            )
-        })?;
+            ));
+        };
         let (canonical, remounted) = record.verify()?;
         if let Some(remounted) = remounted {
             // Held in memory so every later check takes the fast path; startup
@@ -3712,6 +3746,43 @@ mod tests {
             "created {} must stay under {}",
             path.display(),
             canonical_root.display()
+        );
+        *global_slot().write() = None;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn an_internal_root_is_served_and_written_without_an_approval_record() {
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-internal-root-test-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let (user, data, internal, other) =
+            (base.join("user"), base.join("data"), base.join("data").join("lists"), base.join("other"));
+        for dir in [&user, &internal, &other] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let list = internal.join("list.emulecollection");
+        std::fs::write(&list, b"list").unwrap();
+        std::fs::write(other.join("x.bin"), b"x").unwrap();
+        let user_root = user.to_string_lossy().into_owned();
+        initialize_approved_roots(&data, std::slice::from_ref(&user_root)).unwrap();
+        let internal_root = [internal.to_string_lossy().into_owned()];
+
+        assert!(open_existing_approved(&list, &internal_root, false).is_err(), "not yet internal");
+        add_internal_root(&internal);
+        let (_, mut opened) = open_existing_approved(&list, &internal_root, false).unwrap();
+        let mut read = String::new();
+        std::io::Read::read_to_string(&mut opened, &mut read).unwrap();
+        assert_eq!(read, "list");
+        assert!(verify_output_path(&internal.join("fetched.emulecollection"), &internal_root).is_ok());
+        let outside = [other.to_string_lossy().into_owned()];
+        assert!(open_existing_approved(&other.join("x.bin"), &outside, false).is_err(), "only the folder added");
+        assert!(
+            open_existing_approved(&other.join("x.bin"), &internal_root, false).is_err(),
+            "nothing outside it through it"
         );
         *global_slot().write() = None;
         let _ = std::fs::remove_dir_all(base);

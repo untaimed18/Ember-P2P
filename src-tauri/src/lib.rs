@@ -919,6 +919,7 @@ pub fn run() {
                 &import_roots,
             )
             .map_err(|error| anyhow::anyhow!("Failed to load approved filesystem roots: {error}"))?;
+            sharing::feed_files::allow_list_dirs(&data_dir);
             emule_import::apply::root_additions_approved(&data_dir);
             // Only share_intent.json is read here; the known.met migration runs
             // on its own thread, and every share-intent reader and known.met

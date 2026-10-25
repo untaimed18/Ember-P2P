@@ -230,6 +230,25 @@ pub fn feeds_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("feeds")
 }
 
+/// The folders of [`feeds_dir`] lists are served from and fetched into: the
+/// publisher's own, and those of feeds followed.
+pub fn list_dirs(data_dir: &Path) -> [PathBuf; 2] {
+    let dir = feeds_dir(data_dir);
+    [dir.join("own"), dir.join("followed")]
+}
+
+/// Make the list folders and let the upload server and the download workers
+/// use them as approved roots, which a folder of the app's own never is by
+/// the user's choice: without it no list was served or taken in.
+pub fn allow_list_dirs(data_dir: &Path) {
+    for dir in list_dirs(data_dir) {
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            tracing::warn!("Could not create the feeds folder {}: {error}", dir.display());
+        }
+        crate::security::filesystem::add_internal_root(&dir);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

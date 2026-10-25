@@ -98,10 +98,12 @@ fn feeds_dir(app: &tauri::AppHandle) -> PathBuf {
     feed_files::feeds_dir(&crate::storage::paths::resolve_data_dir_with_app(app))
 }
 
+/// Under the first of `feed_files::list_dirs`, which are approved roots.
 fn own_list_path(dir: &Path, salt: &str, sequence: i64) -> PathBuf {
     dir.join("own").join(format!("{salt}-{sequence}.emulecollection"))
 }
 
+/// Under the second of `feed_files::list_dirs`.
 fn followed_list_path(dir: &Path, publisher: &str, salt: &str, sequence: i64) -> PathBuf {
     dir.join("followed").join(format!("{publisher}-{salt}-{sequence}.emulecollection"))
 }
