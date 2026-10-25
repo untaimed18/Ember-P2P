@@ -1378,10 +1378,18 @@ may carry a note, tag `FT_EMBER_NOTE` (`0xE3`, a string of at most 256 bytes),
 which eMule's reader skips as unknown. A follower uses a list only if its size,
 eD2K hash and BLAKE3 all match the head, it parses, it holds `item_count`
 entries and every entry names a file one could fetch; otherwise the feed is
-marked broken.
+marked broken. A list is at most 2 MiB (`MAX_LIST_BYTES`): a publisher refuses
+to publish a larger one, and a follower that finds the newest head naming a
+larger one says so and fetches neither it nor an older head's list.
 The list is shared hidden by its publisher and by every follower holding it:
 served to whoever asks for its hash, with Ember source records, and never in
-the Library, a browse answer, a keyword record, KAD or a server.
+the Library, a browse answer, a keyword record, KAD or a server. Its source
+records go out ahead of the library's, so a publisher with a large library
+behind a firewall is found as a source of a new list within one publishing
+pass. A follower connected to the publisher as a friend also asks the friend
+directly. A fetch is given up after 30 minutes with no byte and no source
+(queued at one counts as a source), or 6 hours in all, keeping what it has,
+and tried again 30 minutes later.
 
 **Links.** `ember-feed:` followed by `publisher(32) || salt(16)` in lowercase
 unpadded RFC 4648 base32 (77 characters in all), or the same after

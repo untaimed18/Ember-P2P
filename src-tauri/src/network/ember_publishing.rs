@@ -2296,6 +2296,31 @@ pub(super) async fn maybe_publish_ember_sources(
         None if firewalled_like => 0,
         None => usize::MAX,
     };
+    // Feed lists: never in the index, so never keyword-published, but their
+    // followers find them through source records alone. Chosen first, ahead
+    // of the Library: a firewalled node's buddy takes only so many a minute,
+    // and a large Library spent all of it, so a list was never placed and
+    // nobody could fetch the feed. A few a pass, so a hundred followed
+    // feeds spread out; the stalest first, as the Library's are.
+    const FEED_LISTS_PER_PASS: usize = 4;
+    let mut lists: Vec<(u64, [u8; 16], crate::sharing::feed_files::HiddenShare)> =
+        crate::sharing::feed_files::hidden_shares()
+            .into_iter()
+            .filter_map(|(hash, share)| {
+                ember_publish_staleness(
+                    &state.ember_publish_unplaced,
+                    &state.ember_source_publish_at,
+                    hash,
+                    EmberPublishKind::Source,
+                    EMBER_SOURCE_REPUBLISH,
+                    now,
+                )
+                .map(|staleness| (staleness, hash, share))
+            })
+            .collect();
+    lists.sort_unstable_by_key(|(staleness, ..)| std::cmp::Reverse(*staleness));
+    lists.truncate(proxy_allowance.min(FEED_LISTS_PER_PASS));
+    let library_allowance = proxy_allowance.saturating_sub(lists.len());
     let mut due: Vec<([u8; 16], u64, String, [u8; 32])> = {
         let idx = local_index.read().await;
         let files = idx.all_files();
@@ -2335,7 +2360,7 @@ pub(super) async fn maybe_publish_ember_sources(
                 ranked.len(),
                 ember_publishable_peer_count(state),
             )
-            .min(proxy_allowance),
+            .min(library_allowance),
         );
         state.ember_publish_pass.selected += ranked.len();
         ranked
@@ -2354,31 +2379,10 @@ pub(super) async fn maybe_publish_ember_sources(
             })
             .collect()
     };
-    // Feed lists: never in the index, so never keyword-published, but their
-    // followers find them through source records like any file. A few a
-    // pass, on top of the Library's, so a hundred followed feeds spread out.
-    // The stalest first, as the Library's are.
-    const FEED_LISTS_PER_PASS: usize = 4;
-    let mut lists: Vec<(u64, [u8; 16], crate::sharing::feed_files::HiddenShare)> =
-        crate::sharing::feed_files::hidden_shares()
-            .into_iter()
-            .filter(|(hash, _)| !due.iter().any(|(listed, ..)| listed == hash))
-            .filter_map(|(hash, share)| {
-                ember_publish_staleness(
-                    &state.ember_publish_unplaced,
-                    &state.ember_source_publish_at,
-                    hash,
-                    EmberPublishKind::Source,
-                    EMBER_SOURCE_REPUBLISH,
-                    now,
-                )
-                .map(|staleness| (staleness, hash, share))
-            })
-            .collect();
-    lists.sort_unstable_by_key(|(staleness, ..)| std::cmp::Reverse(*staleness));
-    let room = proxy_allowance.saturating_sub(due.len()).min(FEED_LISTS_PER_PASS);
-    for (_, hash, share) in lists.into_iter().take(room) {
-        due.push((hash, share.size, share.name, parse_ember_file_hash(&share.ember_file_hash)));
+    for (_, hash, share) in lists {
+        if !due.iter().any(|(listed, ..)| *listed == hash) {
+            due.push((hash, share.size, share.name, parse_ember_file_hash(&share.ember_file_hash)));
+        }
     }
     if due.is_empty() {
         return;

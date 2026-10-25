@@ -38,6 +38,7 @@
     type FeedsFoundEvent,
     type FollowedFeed,
     type FollowedItem,
+    type LookupOutcome,
     type OwnFeed,
   } from '$lib/api/feeds';
   import { AUTO_MIB_MAX, capMib, concernsFollowed, draftOf, sameDraft, type FeedDraft } from '$lib/feedsPage';
@@ -45,9 +46,11 @@
   import FeedFilePicker from '$lib/components/FeedFilePicker.svelte';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import IconX from '$lib/components/IconX.svelte';
-  import { followedFeed, followedFeeds, refreshFollowedFeeds } from '$lib/stores/feeds';
+  import { followedFeed, followedFeeds, followedFeedsFailed, followedFeedsLoaded, refreshFollowedFeeds } from '$lib/stores/feeds';
   import { appSettings } from '$lib/stores/settings';
-  import { toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
+  import { addActionToast, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
+  import { menuKeydown } from '$lib/a11y';
+  import { BUILTIN_DOWNLOAD_CATEGORIES } from '$lib/downloadCategories';
   import { translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
   import { copyToClipboard, formatBytes, formatNumber, formatRelativeTime } from '$lib/utils';
@@ -60,6 +63,8 @@
   const DESCRIPTION_MAX = 256;
   const NOTE_MAX = 256;
   const FEED_ITEMS_MAX = 2000;
+  /** Feeds one identity keeps (`FEEDS_PER_IDENTITY`). */
+  const FEEDS_MAX = 8;
   /** Past this many feeds the list gets a search box. */
   const LIST_SEARCH_FROM = 6;
 
@@ -111,8 +116,10 @@
 
   /** A steady colour per feed, from its key, so a feed is told apart at a
    *  glance in the list and its header. */
-  function hueOf(hex: string): number {
-    return (parseInt(hex.slice(0, 4), 16) || 0) % 360;
+  function hueOf(key: string): number {
+    let hash = 0;
+    for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+    return hash % 360;
   }
 
   function typeOf(name: string): FileTypeKey | '' {
@@ -143,9 +150,23 @@
 
   const keyOf = (f: { publisher: string; salt: string }) => `${f.publisher}/${f.salt}`;
   let selected = $derived($followedFeeds.find((f) => keyOf(f) === selectedKey) ?? null);
-  let newItems = $derived(items.filter((i) => i.is_new && !i.removed && !i.downloaded));
+  let itemsFailed = $state(false);
+  /** Whether a file can be downloaded now: not on its way, nor here. */
+  const canDownload = (i: FollowedItem) =>
+    !i.removed && (i.status === 'none' || i.status === 'missing' || i.status === 'failed');
+  /** What the Download all buttons take: not a file had and deleted since,
+   *  which its own Download brings back. */
+  const bulkTakes = (i: FollowedItem) => canDownload(i) && i.status !== 'missing';
+  let newItems = $derived(items.filter((i) => i.is_new && bulkTakes(i)));
+  /** Every file that can be downloaded, for a feed just followed, whose first
+   *  list brings nothing marked new. */
+  let downloadableItems = $derived(items.filter(bulkTakes));
+  let downloadableSize = $derived(downloadableItems.reduce((sum, i) => sum + i.size, 0));
+  let newSize = $derived(newItems.reduce((sum, i) => sum + i.size, 0));
   let listedItems = $derived(items.filter((i) => !i.removed));
   let listedSize = $derived(listedItems.reduce((sum, i) => sum + i.size, 0));
+  /** Files on their way, so the list keeps up with them. */
+  let itemsInFlight = $derived(items.some((i) => i.status === 'queued' || i.status === 'downloading'));
   let shownItems = $derived.by(() => {
     const q = itemQuery.trim().toLowerCase();
     return items.filter(
@@ -171,11 +192,27 @@
     return f.title.trim() || m.feeds_untitled();
   }
 
+  /** A publisher's key, short, as Discover shows it: enough to tell two
+   *  publishers of one name apart. */
+  const shortKey = (publisher: string) => publisher.slice(0, 8);
+
+  /** No list held yet: its head never found, or found and its list not in. */
+  const noList = (f: FollowedFeed) => f.list_sequence === 0;
+  /** The list its newest head names is owed, and its last fetch gave up:
+   *  nothing runs until `retry_at`, or Retry. */
+  const resting = (f: FollowedFeed) =>
+    f.activity.fetching === null && f.sequence > 0 && f.list_sequence !== f.sequence && f.activity.retry_at > now;
+
   /** The line under a followed feed's name in the list. */
   function followedSub(f: FollowedFeed): string {
-    if (f.state === 'waiting') return m.feeds_state_waiting_short();
-    if (f.state === 'fetching') return m.feeds_state_fetching_short();
+    if (f.activity.too_large) return m.feeds_state_too_large_short();
     if (f.state === 'broken') return m.feeds_state_broken_short();
+    if (f.activity.fetching) return m.feeds_state_fetching_short();
+    if (resting(f)) return m.feeds_state_list_waiting_short();
+    if (f.state === 'fetching' || (noList(f) && f.sequence > 0)) return m.feeds_state_fetching_short();
+    if (noList(f)) {
+      return f.activity.unreachable ? m.feeds_state_unreachable_short() : m.feeds_state_waiting_short();
+    }
     return m.feeds_items_count({ count: formatNumber(f.item_count) });
   }
 
@@ -191,8 +228,8 @@
       followLink = '';
       compose = null;
       await refreshFollowedFeeds();
-      selectedKey = keyOf(feed);
-      toastSuccess(m.feeds_followed_toast());
+      selectFollowed(keyOf(feed));
+      toastSuccess(feed.already_following ? m.feeds_already_following() : m.feeds_followed_toast());
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
@@ -220,18 +257,43 @@
     });
   });
 
-  // Something is always open while there is something to open.
+  /** The followed feed last opened, so coming back opens it again. */
+  const SELECTED_KEY = 'ember.feeds.followedSelected';
+
+  function selectFollowed(key: string) {
+    selectedKey = key;
+    try {
+      localStorage.setItem(SELECTED_KEY, key);
+    } catch {
+      // Storage unavailable: the choice lasts the visit.
+    }
+  }
+
+  // Something is always open while there is something to open: the feed last
+  // opened, else the first with something new, else the first. Opening one
+  // marks it read, so the pick must not be one the user did not come for.
   $effect(() => {
     const feeds = $followedFeeds;
     if (feeds.length === 0) return;
     untrack(() => {
-      if (!feeds.some((f) => keyOf(f) === selectedKey)) selectedKey = keyOf(feeds[0]);
+      if (feeds.some((f) => keyOf(f) === selectedKey)) return;
+      let remembered: string | null = null;
+      try {
+        remembered = localStorage.getItem(SELECTED_KEY);
+      } catch {
+        remembered = null;
+      }
+      const pick =
+        feeds.find((f) => keyOf(f) === remembered) ?? feeds.find((f) => f.unread > 0) ?? feeds[0];
+      selectedKey = keyOf(pick);
     });
   });
 
   let itemsSeq = 0;
   let itemsFor = '';
-  async function loadItems(feed: FollowedFeed | null) {
+  /** `quiet` for the refresh that keeps a list's progress current: no
+   *  spinner, no toast. */
+  async function loadItems(feed: FollowedFeed | null, quiet = false) {
     const seq = ++itemsSeq;
     if (!feed || itemsFor !== keyOf(feed)) {
       // Another feed's files must not show under this one while it loads.
@@ -243,7 +305,7 @@
       itemsFor = '';
       return;
     }
-    itemsLoading = true;
+    if (!quiet) itemsLoading = true;
     try {
       const rows = await getFeedItems(feed.publisher, feed.salt);
       if (seq !== itemsSeq) return;
@@ -252,9 +314,14 @@
       const wasNew = new Set(itemsFor === keyOf(feed) ? items.filter((i) => i.is_new).map((i) => i.ed2k) : []);
       items = rows.map((r) => (wasNew.has(r.ed2k) ? { ...r, is_new: true } : r));
       itemsFor = keyOf(feed);
+      itemsFailed = false;
       await markShownRead();
     } catch (e) {
-      if (seq === itemsSeq) toastError(translateError(e, m.error_operation_failed()));
+      if (seq !== itemsSeq) return;
+      if (!quiet) {
+        itemsFailed = true;
+        toastError(translateError(e, m.error_operation_failed()));
+      }
     } finally {
       if (seq === itemsSeq) itemsLoading = false;
     }
@@ -335,20 +402,47 @@
 
   /** The switch saves at once; turning it on opens the limits that go with it. */
   async function toggleAuto(on: boolean) {
+    const key = selectedKey;
     autoEnabled = on;
     if (!(await saveAuto())) {
-      autoEnabled = !on;
+      // Not another feed's switch, if the user moved on meanwhile.
+      if (selectedKey === key) autoEnabled = !on;
       return;
     }
-    if (on) autoOpen = true;
+    if (on && selectedKey === key) autoOpen = true;
   }
 
   async function saveAutoLimits() {
     if (await saveAuto()) toastSuccess(m.feeds_auto_saved());
   }
 
-  /** Downloads waiting on the user's word, because some can run code. */
-  let riskyAsk = $state<{ ed2ks: string[]; names: string[] } | null>(null);
+  /** A cap in MiB as people read sizes; 0 is no limit. */
+  function mibText(mib: number): string {
+    const capped = capMib(mib);
+    return capped === 0 ? m.feeds_auto_no_limit() : formatBytes(capped * 1024 * 1024);
+  }
+
+  /** The limits in force, said under the switch while it is on. */
+  function autoSummary(itemMib: number, dayMib: number): string {
+    return m.feeds_auto_summary({ item: mibText(itemMib), day: mibText(dayMib) });
+  }
+
+  /** The categories offered for auto-download: the user's own and the
+   *  built-in ones. Any other text is still taken. */
+  let categoryChoices = $derived([
+    ...new Set([...($appSettings?.download_categories ?? []), ...BUILTIN_DOWNLOAD_CATEGORIES]),
+  ]);
+
+  /** Why auto-download has left a file for the user to start. */
+  function heldText(held: NonNullable<FollowedItem['held']>): string {
+    if (held === 'risky') return m.feeds_held_risky();
+    if (held === 'too_large') return m.feeds_held_too_large();
+    return m.feeds_held_day_limit();
+  }
+
+  /** Downloads waiting on the user's word, because some can run code: all
+   *  of them, and those that cannot. */
+  let riskyAsk = $state<{ ed2ks: string[]; safe: string[]; names: string[] } | null>(null);
 
   function riskyText(names: string[]): string {
     return plural(names.length, {
@@ -360,9 +454,13 @@
   /** Download, after asking when any of them can run code. */
   function askDownload(ed2ks: string[]) {
     const wanted = new Set(ed2ks);
-    const risky = items.filter((i) => wanted.has(i.ed2k) && i.risky).map((i) => i.name);
-    if (risky.length > 0) riskyAsk = { ed2ks, names: risky };
-    else void download(ed2ks);
+    const chosen = items.filter((i) => wanted.has(i.ed2k));
+    const risky = chosen.filter((i) => i.risky);
+    if (risky.length > 0) {
+      riskyAsk = { ed2ks, safe: chosen.filter((i) => !i.risky).map((i) => i.ed2k), names: risky.map((i) => i.name) };
+    } else {
+      void download(ed2ks);
+    }
   }
 
   async function openFolder() {
@@ -381,9 +479,14 @@
     downloading = true;
     try {
       const started = await downloadFeedItems(feed.publisher, feed.salt, ed2ks);
-      toastSuccess(m.feeds_downloads_started({ count: formatNumber(started) }));
+      addActionToast(
+        'success',
+        m.feeds_downloads_started({ count: formatNumber(started) }),
+        { label: m.feeds_show_in_transfers(), run: () => void goto('/transfers') },
+        () => {},
+      );
       // Not if the user has opened another feed meanwhile.
-      if (selectedKey === keyOf(feed)) await loadItems(feed);
+      if (selectedKey === keyOf(feed)) await loadItems(feed, true);
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
@@ -396,12 +499,34 @@
     if (!feed || refreshing) return;
     refreshing = true;
     try {
-      await refreshFeed(feed.publisher, feed.salt);
+      const outcome = await refreshFeed(feed.publisher, feed.salt);
       await refreshFollowedFeeds();
+      const said = outcomeText(outcome, feed);
+      if (said) (outcome === 'unreachable' || outcome === 'too_large' ? toastWarning : toastSuccess)(said);
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
       refreshing = false;
+    }
+  }
+
+  /** What "Check now" found, said in a toast. */
+  function outcomeText(outcome: LookupOutcome, feed: FollowedFeed): string | null {
+    switch (outcome) {
+      case 'updated':
+        return m.feeds_check_updated();
+      case 'unchanged':
+        return noList(feed) ? m.feeds_check_fetching_list() : m.feeds_check_unchanged();
+      case 'not_found':
+        return m.feeds_check_not_found();
+      case 'unreachable':
+        return m.feeds_check_unreachable();
+      case 'too_large':
+        return m.feeds_state_too_large();
+      case 'busy':
+        return m.feeds_state_waiting_short();
+      default:
+        return null;
     }
   }
 
@@ -425,10 +550,44 @@
     }
   }
 
-  function stateText(f: FollowedFeed): string | null {
-    if (f.state === 'waiting') return m.feeds_state_waiting();
-    if (f.state === 'fetching') return m.feeds_state_fetching();
-    if (f.state === 'broken') return m.feeds_state_broken();
+  /** The strip above a followed feed's files, saying what it waits on,
+   *  whether that is a fault (`warn`), and whether Retry would do anything. */
+  function stateText(
+    f: FollowedFeed,
+  ): { text: string; spoken?: string; warn: boolean; busy: boolean; retry: boolean } | null {
+    const fetch = f.activity.fetching;
+    if (f.activity.too_large) return { text: m.feeds_state_too_large(), warn: true, busy: false, retry: false };
+    if (f.state === 'broken') return { text: m.feeds_state_broken(), warn: true, busy: false, retry: false };
+    if (fetch) {
+      // The source count changes as the poll runs: a screen reader is told
+      // the fetch, not each count.
+      return fetch.sources > 0
+        ? {
+            text: m.feeds_state_fetching_from({ count: formatNumber(fetch.sources) }),
+            spoken: m.feeds_state_fetching(),
+            warn: false,
+            busy: true,
+            retry: false,
+          }
+        : { text: m.feeds_state_fetching_finding(), warn: false, busy: true, retry: false };
+    }
+    if (resting(f)) {
+      const minutes = Math.max(1, Math.ceil((f.activity.retry_at - now) / 60));
+      return {
+        text: m.feeds_state_list_waiting({ minutes: formatNumber(minutes) }),
+        warn: true,
+        busy: false,
+        retry: true,
+      };
+    }
+    if (f.state === 'fetching' || (f.sequence > 0 && noList(f))) {
+      return { text: m.feeds_state_fetching(), warn: false, busy: true, retry: false };
+    }
+    if (noList(f)) {
+      if (f.activity.unreachable) return { text: m.feeds_state_unreachable(), warn: true, busy: false, retry: true };
+      const checked = f.checked_at > 0 ? ` ${m.feeds_checked_at({ when: ago(f.checked_at) })}.` : '';
+      return { text: `${m.feeds_state_waiting()}${checked}`, warn: false, busy: true, retry: false };
+    }
     return null;
   }
 
@@ -451,14 +610,42 @@
   let menu = $state<{ feed: DiscoveredFeed; x: number; y: number } | null>(null);
   let menuFor = $derived(menu ? keyOf(menu.feed) : null);
 
+  /** The button that opened the card menu, to give focus back to. */
+  let menuTrigger: HTMLElement | null = null;
+
   function toggleMenu(feed: DiscoveredFeed, button: HTMLElement) {
     if (menuFor === keyOf(feed)) {
-      menu = null;
+      closeCardMenu(true);
       return;
     }
     const rect = button.getBoundingClientRect();
+    menuTrigger = button;
     menu = { feed, x: rect.left, y: rect.bottom + 4 };
   }
+
+  function closeCardMenu(refocus: boolean) {
+    menu = null;
+    if (refocus) menuTrigger?.focus();
+    menuTrigger = null;
+  }
+
+  /** Keys in the card menu: arrows move, Escape and Tab close it. */
+  function cardMenuKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      closeCardMenu(true);
+      return;
+    }
+    if (e.key === 'Tab') {
+      closeCardMenu(true);
+      return;
+    }
+    menuKeydown(e, e.currentTarget as HTMLElement);
+  }
+
+  type DiscoverSort = 'active' | 'newest' | 'files' | 'name';
+  let discoverSort = $state<DiscoverSort>('active');
   /** Feeds being followed from Discover. */
   let followingFromDiscover = $state<Set<string>>(new Set());
   /** The walk whose shards are taken; any other's are stale. */
@@ -470,17 +657,20 @@
   let discoverPublisher = $state<string | null>(null);
   let discoverMatches = $derived.by(() => {
     const q = discoverQuery.trim().toLowerCase();
-    return discovered.filter(
+    const matched = discovered.filter(
       (f) =>
         (discoverFilter === 'all' || f.active) &&
         (!discoverPublisher || f.publisher === discoverPublisher) &&
-        (!q || f.title.toLowerCase().includes(q) || f.description.toLowerCase().includes(q)),
+        (!q ||
+          f.title.toLowerCase().includes(q) ||
+          f.description.toLowerCase().includes(q) ||
+          f.publisher.startsWith(q)),
     );
+    // While a walk fills in, cards stay where they are and new ones go at
+    // the end: a card moving under the pointer is followed by mistake.
+    return discovering ? matched : sortDiscovered(matched, discoverSort);
   });
 
-  /** A publisher's key, short, as Discover shows it: enough to tell two
-   *  publishers of one name apart. */
-  const shortKey = (publisher: string) => publisher.slice(0, 8);
   let discoverShown = $derived(discoverMatches.slice(0, discoverLimit));
   let activeDiscovered = $derived(discovered.filter((f) => f.active).length);
   let followedKeys = $derived(new Set($followedFeeds.map(keyOf)));
@@ -493,9 +683,17 @@
     untrack(() => (discoverLimit = DISCOVER_PAGE));
   });
 
-  /** Running publishers first, then the most lately published. */
-  function sortDiscovered(feeds: DiscoveredFeed[]): DiscoveredFeed[] {
-    return feeds.slice().sort((a, b) => Number(b.active) - Number(a.active) || b.sequence - a.sequence);
+  /** By the chosen order; by default running publishers first, then the
+   *  most lately published. */
+  function sortDiscovered(feeds: DiscoveredFeed[], by: DiscoverSort = 'active'): DiscoveredFeed[] {
+    const newest = (a: DiscoveredFeed, b: DiscoveredFeed) => b.sequence - a.sequence;
+    const compare: Record<DiscoverSort, (a: DiscoveredFeed, b: DiscoveredFeed) => number> = {
+      active: (a, b) => Number(b.active) - Number(a.active) || newest(a, b),
+      newest,
+      files: (a, b) => b.item_count - a.item_count || newest(a, b),
+      name: (a, b) => a.title.localeCompare(b.title) || newest(a, b),
+    };
+    return feeds.slice().sort(compare[by]);
   }
 
   /** Feeds, as `publisher/salt`, and publishers, as `publisher/`, hidden
@@ -503,6 +701,8 @@
   let hiddenMeanwhile = new Set<string>();
   const hiddenNow = (f: DiscoveredFeed) => hiddenMeanwhile.has(keyOf(f)) || hiddenMeanwhile.has(`${f.publisher}/`);
 
+  /** Take a shard's feeds in place: one known is updated where it is, a new
+   *  one goes at the end (see `discoverMatches`). */
   function takeFound(feeds: DiscoveredFeed[], gone: FeedsFoundEvent['gone']) {
     const byKey = new Map(discovered.map((f) => [keyOf(f), f]));
     for (const g of gone) {
@@ -513,7 +713,7 @@
       const held = byKey.get(keyOf(f));
       if (!hiddenNow(f) && (!held || held.listed_at <= f.listed_at)) byKey.set(keyOf(f), f);
     }
-    discovered = sortDiscovered([...byKey.values()]);
+    discovered = [...byKey.values()];
   }
 
   function newWalk(): string {
@@ -584,25 +784,57 @@
   }
 
   function openFollowed(feed: DiscoveredFeed) {
-    selectedKey = keyOf(feed);
+    selectFollowed(keyOf(feed));
     setTab('following');
   }
 
+  /** One of the user's own listed feeds, opened in the editor. */
+  function editOwn(feed: DiscoveredFeed) {
+    setTab('mine');
+    const own = mine.find((f) => f.salt === feed.salt);
+    if (own && mineSelected !== own.salt) unlessDirty(() => selectMine(own));
+  }
+
   async function hideDiscovered(feed: DiscoveredFeed, wholePublisher: boolean) {
-    menu = null;
+    closeCardMenu(false);
+    const salt = wholePublisher ? null : feed.salt;
+    const matches = (f: DiscoveredFeed) => (wholePublisher ? f.publisher === feed.publisher : keyOf(f) === keyOf(feed));
     try {
-      await setDiscoveredFeedHidden(feed.publisher, wholePublisher ? null : feed.salt, true);
-      if (discovering) hiddenMeanwhile.add(wholePublisher ? `${feed.publisher}/` : keyOf(feed));
+      await setDiscoveredFeedHidden(feed.publisher, salt, true);
+      const tag = wholePublisher ? `${feed.publisher}/` : keyOf(feed);
+      if (discovering) hiddenMeanwhile.add(tag);
       if (wholePublisher && discoverPublisher === feed.publisher) discoverPublisher = null;
-      discovered = discovered.filter((f) =>
-        wholePublisher ? f.publisher !== feed.publisher : keyOf(f) !== keyOf(feed),
-      );
+      const removed = discovered.filter(matches);
+      discovered = discovered.filter((f) => !matches(f));
       hiddenCount += 1;
-      toastSuccess(m.feeds_discover_hidden_toast());
+      addActionToast(
+        'success',
+        m.feeds_discover_hidden_toast(),
+        {
+          label: m.common_undo(),
+          undo: true,
+          run: () => {
+            void (async () => {
+              try {
+                await setDiscoveredFeedHidden(feed.publisher, salt, false);
+                hiddenMeanwhile.delete(tag);
+                hiddenCount = Math.max(0, hiddenCount - 1);
+                const back = new Set(discovered.map(keyOf));
+                discovered = [...discovered, ...removed.filter((f) => !back.has(keyOf(f)))];
+              } catch (e) {
+                toastError(translateError(e, m.error_operation_failed()));
+              }
+            })();
+          },
+        },
+        () => {},
+      );
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     }
   }
+
+  let showHiddenAsk = $state(false);
 
   /** Not during a walk, whose result leaves out what it read hidden. */
   async function showHidden() {
@@ -822,10 +1054,15 @@
     publishing = true;
     try {
       if (dirty && !(await saveDraft(d))) return;
-      await publishFeed(d.salt);
+      const published = await publishFeed(d.salt);
       const feed = (await loadMine())?.find((f) => f.salt === d.salt);
       if (feed && mineSelected === d.salt) selectMine(feed);
-      toastSuccess(m.feeds_published_toast());
+      addActionToast(
+        'success',
+        m.feeds_published_toast(),
+        { label: m.feeds_copy_link(), run: () => void copy(published.link) },
+        () => {},
+      );
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
@@ -899,11 +1136,12 @@
     let unlisten: UnlistenFn | null = null;
     let alive = true;
     void listen<FeedsChangedEvent>(FEEDS_CHANGED_EVENT, (event) => {
-      void loadMine();
+      // One of ours names only its salt; a followed one, its publisher too.
+      if (!event.payload?.publisher) void loadMine();
       // Files can change without a new list, as when one is downloaded
       // automatically.
       const feed = selected;
-      if (feed && itemsFor === keyOf(feed) && concernsFollowed(event.payload, feed)) void loadItems(feed);
+      if (feed && itemsFor === keyOf(feed) && concernsFollowed(event.payload, feed)) void loadItems(feed, true);
     }).then((fn) => {
       if (alive) unlisten = fn;
       else fn();
@@ -936,11 +1174,27 @@
     window.addEventListener('keydown', closeMenu);
     window.addEventListener('resize', closeMenu);
     const clock = setInterval(() => (now = Math.floor(Date.now() / 1000)), 60_000);
+    // While the open feed waits on something, or its files are on their
+    // way, keep what it shows current: nothing announces a fetch's progress
+    // or a download's percentage.
+    let polls = 0;
+    const poll = setInterval(() => {
+      const feed = selected;
+      if (tab !== 'following' || !feed || document.visibilityState !== 'visible') return;
+      polls++;
+      // Files only queued, waiting on sources for hours perhaps, and a fetch
+      // resting after giving up are looked at less often.
+      const moving = items.some((i) => i.status === 'downloading');
+      if (itemsInFlight && itemsFor === keyOf(feed) && (moving || polls % 4 === 0)) void loadItems(feed, true);
+      const waiting = noList(feed) || feed.activity.fetching !== null || feed.state === 'fetching';
+      if (waiting && polls % (resting(feed) ? 15 : 3) === 0) void refreshFollowedFeeds();
+    }, 4_000);
     return () => {
       alive = false;
       unlisten?.();
       unlistenFound?.();
       clearInterval(clock);
+      clearInterval(poll);
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onFocus);
       window.removeEventListener('pointerdown', closeMenu);
@@ -1031,7 +1285,19 @@
         {/if}
       </button>
     {:else}
-      <button type="button" class="primary" aria-expanded={compose === 'create'} disabled={busy} onclick={() => toggleCompose('create')}>
+      {#if mineLoaded}
+        <span class="feed-quota" title={m.feeds_quota_title({ max: formatNumber(FEEDS_MAX) })}>
+          {m.feeds_quota({ count: formatNumber(mine.length), max: formatNumber(FEEDS_MAX) })}
+        </span>
+      {/if}
+      <button
+        type="button"
+        class="primary"
+        aria-expanded={compose === 'create'}
+        disabled={busy || (compose !== 'create' && mine.length >= FEEDS_MAX)}
+        title={compose !== 'create' && mine.length >= FEEDS_MAX ? m.feeds_quota_full({ max: formatNumber(FEEDS_MAX) }) : undefined}
+        onclick={() => toggleCompose('create')}
+      >
         {compose === 'create' ? m.common_cancel() : m.feeds_new_feed()}
       </button>
     {/if}
@@ -1131,7 +1397,18 @@
   {/if}
 
   {#if tab === 'following'}
-    {#if $followedFeeds.length === 0}
+    {#if $followedFeeds.length === 0 && $followedFeedsFailed}
+      <div class="empty-card">
+        <div class="empty-state">
+          <p class="empty-title">{m.feeds_load_failed()}</p>
+          <div class="empty-actions">
+            <button type="button" class="primary empty-action" onclick={() => void refreshFollowedFeeds()}>{m.common_retry()}</button>
+          </div>
+        </div>
+      </div>
+    {:else if $followedFeeds.length === 0 && !$followedFeedsLoaded}
+      <div class="empty-card"><span class="spinner xs" aria-hidden="true"></span><span class="sr-only">{m.common_loading()}</span></div>
+    {:else if $followedFeeds.length === 0}
       <div class="empty-card">
         <div class="empty-state">
           <span class="empty-glyph">{@render feedGlyph()}</span>
@@ -1140,6 +1417,7 @@
           {#if compose !== 'follow'}
             <div class="empty-actions">
               <button type="button" class="primary empty-action" onclick={() => (compose = 'follow')}>{m.feeds_follow_a_feed()}</button>
+              <button type="button" class="secondary empty-action" onclick={() => setTab('discover')}>{m.feeds_browse_discover()}</button>
             </div>
           {/if}
         </div>
@@ -1159,12 +1437,15 @@
                 class:active
                 class:has-unread={feed.unread > 0}
                 aria-current={active ? 'true' : undefined}
-                onclick={() => (selectedKey = keyOf(feed))}
+                onclick={() => selectFollowed(keyOf(feed))}
               >
-                <span class="feed-avatar" style:--feed-hue={hueOf(feed.publisher)}>{@render feedGlyph()}</span>
+                <span class="feed-avatar" style:--feed-hue={hueOf(feed.publisher + feed.salt)}>{@render feedGlyph()}</span>
                 <span class="feed-row-text">
-                  <span class="feed-row-title"><bdi dir="auto">{feedLabel(feed)}</bdi></span>
-                  <span class="feed-row-sub" class:warn={feed.state === 'broken'}>{followedSub(feed)}</span>
+                  <span class="feed-row-title">
+                    <bdi dir="auto">{feedLabel(feed)}</bdi>
+                    {#if !feed.title.trim()}<span class="row-key">{shortKey(feed.publisher)}</span>{/if}
+                  </span>
+                  <span class="feed-row-sub" class:warn={feed.state === 'broken' || feed.activity.too_large}>{followedSub(feed)}</span>
                 </span>
                 {#if feed.unread > 0}
                   <span class="count-pill" aria-hidden="true">{feed.unread > 99 ? '99+' : feed.unread}</span>
@@ -1180,12 +1461,17 @@
         <section class="detail-pane">
           {#if selected}
             <header class="detail-head">
-              <span class="feed-avatar lg" style:--feed-hue={hueOf(selected.publisher)}>{@render feedGlyph()}</span>
+              <span class="feed-avatar lg" style:--feed-hue={hueOf(selected.publisher + selected.salt)}>{@render feedGlyph()}</span>
               <div class="detail-title">
                 <h3><bdi dir="auto">{feedLabel(selected)}</bdi></h3>
                 <p class="detail-meta">
+                  <span title={m.feeds_discover_publisher({ id: selected.publisher })}>{m.feeds_discover_publisher({ id: shortKey(selected.publisher) })}</span>
+                  <span aria-hidden="true">·</span>
                   <span>{m.feeds_items_count({ count: formatNumber(listedItems.length) })}</span>
                   {#if listedSize > 0}<span aria-hidden="true">·</span><span>{formatBytes(listedSize)}</span>{/if}
+                  {#if selected.sequence > 0}
+                    <span aria-hidden="true">·</span><span>{m.feeds_discover_updated({ when: ago(Math.floor(selected.sequence / 1000)) })}</span>
+                  {/if}
                   {#if selected.checked_at > 0}
                     <span aria-hidden="true">·</span><span>{m.feeds_checked_at({ when: ago(selected.checked_at) })}</span>
                   {/if}
@@ -1228,16 +1514,27 @@
               <span>{m.feeds_private_note()}</span>
             </p>
 
-            {#if stateText(selected)}
-              <div class="state-strip" class:tone-warning={selected.state === 'broken'} role="status">
-                {#if selected.state === 'broken'}
+            {@const strip = stateText(selected)}
+            {#if strip}
+              <div class="state-strip" class:tone-warning={strip.warn} role="status">
+                {#if strip.busy}
+                  <span class="spinner xs" aria-hidden="true"></span>
+                {:else}
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="M8 2.5 14 13H2z"/><line x1="8" y1="6.5" x2="8" y2="9.5"/><line x1="8" y1="11.5" x2="8" y2="11.6"/>
                   </svg>
-                {:else}
-                  <span class="spinner xs" aria-hidden="true"></span>
                 {/if}
-                <span>{stateText(selected)}</span>
+                {#if strip.spoken}
+                  <span class="state-text" aria-hidden="true">{strip.text}</span>
+                  <span class="sr-only">{strip.spoken}</span>
+                {:else}
+                  <span class="state-text">{strip.text}</span>
+                {/if}
+                {#if strip.retry}
+                  <button type="button" class="pill-btn strip-btn" disabled={refreshing || emberOff} onclick={() => void refreshSelected()}>
+                    {m.common_retry()}
+                  </button>
+                {/if}
               </div>
             {/if}
 
@@ -1249,8 +1546,16 @@
                   </svg>
                 </span>
                 <button type="button" class="auto-title" aria-expanded={autoOpen} onclick={() => (autoOpen = !autoOpen)}>
-                  <span class="auto-name">{m.feeds_auto_title()}</span>
-                  <span class="auto-state">{selected.auto_download ? m.feeds_auto_on() : m.feeds_auto_off()}</span>
+                  <span class="auto-text">
+                    <span class="auto-line">
+                      <span class="auto-name">{m.feeds_auto_title()}</span>
+                      <span class="auto-state">{selected.auto_download ? m.feeds_auto_on() : m.feeds_auto_off()}</span>
+                    </span>
+                    <span class="auto-desc">{m.feeds_auto_desc()}</span>
+                    {#if selected.auto_download}
+                      <span class="auto-summary">{autoSummary(selected.auto_max_item_mib, selected.auto_max_day_mib)}</span>
+                    {/if}
+                  </span>
                   <svg class="chevron" class:open={autoOpen} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <polyline points="4 6 8 10 12 6"/>
                   </svg>
@@ -1268,14 +1573,20 @@
                     <label class="field">
                       <span class="field-label">{m.feeds_auto_max_item()}</span>
                       <input type="number" min="0" max={AUTO_MIB_MAX} bind:value={autoItemMib} onchange={() => (autoItemMib = capMib(autoItemMib))} />
+                      <span class="field-hint">{mibText(autoItemMib)}</span>
                     </label>
                     <label class="field">
                       <span class="field-label">{m.feeds_auto_max_day()}</span>
                       <input type="number" min="0" max={AUTO_MIB_MAX} bind:value={autoDayMib} onchange={() => (autoDayMib = capMib(autoDayMib))} />
+                      <span class="field-hint">{mibText(autoDayMib)}</span>
                     </label>
                     <label class="field">
                       <span class="field-label">{m.feeds_auto_category()}</span>
-                      <input type="text" bind:value={autoCategory} maxlength="256" />
+                      <input type="text" list="feeds-auto-categories" bind:value={autoCategory} maxlength="256" />
+                      <datalist id="feeds-auto-categories">
+                        {#each categoryChoices as category (category)}<option value={category}></option>{/each}
+                      </datalist>
+                      <span class="field-hint">{m.feeds_auto_category_hint()}</span>
                     </label>
                   </div>
                   <div class="auto-foot">
@@ -1310,14 +1621,26 @@
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
                   </svg>
-                  {m.feeds_download_all_new({ count: formatNumber(newItems.length) })}
+                  {m.feeds_download_all_new_size({ count: formatNumber(newItems.length), size: formatBytes(newSize) })}
+                </button>
+              {:else if downloadableItems.length > 1}
+                <button type="button" class="secondary sm-btn" disabled={downloading} onclick={() => askDownload(downloadableItems.map((i) => i.ed2k))}>
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
+                  </svg>
+                  {m.feeds_download_all_size({ count: formatNumber(downloadableItems.length), size: formatBytes(downloadableSize) })}
                 </button>
               {/if}
             </div>
 
             <div class="file-list">
               {#if itemsLoading && items.length === 0}
-                <div class="file-list-empty"><span class="spinner xs" aria-hidden="true"></span></div>
+                <div class="file-list-empty"><span class="spinner xs" aria-hidden="true"></span><span class="sr-only">{m.common_loading()}</span></div>
+              {:else if itemsFailed && items.length === 0}
+                <div class="file-list-empty">
+                  <p>{m.feeds_items_load_failed()}</p>
+                  <button type="button" class="secondary sm-btn" onclick={() => void loadItems(selected)}>{m.common_retry()}</button>
+                </div>
               {:else if items.length === 0}
                 <div class="file-list-empty">{m.feeds_no_items()}</div>
               {:else if shownItems.length === 0}
@@ -1338,22 +1661,38 @@
                       <span>{formatBytes(item.size)}</span>
                       {#if type}<span aria-hidden="true">·</span><span>{fileTypeFilterLabel(type)}</span>{/if}
                       {#if item.first_seen > 0}<span aria-hidden="true">·</span><span>{m.feeds_item_added_at({ when: ago(item.first_seen) })}</span>{/if}
+                      {#if item.held}<span aria-hidden="true">·</span><span class="held">{heldText(item.held)}</span>{/if}
+                      {#if item.status === 'missing'}<span aria-hidden="true">·</span><span>{m.feeds_item_missing()}</span>{/if}
                     </span>
                     {#if item.note}
                       <span class="file-note"><bdi dir="auto">{item.note}</bdi></span>
                     {/if}
+                    {#if item.status === 'downloading' || item.status === 'queued' || item.status === 'paused'}
+                      <span class="row-progress" aria-hidden="true"><span style:width={`${Math.min(100, Math.max(0, item.progress))}%`}></span></span>
+                    {/if}
                   </div>
-                  {#if item.downloaded}
-                    <span class="row-done" title={m.feeds_badge_downloaded()}>
+                  {#if item.status === 'done' || item.status === 'in_library'}
+                    <span class="row-done" title={item.status === 'done' ? m.feeds_badge_downloaded() : m.feeds_item_in_library()}>
                       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <polyline points="3 8 7 12 13 4"/>
                       </svg>
-                      <span>{m.feeds_badge_downloaded()}</span>
+                      <span>{item.status === 'done' ? m.feeds_badge_downloaded() : m.feeds_item_in_library()}</span>
                     </span>
+                  {:else if item.status === 'downloading' || item.status === 'queued' || item.status === 'paused'}
+                    <a class="row-state" href="/transfers" title={m.feeds_show_in_transfers()}>
+                      {#if item.status === 'downloading'}
+                        {m.feeds_item_downloading({ percent: formatNumber(Math.floor(item.progress)) })}
+                      {:else if item.status === 'queued'}
+                        {m.feeds_item_queued()}
+                      {:else}
+                        {m.feeds_item_paused()}
+                      {/if}
+                    </a>
                   {:else}
                     <button
                       type="button"
                       class="row-btn"
+                      class:retry={item.status === 'failed'}
                       disabled={downloading}
                       aria-label={m.feeds_download_named({ name: item.name })}
                       onclick={() => askDownload([item.ed2k])}
@@ -1361,7 +1700,7 @@
                       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
                       </svg>
-                      <span>{m.feeds_download()}</span>
+                      <span>{item.status === 'failed' ? m.feeds_item_failed_retry() : m.feeds_download()}</span>
                     </button>
                   {/if}
                 </div>
@@ -1384,7 +1723,7 @@
           <p class="empty-sub">{m.feeds_discover_empty_body()}</p>
           {#if hiddenCount > 0 && !discovering}
             <div class="empty-actions">
-              <button type="button" class="secondary empty-action" onclick={() => void showHidden()}>
+              <button type="button" class="secondary empty-action" onclick={() => (showHiddenAsk = true)}>
                 {m.feeds_discover_show_hidden({ count: formatNumber(hiddenCount) })}
               </button>
             </div>
@@ -1417,14 +1756,23 @@
           {/if}
           <span class="toolbar-spacer"></span>
           {#if hiddenCount > 0}
-            <button type="button" class="link-btn" disabled={discovering} onclick={() => void showHidden()}>
+            <button type="button" class="link-btn" disabled={discovering} onclick={() => (showHiddenAsk = true)}>
               {m.feeds_discover_show_hidden({ count: formatNumber(hiddenCount) })}
             </button>
           {/if}
+          <label class="sort-select">
+            <span class="sr-only">{m.feeds_discover_sort()}</span>
+            <select bind:value={discoverSort} aria-label={m.feeds_discover_sort()}>
+              <option value="active">{m.feeds_discover_sort_active()}</option>
+              <option value="newest">{m.feeds_discover_sort_newest()}</option>
+              <option value="files">{m.feeds_discover_sort_files()}</option>
+              <option value="name">{m.feeds_discover_sort_name()}</option>
+            </select>
+          </label>
         </div>
         <p class="discover-hint">{m.feeds_discover_hint()}</p>
 
-        <div class="discover-scroll" onscroll={() => (menu = null)}>
+        <div class="discover-scroll" onscroll={() => menu && closeCardMenu(false)}>
           {#if discoverMatches.length === 0}
             <p class="list-empty">{m.feeds_no_matches()}</p>
           {/if}
@@ -1434,7 +1782,7 @@
               {@const isFollowed = followedKeys.has(key)}
               <article class="discover-card" class:menu-open={menuFor === key}>
                 <header class="discover-card-head">
-                  <span class="feed-avatar" style:--feed-hue={hueOf(feed.publisher)}>{@render feedGlyph()}</span>
+                  <span class="feed-avatar" style:--feed-hue={hueOf(feed.publisher + feed.salt)}>{@render feedGlyph()}</span>
                   <div class="discover-card-title">
                     <h3 title={feed.title}><bdi dir="auto">{feed.title}</bdi></h3>
                     <p class="discover-seen">
@@ -1478,7 +1826,10 @@
                     {/if}
                   </span>
                   {#if feed.own}
-                    <span class="badge sm tone-muted">{m.feeds_badge_yours()}</span>
+                    <span class="own-actions">
+                      <span class="badge sm tone-muted">{m.feeds_badge_yours()}</span>
+                      <button type="button" class="secondary sm-btn" onclick={() => editOwn(feed)}>{m.feeds_discover_edit()}</button>
+                    </span>
                   {:else if isFollowed}
                     <button type="button" class="secondary sm-btn" onclick={() => openFollowed(feed)}>{m.feeds_discover_open()}</button>
                   {:else}
@@ -1495,19 +1846,24 @@
               </article>
             {/each}
           </div>
+          <!-- Keyed so another card's menu is a new one, given focus too. -->
+          {#key menuFor}
           {#if menu}
             {@const feed = menu.feed}
             <div
               class="ctx-menu feed-card-menu"
               role="menu"
               tabindex="-1"
+              aria-label={m.feeds_discover_more()}
               use:ctxMenuPosition={{ x: menu.x, y: menu.y }}
+              onkeydown={cardMenuKeydown}
+              {@attach (el: HTMLElement) => el.querySelector<HTMLElement>('[role="menuitem"]')?.focus()}
             >
-              <button type="button" class="ctx-item" role="menuitem" onclick={() => { menu = null; void copy(feed.link); }}>
+              <button type="button" class="ctx-item" role="menuitem" onclick={() => { closeCardMenu(true); void copy(feed.link); }}>
                 {m.feeds_copy_link()}
               </button>
               {#if discoverPublisher !== feed.publisher}
-                <button type="button" class="ctx-item" role="menuitem" onclick={() => { menu = null; discoverPublisher = feed.publisher; }}>
+                <button type="button" class="ctx-item" role="menuitem" onclick={() => { closeCardMenu(true); discoverPublisher = feed.publisher; }}>
                   {m.feeds_discover_by_publisher()}
                 </button>
               {/if}
@@ -1522,6 +1878,7 @@
               {/if}
             </div>
           {/if}
+          {/key}
           {#if discoverMatches.length > discoverShown.length}
             <div class="discover-more">
               <button type="button" class="secondary" onclick={() => (discoverLimit += DISCOVER_PAGE)}>
@@ -1579,7 +1936,10 @@
               <span class="feed-row-text">
                 <span class="feed-row-title"><bdi dir="auto">{feed.title}</bdi></span>
                 <span class="feed-row-sub">
-                  {feed.published_at > 0 ? m.feeds_published_short({ when: ago(feed.published_at) }) : m.feeds_badge_draft()}
+                  {feed.published_at > 0
+                    ? m.feeds_published_short({ when: ago(feed.published_at) })
+                    : m.feeds_items_count({ count: formatNumber(feed.items.length) })}
+                  {#if feed.listed && feed.published_at > 0}<span aria-hidden="true"> · </span>{m.feeds_badge_listed()}{/if}
                 </span>
               </span>
               {#if feed.published_at === 0}
@@ -1652,6 +2012,23 @@
             placeholder={m.feeds_description_placeholder()}
             aria-label={m.feeds_description_placeholder()}
           ></textarea>
+
+          <div class="share-row">
+            <span class="share-label">{m.feeds_share_label()}</span>
+            {#if mineFeed.published_at > 0}
+              <input
+                type="text"
+                class="share-link"
+                readonly
+                value={mineFeed.link}
+                aria-label={m.feeds_share_label()}
+                onfocus={(e) => e.currentTarget.select()}
+              />
+              <button type="button" class="secondary sm-btn" onclick={() => void copy(mineFeed!.link)}>{m.feeds_copy_link()}</button>
+            {:else}
+              <span class="share-pending">{m.feeds_share_after_publish()}</span>
+            {/if}
+          </div>
 
           <div class="listed-row" class:on={mineFeed.listed}>
             <span class="auto-icon" aria-hidden="true">
@@ -1805,6 +2182,14 @@
 />
 
 <ConfirmDialog
+  bind:open={showHiddenAsk}
+  title={m.feeds_discover_show_hidden_title()}
+  message={m.feeds_discover_show_hidden_body()}
+  confirmLabel={m.feeds_discover_show_hidden_confirm()}
+  onconfirm={() => void showHidden()}
+/>
+
+<ConfirmDialog
   open={riskyAsk !== null}
   title={m.feeds_risky_confirm_title()}
   message={riskyAsk ? riskyText(riskyAsk.names) : ''}
@@ -1814,6 +2199,12 @@
     const ask = riskyAsk;
     riskyAsk = null;
     if (ask) void download(ask.ed2ks);
+  }}
+  altLabel={riskyAsk && riskyAsk.safe.length > 0 ? m.feeds_risky_skip({ count: formatNumber(riskyAsk.safe.length) }) : undefined}
+  onalt={() => {
+    const ask = riskyAsk;
+    riskyAsk = null;
+    if (ask) void download(ask.safe);
   }}
   oncancel={() => (riskyAsk = null)}
   ondismiss={() => (riskyAsk = null)}
@@ -2422,7 +2813,7 @@
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 8px 10px 8px 12px;
+    padding: 10px 10px 10px 12px;
   }
 
   .auto-icon {
@@ -2462,6 +2853,27 @@
 
   .auto-title:hover {
     background: none;
+  }
+
+  .auto-text {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .auto-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .auto-desc {
+    font-size: var(--font-size-xs);
+    font-weight: 400;
+    color: var(--text-muted);
+    line-height: 1.45;
   }
 
   .auto-name {
@@ -2508,8 +2920,14 @@
     min-width: 0;
   }
 
+  /* Two lines of room, text at the bottom, so the inputs of labels that wrap
+     differently still line up. */
   .field-label {
+    display: flex;
+    align-items: flex-end;
+    min-height: calc(2 * 1.35em);
     font-size: var(--font-size-xs);
+    line-height: 1.35;
     color: var(--text-muted);
   }
 
@@ -2883,6 +3301,125 @@
     line-height: 1.45;
   }
 
+  .share-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 18px 10px;
+    min-width: 0;
+  }
+
+  .share-label {
+    flex-shrink: 0;
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+
+  .share-link {
+    flex: 1;
+    min-width: 0;
+    padding: 5px 8px;
+    font-size: var(--font-size-xs);
+    font-family: var(--font-mono, monospace);
+    color: var(--text-secondary);
+  }
+
+  .share-pending {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+  }
+
+  .feed-quota {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .row-key {
+    margin-inline-start: 6px;
+    font-size: var(--font-size-xs);
+    font-weight: 400;
+    color: var(--text-muted);
+  }
+
+  .state-text {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .strip-btn {
+    min-height: 24px;
+    padding: 0 10px;
+    flex-shrink: 0;
+  }
+
+  .auto-summary {
+    font-size: var(--font-size-xs);
+    color: var(--text-accent);
+  }
+
+  .field-hint {
+    font-size: var(--font-size-2xs, 11px);
+    color: var(--text-muted);
+  }
+
+  .file-meta .held {
+    color: var(--badge-warning-text);
+  }
+
+  .row-progress {
+    display: block;
+    height: 3px;
+    margin-top: 6px;
+    max-width: 320px;
+    border-radius: var(--radius-pill);
+    background: color-mix(in srgb, var(--text-muted) 20%, transparent);
+    overflow: hidden;
+  }
+
+  .row-progress > span {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+    transition: width 0.4s ease;
+  }
+
+  .row-state {
+    flex-shrink: 0;
+    min-height: 30px;
+    display: inline-flex;
+    align-items: center;
+    padding: 0 10px;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    color: var(--text-accent);
+    font-variant-numeric: tabular-nums;
+    text-decoration: none;
+  }
+
+  .row-state:hover {
+    text-decoration: underline;
+  }
+
+  .row-btn.retry {
+    color: var(--badge-warning-text);
+    border-color: color-mix(in srgb, var(--warning) 40%, var(--border));
+    background: color-mix(in srgb, var(--warning) 10%, transparent);
+  }
+
+  .sort-select select {
+    min-height: 28px;
+    padding: 2px 8px;
+    font-size: var(--font-size-xs);
+  }
+
+  .own-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
   .listed-row {
     display: flex;
     align-items: center;
@@ -3192,8 +3729,9 @@
       width: 160px;
     }
 
-    .editor-foot .hint:not(.up-to-date) {
-      display: none;
+    /* The public notice stays: it is what is said before a first publish. */
+    .editor-foot {
+      flex-wrap: wrap;
     }
   }
 

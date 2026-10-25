@@ -11,15 +11,25 @@ export const followedFeeds = writable<FollowedFeed[]>([]);
 /** New items across every followed feed. */
 export const totalFeedUnread = derived(followedFeeds, (feeds) => feeds.reduce((sum, f) => sum + f.unread, 0));
 
+/** Whether the followed feeds have been read once, and whether the last read
+ *  failed: an empty list is not "you follow nothing" until then. */
+export const followedFeedsLoaded = writable(false);
+export const followedFeedsFailed = writable(false);
+
 let refreshSeq = 0;
 
 export async function refreshFollowedFeeds(): Promise<void> {
   const seq = ++refreshSeq;
   try {
     const feeds = await listFollowedFeeds();
-    if (seq === refreshSeq) followedFeeds.set(feeds);
+    if (seq === refreshSeq) {
+      followedFeeds.set(feeds);
+      followedFeedsLoaded.set(true);
+      followedFeedsFailed.set(false);
+    }
   } catch (e) {
     console.warn('feeds: could not read followed feeds', e);
+    if (seq === refreshSeq) followedFeedsFailed.set(true);
   }
 }
 
@@ -61,6 +71,8 @@ export function cleanupFeedsStore(): void {
   initialized = false;
   refreshSeq++;
   followedFeeds.set([]);
+  followedFeedsLoaded.set(false);
+  followedFeedsFailed.set(false);
 }
 
 /** The followed feed `publisher`/`salt`, if followed. */

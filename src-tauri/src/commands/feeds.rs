@@ -67,9 +67,11 @@ const REPUBLISH_RETRY_SECS: i64 = 10 * 60;
 /// Pushed heads taken for one feed: one per this long. The newest of those
 /// pushed meanwhile waits for the next.
 const PUSHED_HEAD_INTERVAL: Duration = Duration::from_secs(5 * 60);
-/// How long a list may take to arrive before the fetch is given up and
-/// tried again later.
+/// How long a list fetch may go with no byte arriving and no source, queued
+/// at one included, before it is given up and tried again later.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// The longest a list fetch runs in all, sources or not.
+const FETCH_MAX: Duration = Duration::from_secs(6 * 3600);
 /// How long after a fetch gave up the next one starts.
 const FETCH_RETRY_SECS: i64 = 30 * 60;
 /// The largest list followed, in bytes. 2,000 items fit in far less.
@@ -568,10 +570,15 @@ pub async fn publish_feed(
 
     // The new list is served beside the feed's others until its head is out.
     let (key, task_feed, task_owner, task_dir, task_kept) = (salt.clone(), feed.clone(), owner.clone(), dir.clone(), kept.clone());
-    let (head, path) = blocking(
+    let built = blocking(
         move || {
             let (feed, kept) = (task_feed, task_kept);
             let bytes = build_list(&feed.title, &author, &kept)?;
+            // Followers refuse a list past this; refused here instead, rather
+            // than published to nobody.
+            if bytes.len() as u64 > MAX_LIST_BYTES {
+                return Ok(None);
+            }
             // After a pending head too, which storers may hold.
             let last = feed.pending.as_ref().map_or(feed.sequence, |pending| pending.sequence.max(feed.sequence));
             let sequence = next_sequence(last.max(0) as u64, now_ms()).min(i64::MAX as u64);
@@ -597,12 +604,18 @@ pub async fn publish_feed(
                     ember_file_hash: hex::encode(head.list_blake3),
                 },
             );
-            Ok((head, path))
+            Ok(Some((head, path)))
         },
         "feeds_publish_failed",
         "Could not publish the feed",
     )
     .await?;
+    let Some((head, path)) = built else {
+        return Err(coded(
+            "feeds_list_too_large",
+            "This feed's list is too large to publish. Remove some files, or shorten their notes.",
+        ));
+    };
     let published = OwnPublish {
         sequence: head.sequence as i64,
         list_ed2k: hex::encode(head.list_ed2k_hash),
@@ -695,13 +708,33 @@ fn hex_to32(text: &str) -> anyhow::Result<[u8; 32]> {
     Ok(out)
 }
 
+/// Write a list in full or not at all: on disk before its name is, so a
+/// power cut cannot leave a short file under it (ext4 and XFS can, for a
+/// rename of data not yet flushed).
 fn write_list(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
     let dir = path.parent().ok_or_else(|| anyhow::anyhow!("no folder"))?;
     std::fs::create_dir_all(dir)?;
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
     std::fs::rename(&tmp, path)?;
+    // The rename itself, on a file system that orders it apart from the data.
+    #[cfg(unix)]
+    if let Ok(folder) = std::fs::File::open(dir) {
+        let _ = folder.sync_all();
+    }
     Ok(())
+}
+
+/// Whether the list at `path` is there whole: a file of the size its head
+/// names. One cut short by a crash is not served, but written or fetched
+/// again.
+fn list_file_whole(path: &Path, size: i64) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() as i64 == size)
 }
 
 /// A list a feed of ours serves, kept in the file its sequence names.
@@ -937,6 +970,52 @@ pub struct FollowedFeedInfo {
     #[serde(flatten)]
     pub feed: FollowedFeed,
     pub link: String,
+    pub activity: FeedActivity,
+    /// Set by a follow of a feed already followed.
+    pub already_following: bool,
+}
+
+/// What a followed feed's lookups and fetches are doing now, beyond what its
+/// row records: what the page shows while it waits.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct FeedActivity {
+    /// A lookup of its head is running.
+    pub looking: bool,
+    /// Its last lookup reached no node.
+    pub unreachable: bool,
+    /// Its newest head names a list larger than Ember takes.
+    pub too_large: bool,
+    /// A fetch of its list is running.
+    pub fetching: Option<FetchActivity>,
+    /// When the next fetch of its list may start, after one gave up; 0 if
+    /// none did.
+    pub retry_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FetchActivity {
+    /// Seconds since it started.
+    pub secs: u64,
+    pub bytes: u64,
+    /// Sources sending or queued at, as of the last tick.
+    pub sources: u32,
+}
+
+fn activity_of(feed: &FollowedFeed) -> FeedActivity {
+    let key = (feed.publisher.clone(), feed.salt.clone());
+    let fetching = fetching()
+        .lock()
+        .values()
+        .filter(|f| f.publisher == feed.publisher && f.salt == feed.salt)
+        .max_by_key(|f| f.sequence)
+        .map(|f| FetchActivity { secs: f.started.elapsed().as_secs(), bytes: f.bytes, sources: f.sources });
+    FeedActivity {
+        looking: looking().lock().contains(&key),
+        unreachable: missed_lookups().lock().contains_key(&key),
+        too_large: too_large().lock().contains(&key),
+        fetching,
+        retry_at: gave_up().lock().get(&key).map_or(0, |at| at + FETCH_RETRY_SECS),
+    }
 }
 
 fn followed_info(feed: FollowedFeed) -> FollowedFeedInfo {
@@ -944,7 +1023,8 @@ fn followed_info(feed: FollowedFeed) -> FollowedFeedInfo {
         (Ok(publisher), Ok(salt)) => link_for(&publisher, &salt),
         _ => String::new(),
     };
-    FollowedFeedInfo { feed, link }
+    let activity = activity_of(&feed);
+    FollowedFeedInfo { feed, link, activity, already_following: false }
 }
 
 #[tauri::command]
@@ -965,37 +1045,46 @@ pub async fn follow_feed(app: tauri::AppHandle, state: tauri::State<'_, AppState
     let db = state.db.clone();
     let (key_pub, key_salt) = (publisher.clone(), salt.clone());
     let now = chrono::Utc::now().timestamp();
-    let feed = blocking(
+    let (added, feed) = blocking(
         move || {
-            db.feed_follow(&key_pub, &key_salt, now)?;
-            db.feed_followed(&key_pub, &key_salt)
+            let added = db.feed_follow(&key_pub, &key_salt, now)?;
+            Ok((added, db.feed_followed(&key_pub, &key_salt)?))
         },
         "feeds_failed",
         "Could not follow the feed",
     )
-    .await?
-    .ok_or_else(|| coded("feeds_failed", "Could not follow the feed"))?;
-    let looked = app.clone();
-    tauri::async_runtime::spawn(async move {
-        if let Some(state) = looked.try_state::<AppState>() {
-            look_up_head(&looked, &state, &publisher, &salt).await;
-        }
-    });
-    let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "publisher": feed.publisher, "salt": feed.salt }));
-    Ok(followed_info(feed))
+    .await?;
+    let feed = feed.ok_or_else(|| coded("feeds_failed", "Could not follow the feed"))?;
+    if added {
+        let looked = app.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Some(state) = looked.try_state::<AppState>() {
+                look_up_head(&looked, &state, &publisher, &salt).await;
+            }
+        });
+        let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "publisher": feed.publisher, "salt": feed.salt }));
+    }
+    Ok(FollowedFeedInfo { already_following: !added, ..followed_info(feed) })
 }
 
-/// Look again now, rather than at the next half hour.
+/// Look again now, rather than at the next half hour, and fetch its list at
+/// once if it is owed one, even while resting after a fetch gave up: the
+/// user asked. What the lookup came to.
 #[tauri::command]
 pub async fn refresh_feed(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     publisher: String,
     salt: String,
-) -> Result<(), String> {
+) -> Result<LookupOutcome, String> {
     let (publisher, salt) = (hex::encode(hex_publisher(&publisher)?), hex::encode(hex_salt(&salt)?));
-    look_up_head(&app, &state, &publisher, &salt).await;
-    Ok(())
+    let outcome = look_up_head(&app, &state, &publisher, &salt).await;
+    if outcome != LookupOutcome::Updated {
+        gave_up().lock().remove(&(publisher.clone(), salt.clone()));
+        fetch_owed(&app, &state, &publisher, &salt, chrono::Utc::now().timestamp()).await;
+    }
+    let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "publisher": publisher, "salt": salt }));
+    Ok(outcome)
 }
 
 #[tauri::command]
@@ -1006,11 +1095,176 @@ pub async fn get_feed_items(
 ) -> Result<Vec<FollowedItemInfo>, String> {
     let (publisher, salt) = (hex::encode(hex_publisher(&publisher)?), hex::encode(hex_salt(&salt)?));
     let db = state.db.clone();
-    let items = blocking(move || db.feed_followed_items(&publisher, &salt), "feeds_failed", "Could not read feeds").await?;
+    let now = chrono::Utc::now().timestamp();
+    let (key_pub, key_salt) = (publisher.clone(), salt.clone());
+    let (feed, items, spent) = blocking(
+        move || {
+            Ok((
+                db.feed_followed(&key_pub, &key_salt)?,
+                db.feed_followed_items(&key_pub, &key_salt)?,
+                db.feed_auto_bytes(&key_pub, &key_salt, now)?,
+            ))
+        },
+        "feeds_failed",
+        "Could not read feeds",
+    )
+    .await?;
+    let feed = feed.ok_or_else(|| coded("feeds_not_found", "That feed could not be found"))?;
+    // What each file's download is doing: the transfer list's own word for
+    // it, newest first, then the file on disk.
+    let transfers: HashMap<String, (ItemStatus, f64, Option<String>)> = {
+        let manager = state.transfer_manager.read().await;
+        let mut by_hash = HashMap::new();
+        for t in manager.completed.iter().chain(manager.queue.iter()).chain(manager.active.values()) {
+            if t.direction == crate::types::TransferDirection::Download {
+                by_hash.insert(t.file_hash.to_ascii_lowercase(), (ItemStatus::of(&t.status), t.progress, t.completed_path.clone()));
+            }
+        }
+        by_hash
+    };
+    // A library scan holds the index through a whole re-index: the page asks
+    // every few seconds, so a busy index counts as holding none of them.
+    let in_library: std::collections::HashSet<String> = match state.local_index.try_read() {
+        Ok(index) => items
+            .iter()
+            .map(|i| i.item.ed2k.to_ascii_lowercase())
+            .filter(|hash| index.get_by_hash(hash).is_some())
+            .collect(),
+        Err(_) => Default::default(),
+    };
+    let folders = state.config.read().await.settings.download_folders();
+    let folder = feed.folder.clone();
+    let finished: Vec<(String, String)> = transfers
+        .iter()
+        .filter_map(|(hash, (status, _, path))| (*status == ItemStatus::Done).then_some((hash.clone(), path.clone()?)))
+        .collect();
+    let (on_disk, gone) = tokio::task::spawn_blocking(move || feed_folder_files(&folders, &folder, &finished))
+        .await
+        .unwrap_or_default();
+    let mut spent = spent;
     Ok(items
         .into_iter()
-        .map(|item| FollowedItemInfo { risky: auto_download_refuses(&item.item.name), item })
+        .map(|item| {
+            let hash = item.item.ed2k.to_ascii_lowercase();
+            let name = crate::security::sanitize_filename(&item.item.name);
+            let tagged = crate::sharing::name_tag::completed_download_name(&name);
+            let size = u64::try_from(item.item.size).unwrap_or(u64::MAX);
+            let file_here = [&name, &tagged]
+                .into_iter()
+                .any(|name| on_disk.get(&file_name_key(name)).is_some_and(|sizes| sizes.contains(&size)));
+            let (status, progress) = match transfers.get(&hash) {
+                Some((ItemStatus::Done, _, Some(_))) if gone.contains(&hash) && !file_here => {
+                    (if item.downloaded { ItemStatus::Missing } else { ItemStatus::None }, 0.0)
+                }
+                Some((status, progress, _)) => (*status, *progress),
+                None if file_here => (ItemStatus::Done, 100.0),
+                None if in_library.contains(&hash) => (ItemStatus::InLibrary, 100.0),
+                None if item.downloaded => (ItemStatus::Missing, 0.0),
+                None => (ItemStatus::None, 0.0),
+            };
+            // In the order a pass takes them, each counted off the 24-hour
+            // cap as it would be started.
+            let held = if status == ItemStatus::None && auto_takes(&feed, &item) {
+                let reason = auto_hold_reason(&feed, &item.item, spent);
+                if reason.is_none() {
+                    spent = spent.saturating_add(item.item.size);
+                }
+                reason
+            } else {
+                None
+            };
+            FollowedItemInfo { risky: auto_download_refuses(&item.item.name), status, progress, held, item }
+        })
         .collect())
+}
+
+/// A file name as the download folder's file system compares it: Windows'
+/// and macOS's ignore case, Linux's do not.
+fn file_name_key(name: &str) -> String {
+    if cfg!(any(windows, target_os = "macos")) {
+        name.to_lowercase()
+    } else {
+        name.to_string()
+    }
+}
+
+/// The files in a feed's folder, under the current download folder or an
+/// earlier one, by [`file_name_key`] with their sizes; and of `finished`
+/// downloads, by hash, those whose file is no longer where it finished.
+fn feed_folder_files(
+    folders: &crate::storage::part_folders::DownloadFolders,
+    folder: &str,
+    finished: &[(String, String)],
+) -> (HashMap<String, Vec<u64>>, std::collections::HashSet<String>) {
+    let mut on_disk: HashMap<String, Vec<u64>> = HashMap::new();
+    if !folder.is_empty() {
+        for root in std::iter::once(&folders.current).chain(&folders.previous) {
+            let dir = crate::sharing::feed_downloads::folder_dir(root, folder);
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                match entry.metadata() {
+                    Ok(meta) if meta.is_file() => {
+                        on_disk.entry(file_name_key(&entry.file_name().to_string_lossy())).or_default().push(meta.len())
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let gone = finished.iter().filter(|(_, path)| !Path::new(path).is_file()).map(|(hash, _)| hash.clone()).collect();
+    (on_disk, gone)
+}
+
+/// What the download of a feed's file is doing, as the page shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemStatus {
+    /// Not downloaded, nor on its way.
+    None,
+    /// Waiting for sources or a slot.
+    Queued,
+    Downloading,
+    Paused,
+    Failed,
+    /// In the feed's folder.
+    Done,
+    /// The user has it in their Library already, from elsewhere.
+    InLibrary,
+    /// Downloaded or started from the feed before, and gone since: removed
+    /// from the transfer list or deleted from the folder.
+    Missing,
+}
+
+impl ItemStatus {
+    fn of(status: &crate::types::TransferStatus) -> Self {
+        use crate::types::TransferStatus as S;
+        match status {
+            S::Active | S::Verifying | S::Completing | S::Hashing => Self::Downloading,
+            S::Searching | S::Queued | S::Insufficient => Self::Queued,
+            S::Paused | S::Stopped => Self::Paused,
+            S::Failed => Self::Failed,
+            S::Completed | S::NoneNeeded => Self::Done,
+        }
+    }
+}
+
+/// Whether `feed`'s auto-download is to take `item`: on, the file first seen
+/// since it was turned on, never asked for, and still listed.
+fn auto_takes(feed: &FollowedFeed, item: &FollowedItem) -> bool {
+    feed.auto_download && feed.auto_since > 0 && item.first_seen >= feed.auto_since && !item.downloaded && !item.removed
+}
+
+/// Why auto-download is holding `item` back, if a cap or its type is why.
+fn auto_hold_reason(feed: &FollowedFeed, item: &FeedItem, spent: i64) -> Option<&'static str> {
+    const MIB: i64 = 1024 * 1024;
+    if auto_download_refuses(&item.name) {
+        Some("risky")
+    } else if feed.auto_max_item_mib != 0 && item.size > feed.auto_max_item_mib.saturating_mul(MIB) {
+        Some("too_large")
+    } else if feed.auto_max_day_mib != 0 && spent.saturating_add(item.size) > feed.auto_max_day_mib.saturating_mul(MIB) {
+        Some("day_limit")
+    } else {
+        None
+    }
 }
 
 /// An item of a followed feed, as the page shows it.
@@ -1021,6 +1275,12 @@ pub struct FollowedItemInfo {
     /// A type that can run code or change settings, which automatic
     /// downloads never take: the page asks before downloading it.
     pub risky: bool,
+    pub status: ItemStatus,
+    /// Of a download on its way, 0 to 100.
+    pub progress: f64,
+    /// Why auto-download has not started it: `risky`, `too_large` or
+    /// `day_limit`.
+    pub held: Option<&'static str>,
 }
 
 #[tauri::command]
@@ -1062,10 +1322,11 @@ pub async fn set_feed_auto_download(
     let category = clip(&category, 256);
     let db = state.db.clone();
     let (key_pub, key_salt) = (publisher.clone(), salt.clone());
+    let now = chrono::Utc::now().timestamp();
     let feed = blocking(
         move || {
             let (item, day) = (auto_cap(max_item_mib), auto_cap(max_day_mib));
-            if !db.feed_set_auto_download(&key_pub, &key_salt, enabled, item, day, &category)? {
+            if !db.feed_set_auto_download(&key_pub, &key_salt, enabled, item, day, &category, now)? {
                 return Ok(None);
             }
             db.feed_followed(&key_pub, &key_salt)
@@ -1212,6 +1473,8 @@ pub async fn unfollow_feed(
     push_gates().lock().remove(&key);
     missed_lookups().lock().remove(&key);
     gave_up().lock().remove(&key);
+    too_large().lock().remove(&key);
+    listing_fallbacks().lock().remove(&key);
     let dir = feeds_dir(&app);
     let db = state.db.clone();
     let (key_pub, key_salt) = (publisher.clone(), salt.clone());
@@ -1239,16 +1502,34 @@ pub async fn unfollow_feed(
 
 // ── Heads and lists ────────────────────────────────────────────────────────
 
+/// What a lookup of a followed feed came to, for "Check now" to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LookupOutcome {
+    /// A newer head was found and taken up; its list is being fetched.
+    Updated,
+    /// The head found is the one held.
+    Unchanged,
+    /// Nodes answered, and none holds the feed.
+    NotFound,
+    /// No node answered.
+    Unreachable,
+    /// The newest head names a list larger than Ember takes.
+    TooLarge,
+    /// A lookup of it was running already.
+    Busy,
+}
+
 /// Look up a followed feed's head and take up a newer one, starting the
 /// fetch of its list.
-async fn look_up_head(app: &tauri::AppHandle, state: &AppState, publisher: &str, salt: &str) {
+async fn look_up_head(app: &tauri::AppHandle, state: &AppState, publisher: &str, salt: &str) -> LookupOutcome {
     let (Ok(publisher_key), Ok(salt_bytes)) = (hex_to32(publisher), hex_to16(salt)) else {
-        return;
+        return LookupOutcome::NotFound;
     };
     // One lookup of a feed at a time: a tick's and the user's "Check now".
     let looking_at = (publisher.to_string(), salt.to_string());
     if !looking().lock().insert(looking_at.clone()) {
-        return;
+        return LookupOutcome::Busy;
     }
     let key = feed_key(&publisher_key, &salt_bytes);
     let looked = LookedAt(looking_at.clone());
@@ -1257,7 +1538,7 @@ async fn look_up_head(app: &tauri::AppHandle, state: &AppState, publisher: &str,
         .ok()
         .flatten();
     let (blobs, mut responded) = found.unwrap_or_default();
-    let mut best = best_head(&blobs, &publisher_key, &salt_bytes);
+    let mut best = newest_head(&blobs, &publisher_key, &salt_bytes);
     let now = chrono::Utc::now().timestamp();
     // A listed feed's listing carries its head, signed alike, and lives
     // under another key: found there when its own key's storers are gone.
@@ -1269,7 +1550,7 @@ async fn look_up_head(app: &tauri::AppHandle, state: &AppState, publisher: &str,
             .flatten();
         if let Some((blobs, shard_responded)) = listed {
             responded = responded.max(shard_responded);
-            best = best_listed_head(&blobs, &publisher_key, &salt_bytes);
+            best = newest_listed_head(&blobs, &publisher_key, &salt_bytes);
             if best.is_some() {
                 tracing::info!("feed {salt}: its head was not at its key; taken from its Discover listing");
             }
@@ -1280,21 +1561,59 @@ async fn look_up_head(app: &tauri::AppHandle, state: &AppState, publisher: &str,
     if responded > 0 {
         missed_lookups().lock().remove(&looking_at);
         let db = state.db.clone();
-        let _ = tokio::task::spawn_blocking(move || db.feed_checked(&looking_at.0, &looking_at.1, now)).await;
+        let (key_pub, key_salt) = looking_at.clone();
+        let _ = tokio::task::spawn_blocking(move || db.feed_checked(&key_pub, &key_salt, now)).await;
     } else {
-        missed_lookups().lock().insert(looking_at, now);
+        missed_lookups().lock().insert(looking_at.clone(), now);
     }
     drop(looked);
-    if let Some(head) = best {
-        take_head(app, state, publisher, salt, head).await;
+    let too_large = best.as_ref().is_some_and(|head| head.list_size > MAX_LIST_BYTES);
+    if best.is_some() || responded > 0 {
+        set_too_large(&looking_at, too_large);
     }
+    match best {
+        Some(_) if too_large => {
+            tracing::info!("feed {salt}: its list is larger than {MAX_LIST_BYTES} bytes; not fetched");
+            LookupOutcome::TooLarge
+        }
+        Some(head) => {
+            if take_head(app, state, publisher, salt, head).await {
+                LookupOutcome::Updated
+            } else {
+                LookupOutcome::Unchanged
+            }
+        }
+        None if responded == 0 => LookupOutcome::Unreachable,
+        None => LookupOutcome::NotFound,
+    }
+}
+
+/// Feeds whose newest head names a list larger than Ember takes.
+fn too_large() -> &'static parking_lot::Mutex<std::collections::HashSet<(String, String)>> {
+    static TOO_LARGE: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    TOO_LARGE.get_or_init(Default::default)
+}
+
+fn set_too_large(key: &(String, String), is: bool) {
+    let mut set = too_large().lock();
+    if is {
+        set.insert(key.clone());
+    } else {
+        set.remove(key);
+    }
+}
+
+/// When each feed's own key last gave nothing and its index shard was read.
+fn listing_fallbacks() -> &'static parking_lot::Mutex<HashMap<(String, String), i64>> {
+    static LAST: std::sync::OnceLock<parking_lot::Mutex<HashMap<(String, String), i64>>> = std::sync::OnceLock::new();
+    LAST.get_or_init(Default::default)
 }
 
 /// Whether a lookup of the feed `key` whose own key gave nothing may read its
 /// index shard now, at most every [`LISTING_FALLBACK_SECS`]; noted as read.
 fn listing_fallback_due(key: &(String, String), now: i64) -> bool {
-    static LAST: std::sync::OnceLock<parking_lot::Mutex<HashMap<(String, String), i64>>> = std::sync::OnceLock::new();
-    let mut last = LAST.get_or_init(Default::default).lock();
+    let mut last = listing_fallbacks().lock();
     if last.get(key).is_some_and(|at| now - at < LISTING_FALLBACK_SECS) {
         return false;
     }
@@ -1303,8 +1622,8 @@ fn listing_fallback_due(key: &(String, String), now: i64) -> bool {
 }
 
 /// The newest head among `blobs` that a listing of this feed by its
-/// publisher carries, unless the newest listing withdraws it.
-fn best_listed_head(blobs: &[Vec<u8>], publisher: &[u8; 32], salt: &FeedSalt) -> Option<FeedHead> {
+/// publisher carries, unless the newest listing withdraws it. Of any size.
+fn newest_listed_head(blobs: &[Vec<u8>], publisher: &[u8; 32], salt: &FeedSalt) -> Option<FeedHead> {
     blobs
         .iter()
         .filter_map(|blob| SignedRecord::from_value_blob(blob))
@@ -1312,7 +1631,7 @@ fn best_listed_head(blobs: &[Vec<u8>], publisher: &[u8; 32], salt: &FeedSalt) ->
         .filter_map(|record| record.feed_listing().map(|listing| (record.timestamp, listing)))
         .filter(|(_, (found_salt, _, _))| found_salt == salt)
         .max_by_key(|(at, _)| *at)
-        .and_then(|(_, (_, head, withdrawn))| (!withdrawn && head.list_size <= MAX_LIST_BYTES).then_some(head))
+        .and_then(|(_, (_, head, withdrawn))| (!withdrawn).then_some(head))
 }
 
 /// When a followed feed's last lookup reached no node.
@@ -1434,8 +1753,9 @@ fn followed_lock() -> &'static tokio::sync::Mutex<()> {
     &LOCK
 }
 
-/// Take up `head` if newer than the one held, and fetch its list.
-async fn take_head(app: &tauri::AppHandle, state: &AppState, publisher: &str, salt: &str, head: FeedHead) {
+/// Take up `head` if newer than the one held, and fetch its list. Whether
+/// it was newer.
+async fn take_head(app: &tauri::AppHandle, state: &AppState, publisher: &str, salt: &str, head: FeedHead) -> bool {
     let followed = followed_lock().lock().await;
     let now = chrono::Utc::now().timestamp();
     let db = state.db.clone();
@@ -1462,7 +1782,7 @@ async fn take_head(app: &tauri::AppHandle, state: &AppState, publisher: &str, sa
     .await
     .unwrap_or(false);
     if !taken {
-        return;
+        return false;
     }
     let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "publisher": publisher, "salt": salt }));
     let db = state.db.clone();
@@ -1475,6 +1795,7 @@ async fn take_head(app: &tauri::AppHandle, state: &AppState, publisher: &str, sa
     if let Some(list) = list {
         after_list(app, state, list).await;
     }
+    true
 }
 
 /// Fetch the list a followed feed's head names, if it is owed one: none
@@ -1504,14 +1825,23 @@ async fn fetch_owed(app: &tauri::AppHandle, state: &AppState, publisher: &str, s
 
 /// The newest valid head among `blobs`, by its publisher for this feed.
 fn best_head(blobs: &[Vec<u8>], publisher: &[u8; 32], salt: &FeedSalt) -> Option<FeedHead> {
+    heads(blobs, publisher, salt).filter(|head| head.list_size <= MAX_LIST_BYTES).max_by_key(|head| head.sequence)
+}
+
+/// The newest valid head among `blobs`, by its publisher for this feed, of
+/// any size: a lookup says when it is too large rather than taking an older.
+fn newest_head(blobs: &[Vec<u8>], publisher: &[u8; 32], salt: &FeedSalt) -> Option<FeedHead> {
+    heads(blobs, publisher, salt).max_by_key(|head| head.sequence)
+}
+
+fn heads<'a>(blobs: &'a [Vec<u8>], publisher: &'a [u8; 32], salt: &'a FeedSalt) -> impl Iterator<Item = FeedHead> + 'a {
     blobs
         .iter()
         .filter_map(|blob| SignedRecord::from_value_blob(blob))
-        .filter(|record| record.publisher_key == *publisher && record.feed_store_ok())
+        .filter(move |record| record.publisher_key == *publisher && record.feed_store_ok())
         .filter_map(|record| record.feed_head())
-        .filter(|(found_salt, head)| found_salt == salt && head.list_size <= MAX_LIST_BYTES)
+        .filter(move |(found_salt, _)| found_salt == salt)
         .map(|(_, head)| head)
-        .max_by_key(|head| head.sequence)
 }
 
 /// A fetch of a list in flight.
@@ -1521,6 +1851,34 @@ struct Fetching {
     salt: String,
     sequence: i64,
     started: Instant,
+    /// When it last gained bytes or held a source, queued at one included.
+    progressed: Instant,
+    /// Bytes it held then.
+    bytes: u64,
+    /// Sources it has now, sending or queued at.
+    sources: u32,
+}
+
+impl Fetching {
+    fn new(publisher: &str, salt: &str, sequence: i64) -> Self {
+        let now = Instant::now();
+        Self { publisher: publisher.into(), salt: salt.into(), sequence, started: now, progressed: now, bytes: 0, sources: 0 }
+    }
+
+    /// Note what its transfer holds now: `bytes` on disk and `sources`.
+    fn note(&mut self, bytes: u64, sources: u32, now: Instant) {
+        if bytes > self.bytes || sources > 0 {
+            self.progressed = now;
+        }
+        self.bytes = self.bytes.max(bytes);
+        self.sources = sources;
+    }
+
+    /// Given up: no byte and no source for [`FETCH_TIMEOUT`], or running
+    /// [`FETCH_MAX`] in all. Waiting in a busy publisher's queue is a source.
+    fn stalled(&self, now: Instant) -> bool {
+        now.duration_since(self.progressed) >= FETCH_TIMEOUT || now.duration_since(self.started) >= FETCH_MAX
+    }
 }
 
 fn fetching() -> &'static parking_lot::Mutex<HashMap<String, Fetching>> {
@@ -1543,6 +1901,28 @@ fn fetches_for(publisher: &str, salt: &str) -> Vec<String> {
         .collect()
 }
 
+/// The publisher of a feed, when they are a friend: their Ember hash and the
+/// address last seen for them. Their own list is fetched from them first,
+/// over the friends' path, which a firewalled publisher whose list no source
+/// record names can still be reached by.
+async fn friend_source(state: &AppState, publisher: &str) -> Option<([u8; 16], Option<(String, u16)>)> {
+    let publisher = hex_to32(publisher).ok()?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let hash = db
+            .get_friend_public_keys()
+            .ok()?
+            .into_iter()
+            .find(|(_, key)| *key == publisher)
+            .map(|(hash, _)| hash)?;
+        let address = db.get_friend_address(&hex::encode(hash)).ok().flatten();
+        Some((hash, address))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Fetch the list `feed`'s head names, unless it is on its way. A fetch of
 /// an older list is given up: its sources may well have moved on. Called
 /// with [`followed_lock`] held; a list held already is taken up at once,
@@ -1561,10 +1941,7 @@ async fn start_fetch(app: &tauri::AppHandle, state: &AppState, feed: &FollowedFe
             return None;
         }
         let older: Vec<String> = fetching.iter().filter(|(_, f)| ours(f)).map(|(id, _)| id.clone()).collect();
-        fetching.insert(
-            transfer_id.clone(),
-            Fetching { publisher: feed.publisher.clone(), salt: feed.salt.clone(), sequence: feed.sequence, started: Instant::now() },
-        );
+        fetching.insert(transfer_id.clone(), Fetching::new(&feed.publisher, &feed.salt, feed.sequence));
         older
     };
     for id in superseded {
@@ -1618,21 +1995,26 @@ async fn start_fetch(app: &tauri::AppHandle, state: &AppState, feed: &FollowedFe
         fetching().lock().remove(&transfer_id);
         return None;
     }
+    let (peer_ip, peer_port, friend_ember_hash) = match friend_source(state, &feed.publisher).await {
+        Some((hash, Some((ip, port)))) => (ip, port, Some(hash)),
+        Some((hash, None)) => (String::new(), 0, Some(hash)),
+        None => (String::new(), 0, None),
+    };
     let sent = bounded_send(
         &state.network_tx,
         NetworkCommand::StartDownload {
             file_hash: hex::encode(list_hash),
             file_name: list_share_name(&feed.title),
             file_size: feed.list_size.max(0) as u64,
-            peer_ip: String::new(),
-            peer_port: 0,
+            peer_ip,
+            peer_port,
             extra_sources: Vec::new(),
             ember_file_hash: feed.list_blake3.clone(),
             expected_aich: None,
             transfer_id: transfer_id.clone(),
             control,
             discovery_only: false,
-            friend_ember_hash: None,
+            friend_ember_hash,
         },
     )
     .await;
@@ -1948,7 +2330,8 @@ const AUTO_DOWNLOAD_REFUSED: &[&str] = &[
     "gadget", "inf",
     // macOS and Linux programs, scripts, libraries, installers and launchers.
     "sh", "bash", "zsh", "py", "app", "dmg", "pkg", "command", "tool", "scpt", "scptd", "workflow", "so",
-    "dylib", "desktop", "appimage", "deb", "rpm", "run",
+    "dylib", "desktop", "appimage", "deb", "rpm", "run", "flatpak", "flatpakref", "flatpakrepo", "snap",
+    "pl", "rb",
     // Electron app archives.
     "asar",
     // Disc and disk images.
@@ -1987,6 +2370,47 @@ fn auto_download_allows(feed: &FollowedFeed, item: &FeedItem, spent: i64) -> boo
 fn auto_download_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     &LOCK
+}
+
+/// How often auto-download looks again at a feed's files it has not started:
+/// held back by the 24-hour cap, the disk, or a start that failed.
+const AUTO_RETRY_SECS: i64 = 10 * 60;
+
+/// Give each feed with auto-download on another pass over the files it is
+/// to take and has not started, at most every [`AUTO_RETRY_SECS`]. A feed
+/// turned on before the window was kept starts it now, rather than taking
+/// every file it was ever listed.
+async fn retry_auto_downloads(app: &tauri::AppHandle, state: &AppState, followed: &[FollowedFeed], now: i64) {
+    static LAST: std::sync::OnceLock<parking_lot::Mutex<HashMap<(String, String), i64>>> = std::sync::OnceLock::new();
+    for feed in followed.iter().filter(|feed| feed.auto_download) {
+        let key = (feed.publisher.clone(), feed.salt.clone());
+        {
+            let mut last = LAST.get_or_init(Default::default).lock();
+            if last.get(&key).is_some_and(|at| now - at < AUTO_RETRY_SECS) {
+                continue;
+            }
+            last.insert(key.clone(), now);
+        }
+        let db = state.db.clone();
+        let feed = feed.clone();
+        let pending = tokio::task::spawn_blocking(move || {
+            if feed.auto_since == 0 {
+                let _ = db.feed_start_auto_since(&feed.publisher, &feed.salt, now);
+                return Vec::new();
+            }
+            db.feed_followed_items(&feed.publisher, &feed.salt)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|item| auto_takes(&feed, item))
+                .map(|item| item.item)
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        if !pending.is_empty() && auto_download(app, state, &key.0, &key.1, &pending).await > 0 {
+            let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "publisher": key.0, "salt": key.1 }));
+        }
+    }
 }
 
 /// Start what auto-download allows of a list's new items, by the feed's
@@ -2156,7 +2580,8 @@ async fn reshare_held(app: &tauri::AppHandle, state: &AppState) {
             kept.insert(path.clone());
             let mut lists = own_lists(&dir, &feed);
             match own_head(&feed) {
-                Some(head) if !path.exists() => {
+                Some(head) if !list_file_whole(&path, head.list_size as i64) => {
+                    let _ = std::fs::remove_file(&path);
                     let items = db.feed_own_items(&feed.salt).unwrap_or_default();
                     if rebuild_own_list(&path, &head, &author, &items) {
                         tracing::info!("feed {}: wrote its missing list again", feed.salt);
@@ -2171,7 +2596,7 @@ async fn reshare_held(app: &tauri::AppHandle, state: &AppState) {
             }
             if let Some(pending) = &feed.pending {
                 let path = own_list_path(&dir, &feed.salt, pending.sequence);
-                if path.is_file() {
+                if list_file_whole(&path, pending.list_size) {
                     kept.insert(path);
                 } else {
                     let _ = db.feed_own_set_pending(&feed.salt, None);
@@ -2185,7 +2610,8 @@ async fn reshare_held(app: &tauri::AppHandle, state: &AppState) {
         for feed in db.feeds_followed().unwrap_or_default() {
             let path = followed_list_path(&dir, &feed.publisher, &feed.salt, feed.list_sequence);
             kept.insert(path.clone());
-            if feed.list_sequence > 0 && !path.exists() {
+            if feed.list_sequence > 0 && !list_file_whole(&path, feed.held_size) {
+                let _ = std::fs::remove_file(&path);
                 let _ = db.feed_lost_held(&feed.publisher, &feed.salt);
                 continue;
             }
@@ -2482,20 +2908,43 @@ fn lookup_due(feed: &FollowedFeed, now: i64) -> bool {
 
 async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
     let now = chrono::Utc::now().timestamp();
-    // Fetches that have waited too long for sources, given up on whether or
-    // not Ember is on now.
-    let stale: Vec<(String, Fetching)> = fetching()
-        .lock()
-        .iter()
-        .filter(|(_, f)| f.started.elapsed() >= FETCH_TIMEOUT)
-        .map(|(id, f)| (id.clone(), f.clone()))
-        .collect();
+    // What each fetch holds now, then those that have stalled, given up on
+    // whether or not Ember is on now.
+    let held: HashMap<String, (u64, u32)> = {
+        let ids: Vec<String> = fetching().lock().keys().cloned().collect();
+        let manager = state.transfer_manager.read().await;
+        ids.into_iter()
+            .filter_map(|id| {
+                let t = manager.get_transfer(&id)?;
+                Some((id, (t.completed_size.max(t.transferred), t.active_sources + t.queued_sources)))
+            })
+            .collect()
+    };
+    let stale: Vec<(String, Fetching)> = {
+        let mut fetching = fetching().lock();
+        let instant = Instant::now();
+        for (id, fetch) in fetching.iter_mut() {
+            if let Some((bytes, sources)) = held.get(id) {
+                fetch.note(*bytes, *sources, instant);
+            }
+        }
+        fetching.iter().filter(|(_, f)| f.stalled(instant)).map(|(id, f)| (id.clone(), f.clone())).collect()
+    };
     for (id, fetch) in stale {
+        tracing::info!(
+            "feed {}: gave up fetching its list after {} min ({} bytes, no source for {} min)",
+            fetch.salt,
+            fetch.started.elapsed().as_secs() / 60,
+            fetch.bytes,
+            fetch.progressed.elapsed().as_secs() / 60
+        );
         cancel_fetch(state, &id).await;
-        gave_up().lock().insert((fetch.publisher, fetch.salt), now);
+        gave_up().lock().insert((fetch.publisher.clone(), fetch.salt.clone()), now);
+        let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "publisher": fetch.publisher, "salt": fetch.salt }));
     }
     feed_files::forget_cancelled_fetches(CANCELLED_FETCH_GRACE);
-    if crate::commands::channels::require_ember(state).await.is_err() || state.db.chat_locked() {
+    // Not held back by a locked chat key: nothing of a feed is sealed with it.
+    if crate::commands::channels::require_ember(state).await.is_err() {
         return;
     }
     send_due_withdrawals(state, now).await;
@@ -2530,6 +2979,7 @@ async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
             fetch_owed(app, state, &feed.publisher, &feed.salt, now).await;
         }
     }
+    retry_auto_downloads(app, state, &followed, now).await;
     followed.sort_by_key(|feed| feed.checked_at);
     for feed in followed.iter().filter(|feed| lookup_due(feed, now)).take(LOOKUPS_PER_TICK) {
         look_up_head(app, state, &feed.publisher, &feed.salt).await;
@@ -2619,6 +3069,7 @@ mod tests {
             auto_max_day_mib: auto_day,
             auto_category: String::new(),
             folder: String::new(),
+            auto_since: 0,
         }
     }
 
@@ -2797,6 +3248,126 @@ mod tests {
         let blobs = vec![blob(&me, 5), blob(&me, 9), blob(&stranger, 50), vec![0u8; 10]];
         assert_eq!(best_head(&blobs, &pk, &salt).map(|h| h.sequence), Some(9));
         assert!(best_head(&blobs, &pk, &[7u8; 16]).is_none(), "another feed of theirs");
+
+        let large = {
+            let record = SignedRecord::feed_head_record(
+                &salt,
+                &FeedHead { list_size: MAX_LIST_BYTES + 1, ..head(12) },
+                &me,
+                1,
+            )
+            .unwrap();
+            [record.data, record.signature.to_vec()].concat()
+        };
+        let blobs = [blobs, vec![large]].concat();
+        assert_eq!(newest_head(&blobs, &pk, &salt).map(|h| h.sequence), Some(12), "a lookup sees it is too large");
+        assert_eq!(best_head(&blobs, &pk, &salt).map(|h| h.sequence), Some(9), "a republish keeps to one it can serve");
+    }
+
+    #[test]
+    fn a_list_fetch_gives_up_only_with_nothing_coming_or_after_its_most() {
+        let fetch = Fetching::new("p", "s", 1);
+        let start = fetch.started;
+        assert!(!fetch.stalled(start + FETCH_TIMEOUT - Duration::from_secs(1)));
+        assert!(fetch.stalled(start + FETCH_TIMEOUT), "no byte and no source");
+
+        let mut fetch = Fetching::new("p", "s", 1);
+        let start = fetch.started;
+        fetch.note(0, 1, start + FETCH_TIMEOUT - Duration::from_secs(1));
+        assert!(!fetch.stalled(start + FETCH_TIMEOUT), "queued at a source");
+        let later = start + FETCH_TIMEOUT * 2;
+        fetch.note(500, 0, later);
+        assert!(!fetch.stalled(later + FETCH_TIMEOUT - Duration::from_secs(1)), "bytes came");
+        fetch.note(400, 0, later + Duration::from_secs(60));
+        assert_eq!(fetch.bytes, 500, "a part file read short is not a loss");
+        assert!(fetch.stalled(later + FETCH_TIMEOUT), "fewer bytes are no progress");
+        fetch.note(0, 3, start + FETCH_MAX);
+        assert!(fetch.stalled(start + FETCH_MAX), "however busy, it has run its most");
+        assert_eq!(fetch.sources, 3);
+    }
+
+    #[test]
+    fn a_transfers_status_is_shown_as_its_items() {
+        use crate::types::TransferStatus as S;
+        assert_eq!(ItemStatus::of(&S::Active), ItemStatus::Downloading);
+        assert_eq!(ItemStatus::of(&S::Hashing), ItemStatus::Downloading);
+        assert_eq!(ItemStatus::of(&S::Searching), ItemStatus::Queued);
+        assert_eq!(ItemStatus::of(&S::Insufficient), ItemStatus::Queued);
+        assert_eq!(ItemStatus::of(&S::Stopped), ItemStatus::Paused);
+        assert_eq!(ItemStatus::of(&S::Failed), ItemStatus::Failed);
+        assert_eq!(ItemStatus::of(&S::Completed), ItemStatus::Done);
+        assert_eq!(serde_json::to_value(ItemStatus::InLibrary).unwrap(), "in_library");
+    }
+
+    #[test]
+    fn auto_download_takes_only_what_came_since_it_was_turned_on() {
+        let mut feed = followed(0, 0);
+        feed.auto_since = 100;
+        let listed = |first_seen: i64| FollowedItem { item: item("a.flac", 1), first_seen, is_new: true, removed: false, downloaded: false };
+        assert!(auto_takes(&feed, &listed(100)));
+        assert!(!auto_takes(&feed, &listed(99)), "there before");
+        assert!(!auto_takes(&feed, &FollowedItem { downloaded: true, ..listed(200) }), "asked for already");
+        assert!(!auto_takes(&feed, &FollowedItem { removed: true, ..listed(200) }), "no longer listed");
+        feed.auto_since = 0;
+        assert!(!auto_takes(&feed, &listed(200)), "no window yet");
+        feed.auto_since = 100;
+        feed.auto_download = false;
+        assert!(!auto_takes(&feed, &listed(200)), "off");
+    }
+
+    #[test]
+    fn auto_download_says_why_it_holds_a_file_back() {
+        let feed = followed(100, 150);
+        const MIB: i64 = 1024 * 1024;
+        assert_eq!(auto_hold_reason(&feed, &item("setup.exe", 1), 0), Some("risky"));
+        assert_eq!(auto_hold_reason(&feed, &item("big.mkv", 101), 0), Some("too_large"));
+        assert_eq!(auto_hold_reason(&feed, &item("track.flac", 60), 100 * MIB), Some("day_limit"));
+        assert_eq!(auto_hold_reason(&feed, &item("track.flac", 50), 100 * MIB), None, "exactly at the day's cap");
+        assert_eq!(auto_hold_reason(&followed(0, 0), &item("huge.mkv", 4000), i64::MAX), None, "no caps");
+    }
+
+    #[test]
+    fn a_feeds_files_are_found_in_its_folder_under_any_download_folder() {
+        let base = std::env::temp_dir().join(format!("ember-feed-files-{}-{}", std::process::id(), rand::random::<u64>()));
+        let (current, previous) = (base.join("now"), base.join("before"));
+        let put = |root: &Path, name: &str, bytes: &[u8]| {
+            let dir = crate::sharing::feed_downloads::folder_dir(root, "Mixes");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(name), bytes).unwrap();
+            dir.join(name)
+        };
+        let here = put(&current, "One.flac", b"abc");
+        put(&previous, "Two.flac", b"abcdef");
+        std::fs::create_dir_all(crate::sharing::feed_downloads::folder_dir(&current, "Mixes").join("sub")).unwrap();
+        let folders = DownloadFolders { current: current.clone(), previous: vec![previous.clone()] };
+        let finished = vec![
+            ("aa".to_string(), here.to_string_lossy().into_owned()),
+            ("bb".to_string(), current.join("gone.flac").to_string_lossy().into_owned()),
+        ];
+        let (on_disk, gone) = feed_folder_files(&folders, "Mixes", &finished);
+        assert_eq!(on_disk.get(&file_name_key("One.flac")), Some(&vec![3]));
+        assert_eq!(on_disk.get(&file_name_key("Two.flac")), Some(&vec![6]), "under an earlier download folder");
+        assert!(!on_disk.contains_key(&file_name_key("sub")), "a folder is not a file");
+        assert_eq!(gone.into_iter().collect::<Vec<_>>(), vec!["bb".to_string()]);
+        assert!(feed_folder_files(&folders, "", &[]).0.is_empty(), "no folder yet");
+        assert_eq!(file_name_key("A.flac") == file_name_key("a.flac"), cfg!(any(windows, target_os = "macos")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_list_is_whole_only_at_the_size_its_head_names() {
+        let dir = std::env::temp_dir().join(format!("ember-feed-whole-{}-{}", std::process::id(), rand::random::<u64>()));
+        let path = dir.join("lists").join("3.emulecollection");
+        assert!(!list_file_whole(&path, 0), "not there");
+        write_list(&path, b"hello").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        assert!(!path.with_extension("tmp").exists(), "renamed into place");
+        assert!(list_file_whole(&path, 5));
+        assert!(!list_file_whole(&path, 6), "cut short");
+        write_list(&path, b"hi").unwrap();
+        assert!(list_file_whole(&path, 2), "replaced");
+        assert!(!list_file_whole(&dir, 0), "a folder");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3050,13 +3621,13 @@ mod tests {
         };
         let listed = blob(&salt, &head, false, 100);
         let other = blob(&[5u8; 16], &head, false, 200);
-        assert_eq!(best_listed_head(&[listed.clone(), other.clone()], &publisher, &salt), Some(head.clone()));
-        assert_eq!(best_listed_head(std::slice::from_ref(&other), &publisher, &salt), None, "another feed's");
-        assert_eq!(best_listed_head(std::slice::from_ref(&listed), &[9u8; 32], &salt), None, "another publisher's");
+        assert_eq!(newest_listed_head(&[listed.clone(), other.clone()], &publisher, &salt), Some(head.clone()));
+        assert_eq!(newest_listed_head(std::slice::from_ref(&other), &publisher, &salt), None, "another feed's");
+        assert_eq!(newest_listed_head(std::slice::from_ref(&listed), &[9u8; 32], &salt), None, "another publisher's");
         let withdrawn = blob(&salt, &crate::network::ember::feed::withdrawal_head(), true, 300);
-        assert_eq!(best_listed_head(&[listed.clone(), withdrawn.clone()], &publisher, &salt), None);
+        assert_eq!(newest_listed_head(&[listed.clone(), withdrawn.clone()], &publisher, &salt), None);
         let relisted = blob(&salt, &head, false, 400);
-        assert_eq!(best_listed_head(&[withdrawn, relisted], &publisher, &salt), Some(head));
+        assert_eq!(newest_listed_head(&[withdrawn, relisted], &publisher, &salt), Some(head));
     }
 
     #[test]

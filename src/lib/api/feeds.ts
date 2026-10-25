@@ -51,19 +51,57 @@ export interface FollowedFeed {
   auto_max_item_mib: number;
   auto_max_day_mib: number;
   auto_category: string;
+  /** When auto-download was last turned on; it takes files first seen since. */
+  auto_since: number;
   /** The folder in Feeds its files finish in; empty before the first. */
   folder: string;
   link: string;
+  /** What its lookups and fetches are doing now. */
+  activity: FeedActivity;
+  /** Set by a follow of a feed already followed. */
+  already_following: boolean;
 }
+
+export interface FeedActivity {
+  looking: boolean;
+  /** Its last lookup reached no node. */
+  unreachable: boolean;
+  /** Its newest head names a list larger than Ember takes. */
+  too_large: boolean;
+  /** A fetch of its list running: seconds, bytes so far, sources. */
+  fetching: { secs: number; bytes: number; sources: number } | null;
+  /** When the next fetch may start after one gave up, in seconds; 0 if none did. */
+  retry_at: number;
+}
+
+/** What a lookup of a followed feed came to. */
+export type LookupOutcome = 'updated' | 'unchanged' | 'not_found' | 'unreachable' | 'too_large' | 'busy';
+
+/** What the download of a feed's file is doing. */
+export type FeedItemStatus =
+  | 'none'
+  | 'queued'
+  | 'downloading'
+  | 'paused'
+  | 'failed'
+  | 'done'
+  | 'in_library'
+  | 'missing';
 
 export interface FollowedItem extends FeedItem {
   first_seen: number;
   is_new: boolean;
   removed: boolean;
+  /** Downloaded or started from the feed at some point. */
   downloaded: boolean;
   /** A type that can run code or change settings: asked about before it is
    *  downloaded, and never downloaded automatically. */
   risky: boolean;
+  status: FeedItemStatus;
+  /** 0 to 100, for one on its way. */
+  progress: number;
+  /** Why auto-download has not started it. */
+  held: 'risky' | 'too_large' | 'day_limit' | null;
 }
 
 /** A feed listed in the public index. */
@@ -80,7 +118,7 @@ export interface DiscoveredFeed {
   listed_at: number;
   first_seen: number;
   link: string;
-  /** Its publisher signed the listing in the last day or so: running. */
+  /** Its publisher signed the listing in the last few hours: running. */
   active: boolean;
   following: boolean;
   own: boolean;
@@ -126,7 +164,8 @@ export const deleteFeed = (salt: string): Promise<void> => invoke('delete_feed',
 
 export const listFollowedFeeds = (): Promise<FollowedFeed[]> => invoke('list_followed_feeds');
 export const followFeed = (link: string): Promise<FollowedFeed> => invoke('follow_feed', { link });
-export const refreshFeed = (publisher: string, salt: string): Promise<void> =>
+/** Look again now, and fetch its list now if owed one. */
+export const refreshFeed = (publisher: string, salt: string): Promise<LookupOutcome> =>
   invoke('refresh_feed', { publisher, salt });
 export const getFeedItems = (publisher: string, salt: string): Promise<FollowedItem[]> =>
   invoke('get_feed_items', { publisher, salt });

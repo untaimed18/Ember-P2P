@@ -176,7 +176,18 @@ friends unless a step says otherwise, and C a follower who is not A's friend.
       the `https://www.emberp2p.org/feed/...` and `https://emberp2p.org/feed/...`
       forms. The feed and its files appear within a few minutes of a lookup
       or Check now; the feed shows "Looking for it…" until then, not an
-      error.
+      error. Check now says what it found (not found yet, no change, a new
+      version, or the network unreachable).
+- [ ] While the list downloads, the line under the feed's title reads
+      "Fetching the file list (sources: N)…". With A closed and no other
+      follower online, after 30 minutes it reads that nobody sent the list
+      yet with the minutes until the next try, and Retry starts one at once.
+      With A open again it arrives.
+- [ ] A behind a firewall or NAT it cannot open (no UPnP, no forwarded
+      port), with a library of several thousand shared files: C follows a
+      new feed of A's and gets its list within a few minutes, without
+      waiting for A's whole library to be published. B, A's friend and
+      connected to A, gets it straight from A.
 - [ ] A feed published more than a day ago, untouched since and with A
       running all along: B, a friend, follows it fresh and has it within an
       hour (the hourly republish pushes it) and C, not a friend, within a few
@@ -192,15 +203,28 @@ friends unless a step says otherwise, and C a follower who is not A's friend.
       editor says which file was left out because it is no longer shared
       with everyone, and the publish leaves it out.
 - [ ] Auto-download: on a feed B has just followed, the caps show 1024 and
-      4096 MiB before it is turned on, and turning it on keeps them. A file
-      over the per-file cap is not started, and files are started only up
-      to the 24-hour cap; the rest wait for Download. Both caps set to 0
-      and saved stay 0, and nothing is held back by size.
+      4096 MiB before it is turned on, and turning it on keeps them. Files
+      already in the feed are not started; files A adds after it was turned
+      on are. A file over the per-file cap is not started, and files are
+      started only up to the 24-hour cap; each held-back file says why, and
+      one held by the 24-hour cap starts by itself once the day's total
+      allows (Ember looks every 10 minutes). Both caps set to 0 and saved
+      stay 0, and nothing is held back by size. Turning it off and on again
+      takes only files added after the second time.
+- [ ] Item states: a file B downloads shows Queued, then its percentage
+      with a bar, then Done; pausing it in Transfers shows Paused, and a
+      failed one shows Retry, which starts it again. A file B already has in
+      its Library shows "In your Library". B removes a finished one from
+      Transfers and deletes it from the feed folder: it shows "No longer on
+      disk" and Download starts it again. "Download all new" shows the count
+      and total size, and its toast's "Show in Transfers" opens Transfers.
 - [ ] Risky types (`.exe`, `.msi`, `.bat`, `.ps1`, `.lnk`, `.iso`, `.docm`,
       and `video.mp4.exe`) are never started automatically, whatever the
       caps. They carry a "Can run code" badge, and Download (one, or
       Download all new with one among them) asks first; Download anyway
-      starts them, Cancel starts nothing.
+      starts them, "Download the others" starts all but them, Cancel starts
+      nothing. On Linux, `.sh`, `.desktop`, `.AppImage`, `.flatpakref` and
+      `.snap` are risky too.
 - [ ] Feeds folder: a file B downloads from A's feed, by hand or
       automatically, finishes in `<download folder>\Feeds\<feed title>\`,
       not in `Downloads`. The feed's header button opens that folder (or
@@ -238,22 +262,37 @@ friends unless a step says otherwise, and C a follower who is not A's friend.
       not fetch that list again; a correct publish after it clears the mark.
 - [ ] A deletes the published list file under its data folder's `feeds\`
       while Ember is closed. At the next start it is written again and
-      followers still fetch it.
+      followers still fetch it. The same with the file cut short instead
+      (truncate it to half its size): it is rewritten, never served short.
+- [ ] A feed whose list would pass 2 MiB (2,000 files with long notes)
+      refuses to publish, saying the list is too large; the previous
+      version stays published.
+- [ ] My feeds shows "N of 8"; with 8 feeds New feed is disabled and its
+      tooltip says why. A published feed's link shows under its
+      description with Copy link; a draft says the link works once
+      published. Deleting a feed warns that its link stops working for good.
+- [ ] With chat history locked because its key could not be recovered,
+      followed feeds still update and auto-download, and A's feeds still
+      republish.
 - [ ] Unfollow: the feed and its list go, the list is no longer served, and
       files already downloaded stay.
 - [ ] Discover: A creates one feed Listed in Discover and one Link only, and
       publishes both. Within a minute or so of Search again, C's Discover
       shows the listed one (Publisher active), never the link-only one, and
-      A sees its own marked Yours. C follows from the card; it opens under
-      Following with Open.
+      A sees its own marked Yours, with Edit opening it under My feeds. C
+      follows from the card; it opens under Following with Open. Following
+      a feed C already follows says so. The cards keep their order while a
+      search fills in; Sort orders them by activity, update, files or name.
 - [ ] A turns List in Discover off: C's next search no longer shows it. A
       turns it on again: it comes back. A deletes a listed feed, also once
       with Ember off and then turned on: it leaves C's Discover. A feed
       created listed and switched to link only before its first publish is
       never shown.
 - [ ] C hides one feed, then everything from its publisher, including
-      during a search; neither comes back when the search ends. Show hidden
-      again brings them back. The publisher ID on a card filters to that
+      during a search; neither comes back when the search ends. Undo on the
+      toast brings one back at once. Show hidden again asks first, then
+      brings them all back. The card's … menu works from the keyboard
+      (arrows, Escape returns focus to the button). The publisher ID on a card filters to that
       publisher's feeds; the chip's x clears it.
 - [ ] With A closed for two days, C still lists A's feed, now "Publisher
       last seen 2 days ago", and the Active filter leaves it out.

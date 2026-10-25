@@ -96,7 +96,9 @@ impl RootListing {
         Self {
             parts: crate::storage::part_folders::part_names(root),
             // Category and feed folders too: a completion copy is made beside
-            // where the file is published.
+            // where the file is published. Feed folders always: they are
+            // small, and a drive without hard links (FAT, exFAT) makes a copy
+            // of every completion, on one volume too.
             copies: if copies {
                 crate::storage::category_folders::finished_download_dirs(root)
                     .into_iter()
@@ -104,7 +106,10 @@ impl RootListing {
                     .flat_map(|dir| ed2k::transfer::earlier_completion_copies(&dir))
                     .collect()
             } else {
-                Vec::new()
+                crate::sharing::feed_downloads::finished_dirs(root)
+                    .into_iter()
+                    .flat_map(|dir| ed2k::transfer::earlier_completion_copies(&dir))
+                    .collect()
             },
         }
     }

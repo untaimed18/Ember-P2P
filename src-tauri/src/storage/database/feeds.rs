@@ -145,6 +145,9 @@ pub struct FollowedFeed {
     /// The folder in `Feeds` its files finish in, fixed by the first one
     /// downloaded; empty before.
     pub folder: String,
+    /// When auto-download was last turned on: it takes the files first seen
+    /// since. 0 when it was turned on before this was kept.
+    pub auto_since: i64,
 }
 
 /// An item of a followed feed's list, with what this side knows of it.
@@ -312,6 +315,8 @@ impl Database {
             ("feeds_own", "refreshed_at", "INTEGER NOT NULL DEFAULT 0"),
             // The folder in `Feeds` its files finish in; empty until the first.
             ("feeds_followed", "folder", "TEXT NOT NULL DEFAULT ''"),
+            // When auto-download was last turned on; 0 if not since this column.
+            ("feeds_followed", "auto_since", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             let present: bool = conn.query_row(
                 "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2",
@@ -704,7 +709,8 @@ impl Database {
         Self::ensure_feeds_locked(&conn)?;
         let select = "SELECT publisher, salt, title, description, sequence, list_ed2k, list_blake3, list_size,
                     item_count, state, list_sequence, unread, followed_at, checked_at, auto_download,
-                    auto_max_item_mib, auto_max_day_mib, auto_category, held_ed2k, held_blake3, held_size, folder
+                    auto_max_item_mib, auto_max_day_mib, auto_category, held_ed2k, held_blake3, held_size, folder,
+                    auto_since
              FROM feeds_followed";
         let map = |row: &rusqlite::Row<'_>| {
             Ok(FollowedFeed {
@@ -730,6 +736,7 @@ impl Database {
                 held_blake3: row.get(19)?,
                 held_size: row.get(20)?,
                 folder: row.get(21)?,
+                auto_since: row.get(22)?,
             })
         };
         let rows = match key {
@@ -841,6 +848,14 @@ impl Database {
             params![publisher, salt],
             |row| row.get(0),
         )?;
+        // Auto-download turned on before it came takes none of it either.
+        if first {
+            tx.execute(
+                "UPDATE feeds_followed SET auto_since = MAX(auto_since, ?3)
+                 WHERE publisher = ?1 AND salt = ?2 AND auto_since > 0",
+                params![publisher, salt, now.saturating_add(1)],
+            )?;
+        }
         // Each item held, and whether the publisher had removed it.
         let held: std::collections::HashMap<String, bool> = {
             let mut stmt =
@@ -923,9 +938,11 @@ impl Database {
         let conn = self.conn.lock();
         Self::ensure_feeds_locked(&conn)?;
         let mut stmt = conn.prepare(
+            // Newest first, and each list's new files in the order the
+            // publisher put them.
             "SELECT ed2k, name, size, aich, blake3, note, first_seen, is_new, removed, downloaded
              FROM feeds_followed_items WHERE publisher = ?1 AND salt = ?2
-             ORDER BY removed, first_seen DESC, rowid DESC",
+             ORDER BY removed, first_seen DESC, rowid ASC",
         )?;
         let rows = stmt
             .query_map(params![publisher, salt], |row| {
@@ -975,6 +992,8 @@ impl Database {
         Ok(())
     }
 
+    /// Set a followed feed's auto-download. Turned on from off at `now`, it
+    /// takes the files first seen from then.
     #[allow(clippy::too_many_arguments)]
     pub fn feed_set_auto_download(
         &self,
@@ -984,15 +1003,29 @@ impl Database {
         max_item_mib: i64,
         max_day_mib: i64,
         category: &str,
+        now: i64,
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         Self::ensure_feeds_locked(&conn)?;
         Ok(conn.execute(
-            "UPDATE feeds_followed SET auto_download = ?3, auto_max_item_mib = ?4, auto_max_day_mib = ?5,
-                    auto_category = ?6
+            "UPDATE feeds_followed SET
+                    auto_since = CASE WHEN ?3 AND auto_download = 0 THEN ?7 ELSE auto_since END,
+                    auto_download = ?3, auto_max_item_mib = ?4, auto_max_day_mib = ?5, auto_category = ?6
              WHERE publisher = ?1 AND salt = ?2",
-            params![publisher, salt, enabled, max_item_mib, max_day_mib, category],
+            params![publisher, salt, enabled, max_item_mib, max_day_mib, category, now],
         )? > 0)
+    }
+
+    /// Start a feed's auto-download window at `now` when it has none: one
+    /// turned on before the window was kept takes only what comes from now.
+    pub fn feed_start_auto_since(&self, publisher: &str, salt: &str, now: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_feeds_locked(&conn)?;
+        conn.execute(
+            "UPDATE feeds_followed SET auto_since = ?3 WHERE publisher = ?1 AND salt = ?2 AND auto_since = 0",
+            params![publisher, salt, now],
+        )?;
+        Ok(())
     }
 
     /// Bytes auto-download has started for a feed in the
@@ -1395,6 +1428,47 @@ mod tests {
     }
 
     #[test]
+    fn auto_download_takes_files_from_when_it_was_last_turned_on() {
+        let (db, path) = db("auto-since");
+        db.feed_follow(PUB, SALT, 1).unwrap();
+        let since = |salt: &str| db.feed_followed(PUB, salt).unwrap().unwrap().auto_since;
+        assert_eq!(since(SALT), 0);
+        assert!(db.feed_set_auto_download(PUB, SALT, true, 0, 0, "", 100).unwrap());
+        assert_eq!(since(SALT), 100);
+        db.feed_set_auto_download(PUB, SALT, true, 50, 0, "", 200).unwrap();
+        assert_eq!(since(SALT), 100, "a cap changed while on");
+        db.feed_set_auto_download(PUB, SALT, false, 50, 0, "", 300).unwrap();
+        assert_eq!(since(SALT), 100);
+        db.feed_set_auto_download(PUB, SALT, true, 50, 0, "", 400).unwrap();
+        assert_eq!(since(SALT), 400, "turned on again");
+        assert!(!db.feed_set_auto_download(PUB, "nope", true, 0, 0, "", 500).unwrap(), "not followed");
+
+        db.feed_follow(PUB, "older", 1).unwrap();
+        db.feed_start_auto_since(PUB, "older", 50).unwrap();
+        db.feed_start_auto_since(PUB, "older", 60).unwrap();
+        assert_eq!(since("older"), 50, "started once");
+        db.feed_start_auto_since(PUB, SALT, 900).unwrap();
+        assert_eq!(since(SALT), 400, "one already started is kept");
+
+        assert!(take_head(&db, 10));
+        db.feed_take_list(PUB, SALT, 10, &[item("a", "A")], 500).unwrap().unwrap();
+        assert_eq!(since(SALT), 501, "turned on before the first list came, which brings nothing to take");
+        let first_seen = db.feed_followed_items(PUB, SALT).unwrap()[0].first_seen;
+        assert!(first_seen < since(SALT));
+        assert!(take_head(&db, 20));
+        db.feed_take_list(PUB, SALT, 20, &[item("a", "A"), item("b", "B")], 600).unwrap().unwrap();
+        assert_eq!(since(SALT), 501, "a later list leaves it");
+        let new = db.feed_followed_items(PUB, SALT).unwrap().into_iter().find(|i| i.item.ed2k == "b").unwrap();
+        assert!(new.first_seen >= since(SALT), "what it adds is taken");
+
+        db.feed_follow(PUB, "off", 1).unwrap();
+        db.feed_take_head(PUB, "off", 10, "T", "", "l", "b", 5, 1, 100).unwrap();
+        db.feed_take_list(PUB, "off", 10, &[item("a", "A")], 700).unwrap().unwrap();
+        assert_eq!(since("off"), 0, "never turned on stays so");
+        drop_db(db, path);
+    }
+
+    #[test]
     fn feeds_and_publishers_are_hidden_and_shown_again() {
         let (db, path) = db("hidden");
         db.feed_set_hidden(PUB, "a", true).unwrap();
@@ -1552,7 +1626,7 @@ mod tests {
             "the column defaults"
         );
 
-        db.feed_set_auto_download(PUB, SALT, true, 0, 0, "").unwrap();
+        db.feed_set_auto_download(PUB, SALT, true, 0, 0, "", 1).unwrap();
         let feed = db.feed_followed(PUB, SALT).unwrap().unwrap();
         assert_eq!((feed.auto_download, feed.auto_max_item_mib, feed.auto_max_day_mib), (true, 0, 0));
         drop_db(db, path);
