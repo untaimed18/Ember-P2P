@@ -2966,6 +2966,8 @@
   "settings_window_on_launch_hint": "Dónde aparece la ventana cuando se inicia Ember. Se aplica la próxima vez que abras la aplicación.",
   "settings_close_behavior_label": "Al cerrar la ventana",
   "settings_close_behavior_hint": "Qué pasa cuando pulsas la X de la barra de título. Minimizado en la bandeja, Ember sigue descargando y compartiendo, y puedes reabrirlo desde su icono en la bandeja. Al salir se detienen todas las transferencias.",
+  "settings_minimize_to_tray_label": "Minimizar a la bandeja",
+  "settings_minimize_to_tray_hint": "Al minimizar la ventana, se oculta en la bandeja del sistema en lugar de la barra de tareas. Sin icono en la bandeja, la ventana se minimiza como siempre.",
   "settings_close_behavior_ask": "Preguntar cada vez",
   "settings_close_behavior_ask_desc": "Mostrar un diálogo con ambas opciones",
   "settings_close_behavior_tray": "Minimizar a la bandeja",

@@ -2974,6 +2974,8 @@
   "settings_window_on_launch_hint": "Where the window appears when Ember starts. Takes effect the next time you launch the app.",
   "settings_close_behavior_label": "When closing the window",
   "settings_close_behavior_hint": "What happens when you click the X in the window's title bar. Minimized to the tray, Ember keeps downloading and sharing, and you can reopen it from its tray icon. Exiting stops all transfers.",
+  "settings_minimize_to_tray_label": "Minimize to the tray",
+  "settings_minimize_to_tray_hint": "When you minimize the window, hide it in the system tray instead of the taskbar. Without a tray icon the window minimizes as usual.",
   "settings_close_behavior_ask": "Ask each time",
   "settings_close_behavior_ask_desc": "Show a dialog with both options",
   "settings_close_behavior_tray": "Minimize to tray",

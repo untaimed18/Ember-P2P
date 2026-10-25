@@ -217,6 +217,10 @@ pub struct AppState {
     /// in `update_settings` and `set_close_behavior`. Holds one of the
     /// validated strings: `"ask"`, `"tray"`, or `"exit"`.
     pub close_behavior: Arc<parking_lot::RwLock<String>>,
+    /// Mirror of `config.settings.minimize_to_tray`, for the same reason as
+    /// `close_behavior`: the minimize is seen on the UI thread. Updated in
+    /// `update_settings`.
+    pub minimize_to_tray: Arc<AtomicBool>,
     /// Deep-link payloads (ed2k:// URIs or `.emulecollection` file paths)
     /// captured from the launch arguments or a second instance's argv before
     /// the webview was ready to handle them. The frontend drains this buffer

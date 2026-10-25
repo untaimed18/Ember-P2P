@@ -1911,6 +1911,11 @@ pub struct AppSettings {
     /// users on older configs.
     #[serde(default = "default_close_to_tray_behavior")]
     pub close_to_tray_behavior: String,
+    /// Hide the main window to the system tray when it is minimized, instead
+    /// of leaving it on the taskbar. Without a visible tray icon the window
+    /// stays minimized. Off by default.
+    #[serde(default)]
+    pub minimize_to_tray: bool,
     /// Maximize the main window when Ember launches.
     ///
     /// The window is created at its configured size (see `tauri.conf.json`)
@@ -3049,6 +3054,7 @@ impl Default for AppSettings {
             max_relay_sessions: default_max_relay_sessions(),
             quic_shares_udp_port: true,
             close_to_tray_behavior: default_close_to_tray_behavior(),
+            minimize_to_tray: false,
             launch_maximized: false,
             silent_update_enabled: false,
             notifications_enabled: true,

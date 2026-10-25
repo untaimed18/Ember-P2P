@@ -2966,6 +2966,8 @@
   "settings_window_on_launch_hint": "Où la fenêtre apparaît au démarrage d’Ember. Prend effet au prochain lancement de l’application.",
   "settings_close_behavior_label": "À la fermeture de la fenêtre",
   "settings_close_behavior_hint": "Ce qui se passe lorsque vous cliquez sur le X de la barre de titre. Réduit dans la zone de notification, Ember continue de télécharger et de partager, et vous pouvez le rouvrir depuis son icône. Quitter arrête tous les transferts.",
+  "settings_minimize_to_tray_label": "Réduire dans la zone de notification",
+  "settings_minimize_to_tray_hint": "Lorsque vous réduisez la fenêtre, elle est masquée dans la zone de notification plutôt que dans la barre des tâches. Sans icône de notification, la fenêtre se réduit normalement.",
   "settings_close_behavior_ask": "Demander à chaque fois",
   "settings_close_behavior_ask_desc": "Afficher une boîte de dialogue avec les deux options",
   "settings_close_behavior_tray": "Réduire dans la zone de notification",

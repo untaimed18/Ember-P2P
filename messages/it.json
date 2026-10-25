@@ -2966,6 +2966,8 @@
   "settings_window_on_launch_hint": "Dove compare la finestra all’avvio di Ember. Ha effetto dal prossimo avvio dell’app.",
   "settings_close_behavior_label": "Alla chiusura della finestra",
   "settings_close_behavior_hint": "Cosa succede quando clicchi la X nella barra del titolo. Ridotto nell’area di notifica, Ember continua a scaricare e condividere, e puoi riaprirlo dalla sua icona. Uscire interrompe tutti i trasferimenti.",
+  "settings_minimize_to_tray_label": "Riduci nell’area di notifica",
+  "settings_minimize_to_tray_hint": "Quando riduci a icona la finestra, viene nascosta nell’area di notifica anziché nella barra delle applicazioni. Senza icona nell’area di notifica, la finestra si riduce come di consueto.",
   "settings_close_behavior_ask": "Chiedi ogni volta",
   "settings_close_behavior_ask_desc": "Mostra una finestra di dialogo con entrambe le opzioni",
   "settings_close_behavior_tray": "Riduci a icona",

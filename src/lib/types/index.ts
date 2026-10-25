@@ -1065,6 +1065,9 @@ export interface AppSettings {
    *  - `'exit'`: fully quit the application.
    */
   close_to_tray_behavior: 'ask' | 'tray' | 'exit';
+  /** Hide the main window to the system tray when it is minimized. Without a
+   *  visible tray icon the window stays minimized. Off by default. */
+  minimize_to_tray: boolean;
   /** Maximize the main window on launch. Applied once at startup (the
    *  window is created at its configured size), so a change only affects
    *  the next launch. Off by default. */

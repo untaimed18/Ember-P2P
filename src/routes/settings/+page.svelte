@@ -2982,6 +2982,18 @@
               </div>
               <span class="hint">{m.settings_close_behavior_hint()}</span>
             </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="minimize-to-tray-label" for="minimize-to-tray-switch">{m.settings_minimize_to_tray_label()}</label>
+                <span class="hint" id="minimize-to-tray-hint">{m.settings_minimize_to_tray_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="minimize-to-tray-switch"
+                bind:checked={settings.minimize_to_tray}
+                ariaLabelledby="minimize-to-tray-label"
+                ariaDescribedby="minimize-to-tray-hint"
+              />
+            </div>
           </div>
 
           <div class="settings-group">

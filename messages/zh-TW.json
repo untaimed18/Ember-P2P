@@ -2966,6 +2966,8 @@
   "settings_window_on_launch_hint": "Ember 啟動時視窗顯示的位置。下次啟動應用程式時生效。",
   "settings_close_behavior_label": "關閉視窗時",
   "settings_close_behavior_hint": "點選標題欄 × 時的行為。最小化到托盤後，Ember 會繼續下載和共享，可從托盤圖示重新開啟。退出會停止所有傳輸。",
+  "settings_minimize_to_tray_label": "最小化到系統匣",
+  "settings_minimize_to_tray_hint": "最小化視窗時，將其隱藏到系統匣而非工作列。沒有系統匣圖示時，視窗會照常最小化。",
   "settings_close_behavior_ask": "每次詢問",
   "settings_close_behavior_ask_desc": "彈出對話方塊顯示兩個選項",
   "settings_close_behavior_tray": "最小化到托盤",

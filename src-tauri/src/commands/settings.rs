@@ -1986,6 +1986,9 @@ pub async fn update_settings(
     // with the canonical config so that a behavior change made here takes
     // effect on the very next title-bar X click without restarting.
     *state.close_behavior.write() = settings.close_to_tray_behavior.clone();
+    state
+        .minimize_to_tray
+        .store(settings.minimize_to_tray, std::sync::atomic::Ordering::Release);
 
     // Through the schedule, not straight from the form. While a timetable
     // window is open the caps in force are the rule's, and applying the manual

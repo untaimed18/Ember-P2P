@@ -2974,6 +2974,8 @@
   "settings_window_on_launch_hint": "Wo das Fenster beim Start von Ember erscheint. Gilt ab dem nächsten Start der App.",
   "settings_close_behavior_label": "Beim Schließen des Fensters",
   "settings_close_behavior_hint": "Was passiert, wenn Sie auf das X in der Titelleiste klicken. In den Infobereich minimiert lädt Ember weiter herunter und teilt weiter; Sie öffnen es über das Symbol im Infobereich wieder. Beenden stoppt alle Übertragungen.",
+  "settings_minimize_to_tray_label": "In den Infobereich minimieren",
+  "settings_minimize_to_tray_hint": "Beim Minimieren wird das Fenster im Infobereich statt in der Taskleiste verborgen. Ohne Tray-Symbol wird das Fenster wie gewohnt minimiert.",
   "settings_close_behavior_ask": "Jedes Mal fragen",
   "settings_close_behavior_ask_desc": "Dialog mit beiden Optionen anzeigen",
   "settings_close_behavior_tray": "In den Infobereich minimieren",

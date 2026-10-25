@@ -1175,6 +1175,9 @@ pub fn run() {
                 close_behavior: Arc::new(parking_lot::RwLock::new(
                     settings.close_to_tray_behavior.clone(),
                 )),
+                minimize_to_tray: Arc::new(std::sync::atomic::AtomicBool::new(
+                    settings.minimize_to_tray,
+                )),
                 pending_deep_links: Arc::new(parking_lot::Mutex::new(pending_deep_links)),
                 runtime_status: Arc::new(parking_lot::RwLock::new(Default::default())),
             });
@@ -2841,6 +2844,21 @@ pub fn run() {
                     tauri::async_runtime::spawn(async move {
                         commands::sharing::share_dropped_paths(app_handle, paths).await;
                     });
+                }
+                return;
+            }
+
+            // Tauri has no minimize event; a minimize arrives as a resize.
+            if let tauri::WindowEvent::Resized(_) = event {
+                let wants_tray = window.app_handle().try_state::<AppState>().is_some_and(|state| {
+                    state.minimize_to_tray.load(std::sync::atomic::Ordering::Acquire)
+                });
+                // Without a visible tray icon the hidden window could not be
+                // reached again, so it stays minimized on the taskbar.
+                if wants_tray && tray::reachable() && window.is_minimized().unwrap_or(false) {
+                    if let Err(e) = window.hide() {
+                        tracing::warn!("Failed to hide window for minimize-to-tray: {e}");
+                    }
                 }
                 return;
             }

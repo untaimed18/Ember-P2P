@@ -2966,6 +2966,8 @@
   "settings_window_on_launch_hint": "Ember 启动时窗口显示的位置。下次启动应用时生效。",
   "settings_close_behavior_label": "关闭窗口时",
   "settings_close_behavior_hint": "点击标题栏 × 时的行为。最小化到托盘后，Ember 会继续下载和共享，可从托盘图标重新打开。退出会停止所有传输。",
+  "settings_minimize_to_tray_label": "最小化到托盘",
+  "settings_minimize_to_tray_hint": "最小化窗口时，将其隐藏到系统托盘而不是任务栏。没有托盘图标时，窗口照常最小化。",
   "settings_close_behavior_ask": "每次询问",
   "settings_close_behavior_ask_desc": "弹出对话框显示两个选项",
   "settings_close_behavior_tray": "最小化到托盘",
