@@ -7,6 +7,7 @@
   import { page } from '$app/state';
   import { beforeNavigate, goto } from '$app/navigation';
   import { navigatingForDeepLink } from '$lib/deepLinkNavigation';
+  import { ctxMenuPosition } from '$lib/actions/ctxMenu';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import {
     cachedDiscoveredFeeds,
@@ -76,7 +77,7 @@
     tab = next;
     compose = null;
     listQuery = '';
-    menuFor = null;
+    menu = null;
     if (next === 'discover') void openDiscover();
   }
 
@@ -444,8 +445,20 @@
   let discoverFilter = $state<'all' | 'active'>('all');
   let discoverLimit = $state(DISCOVER_PAGE);
   let hiddenCount = $state(0);
-  /** The card whose menu is open. */
-  let menuFor = $state<string | null>(null);
+  /** The card menu open, with where its button is: the app's own
+   *  `ctx-menu`, fixed to the window, so neither the next card nor the
+   *  scrolling grid can cover or clip it. */
+  let menu = $state<{ feed: DiscoveredFeed; x: number; y: number } | null>(null);
+  let menuFor = $derived(menu ? keyOf(menu.feed) : null);
+
+  function toggleMenu(feed: DiscoveredFeed, button: HTMLElement) {
+    if (menuFor === keyOf(feed)) {
+      menu = null;
+      return;
+    }
+    const rect = button.getBoundingClientRect();
+    menu = { feed, x: rect.left, y: rect.bottom + 4 };
+  }
   /** Feeds being followed from Discover. */
   let followingFromDiscover = $state<Set<string>>(new Set());
   /** The walk whose shards are taken; any other's are stale. */
@@ -576,7 +589,7 @@
   }
 
   async function hideDiscovered(feed: DiscoveredFeed, wholePublisher: boolean) {
-    menuFor = null;
+    menu = null;
     try {
       await setDiscoveredFeedHidden(feed.publisher, wholePublisher ? null : feed.salt, true);
       if (discovering) hiddenMeanwhile.add(wholePublisher ? `${feed.publisher}/` : keyOf(feed));
@@ -906,15 +919,22 @@
     const onFocus = () => void markShownRead();
     window.addEventListener('focus', onFocus);
     document.addEventListener('visibilitychange', onFocus);
-    // A card's menu closes on a click anywhere else, or Escape.
+    // A card's menu closes on a click anywhere else, Escape, or the window
+    // changing size, which would leave it beside a card that moved.
     const closeMenu = (e: Event) => {
-      if (menuFor === null) return;
-      if (e instanceof KeyboardEvent ? e.key === 'Escape' : !(e.target as Element | null)?.closest?.('.card-menu-wrap')) {
-        menuFor = null;
+      if (menu === null) return;
+      if (
+        e.type === 'resize' ||
+        (e instanceof KeyboardEvent
+          ? e.key === 'Escape'
+          : !(e.target as Element | null)?.closest?.('.feed-card-menu, .card-menu-btn'))
+      ) {
+        menu = null;
       }
     };
     window.addEventListener('pointerdown', closeMenu);
     window.addEventListener('keydown', closeMenu);
+    window.addEventListener('resize', closeMenu);
     const clock = setInterval(() => (now = Math.floor(Date.now() / 1000)), 60_000);
     return () => {
       alive = false;
@@ -925,6 +945,7 @@
       document.removeEventListener('visibilitychange', onFocus);
       window.removeEventListener('pointerdown', closeMenu);
       window.removeEventListener('keydown', closeMenu);
+      window.removeEventListener('resize', closeMenu);
     };
   });
 </script>
@@ -1403,7 +1424,7 @@
         </div>
         <p class="discover-hint">{m.feeds_discover_hint()}</p>
 
-        <div class="discover-scroll">
+        <div class="discover-scroll" onscroll={() => (menu = null)}>
           {#if discoverMatches.length === 0}
             <p class="list-empty">{m.feeds_no_matches()}</p>
           {/if}
@@ -1415,61 +1436,41 @@
                 <header class="discover-card-head">
                   <span class="feed-avatar" style:--feed-hue={hueOf(feed.publisher)}>{@render feedGlyph()}</span>
                   <div class="discover-card-title">
-                    <h3><bdi dir="auto">{feed.title}</bdi></h3>
-                    <p class="discover-seen" class:active={feed.active}>
-                      <span class="status-dot" class:published={feed.active} aria-hidden="true"></span>
-                      <span title={feed.active ? m.feeds_discover_active_title() : undefined}>{seenText(feed)}</span>
+                    <h3 title={feed.title}><bdi dir="auto">{feed.title}</bdi></h3>
+                    <p class="discover-seen">
+                      <span class="seen-state" class:active={feed.active} title={feed.active ? m.feeds_discover_active_title() : undefined}>
+                        <span class="status-dot" class:published={feed.active} aria-hidden="true"></span>
+                        {seenText(feed)}
+                      </span>
+                      <span class="seen-sep" aria-hidden="true">·</span>
+                      <button
+                        type="button"
+                        class="publisher-key"
+                        title={m.feeds_discover_publisher({ id: feed.publisher })}
+                        aria-label={`${m.feeds_discover_publisher({ id: shortKey(feed.publisher) })}: ${m.feeds_discover_by_publisher()}`}
+                        onclick={() => (discoverPublisher = feed.publisher)}
+                      >{shortKey(feed.publisher)}</button>
                     </p>
                   </div>
-                  <div class="card-menu-wrap">
-                    <button
-                      type="button"
-                      class="icon-btn sm"
-                      aria-haspopup="menu"
-                      aria-expanded={menuFor === key}
-                      title={m.feeds_discover_more()}
-                      aria-label={m.feeds_discover_more()}
-                      onclick={() => (menuFor = menuFor === key ? null : key)}
-                    >
-                      <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                        <circle cx="3.5" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="12.5" cy="8" r="1.3"/>
-                      </svg>
-                    </button>
-                    {#if menuFor === key}
-                      <div class="card-menu" role="menu">
-                        <button type="button" role="menuitem" onclick={() => { menuFor = null; void copy(feed.link); }}>
-                          {m.feeds_copy_link()}
-                        </button>
-                        {#if discoverPublisher !== feed.publisher}
-                          <button type="button" role="menuitem" onclick={() => { menuFor = null; discoverPublisher = feed.publisher; }}>
-                            {m.feeds_discover_by_publisher()}
-                          </button>
-                        {/if}
-                        {#if !feed.own}
-                          <button type="button" role="menuitem" onclick={() => void hideDiscovered(feed, false)}>
-                            {m.feeds_discover_hide()}
-                          </button>
-                          <button type="button" role="menuitem" onclick={() => void hideDiscovered(feed, true)}>
-                            {m.feeds_discover_hide_publisher()}
-                          </button>
-                        {/if}
-                      </div>
-                    {/if}
-                  </div>
+                  <button
+                    type="button"
+                    class="icon-btn sm card-menu-btn"
+                    aria-haspopup="menu"
+                    aria-expanded={menuFor === key}
+                    title={m.feeds_discover_more()}
+                    aria-label={m.feeds_discover_more()}
+                    onclick={(e) => toggleMenu(feed, e.currentTarget)}
+                  >
+                    <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                      <circle cx="3.5" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="12.5" cy="8" r="1.3"/>
+                    </svg>
+                  </button>
                 </header>
                 {#if feed.description}
-                  <p class="discover-description"><bdi dir="auto">{feed.description}</bdi></p>
+                  <p class="discover-description" title={feed.description}><bdi dir="auto">{feed.description}</bdi></p>
                 {/if}
                 <footer class="discover-card-foot">
                   <span class="discover-meta">
-                    <button
-                      type="button"
-                      class="publisher-key"
-                      title={feed.publisher}
-                      aria-label={m.feeds_discover_by_publisher()}
-                      onclick={() => (discoverPublisher = feed.publisher)}
-                    >{m.feeds_discover_publisher({ id: shortKey(feed.publisher) })}</button>
-                    <span aria-hidden="true">·</span>
                     <span>{m.feeds_items_count({ count: formatNumber(feed.item_count) })}</span>
                     {#if feed.sequence > 0}
                       <span aria-hidden="true">·</span>
@@ -1494,6 +1495,33 @@
               </article>
             {/each}
           </div>
+          {#if menu}
+            {@const feed = menu.feed}
+            <div
+              class="ctx-menu feed-card-menu"
+              role="menu"
+              tabindex="-1"
+              use:ctxMenuPosition={{ x: menu.x, y: menu.y }}
+            >
+              <button type="button" class="ctx-item" role="menuitem" onclick={() => { menu = null; void copy(feed.link); }}>
+                {m.feeds_copy_link()}
+              </button>
+              {#if discoverPublisher !== feed.publisher}
+                <button type="button" class="ctx-item" role="menuitem" onclick={() => { menu = null; discoverPublisher = feed.publisher; }}>
+                  {m.feeds_discover_by_publisher()}
+                </button>
+              {/if}
+              {#if !feed.own}
+                <div class="ctx-sep" role="separator"></div>
+                <button type="button" class="ctx-item" role="menuitem" onclick={() => void hideDiscovered(feed, false)}>
+                  {m.feeds_discover_hide()}
+                </button>
+                <button type="button" class="ctx-item ctx-danger" role="menuitem" onclick={() => void hideDiscovered(feed, true)}>
+                  {m.feeds_discover_hide_publisher()}
+                </button>
+              {/if}
+            </div>
+          {/if}
           {#if discoverMatches.length > discoverShown.length}
             <div class="discover-more">
               <button type="button" class="secondary" onclick={() => (discoverLimit += DISCOVER_PAGE)}>
@@ -2964,30 +2992,27 @@
   }
 
   .discover-card {
-    position: relative;
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 10px;
     min-width: 0;
-    padding: 12px;
+    min-height: 148px;
+    padding: 14px 14px 12px;
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     background: var(--bg-primary);
-    transition: border-color var(--transition-fast);
+    transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
   }
 
   .discover-card:hover,
   .discover-card.menu-open {
     border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
-  }
-
-  .discover-card.menu-open {
-    z-index: 2;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
   }
 
   .discover-card-head {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 10px;
     min-width: 0;
   }
@@ -2998,9 +3023,10 @@
   }
 
   .discover-card-title h3 {
-    margin: 0;
+    margin: 1px 0 0;
     font-size: var(--font-size-md);
     font-weight: 600;
+    line-height: 1.3;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -3010,48 +3036,41 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    margin: 2px 0 0;
+    min-width: 0;
+    margin: 3px 0 0;
     font-size: var(--font-size-xs);
     color: var(--text-muted);
+    white-space: nowrap;
   }
 
-  .discover-seen.active {
+  .seen-state {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .seen-state.active {
     color: var(--success);
   }
 
-  .card-menu-wrap {
-    position: relative;
+  .seen-state .status-dot {
     flex-shrink: 0;
-    align-self: flex-start;
   }
 
-  .card-menu {
-    position: absolute;
-    top: calc(100% + 4px);
-    inset-inline-end: 0;
-    min-width: 220px;
-    display: flex;
-    flex-direction: column;
-    padding: 4px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    background: var(--bg-secondary);
-    box-shadow: var(--shadow-md, 0 6px 20px rgba(0, 0, 0, 0.3));
+  .seen-sep {
+    flex-shrink: 0;
   }
 
-  .card-menu button {
-    padding: 7px 10px;
-    border: 0;
-    border-radius: var(--radius-sm);
-    background: none;
-    color: var(--text-primary);
-    font-size: var(--font-size-sm);
-    text-align: start;
-    cursor: pointer;
+  .card-menu-btn {
+    flex-shrink: 0;
+    margin: -4px -6px 0 0;
   }
 
-  .card-menu button:hover {
-    background: var(--bg-hover);
+  .feed-card-menu {
+    min-width: 230px;
   }
 
   .discover-description {
@@ -3060,8 +3079,8 @@
     color: var(--text-secondary);
     line-height: 1.45;
     display: -webkit-box;
-    -webkit-line-clamp: 3;
-    line-clamp: 3;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
     overflow-wrap: anywhere;
@@ -3073,12 +3092,14 @@
     align-items: center;
     justify-content: space-between;
     gap: 8px;
+    padding-top: 10px;
+    border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
   }
 
   .discover-meta {
     display: flex;
     flex-wrap: wrap;
-    gap: 6px;
+    gap: 4px 6px;
     min-width: 0;
     font-size: var(--font-size-xs);
     color: var(--text-muted);
@@ -3091,20 +3112,25 @@
     padding-top: 12px;
   }
 
+  /* A short key, not a heading: it reads as part of the status line. */
   .publisher-key {
-    padding: 0;
+    flex-shrink: 0;
+    min-height: 0;
+    padding: 0 4px;
     border: 0;
+    border-radius: var(--radius-sm);
     background: none;
-    color: inherit;
+    color: var(--text-muted);
     font: inherit;
-    font-family: var(--font-mono, monospace);
+    font-weight: 400;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.02em;
     cursor: pointer;
   }
 
   .publisher-key:hover {
-    background: none;
+    background: var(--bg-hover);
     color: var(--text-accent);
-    text-decoration: underline;
   }
 
   .filter-chip {
