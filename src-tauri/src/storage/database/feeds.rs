@@ -44,6 +44,8 @@ pub struct OwnFeed {
     pub list_blake3: String,
     pub list_size: i64,
     pub item_count: i64,
+    /// The sum of the sizes of the files that list names.
+    pub total_size: i64,
     pub created_at: i64,
     /// When the user last published it.
     pub published_at: i64,
@@ -84,6 +86,27 @@ pub struct DueListing {
     pub stamp: i64,
 }
 
+/// The tombstone a deleted feed of ours keeps sending, as
+/// [`Database::feed_own_delete`] records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedFeed {
+    pub sequence: i64,
+    pub title: String,
+    /// When every live head of it has lapsed at its storers, and the
+    /// tombstone need be sent no more.
+    pub until: i64,
+    pub due_at: i64,
+}
+
+/// A deleted feed of ours whose tombstone head is to be sent now (see
+/// [`Database::feed_tombstones_due`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueTombstone {
+    pub salt: String,
+    pub sequence: i64,
+    pub title: String,
+}
+
 /// A public feed the index listed, as Discover last found it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DiscoveredFeed {
@@ -93,6 +116,8 @@ pub struct DiscoveredFeed {
     pub description: String,
     pub item_count: i64,
     pub list_size: i64,
+    /// The sum of the sizes of the files its list names, as its listing says.
+    pub total_size: i64,
     /// The head's sequence: the publisher's clock, in milliseconds, at its
     /// last publish.
     pub sequence: i64,
@@ -129,6 +154,9 @@ pub struct FollowedFeed {
     pub list_blake3: String,
     pub list_size: i64,
     pub item_count: i64,
+    /// The sum of the sizes of the files the newest head's list names, as
+    /// its publisher counted them.
+    pub total_size: i64,
     /// `"waiting"` (no list yet), `"ok"`, `"fetching"` (a newer list on its
     /// way) or `"broken"` (the list did not match its head, or did not parse).
     pub state: String,
@@ -159,6 +187,10 @@ pub struct FollowedFeed {
     /// When a head of the feed was last found, newer or not: by a lookup or
     /// pushed by a friend. 0 before the first.
     pub seen_at: i64,
+    /// Its publisher deleted it: the newest head is a tombstone. Its items
+    /// and files stay; no list is fetched for it and nothing more is
+    /// auto-downloaded, as nothing newer will come.
+    pub deleted: bool,
 }
 
 /// An item of a followed feed's list, with what this side knows of it.
@@ -198,8 +230,25 @@ pub struct OwnPublish {
     pub list_blake3: String,
     pub list_size: i64,
     pub item_count: i64,
+    pub total_size: i64,
     pub title: String,
     pub description: String,
+}
+
+/// A head taken up by a follower, as [`Database::feed_take_head`] records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakenHead {
+    pub sequence: i64,
+    pub title: String,
+    pub description: String,
+    pub list_ed2k: String,
+    pub list_blake3: String,
+    pub list_size: i64,
+    pub item_count: i64,
+    pub total_size: i64,
+    /// A tombstone: only the sequence, and the title when none is held, are
+    /// taken.
+    pub deleted: bool,
 }
 
 /// What taking up a new list changed.
@@ -332,6 +381,16 @@ impl Database {
                 listing_stamp INTEGER NOT NULL,
                 sent_at INTEGER NOT NULL DEFAULT 0
             );
+            -- Deleted feeds of ours whose live heads storers may still hold:
+            -- their tombstone head, at `sequence`, is signed and sent again
+            -- whenever `due_at` comes, until `until`.
+            CREATE TABLE IF NOT EXISTS feeds_own_deleted (
+                salt TEXT PRIMARY KEY,
+                sequence INTEGER NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                until INTEGER NOT NULL,
+                due_at INTEGER NOT NULL DEFAULT 0
+            );
             -- Feeds and publishers the user hid from Discover; an empty salt
             -- hides every feed of the publisher.
             CREATE TABLE IF NOT EXISTS feeds_hidden (
@@ -359,12 +418,19 @@ impl Database {
             ("feeds_own", "listing_sent_at", "INTEGER NOT NULL DEFAULT 0"),
             ("feeds_own", "listing_stamp", "INTEGER NOT NULL DEFAULT 0"),
             ("feeds_own", "refreshed_at", "INTEGER NOT NULL DEFAULT 0"),
+            // What the files a head's list names come to; 0 before this column.
+            ("feeds_own", "total_size", "INTEGER NOT NULL DEFAULT 0"),
+            ("feeds_own", "pending_total_size", "INTEGER NOT NULL DEFAULT 0"),
             // The folder in `Feeds` its files finish in; empty until the first.
             ("feeds_followed", "folder", "TEXT NOT NULL DEFAULT ''"),
             // When auto-download was last turned on; 0 if not since this column.
             ("feeds_followed", "auto_since", "INTEGER NOT NULL DEFAULT 0"),
             // When a head was last found.
             ("feeds_followed", "seen_at", "INTEGER NOT NULL DEFAULT 0"),
+            ("feeds_followed", "total_size", "INTEGER NOT NULL DEFAULT 0"),
+            // The newest head taken up was its publisher's tombstone.
+            ("feeds_followed", "deleted", "INTEGER NOT NULL DEFAULT 0"),
+            ("feeds_discovered", "total_size", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             let present: bool = conn.query_row(
                 "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2",
@@ -400,7 +466,8 @@ impl Database {
             "SELECT salt, title, description, sequence, list_ed2k, list_blake3, list_size, item_count,
                     created_at, published_at, published_title, published_description, changed,
                     pending_sequence, pending_ed2k, pending_blake3, pending_size, pending_item_count,
-                    pending_title, pending_description, listed, listing_sent_at, refreshed_at
+                    pending_title, pending_description, listed, listing_sent_at, refreshed_at,
+                    total_size, pending_total_size
              FROM feeds_own ORDER BY created_at",
         )?;
         let rows = stmt
@@ -413,6 +480,7 @@ impl Database {
                         list_blake3: row.get(15)?,
                         list_size: row.get(16)?,
                         item_count: row.get(17)?,
+                        total_size: row.get(24)?,
                         title: row.get(18)?,
                         description: row.get(19)?,
                     })
@@ -428,6 +496,7 @@ impl Database {
                     list_blake3: row.get(5)?,
                     list_size: row.get(6)?,
                     item_count: row.get(7)?,
+                    total_size: row.get(23)?,
                     created_at: row.get(8)?,
                     published_at: row.get(9)?,
                     published_title: row.get(10)?,
@@ -571,9 +640,10 @@ impl Database {
         let recorded = tx.execute(
             "UPDATE feeds_own SET sequence = ?2, list_ed2k = ?3, list_blake3 = ?4, list_size = ?5,
                     item_count = ?6, published_at = ?7, published_title = ?8, published_description = ?9,
-                    changed = (title != ?8 OR description != ?9 OR ?10),
+                    changed = (title != ?8 OR description != ?9 OR ?10), total_size = ?11,
                     pending_sequence = 0, pending_ed2k = '', pending_blake3 = '', pending_size = 0,
-                    pending_item_count = 0, pending_title = '', pending_description = ''
+                    pending_item_count = 0, pending_title = '', pending_description = '',
+                    pending_total_size = 0
              WHERE salt = ?1 AND sequence < ?2",
             params![
                 salt,
@@ -586,6 +656,7 @@ impl Database {
                 published.title,
                 published.description,
                 items_changed,
+                published.total_size,
             ],
         )? > 0;
         // Who downloaded a file the feed no longer lists is no longer shown.
@@ -613,7 +684,8 @@ impl Database {
         let changed = match pending {
             Some(pending) => conn.execute(
                 "UPDATE feeds_own SET pending_sequence = ?2, pending_ed2k = ?3, pending_blake3 = ?4,
-                        pending_size = ?5, pending_item_count = ?6, pending_title = ?7, pending_description = ?8
+                        pending_size = ?5, pending_item_count = ?6, pending_title = ?7, pending_description = ?8,
+                        pending_total_size = ?9
                  WHERE salt = ?1 AND sequence < ?2",
                 params![
                     salt,
@@ -624,11 +696,12 @@ impl Database {
                     pending.item_count,
                     pending.title,
                     pending.description,
+                    pending.total_size,
                 ],
             )?,
             None => conn.execute(
                 "UPDATE feeds_own SET pending_sequence = 0, pending_ed2k = '', pending_blake3 = '', pending_size = 0,
-                        pending_item_count = 0, pending_title = '', pending_description = ''
+                        pending_item_count = 0, pending_title = '', pending_description = '', pending_total_size = 0
                  WHERE salt = ?1",
                 params![salt],
             )?,
@@ -659,8 +732,17 @@ impl Database {
 
     /// Delete a feed of ours. One whose last listing, sent at most
     /// `listing_ttl` seconds before `now`, may still be live is kept as a
-    /// withdrawal to send (see [`Self::feed_withdrawals_due`]).
-    pub fn feed_own_delete(&self, salt: &str, now: i64, listing_ttl: i64) -> anyhow::Result<()> {
+    /// withdrawal to send (see [`Self::feed_withdrawals_due`]). With
+    /// `tombstone`, its tombstone head is kept to send again until its
+    /// `until` (see [`Self::feed_tombstones_due`]), next due at `due_at`:
+    /// the delete sends it first itself.
+    pub fn feed_own_delete(
+        &self,
+        salt: &str,
+        now: i64,
+        listing_ttl: i64,
+        tombstone: Option<&DeletedFeed>,
+    ) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         self.ensure_feeds_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
@@ -670,6 +752,13 @@ impl Database {
              WHERE salt = ?1 AND listing_sent_at > 0 AND listing_sent_at >= ?2",
             params![salt, now - listing_ttl],
         )?;
+        if let Some(tombstone) = tombstone {
+            tx.execute(
+                "INSERT OR REPLACE INTO feeds_own_deleted (salt, sequence, title, until, due_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![salt, tombstone.sequence, tombstone.title, tombstone.until, tombstone.due_at],
+            )?;
+        }
         tx.execute("DELETE FROM feeds_own_items WHERE salt = ?1", params![salt])?;
         tx.execute("DELETE FROM feeds_own_downloads WHERE salt = ?1", params![salt])?;
         tx.execute("DELETE FROM feeds_own WHERE salt = ?1", params![salt])?;
@@ -794,6 +883,46 @@ impl Database {
         Ok(out)
     }
 
+    /// The tombstones of deleted feeds due at `now`, each claimed until
+    /// `retry` seconds on, so a tick and a send already out never both sign
+    /// one: a send that gets through moves it further (see
+    /// [`Self::feed_tombstone_due_at`]). One past its `until` is forgotten. A
+    /// due time further ahead than `retry` and `interval` together was set
+    /// before the clock went back, and counts as due.
+    pub fn feed_tombstones_due(&self, now: i64, retry: i64, interval: i64) -> anyhow::Result<Vec<DueTombstone>> {
+        let conn = self.conn.lock();
+        self.ensure_feeds_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM feeds_own_deleted WHERE until < ?1", params![now])?;
+        let due: Vec<DueTombstone> = {
+            let mut stmt = tx.prepare(
+                "SELECT salt, sequence, title FROM feeds_own_deleted WHERE due_at <= ?1 OR due_at > ?2",
+            )?;
+            let rows = stmt
+                .query_map(params![now, now.saturating_add(retry).saturating_add(interval)], |row| {
+                    Ok(DueTombstone { salt: row.get(0)?, sequence: row.get(1)?, title: row.get(2)? })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for tombstone in &due {
+            tx.execute(
+                "UPDATE feeds_own_deleted SET due_at = ?2 WHERE salt = ?1",
+                params![tombstone.salt, now.saturating_add(retry)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(due)
+    }
+
+    /// When the tombstone of the deleted feed `salt` is next to be sent.
+    pub fn feed_tombstone_due_at(&self, salt: &str, due_at: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        self.ensure_feeds_locked(&conn)?;
+        conn.execute("UPDATE feeds_own_deleted SET due_at = ?2 WHERE salt = ?1", params![salt, due_at])?;
+        Ok(())
+    }
+
     // ── Following ───────────────────────────────────────────────────────
 
     /// Follow a feed, with auto-download off and its default caps. `false`
@@ -823,7 +952,7 @@ impl Database {
         let select = "SELECT publisher, salt, title, description, sequence, list_ed2k, list_blake3, list_size,
                     item_count, state, list_sequence, unread, followed_at, checked_at, auto_download,
                     auto_max_item_mib, auto_max_day_mib, held_ed2k, held_blake3, held_size, folder,
-                    auto_since, seen_at
+                    auto_since, seen_at, total_size, deleted
              FROM feeds_followed";
         let map = |row: &rusqlite::Row<'_>| {
             Ok(FollowedFeed {
@@ -850,6 +979,8 @@ impl Database {
                 folder: row.get(20)?,
                 auto_since: row.get(21)?,
                 seen_at: row.get(22)?,
+                total_size: row.get(23)?,
+                deleted: row.get::<_, i64>(24)? != 0,
             })
         };
         let rows = match key {
@@ -868,29 +999,41 @@ impl Database {
     }
 
     /// Take up a head newer than the one held. Returns whether it was
-    /// newer: an older or equal sequence changes nothing.
-    #[allow(clippy::too_many_arguments)]
-    pub fn feed_take_head(
-        &self,
-        publisher: &str,
-        salt: &str,
-        sequence: i64,
-        title: &str,
-        description: &str,
-        list_ed2k: &str,
-        list_blake3: &str,
-        list_size: i64,
-        item_count: i64,
-        now: i64,
-    ) -> anyhow::Result<bool> {
+    /// newer: an older or equal sequence changes nothing. A tombstone keeps
+    /// the list, items and details held, its title filling in only one never
+    /// had, and leaves the feed resting on the list it holds, as nothing
+    /// newer will come; a live head after it (the publisher published again)
+    /// takes the feed back up.
+    pub fn feed_take_head(&self, publisher: &str, salt: &str, head: &TakenHead, now: i64) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         self.ensure_feeds_locked(&conn)?;
+        if head.deleted {
+            return Ok(conn.execute(
+                "UPDATE feeds_followed SET sequence = ?3, deleted = 1, checked_at = ?5,
+                        title = CASE WHEN title = '' THEN ?4 ELSE title END,
+                        state = CASE WHEN list_sequence > 0 THEN 'ok' ELSE 'waiting' END
+                 WHERE publisher = ?1 AND salt = ?2 AND sequence < ?3",
+                params![publisher, salt, head.sequence, head.title, now],
+            )? > 0);
+        }
         Ok(conn.execute(
             "UPDATE feeds_followed SET sequence = ?3, title = ?4, description = ?5, list_ed2k = ?6,
-                    list_blake3 = ?7, list_size = ?8, item_count = ?9, checked_at = ?10,
-                    state = CASE WHEN list_sequence = 0 THEN 'waiting' ELSE 'fetching' END
+                    list_blake3 = ?7, list_size = ?8, item_count = ?9, checked_at = ?10, total_size = ?11,
+                    deleted = 0, state = CASE WHEN list_sequence = 0 THEN 'waiting' ELSE 'fetching' END
              WHERE publisher = ?1 AND salt = ?2 AND sequence < ?3",
-            params![publisher, salt, sequence, title, description, list_ed2k, list_blake3, list_size, item_count, now],
+            params![
+                publisher,
+                salt,
+                head.sequence,
+                head.title,
+                head.description,
+                head.list_ed2k,
+                head.list_blake3,
+                head.list_size,
+                head.item_count,
+                now,
+                head.total_size,
+            ],
         )? > 0)
     }
 
@@ -917,14 +1060,15 @@ impl Database {
     }
 
     /// The list held is gone from disk: fetch the current one again. Its
-    /// items stay, so what the new one adds is still news.
+    /// items stay, so what the new one adds is still news. A deleted feed
+    /// has no current one to fetch, and keeps its items as they are.
     pub fn feed_lost_held(&self, publisher: &str, salt: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         self.ensure_feeds_locked(&conn)?;
         conn.execute(
             "UPDATE feeds_followed SET list_sequence = -1, held_ed2k = '', held_blake3 = '', held_size = 0,
                     state = 'fetching'
-             WHERE publisher = ?1 AND salt = ?2 AND list_sequence > 0",
+             WHERE publisher = ?1 AND salt = ?2 AND list_sequence > 0 AND deleted = 0",
             params![publisher, salt],
         )?;
         Ok(())
@@ -1303,7 +1447,8 @@ impl Database {
         self.ensure_feeds_locked(&conn)?;
         conn.execute("DELETE FROM feeds_discovered WHERE listed_at < ?1", params![now - max_age])?;
         let mut stmt = conn.prepare(
-            "SELECT publisher, salt, title, description, item_count, list_size, sequence, listed_at, first_seen
+            "SELECT publisher, salt, title, description, item_count, list_size, sequence, listed_at, first_seen,
+                    total_size
              FROM feeds_discovered ORDER BY sequence DESC",
         )?;
         let rows = stmt
@@ -1315,6 +1460,7 @@ impl Database {
                     description: row.get(3)?,
                     item_count: row.get(4)?,
                     list_size: row.get(5)?,
+                    total_size: row.get(9)?,
                     sequence: row.get(6)?,
                     listed_at: row.get(7)?,
                     first_seen: row.get(8)?,
@@ -1343,12 +1489,14 @@ impl Database {
         {
             let mut upsert = tx.prepare(
                 "INSERT INTO feeds_discovered
-                    (publisher, salt, title, description, item_count, list_size, sequence, listed_at, first_seen)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    (publisher, salt, title, description, item_count, list_size, sequence, listed_at, first_seen,
+                     total_size)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(publisher, salt) DO UPDATE SET
                     title = excluded.title, description = excluded.description,
                     item_count = excluded.item_count, list_size = excluded.list_size,
-                    sequence = excluded.sequence, listed_at = excluded.listed_at
+                    sequence = excluded.sequence, listed_at = excluded.listed_at,
+                    total_size = excluded.total_size
                  WHERE excluded.listed_at > feeds_discovered.listed_at",
             )?;
             let mut seen = tx.prepare("SELECT first_seen FROM feeds_discovered WHERE publisher = ?1 AND salt = ?2")?;
@@ -1363,6 +1511,7 @@ impl Database {
                     feed.sequence,
                     feed.listed_at,
                     now,
+                    feed.total_size,
                 ])?;
                 let at: i64 = seen.query_row(params![feed.publisher, feed.salt], |row| row.get(0))?;
                 first_seen.insert((feed.publisher.clone(), feed.salt.clone()), at);
@@ -1449,8 +1598,22 @@ mod tests {
     const PUB: &str = "pp";
     const SALT: &str = "ss";
 
+    fn head(sequence: i64) -> TakenHead {
+        TakenHead {
+            sequence,
+            title: "T".into(),
+            description: String::new(),
+            list_ed2k: "l".into(),
+            list_blake3: "b".into(),
+            list_size: 5,
+            item_count: 1,
+            total_size: 10,
+            deleted: false,
+        }
+    }
+
     fn take_head(db: &Database, sequence: i64) -> bool {
-        db.feed_take_head(PUB, SALT, sequence, "T", "", "l", "b", 5, 1, 100).unwrap()
+        db.feed_take_head(PUB, SALT, &head(sequence), 100).unwrap()
     }
 
     #[test]
@@ -1502,7 +1665,7 @@ mod tests {
         let (db, path) = db("elsewhere");
         for salt in [SALT, "other"] {
             db.feed_follow(PUB, salt, 1).unwrap();
-            db.feed_take_head(PUB, salt, 20, "T", "", "l", "b", 5, 1, 100).unwrap();
+            db.feed_take_head(PUB, salt, &head(20), 100).unwrap();
             db.feed_take_list(PUB, salt, 20, &[item("a", "A")], 100).unwrap().unwrap();
         }
         assert!(db.feed_downloaded_elsewhere(PUB, SALT).unwrap().is_empty(), "nothing downloaded yet");
@@ -1515,6 +1678,78 @@ mod tests {
         assert!(db.feed_downloaded_elsewhere(PUB, "other").unwrap().is_empty(), "not its own");
         db.feed_mark_cancelled(PUB, "other", "a").unwrap();
         assert!(db.feed_downloaded_elsewhere(PUB, SALT).unwrap().is_empty(), "cancelled there");
+        drop_db(db, path);
+    }
+
+    /// A tombstone keeps the list and items held and leaves the feed resting
+    /// on them; a live head after it takes the feed up again.
+    #[test]
+    fn a_deleted_feeds_tombstone_keeps_what_is_held() {
+        let (db, path) = db("tombstone-taken");
+        db.feed_follow(PUB, SALT, 1).unwrap();
+        assert!(take_head(&db, 10));
+        db.feed_take_list(PUB, SALT, 10, &[item("a", "A")], 100).unwrap().unwrap();
+        let held = db.feed_followed(PUB, SALT).unwrap().unwrap();
+        assert_eq!(held.total_size, 10);
+        let newer = TakenHead { list_ed2k: "m".into(), ..head(20) };
+        assert!(db.feed_take_head(PUB, SALT, &newer, 150).unwrap());
+        assert_eq!(db.feed_followed(PUB, SALT).unwrap().unwrap().state, "fetching");
+
+        let tombstone = TakenHead { title: "Gone".into(), total_size: 0, deleted: true, ..head(30) };
+        assert!(db.feed_take_head(PUB, SALT, &tombstone, 200).unwrap());
+        let feed = db.feed_followed(PUB, SALT).unwrap().unwrap();
+        assert!(feed.deleted);
+        assert_eq!((feed.sequence, feed.state.as_str(), feed.list_sequence), (30, "ok", 10), "rests on the list held");
+        assert_eq!((feed.title.as_str(), feed.total_size), ("T", 10), "its details stay");
+        assert!(db.feed_take_list(PUB, SALT, 20, &[], 210).unwrap().is_none(), "the list on its way is not taken");
+        assert_eq!(db.feed_followed_items(PUB, SALT).unwrap().len(), 1, "its items stay");
+        assert!(!db.feed_take_head(PUB, SALT, &tombstone, 220).unwrap(), "found again");
+        db.feed_lost_held(PUB, SALT).unwrap();
+        assert_eq!(db.feed_followed(PUB, SALT).unwrap().unwrap().list_sequence, 10, "nothing to fetch in its place");
+
+        assert!(db.feed_take_head(PUB, SALT, &head(40), 300).unwrap());
+        let feed = db.feed_followed(PUB, SALT).unwrap().unwrap();
+        assert!(!feed.deleted && feed.state == "fetching", "published again");
+
+        db.feed_follow(PUB, "late", 1).unwrap();
+        db.feed_take_head(PUB, "late", &tombstone, 400).unwrap();
+        let late = db.feed_followed(PUB, "late").unwrap().unwrap();
+        assert_eq!((late.title.as_str(), late.state.as_str(), late.deleted), ("Gone", "waiting", true), "never had a title");
+        drop_db(db, path);
+    }
+
+    /// A deleted feed's tombstone is sent until its `until`, claimed while a
+    /// send is out, and due again when the delete's own send did not land.
+    #[test]
+    fn a_deleted_feeds_tombstone_is_sent_until_every_live_head_lapses() {
+        let (db, path) = db("tombstone-sent");
+        db.feed_own_create("s", "One", "", false, 1, 8).unwrap();
+        let tombstone = DeletedFeed { sequence: 77, title: "One".into(), until: 10_000, due_at: 110 };
+        db.feed_own_delete("s", 100, TTL, Some(&tombstone)).unwrap();
+        assert!(db.feed_own("s").unwrap().is_none());
+        assert!(db.feed_tombstones_due(105, 10, 50).unwrap().is_empty(), "the delete's own send is out");
+        let due = db.feed_tombstones_due(110, 10, 50).unwrap();
+        assert_eq!(due, vec![DueTombstone { salt: "s".into(), sequence: 77, title: "One".into() }]);
+        assert!(db.feed_tombstones_due(115, 10, 50).unwrap().is_empty(), "claimed by that send");
+        db.feed_tombstone_due_at("s", 170).unwrap();
+        assert!(db.feed_tombstones_due(169, 10, 50).unwrap().is_empty());
+        assert_eq!(db.feed_tombstones_due(170, 10, 50).unwrap().len(), 1);
+        db.feed_tombstone_due_at("s", 5_000).unwrap();
+        assert_eq!(db.feed_tombstones_due(300, 10, 50).unwrap().len(), 1, "set before the clock went back");
+        assert!(db.feed_tombstones_due(10_001, 10, 50).unwrap().is_empty(), "every live head has lapsed");
+        assert!(db.feed_tombstones_due(100, 10, 50).unwrap().is_empty(), "and it is forgotten");
+        drop_db(db, path);
+    }
+
+    #[test]
+    fn a_heads_total_size_is_kept_for_its_feed() {
+        let (db, path) = db("total-size");
+        db.feed_own_create("s", "One", "", false, 1, 8).unwrap();
+        db.feed_own_set_pending("s", Some(&OwnPublish { total_size: 99, ..publish(10, "One") })).unwrap();
+        assert_eq!(db.feed_own("s").unwrap().unwrap().pending.map(|p| p.total_size), Some(99));
+        db.feed_own_published("s", &OwnPublish { total_size: 42, ..publish(20, "One") }, None, 5).unwrap();
+        let feed = db.feed_own("s").unwrap().unwrap();
+        assert_eq!((feed.total_size, feed.pending), (42, None));
         drop_db(db, path);
     }
 
@@ -1572,7 +1807,7 @@ mod tests {
         let names: Vec<String> = db.feed_own_items("s1").unwrap().into_iter().map(|i| i.name).collect();
         assert_eq!(names, vec!["B", "A"]);
         assert!(!db.feed_own_set_items("nope", &[item("a", "A")]).unwrap(), "no such feed");
-        db.feed_own_delete("s1", 10, 100).unwrap();
+        db.feed_own_delete("s1", 10, 100, None).unwrap();
         assert!(db.feed_own("s1").unwrap().is_none());
         assert!(db.feed_own_items("s1").unwrap().is_empty());
         drop_db(db, path);
@@ -1592,7 +1827,7 @@ mod tests {
         assert!(db.feed_own_published("s", &publish(20, "One"), Some(&[item("a", "A")]), 7).unwrap());
         let counts = db.feed_own_download_counts("s").unwrap();
         assert_eq!((counts.get("a"), counts.len()), (Some(&2), 1), "b left the feed, and its count with it");
-        db.feed_own_delete("s", 10, 100).unwrap();
+        db.feed_own_delete("s", 10, 100, None).unwrap();
         assert!(db.feed_own_download_counts("s").unwrap().is_empty(), "deleted with the feed");
         drop_db(db, path);
     }
@@ -1636,8 +1871,8 @@ mod tests {
         db.feed_own_create("s", "One", "", true, 1, 8).unwrap();
         db.feed_own_create("t", "Two", "", false, 1, 8).unwrap();
         assert_eq!(take(&db, true, 100), Some((false, 100)));
-        db.feed_own_delete("s", 200, TTL).unwrap();
-        db.feed_own_delete("t", 200, TTL).unwrap();
+        db.feed_own_delete("s", 200, TTL, None).unwrap();
+        db.feed_own_delete("t", 200, TTL, None).unwrap();
         let due = db.feed_withdrawals_due(200, 50, TTL).unwrap();
         assert_eq!(due, vec![DueListing { salt: "s".into(), withdrawn: true, stamp: 200 }], "only the one listed");
         assert!(db.feed_withdrawals_due(240, 50, TTL).unwrap().is_empty(), "not due again yet");
@@ -1655,6 +1890,7 @@ mod tests {
             description: String::new(),
             item_count: 1,
             list_size: 10,
+            total_size: 100,
             sequence: listed_at * 1000,
             listed_at,
             first_seen: 0,
@@ -1733,7 +1969,7 @@ mod tests {
         assert!(new.first_seen >= since(SALT), "what it adds is taken");
 
         db.feed_follow(PUB, "off", 1).unwrap();
-        db.feed_take_head(PUB, "off", 10, "T", "", "l", "b", 5, 1, 100).unwrap();
+        db.feed_take_head(PUB, "off", &head(10), 100).unwrap();
         db.feed_take_list(PUB, "off", 10, &[item("a", "A")], 700).unwrap().unwrap();
         assert_eq!(since("off"), 0, "never turned on stays so");
         drop_db(db, path);
@@ -1760,6 +1996,7 @@ mod tests {
             list_blake3: "b".into(),
             list_size: 5,
             item_count: 1,
+            total_size: 7,
             title: title.into(),
             description: String::new(),
         }

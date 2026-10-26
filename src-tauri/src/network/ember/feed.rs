@@ -127,22 +127,28 @@ fn head_aad(publisher: &[u8; 32], locator: &FeedLocator, version: u8, sequence: 
     [HEAD_AAD_PREFIX, &[version], publisher, locator, &sequence.to_le_bytes()].concat()
 }
 
+/// A sealed head's flag that says its publisher deleted the feed: nothing
+/// newer will come, and its list fields are placeholders ([`tombstone_head`]).
+pub const FEED_HEAD_DELETED: u8 = 0x01;
+
 /// A head's trailer: `version(1) = 2 || sequence(8) || sealed`, little-endian,
 /// where `sealed` is [`seal`] of `list_ed2k_hash(16) || list_blake3(32) ||
-/// list_size(8) || item_count(4) || title_len(1) || title ||
-/// description_len(2) || description` under the head key, bound to the
-/// publisher, the locator, the version and the sequence. `None` for a head
-/// with a field out of bounds.
+/// list_size(8) || item_count(4) || total_size(8) || flags(1) ||
+/// title_len(1) || title || description_len(2) || description` under the
+/// head key, bound to the publisher, the locator, the version and the
+/// sequence. `None` for a head with a field out of bounds.
 pub fn encode_sealed_head(publisher: &[u8; 32], salt: &FeedSalt, head: &FeedHead) -> Option<Vec<u8>> {
     if !head.valid() {
         return None;
     }
     let (title, description) = (head.title.as_bytes(), head.description.as_bytes());
-    let mut body = Vec::with_capacity(16 + 32 + 8 + 4 + 1 + title.len() + 2 + description.len());
+    let mut body = Vec::with_capacity(16 + 32 + 8 + 4 + 8 + 1 + 1 + title.len() + 2 + description.len());
     body.extend_from_slice(&head.list_ed2k_hash);
     body.extend_from_slice(&head.list_blake3);
     body.extend_from_slice(&head.list_size.to_le_bytes());
     body.extend_from_slice(&head.item_count.to_le_bytes());
+    body.extend_from_slice(&head.total_size.to_le_bytes());
+    body.push(if head.deleted { FEED_HEAD_DELETED } else { 0 });
     body.push(u8::try_from(title.len()).ok()?);
     body.extend_from_slice(title);
     body.extend_from_slice(&u16::try_from(description.len()).ok()?.to_le_bytes());
@@ -158,7 +164,8 @@ pub fn encode_sealed_head(publisher: &[u8; 32], salt: &FeedSalt, head: &FeedHead
 
 /// The head a trailer of [`encode_sealed_head`] seals, for the feed `salt` of
 /// `publisher`: `None` for another version, another feed's, or one tampered
-/// with, cut short or out of bounds.
+/// with, cut short or out of bounds. Flag bits this build does not know are
+/// ignored, for a later build to set.
 pub fn decode_sealed_head(publisher: &[u8; 32], salt: &FeedSalt, extra: &[u8]) -> Option<FeedHead> {
     if extra.len() < 1 + 8 + SEAL_OVERHEAD || extra[0] != FEED_HEAD_VERSION {
         return None;
@@ -171,6 +178,8 @@ pub fn decode_sealed_head(publisher: &[u8; 32], salt: &FeedSalt, extra: &[u8]) -
     let list_blake3: [u8; 32] = take(&body, at, 32)?.try_into().ok()?;
     let list_size = u64::from_le_bytes(take(&body, at, 8)?.try_into().ok()?);
     let item_count = u32::from_le_bytes(take(&body, at, 4)?.try_into().ok()?);
+    let total_size = u64::from_le_bytes(take(&body, at, 8)?.try_into().ok()?);
+    let flags = take(&body, at, 1)?[0];
     let title_len = usize::from(take(&body, at, 1)?[0]);
     let title = String::from_utf8(take(&body, at, title_len)?.to_vec()).ok()?;
     let description_len = usize::from(u16::from_le_bytes(take(&body, at, 2)?.try_into().ok()?));
@@ -178,7 +187,17 @@ pub fn decode_sealed_head(publisher: &[u8; 32], salt: &FeedSalt, extra: &[u8]) -
     if *at != body.len() {
         return None;
     }
-    let head = FeedHead { sequence, list_ed2k_hash, list_size, list_blake3, item_count, title, description };
+    let head = FeedHead {
+        sequence,
+        list_ed2k_hash,
+        list_size,
+        list_blake3,
+        item_count,
+        total_size,
+        title,
+        description,
+        deleted: flags & FEED_HEAD_DELETED != 0,
+    };
     head.valid().then_some(head)
 }
 
@@ -233,6 +252,9 @@ pub const FEED_LISTING_WITHDRAWN: u8 = 0x01;
 /// every hour it runs, and junk listings that fill the index lapse within it
 /// unless their signers keep at it.
 pub const FEED_LISTING_TTL_SECS: i64 = 7 * 24 * 3600;
+/// How long storers keep a head after it was signed (`CHANNEL_GOVERNANCE_TTL`
+/// in `dht::store`): what a deleted feed's tombstone must outlast.
+pub const FEED_HEAD_TTL_SECS: i64 = 30 * 24 * 3600;
 /// A listing signed this recently says its publisher is running: one
 /// signs it anew with every publish and hourly republish, and a republish
 /// that does not get through is tried again within minutes.
@@ -269,9 +291,23 @@ pub fn withdrawal_head() -> FeedHead {
         list_size: 1,
         list_blake3: [0xFF; 32],
         item_count: 0,
+        total_size: 0,
         title: "-".into(),
         description: String::new(),
+        deleted: false,
     }
+}
+
+/// The head a deleted feed's publisher signs in place of its last, at
+/// `sequence`, past every head it published: flagged deleted, its list
+/// fields the withdrawal's placeholders, which name no list, and `title`
+/// kept for a follower that never had one, or `-` when it is no title.
+/// Storers rank it above every live copy they hold, and followers take it
+/// as the feed's last word.
+pub fn tombstone_head(sequence: u64, title: &str) -> FeedHead {
+    let title = title.trim();
+    let title = if title.is_empty() || title.len() > FEED_TITLE_MAX { "-" } else { title };
+    FeedHead { sequence, title: title.into(), deleted: true, ..withdrawal_head() }
 }
 
 /// A listing's trailer: `flags(1)`, then the head's own trailer
@@ -294,8 +330,7 @@ pub fn listing_storable(extra: &[u8]) -> bool {
 /// A listing trailer's flags and head fields, as [`decode_feed_extra`] reads
 /// them. Flag bits this build does not know are kept, for a later build's
 /// listings to pass through it.
-#[allow(clippy::type_complexity)]
-pub fn decode_feed_listing_extra(extra: &[u8]) -> Option<(u8, (u64, [u8; 16], u32, String))> {
+pub fn decode_feed_listing_extra(extra: &[u8]) -> Option<(u8, ListedHead)> {
     let (&flags, head) = extra.split_first()?;
     Some((flags, decode_feed_extra(head)?))
 }
@@ -318,8 +353,14 @@ pub struct FeedHead {
     pub list_size: u64,
     pub list_blake3: [u8; 32],
     pub item_count: u32,
+    /// The sum of the sizes of the files the list names, as its publisher
+    /// counted them; 0 for a withdrawal or a tombstone.
+    pub total_size: u64,
     pub title: String,
     pub description: String,
+    /// The publisher deleted the feed ([`tombstone_head`]). Only a sealed
+    /// head carries it; a listing is withdrawn instead.
+    pub deleted: bool,
 }
 
 impl FeedHead {
@@ -340,8 +381,19 @@ pub fn next_sequence(last: u64, now_ms: u64) -> u64 {
     now_ms.max(last.saturating_add(1))
 }
 
+/// The head fields a listing carries in its trailer, the record's own fields
+/// carrying the rest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedHead {
+    pub sequence: u64,
+    pub list_ed2k_hash: [u8; 16],
+    pub item_count: u32,
+    pub total_size: u64,
+    pub description: String,
+}
+
 /// The head a listing carries in the clear, after its flags: `version(1) = 1
-/// || sequence(8) || list_ed2k_hash(16) || item_count(4) ||
+/// || sequence(8) || list_ed2k_hash(16) || item_count(4) || total_size(8) ||
 /// description_len(2) || description`, little-endian, the record's own fields
 /// carrying the rest.
 pub fn encode_feed_extra(head: &FeedHead) -> Option<Vec<u8>> {
@@ -349,32 +401,34 @@ pub fn encode_feed_extra(head: &FeedHead) -> Option<Vec<u8>> {
         return None;
     }
     let description = head.description.as_bytes();
-    let mut out = Vec::with_capacity(1 + 8 + 16 + 4 + 2 + description.len());
+    let mut out = Vec::with_capacity(1 + 8 + 16 + 4 + 8 + 2 + description.len());
     out.push(FEED_LISTED_HEAD_VERSION);
     out.extend_from_slice(&head.sequence.to_le_bytes());
     out.extend_from_slice(&head.list_ed2k_hash);
     out.extend_from_slice(&head.item_count.to_le_bytes());
+    out.extend_from_slice(&head.total_size.to_le_bytes());
     out.extend_from_slice(&(description.len() as u16).to_le_bytes());
     out.extend_from_slice(description);
     Some(out)
 }
 
-/// The trailer's fields `(sequence, list_ed2k_hash, item_count,
-/// description)`, or nothing if it is not exactly one this build writes.
-pub fn decode_feed_extra(extra: &[u8]) -> Option<(u64, [u8; 16], u32, String)> {
-    const FIXED: usize = 1 + 8 + 16 + 4 + 2;
+/// The trailer's fields, or nothing if it is not exactly one this build
+/// writes.
+pub fn decode_feed_extra(extra: &[u8]) -> Option<ListedHead> {
+    const FIXED: usize = 1 + 8 + 16 + 4 + 8 + 2;
     if extra.len() < FIXED || extra[0] != FEED_LISTED_HEAD_VERSION {
         return None;
     }
     let sequence = u64::from_le_bytes(extra[1..9].try_into().ok()?);
     let list_ed2k_hash: [u8; 16] = extra[9..25].try_into().ok()?;
     let item_count = u32::from_le_bytes(extra[25..29].try_into().ok()?);
-    let description_len = u16::from_le_bytes([extra[29], extra[30]]) as usize;
+    let total_size = u64::from_le_bytes(extra[29..37].try_into().ok()?);
+    let description_len = u16::from_le_bytes([extra[37], extra[38]]) as usize;
     if extra.len() != FIXED + description_len || description_len > FEED_DESCRIPTION_MAX {
         return None;
     }
     let description = String::from_utf8(extra[FIXED..].to_vec()).ok()?;
-    Some((sequence, list_ed2k_hash, item_count, description))
+    Some(ListedHead { sequence, list_ed2k_hash, item_count, total_size, description })
 }
 
 /// The span of a feed file each entry of the feed stream's chunk list names.
@@ -577,8 +631,10 @@ mod tests {
             list_size: 4_096,
             list_blake3: [0x22; 32],
             item_count: 12,
+            total_size: 5_000_000_000,
             title: "Field recordings".into(),
             description: "Birds, mostly.".into(),
+            deleted: false,
         }
     }
 
@@ -597,7 +653,13 @@ mod tests {
         let extra = encode_feed_extra(&head).unwrap();
         assert_eq!(
             decode_feed_extra(&extra),
-            Some((head.sequence, head.list_ed2k_hash, head.item_count, head.description.clone()))
+            Some(ListedHead {
+                sequence: head.sequence,
+                list_ed2k_hash: head.list_ed2k_hash,
+                item_count: head.item_count,
+                total_size: head.total_size,
+                description: head.description.clone(),
+            })
         );
         assert!(decode_feed_extra(&extra[..extra.len() - 1]).is_none(), "short");
         let mut longer = extra.clone();
@@ -781,6 +843,230 @@ mod tests {
         let (flags, _) = decode_feed_listing_extra(&extra).unwrap();
         assert_eq!(flags & FEED_LISTING_WITHDRAWN, FEED_LISTING_WITHDRAWN);
         assert!(decode_feed_listing_extra(&[]).is_none());
+    }
+
+    #[test]
+    fn a_tombstone_is_a_valid_head_that_names_no_list() {
+        let (publisher, salt) = ([5u8; 32], [6u8; 16]);
+        let tombstone = tombstone_head(9, "Field recordings");
+        assert!(tombstone.valid() && tombstone.deleted);
+        assert_eq!((tombstone.list_ed2k_hash, tombstone.list_size, tombstone.item_count, tombstone.total_size), ([0xFF; 16], 1, 0, 0));
+        let extra = encode_sealed_head(&publisher, &salt, &tombstone).unwrap();
+        assert_eq!(decode_sealed_head(&publisher, &salt, &extra), Some(tombstone));
+        assert_eq!(tombstone_head(9, "  ").title, "-", "no title to keep");
+        assert_eq!(tombstone_head(9, &"t".repeat(FEED_TITLE_MAX + 1)).title, "-");
+        assert!(!withdrawal_head().deleted, "a withdrawal is not a deletion");
+        assert_eq!(decode_sealed_head(&publisher, &salt, &encode_sealed_head(&publisher, &salt, &head()).unwrap()).map(|h| h.deleted), Some(false));
+    }
+
+    /// A sealed head's body as the fields stand, whatever they are.
+    struct RawHead {
+        ed2k: [u8; 16],
+        blake3: [u8; 32],
+        size: u64,
+        items: u32,
+        total: u64,
+        flags: u8,
+        title: Vec<u8>,
+        description: Vec<u8>,
+    }
+
+    impl RawHead {
+        fn of(head: &FeedHead) -> Self {
+            Self {
+                ed2k: head.list_ed2k_hash,
+                blake3: head.list_blake3,
+                size: head.list_size,
+                items: head.item_count,
+                total: head.total_size,
+                flags: 0,
+                title: head.title.as_bytes().to_vec(),
+                description: head.description.as_bytes().to_vec(),
+            }
+        }
+
+        fn body(&self) -> Vec<u8> {
+            let mut body = [&self.ed2k[..], &self.blake3, &self.size.to_le_bytes(), &self.items.to_le_bytes()].concat();
+            body.extend_from_slice(&self.total.to_le_bytes());
+            body.push(self.flags);
+            body.push(self.title.len() as u8);
+            body.extend_from_slice(&self.title);
+            body.extend_from_slice(&(self.description.len() as u16).to_le_bytes());
+            body.extend_from_slice(&self.description);
+            body
+        }
+    }
+
+    /// `body` sealed as a head's trailer is, for bodies no head encodes.
+    fn sealed_trailer(publisher: &[u8; 32], salt: &FeedSalt, sequence: u64, body: &[u8]) -> Vec<u8> {
+        let aad = head_aad(publisher, &feed_locator(salt), FEED_HEAD_VERSION, sequence);
+        let sealed = seal(HEAD_KEY_CONTEXT, salt, &aad, body).unwrap();
+        [&[FEED_HEAD_VERSION][..], &sequence.to_le_bytes(), &sealed].concat()
+    }
+
+    /// Whatever a sealed head holds once opened, a field out of bounds, text
+    /// that is not UTF-8, or a body cut short or run long is refused, and
+    /// nothing panics on a trailer cut anywhere.
+    #[test]
+    fn a_sealed_head_out_of_bounds_or_malformed_is_refused() {
+        let (publisher, salt, sequence) = ([5u8; 32], [6u8; 16], head().sequence);
+        let decode = |raw: &RawHead| decode_sealed_head(&publisher, &salt, &sealed_trailer(&publisher, &salt, sequence, &raw.body()));
+        assert_eq!(decode(&RawHead::of(&head())), Some(head()), "the body as a head encodes it");
+        assert_eq!(decode(&RawHead { flags: 0x80, ..RawHead::of(&head()) }), Some(head()), "a flag a later build sets");
+        assert_eq!(decode(&RawHead { flags: 0x81, ..RawHead::of(&head()) }).map(|h| h.deleted), Some(true));
+
+        let refused = [
+            ("a title that is not UTF-8", RawHead { title: vec![b'a', 0xFF, 0xFE], ..RawHead::of(&head()) }),
+            ("a description that is not UTF-8", RawHead { description: vec![0xC3, 0x28], ..RawHead::of(&head()) }),
+            ("a description too long", RawHead { description: vec![b'd'; FEED_DESCRIPTION_MAX + 44], ..RawHead::of(&head()) }),
+            ("a title too long", RawHead { title: vec![b't'; FEED_TITLE_MAX + 1], ..RawHead::of(&head()) }),
+            ("a title of whitespace", RawHead { title: b" \t ".to_vec(), ..RawHead::of(&head()) }),
+            ("no title", RawHead { title: Vec::new(), ..RawHead::of(&head()) }),
+            ("too many items", RawHead { items: FEED_ITEMS_MAX as u32 + 1, ..RawHead::of(&head()) }),
+            ("a zero eD2K hash", RawHead { ed2k: [0; 16], ..RawHead::of(&head()) }),
+            ("a zero BLAKE3", RawHead { blake3: [0; 32], ..RawHead::of(&head()) }),
+            ("an empty list", RawHead { size: 0, ..RawHead::of(&head()) }),
+        ];
+        for (why, raw) in &refused {
+            assert_eq!(decode(raw), None, "{why}");
+        }
+
+        let body = RawHead::of(&head()).body();
+        for cut in [0, 1, 16, 48, 60, 68, 69, body.len() - 1] {
+            let trailer = sealed_trailer(&publisher, &salt, sequence, &body[..cut]);
+            assert_eq!(decode_sealed_head(&publisher, &salt, &trailer), None, "a body cut to {cut} bytes");
+        }
+        let longer = sealed_trailer(&publisher, &salt, sequence, &[body.as_slice(), &[0]].concat());
+        assert_eq!(decode_sealed_head(&publisher, &salt, &longer), None, "a byte past the description");
+        // A description length past what follows, with the bytes for it short.
+        let mut short = body.clone();
+        let at = short.len() - head().description.len() - 2;
+        short[at..at + 2].copy_from_slice(&300u16.to_le_bytes());
+        assert_eq!(decode_sealed_head(&publisher, &salt, &sealed_trailer(&publisher, &salt, sequence, &short)), None);
+
+        let extra = encode_sealed_head(&publisher, &salt, &head()).unwrap();
+        for cut in 0..extra.len() {
+            assert_eq!(decode_sealed_head(&publisher, &salt, &extra[..cut]), None, "a trailer cut to {cut} bytes");
+            assert_eq!(head_sequence(&extra[..cut]).is_some(), cut >= 9, "a sequence only once it is all there");
+        }
+    }
+
+    /// A listing record carrying `extra` as its trailer, signed by `identity`.
+    fn listing_with_extra(
+        identity: &ed25519_dalek::SigningKey,
+        salt: &FeedSalt,
+        extra: &[u8],
+        edit: impl FnOnce(&mut Vec<u8>),
+    ) -> crate::network::ember::dht::publish::SignedRecord {
+        use crate::network::ember::dht::publish::SignedRecord;
+        let record = SignedRecord::feed_listing_record(salt, &head(), false, identity, 1_900_000_000).unwrap();
+        let name_len = usize::from(u16::from_le_bytes(record.data[113..115].try_into().unwrap()));
+        let off = 115 + name_len;
+        let mut data = record.data[..off + 1].to_vec();
+        data.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+        data.extend_from_slice(extra);
+        edit(&mut data);
+        let signature = crate::network::ember::crypto::sign(identity, &data);
+        SignedRecord::from_wire(&data, signature).expect("framed as a listing")
+    }
+
+    /// A listing's trailer as the fields stand, whatever they are.
+    fn raw_listing(version: u8, ed2k: [u8; 16], items: u32, description: &[u8], description_len: u16) -> Vec<u8> {
+        let mut extra = vec![0, version];
+        extra.extend_from_slice(&head().sequence.to_le_bytes());
+        extra.extend_from_slice(&ed2k);
+        extra.extend_from_slice(&items.to_le_bytes());
+        extra.extend_from_slice(&head().total_size.to_le_bytes());
+        extra.extend_from_slice(&description_len.to_le_bytes());
+        extra.extend_from_slice(description);
+        extra
+    }
+
+    /// A listing a follower could not read is refused by storers as well as
+    /// by Discover: text that is not UTF-8, a field out of bounds, a length
+    /// that does not match, a whitespace title or zero hashes in its header.
+    /// A later version passes storers, read no further. Nothing panics on a
+    /// trailer cut anywhere.
+    #[test]
+    fn a_malformed_listing_is_refused_by_storers_and_followers() {
+        let identity = crate::network::ember::crypto::signing_key_from_bytes(&[12u8; 32]);
+        let salt = [3u8; 16];
+        let description = head().description.into_bytes();
+        let good = raw_listing(1, [0x11; 16], 12, &description, description.len() as u16);
+        let record = listing_with_extra(&identity, &salt, &good, |_| {});
+        assert_eq!(record.feed_listing(), Some((salt, head(), false)), "the trailer as a listing encodes it");
+        assert!(record.feed_listing_store_ok());
+
+        let long = vec![b'd'; FEED_DESCRIPTION_MAX + 44];
+        let refused: Vec<(&str, Vec<u8>)> = vec![
+            ("a description that is not UTF-8", raw_listing(1, [0x11; 16], 12, &[0xC3, 0x28], 2)),
+            ("a description too long", raw_listing(1, [0x11; 16], 12, &long, long.len() as u16)),
+            ("too many items", raw_listing(1, [0x11; 16], FEED_ITEMS_MAX as u32 + 1, &description, description.len() as u16)),
+            ("a zero eD2K hash", raw_listing(1, [0; 16], 12, &description, description.len() as u16)),
+            ("a length past the bytes", raw_listing(1, [0x11; 16], 12, &description, description.len() as u16 + 5)),
+            ("a length short of them", raw_listing(1, [0x11; 16], 12, &description, 1)),
+            ("no head after the flags", vec![0]),
+            ("a head cut short", good[..20].to_vec()),
+            ("an earlier version", raw_listing(0, [0x11; 16], 12, &description, description.len() as u16)),
+        ];
+        for (why, extra) in &refused {
+            let record = listing_with_extra(&identity, &salt, extra, |_| {});
+            assert_eq!(record.feed_listing(), None, "{why}");
+            assert!(!record.feed_listing_store_ok(), "{why}: not stored either");
+        }
+        let blank_title = listing_with_extra(&identity, &salt, &good, |data| {
+            let name_len = usize::from(u16::from_le_bytes(data[113..115].try_into().unwrap()));
+            data[115..115 + name_len].fill(b' ');
+        });
+        assert_eq!(blank_title.feed_listing(), None, "a title of whitespace");
+        assert!(!blank_title.feed_listing_store_ok());
+        let no_blake3 = listing_with_extra(&identity, &salt, &good, |data| data[33..65].fill(0));
+        assert_eq!(no_blake3.feed_listing(), None, "a zero BLAKE3");
+        assert!(!no_blake3.feed_listing_store_ok());
+
+        let later = listing_with_extra(&identity, &salt, &[0, FEED_LISTED_HEAD_VERSION + 1, 0xAB], |_| {});
+        assert!(later.feed_listing_store_ok(), "a later version passes through");
+        assert_eq!(later.feed_listing(), None, "and only a later build reads it");
+
+        for cut in 0..good.len() {
+            assert!(decode_feed_listing_extra(&good[..cut]).is_none(), "a trailer cut to {cut} bytes");
+        }
+    }
+
+    /// A head is not a listing, nor a listing a head, whichever record type
+    /// it is signed as: their trailers read as nothing in the other's place.
+    #[test]
+    fn a_head_is_not_taken_for_a_listing_nor_a_listing_for_a_head() {
+        use crate::network::ember::dht::publish::{SignedRecord, RECORD_TYPE_FEED, RECORD_TYPE_FEED_LISTING};
+        let identity = crate::network::ember::crypto::signing_key_from_bytes(&[13u8; 32]);
+        let publisher = identity.verifying_key().to_bytes();
+        let salt = [8u8; 16];
+        // Sequences whose first byte reads as a listing's head version.
+        for sequence in [head().sequence, 0x0101_0101_0101_0101, 1] {
+            let head = FeedHead { sequence, ..head() };
+            let record = SignedRecord::feed_head_record(&salt, &head, &identity, 1_900_000_000).unwrap();
+            assert_eq!(record.feed_listing(), None);
+            assert!(!record.feed_listing_store_ok());
+            let mut data = record.data.clone();
+            data[0] = RECORD_TYPE_FEED_LISTING;
+            data[1..17].copy_from_slice(&feed_index_key(feed_index_shard(&publisher, &record.file_hash)));
+            let signature = crate::network::ember::crypto::sign(&identity, &data);
+            let retyped = SignedRecord::from_wire(&data, signature).unwrap();
+            assert_eq!(retyped.feed_listing(), None, "a head's trailer signed as a listing, sequence {sequence:#x}");
+            assert!(!retyped.feed_listing_store_ok());
+            assert_eq!(retyped.feed_head(&salt), None);
+        }
+
+        let listing = SignedRecord::feed_listing_record(&salt, &head(), false, &identity, 1_900_000_000).unwrap();
+        assert_eq!(listing.feed_head(&salt), None);
+        assert!(!listing.feed_store_ok());
+        let mut data = listing.data.clone();
+        data[0] = RECORD_TYPE_FEED;
+        data[1..17].copy_from_slice(&feed_key_at(&publisher, &listing.file_hash));
+        let signature = crate::network::ember::crypto::sign(&identity, &data);
+        let retyped = SignedRecord::from_wire(&data, signature).unwrap();
+        assert_eq!(retyped.feed_head(&salt), None, "a listing's trailer signed as a head");
+        assert!(!retyped.feed_store_ok(), "its flags byte is no head version");
     }
 
     #[test]

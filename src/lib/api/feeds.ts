@@ -48,6 +48,11 @@ export interface FollowedFeed {
   description: string;
   sequence: number;
   item_count: number;
+  /** Bytes of every file its newest head names; 0 when not known. */
+  total_size: number;
+  /** Its publisher deleted it: it stays followed, with its files and what
+   *  was downloaded, but nothing new comes and nothing downloads by itself. */
+  deleted: boolean;
   /** `waiting`: no list yet. `fetching`: a newer one on its way. `broken`:
    *  the list did not match its head. */
   state: 'waiting' | 'ok' | 'fetching' | 'broken';
@@ -153,6 +158,8 @@ export interface DiscoveredFeed {
   description: string;
   item_count: number;
   list_size: number;
+  /** Bytes of every file it lists; 0 when not known. */
+  total_size: number;
   /** The publisher's clock, in milliseconds, at its last publish. */
   sequence: number;
   /** When the publisher last signed its listing, in seconds. */
@@ -233,6 +240,13 @@ export const openFeedFolder = (publisher: string, salt: string): Promise<void> =
 /** Open `Feeds`, where every followed feed's folder is. It is not shared,
  *  unlike `Downloads`. */
 export const openFeedFilesFolder = (): Promise<void> => invoke('open_feed_files_folder');
+/** Open a followed feed's downloaded file, one `done` or `in_library`;
+ *  `feeds_item_not_on_disk` if it has gone since. */
+export const openFeedItem = (publisher: string, salt: string, ed2k: string): Promise<void> =>
+  invoke('open_feed_item', { publisher, salt, ed2k });
+/** Show a followed feed's downloaded file in the file manager, as {@link openFeedItem}. */
+export const showFeedItem = (publisher: string, salt: string, ed2k: string): Promise<void> =>
+  invoke('show_feed_item', { publisher, salt, ed2k });
 
 /** Walk the public feed index. Shards arrive on {@link FEEDS_FOUND_EVENT}
  *  tagged `walk` as they land; the result is the whole set. */

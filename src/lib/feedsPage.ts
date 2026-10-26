@@ -2,7 +2,7 @@
  * Small pieces of the Feeds page's state, kept here so they can be tested
  * without mounting the page.
  */
-import type { FeedsChangedEvent } from '$lib/api/feeds';
+import type { FeedItemStatus, FeedsChangedEvent } from '$lib/api/feeds';
 
 /** The largest auto-download cap the backend keeps, in MiB (`commands/feeds.rs`). */
 export const AUTO_MIB_MAX = 2 ** 30;
@@ -108,4 +108,41 @@ export function keepUnchanged<T extends { ed2k: string }>(prev: readonly T[], ne
     return kept;
   });
   return same ? (prev as T[]) : merged;
+}
+
+/** The followed feed to open when none the user chose is: the one last
+ *  opened, else the first with something new, else the first. */
+export function pickFollowed<T extends { publisher: string; salt: string; unread: number }>(
+  feeds: readonly T[],
+  remembered: string | null,
+): T | undefined {
+  return (
+    feeds.find((f) => `${f.publisher}/${f.salt}` === remembered) ?? feeds.find((f) => f.unread > 0) ?? feeds[0]
+  );
+}
+
+/** Whether a followed feed's file is here to open or show in its folder. */
+export const onDisk = (status: FeedItemStatus): boolean => status === 'done' || status === 'in_library';
+
+/** Run `task` on each of `items`, at most `limit` at once, on to the end
+ *  whatever fails; resolves to what the failed ones threw, in their order. */
+export async function runEach<T>(
+  items: readonly T[],
+  limit: number,
+  task: (item: T) => Promise<unknown>,
+): Promise<unknown[]> {
+  const failed: { at: number; error: unknown }[] = [];
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const at = next++;
+      try {
+        await task(items[at]);
+      } catch (error) {
+        failed.push({ at, error });
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker));
+  return failed.sort((a, b) => a.at - b.at).map((f) => f.error);
 }

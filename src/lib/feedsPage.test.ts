@@ -5,6 +5,9 @@ import {
   concernsFollowed,
   draftOf,
   keepUnchanged,
+  onDisk,
+  pickFollowed,
+  runEach,
   sameDraft,
   withLiveProgress,
   type FeedDraft,
@@ -166,5 +169,67 @@ describe('concernsFollowed', () => {
     expect(concernsFollowed({ publisher: 'other', salt: 'salt' }, feed)).toBe(false);
     expect(concernsFollowed({ publisher: 'pub', salt: 'other' }, feed)).toBe(false);
     expect(concernsFollowed({ salt: 'salt' }, feed)).toBe(false);
+  });
+});
+
+describe('pickFollowed', () => {
+  const feed = (salt: string, unread = 0) => ({ publisher: 'pub', salt, unread });
+  const feeds = [feed('a'), feed('b', 2), feed('c', 5)];
+
+  it('opens the one last opened while it is still followed', () => {
+    expect(pickFollowed(feeds, 'pub/c')?.salt).toBe('c');
+    expect(pickFollowed(feeds, 'pub/a')?.salt).toBe('a');
+  });
+
+  it('else the first with something new, else the first', () => {
+    expect(pickFollowed(feeds, 'pub/gone')?.salt).toBe('b');
+    expect(pickFollowed(feeds, null)?.salt).toBe('b');
+    expect(pickFollowed([feed('a'), feed('b')], null)?.salt).toBe('a');
+  });
+
+  it('opens nothing when nothing is followed', () => {
+    expect(pickFollowed([], 'pub/a')).toBeUndefined();
+  });
+});
+
+describe('onDisk', () => {
+  it('is true only for a file downloaded and kept', () => {
+    expect(onDisk('done')).toBe(true);
+    expect(onDisk('in_library')).toBe(true);
+    for (const status of ['none', 'queued', 'downloading', 'paused', 'failed', 'missing', 'cancelled', 'elsewhere'] as const) {
+      expect(onDisk(status)).toBe(false);
+    }
+  });
+});
+
+describe('runEach', () => {
+  it('runs every item, no more than the limit at once', async () => {
+    let running = 0;
+    let most = 0;
+    const seen: number[] = [];
+    const errors = await runEach([1, 2, 3, 4, 5], 2, async (n) => {
+      running++;
+      most = Math.max(most, running);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      seen.push(n);
+      running--;
+    });
+    expect(errors).toEqual([]);
+    expect(seen.sort()).toEqual([1, 2, 3, 4, 5]);
+    expect(most).toBe(2);
+  });
+
+  it('goes on past a failure, and gives back what failed in order', async () => {
+    const seen: number[] = [];
+    const errors = await runEach([1, 2, 3, 4], 3, async (n) => {
+      seen.push(n);
+      if (n % 2 === 0) throw new Error(`no ${n}`);
+    });
+    expect(seen.sort()).toEqual([1, 2, 3, 4]);
+    expect(errors.map((e) => (e as Error).message)).toEqual(['no 2', 'no 4']);
+  });
+
+  it('runs nothing for nothing', async () => {
+    expect(await runEach([], 4, async () => {})).toEqual([]);
   });
 });

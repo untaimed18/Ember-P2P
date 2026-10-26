@@ -114,6 +114,7 @@ fn listings_from_blobs(blobs: Vec<Vec<u8>>, now: i64) -> Vec<Listing> {
                 description,
                 item_count: i64::from(head.item_count),
                 list_size: head.list_size.min(i64::MAX as u64) as i64,
+                total_size: head.total_size.min(i64::MAX as u64) as i64,
                 sequence: head.sequence.min(i64::MAX as u64).min(signed_ms.max(0) as u64) as i64,
                 listed_at: record.timestamp,
                 first_seen: 0,
@@ -405,8 +406,10 @@ mod tests {
             list_size: 1234,
             list_blake3: [8u8; 32],
             item_count: 3,
+            total_size: 3_000,
             title: title.into(),
             description: "About".into(),
+            deleted: false,
         }
     }
 
@@ -528,6 +531,88 @@ mod tests {
             }
             assert_eq!(heard.newest.values().next(), Some(&winner), "whichever was heard first");
         }
+    }
+
+    fn shard_of(feed: &DiscoveredFeed) -> u8 {
+        let (mut publisher, mut salt) = ([0u8; 32], [0u8; 16]);
+        hex::decode_to_slice(&feed.publisher, &mut publisher).unwrap();
+        hex::decode_to_slice(&feed.salt, &mut salt).unwrap();
+        feed_index_shard(&publisher, &salt)
+    }
+
+    fn cached(publisher: u8, salt: u8, sequence: i64, listed_at: i64) -> DiscoveredFeed {
+        DiscoveredFeed {
+            publisher: hex::encode([publisher; 32]),
+            salt: hex::encode([salt; 16]),
+            title: "T".into(),
+            description: String::new(),
+            item_count: 1,
+            list_size: 10,
+            total_size: 100,
+            sequence,
+            listed_at,
+            first_seen: 0,
+        }
+    }
+
+    /// A shard that comes back with as many records as a lookup returns may
+    /// hold more, so its cached feeds are carried forward, as a shard too
+    /// few nodes answered; one that settled without a cached feed drops it.
+    #[test]
+    fn a_shard_that_comes_back_full_carries_its_cached_feeds() {
+        use crate::commands::channel_recovery::MIN_RESPONDERS_FOR_ABSENCE as ENOUGH;
+        use crate::commands::channels::shard_settled;
+        use crate::network::ember::dht::search::MAX_SEARCH_RESULTS as FULL;
+        assert!(shard_settled(ENOUGH, FULL - 1));
+        assert!(!shard_settled(ENOUGH, FULL), "it may hold more than a lookup returns");
+        assert!(!shard_settled(ENOUGH - 1, 0), "too few answered to say it is empty");
+
+        let feeds: Vec<DiscoveredFeed> = (1..=60u8).map(|salt| cached(1, salt, 5, NOW)).collect();
+        let full = shard_of(&feeds[0]);
+        let unsettled: HashSet<u8> = (0..crate::network::ember::feed::FEED_INDEX_SHARDS)
+            .filter(|shard| !shard_settled(ENOUGH, if *shard == full { FULL } else { 0 }))
+            .collect();
+        assert_eq!(unsettled, HashSet::from([full]));
+        let (carried, lapsed) = sort_cached(feeds.clone(), &unsettled, &Heard::default());
+        assert!(carried.contains(&feeds[0]));
+        assert!(carried.iter().all(|feed| shard_of(feed) == full), "only the full shard's");
+        assert!(lapsed.iter().all(|feed| shard_of(feed) != full), "the settled shards' lapsed");
+        assert_eq!(carried.len() + lapsed.len(), feeds.len());
+    }
+
+    /// What a walk heard and what the cache carries forward come to one
+    /// list: a feed heard is taken as heard, withdrawn or not, each publisher
+    /// keeps its last listed eight, and running publishers' feeds come
+    /// first, then the most lately published.
+    #[test]
+    fn a_walk_and_the_cache_merge_capped_and_in_display_order() {
+        let listing = |feed: DiscoveredFeed, withdrawn: bool| Listing { feed, withdrawn, signature: [0; 64] };
+        let mut heard = Heard::default();
+        assert!(heard.take(listing(cached(1, 1, 50, NOW), false)));
+        assert!(heard.take(listing(cached(1, 2, 10, NOW - 60), false)));
+        assert!(heard.take(listing(cached(1, 4, 60, NOW - 30), true)));
+        let stale = NOW - FEED_LISTING_ACTIVE_SECS - 60;
+        let mut cache = vec![cached(1, 4, 40, stale), cached(1, 3, 99, stale), cached(1, 1, 45, stale)];
+        cache.extend((1..=10u8).map(|salt| cached(2, salt, 100 + i64::from(salt), stale - i64::from(salt))));
+        let every_shard: HashSet<u8> = (0..crate::network::ember::feed::FEED_INDEX_SHARDS).collect();
+
+        let (carried, lapsed) = sort_cached(cache, &every_shard, &heard);
+        assert!(lapsed.is_empty(), "no shard settled");
+        assert!(!carried.iter().any(|feed| feed.publisher == hex::encode([1u8; 32]) && feed.salt != hex::encode([3u8; 16])), "heard, so not carried");
+        let found = heard.newest.into_values().filter(|l| !l.withdrawn).map(|l| l.feed);
+        let local = Local { own_key: String::new(), followed: HashSet::new(), hidden: HashSet::new() };
+        let mut out: Vec<DiscoveredFeedInfo> =
+            cap_per_publisher(found.chain(carried).collect()).into_iter().filter_map(|feed| local.info(feed, NOW)).collect();
+        sort_for_display(&mut out);
+        let order: Vec<(String, String)> = out.iter().map(|info| (info.feed.publisher[..2].to_string(), info.feed.salt[..2].to_string())).collect();
+        let id = |publisher: u8, salt: u8| (hex::encode([publisher]), hex::encode([salt]));
+        let mut want = vec![id(1, 1), id(1, 2)];
+        want.extend((1..=8u8).rev().map(|salt| id(2, salt)));
+        want.push(id(1, 3));
+        assert_eq!(order, want, "active first, then by sequence; the publisher's two staler listings dropped");
+        assert!(out[0].active && !out[2].active);
+        let json = serde_json::to_value(&out[0]).unwrap();
+        assert_eq!(json["total_size"], 100, "the frontend's field");
     }
 
     #[test]

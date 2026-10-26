@@ -2585,6 +2585,21 @@ impl FinishedPlace {
     }
 }
 
+/// A finished download's file, found and checked as [`open_file`] does:
+/// where completion recorded it, or under its name where it would have
+/// finished. Blocking.
+pub(crate) fn verified_finished_file(
+    transfer: &Transfer,
+    folders: &crate::storage::part_folders::DownloadFolders,
+) -> std::io::Result<PathBuf> {
+    let place = FinishedPlace::of(transfer, &folders.current);
+    let path = match transfer.completed_path.as_deref() {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => place.default_path,
+    };
+    crate::security::filesystem::verify_recorded_file_nested(&path, &folders.roots(), place.folder, place.depth)
+}
+
 /// Completed file in `Downloads/`, or in-progress `.part` in `Temp/`.
 /// Always prefers the final file in Downloads/ over the .part in Temp/ so
 /// that a stale in-memory status never misdirects the user.

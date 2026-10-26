@@ -83,7 +83,18 @@ export function cleanupFeedsStore(): void {
   followedFeedsFailed.set(false);
   lastWalkAt = 0;
   runningWalk = null;
+  feedsPageMemory.tab = 'following';
+  feedsPageMemory.own = null;
 }
+
+/** Where the Feeds page was left: its tab and the user's own feed open,
+ *  by salt. Kept here, not on the page, which is made anew on each visit;
+ *  for this run of the app only, and forgotten with the identity. The
+ *  followed feed open is kept by the page itself, across runs. */
+export const feedsPageMemory: { tab: 'following' | 'discover' | 'mine'; own: string | null } = {
+  tab: 'following',
+  own: null,
+};
 
 /** The followed feed `publisher`/`salt`, if followed. */
 export function followedFeed(publisher: string, salt: string): FollowedFeed | undefined {

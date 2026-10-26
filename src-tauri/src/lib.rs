@@ -920,6 +920,9 @@ pub fn run() {
             )
             .map_err(|error| anyhow::anyhow!("Failed to load approved filesystem roots: {error}"))?;
             sharing::feed_files::allow_list_dirs(&data_dir);
+            // Not an approved root, unlike the lists' folders: nothing in it is
+            // ever served.
+            network::ember::attach_stream::set_feed_tree_dir(data_dir.join("feed-trees"));
             emule_import::apply::root_additions_approved(&data_dir);
             // Only share_intent.json is read here; the known.met migration runs
             // on its own thread, and every share-intent reader and known.met
@@ -2607,6 +2610,8 @@ pub fn run() {
             commands::feeds::unfollow_feed,
             commands::feeds::open_feed_folder,
             commands::feeds::open_feed_files_folder,
+            commands::feeds::open_feed_item,
+            commands::feeds::show_feed_item,
             commands::feed_discover::discover_feeds,
             commands::feed_discover::cached_discovered_feeds,
             commands::feed_discover::set_discovered_feed_hidden,

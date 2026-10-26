@@ -5865,7 +5865,7 @@ pub(crate) struct ShardWalk {
 
 /// Whether a shard walk that `responded` nodes answered with `found` blobs
 /// settled (see [`ShardWalk::settled`]).
-fn shard_settled(responded: usize, found: usize) -> bool {
+pub(crate) fn shard_settled(responded: usize, found: usize) -> bool {
     responded >= crate::commands::channel_recovery::MIN_RESPONDERS_FOR_ABSENCE
         && found < crate::network::ember::dht::search::MAX_SEARCH_RESULTS
 }

@@ -520,6 +520,7 @@ mod tests {
         let (mut server_w, mut client_r) = tokio::io::duplex(1 << 20);
         let (served, size, capability) = (rig.served.clone(), rig.worker.file_size, rig.source.capability);
         let roots = vec![rig.base.join("root").to_string_lossy().into_owned()];
+        let blake3 = *blake3::hash(&std::fs::read(&served).unwrap()).as_bytes();
         let server = tokio::spawn(async move {
             let mut prefix = [0u8; 7];
             server_r.read_exact(&mut prefix).await?;
@@ -527,7 +528,7 @@ mod tests {
                 &mut server_r,
                 &mut server_w,
                 &prefix,
-                |_| Ok((served, size, capability, roots)),
+                |_| Ok(attach_stream::FeedGrant { path: served, size, blake3, capability, roots }),
                 |_| Ok(()),
                 |_, _, _| true,
                 None,

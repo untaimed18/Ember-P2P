@@ -1367,10 +1367,15 @@ publisher's identity key:
 
 **Trailer.** Framed as the channel trailer, little-endian: `version(1) = 2 ||
 sequence(8) || sealed`, where `sealed` seals `list_ed2k_hash(16) ||
-list_blake3(32) || list_size(8) || item_count(4) || title_len(1) || title ||
-description_len(2) || description` (title 1 to 64 bytes, description at most
-256) under the head key, with `aad = "ember-feed-head" || version ||
-publisher || locator || sequence`. `sequence` is the publisher's clock in
+list_blake3(32) || list_size(8) || item_count(4) || total_size(8) ||
+flags(1) || title_len(1) || title || description_len(2) || description`
+(title 1 to 64 bytes, description at most 256) under the head key, with
+`aad = "ember-feed-head" || version || publisher || locator || sequence`.
+`total_size` is the sum of the sizes of the files the list names, as the
+publisher counted them, for display. Flag `0x01` (`FEED_HEAD_DELETED`) marks
+a tombstone (below); other bits are ignored, for later builds. A body with
+a field out of bounds, text that is not UTF-8, or a byte short or past its
+description is refused. `sequence` is the publisher's clock in
 milliseconds, never less than one past the last it published
 (`next_sequence`), so the latest publish wins on any of the publisher's
 devices; a device's republish first looks for a newer head and leaves it in
@@ -1385,18 +1390,41 @@ passes through them. They keep it `CHANNEL_GOVERNANCE_TTL` (30 days),
 replicate it, and among a feed's heads keep the highest `sequence`, then the
 newest timestamp (the larger signature on a tie), so a device's republish of
 an older head, or a newer one signed after the clock went back, is ranked as
-followers rank it. Builds before it file it as an unknown type for
+followers rank it. One publisher may hold at most 64 heads across every key
+on a storer (`MAX_FEED_HEADS_PER_PUBLISHER`, far past the eight feeds one
+identity keeps and their tombstones), as each feed's head has a key of its
+own and no per-key cap binds it; a head replacing one the publisher holds
+there is always taken. Builds before it file it as an unknown type for
 `KEYWORD_RECORD_TTL` (24 hours) without replicating or reading it. The
 publisher republishes hourly while it runs, and on every publish: while most
 storers are such builds, a head stored a day ago has often lost every node
 that held it. Each republish is also pushed to friends with a session, as a
 publish is, so a friend who followed since takes it whatever the DHT holds.
 
+**Tombstones.** Deleting a feed ever published (a head sent or left pending)
+signs a tombstone head: flag `0x01`, a sequence past every head the feed
+published or left pending, the withdrawal's placeholder list fields (every
+hash byte `0xFF`, size 1, no items, total 0) and the title last published
+(`-` if none), with no description (`tombstone_head`). Storers rank it above
+every live copy by its sequence, and a device's republish of the feed that
+finds it yields, as to any newer head naming a list not its own. It is sent
+at once, pushed to friends once a node stores it, and signed and sent again
+every 6 hours (`feeds_own_deleted`, 10 minutes after a send no node stored)
+until 30 days after the delete, by when every live head, each signed before
+it, has lapsed.
+
 **Followers** look a feed up every 30 minutes, and every 3 minutes while it
-has never been found, for a day after following it. A lookup whose key gives
+has never been found, for a day after following it. Each one-minute tick
+takes as many lookups as that needs, and two more for those that reached no
+node or fell behind, between 3 and 24 (720 feeds each half hour), up to 8 at
+once. A lookup whose key gives
 no head reads the feed's index shard (below), at most every 15 minutes, and
 takes the head the newest listing of the feed carries, unless it withdraws
-it.
+it. A follower that takes up a tombstone marks the feed deleted
+(`FollowedFeed::deleted`): it keeps the feed's items and files, and the list
+it holds, gives up any list fetch on its way, fetches no list and starts no
+auto-download for it, and still looks it up, as a live head published after
+it takes the feed back up.
 
 **The list** is `"EMBRFL01" ||` a format-v2 collection
 (`network/ed2k/collection.rs`) sealed under the list key, with `aad =
@@ -1456,7 +1484,7 @@ publisher's identity key:
 
 **Trailer.** Framed as the channel trailer: `flags(1) ||` the head in the
 clear (`version(1) = 1 || sequence(8) || list_ed2k_hash(16) || item_count(4) ||
-description_len(2) || description`). Flag `0x01` withdraws the feed from the
+total_size(8) || description_len(2) || description`). Flag `0x01` withdraws the feed from the
 index; other bits are kept for later builds. A listing names its feed by
 publisher and salt, which is all its link holds, so Discover follows it as it
 would the link. A withdrawal carries a
@@ -1467,8 +1495,10 @@ what the listing it displaces already said.
 **Storers** that know the type (`feed_listing_store_ok`) refuse a listing whose
 `keyword_hash` is not the shard key of its signer and salt, so one cannot be
 aimed at whichever shard key lies nearest a storer, or whose trailer has no
-flags and head version 1 or later (`listing_storable`); followers read the
-rest, so a later version passes through storers. They keep it a week
+flags and head version 1 or later (`listing_storable`). One of version 1 must
+read as a follower reads it, header and trailer, or it would only take a
+shard's slot from a real listing; a later version is read no further, and
+passes through storers. They keep it a week
 (`FEED_LISTING_TTL`; the publisher re-signs it hourly while it runs),
 replicate it, and keep the newest timestamp per feed (the larger signature on
 a tie). One publisher may hold at most 16 records under a shard key

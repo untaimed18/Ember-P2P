@@ -7383,8 +7383,10 @@ mod tests {
             list_size: 100,
             list_blake3: [2; 32],
             item_count: 1,
+            total_size: 0,
             title: "Feed".into(),
             description: String::new(),
+            deleted: false,
         };
         let record = SignedRecord::feed_head_record(&[5u8; 16], &head, &sk, chrono::Utc::now().timestamp()).unwrap();
         let (_rid, frame) = a.build_store(record.keyword_hash, record.data.clone(), record.signature);

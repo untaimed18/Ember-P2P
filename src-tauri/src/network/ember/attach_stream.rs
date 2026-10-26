@@ -46,14 +46,31 @@ pub const ATTACH_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// receive slot for one long wait rather than one per attempt.
 pub const ATTACH_RETRY_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Hash trees kept for files being served. A tree is `CHUNK_SIZE`-granular, so
-/// even a 2 GiB file's is 256 KiB.
+/// Hash trees kept for chat and room files being served. A tree is
+/// `CHUNK_SIZE`-granular, so even a 2 GiB file's is 256 KiB. Feed trees are
+/// not counted here; see [`FEED_TREE_CACHE_BYTES`].
 const HASH_CACHE_MAX: usize = 16;
 
-/// A cached tree nobody has asked for in this long is dropped. Past a grant's
-/// lifetime nothing will ask again, and a tree that outlives the bytes it
-/// describes is only ever a wrong answer.
+/// A cached chat or room tree nobody has asked for in this long is dropped.
+/// Past a grant's lifetime nothing will ask again, and a tree that outlives
+/// the bytes it describes is only ever a wrong answer.
 const HASH_CACHE_IDLE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Bytes of feed trees kept in memory, least recently used dropped first:
+/// 64 MiB of chunk values is the lists of some 512 GiB of files. A feed's
+/// followers come back for the same files for as long as it is published,
+/// and with a count bound a feed of more files than it allowed was hashed
+/// over and over, each time out of [`FEED_HASH_BUDGET`], until followers were
+/// told busy for files already hashed. They have no idle expiry either: the
+/// stamp is checked on every stream all the same, and an idle tree under the
+/// bound costs only its bytes, where dropping it costs the next follower a
+/// read from [`set_feed_tree_dir`]'s folder or of the whole file.
+const FEED_TREE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// What a feed tree is charged against [`FEED_TREE_CACHE_BYTES`] beyond its
+/// values: the key, its path and the slot. Without it a feed of many small
+/// files would hold far more than the bound says.
+const FEED_TREE_ENTRY_COST: usize = 512;
 
 /// What identifies the bytes a tree was computed over, as far as the file
 /// system will say without reading them. Revalidated on every stream, from
@@ -174,29 +191,25 @@ fn lookup_hash(stamp: &FileStamp) -> HashLookup {
     let mut cache = hash_cache().lock().unwrap_or_else(|e| e.into_inner());
     let now = std::time::Instant::now();
     match cache.get_mut(stamp) {
-        Some(HashSlot::Ready { tree, used })
-            if now.saturating_duration_since(*used) < HASH_CACHE_IDLE =>
-        {
+        Some(HashSlot::Ready { tree, used }) if fresh(stamp, *used, now) => {
             *used = now;
             return HashLookup::Ready(tree.clone());
         }
         Some(HashSlot::Hashing(rx)) => return HashLookup::Wait(rx.clone()),
         _ => {}
     }
-    // Every other entry for the same path is a version of the file that is no
-    // longer on disk.
-    cache.retain(|key, _| key.path != stamp.path);
-    let now = std::time::Instant::now();
-    cache.retain(|_, slot| match slot {
-        HashSlot::Ready { used, .. } => now.saturating_duration_since(*used) < HASH_CACHE_IDLE,
+    forget_other_versions(&mut cache, stamp);
+    cache.retain(|key, slot| match slot {
+        HashSlot::Ready { used, .. } => fresh(key, *used, now),
         HashSlot::Hashing(_) => true,
     });
-    if cache.len() >= HASH_CACHE_MAX {
+    // Feed trees are bounded by their bytes when they land, in `keep_tree`.
+    if !stamp.subtrees && cache.keys().filter(|key| !key.subtrees).count() >= HASH_CACHE_MAX {
         let oldest = cache
             .iter()
             .filter_map(|(key, slot)| match slot {
-                HashSlot::Ready { used, .. } => Some((key.clone(), *used)),
-                HashSlot::Hashing(_) => None,
+                HashSlot::Ready { used, .. } if !key.subtrees => Some((key.clone(), *used)),
+                _ => None,
             })
             .min_by_key(|(_, used)| *used)
             .map(|(key, _)| key);
@@ -209,12 +222,69 @@ fn lookup_hash(stamp: &FileStamp) -> HashLookup {
     HashLookup::Start(tx, rx)
 }
 
+/// Whether a tree last used at `used` may still be served at `now`. Only
+/// chat and room trees go idle; see [`FEED_TREE_CACHE_BYTES`].
+fn fresh(stamp: &FileStamp, used: std::time::Instant, now: std::time::Instant) -> bool {
+    stamp.subtrees || now.saturating_duration_since(used) < HASH_CACHE_IDLE
+}
+
+/// Drop every entry for `stamp`'s path that is a version of the file no
+/// longer on disk. The same version's other kind of tree stays: a file can
+/// be both offered in a chat and listed in a feed.
+fn forget_other_versions(cache: &mut std::collections::HashMap<FileStamp, HashSlot>, stamp: &FileStamp) {
+    cache.retain(|key, _| key.path != stamp.path || FileStamp { subtrees: stamp.subtrees, ..key.clone() } == *stamp);
+}
+
+/// Put a finished `tree` in the cache under `stamp`, dropping the least
+/// recently used feed trees past [`FEED_TREE_CACHE_BYTES`] when it is one.
+fn keep_tree(
+    cache: &mut std::collections::HashMap<FileStamp, HashSlot>,
+    stamp: FileStamp,
+    tree: std::sync::Arc<HashTree>,
+) {
+    let feed = stamp.subtrees;
+    cache.insert(stamp, HashSlot::Ready { tree, used: std::time::Instant::now() });
+    if !feed {
+        return;
+    }
+    let cost = |tree: &HashTree| tree.chunk_hashes.len() * 32 + FEED_TREE_ENTRY_COST;
+    let mut held: usize = cache
+        .iter()
+        .filter_map(|(key, slot)| match slot {
+            HashSlot::Ready { tree, .. } if key.subtrees => Some(cost(tree)),
+            _ => None,
+        })
+        .sum();
+    if held <= FEED_TREE_CACHE_BYTES {
+        return;
+    }
+    let mut feeds: Vec<_> = cache
+        .iter()
+        .filter_map(|(key, slot)| match slot {
+            HashSlot::Ready { tree, used } if key.subtrees => Some((*used, key.clone(), cost(tree))),
+            _ => None,
+        })
+        .collect();
+    feeds.sort_by_key(|(used, _, _)| *used);
+    // The tree just kept is the newest, and no feed file's is near the bound
+    // (an 8 GiB file's is 1 MiB), so it is never the one dropped.
+    for (_, key, cost) in feeds {
+        if held <= FEED_TREE_CACHE_BYTES {
+            break;
+        }
+        cache.remove(&key);
+        held -= cost;
+    }
+}
+
 /// Whether the tree for `stamp` is cached or being built: a stream for it
-/// reads nothing more of the file to answer.
+/// reads nothing more of the file to answer. Never looks on disk, as it is
+/// asked on the runtime; a feed stream has [`recall_feed_tree`] bring a kept
+/// tree into the cache first.
 fn tree_known(stamp: &FileStamp) -> bool {
     let cache = hash_cache().lock().unwrap_or_else(|e| e.into_inner());
     match cache.get(stamp) {
-        Some(HashSlot::Ready { used, .. }) => used.elapsed() < HASH_CACHE_IDLE,
+        Some(HashSlot::Ready { used, .. }) => fresh(stamp, *used, std::time::Instant::now()),
         Some(HashSlot::Hashing(_)) => true,
         None => false,
     }
@@ -238,19 +308,59 @@ fn feed_hash_spent() -> &'static std::sync::Mutex<(std::time::Instant, u64)> {
     SPENT.get_or_init(|| std::sync::Mutex::new((std::time::Instant::now(), 0)))
 }
 
-/// Leave to hash a feed file of `size` bytes for a follower: one at a time,
-/// and `None` once the hour's budget would be passed.
-async fn feed_hash_permit(size: u64) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    let permit = feed_hash_gate().clone().acquire_owned().await.ok()?;
+/// What [`feed_hash_permit`] found once it was a feed stream's turn.
+enum FeedHashLeave {
+    /// The job ahead of it built the tree, or is building it: nothing to read
+    /// and nothing charged.
+    Known,
+    /// Leave to read the whole file, charged against the hour's budget.
+    Granted(tokio::sync::OwnedSemaphorePermit),
+    /// The hour's budget would be passed.
+    Spent,
+}
+
+/// Leave to hash the feed file `stamp` names for a follower: one at a time,
+/// and refused once the hour's budget would be passed.
+///
+/// The tree is looked for again once it is this stream's turn. Streams for
+/// the same file queue behind one another while its tree is built, and
+/// charging each of them as they joined the queue spent the budget once per
+/// stream for one read.
+async fn feed_hash_permit(stamp: &FileStamp) -> FeedHashLeave {
+    let Ok(permit) = feed_hash_gate().clone().acquire_owned().await else {
+        return FeedHashLeave::Spent;
+    };
+    if tree_known(stamp) {
+        return FeedHashLeave::Known;
+    }
     let mut spent = feed_hash_spent().lock().unwrap_or_else(|e| e.into_inner());
     if spent.0.elapsed() >= FEED_HASH_WINDOW {
         *spent = (std::time::Instant::now(), 0);
     }
-    if spent.1.saturating_add(size) > FEED_HASH_BUDGET {
-        return None;
+    if spent.1.saturating_add(stamp.size) > FEED_HASH_BUDGET {
+        return FeedHashLeave::Spent;
     }
-    spent.1 = spent.1.saturating_add(size);
-    Some(permit)
+    spent.1 = spent.1.saturating_add(stamp.size);
+    #[cfg(test)]
+    tests::note_charged(&stamp.path);
+    FeedHashLeave::Granted(permit)
+}
+
+/// [`feed_hash_permit`] for a feed stream that may have to read its file:
+/// the permit, none when the tree is known after all, or the follower told
+/// it is busy.
+async fn feed_read_leave<W>(send: &mut W, stamp: &FileStamp) -> anyhow::Result<Option<tokio::sync::OwnedSemaphorePermit>>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(ATTACH_STATUS_TIMEOUT, feed_hash_permit(stamp)).await {
+        Ok(FeedHashLeave::Granted(permit)) => Ok(Some(permit)),
+        Ok(FeedHashLeave::Known) => Ok(None),
+        _ => {
+            refuse(send, AttachStreamStatus::Busy).await?;
+            anyhow::bail!("no budget left to hash a feed file for a follower");
+        }
+    }
 }
 
 /// Hash the file `stamp` names and publish the result. Blocking: a read of the
@@ -260,22 +370,24 @@ fn run_hash_job(stamp: FileStamp, tx: tokio::sync::watch::Sender<HashOutcome>) {
     #[cfg(test)]
     tests::note_hashed(&stamp.path);
     let mut cache = hash_cache().lock().unwrap_or_else(|e| e.into_inner());
-    match &outcome {
+    let stored = match &outcome {
         Ok(tree) => {
-            cache.insert(
-                stamp,
-                HashSlot::Ready {
-                    tree: tree.clone(),
-                    used: std::time::Instant::now(),
-                },
-            );
+            keep_tree(&mut cache, stamp.clone(), tree.clone());
+            stamp.subtrees.then(|| tree.clone())
         }
         // Not cached: the next stream tries again, and the file may be back.
         Err(_) => {
             cache.remove(&stamp);
+            None
         }
-    }
+    };
     drop(cache);
+    // Before the waiting streams have their answer, so a follower served from
+    // this tree finds it kept: a write of at most 1 MiB, after a read of the
+    // whole file.
+    if let Some(tree) = stored {
+        store_feed_tree(&stamp, &tree);
+    }
     let _ = tx.send(Some(outcome));
 }
 
@@ -319,6 +431,222 @@ fn subtree_tree<R: std::io::Read>(mut reader: R, size: u64) -> std::io::Result<H
     }
     let root_hash = root_of_chunk_values(&chunk_hashes).unwrap_or(*blake3::hash(&[]).as_bytes());
     Ok(HashTree { chunk_hashes, root_hash, file_size: size })
+}
+
+static FEED_TREE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Keep the feed trees this side computes in `dir`, so a restart does not read
+/// every file followers ask for all over again, out of [`FEED_HASH_BUDGET`].
+/// Called once, at startup, with a folder of the app's data folder that no
+/// shared or download folder covers: a tree only names what a feed's file
+/// holds, which is no secret, but nothing in the folder is the user's to
+/// serve, and nothing but [`load_feed_tree`] reads it. Until it is called
+/// trees are not kept.
+pub fn set_feed_tree_dir(dir: PathBuf) {
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("Could not create the feed tree folder {}: {error}", dir.display());
+        return;
+    }
+    crate::security::restrict_file_permissions(&dir);
+    let _ = FEED_TREE_DIR.set(dir);
+}
+
+fn feed_tree_dir() -> Option<&'static std::path::Path> {
+    FEED_TREE_DIR.get().map(PathBuf::as_path)
+}
+
+/// What [`set_feed_tree_dir`]'s folder may hold before the least recently
+/// used trees in it are deleted: 512 MiB of values is the lists of some 4 TiB
+/// of files, and the count bounds a feed of a great many small ones.
+const FEED_TREE_DISK_BYTES: u64 = 512 * 1024 * 1024;
+const FEED_TREE_DISK_FILES: usize = 20_000;
+
+/// The start of a kept tree's file. A file whose first bytes are anything
+/// else, an older layout included, is deleted when it is found.
+const FEED_TREE_MAGIC: &[u8; 8] = b"EMBRTREE";
+const FEED_TREE_VERSION: u32 = 1;
+
+/// The header of the file that keeps `stamp`'s tree: the magic and version,
+/// every field of the stamp, and the number of values that follow. A kept
+/// tree is taken only for a stamp whose header is this byte for byte, so a
+/// file that has changed in any way the stamp can see is read afresh.
+fn feed_tree_header(stamp: &FileStamp) -> Option<Vec<u8>> {
+    // Nanoseconds from the Unix epoch, negative before it: a `SystemTime`
+    // has no layout of its own to write down.
+    let modified = stamp.modified.map(|time| match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(after) => after.as_nanos() as i128,
+        Err(before) => -(before.duration().as_nanos() as i128),
+    });
+    let path = stamp.path.as_os_str().as_encoded_bytes();
+    let mut header = Vec::with_capacity(80 + path.len());
+    header.extend_from_slice(FEED_TREE_MAGIC);
+    header.extend_from_slice(&FEED_TREE_VERSION.to_le_bytes());
+    header.extend_from_slice(&stamp.size.to_le_bytes());
+    header.push(u8::from(modified.is_some()));
+    header.extend_from_slice(&modified.unwrap_or(0).to_le_bytes());
+    header.extend_from_slice(&stamp.object.0.to_le_bytes());
+    header.extend_from_slice(&stamp.object.1.to_le_bytes());
+    header.extend_from_slice(&stamp.changed.to_le_bytes());
+    header.extend_from_slice(&u32::try_from(path.len()).ok()?.to_le_bytes());
+    header.extend_from_slice(path);
+    header.extend_from_slice(&stamp.size.div_ceil(ATTACH_CHUNK_SIZE as u64).to_le_bytes());
+    Some(header)
+}
+
+/// The file `stamp`'s tree is kept in, named by its path and file id: a new
+/// version of the same file replaces it, and a file renamed into place under
+/// the same name gets one of its own.
+fn feed_tree_file(dir: &std::path::Path, stamp: &FileStamp) -> PathBuf {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&stamp.object.0.to_le_bytes());
+    hasher.update(&stamp.object.1.to_le_bytes());
+    hasher.update(stamp.path.as_os_str().as_encoded_bytes());
+    dir.join(format!("{}.tree", hex::encode(&hasher.finalize().as_bytes()[..16])))
+}
+
+/// Keep `tree`, just computed for `stamp`, in [`set_feed_tree_dir`]'s folder:
+/// the header, the values, and a BLAKE3 of both, so a value the disk changed
+/// is caught on reading rather than served to every follower until the file
+/// itself changes. Blocking. Best effort: a tree not kept is computed again.
+fn store_feed_tree(stamp: &FileStamp, tree: &HashTree) {
+    let Some(dir) = feed_tree_dir() else {
+        return;
+    };
+    let Some(mut bytes) = feed_tree_header(stamp) else {
+        return;
+    };
+    if tree.chunk_hashes.len() as u64 != stamp.size.div_ceil(ATTACH_CHUNK_SIZE as u64) {
+        return;
+    }
+    bytes.reserve(tree.chunk_hashes.len() * 32 + 32);
+    for value in &tree.chunk_hashes {
+        bytes.extend_from_slice(value);
+    }
+    let check = blake3::hash(&bytes);
+    bytes.extend_from_slice(check.as_bytes());
+    // Not restricted on its own: the folder's permissions, set when it was
+    // made, are what its files get.
+    match crate::security::atomic_write(&feed_tree_file(dir, stamp), &bytes, false) {
+        Ok(()) => note_feed_tree_written(dir, bytes.len() as u64),
+        Err(error) => tracing::debug!("Could not keep a feed file's chunk list: {error}"),
+    }
+}
+
+/// The tree an earlier run kept for `stamp`, if it is there and whole. A file
+/// under the same name whose header differs is of a version no longer on
+/// disk, and one cut short or failing its check is no use to anyone; either
+/// is deleted. The root is worked out from the values, never read. Blocking:
+/// a read of at most 1 MiB, for an 8 GiB file.
+fn load_feed_tree(stamp: &FileStamp) -> Option<std::sync::Arc<HashTree>> {
+    use std::io::Read;
+    let dir = feed_tree_dir()?;
+    let header = feed_tree_header(stamp)?;
+    let count = usize::try_from(stamp.size.div_ceil(ATTACH_CHUNK_SIZE as u64)).ok()?;
+    let len = header.len().checked_add(count.checked_mul(32)?)?.checked_add(32)?;
+    let path = feed_tree_file(dir, stamp);
+    let file = std::fs::File::open(&path).ok()?;
+    let mut bytes = Vec::new();
+    // A read that failed says nothing about what the file holds.
+    file.take(len as u64 + 1).read_to_end(&mut bytes).ok()?;
+    let (body, check) = bytes.split_at(bytes.len().saturating_sub(32));
+    if bytes.len() != len || !body.starts_with(&header) || blake3::hash(body).as_bytes() != check {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    let chunk_hashes: Vec<[u8; 32]> = body[header.len()..]
+        .chunks_exact(32)
+        .map(|value| {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(value);
+            out
+        })
+        .collect();
+    let root_hash = crate::network::ember::feed::root_of_chunk_values(&chunk_hashes)
+        .unwrap_or(*blake3::hash(&[]).as_bytes());
+    // Its modified time is when it was last used, which is what
+    // `prune_feed_trees` goes by.
+    let _ = std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|file| file.set_modified(std::time::SystemTime::now()));
+    Some(std::sync::Arc::new(HashTree { chunk_hashes, root_hash, file_size: stamp.size }))
+}
+
+/// Bring the tree an earlier run kept for `stamp` into the cache, unless one
+/// is there or being built already. Blocking: see [`load_feed_tree`].
+fn recall_feed_tree(stamp: &FileStamp) {
+    if tree_known(stamp) {
+        return;
+    }
+    let Some(tree) = load_feed_tree(stamp) else {
+        return;
+    };
+    let mut cache = hash_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.contains_key(stamp) {
+        return;
+    }
+    forget_other_versions(&mut cache, stamp);
+    keep_tree(&mut cache, stamp.clone(), tree);
+}
+
+/// Bytes and files [`set_feed_tree_dir`]'s folder is thought to hold: what
+/// the last [`prune_feed_trees`] left plus what was written since, so the
+/// folder is listed only when it may be past its bounds rather than on every
+/// write. `None` until the first write lists it.
+fn feed_tree_disk() -> &'static std::sync::Mutex<Option<(u64, usize)>> {
+    static HELD: std::sync::Mutex<Option<(u64, usize)>> = std::sync::Mutex::new(None);
+    &HELD
+}
+
+fn note_feed_tree_written(dir: &std::path::Path, len: u64) {
+    let mut held = feed_tree_disk().lock().unwrap_or_else(|e| e.into_inner());
+    // A rewrite of a file already counted is counted again, which only
+    // brings the next listing forward.
+    let (bytes, files) = held.map_or((u64::MAX, usize::MAX), |(bytes, files)| {
+        (bytes.saturating_add(len), files.saturating_add(1))
+    });
+    *held = Some(if bytes > FEED_TREE_DISK_BYTES || files > FEED_TREE_DISK_FILES {
+        prune_feed_trees(dir, FEED_TREE_DISK_BYTES, FEED_TREE_DISK_FILES)
+    } else {
+        (bytes, files)
+    });
+}
+
+/// Delete the least recently used files in `dir` while it holds more than
+/// `max_bytes` or `max_files`, down to seven eighths of each, so the writes
+/// that follow do not each list the folder again. A kept tree's file is
+/// touched whenever it is read, so its modified time is its last use; a
+/// temporary file a crash left mid-write is counted and goes in its turn.
+/// Returns what is left.
+fn prune_feed_trees(dir: &std::path::Path, max_bytes: u64, max_files: usize) -> (u64, usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    let mut held: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            meta.is_file()
+                .then(|| (meta.modified().unwrap_or(std::time::UNIX_EPOCH), meta.len(), entry.path()))
+        })
+        .collect();
+    let mut bytes: u64 = held.iter().map(|(_, len, _)| len).sum();
+    let mut files = held.len();
+    if bytes <= max_bytes && files <= max_files {
+        return (bytes, files);
+    }
+    held.sort_by_key(|(modified, _, _)| *modified);
+    let (max_bytes, max_files) = (max_bytes - max_bytes / 8, max_files - max_files / 8);
+    for (_, len, path) in held {
+        if bytes <= max_bytes && files <= max_files {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            bytes -= len;
+            files -= 1;
+        }
+    }
+    (bytes, files)
 }
 
 /// Drop `tree` from the cache if it is still what `stamp` maps to, so the next
@@ -703,18 +1031,33 @@ where
 /// Serve a file of a feed we publish to a follower who asked for it under
 /// [`super::attach::FEED_STREAM_MSG_TYPE`].
 ///
-/// No root is agreed ahead of a feed stream: the chunk list names each chunk
-/// by its chaining value in the file's BLAKE3 tree
-/// (`ember::feed::chunk_value`), so the follower checks the list against the
-/// file's BLAKE3 the signed list names, and every chunk against the list,
-/// before a byte is written. Served as a priority upload, as a chat file is.
+/// What a feed stream may serve for a request: one file of a feed we publish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedGrant {
+    pub path: PathBuf,
+    pub size: u64,
+    /// The file's BLAKE3 as its feed's list names it, which its chunk tree
+    /// must come to: a tree kept from before that does not is read again.
+    pub blake3: [u8; 32],
+    /// What the request must be tagged under.
+    pub capability: [u8; 32],
+    /// The shared and download folders the file is opened within.
+    pub roots: Vec<String>,
+}
+
+/// Serve a file of a feed we publish to a follower who asked for it under
+/// [`super::attach::FEED_STREAM_MSG_TYPE`].
 ///
-/// `resolve` names the file, its size, the capability, and the shared and
-/// download folders the file is opened within, or the status the follower is
-/// refused with. `admit` is asked once the
-/// file's chunk list is ready, so a wait for it holds nothing it hands out;
-/// what it returns is held while the stream runs, and an `Err` is the status
-/// the follower is refused with.
+/// The chunk list names each chunk by its chaining value in the file's
+/// BLAKE3 tree (`ember::feed::chunk_value`), so the follower checks the list
+/// against the file's BLAKE3 the signed list names, and every chunk against
+/// the list, before a byte is written; the tree is checked against that
+/// BLAKE3 here first. Served as a priority upload, as a chat file is.
+///
+/// `resolve` grants the file, or names the status the follower is refused
+/// with. `admit` is asked once the file's chunk list is ready, so a wait for
+/// it holds nothing it hands out; what it returns is held while the stream
+/// runs, and an `Err` is the status the follower is refused with.
 pub async fn serve_feed_stream<R, W, F, A, G, P>(
     recv: &mut R,
     send: &mut W,
@@ -727,7 +1070,7 @@ pub async fn serve_feed_stream<R, W, F, A, G, P>(
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
-    F: FnOnce(&[u8; 16]) -> Result<(PathBuf, u64, [u8; 32], Vec<String>), AttachStreamStatus>,
+    F: FnOnce(&[u8; 16]) -> Result<FeedGrant, AttachStreamStatus>,
     A: FnOnce(&[u8; 16]) -> Result<G, AttachStreamStatus>,
     P: FnMut(&[u8; 16], u64, u64) -> bool,
 {
@@ -737,7 +1080,7 @@ where
         send,
         prefix,
         move |xfer_id: &[u8; 16]| {
-            resolve(xfer_id).map(|(path, size, capability, roots)| (path, size, None, capability, Some(roots)))
+            resolve(xfer_id).map(|grant| (grant.path, grant.size, Some(grant.blake3), grant.capability, Some(grant.roots)))
         },
         admit,
         on_progress,
@@ -860,6 +1203,13 @@ where
                 }
             };
             let stamp = FileStamp { subtrees, ..FileStamp::of(&path, &file)? };
+            // Here, off the runtime, rather than in `tree_known`: a feed tree
+            // an earlier run kept is read into the cache, so the budget below
+            // is not charged for a file already read. Not for a file of
+            // another size than the grant's, which is refused below anyway.
+            if subtrees && stamp.size == size {
+                recall_feed_tree(&stamp);
+            }
             Ok((file, stamp))
         })
         .await
@@ -884,26 +1234,20 @@ where
     // its turn and its share of an hour's budget; past that it is refused as
     // busy, and the follower asks again later and the rest of the network
     // meanwhile.
-    let permit = if stream_type == super::attach::FEED_STREAM_MSG_TYPE && !tree_known(&stamp) {
-        match tokio::time::timeout(ATTACH_STATUS_TIMEOUT, feed_hash_permit(size)).await {
-            Ok(Some(permit)) => Some(permit),
-            _ => {
-                refuse(send, AttachStreamStatus::Busy).await?;
-                anyhow::bail!("no budget left to hash a feed file for a follower");
-            }
-        }
-    } else {
-        None
-    };
+    let permit = if subtrees && !tree_known(&stamp) { feed_read_leave(send, &stamp).await? } else { None };
     let mut hashed = attachment_tree(stamp.clone(), permit).await;
     // A cached tree that disagrees with the grant may be describing bytes the
     // stamp could not tell apart from the current ones. One fresh read settles
     // it before the file is refused. With no root granted, only a size can
-    // disagree, which a read of the same stamp would not change.
+    // disagree, which a read of the same stamp would not change. A feed
+    // file's second read waits its turn and is charged as a first one is:
+    // one whose bytes no longer make its list's BLAKE3 would otherwise be
+    // read whole again on every request for it.
     if let Ok((tree, true)) = &hashed {
         if !matches(tree) && root.is_some() {
             forget_cached_tree(&stamp, tree);
-            hashed = attachment_tree(stamp, None).await;
+            let permit = if subtrees { feed_read_leave(send, &stamp).await? } else { None };
+            hashed = attachment_tree(stamp, permit).await;
         }
     }
     let tree = match hashed {
@@ -1363,6 +1707,43 @@ mod tests {
             .count()
     }
 
+    static CHARGED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+    pub(super) fn note_charged(path: &Path) {
+        CHARGED.lock().unwrap_or_else(|e| e.into_inner()).push(path.to_path_buf());
+    }
+
+    /// How often a file named `name` was read, or charged to the feed hash
+    /// budget, by name: a feed file's stamp carries the path the approved-root
+    /// layer opened it under, which need not be spelled as the test's.
+    fn times_named(list: &std::sync::Mutex<Vec<PathBuf>>, name: &std::ffi::OsStr) -> usize {
+        list.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|p| p.file_name() == Some(name))
+            .count()
+    }
+
+    /// Keep feed trees in a folder of this test run's. Once one test has, every
+    /// feed file served in the run keeps its tree there, under a name of its
+    /// own path.
+    fn keep_feed_trees() -> &'static Path {
+        set_feed_tree_dir(std::env::temp_dir().join(format!("ember-attach-feed-trees-{}", std::process::id())));
+        feed_tree_dir().expect("feed tree folder")
+    }
+
+    /// A stamp for a feed file that is never opened.
+    fn feed_stamp(tag: &str, size: u64) -> FileStamp {
+        FileStamp {
+            path: temp_path(tag),
+            size,
+            modified: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000)),
+            object: (4, 5),
+            changed: 6,
+            subtrees: true,
+        }
+    }
+
     /// Serve `source` once to an honest receiver and return what it got.
     async fn serve_once(
         source: &Path,
@@ -1688,6 +2069,172 @@ mod tests {
         );
         assert!(matches!(lookup_hash(&stamp), HashLookup::Start(..)));
         hash_cache().lock().unwrap().remove(&stamp);
+    }
+
+    /// Feed trees are held to their bytes, least recently used out first, and
+    /// neither they nor the chat trees push the other kind out.
+    #[test]
+    fn feed_trees_are_bounded_by_their_bytes_not_the_chat_count() {
+        let _own = isolate_hash_cache();
+        let held = |feed: bool| hash_cache().lock().unwrap().keys().filter(|key| key.subtrees == feed).count();
+        let chat: Vec<_> = (0..HASH_CACHE_MAX)
+            .map(|i| FileStamp { subtrees: false, ..feed_stamp(&format!("bound-chat-{i}"), 1) })
+            .collect();
+        for stamp in &chat {
+            assert!(matches!(lookup_hash(stamp), HashLookup::Start(..)));
+            keep_tree(&mut hash_cache().lock().unwrap(), stamp.clone(), std::sync::Arc::new(HashTree::from_data(b"x")));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        // One tree's worth of values, shared: each entry is charged for it all
+        // the same.
+        let values = FEED_TREE_CACHE_BYTES / 32 / 32;
+        let tree = std::sync::Arc::new(HashTree {
+            chunk_hashes: vec![[7u8; 32]; values],
+            root_hash: [0; 32],
+            file_size: (values * ATTACH_CHUNK_SIZE) as u64,
+        });
+        let fit = FEED_TREE_CACHE_BYTES / (values * 32 + FEED_TREE_ENTRY_COST);
+        assert!(fit > HASH_CACHE_MAX, "more feed trees fit than the chat count allows");
+        let feeds: Vec<_> = (0..fit + 5).map(|i| feed_stamp(&format!("bound-feed-{i}"), tree.file_size)).collect();
+        let keep = |stamp: &FileStamp| {
+            keep_tree(&mut hash_cache().lock().unwrap(), stamp.clone(), tree.clone());
+            // Apart, so which is least recently used is never a tie.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        for stamp in &feeds[..fit] {
+            keep(stamp);
+        }
+        assert_eq!(held(true), fit);
+        assert!(matches!(lookup_hash(&feeds[0]), HashLookup::Ready(_)), "asked for again");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        for stamp in &feeds[fit..] {
+            keep(stamp);
+        }
+        assert_eq!(held(true), fit);
+        assert!(tree_known(&feeds[0]), "the one asked for again stays");
+        assert!(!tree_known(&feeds[1]) && !tree_known(&feeds[5]), "the least recently used go");
+        assert!(tree_known(&feeds[6]));
+        assert!(chat.iter().all(tree_known), "no chat tree went for a feed's");
+
+        let one_more = FileStamp { subtrees: false, ..feed_stamp("bound-chat-more", 1) };
+        assert!(matches!(lookup_hash(&one_more), HashLookup::Start(..)));
+        assert!(!tree_known(&chat[0]), "the oldest chat tree makes room");
+        assert_eq!(held(true), fit, "and no feed tree does");
+    }
+
+    /// Streams for one file that queued for the hashing slot while its tree
+    /// was being built are not charged for reading it again.
+    #[tokio::test]
+    async fn streams_queued_behind_a_files_hash_are_not_charged_for_it() {
+        let _own = isolate_hash_cache();
+        // Far larger than any test file, so a charge for it would show
+        // whatever other tests spend meanwhile.
+        let stamp = feed_stamp("queued", 6 * 1024 * 1024 * 1024);
+        let spent = || feed_hash_spent().lock().unwrap().1;
+        let before = spent();
+        let ahead = feed_hash_gate().clone().acquire_owned().await.expect("the hashing slot");
+        let finish = async {
+            tokio::task::yield_now().await;
+            keep_tree(&mut hash_cache().lock().unwrap(), stamp.clone(), std::sync::Arc::new(HashTree::from_data(b"x")));
+            drop(ahead);
+        };
+        let (first, second, ()) = tokio::join!(feed_hash_permit(&stamp), feed_hash_permit(&stamp), finish);
+        assert!(matches!(first, FeedHashLeave::Known));
+        assert!(matches!(second, FeedHashLeave::Known));
+        assert!(spent().saturating_sub(before) < stamp.size, "nothing charged for the file");
+        assert_eq!(times_named(&CHARGED, stamp.path.file_name().unwrap()), 0);
+    }
+
+    /// A kept tree is read back whole, its root worked out from its values;
+    /// one kept for a version of the file the stamp no longer describes is
+    /// not, and is deleted.
+    #[test]
+    fn a_kept_feed_tree_is_read_only_for_the_stamp_it_was_kept_for() {
+        let dir = keep_feed_trees();
+        let size = ATTACH_CHUNK_SIZE as u64 * 2 + 1;
+        let data: Vec<u8> = (0..size).map(|i| (i % 23) as u8).collect();
+        let tree = subtree_tree(&data[..], size).expect("tree");
+        let stamp = feed_stamp("kept-version", size);
+        let file = feed_tree_file(dir, &stamp);
+
+        store_feed_tree(&stamp, &tree);
+        let kept = load_feed_tree(&stamp).expect("read back");
+        assert_eq!(kept.chunk_hashes, tree.chunk_hashes);
+        assert_eq!(kept.root_hash, *blake3::hash(&data).as_bytes());
+        assert_eq!(kept.file_size, size);
+
+        // A microsecond: Windows keeps times in 100 ns steps.
+        let later = stamp.modified.map(|time| time + std::time::Duration::from_micros(1));
+        let others = [
+            FileStamp { size: size + 1, ..stamp.clone() },
+            FileStamp { modified: later, ..stamp.clone() },
+            FileStamp { modified: None, ..stamp.clone() },
+            FileStamp { changed: 7, ..stamp.clone() },
+        ];
+        for other in others {
+            assert_eq!(feed_tree_file(dir, &other), file, "kept under the same name");
+            store_feed_tree(&stamp, &tree);
+            assert!(load_feed_tree(&other).is_none(), "{other:?}");
+            assert!(!file.exists(), "deleted for {other:?}");
+        }
+        assert!(load_feed_tree(&stamp).is_none(), "gone");
+    }
+
+    /// A kept tree cut short, run on, or with a byte changed is not served,
+    /// and is deleted.
+    #[test]
+    fn a_damaged_kept_feed_tree_is_deleted() {
+        let dir = keep_feed_trees();
+        let size = ATTACH_CHUNK_SIZE as u64 * 3;
+        let data: Vec<u8> = (0..size).map(|i| (i % 31) as u8).collect();
+        let tree = subtree_tree(&data[..], size).expect("tree");
+        let stamp = feed_stamp("kept-damaged", size);
+        let file = feed_tree_file(dir, &stamp);
+        let damages: [&dyn Fn(&mut Vec<u8>); 5] = [
+            &|bytes| bytes.truncate(bytes.len() - 1),
+            &|bytes| bytes.push(0),
+            &|bytes| {
+                let value = bytes.len() - 40;
+                bytes[value] ^= 1;
+            },
+            &|bytes| bytes[0] ^= 1,
+            &|bytes| *bytes = b"not a tree".to_vec(),
+        ];
+        for (i, damage) in damages.iter().enumerate() {
+            store_feed_tree(&stamp, &tree);
+            let mut bytes = std::fs::read(&file).expect("kept");
+            damage(&mut bytes);
+            std::fs::write(&file, &bytes).expect("damage");
+            assert!(load_feed_tree(&stamp).is_none(), "damage {i}");
+            assert!(!file.exists(), "deleted after damage {i}");
+        }
+    }
+
+    /// Over either bound the folder loses its least recently used files, down
+    /// to seven eighths of it; under both it keeps them all.
+    #[test]
+    fn the_kept_tree_folder_drops_its_least_recently_used_files() {
+        let dir = temp_path("feed-tree-prune");
+        std::fs::create_dir_all(&dir).expect("folder");
+        let files: Vec<_> = (0..10u64)
+            .map(|i| {
+                let path = dir.join(format!("{i}.tree"));
+                std::fs::write(&path, [0u8; 100]).expect("write");
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|f| f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + i)))
+                    .expect("date it");
+                path
+            })
+            .collect();
+        assert_eq!(prune_feed_trees(&dir, 1000, 10), (1000, 10));
+        assert_eq!(prune_feed_trees(&dir, 800, 10), (700, 7));
+        assert!(files[..3].iter().all(|path| !path.exists()) && files[3..].iter().all(|path| path.exists()));
+        assert_eq!(prune_feed_trees(&dir, 10_000, 5), (500, 5));
+        assert!(files[..5].iter().all(|path| !path.exists()) && files[5..].iter().all(|path| path.exists()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The tree built to put a room offer together is the one the stream
@@ -2539,6 +3086,7 @@ mod tests {
         let (mut client_w, mut server_r) = tokio::io::duplex(1 << 20);
         let (mut server_w, mut client_r) = tokio::io::duplex(1 << 20);
         let served = source.map(Path::to_path_buf);
+        let blake3 = source.map_or([0; 32], |path| *blake3::hash(&std::fs::read(path).expect("feed file")).as_bytes());
         let server = tokio::spawn(async move {
             let mut prefix = [0u8; 7];
             server_r.read_exact(&mut prefix).await?;
@@ -2546,7 +3094,17 @@ mod tests {
                 &mut server_r,
                 &mut server_w,
                 &prefix,
-                |_| served.map(|path| (path, size, capability, vec![feed_files_dir().to_string_lossy().into_owned()])).ok_or(AttachStreamStatus::Unknown),
+                |_| {
+                    served
+                        .map(|path| FeedGrant {
+                            path,
+                            size,
+                            blake3,
+                            capability,
+                            roots: vec![feed_files_dir().to_string_lossy().into_owned()],
+                        })
+                        .ok_or(AttachStreamStatus::Unknown)
+                },
                 |_| admitted,
                 |_, _, _| true,
                 None,
@@ -2615,7 +3173,7 @@ mod tests {
                 &mut server_r,
                 &mut server_w,
                 &prefix,
-                |_| Ok((served, 9, [8; 32], vec![elsewhere])),
+                |_| Ok(FeedGrant { path: served, size: 9, blake3: [7; 32], capability: [8; 32], roots: vec![elsewhere] }),
                 |_| Ok::<(), AttachStreamStatus>(()),
                 |_, _, _| true,
                 None,
@@ -2654,6 +3212,38 @@ mod tests {
         std::fs::write(&source, b"feed file").expect("write");
         let refused = feed_round_trip_admitted(Some(&source), 9, [8; 32], [8; 32], 0, Err(AttachStreamStatus::Busy)).await;
         assert!(matches!(refused, Err(FetchError::Refused(AttachStreamStatus::Busy))));
+        let _ = std::fs::remove_file(&source);
+    }
+
+    /// A feed file's tree outlives the memory cache, as it does a restart: the
+    /// next follower is served from the tree kept on disk, without the file
+    /// being read again or charged to the hour's budget.
+    #[tokio::test]
+    async fn a_kept_feed_tree_is_read_back_rather_than_hashed_and_charged() {
+        let dir = keep_feed_trees();
+        let data: Vec<u8> = (0..ATTACH_CHUNK_SIZE * 2 + 7).map(|i| (i % 29) as u8).collect();
+        let size = data.len() as u64;
+        let source = feed_source("feed-kept");
+        std::fs::write(&source, &data).expect("write");
+        let name = source.file_name().expect("name").to_owned();
+        let (first, _) = feed_round_trip(Some(&source), size, [8; 32], [8; 32], 0).await.expect("served");
+        assert_eq!((times_named(&HASHED, &name), times_named(&CHARGED, &name)), (1, 1));
+
+        let ours = |key: &FileStamp| key.subtrees && key.path.file_name() == Some(name.as_os_str());
+        let stamp = hash_cache().lock().unwrap().keys().find(|key| ours(key)).cloned().expect("cached");
+        assert!(feed_tree_file(dir, &stamp).exists(), "kept on disk");
+        hash_cache().lock().unwrap().retain(|key, _| !ours(key));
+
+        let (second, got) = feed_round_trip(Some(&source), size, [8; 32], [8; 32], 0).await.expect("served again");
+        assert_eq!(second.chunk_hashes, first.chunk_hashes);
+        assert_eq!(got, data);
+        assert_eq!(
+            (times_named(&HASHED, &name), times_named(&CHARGED, &name)),
+            (1, 1),
+            "read back, not hashed or charged again"
+        );
+        assert!(tree_known(&stamp), "and cached again");
+        let _ = std::fs::remove_file(feed_tree_file(dir, &stamp));
         let _ = std::fs::remove_file(&source);
     }
 

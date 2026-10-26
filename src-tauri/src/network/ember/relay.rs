@@ -2344,7 +2344,7 @@ where
         |xfer_id| {
             let file = crate::network::feed_direct::served(xfer_id);
             busy.store(file == Err(super::attach::AttachStreamStatus::Busy), std::sync::atomic::Ordering::Relaxed);
-            file.map(|file| (file.path, file.size, file.capability, file.roots))
+            file
         },
         // Taken once the file's chunk list is ready, so a dialer that sends
         // nothing, asks for nothing we serve, or waits on a hash, holds none.

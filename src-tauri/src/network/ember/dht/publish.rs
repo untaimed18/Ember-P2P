@@ -1878,16 +1878,18 @@ impl SignedRecord {
     fn feed_head_from(
         &self,
         title: String,
-        (sequence, list_ed2k_hash, item_count, description): (u64, [u8; 16], u32, String),
+        listed: crate::network::ember::feed::ListedHead,
     ) -> Option<crate::network::ember::feed::FeedHead> {
         let head = crate::network::ember::feed::FeedHead {
-            sequence,
-            list_ed2k_hash,
+            sequence: listed.sequence,
+            list_ed2k_hash: listed.list_ed2k_hash,
             list_size: self.file_size,
             list_blake3: self.ember_file_hash,
-            item_count,
+            item_count: listed.item_count,
+            total_size: listed.total_size,
             title,
-            description,
+            description: listed.description,
+            deleted: false,
         };
         head.valid().then_some(head)
     }
@@ -1953,12 +1955,17 @@ impl SignedRecord {
     /// Whether a storer should keep this listing: one of this version or a
     /// later one ([`crate::network::ember::feed::listing_storable`]), filed
     /// under the index shard its publisher and salt give, so a listing cannot
-    /// be aimed at whichever shard key is nearest a storer.
+    /// be aimed at whichever shard key is nearest a storer. One of this
+    /// version must also read as a follower reads it: a malformed listing
+    /// would only take a shard's slot from a real one. A later version is
+    /// read no further.
     pub fn feed_listing_store_ok(&self) -> bool {
+        use crate::network::ember::feed::{listing_storable, FEED_LISTED_HEAD_VERSION};
         self.record_type == RECORD_TYPE_FEED_LISTING
-            && self
-                .name_and_trailer_extra()
-                .is_some_and(|(_, extra)| crate::network::ember::feed::listing_storable(extra))
+            && self.name_and_trailer_extra().is_some_and(|(_, extra)| {
+                listing_storable(extra)
+                    && (extra[1] > FEED_LISTED_HEAD_VERSION || self.feed_listing().is_some())
+            })
             && self.keyword_hash
                 == crate::network::ember::feed::feed_index_key(crate::network::ember::feed::feed_index_shard(
                     &self.publisher_key,

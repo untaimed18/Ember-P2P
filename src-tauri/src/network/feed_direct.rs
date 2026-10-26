@@ -393,6 +393,8 @@ pub struct Served {
     /// The feed and file it is, for counting who downloaded it.
     pub salt: [u8; 16],
     pub ed2k: [u8; 16],
+    /// Its BLAKE3 as the feed's list names it.
+    pub blake3: [u8; 32],
 }
 
 /// A follower who read a file of one of our feeds to its end from us, and
@@ -491,10 +493,17 @@ pub fn set_served(files: HashMap<[u8; 16], Served>) {
 }
 
 /// The entry of [`set_served`] for `(publisher, salt, ed2k)`.
-pub fn served_entry(publisher: &[u8; 32], salt: &[u8; 16], ed2k: &[u8; 16], path: PathBuf, size: u64) -> ([u8; 16], Served) {
+pub fn served_entry(
+    publisher: &[u8; 32],
+    salt: &[u8; 16],
+    ed2k: &[u8; 16],
+    blake3: [u8; 32],
+    path: PathBuf,
+    size: u64,
+) -> ([u8; 16], Served) {
     (
         feed_stream_id(publisher, salt, ed2k),
-        Served { path, size, capability: feed_stream_capability(publisher, salt, ed2k), salt: *salt, ed2k: *ed2k },
+        Served { path, size, capability: feed_stream_capability(publisher, salt, ed2k), salt: *salt, ed2k: *ed2k, blake3 },
     )
 }
 
@@ -521,17 +530,6 @@ pub fn set_serve_checks(checks: ServeChecks) {
     *serve_checks().write() = Some(Arc::new(checks));
 }
 
-/// A file of ours a follower may stream now.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServedFile {
-    pub path: PathBuf,
-    pub size: u64,
-    /// What the request must be tagged under.
-    pub capability: [u8; 32],
-    /// The shared and download folders the file must be opened within.
-    pub roots: Vec<String>,
-}
-
 /// A follower's request for `xfer_id`: the file, if it is one of ours a feed
 /// lists that may be streamed now. Still shared with everyone by the Library
 /// when the Library can be read without waiting (it was when the table was
@@ -539,7 +537,7 @@ pub struct ServedFile {
 /// returned. Otherwise the status the follower is refused with: busy while
 /// what decides it cannot be read yet, which the follower asks again after,
 /// and unknown for a file not ours to stream.
-pub fn served(xfer_id: &[u8; 16]) -> Result<ServedFile, AttachStreamStatus> {
+pub fn served(xfer_id: &[u8; 16]) -> Result<super::ember::attach_stream::FeedGrant, AttachStreamStatus> {
     use crate::network::ed2k::upload::{friends_only_snapshot_contains, friends_only_snapshot_ready};
     let file = served_file(xfer_id).ok_or(AttachStreamStatus::Unknown)?;
     let checks = serve_checks().read().clone().ok_or(AttachStreamStatus::Busy)?;
@@ -557,7 +555,13 @@ pub fn served(xfer_id: &[u8; 16]) -> Result<ServedFile, AttachStreamStatus> {
     }
     let mut roots = checks.shared_folders.try_read().map_err(|_| AttachStreamStatus::Busy)?.clone();
     roots.extend(checks.download_folders.read().roots());
-    Ok(ServedFile { path: file.path, size: file.size, capability: file.capability, roots })
+    Ok(super::ember::attach_stream::FeedGrant {
+        path: file.path,
+        size: file.size,
+        blake3: file.blake3,
+        capability: file.capability,
+        roots,
+    })
 }
 
 /// The table's entry for `xfer_id`, if it is a file the stream carries.
@@ -776,10 +780,10 @@ mod tests {
     #[test]
     fn a_served_file_is_found_by_the_id_a_follower_computes() {
         let (key, ed2k) = (key(), [0x44; 16]);
-        let (id, entry) = served_entry(&key, &SALT, &ed2k, PathBuf::from("f"), 10);
+        let (id, entry) = served_entry(&key, &SALT, &ed2k, [0x46; 32], PathBuf::from("f"), 10);
         set_served(HashMap::from([(id, entry)]));
         let file = served_file(&feed_stream_id(&key, &SALT, &ed2k)).expect("served");
-        assert_eq!((file.path, file.size), (PathBuf::from("f"), 10));
+        assert_eq!((file.path, file.size, file.blake3), (PathBuf::from("f"), 10, [0x46; 32]));
         assert_eq!(file.capability, feed_stream_capability(&key, &SALT, &ed2k));
         assert!(served_file(&feed_stream_id(&key, &[4; 16], &ed2k)).is_none(), "another feed's id");
 
@@ -790,7 +794,7 @@ mod tests {
         assert!(take_downloads().is_empty());
 
         // A follower comes to the whole file over every stream of it.
-        let (id, entry) = served_entry(&key, &[5; 16], &[0x45; 16], PathBuf::from("g"), 1_000);
+        let (id, entry) = served_entry(&key, &[5; 16], &[0x45; 16], [0x47; 32], PathBuf::from("g"), 1_000);
         set_served(HashMap::from([(id, entry)]));
         assert!(!note_served(&id, [1; 16], 300), "the end alone is not the file");
         assert!(!note_served(&id, [2; 16], 900), "another follower's bytes are theirs");

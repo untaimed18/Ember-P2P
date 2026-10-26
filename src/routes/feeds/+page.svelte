@@ -24,6 +24,7 @@
     listMyFeeds,
     markFeedRead,
     openFeedFolder,
+    openFeedItem,
     publishFeed,
     refreshFeed,
     setDiscoveredFeedHidden,
@@ -31,6 +32,7 @@
     setFeedDetails,
     setFeedItems,
     setFeedListed,
+    showFeedItem,
     unfollowFeed,
     type DiscoveredFeed,
     type FeedItem,
@@ -47,6 +49,9 @@
     concernsFollowed,
     draftOf,
     keepUnchanged,
+    onDisk,
+    pickFollowed,
+    runEach,
     sameDraft,
     withLiveProgress,
     type FeedDraft,
@@ -58,6 +63,7 @@
   import IconX from '$lib/components/IconX.svelte';
   import {
     discoverWalkRunning,
+    feedsPageMemory,
     followedFeeds,
     followedFeedsFailed,
     followedFeedsLoaded,
@@ -88,7 +94,8 @@
   const LIST_SEARCH_FROM = 6;
 
   type Tab = 'following' | 'discover' | 'mine';
-  let tab = $state<Tab>('following');
+  /** The tab left open on the last visit; Discover's walk starts on mount. */
+  let tab = $state<Tab>(feedsPageMemory.tab);
   let emberOff = $derived($appSettings?.ember_native_enabled === false);
   /** The inline card for following a link or starting a feed. */
   let compose = $state<'follow' | 'create' | null>(null);
@@ -99,6 +106,7 @@
   function setTab(next: Tab) {
     if (tab === next) return;
     tab = next;
+    feedsPageMemory.tab = next;
     compose = null;
     listQuery = '';
     menu = null;
@@ -181,6 +189,11 @@
   let items = $state<FollowedItem[]>([]);
   let itemsLoading = $state(false);
   let unfollowOpen = $state(false);
+  /** The feed Unfollow asks about, named as it was asked: the dialog's
+   *  title must not turn into the next feed's while it closes. */
+  let unfollowTitle = $state('');
+  let markingAll = $state(false);
+  let anyUnread = $derived($followedFeeds.some((f) => f.unread > 0));
   /** Feeds a Check now or a Download is running for, by key: another feed
    *  opened meanwhile has its own buttons. */
   let refreshingFor = $state<ReadonlySet<string>>(new Set());
@@ -268,6 +281,7 @@
 
   /** The line under a followed feed's name in the list. */
   function followedSub(f: FollowedFeed): string {
+    if (f.deleted) return m.feeds_state_deleted_short();
     if (f.activity.too_large) return m.feeds_state_too_large_short();
     if (f.state === 'broken') return m.feeds_state_broken_short();
     if (notSeen(f)) return m.feeds_state_not_seen_short({ when: ago(f.seen_at) });
@@ -345,8 +359,12 @@
   /** The followed feed last opened, so coming back opens it again. */
   const SELECTED_KEY = 'ember.feeds.followedSelected';
 
-  function selectFollowed(key: string) {
-    selectedKey = key;
+  /** The followed feed the user opened, or did something in, themselves:
+   *  only it is marked read once seen. One opened for them, on arriving or
+   *  in an unfollowed one's place, keeps its new files new until then. */
+  let openedKey = $state<string | null>(null);
+
+  function rememberFollowed(key: string) {
     try {
       localStorage.setItem(SELECTED_KEY, key);
     } catch {
@@ -354,9 +372,25 @@
     }
   }
 
+  /** The user opens a followed feed: read once its files are on screen. */
+  function selectFollowed(key: string) {
+    selectedKey = key;
+    openedKey = key;
+    rememberFollowed(key);
+    void markShownRead();
+  }
+
+  /** The user clicked, pressed a key or scrolled in the open feed: one
+   *  opened for them is theirs from now on. */
+  function claimOpen() {
+    if (selectedKey === null || openedKey === selectedKey) return;
+    openedKey = selectedKey;
+    void markShownRead();
+  }
+
   // Something is always open while there is something to open: the feed last
-  // opened, else the first with something new, else the first. Opening one
-  // marks it read, so the pick must not be one the user did not come for.
+  // opened, else the first with something new, else the first. It is not the
+  // user's pick, so it is not marked read for them (see `openedKey`).
   $effect(() => {
     const feeds = $followedFeeds;
     if (feeds.length === 0) return;
@@ -368,15 +402,17 @@
       } catch {
         remembered = null;
       }
-      const pick =
-        feeds.find((f) => keyOf(f) === remembered) ?? feeds.find((f) => f.unread > 0) ?? feeds[0];
-      selectedKey = keyOf(pick);
+      const pick = pickFollowed(feeds, remembered);
+      if (pick) selectedKey = keyOf(pick);
     });
   });
 
   let itemsSeq = 0;
   /** The feed whose files `items` holds; empty while none's are in. */
   let itemsFor = $state('');
+  /** The open feed's size: its listed files', once they are in; until then,
+   *  what its newest head gave, 0 when that is not known. */
+  let selectedSize = $derived(selected && itemsFor !== keyOf(selected) ? selected.total_size : listedSize);
   /** The open feed's downloads, whose transfer events it shows. */
   let itemTransferIds = $derived(new Set(items.flatMap((i) => (i.transfer ? [i.transfer.id] : []))));
   /** How often the open feed's rows take in their downloads' progress. */
@@ -425,10 +461,20 @@
   }
 
   /** The feed whose files are on screen is read once seen: not while Ember
-   *  is hidden or behind another window, nor from the My feeds tab. */
+   *  is hidden or behind another window, nor from the My feeds tab, nor
+   *  before the user has opened it or done something in it. */
   async function markShownRead() {
     const feed = selected;
-    if (!feed || itemsFor !== keyOf(feed) || tab !== 'following' || feed.unread === 0 || !emberFocused()) return;
+    if (
+      !feed ||
+      openedKey !== keyOf(feed) ||
+      itemsFor !== keyOf(feed) ||
+      tab !== 'following' ||
+      feed.unread === 0 ||
+      !emberFocused()
+    ) {
+      return;
+    }
     try {
       await markFeedRead(feed.publisher, feed.salt);
       await refreshFollowedFeeds();
@@ -456,7 +502,7 @@
     }
   });
 
-  // Back on the Following tab, the feed on screen is seen.
+  // Back on the Following tab, the feed on screen is seen, if the user opened it.
   $effect(() => {
     if (tab === 'following') untrack(() => void markShownRead());
   });
@@ -704,6 +750,12 @@
     }
   }
 
+  function askUnfollow() {
+    if (!selected) return;
+    unfollowTitle = feedLabel(selected);
+    unfollowOpen = true;
+  }
+
   async function doUnfollow() {
     const feed = selected;
     if (!feed) return;
@@ -720,8 +772,8 @@
     const at = list.findIndex((f) => keyOf(f) === key);
     const next = list[at + 1] ?? list[at - 1] ?? null;
     followedFeeds.update((feeds) => feeds.filter((f) => keyOf(f) !== key));
-    if (next) selectFollowed(keyOf(next));
-    else selectedKey = null;
+    selectedKey = next ? keyOf(next) : null;
+    if (next) rememberFollowed(keyOf(next));
     toastSuccess(m.feeds_unfollowed_toast({ feed: feedLabel(feed) }));
     // The Unfollow button went with the feed: focus goes to the one opened,
     // or to Follow a feed when none is left.
@@ -732,6 +784,40 @@
       composeTrigger?.focus();
     }
     void refreshFollowedFeeds();
+  }
+
+  /** How many feeds Mark all as read marks at once. */
+  const MARK_ALL_AT_ONCE = 4;
+
+  /** Every followed feed with something new is marked read; one that fails
+   *  stays as it was, and the first failure is said. */
+  async function markAllRead() {
+    if (markingAll) return;
+    markingAll = true;
+    try {
+      const unread = $followedFeeds.filter((f) => f.unread > 0);
+      const failed = await runEach(unread, MARK_ALL_AT_ONCE, (f) => markFeedRead(f.publisher, f.salt));
+      await refreshFollowedFeeds();
+      if (failed.length > 0) toastError(translateError(failed[0], m.error_operation_failed()));
+    } finally {
+      markingAll = false;
+      // The button goes once nothing is unread, and focus with it.
+      await tick();
+      if (focusLost()) composeTrigger?.focus();
+    }
+  }
+
+  /** Open a downloaded file, or show it in its folder. One gone from disk
+   *  since is read again, for its row to say so. */
+  async function openItem(item: FollowedItem, run: typeof openFeedItem) {
+    const feed = selected;
+    if (!feed) return;
+    try {
+      await run(feed.publisher, feed.salt, item.ed2k);
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+      if (codedErrorOf(e)?.code === 'feeds_item_not_on_disk' && selectedKey === keyOf(feed)) void loadItems(feed, true);
+    }
   }
 
   async function copy(text: string) {
@@ -745,6 +831,8 @@
   /** The strip above a followed feed's files, saying what it waits on,
    *  whether that is a fault (`warn`), and whether Retry would do anything. */
   function stateText(f: FollowedFeed): StripState | null {
+    // Nothing more will come of a deleted feed: its own notice says so.
+    if (f.deleted) return null;
     const strip = feedState(f);
     // Nothing runs while the network is off: no spinner promising otherwise.
     if (strip?.busy && emberOff) return { text: m.feeds_state_paused_off(), warn: true, busy: false, retry: false };
@@ -1121,6 +1209,8 @@
   let saving = $state(false);
   let publishing = $state(false);
   let deleteOpen = $state(false);
+  /** The feed Delete asks about, as `unfollowTitle` is. */
+  let deleteTitle = $state('');
   let pickerOpen = $state(false);
   /** What to do once the user agrees to drop unsaved edits. */
   let discardThen = $state<(() => void) | null>(null);
@@ -1185,12 +1275,14 @@
     }
   }
 
-  // As on Following: the first feed opens when none is.
+  // As on Following: the feed open on the last visit opens again, else the
+  // first, when none is.
   $effect(() => {
     const feeds = mine;
     if (feeds.length === 0) return;
     untrack(() => {
-      if (!feeds.some((f) => f.salt === mineSelected) && !dirty) selectMine(feeds[0]);
+      if (feeds.some((f) => f.salt === mineSelected) || dirty) return;
+      selectMine(feeds.find((f) => f.salt === feedsPageMemory.own) ?? feeds[0]);
     });
   });
 
@@ -1202,6 +1294,7 @@
 
   function selectMine(feed: OwnFeed) {
     mineSelected = feed.salt;
+    feedsPageMemory.own = feed.salt;
     editTitle = feed.title;
     editDescription = feed.description;
     editItems = feed.items.map((i) => ({ ...i }));
@@ -1383,6 +1476,12 @@
     }
   }
 
+  function askDelete() {
+    if (!mineFeed) return;
+    deleteTitle = mineFeed.title.trim() || m.feeds_untitled();
+    deleteOpen = true;
+  }
+
   async function doDelete() {
     const feed = mineFeed;
     if (!feed) return;
@@ -1421,6 +1520,8 @@
   onMount(() => {
     void refreshFollowedFeeds();
     void loadMine();
+    // Back on Discover, as `setTab` would have opened it.
+    if (tab === 'discover') void openDiscover();
     let unlisten: UnlistenFn | null = null;
     let alive = true;
     let settledTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1598,6 +1699,18 @@
       </button>
     </div>
     {#if tab === 'following'}
+      {#if anyUnread || markingAll}
+        <button type="button" class="secondary refresh-btn" disabled={markingAll} onclick={() => void markAllRead()}>
+          {#if markingAll}
+            <span class="spinner xs" aria-hidden="true"></span>
+          {:else}
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="3 8 7 12 13 4"/>
+            </svg>
+          {/if}
+          {m.feeds_mark_all_read()}
+        </button>
+      {/if}
       <button
         type="button"
         class="primary"
@@ -1762,8 +1875,9 @@
                 class="feed-row"
                 class:active
                 class:has-unread={feed.unread > 0}
+                class:deleted={feed.deleted}
                 aria-current={active ? 'true' : undefined}
-                title={feedLabel(feed)}
+                title={feed.deleted ? `${feedLabel(feed)}: ${m.feeds_deleted_notice()}` : feedLabel(feed)}
                 onclick={() => selectFollowed(keyOf(feed))}
               >
                 <span class="feed-avatar" style:--feed-hue={hueOf(feed.publisher + feed.salt)}>{@render feedGlyph()}</span>
@@ -1772,7 +1886,10 @@
                     <bdi dir="auto">{feedLabel(feed)}</bdi>
                     {#if !feed.title.trim()}<span class="row-key">{shortKey(feed.publisher)}</span>{/if}
                   </span>
-                  <span class="feed-row-sub" class:warn={feed.state === 'broken' || feed.activity.too_large || notSeen(feed)}>{followedSub(feed)}</span>
+                  <span
+                    class="feed-row-sub"
+                    class:warn={!feed.deleted && (feed.state === 'broken' || feed.activity.too_large || notSeen(feed))}
+                  >{followedSub(feed)}</span>
                 </span>
                 {#if feed.unread > 0}
                   <span class="count-pill" aria-hidden="true">{feed.unread > 99 ? '99+' : feed.unread}</span>
@@ -1785,7 +1902,8 @@
           </div>
         </aside>
 
-        <section class="detail-pane">
+        <!-- svelte-ignore a11y_no_static_element_interactions (noticing the user act in the open feed; the controls are its own) -->
+        <section class="detail-pane" onpointerdown={claimOpen} onkeydown={claimOpen} onwheel={claimOpen}>
           {#if selected}
             <header class="detail-head">
               <span class="feed-avatar lg" style:--feed-hue={hueOf(selected.publisher + selected.salt)}>{@render feedGlyph()}</span>
@@ -1796,7 +1914,7 @@
                   <span aria-hidden="true">·</span>
                   <!-- The count its head gave, until its files are in. -->
                   <span>{m.feeds_items_count({ count: formatNumber(itemsFor === keyOf(selected) ? listedItems.length : selected.item_count) })}</span>
-                  {#if listedSize > 0}<span aria-hidden="true">·</span><span>{formatBytes(listedSize)}</span>{/if}
+                  {#if selectedSize > 0}<span aria-hidden="true">·</span><span>{formatBytes(selectedSize)}</span>{/if}
                   {#if selected.sequence > 0}
                     <span aria-hidden="true">·</span><span>{m.feeds_discover_updated({ when: ago(Math.floor(selected.sequence / 1000)) })}</span>
                   {/if}
@@ -1806,19 +1924,21 @@
                 </p>
               </div>
               <div class="detail-actions">
-                <button
-                  type="button"
-                  class="icon-btn"
-                  class:spinning={refreshing}
-                  disabled={refreshing || emberOff}
-                  title={m.feeds_refresh()}
-                  aria-label={m.feeds_refresh()}
-                  onclick={() => void refreshSelected()}
-                >
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><polyline points="13.5 2.5 13.5 5.5 10.5 5.5"/>
-                  </svg>
-                </button>
+                {#if !selected.deleted}
+                  <button
+                    type="button"
+                    class="icon-btn"
+                    class:spinning={refreshing}
+                    disabled={refreshing || emberOff}
+                    title={m.feeds_refresh()}
+                    aria-label={m.feeds_refresh()}
+                    onclick={() => void refreshSelected()}
+                  >
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><polyline points="13.5 2.5 13.5 5.5 10.5 5.5"/>
+                    </svg>
+                  </button>
+                {/if}
                 <button type="button" class="icon-btn" title={m.feeds_open_folder()} aria-label={m.feeds_open_folder()} onclick={() => void openFolder()}>
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
                     <path d="M2 4.5V12.5h12V6H7.5L6 4.5z"/>
@@ -1829,7 +1949,7 @@
                     <path d="M6.5 9.5a3 3 0 0 0 4.2 0l2.1-2.1a3 3 0 0 0-4.2-4.2l-.7.7"/><path d="M9.5 6.5a3 3 0 0 0-4.2 0L3.2 8.6a3 3 0 0 0 4.2 4.2l.7-.7"/>
                   </svg>
                 </button>
-                <button type="button" class="pill-btn danger-hover" onclick={() => (unfollowOpen = true)}>{m.feeds_unfollow()}</button>
+                <button type="button" class="pill-btn danger-hover" onclick={askUnfollow}>{m.feeds_unfollow()}</button>
               </div>
             </header>
             {#if selected.description}
@@ -1841,6 +1961,16 @@
               </svg>
               <span>{m.feeds_private_note()}</span>
             </p>
+
+            {#if selected.deleted}
+              <div class="state-strip tone-warning" role="status">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M8 2.5 14 13H2z"/><line x1="8" y1="6.5" x2="8" y2="9.5"/><line x1="8" y1="11.5" x2="8" y2="11.6"/>
+                </svg>
+                <span class="state-text">{m.feeds_deleted_notice()}</span>
+                <button type="button" class="pill-btn strip-btn" onclick={askUnfollow}>{m.feeds_unfollow()}</button>
+              </div>
+            {/if}
 
             {@const strip = stateText(selected)}
             {#if strip}
@@ -1866,58 +1996,61 @@
               </div>
             {/if}
 
-            <div class="auto-card" class:on={selected.auto_download}>
-              <div class="auto-head">
-                <span class="auto-icon" aria-hidden="true">
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M8 2v8M4.5 6.5 8 10l3.5-3.5"/><path d="M2.5 11.5v1.75h11V11.5"/>
-                  </svg>
-                </span>
-                <button type="button" class="auto-title" aria-expanded={autoOpen} onclick={() => (autoOpen = !autoOpen)}>
-                  <span class="auto-text">
-                    <span class="auto-line">
-                      <span class="auto-name">{m.feeds_auto_title()}</span>
-                      <span class="auto-state">{selected.auto_download ? m.feeds_auto_on() : m.feeds_auto_off()}</span>
-                    </span>
-                    <span class="auto-desc">{m.feeds_auto_desc()}</span>
-                    {#if selected.auto_download}
-                      <span class="auto-summary">{autoSummary(selected.auto_max_item_mib, selected.auto_max_day_mib)}</span>
-                    {/if}
+            <!-- Nothing new comes of a deleted feed, so nothing downloads by itself. -->
+            {#if !selected.deleted}
+              <div class="auto-card" class:on={selected.auto_download}>
+                <div class="auto-head">
+                  <span class="auto-icon" aria-hidden="true">
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M8 2v8M4.5 6.5 8 10l3.5-3.5"/><path d="M2.5 11.5v1.75h11V11.5"/>
+                    </svg>
                   </span>
-                  <svg class="chevron" class:open={autoOpen} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <polyline points="4 6 8 10 12 6"/>
-                  </svg>
-                </button>
-                <ToggleSwitch
-                  checked={autoEnabled}
-                  disabled={autoSaving}
-                  ariaLabel={m.feeds_auto_enable()}
-                  onchange={(on) => void toggleAuto(on)}
-                />
-              </div>
-              {#if autoOpen}
-                <div class="auto-body">
-                  <div class="auto-grid">
-                    <label class="field">
-                      <span class="field-label">{m.feeds_auto_max_item()}</span>
-                      <input type="number" min="0" max={AUTO_MIB_MAX} bind:value={autoItemMib} onchange={() => (autoItemMib = capMib(autoItemMib))} />
-                      <span class="field-hint">{mibText(autoItemMib)}</span>
-                    </label>
-                    <label class="field">
-                      <span class="field-label">{m.feeds_auto_max_day()}</span>
-                      <input type="number" min="0" max={AUTO_MIB_MAX} bind:value={autoDayMib} onchange={() => (autoDayMib = capMib(autoDayMib))} />
-                      <span class="field-hint">{mibText(autoDayMib)}</span>
-                    </label>
-                  </div>
-                  <div class="auto-foot">
-                    <p class="hint">{m.feeds_auto_hint()}</p>
-                    <button type="button" class="secondary" disabled={!autoChanged || autoSaving} onclick={() => void saveAutoLimits()}>
-                      {m.feeds_save()}
-                    </button>
-                  </div>
+                  <button type="button" class="auto-title" aria-expanded={autoOpen} onclick={() => (autoOpen = !autoOpen)}>
+                    <span class="auto-text">
+                      <span class="auto-line">
+                        <span class="auto-name">{m.feeds_auto_title()}</span>
+                        <span class="auto-state">{selected.auto_download ? m.feeds_auto_on() : m.feeds_auto_off()}</span>
+                      </span>
+                      <span class="auto-desc">{m.feeds_auto_desc()}</span>
+                      {#if selected.auto_download}
+                        <span class="auto-summary">{autoSummary(selected.auto_max_item_mib, selected.auto_max_day_mib)}</span>
+                      {/if}
+                    </span>
+                    <svg class="chevron" class:open={autoOpen} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <polyline points="4 6 8 10 12 6"/>
+                    </svg>
+                  </button>
+                  <ToggleSwitch
+                    checked={autoEnabled}
+                    disabled={autoSaving}
+                    ariaLabel={m.feeds_auto_enable()}
+                    onchange={(on) => void toggleAuto(on)}
+                  />
                 </div>
-              {/if}
-            </div>
+                {#if autoOpen}
+                  <div class="auto-body">
+                    <div class="auto-grid">
+                      <label class="field">
+                        <span class="field-label">{m.feeds_auto_max_item()}</span>
+                        <input type="number" min="0" max={AUTO_MIB_MAX} bind:value={autoItemMib} onchange={() => (autoItemMib = capMib(autoItemMib))} />
+                        <span class="field-hint">{mibText(autoItemMib)}</span>
+                      </label>
+                      <label class="field">
+                        <span class="field-label">{m.feeds_auto_max_day()}</span>
+                        <input type="number" min="0" max={AUTO_MIB_MAX} bind:value={autoDayMib} onchange={() => (autoDayMib = capMib(autoDayMib))} />
+                        <span class="field-hint">{mibText(autoDayMib)}</span>
+                      </label>
+                    </div>
+                    <div class="auto-foot">
+                      <p class="hint">{m.feeds_auto_hint()}</p>
+                      <button type="button" class="secondary" disabled={!autoChanged || autoSaving} onclick={() => void saveAutoLimits()}>
+                        {m.feeds_save()}
+                      </button>
+                    </div>
+                  </div>
+                {/if}
+              </div>
+            {/if}
 
             <div class="files-toolbar">
               <h4 class="section-label">{m.feeds_files_heading()}</h4>
@@ -2003,13 +2136,37 @@
                       {/if}
                     {/if}
                   </div>
-                  {#if item.status === 'done' || item.status === 'in_library'}
-                    <span class="row-done" title={item.status === 'done' ? m.feeds_badge_downloaded() : m.feeds_item_in_library()}>
-                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                        <polyline points="3 8 7 12 13 4"/>
-                      </svg>
-                      <span>{item.status === 'done' ? m.feeds_badge_downloaded() : m.feeds_item_in_library()}</span>
-                    </span>
+                  {#if onDisk(item.status)}
+                    <div class="row-controls">
+                      <span class="row-done" title={item.status === 'done' ? m.feeds_badge_downloaded() : m.feeds_item_in_library()}>
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <polyline points="3 8 7 12 13 4"/>
+                        </svg>
+                        <span>{item.status === 'done' ? m.feeds_badge_downloaded() : m.feeds_item_in_library()}</span>
+                      </span>
+                      <button
+                        type="button"
+                        class="icon-btn"
+                        title={m.feeds_item_open()}
+                        aria-label={m.feeds_item_open_named({ name: item.name })}
+                        onclick={() => void openItem(item, openFeedItem)}
+                      >
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <path d="M9.5 2.5h4v4"/><path d="M13.5 2.5 7.5 8.5"/><path d="M12 9.5v4H2.5V4h4"/>
+                        </svg>
+                      </button>
+                      <button
+                        type="button"
+                        class="icon-btn"
+                        title={m.feeds_item_show()}
+                        aria-label={m.feeds_item_show_named({ name: item.name })}
+                        onclick={() => void openItem(item, showFeedItem)}
+                      >
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
+                          <path d="M2 4.5V12.5h12V6H7.5L6 4.5z"/>
+                        </svg>
+                      </button>
+                    </div>
                   {:else if item.status === 'downloading' || item.status === 'queued' || item.status === 'paused'}
                     {@const stateText =
                       item.status === 'downloading'
@@ -2220,6 +2377,7 @@
                 <footer class="discover-card-foot">
                   <span class="discover-meta">
                     <span>{m.feeds_items_count({ count: formatNumber(feed.item_count) })}</span>
+                    {#if feed.total_size > 0}<span aria-hidden="true">·</span><span>{formatBytes(feed.total_size)}</span>{/if}
                     {#if feed.sequence > 0}
                       <span aria-hidden="true">·</span>
                       <span>{m.feeds_discover_updated({ when: ago(Math.floor(feed.sequence / 1000)) })}</span>
@@ -2341,7 +2499,9 @@
                   {feed.published_at > 0
                     ? m.feeds_published_short({ when: ago(feed.published_at) })
                     : m.feeds_items_count({ count: formatNumber(feed.items.length) })}
-                  {#if feed.followers && feed.published_at > 0}<span aria-hidden="true"> · </span>{followersText(feed.followers)}{/if}
+                  {#if feed.published_at > 0 && (feed.followers || !emberOff)}
+                    <span aria-hidden="true"> · </span>{feed.followers ? followersText(feed.followers) : m.feeds_followers_counting()}
+                  {/if}
                   {#if feed.listed && feed.published_at > 0}<span aria-hidden="true"> · </span>{m.feeds_badge_listed()}{/if}
                 </span>
               </span>
@@ -2390,6 +2550,10 @@
                   <span class="has-hint" title={m.feeds_followers_hint({ when: ago(mineFeed.followers.checked_at) })}>
                     {followersText(mineFeed.followers)}
                   </span>
+                {:else if mineFeed.published_at > 0 && !emberOff}
+                  <!-- Not counted yet: nothing is counted while the network is off. -->
+                  <span aria-hidden="true">·</span>
+                  <span>{m.feeds_followers_counting()}</span>
                 {/if}
                 {#if dirty}<span aria-hidden="true">·</span><span class="unsaved">{m.feeds_unsaved()}</span>{/if}
               </p>
@@ -2402,7 +2566,7 @@
                   </svg>
                 </button>
               {/if}
-              <button type="button" class="icon-btn danger-hover" disabled={busy} title={m.feeds_delete()} aria-label={m.feeds_delete()} onclick={() => (deleteOpen = true)}>
+              <button type="button" class="icon-btn danger-hover" disabled={busy} title={m.feeds_delete()} aria-label={m.feeds_delete()} onclick={askDelete}>
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path d="M2.5 4.5h11"/><path d="M6 4.5V3h4v1.5"/><path d="M4 4.5l.7 9h6.6l.7-9"/>
                 </svg>
@@ -2612,7 +2776,7 @@
 
 <ConfirmDialog
   bind:open={unfollowOpen}
-  title={m.feeds_unfollow_confirm()}
+  title={m.feeds_unfollow_confirm_named({ title: unfollowTitle })}
   message={m.feeds_unfollow_confirm_body()}
   confirmLabel={m.feeds_unfollow()}
   danger
@@ -2669,7 +2833,7 @@
 
 <ConfirmDialog
   bind:open={deleteOpen}
-  title={m.feeds_delete_confirm()}
+  title={m.feeds_delete_confirm_named({ title: deleteTitle })}
   message={m.feeds_delete_confirm_body()}
   confirmLabel={m.feeds_delete()}
   danger
@@ -2681,6 +2845,7 @@
   title={m.feeds_discard_title()}
   message={m.feeds_discard_body()}
   confirmLabel={m.feeds_discard_confirm()}
+  cancelLabel={m.feeds_discard_keep()}
   danger
   onconfirm={() => {
     // `dirty` is cleared by what replaces the editor, if anything does.
@@ -3085,6 +3250,16 @@
 
   .feed-row-sub.warn {
     color: var(--badge-warning-text);
+  }
+
+  /* Kept for what was downloaded, but nothing more comes of it. */
+  .feed-row.deleted .feed-avatar {
+    filter: grayscale(1);
+    opacity: 0.6;
+  }
+
+  .feed-row.deleted:not(.active) .feed-row-title {
+    color: var(--text-secondary);
   }
 
   /* ── Detail ───────────────────────────────────────────────────────── */
@@ -3883,7 +4058,8 @@
     gap: 2px;
   }
 
-  .row-controls .row-state {
+  .row-controls .row-state,
+  .row-controls .row-done {
     padding-inline-end: 4px;
   }
 
