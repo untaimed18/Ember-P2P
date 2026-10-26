@@ -264,12 +264,24 @@ fn record_ttl(data: &[u8]) -> Duration {
         },
         // As long as a room's governance: a feed's publisher may be away for
         // days, and the head is the only way its followers find the list.
-        // Its listing lives as long, so a feed stays discoverable while it is
-        // followable, and a withdrawal outlives every listing it displaces.
-        Some(&RECORD_TYPE_FEED | &RECORD_TYPE_FEED_LISTING) => CHANNEL_GOVERNANCE_TTL,
+        Some(&RECORD_TYPE_FEED) => CHANNEL_GOVERNANCE_TTL,
+        Some(&RECORD_TYPE_FEED_LISTING) => FEED_LISTING_TTL,
         _ => KEYWORD_RECORD_TTL,
     }
 }
+
+/// A feed's listing in the public index, and a withdrawal of one. A week: its
+/// publisher signs it anew every hour it runs, so a listing outlives a
+/// publisher's week away, while junk that fills a shard lapses within it
+/// unless its signers keep re-signing it. A withdrawal lives as long, and so
+/// outlives every listing it displaces.
+const FEED_LISTING_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+
+const _: () = assert!(
+    FEED_LISTING_TTL.as_secs() as i64 == crate::network::ember::feed::FEED_LISTING_TTL_SECS
+        && FEED_LISTING_TTL.as_secs() > KEYWORD_RECORD_TTL.as_secs(),
+    "publishers resend withdrawals for as long as storers keep listings"
+);
 
 fn is_presence_departure(data: &[u8]) -> bool {
     channel_kind_from_data(data) == Some(CHANNEL_KIND_PRESENCE)
@@ -343,7 +355,20 @@ pub struct DhtStoreEntry {
 /// `publish::moderation_supersedes`), so the copy a key serves does not depend
 /// on which one reached this node last. Re-storing the identical record still
 /// replaces it, which is how a republish refreshes it.
-fn resident_gives_way(resident: &DhtRecord, created_at: i64, signature: &[u8; 64]) -> bool {
+///
+/// A feed's heads go by their sequence first, as followers rank them: one
+/// device's republish of an older head, signed later, or a head published
+/// after the clock went back, would otherwise be ranked by its stamp alone.
+fn resident_gives_way(resident: &DhtRecord, data: &[u8], created_at: i64, signature: &[u8; 64]) -> bool {
+    let sequences = (
+        super::publish::SignedRecord::feed_head_sequence_of(&resident.data),
+        super::publish::SignedRecord::feed_head_sequence_of(data),
+    );
+    if let (Some(held), Some(incoming)) = sequences {
+        if held != incoming {
+            return incoming > held;
+        }
+    }
     match created_at.cmp(&resident.created_at) {
         std::cmp::Ordering::Greater => true,
         std::cmp::Ordering::Less => false,
@@ -1232,7 +1257,7 @@ impl DhtStore {
             // that copy's (earlier) expiry, or roll back its metadata.
             // Not ACKed: the sender would otherwise count as placed a copy
             // this key does not hold.
-            if !resident_gives_way(&records[pos], created_at, &signature) {
+            if !resident_gives_way(&records[pos], &record.data, created_at, &signature) {
                 self.timestamp_rejections = self.timestamp_rejections.saturating_add(1);
                 debug!(
                     "Key {} already holds a newer record from this publisher, refusing the older copy",
@@ -1422,6 +1447,35 @@ impl DhtStore {
                 hex::encode(publisher_key),
             );
             return false;
+        }
+
+        // A full index shard makes room for a fresher listing by dropping its
+        // stalest one, as long as that was signed before this one. Refusing
+        // newcomers outright let throwaway identities shut every new feed
+        // out of Discover for a listing's life; this way junk must be kept
+        // fresher than the feeds whose publishers re-sign theirs hourly.
+        if records.len() >= MAX_RECORDS_PER_KEY && record.data.first() == Some(&RECORD_TYPE_FEED_LISTING) {
+            let stalest = records
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.data.first() == Some(&RECORD_TYPE_FEED_LISTING) && r.created_at < created_at)
+                .min_by_key(|(_, r)| r.created_at)
+                .map(|(at, _)| at);
+            if let Some(at) = stalest {
+                let dropped = records.remove(at);
+                let cost = record_cost(dropped.data.len());
+                self.bytes = self.bytes.saturating_sub(cost);
+                // The incoming record keeps its publisher on this key, so a
+                // slot of theirs is not given up for it.
+                let last = dropped.publisher_key != publisher_key
+                    && !records.iter().any(|r| r.publisher_key == dropped.publisher_key);
+                self.publisher_index.discharge(&dropped.publisher_key, cost, last);
+                debug!(
+                    "Key {} is full; dropped its stalest listing, signed at {}, for one signed at {created_at}",
+                    hex::encode(key),
+                    dropped.created_at
+                );
+            }
         }
 
         if records.len() >= MAX_RECORDS_PER_KEY {
@@ -3015,6 +3069,110 @@ mod tests {
         let withdrawal = listing(&salts[0], true, now + 1);
         assert!(store.store(withdrawal.keyword_hash, withdrawal.data, withdrawal.signature), "a replacement");
         assert_eq!(store.get(&withdrawal.keyword_hash).map(|r| r.len()), Some(MAX_FEED_LISTINGS_PER_PUBLISHER_PER_KEY));
+    }
+
+    /// A feed's heads go by their sequence, as followers rank them, and only
+    /// then by their stamp: a stale device's later-signed head, or a newer
+    /// one signed after the clock went back, is ranked by what it says.
+    #[test]
+    fn a_feeds_heads_go_by_sequence_before_stamp() {
+        use super::super::publish::SignedRecord;
+        use crate::network::ember::feed::FeedHead;
+
+        let mut store = DhtStore::new();
+        let sk = SigningKey::from_bytes(&[8u8; 32]);
+        let salt = [4u8; 16];
+        let now = chrono::Utc::now().timestamp();
+        let head = |sequence: u64, at: i64| {
+            let head = FeedHead {
+                sequence,
+                list_ed2k_hash: [1; 16],
+                list_size: 10,
+                list_blake3: [2; 32],
+                item_count: 1,
+                title: "T".into(),
+                description: String::new(),
+            };
+            SignedRecord::feed_head_record(&salt, &head, &sk, at).unwrap()
+        };
+        let stored = |store: &mut DhtStore, rec: SignedRecord| store.store(rec.keyword_hash, rec.data, rec.signature);
+        assert!(stored(&mut store, head(100, now - 60)));
+        assert!(!stored(&mut store, head(90, now)), "an older head signed later");
+        assert!(stored(&mut store, head(110, now - 120)), "a newer head signed after the clock went back");
+        assert!(stored(&mut store, head(110, now - 30)), "the same head signed again");
+        assert!(!stored(&mut store, head(110, now - 90)), "the same head's older copy");
+        let key = head(110, now).keyword_hash;
+        let held = store.get(&key).unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(SignedRecord::feed_head_sequence_of(&held[0].data), Some(110));
+    }
+
+    /// A full index shard drops its stalest listing for a fresher one, so
+    /// junk that fills it must be kept fresher than real feeds, re-signed
+    /// hourly, to keep them out; one staler than all it holds is refused.
+    #[test]
+    fn a_full_feed_index_shard_drops_its_stalest_listing() {
+        use super::super::publish::SignedRecord;
+        use crate::network::ember::feed::{feed_index_key, feed_index_shard, FeedHead};
+
+        let mut store = DhtStore::new();
+        let head = FeedHead {
+            sequence: 1,
+            list_ed2k_hash: [1; 16],
+            list_size: 10,
+            list_blake3: [2; 32],
+            item_count: 1,
+            title: "T".into(),
+            description: String::new(),
+        };
+        let now = chrono::Utc::now().timestamp();
+        let shard_salts = |publisher: &[u8; 32], n: usize| -> Vec<[u8; 16]> {
+            (0..=u16::MAX)
+                .map(|i| {
+                    let mut salt = [0u8; 16];
+                    salt[..2].copy_from_slice(&i.to_le_bytes());
+                    salt
+                })
+                .filter(|salt| feed_index_shard(publisher, salt) == 0)
+                .take(n)
+                .collect()
+        };
+        let mut stored = 0usize;
+        let mut identity = 0u16;
+        while stored < MAX_RECORDS_PER_KEY {
+            identity += 1;
+            let mut seed = [0x30u8; 32];
+            seed[..2].copy_from_slice(&identity.to_le_bytes());
+            let sk = SigningKey::from_bytes(&seed);
+            let take = MAX_FEED_LISTINGS_PER_PUBLISHER_PER_KEY.min(MAX_RECORDS_PER_KEY - stored);
+            for salt in shard_salts(&sk.verifying_key().to_bytes(), take) {
+                // The first stored is the stalest.
+                let at = now - 3600 + stored as i64;
+                let rec = SignedRecord::feed_listing_record(&salt, &head, false, &sk, at).unwrap();
+                assert!(store.store(rec.keyword_hash, rec.data, rec.signature), "filling the shard");
+                stored += 1;
+            }
+        }
+        let key = feed_index_key(0);
+        assert_eq!(store.get(&key).map(|r| r.len()), Some(MAX_RECORDS_PER_KEY));
+
+        let newcomer = SigningKey::from_bytes(&[0xEE; 32]);
+        let salt = shard_salts(&newcomer.verifying_key().to_bytes(), 1)[0];
+        let staler = SignedRecord::feed_listing_record(&salt, &head, false, &newcomer, now - 7200).unwrap();
+        assert!(!store.store(staler.keyword_hash, staler.data, staler.signature), "staler than every listing held");
+        let fresh = SignedRecord::feed_listing_record(&salt, &head, false, &newcomer, now).unwrap();
+        assert!(store.store(fresh.keyword_hash, fresh.data, fresh.signature), "a fresher listing makes room");
+        let held = store.get(&key).unwrap();
+        assert_eq!(held.len(), MAX_RECORDS_PER_KEY);
+        assert!(held.iter().any(|r| r.publisher_key == newcomer.verifying_key().to_bytes()));
+        assert!(!held.iter().any(|r| r.created_at == now - 3600), "the stalest listing went");
+    }
+
+    #[test]
+    fn a_listing_lives_a_week_and_a_head_a_month() {
+        assert_eq!(record_ttl(&[RECORD_TYPE_FEED_LISTING]), FEED_LISTING_TTL);
+        assert_eq!(FEED_LISTING_TTL.as_secs(), 7 * 24 * 3600);
+        assert_eq!(record_ttl(&[RECORD_TYPE_FEED]), CHANNEL_GOVERNANCE_TTL);
     }
 
     #[test]

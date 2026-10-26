@@ -75,6 +75,10 @@ struct FileStamp {
     /// Unix, which a timestamp-restoring tool cannot set back, and the
     /// creation time on Windows.
     changed: u64,
+    /// The tree a feed stream sends: each chunk's BLAKE3 chaining value
+    /// (`ember::feed::chunk_value`) rather than its own BLAKE3, so a
+    /// follower checks the list against the file's BLAKE3 its feed names.
+    subtrees: bool,
 }
 
 impl FileStamp {
@@ -87,6 +91,7 @@ impl FileStamp {
             modified: meta.modified().ok(),
             object: (object.volume_serial, object.file_id),
             changed: change_clock(&meta),
+            subtrees: false,
         })
     }
 }
@@ -276,15 +281,44 @@ fn run_hash_job(stamp: FileStamp, tx: tokio::sync::watch::Sender<HashOutcome>) {
 
 fn hash_stamped_file(stamp: &FileStamp) -> Result<std::sync::Arc<HashTree>, String> {
     let file = std::fs::File::open(&stamp.path).map_err(|e| e.to_string())?;
-    if FileStamp::of(&stamp.path, &file).map_err(|e| e.to_string())? != *stamp {
+    let unchanged = |file: &std::fs::File| {
+        FileStamp::of(&stamp.path, file).map(|now| FileStamp { subtrees: stamp.subtrees, ..now } == *stamp)
+    };
+    if !unchanged(&file).map_err(|e| e.to_string())? {
         return Err("attachment changed before it could be hashed".into());
     }
-    let tree = HashTree::from_reader(std::io::BufReader::new(&file)).map_err(|e| e.to_string())?;
+    let reader = std::io::BufReader::new(&file);
+    let tree = if stamp.subtrees { subtree_tree(reader, stamp.size) } else { HashTree::from_reader(reader) }
+        .map_err(|e| e.to_string())?;
     // A write that landed mid-read leaves a tree of neither version.
-    if FileStamp::of(&stamp.path, &file).map_err(|e| e.to_string())? != *stamp {
+    if !unchanged(&file).map_err(|e| e.to_string())? {
         return Err("attachment changed while it was being hashed".into());
     }
     Ok(std::sync::Arc::new(tree))
+}
+
+/// The tree a feed stream sends for `size` bytes read from `reader`: each
+/// chunk named by its chaining value in the file's BLAKE3 tree, the root
+/// the file's BLAKE3 itself.
+fn subtree_tree<R: std::io::Read>(mut reader: R, size: u64) -> std::io::Result<HashTree> {
+    use crate::network::ember::feed::{chunk_value, root_of_chunk_values};
+    let count = usize::try_from(size.div_ceil(ATTACH_CHUNK_SIZE as u64))
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "file too large"))?;
+    let mut buf = vec![0u8; ATTACH_CHUNK_SIZE];
+    let mut chunk_hashes = Vec::with_capacity(count);
+    let mut read_total = 0u64;
+    for index in 0..count {
+        let len = (size - read_total).min(ATTACH_CHUNK_SIZE as u64) as usize;
+        reader.read_exact(&mut buf[..len])?;
+        read_total += len as u64;
+        chunk_hashes.push(chunk_value(index, count, &buf[..len]));
+    }
+    let mut more = [0u8; 1];
+    if reader.read(&mut more)? != 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file grew while it was hashed"));
+    }
+    let root_hash = root_of_chunk_values(&chunk_hashes).unwrap_or(*blake3::hash(&[]).as_bytes());
+    Ok(HashTree { chunk_hashes, root_hash, file_size: size })
 }
 
 /// Drop `tree` from the cache if it is still what `stamp` maps to, so the next
@@ -647,25 +681,40 @@ fn admit_all(_xfer_id: &[u8; 16]) -> Result<(), AttachStreamStatus> {
     Ok(())
 }
 
-/// A grant whose root is known, as a chat or room offer's is.
-fn with_root<F>(capability_for: F) -> impl FnOnce(&[u8; 16]) -> Option<(PathBuf, u64, Option<[u8; 32]>, [u8; 32])>
+/// What [`serve_paced`] is granted for a request: the file, its size, the
+/// root it must hash to when one was agreed, the capability the request must
+/// be tagged under, and the folders it must be opened within when it may only
+/// be served from those.
+type Grant = (PathBuf, u64, Option<[u8; 32]>, [u8; 32], Option<Vec<String>>);
+
+/// A grant whose root is known, as a chat or room offer's is, of a file
+/// opened wherever the user picked it. No grant is an unknown transfer.
+fn with_root<F>(capability_for: F) -> impl FnOnce(&[u8; 16]) -> Result<Grant, AttachStreamStatus>
 where
     F: FnOnce(&[u8; 16]) -> Option<(PathBuf, u64, [u8; 32], [u8; 32])>,
 {
-    move |xfer_id| capability_for(xfer_id).map(|(path, size, root, capability)| (path, size, Some(root), capability))
+    move |xfer_id| {
+        capability_for(xfer_id)
+            .map(|(path, size, root, capability)| (path, size, Some(root), capability, None))
+            .ok_or(AttachStreamStatus::Unknown)
+    }
 }
 
 /// Serve a file of a feed we publish to a follower who asked for it under
 /// [`super::attach::FEED_STREAM_MSG_TYPE`].
 ///
-/// No root is offered ahead of a feed stream: a feed's list names a file by
-/// its whole-file digests, not by its chunk tree. The tree is whatever the
-/// file on disk hashes to, and the follower checks the finished file against
-/// the list. Served as a priority upload, as a chat file is.
+/// No root is agreed ahead of a feed stream: the chunk list names each chunk
+/// by its chaining value in the file's BLAKE3 tree
+/// (`ember::feed::chunk_value`), so the follower checks the list against the
+/// file's BLAKE3 the signed list names, and every chunk against the list,
+/// before a byte is written. Served as a priority upload, as a chat file is.
 ///
-/// `admit` is asked once the file's chunk list is ready, so a wait for it
-/// holds nothing it hands out; what it returns is held while the stream runs,
-/// and an `Err` is the status the follower is refused with.
+/// `resolve` names the file, its size, the capability, and the shared and
+/// download folders the file is opened within, or the status the follower is
+/// refused with. `admit` is asked once the
+/// file's chunk list is ready, so a wait for it holds nothing it hands out;
+/// what it returns is held while the stream runs, and an `Err` is the status
+/// the follower is refused with.
 pub async fn serve_feed_stream<R, W, F, A, G, P>(
     recv: &mut R,
     send: &mut W,
@@ -678,7 +727,7 @@ pub async fn serve_feed_stream<R, W, F, A, G, P>(
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
-    F: FnOnce(&[u8; 16]) -> Option<(PathBuf, u64, [u8; 32])>,
+    F: FnOnce(&[u8; 16]) -> Result<(PathBuf, u64, [u8; 32], Vec<String>), AttachStreamStatus>,
     A: FnOnce(&[u8; 16]) -> Result<G, AttachStreamStatus>,
     P: FnMut(&[u8; 16], u64, u64) -> bool,
 {
@@ -687,7 +736,9 @@ where
         recv,
         send,
         prefix,
-        move |xfer_id: &[u8; 16]| resolve(xfer_id).map(|(path, size, capability)| (path, size, None, capability)),
+        move |xfer_id: &[u8; 16]| {
+            resolve(xfer_id).map(|(path, size, capability, roots)| (path, size, None, capability, Some(roots)))
+        },
         admit,
         on_progress,
         limiter,
@@ -739,7 +790,7 @@ async fn serve_paced<R, W, F, A, G, P>(
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
-    F: FnOnce(&[u8; 16]) -> Option<(PathBuf, u64, Option<[u8; 32]>, [u8; 32])>,
+    F: FnOnce(&[u8; 16]) -> Result<Grant, AttachStreamStatus>,
     A: FnOnce(&[u8; 16]) -> Result<G, AttachStreamStatus>,
     P: FnMut(&[u8; 16], u64, u64) -> bool,
 {
@@ -758,9 +809,12 @@ where
     // it is keyed on the peer as well as the transfer — see
     // `Database::chat_attachment_grant`. A miss here is the ordinary case for a
     // transfer that was cancelled, declined, or has lapsed.
-    let Some((path, size, root, capability)) = capability_for(&request.xfer_id) else {
-        refuse(send, AttachStreamStatus::Unknown).await?;
-        return Ok(0);
+    let (path, size, root, capability, roots) = match capability_for(&request.xfer_id) {
+        Ok(grant) => grant,
+        Err(status) => {
+            refuse(send, status).await?;
+            return Ok(0);
+        }
     };
 
     // Second, weaker check: the tag proves the dialer holds the offer. Constant
@@ -791,11 +845,21 @@ where
     // file is. Only a file that has changed since it was last hashed is read
     // in full again; before, every stream — every retry included — re-read up
     // to 2 GiB before answering at all.
+    // A feed's file is opened as an upload is, through the approved-root
+    // layer: inside a shared or download folder, and not through a link
+    // that leads out of them.
+    let subtrees = stream_type == super::attach::FEED_STREAM_MSG_TYPE;
     let opened = {
         let path = path.clone();
         tokio::task::spawn_blocking(move || -> std::io::Result<(std::fs::File, FileStamp)> {
-            let file = std::fs::File::open(&path)?;
-            let stamp = FileStamp::of(&path, &file)?;
+            let (path, file) = match &roots {
+                Some(roots) => crate::security::filesystem::open_existing_approved(&path, roots, false)?,
+                None => {
+                    let file = std::fs::File::open(&path)?;
+                    (path, file)
+                }
+            };
+            let stamp = FileStamp { subtrees, ..FileStamp::of(&path, &file)? };
             Ok((file, stamp))
         })
         .await
@@ -1195,6 +1259,7 @@ where
 /// Read chunk `index` of the file `info` lists into the front of `buf`, and
 /// check it against its hash. Returns its length. `on_read` is told the bytes
 /// of it read so far, after every read.
+#[cfg(test)]
 pub async fn read_verified_chunk<R>(
     recv: &mut R,
     info: &AttachFileInfo,
@@ -1212,6 +1277,30 @@ where
     read_full(recv, &mut buf[..len], on_read).await?;
     if blake3::hash(&buf[..len]).as_bytes() != &info.chunk_hashes[index] {
         return Err(FetchError::Corrupt(format!("chunk {index} did not match its hash")));
+    }
+    Ok(len)
+}
+
+/// [`read_verified_chunk`] for a feed stream, whose list names each chunk by
+/// its chaining value in the file's BLAKE3 tree (`ember::feed::chunk_value`).
+/// The caller has checked the list against the file's BLAKE3.
+pub async fn read_verified_feed_chunk<R>(
+    recv: &mut R,
+    info: &AttachFileInfo,
+    index: usize,
+    buf: &mut [u8],
+) -> Result<usize, FetchError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let len = info
+        .chunk_len(index)
+        .filter(|len| *len <= buf.len())
+        .ok_or_else(|| FetchError::Corrupt("chunk index past the end".into()))?;
+    read_full(recv, &mut buf[..len], |_| {}).await?;
+    let value = crate::network::ember::feed::chunk_value(index, info.chunk_count(), &buf[..len]);
+    if info.chunk_hashes.get(index) != Some(&value) {
+        return Err(FetchError::Corrupt(format!("chunk {index} is not the one the feed's file has there")));
     }
     Ok(len)
 }
@@ -1585,6 +1674,7 @@ mod tests {
             modified: None,
             object: (1, 2),
             changed: 3,
+            subtrees: false,
         };
         let stale_use = std::time::Instant::now()
             .checked_sub(HASH_CACHE_IDLE + std::time::Duration::from_secs(1))
@@ -2411,7 +2501,32 @@ mod tests {
         feed_round_trip_admitted(source, size, capability, asked_with, start_chunk, Ok(())).await
     }
 
+    /// The folder feed files are served from in these tests, approved as a
+    /// root while [`approve_feed_files`]'s guard lives.
+    fn feed_files_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("ember-attach-feeds-{}", std::process::id())).join("files")
+    }
+
+    fn approve_feed_files() -> parking_lot::MutexGuard<'static, ()> {
+        let guard = crate::security::filesystem::test_registry_lock();
+        let files = feed_files_dir();
+        let data = files.with_file_name("data");
+        std::fs::create_dir_all(&files).expect("feed files folder");
+        std::fs::create_dir_all(&data).expect("data folder");
+        crate::security::filesystem::initialize_approved_roots(&data, &[files.to_string_lossy().into_owned()])
+            .expect("approve the feed files folder");
+        guard
+    }
+
+    /// Where a test's feed file is served from.
+    fn feed_source(tag: &str) -> PathBuf {
+        let files = feed_files_dir();
+        std::fs::create_dir_all(&files).expect("feed files folder");
+        files.join(format!("{tag}-{}", rand::random::<u64>()))
+    }
+
     /// [`feed_round_trip`], admitted or refused with `admitted`.
+    #[allow(clippy::await_holding_lock)]
     async fn feed_round_trip_admitted(
         source: Option<&Path>,
         size: u64,
@@ -2420,6 +2535,7 @@ mod tests {
         start_chunk: u32,
         admitted: Result<(), AttachStreamStatus>,
     ) -> Result<(AttachFileInfo, Vec<u8>), FetchError> {
+        let _approved = approve_feed_files();
         let (mut client_w, mut server_r) = tokio::io::duplex(1 << 20);
         let (mut server_w, mut client_r) = tokio::io::duplex(1 << 20);
         let served = source.map(Path::to_path_buf);
@@ -2430,7 +2546,7 @@ mod tests {
                 &mut server_r,
                 &mut server_w,
                 &prefix,
-                |_| served.map(|path| (path, size, capability)),
+                |_| served.map(|path| (path, size, capability, vec![feed_files_dir().to_string_lossy().into_owned()])).ok_or(AttachStreamStatus::Unknown),
                 |_| admitted,
                 |_, _, _| true,
                 None,
@@ -2452,7 +2568,7 @@ mod tests {
             let mut got = Vec::new();
             let mut buf = vec![0u8; ATTACH_CHUNK_SIZE];
             for index in start_chunk as usize..info.chunk_count() {
-                let len = read_verified_chunk(&mut client_r, &info, index, &mut buf, |_| {}).await?;
+                let len = read_verified_feed_chunk(&mut client_r, &info, index, &mut buf).await?;
                 got.extend_from_slice(&buf[..len]);
             }
             Ok((info, got))
@@ -2463,24 +2579,61 @@ mod tests {
         fetched
     }
 
-    /// Anyone holding the link is served, from the chunk asked for, with the
-    /// list the file on disk hashes to: no root was offered ahead.
+    /// Anyone holding the link is served, from the chunk asked for, with a
+    /// list that comes to the file's own BLAKE3, so a follower checks it
+    /// against the BLAKE3 the feed names, and every chunk against it.
     #[tokio::test]
     async fn a_feed_file_is_served_from_the_chunk_asked_for() {
-        let data: Vec<u8> = (0..ATTACH_CHUNK_SIZE * 3 + 5).map(|i| (i % 13) as u8).collect();
-        let source = temp_path("feed-src");
-        std::fs::write(&source, &data).expect("write");
-        let (info, got) = feed_round_trip(Some(&source), data.len() as u64, [8; 32], [8; 32], 1)
+        use crate::network::ember::feed::root_of_chunk_values;
+        for size in [5, ATTACH_CHUNK_SIZE, ATTACH_CHUNK_SIZE + 1, ATTACH_CHUNK_SIZE * 3 + 5, ATTACH_CHUNK_SIZE * 4] {
+            let data: Vec<u8> = (0..size).map(|i| (i % 13) as u8).collect();
+            let source = feed_source("feed-src");
+            std::fs::write(&source, &data).expect("write");
+            let from = usize::from(size > ATTACH_CHUNK_SIZE);
+            let (info, got) = feed_round_trip(Some(&source), data.len() as u64, [8; 32], [8; 32], from as u32)
+                .await
+                .expect("served");
+            assert_eq!(root_of_chunk_values(&info.chunk_hashes), Some(*blake3::hash(&data).as_bytes()), "{size} bytes");
+            assert_eq!(got, data[from * ATTACH_CHUNK_SIZE..], "{size} bytes");
+            let _ = std::fs::remove_file(&source);
+        }
+    }
+
+    /// A feed's file is opened only within the folders the request may read.
+    #[tokio::test]
+    async fn a_feed_file_outside_its_folders_is_refused() {
+        let source = temp_path("feed-outside");
+        std::fs::write(&source, b"feed file").expect("write");
+        let (mut client_w, mut server_r) = tokio::io::duplex(1 << 16);
+        let (mut server_w, mut client_r) = tokio::io::duplex(1 << 16);
+        let served = source.clone();
+        let elsewhere = std::env::temp_dir().join("ember-attach-no-such-folder").to_string_lossy().into_owned();
+        let server = tokio::spawn(async move {
+            let mut prefix = [0u8; 7];
+            server_r.read_exact(&mut prefix).await?;
+            serve_feed_stream(
+                &mut server_r,
+                &mut server_w,
+                &prefix,
+                |_| Ok((served, 9, [8; 32], vec![elsewhere])),
+                |_| Ok::<(), AttachStreamStatus>(()),
+                |_, _, _| true,
+                None,
+            )
             .await
-            .expect("served");
-        assert!(info.matches_root(&HashTree::from_data(&data).root_hash));
-        assert_eq!(got, data[ATTACH_CHUNK_SIZE..]);
+        });
+        let refused =
+            request_chunks(super::super::attach::FEED_STREAM_MSG_TYPE, &mut client_r, &mut client_w, &[5u8; 16], &[8; 32], 9, 0, ATTACH_STATUS_TIMEOUT)
+                .await;
+        assert!(matches!(refused, Err(FetchError::Refused(AttachStreamStatus::SourceGone))));
+        drop((client_r, client_w));
+        let _ = server.await;
         let _ = std::fs::remove_file(&source);
     }
 
     #[tokio::test]
     async fn a_feed_request_without_its_capability_is_refused() {
-        let source = temp_path("feed-cap");
+        let source = feed_source("feed-cap");
         std::fs::write(&source, b"feed file").expect("write");
         let refused = feed_round_trip(Some(&source), 9, [8; 32], [9; 32], 0).await;
         assert!(matches!(refused, Err(FetchError::Refused(AttachStreamStatus::Unauthorized))));
@@ -2497,7 +2650,7 @@ mod tests {
     /// rather than told the file is not ours.
     #[tokio::test]
     async fn a_feed_request_past_the_serve_slots_is_refused_as_busy() {
-        let source = temp_path("feed-busy");
+        let source = feed_source("feed-busy");
         std::fs::write(&source, b"feed file").expect("write");
         let refused = feed_round_trip_admitted(Some(&source), 9, [8; 32], [8; 32], 0, Err(AttachStreamStatus::Busy)).await;
         assert!(matches!(refused, Err(FetchError::Refused(AttachStreamStatus::Busy))));

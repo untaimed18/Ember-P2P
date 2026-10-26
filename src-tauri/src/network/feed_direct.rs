@@ -32,7 +32,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::ember::attach::{feed_stream_capability, feed_stream_id, FEED_STREAM_MAX_BYTES};
+use super::ember::attach::{feed_stream_capability, feed_stream_id, AttachStreamStatus, FEED_STREAM_MAX_BYTES};
 use super::ember::dht::publish::DiscoveredSource;
 
 /// How long a held download may go without a byte before the rest of the
@@ -498,14 +498,71 @@ pub fn served_entry(publisher: &[u8; 32], salt: &[u8; 16], ed2k: &[u8; 16], path
     )
 }
 
-/// A follower's request for `xfer_id`: the file, its size and the capability
-/// the request must be tagged under, if it is one of ours a feed lists.
-pub fn served(xfer_id: &[u8; 16]) -> Option<(PathBuf, u64, [u8; 32])> {
-    served_files()
-        .read()
-        .get(xfer_id)
-        .filter(|file| streamable(file.size))
-        .map(|file| (file.path.clone(), file.size, file.capability))
+/// What a follower's request is checked against when it comes, as an eMule
+/// upload is (`ed2k::upload::UploadHandler::resolve_upload_file`): the table
+/// of served files is rebuilt only every minute, and a file made
+/// friends-only, unshared, or moved out of every shared and download folder
+/// since is not to be streamed meanwhile.
+pub struct ServeChecks {
+    pub local_index: Arc<tokio::sync::RwLock<crate::search::index::LocalIndex>>,
+    pub friends_only: crate::network::ed2k::upload::SharedFriendsOnlyHashes,
+    pub shared_folders: Arc<tokio::sync::RwLock<Vec<String>>>,
+    pub download_folders: crate::storage::part_folders::SharedDownloadFolders,
+}
+
+fn serve_checks() -> &'static parking_lot::RwLock<Option<Arc<ServeChecks>>> {
+    static CHECKS: std::sync::OnceLock<parking_lot::RwLock<Option<Arc<ServeChecks>>>> = std::sync::OnceLock::new();
+    CHECKS.get_or_init(Default::default)
+}
+
+/// Check requests against `checks` from now on. Until this is called, as
+/// when the network has not started, nothing is streamed.
+pub fn set_serve_checks(checks: ServeChecks) {
+    *serve_checks().write() = Some(Arc::new(checks));
+}
+
+/// A file of ours a follower may stream now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedFile {
+    pub path: PathBuf,
+    pub size: u64,
+    /// What the request must be tagged under.
+    pub capability: [u8; 32],
+    /// The shared and download folders the file must be opened within.
+    pub roots: Vec<String>,
+}
+
+/// A follower's request for `xfer_id`: the file, if it is one of ours a feed
+/// lists that may be streamed now. Still shared with everyone by the Library
+/// when the Library can be read without waiting (it was when the table was
+/// built), not friends-only by known.met, and opened within the folders
+/// returned. Otherwise the status the follower is refused with: busy while
+/// what decides it cannot be read yet, which the follower asks again after,
+/// and unknown for a file not ours to stream.
+pub fn served(xfer_id: &[u8; 16]) -> Result<ServedFile, AttachStreamStatus> {
+    use crate::network::ed2k::upload::{friends_only_snapshot_contains, friends_only_snapshot_ready};
+    let file = served_file(xfer_id).ok_or(AttachStreamStatus::Unknown)?;
+    let checks = serve_checks().read().clone().ok_or(AttachStreamStatus::Busy)?;
+    if !friends_only_snapshot_ready(&checks.friends_only) {
+        return Err(AttachStreamStatus::Busy);
+    }
+    if friends_only_snapshot_contains(&checks.friends_only, &file.ed2k) {
+        return Err(AttachStreamStatus::Unknown);
+    }
+    if let Ok(index) = checks.local_index.try_read() {
+        let listed = index.get_by_hash(&hex::encode(file.ed2k)).ok_or(AttachStreamStatus::Unknown)?;
+        if !listed.is_public_listable() || std::path::Path::new(&listed.path) != file.path {
+            return Err(AttachStreamStatus::Unknown);
+        }
+    }
+    let mut roots = checks.shared_folders.try_read().map_err(|_| AttachStreamStatus::Busy)?.clone();
+    roots.extend(checks.download_folders.read().roots());
+    Ok(ServedFile { path: file.path, size: file.size, capability: file.capability, roots })
+}
+
+/// The table's entry for `xfer_id`, if it is a file the stream carries.
+fn served_file(xfer_id: &[u8; 16]) -> Option<Served> {
+    served_files().read().get(xfer_id).filter(|file| streamable(file.size)).cloned()
 }
 
 /// Of the [`MAX_SERVES`], how many one follower may hold: one fetching every
@@ -721,10 +778,10 @@ mod tests {
         let (key, ed2k) = (key(), [0x44; 16]);
         let (id, entry) = served_entry(&key, &SALT, &ed2k, PathBuf::from("f"), 10);
         set_served(HashMap::from([(id, entry)]));
-        let (path, size, capability) = served(&feed_stream_id(&key, &SALT, &ed2k)).expect("served");
-        assert_eq!((path, size), (PathBuf::from("f"), 10));
-        assert_eq!(capability, feed_stream_capability(&key, &SALT, &ed2k));
-        assert!(served(&feed_stream_id(&key, &[4; 16], &ed2k)).is_none(), "another feed's id");
+        let file = served_file(&feed_stream_id(&key, &SALT, &ed2k)).expect("served");
+        assert_eq!((file.path, file.size), (PathBuf::from("f"), 10));
+        assert_eq!(file.capability, feed_stream_capability(&key, &SALT, &ed2k));
+        assert!(served_file(&feed_stream_id(&key, &[4; 16], &ed2k)).is_none(), "another feed's id");
 
         take_downloads();
         note_downloaded(&feed_stream_id(&key, &SALT, &ed2k), [9; 16]);

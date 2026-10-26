@@ -89,6 +89,10 @@ pub(super) struct FeedWorker {
     pub worker: usize,
     pub transfer_id: String,
     pub file_size: u64,
+    /// The file's BLAKE3, as the feed's signed list names it: what the
+    /// publisher's chunk list must come to. All zero for none, which no
+    /// stream is taken for.
+    pub expected_blake3: [u8; 32],
     pub tracker: Arc<RwLock<PartTracker>>,
     pub output: super::super::write_coordinator::PartFileWriter,
     pub bandwidth: Arc<BandwidthLimiter>,
@@ -147,7 +151,6 @@ impl FeedWorker {
         self.report(source, "connecting", 0, 0, None).await;
         let mut failures = 0u32;
         let mut busy = 0u32;
-        let mut root: Option<[u8; 32]> = None;
         let mut transferred = 0u64;
         loop {
             if check_control(&self.control).await.is_err() || disk_full_hit(&self.disk_full) {
@@ -172,7 +175,7 @@ impl FeedWorker {
                 Dialled::Quic(conn) => match conn.open_bi().await {
                     Ok((mut send, mut recv)) => {
                         let pulled = self
-                            .pull(source, &mut recv, &mut send, start_chunk, &mut root, &mut transferred, &mut written)
+                            .pull(source, &mut recv, &mut send, start_chunk, &mut transferred, &mut written)
                             .await;
                         let _ = send.finish();
                         let reason = if matches!(pulled, Ok(true)) { ATTACH_CLOSE_RECEIVED } else { ATTACH_CLOSE_ABANDONED };
@@ -183,7 +186,7 @@ impl FeedWorker {
                 },
                 Dialled::Tcp(mut parts) => {
                     let pulled = self
-                        .pull(source, &mut parts.reader, &mut parts.writer, start_chunk, &mut root, &mut transferred, &mut written)
+                        .pull(source, &mut parts.reader, &mut parts.writer, start_chunk, &mut transferred, &mut written)
                         .await;
                     if matches!(pulled, Ok(true)) {
                         // Best effort: the publisher only uses it to know its side is done.
@@ -283,7 +286,6 @@ impl FeedWorker {
         recv: &mut R,
         send: &mut W,
         start_chunk: u32,
-        root: &mut Option<[u8; 32]>,
         transferred: &mut u64,
         written: &mut u64,
     ) -> Result<bool, PullError>
@@ -304,14 +306,15 @@ impl FeedWorker {
             ) => info.map_err(PullError::Fetch)?,
             _ = self.control.wait_cancel_or_pause() => return Err(PullError::Stopped),
         };
-        // Every stream of a run must be of the same bytes: a list that changed
-        // between two means a file that did, and what came before it is of
-        // another.
-        let list_root = crate::network::ember::transfer::root_from_chunk_hashes(&info.chunk_hashes);
-        if root.is_some_and(|seen| seen != list_root) {
-            return Err(PullError::Fetch(FetchError::Corrupt("the publisher's file changed between streams".into())));
+        // The list must name the file the feed's signed list does, by its
+        // BLAKE3, so every chunk checked against it is that file's before it
+        // is written; a publisher whose file changed since, or anyone between,
+        // is refused before a byte lands.
+        let names_the_file = self.expected_blake3 != [0u8; 32]
+            && crate::network::ember::feed::root_of_chunk_values(&info.chunk_hashes) == Some(self.expected_blake3);
+        if !names_the_file {
+            return Err(PullError::Fetch(FetchError::Corrupt("the publisher's chunk list is not the feed's file".into())));
         }
-        *root = Some(list_root);
         feed_direct::stream_connected(&self.transfer_id);
 
         let _active = ActiveRequest::new(&self.active_count);
@@ -332,7 +335,7 @@ impl FeedWorker {
                 return Err(PullError::Stopped);
             }
             tokio::select! {
-                read = attach_stream::read_verified_chunk(recv, &info, index, &mut buf, |_| {}) => {
+                read = attach_stream::read_verified_feed_chunk(recv, &info, index, &mut buf) => {
                     read.map_err(PullError::Fetch)?;
                 }
                 _ = self.control.wait_cancel_or_pause() => return Err(PullError::Stopped),
@@ -466,7 +469,7 @@ mod tests {
         crate::security::filesystem::initialize_approved_roots(&data_dir, std::slice::from_ref(&root_s)).unwrap();
         let part = root.join("file.part");
         std::fs::File::create(&part).unwrap().set_len(data.len() as u64).unwrap();
-        let served = base.join("published");
+        let served = root.join("published");
         std::fs::write(&served, data).unwrap();
         let output = crate::network::ed2k::write_coordinator::PartFileWriter::open(part.clone(), vec![root_s], None)
             .await
@@ -479,6 +482,7 @@ mod tests {
             worker: FEED_WORKER_INDEX,
             transfer_id: format!("feed-worker-{tag}"),
             file_size: data.len() as u64,
+            expected_blake3: *blake3::hash(data).as_bytes(),
             tracker,
             output,
             bandwidth: Arc::new(BandwidthLimiter::new(0, 0)),
@@ -511,10 +515,11 @@ mod tests {
     }
 
     /// Serve the rig's published copy once, and pull it from `start_chunk`.
-    async fn pull_once(rig: &Rig, start_chunk: u32, root: &mut Option<[u8; 32]>) -> (Result<bool, PullError>, u64) {
+    async fn pull_once(rig: &Rig, start_chunk: u32) -> (Result<bool, PullError>, u64) {
         let (mut client_w, mut server_r) = tokio::io::duplex(1 << 20);
         let (mut server_w, mut client_r) = tokio::io::duplex(1 << 20);
         let (served, size, capability) = (rig.served.clone(), rig.worker.file_size, rig.source.capability);
+        let roots = vec![rig.base.join("root").to_string_lossy().into_owned()];
         let server = tokio::spawn(async move {
             let mut prefix = [0u8; 7];
             server_r.read_exact(&mut prefix).await?;
@@ -522,7 +527,7 @@ mod tests {
                 &mut server_r,
                 &mut server_w,
                 &prefix,
-                |_| Some((served, size, capability)),
+                |_| Ok((served, size, capability, roots)),
                 |_| Ok(()),
                 |_, _, _| true,
                 None,
@@ -532,7 +537,7 @@ mod tests {
         let (mut transferred, mut written) = (0, 0);
         let pulled = rig
             .worker
-            .pull(&rig.source, &mut client_r, &mut client_w, start_chunk, root, &mut transferred, &mut written)
+            .pull(&rig.source, &mut client_r, &mut client_w, start_chunk, &mut transferred, &mut written)
             .await;
         drop((client_r, client_w));
         let _ = server.await;
@@ -554,13 +559,11 @@ mod tests {
         let _registry = crate::security::filesystem::test_registry_lock();
         let data = data(3);
         let rig = rig("fill", &data).await;
-        let mut root = None;
-        let (pulled, written) = pull_once(&rig, 0, &mut root).await;
+        let (pulled, written) = pull_once(&rig, 0).await;
         assert!(matches!(pulled, Ok(true)));
         assert_eq!(written, data.len() as u64);
         assert!(rig.worker.tracker.read().await.all_complete());
         assert_eq!(std::fs::read(&rig.part).unwrap(), data);
-        assert_eq!(root, Some(crate::network::ember::transfer::HashTree::from_data(&data).root_hash));
     }
 
     /// Chunks another source filled are not read through: the stream stops
@@ -579,31 +582,33 @@ mod tests {
         }
         rig.worker.tracker.write().await.fill_range(held_from, held_to);
 
-        let mut root = None;
-        let (pulled, written) = pull_once(&rig, 0, &mut root).await;
+        let (pulled, written) = pull_once(&rig, 0).await;
         assert!(matches!(pulled, Ok(false)), "stopped ahead of what is held");
         assert_eq!(written, CHUNK);
         let next = first_gap(&rig).await.expect("the last chunk is missing");
         assert_eq!(next, held_to);
-        let (pulled, written) = pull_once(&rig, (next / CHUNK) as u32, &mut root).await;
+        let (pulled, written) = pull_once(&rig, (next / CHUNK) as u32).await;
         assert!(matches!(pulled, Ok(true)));
         assert_eq!(written, data.len() as u64 - held_to);
         assert!(rig.worker.tracker.read().await.all_complete());
         assert_eq!(std::fs::read(&rig.part).unwrap(), data);
     }
 
-    /// A second stream of other bytes than the first, a file the publisher
-    /// replaced meanwhile, is refused rather than spliced onto them.
+    /// A publisher whose file is not the one the feed names, replaced since
+    /// or never it, is refused before a byte is written: its chunk list does
+    /// not come to the BLAKE3 the signed list names.
     #[tokio::test]
-    async fn a_file_changed_between_streams_is_refused() {
+    async fn a_chunk_list_that_is_not_the_feeds_file_is_refused() {
         let _registry = crate::security::filesystem::test_registry_lock();
         let data = data(2);
-        let rig = rig("changed", &data).await;
-        let mut root = Some([0xAB; 32]);
-        let (pulled, written) = pull_once(&rig, 0, &mut root).await;
-        assert!(matches!(pulled, Err(PullError::Fetch(FetchError::Corrupt(_)))));
-        assert_eq!(written, 0);
-        assert!(first_gap(&rig).await == Some(0), "nothing written");
+        for (tag, expected) in [("changed", [0xAB; 32]), ("unpinned", [0; 32])] {
+            let mut rig = rig(tag, &data).await;
+            rig.worker.expected_blake3 = expected;
+            let (pulled, written) = pull_once(&rig, 0).await;
+            assert!(matches!(pulled, Err(PullError::Fetch(FetchError::Corrupt(_)))), "{tag}");
+            assert_eq!(written, 0);
+            assert!(first_gap(&rig).await == Some(0), "nothing written");
+        }
     }
 
     #[tokio::test]
@@ -612,7 +617,7 @@ mod tests {
         let data = data(2);
         let rig = rig("paused", &data).await;
         rig.worker.control.pause();
-        let (pulled, _) = pull_once(&rig, 0, &mut None).await;
+        let (pulled, _) = pull_once(&rig, 0).await;
         assert!(matches!(pulled, Err(PullError::Stopped)));
     }
 }

@@ -5856,8 +5856,18 @@ pub(crate) struct ShardWalk {
     pub(crate) blobs: Vec<Vec<u8>>,
     /// Enough of the network answered that a listing missing from `blobs`
     /// can be taken as gone. A refused, timed-out or barely answered walk
-    /// says nothing about the listings it did not return.
+    /// says nothing about the listings it did not return, and nor does one
+    /// that came back full: a shard holding more than a lookup returns may
+    /// hold the missing ones too, and junk filling it would otherwise erase
+    /// every listing it crowded out.
     pub(crate) settled: bool,
+}
+
+/// Whether a shard walk that `responded` nodes answered with `found` blobs
+/// settled (see [`ShardWalk::settled`]).
+fn shard_settled(responded: usize, found: usize) -> bool {
+    responded >= crate::commands::channel_recovery::MIN_RESPONDERS_FOR_ABSENCE
+        && found < crate::network::ember::dht::search::MAX_SEARCH_RESULTS
 }
 
 /// Walk one shard of a public index (rooms' or feeds'), asking once more if
@@ -5873,11 +5883,7 @@ pub(crate) async fn walk_index_shard(state: &AppState, shard: u8, key: [u8; 16])
         walk = find_raw_keys_counted(state, vec![key], DEFAULT_FIND_TIMEOUT_MS).await;
     }
     match walk {
-        Ok(Some((blobs, responded))) => ShardWalk {
-            shard,
-            blobs,
-            settled: responded >= crate::commands::channel_recovery::MIN_RESPONDERS_FOR_ABSENCE,
-        },
+        Ok(Some((blobs, responded))) => ShardWalk { shard, settled: shard_settled(responded, blobs.len()), blobs },
         Ok(None) => {
             tracing::debug!(shard, "index shard walk timed out");
             ShardWalk { shard, blobs: Vec::new(), settled: false }

@@ -2334,19 +2334,23 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let mut busy = false;
+    let busy = std::sync::atomic::AtomicBool::new(false);
     let mut streamed: Option<([u8; 16], u64)> = None;
     let mut sent = 0u64;
     let served = super::attach_stream::serve_feed_stream(
         recv,
         send,
         header,
-        crate::network::feed_direct::served,
+        |xfer_id| {
+            let file = crate::network::feed_direct::served(xfer_id);
+            busy.store(file == Err(super::attach::AttachStreamStatus::Busy), std::sync::atomic::Ordering::Relaxed);
+            file.map(|file| (file.path, file.size, file.capability, file.roots))
+        },
         // Taken once the file's chunk list is ready, so a dialer that sends
         // nothing, asks for nothing we serve, or waits on a hash, holds none.
         |_| {
             let slot = crate::network::feed_direct::serve_slot(follower);
-            busy = slot.is_none();
+            busy.store(slot.is_none(), std::sync::atomic::Ordering::Relaxed);
             slot.ok_or(super::attach::AttachStreamStatus::Busy)
         },
         |xfer_id, position, size| {
@@ -2358,7 +2362,7 @@ where
     )
     .await;
     match &served {
-        Ok(0) if busy => debug!("Feed stream refused: as many as we serve at once, or to this follower, are running"),
+        Ok(0) if busy.load(std::sync::atomic::Ordering::Relaxed) => debug!("Feed stream refused as busy: no slot free, or the file's checks not ready"),
         Ok(0) => debug!("No feed file of ours under the id a follower asked for"),
         Ok(bytes) => debug!("Feed stream: served {bytes} byte(s)"),
         Err(e) => debug!("Feed stream failed: {e}"),

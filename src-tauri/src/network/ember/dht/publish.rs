@@ -1810,43 +1810,58 @@ impl SignedRecord {
     }
 
     /// A feed's head, signed by the publisher's identity and filed under
-    /// [`crate::network::ember::feed::feed_key`], stamped `timestamp`. `None`
-    /// for a head with a field out of bounds.
+    /// [`crate::network::ember::feed::feed_key`], stamped `timestamp`: its
+    /// locator in `file_hash`, and all but its sequence sealed in the trailer
+    /// ([`crate::network::ember::feed::encode_sealed_head`]). The header's
+    /// digest and size are the trailer's, so the record names nothing of the
+    /// feed. `None` for a head with a field out of bounds.
     pub fn feed_head_record(
         salt: &crate::network::ember::feed::FeedSalt,
         head: &crate::network::ember::feed::FeedHead,
         identity: &SigningKey,
         timestamp: i64,
     ) -> Option<Self> {
-        let extra = crate::network::ember::feed::encode_feed_extra(head)?;
+        use crate::network::ember::feed;
         let pubkey = identity.verifying_key().to_bytes();
-        let record = Self::build_with_media(
+        let extra = feed::encode_sealed_head(&pubkey, salt, head)?;
+        Some(Self::build_with_media(
             RECORD_TYPE_FEED,
-            crate::network::ember::feed::feed_key(&pubkey, salt),
-            *salt,
-            head.list_blake3,
-            head.list_size,
-            &head.title,
+            feed::feed_key(&pubkey, salt),
+            feed::feed_locator(salt),
+            *blake3::hash(&extra).as_bytes(),
+            extra.len() as u64,
+            feed::FEED_HEAD_RECORD_NAME,
             None,
             Some(extra),
             None,
             identity,
             timestamp,
-        );
-        // The name is clamped to fit the record; a title it cut would no
-        // longer be the head that was asked for.
-        (record.file_name == head.title).then_some(record)
+        ))
     }
 
-    /// The salt and head a feed record carries, if it is one and well formed.
-    /// Says nothing about the signature: from a verified record only.
-    pub fn feed_head(&self) -> Option<(crate::network::ember::feed::FeedSalt, crate::network::ember::feed::FeedHead)> {
-        if self.record_type != RECORD_TYPE_FEED {
+    /// The head of the feed `salt` this record carries, if it is one of it,
+    /// well formed and opens under the salt's key. Says nothing about the
+    /// signature: from a verified record only.
+    pub fn feed_head(&self, salt: &crate::network::ember::feed::FeedSalt) -> Option<crate::network::ember::feed::FeedHead> {
+        use crate::network::ember::feed;
+        if self.record_type != RECORD_TYPE_FEED || self.file_hash != feed::feed_locator(salt) {
             return None;
         }
-        let (title, extra) = self.name_and_trailer_extra()?;
-        let fields = crate::network::ember::feed::decode_feed_extra(extra)?;
-        self.feed_head_from(title, fields).map(|head| (self.file_hash, head))
+        let (_, extra) = self.name_and_trailer_extra()?;
+        feed::decode_sealed_head(&self.publisher_key, salt, extra)
+    }
+
+    /// The sequence a feed head's record body carries in the clear, of any
+    /// version this build or a later one writes: what a storer ranks a
+    /// feed's heads by. `None` for any other record.
+    pub fn feed_head_sequence_of(data: &[u8]) -> Option<u64> {
+        if data.first() != Some(&RECORD_TYPE_FEED) {
+            return None;
+        }
+        let name_len = usize::from(u16::from_le_bytes(data.get(113..115)?.try_into().ok()?));
+        let off = 115 + name_len;
+        let extra_len = usize::from(u16::from_le_bytes(data.get(off + 1..off + 3)?.try_into().ok()?));
+        crate::network::ember::feed::head_sequence(data.get(off + 3..off + 3 + extra_len)?)
     }
 
     /// The title (the record's name) and the trailer's extra bytes of a record
@@ -1877,12 +1892,17 @@ impl SignedRecord {
         head.valid().then_some(head)
     }
 
-    /// Whether a storer should keep this feed head: well formed, and filed
-    /// under the key its publisher and salt give.
+    /// Whether a storer should keep this feed head: one of this version or a
+    /// later one, whose sequence it can read, filed under the key its
+    /// publisher and locator give. Nothing more is checked, as nothing more
+    /// can be read without the salt, and a later build's head passes through
+    /// this one.
     pub fn feed_store_ok(&self) -> bool {
         self.record_type == RECORD_TYPE_FEED
-            && self.feed_head().is_some()
-            && self.keyword_hash == crate::network::ember::feed::feed_key(&self.publisher_key, &self.file_hash)
+            && self
+                .name_and_trailer_extra()
+                .is_some_and(|(_, extra)| crate::network::ember::feed::head_sequence(extra).is_some())
+            && self.keyword_hash == crate::network::ember::feed::feed_key_at(&self.publisher_key, &self.file_hash)
     }
 
     /// A public feed's listing: the head `head` of the feed `salt`, signed by
@@ -1930,12 +1950,15 @@ impl SignedRecord {
         Some((self.file_hash, head, withdrawn))
     }
 
-    /// Whether a storer should keep this listing: well formed, and filed under
-    /// the index shard its publisher and salt give, so a listing cannot be
-    /// aimed at whichever shard key is nearest a storer.
+    /// Whether a storer should keep this listing: one of this version or a
+    /// later one ([`crate::network::ember::feed::listing_storable`]), filed
+    /// under the index shard its publisher and salt give, so a listing cannot
+    /// be aimed at whichever shard key is nearest a storer.
     pub fn feed_listing_store_ok(&self) -> bool {
         self.record_type == RECORD_TYPE_FEED_LISTING
-            && self.feed_listing().is_some()
+            && self
+                .name_and_trailer_extra()
+                .is_some_and(|(_, extra)| crate::network::ember::feed::listing_storable(extra))
             && self.keyword_hash
                 == crate::network::ember::feed::feed_index_key(crate::network::ember::feed::feed_index_shard(
                     &self.publisher_key,

@@ -3,30 +3,41 @@
 //!
 //! A feed is two things. Its **head** is a small record in the Ember DHT
 //! (`RECORD_TYPE_FEED`), signed by the publisher's identity and filed under
-//! [`feed_key`]; it names the current list by its hashes. The **list** is an
-//! ordinary collection file, fetched like any download; the head commits to
-//! it, so it needs no signature of its own.
+//! [`feed_key`]; it names the current list by its hashes. The **list** is a
+//! collection file, sealed ([`seal_list`]) and fetched like any download; the
+//! head commits to it, so it needs no signature of its own.
 //!
-//! The head uses the record header's own fields where they fit (see
-//! `SignedRecord::feed_head_record`): the salt is `file_hash`, so a storer's
-//! per-publisher dedupe keeps one head per feed; the list's BLAKE3 is
-//! `ember_file_hash`, its size `file_size`, the title the name. The record's
-//! trailer carries the rest ([`encode_feed_extra`]).
+//! A feed is public to whoever has its link, and to nobody else unless it is
+//! listed: the salt only the link holds is never on the network. The head is
+//! filed under the salt's [`feed_locator`], which is its `file_hash`, so a
+//! storer's per-publisher dedupe keeps one head per feed; everything in it
+//! but its sequence is sealed under a key derived from the salt
+//! ([`encode_sealed_head`]), and so is the list. A storer sees who publishes
+//! a feed and when, and nothing of what it is.
 //!
 //! A publisher may also list a feed in the public index, for anyone to find
-//! without its link: a **listing** (`RECORD_TYPE_FEED_LISTING`) is a copy of
-//! the head, flagged ([`encode_feed_listing_extra`]), filed under one of
-//! [`FEED_INDEX_SHARDS`] shared keys ([`feed_index_key`]). Taking a feed out
-//! of the index is a listing flagged withdrawn, which displaces the last.
+//! without its link: a **listing** (`RECORD_TYPE_FEED_LISTING`) carries the
+//! salt and the head in the clear, flagged ([`encode_feed_listing_extra`]),
+//! filed under one of [`FEED_INDEX_SHARDS`] shared keys ([`feed_index_key`]).
+//! Taking a feed out of the index is a listing flagged withdrawn, which
+//! displaces the last.
 
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use rand::rngs::OsRng;
 use rand::RngCore;
 
 /// What tells a feed's key apart from every other key derived from an
 /// identity. Changing it would move every feed.
-const FEED_KEY_PREFIX: &[u8] = b"ember-feed-v1";
-/// The trailer's own version, ahead of its fields.
-pub const FEED_HEAD_VERSION: u8 = 1;
+const FEED_KEY_PREFIX: &[u8] = b"ember-feed-v2";
+/// The head trailer's version, ahead of its fields: its sequence in the
+/// clear, the rest sealed. Storers keep any later version, which they read
+/// the sequence of and nothing more.
+pub const FEED_HEAD_VERSION: u8 = 2;
+/// The version of the head a listing carries in the clear.
+pub const FEED_LISTED_HEAD_VERSION: u8 = 1;
+/// The name a head record carries, its title being sealed.
+pub const FEED_HEAD_RECORD_NAME: &str = "-";
 /// The longest title, in UTF-8 bytes.
 pub const FEED_TITLE_MAX: usize = 64;
 /// The longest description, in UTF-8 bytes.
@@ -39,19 +50,173 @@ pub const FEED_ITEMS_MAX: usize = 2_000;
 /// The longest note on one item, in UTF-8 bytes.
 pub const FEED_NOTE_MAX: usize = 256;
 
-/// What tells one of an identity's feeds from another.
+/// What tells one of an identity's feeds from another. Secret to whoever has
+/// the feed's link; never sent.
 pub type FeedSalt = [u8; 16];
 
-/// DHT key of the feed `salt` of `publisher`. Storers recompute it from the
-/// head and refuse one filed anywhere else.
+/// What a head names its feed by in the salt's place: derived from it, and
+/// telling nothing of it.
+pub type FeedLocator = [u8; 16];
+
+const LOCATOR_CONTEXT: &str = "Ember feed locator v1";
+const HEAD_KEY_CONTEXT: &str = "Ember feed head key v1";
+const LIST_KEY_CONTEXT: &str = "Ember feed list key v1";
+const NONCE_KEY_CONTEXT: &str = "Ember feed nonce key v1";
+const HEAD_AAD_PREFIX: &[u8] = b"ember-feed-head";
+/// What a sealed list starts with.
+pub const SEALED_LIST_MAGIC: &[u8; 8] = b"EMBRFL01";
+/// What sealing adds to what it seals: a nonce and a tag.
+const SEAL_OVERHEAD: usize = 24 + 16;
+
+/// The locator of the feed `salt`.
+pub fn feed_locator(salt: &FeedSalt) -> FeedLocator {
+    let key = blake3::derive_key(LOCATOR_CONTEXT, salt);
+    let mut locator = [0u8; 16];
+    locator.copy_from_slice(&key[..16]);
+    locator
+}
+
+/// DHT key of the feed `salt` of `publisher`.
 pub fn feed_key(publisher: &[u8; 32], salt: &FeedSalt) -> [u8; 16] {
+    feed_key_at(publisher, &feed_locator(salt))
+}
+
+/// [`feed_key`], from the feed's locator: what storers recompute from a head,
+/// refusing one filed anywhere else.
+pub fn feed_key_at(publisher: &[u8; 32], locator: &FeedLocator) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(FEED_KEY_PREFIX);
     hasher.update(publisher);
-    hasher.update(salt);
+    hasher.update(locator);
     let mut key = [0u8; 16];
     key.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
     key
+}
+
+/// `plaintext` sealed under the key `context` derives from `salt`, bound to
+/// `aad`: `nonce(24) || ciphertext || tag(16)`, XChaCha20-Poly1305. The nonce
+/// is a keyed hash of what is sealed, so the same bytes seal the same way: a
+/// list written again from its items is the list its head names.
+fn seal(context: &str, salt: &FeedSalt, aad: &[u8], plaintext: &[u8]) -> Option<Vec<u8>> {
+    let mut nonce_hasher = blake3::Hasher::new_keyed(&blake3::derive_key(NONCE_KEY_CONTEXT, salt));
+    nonce_hasher.update(&(aad.len() as u64).to_le_bytes());
+    nonce_hasher.update(aad);
+    nonce_hasher.update(plaintext);
+    let digest = nonce_hasher.finalize();
+    let nonce = &digest.as_bytes()[..24];
+    let key = blake3::derive_key(context, salt);
+    let sealed = XChaCha20Poly1305::new(Key::from_slice(&key))
+        .encrypt(XNonce::from_slice(nonce), Payload { msg: plaintext, aad })
+        .ok()?;
+    Some([nonce, &sealed].concat())
+}
+
+/// What [`seal`] sealed, if `sealed` is that and untouched.
+fn open(context: &str, salt: &FeedSalt, aad: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
+    if sealed.len() < SEAL_OVERHEAD {
+        return None;
+    }
+    let (nonce, ciphertext) = sealed.split_at(24);
+    let key = blake3::derive_key(context, salt);
+    XChaCha20Poly1305::new(Key::from_slice(&key))
+        .decrypt(XNonce::from_slice(nonce), Payload { msg: ciphertext, aad })
+        .ok()
+}
+
+fn head_aad(publisher: &[u8; 32], locator: &FeedLocator, version: u8, sequence: u64) -> Vec<u8> {
+    [HEAD_AAD_PREFIX, &[version], publisher, locator, &sequence.to_le_bytes()].concat()
+}
+
+/// A head's trailer: `version(1) = 2 || sequence(8) || sealed`, little-endian,
+/// where `sealed` is [`seal`] of `list_ed2k_hash(16) || list_blake3(32) ||
+/// list_size(8) || item_count(4) || title_len(1) || title ||
+/// description_len(2) || description` under the head key, bound to the
+/// publisher, the locator, the version and the sequence. `None` for a head
+/// with a field out of bounds.
+pub fn encode_sealed_head(publisher: &[u8; 32], salt: &FeedSalt, head: &FeedHead) -> Option<Vec<u8>> {
+    if !head.valid() {
+        return None;
+    }
+    let (title, description) = (head.title.as_bytes(), head.description.as_bytes());
+    let mut body = Vec::with_capacity(16 + 32 + 8 + 4 + 1 + title.len() + 2 + description.len());
+    body.extend_from_slice(&head.list_ed2k_hash);
+    body.extend_from_slice(&head.list_blake3);
+    body.extend_from_slice(&head.list_size.to_le_bytes());
+    body.extend_from_slice(&head.item_count.to_le_bytes());
+    body.push(u8::try_from(title.len()).ok()?);
+    body.extend_from_slice(title);
+    body.extend_from_slice(&u16::try_from(description.len()).ok()?.to_le_bytes());
+    body.extend_from_slice(description);
+    let aad = head_aad(publisher, &feed_locator(salt), FEED_HEAD_VERSION, head.sequence);
+    let sealed = seal(HEAD_KEY_CONTEXT, salt, &aad, &body)?;
+    let mut out = Vec::with_capacity(1 + 8 + sealed.len());
+    out.push(FEED_HEAD_VERSION);
+    out.extend_from_slice(&head.sequence.to_le_bytes());
+    out.extend_from_slice(&sealed);
+    Some(out)
+}
+
+/// The head a trailer of [`encode_sealed_head`] seals, for the feed `salt` of
+/// `publisher`: `None` for another version, another feed's, or one tampered
+/// with, cut short or out of bounds.
+pub fn decode_sealed_head(publisher: &[u8; 32], salt: &FeedSalt, extra: &[u8]) -> Option<FeedHead> {
+    if extra.len() < 1 + 8 + SEAL_OVERHEAD || extra[0] != FEED_HEAD_VERSION {
+        return None;
+    }
+    let sequence = u64::from_le_bytes(extra[1..9].try_into().ok()?);
+    let aad = head_aad(publisher, &feed_locator(salt), FEED_HEAD_VERSION, sequence);
+    let body = open(HEAD_KEY_CONTEXT, salt, &aad, &extra[9..])?;
+    let at = &mut 0usize;
+    let list_ed2k_hash: [u8; 16] = take(&body, at, 16)?.try_into().ok()?;
+    let list_blake3: [u8; 32] = take(&body, at, 32)?.try_into().ok()?;
+    let list_size = u64::from_le_bytes(take(&body, at, 8)?.try_into().ok()?);
+    let item_count = u32::from_le_bytes(take(&body, at, 4)?.try_into().ok()?);
+    let title_len = usize::from(take(&body, at, 1)?[0]);
+    let title = String::from_utf8(take(&body, at, title_len)?.to_vec()).ok()?;
+    let description_len = usize::from(u16::from_le_bytes(take(&body, at, 2)?.try_into().ok()?));
+    let description = String::from_utf8(take(&body, at, description_len)?.to_vec()).ok()?;
+    if *at != body.len() {
+        return None;
+    }
+    let head = FeedHead { sequence, list_ed2k_hash, list_size, list_blake3, item_count, title, description };
+    head.valid().then_some(head)
+}
+
+/// The `n` bytes of `body` at `*at`, moving it past them.
+fn take<'a>(body: &'a [u8], at: &mut usize, n: usize) -> Option<&'a [u8]> {
+    let bytes = body.get(*at..at.checked_add(n)?)?;
+    *at += n;
+    Some(bytes)
+}
+
+/// The sequence a head's trailer carries in the clear, of this version or a
+/// later one: what a storer ranks a feed's heads by, reading nothing more.
+pub fn head_sequence(extra: &[u8]) -> Option<u64> {
+    if extra.first().is_none_or(|version| *version < FEED_HEAD_VERSION) {
+        return None;
+    }
+    Some(u64::from_le_bytes(extra.get(1..9)?.try_into().ok()?))
+}
+
+/// `list`, a collection file's bytes, sealed for the feed `salt` of
+/// `publisher`: [`SEALED_LIST_MAGIC`], then [`seal`] of the bytes under the
+/// list key, bound to the magic, the publisher and the locator. The same
+/// bytes seal the same way.
+pub fn seal_list(publisher: &[u8; 32], salt: &FeedSalt, list: &[u8]) -> Option<Vec<u8>> {
+    let aad = list_aad(publisher, salt);
+    let sealed = seal(LIST_KEY_CONTEXT, salt, &aad, list)?;
+    Some([SEALED_LIST_MAGIC.as_slice(), &sealed].concat())
+}
+
+/// The collection file [`seal_list`] sealed, if `bytes` are that list of the
+/// feed `salt` of `publisher`, whole and untouched.
+pub fn open_list(publisher: &[u8; 32], salt: &FeedSalt, bytes: &[u8]) -> Option<Vec<u8>> {
+    let sealed = bytes.strip_prefix(SEALED_LIST_MAGIC.as_slice())?;
+    open(LIST_KEY_CONTEXT, salt, &list_aad(publisher, salt), sealed)
+}
+
+fn list_aad(publisher: &[u8; 32], salt: &FeedSalt) -> Vec<u8> {
+    [SEALED_LIST_MAGIC.as_slice(), publisher, &feed_locator(salt)].concat()
 }
 
 /// What tells a feed-index key apart from every other key. Changing it would
@@ -63,9 +228,11 @@ pub const FEED_INDEX_SHARDS: u8 = 16;
 /// of the feed outranks the one it replaces, so this one, kept as long as a
 /// listing, displaces the copies storers still hold.
 pub const FEED_LISTING_WITHDRAWN: u8 = 0x01;
-/// How long storers keep a listing, or a withdrawal, after it was signed:
-/// the governance record lifetime in `dht::store`.
-pub const FEED_LISTING_TTL_SECS: i64 = 30 * 24 * 3600;
+/// How long storers keep a listing, or a withdrawal, after it was signed
+/// (`FEED_LISTING_TTL` in `dht::store`). A week: its publisher signs it anew
+/// every hour it runs, and junk listings that fill the index lapse within it
+/// unless their signers keep at it.
+pub const FEED_LISTING_TTL_SECS: i64 = 7 * 24 * 3600;
 /// A listing signed this recently says its publisher is running: one
 /// signs it anew with every publish and hourly republish, and a republish
 /// that does not get through is tried again within minutes.
@@ -117,6 +284,13 @@ pub fn encode_feed_listing_extra(head: &FeedHead, withdrawn: bool) -> Option<Vec
     Some(out)
 }
 
+/// Whether a storer keeps a listing of this trailer: flags, and a head of
+/// this version or a later one, whatever follows. Only a follower reads the
+/// rest, so a later build's listings pass through this one.
+pub fn listing_storable(extra: &[u8]) -> bool {
+    extra.get(1).is_some_and(|version| *version >= FEED_LISTED_HEAD_VERSION)
+}
+
 /// A listing trailer's flags and head fields, as [`decode_feed_extra`] reads
 /// them. Flag bits this build does not know are kept, for a later build's
 /// listings to pass through it.
@@ -166,15 +340,17 @@ pub fn next_sequence(last: u64, now_ms: u64) -> u64 {
     now_ms.max(last.saturating_add(1))
 }
 
-/// The head's trailer: `version(1) || sequence(8) || list_ed2k_hash(16) ||
-/// item_count(4) || description_len(2) || description`, little-endian.
+/// The head a listing carries in the clear, after its flags: `version(1) = 1
+/// || sequence(8) || list_ed2k_hash(16) || item_count(4) ||
+/// description_len(2) || description`, little-endian, the record's own fields
+/// carrying the rest.
 pub fn encode_feed_extra(head: &FeedHead) -> Option<Vec<u8>> {
     if !head.valid() {
         return None;
     }
     let description = head.description.as_bytes();
     let mut out = Vec::with_capacity(1 + 8 + 16 + 4 + 2 + description.len());
-    out.push(FEED_HEAD_VERSION);
+    out.push(FEED_LISTED_HEAD_VERSION);
     out.extend_from_slice(&head.sequence.to_le_bytes());
     out.extend_from_slice(&head.list_ed2k_hash);
     out.extend_from_slice(&head.item_count.to_le_bytes());
@@ -187,7 +363,7 @@ pub fn encode_feed_extra(head: &FeedHead) -> Option<Vec<u8>> {
 /// description)`, or nothing if it is not exactly one this build writes.
 pub fn decode_feed_extra(extra: &[u8]) -> Option<(u64, [u8; 16], u32, String)> {
     const FIXED: usize = 1 + 8 + 16 + 4 + 2;
-    if extra.len() < FIXED || extra[0] != FEED_HEAD_VERSION {
+    if extra.len() < FIXED || extra[0] != FEED_LISTED_HEAD_VERSION {
         return None;
     }
     let sequence = u64::from_le_bytes(extra[1..9].try_into().ok()?);
@@ -199,6 +375,63 @@ pub fn decode_feed_extra(extra: &[u8]) -> Option<(u64, [u8; 16], u32, String)> {
     }
     let description = String::from_utf8(extra[FIXED..].to_vec()).ok()?;
     Some((sequence, list_ed2k_hash, item_count, description))
+}
+
+/// The span of a feed file each entry of the feed stream's chunk list names.
+pub const FEED_CHUNK_SIZE: usize = 256 * 1024;
+
+const _: () = assert!(
+    FEED_CHUNK_SIZE == super::attach::ATTACH_CHUNK_SIZE && FEED_CHUNK_SIZE.is_multiple_of(1024),
+    "a feed chunk is a stream chunk, and a whole number of BLAKE3 chunks"
+);
+
+/// What the feed stream names chunk `index` of `count` by: the chunk's
+/// chaining value in the file's own BLAKE3 tree, so the list is checked
+/// against the file's BLAKE3 ([`root_of_chunk_values`]) and each chunk
+/// against the list. A file of one chunk is named by its BLAKE3 itself,
+/// which has no tree above it.
+pub fn chunk_value(index: usize, count: usize, chunk: &[u8]) -> [u8; 32] {
+    use blake3::hazmat::HasherExt;
+    if count <= 1 {
+        return *blake3::hash(chunk).as_bytes();
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.set_input_offset(index as u64 * FEED_CHUNK_SIZE as u64);
+    hasher.update(chunk);
+    hasher.finalize_non_root()
+}
+
+/// The BLAKE3 of the file whose chunks [`chunk_value`] names `values`.
+/// `None` for none.
+pub fn root_of_chunk_values(values: &[[u8; 32]]) -> Option<[u8; 32]> {
+    use blake3::hazmat::{merge_subtrees_root, Mode};
+    match values {
+        [] => None,
+        [only] => Some(*only),
+        _ => {
+            let (left, right) = values.split_at(left_subtrees(values.len()));
+            Some(*merge_subtrees_root(&merge_chunk_values(left), &merge_chunk_values(right), Mode::Hash).as_bytes())
+        }
+    }
+}
+
+/// The chaining value of the subtree `values` name.
+fn merge_chunk_values(values: &[[u8; 32]]) -> [u8; 32] {
+    use blake3::hazmat::{merge_subtrees_non_root, Mode};
+    match values {
+        [only] => *only,
+        _ => {
+            let (left, right) = values.split_at(left_subtrees(values.len()));
+            merge_subtrees_non_root(&merge_chunk_values(left), &merge_chunk_values(right), Mode::Hash)
+        }
+    }
+}
+
+/// How many of `count` chunks BLAKE3's tree puts on the left: the largest
+/// power of two below `count`, as only the last chunk may be short.
+fn left_subtrees(count: usize) -> usize {
+    debug_assert!(count > 1);
+    1 << (usize::BITS - 1 - (count - 1).leading_zeros())
 }
 
 /// What a feed link names: whose feed, and which of theirs.
@@ -375,6 +608,78 @@ mod tests {
         assert!(decode_feed_extra(&other).is_none(), "another version");
     }
 
+    /// A head's trailer names nothing of its feed but its sequence, opens
+    /// only under its own feed's salt and publisher, and refuses tampering.
+    #[test]
+    fn a_sealed_head_reads_back_only_for_its_feed() {
+        let (publisher, salt) = ([5u8; 32], [6u8; 16]);
+        let extra = encode_sealed_head(&publisher, &salt, &head()).unwrap();
+        assert_eq!(extra[0], FEED_HEAD_VERSION);
+        assert_eq!(head_sequence(&extra), Some(head().sequence));
+        let text = String::from_utf8_lossy(&extra);
+        assert!(!text.contains("Field recordings") && !text.contains("Birds"), "the title and description are sealed");
+        assert!(!extra.windows(16).any(|w| w == head().list_ed2k_hash), "the list is not named");
+        assert_eq!(encode_sealed_head(&publisher, &salt, &head()), Some(extra.clone()), "the same head seals the same way");
+        assert_eq!(decode_sealed_head(&publisher, &salt, &extra), Some(head()));
+        assert!(decode_sealed_head(&publisher, &[7u8; 16], &extra).is_none(), "another feed's salt");
+        assert!(decode_sealed_head(&[8u8; 32], &salt, &extra).is_none(), "another publisher");
+        let mut moved = extra.clone();
+        moved[1] ^= 1;
+        assert!(decode_sealed_head(&publisher, &salt, &moved).is_none(), "its sequence is bound to what it seals");
+        let mut cut = extra.clone();
+        cut.pop();
+        assert!(decode_sealed_head(&publisher, &salt, &cut).is_none(), "cut short");
+        let mut later = extra;
+        later[0] = FEED_HEAD_VERSION + 1;
+        later.push(0);
+        assert_eq!(head_sequence(&later), Some(head().sequence), "a storer reads a later version's sequence");
+        assert!(decode_sealed_head(&publisher, &salt, &later).is_none(), "and only a later build reads the rest");
+        assert_eq!(head_sequence(&[1, 0, 0, 0, 0, 0, 0, 0, 0]), None, "an older version is not one");
+    }
+
+    #[test]
+    fn the_locator_is_derived_from_the_salt_and_tells_nothing_of_it() {
+        let salt = [9u8; 16];
+        assert_eq!(feed_locator(&salt), feed_locator(&salt));
+        assert_ne!(feed_locator(&salt), salt);
+        assert_ne!(feed_locator(&salt), feed_locator(&[10u8; 16]));
+        assert_eq!(feed_key(&[1; 32], &salt), feed_key_at(&[1; 32], &feed_locator(&salt)));
+    }
+
+    #[test]
+    fn a_sealed_list_opens_only_for_its_feed() {
+        let list = b"a collection file's bytes".to_vec();
+        let (publisher, salt) = ([5u8; 32], [6u8; 16]);
+        let sealed = seal_list(&publisher, &salt, &list).unwrap();
+        assert!(sealed.starts_with(SEALED_LIST_MAGIC));
+        assert_eq!(seal_list(&publisher, &salt, &list), Some(sealed.clone()), "the same list seals the same way");
+        assert_eq!(open_list(&publisher, &salt, &sealed), Some(list.clone()));
+        assert!(open_list(&publisher, &[7u8; 16], &sealed).is_none());
+        assert!(open_list(&[8u8; 32], &salt, &sealed).is_none());
+        assert!(open_list(&publisher, &salt, &list).is_none(), "a list in the clear");
+    }
+
+    /// The chunk values of a file come to its BLAKE3 whatever its length:
+    /// one chunk, an exact number, a short last one, and counts on either
+    /// side of a power of two.
+    #[test]
+    fn chunk_values_come_to_the_files_blake3() {
+        let chunk = FEED_CHUNK_SIZE;
+        for size in [1, 1024, chunk, chunk + 1, 2 * chunk, 3 * chunk - 7, 4 * chunk, 5 * chunk + 1, 8 * chunk + 3] {
+            let data: Vec<u8> = (0..size).map(|i| (i * 7 % 251) as u8).collect();
+            let count = size.div_ceil(chunk);
+            let values: Vec<[u8; 32]> =
+                data.chunks(chunk).enumerate().map(|(index, bytes)| chunk_value(index, count, bytes)).collect();
+            assert_eq!(root_of_chunk_values(&values), Some(*blake3::hash(&data).as_bytes()), "{size} bytes");
+            if count > 1 {
+                let mut swapped = values.clone();
+                swapped.swap(0, 1);
+                assert_ne!(root_of_chunk_values(&swapped), Some(*blake3::hash(&data).as_bytes()), "{size} bytes, reordered");
+            }
+        }
+        assert_eq!(root_of_chunk_values(&[]), None);
+    }
+
     #[test]
     fn a_head_out_of_bounds_is_not_encoded() {
         assert!(encode_feed_extra(&FeedHead { title: "t".repeat(FEED_TITLE_MAX + 1), ..head() }).is_none());
@@ -397,7 +702,11 @@ mod tests {
         let blob = [record.data.clone(), record.signature.to_vec()].concat();
         assert!(SignedRecord::value_blob_is_authentic(&blob));
         let back = SignedRecord::from_value_blob(&blob).unwrap();
-        assert_eq!(back.feed_head(), Some((salt, head())));
+        assert_eq!(back.feed_head(&salt), Some(head()));
+        assert_eq!(back.feed_head(&[8u8; 16]), None, "another feed's salt");
+        assert_eq!(back.file_hash, feed_locator(&salt), "the salt is not in the record");
+        assert!(!blob.windows(16).any(|w| w == salt), "nor anywhere in it");
+        assert!(!String::from_utf8_lossy(&blob).contains("Field recordings"), "nor the title");
         assert!(back.channel.is_none(), "not read as a channel record");
 
         let mut elsewhere = record.data.clone();
@@ -432,7 +741,7 @@ mod tests {
             assert!(SignedRecord::value_blob_is_authentic(&blob));
             let back = SignedRecord::from_value_blob(&blob).unwrap();
             assert_eq!(back.feed_listing(), Some((salt, head(), withdrawn)));
-            assert_eq!(back.feed_head(), None, "a listing is not read as a head");
+            assert_eq!(back.feed_head(&salt), None, "a listing is not read as a head");
         }
 
         let record = SignedRecord::feed_listing_record(&salt, &head(), false, &identity, 1).unwrap();

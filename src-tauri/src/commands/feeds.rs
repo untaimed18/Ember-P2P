@@ -110,8 +110,10 @@ fn followed_list_path(dir: &Path, publisher: &str, salt: &str, sequence: i64) ->
     dir.join("followed").join(format!("{publisher}-{salt}-{sequence}.emulecollection"))
 }
 
-fn list_share_name(title: &str) -> String {
-    crate::security::sanitize_filename(&format!("{title}.emulecollection"))
+/// The name a list is served under: the same for every feed, as a list's
+/// title is sealed in it.
+fn list_share_name() -> String {
+    "ember-feed-list".to_string()
 }
 
 /// Who holds a hidden share: one of our feeds, or one we follow.
@@ -301,9 +303,17 @@ struct HeldCount {
 
 impl HeldCount {
     fn due(&self, now: i64) -> bool {
-        now - self.tried_at >= FOLLOWER_RETRY_SECS
-            && self.count.is_none_or(|count| now - count.checked_at >= FOLLOWER_COUNT_SECS)
+        elapsed(now, self.tried_at, FOLLOWER_RETRY_SECS)
+            && self.count.is_none_or(|count| elapsed(now, count.checked_at, FOLLOWER_COUNT_SECS))
     }
+}
+
+/// Whether `interval` seconds have passed since `at`, by the clock at `now`.
+/// A time ahead of the clock was taken while it ran fast and counts as long
+/// past: otherwise, once it was put right, every schedule would wait out the
+/// lead, and a feed's head would lapse unpublished meanwhile.
+fn elapsed(now: i64, at: i64, interval: i64) -> bool {
+    at > now || now - at >= interval
 }
 
 fn follower_counts() -> &'static parking_lot::Mutex<HashMap<String, HeldCount>> {
@@ -720,9 +730,10 @@ fn own_list_files_cache() -> &'static parking_lot::Mutex<HashMap<[u8; 16], std::
     CACHE.get_or_init(Default::default)
 }
 
-/// [`own_list_files_cache`]'s entry for `hash`, read now if it has none.
-/// `None` for a list not shared, or not whole. Blocking: reads the list.
-fn own_list_files(hash: &[u8; 16]) -> Option<std::sync::Arc<Vec<(String, String)>>> {
+/// [`own_list_files_cache`]'s entry for `hash`, a list of our feed `salt`,
+/// read now if it has none. `None` for a list not shared, not whole, or not
+/// that feed's. Blocking: reads the list.
+fn own_list_files(hash: &[u8; 16], publisher: &str, salt: &str) -> Option<std::sync::Arc<Vec<(String, String)>>> {
     if let Some(files) = own_list_files_cache().lock().get(hash) {
         return Some(files.clone());
     }
@@ -731,7 +742,7 @@ fn own_list_files(hash: &[u8; 16]) -> Option<std::sync::Arc<Vec<(String, String)
     if crate::network::ed2k::hash::ed2k_hash_bytes(&bytes) != hex::encode(hash) {
         return None;
     }
-    let collection = Collection::from_binary_bytes(&bytes).ok()?;
+    let collection = open_list_collection(publisher, salt, &bytes)?;
     let files = std::sync::Arc::new(
         collection
             .files
@@ -762,6 +773,7 @@ async fn refresh_served_files(state: &AppState) {
     }
     let _rebuilding = served_rebuild_lock().lock().await;
     let db = state.db.clone();
+    let us = hex::encode(state.identity.ed25519_public_key);
     let feeds = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(String, Vec<(String, String)>)>> {
         let mut out = Vec::new();
         let mut lists_used = std::collections::HashSet::new();
@@ -773,7 +785,7 @@ async fn refresh_served_files(state: &AppState) {
             lists.dedup();
             for hash in lists {
                 lists_used.insert(hash);
-                match own_list_files(&hash) {
+                match own_list_files(&hash, &us, &feed.salt) {
                     Some(listed) => files.extend(listed.iter().cloned()),
                     None => tracing::debug!("Feed {}: list {} is not served; its files are not either", feed.salt, hex::encode(hash)),
                 }
@@ -803,9 +815,11 @@ async fn refresh_served_files(state: &AppState) {
     crate::network::feed_direct::set_served(served);
 }
 
-/// The list a feed's items make, as a collection file's bytes.
-fn build_list(title: &str, author: &str, items: &[FeedItem]) -> anyhow::Result<Vec<u8>> {
-    Collection {
+/// The list a feed's items make: a collection file's bytes, sealed for the
+/// feed `salt` of `publisher` (see `ember::feed::seal_list`). The same items,
+/// title and author make the same bytes.
+fn build_list(publisher: &[u8; 32], salt: &FeedSalt, title: &str, author: &str, items: &[FeedItem]) -> anyhow::Result<Vec<u8>> {
+    let collection = Collection {
         name: title.to_string(),
         author: author.to_string(),
         files: items
@@ -820,7 +834,17 @@ fn build_list(title: &str, author: &str, items: &[FeedItem]) -> anyhow::Result<V
             })
             .collect(),
     }
-    .to_binary_bytes()
+    .to_binary_bytes()?;
+    crate::network::ember::feed::seal_list(publisher, salt, &collection).ok_or_else(|| anyhow::anyhow!("the list could not be sealed"))
+}
+
+/// The collection file a list file of the feed `salt` of `publisher` (both
+/// lowercase hex) seals, parsed. `None` for one of another feed, cut short,
+/// tampered with, or that does not parse.
+fn open_list_collection(publisher: &str, salt: &str, bytes: &[u8]) -> Option<Collection> {
+    let (publisher, salt) = (hex_to32(publisher).ok()?, hex_to16(salt).ok()?);
+    let opened = crate::network::ember::feed::open_list(&publisher, &salt, bytes)?;
+    Collection::from_binary_bytes(&opened).ok()
 }
 
 /// Write the feed's list, serve it, and publish a head naming it. Holds
@@ -862,10 +886,11 @@ pub async fn publish_feed(
 
     // The new list is served beside the feed's others until its head is out.
     let (key, task_feed, task_owner, task_dir, task_kept) = (salt.clone(), feed.clone(), owner.clone(), dir.clone(), kept.clone());
+    let publisher = state.identity.ed25519_public_key;
     let built = blocking(
         move || {
             let (feed, kept) = (task_feed, task_kept);
-            let bytes = build_list(&feed.title, &author, &kept)?;
+            let bytes = build_list(&publisher, &salt_bytes, &feed.title, &author, &kept)?;
             // Followers refuse a list past this; refused here instead, rather
             // than published to nobody.
             if bytes.len() as u64 > MAX_LIST_BYTES {
@@ -892,7 +917,7 @@ pub async fn publish_feed(
                 HiddenShare {
                     path: path.clone(),
                     size: head.list_size,
-                    name: list_share_name(&feed.title),
+                    name: list_share_name(),
                     ember_file_hash: hex::encode(head.list_blake3),
                 },
             );
@@ -923,7 +948,7 @@ pub async fn publish_feed(
         share: HiddenShare {
             path,
             size: head.list_size,
-            name: list_share_name(&feed.title),
+            name: list_share_name(),
             ember_file_hash: published.list_blake3.clone(),
         },
     };
@@ -1043,23 +1068,22 @@ struct OwnList {
 /// The lists `feed` serves: the one its last head names, once published,
 /// and its pending one.
 fn own_lists(dir: &Path, feed: &OwnFeed) -> Vec<OwnList> {
-    let title = if feed.published_title.is_empty() { &feed.title } else { &feed.published_title };
-    let published = (feed.sequence > 0).then_some((feed.sequence, &feed.list_ed2k, &feed.list_blake3, feed.list_size, title));
+    let published = (feed.sequence > 0).then_some((feed.sequence, &feed.list_ed2k, &feed.list_blake3, feed.list_size));
     let pending = feed
         .pending
         .as_ref()
-        .map(|pending| (pending.sequence, &pending.list_ed2k, &pending.list_blake3, pending.list_size, &pending.title));
+        .map(|pending| (pending.sequence, &pending.list_ed2k, &pending.list_blake3, pending.list_size));
     published
         .into_iter()
         .chain(pending)
-        .filter_map(|(sequence, ed2k, blake3, size, title)| {
+        .filter_map(|(sequence, ed2k, blake3, size)| {
             Some(OwnList {
                 sequence,
                 hash: hex_to16(ed2k).ok()?,
                 share: HiddenShare {
                     path: own_list_path(dir, &feed.salt, sequence),
                     size: size.max(0) as u64,
-                    name: list_share_name(title),
+                    name: list_share_name(),
                     ember_file_hash: blake3.clone(),
                 },
             })
@@ -2288,7 +2312,7 @@ fn listing_fallbacks() -> &'static parking_lot::Mutex<HashMap<(String, String), 
 /// index shard now, at most every [`LISTING_FALLBACK_SECS`]; noted as read.
 fn listing_fallback_due(key: &(String, String), now: i64) -> bool {
     let mut last = listing_fallbacks().lock();
-    if last.get(key).is_some_and(|at| now - at < LISTING_FALLBACK_SECS) {
+    if last.get(key).is_some_and(|at| !elapsed(now, *at, LISTING_FALLBACK_SECS)) {
         return false;
     }
     last.insert(key.clone(), now);
@@ -2339,24 +2363,30 @@ async fn on_pushed_head(app: &tauri::AppHandle, state: &AppState, from: [u8; 32]
     let Some(record) = SignedRecord::from_value_blob(&blob) else {
         return;
     };
-    let Some((salt, _)) = record.feed_head() else {
+    if record.record_type != crate::network::ember::dht::publish::RECORD_TYPE_FEED || record.publisher_key != from {
+        return;
+    }
+    // Which of their feeds it is, of those followed: a head names its feed
+    // by the salt's locator, and only a follower has the salt.
+    let (db, key_pub) = (state.db.clone(), hex::encode(from));
+    let followed = tokio::task::spawn_blocking(move || db.feeds_followed())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|feed| feed.publisher == key_pub)
+        .find_map(|feed| {
+            let salt = hex_to16(&feed.salt).ok()?;
+            (crate::network::ember::feed::feed_locator(&salt) == record.file_hash).then_some((salt, feed.sequence))
+        });
+    let Some((salt, held)) = followed else {
         return;
     };
     let Some(head) = best_head(&[blob], &from, &salt) else {
         return;
     };
     let (publisher, salt) = (hex::encode(from), hex::encode(salt));
-    let db = state.db.clone();
-    let (key_pub, key_salt) = (publisher.clone(), salt.clone());
-    let held = tokio::task::spawn_blocking(move || db.feed_followed(&key_pub, &key_salt))
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .flatten()
-        .map(|feed| feed.sequence);
-    let Some(held) = held else {
-        return;
-    };
     note_seen(state, &publisher, &salt, chrono::Utc::now().timestamp()).await;
     if head.sequence.min(i64::MAX as u64) as i64 <= held {
         return;
@@ -2479,7 +2509,7 @@ async fn fetch_owed(app: &tauri::AppHandle, state: &AppState, publisher: &str, s
     let resting = gave_up()
         .lock()
         .get(&(publisher.to_string(), salt.to_string()))
-        .is_some_and(|at| now - at < FETCH_RETRY_SECS);
+        .is_some_and(|at| !elapsed(now, *at, FETCH_RETRY_SECS));
     if resting {
         return;
     }
@@ -2514,9 +2544,7 @@ fn heads<'a>(blobs: &'a [Vec<u8>], publisher: &'a [u8; 32], salt: &'a FeedSalt) 
         .iter()
         .filter_map(|blob| SignedRecord::from_value_blob(blob))
         .filter(move |record| record.publisher_key == *publisher && record.feed_store_ok())
-        .filter_map(|record| record.feed_head())
-        .filter(move |(found_salt, _)| found_salt == salt)
-        .map(|(_, head)| head)
+        .filter_map(move |record| record.feed_head(salt))
 }
 
 /// A fetch of a list in flight.
@@ -2679,7 +2707,7 @@ async fn start_fetch(app: &tauri::AppHandle, state: &AppState, feed: &FollowedFe
         &state.network_tx,
         NetworkCommand::StartDownload {
             file_hash: hex::encode(list_hash),
-            file_name: list_share_name(&feed.title),
+            file_name: list_share_name(),
             file_size: feed.list_size.max(0) as u64,
             peer_ip,
             peer_port,
@@ -2702,7 +2730,7 @@ async fn start_fetch(app: &tauri::AppHandle, state: &AppState, feed: &FollowedFe
 fn list_transfer(id: &str, feed: &FollowedFeed, list_hash: &[u8; 16]) -> Transfer {
     Transfer {
         id: id.to_string(),
-        file_name: list_share_name(&feed.title),
+        file_name: list_share_name(),
         file_hash: hex::encode(list_hash),
         peer_id: String::new(),
         peer_name: String::new(),
@@ -2858,7 +2886,7 @@ fn read_list(path: &Path, feed: &FollowedFeed) -> Result<Vec<FeedItem>, ListErro
     {
         return Err(ListError::Broken);
     }
-    let collection = Collection::from_binary_bytes(&bytes).map_err(|_| ListError::Broken)?;
+    let collection = open_list_collection(&feed.publisher, &feed.salt, &bytes).ok_or(ListError::Broken)?;
     if collection.files.len() > FEED_ITEMS_MAX || collection.files.len() as i64 != feed.item_count {
         return Err(ListError::Broken);
     }
@@ -2957,7 +2985,7 @@ async fn take_list_held(app: &tauri::AppHandle, state: &AppState, feed: Followed
                 HiddenShare {
                     path: path.clone(),
                     size: feed.list_size.max(0) as u64,
-                    name: list_share_name(&feed.title),
+                    name: list_share_name(),
                     ember_file_hash: feed.list_blake3.clone(),
                 },
             );
@@ -3078,7 +3106,7 @@ async fn retry_auto_downloads(app: &tauri::AppHandle, state: &AppState, followed
         let key = (feed.publisher.clone(), feed.salt.clone());
         {
             let mut last = LAST.get_or_init(Default::default).lock();
-            if last.get(&key).is_some_and(|at| now - at < AUTO_RETRY_SECS) {
+            if last.get(&key).is_some_and(|at| !elapsed(now, *at, AUTO_RETRY_SECS)) {
                 continue;
             }
             last.insert(key.clone(), now);
@@ -3257,8 +3285,26 @@ fn list_matches(bytes: &[u8], head: &FeedHead) -> bool {
 /// its items: the same items, title and author make the same bytes. `false`
 /// when they no longer do (an edit since, or another name to publish under)
 /// or it could not be written.
-fn rebuild_own_list(path: &Path, head: &FeedHead, author: &str, items: &[FeedItem]) -> bool {
-    build_list(&head.title, author, items).is_ok_and(|bytes| list_matches(&bytes, head) && write_list(path, &bytes).is_ok())
+fn rebuild_own_list(
+    path: &Path,
+    publisher: &[u8; 32],
+    salt: &FeedSalt,
+    head: &FeedHead,
+    author: &str,
+    items: &[FeedItem],
+) -> bool {
+    build_list(publisher, salt, &head.title, author, items)
+        .is_ok_and(|bytes| list_matches(&bytes, head) && write_list(path, &bytes).is_ok())
+}
+
+/// Whether the list file at `path` is sealed, as every list since feeds
+/// stopped naming their contents to the network is. One that is not was
+/// written by an earlier build, in the clear.
+fn list_is_sealed(path: &Path) -> bool {
+    use std::io::Read;
+    let mut magic = [0u8; 8];
+    std::fs::File::open(path).and_then(|mut file| file.read_exact(&mut magic)).is_ok()
+        && magic == *crate::network::ember::feed::SEALED_LIST_MAGIC
 }
 
 /// Serve again what was served before a restart: each published feed's
@@ -3267,70 +3313,95 @@ fn rebuild_own_list(path: &Path, head: &FeedHead, author: &str, items: &[FeedIte
 /// make it; otherwise the feed is marked changed, to be published again,
 /// and its head is not republished meanwhile (see [`republish`]). A pending
 /// list gone from disk is forgotten.
+///
+/// A list an earlier build wrote in the clear is no longer served, and is
+/// deleted: what it names is no longer told to whoever asks for its hash. A
+/// feed of ours published with one is published again, sealed.
 async fn reshare_held(app: &tauri::AppHandle, state: &AppState) {
     let dir = feeds_dir(app);
     let db = state.db.clone();
     let author = state.config.read().await.settings.channel_username.trim().to_string();
-    let _publishing = publish_lock().lock().await;
-    let _followed = followed_lock().lock().await;
-    let _ = tokio::task::spawn_blocking(move || {
-        let mut kept = std::collections::HashSet::new();
-        for feed in db.feeds_own().unwrap_or_default() {
-            let path = own_list_path(&dir, &feed.salt, feed.sequence);
-            kept.insert(path.clone());
-            let mut lists = own_lists(&dir, &feed);
-            match own_head(&feed) {
-                Some(head) if !list_file_whole(&path, head.list_size as i64) => {
-                    let _ = std::fs::remove_file(&path);
-                    let items = db.feed_own_items(&feed.salt).unwrap_or_default();
-                    if rebuild_own_list(&path, &head, &author, &items) {
-                        tracing::info!("feed {}: wrote its missing list again", feed.salt);
-                    } else {
-                        tracing::warn!("feed {}: its list is missing and its items no longer make it", feed.salt);
-                        let _ = db.feed_own_mark_changed(&feed.salt);
-                        lists.retain(|list| list.sequence != feed.sequence);
-                    }
-                }
-                Some(_) => {}
-                None => lists.retain(|list| list.sequence != feed.sequence),
-            }
-            if let Some(pending) = &feed.pending {
-                let path = own_list_path(&dir, &feed.salt, pending.sequence);
-                if list_file_whole(&path, pending.list_size) {
-                    kept.insert(path);
-                } else {
-                    let _ = db.feed_own_set_pending(&feed.salt, None);
-                    lists.retain(|list| list.sequence != pending.sequence);
-                }
-            }
-            for list in lists {
-                feed_files::share_hidden(list.hash, &own_owner(&feed.salt), list.share);
-            }
+    let publisher = state.identity.ed25519_public_key;
+    let resealed = {
+        let _publishing = publish_lock().lock().await;
+        let _followed = followed_lock().lock().await;
+        tokio::task::spawn_blocking(move || reshare_lists(&db, &dir, &publisher, &author)).await.unwrap_or_default()
+    };
+    for salt in resealed {
+        tracing::info!("feed {salt}: publishing it again with its list sealed");
+        if let Err(error) = publish_feed(app.clone(), app.state::<AppState>(), salt.clone()).await {
+            tracing::warn!("feed {salt}: could not publish it again sealed, so it waits for Publish: {error}");
         }
-        for feed in db.feeds_followed().unwrap_or_default() {
-            let path = followed_list_path(&dir, &feed.publisher, &feed.salt, feed.list_sequence);
-            kept.insert(path.clone());
-            if feed.list_sequence > 0 && !list_file_whole(&path, feed.held_size) {
+    }
+}
+
+/// [`reshare_held`]'s part on the blocking pool. The feeds of ours whose
+/// list was in the clear, for publishing again.
+fn reshare_lists(db: &crate::storage::database::Database, dir: &Path, publisher: &[u8; 32], author: &str) -> Vec<String> {
+    let mut kept = std::collections::HashSet::new();
+    let mut resealed = Vec::new();
+    for feed in db.feeds_own().unwrap_or_default() {
+        let path = own_list_path(dir, &feed.salt, feed.sequence);
+        kept.insert(path.clone());
+        let mut lists = own_lists(dir, &feed);
+        let Ok(salt) = hex_to16(&feed.salt) else { continue };
+        match own_head(&feed) {
+            Some(head) if !list_file_whole(&path, head.list_size as i64) => {
                 let _ = std::fs::remove_file(&path);
-                let _ = db.feed_lost_held(&feed.publisher, &feed.salt);
-                continue;
+                let items = db.feed_own_items(&feed.salt).unwrap_or_default();
+                if rebuild_own_list(&path, publisher, &salt, &head, author, &items) {
+                    tracing::info!("feed {}: wrote its missing list again", feed.salt);
+                } else {
+                    tracing::warn!("feed {}: its list is missing and its items no longer make it", feed.salt);
+                    let _ = db.feed_own_mark_changed(&feed.salt);
+                    lists.retain(|list| list.sequence != feed.sequence);
+                }
             }
-            if let Ok(hash) = hex_to16(&feed.held_ed2k) {
-                feed_files::share_hidden(
-                    hash,
-                    &followed_owner(&feed.publisher, &feed.salt),
-                    HiddenShare {
-                        path,
-                        size: feed.held_size.max(0) as u64,
-                        name: list_share_name(&feed.title),
-                        ember_file_hash: feed.held_blake3.clone(),
-                    },
-                );
+            Some(_) if !list_is_sealed(&path) => {
+                let _ = std::fs::remove_file(&path);
+                let _ = db.feed_own_mark_changed(&feed.salt);
+                lists.retain(|list| list.sequence != feed.sequence);
+                resealed.push(feed.salt.clone());
+            }
+            Some(_) => {}
+            None => lists.retain(|list| list.sequence != feed.sequence),
+        }
+        if let Some(pending) = &feed.pending {
+            let path = own_list_path(dir, &feed.salt, pending.sequence);
+            if list_file_whole(&path, pending.list_size) && list_is_sealed(&path) {
+                kept.insert(path);
+            } else {
+                let _ = db.feed_own_set_pending(&feed.salt, None);
+                lists.retain(|list| list.sequence != pending.sequence);
             }
         }
-        sweep_stray_lists(&dir, &kept);
-    })
-    .await;
+        for list in lists {
+            feed_files::share_hidden(list.hash, &own_owner(&feed.salt), list.share);
+        }
+    }
+    for feed in db.feeds_followed().unwrap_or_default() {
+        let path = followed_list_path(dir, &feed.publisher, &feed.salt, feed.list_sequence);
+        kept.insert(path.clone());
+        if feed.list_sequence > 0 && !(list_file_whole(&path, feed.held_size) && list_is_sealed(&path)) {
+            let _ = std::fs::remove_file(&path);
+            let _ = db.feed_lost_held(&feed.publisher, &feed.salt);
+            continue;
+        }
+        if let Ok(hash) = hex_to16(&feed.held_ed2k) {
+            feed_files::share_hidden(
+                hash,
+                &followed_owner(&feed.publisher, &feed.salt),
+                HiddenShare {
+                    path,
+                    size: feed.held_size.max(0) as u64,
+                    name: list_share_name(),
+                    ember_file_hash: feed.held_blake3.clone(),
+                },
+            );
+        }
+    }
+    sweep_stray_lists(dir, &kept);
+    resealed
 }
 
 /// Delete list files no feed holds: left by a crash, a failed write, or a
@@ -3372,8 +3443,11 @@ fn last_sent(feed: &OwnFeed) -> i64 {
 /// last, or at once while it has a pending head, which the user published
 /// and no node is known to hold. Either waits for a retry set after a try.
 fn republish_due(feed: &OwnFeed, now: i64) -> bool {
-    let published = feed.published_at > 0 && now - last_sent(feed) >= REPUBLISH_SECS;
-    (published || feed.pending.is_some()) && republish_retry().lock().get(&feed.salt).is_none_or(|at| now >= *at)
+    let published = feed.published_at > 0 && elapsed(now, last_sent(feed), REPUBLISH_SECS);
+    // A retry is set at most [`REPUBLISH_SECS`] ahead; one further off was
+    // set before the clock went back.
+    let retry_due = |at: &i64| now >= *at || *at - now > REPUBLISH_SECS;
+    (published || feed.pending.is_some()) && republish_retry().lock().get(&feed.salt).is_none_or(retry_due)
 }
 
 /// Whether a republish is running: the tick starts at most one at a time.
@@ -3444,10 +3518,12 @@ async fn read_own(state: &AppState, salt: &str) -> Option<OwnFeed> {
 async fn adopt_pending(state: &AppState, dir: &Path, feed: &OwnFeed, pending: &OwnPublish, at: i64) -> Option<OwnFeed> {
     let author = state.config.read().await.settings.channel_username.trim().to_string();
     let (db, key, task_pending) = (state.db.clone(), feed.salt.clone(), pending.clone());
+    let publisher = state.identity.ed25519_public_key;
     let adopted = tokio::task::spawn_blocking(move || {
         let items = db.feed_own_items(&key)?;
+        let salt = hex_to16(&key)?;
         // Up to date only if the items held still make its list.
-        let made = build_list(&task_pending.title, &author, &items)
+        let made = build_list(&publisher, &salt, &task_pending.title, &author, &items)
             .is_ok_and(|bytes| crate::network::ed2k::hash::ed2k_hash_bytes(&bytes).eq_ignore_ascii_case(&task_pending.list_ed2k));
         if !db.feed_own_published(&key, &task_pending, made.then_some(items.as_slice()), at)? {
             return Ok(None);
@@ -3600,10 +3676,10 @@ fn lookup_due(feed: &FollowedFeed, now: i64) -> bool {
     let missed = missed_lookups()
         .lock()
         .get(&(feed.publisher.clone(), feed.salt.clone()))
-        .is_some_and(|at| now - at < LOOKUP_RETRY_SECS);
-    let waiting = feed.sequence == 0 && now - feed.followed_at < WAITING_FAST_FOR_SECS;
+        .is_some_and(|at| !elapsed(now, *at, LOOKUP_RETRY_SECS));
+    let waiting = feed.sequence == 0 && !elapsed(now, feed.followed_at, WAITING_FAST_FOR_SECS);
     let interval = if waiting { WAITING_POLL_SECS } else { POLL_SECS + spread };
-    !missed && now - feed.checked_at >= interval
+    !missed && elapsed(now, feed.checked_at, interval)
 }
 
 async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
@@ -3924,7 +4000,8 @@ mod tests {
             blake3: "cd".repeat(32),
             note: String::new(),
         }];
-        let bytes = build_list("T", "me", &items).unwrap();
+        let (publisher, salt) = ([0x51; 32], [0x52; 16]);
+        let bytes = build_list(&publisher, &salt, "T", "me", &items).unwrap();
         let head = FeedHead {
             sequence: 3,
             list_ed2k_hash: hex_to16(&crate::network::ed2k::hash::ed2k_hash_bytes(&bytes)).unwrap(),
@@ -3936,13 +4013,43 @@ mod tests {
         };
         let dir = std::env::temp_dir().join(format!("ember-feed-rebuild-{}-{}", std::process::id(), rand::random::<u64>()));
         let path = dir.join("own").join("list.emulecollection");
-        assert!(!rebuild_own_list(&path, &head, "someone else", &items), "another author");
+        assert!(!rebuild_own_list(&path, &publisher, &salt, &head, "someone else", &items), "another author");
         assert!(!path.exists());
         let edited = vec![FeedItem { note: "new".into(), ..items[0].clone() }];
-        assert!(!rebuild_own_list(&path, &head, "me", &edited), "an edit since");
-        assert!(rebuild_own_list(&path, &head, "me", &items));
+        assert!(!rebuild_own_list(&path, &publisher, &salt, &head, "me", &edited), "an edit since");
+        assert!(!rebuild_own_list(&path, &publisher, &[0x53; 16], &head, "me", &items), "another feed's");
+        assert!(rebuild_own_list(&path, &publisher, &salt, &head, "me", &items));
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(list_is_sealed(&path));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A list names nothing to whoever fetches it by its hash: its title,
+    /// author and files are sealed under its feed's salt, which only the
+    /// feed's link holds.
+    #[test]
+    fn a_list_is_sealed_to_its_feed() {
+        let items = vec![FeedItem {
+            ed2k: "00112233445566778899aabbccddeeff".into(),
+            name: "Secret holiday film.mkv".into(),
+            size: 9,
+            aich: String::new(),
+            blake3: "cd".repeat(32),
+            note: String::new(),
+        }];
+        let (publisher, salt) = ([0x51; 32], [0x52; 16]);
+        let bytes = build_list(&publisher, &salt, "Private title", "me", &items).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("Secret holiday") && !text.contains("Private title") && !text.contains("0011223344"));
+        let (key, salt_hex) = (hex::encode(publisher), hex::encode(salt));
+        let opened = open_list_collection(&key, &salt_hex, &bytes).expect("opens for its feed");
+        assert_eq!(opened.name, "Private title");
+        assert_eq!(opened.files[0].name, "Secret holiday film.mkv");
+        assert!(open_list_collection(&key, &hex::encode([0x53u8; 16]), &bytes).is_none(), "another feed");
+        assert!(open_list_collection(&hex::encode([0x54u8; 32]), &salt_hex, &bytes).is_none(), "another publisher");
+        let mut tampered = bytes.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(open_list_collection(&key, &salt_hex, &tampered).is_none(), "tampered with");
     }
 
     #[test]
@@ -4181,10 +4288,12 @@ mod tests {
             note: "best one".into(),
         }];
         let path = std::env::temp_dir().join(format!("ember-feed-list-{}-{}.emulecollection", std::process::id(), rand::random::<u64>()));
+        let (publisher, salt) = ([0x61; 32], [0x62; 16]);
         let matching = |items: &[FeedItem]| {
-            let bytes = build_list("T", "me", items).unwrap();
+            let bytes = build_list(&publisher, &salt, "T", "me", items).unwrap();
             std::fs::write(&path, &bytes).unwrap();
             let mut feed = followed(0, 0);
+            (feed.publisher, feed.salt) = (hex::encode(publisher), hex::encode(salt));
             feed.list_size = bytes.len() as i64;
             feed.list_ed2k = crate::network::ed2k::hash::ed2k_hash_bytes(&bytes);
             feed.list_blake3 = blake3::hash(&bytes).to_hex().to_string();

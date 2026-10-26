@@ -3439,6 +3439,7 @@ impl MultiSourceDownload {
                 worker: FEED_WORKER_INDEX,
                 transfer_id: self.transfer_id.clone(),
                 file_size: self.file_size,
+                expected_blake3: self.ember_file_hash,
                 tracker: tracker.clone(),
                 output: shared_part_file.clone(),
                 bandwidth: self.bandwidth_limiter.clone(),

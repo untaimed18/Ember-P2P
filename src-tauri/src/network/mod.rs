@@ -1945,6 +1945,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let ul_inbound_stream_rx = inbound_stream_rx;
         let ul_adv_tcp = state.advertise_tcp_port.clone();
         let ul_adv_udp = state.advertise_udp_port.clone();
+        // A feed's files are streamed over QUIC as well as on this listener,
+        // and are checked on each request as an upload here is.
+        feed_direct::set_serve_checks(feed_direct::ServeChecks {
+            local_index: local_index.clone(),
+            friends_only: shared_friends_only_hashes.clone(),
+            shared_folders: upload_shared_folders.clone(),
+            download_folders: state.download_folders.clone(),
+        });
         let ul_file_streams = Some(ember::relay::FileStreamServe {
             chat: ember::relay::AttachServeContext {
                 db: db.clone(),

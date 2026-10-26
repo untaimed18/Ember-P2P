@@ -1337,29 +1337,55 @@ A feed is a signed, updatable list of files under a publisher's identity; the
 head points at the current list, which is an ordinary collection file
 fetched like any download. Design: [post-1.7.5 item 3](post-1.7.5.md#3-follow-a-publisher-feeds).
 
+**Privacy.** A feed is public to whoever has its link, and to nobody else
+unless it is listed (below). The 16-byte salt only the link holds is never
+sent: the head names its feed by the salt's locator, and everything in it but
+its sequence is sealed under a key derived from the salt, as is the list. A
+storer of the head, or of the list's source records, sees who publishes a
+feed and when it was published, and nothing of its title, description or
+files; it cannot compute the link, the list's hash, or the feed stream's ids
+and capabilities.
+
+**Keys.** From the salt: `locator = BLAKE3_derive_key("Ember feed locator
+v1", salt)[..16]`, and the sealing keys `BLAKE3_derive_key("Ember feed head
+key v1", salt)`, `BLAKE3_derive_key("Ember feed list key v1", salt)` and
+`BLAKE3_derive_key("Ember feed nonce key v1", salt)`. Sealing is
+XChaCha20-Poly1305 under the head or list key, `nonce(24) || ciphertext ||
+tag(16)`, the nonce the first 24 bytes of `BLAKE3_keyed(nonce key,
+len(aad)(8, LE) || aad || plaintext)`: the same bytes seal the same way, so a
+list written again from its items is the list its head names.
+
 **Header.** `record_type` `RECORD_TYPE_FEED` (`0x04`), signed by the
-publisher's identity key. The header's own fields carry what fits:
+publisher's identity key:
 
-- `keyword_hash` is `feed_key = BLAKE3("ember-feed-v1" || publisher || salt)[..16]`;
-- `file_hash` is the feed's 16-byte salt, so the per-publisher dedupe keeps one
-  head per feed;
-- `ember_file_hash` is the list's BLAKE3 and `file_size` its size;
-- the name is the title, at most 64 bytes.
+- `keyword_hash` is `feed_key = BLAKE3("ember-feed-v2" || publisher || locator)[..16]`;
+- `file_hash` is the locator, so the per-publisher dedupe keeps one head per
+  feed;
+- `ember_file_hash` is the BLAKE3 of the trailer's extra bytes and
+  `file_size` their length, naming nothing of the feed;
+- the name is `-`.
 
-**Trailer.** Framed as the channel trailer, little-endian: `version(1) = 1 ||
-sequence(8) || list_ed2k_hash(16) || item_count(4) || description_len(2) ||
-description`, with the description at most 256 bytes and nothing after it.
-`sequence` is the publisher's clock in milliseconds, never less than one past
-the last it published (`next_sequence`), so the latest publish wins on any of
-the publisher's devices; a device's republish first looks for a newer
-head and leaves it in place. A follower takes the highest `sequence` it has
-seen and never goes back.
+**Trailer.** Framed as the channel trailer, little-endian: `version(1) = 2 ||
+sequence(8) || sealed`, where `sealed` seals `list_ed2k_hash(16) ||
+list_blake3(32) || list_size(8) || item_count(4) || title_len(1) || title ||
+description_len(2) || description` (title 1 to 64 bytes, description at most
+256) under the head key, with `aad = "ember-feed-head" || version ||
+publisher || locator || sequence`. `sequence` is the publisher's clock in
+milliseconds, never less than one past the last it published
+(`next_sequence`), so the latest publish wins on any of the publisher's
+devices; a device's republish first looks for a newer head and leaves it in
+place. A follower opens the head with the salt, takes the highest `sequence`
+it has seen and never goes back.
 
 **Storers** that know the type (`accept_record`, `feed_store_ok`) refuse a head
-whose `keyword_hash` is not the `feed_key` of its signer and salt, whose
-trailer does not parse, or which names no list. They keep it
-`CHANNEL_GOVERNANCE_TTL` (30 days), replicate it, and among a feed's heads keep
-the newest timestamp. Builds before it file it as an unknown type for
+whose `keyword_hash` is not the `feed_key` of its signer and locator, or whose
+trailer is not version 2 or later with a sequence after it; they read nothing
+more, as nothing more can be read without the salt, so a later version
+passes through them. They keep it `CHANNEL_GOVERNANCE_TTL` (30 days),
+replicate it, and among a feed's heads keep the highest `sequence`, then the
+newest timestamp (the larger signature on a tie), so a device's republish of
+an older head, or a newer one signed after the clock went back, is ranked as
+followers rank it. Builds before it file it as an unknown type for
 `KEYWORD_RECORD_TTL` (24 hours) without replicating or reading it. The
 publisher republishes hourly while it runs, and on every publish: while most
 storers are such builds, a head stored a day ago has often lost every node
@@ -1372,16 +1398,23 @@ no head reads the feed's index shard (below), at most every 15 minutes, and
 takes the head the newest listing of the feed carries, unless it withdraws
 it.
 
-**The list** is a format-v2 collection (`network/ed2k/collection.rs`) of at
-most 2,000 entries, each with name, size, eD2K, AICH and Ember BLAKE3. An entry
-may carry a note, tag `FT_EMBER_NOTE` (`0xE3`, a string of at most 256 bytes),
-which eMule's reader skips as unknown. A follower uses a list only if its size,
-eD2K hash and BLAKE3 all match the head, it parses, it holds `item_count`
-entries and every entry names a file one could fetch; otherwise the feed is
-marked broken. A list is at most 2 MiB (`MAX_LIST_BYTES`): a publisher refuses
-to publish a larger one, and a follower that finds the newest head naming a
-larger one says so and fetches neither it nor an older head's list.
-The list is shared hidden by its publisher and by every follower holding it:
+**The list** is `"EMBRFL01" ||` a format-v2 collection
+(`network/ed2k/collection.rs`) sealed under the list key, with `aad =
+"EMBRFL01" || publisher || locator` (`seal_list`). The collection holds at
+most 2,000 entries, each with name, size, eD2K, AICH and Ember BLAKE3, and
+its name and author are the feed's title and the publisher's name. An entry
+may carry a note, tag `FT_EMBER_NOTE` (`0xE3`, a string of at most 256 bytes).
+A follower uses a list only if its size, eD2K hash and BLAKE3 (of the sealed
+bytes) all match the head, it opens under the salt, it parses, it holds
+`item_count` entries and every entry names a file one could fetch; otherwise
+the feed is marked broken. A list is at most 2 MiB (`MAX_LIST_BYTES`), sealed:
+a publisher refuses to publish a larger one, and a follower that finds the
+newest head naming a larger one says so and fetches neither it nor an older
+head's list. A list an earlier build wrote in the clear is no longer served
+and is deleted at startup; a feed of ours published with one is published
+again, sealed.
+The list is shared hidden by its publisher and by every follower holding it,
+under the name `ember-feed-list`:
 served to whoever asks for its hash, with Ember source records, and never in
 the Library, a browse answer, a keyword record, KAD or a server. Its source
 records go out ahead of the library's, so a publisher with a large library
@@ -1407,18 +1440,21 @@ link, as before (`network/ember/feed.rs`, `SignedRecord::feed_listing_record`).
 The choice is made when the feed is created and can be changed at any time.
 There is no directory server: the index is sixteen DHT keys.
 
+A listing is public by design: it carries the salt, and so the link, and the
+head in the clear.
+
 **Header.** `record_type` `RECORD_TYPE_FEED_LISTING` (`0x05`), signed by the
-publisher's identity key. Every field is the head's, as published, but for the
-key:
+publisher's identity key:
 
 - `keyword_hash` is the index shard key `BLAKE3("ember-feed-index-v1" ||
   shard)[..16]`, where `shard` is one byte, `feed_key[0] % 16`;
 - `file_hash` is the salt, so the per-publisher dedupe keeps one listing per
   feed in a shard;
-- `ember_file_hash`, `file_size` and the name are the head's.
+- `ember_file_hash` is the list's BLAKE3, `file_size` its size and the name
+  the title.
 
-**Trailer.** Framed as the channel trailer: `flags(1) ||` the head's trailer
-whole (`version(1) = 1 || sequence(8) || list_ed2k_hash(16) || item_count(4) ||
+**Trailer.** Framed as the channel trailer: `flags(1) ||` the head in the
+clear (`version(1) = 1 || sequence(8) || list_ed2k_hash(16) || item_count(4) ||
 description_len(2) || description`). Flag `0x01` withdraws the feed from the
 index; other bits are kept for later builds. A listing names its feed by
 publisher and salt, which is all its link holds, so Discover follows it as it
@@ -1429,14 +1465,19 @@ what the listing it displaces already said.
 
 **Storers** that know the type (`feed_listing_store_ok`) refuse a listing whose
 `keyword_hash` is not the shard key of its signer and salt, so one cannot be
-aimed at whichever shard key lies nearest a storer, or whose trailer does not
-parse into a valid head. They keep it `CHANNEL_GOVERNANCE_TTL` (30 days),
+aimed at whichever shard key lies nearest a storer, or whose trailer has no
+flags and head version 1 or later (`listing_storable`); followers read the
+rest, so a later version passes through storers. They keep it a week
+(`FEED_LISTING_TTL`; the publisher re-signs it hourly while it runs),
 replicate it, and keep the newest timestamp per feed (the larger signature on
 a tie). One publisher may hold at most 16 records under a shard key
 (`MAX_FEED_LISTINGS_PER_PUBLISHER_PER_KEY`, twice the feeds one identity
 keeps, for withdrawals of deleted ones), against 150 under other keys; a
-replacement of one it holds is always taken. Older builds file it as an
-unknown type for 24 hours.
+replacement of one it holds is always taken. A shard key holding its 1,000
+records (`MAX_RECORDS_PER_KEY`) drops its stalest listing for one signed
+after it, rather than refusing every newcomer: junk filling a shard must be
+re-signed more often than real feeds are to keep them out, and lapses within
+a week when it is not. Older builds file it as an unknown type for 24 hours.
 
 **The publisher** signs its listing anew with every publish and every hourly
 republish while the feed is listed. Each listing or withdrawal of a feed is
@@ -1445,23 +1486,25 @@ restarts, and whether the feed is listed is read as it is stamped, so a
 change of mind is never a tie nor outranked by a listing decided before it.
 Taking a feed out of the index sends a withdrawal, the listing with flag
 `0x01`, which displaces the last at each storer, and again with each
-republish until 30 days after the last listing sent, by when it has lapsed. A
+republish until a week after the last listing sent, by when it has lapsed. A
 feed never listed while published sends none: no listing named it. Deleting a
 listed feed keeps its salt as a tombstone, whose withdrawal the feeds service
 sends within a minute while the Ember Network is on and daily after, until
-the same 30 days have passed.
+the same week has passed.
 
 **Discover** walks the sixteen shard keys, as rooms' Discover does, and keeps
 the newest listing of each feed (the larger signature on a tie), signed and
-stamped within the last 30 days and no more than ten minutes ahead of the
+stamped within the last week and no more than ten minutes ahead of the
 local clock. A head's `sequence` past the listing's own time is cut to it, as a
 head is published before its listing is signed. Discover drops withdrawn feeds,
 takes at most eight listed feeds from one publisher (the most one identity
 keeps), the last listed, and cleans titles and descriptions as any remote
 text. A listing signed in the last 3 hours shows its publisher as active.
-What a walk finds is cached: a shard that too few nodes answered keeps its
-cached feeds, and one that settled without a cached feed forgets it. The user
-can hide a feed or a publisher from Discover, locally.
+What a walk finds is cached: a shard that too few nodes answered, or that came
+back with as many records as a lookup returns (300, `MAX_SEARCH_RESULTS`, so
+it may hold more), keeps its cached feeds, and one that settled without a
+cached feed forgets it. Rooms' Discover settles shards by the same rule. The
+user can hide a feed or a publisher from Discover, locally.
 
 ## Feed file stream (type 0x09)
 
@@ -1492,21 +1535,32 @@ show is that the dialer does, and they name one file of one feed.
 
 **Answer.** A status byte (`0` ok, `1` unknown, `2` unauthorized, `3`
 source gone, `4` bad cursor, `5` busy), then for `0` the file's size (8, LE), its chunk
-count (4, LE) and the BLAKE3 of each 256 KiB chunk, then the chunks from
-`start_chunk` to the end. A file may be up to 8 GiB (`FEED_STREAM_MAX_BYTES`)
-here, against 2 GiB for the other two types; a larger one is fetched over
-eD2K. No root is agreed ahead, as a feed's list names its files by whole-file
-digests: the follower checks each chunk against the list, every later stream
-of the download against the first one's list, and the finished file against
-the list's eD2K, AICH and BLAKE3. Once it has read the last chunk it closes
-QUIC with `attach done`, or writes `0x01` on TCP.
+count (4, LE) and a 32-byte value for each 256 KiB chunk, then the chunks
+from `start_chunk` to the end. A file may be up to 8 GiB
+(`FEED_STREAM_MAX_BYTES`) here, against 2 GiB for the other two types; a
+larger one is fetched over eD2K. Where the other types send each chunk's own
+BLAKE3, a feed stream sends its **chaining value** in the file's BLAKE3 tree
+(`chunk_value`: the chunk hashed at its offset into the file and finalised as
+a non-root node; for a file of one chunk, its BLAKE3), so the values merge, as
+BLAKE3's tree does, into the file's BLAKE3 (`root_of_chunk_values`). The
+follower refuses a list that does not come to the BLAKE3 the feed's signed
+list names, and a chunk whose value is not the list's, before a byte of it is
+written: a publisher whose file changed, or anyone between, cannot put a
+wrong byte on disk. The finished file is then checked against the list's
+eD2K, AICH and BLAKE3 as any download is. Once it has read the last chunk the
+follower closes QUIC with `attach done`, or writes `0x01` on TCP.
 
 **The publisher** serves a file under its `xfer_id` while the file is named
 by the list of a feed's published head or its pending one (what a follower
 can hold; not the editor's unpublished items), is still shared with everyone
 and has the BLAKE3 the list names; the table is rebuilt each minute and on
-every publish or delete, one rebuild at a time. It answers `1` to an id it
-does not serve. A file whose chunk list is not cached is hashed for followers
+every publish or delete, one rebuild at a time. Each request is checked
+again as an eMule upload is: the file must still be shared with everyone in
+the Library (when the Library can be read without waiting), not friends-only
+by `known.met`, and it is opened through the approved-root layer, inside a
+shared or download folder and not through a link out of them. It answers `1`
+to an id it does not serve or a file that fails these, and `3` to one that
+cannot be opened there. A file whose chunk list is not cached is hashed for followers
 one at a time, at most 32 GiB of such reads an hour (`FEED_HASH_BUDGET`),
 since anyone with the link may ask for any of a feed's files; past that it
 answers `5`. Once the chunk list is ready it takes a serve slot, and answers
