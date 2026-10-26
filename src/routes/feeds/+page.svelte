@@ -4,6 +4,7 @@
    * publish lists of your own. See `commands/feeds.rs`.
    */
   import { onMount, tick, untrack } from 'svelte';
+  import { on } from 'svelte/events';
   import { page } from '$app/state';
   import { beforeNavigate, goto } from '$app/navigation';
   import { navigatingForDeepLink } from '$lib/deepLinkNavigation';
@@ -193,6 +194,7 @@
    *  title must not turn into the next feed's while it closes. */
   let unfollowTitle = $state('');
   let markingAll = $state(false);
+  let markAllButton = $state<HTMLButtonElement | null>(null);
   let anyUnread = $derived($followedFeeds.some((f) => f.unread > 0));
   /** Feeds a Check now or a Download is running for, by key: another feed
    *  opened meanwhile has its own buttons. */
@@ -311,11 +313,14 @@
   /** Links opened from outside while another follow was running, in the
    *  order they came. */
   let queuedLinks: string[] = [];
+  /** The link being followed now, trimmed; '' when none is. */
+  let followingLink = '';
 
   async function follow(link = followLink) {
     const text = link.trim();
     if (!text || following) return;
     following = true;
+    followingLink = text;
     try {
       const feed = await followFeed(text);
       followLink = '';
@@ -334,6 +339,9 @@
       }
     } finally {
       following = false;
+      followingLink = '';
+      // A blank one would be dropped without following on to the rest.
+      while (queuedLinks.length > 0 && !queuedLinks[0].trim()) queuedLinks.shift();
       const next = queuedLinks.shift();
       if (next) void follow(next);
     }
@@ -347,7 +355,7 @@
     untrack(() => {
       setTab('following');
       if (!following) void follow(linked);
-      else if (!queuedLinks.includes(linked)) queuedLinks.push(linked);
+      else if (linked.trim() !== followingLink && !queuedLinks.includes(linked)) queuedLinks.push(linked);
       const next = new URL(page.url);
       next.searchParams.delete('follow');
       void goto(`${next.pathname}${next.search}${next.hash}`, { replaceState: true, keepFocus: true, noScroll: true }).catch(
@@ -403,7 +411,10 @@
         remembered = null;
       }
       const pick = pickFollowed(feeds, remembered);
-      if (pick) selectedKey = keyOf(pick);
+      if (pick) {
+        selectedKey = keyOf(pick);
+        openedKey = null;
+      }
     });
   });
 
@@ -721,7 +732,9 @@
       await refreshFollowedFeeds();
       const said = outcomeText(outcome, feed);
       if (said) {
-        (outcome === 'unreachable' || outcome === 'too_large' ? toastWarning : toastSuccess)(aboutFeed(feed, said));
+        (outcome === 'unreachable' || outcome === 'too_large' || outcome === 'deleted' ? toastWarning : toastSuccess)(
+          aboutFeed(feed, said),
+        );
       }
     } catch (e) {
       toastError(aboutFeed(feed, translateError(e, m.error_operation_failed())));
@@ -745,6 +758,8 @@
         return m.feeds_state_too_large();
       case 'busy':
         return m.feeds_state_waiting_short();
+      case 'deleted':
+        return m.feeds_check_deleted();
       default:
         return null;
     }
@@ -773,6 +788,7 @@
     const next = list[at + 1] ?? list[at - 1] ?? null;
     followedFeeds.update((feeds) => feeds.filter((f) => keyOf(f) !== key));
     selectedKey = next ? keyOf(next) : null;
+    openedKey = null;
     if (next) rememberFollowed(keyOf(next));
     toastSuccess(m.feeds_unfollowed_toast({ feed: feedLabel(feed) }));
     // The Unfollow button went with the feed: focus goes to the one opened,
@@ -801,9 +817,10 @@
       if (failed.length > 0) toastError(translateError(failed[0], m.error_operation_failed()));
     } finally {
       markingAll = false;
-      // The button goes once nothing is unread, and focus with it.
+      // The button goes once nothing is unread, and focus with it; it stays
+      // while some failed, and focus goes back to it.
       await tick();
-      if (focusLost()) composeTrigger?.focus();
+      if (focusLost()) (markAllButton?.isConnected ? markAllButton : composeTrigger)?.focus();
     }
   }
 
@@ -957,6 +974,8 @@
   /** The walk whose shards are taken; any other's are stale. */
   let discoverWalk = '';
   let discoverOpened = false;
+  /** Left: a walk still running is the next visit's to take in and report. */
+  let destroyed = false;
 
   /** Show only this publisher's feeds. */
   let discoverPublisher = $state<string | null>(null);
@@ -1054,7 +1073,7 @@
 
   /** Walk the index, or take in the walk running since an earlier visit. */
   async function walkDiscover() {
-    if (discovering || emberOff) return;
+    if (discovering || emberOff || destroyed) return;
     const { walk, result } = startDiscoverWalk();
     discoverWalk = walk;
     discovering = true;
@@ -1223,6 +1242,8 @@
   );
   let inFeed = $derived(new Set(editItems.map((i) => i.ed2k.toLowerCase())));
   let editSize = $derived(editItems.reduce((sum, i) => sum + i.size, 0));
+  /** No title: neither saved nor published without one. */
+  let titleMissing = $derived(!editTitle.trim());
   /** Published, and nothing saved or typed since: nothing to publish. */
   let upToDate = $derived(!!mineFeed && mineFeed.published_at > 0 && !mineFeed.changed && !dirty);
   let mineShown = $derived.by(() => {
@@ -1618,6 +1639,8 @@
     }, 4_000);
     return () => {
       alive = false;
+      destroyed = true;
+      discoverWalk = '';
       unlisten?.();
       unlistenFound?.();
       for (const fn of unlistenTransfers) fn();
@@ -1700,7 +1723,7 @@
     </div>
     {#if tab === 'following'}
       {#if anyUnread || markingAll}
-        <button type="button" class="secondary refresh-btn" disabled={markingAll} onclick={() => void markAllRead()}>
+        <button type="button" class="secondary refresh-btn" disabled={markingAll} bind:this={markAllButton} onclick={() => void markAllRead()}>
           {#if markingAll}
             <span class="spinner xs" aria-hidden="true"></span>
           {:else}
@@ -1877,7 +1900,7 @@
                 class:has-unread={feed.unread > 0}
                 class:deleted={feed.deleted}
                 aria-current={active ? 'true' : undefined}
-                title={feed.deleted ? `${feedLabel(feed)}: ${m.feeds_deleted_notice()}` : feedLabel(feed)}
+                title={feed.deleted ? m.feeds_toast_in_feed({ feed: feedLabel(feed), text: m.feeds_deleted_notice() }) : feedLabel(feed)}
                 onclick={() => selectFollowed(keyOf(feed))}
               >
                 <span class="feed-avatar" style:--feed-hue={hueOf(feed.publisher + feed.salt)}>{@render feedGlyph()}</span>
@@ -1903,7 +1926,12 @@
         </aside>
 
         <!-- svelte-ignore a11y_no_static_element_interactions (noticing the user act in the open feed; the controls are its own) -->
-        <section class="detail-pane" onpointerdown={claimOpen} onkeydown={claimOpen} onwheel={claimOpen}>
+        <section
+          class="detail-pane"
+          onpointerdown={claimOpen}
+          onkeydown={claimOpen}
+          {@attach (el: HTMLElement) => on(el, 'wheel', claimOpen, { passive: true })}
+        >
           {#if selected}
             <header class="detail-head">
               <span class="feed-avatar lg" style:--feed-hue={hueOf(selected.publisher + selected.salt)}>{@render feedGlyph()}</span>
@@ -2533,7 +2561,10 @@
                 oncompositionend={() => (editTitle = fitBytes(editTitle, TITLE_MAX))}
                 placeholder={m.feeds_title_placeholder()}
                 aria-label={m.feeds_title_placeholder()}
+                aria-invalid={titleMissing || undefined}
+                aria-describedby={titleMissing ? 'feeds-title-required' : undefined}
               />
+              {#if titleMissing}<p class="hint title-required" id="feeds-title-required">{m.error_feeds_title_required()}</p>{/if}
               <p class="detail-meta">
                 {#if mineFeed.published_at > 0}
                   <span class="status-dot published" aria-hidden="true"></span>
@@ -2736,14 +2767,20 @@
               {upToDate ? m.feeds_publish_up_to_date_title() : m.feeds_publish_public_hint()}
             </p>
             <div class="editor-foot-actions">
-              <button type="button" class="secondary" disabled={!dirty || busy || !editTitle.trim()} onclick={() => void save()}>{m.feeds_save()}</button>
+              <button
+                type="button"
+                class="secondary"
+                disabled={!dirty || busy || titleMissing}
+                aria-describedby={titleMissing ? 'feeds-title-required' : undefined}
+                onclick={() => void save()}
+              >{m.feeds_save()}</button>
               <!-- Published and unchanged: publishing again would only bump the
                    sequence, and the hourly republish keeps the head alive. -->
               <button
                 type="button"
                 class="primary"
-                disabled={busy || emberOff || upToDate || !editTitle.trim()}
-                aria-describedby={upToDate ? 'feeds-publish-hint' : undefined}
+                disabled={busy || emberOff || upToDate || titleMissing}
+                aria-describedby={titleMissing ? 'feeds-title-required' : upToDate ? 'feeds-publish-hint' : undefined}
                 onclick={() => void publish()}
               >
                 {#if publishing}
@@ -3844,6 +3881,11 @@
 
   .title-input:hover:not(:disabled) {
     border-color: var(--input-border);
+  }
+
+  .title-required {
+    margin-top: 2px;
+    color: var(--badge-warning-text);
   }
 
   .desc-input {

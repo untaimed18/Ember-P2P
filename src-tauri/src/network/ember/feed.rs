@@ -280,6 +280,13 @@ pub fn all_feed_index_keys() -> [[u8; 16]; FEED_INDEX_SHARDS as usize] {
     std::array::from_fn(|shard| feed_index_key(shard as u8))
 }
 
+/// Whether `key` is one of the index shard keys. Asked of every record a
+/// storer is sent, so the keys are worked out once.
+pub fn is_feed_index_key(key: &[u8; 16]) -> bool {
+    static KEYS: std::sync::OnceLock<[[u8; 16]; FEED_INDEX_SHARDS as usize]> = std::sync::OnceLock::new();
+    KEYS.get_or_init(all_feed_index_keys).contains(key)
+}
+
 /// The head a withdrawal carries in place of its feed's: a fixed one that
 /// says nothing of the feed, as only its publisher and salt are needed to
 /// displace the last listing. Its hashes are not zero, as a storer keeps a

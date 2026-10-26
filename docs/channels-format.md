@@ -1393,8 +1393,12 @@ an older head, or a newer one signed after the clock went back, is ranked as
 followers rank it. One publisher may hold at most 64 heads across every key
 on a storer (`MAX_FEED_HEADS_PER_PUBLISHER`, far past the eight feeds one
 identity keeps and their tombstones), as each feed's head has a key of its
-own and no per-key cap binds it; a head replacing one the publisher holds
-there is always taken. Builds before it file it as an unknown type for
+own and no per-key cap binds it; a head replacing a head the publisher
+holds there is always taken (a record of another type under that key with
+the same `file_hash` is not one). A tombstone holds its slot for up to about
+60 days (re-sent for 30 days after the delete, each copy kept 30), so heavy
+delete churn on a tiny network, where one storer holds most of an identity's
+heads, can reach the cap. Builds before it file it as an unknown type for
 `KEYWORD_RECORD_TTL` (24 hours) without replicating or reading it. The
 publisher republishes hourly while it runs, and on every publish: while most
 storers are such builds, a head stored a day ago has often lost every node
@@ -1424,7 +1428,10 @@ it. A follower that takes up a tombstone marks the feed deleted
 (`FollowedFeed::deleted`): it keeps the feed's items and files, and the list
 it holds, gives up any list fetch on its way, fetches no list and starts no
 auto-download for it, and still looks it up, as a live head published after
-it takes the feed back up.
+it takes the feed back up: every 24 hours rather than every 30 minutes
+(`DELETED_POLL_SECS`, counted so in each tick's share), and never in its
+index shard, as no listing carries a head newer than the tombstone. "Check
+now" on it says the feed was deleted.
 
 **The list** is `"EMBRFL01" ||` a format-v2 collection
 (`network/ed2k/collection.rs`) sealed under the list key, with `aad =
@@ -1498,7 +1505,10 @@ aimed at whichever shard key lies nearest a storer, or whose trailer has no
 flags and head version 1 or later (`listing_storable`). One of version 1 must
 read as a follower reads it, header and trailer, or it would only take a
 shard's slot from a real listing; a later version is read no further, and
-passes through storers. They keep it a week
+passes through storers. A shard key holds listings and nothing else: any
+other record filed under one of the sixteen is refused, off the wire and
+when persisted records are restored, as it would take a slot the eviction
+below never frees. They keep a listing a week
 (`FEED_LISTING_TTL`; the publisher re-signs it hourly while it runs),
 replicate it, and keep the newest timestamp per feed (the larger signature on
 a tie). One publisher may hold at most 16 records under a shard key
@@ -1506,8 +1516,11 @@ a tie). One publisher may hold at most 16 records under a shard key
 keeps, for withdrawals of deleted ones), against 150 under other keys; a
 replacement of one it holds is always taken. A shard key holding its 1,000
 records (`MAX_RECORDS_PER_KEY`) drops its stalest listing for one signed
-after it, rather than refusing every newcomer: junk filling a shard must be
-re-signed more often than real feeds are to keep them out, and lapses within
+after it, rather than refusing every newcomer. Each is dated by the earlier
+of its stamp and when it was stored (the date its expiry is aged from), so a
+stamp up to the hour's skew tolerance ahead of the clock buys nothing. Junk
+filling a shard must be re-signed more often than real feeds are to keep
+them out, and lapses within
 a week when it is not. Older builds file it as an unknown type for 24 hours.
 
 **The publisher** signs its listing anew with every publish and every hourly

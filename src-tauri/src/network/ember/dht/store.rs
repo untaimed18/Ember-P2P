@@ -1222,10 +1222,14 @@ impl DhtStore {
         // yet still count, for the few minutes until `expire` runs.
         if is_feed_head(&data) && self.publisher_index.feed_heads_full(&publisher_key) {
             let incoming_file = file_hash_from_record_data(&data);
+            // A head: another record of that file hash, replaced by a head,
+            // would put one more head on the publisher's count.
             let replaces = self.entries.get(&key).is_some_and(|records| {
-                records
-                    .iter()
-                    .any(|r| r.publisher_key == publisher_key && file_hash_from_record_data(&r.data) == incoming_file)
+                records.iter().any(|r| {
+                    r.publisher_key == publisher_key
+                        && is_feed_head(&r.data)
+                        && file_hash_from_record_data(&r.data) == incoming_file
+                })
             });
             if !replaces {
                 self.publisher_cap_rejections = self.publisher_cap_rejections.saturating_add(1);
@@ -1510,12 +1514,19 @@ impl DhtStore {
         // newcomers outright let throwaway identities shut every new feed
         // out of Discover for a listing's life; this way junk must be kept
         // fresher than the feeds whose publishers re-sign theirs hourly.
+        //
+        // Ranked by expiry rather than by the stamp: every listing has one
+        // TTL, aged from its stamp or from when it was stored, whichever is
+        // earlier. By the stamp alone, junk stamped up to the skew tolerance
+        // ahead of the clock outranked every honest listing.
         if records.len() >= MAX_RECORDS_PER_KEY && record.data.first() == Some(&RECORD_TYPE_FEED_LISTING) {
             let stalest = records
                 .iter()
                 .enumerate()
-                .filter(|(_, r)| r.data.first() == Some(&RECORD_TYPE_FEED_LISTING) && r.created_at < created_at)
-                .min_by_key(|(_, r)| r.created_at)
+                .filter(|(_, r)| {
+                    r.data.first() == Some(&RECORD_TYPE_FEED_LISTING) && r.expires_at_unix < record.expires_at_unix
+                })
+                .min_by_key(|(_, r)| r.expires_at_unix)
                 .map(|(at, _)| at);
             if let Some(at) = stalest {
                 let dropped = records.remove(at);
@@ -1984,6 +1995,9 @@ impl DhtStore {
                 if !ok {
                     continue;
                 }
+            } else if crate::network::ember::feed::is_feed_index_key(&key) {
+                // Only listings under an index shard key, as `accept_record`.
+                continue;
             }
             if self.store_record(key, record.data, record.signature, None, true) {
                 accepted += 1;
@@ -3204,6 +3218,16 @@ mod tests {
         }
         assert!(!stored(&mut store, head(&sk, cap, 1)), "past the cap");
         assert_eq!(store.reject_stats().publisher_cap, 1);
+        // A record of another type, filed first under a feed's key with its
+        // head's file hash, is no head for one to replace.
+        let blocked = head(&sk, cap + 2, 1);
+        let mut decoy = SignedRecord::keyword("ubuntu", [0u8; 16], [0u8; 32], 100, "u.iso", &sk).data;
+        decoy[1..17].copy_from_slice(&blocked.keyword_hash);
+        decoy[17..33].copy_from_slice(&blocked.data[17..33]);
+        let decoy_sig = sign(&sk, &decoy);
+        assert!(store.store(blocked.keyword_hash, decoy, decoy_sig));
+        assert!(!stored(&mut store, blocked), "still past the cap");
+        assert_eq!(store.reject_stats().publisher_cap, 2);
         assert!(stored(&mut store, head(&sk, 0, 2)), "a newer head of a feed it holds");
         assert!(stored(&mut store, head(&SigningKey::from_bytes(&[10u8; 32]), cap, 1)), "another publisher's");
         store.assert_publisher_index_consistent();
@@ -3251,22 +3275,24 @@ mod tests {
                 .take(n)
                 .collect()
         };
-        let mut stored = 0usize;
-        let mut identity = 0u16;
-        while stored < MAX_RECORDS_PER_KEY {
-            identity += 1;
-            let mut seed = [0x30u8; 32];
-            seed[..2].copy_from_slice(&identity.to_le_bytes());
-            let sk = SigningKey::from_bytes(&seed);
-            let take = MAX_FEED_LISTINGS_PER_PUBLISHER_PER_KEY.min(MAX_RECORDS_PER_KEY - stored);
-            for salt in shard_salts(&sk.verifying_key().to_bytes(), take) {
-                // The first stored is the stalest.
-                let at = now - 3600 + stored as i64;
-                let rec = SignedRecord::feed_listing_record(&salt, &head, false, &sk, at).unwrap();
-                assert!(store.store(rec.keyword_hash, rec.data, rec.signature), "filling the shard");
-                stored += 1;
+        let fill = |store: &mut DhtStore, at: &dyn Fn(usize) -> i64| {
+            let mut stored = 0usize;
+            let mut identity = 0u16;
+            while stored < MAX_RECORDS_PER_KEY {
+                identity += 1;
+                let mut seed = [0x30u8; 32];
+                seed[..2].copy_from_slice(&identity.to_le_bytes());
+                let sk = SigningKey::from_bytes(&seed);
+                let take = MAX_FEED_LISTINGS_PER_PUBLISHER_PER_KEY.min(MAX_RECORDS_PER_KEY - stored);
+                for salt in shard_salts(&sk.verifying_key().to_bytes(), take) {
+                    let rec = SignedRecord::feed_listing_record(&salt, &head, false, &sk, at(stored)).unwrap();
+                    assert!(store.store(rec.keyword_hash, rec.data, rec.signature), "filling the shard");
+                    stored += 1;
+                }
             }
-        }
+        };
+        // The first stored is the stalest.
+        fill(&mut store, &|stored| now - 3600 + stored as i64);
         let key = feed_index_key(0);
         assert_eq!(store.get(&key).map(|r| r.len()), Some(MAX_RECORDS_PER_KEY));
 
@@ -3280,6 +3306,68 @@ mod tests {
         assert_eq!(held.len(), MAX_RECORDS_PER_KEY);
         assert!(held.iter().any(|r| r.publisher_key == newcomer.verifying_key().to_bytes()));
         assert!(!held.iter().any(|r| r.created_at == now - 3600), "the stalest listing went");
+
+        // Junk stamped ahead of the clock, as far as the skew tolerance
+        // allows, ranks from when it was stored: a listing signed since
+        // still makes room.
+        let mut ahead = DhtStore::new();
+        fill(&mut ahead, &|_| now + 1800);
+        for resident in ahead.entries.get_mut(&key).unwrap() {
+            // Stored a minute ago.
+            resident.expires_at_unix -= 60;
+        }
+        let since = SignedRecord::feed_listing_record(&salt, &head, false, &newcomer, now - 30).unwrap();
+        assert!(ahead.store(since.keyword_hash, since.data, since.signature), "signed after the junk was stored");
+        assert_eq!(ahead.get(&key).map(|r| r.len()), Some(MAX_RECORDS_PER_KEY));
+    }
+
+    /// A feed index shard key holds listings only, restored or not: anything
+    /// else there takes a slot the full shard's eviction never gives back.
+    #[test]
+    fn a_feed_index_key_restores_only_listings() {
+        use super::super::publish::SignedRecord;
+        use crate::network::ember::feed::{feed_index_key, feed_index_shard, FeedHead};
+
+        let sk = SigningKey::from_bytes(&[0x52u8; 32]);
+        let key = feed_index_key(0);
+        let word = SignedRecord::keyword("ubuntu", [0x33; 16], [0u8; 32], 100, "u.iso", &sk);
+        let mut misfiled = word.data.clone();
+        misfiled[1..17].copy_from_slice(&key);
+        let misfiled_sig = sign(&sk, &misfiled);
+        let salt = (0..=u16::MAX)
+            .map(|i| {
+                let mut salt = [0u8; 16];
+                salt[..2].copy_from_slice(&i.to_le_bytes());
+                salt
+            })
+            .find(|salt| feed_index_shard(&sk.verifying_key().to_bytes(), salt) == 0)
+            .unwrap();
+        let head = FeedHead {
+            sequence: 1,
+            list_ed2k_hash: [1; 16],
+            list_size: 10,
+            list_blake3: [2; 32],
+            item_count: 1,
+            total_size: 0,
+            title: "T".into(),
+            description: String::new(),
+            deleted: false,
+        };
+        let listing = SignedRecord::feed_listing_record(&salt, &head, false, &sk, now_ts()).unwrap();
+        let saved = [(misfiled, misfiled_sig), (listing.data, listing.signature)]
+            .into_iter()
+            .map(|(data, signature)| PersistedRecord {
+                key,
+                data,
+                signature,
+                publisher_key: sk.verifying_key().to_bytes(),
+                created_at: now_ts(),
+                attributed_ip: None,
+            })
+            .collect();
+        let mut restored = DhtStore::new();
+        assert_eq!(restored.restore(saved), 1, "the listing alone");
+        assert_eq!(restored.get(&key).unwrap()[0].data.first(), Some(&RECORD_TYPE_FEED_LISTING));
     }
 
     #[test]

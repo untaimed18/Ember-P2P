@@ -89,8 +89,8 @@ export interface FeedActivity {
   retry_at: number;
 }
 
-/** What a lookup of a followed feed came to. */
-export type LookupOutcome = 'updated' | 'unchanged' | 'not_found' | 'unreachable' | 'too_large' | 'busy';
+/** What a lookup of a followed feed came to; `deleted`, its tombstone found. */
+export type LookupOutcome = 'updated' | 'unchanged' | 'not_found' | 'unreachable' | 'too_large' | 'busy' | 'deleted';
 
 /** What the download of a feed's file is doing. */
 export type FeedItemStatus =

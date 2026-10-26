@@ -52,6 +52,13 @@ fn busy_pause(busy: u32) -> std::time::Duration {
 /// count of a stream registered before it started, taken so the download
 /// never sees it idle in between.
 pub(super) async fn dispatch(template: FeedWorker, mut first: Option<Working>, total_sources: Arc<AtomicU32>) {
+    // With no BLAKE3 to check it against, every chunk list the publisher
+    // sends is refused: the hold ends now, and every network is asked,
+    // rather than after dialling it only to refuse what it says.
+    if template.expected_blake3 == [0u8; 32] {
+        feed_direct::stream_finished(&template.transfer_id, false);
+        return;
+    }
     let mut running: Option<super::super::transfer::AbortOnDrop> = None;
     let mut counted = false;
     loop {
@@ -610,6 +617,31 @@ mod tests {
             assert_eq!(written, 0);
             assert!(first_gap(&rig).await == Some(0), "nothing written");
         }
+    }
+
+    /// A download with no BLAKE3 for the file takes no stream: its hold ends
+    /// at once, rather than after the publisher is dialled and refused.
+    #[tokio::test]
+    async fn an_unpinned_download_ends_its_hold_without_dialling() {
+        let _registry = crate::security::filesystem::test_registry_lock();
+        let data = data(2);
+        let mut rig = rig("unpinned-dispatch", &data).await;
+        rig.worker.expected_blake3 = [0; 32];
+        let id = rig.worker.transfer_id.clone();
+        let publisher = feed_direct::Publisher {
+            key: ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes(),
+            salt: [3; 16],
+            friend_tcp: Some(std::net::SocketAddr::from(([9, 9, 9, 9], 4662))),
+        };
+        assert!(feed_direct::begin(&id, [0x3B; 16], data.len() as u64, publisher));
+        assert!(feed_direct::stream_ready(&id), "a friend's stream is registered at once");
+        let counted = Arc::new(AtomicU32::new(0));
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch(rig.worker.clone(), None, counted.clone()))
+            .await
+            .expect("returns at once");
+        assert!(!feed_direct::holds(&id) && !feed_direct::stream_ready(&id));
+        assert_eq!(counted.load(Ordering::Relaxed), 0, "not counted as a source");
+        feed_direct::forget(&id);
     }
 
     #[tokio::test]

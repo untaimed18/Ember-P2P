@@ -521,6 +521,22 @@ async fn feed_publishers(
         .collect()
 }
 
+/// Pin the Ember digest persisted on a restored download's row. The pin a
+/// start seeded lives only in memory, and the digest on the row is the one
+/// that start was given, so it gets the same standing again: below a digest
+/// hashed here, above a plurality. Without it a feed's download resumed with
+/// no BLAKE3 for its publisher's chunk list to come to.
+fn seed_restored_pin(pins: &mut HashMap<[u8; 16], EmberDigestPin>, transfer: &Transfer) {
+    if let Some(ed2k) = parse_ed2k_hash16(&transfer.file_hash) {
+        seed_ember_content_hash(
+            pins,
+            ed2k,
+            parse_ember_file_hash(transfer.ember_file_hash.as_deref().unwrap_or_default()),
+            EmberDigestProvenance::UserSelected,
+        );
+    }
+}
+
 /// Put a restored download into `active` for its re-verification, which runs
 /// whatever the concurrent-download cap: a check that finishes it is only
 /// local work. With `rejoin`, a check that does not finish it hands the row a
@@ -630,6 +646,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
             // Before any branch below can finish it: several insert straight
             // into the transfer list rather than through `enqueue`.
             crate::storage::category_folders::note_category(&transfer.id, &transfer.category);
+            seed_restored_pin(&mut state.ember_content_hashes, &transfer);
             // Failed downloads are restored to keep their Temp `.part` owned
             // (orphan sweep) and resumable by hand. Do not auto-start them.
             if transfer.status == TransferStatus::Failed {
@@ -1674,6 +1691,43 @@ mod tests {
             find_published_file(&candidates, &root, 100, &hash, None, None),
             Ok(downloads.join("[Ember-P2P] movie.bin"))
         );
+    }
+
+    /// A restored download is pinned to the digest on its row, as the start
+    /// that wrote it was, without displacing a digest hashed here.
+    #[test]
+    fn a_restored_download_is_pinned_to_the_digest_on_its_row() {
+        let restored = |ember: Option<&str>| -> Transfer {
+            serde_json::from_value(serde_json::json!({
+                "id": "restored",
+                "file_name": "movie.bin",
+                "file_hash": "11".repeat(16),
+                "peer_id": "",
+                "peer_name": "",
+                "direction": "download",
+                "status": "searching",
+                "progress": 0.0,
+                "speed": 0,
+                "total_size": 100,
+                "transferred": 0,
+                "started_at": 0,
+                "ember_file_hash": ember,
+            }))
+            .unwrap()
+        };
+        let file = [0x11u8; 16];
+        let mut pins = HashMap::new();
+        seed_restored_pin(&mut pins, &restored(None));
+        assert!(pins.is_empty(), "no digest on the row: nothing to pin");
+
+        seed_ember_content_hash(&mut pins, file, [0xBB; 32], EmberDigestProvenance::Corroborated(3));
+        seed_restored_pin(&mut pins, &restored(Some(&"aa".repeat(32))));
+        assert_eq!(pins[&file].digest, [0xAA; 32], "the row's digest outranks a plurality");
+        assert_eq!(pins[&file].provenance, EmberDigestProvenance::UserSelected);
+
+        seed_ember_content_hash(&mut pins, file, [0xDD; 32], EmberDigestProvenance::Local);
+        seed_restored_pin(&mut pins, &restored(Some(&"aa".repeat(32))));
+        assert_eq!(pins[&file].digest, [0xDD; 32], "but not a digest hashed here");
     }
 
     #[tokio::test]

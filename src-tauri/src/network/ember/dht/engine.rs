@@ -1214,6 +1214,13 @@ impl EmberDht {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
             return StoreOutcome::Rejected;
         }
+        // An index shard key holds listings only. A keyword record, whose key
+        // nothing can check, filed there took a shard's slot that the full
+        // shard's eviction, which drops listings alone, never gave back.
+        if parsed.record_type != RECORD_TYPE_FEED_LISTING && crate::network::ember::feed::is_feed_index_key(&key) {
+            self.store_reject_verify = self.store_reject_verify.saturating_add(1);
+            return StoreOutcome::Rejected;
+        }
 
         if key != parsed.keyword_hash {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
@@ -4554,6 +4561,29 @@ mod tests {
         let (_rid, frame) = a.build_store(record.keyword_hash, record.data.clone(), record.signature);
         assert!(b.handle_message(&frame, a_addr, a_noise, 1002).stored_record);
         assert_eq!(b.inbound_record_verifications, 1);
+    }
+
+    /// A feed index shard key holds listings only: a keyword record filed
+    /// there is refused, for the price of reading it, before its signature is
+    /// checked.
+    #[test]
+    fn only_a_feed_listing_is_stored_under_a_feed_index_key() {
+        let mut a = dht(28);
+        let mut b = dht(29);
+        let a_noise = a.local_noise_pub;
+        let a_addr = addr(28, 4672);
+
+        let key = crate::network::ember::feed::feed_index_key(0);
+        let mut data = a.build_keyword_record("ubuntu", [9u8; 16], [0u8; 32], 4096, "ubuntu.iso").data;
+        data[1..17].copy_from_slice(&key);
+        let signature = crypto::sign(&a.signing_key, &data);
+        let (_rid, frame) = a.build_store(key, data, signature);
+        let on_b = b.handle_message(&frame, a_addr, a_noise, 1000);
+        assert!(!on_b.stored_record);
+        assert!(on_b.responses.is_empty(), "no STORE_ACK for a refused record");
+        assert_eq!(b.store_reject_verify, 1);
+        assert_eq!(b.inbound_record_verifications, 0);
+        assert_eq!(b.store_stats(), (0, 0));
     }
 
     /// A byte-identical retransmit of a record we hold is answered from the

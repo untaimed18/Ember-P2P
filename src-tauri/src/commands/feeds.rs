@@ -66,6 +66,9 @@ const LOOKUP_RETRY_SECS: i64 = 5 * 60;
 /// it, and its publisher may be about to republish.
 const WAITING_POLL_SECS: i64 = 3 * 60;
 const WAITING_FAST_FOR_SECS: i64 = 24 * 3600;
+/// How often a deleted feed is looked up: only a head published after its
+/// tombstone would take it back up, and it was looked for forever.
+const DELETED_POLL_SECS: i64 = 24 * 3600;
 /// How long after a feed's own key gave nothing its index shard is read for
 /// a listing of it, which carries the same head: a shard is many records.
 const LISTING_FALLBACK_SECS: i64 = 15 * 60;
@@ -2484,6 +2487,9 @@ pub enum LookupOutcome {
     TooLarge,
     /// A lookup of it was running already.
     Busy,
+    /// The head found, or the one held, is a tombstone: its publisher
+    /// deleted it.
+    Deleted,
 }
 
 /// Look up a followed feed's head and take up a newer one, starting the
@@ -2499,6 +2505,7 @@ async fn look_up_head(app: &tauri::AppHandle, state: &AppState, publisher: &str,
     }
     let key = feed_key(&publisher_key, &salt_bytes);
     let looked = LookedAt(looking_at.clone());
+    let deleted = held_deleted(state, publisher, salt).await;
     let found = crate::commands::channels::find_raw_keys_counted(state, vec![key], LOOKUP_TIMEOUT_MS)
         .await
         .ok()
@@ -2508,7 +2515,9 @@ async fn look_up_head(app: &tauri::AppHandle, state: &AppState, publisher: &str,
     let now = chrono::Utc::now().timestamp();
     // A listed feed's listing carries its head, signed alike, and lives
     // under another key: found there when its own key's storers are gone.
-    if best.is_none() && listing_fallback_due(&looking_at, now) {
+    // Not for a deleted feed: no listing carries a head newer than its
+    // tombstone, and once that lapses its key gives nothing on every lookup.
+    if best.is_none() && !deleted && listing_fallback_due(&looking_at, now) {
         let shard = feed_index_key(feed_index_shard(&publisher_key, &salt_bytes));
         let listed = crate::commands::channels::find_raw_keys_counted(state, vec![shard], LOOKUP_TIMEOUT_MS)
             .await
@@ -2559,15 +2568,30 @@ async fn look_up_head(app: &tauri::AppHandle, state: &AppState, publisher: &str,
             LookupOutcome::TooLarge
         }
         Some(head) => {
-            if take_head(app, state, publisher, salt, head).await {
+            let tombstone = head.deleted;
+            let taken = take_head(app, state, publisher, salt, head).await;
+            if taken && !tombstone {
                 LookupOutcome::Updated
+            } else if tombstone || deleted {
+                LookupOutcome::Deleted
             } else {
                 LookupOutcome::Unchanged
             }
         }
         None if responded == 0 => LookupOutcome::Unreachable,
+        None if deleted => LookupOutcome::Deleted,
         None => LookupOutcome::NotFound,
     }
+}
+
+/// Whether the head held for the feed is a tombstone. A read that fails
+/// counts as not: the lookup then goes on as for any feed.
+async fn held_deleted(state: &AppState, publisher: &str, salt: &str) -> bool {
+    let (db, publisher, salt) = (state.db.clone(), publisher.to_string(), salt.to_string());
+    matches!(
+        tokio::task::spawn_blocking(move || db.feed_followed(&publisher, &salt)).await,
+        Ok(Ok(Some(feed))) if feed.deleted
+    )
 }
 
 /// Whether the feed is still followed. A read that fails counts as
@@ -3502,11 +3526,14 @@ async fn auto_download(app: &tauri::AppHandle, state: &AppState, publisher: &str
     let mut started = 0;
     for item in added {
         // Held already, or on its way. A feed's files are in no library, so
-        // one this feed started before counts as held.
-        let have = downloaded.contains(&item.ed2k)
-            || elsewhere.contains_key(&item.ed2k.to_ascii_lowercase())
-            || state.local_index.read().await.get_by_hash(&item.ed2k).is_some()
-            || state.transfer_manager.read().await.has_pending_for_hash(&item.ed2k);
+        // one this feed started before counts as held. Not looked for, under
+        // two locks, when its type or a cap holds it back: `auto_choice`
+        // says so first either way.
+        let have = auto_hold_reason(&feed, item, spent).is_none()
+            && (downloaded.contains(&item.ed2k)
+                || elsewhere.contains_key(&item.ed2k.to_ascii_lowercase())
+                || state.local_index.read().await.get_by_hash(&item.ed2k).is_some()
+                || state.transfer_manager.read().await.has_pending_for_hash(&item.ed2k));
         if auto_choice(&feed, item, spent, room, have) != AutoChoice::Start {
             continue;
         }
@@ -3998,15 +4025,22 @@ async fn republish(app: &tauri::AppHandle, state: &AppState, salt: &str, now: i6
 
 /// When `feed` is next due a lookup, spread by feed so they do not all come
 /// at once. One whose last lookup reached no node is due again
-/// [`LOOKUP_RETRY_SECS`] after it, and one never found every
-/// [`WAITING_POLL_SECS`] for its first day.
+/// [`LOOKUP_RETRY_SECS`] after it, one never found every
+/// [`WAITING_POLL_SECS`] for its first day, and a deleted one every
+/// [`DELETED_POLL_SECS`].
 fn lookup_due(feed: &FollowedFeed, now: i64) -> bool {
     let spread = i64::from(u16::from_str_radix(feed.salt.get(..4).unwrap_or("0"), 16).unwrap_or(0)) % POLL_JITTER_SECS;
     let missed = missed_lookups()
         .lock()
         .get(&(feed.publisher.clone(), feed.salt.clone()))
         .is_some_and(|at| !elapsed(now, *at, LOOKUP_RETRY_SECS));
-    let interval = if waiting_fast(feed, now) { WAITING_POLL_SECS } else { POLL_SECS + spread };
+    let interval = if feed.deleted {
+        DELETED_POLL_SECS + spread
+    } else if waiting_fast(feed, now) {
+        WAITING_POLL_SECS
+    } else {
+        POLL_SECS + spread
+    };
     !missed && elapsed(now, feed.checked_at, interval)
 }
 
@@ -4113,8 +4147,9 @@ async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
     }
     retry_auto_downloads(app, state, &followed, now).await;
     followed.sort_by_key(|feed| feed.checked_at);
-    let waiting = followed.iter().filter(|feed| waiting_fast(feed, now)).count();
-    let budget = lookups_per_tick(followed.len(), waiting);
+    let waiting = followed.iter().filter(|feed| !feed.deleted && waiting_fast(feed, now)).count();
+    let deleted = followed.iter().filter(|feed| feed.deleted).count();
+    let budget = lookups_per_tick(followed.len(), waiting, deleted);
     let due: Vec<(String, String)> = followed
         .into_iter()
         .filter(|feed| lookup_due(feed, now))
@@ -4134,16 +4169,18 @@ async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
 }
 
 /// How many lookups a tick takes, of `followed` feeds of which `waiting` are
-/// looked for every [`WAITING_POLL_SECS`]: enough for each to be looked up
-/// about as often as it is due, and a few more for lookups that reached no
-/// node and those fallen behind, between [`LOOKUPS_PER_TICK_MIN`] and
+/// looked for every [`WAITING_POLL_SECS`] and `deleted` every
+/// [`DELETED_POLL_SECS`]: enough for each to be looked up about as often as
+/// it is due, and a few more for lookups that reached no node and those
+/// fallen behind, between [`LOOKUPS_PER_TICK_MIN`] and
 /// [`LOOKUPS_PER_TICK_MAX`]. A fixed three a tick fell behind past about 90
 /// feeds, and said nothing.
-fn lookups_per_tick(followed: usize, waiting: usize) -> usize {
+fn lookups_per_tick(followed: usize, waiting: usize, deleted: usize) -> usize {
     const HEADROOM: usize = 2;
-    let polled = followed.saturating_sub(waiting).div_ceil((POLL_SECS / TICK_SECS) as usize);
+    let polled = followed.saturating_sub(waiting + deleted).div_ceil((POLL_SECS / TICK_SECS) as usize);
     let waited = waiting.div_ceil((WAITING_POLL_SECS / TICK_SECS) as usize);
-    (polled + waited + HEADROOM).clamp(LOOKUPS_PER_TICK_MIN, LOOKUPS_PER_TICK_MAX)
+    let rare = deleted.div_ceil((DELETED_POLL_SECS / TICK_SECS) as usize);
+    (polled + waited + rare + HEADROOM).clamp(LOOKUPS_PER_TICK_MIN, LOOKUPS_PER_TICK_MAX)
 }
 
 /// How many of a tick's `lookups` run at once: few enough to leave the
@@ -4349,12 +4386,13 @@ mod tests {
 
     #[test]
     fn lookups_scale_with_the_feeds_followed() {
-        assert_eq!(lookups_per_tick(0, 0), LOOKUPS_PER_TICK_MIN);
-        assert_eq!(lookups_per_tick(30, 0), LOOKUPS_PER_TICK_MIN, "one a tick and the headroom");
-        assert_eq!(lookups_per_tick(90, 0), 5);
-        assert_eq!(lookups_per_tick(300, 0), 12, "each about every half hour");
-        assert_eq!(lookups_per_tick(300, 30), 9 + 10 + 2, "a feed never found is looked for every 3 minutes");
-        assert_eq!(lookups_per_tick(10_000, 0), LOOKUPS_PER_TICK_MAX);
+        assert_eq!(lookups_per_tick(0, 0, 0), LOOKUPS_PER_TICK_MIN);
+        assert_eq!(lookups_per_tick(30, 0, 0), LOOKUPS_PER_TICK_MIN, "one a tick and the headroom");
+        assert_eq!(lookups_per_tick(90, 0, 0), 5);
+        assert_eq!(lookups_per_tick(300, 0, 0), 12, "each about every half hour");
+        assert_eq!(lookups_per_tick(300, 30, 0), 9 + 10 + 2, "a feed never found is looked for every 3 minutes");
+        assert_eq!(lookups_per_tick(300, 0, 270), 1 + 1 + 2, "a deleted feed is looked up once a day");
+        assert_eq!(lookups_per_tick(10_000, 0, 0), LOOKUPS_PER_TICK_MAX);
         assert_eq!(lookups_at_once(0), 1);
         assert_eq!(lookups_at_once(3), 1);
         assert_eq!(lookups_at_once(12), 4);
@@ -5014,6 +5052,20 @@ mod tests {
         feed.followed_at = now - 600;
         feed.sequence = 5;
         assert!(!lookup_due(&feed, now), "found once: every half hour");
+    }
+
+    /// A deleted feed is looked up once a day, not every half hour.
+    #[test]
+    fn a_deleted_feed_is_looked_up_once_a_day() {
+        let now = 100 * DELETED_POLL_SECS;
+        let mut feed = followed(0, 0);
+        feed.salt = format!("{:032x}", rand::random::<u128>());
+        feed.sequence = 5;
+        feed.deleted = true;
+        feed.checked_at = now - POLL_SECS - POLL_JITTER_SECS;
+        assert!(!lookup_due(&feed, now), "not at the half hour");
+        feed.checked_at = now - DELETED_POLL_SECS - POLL_JITTER_SECS;
+        assert!(lookup_due(&feed, now));
     }
 
     /// A listing of the feed carries its head, unless the newest withdraws it;

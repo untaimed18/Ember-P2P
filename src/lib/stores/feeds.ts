@@ -127,10 +127,18 @@ function newWalk(): string {
 export function startDiscoverWalk(): DiscoverWalk {
   if (runningWalk) return runningWalk;
   const walk = newWalk();
-  lastWalkAt = Date.now();
-  const result = discoverFeeds(walk).finally(() => {
-    if (runningWalk?.walk === walk) runningWalk = null;
-  });
+  const before = lastWalkAt;
+  const startedAt = Date.now();
+  lastWalkAt = startedAt;
+  const result = discoverFeeds(walk)
+    .catch((e: unknown) => {
+      // A walk that failed does not put off the next one a visit starts.
+      if (lastWalkAt === startedAt) lastWalkAt = before;
+      throw e;
+    })
+    .finally(() => {
+      if (runningWalk?.walk === walk) runningWalk = null;
+    });
   runningWalk = { walk, result };
   return runningWalk;
 }

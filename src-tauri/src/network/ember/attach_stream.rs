@@ -363,32 +363,43 @@ where
     }
 }
 
-/// Hash the file `stamp` names and publish the result. Blocking: a read of the
-/// whole file.
-fn run_hash_job(stamp: FileStamp, tx: tokio::sync::watch::Sender<HashOutcome>) {
+/// Hash the file `stamp` names and publish the result. `expected` is the root
+/// the grant it is read for names, if any. Blocking: a read of the whole file.
+fn run_hash_job(stamp: FileStamp, tx: tokio::sync::watch::Sender<HashOutcome>, expected: Option<[u8; 32]>) {
     let outcome = hash_stamped_file(&stamp);
     #[cfg(test)]
     tests::note_hashed(&stamp.path);
     let mut cache = hash_cache().lock().unwrap_or_else(|e| e.into_inner());
+    // Only while the slot is still this job's: a newer version of the file
+    // looked up meanwhile drops it (`forget_other_versions`), and a feed tree
+    // of the old one kept now, with no idle expiry, would stay until the
+    // byte bound pushed it out.
+    let own = matches!(cache.get(&stamp), Some(HashSlot::Hashing(rx)) if rx.same_channel(&tx.subscribe()));
     let stored = match &outcome {
-        Ok(tree) => {
+        Ok(tree) if own => {
             keep_tree(&mut cache, stamp.clone(), tree.clone());
-            stamp.subtrees.then(|| tree.clone())
+            // Not one that misses the grant's root: kept on disk, it would be
+            // read back after every restart only to be doubted and read again.
+            (stamp.subtrees && expected.is_none_or(|root| tree.root_hash == root)).then(|| tree.clone())
         }
         // Not cached: the next stream tries again, and the file may be back.
-        Err(_) => {
+        Err(_) if own => {
             cache.remove(&stamp);
             None
         }
+        _ => None,
     };
     drop(cache);
-    // Before the waiting streams have their answer, so a follower served from
-    // this tree finds it kept: a write of at most 1 MiB, after a read of the
-    // whole file.
+    let _ = tx.send(Some(outcome));
+    // After the waiting streams have their answer: a write of at most 1 MiB,
+    // and on the first write a listing of the whole folder, are nothing for
+    // a follower to wait on. A follower asking again meanwhile finds the tree
+    // in the cache. The feed hash permit is held until this returns (see
+    // `attachment_tree`), so the next file's read still waits for this disk
+    // work to end, as the one-at-a-time gate means it to.
     if let Some(tree) = stored {
         store_feed_tree(&stamp, &tree);
     }
-    let _ = tx.send(Some(outcome));
 }
 
 fn hash_stamped_file(stamp: &FileStamp) -> Result<std::sync::Arc<HashTree>, String> {
@@ -661,6 +672,41 @@ fn forget_cached_tree(stamp: &FileStamp, tree: &std::sync::Arc<HashTree>) {
     }
 }
 
+/// Stamps whose file, read afresh, came to a root other than the one its
+/// grant named, with the root it came to: at most this many, any one dropped
+/// to make room. A feed file whose bytes no longer make its list's BLAKE3 was
+/// read whole on every request, each read charged to [`FEED_HASH_BUDGET`].
+const OTHER_ROOTS_MAX: usize = 1024;
+
+fn other_roots() -> &'static std::sync::Mutex<std::collections::HashMap<FileStamp, [u8; 32]>> {
+    static OTHER: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<FileStamp, [u8; 32]>>> =
+        std::sync::OnceLock::new();
+    OTHER.get_or_init(Default::default)
+}
+
+/// A fresh read of the file `stamp` describes came to `found`, not the root
+/// its grant named. Only a fresh read: a tree from the cache may be of bytes
+/// from before a rewrite the stamp could not see, and is read again once.
+fn note_read_to_other_root(stamp: &FileStamp, found: [u8; 32]) {
+    let mut other = other_roots().lock().unwrap_or_else(|e| e.into_inner());
+    if other.len() >= OTHER_ROOTS_MAX && !other.contains_key(stamp) {
+        if let Some(any) = other.keys().next().cloned() {
+            other.remove(&any);
+        }
+    }
+    other.insert(stamp.clone(), found);
+}
+
+/// Whether the file `stamp` describes was read afresh and came to a root
+/// other than `root`.
+fn read_to_other_root(stamp: &FileStamp, root: &[u8; 32]) -> bool {
+    other_roots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(stamp)
+        .is_some_and(|found| found != root)
+}
+
 /// The hash tree for the file `stamp` describes: from the cache, from a job
 /// already running, or from a new job this call starts. The flag is true for a
 /// tree that came straight from the cache, which is the only kind worth
@@ -672,9 +718,11 @@ fn forget_cached_tree(stamp: &FileStamp, tree: &std::sync::Arc<HashTree>) {
 ///
 /// `permit`, a feed stream's leave to hash, is held by the job it starts, so
 /// the next waits for the read to end rather than for the stream to.
+/// `expected` is the root the grant names, if any.
 async fn attachment_tree(
     stamp: FileStamp,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    expected: Option<[u8; 32]>,
 ) -> Result<(std::sync::Arc<HashTree>, bool), String> {
     let mut rx = match lookup_hash(&stamp) {
         HashLookup::Ready(tree) => return Ok((tree, true)),
@@ -682,7 +730,7 @@ async fn attachment_tree(
         HashLookup::Start(tx, rx) => {
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                run_hash_job(stamp, tx)
+                run_hash_job(stamp, tx, expected)
             });
             rx
         }
@@ -704,7 +752,7 @@ pub fn prewarm_attachment_hash(path: &std::path::Path) {
         return;
     };
     if let HashLookup::Start(tx, _rx) = lookup_hash(&stamp) {
-        run_hash_job(stamp, tx);
+        run_hash_job(stamp, tx, None);
     }
 }
 
@@ -718,7 +766,7 @@ pub fn hash_for_serving(path: &std::path::Path) -> Result<std::sync::Arc<HashTre
     match lookup_hash(&stamp) {
         HashLookup::Ready(tree) => Ok(tree),
         HashLookup::Start(tx, rx) => {
-            run_hash_job(stamp, tx);
+            run_hash_job(stamp, tx, None);
             let outcome = rx.borrow().clone();
             outcome.unwrap_or_else(|| Err("attachment hash job went away".into()))
         }
@@ -809,6 +857,19 @@ fn held_source_unopened(path: &std::path::Path, error: &std::io::Error) -> HeldS
     } else {
         HeldSource::Unreadable
     }
+}
+
+/// Whether a file to be served could not be opened for a passing reason:
+/// another program has it open without sharing it (Windows' sharing and lock
+/// violations), or the open would block, timed out or was interrupted. Not
+/// found, a permission refused and a path outside the folders served are not.
+fn open_failed_for_now(error: &std::io::Error) -> bool {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted
+    ) || (cfg!(windows) && matches!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)))
 }
 
 /// Whether the drive or share holding `path` can be listed, `D:\` or
@@ -1217,7 +1278,14 @@ where
     let (file, stamp) = match opened {
         Ok(Ok(opened)) => opened,
         Ok(Err(e)) => {
-            refuse(send, AttachStreamStatus::SourceGone).await?;
+            // A feed's follower takes gone as for good, so a file only held
+            // open by another program just now is busy: asked again later.
+            let status = if subtrees && open_failed_for_now(&e) {
+                AttachStreamStatus::Busy
+            } else {
+                AttachStreamStatus::SourceGone
+            };
+            refuse(send, status).await?;
             return Err(e.into());
         }
         Err(e) => {
@@ -1229,13 +1297,19 @@ where
         refuse(send, AttachStreamStatus::SourceGone).await?;
         anyhow::bail!("attachment on disk no longer matches the offer");
     }
+    // These bytes, as far as the stamp can tell, were read afresh already and
+    // came to another root: reading them again would only come to it again.
+    if root.is_some_and(|root| read_to_other_root(&stamp, &root)) {
+        refuse(send, AttachStreamStatus::SourceGone).await?;
+        anyhow::bail!("attachment on disk no longer matches the offer");
+    }
     let matches = |tree: &HashTree| tree.file_size == size && root.is_none_or(|root| tree.root_hash == root);
     // Anyone with a feed's link may ask, so a feed file read for its list waits
     // its turn and its share of an hour's budget; past that it is refused as
     // busy, and the follower asks again later and the rest of the network
     // meanwhile.
     let permit = if subtrees && !tree_known(&stamp) { feed_read_leave(send, &stamp).await? } else { None };
-    let mut hashed = attachment_tree(stamp.clone(), permit).await;
+    let mut hashed = attachment_tree(stamp.clone(), permit, root).await;
     // A cached tree that disagrees with the grant may be describing bytes the
     // stamp could not tell apart from the current ones. One fresh read settles
     // it before the file is refused. With no root granted, only a size can
@@ -1247,12 +1321,15 @@ where
         if !matches(tree) && root.is_some() {
             forget_cached_tree(&stamp, tree);
             let permit = if subtrees { feed_read_leave(send, &stamp).await? } else { None };
-            hashed = attachment_tree(stamp, permit).await;
+            hashed = attachment_tree(stamp.clone(), permit, root).await;
         }
     }
     let tree = match hashed {
         Ok((tree, _)) if matches(&tree) => tree,
-        Ok(_) => {
+        Ok((tree, cached)) => {
+            if !cached && root.is_some() {
+                note_read_to_other_root(&stamp, tree.root_hash);
+            }
             refuse(send, AttachStreamStatus::SourceGone).await?;
             anyhow::bail!("attachment on disk no longer matches the offer");
         }
@@ -1839,7 +1916,7 @@ mod tests {
         std::fs::write(&source, &data).expect("write");
         let stamp = FileStamp::of(&source, &std::fs::File::open(&source).expect("open"))
             .expect("stamp");
-        let (a, b) = tokio::join!(attachment_tree(stamp.clone(), None), attachment_tree(stamp, None));
+        let (a, b) = tokio::join!(attachment_tree(stamp.clone(), None, None), attachment_tree(stamp, None, None));
         let expected = HashTree::from_data(&data).root_hash;
         assert_eq!(a.expect("first").0.root_hash, expected);
         assert_eq!(b.expect("second").0.root_hash, expected);
@@ -3231,6 +3308,9 @@ mod tests {
 
         let ours = |key: &FileStamp| key.subtrees && key.path.file_name() == Some(name.as_os_str());
         let stamp = hash_cache().lock().unwrap().keys().find(|key| ours(key)).cloned().expect("cached");
+        // The job keeps the tree after answering, while it still holds the
+        // hashing slot.
+        drop(feed_hash_gate().acquire().await.expect("the hashing slot"));
         assert!(feed_tree_file(dir, &stamp).exists(), "kept on disk");
         hash_cache().lock().unwrap().retain(|key, _| !ours(key));
 
@@ -3244,6 +3324,113 @@ mod tests {
         );
         assert!(tree_known(&stamp), "and cached again");
         let _ = std::fs::remove_file(feed_tree_file(dir, &stamp));
+        let _ = std::fs::remove_file(&source);
+    }
+
+    /// Ask for `source`, served as a feed file whose list names `blake3`, and
+    /// read only the answer to the request.
+    #[allow(clippy::await_holding_lock)]
+    async fn feed_request(source: &Path, size: u64, blake3: [u8; 32]) -> Result<AttachFileInfo, FetchError> {
+        let _approved = approve_feed_files();
+        let (mut client_w, mut server_r) = tokio::io::duplex(1 << 20);
+        let (mut server_w, mut client_r) = tokio::io::duplex(1 << 20);
+        let path = source.to_path_buf();
+        let server = tokio::spawn(async move {
+            let mut prefix = [0u8; 7];
+            server_r.read_exact(&mut prefix).await?;
+            let roots = vec![feed_files_dir().to_string_lossy().into_owned()];
+            serve_feed_stream(
+                &mut server_r,
+                &mut server_w,
+                &prefix,
+                |_| Ok(FeedGrant { path, size, blake3, capability: [8; 32], roots }),
+                |_| Ok::<(), AttachStreamStatus>(()),
+                |_, _, _| true,
+                None,
+            )
+            .await
+        });
+        let asked = request_chunks(
+            super::super::attach::FEED_STREAM_MSG_TYPE,
+            &mut client_r,
+            &mut client_w,
+            &[5u8; 16],
+            &[8; 32],
+            size,
+            0,
+            ATTACH_STATUS_TIMEOUT,
+        )
+        .await;
+        drop((client_r, client_w));
+        let _ = server.await;
+        asked
+    }
+
+    /// A feed file whose bytes no longer make the BLAKE3 its list names is
+    /// read once to learn so, not on every request, and that tree is not kept
+    /// on disk to be doubted after every restart. A list naming the BLAKE3 it
+    /// does make is served from the tree read.
+    #[tokio::test]
+    async fn a_feed_file_that_misses_its_lists_blake3_is_read_once() {
+        let dir = keep_feed_trees();
+        let data: Vec<u8> = (0..ATTACH_CHUNK_SIZE * 2 + 3).map(|i| (i % 37) as u8).collect();
+        let size = data.len() as u64;
+        let source = feed_source("feed-other-root");
+        std::fs::write(&source, &data).expect("write");
+        let name = source.file_name().expect("name").to_owned();
+        for _ in 0..3 {
+            let refused = feed_request(&source, size, [0xAB; 32]).await;
+            assert!(matches!(refused, Err(FetchError::Refused(AttachStreamStatus::SourceGone))));
+        }
+        assert_eq!((times_named(&HASHED, &name), times_named(&CHARGED, &name)), (1, 1), "read and charged once");
+
+        let ours = |key: &FileStamp| key.subtrees && key.path.file_name() == Some(name.as_os_str());
+        let stamp = hash_cache().lock().unwrap().keys().find(|key| ours(key)).cloned().expect("cached");
+        drop(feed_hash_gate().acquire().await.expect("the hashing slot"));
+        assert!(!feed_tree_file(dir, &stamp).exists(), "not kept on disk");
+
+        let (_, got) = feed_round_trip(Some(&source), size, [8; 32], [8; 32], 0).await.expect("served");
+        assert_eq!(got, data);
+        assert_eq!(times_named(&HASHED, &name), 1, "from the tree read");
+        hash_cache().lock().unwrap().retain(|key, _| !ours(key));
+        let _ = std::fs::remove_file(&source);
+    }
+
+    /// A file another program holds open just now is busy to a follower, who
+    /// asks again; one that is not there, or may not be read, is gone.
+    #[test]
+    fn only_a_passing_open_failure_is_busy() {
+        use std::io::{Error, ErrorKind};
+        for kind in [ErrorKind::WouldBlock, ErrorKind::TimedOut, ErrorKind::Interrupted] {
+            assert!(open_failed_for_now(&Error::from(kind)), "{kind:?}");
+        }
+        for kind in [ErrorKind::NotFound, ErrorKind::PermissionDenied, ErrorKind::InvalidInput] {
+            assert!(!open_failed_for_now(&Error::from(kind)), "{kind:?}");
+        }
+        assert_eq!(open_failed_for_now(&Error::from_raw_os_error(32)), cfg!(windows), "sharing violation");
+        assert_eq!(open_failed_for_now(&Error::from_raw_os_error(33)), cfg!(windows), "lock violation");
+    }
+
+    /// A hash of a version looked past while it ran answers the streams that
+    /// waited on it, and is not kept: nothing would ask for it again.
+    #[test]
+    fn a_hash_of_a_version_since_replaced_is_not_kept() {
+        let _own = isolate_hash_cache();
+        let source = temp_path("src-replaced");
+        std::fs::write(&source, b"the older bytes").expect("write");
+        let stamp = FileStamp {
+            subtrees: true,
+            ..FileStamp::of(&source, &std::fs::File::open(&source).expect("open")).expect("stamp")
+        };
+        let HashLookup::Start(tx, rx) = lookup_hash(&stamp) else {
+            panic!("nobody is hashing it yet");
+        };
+        let newer = FileStamp { changed: stamp.changed.wrapping_add(1), ..stamp.clone() };
+        assert!(matches!(lookup_hash(&newer), HashLookup::Start(..)), "its slot goes for the newer version");
+        run_hash_job(stamp.clone(), tx, None);
+        assert!(rx.borrow().as_ref().is_some_and(Result::is_ok), "answered");
+        assert!(!tree_known(&stamp), "not kept");
+        assert!(tree_known(&newer), "the newer version's job is left alone");
         let _ = std::fs::remove_file(&source);
     }
 
