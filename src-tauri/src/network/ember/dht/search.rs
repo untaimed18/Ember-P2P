@@ -49,7 +49,7 @@ const SEARCH_TIMEOUT_SECS: u64 = 60;
 /// something new is charged: a file the search does not have yet for a keyword
 /// record, and every record for anything else, since the source records under
 /// one file's key all name that same file and each is a different source.
-const MAX_SEARCH_RESULTS: usize = 300;
+pub const MAX_SEARCH_RESULTS: usize = 300;
 
 /// Blobs a search will hold while reaching for [`MAX_SEARCH_RESULTS`].
 ///

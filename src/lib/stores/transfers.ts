@@ -21,6 +21,7 @@ import {
 } from './transferRows';
 import { formatBytes, withTimeout } from '$lib/utils';
 import { notify, shouldNotify } from '$lib/notifications';
+import { noteDelivery, noteUiActivity, timedUiActivity } from '$lib/uiStall';
 import { transferFailureReasonText } from '$lib/i18n';
 import * as m from '$lib/paraglide/messages';
 
@@ -337,6 +338,27 @@ interface PendingProgress {
 }
 const pendingProgress = new Map<string, PendingProgress>();
 const ORPHAN_PROGRESS_TTL_MS = 5000;
+/** How soon progress with no row yet is looked at again. Not every frame: a
+ *  feed's download never gets a row here, and retrying its progress each frame
+ *  for as long as it downloaded kept the window rendering flat out. A row
+ *  arriving meanwhile picks it up at the flush that adds it. */
+const ORPHAN_RETRY_MS = 500;
+let orphanRetry: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleOrphanRetry() {
+  if (orphanRetry !== null) return;
+  orphanRetry = setTimeout(() => {
+    orphanRetry = null;
+    if (pendingProgress.size > 0) scheduleProgressFlush();
+  }, ORPHAN_RETRY_MS);
+}
+
+function cancelOrphanRetry() {
+  if (orphanRetry !== null) {
+    clearTimeout(orphanRetry);
+    orphanRetry = null;
+  }
+}
 let progressFlushScheduled = false;
 // Handles for the pending flush so `cleanupTransferStore` can cancel a frame
 // that would otherwise fire after teardown.
@@ -551,7 +573,7 @@ function flushPendingTransfers() {
         retained = true;
       }
     }
-    if (retained) scheduleProgressFlush();
+    if (retained) scheduleOrphanRetry();
   }
   commitTransfers(list);
 }
@@ -712,7 +734,10 @@ export async function initTransferStore() {
     handler: Parameters<typeof listen<T>>[1],
   ): Promise<void> => {
     try {
-      const unlisten = await listen<T>(event, handler);
+      const unlisten = await listen<T>(event, (delivered) => {
+        noteDelivery(event);
+        return handler(delivered);
+      });
       registered.push(unlisten);
     } catch (e) {
       for (const u of registered) {
@@ -769,7 +794,7 @@ export async function initTransferStore() {
       });
       scheduleProgressFlush();
     });
-    await safeListen<TransferEventPayload>('transfer-complete', (event) => {
+    await safeListen<TransferEventPayload>('transfer-complete', (event) => timedUiActivity(`transfer-complete ${event.payload.direction ?? ''}`, () => {
       markEventUpdate();
       flushPendingTransfers();
       const { id, direction } = event.payload;
@@ -829,8 +854,8 @@ export async function initTransferStore() {
           };
         }]]));
       }
-    });
-    await safeListen<TransferEventPayload>('transfer-failed', (event) => {
+    }));
+    await safeListen<TransferEventPayload>('transfer-failed', (event) => timedUiActivity(`transfer-failed ${event.payload.direction ?? ''}`, () => {
       markEventUpdate();
       flushPendingTransfers();
       const { id, error, failure_code, failure_kind, failure_stage, direction } = event.payload;
@@ -876,7 +901,7 @@ export async function initTransferStore() {
           };
         }]]));
       }
-    });
+    }));
     const onStatus = (payload: StatusEventPayload, receivedAt: number) => {
       const { id, failure_code } = payload;
       // A cancel that did not originate on this page arrives here rather than
@@ -1262,6 +1287,7 @@ export function cleanupTransferStore() {
   // Cancel any flush queued for the next frame/tick so it can't run against a
   // store we've just reset (or a subsequently re-initialised one).
   cancelScheduledFlush();
+  cancelOrphanRetry();
   pendingRowOps.clear();
   backendSnapshot = { epoch: null, revision: 0, rows: new Map() };
   reconciledRows = new WeakSet();
@@ -1349,7 +1375,11 @@ export function startTransferPoll() {
       // poll's snapshot was already in flight when a pause/stop/insufficient
       // transition landed (see `reversibleStateEnteredAt`), not just whether
       // the poll resolved before or after — it always resolves after.
+      const started = performance.now();
+      noteUiActivity('transfers refresh');
       await syncFromBackend(Date.now());
+      const took = performance.now() - started;
+      if (took >= 500) noteUiActivity(`transfers refresh took ${Math.round(took)} ms`);
     } catch {
       // Ignore timeouts and errors
     }

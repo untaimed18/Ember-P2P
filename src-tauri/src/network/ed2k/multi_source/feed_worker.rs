@@ -402,6 +402,11 @@ impl FeedWorker {
 }
 
 #[cfg(test)]
+// `test_registry_lock` is held across the awaits on purpose: it serialises
+// tests that swap the process-global approved-root registry, and the part file
+// is opened asynchronously. Current-thread runtimes, so no executor thread is
+// stranded.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
 

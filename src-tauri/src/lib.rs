@@ -2718,6 +2718,8 @@ pub fn run() {
             commands::system::get_runtime_status,
             commands::system::read_clipboard_text,
             commands::system::write_clipboard_text,
+            commands::system::ui_ping,
+            commands::system::log_ui_stall,
             commands::deeplink::list_pending_deep_links,
             commands::deeplink::ack_pending_deep_link,
             commands::deeplink::preview_deep_link,

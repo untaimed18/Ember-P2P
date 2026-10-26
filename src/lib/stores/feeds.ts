@@ -44,8 +44,9 @@ export async function initFeedsStore(): Promise<void> {
   let registered: UnlistenFn;
   try {
     registered = await listen<FeedsChangedEvent>(FEEDS_CHANGED_EVENT, (event) => {
-      void refreshFollowedFeeds();
-      const { added, title } = event.payload ?? {};
+      const { publisher, salt, added, title } = event.payload ?? {};
+      // One naming only a salt is of a feed of ours.
+      if (publisher || !salt) void refreshFollowedFeeds();
       // `notify` stays quiet while the user is looking at Ember.
       if (added && added > 0) {
         void notify('feed_update', m.feeds_notify_new({ title: title?.trim() || m.feeds_untitled(), count: formatNumber(added) }));

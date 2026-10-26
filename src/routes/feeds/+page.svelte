@@ -42,12 +42,22 @@
     type LookupOutcome,
     type OwnFeed,
   } from '$lib/api/feeds';
-  import { AUTO_MIB_MAX, capMib, concernsFollowed, draftOf, sameDraft, type FeedDraft } from '$lib/feedsPage';
+  import {
+    AUTO_MIB_MAX,
+    capMib,
+    concernsFollowed,
+    draftOf,
+    sameDraft,
+    withLiveProgress,
+    type FeedDraft,
+    type LiveProgress,
+  } from '$lib/feedsPage';
   import type { FileInfo } from '$lib/types';
   import FeedFilePicker from '$lib/components/FeedFilePicker.svelte';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import IconX from '$lib/components/IconX.svelte';
   import { followedFeed, followedFeeds, followedFeedsFailed, followedFeedsLoaded, refreshFollowedFeeds } from '$lib/stores/feeds';
+  import { noteUiActivity } from '$lib/uiStall';
   import { appSettings } from '$lib/stores/settings';
   import { addActionToast, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
   import { menuKeydown } from '$lib/a11y';
@@ -360,6 +370,14 @@
 
   let itemsSeq = 0;
   let itemsFor = '';
+  /** The open feed's downloads, whose transfer events it shows. */
+  let itemTransferIds = $derived(new Set(items.flatMap((i) => (i.transfer ? [i.transfer.id] : []))));
+  /** How often the open feed's rows take in their downloads' progress. */
+  const LIVE_PROGRESS_MS = 500;
+  /** How long after a download of the open feed ends its files are read
+   *  again, so several ending together are read once. */
+  const SETTLED_RELOAD_MS = 300;
+
   /** `quiet` for the refresh that keeps a list's progress current: no
    *  spinner, no toast. */
   async function loadItems(feed: FollowedFeed | null, quiet = false) {
@@ -378,6 +396,7 @@
     try {
       const rows = await getFeedItems(feed.publisher, feed.salt);
       if (seq !== itemsSeq) return;
+      noteUiActivity(`feed items ${rows.length}${quiet ? ' (refresh)' : ''}`);
       // What was new stays shown as new while the feed stays open, though
       // opening it marks it read.
       const wasNew = new Set(itemsFor === keyOf(feed) ? items.filter((i) => i.is_new).map((i) => i.ed2k) : []);
@@ -1060,6 +1079,26 @@
     return q ? mine.filter((f) => f.title.toLowerCase().includes(q)) : mine;
   });
 
+  function followersText({ count, at_least }: { count: number; at_least: boolean }): string {
+    if (at_least) return m.feeds_followers({ count: `${formatNumber(count)}+` });
+    return plural(count, {
+      one: () => m.feeds_followers_one(),
+      other: () => m.feeds_followers({ count: formatNumber(count) }),
+    });
+  }
+
+  /** Followers who downloaded the file from this identity. */
+  function downloadsOf(feed: OwnFeed, ed2k: string): number {
+    return feed.downloads[ed2k.toLowerCase()] ?? 0;
+  }
+
+  function downloadsText(count: number): string {
+    return plural(count, {
+      one: () => m.feeds_item_downloads_one(),
+      other: () => m.feeds_item_downloads({ count: formatNumber(count) }),
+    });
+  }
+
   let mineSeq = 0;
   let mineShownSeq = 0;
   /** The user's feeds, shown unless a later load has answered first.
@@ -1323,6 +1362,44 @@
       if (alive) unlistenFound = fn;
       else fn();
     });
+    // The open feed's downloads move as their bytes arrive, between polls,
+    // and show done or failed as soon as they are.
+    const live = new Map<string, LiveProgress>();
+    let liveTimer: ReturnType<typeof setTimeout> | null = null;
+    const takeLive = () => {
+      liveTimer = null;
+      const next = withLiveProgress(items, live);
+      live.clear();
+      if (next !== items) items = next;
+    };
+    let settledTimer: ReturnType<typeof setTimeout> | null = null;
+    const reloadSettled = () => {
+      if (settledTimer) return;
+      settledTimer = setTimeout(() => {
+        settledTimer = null;
+        const feed = selected;
+        if (feed && itemsFor === keyOf(feed)) void loadItems(feed, true);
+      }, SETTLED_RELOAD_MS);
+    };
+    const unlistenTransfers: UnlistenFn[] = [];
+    const listenTransfers = <T,>(event: string, handler: (payload: T) => void) =>
+      void listen<T>(event, (e) => handler(e.payload)).then((fn) => {
+        if (alive) unlistenTransfers.push(fn);
+        else fn();
+      });
+    listenTransfers<{ id: string; direction?: string; completed_size?: number; downloaded: number; speed: number }>(
+      'transfer-progress',
+      (p) => {
+        if (!p || p.direction === 'upload' || tab !== 'following' || !itemTransferIds.has(p.id)) return;
+        live.set(p.id, { done: p.completed_size ?? p.downloaded, speed: p.speed });
+        liveTimer ??= setTimeout(takeLive, LIVE_PROGRESS_MS);
+      },
+    );
+    for (const event of ['transfer-complete', 'transfer-failed']) {
+      listenTransfers<{ id: string }>(event, (p) => {
+        if (p && tab === 'following' && itemTransferIds.has(p.id)) reloadSettled();
+      });
+    }
     // Seen once the user comes back to Ember.
     const onFocus = () => void markShownRead();
     window.addEventListener('focus', onFocus);
@@ -1363,6 +1440,9 @@
       alive = false;
       unlisten?.();
       unlistenFound?.();
+      for (const fn of unlistenTransfers) fn();
+      if (liveTimer) clearTimeout(liveTimer);
+      if (settledTimer) clearTimeout(settledTimer);
       clearInterval(clock);
       clearInterval(poll);
       window.removeEventListener('focus', onFocus);
@@ -2159,6 +2239,7 @@
                   {feed.published_at > 0
                     ? m.feeds_published_short({ when: ago(feed.published_at) })
                     : m.feeds_items_count({ count: formatNumber(feed.items.length) })}
+                  {#if feed.followers && feed.published_at > 0}<span aria-hidden="true"> · </span>{followersText(feed.followers)}{/if}
                   {#if feed.listed && feed.published_at > 0}<span aria-hidden="true"> · </span>{m.feeds_badge_listed()}{/if}
                 </span>
               </span>
@@ -2202,6 +2283,12 @@
                 <span aria-hidden="true">·</span>
                 <span>{m.feeds_items_count({ count: formatNumber(editItems.length) })}</span>
                 {#if editSize > 0}<span aria-hidden="true">·</span><span>{formatBytes(editSize)}</span>{/if}
+                {#if mineFeed.published_at > 0 && mineFeed.followers}
+                  <span aria-hidden="true">·</span>
+                  <span class="has-hint" title={m.feeds_followers_hint({ when: ago(mineFeed.followers.checked_at) })}>
+                    {followersText(mineFeed.followers)}
+                  </span>
+                {/if}
                 {#if dirty}<span aria-hidden="true">·</span><span class="unsaved">{m.feeds_unsaved()}</span>{/if}
               </p>
             </div>
@@ -2312,6 +2399,7 @@
             {/if}
             {#each editItems as item, i (item.ed2k)}
               {@const type = typeOf(item.name)}
+              {@const downloads = downloadsOf(mineFeed, item.ed2k)}
               <div class="file-row">
                 <span class="file-index" aria-hidden="true">{i + 1}</span>
                 {@render fileIcon(type)}
@@ -2320,6 +2408,10 @@
                   <span class="file-meta">
                     <span>{formatBytes(item.size)}</span>
                     {#if type}<span aria-hidden="true">·</span><span>{fileTypeFilterLabel(type)}</span>{/if}
+                    {#if downloads > 0}
+                      <span aria-hidden="true">·</span>
+                      <span class="has-hint" title={m.feeds_item_downloads_hint()}>{downloadsText(downloads)}</span>
+                    {/if}
                   </span>
                   <input
                     type="text"
@@ -3345,6 +3437,13 @@
     font-size: var(--font-size-xs);
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
+  }
+
+  .has-hint {
+    cursor: help;
+    text-decoration: underline dotted;
+    text-decoration-color: color-mix(in srgb, currentColor 45%, transparent);
+    text-underline-offset: 2px;
   }
 
   .file-note {

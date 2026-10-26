@@ -241,6 +241,13 @@ impl Database {
                 note TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (salt, ed2k)
             );
+            CREATE TABLE IF NOT EXISTS feeds_own_downloads (
+                salt TEXT NOT NULL,
+                ed2k TEXT NOT NULL,
+                follower TEXT NOT NULL,
+                at INTEGER NOT NULL,
+                PRIMARY KEY (salt, ed2k, follower)
+            );
             CREATE TABLE IF NOT EXISTS feeds_followed (
                 publisher TEXT NOT NULL,
                 salt TEXT NOT NULL,
@@ -630,9 +637,47 @@ impl Database {
             params![salt, now - listing_ttl],
         )?;
         tx.execute("DELETE FROM feeds_own_items WHERE salt = ?1", params![salt])?;
+        tx.execute("DELETE FROM feeds_own_downloads WHERE salt = ?1", params![salt])?;
         tx.execute("DELETE FROM feeds_own WHERE salt = ?1", params![salt])?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Note followers who downloaded files of our feeds from us:
+    /// `(salt, ed2k, follower)`, lowercase hex, at `now`. Each follower counts
+    /// once per file, however often they fetch it again.
+    pub fn feed_own_note_downloads(&self, downloads: &[(String, String, String)], now: i64) -> anyhow::Result<()> {
+        if downloads.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        Self::ensure_feeds_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut insert = tx.prepare(
+                "INSERT OR IGNORE INTO feeds_own_downloads (salt, ed2k, follower, at)
+                 SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM feeds_own WHERE salt = ?1)",
+            )?;
+            for (salt, ed2k, follower) in downloads {
+                insert.execute(params![salt, ed2k, follower, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// How many followers downloaded each file of a feed of ours from us, by
+    /// lowercase eD2K hash.
+    pub fn feed_own_download_counts(&self, salt: &str) -> anyhow::Result<std::collections::HashMap<String, u32>> {
+        let conn = self.conn.lock();
+        Self::ensure_feeds_locked(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT ed2k, COUNT(*) FROM feeds_own_downloads WHERE salt = ?1 GROUP BY ed2k",
+        )?;
+        let rows = stmt
+            .query_map(params![salt], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().map(|(ed2k, n)| (ed2k, u32::try_from(n).unwrap_or(u32::MAX))).collect())
     }
 
     /// List a feed of ours in the public index, or take it out. `false` when
@@ -1479,6 +1524,22 @@ mod tests {
         db.feed_own_delete("s1", 10, 100).unwrap();
         assert!(db.feed_own("s1").unwrap().is_none());
         assert!(db.feed_own_items("s1").unwrap().is_empty());
+        drop_db(db, path);
+    }
+
+    #[test]
+    fn each_follower_counts_once_per_file_and_only_for_a_feed_we_have() {
+        let (db, path) = db("downloads");
+        assert!(db.feed_own_create("s", "One", "", false, 1, 2).unwrap());
+        let row = |salt: &str, ed2k: &str, follower: &str| (salt.to_string(), ed2k.to_string(), follower.to_string());
+        db.feed_own_note_downloads(&[row("s", "a", "f1"), row("s", "a", "f2"), row("s", "b", "f1"), row("gone", "a", "f3")], 5)
+            .unwrap();
+        db.feed_own_note_downloads(&[row("s", "a", "f1")], 6).unwrap();
+        let counts = db.feed_own_download_counts("s").unwrap();
+        assert_eq!((counts.get("a"), counts.get("b"), counts.len()), (Some(&2), Some(&1), 2), "f1 fetched a twice");
+        assert!(db.feed_own_download_counts("gone").unwrap().is_empty(), "no such feed of ours");
+        db.feed_own_delete("s", 10, 100).unwrap();
+        assert!(db.feed_own_download_counts("s").unwrap().is_empty(), "deleted with the feed");
         drop_db(db, path);
     }
 

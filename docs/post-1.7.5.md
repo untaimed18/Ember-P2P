@@ -384,6 +384,21 @@ for files up to 8 GiB. The hold ends when the lookup finds no record of
 theirs, the stream fails or is refused, or 45 s pass with no byte, and every
 network is then asked at once (`FindSources`).
 
+**Followers and downloads.** The editor shows a published feed's followers
+and each file's downloads. Followers: the distinct signers, ours aside, of
+source records for the feed's current list and the two before it, one lookup
+per list (a lookup's further keys narrow it to records naming all of them),
+shown with a "+" when a lookup comes back full, one feed at a time every 30
+minutes (2 after a lookup no node answered), held
+in memory only (`count_due_followers`). Downloads: a follower's node id once
+the feed stream reached the end of the file and the follower acknowledged it
+(QUIC stream finish, or the TCP stream's delivery ack), noted by the serving
+side (`feed_direct::note_downloaded`), which wakes the feeds service to save
+it to `feeds_own_downloads` at once, one row per follower per file, deleted
+with the feed.
+The followed side's rows take in `transfer-progress` every 500 ms and reload
+on `transfer-complete` or `transfer-failed`, besides the 4 s poll.
+
 **Publishing.** "Add to feed…" on Library rows (the selection or one file),
 and a feed editor with title, description, reordering and removal.
 Publishing bumps `sequence`, rebuilds the list and republishes the head.

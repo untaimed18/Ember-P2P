@@ -1,5 +1,37 @@
 import { describe, expect, it } from 'vitest';
-import { AUTO_MIB_MAX, capMib, concernsFollowed, draftOf, sameDraft, type FeedDraft } from './feedsPage';
+import { AUTO_MIB_MAX, capMib, concernsFollowed, draftOf, sameDraft, withLiveProgress, type FeedDraft } from './feedsPage';
+
+describe('withLiveProgress', () => {
+  const row = (id: string | null, done = 0, speed = 0) => ({
+    ed2k: id ?? 'none',
+    size: 1000,
+    progress: done / 10,
+    transfer: id ? { id, done, speed, sources: 3 } : null,
+  });
+
+  it('takes in the figures for rows downloading, and only theirs', () => {
+    const items = [row('a', 100, 5), row('b', 200, 5), row(null)];
+    const next = withLiveProgress(items, new Map([['a', { done: 400, speed: 9 }]]));
+    expect(next).not.toBe(items);
+    expect(next[0]).toMatchObject({ progress: 40, transfer: { id: 'a', done: 400, speed: 9, sources: 3 } });
+    expect(next[1]).toBe(items[1]);
+    expect(next[2]).toBe(items[2]);
+  });
+
+  it('keeps the same rows when nothing changes, so nothing redraws', () => {
+    const items = [row('a', 100, 5)];
+    expect(withLiveProgress(items, new Map([['a', { done: 100, speed: 5 }]]))).toBe(items);
+    expect(withLiveProgress(items, new Map([['other', { done: 900, speed: 1 }]]))).toBe(items);
+    expect(withLiveProgress(items, new Map())).toBe(items);
+  });
+
+  it('never shows more than the file or less than nothing', () => {
+    const [over] = withLiveProgress([row('a')], new Map([['a', { done: 5000, speed: 1 }]]));
+    expect(over).toMatchObject({ progress: 100, transfer: { done: 1000 } });
+    const [under] = withLiveProgress([row('a', 10)], new Map([['a', { done: -1, speed: 0 }]]));
+    expect(under).toMatchObject({ progress: 0, transfer: { done: 0 } });
+  });
+});
 
 describe('capMib', () => {
   it('saves an emptied, negative or fractional field as a whole number from 0', () => {

@@ -63,7 +63,7 @@
     addActionToast, addToast, clearAllToasts, onPendingUndoChange, toastError, toastSuccess, toastWarning,
   } from '$lib/stores/toast';
   import { backupReminderDue, noteBackupReminderShown } from '$lib/backupReminder';
-  import { goto } from '$app/navigation';
+  import { afterNavigate, goto } from '$app/navigation';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { confirmDroppedFolders, dismissDroppedFolders } from '$lib/api/sharing';
   import { takePendingDownloadOverflowNotice } from '$lib/api/transfers';
@@ -78,10 +78,12 @@
   import { initChatPopoutMain } from '$lib/chatPopout';
   import { applyUpdateResume, initUpdateResume } from '$lib/updateResume';
   import { isChatWindow } from '$lib/windowRole';
+  import { noteUiActivity, startStallDetector } from '$lib/uiStall';
 
   /** This document is the popped-out chat window, which draws the chat and
    *  nothing else of the shell. Fixed for the life of the document. */
   const chatWindow = isChatWindow();
+  afterNavigate((nav) => noteUiActivity(`opened ${nav.to?.url.pathname.replace(/^\/+/, '') || 'home'}`));
 
   // Sync `<html lang>` to the active Paraglide locale on every
   // mount. Paraglide's strategy chain (localStorage →
@@ -326,6 +328,7 @@
     // The chat window's shell starts what it needs itself.
     if (chatWindow) return;
     initTheme();
+    const stopStallDetector = startStallDetector();
     const splashStartedAt = performance.now();
     // The splash exists to mask the first paint, not to delay it. Once
     // the stores have initialized we want the app visible immediately;
@@ -852,6 +855,7 @@
       stopActivityReporting();
       if (stopPoll) stopPoll();
       if (stopTransferPoll) stopTransferPoll();
+      stopStallDetector();
       cleanupTheme();
       cleanupNetworkStore();
       cleanupTransferStore();

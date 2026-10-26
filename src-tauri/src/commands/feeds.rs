@@ -247,19 +247,190 @@ pub struct OwnFeedInfo {
     pub publisher: String,
     pub link: String,
     pub items: Vec<FeedItem>,
+    /// Its followers, once counted (see [`count_followers`]).
+    pub followers: Option<FollowerCount>,
+    /// Followers who downloaded each file from us, by lowercase eD2K hash.
+    pub downloads: HashMap<String, u32>,
 }
 
 async fn own_feed_info(state: &AppState, feed: OwnFeed) -> Result<OwnFeedInfo, String> {
     let salt = hex_salt(&feed.salt)?;
     let db = state.db.clone();
     let key = feed.salt.clone();
-    let items = blocking(move || db.feed_own_items(&key), "feeds_failed", "Could not read feeds").await?;
+    let (items, downloads) = blocking(
+        move || Ok((db.feed_own_items(&key)?, db.feed_own_download_counts(&key)?)),
+        "feeds_failed",
+        "Could not read feeds",
+    )
+    .await?;
+    let followers = follower_counts().lock().get(&feed.salt).and_then(|held| held.count);
     Ok(OwnFeedInfo {
         publisher: hex::encode(state.identity.ed25519_public_key),
         link: link_for(&state.identity.ed25519_public_key, &salt),
         feed,
         items,
+        followers,
+        downloads,
     })
+}
+
+/// How often a published feed's followers are counted, and how soon a count
+/// no node answered is tried again.
+const FOLLOWER_COUNT_SECS: i64 = 30 * 60;
+const FOLLOWER_RETRY_SECS: i64 = 2 * 60;
+/// Lists of a feed counted across, the newest first: followers still on the
+/// one before a publish keep counting until they take the new one.
+const FOLLOWER_LISTS: usize = 3;
+
+/// A feed's followers, as last counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct FollowerCount {
+    pub count: u32,
+    /// A lookup came back as full as a search takes: there may be more.
+    pub at_least: bool,
+    pub checked_at: i64,
+}
+
+#[derive(Debug, Default)]
+struct HeldCount {
+    count: Option<FollowerCount>,
+    tried_at: i64,
+    /// The lists counted across, newest first.
+    lists: Vec<[u8; 16]>,
+}
+
+impl HeldCount {
+    fn due(&self, now: i64) -> bool {
+        now - self.tried_at >= FOLLOWER_RETRY_SECS
+            && self.count.is_none_or(|count| now - count.checked_at >= FOLLOWER_COUNT_SECS)
+    }
+}
+
+fn follower_counts() -> &'static parking_lot::Mutex<HashMap<String, HeldCount>> {
+    static COUNTS: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, HeldCount>>> = std::sync::OnceLock::new();
+    COUNTS.get_or_init(Default::default)
+}
+
+/// The identities, ours aside, that published a source record for any of
+/// `lists`. Every follower serves the list it holds, with such a record, and
+/// keeps it standing while online, so this is the feed's followers online in
+/// the last few hours, those who never downloaded a file included.
+fn followers_in(
+    blobs: &[Vec<u8>],
+    list: &[u8; 16],
+    own: &[u8; 32],
+    into: &mut std::collections::HashSet<[u8; 32]>,
+) {
+    use crate::network::ember::dht::publish::RECORD_TYPE_SOURCE;
+    into.extend(
+        blobs
+            .iter()
+            .filter_map(|blob| SignedRecord::from_value_blob(blob))
+            .filter(|record| {
+                record.record_type == RECORD_TYPE_SOURCE && record.file_hash == *list && record.publisher_key != *own
+            })
+            .map(|record| record.publisher_key),
+    );
+}
+
+/// Count `feed`'s followers across the lists it serves and the last few it
+/// served, one lookup each: a lookup's further keys narrow it to records
+/// naming all of them, which a list's sources never do. `None` when no node
+/// answered any of them.
+async fn count_followers(state: &AppState, dir: &Path, feed: &OwnFeed) -> Option<(u32, bool)> {
+    let mut lists: Vec<[u8; 16]> = own_lists(dir, feed).iter().map(|list| list.hash).collect();
+    let earlier = follower_counts().lock().get(&feed.salt).map(|held| held.lists.clone()).unwrap_or_default();
+    for hash in earlier {
+        if !lists.contains(&hash) {
+            lists.push(hash);
+        }
+    }
+    lists.truncate(FOLLOWER_LISTS);
+    if lists.is_empty() {
+        return Some((0, false));
+    }
+    let own = state.identity.ed25519_public_key;
+    let mut followers = std::collections::HashSet::new();
+    let (mut answered, mut at_least) = (false, false);
+    for list in &lists {
+        let key = crate::network::ember::dht::publish::source_key(list);
+        let Some((blobs, responded)) =
+            crate::commands::channels::find_raw_keys_counted(state, vec![key], LOOKUP_TIMEOUT_MS).await.ok().flatten()
+        else {
+            continue;
+        };
+        if responded == 0 {
+            continue;
+        }
+        answered = true;
+        at_least |= blobs.len() >= crate::network::ember::dht::search::MAX_SEARCH_RESULTS;
+        followers_in(&blobs, list, &own, &mut followers);
+    }
+    if !answered {
+        return None;
+    }
+    if let Some(held) = follower_counts().lock().get_mut(&feed.salt) {
+        held.lists = lists;
+    }
+    Some((u32::try_from(followers.len()).unwrap_or(u32::MAX), at_least))
+}
+
+/// Count the followers of the published feed of ours counted longest ago, if
+/// one is due, and say so to the page.
+async fn count_due_followers(app: &tauri::AppHandle, state: &AppState, own: &[OwnFeed], now: i64) {
+    let due = {
+        let mut counts = follower_counts().lock();
+        counts.retain(|salt, _| own.iter().any(|feed| feed.salt == *salt));
+        own.iter()
+            .filter(|feed| feed.sequence > 0)
+            .filter(|feed| counts.get(&feed.salt).is_none_or(|held| held.due(now)))
+            .min_by_key(|feed| counts.get(&feed.salt).and_then(|held| held.count).map_or(0, |count| count.checked_at))
+            .cloned()
+    };
+    let Some(feed) = due else { return };
+    follower_counts().lock().entry(feed.salt.clone()).or_default().tried_at = now;
+    let Some((count, at_least)) = count_followers(state, &feeds_dir(app), &feed).await else { return };
+    let changed = {
+        let mut counts = follower_counts().lock();
+        let held = counts.entry(feed.salt.clone()).or_default();
+        let changed = held.count.map(|old| (old.count, old.at_least)) != Some((count, at_least));
+        held.count = Some(FollowerCount { count, at_least, checked_at: now });
+        changed
+    };
+    if changed {
+        let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "salt": feed.salt }));
+    }
+}
+
+fn counting_followers() -> &'static std::sync::Arc<std::sync::atomic::AtomicBool> {
+    static COUNTING: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> = std::sync::OnceLock::new();
+    COUNTING.get_or_init(Default::default)
+}
+
+/// Save the downloads followers made from us since the last tick, and say
+/// so to the page for each feed they were of.
+async fn record_feed_downloads(app: &tauri::AppHandle, state: &AppState, now: i64) {
+    let downloads = crate::network::feed_direct::take_downloads();
+    if downloads.is_empty() {
+        return;
+    }
+    let rows: Vec<(String, String, String)> = downloads
+        .iter()
+        .map(|(salt, ed2k, follower)| (hex::encode(salt), hex::encode(ed2k), hex::encode(follower)))
+        .collect();
+    let mut salts: Vec<String> = rows.iter().map(|(salt, _, _)| salt.clone()).collect();
+    salts.sort();
+    salts.dedup();
+    let db = state.db.clone();
+    match tokio::task::spawn_blocking(move || db.feed_own_note_downloads(&rows, now)).await {
+        Ok(Ok(())) => {
+            for salt in salts {
+                let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "salt": salt }));
+            }
+        }
+        Ok(Err(e)) => tracing::warn!("Could not save feed downloads: {e:#}"),
+        Err(e) => tracing::warn!("Could not save feed downloads: {e}"),
+    }
 }
 
 #[tauri::command]
@@ -1149,6 +1320,15 @@ pub async fn get_feed_items(
     salt: String,
 ) -> Result<Vec<FollowedItemInfo>, String> {
     let (publisher, salt) = (hex::encode(hex_publisher(&publisher)?), hex::encode(hex_salt(&salt)?));
+    // The page asks every few seconds while files download; a slow answer is
+    // logged with where the time went.
+    let started = Instant::now();
+    let mut phases: Vec<(&str, u128)> = Vec::new();
+    let mut mark = |phase: &'static str, at: &mut Instant| {
+        phases.push((phase, at.elapsed().as_millis()));
+        *at = Instant::now();
+    };
+    let mut at = Instant::now();
     let db = state.db.clone();
     let now = chrono::Utc::now().timestamp();
     let (key_pub, key_salt) = (publisher.clone(), salt.clone());
@@ -1166,10 +1346,12 @@ pub async fn get_feed_items(
     )
     .await?;
     let feed = feed.ok_or_else(|| coded("feeds_not_found", "That feed could not be found"))?;
+    mark("database", &mut at);
     // What each file's download is doing: the transfer list's own word for
     // it, newest first, then the file on disk.
     let transfers: HashMap<String, (ItemStatus, f64, Option<String>, ItemTransfer)> = {
         let manager = state.transfer_manager.read().await;
+        mark("transfer list lock", &mut at);
         let mut by_hash = HashMap::new();
         for t in manager.completed.iter().chain(manager.queue.iter()).chain(manager.active.values()) {
             if t.direction == crate::types::TransferDirection::Download {
@@ -1181,6 +1363,7 @@ pub async fn get_feed_items(
         }
         by_hash
     };
+    mark("transfer list", &mut at);
     // A library scan holds the index through a whole re-index: the page asks
     // every few seconds, so a busy index counts as holding none of them.
     let in_library: std::collections::HashSet<String> = match state.local_index.try_read() {
@@ -1197,6 +1380,7 @@ pub async fn get_feed_items(
         .iter()
         .filter_map(|(hash, (status, _, path, _))| (*status == ItemStatus::Done).then_some((hash.clone(), path.clone()?)))
         .collect();
+    let finished_count = finished.len();
     let wanted: std::collections::HashSet<String> = items.iter().map(|i| i.item.ed2k.to_ascii_lowercase()).collect();
     let ((on_disk, gone), held_elsewhere) = tokio::task::spawn_blocking(move || {
         let copies = copies.into_iter().filter(|copy| wanted.contains(&copy.ed2k.to_ascii_lowercase())).collect();
@@ -1204,10 +1388,23 @@ pub async fn get_feed_items(
     })
     .await
     .unwrap_or_default();
+    mark("files on disk", &mut at);
     let mut spent = spent;
     // As the auto-download pass measures it, so a file it leaves for want of
     // space says so rather than nothing.
     let mut room = if feed.auto_download { auto_download_room(&state).await } else { u64::MAX };
+    mark("free space", &mut at);
+    let elapsed = started.elapsed();
+    if elapsed >= Duration::from_secs(1) {
+        let phases: Vec<String> = phases.iter().map(|(phase, ms)| format!("{phase} {ms} ms")).collect();
+        tracing::warn!(
+            "get_feed_items took {} ms for {} item(s), {} finished download(s) checked on disk: {}",
+            elapsed.as_millis(),
+            items.len(),
+            finished_count,
+            phases.join(", ")
+        );
+    }
     Ok(items
         .into_iter()
         .map(|item| {
@@ -3340,6 +3537,7 @@ async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
         let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "publisher": fetch.publisher, "salt": fetch.salt }));
     }
     feed_files::forget_cancelled_fetches(CANCELLED_FETCH_GRACE);
+    record_feed_downloads(app, state, now).await;
     refresh_served_files(state).await;
     // Not held back by a locked chat key: nothing of a feed is sealed with it.
     if crate::commands::channels::require_ember(state).await.is_err() {
@@ -3361,6 +3559,17 @@ async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
                 }
             });
         }
+    }
+    // Our feeds' followers, counted off the tick, one feed at a time.
+    if !counting_followers().swap(true, std::sync::atomic::Ordering::AcqRel) {
+        let app = app.clone();
+        let own = own.clone();
+        tauri::async_runtime::spawn(async move {
+            let _done = ClearOnDrop(counting_followers().clone());
+            if let Some(state) = app.try_state::<AppState>() {
+                count_due_followers(&app, &state, &own, now).await;
+            }
+        });
     }
     // Heads friends pushed while their feeds' gates were shut.
     let due = due_pushed_heads(&mut push_gates().lock(), Instant::now());
@@ -3419,6 +3628,11 @@ pub fn spawn_feeds(app: tauri::AppHandle) {
                     let Some((from, blob)) = head else { return };
                     if let Some(state) = app.try_state::<AppState>() {
                         on_pushed_head(&app, &state, from, blob).await;
+                    }
+                }
+                () = crate::network::feed_direct::downloads_noted().notified() => {
+                    if let Some(state) = app.try_state::<AppState>() {
+                        record_feed_downloads(&app, &state, chrono::Utc::now().timestamp()).await;
                     }
                 }
                 _ = tick.tick() => {
@@ -3623,6 +3837,54 @@ mod tests {
         assert!(rebuild_own_list(&path, &head, "me", &items));
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn followers_are_the_distinct_others_serving_a_list_of_the_feed() {
+        use crate::network::ember::dht::publish::SourceContact;
+        let key = |seed: u8| crate::network::ember::crypto::signing_key_from_bytes(&[seed; 32]);
+        let (me, ann, bob, eve) = (key(4), key(5), key(6), key(7));
+        let (current, earlier, other) = ([1u8; 16], [2u8; 16], [3u8; 16]);
+        let source = |list: [u8; 16], key: &ed25519_dalek::SigningKey| {
+            let record = SignedRecord::source(list, [0; 32], 100, "", SourceContact::default(), key);
+            [record.data, record.signature.to_vec()].concat()
+        };
+        let mut tampered = source(current, &eve);
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xFF;
+        let blobs = vec![
+            source(current, &me),
+            source(current, &ann),
+            source(earlier, &ann),
+            source(earlier, &bob),
+            source(other, &eve),
+            tampered,
+            vec![0u8; 10],
+        ];
+        let own = me.verifying_key().to_bytes();
+        let mut followers = std::collections::HashSet::new();
+        followers_in(&blobs, &current, &own, &mut followers);
+        assert_eq!(followers.len(), 1, "Ann: not us, nor Eve's tampered record");
+        followers_in(&blobs, &earlier, &own, &mut followers);
+        assert_eq!(followers.len(), 2, "Ann once across both lists, and Bob");
+        followers_in(&blobs, &[9u8; 16], &own, &mut followers);
+        assert_eq!(followers.len(), 2, "a list nobody serves adds none");
+    }
+
+    #[test]
+    fn a_follower_count_is_due_after_its_interval_and_a_failed_one_sooner() {
+        let fresh = HeldCount::default();
+        assert!(fresh.due(1_000_000), "never counted");
+        let counted = HeldCount {
+            count: Some(FollowerCount { count: 3, at_least: false, checked_at: 1_000 }),
+            tried_at: 1_000,
+            lists: Vec::new(),
+        };
+        assert!(!counted.due(1_000 + FOLLOWER_COUNT_SECS - 1));
+        assert!(counted.due(1_000 + FOLLOWER_COUNT_SECS));
+        let unanswered = HeldCount { tried_at: 1_000, ..HeldCount::default() };
+        assert!(!unanswered.due(1_000 + FOLLOWER_RETRY_SECS - 1));
+        assert!(unanswered.due(1_000 + FOLLOWER_RETRY_SECS), "no node answered: tried again soon");
     }
 
     #[test]

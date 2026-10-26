@@ -29,10 +29,20 @@ const _: () = assert!(UPLOAD_REQUEST_BYTES.is_multiple_of(UPLOAD_CHUNK_BYTES as 
 /// Covers DNS, connecting every stream and the warm-up request.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(4);
 const LEG_DURATION: Duration = Duration::from_secs(8);
-/// A leg stops early once it has moved this much, so a very fast connection
-/// costs a bounded amount of data rather than eight seconds of line rate.
+/// A leg stops early once it has moved this much and run [`MIN_LEG`], so a
+/// very fast connection costs a bounded amount of data rather than eight
+/// seconds of line rate.
 const DOWNLOAD_BYTE_CAP: u64 = 250_000_000;
 const UPLOAD_BYTE_CAP: u64 = 100_000_000;
+/// The least a leg runs before its byte cap may end it: the warm-up and a full
+/// [`RATE_WINDOW_SECS`] after it. A gigabit uplink reached the upload cap in
+/// a second and a quarter, so its rate came from one short span, which the
+/// upload counter's lead over the wire (the send buffers filling) inflates,
+/// and three runs on one line read 54, 59 and 92 MB/s.
+const MIN_LEG: Duration = Duration::from_millis(3_500);
+/// What a leg may move however long it has run, so a multi-gigabit line is
+/// still bounded: the whole test stays under 1.2 GB.
+const LEG_BYTE_CEILING: u64 = 600_000_000;
 
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 /// Long enough that the up-to-one-chunk-per-stream lead the upload counter
@@ -180,7 +190,7 @@ async fn measure(leg: Leg, limiter: &BandwidthLimiter) -> Result<u64, String> {
             _ = ticker.tick() => {
                 let sample = take_sample();
                 samples.push(sample);
-                if sample.test_bytes >= leg.byte_cap() || Instant::now() >= deadline {
+                if leg_finished(start.elapsed(), sample.test_bytes, leg.byte_cap()) || Instant::now() >= deadline {
                     break;
                 }
             }
@@ -203,6 +213,13 @@ async fn measure(leg: Leg, limiter: &BandwidthLimiter) -> Result<u64, String> {
         format_speed(rate)
     );
     Ok(rate)
+}
+
+/// Whether a leg that has run `elapsed` and moved `bytes` has measured
+/// enough: its `byte_cap` once it has run [`MIN_LEG`], or
+/// [`LEG_BYTE_CEILING`] at any time. [`LEG_DURATION`] ends it regardless.
+fn leg_finished(elapsed: Duration, bytes: u64, byte_cap: u64) -> bool {
+    bytes >= LEG_BYTE_CEILING || (bytes >= byte_cap && elapsed >= MIN_LEG)
 }
 
 /// Resolves the test host once and opens [`STREAMS`] connections to it, each
@@ -498,6 +515,38 @@ mod tests {
             (99_000_000..=100_000_000).contains(&rate),
             "the dead first quarter must not count: {rate}"
         );
+    }
+
+    /// A fast link runs on past its cap until there is a full window after
+    /// the warm-up to measure, but never past the ceiling.
+    #[test]
+    fn a_fast_leg_runs_long_enough_for_a_full_window() {
+        let cap = UPLOAD_BYTE_CAP;
+        assert!(!leg_finished(Duration::from_millis(1_250), cap + 4_000_000, cap));
+        assert!(leg_finished(MIN_LEG, cap, cap));
+        assert!(!leg_finished(Duration::from_secs(5), cap - 1, cap), "a slow link runs to its cap or the deadline");
+        assert!(leg_finished(Duration::from_millis(500), LEG_BYTE_CEILING, cap));
+        let warm_up = (MIN_LEG.as_secs_f64() * WARM_UP_FRACTION).min(MAX_WARM_UP_SECS);
+        assert!(MIN_LEG.as_secs_f64() - warm_up >= RATE_WINDOW_SECS);
+        assert!(LEG_BYTE_CEILING >= DOWNLOAD_BYTE_CAP.max(UPLOAD_BYTE_CAP));
+    }
+
+    const _: () = assert!(2 * LEG_BYTE_CEILING <= 1_200_000_000, "what the settings hint promises");
+
+    /// A gigabit uplink, its counter running ahead of the wire as the send
+    /// buffers fill over the first second: run to the minimum, the windows
+    /// after the warm-up read the link, where stopping at the cap read the fill.
+    #[test]
+    fn a_gigabit_upload_is_read_at_its_rate_not_its_buffer_fill() {
+        let link = 100_000_000.0;
+        let lead = |t: f64| 12_000_000.0 * t.min(1.0);
+        let bytes = |t: f64| (link * t + lead(t)) as u64;
+        let stopped_at_cap = series(1.25, bytes);
+        let ran_on = series(MIN_LEG.as_secs_f64(), bytes);
+        let early = steady_state_rate(&stopped_at_cap).unwrap();
+        let settled = steady_state_rate(&ran_on).unwrap();
+        assert!(early > 105_000_000, "the short leg reads the buffers filling: {early}");
+        assert!((99_000_000..=101_000_000).contains(&settled), "{settled}");
     }
 
     /// Data during the warm-up, then nothing: the windows after it all read

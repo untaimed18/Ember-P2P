@@ -32,6 +32,12 @@ export interface OwnFeed {
   publisher: string;
   link: string;
   items: FeedItem[];
+  /** Followers online in the last few hours, as last counted on the network;
+   *  null until a count is in. `at_least`: there may be more than a lookup
+   *  holds. `checked_at` is in seconds. */
+  followers: { count: number; at_least: boolean; checked_at: number } | null;
+  /** Followers who downloaded each file from this identity, by eD2K hash. */
+  downloads: Record<string, number>;
 }
 
 /** A feed this identity follows. */

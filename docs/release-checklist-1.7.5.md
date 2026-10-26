@@ -261,6 +261,15 @@ friends unless a step says otherwise, and C a follower who is not A's friend.
       stream gives up.
 - [ ] Nine followers at once on A: eight stream from A, the ninth fetches
       over eD2K, and all finish.
+- [ ] B's row moves smoothly while A streams (several updates a second, not
+      every 4 seconds), shows Done the moment the download completes, and
+      B's window never stalls.
+- [ ] Follower and download counts: within a few minutes of starting, A's
+      My feeds shows "2 followers" for a feed B and C follow (hover explains
+      it). Within seconds of B finishing a file from A, that file's row on A
+      says "Downloaded by 1 follower"; B downloading it again leaves it at 1, and
+      C's finished download makes it 2. A file C got only from D is not
+      counted. Deleting the feed and making a new one starts at none.
 - [ ] Pause B's download mid-stream and resume it: it carries on from where
       it was, not from the start. Remove a file from A's feed and publish
       while B's download of it is still queued: A refuses it, and B fetches

@@ -150,7 +150,7 @@ export function applyRowPatches<T extends { id: string }>(
     if (out === null) {
       out = list.slice();
       // Same ids at the same positions until a removal.
-      indexCache.set(out, index);
+      indexCache.set(out, { index, length: out.length });
     }
     out[idx] = next;
   }
@@ -159,17 +159,19 @@ export function applyRowPatches<T extends { id: string }>(
 
 /** id -> position, cached per array so a burst of flushes over a list whose
  *  shape did not change builds it once. Arrays are never mutated in place
- *  once published, which is what makes the cache sound. */
-const indexCache = new WeakMap<object, Map<string, number>>();
+ *  once published, which is what makes the cache sound. Keyed on the length
+ *  the index was built over, not its size: a list holding one id twice has
+ *  fewer entries than rows, and comparing those rebuilt it on every call. */
+const indexCache = new WeakMap<object, { index: Map<string, number>; length: number }>();
 
 function rowIndex<T extends { id: string }>(rows: T[], rebuild = false): Map<string, number> {
   const cached = rebuild ? undefined : indexCache.get(rows);
-  if (cached && cached.size === rows.length) return cached;
+  if (cached && cached.length === rows.length) return cached.index;
   const index = new Map<string, number>();
   for (let i = 0; i < rows.length; i++) {
     if (!index.has(rows[i].id)) index.set(rows[i].id, i);
   }
-  indexCache.set(rows, index);
+  indexCache.set(rows, { index, length: rows.length });
   return index;
 }
 

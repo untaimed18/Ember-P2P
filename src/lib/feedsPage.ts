@@ -51,3 +51,33 @@ export function concernsFollowed(
   if (!event?.publisher && !event?.salt) return true;
   return event.publisher === feed.publisher && event.salt === feed.salt;
 }
+
+/** A download's latest figures from its progress events: bytes on disk and
+ *  bytes per second. */
+export interface LiveProgress {
+  done: number;
+  speed: number;
+}
+
+interface ProgressRow {
+  size: number;
+  progress: number;
+  transfer: { id: string; done: number; speed: number } | null;
+}
+
+/** `items` with the figures in `live`, by transfer id, taken in; `items`
+ *  itself when none of them change, so nothing redraws for nothing. */
+export function withLiveProgress<T extends ProgressRow>(items: T[], live: ReadonlyMap<string, LiveProgress>): T[] {
+  let changed = false;
+  const next = items.map((item) => {
+    const t = item.transfer;
+    const p = t ? live.get(t.id) : undefined;
+    if (!t || !p) return item;
+    const done = Math.min(item.size, Math.max(0, p.done));
+    if (done === t.done && p.speed === t.speed) return item;
+    changed = true;
+    const progress = item.size > 0 ? (done / item.size) * 100 : item.progress;
+    return { ...item, progress, transfer: { ...t, done, speed: p.speed } };
+  });
+  return changed ? next : items;
+}

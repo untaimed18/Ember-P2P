@@ -122,6 +122,28 @@ describe('applyRowPatches', () => {
     expect(out[0].health).toBe('healthy');
     expect(out[0].health_reason).toBeUndefined();
   });
+
+  /** A list holding one id twice has fewer index entries than rows. Judged by
+   *  that count, the cached index never held and every flush walked the whole
+   *  list again. */
+  it('reuses its index for a list that holds one id twice', () => {
+    const rows = [row('a'), ...Array.from({ length: 500 }, (_, i) => row(`r${i}`)), row('a')];
+    let reads = 0;
+    const list = new Proxy(rows, {
+      get(target, key, receiver) {
+        if (typeof key === 'string' && /^\d+$/.test(key)) reads++;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    expect(applyRowPatches(list, [['missing', () => null]])).toBe(list);
+    expect(reads).toBeGreaterThanOrEqual(rows.length);
+    reads = 0;
+    expect(applyRowPatches(list, [['missing', () => null]])).toBe(list);
+    expect(reads, 'the second flush reads no row').toBe(0);
+    const out = applyRowPatches(list, [['a', (t) => ({ ...t, speed: 7 })]]);
+    expect(out[0].speed).toBe(7);
+    expect(out[rows.length - 1].speed, 'the first of the two is the one patched').toBe(100);
+  });
 });
 
 describe('row event reducers', () => {

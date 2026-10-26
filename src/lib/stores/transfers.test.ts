@@ -235,3 +235,61 @@ describe('the transfers poll', () => {
     stop();
   });
 });
+
+describe('progress for a download with no row here', () => {
+  let frames: FrameRequestCallback[] = [];
+  const runFrame = () => {
+    const due = frames;
+    frames = [];
+    for (const frame of due) frame(0);
+  };
+  const progress = (id: string, downloaded: number) =>
+    handlers.get('transfer-progress')?.({
+      payload: { id, downloaded, completed_size: downloaded, total: 1000, progress: downloaded / 10, speed: 1 },
+    });
+
+  beforeEach(async () => {
+    fakeDocument.visibilityState = 'visible';
+    vi.stubGlobal('document', fakeDocument);
+    frames = [];
+    backend.rows = [row('a')];
+    backend.hold = null;
+    // Before the frame stubs: fake timers replace `requestAnimationFrame` too.
+    vi.useFakeTimers();
+    vi.stubGlobal('requestAnimationFrame', (frame: FrameRequestCallback) => frames.push(frame));
+    vi.stubGlobal('cancelAnimationFrame', () => {});
+    await store.initTransferStore();
+    // Whatever the start queued, settled before the counting starts.
+    runFrame();
+    vi.advanceTimersByTime(1_000);
+    frames = [];
+  });
+
+  afterEach(() => {
+    store.cleanupTransferStore();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  /** A feed's download is never listed here. Its progress used to ask for a
+   *  frame from every frame it was flushed in, for as long as it downloaded,
+   *  which kept the window rendering flat out and its timers starved. */
+  it('is looked at again on a timer, not on every frame', () => {
+    progress('feed', 100);
+    expect(frames).toHaveLength(1);
+    runFrame();
+    for (let i = 0; i < 30; i++) runFrame();
+    expect(frames, 'no frame asked for while it waits').toHaveLength(0);
+    vi.advanceTimersByTime(500);
+    expect(frames).toHaveLength(1);
+  });
+
+  it('still reaches a row that arrives after it', () => {
+    progress('b', 400);
+    runFrame();
+    handlers.get('transfer-started')?.({ payload: { ...row('b'), progress: 0, transferred: 0, completed_size: 0 } });
+    vi.advanceTimersByTime(500);
+    runFrame();
+    expect(get(store.transfers).find((t) => t.id === 'b')?.completed_size).toBe(400);
+  });
+});

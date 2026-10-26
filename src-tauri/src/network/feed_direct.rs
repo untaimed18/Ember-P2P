@@ -375,6 +375,48 @@ pub struct Served {
     pub path: PathBuf,
     pub size: u64,
     pub capability: [u8; 32],
+    /// The feed and file it is, for counting who downloaded it.
+    pub salt: [u8; 16],
+    pub ed2k: [u8; 16],
+}
+
+/// A follower who read a file of one of our feeds to its end from us, and
+/// said they had it: `(salt, ed2k, follower node id)`.
+pub type FeedDownload = ([u8; 16], [u8; 16], [u8; 16]);
+
+/// Downloads waiting for the feeds service to record. Far more than a minute
+/// of them; past it the oldest are dropped rather than the service held up.
+const MAX_PENDING_DOWNLOADS: usize = 4096;
+
+fn pending_downloads() -> &'static parking_lot::Mutex<std::collections::VecDeque<FeedDownload>> {
+    static PENDING: std::sync::OnceLock<parking_lot::Mutex<std::collections::VecDeque<FeedDownload>>> =
+        std::sync::OnceLock::new();
+    PENDING.get_or_init(Default::default)
+}
+
+/// Woken when a download is noted, for the feeds service to record it.
+pub fn downloads_noted() -> &'static tokio::sync::Notify {
+    static NOTED: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    NOTED.get_or_init(tokio::sync::Notify::new)
+}
+
+/// `follower` read the file served as `xfer_id` to its end, and said so.
+pub fn note_downloaded(xfer_id: &[u8; 16], follower: [u8; 16]) {
+    let Some((salt, ed2k)) = served_files().read().get(xfer_id).map(|file| (file.salt, file.ed2k)) else {
+        return;
+    };
+    let mut pending = pending_downloads().lock();
+    if pending.len() >= MAX_PENDING_DOWNLOADS {
+        pending.pop_front();
+    }
+    pending.push_back((salt, ed2k, follower));
+    drop(pending);
+    downloads_noted().notify_one();
+}
+
+/// The downloads noted since the last call.
+pub fn take_downloads() -> Vec<FeedDownload> {
+    pending_downloads().lock().drain(..).collect()
 }
 
 fn served_files() -> &'static parking_lot::RwLock<HashMap<[u8; 16], Served>> {
@@ -391,7 +433,7 @@ pub fn set_served(files: HashMap<[u8; 16], Served>) {
 pub fn served_entry(publisher: &[u8; 32], salt: &[u8; 16], ed2k: &[u8; 16], path: PathBuf, size: u64) -> ([u8; 16], Served) {
     (
         feed_stream_id(publisher, salt, ed2k),
-        Served { path, size, capability: feed_stream_capability(publisher, salt, ed2k) },
+        Served { path, size, capability: feed_stream_capability(publisher, salt, ed2k), salt: *salt, ed2k: *ed2k },
     )
 }
 
@@ -595,6 +637,12 @@ mod tests {
         assert_eq!((path, size), (PathBuf::from("f"), 10));
         assert_eq!(capability, feed_stream_capability(&key, &SALT, &ed2k));
         assert!(served(&feed_stream_id(&key, &[4; 16], &ed2k)).is_none(), "another feed's id");
+
+        take_downloads();
+        note_downloaded(&feed_stream_id(&key, &SALT, &ed2k), [9; 16]);
+        note_downloaded(&feed_stream_id(&key, &[4; 16], &ed2k), [8; 16]);
+        assert_eq!(take_downloads(), vec![(SALT, ed2k, [9; 16])], "only a file of ours is counted");
+        assert!(take_downloads().is_empty());
         set_served(HashMap::new());
     }
 

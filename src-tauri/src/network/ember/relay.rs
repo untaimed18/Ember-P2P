@@ -2318,13 +2318,15 @@ where
 /// `network::feed_direct`). Anyone may ask, friend or not: a feed is public to
 /// whoever has its link, and the request names the file by an id only the
 /// link and the list let one compute. A few at a time; past that the request
-/// is refused, and the follower fetches over eD2K instead.
+/// is refused, and the follower fetches over eD2K instead. Returns the
+/// stream's id when it ran to the file's end, for the caller to count the
+/// download once the follower says it has it.
 pub async fn serve_feed_stream<R, W>(
     recv: &mut R,
     send: &mut W,
     header: &[u8; 7],
     limiter: &crate::bandwidth::limiter::BandwidthLimiter,
-) -> anyhow::Result<u64>
+) -> anyhow::Result<Option<[u8; 16]>>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -2333,6 +2335,7 @@ where
     // nothing, or asks for nothing we serve, holds none.
     let mut slot = None;
     let mut busy = false;
+    let mut to_end = None;
     let served = super::attach_stream::serve_feed_stream(
         recv,
         send,
@@ -2343,7 +2346,12 @@ where
             busy = slot.is_none();
             slot.as_ref().map(|_| file)
         },
-        |_, _, _| true,
+        |xfer_id, position, size| {
+            if position >= size {
+                to_end = Some(*xfer_id);
+            }
+            true
+        },
         Some(limiter),
     )
     .await;
@@ -2354,7 +2362,7 @@ where
         Ok(bytes) => debug!("Feed stream: served {bytes} byte(s)"),
         Err(e) => debug!("Feed stream failed: {e}"),
     }
-    served
+    served.map(|_| to_end)
 }
 
 /// How long a sender holds an attachment connection open after the last chunk,
@@ -2697,9 +2705,13 @@ pub async fn run_quic_accept_loop(
             if msg_type == super::attach::FEED_STREAM_MSG_TYPE {
                 // A follower fetching a file of a feed we publish. No identity
                 // check: a feed is public, and the request's id is the grant.
-                let _ = serve_feed_stream(&mut init_recv, &mut init_send, &header, limiter.as_ref()).await;
+                // The certificate names who it was, for the download count.
+                let finished = serve_feed_stream(&mut init_recv, &mut init_send, &header, limiter.as_ref()).await;
                 let _ = init_send.finish();
-                let _ = attachment_delivered(&init_send).await;
+                let delivered = attachment_delivered(&init_send).await;
+                if let (Ok(Some(xfer_id)), true, Some(follower)) = (finished, delivered, peer_node_id) {
+                    crate::network::feed_direct::note_downloaded(&xfer_id, follower);
+                }
                 return;
             }
 
