@@ -2840,6 +2840,50 @@ pub fn ember_publish_keywords(file_name: &str) -> Vec<String> {
     words
 }
 
+/// [`ember_publish_keywords`] less the words only the `[Ember-P2P]` name tag
+/// contributes, which is what the publish loop files a shared file under.
+///
+/// Every tagged file in every library would otherwise be filed under `ember`
+/// and `p2p`. Those keys fill (a storer takes 150 records of one publisher per
+/// key and 1,000 in all), every later tagged file's publish then comes back
+/// partial and is retried, and a match under them is one of a thousand
+/// arbitrary records anyway. A word the rest of the name also holds is kept,
+/// and a name that is nothing but the tag keeps its words, so no file loses
+/// its only keys.
+pub fn ember_file_keywords(file_name: &str) -> Vec<String> {
+    let all = ember_publish_keywords(file_name);
+    let untagged = strip_name_tag(file_name);
+    if untagged.len() == file_name.len() {
+        return all;
+    }
+    let own: HashSet<[u8; 16]> = ember_publish_keywords(&untagged)
+        .iter()
+        .map(|word| keyword_hash(word))
+        .collect();
+    let kept: Vec<String> = all
+        .iter()
+        .filter(|word| own.contains(&keyword_hash(word)))
+        .cloned()
+        .collect();
+    if kept.is_empty() { all } else { kept }
+}
+
+/// `file_name` with every `[Ember-P2P]` tag in it, in any case, taken out.
+fn strip_name_tag(file_name: &str) -> String {
+    let tag = crate::sharing::name_tag::EMBER_NAME_TAG;
+    let lower = file_name.to_ascii_lowercase();
+    let tag_lower = tag.to_ascii_lowercase();
+    let mut out = String::with_capacity(file_name.len());
+    let mut at = 0;
+    while let Some(found) = lower[at..].find(&tag_lower) {
+        out.push_str(&file_name[at..at + found]);
+        out.push(' ');
+        at += found + tag.len();
+    }
+    out.push_str(&file_name[at..]);
+    out
+}
+
 /// Whether any keyword the publish loop would derive from `file_name` hashes to
 /// `key` — that is, whether a keyword record filed under `key` could have been
 /// aimed there by the name it carries.
@@ -2958,7 +3002,14 @@ fn hash_query_words(mut keywords: Vec<String>) -> Vec<([u8; 16], String)> {
     // Already lowercased and deduplicated (case-insensitively) by the
     // tokenizer; this only imposes the most-selective-first ordering the
     // primary/secondary split depends on.
-    keywords.sort_by_key(|kw| std::cmp::Reverse(kw.len()));
+    //
+    // The name tag's words go last, whatever their length: publishers do not
+    // file under them (see `ember_file_keywords`), so walking one first missed
+    // every tagged file, and `[Ember-P2P] Linux` walked `ember`. They still
+    // ride along to be matched against the names a storer holds.
+    let tag_words =
+        crate::network::kad::publish::extract_query_keywords(crate::sharing::name_tag::EMBER_NAME_TAG);
+    keywords.sort_by_key(|kw| (tag_words.contains(kw), std::cmp::Reverse(kw.len())));
 
     keywords
         .into_iter()
@@ -3013,6 +3064,26 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    /// The name tag files nothing under its own words, unless the rest of the
+    /// name has them too or has no words at all.
+    #[test]
+    fn a_tagged_file_is_not_filed_under_the_tag() {
+        let words = ember_file_keywords("[Ember-P2P] Ubuntu Desktop.iso");
+        assert!(words.contains(&"ubuntu".to_string()) && words.contains(&"desktop".to_string()));
+        assert!(!words.iter().any(|w| w == "ember" || w == "p2p"), "{words:?}");
+
+        let words = ember_file_keywords("[ember-p2p] Ember Overview.pdf");
+        assert!(words.contains(&"ember".to_string()), "the name's own word stays");
+        assert!(!words.contains(&"p2p".to_string()));
+
+        assert_eq!(
+            ember_file_keywords("[Ember-P2P] 01.mp3"),
+            ember_publish_keywords("[Ember-P2P] 01.mp3"),
+            "a name with no other words keeps the tag's, rather than none"
+        );
+        assert_eq!(ember_file_keywords("Ubuntu Desktop.iso"), ember_publish_keywords("Ubuntu Desktop.iso"));
+    }
 
     fn make_id(byte: u8) -> EmberNodeId {
         let mut id = [0u8; 16];
@@ -4391,6 +4462,17 @@ mod tests {
         assert_eq!(hashes.len(), 2); // "a" filtered out (under 3 bytes)
         assert_eq!(hashes[0].1, "longer"); // longest first
         assert_eq!(hashes[1].1, "short");
+    }
+
+    /// Publishers do not file under the name tag's words, so a search never
+    /// walks one while it has another word to walk.
+    #[test]
+    fn a_query_never_walks_the_name_tag_first() {
+        let words = |q: &str| -> Vec<String> { compute_keyword_hashes(q).into_iter().map(|(_, w)| w).collect() };
+        assert_eq!(words("[Ember-P2P] Linux"), ["linux", "ember", "p2p"]);
+        assert_eq!(words("ember linux")[0], "linux");
+        assert_eq!(words("ember"), ["ember"], "alone it is still searched");
+        assert_eq!(words("ember overview")[0], "overview");
     }
 
     /// The publisher splits a filename on separators, so a query carrying one

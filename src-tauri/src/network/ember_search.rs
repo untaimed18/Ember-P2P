@@ -2836,7 +2836,7 @@ mod ember_keyword_match_tests {
         let name = format!("ubuntu {filler}finalword.iso");
         let signed = ember::dht::publish::keyword_record_signed_name(&name, None);
         assert!(signed.len() < name.len());
-        let keywords = ember::dht::search::ember_publish_keywords(signed);
+        let keywords = ember::dht::search::ember_publish_keywords(&signed);
         assert!(keywords.contains(&"ubuntu".to_string()));
         assert!(!keywords.contains(&"finalword".to_string()));
         let sk = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);

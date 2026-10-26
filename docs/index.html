@@ -239,6 +239,7 @@
                   <li><strong>Unread counts at startup</strong> are exact</li>
                   <li><strong>Credits between Ember users:</strong> two Ember clients meeting for the first time now complete Secure Identification, where before each usually waited for the other to go first, so Ember peers keep their credit across sessions and appear under Known Ember Peers, relayed and IPv6 connections included. Only a friend&rsquo;s own proven identity marks a row there as a friend</li>
                   <li><strong>Speed test:</strong> a fast upload is measured at its real rate instead of at how quickly the send buffers fill</li>
+                  <li><strong>Sharing on the Ember network:</strong> shared files go out several times faster, since a file still finding the nodes it belongs on no longer holds up the ones behind it, and keyword records keep their share of each minute while source records catch up after a restart or an address change. A file that lost one word is retried for that word alone. Files tagged <code>[Ember-P2P]</code> are filed under their own words rather than the tag&rsquo;s, a very long name keeps its extension, several firewalled users sharing one file through the same relay are all found as sources, and a firewalled node&rsquo;s records name its current relay after a restart</li>
                 </ul>
 
                 <p class="full-changelog">

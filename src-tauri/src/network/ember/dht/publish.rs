@@ -21,19 +21,51 @@ fn max_encoded_name_bytes(contact_bytes: usize) -> usize {
         .saturating_sub(contact_bytes)
 }
 
-/// Truncate `file_name` on a UTF-8 boundary so the encoded body fits the
-/// FOUND_VALUE pack budget.
-fn clamp_name_to_record_budget(file_name: &str, contact_bytes: usize) -> &str {
+/// Longest extension [`clamp_name_to_record_budget`] keeps on a shortened name.
+const MAX_KEPT_EXTENSION_BYTES: usize = 16;
+
+/// How far back from the budget a shortened name looks for the end of a word.
+const WORD_BACKOFF_BYTES: usize = 64;
+
+/// Shorten `file_name` so the encoded body fits the FOUND_VALUE pack budget.
+///
+/// The cut is taken out of the middle, before the extension, and at the end of
+/// a word. Cutting the tail took the extension with it, and a searcher's type
+/// and extension filters read those off the stored name, so a long name went
+/// missing from every filtered search; and a cut inside a word left its first
+/// letters to be published as a keyword of their own.
+fn clamp_name_to_record_budget(file_name: &str, contact_bytes: usize) -> std::borrow::Cow<'_, str> {
     let max = max_encoded_name_bytes(contact_bytes);
-    let bytes = file_name.as_bytes();
-    if bytes.len() <= max {
-        return file_name;
+    if file_name.len() <= max {
+        return std::borrow::Cow::Borrowed(file_name);
     }
-    let mut end = max;
-    while end > 0 && (bytes[end] & 0b1100_0000) == 0b1000_0000 {
+    let ext = file_name
+        .rfind('.')
+        .map(|dot| &file_name[dot..])
+        .filter(|ext| {
+            ext.len() > 1
+                && ext.len() <= MAX_KEPT_EXTENSION_BYTES
+                && ext[1..].chars().all(char::is_alphanumeric)
+        })
+        .unwrap_or("");
+    let stem_end = file_name.len() - ext.len();
+    let mut end = max.saturating_sub(ext.len()).min(stem_end);
+    while end > 0 && !file_name.is_char_boundary(end) {
         end -= 1;
     }
-    std::str::from_utf8(&bytes[..end]).unwrap_or("")
+    let cut_in_word = file_name[end..]
+        .chars()
+        .next()
+        .is_some_and(char::is_alphanumeric);
+    if cut_in_word {
+        if let Some(boundary) = file_name[..end].rfind(|c: char| !c.is_alphanumeric()) {
+            if boundary > 0 && end - boundary <= WORD_BACKOFF_BYTES {
+                end = boundary;
+            }
+        }
+    }
+    let stem = file_name[..end].trim_end();
+    std::borrow::Cow::Owned(format!("{stem}{ext}"))
 }
 
 /// Maximum concurrent publish operations.
@@ -532,9 +564,10 @@ pub(super) fn name_bytes_from_record_data(data: &[u8]) -> Option<&[u8]> {
 
 /// Whether a record body `data_len` bytes long may carry a name the publisher
 /// shortened to fit [`messages::MAX_STORE_RECORD_BYTES`]. The clamp backs off
-/// to a UTF-8 boundary, so a clamped body can end up to three bytes short.
+/// to a UTF-8 boundary and then to the end of a word, so a clamped body can end
+/// up to [`WORD_BACKOFF_BYTES`] and three bytes short.
 pub fn record_name_may_be_clamped(data_len: usize) -> bool {
-    data_len + 3 >= messages::MAX_STORE_RECORD_BYTES
+    data_len + 3 + WORD_BACKOFF_BYTES >= messages::MAX_STORE_RECORD_BYTES
 }
 
 /// The file name a keyword record carrying `media` signs for `file_name`:
@@ -544,7 +577,7 @@ pub fn record_name_may_be_clamped(data_len: usize) -> bool {
 pub fn keyword_record_signed_name<'a>(
     file_name: &'a str,
     media: Option<&crate::types::MediaMetadata>,
-) -> &'a str {
+) -> std::borrow::Cow<'a, str> {
     clamp_name_to_record_budget(file_name, encode_media_trailer(media).len())
 }
 
@@ -6275,6 +6308,26 @@ mod tests {
         );
         assert!(record.file_name.len() < huge.len());
         assert!(record.verify());
+    }
+
+    /// A shortened name keeps its extension, which type and extension filters
+    /// read off the stored name, and ends on a whole word.
+    #[test]
+    fn a_shortened_name_keeps_its_extension_and_whole_words() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let words: String = (0..400).map(|i| format!("Episode{i:03} ")).collect();
+        let name = format!("Show {words}Finale.mkv");
+        let record = SignedRecord::keyword("show", [0xAA; 16], [0xBB; 32], 1, &name, &sk);
+        assert!(record.data.len() <= super::super::messages::MAX_STORE_RECORD_BYTES);
+        assert!(record.file_name.len() < name.len());
+        assert!(record.file_name.ends_with(".mkv"), "{}", &record.file_name[record.file_name.len() - 20..]);
+        let stem = record.file_name.trim_end_matches(".mkv");
+        let last = stem.rsplit(' ').next().unwrap();
+        assert!(last.len() == "Episode000".len() && last.starts_with("Episode"), "cut inside a word: {last}");
+        assert!(record_name_may_be_clamped(record.data.len()));
+        assert!(record.verify());
+
+        assert_eq!(keyword_record_signed_name("Show Finale.mkv", None), "Show Finale.mkv");
     }
 
     fn discovered_firewalled(buddy: Option<SourceBuddy>) -> DiscoveredSource {

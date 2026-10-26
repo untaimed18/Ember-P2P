@@ -1370,14 +1370,18 @@ impl DhtStore {
             // Without this, storing from one address and replacing from another
             // freed the first address's slot each time, so two hosts could fill
             // every source slot of a key with one of them.
-            let record_ip = |r: &DhtRecord| r.attributed_ip.or_else(|| source_ip_from_record_data(&r.data));
-            if let Some(ip) = record_ip(&record).filter(|ip| record_ip(&records[pos]) != Some(*ip)) {
+            if let Some(class) =
+                source_ip_class(&record).filter(|class| source_ip_class(&records[pos]) != Some(*class))
+            {
+                let ip = class.0;
                 let same_ip = records
                     .iter()
                     .enumerate()
-                    .filter(|(i, r)| *i != pos && r.expires_at_unix > now_unix && record_ip(r) == Some(ip))
+                    .filter(|(i, r)| {
+                        *i != pos && r.expires_at_unix > now_unix && source_ip_class(r) == Some(class)
+                    })
                     .count();
-                if same_ip >= self.scale.max_sources_per_ip() {
+                if same_ip >= source_ip_cap(&self.scale, class) {
                     self.source_ip_cap_rejections = self.source_ip_cap_rejections.saturating_add(1);
                     debug!(
                         "Key {} already has {same_ip} source record(s) attributed to {ip}, rejecting a replacement",
@@ -1455,19 +1459,15 @@ impl DhtStore {
         //
         // Counted against the attributed address where there is one, so a
         // firewalled source — whose declared address nothing verifies —
-        // cannot buy a fresh quota per invented address.
-        let incoming_ip = record
-            .attributed_ip
-            .or_else(|| source_ip_from_record_data(&record.data));
-        if let Some(ip) = incoming_ip {
-            let max_per_ip = self.scale.max_sources_per_ip();
+        // cannot buy a fresh quota per invented address. See
+        // `source_ip_class` for why relayed and direct sources are counted
+        // apart.
+        if let Some(class) = source_ip_class(&record) {
+            let ip = class.0;
+            let max_per_ip = source_ip_cap(&self.scale, class);
             let same_ip = records
                 .iter()
-                .filter(|r| {
-                    r.attributed_ip
-                        .or_else(|| source_ip_from_record_data(&r.data))
-                        == Some(ip)
-                })
+                .filter(|r| source_ip_class(r) == Some(class))
                 .count();
             if same_ip >= max_per_ip {
                 self.source_ip_cap_rejections = self.source_ip_cap_rejections.saturating_add(1);
@@ -2183,6 +2183,35 @@ fn storer_replicates(data: &[u8]) -> bool {
         Some(&RECORD_TYPE_KEYWORD | &RECORD_TYPE_FEED | &RECORD_TYPE_FEED_LISTING) => true,
         Some(&RECORD_TYPE_CHANNEL) => channel_kind_from_data(data) != Some(CHANNEL_KIND_PRESENCE),
         _ => false,
+    }
+}
+
+/// How many times [`scale::NetworkScale::max_sources_per_ip`] a relay's address
+/// may hold of firewalled sources under one key.
+pub(super) const RELAYED_SOURCES_PER_IP_FACTOR: usize = 4;
+
+/// The address a source record counts against for the per-IP cap, and whether
+/// it is a firewalled source attributed to the peer that relayed it.
+///
+/// Counted apart because they are different things at one address. Every
+/// firewalled source reaches storers through its buddy, so all of a buddy's
+/// firewalled users who share a file were held to the cap of one host, and the
+/// fourth on a large network was refused by every storer alike and never found
+/// as a source for that file; the buddy's own source competed with them too.
+/// The relayed allowance is larger, and it still bounds what one host can
+/// claim, since what it relays is counted against it alone.
+fn source_ip_class(record: &DhtRecord) -> Option<(std::net::Ipv4Addr, bool)> {
+    match record.attributed_ip {
+        Some(ip) => Some((ip, true)),
+        None => source_ip_from_record_data(&record.data).map(|ip| (ip, false)),
+    }
+}
+
+fn source_ip_cap(scale: &scale::NetworkScale, (_, relayed): (std::net::Ipv4Addr, bool)) -> usize {
+    if relayed {
+        scale.max_sources_per_ip() * RELAYED_SOURCES_PER_IP_FACTOR
+    } else {
+        scale.max_sources_per_ip()
     }
 }
 
@@ -3052,8 +3081,8 @@ mod tests {
         let key = source_key(&file);
 
         // Fill the address's whole source allowance, from distinct publishers so
-        // only the per-IP cap is in play.
-        let max_per_ip = store.scale.max_sources_per_ip();
+        // only the per-IP cap is in play. Attributed, so the relayed allowance.
+        let max_per_ip = source_ip_cap(&store.scale, (ip, true));
         for p in 0..max_per_ip {
             let sk = SigningKey::from_bytes(&[p as u8 + 1; 32]);
             let rec = SignedRecord::source(file, [0u8; 32], 100, "iso", contact, &sk);
@@ -3493,6 +3522,50 @@ mod tests {
         assert!(
             store.store(key, honest.data.clone(), honest.signature),
             "a genuine source from another address must still be accepted"
+        );
+    }
+
+    /// Every firewalled source reaches a storer through its buddy, so a buddy
+    /// relaying for several users of one file must not be held to one host's
+    /// allowance, nor crowd out its own direct source; what it relays is still
+    /// bounded.
+    #[test]
+    fn a_buddys_relayed_sources_have_their_own_larger_allowance() {
+        use super::super::publish::{SignedRecord, SourceContact};
+        use crate::network::ember::SOURCE_FLAG_FIREWALLED;
+        use std::net::Ipv4Addr;
+
+        let mut store = DhtStore::new();
+        store.set_scale(scale::NetworkScale::Established);
+        let cap = scale::NetworkScale::Established.max_sources_per_ip();
+        let file_hash = [0x79u8; 16];
+        let key = super::super::publish::source_key(&file_hash);
+        let buddy = Ipv4Addr::new(198, 51, 7, 1);
+        let contact = |ip, flags, i: u8| SourceContact {
+            ip,
+            tcp_port: 4662,
+            udp_port: 4672,
+            flags,
+            noise_pub: [i; 32],
+            ..Default::default()
+        };
+
+        let mut relayed = 0;
+        for i in 0..(cap * RELAYED_SOURCES_PER_IP_FACTOR + 3) as u8 {
+            let sk = SigningKey::from_bytes(&[i.wrapping_add(90); 32]);
+            let behind = contact(Ipv4Addr::new(10, 0, 0, i + 1), SOURCE_FLAG_FIREWALLED, i);
+            let rec = SignedRecord::source(file_hash, [0u8; 32], 100, "shared.iso", behind, &sk);
+            if store.store_attributed(key, rec.data.clone(), rec.signature, Some(buddy)) {
+                relayed += 1;
+            }
+        }
+        assert_eq!(relayed, cap * RELAYED_SOURCES_PER_IP_FACTOR, "more than one host's worth, and bounded");
+
+        let own = SigningKey::from_bytes(&[0xEE; 32]);
+        let direct = SignedRecord::source(file_hash, [0u8; 32], 100, "shared.iso", contact(buddy, 0, 0xEE), &own);
+        assert!(
+            store.store(key, direct.data.clone(), direct.signature),
+            "the buddy's own source is not crowded out by those it relays"
         );
     }
 
