@@ -58,7 +58,6 @@ export interface FollowedFeed {
   auto_download: boolean;
   auto_max_item_mib: number;
   auto_max_day_mib: number;
-  auto_category: string;
   /** When auto-download was last turned on; it takes files first seen since. */
   auto_since: number;
   /** When a head of the feed was last found on the network, newer or not;
@@ -216,9 +215,8 @@ export const setFeedAutoDownload = (
   enabled: boolean,
   maxItemMib: number,
   maxDayMib: number,
-  category: string,
-): Promise<void> =>
-  invoke('set_feed_auto_download', { publisher, salt, enabled, maxItemMib, maxDayMib, category });
+): Promise<FollowedFeed> =>
+  invoke('set_feed_auto_download', { publisher, salt, enabled, maxItemMib, maxDayMib });
 export const downloadFeedItems = (publisher: string, salt: string, ed2ks: string[]): Promise<number> =>
   invoke('download_feed_items', { publisher, salt, ed2ks });
 /** Cancel the feed's download of a file: what has arrived is deleted. */

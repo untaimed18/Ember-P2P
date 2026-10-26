@@ -2999,6 +2999,13 @@ pub async fn remove_transfer(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
+    discard_transfer(&state, transfer_id, true).await
+}
+
+/// [`remove_transfer`], with `keep_failed` saying whether a failed
+/// download's bytes are moved into Downloads first or deleted with the rest:
+/// a feed's are private, and its Cancel says what arrived is deleted.
+pub(crate) async fn discard_transfer(state: &AppState, transfer_id: String, keep_failed: bool) -> Result<(), String> {
     let snapshot = {
         let manager = state.transfer_manager.read().await;
         manager.get_transfer(&transfer_id).cloned()
@@ -3013,7 +3020,7 @@ pub async fn remove_transfer(
     // are, and the user is told why.
     let mut leave_files = false;
     if let Some(failed) = snapshot.filter(|t| {
-        t.status == TransferStatus::Failed && t.direction == TransferDirection::Download
+        keep_failed && t.status == TransferStatus::Failed && t.direction == TransferDirection::Download
     }) {
         leave_files = preserve_failed_partial(&dl_folders, &transfer_id, &failed.file_name).await?;
     }
@@ -3054,7 +3061,7 @@ pub async fn remove_transfer(
             }
         })
         .await;
-        start_promoted_downloads(&state, &promoted).await;
+        start_promoted_downloads(state, &promoted).await;
         return Ok(());
     }
 
@@ -3101,7 +3108,7 @@ pub async fn remove_transfer(
         .await;
     },);
     spawn_deferred_partial_cleanup(state.db.clone(), dl_roots, transfer_id.clone());
-    start_promoted_downloads(&state, &promoted).await;
+    start_promoted_downloads(state, &promoted).await;
     Ok(())
 }
 

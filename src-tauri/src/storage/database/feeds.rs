@@ -10,6 +10,11 @@ use super::*;
 /// Items a publisher removed that a follower keeps showing, per feed.
 const REMOVED_ITEMS_KEPT: i64 = 2_000;
 
+/// Followers counted as having downloaded one file of a feed of ours from us,
+/// past which no more are kept: each costs a whole file's worth of our upload,
+/// but node ids cost nothing, and the table would otherwise grow for good.
+const FEED_DOWNLOADS_PER_FILE_MAX: i64 = 10_000;
+
 /// The window auto-download's per-day cap counts over, in seconds: the last
 /// 24 hours, not the calendar day, so a cap is not spent twice across
 /// midnight.
@@ -145,7 +150,6 @@ pub struct FollowedFeed {
     /// Per [`FEED_AUTO_WINDOW_SECS`], in MiB; 0 for no cap.
     /// [`FEED_AUTO_DEFAULT_DAY_MIB`] for a new follow.
     pub auto_max_day_mib: i64,
-    pub auto_category: String,
     /// The folder in `Feeds` its files finish in, fixed by the first one
     /// downloaded; empty before.
     pub folder: String,
@@ -566,6 +570,18 @@ impl Database {
                 items_changed,
             ],
         )? > 0;
+        // Who downloaded a file the feed no longer lists is no longer shown.
+        if let Some(items) = items.filter(|_| recorded) {
+            let listed: std::collections::HashSet<&str> = items.iter().map(|item| item.ed2k.as_str()).collect();
+            let counted: Vec<String> = {
+                let mut stmt = tx.prepare("SELECT DISTINCT ed2k FROM feeds_own_downloads WHERE salt = ?1")?;
+                let rows = stmt.query_map(params![salt], |row| row.get(0))?.collect::<Result<Vec<String>, _>>()?;
+                rows
+            };
+            for ed2k in counted.iter().filter(|ed2k| !listed.contains(ed2k.as_str())) {
+                tx.execute("DELETE FROM feeds_own_downloads WHERE salt = ?1 AND ed2k = ?2", params![salt, ed2k])?;
+            }
+        }
         tx.commit()?;
         Ok(recorded)
     }
@@ -645,7 +661,8 @@ impl Database {
 
     /// Note followers who downloaded files of our feeds from us:
     /// `(salt, ed2k, follower)`, lowercase hex, at `now`. Each follower counts
-    /// once per file, however often they fetch it again.
+    /// once per file, however often they fetch it again, and a file stops
+    /// being counted at [`FEED_DOWNLOADS_PER_FILE_MAX`].
     pub fn feed_own_note_downloads(&self, downloads: &[(String, String, String)], now: i64) -> anyhow::Result<()> {
         if downloads.is_empty() {
             return Ok(());
@@ -656,10 +673,11 @@ impl Database {
         {
             let mut insert = tx.prepare(
                 "INSERT OR IGNORE INTO feeds_own_downloads (salt, ed2k, follower, at)
-                 SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM feeds_own WHERE salt = ?1)",
+                 SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM feeds_own WHERE salt = ?1)
+                    AND (SELECT COUNT(*) FROM feeds_own_downloads WHERE salt = ?1 AND ed2k = ?2) < ?5",
             )?;
             for (salt, ed2k, follower) in downloads {
-                insert.execute(params![salt, ed2k, follower, now])?;
+                insert.execute(params![salt, ed2k, follower, now, FEED_DOWNLOADS_PER_FILE_MAX])?;
             }
         }
         tx.commit()?;
@@ -786,7 +804,7 @@ impl Database {
         Self::ensure_feeds_locked(&conn)?;
         let select = "SELECT publisher, salt, title, description, sequence, list_ed2k, list_blake3, list_size,
                     item_count, state, list_sequence, unread, followed_at, checked_at, auto_download,
-                    auto_max_item_mib, auto_max_day_mib, auto_category, held_ed2k, held_blake3, held_size, folder,
+                    auto_max_item_mib, auto_max_day_mib, held_ed2k, held_blake3, held_size, folder,
                     auto_since, seen_at
              FROM feeds_followed";
         let map = |row: &rusqlite::Row<'_>| {
@@ -808,13 +826,12 @@ impl Database {
                 auto_download: row.get::<_, i64>(14)? != 0,
                 auto_max_item_mib: row.get(15)?,
                 auto_max_day_mib: row.get(16)?,
-                auto_category: row.get(17)?,
-                held_ed2k: row.get(18)?,
-                held_blake3: row.get(19)?,
-                held_size: row.get(20)?,
-                folder: row.get(21)?,
-                auto_since: row.get(22)?,
-                seen_at: row.get(23)?,
+                held_ed2k: row.get(17)?,
+                held_blake3: row.get(18)?,
+                held_size: row.get(19)?,
+                folder: row.get(20)?,
+                auto_since: row.get(21)?,
+                seen_at: row.get(22)?,
             })
         };
         let rows = match key {
@@ -1152,17 +1169,16 @@ impl Database {
         enabled: bool,
         max_item_mib: i64,
         max_day_mib: i64,
-        category: &str,
         now: i64,
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         Self::ensure_feeds_locked(&conn)?;
         Ok(conn.execute(
             "UPDATE feeds_followed SET
-                    auto_since = CASE WHEN ?3 AND auto_download = 0 THEN ?7 ELSE auto_since END,
-                    auto_download = ?3, auto_max_item_mib = ?4, auto_max_day_mib = ?5, auto_category = ?6
+                    auto_since = CASE WHEN ?3 AND auto_download = 0 THEN ?6 ELSE auto_since END,
+                    auto_download = ?3, auto_max_item_mib = ?4, auto_max_day_mib = ?5, auto_category = ''
              WHERE publisher = ?1 AND salt = ?2",
-            params![publisher, salt, enabled, max_item_mib, max_day_mib, category, now],
+            params![publisher, salt, enabled, max_item_mib, max_day_mib, now],
         )? > 0)
     }
 
@@ -1538,6 +1554,9 @@ mod tests {
         let counts = db.feed_own_download_counts("s").unwrap();
         assert_eq!((counts.get("a"), counts.get("b"), counts.len()), (Some(&2), Some(&1), 2), "f1 fetched a twice");
         assert!(db.feed_own_download_counts("gone").unwrap().is_empty(), "no such feed of ours");
+        assert!(db.feed_own_published("s", &publish(20, "One"), Some(&[item("a", "A")]), 7).unwrap());
+        let counts = db.feed_own_download_counts("s").unwrap();
+        assert_eq!((counts.get("a"), counts.len()), (Some(&2), 1), "b left the feed, and its count with it");
         db.feed_own_delete("s", 10, 100).unwrap();
         assert!(db.feed_own_download_counts("s").unwrap().is_empty(), "deleted with the feed");
         drop_db(db, path);
@@ -1650,15 +1669,15 @@ mod tests {
         db.feed_follow(PUB, SALT, 1).unwrap();
         let since = |salt: &str| db.feed_followed(PUB, salt).unwrap().unwrap().auto_since;
         assert_eq!(since(SALT), 0);
-        assert!(db.feed_set_auto_download(PUB, SALT, true, 0, 0, "", 100).unwrap());
+        assert!(db.feed_set_auto_download(PUB, SALT, true, 0, 0, 100).unwrap());
         assert_eq!(since(SALT), 100);
-        db.feed_set_auto_download(PUB, SALT, true, 50, 0, "", 200).unwrap();
+        db.feed_set_auto_download(PUB, SALT, true, 50, 0, 200).unwrap();
         assert_eq!(since(SALT), 100, "a cap changed while on");
-        db.feed_set_auto_download(PUB, SALT, false, 50, 0, "", 300).unwrap();
+        db.feed_set_auto_download(PUB, SALT, false, 50, 0, 300).unwrap();
         assert_eq!(since(SALT), 100);
-        db.feed_set_auto_download(PUB, SALT, true, 50, 0, "", 400).unwrap();
+        db.feed_set_auto_download(PUB, SALT, true, 50, 0, 400).unwrap();
         assert_eq!(since(SALT), 400, "turned on again");
-        assert!(!db.feed_set_auto_download(PUB, "nope", true, 0, 0, "", 500).unwrap(), "not followed");
+        assert!(!db.feed_set_auto_download(PUB, "nope", true, 0, 0, 500).unwrap(), "not followed");
 
         db.feed_follow(PUB, "older", 1).unwrap();
         db.feed_start_auto_since(PUB, "older", 50).unwrap();
@@ -1843,7 +1862,7 @@ mod tests {
             "the column defaults"
         );
 
-        db.feed_set_auto_download(PUB, SALT, true, 0, 0, "", 1).unwrap();
+        db.feed_set_auto_download(PUB, SALT, true, 0, 0, 1).unwrap();
         let feed = db.feed_followed(PUB, SALT).unwrap().unwrap();
         assert_eq!((feed.auto_download, feed.auto_max_item_mib, feed.auto_max_day_mib), (true, 0, 0));
         drop_db(db, path);

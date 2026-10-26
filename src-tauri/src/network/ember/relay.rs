@@ -2317,52 +2317,57 @@ where
 /// Serve a follower's request for a file of a feed we publish (see
 /// `network::feed_direct`). Anyone may ask, friend or not: a feed is public to
 /// whoever has its link, and the request names the file by an id only the
-/// link and the list let one compute. A few at a time; past that the request
-/// is refused, and the follower fetches over eD2K instead. Returns the
-/// stream's id when it ran to the file's end, for the caller to count the
-/// download once the follower says it has it.
+/// link and the list let one compute. A few at a time, and at most
+/// two to one `follower` (its proven node id); past that the request is
+/// refused as busy, and the follower asks again later. Returns the stream's
+/// id once this follower has been sent the whole file, over this stream and
+/// those before it, for the caller to count the download once the follower
+/// says it has it.
 pub async fn serve_feed_stream<R, W>(
     recv: &mut R,
     send: &mut W,
     header: &[u8; 7],
+    follower: Option<[u8; 16]>,
     limiter: &crate::bandwidth::limiter::BandwidthLimiter,
 ) -> anyhow::Result<Option<[u8; 16]>>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    // Taken once the request names a file of ours, so a dialer that sends
-    // nothing, or asks for nothing we serve, holds none.
-    let mut slot = None;
     let mut busy = false;
-    let mut to_end = None;
+    let mut streamed: Option<([u8; 16], u64)> = None;
+    let mut sent = 0u64;
     let served = super::attach_stream::serve_feed_stream(
         recv,
         send,
         header,
-        |xfer_id| {
-            let file = crate::network::feed_direct::served(xfer_id)?;
-            slot = crate::network::feed_direct::serve_slot();
+        crate::network::feed_direct::served,
+        // Taken once the file's chunk list is ready, so a dialer that sends
+        // nothing, asks for nothing we serve, or waits on a hash, holds none.
+        |_| {
+            let slot = crate::network::feed_direct::serve_slot(follower);
             busy = slot.is_none();
-            slot.as_ref().map(|_| file)
+            slot.ok_or(super::attach::AttachStreamStatus::Busy)
         },
         |xfer_id, position, size| {
-            if position >= size {
-                to_end = Some(*xfer_id);
-            }
+            let (_, from) = *streamed.get_or_insert((*xfer_id, position));
+            sent = position.saturating_sub(from).min(size);
             true
         },
         Some(limiter),
     )
     .await;
-    drop(slot);
     match &served {
-        Ok(0) if busy => debug!("Feed stream refused: as many as we serve at once are running"),
+        Ok(0) if busy => debug!("Feed stream refused: as many as we serve at once, or to this follower, are running"),
         Ok(0) => debug!("No feed file of ours under the id a follower asked for"),
         Ok(bytes) => debug!("Feed stream: served {bytes} byte(s)"),
         Err(e) => debug!("Feed stream failed: {e}"),
     }
-    served.map(|_| to_end)
+    let whole = streamed.and_then(|(xfer_id, _)| {
+        let follower = follower?;
+        crate::network::feed_direct::note_served(&xfer_id, follower, sent).then_some(xfer_id)
+    });
+    served.map(|_| whole)
 }
 
 /// How long a sender holds an attachment connection open after the last chunk,
@@ -2706,7 +2711,8 @@ pub async fn run_quic_accept_loop(
                 // A follower fetching a file of a feed we publish. No identity
                 // check: a feed is public, and the request's id is the grant.
                 // The certificate names who it was, for the download count.
-                let finished = serve_feed_stream(&mut init_recv, &mut init_send, &header, limiter.as_ref()).await;
+                let finished =
+                    serve_feed_stream(&mut init_recv, &mut init_send, &header, peer_node_id, limiter.as_ref()).await;
                 let _ = init_send.finish();
                 let delivered = attachment_delivered(&init_send).await;
                 if let (Ok(Some(xfer_id)), true, Some(follower)) = (finished, delivered, peer_node_id) {

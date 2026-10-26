@@ -392,6 +392,9 @@ pub enum AttachStreamStatus {
     SourceGone,
     /// The requester asked to resume past the end of the file.
     BadCursor,
+    /// The sender is serving as many as it will at once, or as many to this
+    /// requester, or has read all it will for them lately: ask again later.
+    Busy,
 }
 
 impl AttachStreamStatus {
@@ -402,6 +405,7 @@ impl AttachStreamStatus {
             AttachStreamStatus::Unauthorized => 2,
             AttachStreamStatus::SourceGone => 3,
             AttachStreamStatus::BadCursor => 4,
+            AttachStreamStatus::Busy => 5,
         }
     }
 
@@ -412,6 +416,7 @@ impl AttachStreamStatus {
             2 => AttachStreamStatus::Unauthorized,
             3 => AttachStreamStatus::SourceGone,
             4 => AttachStreamStatus::BadCursor,
+            5 => AttachStreamStatus::Busy,
             _ => return None,
         })
     }

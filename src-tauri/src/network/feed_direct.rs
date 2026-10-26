@@ -18,8 +18,10 @@
 //! answered ([`LOOKUP_MAX`] before then). Time paused or waiting for a
 //! download slot is not counted.
 //!
-//! Held in memory only: a download resumed after a restart looks everywhere
-//! at once, as any other does.
+//! Held in memory only, and held again when a feed's download is restored
+//! after a restart (see `network::event_loop::resume_downloads`). Every
+//! download held is watched by the feeds service, which ends its hold when
+//! it is due and forgets it once the download ends (see [`watched`]).
 //!
 //! The publisher's half is here too: which files a follower may ask for,
 //! and how many are served at once.
@@ -40,12 +42,12 @@ pub const HOLD_IDLE: Duration = Duration::from_secs(45);
 /// How long the first lookup may take to answer. One on a cold routing table
 /// can run most of its 60-second cap.
 pub const LOOKUP_MAX: Duration = Duration::from_secs(75);
-/// Far more feed downloads than a user starts at once; past it a download is
-/// simply not held.
-const MAX_HOLDS: usize = 512;
+/// More feed downloads than every followed feed's auto-download starts; past
+/// it a download is simply not held, and looks everywhere at once.
+const MAX_HOLDS: usize = 16_384;
 /// Feed files a publisher streams at once. Each is a priority upload, ahead
 /// of the eD2K queue, so a few rather than every follower who asks: one
-/// refused fetches over eD2K instead.
+/// refused is told it is busy, and asks again later.
 const MAX_SERVES: usize = 8;
 
 /// Why a download stopped waiting on its publisher.
@@ -112,6 +114,9 @@ struct Registry {
     /// Kept apart from the holds: a stream outlives the hold that found it,
     /// and a run of the download started again picks it up again.
     streams: HashMap<String, StreamSource>,
+    /// Every download begun here and not yet forgotten, with when it was
+    /// begun: what the feeds service watches.
+    watched: HashMap<String, Instant>,
 }
 
 fn registry() -> &'static parking_lot::Mutex<Registry> {
@@ -125,15 +130,17 @@ fn streamable(size: u64) -> bool {
 }
 
 /// Hold `transfer_id`, a download of `file_hash` (`size` bytes) from a feed
-/// `publisher` publishes, until its publisher has had the first go.
-pub fn begin(transfer_id: &str, file_hash: [u8; 16], size: u64, publisher: Publisher) {
+/// `publisher` publishes, until its publisher has had the first go. Whether
+/// it is held: past [`MAX_HOLDS`], or for a key that is no identity, not.
+pub fn begin(transfer_id: &str, file_hash: [u8; 16], size: u64, publisher: Publisher) -> bool {
     let Some(node) = super::ember::crypto::node_id_from_ed25519_bytes(&publisher.key) else {
-        return;
+        return false;
     };
     let mut reg = registry().lock();
     if reg.holds.len() >= MAX_HOLDS && !reg.holds.contains_key(transfer_id) {
-        return;
+        return false;
     }
+    reg.watched.insert(transfer_id.to_string(), Instant::now());
     let tcp = publisher.friend_tcp.filter(|_| streamable(size));
     reg.holds.insert(
         transfer_id.to_string(),
@@ -166,6 +173,7 @@ pub fn begin(transfer_id: &str, file_hash: [u8; 16], size: u64, publisher: Publi
             reg.streams.remove(transfer_id);
         }
     }
+    true
 }
 
 /// Stop holding `transfer_id`, whatever it was waiting on, and forget its
@@ -174,6 +182,13 @@ pub fn forget(transfer_id: &str) {
     let mut reg = registry().lock();
     reg.holds.remove(transfer_id);
     reg.streams.remove(transfer_id);
+    reg.watched.remove(transfer_id);
+}
+
+/// The downloads begun and not forgotten, with when each was begun: to be
+/// [`poll`]ed while they run and [`forget`]ten when they end.
+pub fn watched() -> Vec<(String, Instant)> {
+    registry().lock().watched.iter().map(|(id, at)| (id.clone(), *at)).collect()
 }
 
 /// Whether `transfer_id` is still waiting on its publisher, so no other
@@ -209,7 +224,7 @@ pub fn take_lookup(
     endpoint: Option<Arc<quinn::Endpoint>>,
 ) -> Vec<DiscoveredSource> {
     let mut reg = registry().lock();
-    let Registry { holds, streams } = &mut *reg;
+    let Registry { holds, streams, .. } = &mut *reg;
     let Some((transfer_id, hold)) = holds
         .iter_mut()
         .find(|(_, hold)| hold.released.is_none() && hold.file_hash == file_hash)
@@ -400,8 +415,42 @@ pub fn downloads_noted() -> &'static tokio::sync::Notify {
     NOTED.get_or_init(tokio::sync::Notify::new)
 }
 
-/// `follower` read the file served as `xfer_id` to its end, and said so.
+/// Followers' tallies past which the least lately added to are dropped.
+const MAX_SERVED_TALLIES: usize = 8192;
+
+/// Bytes of each served file sent to each follower, `(follower, xfer id)`,
+/// over every stream of it. A download is counted once they come to a whole
+/// file's worth, not when one stream reaches the file's end, which one asking
+/// for its last chunk alone would.
+fn served_tallies() -> &'static parking_lot::Mutex<HashMap<([u8; 16], [u8; 16]), (u64, Instant)>> {
+    static TALLIES: std::sync::OnceLock<parking_lot::Mutex<HashMap<([u8; 16], [u8; 16]), (u64, Instant)>>> =
+        std::sync::OnceLock::new();
+    TALLIES.get_or_init(Default::default)
+}
+
+/// `follower` was sent `bytes` of the file served as `xfer_id`. Whether they
+/// have now been sent a whole file's worth of it.
+pub fn note_served(xfer_id: &[u8; 16], follower: [u8; 16], bytes: u64) -> bool {
+    let Some(size) = served_files().read().get(xfer_id).map(|file| file.size) else {
+        return false;
+    };
+    let key = (follower, *xfer_id);
+    let mut tallies = served_tallies().lock();
+    if tallies.len() >= MAX_SERVED_TALLIES && !tallies.contains_key(&key) {
+        if let Some(oldest) = tallies.iter().min_by_key(|(_, (_, at))| *at).map(|(key, _)| *key) {
+            tallies.remove(&oldest);
+        }
+    }
+    let (sent, at) = tallies.entry(key).or_insert((0, Instant::now()));
+    *sent = sent.saturating_add(bytes).min(size);
+    *at = Instant::now();
+    *sent >= size
+}
+
+/// `follower` was sent the whole file served as `xfer_id` (see
+/// [`note_served`]), and said they had it.
 pub fn note_downloaded(xfer_id: &[u8; 16], follower: [u8; 16]) {
+    served_tallies().lock().remove(&(follower, *xfer_id));
     let Some((salt, ed2k)) = served_files().read().get(xfer_id).map(|file| (file.salt, file.ed2k)) else {
         return;
     };
@@ -417,6 +466,18 @@ pub fn note_downloaded(xfer_id: &[u8; 16], follower: [u8; 16]) {
 /// The downloads noted since the last call.
 pub fn take_downloads() -> Vec<FeedDownload> {
     pending_downloads().lock().drain(..).collect()
+}
+
+/// Put back `downloads` taken but not recorded, ahead of any noted since,
+/// for the next try. Past [`MAX_PENDING_DOWNLOADS`] the oldest go.
+pub fn requeue_downloads(downloads: Vec<FeedDownload>) {
+    let mut pending = pending_downloads().lock();
+    for download in downloads.into_iter().rev() {
+        pending.push_front(download);
+    }
+    while pending.len() > MAX_PENDING_DOWNLOADS {
+        pending.pop_front();
+    }
 }
 
 fn served_files() -> &'static parking_lot::RwLock<HashMap<[u8; 16], Served>> {
@@ -447,25 +508,52 @@ pub fn served(xfer_id: &[u8; 16]) -> Option<(PathBuf, u64, [u8; 32])> {
         .map(|file| (file.path.clone(), file.size, file.capability))
 }
 
-/// One of the [`MAX_SERVES`] feed streams served at once, while held.
-pub struct ServeSlot(());
+/// Of the [`MAX_SERVES`], how many one follower may hold: one fetching every
+/// file of a feed at once would otherwise take them all.
+const MAX_SERVES_PER_FOLLOWER: usize = 2;
 
-static SERVING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The feed streams being served, in all and to each follower by node id
+/// (`None` for one whose identity was not proven).
+#[derive(Default)]
+struct Serving {
+    total: usize,
+    by_follower: HashMap<Option<[u8; 16]>, usize>,
+}
+
+fn serving() -> &'static parking_lot::Mutex<Serving> {
+    static SERVING: std::sync::OnceLock<parking_lot::Mutex<Serving>> = std::sync::OnceLock::new();
+    SERVING.get_or_init(Default::default)
+}
+
+/// One of the [`MAX_SERVES`] feed streams served at once, while held.
+pub struct ServeSlot {
+    follower: Option<[u8; 16]>,
+}
 
 impl Drop for ServeSlot {
     fn drop(&mut self) {
-        SERVING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        let mut serving = serving().lock();
+        serving.total = serving.total.saturating_sub(1);
+        if let Some(held) = serving.by_follower.get_mut(&self.follower) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                serving.by_follower.remove(&self.follower);
+            }
+        }
     }
 }
 
-/// A slot to serve a feed stream in, or `None` while [`MAX_SERVES`] run.
-pub fn serve_slot() -> Option<ServeSlot> {
-    SERVING
-        .fetch_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |n| {
-            (n < MAX_SERVES).then_some(n + 1)
-        })
-        .ok()
-        .map(|_| ServeSlot(()))
+/// A slot to serve `follower` a feed stream in, or `None` while
+/// [`MAX_SERVES`] run, or [`MAX_SERVES_PER_FOLLOWER`] for them.
+pub fn serve_slot(follower: Option<[u8; 16]>) -> Option<ServeSlot> {
+    let mut serving = serving().lock();
+    let theirs = serving.by_follower.get(&follower).copied().unwrap_or(0);
+    if serving.total >= MAX_SERVES || theirs >= MAX_SERVES_PER_FOLLOWER {
+        return None;
+    }
+    serving.total += 1;
+    *serving.by_follower.entry(follower).or_default() += 1;
+    Some(ServeSlot { follower })
 }
 
 #[cfg(test)]
@@ -643,15 +731,41 @@ mod tests {
         note_downloaded(&feed_stream_id(&key, &[4; 16], &ed2k), [8; 16]);
         assert_eq!(take_downloads(), vec![(SALT, ed2k, [9; 16])], "only a file of ours is counted");
         assert!(take_downloads().is_empty());
+
+        // A follower comes to the whole file over every stream of it.
+        let (id, entry) = served_entry(&key, &[5; 16], &[0x45; 16], PathBuf::from("g"), 1_000);
+        set_served(HashMap::from([(id, entry)]));
+        assert!(!note_served(&id, [1; 16], 300), "the end alone is not the file");
+        assert!(!note_served(&id, [2; 16], 900), "another follower's bytes are theirs");
+        assert!(note_served(&id, [1; 16], 700));
+        assert!(note_served(&id, [1; 16], 0), "still whole until counted");
+        note_downloaded(&id, [1; 16]);
+        assert!(!note_served(&id, [1; 16], 0), "counted, and begun again");
+        assert!(!note_served(&[0x99; 16], [1; 16], 5_000), "not a file of ours");
         set_served(HashMap::new());
     }
 
     #[test]
     fn serve_slots_run_out_and_come_back() {
-        let held: Vec<_> = (0..MAX_SERVES).filter_map(|_| serve_slot()).collect();
+        let followers: Vec<Option<[u8; 16]>> = (0..MAX_SERVES as u8).map(|n| Some([n; 16])).collect();
+        let held: Vec<_> = followers.iter().filter_map(|follower| serve_slot(*follower)).collect();
         assert_eq!(held.len(), MAX_SERVES);
-        assert!(serve_slot().is_none());
+        assert!(serve_slot(Some([0xEE; 16])).is_none(), "every slot is taken");
         drop(held);
-        assert!(serve_slot().is_some());
+        assert!(serve_slot(Some([0xEE; 16])).is_some());
+
+        let theirs: Vec<_> = (0..MAX_SERVES).filter_map(|_| serve_slot(Some([0xAA; 16]))).collect();
+        assert_eq!(theirs.len(), MAX_SERVES_PER_FOLLOWER, "one follower holds only their share");
+        assert!(serve_slot(Some([0xBB; 16])).is_some(), "another is still served");
+    }
+
+    #[test]
+    fn a_begun_download_is_watched_until_forgotten() {
+        let (id, hash) = ("feed-direct-watched", [0x3B; 16]);
+        assert!(begin(id, hash, 1_000, publisher(None)));
+        assert!(watched().iter().any(|(watched, _)| watched == id));
+        assert_eq!(poll(id, 0, true, Instant::now()), Poll::Holding);
+        forget(id);
+        assert!(!watched().iter().any(|(watched, _)| watched == id));
     }
 }

@@ -634,11 +634,17 @@ where
         send,
         prefix,
         with_root(capability_for),
+        admit_all,
         on_progress,
         limiter,
         true,
     )
     .await
+}
+
+/// The admission of a stream nothing limits but its grant.
+fn admit_all(_xfer_id: &[u8; 16]) -> Result<(), AttachStreamStatus> {
+    Ok(())
 }
 
 /// A grant whose root is known, as a chat or room offer's is.
@@ -656,11 +662,16 @@ where
 /// its whole-file digests, not by its chunk tree. The tree is whatever the
 /// file on disk hashes to, and the follower checks the finished file against
 /// the list. Served as a priority upload, as a chat file is.
-pub async fn serve_feed_stream<R, W, F, P>(
+///
+/// `admit` is asked once the file's chunk list is ready, so a wait for it
+/// holds nothing it hands out; what it returns is held while the stream runs,
+/// and an `Err` is the status the follower is refused with.
+pub async fn serve_feed_stream<R, W, F, A, G, P>(
     recv: &mut R,
     send: &mut W,
     prefix: &[u8; 7],
     resolve: F,
+    admit: A,
     on_progress: P,
     limiter: Option<&crate::bandwidth::limiter::BandwidthLimiter>,
 ) -> anyhow::Result<u64>
@@ -668,6 +679,7 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
     F: FnOnce(&[u8; 16]) -> Option<(PathBuf, u64, [u8; 32])>,
+    A: FnOnce(&[u8; 16]) -> Result<G, AttachStreamStatus>,
     P: FnMut(&[u8; 16], u64, u64) -> bool,
 {
     serve_paced(
@@ -676,6 +688,7 @@ where
         send,
         prefix,
         move |xfer_id: &[u8; 16]| resolve(xfer_id).map(|(path, size, capability)| (path, size, None, capability)),
+        admit,
         on_progress,
         limiter,
         true,
@@ -701,16 +714,24 @@ where
     F: FnOnce(&[u8; 16]) -> Option<(PathBuf, u64, [u8; 32], [u8; 32])>,
     P: FnMut(&[u8; 16], u64, u64) -> bool,
 {
-    serve_paced(stream_type, recv, send, prefix, with_root(capability_for), on_progress, limiter, false).await
+    serve_paced(stream_type, recv, send, prefix, with_root(capability_for), admit_all, on_progress, limiter, false).await
 }
 
+/// Seconds of a feed stream spent waiting on the follower to take what was
+/// sent, over which they must have taken [`FEED_MIN_BYTES_PER_WINDOW`]: a
+/// follower reading a trickle would otherwise hold a serve slot for as long
+/// as they liked. Time waiting on our own upload cap is not counted.
+const FEED_SLOW_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const FEED_MIN_BYTES_PER_WINDOW: u64 = 1024 * 1024;
+
 #[allow(clippy::too_many_arguments)]
-async fn serve_paced<R, W, F, P>(
+async fn serve_paced<R, W, F, A, G, P>(
     stream_type: u8,
     recv: &mut R,
     send: &mut W,
     prefix: &[u8; 7],
     capability_for: F,
+    admit: A,
     mut on_progress: P,
     limiter: Option<&crate::bandwidth::limiter::BandwidthLimiter>,
     priority: bool,
@@ -719,6 +740,7 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
     F: FnOnce(&[u8; 16]) -> Option<(PathBuf, u64, Option<[u8; 32]>, [u8; 32])>,
+    A: FnOnce(&[u8; 16]) -> Result<G, AttachStreamStatus>,
     P: FnMut(&[u8; 16], u64, u64) -> bool,
 {
     let mut tail = [0u8; ATTACH_REQUEST_TAIL_LEN];
@@ -795,13 +817,14 @@ where
     }
     let matches = |tree: &HashTree| tree.file_size == size && root.is_none_or(|root| tree.root_hash == root);
     // Anyone with a feed's link may ask, so a feed file read for its list waits
-    // its turn and its share of an hour's budget; past that it is refused,
-    // and the follower fetches it over eD2K.
+    // its turn and its share of an hour's budget; past that it is refused as
+    // busy, and the follower asks again later and the rest of the network
+    // meanwhile.
     let permit = if stream_type == super::attach::FEED_STREAM_MSG_TYPE && !tree_known(&stamp) {
         match tokio::time::timeout(ATTACH_STATUS_TIMEOUT, feed_hash_permit(size)).await {
             Ok(Some(permit)) => Some(permit),
             _ => {
-                refuse(send, AttachStreamStatus::Unknown).await?;
+                refuse(send, AttachStreamStatus::Busy).await?;
                 anyhow::bail!("no budget left to hash a feed file for a follower");
             }
         }
@@ -830,6 +853,13 @@ where
             anyhow::bail!("attachment could not be hashed: {e}");
         }
     };
+    let _admitted = match admit(&request.xfer_id) {
+        Ok(admitted) => admitted,
+        Err(status) => {
+            refuse(send, status).await?;
+            return Ok(0);
+        }
+    };
 
     let info = AttachFileInfo {
         size,
@@ -855,6 +885,8 @@ where
     // Registered only once the bytes start, so the hash wait above holds no
     // reserve.
     let priority = limiter.filter(|_| priority).map(|limiter| limiter.priority_upload());
+    let slow_floor = stream_type == super::attach::FEED_STREAM_MSG_TYPE;
+    let (mut waited, mut taken) = (std::time::Duration::ZERO, 0u64);
     for index in request.start_chunk as usize..info.chunk_count() {
         let len = info
             .chunk_len(index)
@@ -875,7 +907,18 @@ where
                     anyhow::bail!("upload limiter stopped");
                 }
             }
+            let writing = std::time::Instant::now();
             tokio::time::timeout(ATTACH_IO_TIMEOUT, send.write_all(slice)).await??;
+            if slow_floor {
+                waited += writing.elapsed();
+                taken += slice.len() as u64;
+                if waited >= FEED_SLOW_WINDOW {
+                    if taken < FEED_MIN_BYTES_PER_WINDOW {
+                        anyhow::bail!("the follower took {taken} byte(s) in {}s of waiting", waited.as_secs());
+                    }
+                    (waited, taken) = (std::time::Duration::ZERO, 0);
+                }
+            }
             sent += slice.len() as u64;
             position += slice.len() as u64;
             if !on_progress(&request.xfer_id, position, size) {
@@ -2365,6 +2408,18 @@ mod tests {
         asked_with: [u8; 32],
         start_chunk: u32,
     ) -> Result<(AttachFileInfo, Vec<u8>), FetchError> {
+        feed_round_trip_admitted(source, size, capability, asked_with, start_chunk, Ok(())).await
+    }
+
+    /// [`feed_round_trip`], admitted or refused with `admitted`.
+    async fn feed_round_trip_admitted(
+        source: Option<&Path>,
+        size: u64,
+        capability: [u8; 32],
+        asked_with: [u8; 32],
+        start_chunk: u32,
+        admitted: Result<(), AttachStreamStatus>,
+    ) -> Result<(AttachFileInfo, Vec<u8>), FetchError> {
         let (mut client_w, mut server_r) = tokio::io::duplex(1 << 20);
         let (mut server_w, mut client_r) = tokio::io::duplex(1 << 20);
         let served = source.map(Path::to_path_buf);
@@ -2376,6 +2431,7 @@ mod tests {
                 &mut server_w,
                 &prefix,
                 |_| served.map(|path| (path, size, capability)),
+                |_| admitted,
                 |_, _, _| true,
                 None,
             )
@@ -2435,6 +2491,17 @@ mod tests {
     async fn a_file_no_feed_of_ours_lists_is_refused() {
         let refused = feed_round_trip(None, 9, [8; 32], [8; 32], 0).await;
         assert!(matches!(refused, Err(FetchError::Refused(AttachStreamStatus::Unknown))));
+    }
+
+    /// A follower turned away for want of a slot is told so, to ask again,
+    /// rather than told the file is not ours.
+    #[tokio::test]
+    async fn a_feed_request_past_the_serve_slots_is_refused_as_busy() {
+        let source = temp_path("feed-busy");
+        std::fs::write(&source, b"feed file").expect("write");
+        let refused = feed_round_trip_admitted(Some(&source), 9, [8; 32], [8; 32], 0, Err(AttachStreamStatus::Busy)).await;
+        assert!(matches!(refused, Err(FetchError::Refused(AttachStreamStatus::Busy))));
+        let _ = std::fs::remove_file(&source);
     }
 
     /// Past the 2 GiB a chat file may be, which a feed's film can be.

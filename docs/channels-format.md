@@ -1491,7 +1491,7 @@ ed2k)`. Both are public to whoever holds the feed's link and list; what they
 show is that the dialer does, and they name one file of one feed.
 
 **Answer.** A status byte (`0` ok, `1` unknown, `2` unauthorized, `3`
-source gone, `4` bad cursor), then for `0` the file's size (8, LE), its chunk
+source gone, `4` bad cursor, `5` busy), then for `0` the file's size (8, LE), its chunk
 count (4, LE) and the BLAKE3 of each 256 KiB chunk, then the chunks from
 `start_chunk` to the end. A file may be up to 8 GiB (`FEED_STREAM_MAX_BYTES`)
 here, against 2 GiB for the other two types; a larger one is fetched over
@@ -1501,21 +1501,37 @@ of the download against the first one's list, and the finished file against
 the list's eD2K, AICH and BLAKE3. Once it has read the last chunk it closes
 QUIC with `attach done`, or writes `0x01` on TCP.
 
-**The publisher** serves a file under its `xfer_id` while the file is in a
-feed it has published, is still shared with everyone and has the BLAKE3 the
-feed names; the table is rebuilt each minute and on every publish or delete.
-It answers `1` to an id it does not serve, and to any request while 8 feed
-streams already run (`MAX_SERVES`). A file whose chunk list is not cached is
-hashed for followers one at a time, at most 32 GiB of such reads an hour
-(`FEED_HASH_BUDGET`), since anyone with the link may ask for any of a feed's
-files; past that it answers `1` too. A stream is a priority upload, ahead of
-the eD2K slots, within the upload limit.
+**The publisher** serves a file under its `xfer_id` while the file is named
+by the list of a feed's published head or its pending one (what a follower
+can hold; not the editor's unpublished items), is still shared with everyone
+and has the BLAKE3 the list names; the table is rebuilt each minute and on
+every publish or delete, one rebuild at a time. It answers `1` to an id it
+does not serve. A file whose chunk list is not cached is hashed for followers
+one at a time, at most 32 GiB of such reads an hour (`FEED_HASH_BUDGET`),
+since anyone with the link may ask for any of a feed's files; past that it
+answers `5`. Once the chunk list is ready it takes a serve slot, and answers
+`5` while 8 feed streams already run (`MAX_SERVES`) or 2 to this follower's
+node id (`MAX_SERVES_PER_FOLLOWER`). A stream is a priority upload, ahead of
+the eD2K slots, within the upload limit; one whose follower takes less than
+1 MiB over 60 seconds spent waiting on them (time waiting on the upload limit
+aside) is ended (`FEED_MIN_BYTES_PER_WINDOW`).
+
+A follower is counted as having downloaded a file once it has been sent a
+whole file's worth of it, over this stream and its earlier ones (kept in
+memory, for up to 8,192 follower and file pairs), and acknowledges the
+stream that brought it there. Each node id counts once per file; a file's
+count stops at 10,000 (`FEED_DOWNLOADS_PER_FILE_MAX`), and counts of a file
+the feed no longer lists are dropped at the next publish.
 
 **The follower** writes each verified chunk's missing bytes into the
 download's part file, as any source does, and asks again from the next missing
-chunk when the next four are held already. Three failed dials or streams in a
-row, a refusal or a chunk that does not verify end it, and every network is
-asked for the file.
+chunk when the next four are held already. A `5` is asked again after 15
+seconds, doubling to at most 2 minutes, and ends the stream after 8 in a row;
+the download's hold for its publisher ends meanwhile once nothing arrives, so
+the rest of the network is asked alongside. Three failed dials or streams in
+a row, any other refusal, or a chunk that does not verify end it, and every
+network is asked for the file. A feed's download restored after a restart is
+held for its publisher again, as when it was started.
 
 ## Friend sessions: `EMBER_EXT_BROWSE_SCOPE_AWARE`
 

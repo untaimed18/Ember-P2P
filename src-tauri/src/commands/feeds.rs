@@ -422,16 +422,33 @@ async fn record_feed_downloads(app: &tauri::AppHandle, state: &AppState, now: i6
     salts.sort();
     salts.dedup();
     let db = state.db.clone();
-    match tokio::task::spawn_blocking(move || db.feed_own_note_downloads(&rows, now)).await {
+    let failed = match tokio::task::spawn_blocking(move || db.feed_own_note_downloads(&rows, now)).await {
         Ok(Ok(())) => {
             for salt in salts {
                 let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "salt": salt }));
             }
+            return;
         }
-        Ok(Err(e)) => tracing::warn!("Could not save feed downloads: {e:#}"),
-        Err(e) => tracing::warn!("Could not save feed downloads: {e}"),
+        Ok(Err(e)) => format!("{e:#}"),
+        Err(e) => e.to_string(),
+    };
+    // Kept for another go: a follower is counted once, when they finish, and
+    // a busy or full disk would otherwise lose them for good.
+    tracing::warn!("Could not save feed downloads; trying again shortly: {failed}");
+    crate::network::feed_direct::requeue_downloads(downloads);
+    // One retry waiting at a time, however many saves fail meanwhile.
+    if !DOWNLOADS_RETRY_DUE.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        tauri::async_runtime::spawn(async {
+            tokio::time::sleep(DOWNLOADS_RETRY).await;
+            DOWNLOADS_RETRY_DUE.store(false, std::sync::atomic::Ordering::Release);
+            crate::network::feed_direct::downloads_noted().notify_one();
+        });
     }
 }
+
+/// How long after a failed save of followers' downloads it is tried again.
+const DOWNLOADS_RETRY: Duration = Duration::from_secs(30);
+static DOWNLOADS_RETRY_DUE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[tauri::command]
 pub async fn list_my_feeds(state: tauri::State<'_, AppState>) -> Result<Vec<OwnFeedInfo>, String> {
@@ -684,26 +701,86 @@ fn library_loading() -> String {
 /// Whether `item` is still a file the user shares with everyone, as it was
 /// when added: one since made friends-only, or gone, must not be published.
 fn still_public(index: &crate::search::index::LocalIndex, item: &FeedItem) -> bool {
+    still_public_file(index, &item.ed2k, &item.blake3)
+}
+
+/// [`still_public`], for the file of eD2K hash `ed2k` and BLAKE3 `blake3`.
+fn still_public_file(index: &crate::search::index::LocalIndex, ed2k: &str, blake3: &str) -> bool {
     index
-        .get_by_hash(&item.ed2k)
-        .is_some_and(|file| file.is_public_listable() && file.ember_file_hash.eq_ignore_ascii_case(&item.blake3))
+        .get_by_hash(ed2k)
+        .is_some_and(|file| file.is_public_listable() && file.ember_file_hash.eq_ignore_ascii_case(blake3))
+}
+
+/// The files a list of ours names, `(ed2k, blake3)` in lowercase hex, by the
+/// list's eD2K hash. A list's bytes never change under its hash, so each is
+/// read once, from the file it is shared from.
+fn own_list_files_cache() -> &'static parking_lot::Mutex<HashMap<[u8; 16], std::sync::Arc<Vec<(String, String)>>>> {
+    static CACHE: std::sync::OnceLock<parking_lot::Mutex<HashMap<[u8; 16], std::sync::Arc<Vec<(String, String)>>>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// [`own_list_files_cache`]'s entry for `hash`, read now if it has none.
+/// `None` for a list not shared, or not whole. Blocking: reads the list.
+fn own_list_files(hash: &[u8; 16]) -> Option<std::sync::Arc<Vec<(String, String)>>> {
+    if let Some(files) = own_list_files_cache().lock().get(hash) {
+        return Some(files.clone());
+    }
+    let share = feed_files::hidden_share(hash)?;
+    let bytes = std::fs::read(&share.path).ok()?;
+    if crate::network::ed2k::hash::ed2k_hash_bytes(&bytes) != hex::encode(hash) {
+        return None;
+    }
+    let collection = Collection::from_binary_bytes(&bytes).ok()?;
+    let files = std::sync::Arc::new(
+        collection
+            .files
+            .iter()
+            .map(|file| (file.hash.to_ascii_lowercase(), file.ember_file_hash.to_ascii_lowercase()))
+            .collect(),
+    );
+    own_list_files_cache().lock().insert(*hash, std::sync::Arc::clone(&files));
+    Some(files)
+}
+
+/// Held while the served files are rebuilt, so one that read the database
+/// before a publish or delete cannot replace what a later one set.
+fn served_rebuild_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(Default::default)
 }
 
 /// Let followers stream our feeds' files (see `network::feed_direct`): every
-/// file of a feed published at least once that is still shared with
-/// everyone, from where the Library has it. Left as it was while the Library
-/// is still loading or busy re-indexing.
+/// file the published or pending list of a feed of ours names, as followers
+/// may hold either, that is still shared with everyone, from where the
+/// Library has it. Not the items the editor saved since, which no follower
+/// has been sent. Left as it was while the Library is still loading or busy
+/// re-indexing.
 async fn refresh_served_files(state: &AppState) {
     if crate::commands::sharing::startup_library_loading() {
         return;
     }
+    let _rebuilding = served_rebuild_lock().lock().await;
     let db = state.db.clone();
-    let feeds = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(String, Vec<FeedItem>)>> {
+    let feeds = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(String, Vec<(String, String)>)>> {
         let mut out = Vec::new();
-        for feed in db.feeds_own()?.into_iter().filter(|feed| feed.sequence > 0) {
-            let items = db.feed_own_items(&feed.salt)?;
-            out.push((feed.salt, items));
+        let mut lists_used = std::collections::HashSet::new();
+        for feed in db.feeds_own()? {
+            let published = (feed.sequence > 0).then_some(feed.list_ed2k.as_str());
+            let pending = feed.pending.as_ref().map(|pending| pending.list_ed2k.as_str());
+            let mut files = Vec::new();
+            let mut lists = published.into_iter().chain(pending).filter_map(|hash| hex_to16(hash).ok()).collect::<Vec<_>>();
+            lists.dedup();
+            for hash in lists {
+                lists_used.insert(hash);
+                match own_list_files(&hash) {
+                    Some(listed) => files.extend(listed.iter().cloned()),
+                    None => tracing::debug!("Feed {}: list {} is not served; its files are not either", feed.salt, hex::encode(hash)),
+                }
+            }
+            out.push((feed.salt, files));
         }
+        own_list_files_cache().lock().retain(|hash, _| lists_used.contains(hash));
         Ok(out)
     })
     .await;
@@ -711,11 +788,11 @@ async fn refresh_served_files(state: &AppState) {
     let publisher = state.identity.ed25519_public_key;
     let Ok(index) = state.local_index.try_read() else { return };
     let mut served = HashMap::new();
-    for (salt, items) in &feeds {
+    for (salt, files) in &feeds {
         let Ok(salt) = hex_to16(salt) else { continue };
-        for item in items {
-            let (Some(file), Ok(ed2k)) = (index.get_by_hash(&item.ed2k), hex_to16(&item.ed2k)) else { continue };
-            if still_public(&index, item) {
+        for (ed2k_hex, blake3) in files {
+            let (Some(file), Ok(ed2k)) = (index.get_by_hash(ed2k_hex), hex_to16(ed2k_hex)) else { continue };
+            if still_public_file(&index, ed2k_hex, blake3) {
                 let (id, entry) =
                     crate::network::feed_direct::served_entry(&publisher, &salt, &ed2k, PathBuf::from(&file.path), file.size);
                 served.insert(id, entry);
@@ -868,6 +945,7 @@ pub async fn publish_feed(
         }
         Placed::Unknown => {
             keep_pending(&state, &owner, &feed, &held, new_list.clone(), &published).await;
+            refresh_served_files(&state).await;
             return Err(publish_unreachable());
         }
     }
@@ -899,6 +977,7 @@ pub async fn publish_feed(
         // head, the next republish sends it and records it once stored.
         Err(error) => {
             keep_pending(&state, &owner, &feed, &held, new_list, &published).await;
+            refresh_served_files(&state).await;
             return Err(error);
         }
     }
@@ -1699,17 +1778,15 @@ pub async fn set_feed_auto_download(
     enabled: bool,
     max_item_mib: i64,
     max_day_mib: i64,
-    category: String,
 ) -> Result<FollowedFeedInfo, String> {
     let (publisher, salt) = (hex::encode(hex_publisher(&publisher)?), hex::encode(hex_salt(&salt)?));
-    let category = clip(&category, 256);
     let db = state.db.clone();
     let (key_pub, key_salt) = (publisher.clone(), salt.clone());
     let now = chrono::Utc::now().timestamp();
     let feed = blocking(
         move || {
             let (item, day) = (auto_cap(max_item_mib), auto_cap(max_day_mib));
-            if !db.feed_set_auto_download(&key_pub, &key_salt, enabled, item, day, &category, now)? {
+            if !db.feed_set_auto_download(&key_pub, &key_salt, enabled, item, day, now)? {
                 return Ok(None);
             }
             db.feed_followed(&key_pub, &key_salt)
@@ -1721,6 +1798,16 @@ pub async fn set_feed_auto_download(
     .ok_or_else(|| coded("feeds_not_found", "That feed could not be found"))?;
     let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "publisher": publisher, "salt": salt }));
     Ok(followed_info(feed))
+}
+
+/// Every transfer that has not finished: running, queued, or failed and
+/// still listed with its partial file, which only the feed's page shows.
+fn unfinished_downloads(manager: &crate::sharing::manager::TransferManager) -> impl Iterator<Item = &Transfer> {
+    manager
+        .active
+        .values()
+        .chain(manager.queue.iter())
+        .chain(manager.completed.iter().filter(|t| t.status == TransferStatus::Failed))
 }
 
 /// Cancel an item's download from the feed: the download and what has
@@ -1747,20 +1834,18 @@ pub async fn cancel_feed_download(
         .folder;
     let transfer_id = {
         let manager = state.transfer_manager.read().await;
-        manager
-            .active
-            .values()
-            .chain(manager.queue.iter())
+        let found = unfinished_downloads(&manager)
             .find(|t| {
                 t.direction == TransferDirection::Download
                     && t.file_hash.eq_ignore_ascii_case(&ed2k)
                     && !folder.is_empty()
                     && crate::sharing::feed_downloads::folder_of(&t.id).as_deref() == Some(folder.as_str())
             })
-            .map(|t| t.id.clone())
+            .map(|t| t.id.clone());
+        found
     };
     if let Some(id) = transfer_id {
-        crate::commands::transfers::remove_transfer(state.clone(), id).await?;
+        crate::commands::transfers::discard_transfer(&state, id, false).await?;
     }
     let db = state.db.clone();
     let (key_pub, key_salt) = (publisher.clone(), salt.clone());
@@ -1812,7 +1897,7 @@ pub async fn download_feed_items(
     }
 }
 
-/// Start one item's download, in the feed's category, and mark it so. It
+/// Start one item's download, and mark it so. It
 /// finishes in the feed's folder in `Feeds`, kept private (see
 /// `sharing::feed_downloads`), and is streamed from the publisher first,
 /// friend or not; a friend's last address is tried at once (see
@@ -1863,17 +1948,20 @@ async fn start_item_download(app: &tauri::AppHandle, feed: &FollowedFeed, item: 
     )
     .await?;
     if !started.already_queued {
-        watch_publisher_hold(app.clone(), started.transfer_id.clone());
-    }
-    if !feed.auto_category.trim().is_empty() && !started.already_queued {
-        let _ = crate::commands::transfers::set_transfers_category(
-            app.clone(),
-            state.clone(),
-            vec![started.transfer_id],
-            feed.auto_category.clone(),
-            None,
-        )
-        .await;
+        // Unfollow takes the feed's downloads only after its row is gone, so
+        // a download started while it ran either is seen there or sees the
+        // row gone here; one left would be shown nowhere and never stopped.
+        let db = state.db.clone();
+        let (publisher, salt) = (feed.publisher.clone(), feed.salt.clone());
+        let still_followed = tokio::task::spawn_blocking(move || db.feed_followed(&publisher, &salt))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .is_none_or(|row| row.is_some());
+        if !still_followed {
+            let _ = crate::commands::transfers::discard_transfer(&state, started.transfer_id.clone(), false).await;
+            return Err(coded("feeds_not_found", "That feed could not be found"));
+        }
     }
     let db = state.db.clone();
     let (publisher, salt, ed2k) = (feed.publisher.clone(), feed.salt.clone(), item.ed2k.clone());
@@ -1881,53 +1969,74 @@ async fn start_item_download(app: &tauri::AppHandle, feed: &FollowedFeed, item: 
     Ok(())
 }
 
-/// How often a download held for its publisher is looked at.
+/// How often the downloads held for their publishers are looked at.
 const HOLD_POLL: Duration = Duration::from_secs(2);
+/// How long a download just begun may be missing from the transfer list, or
+/// still show the failure it is being revived from, before it is forgotten.
+const HOLD_GRACE: Duration = Duration::from_secs(10);
 
-/// Watch a download held for its publisher (see `network::feed_direct`), and
-/// the moment it is let go ask every network for its sources, rather than
-/// leave it to their next sweeps, the slowest of which is half an hour.
-fn watch_publisher_hold(app: tauri::AppHandle, transfer_id: String) {
-    use crate::network::feed_direct::{self, Poll};
-    use TransferStatus as S;
+/// Watch every download held for its publisher (see `network::feed_direct`),
+/// however it was begun, and the moment one is let go ask every network for
+/// its sources, rather than leave it to their next sweeps, the slowest of
+/// which is half an hour.
+fn spawn_hold_watcher(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let state = app.state::<AppState>();
+        let mut tick = tokio::time::interval(HOLD_POLL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tokio::time::sleep(HOLD_POLL).await;
-            let row = {
-                let manager = state.transfer_manager.read().await;
-                let active = manager.active.contains_key(&transfer_id);
-                manager
-                    .get_transfer(&transfer_id)
-                    .map(|t| (t.transferred, t.status.clone(), t.file_hash.clone(), t.total_size, active))
-            };
-            let Some((transferred, status, hash, size, active)) = row else {
-                feed_direct::forget(&transfer_id);
-                return;
-            };
-            if matches!(status, S::Completed | S::NoneNeeded | S::Failed) {
-                feed_direct::forget(&transfer_id);
-                return;
-            }
-            // Waiting for a download slot is not the publisher's to answer for.
-            let counting = active && !matches!(status, S::Paused | S::Stopped);
-            // Watched on once let go, for as long as the download lasts: its
-            // publisher's stream outlives the hold, and is forgotten with it.
-            match feed_direct::poll(&transfer_id, transferred, counting, Instant::now()) {
-                Poll::Holding | Poll::Gone => {}
-                Poll::Released(why) => {
-                    tracing::info!("Feed download {transfer_id}: asking every network for sources ({why:?})");
-                    let Ok(file_hash) = hex_to16(&hash) else { continue };
-                    let (tx, _answer) = tokio::sync::oneshot::channel();
-                    let _ = bounded_send(
-                        &state.network_tx,
-                        NetworkCommand::FindSources { transfer_id: transfer_id.clone(), file_hash, file_size: size, tx },
-                    )
-                    .await;
-                }
+            tick.tick().await;
+            if let Some(state) = app.try_state::<AppState>() {
+                watch_holds(&state).await;
             }
         }
     });
+}
+
+async fn watch_holds(state: &AppState) {
+    use crate::network::feed_direct::{self, Poll};
+    use TransferStatus as S;
+    let watched = feed_direct::watched();
+    if watched.is_empty() {
+        return;
+    }
+    let rows: Vec<_> = {
+        let manager = state.transfer_manager.read().await;
+        watched
+            .into_iter()
+            .map(|(id, begun)| {
+                let active = manager.active.contains_key(&id);
+                let row = manager
+                    .get_transfer(&id)
+                    .map(|t| (t.transferred, t.status.clone(), t.file_hash.clone(), t.total_size, active));
+                (id, begun, row)
+            })
+            .collect()
+    };
+    let now = Instant::now();
+    for (transfer_id, begun, row) in rows {
+        let ended = row.as_ref().is_none_or(|(_, status, ..)| matches!(status, S::Completed | S::NoneNeeded | S::Failed));
+        if ended {
+            if now.saturating_duration_since(begun) >= HOLD_GRACE {
+                feed_direct::forget(&transfer_id);
+            }
+            continue;
+        }
+        let Some((transferred, status, hash, size, active)) = row else { continue };
+        // Waiting for a download slot is not the publisher's to answer for.
+        let counting = active && !matches!(status, S::Paused | S::Stopped);
+        // Watched on once let go, for as long as the download lasts: its
+        // publisher's stream outlives the hold, and is forgotten with it.
+        if let Poll::Released(why) = feed_direct::poll(&transfer_id, transferred, counting, now) {
+            tracing::info!("Feed download {transfer_id}: asking every network for sources ({why:?})");
+            let Ok(file_hash) = hex_to16(&hash) else { continue };
+            let (tx, _answer) = tokio::sync::oneshot::channel();
+            let _ = bounded_send(
+                &state.network_tx,
+                NetworkCommand::FindSources { transfer_id: transfer_id.clone(), file_hash, file_size: size, tx },
+            )
+            .await;
+        }
+    }
 }
 
 /// Open the folder a followed feed's files finish in, or `Feeds` before the
@@ -2040,16 +2149,13 @@ pub async fn unfollow_feed(
     if !folder.is_empty() {
         let unfinished: Vec<String> = {
             let manager = state.transfer_manager.read().await;
-            manager
-                .active
-                .values()
-                .chain(manager.queue.iter())
+            unfinished_downloads(&manager)
                 .filter(|t| crate::sharing::feed_downloads::folder_of(&t.id).as_deref() == Some(folder.as_str()))
                 .map(|t| t.id.clone())
                 .collect()
         };
         for id in unfinished {
-            if let Err(e) = crate::commands::transfers::remove_transfer(state.clone(), id.clone()).await {
+            if let Err(e) = crate::commands::transfers::discard_transfer(&state, id.clone(), false).await {
                 tracing::warn!("Unfollow: could not cancel feed download {id}: {e}");
             }
         }
@@ -3603,6 +3709,7 @@ impl Drop for ClearOnDrop {
 
 /// Keep feeds current for the life of the app.
 pub fn spawn_feeds(app: tauri::AppHandle) {
+    spawn_hold_watcher(app.clone());
     tauri::async_runtime::spawn(async move {
         let mut reports = feed_files::listen_for_fetches();
         let mut pushed = feed_files::listen_for_pushed_heads();
@@ -3679,7 +3786,6 @@ mod tests {
             auto_download: true,
             auto_max_item_mib: auto_item,
             auto_max_day_mib: auto_day,
-            auto_category: String::new(),
             folder: String::new(),
             auto_since: 0,
             seen_at: 0,

@@ -14,7 +14,9 @@ use super::web_worker::{ActiveRequest, Working};
 use super::*;
 use crate::network::ed2k::secure_stream::SecureStreamParts;
 use crate::network::ed2k::transfer::SourceFailureKind;
-use crate::network::ember::attach::{ATTACH_CHUNK_SIZE, ATTACH_CLOSE_ABANDONED, ATTACH_CLOSE_RECEIVED, FEED_STREAM_MSG_TYPE};
+use crate::network::ember::attach::{
+    AttachStreamStatus, ATTACH_CHUNK_SIZE, ATTACH_CLOSE_ABANDONED, ATTACH_CLOSE_RECEIVED, FEED_STREAM_MSG_TYPE,
+};
 use crate::network::ember::attach_stream::{self, FetchError};
 use crate::network::ember::attach_tcp::{self, Dialled};
 use crate::network::feed_direct::{self, StreamSource};
@@ -28,9 +30,22 @@ const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 const MAX_FAILURES: u32 = 3;
 /// How long between them.
 const RETRY_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+/// Times in a row the publisher may say it is busy before it is given up on.
+/// The download's hold ends meanwhile once nothing arrives, so the rest of
+/// the network is asked while the publisher is asked again.
+const MAX_BUSY: u32 = 8;
+/// The pause after the first busy answer, doubled after each up to
+/// [`BUSY_PAUSE_MAX`]: about ten minutes before it is given up on.
+const BUSY_PAUSE: std::time::Duration = std::time::Duration::from_secs(15);
+const BUSY_PAUSE_MAX: std::time::Duration = std::time::Duration::from_secs(120);
 /// Chunks held already, ahead of the stream, past which it is asked again
 /// from the next missing one rather than read on through.
 const SKIP_CHUNKS: u64 = 4;
+
+/// The pause after the `busy`th busy answer in a row.
+fn busy_pause(busy: u32) -> std::time::Duration {
+    BUSY_PAUSE.saturating_mul(1 << busy.saturating_sub(1).min(8)).min(BUSY_PAUSE_MAX)
+}
 
 /// Run the publisher's stream for the download once one is registered, until
 /// the file is complete or the download stops. `first` is the download's
@@ -131,6 +146,7 @@ impl FeedWorker {
         };
         self.report(source, "connecting", 0, 0, None).await;
         let mut failures = 0u32;
+        let mut busy = 0u32;
         let mut root: Option<[u8; 32]> = None;
         let mut transferred = 0u64;
         loop {
@@ -182,6 +198,7 @@ impl FeedWorker {
             };
             if written > 0 {
                 failures = 0;
+                busy = 0;
             }
             match pulled {
                 // To the end, or stopped to skip what is held: the top of the
@@ -189,6 +206,17 @@ impl FeedWorker {
                 Ok(_) if written > 0 => continue,
                 Ok(_) => failures += 1,
                 Err(PullError::Stopped) => return End::Stopped,
+                Err(PullError::Fetch(FetchError::Refused(AttachStreamStatus::Busy))) => {
+                    busy += 1;
+                    if busy >= MAX_BUSY {
+                        debug!("Feed download {}: the publisher stayed busy; giving up on it", self.transfer_id);
+                        self.report(source, "failed", 0, transferred, Some(SourceFailureKind::Transient)).await;
+                        return End::Failed;
+                    }
+                    self.report(source, "queue_full", 0, transferred, None).await;
+                    self.pause(busy_pause(busy)).await;
+                    continue;
+                }
                 Err(PullError::Fetch(error @ (FetchError::Refused(_) | FetchError::Corrupt(_)))) => {
                     debug!("Feed download {}: the publisher's stream ended: {error}", self.transfer_id);
                     self.report(source, "failed", 0, transferred, Some(SourceFailureKind::Permanent)).await;
@@ -495,6 +523,7 @@ mod tests {
                 &mut server_w,
                 &prefix,
                 |_| Some((served, size, capability)),
+                |_| Ok(()),
                 |_, _, _| true,
                 None,
             )

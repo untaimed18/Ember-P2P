@@ -481,6 +481,46 @@ fn recover_restored_copies(
     })
 }
 
+/// The publisher of each followed feed, by the folder in `Feeds` its files
+/// finish in: who a feed's restored download is held for again. Read only
+/// when one of `incomplete` is a feed's.
+async fn feed_publishers(
+    db: &Arc<Database>,
+    incomplete: &[Transfer],
+) -> HashMap<String, crate::network::feed_direct::Publisher> {
+    if !incomplete
+        .iter()
+        .any(|t| crate::sharing::feed_downloads::folder_of(&t.id).is_some())
+    {
+        return HashMap::new();
+    }
+    let db = db.clone();
+    let feeds = match tokio::task::spawn_blocking(move || db.feeds_followed()).await {
+        Ok(Ok(feeds)) => feeds,
+        Ok(Err(e)) => {
+            warn!("Could not read followed feeds for their restored downloads: {e}");
+            return HashMap::new();
+        }
+        Err(e) => {
+            warn!("Followed feeds read for their restored downloads failed: {e}");
+            return HashMap::new();
+        }
+    };
+    feeds
+        .into_iter()
+        .filter(|feed| !feed.folder.is_empty())
+        .filter_map(|feed| {
+            let (mut key, mut salt) = ([0u8; 32], [0u8; 16]);
+            hex::decode_to_slice(&feed.publisher, &mut key).ok()?;
+            hex::decode_to_slice(&feed.salt, &mut salt).ok()?;
+            Some((
+                feed.folder,
+                crate::network::feed_direct::Publisher { key, salt, friend_tcp: None },
+            ))
+        })
+        .collect()
+}
+
 /// Put a restored download into `active` for its re-verification, which runs
 /// whatever the concurrent-download cap: a check that finishes it is only
 /// local work. With `rejoin`, a check that does not finish it hands the row a
@@ -585,6 +625,7 @@ pub(in crate::network) async fn resume_incomplete_downloads(
             let index = local_index.read().await;
             collect_friends_only_hashes(&index, known_files)
         };
+        let feed_publishers = feed_publishers(db, &incomplete).await;
         for mut transfer in incomplete {
             // Before any branch below can finish it: several insert straight
             // into the transfer list rather than through `enqueue`.
@@ -1001,6 +1042,18 @@ pub(in crate::network) async fn resume_incomplete_downloads(
 
             TransferManager::normalize_restored_incomplete_download(&mut transfer);
             restore_db_writes.push(transfer.clone());
+
+            // A feed's download is held for its publisher again, as when it
+            // was started, before anything asks the other networks for it.
+            let publisher = crate::sharing::feed_downloads::folder_of(&transfer.id)
+                .and_then(|folder| feed_publishers.get(&folder).copied());
+            let mut file_hash = [0u8; 16];
+            if let Some(publisher) = publisher.filter(|_| {
+                transfer.status != TransferStatus::Insufficient
+                    && hex::decode_to_slice(&transfer.file_hash, &mut file_hash).is_ok()
+            }) {
+                crate::network::feed_direct::begin(&transfer.id, file_hash, transfer.total_size, publisher);
+            }
 
             let active_now = {
                 let mut mgr = transfer_manager.write().await;

@@ -56,7 +56,7 @@
   import FeedFilePicker from '$lib/components/FeedFilePicker.svelte';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import IconX from '$lib/components/IconX.svelte';
-  import { followedFeed, followedFeeds, followedFeedsFailed, followedFeedsLoaded, refreshFollowedFeeds } from '$lib/stores/feeds';
+  import { followedFeeds, followedFeedsFailed, followedFeedsLoaded, refreshFollowedFeeds } from '$lib/stores/feeds';
   import { noteUiActivity } from '$lib/uiStall';
   import { appSettings } from '$lib/stores/settings';
   import { addActionToast, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
@@ -182,7 +182,6 @@
   let autoEnabled = $state(false);
   let autoItemMib = $state(0);
   let autoDayMib = $state(0);
-  let autoCategory = $state('');
   let autoOpen = $state(false);
   let autoSaving = $state(false);
   let itemFilter = $state<'all' | 'new'>('all');
@@ -229,8 +228,7 @@
   let autoChanged = $derived(
     !!selected &&
       (capMib(autoItemMib) !== selected.auto_max_item_mib ||
-        capMib(autoDayMib) !== selected.auto_max_day_mib ||
-        autoCategory !== selected.auto_category),
+        capMib(autoDayMib) !== selected.auto_max_day_mib),
   );
   /** New and still listed, downloaded or not: what the New filter shows. */
   let newShownCount = $derived(items.filter((i) => i.is_new && !i.removed).length);
@@ -443,7 +441,6 @@
       autoEnabled = feed.auto_download;
       autoItemMib = feed.auto_max_item_mib;
       autoDayMib = feed.auto_max_day_mib;
-      autoCategory = feed.auto_category;
       autoOpen = false;
     }
   });
@@ -470,14 +467,12 @@
     try {
       autoItemMib = capMib(autoItemMib);
       autoDayMib = capMib(autoDayMib);
-      await setFeedAutoDownload(feed.publisher, feed.salt, autoEnabled, autoItemMib, autoDayMib, autoCategory);
+      const saved = await setFeedAutoDownload(feed.publisher, feed.salt, autoEnabled, autoItemMib, autoDayMib);
       await refreshFollowedFeeds();
       // The fields show what was saved, which the backend may have clipped.
-      const saved = followedFeed(feed.publisher, feed.salt);
-      if (saved && selectedKey === keyOf(feed)) {
+      if (selectedKey === keyOf(feed)) {
         autoItemMib = saved.auto_max_item_mib;
         autoDayMib = saved.auto_max_day_mib;
-        autoCategory = saved.auto_category;
       }
       return true;
     } catch (e) {
@@ -1986,21 +1981,37 @@
                       </div>
                     {/if}
                   {:else if canDownload(item)}
-                    <button
-                      type="button"
-                      class="row-btn"
-                      class:retry={item.status === 'failed'}
-                      disabled={downloading}
-                      aria-label={item.status === 'failed'
-                        ? m.feeds_item_retry_named({ name: item.name })
-                        : m.feeds_download_named({ name: item.name })}
-                      onclick={() => askDownload([item.ed2k])}
-                    >
-                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                        <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
-                      </svg>
-                      <span>{item.status === 'failed' ? m.feeds_item_failed_retry() : m.feeds_download()}</span>
-                    </button>
+                    {@const discardable =
+                      item.status === 'failed' && !!item.transfer && !item.transfer.in_transfers && !item.transfer.other_feed}
+                    <div class="row-controls">
+                      <button
+                        type="button"
+                        class="row-btn"
+                        class:retry={item.status === 'failed'}
+                        disabled={downloading}
+                        aria-label={item.status === 'failed'
+                          ? m.feeds_item_retry_named({ name: item.name })
+                          : m.feeds_download_named({ name: item.name })}
+                        onclick={() => askDownload([item.ed2k])}
+                      >
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
+                        </svg>
+                        <span>{item.status === 'failed' ? m.feeds_item_failed_retry() : m.feeds_download()}</span>
+                      </button>
+                      {#if discardable && item.transfer}
+                        <button
+                          type="button"
+                          class="icon-btn danger"
+                          disabled={controlling.has(item.transfer.id)}
+                          title={m.feeds_item_discard()}
+                          aria-label={m.feeds_item_discard_named({ name: item.name })}
+                          onclick={() => (cancelAsk = item)}
+                        >
+                          <IconX />
+                        </button>
+                      {/if}
+                    </div>
                   {/if}
                 </div>
               {/each}
@@ -2524,9 +2535,13 @@
 
 <ConfirmDialog
   open={cancelAsk !== null}
-  title={m.feeds_item_cancel_title()}
-  message={cancelAsk ? m.feeds_item_cancel_body({ name: cancelAsk.name }) : ''}
-  confirmLabel={m.feeds_item_cancel()}
+  title={cancelAsk?.status === 'failed' ? m.feeds_item_discard_title() : m.feeds_item_cancel_title()}
+  message={cancelAsk
+    ? cancelAsk.status === 'failed'
+      ? m.feeds_item_discard_body({ name: cancelAsk.name })
+      : m.feeds_item_cancel_body({ name: cancelAsk.name })
+    : ''}
+  confirmLabel={cancelAsk?.status === 'failed' ? m.feeds_item_discard() : m.feeds_item_cancel()}
   danger
   onconfirm={() => {
     const item = cancelAsk;
@@ -3755,6 +3770,10 @@
 
   .row-controls .row-state {
     padding-inline-end: 4px;
+  }
+
+  .row-controls .row-btn + .icon-btn {
+    margin-inline-start: 4px;
   }
 
   .icon-btn.danger:hover:not(:disabled) {
