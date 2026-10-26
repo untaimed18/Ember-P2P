@@ -163,7 +163,7 @@ pub(super) fn fail_ember_record_pending(
         return false;
     }
     let round_open = !unplaced.is_empty();
-    schedule.partial.insert(slot);
+    schedule.partial.entry(slot).or_default().insert(reference.key);
     if round_open {
         return false;
     }
@@ -229,6 +229,11 @@ pub(super) fn charge_ember_publish_round(
     // putting it first. It gets one more try after a full interval.
     schedule.attempts.remove(&slot);
     schedule.unplaced.remove(&slot);
+    // The next round is a full interval away, when every word is due again,
+    // not just the ones a retry was for.
+    if kind == EmberPublishKind::Keyword {
+        schedule.retry_keys.remove(&file_hash);
+    }
     schedule.stamp(file_hash, kind, now);
     debug!(
         "Ember publish: {} records for {} went unconfirmed {EMBER_PUBLISH_MAX_ATTEMPTS} rounds; deferring a full interval",

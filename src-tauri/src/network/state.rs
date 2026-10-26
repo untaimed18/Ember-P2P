@@ -901,9 +901,16 @@ pub(super) struct NetworkState {
     /// its last key resolves.
     pub(super) ember_publish_placed: HashSet<([u8; 16], EmberPublishKind)>,
     /// Rounds in `ember_publish_unplaced` in which at least one key failed on
-    /// every replica, so a round that also placed others comes back soon for
-    /// the one that did not.
-    pub(super) ember_publish_partial: HashSet<([u8; 16], EmberPublishKind)>,
+    /// every replica, with those keys, so a round that also placed others
+    /// comes back soon for the ones that did not.
+    pub(super) ember_publish_partial: HashMap<([u8; 16], EmberPublishKind), HashSet<[u8; 16]>>,
+    /// How many files' keyword records were due at the last keyword pass, so
+    /// the source pass that runs before it leaves them part of the tick.
+    pub(super) ember_keyword_due_last: usize,
+    /// The keys a file's pending partial keyword retry is for. The retry
+    /// re-sends only these: sending the whole set again for one refused word
+    /// cost a file's every keyword, three times a session.
+    pub(super) ember_keyword_retry_keys: HashMap<[u8; 16], HashSet<[u8; 16]>>,
     /// Files whose keyword rounds have used up their partial retries, so a
     /// round that loses a key again waits out the full interval. Cleared by a
     /// round that places every key.

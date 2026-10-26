@@ -51,8 +51,11 @@ pub(super) struct EmberPublishSchedule<'a> {
     pub(super) unplaced: &'a mut HashMap<([u8; 16], EmberPublishKind), HashSet<[u8; 16]>>,
     /// Rounds still in progress that have already placed at least one record.
     pub(super) placed: &'a mut HashSet<([u8; 16], EmberPublishKind)>,
-    /// Rounds still in progress in which a key has failed on every replica.
-    pub(super) partial: &'a mut HashSet<([u8; 16], EmberPublishKind)>,
+    /// Rounds still in progress in which a key has failed on every replica,
+    /// with those keys.
+    pub(super) partial: &'a mut HashMap<([u8; 16], EmberPublishKind), HashSet<[u8; 16]>>,
+    /// The keys each file's pending partial keyword retry re-sends.
+    pub(super) retry_keys: &'a mut HashMap<[u8; 16], HashSet<[u8; 16]>>,
     /// Files whose keyword rounds have used up their partial retries.
     pub(super) retries_spent: &'a mut HashSet<[u8; 16]>,
     pub(super) attempts: &'a mut HashMap<([u8; 16], EmberPublishKind), EmberPublishAttempts>,
@@ -68,6 +71,7 @@ impl EmberPublishSchedule<'_> {
             unplaced: self.unplaced,
             placed: self.placed,
             partial: self.partial,
+            retry_keys: self.retry_keys,
             retries_spent: self.retries_spent,
             attempts: self.attempts,
             source_at: self.source_at,
@@ -110,27 +114,36 @@ impl EmberPublishSchedule<'_> {
     /// for as long as the file is shared — past the per-publisher cap on a
     /// word most of the library carries, or under a full key — otherwise
     /// brought the whole file's keyword set back three times every interval.
+    ///
+    /// The retry is for the keys that failed alone (`retry_keys`), not the
+    /// file's whole set again.
     pub(super) fn finish_round(&mut self, slot: ([u8; 16], EmberPublishKind), now: std::time::Instant) -> bool {
         self.unplaced.remove(&slot);
-        let partial = self.partial.remove(&slot);
+        let failed = self.partial.remove(&slot);
         if !self.placed.remove(&slot) {
             return false;
         }
         if slot.1 == EmberPublishKind::Keyword {
-            if !partial {
-                self.retries_spent.remove(&slot.0);
-            } else if !self.retries_spent.contains(&slot.0) {
-                let attempts = self.attempts.entry(slot).or_insert(EmberPublishAttempts {
-                    rounds_failed: 0,
-                    last_charged: now,
-                });
-                attempts.rounds_failed += 1;
-                attempts.last_charged = now;
-                if attempts.rounds_failed <= EMBER_PUBLISH_MAX_ATTEMPTS {
-                    self.keyword_at.insert(slot.0, now + EMBER_KEYWORD_PARTIAL_RETRY);
-                    return true;
+            self.retry_keys.remove(&slot.0);
+            match failed {
+                None => {
+                    self.retries_spent.remove(&slot.0);
                 }
-                self.retries_spent.insert(slot.0);
+                Some(failed) if !self.retries_spent.contains(&slot.0) => {
+                    let attempts = self.attempts.entry(slot).or_insert(EmberPublishAttempts {
+                        rounds_failed: 0,
+                        last_charged: now,
+                    });
+                    attempts.rounds_failed += 1;
+                    attempts.last_charged = now;
+                    if attempts.rounds_failed <= EMBER_PUBLISH_MAX_ATTEMPTS {
+                        self.keyword_at.insert(slot.0, now + EMBER_KEYWORD_PARTIAL_RETRY);
+                        self.retry_keys.insert(slot.0, failed);
+                        return true;
+                    }
+                    self.retries_spent.insert(slot.0);
+                }
+                Some(_) => {}
             }
         }
         self.attempts.remove(&slot);
@@ -145,6 +158,7 @@ impl NetworkState {
             unplaced: &mut self.ember_publish_unplaced,
             placed: &mut self.ember_publish_placed,
             partial: &mut self.ember_publish_partial,
+            retry_keys: &mut self.ember_keyword_retry_keys,
             retries_spent: &mut self.ember_keyword_retries_spent,
             attempts: &mut self.ember_publish_attempts,
             source_at: &mut self.ember_source_publish_at,
@@ -235,7 +249,7 @@ pub(super) fn untrack_ember_record_pending(
     // the round as complete, and the dropped word stayed unsearchable for the
     // whole interval instead of coming back on the partial retry.
     if unplaced.remove(&reference.key) {
-        schedule.partial.insert(slot);
+        schedule.partial.entry(slot).or_default().insert(reference.key);
     }
     if !unplaced.is_empty() {
         return false;
@@ -326,7 +340,16 @@ pub(super) fn note_ember_file_published(state: &mut NetworkState, file_hash: [u8
                 .ember_diagnostics
                 .ember_dht_keywords_published
                 .saturating_add(1);
-            let unix = chrono::Utc::now().timestamp().max(0) as u32;
+            let mut unix = chrono::Utc::now().timestamp().max(0) as u32;
+            // A round waiting on its partial retry is saved as though published
+            // long enough ago that a restart brings it back on the retry's
+            // schedule; saved as now, the lost word waited out the whole
+            // interval after any restart.
+            if state.ember_keyword_retry_keys.contains_key(&file_hash) {
+                unix = unix.saturating_sub(
+                    (EMBER_KEYWORD_REPUBLISH - EMBER_KEYWORD_PARTIAL_RETRY).as_secs() as u32,
+                );
+            }
             state.ember_keyword_publish_unix.insert(file_hash, unix);
         }
         EmberPublishKind::Source => {
@@ -714,7 +737,7 @@ pub(super) fn note_ember_source_address(state: &mut NetworkState, ip: Ipv4Addr) 
         .retain(|(_, kind)| *kind != EmberPublishKind::Source);
     state
         .ember_publish_partial
-        .retain(|(_, kind)| *kind != EmberPublishKind::Source);
+        .retain(|(_, kind), _| *kind != EmberPublishKind::Source);
 }
 
 /// How often we re-announce an Ember DHT *source* record for each shared
@@ -952,6 +975,29 @@ pub(super) fn ember_keyword_files_per_tick(publishable: usize, contacts: usize) 
             EMBER_KEYWORD_PUBLISH_MAX_PER_TICK,
         )
         .min(deliverable_files)
+}
+
+/// The records of a tick sources may take, out of the `deliverable` the flush
+/// can carry, with `keywords_due` files' keyword records waiting.
+///
+/// Half, while keywords wait. Each publisher was sized to the whole flush on
+/// its own, and sources go first, so a source backlog (a first run, an address
+/// change, a firewalled node's restart) filled the queue every tick, the
+/// backed-up gate turned the keyword pass away, and for a large library the
+/// files left search for the better part of an hour.
+pub(super) fn ember_source_record_share(deliverable: usize, keywords_due: usize) -> usize {
+    if keywords_due == 0 {
+        deliverable
+    } else {
+        deliverable - deliverable / 2
+    }
+}
+
+/// Files whose keyword records may go out after sources took `source_records`
+/// of the `deliverable` records this tick.
+pub(super) fn ember_keyword_files_left(deliverable: usize, source_records: usize) -> usize {
+    (deliverable.saturating_sub(source_records) / EMBER_KEYWORDS_PER_FILE_ESTIMATE.max(1))
+        .max(EMBER_KEYWORD_PUBLISH_MIN_PER_TICK)
 }
 
 /// How often a download re-queries the Ember DHT for sources, indexed by
@@ -1281,6 +1327,12 @@ pub(super) async fn drive_ember_publish(socket: &UdpSocket, state: &mut NetworkS
         if let Some(op) = state.ember_publish.get_mut(publish_id) {
             op.sent += 1;
         }
+        // The storer charges a single STORE to the same per-node budget as a
+        // batch, so the batch pacing has to see it too, or the batch that
+        // follows overruns the budget and is refused whole, unacked.
+        state
+            .ember_batch_publish
+            .note_records_sent(contact.node_id, std::time::Instant::now(), 1);
 
         let budget = if behind_handshake {
             EMBER_SEARCH_QUEUED_QUERY_TIMEOUT
@@ -1514,7 +1566,13 @@ pub(super) const EMBER_MAINT_MAX_TARGET_LOOKUPS: usize = 8;
 pub(super) const EMBER_MAINT_MAX_AWAITED_TARGET_LOOKUPS: usize = 16;
 
 /// Cycles a queue of awaited lookups is drained over.
-pub(super) const EMBER_AWAITED_TARGET_LOOKUP_CYCLES: usize = 4;
+///
+/// One: every key in it is a file held back from publishing, so it is asked
+/// about as fast as [`EMBER_MAINT_MAX_AWAITED_TARGET_LOOKUPS`] allows. Draining
+/// over four cycles made the average wait four minutes, and with the waiting
+/// files holding their selection slots meanwhile, publishing ran at a fifth of
+/// what the storers would take.
+pub(super) const EMBER_AWAITED_TARGET_LOOKUP_CYCLES: usize = 1;
 
 /// Target lookups to start this cycle with `queued` keys waiting.
 ///
@@ -1704,6 +1762,64 @@ pub(super) fn ember_publish_awaits_lookup(state: &mut NetworkState, key: [u8; 16
     )
 }
 
+/// Where a publish under one key stands against [`ember_publish_awaits_lookup`],
+/// read without starting anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EmberLookupGate {
+    /// It can go out now.
+    Ready,
+    /// It is waiting on a lookup already asked for.
+    Waiting,
+    /// It would start a wait, and queue its lookup, if asked now.
+    WouldWait,
+}
+
+pub(super) fn ember_publish_lookup_gate(state: &NetworkState, key: [u8; 16]) -> EmberLookupGate {
+    ember_publish_lookup_gate_in(
+        state.ember_dht.routing().verified_len(),
+        &state.ember_publish_targets,
+        &state.ember_publish_target_waits,
+        &state.ember_publish_target_queue,
+        state.ember_publish_target_lookups.values().any(|k| *k == key),
+        key,
+        chrono::Utc::now().timestamp(),
+    )
+}
+
+/// [`ember_publish_lookup_gate`] over its inputs alone.
+pub(super) fn ember_publish_lookup_gate_in(
+    verified: usize,
+    cache: &HashMap<[u8; 16], (Vec<ember::dht::EmberContact>, i64)>,
+    waits: &HashMap<[u8; 16], (i64, bool)>,
+    queue: &std::collections::VecDeque<[u8; 16]>,
+    in_flight: bool,
+    key: [u8; 16],
+    now: i64,
+) -> EmberLookupGate {
+    if verified < ember::dht::K_BUCKET_SIZE {
+        return EmberLookupGate::Ready;
+    }
+    let fresh = cache.get(&key).is_some_and(|(found, at)| {
+        !found.is_empty() && now.saturating_sub(*at) < EMBER_PUBLISH_TARGETS_TTL_SECS
+    });
+    if fresh {
+        return EmberLookupGate::Ready;
+    }
+    if let Some(&(since, ended)) = waits.get(&key) {
+        return if !ended && now.saturating_sub(since) < EMBER_PUBLISH_LOOKUP_WAIT_SECS {
+            EmberLookupGate::Waiting
+        } else {
+            EmberLookupGate::Ready
+        };
+    }
+    if waits.len() >= EMBER_PUBLISH_TARGET_WAITS_MAX
+        || (!in_flight && !queue.contains(&key) && queue.len() >= EMBER_PUBLISH_TARGET_QUEUE_MAX)
+    {
+        return EmberLookupGate::Ready;
+    }
+    EmberLookupGate::WouldWait
+}
+
 /// [`ember_publish_awaits_lookup`] over its inputs alone, so the rule can be
 /// tested without standing up a whole `NetworkState`.
 pub(super) fn ember_publish_awaits_lookup_in(
@@ -1715,29 +1831,62 @@ pub(super) fn ember_publish_awaits_lookup_in(
     key: [u8; 16],
     now: i64,
 ) -> bool {
-    if verified < ember::dht::K_BUCKET_SIZE {
-        return false;
-    }
-    let fresh = cache.get(&key).is_some_and(|(found, at)| {
-        !found.is_empty() && now.saturating_sub(*at) < EMBER_PUBLISH_TARGETS_TTL_SECS
-    });
-    if fresh {
-        return false;
-    }
-    if let Some(&(since, ended)) = waits.get(&key) {
-        return !ended && now.saturating_sub(since) < EMBER_PUBLISH_LOOKUP_WAIT_SECS;
-    }
-    if waits.len() >= EMBER_PUBLISH_TARGET_WAITS_MAX {
-        return false;
-    }
-    if !in_flight && !queue.contains(&key) {
-        if queue.len() >= EMBER_PUBLISH_TARGET_QUEUE_MAX {
-            return false;
+    match ember_publish_lookup_gate_in(verified, cache, waits, queue, in_flight, key, now) {
+        EmberLookupGate::Ready => false,
+        EmberLookupGate::Waiting => true,
+        EmberLookupGate::WouldWait => {
+            if !in_flight && !queue.contains(&key) {
+                queue.push_back(key);
+            }
+            waits.insert(key, (now, false));
+            true
         }
-        queue.push_back(key);
     }
-    waits.insert(key, (now, false));
-    true
+}
+
+/// Which of the stalest due files go out this tick, and which start waiting.
+///
+/// `gates` yields each candidate's gate, stalest first, and is read only as far
+/// as needed. A file whose lookup is ready takes a slot of `budget`; one
+/// already waiting is passed over without taking one; and at most `budget` new
+/// waits start, so a backlog larger than the queue does not fill it in one
+/// tick. Cutting to `budget` before looking left the stalest files, waiting,
+/// holding every slot for minutes while files behind them with nothing to wait
+/// for never got a turn, and only the files inside the cut ever had their
+/// lookups queued.
+pub(super) fn ember_publish_pick(
+    gates: impl IntoIterator<Item = EmberLookupGate>,
+    budget: usize,
+) -> EmberPublishPick {
+    let mut pick = EmberPublishPick::default();
+    let mut gates = gates.into_iter().take(EMBER_PUBLISH_PICK_SCAN_MAX).enumerate();
+    while pick.send.len() < budget || pick.start_wait.len() < budget {
+        let Some((i, gate)) = gates.next() else {
+            break;
+        };
+        match gate {
+            EmberLookupGate::Ready if pick.send.len() < budget => pick.send.push(i),
+            EmberLookupGate::Waiting => pick.waiting += 1,
+            EmberLookupGate::WouldWait if pick.start_wait.len() < budget => pick.start_wait.push(i),
+            _ => {}
+        }
+    }
+    pick
+}
+
+/// Most due files one tick reads the gate of. Past it the rest wait for a later
+/// tick, stalest first as ever: each read is a name tokenised and every key
+/// looked up in the lookup queue, under the Library's read lock, and a large
+/// library whose head is all waiting would otherwise be read in full every
+/// minute.
+pub(super) const EMBER_PUBLISH_PICK_SCAN_MAX: usize = 2048;
+
+/// See [`ember_publish_pick`]. Indexes into the candidates it was given.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct EmberPublishPick {
+    pub send: Vec<usize>,
+    pub start_wait: Vec<usize>,
+    pub waiting: usize,
 }
 
 /// A target lookup for `key` has ended, found anything or not, so a publish
@@ -1749,8 +1898,16 @@ pub(super) fn note_ember_target_lookup_ended(state: &mut NetworkState, key: [u8;
 }
 
 /// Whether any publish is waiting on a target lookup that has not ended.
+///
+/// A wait past [`EMBER_PUBLISH_LOOKUP_WAIT_SECS`] holds nothing back any more
+/// and does not count, or the faster lookup rate stayed on for the four hours
+/// until it was pruned.
 pub(super) fn ember_publish_lookups_awaited(state: &NetworkState) -> bool {
-    state.ember_publish_target_waits.values().any(|(_, ended)| !ended)
+    let now = chrono::Utc::now().timestamp();
+    state
+        .ember_publish_target_waits
+        .values()
+        .any(|(since, ended)| !ended && now.saturating_sub(*since) < EMBER_PUBLISH_LOOKUP_WAIT_SECS)
 }
 
 /// Forget waits older than a target set's lifetime, so a key can wait again
@@ -2039,6 +2196,7 @@ pub(super) fn retract_ember_publish(
             state.ember_publish_partial.remove(&(*file_hash, kind));
             state.ember_publish_attempts.remove(&(*file_hash, kind));
         }
+        state.ember_keyword_retry_keys.remove(file_hash);
         state.ember_keyword_retries_spent.remove(file_hash);
         state.ember_published_sources.remove(file_hash);
         state.ember_source_publish_at.remove(file_hash);
@@ -2257,10 +2415,13 @@ pub(super) async fn maybe_publish_ember_sources(
         // records naming the old one would send searchers to a peer that no
         // longer relays for us until each came up for republish, up to two
         // hours later. Making them all due lets the per-tick budget pace them.
+        //
+        // The first buddy of a session too. It is not remembered across a
+        // restart, so the records restored with their stamps name last
+        // session's buddy, or, on a node that was reachable before, no buddy
+        // and a direct address nobody can dial.
         if named_id.is_some() && named_id != state.ember_named_source_buddy {
-            if state.ember_named_source_buddy.is_some() {
-                state.ember_source_publish_at.clear();
-            }
+            state.ember_source_publish_at.clear();
             state.ember_named_source_buddy = named_id;
         }
         if let Some((contact, _)) = named_buddy.as_ref() {
@@ -2272,6 +2433,10 @@ pub(super) async fn maybe_publish_ember_sources(
                 ask_ember_buddy_endorsements(socket, state, std::slice::from_ref(contact)).await;
             }
         }
+    } else if state.ember_named_source_buddy.take().is_some() {
+        // Reachable again: the records naming a buddy and flagged firewalled
+        // would keep searchers on the relay until their republish.
+        state.ember_source_publish_at.clear();
     }
 
     // The endorsement ask above is wanted every tick, so this comes after it.
@@ -2321,11 +2486,14 @@ pub(super) async fn maybe_publish_ember_sources(
     lists.sort_unstable_by_key(|(staleness, ..)| std::cmp::Reverse(*staleness));
     lists.truncate(proxy_allowance.min(FEED_LISTS_PER_PASS));
     let library_allowance = proxy_allowance.saturating_sub(lists.len());
-    let mut due: Vec<([u8; 16], u64, String, [u8; 32])> = {
+    let (mut due, start_waits): (Vec<([u8; 16], u64, String, [u8; 32])>, Vec<[u8; 16]>) = {
         let idx = local_index.read().await;
         let files = idx.all_files();
         let restricted = collect_friends_only_hashes(&idx, known_files);
-        let mut ranked: Vec<(u64, usize)> = Vec::new();
+        let mut ranked: Vec<(u64, usize, [u8; 16])> = Vec::new();
+        // The index can hold one file twice (shared from two folders); one
+        // record covers both.
+        let mut seen: HashSet<[u8; 16]> = HashSet::new();
         let mut publishable = 0usize;
         for (i, f) in files.iter().enumerate() {
             if !is_ember_publishable(f)
@@ -2339,6 +2507,9 @@ pub(super) async fn maybe_publish_ember_sources(
             else {
                 continue;
             };
+            if !seen.insert(hash) {
+                continue;
+            }
             publishable += 1;
             let Some(staleness) = ember_publish_staleness(
                 &state.ember_publish_unplaced,
@@ -2350,35 +2521,45 @@ pub(super) async fn maybe_publish_ember_sources(
             ) else {
                 continue;
             };
-            ranked.push((staleness, i));
+            ranked.push((staleness, i, hash));
         }
         ranked.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
         state.ember_publish_pass.due += ranked.len();
-        ranked.truncate(
-            ember_source_files_per_tick(
-                publishable,
-                ranked.len(),
-                ember_publishable_peer_count(state),
-            )
-            .min(library_allowance),
+        let peers = ember_publishable_peer_count(state);
+        let budget = ember_source_files_per_tick(publishable, ranked.len(), peers)
+            .min(ember_source_record_share(
+                ember_deliverable_records_per_tick(peers),
+                state.ember_keyword_due_last,
+            ))
+            .min(library_allowance);
+        let pick = ember_publish_pick(
+            ranked.iter().map(|&(_, _, hash)| {
+                ember_publish_lookup_gate(state, ember::dht::publish::source_key(&hash))
+            }),
+            budget,
         );
-        state.ember_publish_pass.selected += ranked.len();
-        ranked
-            .into_iter()
-            .filter_map(|(_, i)| {
+        state.ember_publish_pass.selected += pick.send.len();
+        state.ember_publish_pass.source_records += pick.send.len() + lists.len();
+        state.ember_publish_pass.awaiting_lookup += pick.waiting + pick.start_wait.len();
+        let start_waits = pick
+            .start_wait
+            .iter()
+            .map(|&at| ember::dht::publish::source_key(&ranked[at].2))
+            .collect();
+        let send = pick
+            .send
+            .iter()
+            .map(|&at| {
+                let (_, i, hash) = ranked[at];
                 let f = &files[i];
-                let hash = hex::decode(&f.hash)
-                    .ok()
-                    .and_then(|v| <[u8; 16]>::try_from(v).ok())?;
-                Some((
-                    hash,
-                    f.size,
-                    f.name.clone(),
-                    parse_ember_file_hash(&f.ember_file_hash),
-                ))
+                (hash, f.size, f.name.clone(), parse_ember_file_hash(&f.ember_file_hash))
             })
-            .collect()
+            .collect();
+        (send, start_waits)
     };
+    for key in start_waits {
+        ember_publish_awaits_lookup(state, key);
+    }
     for (_, hash, share) in lists {
         if !due.iter().any(|(listed, ..)| *listed == hash) {
             due.push((hash, share.size, share.name, parse_ember_file_hash(&share.ember_file_hash)));
@@ -2640,6 +2821,9 @@ pub(super) async fn ask_ember_source_buddy(
             .ember_dht
             .note_proxy_store_sent(buddy.node_id, rid, record.file_hash, now);
         state.ember_proxy_buddies.note_asked(buddy.node_id, now);
+        // Charged to the buddy's store budget as a batch record is; see
+        // `drive_ember_publish`.
+        state.ember_batch_publish.note_records_sent(buddy.node_id, now, 1);
         state.ember_diagnostics.ember_dht_buddy_publishes = state
             .ember_diagnostics
             .ember_dht_buddy_publishes
@@ -2712,6 +2896,21 @@ pub(super) async fn send_ember_callback_req(
     sent
 }
 
+/// The words of a file to publish this round: those its pending partial retry
+/// is for, when it has one, or else all of them. A retry whose keys the name no
+/// longer yields (renamed meanwhile) sends the whole set, as a new name needs.
+pub(super) fn ember_keywords_to_send(words: Vec<String>, retry: Option<&HashSet<[u8; 16]>>) -> Vec<String> {
+    let Some(retry) = retry else {
+        return words;
+    };
+    let only: Vec<String> = words
+        .iter()
+        .filter(|word| retry.contains(&ember::dht::search::keyword_hash(word)))
+        .cloned()
+        .collect();
+    if only.is_empty() { words } else { only }
+}
+
 /// Publish Ember DHT *keyword* records for shared files (slice 8) so a
 /// keyword search can find them on a KAD-less network. Mirrors
 /// `maybe_publish_ember_sources`, but keys off each filename keyword and
@@ -2736,11 +2935,12 @@ pub(super) async fn maybe_publish_ember_keywords(
     let now = std::time::Instant::now();
     // The path trails the fields the publish itself needs, for the one-time media
     // probe below.
-    let due: Vec<([u8; 16], u64, String, [u8; 32], String)> = {
+    let (due, start_waits): (Vec<([u8; 16], u64, String, [u8; 32], String)>, Vec<[u8; 16]>) = {
         let idx = local_index.read().await;
         let files = idx.all_files();
         let restricted = collect_friends_only_hashes(&idx, known_files);
-        let mut ranked: Vec<(u64, usize)> = Vec::new();
+        let mut ranked: Vec<(u64, usize, [u8; 16])> = Vec::new();
+        let mut seen: HashSet<[u8; 16]> = HashSet::new();
         for (i, f) in files.iter().enumerate() {
             if !is_ember_publishable(f)
                 || !kad_may_advertise_partial(known_files, &restricted, &f.hash)
@@ -2753,6 +2953,9 @@ pub(super) async fn maybe_publish_ember_keywords(
             else {
                 continue;
             };
+            if !seen.insert(hash) {
+                continue;
+            }
             let Some(staleness) = ember_publish_staleness(
                 &state.ember_publish_unplaced,
                 &state.ember_keyword_publish_at,
@@ -2763,36 +2966,75 @@ pub(super) async fn maybe_publish_ember_keywords(
             ) else {
                 continue;
             };
-            ranked.push((staleness, i));
+            ranked.push((staleness, i, hash));
         }
         // Budget follows library size so the whole library completes a cycle
         // inside the republish interval. A fixed budget silently stopped
         // republishing everything past the first few thousand files.
-        let publishable = files.iter().filter(|f| is_ember_publishable(f)).count();
+        let publishable = seen.len();
         ranked.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
         state.ember_publish_pass.due += ranked.len();
-        ranked.truncate(ember_keyword_files_per_tick(
-            publishable,
-            ember_publishable_peer_count(state),
+        state.ember_keyword_due_last = ranked.len();
+        let peers = ember_publishable_peer_count(state);
+        let budget = ember_keyword_files_per_tick(publishable, peers).min(ember_keyword_files_left(
+            ember_deliverable_records_per_tick(peers),
+            state.ember_publish_pass.source_records,
         ));
-        state.ember_publish_pass.selected += ranked.len();
-        ranked
-            .into_iter()
-            .filter_map(|(_, i)| {
+        // A file goes out only once every one of its keywords can; its keys are
+        // those of the name as its record will sign it, or of a pending retry.
+        let retry_keys = state.ember_keyword_retry_keys.clone();
+        let keys_of = |at: usize| -> Vec<[u8; 16]> {
+            let (_, i, hash) = ranked[at];
+            let media = known_files.media_for(&hash).and_then(|(_, media)| media);
+            let signed_name =
+                ember::dht::publish::keyword_record_signed_name(&files[i].name, media.as_ref());
+            ember_keywords_to_send(
+                ember::dht::search::ember_file_keywords(&signed_name),
+                retry_keys.get(&hash),
+            )
+            .iter()
+            .map(|word| ember::dht::search::keyword_hash(word))
+            .collect()
+        };
+        let pick = ember_publish_pick(
+            (0..ranked.len()).map(|at| {
+                let gates: Vec<EmberLookupGate> = keys_of(at)
+                    .into_iter()
+                    .map(|key| ember_publish_lookup_gate(state, key))
+                    .collect();
+                if gates.contains(&EmberLookupGate::WouldWait) {
+                    EmberLookupGate::WouldWait
+                } else if gates.contains(&EmberLookupGate::Waiting) {
+                    EmberLookupGate::Waiting
+                } else {
+                    EmberLookupGate::Ready
+                }
+            }),
+            budget,
+        );
+        state.ember_publish_pass.selected += pick.send.len();
+        state.ember_publish_pass.awaiting_lookup += pick.waiting + pick.start_wait.len();
+        let start_waits = pick.start_wait.iter().flat_map(|&at| keys_of(at)).collect();
+        let send = pick
+            .send
+            .iter()
+            .map(|&at| {
+                let (_, i, hash) = ranked[at];
                 let f = &files[i];
-                let hash = hex::decode(&f.hash)
-                    .ok()
-                    .and_then(|v| <[u8; 16]>::try_from(v).ok())?;
-                Some((
+                (
                     hash,
                     f.size,
                     f.name.clone(),
                     parse_ember_file_hash(&f.ember_file_hash),
                     f.path.clone(),
-                ))
+                )
             })
-            .collect()
+            .collect();
+        (send, start_waits)
     };
+    for key in start_waits {
+        ember_publish_awaits_lookup(state, key);
+    }
     if due.is_empty() {
         return;
     }
@@ -2854,7 +3096,10 @@ pub(super) async fn maybe_publish_ember_keywords(
         // the record signs it, so a word cut off to fit is not a key the
         // record's own name cannot vouch for.
         let signed_name = ember::dht::publish::keyword_record_signed_name(&file_name, media.as_ref());
-        let keywords = ember::dht::search::ember_publish_keywords(signed_name);
+        let keywords = ember_keywords_to_send(
+            ember::dht::search::ember_file_keywords(&signed_name),
+            state.ember_keyword_retry_keys.get(&file_hash),
+        );
         if keywords.is_empty() {
             // Nothing to publish for this name, ever. Mark it done so it does
             // not get re-selected every tick and starve the rest of the

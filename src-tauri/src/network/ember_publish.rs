@@ -77,6 +77,9 @@ pub(crate) struct EmberPublishPassStats {
     /// Selected files held back for a target lookup; see
     /// `ember_publish_awaits_lookup`.
     pub(crate) awaiting_lookup: usize,
+    /// Source records this tick queued, each one record to each replica, so
+    /// the keyword pass that follows budgets from what is left.
+    pub(crate) source_records: usize,
     pub(crate) flush: EmberFlushStats,
 }
 

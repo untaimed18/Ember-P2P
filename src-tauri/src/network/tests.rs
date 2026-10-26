@@ -2380,7 +2380,8 @@ fn a_queued_batch_uses_the_handshake_extended_deadline() {
 struct TestSchedule {
     unplaced: HashMap<([u8; 16], EmberPublishKind), HashSet<[u8; 16]>>,
     placed: HashSet<([u8; 16], EmberPublishKind)>,
-    partial: HashSet<([u8; 16], EmberPublishKind)>,
+    partial: HashMap<([u8; 16], EmberPublishKind), HashSet<[u8; 16]>>,
+    retry_keys: HashMap<[u8; 16], HashSet<[u8; 16]>>,
     retries_spent: HashSet<[u8; 16]>,
     attempts: HashMap<([u8; 16], EmberPublishKind), EmberPublishAttempts>,
     source_at: HashMap<[u8; 16], std::time::Instant>,
@@ -2393,6 +2394,7 @@ impl TestSchedule {
             unplaced: &mut self.unplaced,
             placed: &mut self.placed,
             partial: &mut self.partial,
+            retry_keys: &mut self.retry_keys,
             retries_spent: &mut self.retries_spent,
             attempts: &mut self.attempts,
             source_at: &mut self.source_at,
@@ -2715,12 +2717,92 @@ fn a_publish_waits_for_its_target_lookup_only_where_storers_filter_by_proximity(
     ));
 }
 
+/// Files waiting on a lookup do not hold the per-tick budget: those that can
+/// go out fill it, the waiting are passed over, and no more new waits start a
+/// tick than the budget.
+#[test]
+fn files_waiting_on_a_lookup_leave_their_slots_to_the_ones_that_can_go() {
+    use EmberLookupGate::{Ready, Waiting, WouldWait};
+    let gates = [Waiting, Waiting, WouldWait, Ready, WouldWait, Ready, WouldWait, Ready, Ready];
+    let pick = ember_publish_pick(gates, 2);
+    assert_eq!(pick.send, vec![3, 5], "the first two that can go, behind the waiting ones");
+    assert_eq!(pick.start_wait, vec![2, 4], "a budget's worth of new waits");
+    assert_eq!(pick.waiting, 2);
+
+    // It stops reading once both are full.
+    let mut read = 0;
+    let pick = ember_publish_pick(
+        std::iter::repeat_with(|| {
+            read += 1;
+            if read % 2 == 0 { Ready } else { WouldWait }
+        })
+        .take(1000),
+        3,
+    );
+    assert_eq!((pick.send.len(), pick.start_wait.len()), (3, 3));
+    assert!(read <= 6, "read {read} gates for a budget of 3");
+
+    assert_eq!(ember_publish_pick([Ready, Ready], 0), EmberPublishPick::default());
+}
+
+/// Sources leave keywords part of each tick while both are due, and keywords
+/// budget from what sources left.
+#[test]
+fn sources_and_keywords_share_a_tick() {
+    assert_eq!(ember_source_record_share(96, 0), 96, "nothing else waiting");
+    assert_eq!(ember_source_record_share(96, 40), 48);
+    assert_eq!(ember_source_record_share(1, 40), 1, "never nothing");
+    assert_eq!(ember_keyword_files_left(96, 48), 48 / EMBER_KEYWORDS_PER_FILE_ESTIMATE);
+    assert_eq!(
+        ember_keyword_files_left(96, 96),
+        EMBER_KEYWORD_PUBLISH_MIN_PER_TICK,
+        "a full source tick still leaves the floor"
+    );
+}
+
+/// A partial retry re-sends the words it is for, unless the name no longer
+/// has them.
+#[test]
+fn a_partial_retry_sends_only_its_lost_words() {
+    let words = vec!["ubuntu".to_string(), "desktop".to_string(), "flac".to_string()];
+    let lost = HashSet::from([ember::dht::search::keyword_hash("flac")]);
+    assert_eq!(ember_keywords_to_send(words.clone(), Some(&lost)), ["flac"]);
+    assert_eq!(ember_keywords_to_send(words.clone(), None), words);
+    let renamed = HashSet::from([ember::dht::search::keyword_hash("gone")]);
+    assert_eq!(ember_keywords_to_send(words.clone(), Some(&renamed)), words);
+}
+
+/// The gate reads what the wait rule would do without doing it.
+#[test]
+fn the_lookup_gate_reads_the_wait_rule_without_starting_it() {
+    use std::collections::VecDeque;
+    let k = ember::dht::K_BUCKET_SIZE;
+    let key = [0x6A; 16];
+    let now = 1_700_000_000i64;
+    let cache: HashMap<[u8; 16], (Vec<ember::dht::EmberContact>, i64)> = HashMap::new();
+    let mut waits = HashMap::new();
+    let mut queue = VecDeque::new();
+
+    assert_eq!(ember_publish_lookup_gate_in(k - 1, &cache, &waits, &queue, false, key, now), EmberLookupGate::Ready);
+    assert_eq!(ember_publish_lookup_gate_in(k, &cache, &waits, &queue, false, key, now), EmberLookupGate::WouldWait);
+    assert!(waits.is_empty() && queue.is_empty(), "reading starts nothing");
+
+    assert!(ember_publish_awaits_lookup_in(k, &cache, &mut waits, &mut queue, false, key, now));
+    assert_eq!(ember_publish_lookup_gate_in(k, &cache, &waits, &queue, false, key, now + 60), EmberLookupGate::Waiting);
+    assert_eq!(
+        ember_publish_lookup_gate_in(k, &cache, &waits, &queue, false, key, now + EMBER_PUBLISH_LOOKUP_WAIT_SECS),
+        EmberLookupGate::Ready,
+        "a wait past its limit holds nothing back"
+    );
+}
+
 /// A lookup a publish is waiting on holds a file back, so the queue drains in
 /// minutes then rather than over the hour an ordinary refresh can take.
 #[test]
 fn awaited_target_lookups_drain_within_a_few_cycles() {
     assert_eq!(ember_target_lookups_this_cycle(0, true), EMBER_MAINT_MIN_TARGET_LOOKUPS);
-    assert_eq!(ember_target_lookups_this_cycle(20, true), 5);
+    assert_eq!(ember_target_lookups_this_cycle(10, true), 10, "a held-back file is asked about at once");
+    assert_eq!(ember_target_lookups_this_cycle(20, true), EMBER_MAINT_MAX_AWAITED_TARGET_LOOKUPS);
     assert_eq!(
         ember_target_lookups_this_cycle(EMBER_PUBLISH_TARGET_QUEUE_MAX, true),
         EMBER_MAINT_MAX_AWAITED_TARGET_LOOKUPS
@@ -2758,8 +2840,13 @@ fn a_round_that_placed_one_key_is_published_when_its_last_key_fails() {
     );
     assert!(!sched.unplaced.contains_key(&slot));
     assert!(!sched.placed.contains(&slot));
-    assert!(!sched.partial.contains(&slot));
+    assert!(!sched.partial.contains_key(&slot));
     assert_eq!(sched.rounds_failed(landed), 1, "the lost keyword counts against the file");
+    assert_eq!(
+        sched.retry_keys.get(&landed.file_hash),
+        Some(&HashSet::from([refused.key])),
+        "the retry is for the key that was lost, not the whole set"
+    );
     let staleness_at = |at| {
         ember_publish_staleness(
             &sched.unplaced,

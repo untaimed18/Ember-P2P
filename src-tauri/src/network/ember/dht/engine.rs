@@ -6743,7 +6743,7 @@ mod tests {
         // whole key. Each identity declares a different invented address; all of
         // them arrive from the same peer.
         let attacker = addr(136, 4672);
-        let sybils = 12u8;
+        let sybils = 40u8;
         for i in 1..=sybils {
             let sk = ed25519_dalek::SigningKey::from_bytes(&[0xC0 + i; 32]);
             let contact = SourceContact {
@@ -6757,7 +6757,8 @@ mod tests {
         }
 
         let held = buddy.local_records(&key, &[], &messages::ValueConstraints::default()).len();
-        let loosest = super::super::scale::NetworkScale::Bootstrap.max_sources_per_ip();
+        let loosest = super::super::scale::NetworkScale::Bootstrap.max_sources_per_ip()
+            * super::super::store::RELAYED_SOURCES_PER_IP_FACTOR;
         assert!(
             held <= loosest,
             "the sender's own address is what the cap has to count: {held} of \
