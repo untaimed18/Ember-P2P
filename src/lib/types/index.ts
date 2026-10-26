@@ -820,8 +820,12 @@ export interface KnownClient {
   last_known_ip: string | null;
   country_code: string | null;
   has_public_key: boolean;
-  /** Ember node id hex when known; friends are keyed by this, not user_hash. */
+  /** Ember node id hex when known: decides the tab and the hash shown. */
   ember_hash: string | null;
+  /** The Ember identity this row is known to be, which friends are matched
+   *  on. Unlike `ember_hash` it is never just a key the peer presented: a
+   *  friend's key is public. */
+  friend_hash?: string | null;
   is_friend: boolean;
   /** Friend nickname from the friends DB when this row is a friend. */
   nickname?: string;

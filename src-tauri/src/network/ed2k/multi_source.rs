@@ -7071,6 +7071,12 @@ async fn download_parts_from_source(
     // the Friends UI can distinguish binding-consistent peers from
     // peers that didn't advertise a pubkey at all.
     let mut ember_hash_binding_verified = false;
+    // The Ember hash this session's binding check passed for, and whether
+    // SecIdent verified this session: together they keep the binding for the
+    // Known Ember Peers tab without an address to tie them (see
+    // `CreditManager::note_session_proven_ember`).
+    let mut session_bound_ember: Option<[u8; 16]> = None;
+    let mut secident_verified_here = false;
     // Strict proof-of-possession flag. `true` iff
     // `perform_ember_auth_buffered` completed successfully on THIS
     // TCP session — the peer signed a fresh random nonce we issued
@@ -7203,7 +7209,16 @@ async fn download_parts_from_source(
                     true
                 };
                 if missing_peer_key {
-                    pending_peer_challenge = Some((challenge, state));
+                    pending_peer_challenge = Some(
+                        super::transfer::park_secident_challenge(
+                            &mut *writer,
+                            credit_mgr.as_ref(),
+                            state,
+                            challenge,
+                            addr,
+                        )
+                        .await?,
+                    );
                     debug!(
                         "Deferred SecIdent challenge from source {} — awaiting their public key",
                         _src_idx
@@ -7267,7 +7282,7 @@ async fn download_parts_from_source(
                 }
             }
             (OP_EMULEPROT, OP_SIGNATURE) if payload.len() >= 2 => {
-                super::transfer::handle_secident_signature(
+                if super::transfer::handle_secident_signature(
                     credit_mgr.as_ref(),
                     peer_user_hash,
                     &mut pending_secident_challenge,
@@ -7276,7 +7291,13 @@ async fn download_parts_from_source(
                     &payload,
                     our_client_id,
                 )
-                .await;
+                .await
+                {
+                    secident_verified_here = true;
+                    if let (Some(eh), Some(cm)) = (session_bound_ember, &credit_mgr) {
+                        cm.write().await.note_session_proven_ember(peer_user_hash, eh);
+                    }
+                }
             }
             (OP_EMULEPROT, OP_EMULEINFOANSWER) | (OP_EMULEPROT, OP_EMULEINFO) => {
                 merge_caps(&mut hello_caps, parse_emule_info(&payload));
@@ -7504,14 +7525,19 @@ async fn download_parts_from_source(
                                 peer_pk, peer_eh,
                             ) {
                                 ember_hash_binding_verified = true;
+                                session_bound_ember = Some(*peer_eh);
                                 info!("Ember binding: source {} at {} pubkey BLAKE3-binds to advertised hash", _src_idx, addr);
                                 if peer_user_hash != [0u8; 16] {
                                     if let Some(cm) = &credit_mgr {
-                                        cm.write().await.note_bound_ember_hash(
+                                        let mut cm = cm.write().await;
+                                        cm.note_bound_ember_hash(
                                             peer_user_hash,
                                             *peer_eh,
                                             CreditManager::ident_ip_of(addr),
                                         );
+                                        if secident_verified_here {
+                                            cm.note_session_proven_ember(peer_user_hash, *peer_eh);
+                                        }
                                     }
                                 }
                             } else {
@@ -8112,7 +8138,16 @@ async fn download_parts_from_source(
                 true
             };
             if missing_peer_key {
-                pending_peer_challenge = Some((challenge, state));
+                pending_peer_challenge = Some(
+                    super::transfer::park_secident_challenge(
+                        &mut *writer,
+                        credit_mgr.as_ref(),
+                        state,
+                        challenge,
+                        addr,
+                    )
+                    .await?,
+                );
             } else {
                 super::transfer::respond_to_secident_challenge(
                     &mut *writer,
@@ -8129,7 +8164,7 @@ async fn download_parts_from_source(
             continue;
         }
         if proto == OP_EMULEPROT && opcode == OP_SIGNATURE && _payload.len() >= 2 {
-            super::transfer::handle_secident_signature(
+            if super::transfer::handle_secident_signature(
                 credit_mgr.as_ref(),
                 peer_user_hash,
                 &mut pending_secident_challenge,
@@ -8138,7 +8173,13 @@ async fn download_parts_from_source(
                 &_payload,
                 our_client_id,
             )
-            .await;
+            .await
+            {
+                secident_verified_here = true;
+                if let (Some(eh), Some(cm)) = (session_bound_ember, &credit_mgr) {
+                    cm.write().await.note_session_proven_ember(peer_user_hash, eh);
+                }
+            }
             continue;
         }
         if proto == OP_EMULEPROT && opcode == OP_FILEDESC && _payload.len() >= 5 {
@@ -8309,14 +8350,19 @@ async fn download_parts_from_source(
                             peer_pk, peer_eh,
                         ) {
                             ember_hash_binding_verified = true;
+                            session_bound_ember = Some(*peer_eh);
                             info!("Ember binding: source {} at {} pubkey BLAKE3-binds (file-status-wait)", _src_idx, addr);
                             if peer_user_hash != [0u8; 16] {
                                 if let Some(cm) = &credit_mgr {
-                                    cm.write().await.note_bound_ember_hash(
+                                    let mut cm = cm.write().await;
+                                    cm.note_bound_ember_hash(
                                         peer_user_hash,
                                         *peer_eh,
                                         CreditManager::ident_ip_of(addr),
                                     );
+                                    if secident_verified_here {
+                                        cm.note_session_proven_ember(peer_user_hash, *peer_eh);
+                                    }
                                 }
                             }
                             if hello_caps.is_ember && !mesh_discovered_emitted {

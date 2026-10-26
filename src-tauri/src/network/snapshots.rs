@@ -526,10 +526,19 @@ fn record_ember_identity(
     record: &ed2k::credits::CreditRecord,
     live_ember: &std::collections::HashMap<[u8; 16], [u8; 16]>,
 ) -> Option<[u8; 16]> {
-    record
-        .ember_hash
-        .or_else(|| live_ember.get(&record.user_hash).copied())
-        .or(record.proven_ember_hash)
+    record_friend_identity(record, live_ember).or(record.proven_ember_hash)
+}
+
+/// The part of [`record_ember_identity`] that says who the peer *is*, which is
+/// all friend recognition may read: the friend-proven link, then a queue row's
+/// identity a session proved. `proven_ember_hash` only shows that the peer
+/// presented a key hashing to it, and anyone can present a friend's public
+/// key; trusting it put a stranger's row under a friend's name.
+fn record_friend_identity(
+    record: &ed2k::credits::CreditRecord,
+    live_ember: &std::collections::HashMap<[u8; 16], [u8; 16]>,
+) -> Option<[u8; 16]> {
+    record.ember_hash.or_else(|| live_ember.get(&record.user_hash).copied())
 }
 
 pub(super) async fn known_clients_snapshot(
@@ -629,12 +638,12 @@ pub(super) async fn known_clients_snapshot(
     // lose: they are the peers a lifetime-view is least likely to be asked
     // about. The counts carry the untrimmed totals so the UI can say so.
     let (mut ranked, counts) = trim_known_rows(records.iter().enumerate().map(|(idx, record)| {
-        let ember = record_ember_identity(record, &live_ember);
-        let meta_last_seen = ember
+        let meta_last_seen = record_friend_identity(record, &live_ember)
             .and_then(|eh| friend_meta.get(&eh))
             .map(|m| m.last_seen)
             .unwrap_or(i64::MIN);
-        (record.last_seen.max(meta_last_seen), ember.is_some(), idx)
+        let on_ember_tab = record_ember_identity(record, &live_ember).is_some();
+        (record.last_seen.max(meta_last_seen), on_ember_tab, idx)
     }));
     if counts.ed2k_total > counts.ed2k || counts.ember_total > counts.ember {
         debug!(
@@ -655,8 +664,9 @@ pub(super) async fn known_clients_snapshot(
                     .to_string();
             let credit_ratio = cm.get_score_ratio(&record.user_hash, record.ident_ip);
             let ember = record_ember_identity(record, &live_ember);
-            let is_friend = ember.map(|eh| friends.contains(&eh)).unwrap_or(false);
-            let meta = ember.and_then(|eh| friend_meta.get(&eh));
+            let friend = record_friend_identity(record, &live_ember);
+            let is_friend = friend.is_some_and(|eh| friends.contains(&eh));
+            let meta = friend.and_then(|eh| friend_meta.get(&eh));
 
             // The proven address first: a session address is only as good as
             // the user hash the peer claimed on it.
@@ -698,6 +708,7 @@ pub(super) async fn known_clients_snapshot(
                 country_code,
                 has_public_key: !record.public_key.is_empty(),
                 ember_hash: ember.map(hex::encode),
+                friend_hash: friend.map(hex::encode),
                 is_friend,
                 nickname: meta.map(|m| m.nickname.clone()).unwrap_or_default(),
             }
@@ -715,6 +726,30 @@ pub(super) async fn known_clients_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A binding SecIdent vouched for puts a row on the Ember tab, but a
+    /// friend's key is public, so it must not make the row that friend.
+    #[test]
+    fn a_vouched_binding_moves_a_row_to_the_ember_tab_but_names_no_friend() {
+        use std::collections::HashMap;
+        let friend = [0x08u8; 16];
+        let presented = [0x07u8; 16];
+        let none = HashMap::new();
+
+        let mut record = ed2k::credits::CreditRecord::new([0x01; 16]);
+        record.proven_ember_hash = Some(presented);
+        assert_eq!(record_ember_identity(&record, &none), Some(presented));
+        assert_eq!(record_friend_identity(&record, &none), None);
+
+        record.ember_hash = Some(friend);
+        assert_eq!(record_friend_identity(&record, &none), Some(friend));
+        assert_eq!(record_ember_identity(&record, &none), Some(friend), "the friend link is shown first");
+
+        let mut queued = ed2k::credits::CreditRecord::new([0x02; 16]);
+        queued.proven_ember_hash = Some(presented);
+        let live = HashMap::from([([0x02u8; 16], friend)]);
+        assert_eq!(record_friend_identity(&queued, &live), Some(friend), "a session-proven identity counts");
+    }
 
     #[test]
     fn known_rows_under_the_cap_are_all_kept() {

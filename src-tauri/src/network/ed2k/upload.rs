@@ -9424,6 +9424,12 @@ impl UploadHandler {
         // signal; we prefer that when available and fall back to
         // this binding flag only if auth never completes.
         let mut ember_hash_binding_verified = secure_v2_authenticated;
+        // The Ember hash this session's binding check passed for, and whether
+        // SecIdent verified this session: together they keep the binding for
+        // the Known Ember Peers tab without an address to tie them (see
+        // `CreditManager::note_session_proven_ember`).
+        let mut session_bound_ember: Option<[u8; 16]> = None;
+        let mut secident_verified_here = false;
         // Reactive Ember Ed25519 challenge-response state machine.
         // Driven by inbound `OP_EMBER_AUTH_CHALLENGE` /
         // `OP_EMBER_AUTH_RESPONSE` packets dispatched from the
@@ -10906,13 +10912,11 @@ impl UploadHandler {
                     // OP_PUBLICKEY only in response to our own
                     // OP_SECIDENTSTATE). Park the challenge in
                     // `pending_peer_challenge` and let the OP_PUBLICKEY
-                    // handler replay the whole OP_PUBLICKEY + OP_SIGNATURE
-                    // response once their key lands. Matching transfer.rs
-                    // we skip the immediate send entirely on defer —
-                    // eMule's SendSignaturePacket won't fire for our
-                    // outgoing SECIDENTSTATE challenge until it sees our
-                    // OP_PUBLICKEY anyway (BaseClient.cpp:1851), so there's
-                    // no timing benefit to sending ours twice.
+                    // handler replay the signature once their key lands.
+                    // Our own key, when they asked for it, goes now
+                    // (`park_secident_challenge`): two peers that each held
+                    // their key until they had the other's would never
+                    // send either.
                     //
                     // Whatever the state: a state-1 challenge (the peer
                     // already holds our key) still needs theirs to sign, and
@@ -10924,7 +10928,16 @@ impl UploadHandler {
                         !cm.has_public_key(&peer_user_hash)
                     };
                     if missing_peer_key {
-                        pending_peer_challenge = Some((challenge, state));
+                        pending_peer_challenge = Some(
+                            super::transfer::park_secident_challenge(
+                                &mut writer,
+                                Some(&self.credit_manager),
+                                state,
+                                challenge,
+                                peer_addr,
+                            )
+                            .await?,
+                        );
                         debug!(
                             "Deferred SecIdent challenge from {peer_addr} — awaiting their public key"
                         );
@@ -10975,6 +10988,15 @@ impl UploadHandler {
                         &payload,
                         our_client_id,
                     ).await;
+                    if verified_here {
+                        secident_verified_here = true;
+                        if let Some(eh) = session_bound_ember {
+                            self.credit_manager
+                                .write()
+                                .await
+                                .note_session_proven_ember(peer_user_hash, eh);
+                        }
+                    }
                     if relayed
                         && relayed_proof.is_none()
                         && relayed_session_proves_hash(
@@ -14551,6 +14573,7 @@ impl UploadHandler {
                             if let (Some(ref peer_pk), Some(ref peer_eh)) = (hello_caps.ember_pubkey, hello_caps.ember_hash) {
                                 if crate::network::ember::crypto::verify_ember_hash_binding(peer_pk, peer_eh) {
                                     ember_hash_binding_verified = true;
+                                    session_bound_ember = Some(*peer_eh);
                                     info!("Ember binding: peer {peer_addr} pubkey matches advertised hash");
                                     if peer_user_hash != [0u8; 16] {
                                         let mut cm = self.credit_manager.write().await;
@@ -14559,6 +14582,9 @@ impl UploadHandler {
                                             *peer_eh,
                                             CreditManager::ident_ip_of(peer_addr),
                                         );
+                                        if secident_verified_here {
+                                            cm.note_session_proven_ember(peer_user_hash, *peer_eh);
+                                        }
                                     }
                                     // Unlock mesh + first EPX once HELLO
                                     // binding succeeds (friend privileges

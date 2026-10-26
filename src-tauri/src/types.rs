@@ -2441,11 +2441,18 @@ pub struct KnownClient {
     /// Unknown after several connections).
     pub has_public_key: bool,
     /// Ember node id hex when known (from a verified hello binding).
-    /// Friends are keyed by this hash, not `user_hash`.
+    /// Decides the tab the row is on and the hash it shows.
     pub ember_hash: Option<String>,
-    /// True when `ember_hash` is present in the local friends set.
+    /// The Ember identity this row is known to be, which friends are
+    /// recognised by: the friend-proven link, or the identity a session in
+    /// the upload queue proved this run. `ember_hash` can also be a binding
+    /// SecIdent vouched for, which shows only that the peer presented a key,
+    /// and a friend's key is public.
+    #[serde(default)]
+    pub friend_hash: Option<String>,
+    /// True when `friend_hash` is present in the local friends set.
     pub is_friend: bool,
-    /// Friend nickname from the friends DB when this row's Ember hash
+    /// Friend nickname from the friends DB when this row's `friend_hash`
     /// matches a friends entry (empty otherwise). Surfaced so Known
     /// Clients can show a readable name even with no transfer history.
     #[serde(default)]

@@ -209,8 +209,15 @@ pub mod logging {
                 Regex::new(r"(?i)(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}").expect("static IPv6 regex")
             })
             .replace_all(&value, |caps: &Captures<'_>| {
-                let candidate = &caps[0];
-                if candidate.parse::<std::net::Ipv6Addr>().is_ok() {
+                let whole = caps.get(0).expect("group 0 always matches");
+                let candidate = whole.as_str();
+                // `b::` and `::` are valid addresses, and every Rust path
+                // (`ember_lib::network`) is full of them. An address never
+                // runs into an identifier, so one that does is not one.
+                let word = |c: char| c.is_alphanumeric() || c == '_';
+                let joined = value[..whole.start()].chars().next_back().is_some_and(word)
+                    || value[whole.end()..].chars().next().is_some_and(word);
+                if !joined && candidate.parse::<std::net::Ipv6Addr>().is_ok() {
                     format!("<ip:{}>", pseudonym(candidate))
                 } else {
                     candidate.to_string()
@@ -256,6 +263,32 @@ pub mod logging {
             assert!(redacted.contains("<ip:"));
             assert!(redacted.contains("<id:"));
             assert!(redacted.contains("<path:"));
+        }
+
+        #[test]
+        fn rust_paths_are_not_read_as_ipv6_addresses() {
+            for line in [
+                "INFO ember_lib::network::ed2k::multi_source: Ember binding ok",
+                "ember_lib::storage::known_files: Saved 2915 known files",
+                "ember_lib::network::ember::dht::engine: cycle done",
+                "std::io::Error",
+            ] {
+                assert_eq!(redact_normal_log(line), line);
+            }
+        }
+
+        #[test]
+        fn ipv6_addresses_are_still_redacted() {
+            for (line, addr) in [
+                ("peer [2001:db8::1]:4662 connected", "2001:db8::1"),
+                ("bound to ::1 port 4662", "::1"),
+                ("from fe80::1%eth0", "fe80::1"),
+                ("addr=2001:db8:85a3::8a2e:370:7334", "2001:db8:85a3::8a2e:370:7334"),
+            ] {
+                let redacted = redact_normal_log(line);
+                assert!(!redacted.contains(addr), "{line} -> {redacted}");
+                assert!(redacted.contains("<ip:"), "{line} -> {redacted}");
+            }
         }
 
         #[test]

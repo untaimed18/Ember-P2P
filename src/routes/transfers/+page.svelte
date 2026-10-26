@@ -1383,6 +1383,16 @@
   // granularity so we don't need a separate poll.
   let friendHashSet = $state<Set<string>>(new Set());
   let friendNickById = $state<Record<string, string>>({});
+  // By `friend_hash`, never `ember_hash`: that can be a friend's public key
+  // replayed by someone else (see `KnownClient.friend_hash`).
+  function isKnownFriend(kc: KnownClient): boolean {
+    const id = kc.friend_hash?.toLowerCase();
+    return kc.is_friend || (id != null && friendHashSet.has(id));
+  }
+  function friendNickOf(kc: KnownClient): string | undefined {
+    const id = kc.friend_hash?.toLowerCase();
+    return id ? friendNickById[id] : undefined;
+  }
   // Click-to-copy feedback. Cleared after a short delay so the badge
   // doesn't linger after the user moves on.
   let knownCopiedHash = $state<string | null>(null);
@@ -1472,7 +1482,7 @@
       if (ember && ember.includes(q)) return true;
       if (kc.last_known_ip && kc.last_known_ip.toLowerCase().includes(q)) return true;
       if (kc.country_code && kc.country_code.toLowerCase().includes(q)) return true;
-      const nick = (ember ? friendNickById[ember] : undefined) || kc.nickname;
+      const nick = friendNickOf(kc) || kc.nickname;
       if (nick && nick.toLowerCase().includes(q)) return true;
       if (kc.peer_name && kc.peer_name.toLowerCase().includes(q)) return true;
       if (kc.client_software && kc.client_software.toLowerCase().includes(q)) return true;
@@ -1512,8 +1522,7 @@
   // Top-line stats for the active known-peers tab. Computed off the
   // unfiltered split (eD2K or Ember) so totals match that tab's ledger
   // regardless of the current search. Friend count uses backend
-  // is_friend (ember hash) with a live friendHashSet fallback after
-  // add/remove.
+  // is_friend with a live friendHashSet fallback after add/remove.
   let knownStats = $derived.by(() => {
     let totalUp = 0;
     let totalDown = 0;
@@ -1521,8 +1530,7 @@
     for (const kc of knownLedger) {
       totalUp += kc.uploaded;
       totalDown += kc.downloaded;
-      const ember = kc.ember_hash?.toLowerCase();
-      if (kc.is_friend || (ember != null && friendHashSet.has(ember))) friendCount++;
+      if (isKnownFriend(kc)) friendCount++;
     }
     return {
       total: knownLedger.length,
@@ -1713,8 +1721,7 @@
       switch (knSortField) {
         case 'user_hash': {
           const nameOf = (kc: KnownClient) => {
-            const ember = kc.ember_hash?.toLowerCase();
-            const nick = (ember ? friendNickById[ember] : undefined) || kc.nickname;
+            const nick = friendNickOf(kc) || kc.nickname;
             if (nick && nick.trim()) return nick;
             return showingEmberKnown ? (kc.ember_hash || kc.user_hash) : kc.user_hash;
           };
@@ -3389,15 +3396,14 @@
           confirmBan = {
             open: true,
             userHash: kc.user_hash,
-            name: (kc.ember_hash && friendNickById[kc.ember_hash.toLowerCase()])
-              || kc.user_hash.slice(0, 8) + '\u2026',
+            name: friendNickOf(kc) || kc.user_hash.slice(0, 8) + '\u2026',
           };
           return;
         }
         case 'unban_user':
           await unbanUser(
             kc.user_hash,
-            (kc.ember_hash && friendNickById[kc.ember_hash.toLowerCase()])
+            friendNickOf(kc)
               || kc.peer_name
               || kc.user_hash.slice(0, 8) + '\u2026',
           );
@@ -6601,9 +6607,8 @@
               <tr class="vpad-row" aria-hidden="true" style="height: {knownWindow.topPad}px;"><td colspan={knownColCount}></td></tr>
             {/if}
             {#each displayedKnownClients as kc, i (kc.user_hash)}
-              {@const emberKey = kc.ember_hash?.toLowerCase()}
-              {@const isFriend = kc.is_friend || (!!emberKey && friendHashSet.has(emberKey))}
-              {@const friendNick = (emberKey ? friendNickById[emberKey] : undefined) || (kc.nickname || undefined)}
+              {@const isFriend = isKnownFriend(kc)}
+              {@const friendNick = friendNickOf(kc) || (kc.nickname || undefined)}
               {@const shownHash = showingEmberKnown ? (kc.ember_hash || kc.user_hash) : kc.user_hash}
               <tr
                 class="client-row win-row"

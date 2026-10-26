@@ -4665,10 +4665,7 @@ pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
         (pub_key, sig)
     };
     if state >= 2 && !pub_key.is_empty() {
-        let mut key_pkt = Vec::with_capacity(1 + pub_key.len());
-        key_pkt.push(pub_key.len() as u8);
-        key_pkt.extend_from_slice(&pub_key);
-        write_packet_async(writer, OP_EMULEPROT, OP_PUBLICKEY, &key_pkt).await?;
+        write_public_key_packet(writer, &pub_key).await?;
     }
     if !sig.is_empty() {
         let mut sig_pkt = Vec::with_capacity(2 + sig.len() + usize::from(add_trailer));
@@ -4692,6 +4689,49 @@ pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
         );
     }
     Ok(())
+}
+
+async fn write_public_key_packet<W: AsyncWriteExt + Unpin + ?Sized>(
+    writer: &mut W,
+    pub_key: &[u8],
+) -> std::io::Result<()> {
+    let mut key_pkt = Vec::with_capacity(1 + pub_key.len());
+    key_pkt.push(pub_key.len() as u8);
+    key_pkt.extend_from_slice(pub_key);
+    write_packet_async(writer, OP_EMULEPROT, OP_PUBLICKEY, &key_pkt).await
+}
+
+/// Take a peer's `OP_SECIDENTSTATE` that cannot be signed yet because we do
+/// not hold their key, and return the challenge to park for when it arrives.
+///
+/// A state-2 challenge asks for our key as well as a signature, and the key
+/// needs nothing of theirs, so it goes now; only the signature waits, and the
+/// parked state drops to 1 so the replay does not send the key again. This is
+/// eMule's `OP_SECIDENTSTATE` handler: `SendPublicKeyPacket` at once, moving
+/// to `IS_SIGNATURENEEDED`, and `SendSignaturePacket` returning until
+/// `ProcessPublicKeyPacket` brings the peer's key. Holding the key back as
+/// well leaves two peers that each wait for the other's key before sending
+/// their own with neither ever sent: every first meeting of two Ember clients.
+pub(crate) async fn park_secident_challenge<W: AsyncWriteExt + Unpin + ?Sized>(
+    writer: &mut W,
+    credit_manager: Option<&Arc<tokio::sync::RwLock<CreditManager>>>,
+    state: u8,
+    challenge: u32,
+    peer_addr: SocketAddr,
+) -> std::io::Result<(u32, u8)> {
+    if state < 2 {
+        return Ok((challenge, state));
+    }
+    let pub_key = match credit_manager {
+        Some(cm) => cm.read().await.our_public_key().to_vec(),
+        None => Vec::new(),
+    };
+    if pub_key.is_empty() {
+        return Ok((challenge, state));
+    }
+    write_public_key_packet(writer, &pub_key).await?;
+    debug!("SecIdent: sent our key to {peer_addr}; its signature waits for theirs");
+    Ok((challenge, 1))
 }
 
 /// Check a peer's `OP_SIGNATURE` against our outstanding challenge and record
@@ -4838,6 +4878,147 @@ async fn write_packet_async<W: AsyncWriteExt + Unpin + ?Sized>(
     writer.write_all(payload).await?;
     writer.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod secident_handshake_tests {
+    use super::*;
+
+    type Frame = (u8, u8, Vec<u8>);
+
+    /// The level an Ember client advertises with its keypair loaded.
+    const LEVEL: u8 = 3;
+
+    fn take_frames(buf: &mut Vec<u8>) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        let mut at = 0;
+        while at < buf.len() {
+            let len = u32::from_le_bytes(buf[at + 1..at + 5].try_into().unwrap()) as usize;
+            frames.push((buf[at], buf[at + 5], buf[at + 6..at + 5 + len].to_vec()));
+            at += 5 + len;
+        }
+        buf.clear();
+        frames
+    }
+
+    struct Side {
+        cm: Arc<tokio::sync::RwLock<CreditManager>>,
+        hash: [u8; 16],
+        addr: SocketAddr,
+        out: Vec<u8>,
+        ours: Option<u32>,
+        parked: Option<(u32, u8)>,
+        verified: bool,
+    }
+
+    impl Side {
+        fn new(hash: u8, addr: &str) -> Self {
+            Self {
+                cm: Arc::new(tokio::sync::RwLock::new(CreditManager::with_generated_keys())),
+                hash: [hash; 16],
+                addr: addr.parse().unwrap(),
+                out: Vec::new(),
+                ours: None,
+                parked: None,
+                verified: false,
+            }
+        }
+
+        /// What the download and upload loops do with each SecIdent packet.
+        async fn receive(&mut self, peer_hash: [u8; 16], peer_addr: SocketAddr, frame: Frame) {
+            let (proto, opcode, payload) = frame;
+            assert_eq!(proto, OP_EMULEPROT);
+            match opcode {
+                OP_SECIDENTSTATE => {
+                    let state = payload[0];
+                    let challenge = u32::from_le_bytes(payload[1..5].try_into().unwrap());
+                    if self.cm.read().await.has_public_key(&peer_hash) {
+                        respond_to_secident_challenge(
+                            &mut self.out, Some(&self.cm), state, challenge, peer_addr, peer_hash, LEVEL, 0,
+                        )
+                        .await
+                        .unwrap();
+                    } else {
+                        self.parked = Some(
+                            park_secident_challenge(&mut self.out, Some(&self.cm), state, challenge, peer_addr)
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                }
+                OP_PUBLICKEY => {
+                    let key = super::super::multi_source::public_key_from_packet(&payload).unwrap();
+                    assert!(self.cm.write().await.set_public_key(peer_hash, key.to_vec()));
+                    if let Some((challenge, state)) = self.parked.take() {
+                        respond_to_secident_challenge(
+                            &mut self.out, Some(&self.cm), state, challenge, peer_addr, peer_hash, LEVEL, 0,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+                OP_SIGNATURE => {
+                    self.verified = handle_secident_signature(
+                        Some(&self.cm), peer_hash, &mut self.ours, peer_addr, LEVEL, &payload, 0,
+                    )
+                    .await;
+                }
+                other => panic!("unexpected opcode {other:#04x}"),
+            }
+        }
+    }
+
+    /// Two Ember clients meeting for the first time each hold the other's
+    /// challenge until the other's key arrives. Unless the key a challenge
+    /// asks for is sent without waiting, neither ever arrives.
+    #[tokio::test]
+    async fn two_peers_that_have_never_met_prove_themselves_to_each_other() {
+        let mut a = Side::new(0xA1, "81.2.69.7:4662");
+        let mut b = Side::new(0xB2, "81.2.69.8:4662");
+        a.ours = maybe_send_secident_challenge(&mut a.out, Some(&a.cm), b.hash, b.addr, LEVEL).await.unwrap();
+        b.ours = maybe_send_secident_challenge(&mut b.out, Some(&b.cm), a.hash, a.addr, LEVEL).await.unwrap();
+        assert!(a.ours.is_some() && b.ours.is_some(), "each challenges the other");
+
+        let mut keys_sent = [0usize; 2];
+        for _ in 0..8 {
+            let from_a = take_frames(&mut a.out);
+            let from_b = take_frames(&mut b.out);
+            if from_a.is_empty() && from_b.is_empty() {
+                break;
+            }
+            keys_sent[0] += from_a.iter().filter(|f| f.1 == OP_PUBLICKEY).count();
+            keys_sent[1] += from_b.iter().filter(|f| f.1 == OP_PUBLICKEY).count();
+            for frame in from_b {
+                a.receive(b.hash, b.addr, frame).await;
+            }
+            for frame in from_a {
+                b.receive(a.hash, a.addr, frame).await;
+            }
+        }
+
+        assert!(a.verified && b.verified, "both signatures verified");
+        assert_eq!(keys_sent, [1, 1], "each key goes once");
+        for (side, peer) in [(&a, b.hash), (&b, a.hash)] {
+            let record = side.cm.read().await;
+            assert_eq!(record.get_record(&peer).unwrap().ident_state, IdentState::Verified);
+        }
+    }
+
+    /// Parking sends the key a challenge asked for, and nothing for one that
+    /// asked only for a signature.
+    #[tokio::test]
+    async fn parking_sends_only_the_key_a_challenge_asked_for() {
+        let mut side = Side::new(0xC3, "81.2.69.9:4662");
+        let parked = park_secident_challenge(&mut side.out, Some(&side.cm), 1, 42, side.addr).await.unwrap();
+        assert_eq!(parked, (42, 1));
+        assert!(side.out.is_empty());
+
+        let parked = park_secident_challenge(&mut side.out, Some(&side.cm), 2, 43, side.addr).await.unwrap();
+        assert_eq!(parked, (43, 1), "the key went, so only the signature is left");
+        let frames = take_frames(&mut side.out);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, OP_PUBLICKEY);
+    }
 }
 
 #[cfg(test)]
