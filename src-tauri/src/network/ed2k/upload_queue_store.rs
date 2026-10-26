@@ -397,7 +397,7 @@ async fn merge_pending(
         hashes
             .iter()
             .copied()
-            .filter(|h| index_offers_hash(&index, h))
+            .filter(|h| index_offers_hash(&index, h) || crate::sharing::feed_files::hidden_share(h).is_some())
             .collect()
     };
     let downloading: HashSet<[u8; 16]> = {

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { getFriends, addFriend, removeFriend, blockFriend, unblockFriend, getBlockedFriends, isChatLocked, updateFriendNickname, getMyEmberHash, resetFriendCode, acceptFriendRequest, rejectFriendRequest, retryFriendSearch, type FriendInfo, type FriendRequestInfo, type BlockedInfo } from '$lib/api/friends';
   import { carriesIntroSecret, friendHashFromCode, isAcceptedFriendInput } from '$lib/friendCode';
-  import { getNetworkStats, kadRecheckFirewall } from '$lib/api/kad';
+  import { kadRecheckFirewall } from '$lib/api/kad';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import BrowseFriendDialog from '$lib/components/BrowseFriendDialog.svelte';
   import { openChat as openChatTab, removeChatForFriend, renameTab as renameChatTab, retainChatTabs } from '$lib/stores/chatTabs';
@@ -14,10 +14,17 @@
   import { toastError, toastWarning } from '$lib/stores/toast';
   import { copyToClipboard, formatBytes, formatCalendarDate } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
+  import { alreadyQueuedText } from '$lib/alreadyQueued';
   import { translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
   import {
     onlineFriends as onlineFriendsStore,
+    friendStatuses as friendStatusesStore,
+    idleAway as idleAwayStore,
+    friendPresence as presenceOf,
+    friendPresenceLabel,
+    FRIEND_STATUSES,
+    type FriendPresence,
     unreadCounts as unreadCountsStore,
     friendRequests as friendRequestsStore,
     searchingFriends as searchingFriendsStore,
@@ -46,7 +53,9 @@
     legacyStrandedFriends as legacyStrandedFriendsStore,
   } from '$lib/stores/friends';
   import { minuteClock } from '$lib/stores/clock';
-  import { appSettings } from '$lib/stores/settings';
+  import { appSettings, setAppSettings } from '$lib/stores/settings';
+  import { setFriendStatus } from '$lib/api/settings';
+  import type { FriendStatus } from '$lib/types';
   import { networkStats } from '$lib/stores/network';
   import { menuKeydown } from '$lib/a11y';
   import IconX from '$lib/components/IconX.svelte';
@@ -152,7 +161,7 @@
       // new started when nothing did.
       flash(
         res.already_queued
-          ? m.search_already_queued_name({ name: offer.file_name })
+          ? alreadyQueuedText(res, offer.file_name)
           : m.friends_offer_accepted({ name: offer.file_name }),
       );
     } catch (e: unknown) {
@@ -174,7 +183,11 @@
   });
   let searchingFriends: Set<string> = $derived($searchingFriendsStore);
   let reconnectingFriends = $state(new Set<string>());
-  let isFirewalled = $state(false);
+  // The shared store, which the `firewall-status` event and the app-wide poll
+  // both keep current; a fetch and listener of the page's own duplicated it.
+  // Not while disconnected: the store marks that firewalled too, and the
+  // banner's advice is about reachability, not about being offline.
+  let isFirewalled = $derived($networkStats.firewalled && $networkStats.status !== 'disconnected');
   // A symmetric NAT re-maps per destination, so hole punching cannot get
   // through and a firewalled friend genuinely cannot be reached without port
   // forwarding. Every other NAT class can be punched, so the advice differs.
@@ -213,7 +226,10 @@
     const q = searchQuery.trim().toLowerCase();
     if (q) {
       list = list.filter(
-        (f) => f.user_hash.toLowerCase().includes(q) || f.nickname.toLowerCase().includes(q),
+        (f) =>
+          f.user_hash.toLowerCase().includes(q) ||
+          f.nickname.toLowerCase().includes(q) ||
+          (f.self_name ?? '').toLowerCase().includes(q),
       );
     }
     return list.slice().sort((a, b) => {
@@ -264,8 +280,8 @@
     return formatCalendarDate(ts, { month: 'short', day: 'numeric' });
   }
 
-  function friendPresence(f: FriendInfo): 'online' | 'offline' {
-    return isFriendOnline(f.user_hash) ? 'online' : 'offline';
+  function friendPresence(f: FriendInfo): FriendPresence {
+    return presenceOf(f.user_hash, onlineFriends, $friendStatusesStore);
   }
 
   async function handleAcceptRequest(req: FriendRequestInfo) {
@@ -394,6 +410,11 @@
     recheckTimer = setTimeout(() => { recheckingFirewall = false; }, 5000);
   }
 
+  // A recheck that found us reachable is done, whenever the store hears it.
+  $effect(() => {
+    if (!isFirewalled) recheckingFirewall = false;
+  });
+
   $effect(() => {
     const addParam = $page.url.searchParams.get('add');
     if (!addParam) return;
@@ -422,10 +443,6 @@
         console.warn('friends: failed to read chat lock state:', e);
         if (!destroyed) chatLocked = true;
       });
-    getNetworkStats()
-      .then(s => { if (!destroyed) isFirewalled = s.firewalled; })
-      .catch((e) => { console.warn('friends: initial getNetworkStats failed:', e); });
-
     const unlistenFns: (() => void)[] = [];
 
     // Page-local listeners for side effects not already covered by the shared
@@ -437,14 +454,6 @@
     // 'ember:friend-confirmed' is likewise left to the store, whose debounced
     // refresh writes the same `friendsList` this page renders from; a reload
     // here per event doubled the `get_friends` calls of every rediscovery sweep.
-
-    listen<{ firewalled: boolean }>('firewall-status', (event) => {
-      if (destroyed) return;
-      if (typeof event.payload?.firewalled !== 'boolean') return;
-      isFirewalled = event.payload.firewalled;
-      if (!event.payload.firewalled) recheckingFirewall = false;
-    }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); })
-      .catch((e) => console.error('friends: failed to register firewall-status listener', e));
 
     listen<{ user_hash: string; reason?: string; legacy_code?: boolean }>('ember:friend-search-failed', (event) => {
       if (destroyed) return;
@@ -524,6 +533,25 @@
 
   function toErr(e: unknown): string {
     return translateError(e, m.error_operation_failed());
+  }
+
+  let myStatus: FriendStatus = $derived($appSettings?.friend_status ?? 'online');
+  /** What friends see: Away replaces Online while we are idle. */
+  let myShownStatus: FriendStatus = $derived(myStatus === 'online' && $idleAwayStore ? 'away' : myStatus);
+  let savingStatus = $state(false);
+  async function changeMyStatus(select: HTMLSelectElement) {
+    const next = FRIEND_STATUSES.find((s) => s === select.value);
+    if (savingStatus || !next || next === myStatus) return;
+    savingStatus = true;
+    try {
+      setAppSettings(await setFriendStatus(next));
+    } catch (e: unknown) {
+      // The select shows what was picked, not what was saved.
+      select.value = myStatus;
+      error = translateError(e, m.friends_my_status_failed());
+    } finally {
+      savingStatus = false;
+    }
   }
 
   let loadFriendsSeq = 0;
@@ -772,6 +800,17 @@
       saveEditPending = false;
       return;
     }
+    // Clicked into and out of unchanged, as their settings dialog does: no
+    // save. `renameFriend` reads a name equal to theirs as "no label", and
+    // until their session says what they are called, theirs is a stand-in
+    // equal to the label — a typed name, or one carried over from before
+    // labels — so saving it unchanged would drop the label for good.
+    const current = (friends.find((f) => f.user_hash === hash)?.nickname ?? '').trim();
+    if (nick === current) {
+      if (editingHash === hash) editingHash = null;
+      saveEditPending = false;
+      return;
+    }
     try {
       await renameFriend(hash, nick);
       // Blur-to-save means the user may already be renaming a different friend
@@ -787,24 +826,29 @@
   /** Save a friend's name, from the card or from their settings, and carry it
    *  to every place that shows it. */
   async function renameFriend(hash: string, nick: string): Promise<void> {
-    await updateFriendNickname(hash, nick);
+    const selfName = friends.find((f) => f.user_hash === hash)?.self_name ?? '';
+    // Their own name, saved unchanged or typed back, is no label: the card
+    // keeps following their renames.
+    const label = nick === selfName ? '' : nick;
+    await updateFriendNickname(hash, label);
+    const shown = label || selfName;
     patchFriendsList((list) =>
-      list.map((f) => (f.user_hash === hash ? { ...f, nickname: nick } : f)),
+      list.map((f) => (f.user_hash === hash ? { ...f, alias: label, nickname: shown } : f)),
     );
-    showFriendName(hash, nick);
+    showFriendName(hash, shown, label);
     // The backend drops characters it will not store, so the saved name can
     // differ from the typed one. Whatever list the store holds once this
     // settles postdates the rename.
     void refreshFriendsList().then(() => {
       const saved = friends.find((f) => f.user_hash === hash);
-      if (saved && saved.nickname !== nick) showFriendName(hash, saved.nickname);
+      if (saved && saved.nickname !== shown) showFriendName(hash, saved.nickname, saved.alias);
     });
   }
 
   /** The open settings dialog and the chat tab keep their own copy of the
    *  name; the list and the name cache follow the store. */
-  function showFriendName(hash: string, nick: string) {
-    if (settingsFor?.user_hash === hash) settingsFor = { ...settingsFor, nickname: nick };
+  function showFriendName(hash: string, nick: string, alias: string) {
+    if (settingsFor?.user_hash === hash) settingsFor = { ...settingsFor, nickname: nick, alias };
     renameChatTab(hash, nick || hash.slice(0, 8) + '\u2026');
   }
 
@@ -1063,6 +1107,30 @@
           {:else if undiscoverable}
             <span class="my-id-status undiscoverable">{m.friends_status_undiscoverable()}</span>
           {/if}
+          <div class="my-status-row">
+            <span
+              class="my-status-dot"
+              class:dot-online={myShownStatus === 'online'}
+              class:dot-away={myShownStatus === 'away'}
+              class:dot-busy={myShownStatus === 'busy'}
+              aria-hidden="true"
+            ></span>
+            <label for="my-friend-status">{m.friends_my_status_label()}</label>
+            <select
+              id="my-friend-status"
+              value={myStatus}
+              disabled={!$appSettings || savingStatus}
+              aria-describedby="my-friend-status-hint"
+              onchange={(e) => void changeMyStatus(e.currentTarget)}
+            >
+              {#each FRIEND_STATUSES as status (status)}
+                <option value={status}>{friendPresenceLabel(status)}</option>
+              {/each}
+            </select>
+          </div>
+          <span id="my-friend-status-hint" class="my-status-hint">
+            {myShownStatus !== myStatus ? m.friends_my_status_idle() : m.friends_my_status_hint()}
+          </span>
         </div>
       </div>
       <div class="my-id-actions">
@@ -1122,6 +1190,7 @@
       </div>
       <div class="requests-list">
         {#each pendingOffers as offer (offerKey(offer.user_hash, offer.file_hash))}
+          {@const accepting = $acceptingOfferStore === offerKey(offer.user_hash, offer.file_hash)}
           <div
             class="request-card"
             in:fly={{ y: 6, duration: 200 }}
@@ -1151,13 +1220,14 @@
               <button
                 class="request-accept"
                 disabled={$acceptingOfferStore !== null}
+                aria-busy={accepting}
                 onclick={() => acceptOffer(offer)}
-              >{m.friends_offer_download()}</button>
+              >{accepting ? m.browse_downloading() : m.friends_offer_download()}</button>
               <!-- Only the offer being accepted is held, as in the dock:
                    dismissing another one starts nothing. -->
               <button
                 class="request-reject"
-                disabled={$acceptingOfferStore === offerKey(offer.user_hash, offer.file_hash)}
+                disabled={accepting}
                 onclick={() => clearFileOffer(offer.user_hash, offer.file_hash)}
               >{m.common_dismiss()}</button>
             </div>
@@ -1393,9 +1463,11 @@
           <span
             class="status-dot"
             class:dot-online={presence === 'online'}
+            class:dot-away={presence === 'away'}
+            class:dot-busy={presence === 'busy'}
             class:dot-offline={presence === 'offline'}
             role="img"
-            aria-label={presence === 'online' ? m.chat_online_label() : m.chat_offline_label()}
+            aria-label={friendPresenceLabel(presence)}
           ></span>
         </div>
 
@@ -1408,7 +1480,7 @@
               onkeydown={editKeydown}
               onblur={saveEdit}
               maxlength="64"
-              placeholder={m.friends_nickname_edit_placeholder()}
+              placeholder={f.self_name || m.friends_nickname_edit_placeholder()}
               use:autoFocus
               aria-label={m.friends_nickname_edit_placeholder()}
               aria-invalid={friendNameTooLong(editNickname)}
@@ -1432,6 +1504,15 @@
                 </span>
               {/if}
             </div>
+            <!-- Under a label, the name they chose stays in view, so a label
+                 never hides who this is and their renames still show. -->
+            {#if f.alias && f.self_name && f.self_name !== f.alias}
+              <bdi
+                dir="auto"
+                class="self-name"
+                title={m.friends_self_name_title({ name: f.self_name })}
+              >{f.self_name}</bdi>
+            {/if}
           {/if}
           <!-- Exactly one status line, highest-priority state wins. -->
           <span class="card-substatus">
@@ -1449,6 +1530,10 @@
               </span>
             {:else if presence === 'online'}
               <span class="status-online">{m.friends_status_online()}</span>
+            {:else if presence === 'away'}
+              <span class="status-away">{m.friends_status_away()}</span>
+            {:else if presence === 'busy'}
+              <span class="status-busy">{m.friends_status_busy()}</span>
             {:else if f.last_seen}
               {m.friends_status_last_seen({ when: formatLastSeen(f.last_seen, $minuteClock) })}
             {:else}
@@ -1463,7 +1548,6 @@
         <div class="card-controls">
           <button
             class="chat-btn"
-            class:has-unread={unread > 0}
             onclick={() => openChat(f)}
             disabled={chatDisabledFor(f.user_hash)}
             title={chatDisabledFor(f.user_hash)
@@ -1788,6 +1872,27 @@
     color: color-mix(in srgb, var(--danger) 85%, var(--text-primary));
   }
 
+  .my-status-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+  }
+
+  .my-status-dot {
+    width: 10px;
+    height: 10px;
+    flex-shrink: 0;
+    border-radius: 50%;
+  }
+
+  .my-status-hint {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+  }
+
   .my-id-copy {
     display: inline-flex;
     align-items: center;
@@ -1954,6 +2059,7 @@
   .add-form-inner input:focus {
     border-color: var(--accent);
     outline: none;
+    box-shadow: 0 0 0 2px var(--accent-halo);
   }
 
   .hash-input {
@@ -2005,6 +2111,7 @@
   .search-input:focus {
     border-color: var(--accent);
     outline: none;
+    box-shadow: 0 0 0 2px var(--accent-halo);
   }
 
   .search-clear {
@@ -2042,8 +2149,8 @@
   /* --- Card grid --- */
   .cards-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-    gap: 10px;
+    grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr));
+    gap: 12px;
   }
 
   /* Single row: avatar · identity · controls. No `overflow: hidden` — the
@@ -2054,8 +2161,8 @@
     border-radius: var(--radius-lg);
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 9px 10px;
+    gap: 12px;
+    padding: 12px 14px;
     transition: border-color var(--transition-normal), box-shadow var(--transition-normal);
   }
 
@@ -2070,8 +2177,8 @@
   }
 
   .card-avatar {
-    width: var(--avatar-size);
-    height: var(--avatar-size);
+    width: 40px;
+    height: 40px;
     flex-shrink: 0;
     border-radius: 50%;
     background: var(--accent-dim);
@@ -2082,8 +2189,8 @@
   }
 
   .card-avatar svg {
-    width: 18px;
-    height: 18px;
+    width: 22px;
+    height: 22px;
   }
 
   .card-identity {
@@ -2091,7 +2198,7 @@
     min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 1px;
+    gap: 2px;
   }
 
   .card-name-row {
@@ -2105,6 +2212,14 @@
     display: inline-flex;
     color: var(--accent);
     flex-shrink: 0;
+  }
+
+  .self-name {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .lock-glyph svg {
@@ -2128,6 +2243,16 @@
 
   .status-online {
     color: var(--success);
+    font-weight: 600;
+  }
+
+  .status-away {
+    color: var(--warning);
+    font-weight: 600;
+  }
+
+  .status-busy {
+    color: var(--danger);
     font-weight: 600;
   }
 
@@ -2406,6 +2531,14 @@
 
   .dot-online {
     background: var(--success);
+  }
+
+  .dot-away {
+    background: var(--warning);
+  }
+
+  .dot-busy {
+    background: var(--danger);
   }
 
   .dot-offline {
@@ -2752,6 +2885,7 @@
     border-color: var(--danger);
   }
 
+  .request-accept:disabled,
   .request-block:disabled,
   .request-reject:disabled {
     opacity: 0.5;
@@ -2864,7 +2998,6 @@
     color: var(--text-secondary);
     padding: 12px 16px;
     border-radius: var(--radius-lg);
-    margin-bottom: 12px;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -2881,7 +3014,6 @@
     color: var(--text-secondary);
     padding: 12px 16px;
     border-radius: var(--radius-lg);
-    margin-bottom: 12px;
     display: flex;
     align-items: center;
     gap: 14px;

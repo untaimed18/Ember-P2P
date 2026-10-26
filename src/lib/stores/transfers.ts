@@ -21,6 +21,7 @@ import {
 } from './transferRows';
 import { formatBytes, withTimeout } from '$lib/utils';
 import { notify, shouldNotify } from '$lib/notifications';
+import { noteDelivery, noteUiActivity, timedUiActivity } from '$lib/uiStall';
 import { transferFailureReasonText } from '$lib/i18n';
 import * as m from '$lib/paraglide/messages';
 
@@ -41,6 +42,7 @@ interface ProgressPayload {
   upload_time?: number;
   up_part_status?: string;
   up_part_count?: number;
+  up_part_fill?: string;
   up_peer_part_status?: string;
   /** `'upload'` on upload-direction events; omitted entirely for downloads
    *  (`TransferProgressPayload::direction` is `Option<&'static str>` and is
@@ -284,6 +286,10 @@ interface TransferEventPayload extends StatusEventPayload {
    *  upload sessions disappear from the active list). Falls back to
    *  the in-store row's `direction` when the payload doesn't carry it. */
   direction?: string;
+  /** The download's file, for a notification about one this store does not
+   *  list (a feed's). */
+  file_name?: string;
+  total_size?: number;
 }
 
 export const transfers = writable<Transfer[]>([]);
@@ -332,6 +338,27 @@ interface PendingProgress {
 }
 const pendingProgress = new Map<string, PendingProgress>();
 const ORPHAN_PROGRESS_TTL_MS = 5000;
+/** How soon progress with no row yet is looked at again. Not every frame: a
+ *  feed's download never gets a row here, and retrying its progress each frame
+ *  for as long as it downloaded kept the window rendering flat out. A row
+ *  arriving meanwhile picks it up at the flush that adds it. */
+const ORPHAN_RETRY_MS = 500;
+let orphanRetry: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleOrphanRetry() {
+  if (orphanRetry !== null) return;
+  orphanRetry = setTimeout(() => {
+    orphanRetry = null;
+    if (pendingProgress.size > 0) scheduleProgressFlush();
+  }, ORPHAN_RETRY_MS);
+}
+
+function cancelOrphanRetry() {
+  if (orphanRetry !== null) {
+    clearTimeout(orphanRetry);
+    orphanRetry = null;
+  }
+}
 let progressFlushScheduled = false;
 // Handles for the pending flush so `cleanupTransferStore` can cancel a frame
 // that would otherwise fire after teardown.
@@ -546,7 +573,7 @@ function flushPendingTransfers() {
         retained = true;
       }
     }
-    if (retained) scheduleProgressFlush();
+    if (retained) scheduleOrphanRetry();
   }
   commitTransfers(list);
 }
@@ -591,6 +618,7 @@ function applyProgress(existing: Transfer, p: ProgressPayload): Transfer {
     ...(p.upload_time != null ? { upload_time: p.upload_time } : {}),
     ...(p.up_part_status != null ? { up_part_status: p.up_part_status } : {}),
     ...(p.up_part_count != null ? { up_part_count: p.up_part_count } : {}),
+    ...(p.up_part_fill != null ? { up_part_fill: p.up_part_fill } : {}),
     // Mirrored, absent included: the backend sets the row's bitmap from each
     // upload progress event and clears it when the peer's file no longer
     // matches, and a cleared value is left out of the payload.
@@ -626,28 +654,40 @@ const announcedTerminal = new Set<string>();
  * those endings is news. The direction comes from the event when the backend
  * sent one and from the stored row otherwise, exactly as the listeners do.
  */
-function finishedDownloadRow(id: string, direction?: string): Transfer | null {
+function finishedDownloadRow(
+  id: string,
+  direction: string | undefined,
+  named: NamedDownload,
+): NamedDownload | null {
   if (announcedTerminal.has(id)) return null;
   const existing = get(transfers).find((t) => t.id === id);
   const isUpload = direction === 'upload' || existing?.direction === 'upload';
-  if (isUpload || !existing) return null;
+  // A feed's download is not listed here; the event names it instead.
+  const row = existing ?? (named.file_name ? named : null);
+  if (isUpload || !row) return null;
   // Claimed only once the row is one we would actually announce, so an event
   // that arrives before the row exists does not burn the id.
   announcedTerminal.add(id);
-  return existing;
+  return row;
+}
+
+/** What a download's terminal event says of its file. */
+interface NamedDownload {
+  file_name?: string;
+  total_size?: number;
 }
 
 /** Announce a finished download. */
-function notifyDownloadFinished(id: string, direction?: string): void {
+function notifyDownloadFinished(id: string, direction: string | undefined, named: NamedDownload): void {
   if (!shouldNotify('download_complete')) return;
-  const row = finishedDownloadRow(id, direction);
+  const row = finishedDownloadRow(id, direction, named);
   if (!row) return;
   void notify(
     'download_complete',
     m.notify_download_complete_title(),
     m.notify_download_complete_body({
-      name: row.file_name,
-      size: formatBytes(row.total_size),
+      name: row.file_name ?? '',
+      size: formatBytes(row.total_size ?? 0),
     }),
   );
 }
@@ -658,18 +698,19 @@ function notifyDownloadFailed(
   direction: string | undefined,
   error: string | undefined,
   failureCode: string | undefined,
+  named: NamedDownload,
 ): void {
   // A cancel is a user action with its own visible outcome — the row leaves the
   // list — so reporting it back as a failure would be telling someone what they
   // just did.
   if (failureCode === 'cancelled') return;
   if (!shouldNotify('download_failed')) return;
-  const row = finishedDownloadRow(id, direction);
+  const row = finishedDownloadRow(id, direction, named);
   if (!row) return;
   const reason = transferFailureReasonText(error, failureCode);
   void notify(
     'download_failed',
-    m.notify_download_failed_title({ name: row.file_name }),
+    m.notify_download_failed_title({ name: row.file_name ?? '' }),
     reason,
   );
 }
@@ -693,7 +734,10 @@ export async function initTransferStore() {
     handler: Parameters<typeof listen<T>>[1],
   ): Promise<void> => {
     try {
-      const unlisten = await listen<T>(event, handler);
+      const unlisten = await listen<T>(event, (delivered) => {
+        noteDelivery(event);
+        return handler(delivered);
+      });
       registered.push(unlisten);
     } catch (e) {
       for (const u of registered) {
@@ -750,7 +794,7 @@ export async function initTransferStore() {
       });
       scheduleProgressFlush();
     });
-    await safeListen<TransferEventPayload>('transfer-complete', (event) => {
+    await safeListen<TransferEventPayload>('transfer-complete', (event) => timedUiActivity(`transfer-complete ${event.payload.direction ?? ''}`, () => {
       markEventUpdate();
       flushPendingTransfers();
       const { id, direction } = event.payload;
@@ -758,7 +802,7 @@ export async function initTransferStore() {
       // must stay a pure function of its input, and the download branch below
       // is unreachable for uploads (they return early), so there is nowhere
       // inside to hang this without duplicating the direction check.
-      notifyDownloadFinished(id, direction);
+      notifyDownloadFinished(id, direction, event.payload);
       // Row is terminal from here on — reversible-state tracking no longer
       // applies (a stale entry wouldn't cause wrong merges, since a terminal
       // event status already wins on its own, but there's no reason to keep it).
@@ -810,12 +854,12 @@ export async function initTransferStore() {
           };
         }]]));
       }
-    });
-    await safeListen<TransferEventPayload>('transfer-failed', (event) => {
+    }));
+    await safeListen<TransferEventPayload>('transfer-failed', (event) => timedUiActivity(`transfer-failed ${event.payload.direction ?? ''}`, () => {
       markEventUpdate();
       flushPendingTransfers();
       const { id, error, failure_code, failure_kind, failure_stage, direction } = event.payload;
-      notifyDownloadFailed(id, direction, error, failure_code);
+      notifyDownloadFailed(id, direction, error, failure_code, event.payload);
       reversibleStateEnteredAt.delete(id);
       reversibleStateLeftAt.delete(id);
       {
@@ -857,7 +901,7 @@ export async function initTransferStore() {
           };
         }]]));
       }
-    });
+    }));
     const onStatus = (payload: StatusEventPayload, receivedAt: number) => {
       const { id, failure_code } = payload;
       // A cancel that did not originate on this page arrives here rather than
@@ -1243,6 +1287,7 @@ export function cleanupTransferStore() {
   // Cancel any flush queued for the next frame/tick so it can't run against a
   // store we've just reset (or a subsequently re-initialised one).
   cancelScheduledFlush();
+  cancelOrphanRetry();
   pendingRowOps.clear();
   backendSnapshot = { epoch: null, revision: 0, rows: new Map() };
   reconciledRows = new WeakSet();
@@ -1330,7 +1375,11 @@ export function startTransferPoll() {
       // poll's snapshot was already in flight when a pause/stop/insufficient
       // transition landed (see `reversibleStateEnteredAt`), not just whether
       // the poll resolved before or after — it always resolves after.
+      const started = performance.now();
+      noteUiActivity('transfers refresh');
       await syncFromBackend(Date.now());
+      const took = performance.now() - started;
+      if (took >= 500) noteUiActivity(`transfers refresh took ${Math.round(took)} ms`);
     } catch {
       // Ignore timeouts and errors
     }

@@ -498,6 +498,13 @@ fn encrypt_stream(
         .create_new(true)
         .open(dest)
         .map_err(io)?;
+    // Takes the permissions of the folder the user saved it to, not the
+    // current-user-only ACL Ember's own files get. A backup exists to be
+    // carried to a reinstalled or different computer, whose account has a new
+    // SID that such an ACL shuts out, so the restore it was made for failed
+    // with "permission denied". The passphrase is what protects it. Unix keeps
+    // 0600, which follows the UID rather than a per-install identity.
+    #[cfg(unix)]
     crate::security::restrict_file_permissions(dest);
     out.write_all(MAGIC).map_err(io)?;
     out.write_all(&(header_json.len() as u32).to_le_bytes())
@@ -548,10 +555,9 @@ fn encrypt_stream(
 /// Decrypt `src` into `dest`, verifying order, completeness and the header.
 fn decrypt_stream(src: &Path, dest: &Path, passphrase: &str) -> Result<(), String> {
     let io = |e: std::io::Error| coded_ctx("backup_corrupt_archive", "Failed to read backup", e);
-    let mut input =
-        std::io::BufReader::new(std::fs::File::open(src).map_err(|e| {
-            coded_ctx("backup_invalid_source", "Failed to open the backup file", e)
-        })?);
+    let mut input = std::io::BufReader::new(
+        std::fs::File::open(src).map_err(|e| open_backup_error(e, "Failed to open the backup file"))?,
+    );
 
     let mut magic = [0u8; 8];
     input
@@ -1090,11 +1096,27 @@ fn validate_source(path: &Path) -> Result<PathBuf, String> {
     }
     let canonical = path
         .canonicalize()
-        .map_err(|e| coded_ctx("backup_invalid_source", "Cannot open that file", e))?;
+        .map_err(|e| open_backup_error(e, "Cannot open that file"))?;
     if !canonical.is_file() {
         return Err(coded("backup_invalid_source", "That is not a backup file"));
     }
     Ok(canonical)
+}
+
+/// The error for a backup file that would not open. Access denied gets its own
+/// code, with the way out: backups from before the export stopped restricting
+/// its ACL are readable only by the Windows account that made them, which a
+/// reinstall replaces even under the same user name.
+fn open_backup_error(error: std::io::Error, context: &str) -> String {
+    if cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied {
+        coded_ctx(
+            "backup_source_access_denied",
+            "This backup file can only be opened by the Windows account that made it",
+            error,
+        )
+    } else {
+        coded_ctx("backup_invalid_source", context, error)
+    }
 }
 
 /// Native save-dialog export. The OS dialog *is* the authorization; this
@@ -3067,6 +3089,64 @@ mod tests {
     #[test]
     fn roundtrips_an_empty_payload() {
         roundtrip(b"");
+    }
+
+    /// A backup has to open on a reinstalled Windows, whose account is a new
+    /// SID, so it inherits its folder's ACL instead of a protected one naming
+    /// only the account that made it.
+    #[cfg(windows)]
+    #[test]
+    fn an_exported_backup_takes_its_folders_permissions() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            GetSecurityDescriptorControl, DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        };
+
+        let dir = scratch("acl");
+        let dest = encrypt_bytes(&dir, b"payload", "correct horse battery");
+        let wide: Vec<u16> = dest.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut descriptor = std::ptr::null_mut();
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        let read = unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
+        unsafe { LocalFree(descriptor.cast()) };
+        assert_ne!(read, 0);
+        assert_eq!(
+            control & SE_DACL_PROTECTED,
+            0,
+            "the backup must inherit, not be shut to every account but this one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_backup_this_account_cannot_read_says_why() {
+        let denied = open_backup_error(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            "Cannot open that file",
+        );
+        assert!(denied.contains("backup_source_access_denied"), "{denied}");
+        let missing = open_backup_error(
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+            "Cannot open that file",
+        );
+        assert!(missing.contains("backup_invalid_source"), "{missing}");
     }
 
     #[test]

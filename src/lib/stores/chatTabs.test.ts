@@ -91,6 +91,18 @@ describe('retainChatTabs', () => {
     expect(get(chatTabs).map((t) => t.hash)).toEqual([FRIEND]);
   });
 
+  // A private conversation with a room member is a dock tab without being a
+  // friend's, so the friend-list sweep must leave it be.
+  it('keeps a private conversation with a room member', () => {
+    const dm = `dm:${'dd'.repeat(32)}`;
+    openChat(dm, 'Lin');
+    openChat(OTHER, 'Grace');
+
+    retainChatTabs([FRIEND]);
+
+    expect(get(chatTabs).map((t) => t.hash)).toEqual([dm]);
+  });
+
   it('collapses the dock when nothing is left to show', () => {
     openChat(FRIEND, 'Ada');
     expect(get(chatDockOpen)).toBe(true);
@@ -183,6 +195,17 @@ describe('focusNextUnread', () => {
 
     expect(focusNextUnread()).toBe(true);
     expect(get(chatDockOpen)).toBe(true);
+  });
+
+  it('counts the private conversations it is handed', () => {
+    const dm = `dm:${'dd'.repeat(32)}`;
+    openChat(FRIEND, 'Ada');
+    openChat(dm, 'Lin');
+    activeChatTab.set(FRIEND);
+    unreadCounts.set(new Map());
+
+    expect(focusNextUnread(new Map([[dm, 2]]))).toBe(true);
+    expect(get(activeChatTab)).toBe(dm);
   });
 });
 

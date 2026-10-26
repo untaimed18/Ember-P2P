@@ -899,6 +899,14 @@ impl TransferManager {
         transfer.failure_stage = None;
     }
 
+    /// A row restored Stopped because its part files were removed says so
+    /// until it is resumed, which starts it over.
+    fn clear_part_files_removed(transfer: &mut Transfer) {
+        if transfer.failure_code.as_deref() == Some(TransferFailureCode::PartFilesRemoved.as_code()) {
+            Self::clear_failure_context(transfer);
+        }
+    }
+
     /// Write a health verdict onto a row, keeping `health_reason` and
     /// `health_code` derived from the same variant.
     fn apply_health_code(transfer: &mut Transfer, code: Option<TransferHealthCode>) {
@@ -990,7 +998,10 @@ impl TransferManager {
     }
 
     fn occupies_download_slot(transfer: &Transfer) -> bool {
+        // A feed's list is a few KB the user never sees: it must not hold
+        // their downloads back.
         transfer.direction == TransferDirection::Download
+            && !crate::sharing::feed_files::is_internal_fetch(&transfer.id)
             && !matches!(
                 transfer.status,
                 TransferStatus::Paused
@@ -1109,6 +1120,17 @@ impl TransferManager {
             self.queue_changed();
             false
         }
+    }
+
+    /// Start a fetch for the feeds code at once, beside the user's downloads
+    /// rather than queued behind them: it is one small file, and nothing the
+    /// user sees waits on it. `false` if one of that id is already here.
+    pub fn start_internal(&mut self, transfer: Transfer) -> bool {
+        if self.active.contains_key(&transfer.id) || self.queue_position(&transfer.id).is_some() {
+            return false;
+        }
+        self.active.insert(transfer.id.clone(), transfer);
+        true
     }
 
     pub fn has_pending_for_hash(&self, file_hash: &str) -> bool {
@@ -2238,6 +2260,7 @@ impl TransferManager {
             self.queue_changed();
             transfer.status = Self::queued_wait_status(&transfer);
             Self::clear_runtime_health(&mut transfer);
+            Self::clear_part_files_removed(&mut transfer);
             if let Some(control) = self.controls.get(id) {
                 control.resume();
             }
@@ -2339,6 +2362,7 @@ impl TransferManager {
                 let transfer = &mut self.queue[idx];
                 transfer.status = Self::queued_wait_status(transfer);
                 Self::clear_runtime_health(transfer);
+                Self::clear_part_files_removed(transfer);
                 let promote = if transfer.direction == TransferDirection::Upload {
                     transfer.status = TransferStatus::Active;
                     true
@@ -2413,6 +2437,7 @@ impl TransferManager {
         self.speed_history.remove(id);
         self.source_details.remove(id);
         crate::storage::category_folders::forget(id);
+        crate::sharing::feed_downloads::forget(id);
         if was_active {
             self.promote_next()
         } else {
@@ -2650,12 +2675,17 @@ impl TransferManager {
     }
 
     /// Every row in `get_all` order, with the live preview flag `get_all`
-    /// overlays.
+    /// overlays. For the Transfers poll, so a fetch for the feeds code is not
+    /// among them, nor a feed's files, which the Feeds page shows.
     fn snapshot_rows(&self) -> impl Iterator<Item = (&Transfer, bool)> {
         self.active
             .values()
             .chain(self.queue.iter())
             .chain(self.completed.iter())
+            .filter(|t| {
+                !crate::sharing::feed_files::is_internal_fetch(&t.id)
+                    && !crate::sharing::feed_downloads::is_private(&t.id)
+            })
             .map(|t| {
                 let preview_ready = self
                     .controls
@@ -3032,6 +3062,7 @@ mod tests {
             completed_path: None,
             up_part_status: None,
             up_part_count: None,
+            up_part_fill: None,
             up_peer_part_status: None,
             ember_verified: false,
             friends_only: false,
@@ -3571,6 +3602,28 @@ mod tests {
             manager.get_transfers_since(None, 0).resumable_failed.is_empty(),
             "a row queued again is not offered as Failed"
         );
+    }
+
+    /// A download restored Stopped because its part files were removed stops
+    /// saying so once it is resumed, alone or with others.
+    #[test]
+    fn resuming_a_download_whose_part_files_were_removed_clears_the_notice() {
+        let mut manager = TransferManager::new(4);
+        for id in ["one", "batch"] {
+            let mut stopped = sourced(id, 2);
+            stopped.status = TransferStatus::Stopped;
+            stopped.failure_code = Some(TransferFailureCode::PartFilesRemoved.as_code().into());
+            stopped.failure_reason = Some(TransferFailureCode::PartFilesRemoved.message().into());
+            manager.enqueue(stopped);
+            manager.register_control(id, TransferControl::new());
+        }
+        manager.resume("one");
+        manager.resume_many(&["batch".to_string()], false);
+        for id in ["one", "batch"] {
+            let row = manager.get_transfer(id).expect("still listed");
+            assert_ne!(row.status, TransferStatus::Stopped, "{id}");
+            assert!(row.failure_code.is_none() && row.failure_reason.is_none(), "{id}");
+        }
     }
 
     /// A Failed row saved before failure codes were kept: a pinned one may

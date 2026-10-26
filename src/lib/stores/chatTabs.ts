@@ -26,10 +26,15 @@ import { unreadCounts } from '$lib/stores/friends';
  * looks the same as a clean launch.
  */
 export interface ChatTab {
-  /** Friend hash. The dock holds friend conversations and nothing else. */
+  /** Friend hash, or `dm:<member key>` for a private conversation with a
+   *  room member (`stores/roomDm.ts`). Nothing else is a dock conversation. */
   hash: string;
   name: string;
 }
+
+/** Tab-key namespace of a private conversation with a room member. Mirrored
+ *  as `DM_TAB_PREFIX` in `stores/roomDm.ts`, which imports this store. */
+const DM_TAB_PREFIX = 'dm:';
 
 /**
  * Draft-key namespace for a room, which is *not* a tab namespace.
@@ -116,6 +121,7 @@ activeChatTab.subscribe((activeHash) => persist({ tabs: get(chatTabs), activeHas
 /** A change to the tab list made in one window, to be replayed in the other. */
 export type ChatTabOp =
   | { kind: 'open'; hash: string; name: string }
+  | { kind: 'add'; hash: string; name: string }
   | { kind: 'close'; hash: string }
   | { kind: 'rename'; hash: string; name: string };
 
@@ -291,6 +297,21 @@ export function openChat(hash: string, name: string) {
 }
 
 /**
+ * Put a conversation in the tab list without showing it: a tab for something
+ * that arrived, so its unread count has somewhere to be found, without taking
+ * the user away from what they are reading. Nothing when it is open already.
+ */
+export function addChatTab(hash: string, name: string) {
+  const key = hash.toLowerCase();
+  if (popout) reloadChatTabs();
+  const tabs = get(chatTabs);
+  if (tabs.some((t) => t.hash.toLowerCase() === key) || tabs.length >= MAX_CHAT_TABS) return;
+  chatTabs.set([...tabs, { hash: key, name }]);
+  if (get(activeChatTab) === null) activeChatTab.set(key);
+  popout?.forward({ kind: 'add', hash: key, name });
+}
+
+/**
  * Close a single tab. If it was the active one, the neighbouring tab
  * (preferring the previous) becomes active. Closing the last tab
  * collapses the dock — there's nothing left to show.
@@ -381,7 +402,7 @@ export function cycleTab(direction: 1 | -1) {
  * every unread conversation rather than returning to the same one — and when
  * nothing is active it starts at the first tab instead of skipping it.
  */
-export function focusNextUnread(): boolean {
+export function focusNextUnread(more?: ReadonlyMap<string, number>): boolean {
   const tabs = get(chatTabs);
   if (tabs.length === 0) return false;
   const counts = get(unreadCounts);
@@ -389,7 +410,7 @@ export function focusNextUnread(): boolean {
   const activeIdx = tabs.findIndex((t) => t.hash === active);
   for (let step = 1; step <= tabs.length; step++) {
     const tab = tabs[(activeIdx + step + tabs.length) % tabs.length];
-    if ((counts.get(tab.hash) ?? 0) > 0) {
+    if ((counts.get(tab.hash) ?? more?.get(tab.hash) ?? 0) > 0) {
       activeChatTab.set(tab.hash);
       chatDockOpen.set(true);
       return true;
@@ -415,12 +436,13 @@ export function removeChatForFriend(hash: string) {
  * version let the Channels page pin here: rooms are not dock conversations, and
  * this is the sweep that clears one left in `localStorage` on the first launch
  * after the change rather than leaving it to sit there opening nothing.
+ * Private conversations with room members are not friends' and are kept.
  */
 export function retainChatTabs(friendHashes: Iterable<string>) {
   if (popout) reloadChatTabs();
   const allow = new Set([...friendHashes].map((h) => h.toLowerCase()));
   const tabs = get(chatTabs);
-  const next = tabs.filter((t) => allow.has(t.hash.toLowerCase()));
+  const next = tabs.filter((t) => t.hash.startsWith(DM_TAB_PREFIX) || allow.has(t.hash.toLowerCase()));
   if (next.length === tabs.length) return;
   for (const gone of tabs) {
     if (!next.includes(gone)) chatDrafts.delete(gone.hash);

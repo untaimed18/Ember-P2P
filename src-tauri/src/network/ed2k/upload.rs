@@ -77,6 +77,10 @@ pub struct EmberSessionHandle {
     /// and spread to the friend's other live secure sessions (see
     /// [`SecureSessionEntry`]).
     honours_friends_only: Arc<std::sync::atomic::AtomicBool>,
+    /// The friend has sent `EMBER_EXT_ATTACH_WAITS` on this session: it will
+    /// hold a file it offers us once we say we are keeping the offer for the
+    /// user. Shared and spread exactly as `honours_friends_only` is.
+    holds_offers: Arc<std::sync::atomic::AtomicBool>,
 }
 
 static NEXT_EMBER_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -89,6 +93,9 @@ struct SecureSessionEntry {
     /// is set on all of them: a frame the friend sent down a duplicate
     /// connection still counts on the one our session map holds.
     honours_friends_only: Arc<std::sync::atomic::AtomicBool>,
+    /// The session's [`EmberSessionHandle::holds_offers`] flag, for the same
+    /// reason.
+    holds_offers: Arc<std::sync::atomic::AtomicBool>,
 }
 
 type SecureRevocationIndex = std::sync::Mutex<HashMap<[u8; 16], HashMap<u64, SecureSessionEntry>>>;
@@ -167,6 +174,7 @@ impl EmberSessionHandle {
             relayed: false,
             peer_addr: None,
             honours_friends_only: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            holds_offers: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -189,6 +197,28 @@ impl EmberSessionHandle {
     /// build would drop the flag and republish the file as public.
     pub fn honours_friends_only(&self) -> bool {
         self.honours_friends_only.load(Ordering::Relaxed)
+    }
+
+    /// Record that the friend's build holds the files it offers us while we
+    /// keep them waiting, on this session and on every other live secure
+    /// session of the same friend.
+    pub fn mark_holds_offers(&self) {
+        self.holds_offers.store(true, Ordering::Relaxed);
+        let (Some(registration), Some(index)) =
+            (self.secure_registration.as_ref(), SECURE_REVOCATION_INDEX.get())
+        else {
+            return;
+        };
+        let index = index.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for entry in index.get(&registration.ember_hash).into_iter().flat_map(|s| s.values()) {
+            entry.holds_offers.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether an offer from this friend may wait for our user past an
+    /// offer's five minutes: an older build lapses it there whatever we say.
+    pub fn holds_offers(&self) -> bool {
+        self.holds_offers.load(Ordering::Relaxed)
     }
 
     pub fn via_relay(mut self, relayed: bool) -> Self {
@@ -227,11 +257,18 @@ impl EmberSessionHandle {
         {
             handle.honours_friends_only.store(true, Ordering::Relaxed);
         }
+        if sessions
+            .values()
+            .any(|entry| entry.holds_offers.load(Ordering::Relaxed))
+        {
+            handle.holds_offers.store(true, Ordering::Relaxed);
+        }
         sessions.insert(
             handle.session_id,
             SecureSessionEntry {
                 shutdown: handle.shutdown.clone(),
                 honours_friends_only: handle.honours_friends_only.clone(),
+                holds_offers: handle.holds_offers.clone(),
             },
         );
         drop(index);
@@ -307,6 +344,28 @@ impl EmberSessionHandle {
 }
 
 pub type EmberSessionMap = Arc<RwLock<HashMap<[u8; 16], EmberSessionHandle>>>;
+
+/// What the network loop hears when an upload-side session with `peer` ends:
+/// the slot owner's end as [`UploadEventKind::EmberFriendDisconnected`], and
+/// a friend's secure duplicate's as
+/// [`UploadEventKind::EmberFriendSessionEnded`]. Either may have carried
+/// chat attachment notes, since friend frames are read on both.
+fn session_end_event(
+    owns_slot: bool,
+    is_friend: bool,
+    peer: Option<[u8; 16]>,
+    session: Option<&EmberSessionHandle>,
+) -> Option<UploadEventKind> {
+    let (ember_hash, session) = (peer?, session?);
+    let session_id = session.session_id();
+    if owns_slot {
+        Some(UploadEventKind::EmberFriendDisconnected { ember_hash, session_id })
+    } else if is_friend && session.is_secure_v2() {
+        Some(UploadEventKind::EmberFriendSessionEnded { ember_hash, session_id })
+    } else {
+        None
+    }
+}
 
 /// Friend chat/browse authorization on a live secure-v2 stream.
 ///
@@ -413,6 +472,14 @@ pub(crate) fn attach_event_from_ext(
                 reason,
             }
         }
+        super::messages::EMBER_EXT_ATTACH_WAITS => UploadEventKind::EmberAttachHeld {
+            ember_hash,
+            xfer_id: if body.is_empty() {
+                None
+            } else {
+                Some(attach::decode_attach_held(body)?)
+            },
+        },
         _ => return None,
     };
     Some(kind)
@@ -2580,6 +2647,49 @@ fn build_up_part_status(served: &[u64], total_size: u64) -> (Option<String>, Opt
     (Some(hex), Some(part_count as u32))
 }
 
+/// How much of each part has been delivered this session, as hex, one byte per
+/// part: 255 for a whole part, and for a partial one its share scaled to
+/// 1..=254, so a part with bytes sent never reads as empty and one still short
+/// never reads as done. Pairs with the bitmap from [`build_up_part_status`],
+/// which only lights whole parts.
+///
+/// The bitmap alone drew nothing for a peer that pulls each part from several
+/// sources: everything we sent it fell inside parts someone else finished, so
+/// hundreds of megabytes went out under a bar at "0 parts". eMule's bar draws
+/// delivered blocks (`m_DoneBlocks_list`), not whole parts, for this reason.
+///
+/// `None` only when the size is unknown. A tally sized for another file — the
+/// bitmap's all-grey case — gives all zeros rather than `None`, because the row
+/// and the UI both keep the last value when the field is absent, and that value
+/// would be the previous file's parts.
+fn build_up_part_fill(served: &[u64], total_size: u64) -> Option<String> {
+    use std::fmt::Write as _;
+    if total_size == 0 {
+        return None;
+    }
+    let part_count = total_size.div_ceil(PARTSIZE).max(1) as usize;
+    if served.len() != part_count {
+        return Some("00".repeat(part_count));
+    }
+    let mut hex = String::with_capacity(part_count * 2);
+    for (i, &s) in served.iter().enumerate() {
+        let part_size = if i + 1 < part_count {
+            PARTSIZE
+        } else {
+            total_size.saturating_sub((part_count as u64 - 1) * PARTSIZE)
+        };
+        let level = if part_size == 0 || s == 0 {
+            0
+        } else if s >= part_size {
+            255
+        } else {
+            (s.saturating_mul(254) / part_size).clamp(1, 254) as u8
+        };
+        let _ = write!(hex, "{level:02x}");
+    }
+    Some(hex)
+}
+
 /// Decode a downloader's advertised ED2K part bitmap (from the
 /// `OP_REQUESTFILENAME` extended-info block — see
 /// [`MultiPacketRequest::req_part_status`]) into the IPC hex bitmap used by the
@@ -3061,6 +3171,7 @@ fn upload_progress_kind(
         total: total_size,
         part_status,
         part_count,
+        part_fill: build_up_part_fill(served, total_size),
         peer_part_status,
     }
 }
@@ -3171,6 +3282,9 @@ pub enum UploadEventKind {
         /// [`crate::types::Transfer::up_part_status`].
         part_status: Option<String>,
         part_count: Option<u32>,
+        /// How much of each part has gone out, one byte per part. See
+        /// [`crate::types::Transfer::up_part_fill`].
+        part_fill: Option<String>,
         /// Hex bitmap of parts the downloader advertised it already has at
         /// request time (eMule `m_abyUpPartStatus`), shading the parts bar
         /// dark. Shares [`part_count`]. See
@@ -3275,6 +3389,11 @@ pub enum UploadEventKind {
     EmberChatTyping {
         ember_hash: [u8; 16],
         typing: bool,
+    },
+    /// Friend set the status they show while connected.
+    EmberFriendStatus {
+        ember_hash: [u8; 16],
+        status: crate::types::FriendStatus,
     },
     /// Friend has read our chat up through the message with this body hash.
     EmberChatRead {
@@ -3438,6 +3557,15 @@ pub enum UploadEventKind {
         xfer_id: [u8; 16],
         reason: crate::network::ember::attach::AttachCancel,
     },
+    /// `EMBER_EXT_ATTACH_WAITS` from a friend. `None` for the empty form: a
+    /// session came up, or the friend let go of offers it held, and wants to
+    /// hear again which of its offers we keep. Otherwise the offer a note
+    /// names: theirs we offered and they keep, or ours they offered and say
+    /// they hold.
+    EmberAttachHeld {
+        ember_hash: [u8; 16],
+        xfer_id: Option<[u8; 16]>,
+    },
     /// A friend answered a file offer we sent them.
     EmberFileOfferAck {
         ember_hash: [u8; 16],
@@ -3445,6 +3573,18 @@ pub enum UploadEventKind {
         file_hash: [u8; 16],
     },
     EmberFriendDisconnected {
+        ember_hash: [u8; 16],
+        session_id: u64,
+    },
+    /// A secure session with a friend ended that never held the
+    /// `ember_sessions` slot: a duplicate kept beside a fresh one, as each end
+    /// of a crossed pair of dials holds. Unlike `EmberFriendDisconnected` it
+    /// says nothing about whether the friend is online, and nothing dials
+    /// them again; only the chat attachment holds that may have been agreed
+    /// over it are let go (`chat_attach::on_session_ended`). It is not moved
+    /// into the slot when the owner ends first: that end's reconnect claims
+    /// it.
+    EmberFriendSessionEnded {
         ember_hash: [u8; 16],
         session_id: u64,
     },
@@ -6088,9 +6228,10 @@ pub async fn start_upload_server(
 }
 
 impl UploadHandler {
-    /// A secure stream that asked for a chat attachment or a room transfer
-    /// instead of an eD2K session: the fallback for a recipient that could not
-    /// reach our QUIC port. `first` is the stream type it opened with.
+    /// A secure stream that asked for a chat attachment, a room transfer or a
+    /// feed's file instead of an eD2K session: the fallback for a recipient
+    /// that could not reach our QUIC port. `first` is the stream type it
+    /// opened with.
     ///
     /// Never over a relay. A relay operator forwards sessions as a favour to
     /// friends, and a file would turn that into carrying gigabytes for them.
@@ -6108,6 +6249,26 @@ impl UploadHandler {
             debug!("Refusing a file stream over a relayed session");
             return Ok(());
         }
+        let mut header = [0u8; 7];
+        header[0] = first;
+        if first == attach::FEED_STREAM_MSG_TYPE {
+            // Anyone's: a feed is public, and the request's id is the grant.
+            if !matches!(
+                tokio::time::timeout_at(deadline, reader.read_exact(&mut header[1..])).await,
+                Ok(Ok(_))
+            ) {
+                return Ok(());
+            }
+            let served =
+                relay::serve_feed_stream(&mut reader, &mut writer, &header, Some(peer.ember_hash), &self.bandwidth_limiter)
+                    .await;
+            if let Ok(Some(xfer_id)) = served {
+                if attach_tcp::tcp_stream_delivered(&mut reader, &mut writer).await {
+                    crate::network::feed_direct::note_downloaded(&xfer_id, peer.ember_hash);
+                }
+            }
+            return Ok(());
+        }
         let Some(serve) = self.file_stream_serve.clone() else {
             return Ok(());
         };
@@ -6120,8 +6281,6 @@ impl UploadHandler {
             debug!("Refusing a chat attachment stream from a non-friend");
             return Ok(());
         }
-        let mut header = [0u8; 7];
-        header[0] = first;
         if !matches!(
             tokio::time::timeout_at(deadline, reader.read_exact(&mut header[1..])).await,
             Ok(Ok(_))
@@ -6146,7 +6305,7 @@ impl UploadHandler {
             let delivered =
                 served.is_ok() && attach_tcp::tcp_stream_delivered(&mut reader, &mut writer).await;
             progress.finish(&serve.chat.db, &serve.chat.app_handle, delivered);
-        } else {
+        } else if first == attach::ROOM_XFER_STREAM_MSG_TYPE {
             let served = relay::serve_room_transfer_stream(
                 &serve.room,
                 peer.ed25519_public_key,
@@ -6557,6 +6716,35 @@ impl UploadHandler {
             }
         }
 
+        // A feed's list: served to anyone, from the feeds folder alone, and
+        // never in the index (see `sharing::feed_files`).
+        if let Some(share) = crate::sharing::feed_files::hidden_share(file_hash) {
+            let root = share.path.parent().map(|dir| dir.to_string_lossy().into_owned())?;
+            let allowed = vec![root];
+            let path = share.path.clone();
+            let allowed_for_open = allowed.clone();
+            let opened = tokio::task::spawn_blocking(move || {
+                crate::security::filesystem::open_existing_approved(&path, &allowed_for_open, false)
+            })
+            .await
+            .ok()?;
+            return match opened {
+                Ok((verified_path, opened)) => Some(ResolvedUploadFile {
+                    name: share.name,
+                    path: verified_path,
+                    opened,
+                    allowed_roots: allowed,
+                    size: share.size,
+                    aich_hash_hex: String::new(),
+                    is_partial: false,
+                }),
+                Err(error) => {
+                    note_upload_refusal(&share.path, &allowed, &error);
+                    None
+                }
+            };
+        }
+
         // Unshared index rows `break` into this `.part` branch, and hashes
         // that exist only in known.met never enter the index branch at all.
         // Either way, friends-only content must not leave for a stranger.
@@ -6577,20 +6765,20 @@ impl UploadHandler {
             return None;
         }
 
+        // A feed's download is private, its partial served to nobody (see
+        // `sharing::feed_downloads`).
+        let servable = |t: &&crate::types::Transfer| {
+            t.direction == TransferDirection::Download
+                && t.file_hash == hash_hex
+                && !crate::sharing::feed_downloads::is_private(&t.id)
+        };
         let transfer = {
             let mgr = self.transfer_manager.read().await;
             mgr.active
                 .values()
-                .find(|t| t.direction == TransferDirection::Download && t.file_hash == hash_hex)
+                .find(servable)
                 .cloned()
-                .or_else(|| {
-                    mgr.queue
-                        .iter()
-                        .find(|t| {
-                            t.direction == TransferDirection::Download && t.file_hash == hash_hex
-                        })
-                        .cloned()
-                })
+                .or_else(|| mgr.queue.iter().find(servable).cloned())
         }?;
 
         let folders = self.download_folders.read().clone();
@@ -6708,9 +6896,12 @@ impl UploadHandler {
             mgr.active
                 .values()
                 .chain(mgr.queue.iter())
+                // A feed's download is private: asking for its sources is
+                // refused as for a file we do not have.
                 .find(|t| {
                     t.direction == TransferDirection::Download
                         && t.file_hash == hash_hex
+                        && !crate::sharing::feed_downloads::is_private(&t.id)
                         && !matches!(
                             t.status,
                             TransferStatus::Completed | TransferStatus::Failed
@@ -6953,7 +7144,7 @@ impl UploadHandler {
             hashes
                 .iter()
                 .copied()
-                .filter(|h| index_offers_hash(&index, h))
+                .filter(|h| index_offers_hash(&index, h) || crate::sharing::feed_files::hidden_share(h).is_some())
                 .collect()
         };
         // Short-circuit: if every queued file is still shared there is nothing
@@ -8018,6 +8209,7 @@ impl UploadHandler {
                     // stream's type byte cannot be mistaken for a session.
                     if first == crate::network::ember::attach::ATTACH_STREAM_MSG_TYPE
                         || first == crate::network::ember::attach::ROOM_XFER_STREAM_MSG_TYPE
+                        || first == crate::network::ember::attach::FEED_STREAM_MSG_TYPE
                     {
                         if let Some(socket) = socket {
                             let _ = socket.set_send_buffer_size(FILE_STREAM_SEND_BUFFER_BYTES);
@@ -9232,6 +9424,12 @@ impl UploadHandler {
         // signal; we prefer that when available and fall back to
         // this binding flag only if auth never completes.
         let mut ember_hash_binding_verified = secure_v2_authenticated;
+        // The Ember hash this session's binding check passed for, and whether
+        // SecIdent verified this session: together they keep the binding for
+        // the Known Ember Peers tab without an address to tie them (see
+        // `CreditManager::note_session_proven_ember`).
+        let mut session_bound_ember: Option<[u8; 16]> = None;
+        let mut secident_verified_here = false;
         // Reactive Ember Ed25519 challenge-response state machine.
         // Driven by inbound `OP_EMBER_AUTH_CHALLENGE` /
         // `OP_EMBER_AUTH_RESPONSE` packets dispatched from the
@@ -9554,7 +9752,7 @@ impl UploadHandler {
                         &mut writer,
                         OP_EMULEPROT,
                         OP_EMBER_FRIEND_REQ,
-                        nickname.as_bytes(),
+                        super::friend_connect::friend_request_payload(&nickname),
                     )
                     .await
                     .is_ok()
@@ -9992,7 +10190,7 @@ impl UploadHandler {
                             &mut writer,
                             OP_EMULEPROT,
                             OP_EMBER_FRIEND_REQ,
-                            nickname.as_bytes(),
+                            super::friend_connect::friend_request_payload(&nickname),
                         )
                         .await
                         .is_ok()
@@ -10714,13 +10912,11 @@ impl UploadHandler {
                     // OP_PUBLICKEY only in response to our own
                     // OP_SECIDENTSTATE). Park the challenge in
                     // `pending_peer_challenge` and let the OP_PUBLICKEY
-                    // handler replay the whole OP_PUBLICKEY + OP_SIGNATURE
-                    // response once their key lands. Matching transfer.rs
-                    // we skip the immediate send entirely on defer —
-                    // eMule's SendSignaturePacket won't fire for our
-                    // outgoing SECIDENTSTATE challenge until it sees our
-                    // OP_PUBLICKEY anyway (BaseClient.cpp:1851), so there's
-                    // no timing benefit to sending ours twice.
+                    // handler replay the signature once their key lands.
+                    // Our own key, when they asked for it, goes now
+                    // (`park_secident_challenge`): two peers that each held
+                    // their key until they had the other's would never
+                    // send either.
                     //
                     // Whatever the state: a state-1 challenge (the peer
                     // already holds our key) still needs theirs to sign, and
@@ -10732,7 +10928,16 @@ impl UploadHandler {
                         !cm.has_public_key(&peer_user_hash)
                     };
                     if missing_peer_key {
-                        pending_peer_challenge = Some((challenge, state));
+                        pending_peer_challenge = Some(
+                            super::transfer::park_secident_challenge(
+                                &mut writer,
+                                Some(&self.credit_manager),
+                                state,
+                                challenge,
+                                peer_addr,
+                            )
+                            .await?,
+                        );
                         debug!(
                             "Deferred SecIdent challenge from {peer_addr} — awaiting their public key"
                         );
@@ -10783,6 +10988,15 @@ impl UploadHandler {
                         &payload,
                         our_client_id,
                     ).await;
+                    if verified_here {
+                        secident_verified_here = true;
+                        if let Some(eh) = session_bound_ember {
+                            self.credit_manager
+                                .write()
+                                .await
+                                .note_session_proven_ember(peer_user_hash, eh);
+                        }
+                    }
                     if relayed
                         && relayed_proof.is_none()
                         && relayed_session_proves_hash(
@@ -14359,6 +14573,7 @@ impl UploadHandler {
                             if let (Some(ref peer_pk), Some(ref peer_eh)) = (hello_caps.ember_pubkey, hello_caps.ember_hash) {
                                 if crate::network::ember::crypto::verify_ember_hash_binding(peer_pk, peer_eh) {
                                     ember_hash_binding_verified = true;
+                                    session_bound_ember = Some(*peer_eh);
                                     info!("Ember binding: peer {peer_addr} pubkey matches advertised hash");
                                     if peer_user_hash != [0u8; 16] {
                                         let mut cm = self.credit_manager.write().await;
@@ -14367,6 +14582,9 @@ impl UploadHandler {
                                             *peer_eh,
                                             CreditManager::ident_ip_of(peer_addr),
                                         );
+                                        if secident_verified_here {
+                                            cm.note_session_proven_ember(peer_user_hash, *peer_eh);
+                                        }
                                     }
                                     // Unlock mesh + first EPX once HELLO
                                     // binding succeeds (friend privileges
@@ -14481,7 +14699,7 @@ impl UploadHandler {
                                 &mut writer,
                                 OP_EMULEPROT,
                                 OP_EMBER_FRIEND_REQ,
-                                nickname.as_bytes(),
+                                super::friend_connect::friend_request_payload(&nickname),
                             )
                             .await
                             .is_ok()
@@ -14808,7 +15026,8 @@ impl UploadHandler {
                                     "Sending friend request to verified Ember peer {peer_addr}"
                                 );
                                 let nickname = self.nickname_snapshot().await;
-                                let nick_bytes = nickname.as_bytes();
+                                let nick_bytes =
+                                    super::friend_connect::friend_request_payload(&nickname);
                                 if write_packet_async(
                                     &mut writer,
                                     OP_EMULEPROT,
@@ -15033,6 +15252,43 @@ impl UploadHandler {
                                     }
                                 }
                             }
+                            Some((super::messages::EMBER_EXT_FEED_HEAD, body)) => {
+                                if let Some(pk) = hello_caps.ember_pubkey {
+                                    if body.len() <= crate::network::ember::crypto::MAX_CHAT_WIRE_LEN {
+                                        if let Some(blob) = crate::network::ember::crypto::decrypt_chat_from_peer(
+                                            &self.ed25519_secret_key,
+                                            &pk,
+                                            body,
+                                        ) {
+                                            crate::sharing::feed_files::report_pushed_head(pk, blob);
+                                        }
+                                    }
+                                }
+                            }
+                            Some((super::messages::EMBER_EXT_STATUS, body)) => {
+                                if let Some(pk) = hello_caps.ember_pubkey {
+                                    if let Some(byte) =
+                                        crate::network::ember::crypto::decrypt_chat_status(
+                                            &self.ed25519_secret_key,
+                                            &pk,
+                                            body,
+                                        )
+                                    {
+                                        let _ = self
+                                            .upload_event_tx
+                                            .send(UploadEvent {
+                                                transfer_id: String::new(),
+                                                kind: UploadEventKind::EmberFriendStatus {
+                                                    ember_hash: eh,
+                                                    status: crate::types::FriendStatus::from_wire(
+                                                        byte,
+                                                    ),
+                                                },
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
                             Some((super::messages::EMBER_EXT_CHAT_READ, body)) => {
                                 if let Some(pk) = hello_caps.ember_pubkey {
                                     if let Some(body_hash) =
@@ -15153,6 +15409,23 @@ impl UploadHandler {
                             Some((super::messages::EMBER_EXT_ATTACH_OFFER
                                 | super::messages::EMBER_EXT_ATTACH_REPLY
                                 | super::messages::EMBER_EXT_ATTACH_CANCEL, _)) => {
+                                if let Some(kind) = attach_event_from_ext(eh, &payload, attach_addr) {
+                                    let _ = self
+                                        .upload_event_tx
+                                        .send(UploadEvent {
+                                            transfer_id: String::new(),
+                                            kind,
+                                        })
+                                        .await;
+                                }
+                            }
+                            // Either form says the build holds what it
+                            // offers. Marked here, ahead of the offers that
+                            // follow on this stream, so they are judged by it.
+                            Some((super::messages::EMBER_EXT_ATTACH_WAITS, _)) => {
+                                if let Some(session) = ember_session_handle.as_ref() {
+                                    session.mark_holds_offers();
+                                }
                                 if let Some(kind) = attach_event_from_ext(eh, &payload, attach_addr) {
                                     let _ = self
                                         .upload_event_tx
@@ -15306,7 +15579,6 @@ impl UploadHandler {
             peer_ember_hash,
             ember_session_handle.as_ref(),
         ) {
-            let session_id = session.session_id();
             let mut sessions = self.ember_sessions.write().await;
             let remove_current = sessions
                 .get(&eh)
@@ -15314,15 +15586,18 @@ impl UploadHandler {
             if remove_current {
                 sessions.remove(&eh);
             }
-            drop(sessions);
+        }
+        if let Some(kind) = session_end_event(
+            owns_ember_slot,
+            is_friend,
+            peer_ember_hash,
+            ember_session_handle.as_ref(),
+        ) {
             let _ = self
                 .upload_event_tx
                 .send(UploadEvent {
                     transfer_id: String::new(),
-                    kind: UploadEventKind::EmberFriendDisconnected {
-                        ember_hash: eh,
-                        session_id,
-                    },
+                    kind,
                 })
                 .await;
         }
@@ -16009,6 +16284,35 @@ mod unique_served_tests {
             unique_served_bytes(&served, total) < total,
             "re-requests must not make unique coverage look complete"
         );
+    }
+
+    /// Parts we sent some of draw as partly filled even though no part was sent
+    /// whole — the peer that finishes them from other sources. A partial part
+    /// never reads as empty or done, and the short last part is scaled to its
+    /// own size.
+    #[test]
+    fn the_part_fill_shows_parts_sent_in_part() {
+        let total = PARTSIZE * 2 + PARTSIZE / 2;
+        let served = vec![PARTSIZE / 2, 1, PARTSIZE / 2];
+        let (bitmap, count) = build_up_part_status(&served, total);
+        assert_eq!(count, Some(3));
+        assert_eq!(bitmap.as_deref(), Some("04"), "only the short last part is whole");
+        let fill = build_up_part_fill(&served, total).unwrap();
+        assert_eq!(fill.len(), 6, "one byte per part");
+        let level = |i: usize| u8::from_str_radix(&fill[i * 2..i * 2 + 2], 16).unwrap();
+        assert_eq!(level(0), 127, "half a part");
+        assert_eq!(level(1), 1, "a single byte still shows");
+        assert_eq!(level(2), 255, "the last part, sent whole at its own size");
+
+        assert_eq!(build_up_part_fill(&[PARTSIZE - 1], PARTSIZE).as_deref(), Some("fd"), "short of whole is not whole");
+        assert_eq!(build_up_part_fill(&[0, 0], PARTSIZE * 2).as_deref(), Some("0000"));
+        assert_eq!(build_up_part_fill(&[PARTSIZE], 0), None, "unknown size");
+        assert_eq!(
+            build_up_part_fill(&[PARTSIZE], PARTSIZE * 2).as_deref(),
+            Some("0000"),
+            "a tally for another file clears the bar rather than leaving the last one"
+        );
+        assert_eq!(build_up_part_fill(&[], PARTSIZE * 2).as_deref(), Some("0000"), "nothing sent yet");
     }
 
     #[test]
@@ -17274,6 +17578,54 @@ mod ember_session_handle_tests {
         let legacy = EmberSessionHandle::new(channel(), [2; 32]);
         legacy.mark_honours_friends_only();
         assert!(legacy.honours_friends_only());
+    }
+
+    /// The friend's `EMBER_EXT_ATTACH_WAITS` may arrive down a duplicate
+    /// connection; the offers it describes are judged on the one our map
+    /// holds. It is a mark of its own, not the friends-only one.
+    #[test]
+    fn a_holds_offers_mark_reaches_every_live_session_of_that_friend() {
+        let hash = [0xE5; 16];
+        let channel = || tokio::sync::mpsc::channel::<Vec<u8>>(1).0;
+        let a = EmberSessionHandle::new_secure(channel(), [2; 32], hash);
+        let b = EmberSessionHandle::new_secure(channel(), [2; 32], hash);
+        let stranger = EmberSessionHandle::new_secure(channel(), [3; 32], [0xE6; 16]);
+        assert!(!a.holds_offers() && !b.holds_offers());
+
+        a.mark_holds_offers();
+        assert!(b.holds_offers(), "the duplicate is marked too");
+        assert!(!a.honours_friends_only(), "the other mark is left alone");
+        assert!(!stranger.holds_offers());
+        assert!(EmberSessionHandle::new_secure(channel(), [2; 32], hash).holds_offers());
+
+        drop((a, b));
+        assert!(!EmberSessionHandle::new_secure(channel(), [2; 32], hash).holds_offers());
+    }
+
+    /// Each end of a crossed pair of dials routes through its own and reads
+    /// the friend's frames on the other, so holds can be agreed over a
+    /// session that never held the slot. Its end reaches the loop too, as an
+    /// end of its own that neither marks the friend offline nor redials.
+    #[test]
+    fn a_duplicate_secure_sessions_end_reaches_the_loop() {
+        let hash = [0xE7; 16];
+        let channel = || tokio::sync::mpsc::channel::<Vec<u8>>(1).0;
+        let duplicate = EmberSessionHandle::new_secure(channel(), [2; 32], hash);
+        let id = duplicate.session_id();
+        assert!(matches!(
+            session_end_event(false, true, Some(hash), Some(&duplicate)),
+            Some(UploadEventKind::EmberFriendSessionEnded { ember_hash, session_id })
+                if ember_hash == hash && session_id == id
+        ));
+        assert!(matches!(
+            session_end_event(true, true, Some(hash), Some(&duplicate)),
+            Some(UploadEventKind::EmberFriendDisconnected { ember_hash, session_id })
+                if ember_hash == hash && session_id == id
+        ));
+        assert!(session_end_event(false, false, Some(hash), Some(&duplicate)).is_none(), "not a friend");
+        assert!(session_end_event(false, true, Some(hash), None).is_none(), "never authenticated");
+        let legacy = EmberSessionHandle::new(channel(), [2; 32]);
+        assert!(session_end_event(false, true, Some(hash), Some(&legacy)).is_none(), "not secure");
     }
 
     /// The guard owns both halves of an admission — the unit of the

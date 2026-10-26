@@ -29,7 +29,7 @@
 </script>
 
 <script lang="ts">
-  import { onDestroy, untrack } from 'svelte';
+  import { onDestroy, tick, untrack } from 'svelte';
   import { goto } from '$app/navigation';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import {
@@ -49,7 +49,7 @@
     type FileTypeFilter,
     type FileTypeKey,
   } from '$lib/fileTypes';
-  import { copyToClipboard, formatClockTime, formatNumber, formatSize } from '$lib/utils';
+  import { compareFileNames, copyToClipboard, formatClockTime, formatNumber, formatSize } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
@@ -105,6 +105,9 @@
   let selectedHashes: Set<string> = $state(new Set());
   let selectionAnchor: string | null = null;
   let bulkDownloading = $state(false);
+  /** Close was asked for mid-queue. Closing stops the queue, so it says so
+   *  first instead of quietly leaving the rest unqueued. */
+  let closeConfirming = $state(false);
   let bulkConfirming = $state(false);
   let bulkStopRequested = $state(false);
   let bulkDone = $state(0);
@@ -148,8 +151,6 @@
     'searching', 'queued', 'active', 'paused', 'stopped',
     'verifying', 'completing', 'hashing', 'insufficient', 'noneneeded',
   ]);
-  const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
-
   let typeByHash = $derived(
     new Map<string, FileTypeKey | ''>(
       files.map((f) => [f.hash, fileTypeKey(extensionFromPath(f.name))]),
@@ -189,8 +190,8 @@
       : textMatchedFiles.filter((f) => typeByHash.get(f.hash) === typeFilter);
     list.sort(
       sortKey === 'size'
-        ? (a, b) => a.size - b.size || collator.compare(a.name, b.name)
-        : (a, b) => collator.compare(a.name, b.name),
+        ? (a, b) => a.size - b.size || compareFileNames(a.name, b.name)
+        : (a, b) => compareFileNames(a.name, b.name),
     );
     if (!sortAsc) list.reverse();
     return list;
@@ -359,6 +360,7 @@
     libraryHashes = new Set();
     bulkDownloading = false;
     bulkConfirming = false;
+    closeConfirming = false;
   }
 
   function applyListing(listing: CachedListing) {
@@ -777,7 +779,11 @@
         downloadError = m.browse_download_selected_failed({ failed, total: attempted });
       }
     } finally {
-      if (gen === listenerGen) bulkDownloading = false;
+      if (gen === listenerGen) {
+        bulkDownloading = false;
+        // The queue finished under the prompt: it has nothing left to ask.
+        if (closeConfirming) keepGoing();
+      }
     }
   }
 
@@ -807,9 +813,52 @@
     }
   }
 
+  /** The close being confirmed was View transfers, so stopping goes there. */
+  let closeThenTransfers = false;
+
   function viewTransfers() {
+    // Leaving closes the dialog and stops the queue like any close, so it is
+    // asked about like one; the banner offering it shows once the first file
+    // of a bulk download is in.
+    if (bulkDownloading && !bulkStopRequested) {
+      closeThenTransfers = true;
+      closeConfirming = true;
+      return;
+    }
     onclose();
     void goto('/transfers');
+  }
+
+  function requestClose() {
+    closeThenTransfers = false;
+    if (bulkDownloading && !bulkStopRequested) {
+      closeConfirming = true;
+      return;
+    }
+    closeConfirming = false;
+    onclose();
+  }
+
+  function stopAndClose() {
+    bulkStopRequested = true;
+    closeConfirming = false;
+    onclose();
+    if (closeThenTransfers) {
+      closeThenTransfers = false;
+      void goto('/transfers');
+    }
+  }
+
+  /** Back to the queue. The prompt held focus and is gone, so focus goes to
+   *  the dialog, where Escape and Tab are handled, rather than to <body>. */
+  function keepGoing() {
+    closeThenTransfers = false;
+    closeConfirming = false;
+    void tick().then(() => {
+      if (open && (!document.activeElement || document.activeElement === document.body)) {
+        modalEl?.focus();
+      }
+    });
   }
 
   function handleKeydown(e: KeyboardEvent) {
@@ -820,7 +869,11 @@
         bulkConfirming = false;
         return;
       }
-      onclose();
+      if (closeConfirming) {
+        keepGoing();
+        return;
+      }
+      requestClose();
       return;
     }
     trapTabKey(e, modalEl);
@@ -868,7 +921,7 @@
   <div bind:this={dialogRootEl}>
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="browse-overlay" onclick={onclose}></div>
+    <div class="browse-overlay" onclick={requestClose}></div>
     <!-- svelte-ignore a11y_interactive_supports_focus -->
     <div
       class="browse-modal"
@@ -901,7 +954,7 @@
               <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><polyline points="13.5 2.5 13.5 5.5 10.5 5.5"/>
             </svg>
           </button>
-          <button type="button" class="icon-close" onclick={onclose} title={m.common_close()} aria-label={m.common_close()}>
+          <button type="button" class="icon-close" onclick={requestClose} title={m.common_close()} aria-label={m.common_close()}>
             <IconX size={16} />
           </button>
         </div>
@@ -1005,7 +1058,24 @@
                 <span aria-hidden="true">·</span>
                 {formatSize(filteredTotalSize)}
               </div>
-              {#if bulkDownloading}
+              {#if bulkDownloading && closeConfirming}
+                <div class="browse-selection browse-selection-confirm" role="alert">
+                  <span class="browse-selection-summary">
+                    {m.browse_close_confirm({ done: formatNumber(bulkDone), total: formatNumber(bulkTotal) })}
+                  </span>
+                  <button
+                    type="button"
+                    class="browse-secondary-btn"
+                    onclick={keepGoing}
+                    {@attach (el: HTMLButtonElement) => el.focus()}
+                  >{m.browse_keep_going()}</button>
+                  <button
+                    type="button"
+                    class="browse-secondary-btn"
+                    onclick={stopAndClose}
+                  >{m.browse_stop_and_close()}</button>
+                </div>
+              {:else if bulkDownloading}
                 <div class="browse-selection" role="status">
                   <span class="spinner xs" aria-hidden="true"></span>
                   <span class="browse-selection-summary">
@@ -1521,6 +1591,7 @@
   .browse-filter-input:focus {
     border-color: var(--accent);
     outline: none;
+    box-shadow: 0 0 0 2px var(--accent-halo);
   }
 
   .browse-filter-clear {

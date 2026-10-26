@@ -88,7 +88,7 @@
       <span class="stat-label">{m.kad_stat_public_ports()}</span>
       <span class="stat-value">
         {#if ($networkStats.public_tcp_port || 0) > 0 || ($networkStats.public_udp_port || 0) > 0}
-          TCP {$networkStats.public_tcp_port || '—'} / UDP {$networkStats.public_udp_port || '—'}
+          {m.kad_stat_tcp()} {$networkStats.public_tcp_port || '—'} / {m.kad_stat_udp()} {$networkStats.public_udp_port || '—'}
         {:else}
           —
         {/if}

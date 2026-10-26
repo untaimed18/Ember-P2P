@@ -7,9 +7,12 @@
   import AddLinksDialog from '$lib/components/AddLinksDialog.svelte';
   import { addLinksRequested, MAX_LINKS_TEXT_BYTES } from '$lib/clipboardWatch';
   import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
-  import { categoryDestinationLabel, categorySubdir, normalizeCategoryFolder } from '$lib/categoryFolders';
+  import { categoryDestinationLabel, categorySubdir } from '$lib/categoryFolders';
+  import {
+    addUserCategory, countDownloadCategories, isCategoryTaken, removeUserCategory, setCategoryFolder,
+  } from '$lib/categorySettings';
   import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, holdDownloadRemoved, setLocalCategory, IDLE_STATUSES, effectiveUploadSpeed, resumableFailedDownloads } from '$lib/stores/transfers';
-  import { addActionToast, removeToast, setToastMessage, toastError, toastSuccess } from '$lib/stores/toast';
+  import { addActionToast, removeToast, setToastMessage, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
   import { holdPendingCancel, releasePendingCancel } from '$lib/stores/pendingCancels';
   import { finishAction, setFinishAction, type FinishAction } from '$lib/stores/finishAction';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
@@ -29,29 +32,31 @@
   import { getPeerReputationBatch, labelForReputation, type PeerReputationInfo } from '$lib/api/reputation';
   import {
     formatSize, formatLiveSpeed, formatDate, formatDateWithYear, formatDurationSecs,
-    formatRemaining, formatRelativeTime, formatNumber, copyToClipboard, readFromClipboard,
+    formatRemaining, formatRelativeTime, formatNumber, formatDecimal, compareFileNames,
+    copyToClipboard, readFromClipboard,
   } from '$lib/utils';
-  import { onMount, onDestroy, untrack } from 'svelte';
+  import { onMount, onDestroy, tick, untrack } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
   import { fade } from 'svelte/transition';
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import type {
     Transfer, SourceInfo, UploadQueueClient, KnownClient, KnownClientCounts, DownloadFileDetails,
   } from '$lib/types';
-  import { inertBackground, trapTabKey } from '$lib/a11y';
+  import { inertBackground, menuKeydown, swallowKeyboardContextMenu, trapTabKey } from '$lib/a11y';
+  import { menuKeyDownloadId } from '$lib/transfersMenuKey';
   import { scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { hoverSubmenus } from '$lib/hoverSubmenus';
-  import { appSettings, setAppSettings } from '$lib/stores/settings';
-  import { getSettings, openWebService, updateSettings } from '$lib/api/settings';
+  import { appSettings } from '$lib/stores/settings';
+  import { openWebService } from '$lib/api/settings';
   import { serviceAvailableFor } from '$lib/webServices';
   import { mapSettledWithLimit } from '$lib/concurrency';
   import * as m from '$lib/paraglide/messages';
   import { plural } from '$lib/plural';
   import { BUILTIN_DOWNLOAD_CATEGORIES, downloadCategoryLabel } from '$lib/downloadCategories';
-  import { categoriesDialogRequested } from '$lib/stores/categoriesDialog';
   import {
+    codedErrorOf,
     translateError,
     transferFailureKindText,
     transferFailureReasonText,
@@ -1247,17 +1252,12 @@
     const countGen = ++knownCountsGen;
     knownClientsInFlight++;
     try {
-      const data = await getKnownClients();
+      const snap = await getKnownClients();
       if (!mounted || gen !== knownClientsGen) return;
-      knownClients = data;
-      // The ledger we just fetched is a stricter answer than the counts poll
-      // can give, so publish the labels from it. Split exactly as `knownSplit`
-      // does, or the label and the table it opens would disagree.
-      if (countGen === knownCountsGen) {
-        let ember = 0;
-        for (const kc of data) if (kc.ember_hash) ember++;
-        knownCounts = { ed2k: data.length - ember, ember };
-      }
+      knownClients = snap.clients;
+      // The snapshot's counts were taken with the rows they describe, so they
+      // are a stricter answer than the counts poll can give.
+      if (countGen === knownCountsGen) knownCounts = snap.counts;
       knownClientsLoaded = true;
       knownClientsFailCount = 0;
       knownClientsLoadFailed = false;
@@ -1366,6 +1366,12 @@
   });
   let showingEmberKnown = $derived(bottomView === 'known_ember');
   let knownLedger = $derived(showingEmberKnown ? knownSplit.ember : knownSplit.ed2k);
+  // Records the ledger holds for the showing tab. Larger than `knownLedger`
+  // once the backend trims the tab to its most recently seen peers.
+  let knownLedgerTotal = $derived(Math.max(
+    knownLedger.length,
+    (showingEmberKnown ? knownCounts?.ember_total : knownCounts?.ed2k_total) ?? 0,
+  ));
 
   // --- Known-peers sub-toolbar state ---
   // Filter string applied case-insensitively across user_hash, last_known_ip,
@@ -1377,6 +1383,16 @@
   // granularity so we don't need a separate poll.
   let friendHashSet = $state<Set<string>>(new Set());
   let friendNickById = $state<Record<string, string>>({});
+  // By `friend_hash`, never `ember_hash`: that can be a friend's public key
+  // replayed by someone else (see `KnownClient.friend_hash`).
+  function isKnownFriend(kc: KnownClient): boolean {
+    const id = kc.friend_hash?.toLowerCase();
+    return kc.is_friend || (id != null && friendHashSet.has(id));
+  }
+  function friendNickOf(kc: KnownClient): string | undefined {
+    const id = kc.friend_hash?.toLowerCase();
+    return id ? friendNickById[id] : undefined;
+  }
   // Click-to-copy feedback. Cleared after a short delay so the badge
   // doesn't linger after the user moves on.
   let knownCopiedHash = $state<string | null>(null);
@@ -1466,7 +1482,7 @@
       if (ember && ember.includes(q)) return true;
       if (kc.last_known_ip && kc.last_known_ip.toLowerCase().includes(q)) return true;
       if (kc.country_code && kc.country_code.toLowerCase().includes(q)) return true;
-      const nick = (ember ? friendNickById[ember] : undefined) || kc.nickname;
+      const nick = friendNickOf(kc) || kc.nickname;
       if (nick && nick.toLowerCase().includes(q)) return true;
       if (kc.peer_name && kc.peer_name.toLowerCase().includes(q)) return true;
       if (kc.client_software && kc.client_software.toLowerCase().includes(q)) return true;
@@ -1506,8 +1522,7 @@
   // Top-line stats for the active known-peers tab. Computed off the
   // unfiltered split (eD2K or Ember) so totals match that tab's ledger
   // regardless of the current search. Friend count uses backend
-  // is_friend (ember hash) with a live friendHashSet fallback after
-  // add/remove.
+  // is_friend with a live friendHashSet fallback after add/remove.
   let knownStats = $derived.by(() => {
     let totalUp = 0;
     let totalDown = 0;
@@ -1515,8 +1530,7 @@
     for (const kc of knownLedger) {
       totalUp += kc.uploaded;
       totalDown += kc.downloaded;
-      const ember = kc.ember_hash?.toLowerCase();
-      if (kc.is_friend || (ember != null && friendHashSet.has(ember))) friendCount++;
+      if (isKnownFriend(kc)) friendCount++;
     }
     return {
       total: knownLedger.length,
@@ -1707,8 +1721,7 @@
       switch (knSortField) {
         case 'user_hash': {
           const nameOf = (kc: KnownClient) => {
-            const ember = kc.ember_hash?.toLowerCase();
-            const nick = (ember ? friendNickById[ember] : undefined) || kc.nickname;
+            const nick = friendNickOf(kc) || kc.nickname;
             if (nick && nick.trim()) return nick;
             return showingEmberKnown ? (kc.ember_hash || kc.user_hash) : kc.user_hash;
           };
@@ -1781,7 +1794,9 @@
         case 'peer_name': raw = cmpStr(a.peer_name, b.peer_name); break;
         case 'user_name': raw = cmpStr(a.user_hash || a.peer_ip, b.user_hash || b.peer_ip); break;
         case 'client_software': raw = cmpStr(a.client_software, b.client_software); break;
-        case 'file_name': raw = cmpStr(a.file_name, b.file_name); break;
+        case 'file_name':
+          raw = a.file_name && b.file_name ? compareFileNames(a.file_name, b.file_name) : cmpStr(a.file_name, b.file_name);
+          break;
         case 'wait_time': raw = cmpNum(a.wait_seconds, b.wait_seconds); break;
         case 'queue_rank': raw = cmpNum(a.queue_rank, b.queue_rank); break;
         case 'credit_ratio': raw = cmpNum(a.credit_ratio, b.credit_ratio); break;
@@ -2141,7 +2156,7 @@
   function compareDownloads(a: Transfer, b: Transfer): number {
     let cmp = 0;
     switch (dlSortField) {
-      case 'file_name': cmp = sortCollator.compare(a.file_name, b.file_name); break;
+      case 'file_name': cmp = compareFileNames(a.file_name, b.file_name); break;
       case 'total_size': cmp = a.total_size - b.total_size; break;
       case 'transferred': cmp = a.transferred - b.transferred; break;
       case 'completed_size': cmp = (a.completed_size || 0) - (b.completed_size || 0); break;
@@ -2165,7 +2180,7 @@
     // Fixed-direction tie-break, as the upload sort has: the list is re-sorted
     // on every store update, and equal keys otherwise kept whatever order the
     // backend last emitted, so rows sharing a priority or status reshuffled.
-    return sortCollator.compare(a.file_name, b.file_name) || a.id.localeCompare(b.id);
+    return compareFileNames(a.file_name, b.file_name) || a.id.localeCompare(b.id);
   }
 
   let sortedActiveDownloads = $derived.by(() => {
@@ -2178,13 +2193,7 @@
   // --- Categories ---
   const BUILTIN_CATEGORIES = BUILTIN_DOWNLOAD_CATEGORIES;
   let userCategories = $derived($appSettings?.download_categories ?? []);
-  let categoryCounts = $derived.by(() => {
-    const counts: Record<string, number> = {};
-    for (const t of allDownloads) {
-      if (t.category) counts[t.category] = (counts[t.category] ?? 0) + 1;
-    }
-    return counts;
-  });
+  let categoryCounts = $derived(countDownloadCategories(allDownloads));
   /** The filter chips: the built-in categories in use, then the user's own
    *  even while empty, then any other a download still carries (one the user
    *  has since deleted, say). */
@@ -2573,7 +2582,7 @@
       switch (ulSortField) {
         case 'country': cmp = cmpCountry(a.country_code, b.country_code); break;
         case 'peer_name': cmp = (a.peer_name || a.peer_id).localeCompare(b.peer_name || b.peer_id); break;
-        case 'file_name': cmp = a.file_name.localeCompare(b.file_name); break;
+        case 'file_name': cmp = compareFileNames(a.file_name, b.file_name); break;
         case 'speed': cmp = displaySpeed(a) - displaySpeed(b); break;
         case 'transferred': cmp = a.transferred - b.transferred; break;
         case 'waited': cmp = (a.wait_time || 0) - (b.wait_time || 0); break;
@@ -2654,7 +2663,10 @@
         // ranks still show in the source drawer via SourceInfo.queue_rank.
         return m.transfer_status_queued();
       case 'paused': return m.transfer_status_paused();
-      case 'stopped': return m.transfer_status_stopped();
+      case 'stopped':
+        return t.failure_code === 'part_files_removed'
+          ? m.transfers_dl_status_part_files_removed()
+          : m.transfer_status_stopped();
       case 'verifying': return m.transfer_status_verifying();
       case 'completing': return m.transfer_status_completing();
       case 'completed': return m.transfers_dl_status_complete();
@@ -2743,28 +2755,49 @@
    *  the `speedHistory` sweep below, which walks the same live-id set. */
   const uploadTooltipCache: Map<
     string,
-    { served?: string; peer?: string; total: number; text: string }
+    { served?: string; peer?: string; fill?: string; sentPct: number; total: number; text: string }
   > = new Map();
 
-  /** Tooltip for the upload parts bar: parts we've sent this session, plus the
-   *  count the downloader already had (eMule `m_abyUpPartStatus`) when present. */
+  /** Whether some part has bytes sent without being whole (`up_part_fill`
+   *  bytes strictly between 00 and ff). */
+  function hasPartialParts(fill: string | undefined): boolean {
+    if (!fill) return false;
+    for (let i = 0; i + 1 < fill.length; i += 2) {
+      const byte = fill.slice(i, i + 2);
+      if (byte !== '00' && byte !== 'ff') return true;
+    }
+    return false;
+  }
+
+  /** Tooltip for the upload parts bar: whole parts we've sent this session, how
+   *  much of the file has gone out when parts are only partly sent (a peer
+   *  taking the rest of them from other sources, where the whole-part count
+   *  alone reads as nothing sent), and the count the downloader already had
+   *  (eMule `m_abyUpPartStatus`) when present. */
   function uploadPartsTooltip(t: Transfer): string {
     const total = t.up_part_count ?? 0;
+    const sentPct = t.total_size > 0 ? Math.round((Math.min(t.completed_size, t.total_size) / t.total_size) * 100) : 0;
     const cached = uploadTooltipCache.get(t.id);
     if (
       cached
       && cached.total === total
       && cached.served === t.up_part_status
       && cached.peer === t.up_peer_part_status
+      && cached.fill === t.up_part_fill
+      && cached.sentPct === sentPct
     ) {
       return cached.text;
     }
-    const base = m.transfers_parts({ have: countServedParts(t.up_part_status), total });
+    const pieces = [m.transfers_parts({ have: countServedParts(t.up_part_status), total })];
+    if (hasPartialParts(t.up_part_fill)) pieces.push(m.transfers_parts_sent({ percent: sentPct }));
     const peerOnly = countPeerOnlyParts(t.up_peer_part_status, t.up_part_status, total);
-    const text = peerOnly > 0 ? `${base} · ${m.transfers_parts_peer({ peer: peerOnly })}` : base;
+    if (peerOnly > 0) pieces.push(m.transfers_parts_peer({ peer: peerOnly }));
+    const text = pieces.join(' · ');
     uploadTooltipCache.set(t.id, {
       served: t.up_part_status,
       peer: t.up_peer_part_status,
+      fill: t.up_part_fill,
+      sentPct,
       total,
       text,
     });
@@ -2810,8 +2843,10 @@
     return t.status === 'active' || t.status === 'searching' || t.status === 'queued';
   }
 
+  // Not while the finished file is moved into place: nothing stops that move,
+  // and the backend leaves such a row to finish.
   function canStop(t: Transfer): boolean {
-    return t.status !== 'completed' && t.status !== 'failed' && t.status !== 'stopped';
+    return t.status !== 'completed' && t.status !== 'failed' && t.status !== 'stopped' && t.status !== 'completing';
   }
 
   function isPausedState(t: Transfer): boolean {
@@ -2956,12 +2991,6 @@
   let categoryOptions = $derived(['None', ...BUILTIN_CATEGORIES, ...userCategories]);
 
   let categoriesDialog = $state<{ open: boolean; assignIds: string[] }>({ open: false, assignIds: [] });
-  // "Edit categories…" in the Library brings the user here for the dialog.
-  $effect(() => {
-    if (!$categoriesDialogRequested) return;
-    categoriesDialogRequested.set(false);
-    categoriesDialog = { open: true, assignIds: [] };
-  });
 
   /** A category set from the menu goes to the whole selection when the
    *  clicked row is part of it, as in eMule. */
@@ -2994,68 +3023,15 @@
         detail: translateError(firstFailure, m.transfers_operation_failed()),
       }));
     }
+    const [warning] = changes.move_warnings;
+    if (warning) toastWarning(translateError(warning, m.transfers_operation_failed()));
     if (changes.error) throw changes.error;
   }
 
-  function isCategoryTaken(name: string): boolean {
-    const folded = name.toLocaleLowerCase();
-    return ['None', ...BUILTIN_CATEGORIES].some(
-      (cat) => cat.toLocaleLowerCase() === folded || categoryLabel(cat).toLocaleLowerCase() === folded,
-    ) || userCategories.some((cat) => cat.toLocaleLowerCase() === folded);
-  }
-
-  /** Edits the categories and their folders as the backend holds them now,
-   *  not as this page last saw them. */
-  async function saveCategorySettings(
-    edit: (categories: string[], folders: Record<string, string>) => {
-      categories: string[];
-      folders: Record<string, string>;
-    },
-  ): Promise<{ before: string[]; saved: string[] }> {
-    const current = await getSettings();
-    const before = current.download_categories ?? [];
-    const next = edit(before, current.download_category_folders ?? {});
-    const result = await updateSettings({
-      ...current,
-      download_categories: next.categories,
-      download_category_folders: next.folders,
-    });
-    setAppSettings(result.settings);
-    return { before, saved: result.settings.download_categories ?? [] };
-  }
-
-  function saveUserCategories(edit: (current: string[]) => string[]) {
-    return saveCategorySettings((categories, folders) => ({ categories: edit(categories), folders }));
-  }
-
-  /** Where a category's downloads finish; `null` is Downloads itself. */
-  async function setCategoryFolder(category: string, folder: string | null) {
-    await saveCategorySettings((categories, folders) => {
-      const next = { ...folders };
-      if (folder) next[category] = folder;
-      else delete next[category];
-      return { categories, folders: next };
-    });
-  }
-
-  async function addUserCategory(name: string, ownFolder: boolean) {
-    const { before, saved } = await saveUserCategories((current) => [...current, name]);
-    // The name as the backend kept it, which may be trimmed or cut; none when
-    // it cleaned the name into one that already exists.
-    const kept = saved.find((cat) => !before.includes(cat));
-    if (!kept) throw new Error(m.transfers_categories_exists());
-    // Named after the category as kept, so it matches what the backend holds.
+  async function addCategory(name: string, ownFolder: boolean) {
+    const { kept, folderError } = await addUserCategory(name, ownFolder);
     // A folder that could not be saved is reported once the downloads asked
     // for have their category anyway.
-    let folderError: unknown = null;
-    const folder = ownFolder ? normalizeCategoryFolder(kept) : null;
-    if (folder) {
-      try {
-        await setCategoryFolder(kept, folder);
-      } catch (e: unknown) {
-        folderError = e;
-      }
-    }
     const ids = new Set(categoriesDialog.assignIds);
     if (ids.size > 0) {
       await assignCategory(allDownloads.filter((t) => ids.has(t.id)), kept);
@@ -3063,10 +3039,8 @@
     if (folderError) throw folderError;
   }
 
-  async function removeUserCategory(name: string) {
-    const members = allDownloads.filter((t) => t.category === name);
-    if (members.length > 0) await assignCategory(members, '', false);
-    await saveUserCategories((current) => current.filter((cat) => cat !== name));
+  async function removeCategory(name: string) {
+    await removeUserCategory(name);
     if (categoryFilter === name) categoryFilter = '';
   }
 
@@ -3095,6 +3069,7 @@
     // Raw pointer position: `ctxMenuPosition` measures the rendered panel and
     // keeps it on screen.
     ctxMenu = { x: e.clientX, y: e.clientY, transfer: t, section };
+    ctxReturnFocus = null;
     ctxQueuedIds = null;
     if (section !== 'upload') {
       const menu = ctxMenu;
@@ -3103,6 +3078,12 @@
         .catch((err: unknown) => console.warn('transfers: could not read the download queue', err));
     }
   }
+
+  let ctxMenuEl: HTMLDivElement | undefined = $state(undefined);
+  /** Where focus was when the Menu key opened the row menu, handed back when
+   *  Escape closes it. Not on other closes: a click has put focus where it
+   *  wants. */
+  let ctxReturnFocus: HTMLElement | null = null;
 
   /** The downloads waiting in the queue when the menu opened; `null` until
    *  known. Only those can move in it: a paused row that was running keeps
@@ -3404,7 +3385,7 @@
             break;
           }
           const nick = kc.peer_name || undefined;
-          await addFriend(kc.ember_hash, nick);
+          await addFriend(kc.ember_hash, nick, true);
           await refreshFriendHashes();
           showInfo(m.transfers_added_friend({
             name: nick || kc.ember_hash.slice(0, 8) + '\u2026',
@@ -3415,15 +3396,14 @@
           confirmBan = {
             open: true,
             userHash: kc.user_hash,
-            name: (kc.ember_hash && friendNickById[kc.ember_hash.toLowerCase()])
-              || kc.user_hash.slice(0, 8) + '\u2026',
+            name: friendNickOf(kc) || kc.user_hash.slice(0, 8) + '\u2026',
           };
           return;
         }
         case 'unban_user':
           await unbanUser(
             kc.user_hash,
-            (kc.ember_hash && friendNickById[kc.ember_hash.toLowerCase()])
+            friendNickOf(kc)
               || kc.peer_name
               || kc.user_hash.slice(0, 8) + '\u2026',
           );
@@ -3537,7 +3517,7 @@
         case 'add_friend': {
           const emberHash = emberHashForUpload(t);
           if (!emberHash) { transferError = m.transfers_no_ember_hash(); break; }
-          await addFriend(emberHash, t.peer_name || undefined);
+          await addFriend(emberHash, t.peer_name || undefined, true);
           await refreshFriendHashes();
           showInfo(m.transfers_added_friend({ name: t.peer_name || emberHash.slice(0, 8) + '\u2026' }));
           break;
@@ -4049,15 +4029,20 @@
     if (cancelIds.length > 0) {
       const pending = new Set(cancelIds);
       try {
+        const fresh = await getTransfers();
         const finished = new Set(
-          (await getTransfers())
-            .filter((t) => pending.has(t.id) && t.status === 'completed')
-            .map((t) => t.id),
+          fresh.filter((t) => pending.has(t.id) && t.status === 'completed').map((t) => t.id),
         );
-        if (finished.size > 0) {
-          cancel = cancelIds.filter((id) => !finished.has(id));
+        // Still moving its file into Downloads: nothing can stop that, and the
+        // backend leaves the row to finish, so it goes back in the list.
+        const moving = new Set(
+          fresh.filter((t) => pending.has(t.id) && t.status === 'completing').map((t) => t.id),
+        );
+        if (finished.size > 0 || moving.size > 0) {
+          cancel = cancelIds.filter((id) => !finished.has(id) && !moving.has(id));
           remove = [...removeIds, ...finished];
         }
+        if (moving.size > 0) restore(moving);
       } catch (e: unknown) {
         console.warn('transfers: could not re-check rows before a deferred cancel', e);
       }
@@ -4085,12 +4070,29 @@
       });
       const failed = remove.flatMap((id, i) => {
         const r = results[i];
-        return r.status === 'rejected' ? [{ id, error: toErrorMsg(r.reason) }] : [];
+        return r.status === 'rejected'
+          ? [{ id, error: toErrorMsg(r.reason), kept: codedErrorOf(r.reason)?.code === 'transfers_preserve_partial_failed' }]
+          : [];
       });
       if (failed.length > 0) {
         restore(new Set(failed.map((f) => f.id)));
-        const more = failed.length > 1 ? m.transfers_batch_failed_more({ count: failed.length - 1 }) : '';
-        toastError(`${failed[0].error}${more}`);
+        // A failed download is removed only once its progress is safe in
+        // Downloads. When that move cannot be made, deleting is the one way
+        // left to clear the row, so it is offered rather than a dead end.
+        const kept = failed.filter((f) => f.kept).map((f) => f.id);
+        if (kept.length > 0) {
+          addActionToast(
+            'error',
+            m.transfers_keep_progress_failed(),
+            { label: m.common_delete(), run: () => void deleteInstead(kept, restore) },
+            () => {},
+          );
+        }
+        const others = failed.filter((f) => !f.kept);
+        if (others.length > 0) {
+          const more = others.length > 1 ? m.transfers_batch_failed_more({ count: others.length - 1 }) : '';
+          toastError(`${others[0].error}${more}`);
+        }
       }
       return;
     }
@@ -4098,6 +4100,21 @@
       await clearCompleted(remove);
     } catch (e: unknown) {
       restore(new Set(remove));
+      toastError(toErrorMsg(e));
+    }
+  }
+
+  /** Delete failed downloads whose progress could not be kept, with it. */
+  async function deleteInstead(ids: string[], restore: (ids: ReadonlySet<string>) => void) {
+    for (const id of ids) {
+      markDownloadRemoved(id);
+      speedHistory.delete(id);
+      forgetTransfer(id);
+    }
+    try {
+      await cancelTransfersBatch(ids);
+    } catch (e: unknown) {
+      restore(new Set(ids));
       toastError(toErrorMsg(e));
     }
   }
@@ -5005,7 +5022,10 @@
           : m.transfers_dl_tooltip_queued_base();
       }
       case 'paused': return m.transfers_dl_tooltip_paused();
-      case 'stopped': return m.transfers_dl_tooltip_stopped();
+      case 'stopped':
+        return t.failure_code === 'part_files_removed'
+          ? transferFailureReasonText(t.failure_reason, t.failure_code)
+          : m.transfers_dl_tooltip_stopped();
       case 'verifying': return m.transfers_dl_tooltip_verifying();
       case 'completing': return m.transfers_dl_tooltip_completing();
       case 'completed': return m.transfers_dl_tooltip_completed();
@@ -5220,7 +5240,13 @@
     // first because the dialog sits above everything else.
     if (renameDialog.open) { closeRename(); e.preventDefault(); e.stopPropagation(); }
     else if (fileDetailsId) { closeFileDetails(); e.preventDefault(); e.stopPropagation(); }
-    else if (ctxMenu) { closeCtx(); e.preventDefault(); e.stopPropagation(); }
+    else if (ctxMenu) {
+      const returnTo = ctxReturnFocus;
+      closeCtx();
+      returnTo?.focus({ preventScroll: true });
+      e.preventDefault();
+      e.stopPropagation();
+    }
     else if (paneCtxMenu) { closePaneCtx(); e.preventDefault(); e.stopPropagation(); }
     else if (uploadsPaneCtxMenu) { closeUploadsPaneCtx(); e.preventDefault(); e.stopPropagation(); }
     else if (knownCtxMenu) { closeKnownCtx(); e.preventDefault(); e.stopPropagation(); }
@@ -5337,6 +5363,43 @@
     focusedDlId = next.id;
     lastClickedDlId = next.id;
     revealDownloadRow(next.id);
+  } else if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
+    // The focused row's menu, beside the row, as Library and Search do.
+    const focusRowId = target?.closest<HTMLElement>('tr[data-transfer-id]')?.dataset.transferId ?? null;
+    const rowId = menuKeyDownloadId({
+      focusRowId:
+        focusRowId && filteredSelectableDownloads.some((t) => t.id === focusRowId) ? focusRowId : null,
+      inDownloadsTable: !!(target && downloadsScrollEl?.contains(target)),
+      onPage: !target || target === document.body || target === document.documentElement,
+      currentId: idx >= 0 ? filteredSelectableDownloads[idx].id : null,
+    });
+    const row = rowId ? filteredSelectableDownloads.find((t) => t.id === rowId) : undefined;
+    if (!row) return;
+    e.preventDefault();
+    swallowKeyboardContextMenu();
+    revealDownloadRow(row.id);
+    const section = filteredActiveDownloads.some((t) => t.id === row.id) ? 'active' : 'completed';
+    const returnTo = document.activeElement;
+    void tick().then(async () => {
+      const el =
+        downloadsScrollEl?.querySelector<HTMLElement>(`tr[data-transfer-id="${CSS.escape(row.id)}"]`) ??
+        downloadsScrollEl;
+      const rect = el?.getBoundingClientRect();
+      onCtx(
+        new MouseEvent('contextmenu', {
+          cancelable: true,
+          clientX: rect ? rect.left + Math.min(24, rect.width / 2) : 0,
+          clientY: rect ? rect.top + Math.min(16, rect.height / 2) : 0,
+        }),
+        row,
+        section,
+      );
+      ctxReturnFocus = returnTo instanceof HTMLElement && returnTo !== document.body ? returnTo : null;
+      // Drawn at the end of the page, and the row keys stand down while it is
+      // open, so the keyboard could not reach it otherwise.
+      await tick();
+      ctxMenuEl?.querySelector<HTMLElement>('.ctx-item:not([disabled])')?.focus();
+    });
   } else if (e.key === 'Delete' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && selectedDownloadIds.length > 0) {
     // Shift+Delete is Cancel, as a file manager's is the stronger Delete: it
     // also deletes the files of finished downloads, behind Cancel's prompt.
@@ -5391,9 +5454,9 @@
   folders={$appSettings?.download_category_folders ?? {}}
   counts={categoryCounts}
   assignCount={categoriesDialog.assignIds.length}
-  isTaken={isCategoryTaken}
-  onadd={addUserCategory}
-  onremove={removeUserCategory}
+  isTaken={(name) => isCategoryTaken(name, userCategories)}
+  onadd={addCategory}
+  onremove={removeCategory}
   onfolder={setCategoryFolder}
 />
 
@@ -5593,6 +5656,7 @@
               class:expanded={expandedTransferId === t.id}
               class:selected={focusedDlId === t.id || checkedDlIdSet.has(t.id)}
               class:ctx-target={ctxMenu?.transfer.id === t.id && focusedDlId !== t.id && !checkedDlIdSet.has(t.id)}
+              data-transfer-id={t.id}
               onclick={(e) => onDownloadRowClick(e, t)}
               oncontextmenu={(e) => onCtx(e, t, 'active')}
               ondblclick={() => toggleSourceDetail(t)}
@@ -5797,6 +5861,7 @@
                 class:row-alt={((filteredActiveDownloads.length + dlCompletedWindow.start + i) & 1) === 1}
                 class:selected={focusedDlId === t.id || checkedDlIdSet.has(t.id)}
                 class:ctx-target={ctxMenu?.transfer.id === t.id && focusedDlId !== t.id && !checkedDlIdSet.has(t.id)}
+                data-transfer-id={t.id}
                 onclick={(e) => onDownloadRowClick(e, t)}
                 oncontextmenu={(e) => onCtx(e, t, 'completed')}
               >
@@ -5839,7 +5904,7 @@
                         tooltip so the user can distinguish transient from
                         terminal failures without opening the context menu.
                       -->
-                      {#if t.status === 'failed' && (t.failure_reason || t.failure_code)}
+                      {#if (t.status === 'failed' || t.failure_code === 'part_files_removed') && (t.failure_reason || t.failure_code)}
                         <span class="failure-hint" title={failureContextTooltip(t)}>{transferFailureReasonText(t.failure_reason, t.failure_code)}</span>
                       {:else if t.health !== 'healthy' && (t.health_reason || t.health_code)}
                         {@const health = transferHealthReasonText(t.health_reason, t.health_code, t.failure_code)}
@@ -6059,7 +6124,7 @@
           tabindex={bottomView === 'known_clients' ? 0 : -1}
           onclick={() => bottomView = 'known_clients'}
           title={m.transfers_tab_known_title()}
-        >{knownCounts ? m.transfers_tab_known_count({ count: knownCounts.ed2k }) : m.transfers_tab_known()}</button>
+        >{knownCounts ? m.transfers_tab_known_count({ count: formatNumber(knownCounts.ed2k_total) }) : m.transfers_tab_known()}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'known_ember'}
@@ -6069,7 +6134,7 @@
           tabindex={bottomView === 'known_ember' ? 0 : -1}
           onclick={() => bottomView = 'known_ember'}
           title={m.transfers_tab_known_ember_title()}
-        >{knownCounts ? m.transfers_tab_known_ember_count({ count: knownCounts.ember }) : m.transfers_tab_known_ember()}</button>
+        >{knownCounts ? m.transfers_tab_known_ember_count({ count: formatNumber(knownCounts.ember_total) }) : m.transfers_tab_known_ember()}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'download_clients'}
@@ -6184,6 +6249,7 @@
                           <PartsBar
                             partStatus={t.up_part_status}
                             partCount={t.up_part_count}
+                            partFill={t.up_part_fill}
                             peerPartStatus={t.up_peer_part_status}
                             transferred={t.completed_size}
                             total={t.total_size}
@@ -6363,7 +6429,7 @@
                          dimming the row's position, not by replacing it. -->
                     <td class="num-cell" class:rank-idle={!q.connected} title={q.connected ? '' : m.transfers_queue_disconnected_title()}>{q.queue_rank}</td>
                   {:else if column.key === 'credit_ratio'}
-                    <td class="num-cell" title={m.transfers_queue_credit_title()}>{q.credit_ratio.toFixed(2)}</td>
+                    <td class="num-cell" title={m.transfers_queue_credit_title()}>{formatDecimal(q.credit_ratio, 2)}</td>
                   {:else if column.key === 'transfer_history'}
                     <td class="num-cell" title={m.transfers_queue_transfer_history_title({ up: formatSize(q.uploaded), down: formatSize(q.downloaded) })}>
                       {formatSize(q.uploaded)} / {formatSize(q.downloaded)}
@@ -6452,10 +6518,19 @@
           </label>
           {#if knownClientsLoaded}
             <div class="known-stats" aria-live="polite">
-              <span class="known-stat">
-                <strong>{knownStats.total}</strong>
-                {peersNoun(knownStats.total)}
-              </span>
+              {#if knownLedgerTotal > knownStats.total}
+                <span class="known-stat" title={m.transfers_known_trimmed_title()}>
+                  {m.transfers_known_trimmed({
+                    shown: formatNumber(knownStats.total),
+                    total: formatNumber(knownLedgerTotal),
+                  })}
+                </span>
+              {:else}
+                <span class="known-stat">
+                  <strong>{knownStats.total}</strong>
+                  {peersNoun(knownStats.total)}
+                </span>
+              {/if}
               {#if knownStats.friends > 0}
                 <span class="known-stat known-stat-friends" title={m.transfers_known_friends_title()}>
                   <strong>{knownStats.friends}</strong>
@@ -6532,9 +6607,8 @@
               <tr class="vpad-row" aria-hidden="true" style="height: {knownWindow.topPad}px;"><td colspan={knownColCount}></td></tr>
             {/if}
             {#each displayedKnownClients as kc, i (kc.user_hash)}
-              {@const emberKey = kc.ember_hash?.toLowerCase()}
-              {@const isFriend = kc.is_friend || (!!emberKey && friendHashSet.has(emberKey))}
-              {@const friendNick = (emberKey ? friendNickById[emberKey] : undefined) || (kc.nickname || undefined)}
+              {@const isFriend = isKnownFriend(kc)}
+              {@const friendNick = friendNickOf(kc) || (kc.nickname || undefined)}
               {@const shownHash = showingEmberKnown ? (kc.ember_hash || kc.user_hash) : kc.user_hash}
               <tr
                 class="client-row win-row"
@@ -6580,7 +6654,7 @@
                   {:else if column.key === 'downloaded'}
                     <td class="num-cell" title={m.transfers_known_downloaded_title()}>{kc.downloaded > 0 ? formatSize(kc.downloaded) : '\u2014'}</td>
                   {:else if column.key === 'credit_ratio'}
-                    <td class="num-cell" title={!kc.has_public_key ? m.transfers_known_no_pubkey_title() : m.transfers_known_credit_title()}>{kc.credit_ratio.toFixed(2)}</td>
+                    <td class="num-cell" title={!kc.has_public_key ? m.transfers_known_no_pubkey_title() : m.transfers_known_credit_title()}>{formatDecimal(kc.credit_ratio, 2)}</td>
                   {:else if column.key === 'reputation'}
                     {@const rep = reputationMap[kc.user_hash]}
                     {@const label = labelForReputation(rep)}
@@ -6980,7 +7054,15 @@
 
 {#if ctxMenu && ctxTransfer}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-  <div class="ctx-menu" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }} onclick={(e) => e.stopPropagation()}>
+  <div
+    class="ctx-menu"
+    role="menu"
+    tabindex="-1"
+    bind:this={ctxMenuEl}
+    use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}
+    onclick={(e) => e.stopPropagation()}
+    onkeydown={(e) => menuKeydown(e, e.currentTarget)}
+  >
     <div class="ctx-header" role="presentation">
       {#if ctxMulti}
         {m.transfers_selected_count({ count: ctxTargets.length })}
@@ -8316,6 +8398,10 @@
   .transfer-table th.sortable:hover {
     color: var(--text-primary);
     background: var(--bg-hover);
+  }
+  .transfer-table th.sortable:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
   .transfer-table th.drag-enabled {
     cursor: grab;

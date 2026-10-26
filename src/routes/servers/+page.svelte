@@ -1322,7 +1322,7 @@
                   <td class="num">{formatCount(server.file_count)}</td>
                   <td class="num">{formatCount(perUserFileLimit(server))}</td>
                   <td class="num" class:fail-warn={server.fail_count > 0}>
-                    {server.fail_count > 0 ? server.fail_count : '—'}
+                    {server.fail_count > 0 ? formatNumber(server.fail_count) : '—'}
                   </td>
                   <td class="priority-cell" class:priority-high={server.priority === 'high'} class:priority-low={server.priority === 'low'}>
                     {priorityLabel(server.priority)}
@@ -1387,7 +1387,7 @@
               />
             </div>
           </div>
-          <button class="add-btn" onclick={handleAddServer} disabled={addingServer}>{m.servers_add_server()}</button>
+          <button class="add-btn" onclick={handleAddServer} disabled={addingServer} aria-busy={addingServer}>{addingServer ? m.friends_adding() : m.servers_add_server()}</button>
         </div>
       </div>
 
@@ -1405,7 +1405,7 @@
               onkeydown={handleKeydownMet}
             />
           </div>
-          <button class="add-btn" onclick={handleUpdateServerMet} disabled={updatingMet}>{m.servers_update()}</button>
+          <button class="add-btn" onclick={handleUpdateServerMet} disabled={updatingMet} aria-busy={updatingMet}>{updatingMet ? m.servers_updating() : m.servers_update()}</button>
         </div>
       </div>
 

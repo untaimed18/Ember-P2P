@@ -360,13 +360,21 @@
   // K30: cancel an active search from the row-level action button. We
   // optimistically remove it from the local list so the row disappears
   // immediately; the next periodic refresh confirms it's gone server-side.
+  let cancellingSearches: Set<number> = $state(new Set());
+
   async function handleCancelSearch(id: number) {
+    if (cancellingSearches.has(id)) return;
+    cancellingSearches = new Set(cancellingSearches).add(id);
     try {
       await kadCancelSearch(id);
       searches = searches.filter((s) => s.id !== id);
       toastSuccess(m.kad_search_cancelled());
     } catch (e: unknown) {
       toastError(toErrMsg(e, m.kad_failed_to_cancel_search()));
+    } finally {
+      const next = new Set(cancellingSearches);
+      next.delete(id);
+      cancellingSearches = next;
     }
   }
 
@@ -1432,11 +1440,11 @@
                       </span>
                     </td>
                   {:else if column.key === 'load'}
-                    <td class="num">{search.load} ({search.load_response}/{search.load_total})</td>
+                    <td class="num">{formatNumber(search.load)} ({formatNumber(search.load_response)}/{formatNumber(search.load_total)})</td>
                   {:else if column.key === 'packets_sent'}
-                    <td class="num">{search.packets_sent} / {search.request_answer}</td>
+                    <td class="num">{formatNumber(search.packets_sent)} / {formatNumber(search.request_answer)}</td>
                   {:else if column.key === 'responses'}
-                    <td class="num">{search.responses}</td>
+                    <td class="num">{formatNumber(search.responses)}</td>
                   {:else if column.key === 'started_at'}
                     <td title={formatDateTime(search.started_at)}>{formatSearchAge(search.started_at)}</td>
                   {/if}
@@ -1448,6 +1456,8 @@
                       class="cancel-btn"
                       title={m.kad_search_cancel_title()}
                       aria-label={m.kad_search_cancel_aria({ id: search.id })}
+                      disabled={cancellingSearches.has(search.id)}
+                      aria-busy={cancellingSearches.has(search.id)}
                       onclick={() => handleCancelSearch(search.id)}
                     >
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>
@@ -1490,8 +1500,6 @@
     gap: 8px;
     align-items: center;
   }
-
-  .error-banner,
 
   .kad-layout {
     flex: 1;
@@ -2073,10 +2081,15 @@
     height: 14px;
   }
 
-  .cancel-btn:hover {
+  .cancel-btn:hover:not(:disabled) {
     color: var(--on-danger);
     border-color: var(--danger);
     background: var(--danger);
+  }
+
+  .cancel-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
 
   /* Short laptop viewports: give the contact map more of the column and

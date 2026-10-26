@@ -107,13 +107,17 @@ pub(super) fn kad_may_advertise_partial(
 
 /// [`kad_may_advertise_partial`] for one of our downloads. A download taken
 /// from a friend who restricts the file carries that on the transfer, since
-/// neither the index nor known.met knows the hash until it completes.
+/// neither the index nor known.met knows the hash until it completes. One
+/// from a feed is private (see `sharing::feed_downloads`).
 pub(super) fn transfer_may_advertise_partial(
     known_files: &KnownFileList,
     restricted: &HashSet<String>,
     transfer: &Transfer,
 ) -> bool {
-    !transfer.friends_only && kad_may_advertise_partial(known_files, restricted, &transfer.file_hash)
+    !transfer.friends_only
+        && !crate::sharing::feed_files::is_internal_fetch(&transfer.id)
+        && !crate::sharing::feed_downloads::is_private(&transfer.id)
+        && kad_may_advertise_partial(known_files, restricted, &transfer.file_hash)
 }
 
 /// Complete shares: must be publicly listable on the index *and* not
@@ -710,6 +714,21 @@ mod known_friends_only_snapshot_tests {
             !transfer_may_advertise_partial(&known, &restricted, &download_of(hash, false)),
             "known.met restrictions still apply to unflagged transfers"
         );
+    }
+
+    /// A download from a feed is private: its partial goes nowhere.
+    #[test]
+    fn a_feeds_partial_is_never_advertised() {
+        let hash = [0xEF; 16];
+        let mut known = KnownFileList::new();
+        known.mark_authoritative_for_tests();
+        let restricted = collect_friends_only_hashes(&LocalIndex::new(), &known);
+        let mut download = download_of(hash, false);
+        download.id = format!("feed-{}", uuid::Uuid::new_v4());
+        assert!(transfer_may_advertise_partial(&known, &restricted, &download));
+        crate::sharing::feed_downloads::note(&download.id, "Mixes");
+        assert!(!transfer_may_advertise_partial(&known, &restricted, &download));
+        crate::sharing::feed_downloads::forget(&download.id);
     }
 
     #[test]

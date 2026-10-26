@@ -93,6 +93,63 @@ pub const ATTACH_STREAM_MSG_TYPE: u8 = 0x07;
 /// the grant table, a room member against the transfer offered to them.
 pub const ROOM_XFER_STREAM_MSG_TYPE: u8 = 0x08;
 
+/// First byte of a feed file's data stream: a follower fetching a file of a
+/// feed from its publisher (see `network::feed_direct`).
+///
+/// Same request, header and verified chunks again, authorized a third way:
+/// by the file being in a feed the publisher publishes, which anyone with the
+/// feed's link may see. Nobody need be a friend or share a room.
+pub const FEED_STREAM_MSG_TYPE: u8 = 0x09;
+
+/// Largest feed file the stream carries; a larger one is fetched over eD2K.
+///
+/// Feeds hold films and disc images, so past [`ATTACH_MAX_BYTES`]. The bound
+/// is the publisher's first stream for a file, which reads all of it for the
+/// chunk list before answering: 8 GiB is under [`super::attach_stream`]'s
+/// status wait from a disk reading 30 MB/s, and a 1 MiB list.
+pub const FEED_STREAM_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// The largest file a stream of `stream_type` carries.
+pub fn stream_max_bytes(stream_type: u8) -> u64 {
+    if stream_type == FEED_STREAM_MSG_TYPE {
+        FEED_STREAM_MAX_BYTES
+    } else {
+        ATTACH_MAX_BYTES
+    }
+}
+
+const FEED_STREAM_ID_CONTEXT: &str = "Ember feed stream id v1";
+const FEED_STREAM_CAPABILITY_CONTEXT: &str = "Ember feed stream capability v1";
+
+fn feed_stream_material(publisher: &[u8; 32], salt: &[u8; 16], ed2k: &[u8; 16]) -> [u8; 64] {
+    let mut material = [0u8; 64];
+    material[..32].copy_from_slice(publisher);
+    material[32..48].copy_from_slice(salt);
+    material[48..].copy_from_slice(ed2k);
+    material
+}
+
+/// The transfer id a follower asks a publisher for one file of one feed by.
+///
+/// Computed from what the feed's link and list hold, so a follower needs no
+/// offer first, and keyed on the feed so the publisher can tell which feed's
+/// file is asked for without being told.
+pub fn feed_stream_id(publisher: &[u8; 32], salt: &[u8; 16], ed2k: &[u8; 16]) -> [u8; 16] {
+    let key = blake3::derive_key(FEED_STREAM_ID_CONTEXT, &feed_stream_material(publisher, salt, ed2k));
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&key[..16]);
+    id
+}
+
+/// The capability a feed stream request is tagged under.
+///
+/// Not a secret between two parties, as a pairwise one is: a feed is public
+/// to whoever has its link. What it shows is that the dialer has the link,
+/// which the salt it is derived from is only found in.
+pub fn feed_stream_capability(publisher: &[u8; 32], salt: &[u8; 16], ed2k: &[u8; 16]) -> [u8; 32] {
+    blake3::derive_key(FEED_STREAM_CAPABILITY_CONTEXT, &feed_stream_material(publisher, salt, ed2k))
+}
+
 /// Wire version of the stream request and of the signalling payloads.
 pub const ATTACH_VERSION: u8 = 1;
 
@@ -335,6 +392,9 @@ pub enum AttachStreamStatus {
     SourceGone,
     /// The requester asked to resume past the end of the file.
     BadCursor,
+    /// The sender is serving as many as it will at once, or as many to this
+    /// requester, or has read all it will for them lately: ask again later.
+    Busy,
 }
 
 impl AttachStreamStatus {
@@ -345,6 +405,7 @@ impl AttachStreamStatus {
             AttachStreamStatus::Unauthorized => 2,
             AttachStreamStatus::SourceGone => 3,
             AttachStreamStatus::BadCursor => 4,
+            AttachStreamStatus::Busy => 5,
         }
     }
 
@@ -355,6 +416,7 @@ impl AttachStreamStatus {
             2 => AttachStreamStatus::Unauthorized,
             3 => AttachStreamStatus::SourceGone,
             4 => AttachStreamStatus::BadCursor,
+            5 => AttachStreamStatus::Busy,
             _ => return None,
         })
     }
@@ -411,7 +473,13 @@ pub fn encode_attach_file_info(info: &AttachFileInfo) -> Vec<u8> {
 /// Chunks a file of `size` bytes is cut into, or `None` if it is not a size an
 /// attachment may have.
 pub fn attach_chunk_count(size: u64) -> Option<u32> {
-    if size == 0 || size > ATTACH_MAX_BYTES {
+    chunk_count_up_to(size, ATTACH_MAX_BYTES)
+}
+
+/// [`attach_chunk_count`] for a stream whose files may be up to `max` bytes;
+/// see [`stream_max_bytes`].
+pub fn chunk_count_up_to(size: u64, max: u64) -> Option<u32> {
+    if size == 0 || size > max {
         return None;
     }
     u32::try_from(size.div_ceil(ATTACH_CHUNK_SIZE as u64)).ok()
@@ -423,6 +491,12 @@ pub fn attach_chunk_count(size: u64) -> Option<u32> {
 /// is, and a receiver must not allocate from a number a peer chose without
 /// bounding it first — which [`attach_chunk_count`] does against the size.
 pub fn decode_attach_file_info(bytes: &[u8]) -> Result<AttachFileInfo, AttachStreamStatus> {
+    decode_file_info_up_to(bytes, ATTACH_MAX_BYTES)
+}
+
+/// [`decode_attach_file_info`] for a stream whose files may be up to `max`
+/// bytes.
+pub fn decode_file_info_up_to(bytes: &[u8], max: u64) -> Result<AttachFileInfo, AttachStreamStatus> {
     let status = bytes
         .first()
         .and_then(|b| AttachStreamStatus::from_byte(*b))
@@ -441,7 +515,7 @@ pub fn decode_attach_file_info(bytes: &[u8]) -> Result<AttachFileInfo, AttachStr
     );
     // The size decides the count, so a count that disagrees with it is a
     // malformed header rather than something to trust and allocate from.
-    if attach_chunk_count(size) != Some(declared) {
+    if chunk_count_up_to(size, max) != Some(declared) {
         return Err(AttachStreamStatus::Unknown);
     }
     let want = 13 + declared as usize * 32;
@@ -460,7 +534,12 @@ pub fn decode_attach_file_info(bytes: &[u8]) -> Result<AttachFileInfo, AttachStr
 
 /// Bytes of the chunk-hash list for a file of `size`, for sizing a read.
 pub fn attach_file_info_len(size: u64) -> Option<usize> {
-    let count = attach_chunk_count(size)?;
+    file_info_len_up_to(size, ATTACH_MAX_BYTES)
+}
+
+/// [`attach_file_info_len`] for a stream whose files may be up to `max` bytes.
+pub fn file_info_len_up_to(size: u64, max: u64) -> Option<usize> {
+    let count = chunk_count_up_to(size, max)?;
     Some(13 + count as usize * 32)
 }
 
@@ -578,6 +657,25 @@ pub fn decode_attach_cancel(bytes: &[u8]) -> Option<([u8; 16], AttachCancel)> {
     Some((xfer_id, AttachCancel::from_byte(bytes[17])?))
 }
 
+/// The body of an `EMBER_EXT_ATTACH_WAITS` that names an offer. From the
+/// offer's receiver it says `xfer_id` is kept waiting for its user; from the
+/// offer's sender, sent back in answer, that the grant is held for it.
+pub fn encode_attach_held(xfer_id: &[u8; 16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 16);
+    out.push(ATTACH_VERSION);
+    out.extend_from_slice(xfer_id);
+    out
+}
+
+/// The offer an `EMBER_EXT_ATTACH_WAITS` names. `None` for the empty form,
+/// which names none, and for any body this one cannot read.
+pub fn decode_attach_held(bytes: &[u8]) -> Option<[u8; 16]> {
+    if bytes.len() != 1 + 16 || bytes[0] != ATTACH_VERSION {
+        return None;
+    }
+    bytes[1..17].try_into().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,6 +783,23 @@ mod tests {
             assert_eq!(decode_attach_cancel(&bytes), Some((id, reason)));
         }
         assert!(decode_attach_reply(&[ATTACH_VERSION, 0, 0]).is_none());
+    }
+
+    /// The empty form only says the build waits; the named form is the one a
+    /// sender holds a grant on, so nothing else may read as it.
+    #[test]
+    fn only_a_whole_held_note_names_an_offer() {
+        let id = [4u8; 16];
+        assert_eq!(decode_attach_held(&encode_attach_held(&id)), Some(id));
+        assert_eq!(decode_attach_held(&[]), None);
+        let held = encode_attach_held(&id);
+        assert_eq!(decode_attach_held(&held[..16]), None);
+        let mut longer = held.clone();
+        longer.push(0);
+        assert_eq!(decode_attach_held(&longer), None);
+        let mut newer = held;
+        newer[0] = ATTACH_VERSION + 1;
+        assert_eq!(decode_attach_held(&newer), None);
     }
 
     /// Both ends derive the same capability without agreeing who is which —
@@ -851,5 +966,29 @@ mod tests {
         assert_eq!(attach_chunk_count(ATTACH_CHUNK_SIZE as u64 + 1), Some(2));
         assert_eq!(attach_chunk_count(ATTACH_MAX_BYTES + 1), None);
         assert!(attach_chunk_count(ATTACH_MAX_BYTES).is_some());
+    }
+
+    /// A follower and the publisher compute one id and one capability per
+    /// file of a feed, and another feed's, publisher's or file's are others.
+    #[test]
+    fn a_feed_file_has_its_own_id_and_capability() {
+        let (publisher, salt, ed2k) = ([1u8; 32], [2u8; 16], [3u8; 16]);
+        let id = feed_stream_id(&publisher, &salt, &ed2k);
+        let capability = feed_stream_capability(&publisher, &salt, &ed2k);
+        assert_eq!(id, feed_stream_id(&publisher, &salt, &ed2k));
+        assert_ne!(id, feed_stream_id(&[9; 32], &salt, &ed2k));
+        assert_ne!(id, feed_stream_id(&publisher, &[9; 16], &ed2k));
+        assert_ne!(id, feed_stream_id(&publisher, &salt, &[9; 16]));
+        assert_ne!(capability, feed_stream_capability(&publisher, &[9; 16], &ed2k));
+        assert_ne!(&capability[..16], &id[..], "the id says nothing of the capability");
+    }
+
+    #[test]
+    fn a_feed_request_round_trips_under_its_own_type() {
+        let req = AttachRequest { xfer_id: [4; 16], tag: [5; ATTACH_TAG_LEN], start_chunk: 9 };
+        let bytes = encode_stream_request(FEED_STREAM_MSG_TYPE, &req);
+        assert_eq!(bytes[0], FEED_STREAM_MSG_TYPE);
+        assert_eq!(decode_stream_request(FEED_STREAM_MSG_TYPE, &bytes), Some(req));
+        assert_eq!(decode_stream_request(ROOM_XFER_STREAM_MSG_TYPE, &bytes), None);
     }
 }

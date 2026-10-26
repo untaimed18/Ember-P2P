@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { LIKELY_SPAM_SCORE, listingNameKey, listingSpamScores } from './channelListingSpam';
+import { LIKELY_SPAM_SCORE, LONG_LISTED_SECS, listingNameKey, listingSpamScores } from './channelListingSpam';
 
 const listing = (channel_id: string, name: string, member_count: number | null = 2) => ({
   channel_id,
@@ -7,7 +7,7 @@ const listing = (channel_id: string, name: string, member_count: number | null =
   member_count,
 });
 
-const flagged = (rows: ReturnType<typeof listing>[]) => {
+const flagged = (rows: (ReturnType<typeof listing> & { friends_present?: number | null })[]) => {
   const scores = listingSpamScores(rows);
   return rows.filter((row) => (scores.get(row.channel_id) ?? 0) >= LIKELY_SPAM_SCORE).map((row) => row.channel_id);
 };
@@ -61,6 +61,30 @@ describe('listingSpamScores', () => {
   it('does not fold copies on a count it could not read', () => {
     const rows = [listing('a', 'Lobby', null), listing('b', 'lobby', null), listing('c', 'LOBBY', null)];
     expect(flagged(rows)).toEqual([]);
+  });
+
+  it('never folds a room a friend is in', () => {
+    const rows = [
+      { ...listing('ad', 'Free coins at www.example.com', 3), friends_present: 1 },
+      { ...listing('copy', 'FREEEEEE STUFF', 0), friends_present: 0 },
+    ];
+    expect(flagged(rows)).toEqual(['copy']);
+  });
+
+  it('lets a long-listed room outlive one quirk, never a link', () => {
+    const now = 2_000_000_000;
+    const old = now - LONG_LISTED_SECS;
+    const scores = listingSpamScores(
+      [
+        { ...listing('shouty', 'FREEEEEE STUFF', 0), listed_since: old },
+        { ...listing('fresh', 'FREEEEEE STUFF', 0), listed_since: now - 3600 },
+        { ...listing('linked', 'www.example.com', 4), listed_since: old },
+      ],
+      now,
+    );
+    expect(scores.get('shouty')).toBeLessThan(LIKELY_SPAM_SCORE);
+    expect(scores.get('fresh')).toBeGreaterThanOrEqual(LIKELY_SPAM_SCORE);
+    expect(scores.get('linked')).toBeGreaterThanOrEqual(LIKELY_SPAM_SCORE);
   });
 
   it('reads names the way a person would', () => {

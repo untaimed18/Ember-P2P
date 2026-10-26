@@ -1,32 +1,41 @@
-/** The two parts of the Channels directory, in the order they are drawn. */
+/** The parts of the Channels directory, in the order they are drawn. */
 export interface RoomSections<T> {
+  /** The rooms this device is in, public ones then private ones. */
   yours: T[];
+  yoursPublic: T[];
+  yoursPrivate: T[];
   discover: T[];
 }
 
 /**
- * Split an already-ranked room list into the rooms this device is in and the
- * ones it could join.
+ * Split an already-ranked room list into the rooms this device is in, public
+ * and private apart, and the ones it could join.
  *
- * Mixing the two let a small room the user actually belongs to sink beneath
- * strangers' large ones. Each part keeps the ranking it was handed, and
- * favourites lead "Your rooms" in that same order rather than in the order
- * they were starred, so pinning a room never reshuffles the others.
+ * Mixing joined and joinable let a small room the user actually belongs to
+ * sink beneath strangers' large ones. Each part keeps the ranking it was
+ * handed, and favourites lead their section in that same order rather than in
+ * the order they were starred, so pinning a room never reshuffles the others.
+ * Anything not marked private counts as public, as Discover only ever lists
+ * public rooms.
  */
-export function sectionRooms<T extends { channel_id: string; in_room: boolean }>(
+export function sectionRooms<T extends { channel_id: string; in_room: boolean; visibility?: string }>(
   ranked: readonly T[],
   favourites: readonly string[],
 ): RoomSections<T> {
   const pinned = new Set(favourites);
-  const starred: T[] = [];
-  const rest: T[] = [];
+  const lists = { public: { starred: [] as T[], rest: [] as T[] }, private: { starred: [] as T[], rest: [] as T[] } };
   const discover: T[] = [];
   for (const row of ranked) {
-    if (!row.in_room) discover.push(row);
-    else if (pinned.has(row.channel_id)) starred.push(row);
-    else rest.push(row);
+    if (!row.in_room) {
+      discover.push(row);
+      continue;
+    }
+    const list = row.visibility === 'private' ? lists.private : lists.public;
+    (pinned.has(row.channel_id) ? list.starred : list.rest).push(row);
   }
-  return { yours: [...starred, ...rest], discover };
+  const yoursPublic = [...lists.public.starred, ...lists.public.rest];
+  const yoursPrivate = [...lists.private.starred, ...lists.private.rest];
+  return { yours: [...yoursPublic, ...yoursPrivate], yoursPublic, yoursPrivate, discover };
 }
 
 interface RankableRoom {

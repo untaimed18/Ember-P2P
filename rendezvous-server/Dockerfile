@@ -16,5 +16,8 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 COPY --from=builder /app/target/release/ember-rendezvous /usr/local/bin/
 EXPOSE 8080
 ENV PORT=8080
-USER ember
-CMD ["ember-rendezvous"]
+# Starts as root only to hand the Fly volume at /data to `ember`: a volume is
+# mounted root-owned, and the server, running as `ember`, could not write the
+# channel registry there. Then drops to `ember` for good (`setpriv` is in
+# util-linux, which every Debian image has).
+CMD ["/bin/sh", "-c", "if [ -d /data ]; then chown -R ember:ember /data; fi; exec setpriv --reuid=ember --regid=ember --init-groups --no-new-privs -- /usr/local/bin/ember-rendezvous"]

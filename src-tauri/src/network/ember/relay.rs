@@ -2314,6 +2314,66 @@ where
     served
 }
 
+/// Serve a follower's request for a file of a feed we publish (see
+/// `network::feed_direct`). Anyone may ask, friend or not: a feed is public to
+/// whoever has its link, and the request names the file by an id only the
+/// link and the list let one compute. A few at a time, and at most
+/// two to one `follower` (its proven node id); past that the request is
+/// refused as busy, and the follower asks again later. Returns the stream's
+/// id once this follower has been sent the whole file, over this stream and
+/// those before it, for the caller to count the download once the follower
+/// says it has it.
+pub async fn serve_feed_stream<R, W>(
+    recv: &mut R,
+    send: &mut W,
+    header: &[u8; 7],
+    follower: Option<[u8; 16]>,
+    limiter: &crate::bandwidth::limiter::BandwidthLimiter,
+) -> anyhow::Result<Option<[u8; 16]>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let busy = std::sync::atomic::AtomicBool::new(false);
+    let mut streamed: Option<([u8; 16], u64)> = None;
+    let mut sent = 0u64;
+    let served = super::attach_stream::serve_feed_stream(
+        recv,
+        send,
+        header,
+        |xfer_id| {
+            let file = crate::network::feed_direct::served(xfer_id);
+            busy.store(file == Err(super::attach::AttachStreamStatus::Busy), std::sync::atomic::Ordering::Relaxed);
+            file
+        },
+        // Taken once the file's chunk list is ready, so a dialer that sends
+        // nothing, asks for nothing we serve, or waits on a hash, holds none.
+        |_| {
+            let slot = crate::network::feed_direct::serve_slot(follower);
+            busy.store(slot.is_none(), std::sync::atomic::Ordering::Relaxed);
+            slot.ok_or(super::attach::AttachStreamStatus::Busy)
+        },
+        |xfer_id, position, size| {
+            let (_, from) = *streamed.get_or_insert((*xfer_id, position));
+            sent = position.saturating_sub(from).min(size);
+            true
+        },
+        Some(limiter),
+    )
+    .await;
+    match &served {
+        Ok(0) if busy.load(std::sync::atomic::Ordering::Relaxed) => debug!("Feed stream refused as busy: no slot free, or the file's checks not ready"),
+        Ok(0) => debug!("No feed file of ours under the id a follower asked for"),
+        Ok(bytes) => debug!("Feed stream: served {bytes} byte(s)"),
+        Err(e) => debug!("Feed stream failed: {e}"),
+    }
+    let whole = streamed.and_then(|(xfer_id, _)| {
+        let follower = follower?;
+        crate::network::feed_direct::note_served(&xfer_id, follower, sent).then_some(xfer_id)
+    });
+    served.map(|_| whole)
+}
+
 /// How long a sender holds an attachment connection open after the last chunk,
 /// waiting for the friend to confirm it has every byte.
 const ATTACH_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2342,7 +2402,7 @@ async fn accept_or_wait(endpoint: Option<&quinn::Endpoint>) -> Option<quinn::Inc
     }
 }
 
-/// Run the QUIC accept loop. Handles five kinds of inbound QUIC connections:
+/// Run the QUIC accept loop. Handles six kinds of inbound QUIC connections:
 ///   4. **Chat attachment** — a friend is fetching a file we offered them in
 ///      chat. Dispatched on [`super::attach::ATTACH_STREAM_MSG_TYPE`] and
 ///      authorized by the certificate identity plus the grant; see
@@ -2350,6 +2410,9 @@ async fn accept_or_wait(endpoint: Option<&quinn::Endpoint>) -> Option<quinn::Inc
 ///   5. **Room transfer** — a room member is fetching a file we offered them.
 ///      Dispatched on [`super::attach::ROOM_XFER_STREAM_MSG_TYPE`] and
 ///      authorized the same way against [`RoomXferServeContext::grants`].
+///   6. **Feed file** — a follower is fetching a file of a feed we publish.
+///      Dispatched on [`super::attach::FEED_STREAM_MSG_TYPE`] and authorized
+///      by the file being in one; see [`serve_feed_stream`].
 ///
 /// The original three:
 ///   1. **RELAY_REQUEST** — peer wants us to relay a LowID transfer (existing relay logic)
@@ -2645,6 +2708,20 @@ pub async fn run_quic_accept_loop(
                 // quinn would discard whatever is still queued.
                 let _ = init_send.finish();
                 let _ = attachment_delivered(&init_send).await;
+                return;
+            }
+
+            if msg_type == super::attach::FEED_STREAM_MSG_TYPE {
+                // A follower fetching a file of a feed we publish. No identity
+                // check: a feed is public, and the request's id is the grant.
+                // The certificate names who it was, for the download count.
+                let finished =
+                    serve_feed_stream(&mut init_recv, &mut init_send, &header, peer_node_id, limiter.as_ref()).await;
+                let _ = init_send.finish();
+                let delivered = attachment_delivered(&init_send).await;
+                if let (Ok(Some(xfer_id)), true, Some(follower)) = (finished, delivered, peer_node_id) {
+                    crate::network::feed_direct::note_downloaded(&xfer_id, follower);
+                }
                 return;
             }
 

@@ -15,6 +15,7 @@
   let {
     partStatus = '',
     partCount = 0,
+    partFill = '',
     peerPartStatus = '',
     transferred = 0,
     total = 0,
@@ -25,6 +26,11 @@
   }: {
     partStatus?: string;
     partCount?: number;
+    /** Uploads: hex, one byte per part, of how much of each part went out —
+     *  255 whole, 1–254 partly. When present each part fills from its left
+     *  edge in proportion, the way eMule draws delivered blocks, so a peer
+     *  finishing parts from other sources still shows what we sent it. */
+    partFill?: string;
     peerPartStatus?: string;
     /** What the dark overlay means, which differs by direction and is only
      *  observable in the accessible readout. Uploading, `peerPartStatus` is
@@ -77,6 +83,18 @@
     return bits;
   }
 
+  /** Per-part share sent, 0..1, from `partFill`; null when it is absent. */
+  function decodeFill(hex: string, n: number): number[] | null {
+    if (!hex || hex.length < n * 2) return null;
+    const out = new Array(n).fill(0) as number[];
+    for (let i = 0; i < n; i++) {
+      const byte = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+      out[i] = Number.isNaN(byte) ? 0 : byte >= 255 ? 1 : byte / 255;
+    }
+    return out;
+  }
+
+  let fill = $derived(decodeFill(partFill ?? '', count));
   let bits = $derived(decodeBits(partStatus ?? '', count));
   let peerBits = $derived(decodeBits(peerPartStatus ?? '', count));
   let servedCount = $derived(bits.reduce((acc, b) => acc + (b ? 1 : 0), 0));
@@ -85,50 +103,67 @@
   let peerOnlyCount = $derived(
     peerBits.reduce((acc, b, i) => acc + (b && !bits[i] ? 1 : 0), 0)
   );
+  /** Whether some part has bytes sent without being whole: the case the
+   *  whole-part count reads as nothing at all. */
+  let anyPartial = $derived(!!fill && fill.some((f) => f > 0 && f < 1));
 
-  // Per-segment state: 2 = served (green), 1 = peer-has (dark), 0 = empty.
+  // Per segment: how much of it is sent (0..1, green from the left edge) and
+  // whether the rest is a part the peer already had (dark) or nothing (grey).
   //
-  // While `partsPerSegment` is 1 this is exactly the per-part mapping it has
-  // always been. When several parts share a segment, only a fully-served
-  // segment reads as served, so the bar can under-state progress but never
-  // claim any the file does not have.
+  // Without a fill map a segment is all or nothing, as it has always been: a
+  // bucket of several parts reads as served only once every one of them is,
+  // so the bar can under-state progress but never claim any the file does
+  // not have. With one, a bucket fills by the average of its parts.
   let states = $derived.by(() => {
     const n = segments;
     const per = partsPerSegment;
-    const s = new Array(n).fill(0) as number[];
+    const s: { sent: number; peer: boolean }[] = [];
     for (let seg = 0; seg < n; seg++) {
       const start = seg * per;
       const end = Math.min(count, start + per);
-      let served = 0;
-      let peer = 0;
-      for (let i = start; i < end; i++) {
-        if (bits[i]) served += 1;
-        else if (peerBits[i]) peer += 1;
-      }
       const held = end - start;
-      s[seg] = held > 0 && served === held ? 2 : served > 0 || peer > 0 ? 1 : 0;
+      let sent = 0;
+      let whole = 0;
+      let peer = false;
+      for (let i = start; i < end; i++) {
+        const f = fill ? fill[i] : bits[i] ? 1 : 0;
+        sent += f;
+        if (f >= 1) whole += 1;
+        else if (peerBits[i]) peer = true;
+      }
+      const share = held === 0 ? 0 : fill ? sent / held : whole === held ? 1 : 0;
+      // Without a fill map, a bucket only partly served still shades dark, as
+      // it always has, rather than reading as untouched.
+      s.push({ sent: share, peer: peer || (!fill && whole > 0 && whole < held) });
     }
     return s;
   });
 
-  // Collapse runs of same-state parts into as few gradient stops as
-  // possible (hard colour edges = crisp part boundaries).
+  // Each segment becomes a sent run and a rest run; neighbouring runs of one
+  // colour merge, so a mostly whole bar is still a handful of stops (hard
+  // colour edges = crisp part boundaries).
   let gradient = $derived.by(() => {
     const n = states.length;
     if (n === 0) return 'var(--bg-input)';
     const seg = 100 / n;
-    const colorFor = (v: number) =>
-      v === 2 ? servedColor : v === 1 ? peerHasColor : 'var(--bg-input)';
-    const stops: string[] = [];
-    let i = 0;
-    while (i < n) {
-      const v = states[i];
-      let j = i;
-      while (j < n && states[j] === v) j++;
-      const c = colorFor(v);
-      stops.push(`${c} ${(i * seg).toFixed(4)}%`, `${c} ${(j * seg).toFixed(4)}%`);
-      i = j;
+    const runs: { color: string; from: number; to: number }[] = [];
+    const push = (color: string, from: number, to: number) => {
+      if (to <= from) return;
+      const last = runs[runs.length - 1];
+      if (last && last.color === color && Math.abs(last.to - from) < 1e-6) last.to = to;
+      else runs.push({ color, from, to });
+    };
+    for (let i = 0; i < n; i++) {
+      const { sent, peer } = states[i];
+      const start = i * seg;
+      const split = start + seg * Math.min(1, Math.max(0, sent));
+      push(servedColor, start, split);
+      push(peer ? peerHasColor : 'var(--bg-input)', split, start + seg);
     }
+    const stops = runs.flatMap((r) => [
+      `${r.color} ${r.from.toFixed(4)}%`,
+      `${r.color} ${r.to.toFixed(4)}%`,
+    ]);
     return `linear-gradient(to right, ${stops.join(', ')})`;
   });
 
@@ -152,9 +187,16 @@
   // overlay: that figure is not session completion, and the digits sat
   // on top of the part map the cell is there to show. The tooltip and
   // sr-only label already carry the served/total counts.
+  // With a fill map, what is drawn is every byte sent, so the figure follows
+  // it: the caller's unique byte count when it has one, which weighs the short
+  // last part correctly, else the parts' average.
   let rawPct = $derived(
     count > 0
-      ? (servedCount / count) * 100
+      ? fill
+        ? total > 0
+          ? (transferred / total) * 100
+          : (fill.reduce((acc, f) => acc + f, 0) / count) * 100
+        : (servedCount / count) * 100
       : total > 0
         ? (transferred / total) * 100
         : 0
@@ -173,7 +215,9 @@
 >
   <div class="parts-fill" style="background: {background};"></div>
   <span class="sr-only"
-    >{m.transfers_parts({ have: servedCount, total: count })}{peerOnlyCount > 0
+    >{m.transfers_parts({ have: servedCount, total: count })}{anyPartial
+      ? `, ${m.transfers_parts_sent({ percent: Math.round(pct) })}`
+      : ''}{peerOnlyCount > 0
       ? `, ${
           peerSense === 'swarm'
             ? m.transfers_parts_swarm({ peer: peerOnlyCount })

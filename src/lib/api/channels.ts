@@ -87,6 +87,9 @@ export interface ChannelMemberInfo {
   moderator: boolean;
   /** BLAKE3(pubkey)[..16] hex, same identity friends use. Empty if the key is invalid. */
   ember_hash: string;
+  /** The language the member publishes, a code from `CHANNEL_LANGUAGES`;
+   *  empty when they publish none or run a build without it. */
+  language: string;
 }
 
 /** The windows the roster's presence dots are drawn with.
@@ -200,6 +203,14 @@ export interface GatheredChannelInfo {
   member_count: number | null;
   /** Default language code from the room's signed listing, empty for none. */
   language: string;
+  /** How many of those present are friends, when the size was read; null for
+   *  a room whose size was not looked up, which a long directory leaves to
+   *  all but its first rooms. */
+  friends_present: number | null;
+  /** Unix seconds this device first saw the listing: the walk's own time for
+   *  one it had not seen before, null when not known (a cached or partial
+   *  result). */
+  listed_since: number | null;
 }
 
 export async function listChannels(): Promise<ChannelInfo[]> {
@@ -303,8 +314,22 @@ export async function sendChannelMessage(
 
 /** UTF-8 bytes a reply's signed reference adds to the message on the wire.
  *  Mirrors `REPLY_TRAILER_BYTES` in `src-tauri/src/network/ember/channel.rs`;
- *  the 4096-byte cap counts it, so a reply leaves this much less room. */
+ *  every room line limit counts it, so a reply leaves this much less room. */
 export const REPLY_REFERENCE_BYTES = 136;
+
+/** The longest room line, in UTF-8 bytes of what was typed, that always goes
+ *  out. Its sealed frame has to fit one datagram through a relay hop, which
+ *  stops well short of the 4096-byte text cap, and the backend refuses a
+ *  longer one with `channels_message_too_long_to_send`. Emoji joiners do not
+ *  travel in that frame, so a line typed with them can be slightly longer. A
+ *  reply leaves `REPLY_REFERENCE_BYTES` less. Mirrors
+ *  `CHANNEL_LINE_MAX_TEXT_BYTES` in `src-tauri/src/commands/channels.rs`. */
+export const CHANNEL_LINE_MAX_TEXT_BYTES = 3728;
+
+/** `CHANNEL_LINE_MAX_TEXT_BYTES` for a revision, whose frame also carries the
+ *  line's id and both its times. A revised reply keeps its reference, so it too
+ *  leaves `REPLY_REFERENCE_BYTES` less. Mirrors `CHANNEL_EDIT_MAX_TEXT_BYTES`. */
+export const CHANNEL_EDIT_MAX_TEXT_BYTES = 3696;
 
 export async function markChannelMessagesRead(channelId: string): Promise<void> {
   return invoke('mark_channel_messages_read', { channelId });
@@ -613,6 +638,9 @@ export interface OwnedRoomScan {
   /** Rooms in the list that could not be settled this time. Ember keeps
    *  looking at them on its own. */
   unsettled: number;
+  /** Rooms this device runs that the registry lists as deleted, waiting on
+   *  the user's answer. */
+  deleted_elsewhere: number;
 }
 
 /** Emitted when rooms this identity owns were put back: `{ count }`. */
@@ -622,6 +650,28 @@ export const CHANNELS_RECOVERED_EVENT = 'ember:channels-recovered';
  *  not hold, and put them back. */
 export async function recoverOwnedChannels(): Promise<OwnedRoomScan> {
   return invoke('recover_owned_channels');
+}
+
+/** Emitted when rooms this device runs turned out to be listed as deleted:
+ *  `{ count }`. */
+export const ROOMS_DELETED_ELSEWHERE_EVENT = 'ember:channels-deleted-elsewhere';
+
+/** A room we own that the name registry lists as deleted while this device
+ *  still runs it: deleted on another device, or after the backup this one was
+ *  restored from. */
+export interface RoomDeletedElsewhere {
+  channel_id: string;
+  name: string;
+}
+
+export async function listRoomsDeletedElsewhere(): Promise<RoomDeletedElsewhere[]> {
+  return invoke('list_rooms_deleted_elsewhere');
+}
+
+/** `delete` purges the room here as deleting it would have; otherwise it is
+ *  kept and never asked about again. */
+export async function confirmRoomDeletedElsewhere(channelId: string, del: boolean): Promise<void> {
+  return invoke('confirm_room_deleted_elsewhere', { channelId, delete: del });
 }
 
 /** Open the folder received room transfers are saved to. It is not shared,

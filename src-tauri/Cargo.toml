@@ -1,6 +1,6 @@
 [package]
 name = "ember"
-version = "1.7.4"
+version = "1.7.5"
 description = "A decentralized P2P file sharing application"
 authors = ["untaimed18"]
 license = "GPL-3.0-only"
@@ -63,6 +63,9 @@ rand = "0.8"
 flate2 = "1"
 hex = "0.4"
 reqwest = { version = "0.13", features = ["rustls", "stream", "json"], default-features = false }
+# The updater alone follows the system proxy; every other client stays direct.
+hyper-util = { version = "0.1", features = ["client-proxy", "client-proxy-system"] }
+http = "1"
 sha2 = "0.10"
 base64 = "0.22"
 minisign-verify = "0.2.5"
@@ -208,7 +211,11 @@ windows-sys = { version = "0.61", features = [
     # `RegGetValueW`, to tell a missing launch-at-sign-in `Run` value from one
     # the user disabled in Task Manager (see `src/login_launch.rs`).
     "Win32_System_Registry",
+    # `GetTickCount` and `GetLastInputInfo`, for how long the user has been
+    # idle before friends see them as Away (see `src/idle.rs`).
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 # Ed25519 verification runs ~100x slower unoptimized, and startup re-verifies

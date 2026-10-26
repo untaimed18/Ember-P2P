@@ -23,6 +23,8 @@
   import { initTransferStore, cleanupTransferStore, startTransferPoll } from '$lib/stores/transfers';
   import { initSearchStore, cleanupSearchStore } from '$lib/stores/search';
   import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
+  import { initRoomDmStore, cleanupRoomDmStore } from '$lib/stores/roomDm';
+  import { initFeedsStore, cleanupFeedsStore } from '$lib/stores/feeds';
   import { chatDockOpen, closeDock, retainChatTabs } from '$lib/stores/chatTabs';
   import { initChannelsStore, cleanupChannelsStore, refreshChannels } from '$lib/stores/channels';
   import { CHANNELS_RECOVERED_EVENT } from '$lib/api/channels';
@@ -61,7 +63,7 @@
     addActionToast, addToast, clearAllToasts, onPendingUndoChange, toastError, toastSuccess, toastWarning,
   } from '$lib/stores/toast';
   import { backupReminderDue, noteBackupReminderShown } from '$lib/backupReminder';
-  import { goto } from '$app/navigation';
+  import { afterNavigate, goto } from '$app/navigation';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { confirmDroppedFolders, dismissDroppedFolders } from '$lib/api/sharing';
   import { takePendingDownloadOverflowNotice } from '$lib/api/transfers';
@@ -76,10 +78,12 @@
   import { initChatPopoutMain } from '$lib/chatPopout';
   import { applyUpdateResume, initUpdateResume } from '$lib/updateResume';
   import { isChatWindow } from '$lib/windowRole';
+  import { noteUiActivity, startStallDetector } from '$lib/uiStall';
 
   /** This document is the popped-out chat window, which draws the chat and
    *  nothing else of the shell. Fixed for the life of the document. */
   const chatWindow = isChatWindow();
+  afterNavigate((nav) => noteUiActivity(`opened ${nav.to?.url.pathname.replace(/^\/+/, '') || 'home'}`));
 
   // Sync `<html lang>` to the active Paraglide locale on every
   // mount. Paraglide's strategy chain (localStorage →
@@ -286,6 +290,8 @@
       { init: initSearchStore, essential: false },
       { init: initFriendsStore, essential: false },
       { init: initChannelsStore, essential: false },
+      { init: initRoomDmStore, essential: false },
+      { init: initFeedsStore, essential: false },
       { init: loadAppSettings, essential: true },
     ];
     const outcomes = await Promise.allSettled(stores.map((s) => s.init()));
@@ -300,9 +306,12 @@
     }
     if (fatal.length > 0) throw fatal[0];
     try {
-      const { getFriends } = await import('$lib/api/friends');
-      const list = await getFriends();
-      retainChatTabs(list.map((f) => f.user_hash));
+      // The friends store has just seeded the list; a second `get_friends`
+      // here only raced it. Fetched only when that seed did not land.
+      const { friendsList, friendsListLoaded, refreshFriendsList } = await import('$lib/stores/friends');
+      const { get: getStore } = await import('svelte/store');
+      const list = friendsListLoaded() ? getStore(friendsList) : await refreshFriendsList();
+      if (list) retainChatTabs(list.map((f) => f.user_hash));
     } catch (e) {
       console.warn('friends: chat-tab reconcile failed', e);
     }
@@ -319,6 +328,7 @@
     // The chat window's shell starts what it needs itself.
     if (chatWindow) return;
     initTheme();
+    const stopStallDetector = startStallDetector();
     const splashStartedAt = performance.now();
     // The splash exists to mask the first paint, not to delay it. Once
     // the stores have initialized we want the app visible immediately;
@@ -810,6 +820,8 @@
           cleanupSearchStore();
           cleanupFriendsStore();
           cleanupChannelsStore();
+          cleanupRoomDmStore();
+          cleanupFeedsStore();
         }
       })
       .catch((e) => {
@@ -818,6 +830,8 @@
         cleanupSearchStore();
         cleanupFriendsStore();
         cleanupChannelsStore();
+        cleanupRoomDmStore();
+        cleanupFeedsStore();
         initError = translateError(e, m.layout_init_failed());
         initialized = true;
         releaseSplashWhenReady();
@@ -841,12 +855,15 @@
       stopActivityReporting();
       if (stopPoll) stopPoll();
       if (stopTransferPoll) stopTransferPoll();
+      stopStallDetector();
       cleanupTheme();
       cleanupNetworkStore();
       cleanupTransferStore();
       cleanupSearchStore();
       cleanupFriendsStore();
       cleanupChannelsStore();
+      cleanupRoomDmStore();
+      cleanupFeedsStore();
       clearAllToasts();
       clearAppSettings();
       if (unlistenClose) unlistenClose();

@@ -95,10 +95,12 @@ pub(in crate::network) async fn on_server_tcp_source_tick(
 
         // Prioritize files with fewer sources; skip files already
         // at the soft source cap (same gate as UDP/KAD sweeps), files
-        // any path asked the server for within the per-file floor, and
-        // files the explicit asks above already put in this frame.
-        all_downloads.retain(|(_, fh, _, sc)| {
+        // any path asked the server for within the per-file floor, files
+        // the explicit asks above already put in this frame, and feed
+        // downloads still waiting on their publisher (`feed_direct`).
+        all_downloads.retain(|(tid, fh, _, sc)| {
             *sc < udp_cap
+                && !crate::network::feed_direct::holds(tid)
                 && server_tcp_srcreq_file_due(&state.server_tcp_srcreq_file_at, fh, srcreq_now)
                 && !frame.iter().any(|(_, queued, _)| queued == fh)
         });

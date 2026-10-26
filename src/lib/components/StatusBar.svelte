@@ -7,7 +7,8 @@
   import { networkStats, serverStatus } from '$lib/stores/network';
   import { getSharedFileCount } from '$lib/api/sharing';
   import { formatBytes, formatNumber, formatLiveSpeed } from '$lib/utils';
-  import { addToast } from '$lib/stores/toast';
+  import { addActionToast, addToast } from '$lib/stores/toast';
+  import { initialDoctorOffer, runDoctorOffer } from '$lib/connectionDoctorOffer';
   import { emberJoinTimedOut } from '$lib/stores/emberJoin';
   import { isUploadCounterPhase } from '$lib/sharedFileStats';
   import { plural } from '$lib/plural';
@@ -126,6 +127,28 @@
     $serverStatus === 'connected' && typeof $networkStats.ed2k_low_id === 'boolean'
       ? ($networkStats.ed2k_low_id ? 'low' : 'high')
       : null,
+  );
+
+  // Hard to reach, on a result rather than an assumption: `firewalled` starts
+  // true for everyone until UPnP and the firewall checks settle, so it alone
+  // would show the link at every launch.
+  const hardToReach = $derived(ed2kId === 'low' || $networkStats.tcp_status === 'Firewalled');
+
+  // Offered once a session, after ten minutes of being hard to reach: by then
+  // the checks that settle it have run, and it is not going away by itself.
+  // `hardToReach` staying true never runs the effect again, so the runner
+  // keeps its own timer for the ten minutes.
+  const doctorOffer = { current: initialDoctorOffer };
+  $effect(() =>
+    runDoctorOffer(doctorOffer, hardToReach, () =>
+      addActionToast(
+        'info',
+        m.doctor_offer(),
+        { label: m.doctor_statusbar_label(), run: () => openPage('/settings?section=network#connection-check') },
+        () => {},
+        15_000,
+      ),
+    ),
   );
 
   function ed2kTitle(status: string, id: 'low' | 'high' | null): string {
@@ -260,6 +283,17 @@
           </span>
         {/if}
       </button>
+      {#if hardToReach}
+        <!-- Where a LowID or a firewall shows, the way to find out why. -->
+        <button
+          type="button"
+          class="status-label doctor-link"
+          title={m.doctor_statusbar_title()}
+          onclick={() => openPage('/settings?section=network#connection-check')}
+        >
+          {m.doctor_statusbar_label()}
+        </button>
+      {/if}
     </div>
     <button
       type="button"
@@ -403,6 +437,12 @@
 
   .ed2k-id.low {
     color: var(--warning);
+  }
+
+  .doctor-link {
+    color: var(--warning);
+    text-decoration: underline dotted;
+    text-underline-offset: 2px;
   }
 
   .shared-count,

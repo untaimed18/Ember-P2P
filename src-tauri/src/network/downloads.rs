@@ -107,7 +107,8 @@ pub(super) fn kad_source_search_may_start(
     // A tick of slack, so a check landing just short of the interval on the
     // periodic sweep does not wait a whole extra sweep.
     const SLACK: std::time::Duration = std::time::Duration::from_secs(1);
-    !state.download_source_searches.values().any(|(t, _)| t == tid)
+    !super::feed_direct::holds(tid)
+        && !state.download_source_searches.values().any(|(t, _)| t == tid)
         && state.active_kad_search_state.get(tid).is_none_or(|&(at, count)| {
             now.saturating_duration_since(at) + SLACK >= kad_source_search_interval(count)
         })
@@ -158,11 +159,18 @@ pub(super) fn expected_aich_bytes(value: Option<&str>) -> Option<[u8; 20]> {
 /// rebuilds from the `.part.met` sidecar on the blocking pool, off the event
 /// loop. That sidecar lags the live tracker, so it can only under-report what we
 /// hold — never advertise a part we would then refuse to serve.
+///
+/// `None` for a feed's download, which is private: a reask of ours says we
+/// hold nothing, so no uploader passes us on as a source of it.
 pub(super) async fn udp_reask_serveable_parts(state: &NetworkState, transfer_id: &str) -> Option<Vec<bool>> {
     /// Short enough that 20 contended datagrams cost well under a second, long
     /// enough that the uncontended case (the overwhelming majority, where the
     /// lock is free and the read returns immediately) never falls back.
     const TRACKER_READ_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
+
+    if crate::sharing::feed_downloads::is_private(transfer_id) {
+        return None;
+    }
 
     let tracker = state.tracker_registry.lock().get(transfer_id).cloned()?;
     // Bound to a `let` rather than returned directly: as a tail expression the
@@ -889,9 +897,11 @@ async fn start_pending_download_worker(
         .collect();
 
     if live_sources.is_empty() && !callback_stream_in_hand {
-        // A mirror from the link is a source too, and needs no peer to start.
+        // A mirror from the link is a source too, and needs no peer to start;
+        // so is a feed's publisher, streamed from.
         if !pending_download_has_parked_ember_sources(state, transfer_id)
             && !ed2k::web_sources::has_ready(&hash_bytes)
+            && !super::feed_direct::stream_ready(transfer_id)
         {
             state
                 .pending_downloads
@@ -1039,7 +1049,7 @@ async fn start_pending_download_worker(
         sources: download_sources,
         download_folders: state.download_folders.clone(),
         user_hash: state.user_hash,
-        nickname: settings.nickname.clone(),
+        nickname: state.shared_nickname.clone(),
         tcp_port: advertised_tcp_port(state),
         udp_port: advertised_udp_port(state),
         bandwidth_limiter: bandwidth_limiter.clone(),

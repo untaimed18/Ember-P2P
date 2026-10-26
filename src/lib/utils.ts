@@ -151,6 +151,36 @@ export function formatNumber(n: number): string {
   return NUMBER_FORMATTER.format(n);
 }
 
+const DECIMAL_FORMATTERS = new Map<number, Intl.NumberFormat>();
+
+/**
+ * A number with exactly `digits` decimals in the app language ("12.5",
+ * "12,5") — the in-app replacement for `n.toFixed(digits)`, which always
+ * prints a point and reads as foreign next to sizes and speeds.
+ */
+export function formatDecimal(n: number, digits: number): string {
+  if (!Number.isFinite(n)) return '\u2014';
+  let formatter = DECIMAL_FORMATTERS.get(digits);
+  if (!formatter) {
+    formatter = new Intl.NumberFormat(APP_LOCALE, {
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    });
+    DECIMAL_FORMATTERS.set(digits, formatter);
+  }
+  return formatter.format(n);
+}
+
+const FILE_NAME_COLLATOR = new Intl.Collator(APP_LOCALE, { numeric: true, sensitivity: 'base' });
+
+/**
+ * The one order file names sort in, on every page: by the app language,
+ * numbers by value ("File2" before "File10"), case and accents ignored.
+ */
+export function compareFileNames(a: string, b: string): number {
+  return FILE_NAME_COLLATOR.compare(a, b);
+}
+
 /** A unix timestamp as date and time in the app language — the in-app
  *  replacement for `new Date(ts * 1000).toLocaleString()`. */
 export function formatDateTime(

@@ -5,6 +5,7 @@
     formatBytes,
     formatCalendarDate,
     formatDateTime,
+    formatDecimal,
     formatNumber,
     formatSpeed as formatRate,
     formatDurationSecs as formatDuration,
@@ -159,9 +160,9 @@
   function formatRatio(ratio: number | null): string {
     if (ratio === null) return '\u2014';
     if (!Number.isFinite(ratio)) return '\u221E';
-    if (ratio >= 100) return ratio.toFixed(0);
-    if (ratio >= 10) return ratio.toFixed(1);
-    return ratio.toFixed(2);
+    if (ratio >= 100) return formatDecimal(ratio, 0);
+    if (ratio >= 10) return formatDecimal(ratio, 1);
+    return formatDecimal(ratio, 2);
   }
 
   let sessionRatioLabel = $derived(formatRatio(sessionRatio));

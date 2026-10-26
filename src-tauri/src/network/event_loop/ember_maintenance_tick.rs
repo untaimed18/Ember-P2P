@@ -80,6 +80,7 @@ pub(in crate::network) async fn on_ember_maintenance_tick(
             identity,
         )
         .await;
+        maybe_publish_channel_settings(udp_socket, state, db, settings).await;
         maybe_publish_owned_rooms_list(udp_socket, state, db, identity).await;
     }
     if settings.ember_native_enabled {
@@ -126,6 +127,8 @@ pub(in crate::network) async fn on_ember_maintenance_tick(
             std::time::Duration::from_secs(60),
         );
         maybe_refresh_channel_moderation(udp_socket, state, db, settings)
+            .await;
+        maybe_refresh_channel_settings(udp_socket, state, db, settings)
             .await;
         maybe_refresh_channel_handoff(udp_socket, state, db, settings)
             .await;

@@ -298,6 +298,1418 @@ mod owner_room_policy_ingest_tests {
 }
 
 #[cfg(test)]
+mod membership_record_v2_tests {
+    use super::{
+        channel_epoch_lookup, ingest_channel_epoch_records, merge_channel_presence_blobs,
+        ChannelEpochIngest,
+    };
+    use crate::network::ember::channel::{self, ChannelIdentity};
+    use crate::network::ember::dht::publish::SignedRecord;
+    use crate::storage::database::Database;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    fn blob(record: &SignedRecord) -> Vec<u8> {
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        blob
+    }
+
+    /// Of a member's two forms stamped alike, the v2 one is what is read; a
+    /// member with only a v1 record is still read; a v2 record whose seal was
+    /// lifted into another pseudonym's record names nobody; and only the
+    /// current secret's records admit.
+    #[test]
+    fn presence_reads_v2_first_and_falls_back_to_v1() {
+        let room = ChannelIdentity::generate();
+        let current = [0x21u8; 32];
+        let retired = [0x20u8; 32];
+        let secrets = [current, retired];
+        let now = 1_800_000_000;
+        let ada = SigningKey::generate(&mut OsRng);
+        let bob = SigningKey::generate(&mut OsRng);
+        let cy = SigningKey::generate(&mut OsRng);
+        let pk = |key: &SigningKey| key.verifying_key().to_bytes();
+
+        let ada_v1 = SignedRecord::channel_presence_v1_at(
+            "ada (v1)", None, room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), false, &[1; 32], &ada, now,
+        );
+        let ada_v2 =
+            SignedRecord::channel_presence_v2_at("ada", Some("ja"), room.channel_id, &current, false, &[2; 32], &ada, now);
+        let bob_v1 = SignedRecord::channel_presence_v1_at(
+            "bob", Some("de"), room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), false, &[3; 32], &bob, now,
+        );
+        let cy_v2 = SignedRecord::channel_presence_v2_at("cy", None, room.channel_id, &retired, false, &[4; 32], &cy, now);
+        let storer = SigningKey::generate(&mut OsRng);
+        let mut lifted = ada_v2.clone();
+        lifted.publisher_key = pk(&storer);
+        lifted.data[73..105].copy_from_slice(&lifted.publisher_key);
+        lifted.signature = crate::network::ember::crypto::sign(&storer, &lifted.data);
+
+        for blobs in [
+            vec![blob(&ada_v2), blob(&ada_v1), blob(&bob_v1), blob(&cy_v2), blob(&lifted)],
+            vec![blob(&ada_v1), blob(&ada_v2), blob(&lifted), blob(&cy_v2), blob(&bob_v1)],
+        ] {
+            let (latest, admits) = merge_channel_presence_blobs(&blobs, &room.channel_id, &secrets, true, now);
+            assert_eq!(latest.len(), 3, "the lifted seal names nobody");
+            assert_eq!(latest[&pk(&ada)].nickname, "ada");
+            assert_eq!(latest[&pk(&ada)].noise_pub, [2; 32]);
+            assert_eq!(latest[&pk(&ada)].language, Some("ja"), "the v2 copy stands");
+            assert_eq!(latest[&pk(&bob)].nickname, "bob");
+            assert_eq!(latest[&pk(&bob)].language, Some("de"));
+            assert_eq!(latest[&pk(&cy)].nickname, "cy");
+            assert_eq!(latest[&pk(&cy)].language, None);
+            assert!(!latest.contains_key(&pk(&storer)));
+            assert!(admits.contains(&pk(&ada)));
+            assert!(!admits.contains(&pk(&bob)), "a v1 record is read but admits nobody in a private room");
+            assert!(!admits.contains(&pk(&cy)), "a retired secret does not admit");
+        }
+
+        // A v1 seal lifted into a record another key signs opens under the
+        // current key, since its AAD names only the room. It must not admit
+        // that key, or the owner would seal the next epoch to it.
+        let mut lifted_v1 = SignedRecord::channel_presence_v1_at(
+            "ada (v1)", None, room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), false, &[1; 32], &storer, now,
+        );
+        lifted_v1.data = ada_v1.data.clone();
+        lifted_v1.publisher_key = pk(&storer);
+        lifted_v1.data[73..105].copy_from_slice(&lifted_v1.publisher_key);
+        lifted_v1.signature = crate::network::ember::crypto::sign(&storer, &lifted_v1.data);
+        let (latest, admits) =
+            merge_channel_presence_blobs(&[blob(&lifted_v1)], &room.channel_id, &secrets, true, now);
+        assert!(latest.contains_key(&pk(&storer)), "the copied seal still opens");
+        assert!(!admits.contains(&pk(&storer)), "but proves nothing about its signer");
+        let (_, admits) = merge_channel_presence_blobs(&[blob(&bob_v1)], &room.channel_id, &secrets, false, now);
+        assert!(admits.contains(&pk(&bob)), "a public room's v1 record still admits");
+
+        // A v1 record that is neither flagged private nor sealed — a bare
+        // 32-byte extra, which anyone who knows the room's id and pubkey can
+        // sign under a fresh key — is no member of a private room, and above
+        // all no proof of its current key. A public room still reads it.
+        let mallory = SigningKey::generate(&mut OsRng);
+        let forged = SignedRecord::channel_presence_v1_at(
+            "mallory", None, room.channel_id, room.pubkey, &current, false, channel::presence_epoch(now), false, &[9; 32], &mallory, now,
+        );
+        let (latest, admits) = merge_channel_presence_blobs(&[blob(&forged)], &room.channel_id, &secrets, true, now);
+        assert!(latest.is_empty(), "not read in a private room");
+        assert!(!admits.contains(&pk(&mallory)), "and never as holding the current key");
+        let (latest, _) = merge_channel_presence_blobs(&[blob(&forged)], &room.channel_id, &secrets, false, now);
+        assert!(latest.contains_key(&pk(&mallory)), "the public shape, in a public room");
+
+        // A newer v1 leave beats an older v2 announce: the merge is by member.
+        let ada_left = SignedRecord::channel_presence_v1_at(
+            "ada", None, room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), true, &[1; 32], &ada, now + 5,
+        );
+        let (latest, _) =
+            merge_channel_presence_blobs(&[blob(&ada_v2), blob(&ada_left)], &room.channel_id, &secrets, true, now + 5);
+        assert!(latest[&pk(&ada)].departed);
+    }
+
+    fn temp_db(name: &str) -> (std::path::PathBuf, Database) {
+        let path = std::env::temp_dir().join(format!(
+            "ember-membership-v2-{name}-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        (path.clone(), Database::open_at(&path).expect("open db"))
+    }
+
+    fn identity(seed: [u8; 32]) -> crate::storage::identity::NodeIdentity {
+        let public = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        crate::storage::identity::NodeIdentity {
+            kad_id: [0; 16],
+            user_hash: [0; 16],
+            udp_key_seed: 0,
+            ember_hash: channel::channel_id_from_pubkey(&public),
+            ed25519_secret_key: seed,
+            ed25519_public_key: public,
+            noise_private_key: [0; 32],
+            noise_public_key: [0; 32],
+            intro_secret: [0; crate::network::ember::crypto::INTRO_SECRET_LEN],
+        }
+    }
+
+    fn remove(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A room at epoch 4 whose owner signs with `OWNER_SEED`, and the secret
+    /// of each epoch.
+    const OWNER_SEED: [u8; 32] = [0x0Au8; 32];
+    const SECRETS: [[u8; 32]; 5] = [[0x30; 32], [0x31; 32], [0x32; 32], [0x33; 32], [0x34; 32]];
+
+    /// A member's device in `room`: joined with epoch 0's secret, told of
+    /// epoch 4 by the owner's snapshot, holding `held` besides.
+    fn member_device(name: &str, room: &ChannelIdentity, held: &[i64]) -> (std::path::PathBuf, Database) {
+        let (path, db) = temp_db(name);
+        let id_hex = hex::encode(room.channel_id);
+        let owner_pub = SigningKey::from_bytes(&OWNER_SEED).verifying_key().to_bytes();
+        db.insert_channel(&id_hex, &hex::encode(room.pubkey), "Den", "private", false, None, Some(&SECRETS[0]))
+            .expect("insert channel");
+        db.apply_channel_moderation(&id_hex, "", "", 1_000, &[], &[], Some(&owner_pub), None, None, Some(4), None, None)
+            .expect("owner known");
+        for &epoch in held {
+            db.insert_channel_key_epoch(&id_hex, epoch, &SECRETS[epoch as usize]).expect("held epoch");
+        }
+        (path, db)
+    }
+
+    /// The owner's copy of `epoch` for `member`, every form it publishes,
+    /// as blobs: what a rotation, a renewal and an unban's re-seal all send.
+    fn owner_publishes(room: &ChannelIdentity, member: &[u8; 32], epoch: i64, key: &[u8; 32]) -> Vec<SignedRecord> {
+        let wrap = channel::derive_channel_epoch_secret(&OWNER_SEED, member, &room.channel_id, epoch).unwrap();
+        let blind = channel::epoch_blind(&OWNER_SEED, member, &room.channel_id).unwrap();
+        let sealed = channel::seal_channel_key_epoch(&wrap, &room.channel_id, epoch, key);
+        SignedRecord::channel_key_epoch_forms(
+            room.channel_id, room.pubkey, member, false, epoch, &blind, &sealed, &room.signing_key,
+        )
+    }
+
+    fn v2_only(records: &[SignedRecord]) -> Vec<Vec<u8>> {
+        records
+            .iter()
+            .filter(|r| r.channel.as_ref().unwrap().flags & crate::network::ember::dht::publish::CHANNEL_FLAG_BLINDED != 0)
+            .map(blob)
+            .collect()
+    }
+
+    /// A member several epochs behind computes its own v2 record's key for
+    /// the room's current epoch from the owner's key alone and opens it, then
+    /// looks up the newest epoch it still misses; a v1 record is still read.
+    #[test]
+    fn a_member_several_epochs_behind_finds_its_current_v2_record_directly() {
+        let room = ChannelIdentity::generate();
+        let id_hex = hex::encode(room.channel_id);
+        let ada = identity([0x0Bu8; 32]);
+        let (path, db) = member_device("behind", &room, &[]);
+        let lookup = |db: &Database| {
+            let ch = db.get_channel(&id_hex).unwrap().unwrap();
+            channel_epoch_lookup(db, &ada.ed25519_secret_key, &ada.ed25519_public_key, &ch, &room.channel_id)
+        };
+
+        let published = owner_publishes(&room, &ada.ed25519_public_key, 4, &SECRETS[4]);
+        let (target, keys) = lookup(&db).expect("epoch 4 is missing");
+        assert_eq!(target, 4);
+        assert_eq!(keys, published.iter().map(|r| r.keyword_hash).collect::<Vec<_>>(), "v2 key, then v1");
+        assert_eq!(
+            ingest_channel_epoch_records(&db, &ada, room.channel_id, 4, &v2_only(&published)),
+            ChannelEpochIngest::Rekeyed
+        );
+        assert_eq!(db.load_channel_key_epochs(&id_hex).unwrap()[0], (4, SECRETS[4]));
+
+        // The epochs in between, newest first, each under its own key.
+        let (target, keys) = lookup(&db).unwrap();
+        assert_eq!(target, 3);
+        let three = owner_publishes(&room, &ada.ed25519_public_key, 3, &SECRETS[3]);
+        assert_eq!(keys[0], three[0].keyword_hash);
+        // v1 alone, as a 1.7.4 owner or storer leaves it, is still read.
+        assert_eq!(
+            ingest_channel_epoch_records(&db, &ada, room.channel_id, 3, &[blob(&three[1])]),
+            ChannelEpochIngest::Rekeyed
+        );
+        assert_eq!(lookup(&db).unwrap().0, 2);
+        for epoch in [2, 1] {
+            let records = owner_publishes(&room, &ada.ed25519_public_key, epoch, &SECRETS[epoch as usize]);
+            assert_eq!(
+                ingest_channel_epoch_records(&db, &ada, room.channel_id, epoch, &v2_only(&records)),
+                ChannelEpochIngest::Rekeyed
+            );
+        }
+        assert_eq!(lookup(&db), None, "nothing left to look up");
+
+        drop(db);
+        remove(&path);
+    }
+
+    /// A member whose copy of a rotation was never published opens the
+    /// owner's renewal, and one unbanned after rotations it was left out of
+    /// opens the re-seal: neither needs any epoch it does not hold.
+    #[test]
+    fn a_missed_rotation_and_an_unban_after_several_rotations_both_open_the_current_record() {
+        let room = ChannelIdentity::generate();
+        // Bob held epoch 2; the publish of epoch 3 to him failed, and epoch
+        // 4's arrives as the owner's renewal.
+        let bob = identity([0x0Cu8; 32]);
+        let (bob_path, bob_db) = member_device("missed", &room, &[1, 2]);
+        // Cy was banned before epoch 2, so 2 and 3 were sealed to everyone but
+        // him; the unban re-seals epoch 4.
+        let cy = identity([0x0Du8; 32]);
+        let (cy_path, cy_db) = member_device("unbanned", &room, &[1]);
+
+        for (member, db) in [(&bob, &bob_db), (&cy, &cy_db)] {
+            let ch = db.get_channel(&hex::encode(room.channel_id)).unwrap().unwrap();
+            let (target, keys) = channel_epoch_lookup(
+                db,
+                &member.ed25519_secret_key,
+                &member.ed25519_public_key,
+                &ch,
+                &room.channel_id,
+            )
+            .unwrap();
+            assert_eq!(target, 4);
+            let current = owner_publishes(&room, &member.ed25519_public_key, 4, &SECRETS[4]);
+            assert_eq!(keys[0], current[0].keyword_hash);
+            assert_eq!(
+                ingest_channel_epoch_records(db, member, room.channel_id, 4, &v2_only(&current)),
+                ChannelEpochIngest::Rekeyed
+            );
+        }
+
+        drop(bob_db);
+        drop(cy_db);
+        remove(&bob_path);
+        remove(&cy_path);
+    }
+
+    /// Of copies signed the same second, v2 is the one taken; a v2 record is
+    /// read only in its own slot, under the key a storer recomputes; and
+    /// another member's record is not ours.
+    #[test]
+    fn epoch_records_read_v2_first_and_only_where_they_are_filed() {
+        let room = ChannelIdentity::generate();
+        let ada = identity([0x0Bu8; 32]);
+        let (path, db) = member_device("v2-first", &room, &[]);
+        let record = |epoch: i64, key: &[u8; 32], blinded: bool, at: i64| {
+            let wrap = channel::derive_channel_epoch_secret(
+                &OWNER_SEED,
+                &ada.ed25519_public_key,
+                &room.channel_id,
+                epoch,
+            )
+            .unwrap();
+            let blind = channel::epoch_blind(&OWNER_SEED, &ada.ed25519_public_key, &room.channel_id).unwrap();
+            let sealed = channel::seal_channel_key_epoch(&wrap, &room.channel_id, epoch, key);
+            SignedRecord::channel_key_epoch_at(
+                room.channel_id,
+                room.pubkey,
+                &ada.ed25519_public_key,
+                blinded.then_some(&blind),
+                epoch,
+                &sealed,
+                &room.signing_key,
+                at,
+            )
+        };
+
+        // Signed by the room key and sealed to Ada, but filed under epoch 3's
+        // key: refused by the parse, as by a storer.
+        let genuine = record(4, &SECRETS[4], true, 2_000);
+        let mut misfiled = genuine.clone();
+        misfiled.keyword_hash = record(3, &SECRETS[4], true, 2_000).keyword_hash;
+        misfiled.data[1..17].copy_from_slice(&misfiled.keyword_hash);
+        misfiled.signature = crate::network::ember::crypto::sign(&room.signing_key, &misfiled.data);
+        assert!(!misfiled.channel_store_ok());
+        assert_eq!(
+            ingest_channel_epoch_records(&db, &ada, room.channel_id, 4, &[blob(&misfiled)]),
+            ChannelEpochIngest::Nothing
+        );
+
+        // The v1 copy signed the same second carries another key: v2 wins.
+        let decoy = [0x99u8; 32];
+        assert_eq!(
+            ingest_channel_epoch_records(
+                &db,
+                &ada,
+                room.channel_id,
+                4,
+                &[blob(&record(4, &decoy, false, 2_000)), blob(&genuine)],
+            ),
+            ChannelEpochIngest::Rekeyed
+        );
+        assert_eq!(db.load_channel_key_epochs(&hex::encode(room.channel_id)).unwrap()[0], (4, SECRETS[4]));
+
+        // A v2 record sealed to someone else's slot is not ours.
+        let other = identity([0x0Eu8; 32]);
+        let (other_path, other_db) = member_device("v2-other", &room, &[]);
+        assert_eq!(
+            ingest_channel_epoch_records(&other_db, &other, room.channel_id, 4, &[blob(&genuine)]),
+            ChannelEpochIngest::Nothing
+        );
+
+        drop(db);
+        drop(other_db);
+        remove(&path);
+        remove(&other_path);
+    }
+}
+
+#[cfg(test)]
+mod channel_settings_ingest_tests {
+    use super::{
+        ingest_channel_settings_records, own_channel_settings, owner_publishes_channel_settings,
+        private_room_admission,
+    };
+    use crate::network::ember::channel::{
+        chat_author_joins_gossip_roster, ChannelIdentity, OpenedUnder, RosterAdmission,
+        CHANNEL_MSG_TTL_DEFAULT,
+    };
+    use crate::network::ember::dht::publish::SignedRecord;
+    use crate::storage::database::Database;
+
+    fn blob(ident: &ChannelIdentity, commitments: &[(i64, [u8; 32])], at: i64) -> Vec<u8> {
+        blob_admitting(ident, commitments, 0, at)
+    }
+
+    fn blob_admitting(
+        ident: &ChannelIdentity,
+        commitments: &[(i64, [u8; 32])],
+        admission: u8,
+        at: i64,
+    ) -> Vec<u8> {
+        let record = SignedRecord::channel_settings_at(
+            commitments,
+            admission,
+            ident.channel_id,
+            ident.pubkey,
+            true,
+            &ident.signing_key,
+            at,
+        )
+        .expect("fits");
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        blob
+    }
+
+    /// The newest record among those found is held, a later lookup that finds
+    /// older ones or none changes nothing, and a record from any key but the
+    /// room's is never held.
+    #[test]
+    fn the_newest_settings_record_is_held_and_absence_changes_nothing() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-room-settings-ingest-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let ident = ChannelIdentity::generate();
+        let id_hex = hex::encode(ident.channel_id);
+        db.insert_channel(&id_hex, &hex::encode(ident.pubkey), "Den", "private", false, None, Some(&[3u8; 32]))
+            .expect("insert channel");
+
+        let one = [(1, [0x01; 32])];
+        let two = [(2, [0x02; 32]), (1, [0x01; 32])];
+        assert!(ingest_channel_settings_records(
+            &db,
+            ident.channel_id,
+            &[blob(&ident, &one, 1_000), blob(&ident, &two, 1_001), b"junk".to_vec()],
+        ));
+        assert_eq!(db.channel_settings(&id_hex).unwrap().unwrap().key_commitments, two.to_vec());
+
+        assert!(!ingest_channel_settings_records(&db, ident.channel_id, &[blob(&ident, &one, 1_000)]));
+        assert!(!ingest_channel_settings_records(&db, ident.channel_id, &[]));
+        let held = db.channel_settings(&id_hex).unwrap().unwrap();
+        assert_eq!((held.signed_at, held.key_commitments), (1_001, two.to_vec()));
+
+        // Another room's record, even one newer, is not this room's.
+        let other = ChannelIdentity::generate();
+        assert!(!ingest_channel_settings_records(&db, ident.channel_id, &[blob(&other, &one, 2_000)]));
+        assert_eq!(db.channel_settings(&id_hex).unwrap().unwrap().signed_at, 1_001);
+
+        let three = [(3, [0x03; 32]), (2, [0x02; 32]), (1, [0x01; 32])];
+        assert!(ingest_channel_settings_records(&db, ident.channel_id, &[blob(&ident, &three, 1_002)]));
+        assert_eq!(db.channel_settings(&id_hex).unwrap().unwrap().key_commitments, three.to_vec());
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    fn temp_db(name: &str) -> (std::path::PathBuf, Database) {
+        let path = std::env::temp_dir().join(format!(
+            "ember-room-settings-{name}-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        (path, db)
+    }
+
+    fn remove(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A member holds a private room's chat lines to the newest settings
+    /// record it holds: none held is the rule before 1.7.5, a held tag 2 of 1
+    /// or any value it does not know closes chat admission, and a newer record
+    /// without it opens it again. The owner applies its own rule with nothing
+    /// held.
+    #[test]
+    fn the_held_settings_record_decides_whether_a_chat_line_admits() {
+        let (path, db) = temp_db("admission");
+        let ident = ChannelIdentity::generate();
+        let id_hex = hex::encode(ident.channel_id);
+        db.insert_channel(&id_hex, &hex::encode(ident.pubkey), "Den", "private", false, None, Some(&[3u8; 32]))
+            .expect("insert channel");
+        let now = 1_800_000_000;
+        let fresh_line = |admission| {
+            chat_author_joins_gossip_roster(
+                true,
+                admission,
+                OpenedUnder::Current,
+                CHANNEL_MSG_TTL_DEFAULT,
+                now,
+                now,
+            )
+        };
+
+        assert_eq!(private_room_admission(&db, &id_hex, false), RosterAdmission::Open);
+        assert!(fresh_line(private_room_admission(&db, &id_hex, false)), "nothing held: unchanged");
+
+        assert!(ingest_channel_settings_records(&db, ident.channel_id, &[blob_admitting(&ident, &[], 1, 1_000)]));
+        assert_eq!(db.channel_settings(&id_hex).unwrap().unwrap().admission, 1);
+        assert_eq!(private_room_admission(&db, &id_hex, false), RosterAdmission::KeyProven);
+        assert!(!fresh_line(private_room_admission(&db, &id_hex, false)));
+
+        assert!(ingest_channel_settings_records(&db, ident.channel_id, &[blob_admitting(&ident, &[], 0xC8, 1_001)]));
+        assert_eq!(db.channel_settings(&id_hex).unwrap().unwrap().admission, 0xC8);
+        assert_eq!(
+            private_room_admission(&db, &id_hex, false),
+            RosterAdmission::KeyProven,
+            "a value this build does not know reads as the strict rule"
+        );
+
+        assert!(ingest_channel_settings_records(&db, ident.channel_id, &[blob(&ident, &[], 1_002)]));
+        assert_eq!(private_room_admission(&db, &id_hex, false), RosterAdmission::Open, "the owner left it out");
+        assert!(!ingest_channel_settings_records(&db, ident.channel_id, &[]));
+        assert_eq!(private_room_admission(&db, &id_hex, false), RosterAdmission::Open, "absence is no reset");
+
+        let owned = ChannelIdentity::generate();
+        let owned_hex = hex::encode(owned.channel_id);
+        db.insert_channel(&owned_hex, &hex::encode(owned.pubkey), "Ours", "private", true, Some(&[4u8; 32]), Some(&[5u8; 32]))
+            .expect("insert owned channel");
+        assert_eq!(db.channel_settings(&owned_hex).unwrap(), None);
+        assert_eq!(private_room_admission(&db, &owned_hex, true), RosterAdmission::OWNED_PRIVATE_ROOM);
+
+        drop(db);
+        remove(&path);
+    }
+
+    /// Tag 2 gives every private room something to state, so an owner
+    /// publishes for one that has never rotated, with no commitments; a
+    /// public room still publishes nothing.
+    #[test]
+    fn an_owner_publishes_tag_2_for_a_room_that_never_rotated_and_nothing_for_a_public_one() {
+        let (path, db) = temp_db("owner-publish");
+        let private = ChannelIdentity::generate();
+        let private_hex = hex::encode(private.channel_id);
+        db.insert_channel(&private_hex, &hex::encode(private.pubkey), "Ours", "private", true, Some(&[6u8; 32]), Some(&[7u8; 32]))
+            .expect("insert private channel");
+        let public = ChannelIdentity::generate();
+        let public_hex = hex::encode(public.channel_id);
+        db.insert_channel(&public_hex, &hex::encode(public.pubkey), "Open", "public", true, Some(&[8u8; 32]), None)
+            .expect("insert public channel");
+
+        let row = db.get_channel(&private_hex).unwrap().unwrap();
+        assert_eq!(row.key_epoch, 0, "never rotated");
+        assert!(owner_publishes_channel_settings(&row));
+        let epochs = db.load_channel_key_epochs(&private_hex).unwrap();
+        assert!(epochs.iter().all(|(epoch, _)| *epoch == 0));
+        let (commitments, admission) = own_channel_settings(&private.channel_id, &epochs);
+        assert!(commitments.is_empty(), "epoch 0 has nothing to commit to");
+        assert_eq!(admission, RosterAdmission::KeyProven);
+        let record = SignedRecord::channel_settings_at(
+            &commitments,
+            admission.setting(),
+            private.channel_id,
+            private.pubkey,
+            true,
+            &private.signing_key,
+            1_000,
+        )
+        .unwrap();
+        let mut published = record.data.clone();
+        published.extend_from_slice(&record.signature);
+        let parsed = SignedRecord::parse_channel_settings(&published, &private.channel_id).unwrap();
+        assert_eq!(parsed.admission, 1);
+        assert!(parsed.key_commitments.is_empty());
+
+        let rotated = [(2, [0x22; 32]), (1, [0x11; 32]), (0, [7u8; 32])];
+        let (commitments, _) = own_channel_settings(&private.channel_id, &rotated);
+        assert_eq!(commitments.iter().map(|(epoch, _)| *epoch).collect::<Vec<_>>(), vec![2, 1]);
+
+        assert!(!owner_publishes_channel_settings(&db.get_channel(&public_hex).unwrap().unwrap()));
+        let joined = ChannelIdentity::generate();
+        let joined_hex = hex::encode(joined.channel_id);
+        db.insert_channel(&joined_hex, &hex::encode(joined.pubkey), "Theirs", "private", false, None, Some(&[9u8; 32]))
+            .expect("insert joined channel");
+        assert!(
+            !owner_publishes_channel_settings(&db.get_channel(&joined_hex).unwrap().unwrap()),
+            "only the owner speaks for a room"
+        );
+
+        drop(db);
+        remove(&path);
+    }
+}
+
+#[cfg(test)]
+mod channel_settings_schedule_tests {
+    use super::{
+        channel_settings_publish_plan, channel_settings_read_due, note_owned_rooms_read_ended,
+        owned_rooms_publish_gate, owned_rooms_publish_waits, owned_rooms_read_asked_at,
+        owned_rooms_read_still_wanted, owned_rooms_read_test_lock, owner_publishes_channel_settings,
+        owner_republish_held_back, read_owned_channel_settings, reset_owned_rooms_read_times,
+        rearm_abandoned_settings_lookup, settings_fetch_rides_pass, settings_lookup_backoff_allows,
+        settings_owed_after_pass, ChannelSettingsPublished, OwnedChannelSettingsRead, RestoringRoom,
+        RotatingRoom, SettingsLookupBackoff, CHANNEL_SETTINGS_CONFIRM_SECS,
+        CHANNEL_SETTINGS_HELD_BACK_SECS, OWNED_ROOMS_READ_FRESH_SECS, OWNED_ROOMS_READ_WAIT_SECS,
+        SETTINGS_LOOKUP_BACKOFF_MAX_SECS,
+    };
+    use crate::network::ember::channel::{content_key, key_commitment, ChannelIdentity, MODERATION_REPUBLISH_SECS};
+    use crate::network::ember::dht::publish::SignedRecord;
+    use crate::storage::database::{Database, HeldChannelSettings};
+    use std::collections::{HashMap, HashSet};
+
+    fn temp_db(name: &str) -> (std::path::PathBuf, Database) {
+        let path = std::env::temp_dir().join(format!(
+            "ember-settings-schedule-{name}-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        (path, db)
+    }
+
+    fn remove(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    fn owned_room(db: &Database, visibility: &str) -> ChannelIdentity {
+        let ident = ChannelIdentity::generate();
+        db.insert_channel(
+            &hex::encode(ident.channel_id),
+            &hex::encode(ident.pubkey),
+            "Ours",
+            visibility,
+            true,
+            Some(&ident.seed()),
+            (visibility == "private").then_some(&[7u8; 32]),
+        )
+        .expect("insert owned channel");
+        ident
+    }
+
+    fn held(commitments: &[(i64, [u8; 32])]) -> HeldChannelSettings {
+        HeldChannelSettings {
+            signed_at: 1,
+            signature: [1; 64],
+            key_commitments: commitments.to_vec(),
+            admission: 1,
+        }
+    }
+
+    /// [`read_owned_channel_settings`] at the room's key generation as it
+    /// stands, read again when another test's key write moves the slot the
+    /// room shares under the read.
+    fn read_now(
+        db: &Database,
+        ident: &ChannelIdentity,
+        last: Option<&[(i64, [u8; 32])]>,
+        schedule_due: bool,
+        now: i64,
+    ) -> OwnedChannelSettingsRead {
+        let id_hex = hex::encode(ident.channel_id);
+        for _ in 0..8 {
+            let generation = db.channel_key_generation(&id_hex);
+            let read = read_owned_channel_settings(db, ident.channel_id, generation, last, schedule_due, now);
+            if !matches!(read, OwnedChannelSettingsRead::HeldBack) || db.channel_key_generation(&id_hex) == generation {
+                return read;
+            }
+        }
+        panic!("the key generation kept moving");
+    }
+
+    /// The settings lookup rides every third moderation pass, the first
+    /// included, and only for a private room this device does not own.
+    #[test]
+    fn settings_ride_every_third_moderation_pass_of_a_room_this_device_reads() {
+        let (path, db) = temp_db("rides");
+        let member = ChannelIdentity::generate();
+        let member_hex = hex::encode(member.channel_id);
+        db.insert_channel(&member_hex, &hex::encode(member.pubkey), "Den", "private", false, None, Some(&[3u8; 32]))
+            .unwrap();
+        let public = ChannelIdentity::generate();
+        let public_hex = hex::encode(public.channel_id);
+        db.insert_channel(&public_hex, &hex::encode(public.pubkey), "Hall", "public", false, None, None)
+            .unwrap();
+        let owned = owned_room(&db, "private");
+        let row = |id: &str| db.get_channel(id).unwrap().unwrap();
+
+        let rides: Vec<u64> = (0..9).filter(|pass| settings_fetch_rides_pass(*pass, &row(&member_hex))).collect();
+        assert_eq!(rides, vec![0, 3, 6]);
+        for pass in 0..9 {
+            assert!(!settings_fetch_rides_pass(pass, &row(&public_hex)), "a public room states nothing");
+            assert!(
+                !settings_fetch_rides_pass(pass, &row(&hex::encode(owned.channel_id))),
+                "an owner applies its own"
+            );
+        }
+
+        drop(db);
+        remove(&path);
+    }
+
+    /// A moderation pass asks for the settings record at once when its
+    /// snapshot named a newer epoch, and on every pass after while this device
+    /// is behind and holds no commitment to the epoch it is behind on.
+    #[test]
+    fn a_pass_asks_for_settings_at_once_while_the_announced_epoch_is_uncommitted() {
+        let (path, db) = temp_db("owed");
+        let ident = ChannelIdentity::generate();
+        let id_hex = hex::encode(ident.channel_id);
+        db.insert_channel(&id_hex, &hex::encode(ident.pubkey), "Den", "private", false, None, Some(&[3u8; 32]))
+            .unwrap();
+        db.insert_channel_key_epoch(&id_hex, 1, &[1u8; 32]).unwrap();
+        let row = || db.get_channel(&id_hex).unwrap().unwrap();
+        let committed = |epochs: &[i64]| held(&epochs.iter().map(|epoch| (*epoch, [*epoch as u8; 32])).collect::<Vec<_>>());
+
+        assert!(!settings_owed_after_pass(Some(0), &row(), None), "not behind, nothing new");
+
+        assert!(db
+            .apply_channel_moderation(&id_hex, "", "", 10, &[], &[], None, None, None, Some(3), None, None)
+            .unwrap());
+        assert!(settings_owed_after_pass(Some(0), &row(), None), "the snapshot named a newer epoch");
+        assert!(settings_owed_after_pass(Some(3), &row(), None), "behind, with no record held");
+        assert!(settings_owed_after_pass(Some(3), &row(), Some(&committed(&[2, 1]))), "behind, uncommitted");
+        assert!(!settings_owed_after_pass(Some(3), &row(), Some(&committed(&[3, 2]))), "the commitment is held");
+        assert!(!settings_owed_after_pass(None, &row(), Some(&committed(&[3]))));
+
+        db.insert_channel_key_epoch(&id_hex, 3, &[3u8; 32]).unwrap();
+        assert!(!settings_owed_after_pass(Some(3), &row(), Some(&committed(&[2, 1]))), "caught up");
+
+        let owned = owned_room(&db, "private");
+        let owned_row = db.get_channel(&hex::encode(owned.channel_id)).unwrap().unwrap();
+        assert!(!settings_owed_after_pass(Some(-1), &owned_row, None), "an owner fetches none");
+
+        drop(db);
+        remove(&path);
+    }
+
+    /// A lookup given up on before it finished leaves its room owed one, so
+    /// the next settings pass asks again.
+    #[test]
+    fn an_abandoned_settings_lookup_is_owed_again() {
+        let room = [0x5Au8; 16];
+        let mut searches = HashMap::from([(7u32, room), (8u32, [0x5Bu8; 16])]);
+        let mut owed = HashSet::new();
+        rearm_abandoned_settings_lookup(&mut searches, &mut owed, 7);
+        assert!(owed.contains(&room));
+        assert!(!searches.contains_key(&7));
+        assert!(searches.contains_key(&8), "other lookups stay");
+        rearm_abandoned_settings_lookup(&mut searches, &mut owed, 99);
+        assert_eq!(owed.len(), 1, "an unknown search owes nothing");
+    }
+
+    /// A room owed lookups after its passes gets the first at once and the
+    /// next a pass later, then each twice as long after the one before, up to
+    /// the cap; a move of its epochs or a record landing starts over.
+    #[test]
+    fn lookups_owed_after_passes_back_off_while_nothing_answers() {
+        let pass = crate::network::ember::channel::MODERATION_FETCH_SECS;
+        let room = [0x61u8; 16];
+        let mut backoff = SettingsLookupBackoff::default();
+        let now = 1_800_000_000;
+        // A pass every five minutes for two days, each a few seconds late.
+        let asked: Vec<i64> = (0..576)
+            .map(|n| now + n * pass + n % 7)
+            .filter(|at| settings_lookup_backoff_allows(&mut backoff, room, (3, 1), *at))
+            .collect();
+        let gaps: Vec<i64> = asked.windows(2).map(|w| (w[1] - w[0] + pass / 2) / pass * pass).collect();
+        assert_eq!(&gaps[..4], &[pass, 2 * pass, 4 * pass, 8 * pass], "{asked:?}");
+        assert!(gaps.windows(2).all(|w| w[1] >= w[0]), "never sooner than the last wait: {gaps:?}");
+        let last = *gaps.last().unwrap();
+        assert!(
+            (SETTINGS_LOOKUP_BACKOFF_MAX_SECS - pass..=SETTINGS_LOOKUP_BACKOFF_MAX_SECS + pass).contains(&last),
+            "capped at six hours: {gaps:?}"
+        );
+
+        let later = *asked.last().unwrap() + pass;
+        assert!(!settings_lookup_backoff_allows(&mut backoff, room, (3, 1), later));
+        assert!(settings_lookup_backoff_allows(&mut backoff, room, (4, 1), later), "a newer epoch announced");
+        assert!(!settings_lookup_backoff_allows(&mut backoff, room, (4, 1), later + 1));
+        backoff.forget(&room);
+        assert!(settings_lookup_backoff_allows(&mut backoff, room, (4, 1), later + 2), "a record landed");
+        assert!(
+            settings_lookup_backoff_allows(&mut backoff, [0x62u8; 16], (4, 1), later + 2),
+            "each room on its own"
+        );
+
+        backoff.retain_rooms(|id| *id == room);
+        assert!(!settings_lookup_backoff_allows(&mut backoff, room, (4, 1), later + 3), "a room kept keeps its wait");
+        assert_eq!(backoff.0.len(), 1, "a room left is dropped");
+    }
+
+    /// The owned-rooms list goes out only on a recent look at the network's
+    /// copy. Without one it waits, for a look that then ends however it
+    /// ends, or for a bounded time when none does.
+    #[test]
+    fn the_owned_rooms_list_goes_out_only_after_a_recent_look() {
+        let now = 1_800_000_000;
+        assert!(owned_rooms_publish_waits(0, 0, now), "no look this launch");
+        assert!(!owned_rooms_publish_waits(now - 60, 0, now), "the look ahead of a scheduled publish");
+        assert!(!owned_rooms_publish_waits(now - OWNED_ROOMS_READ_FRESH_SECS, 0, now));
+        let stale = now - 3 * 3_600;
+        assert!(owned_rooms_publish_waits(stale, 0, now), "the last look was hours ago: ask for one");
+        let asked = now;
+        assert!(owned_rooms_publish_waits(stale, asked, asked + 30), "the look asked for is under way");
+        assert!(!owned_rooms_publish_waits(asked + 1, asked, asked + 90), "it ended, read or not");
+        assert!(owned_rooms_publish_waits(stale, asked, asked + OWNED_ROOMS_READ_WAIT_SECS - 1));
+        assert!(
+            !owned_rooms_publish_waits(stale, asked, asked + OWNED_ROOMS_READ_WAIT_SECS),
+            "a look that never comes holds it back only so long"
+        );
+        let long_after = asked + OWNED_ROOMS_READ_WAIT_SECS + OWNED_ROOMS_READ_FRESH_SECS;
+        assert!(
+            owned_rooms_publish_waits(stale, asked, long_after),
+            "an ask left by a publish that never went is no ask"
+        );
+    }
+
+    /// A publish that waits asks for a look once. Its ask is dropped when the
+    /// list is no longer due, so a publish due hours later asks for a look of
+    /// its own rather than going out on the old ask.
+    #[test]
+    fn a_publish_no_longer_due_drops_its_ask_for_a_look() {
+        let _serial = owned_rooms_read_test_lock().blocking_lock();
+        reset_owned_rooms_read_times();
+        let now = 1_800_000_000;
+        assert!(!owned_rooms_publish_gate(true, now), "no look this launch");
+        assert_eq!(owned_rooms_read_asked_at(), now);
+        assert!(!owned_rooms_publish_gate(true, now + 30));
+        assert_eq!(owned_rooms_read_asked_at(), now, "asked once");
+
+        // The room that made the list due is deleted within the wait.
+        assert!(!owned_rooms_publish_gate(false, now + 60));
+        assert_eq!(owned_rooms_read_asked_at(), 0);
+        let later = now + 3 * 3_600;
+        assert!(!owned_rooms_publish_gate(true, later), "waits on a look of its own");
+        assert_eq!(owned_rooms_read_asked_at(), later);
+
+        // An ask left behind all the same is too old to let a publish go.
+        reset_owned_rooms_read_times();
+        assert!(!owned_rooms_publish_gate(true, now));
+        let much_later = now + 5 * 3_600;
+        assert!(!owned_rooms_publish_gate(true, much_later));
+        assert_eq!(owned_rooms_read_asked_at(), much_later, "asked again");
+        assert!(owned_rooms_publish_gate(true, much_later + OWNED_ROOMS_READ_WAIT_SECS));
+        assert_eq!(owned_rooms_read_asked_at(), 0, "gone out");
+        reset_owned_rooms_read_times();
+    }
+
+    /// The read loop, woken by a publish, looks only when no recent look has
+    /// ended since: one already under way when the publish asked serves it.
+    #[test]
+    fn a_look_under_way_when_a_publish_asks_serves_it() {
+        let _serial = owned_rooms_read_test_lock().blocking_lock();
+        reset_owned_rooms_read_times();
+        let now = chrono::Utc::now().timestamp();
+        assert!(!owned_rooms_publish_gate(true, now));
+        assert!(owned_rooms_read_still_wanted(now));
+        note_owned_rooms_read_ended(now - 120);
+        assert!(!owned_rooms_read_still_wanted(now + 1));
+        assert!(owned_rooms_publish_gate(true, now + 1));
+        assert!(owned_rooms_read_still_wanted(now + OWNED_ROOMS_READ_FRESH_SECS), "that look has gone stale");
+        reset_owned_rooms_read_times();
+    }
+
+    /// The owner loop signs nothing for a room whose rotation has stored its
+    /// key and not committed yet, nor for one a recovery is putting back.
+    #[test]
+    fn the_owner_loop_leaves_a_rotating_room_alone() {
+        let (path, db) = temp_db("rotating-owner");
+        let ident = owned_room(&db, "private");
+        let id_hex = hex::encode(ident.channel_id);
+        assert!(!owner_republish_held_back(&db, &id_hex));
+
+        let rotating = RotatingRoom::begin(&id_hex);
+        db.insert_channel_key_epoch(&id_hex, 1, &[0x11; 32]).unwrap();
+        assert!(owner_republish_held_back(&db, &id_hex), "the new epoch may yet be taken back");
+        db.rollback_channel_key_epoch(&id_hex, 1).unwrap();
+        drop(rotating);
+        assert!(!owner_republish_held_back(&db, &id_hex), "once the rotation is over");
+
+        let restoring = RestoringRoom::begin(&id_hex);
+        assert!(owner_republish_held_back(&db, &id_hex));
+        drop(restoring);
+        assert!(!owner_republish_held_back(&db, &id_hex));
+
+        drop(db);
+        remove(&path);
+    }
+
+    /// The owner reads a room's keys only when they have moved or the room is
+    /// due, publishes when the commitments differ from those last published,
+    /// once more within the confirm interval, then on the snapshot's cadence;
+    /// a public room publishes nothing, and a room the gates hold back reads
+    /// nothing either.
+    #[test]
+    fn the_owner_publishes_on_a_change_then_confirms_then_republishes() {
+        let (path, db) = temp_db("publish");
+        let ident = owned_room(&db, "private");
+        let id_hex = hex::encode(ident.channel_id);
+        let now = 1_800_000_000;
+        let commit = |epoch: i64, secret: &[u8; 32]| (epoch, key_commitment(&ident.channel_id, epoch, &content_key(secret)));
+
+        assert!(channel_settings_read_due(None, 0, now), "nothing published this launch");
+        let OwnedChannelSettingsRead::Read {
+            key_commitments,
+            publish: Some(publish),
+        } = read_now(&db, &ident, None, true, now)
+        else {
+            panic!("a never-rotated private room publishes");
+        };
+        let (record, held_copy, next_in) = *publish;
+        assert!(key_commitments.is_empty());
+        assert_eq!(next_in, MODERATION_REPUBLISH_SECS);
+        assert_eq!(held_copy.admission, 1);
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        assert_eq!(SignedRecord::parse_channel_settings(&blob, &ident.channel_id).unwrap().admission, 1);
+        assert_eq!(db.channel_settings(&id_hex).unwrap(), None, "nothing is held until the publish starts");
+
+        let generation = db.channel_key_generation(&id_hex);
+        let published = ChannelSettingsPublished {
+            generation,
+            key_commitments: Some(key_commitments),
+            due_at: now + next_in,
+            verdict: None,
+        };
+        assert!(!channel_settings_read_due(Some(&published), generation, now + 60), "settled: no read");
+        assert!(channel_settings_read_due(Some(&published), generation, now + next_in), "due");
+
+        db.insert_channel_key_epoch(&id_hex, 1, &[0x11; 32]).unwrap();
+        let moved = db.channel_key_generation(&id_hex);
+        assert_ne!(moved, generation, "a rotation moves the room's key generation");
+        assert!(channel_settings_read_due(Some(&published), moved, now + 60));
+        let OwnedChannelSettingsRead::Read {
+            key_commitments,
+            publish: Some(publish),
+        } = read_now(&db, &ident, Some(&[][..]), false, now + 60)
+        else {
+            panic!("changed commitments publish at once");
+        };
+        let (_, _, next_in) = *publish;
+        assert_eq!(key_commitments, vec![commit(1, &[0x11; 32])]);
+        assert_eq!(next_in, CHANNEL_SETTINGS_CONFIRM_SECS);
+
+        let OwnedChannelSettingsRead::Read { publish: None, .. } =
+            read_now(&db, &ident, Some(key_commitments.as_slice()), false, now + 120)
+        else {
+            panic!("unchanged and not due: nothing goes out");
+        };
+        let current = key_commitments.as_slice();
+        assert_eq!(
+            channel_settings_publish_plan(Some(current), None, current, true),
+            Some(MODERATION_REPUBLISH_SECS),
+            "the confirm, and every republish after it"
+        );
+        assert_eq!(channel_settings_publish_plan(Some(current), None, current, false), None);
+        assert_eq!(
+            channel_settings_publish_plan(None, Some(current), current, false),
+            Some(MODERATION_REPUBLISH_SECS),
+            "the first of a launch, as held"
+        );
+        assert_eq!(
+            channel_settings_publish_plan(None, Some(&[][..]), current, false),
+            Some(CHANNEL_SETTINGS_CONFIRM_SECS),
+            "the first of a launch after a rotation the held copy predates is confirmed"
+        );
+        assert_eq!(channel_settings_publish_plan(None, None, current, false), Some(CHANNEL_SETTINGS_CONFIRM_SECS));
+        assert_eq!(channel_settings_publish_plan(None, None, &[], false), Some(MODERATION_REPUBLISH_SECS));
+
+        {
+            let _restoring = RestoringRoom::begin(&id_hex);
+            assert!(matches!(read_now(&db, &ident, None, true, now), OwnedChannelSettingsRead::HeldBack));
+        }
+
+        let public = owned_room(&db, "public");
+        assert!(!owner_publishes_channel_settings(
+            &db.get_channel(&hex::encode(public.channel_id)).unwrap().unwrap()
+        ));
+
+        drop(db);
+        remove(&path);
+    }
+
+    /// A rotation taken back and minted again under the same number leaves
+    /// `key_epoch` where it was, but not the commitment: the owner publishes
+    /// the new one on the next pass rather than leaving the old one out for
+    /// hours.
+    #[test]
+    fn a_rotation_taken_back_and_minted_again_under_the_same_epoch_publishes_again() {
+        let (path, db) = temp_db("rerotate");
+        let ident = owned_room(&db, "private");
+        let id_hex = hex::encode(ident.channel_id);
+        let now = 1_800_000_000;
+
+        db.insert_channel_key_epoch(&id_hex, 1, &[0x11; 32]).unwrap();
+        let OwnedChannelSettingsRead::Read { key_commitments: first, .. } = read_now(&db, &ident, None, true, now)
+        else {
+            panic!("readable");
+        };
+        let generation = db.channel_key_generation(&id_hex);
+
+        db.rollback_channel_key_epoch(&id_hex, 1).unwrap();
+        db.insert_channel_key_epoch(&id_hex, 1, &[0x22; 32]).unwrap();
+        assert_eq!(db.get_channel(&id_hex).unwrap().unwrap().key_epoch, 1, "the same epoch number");
+        let published = ChannelSettingsPublished {
+            generation,
+            key_commitments: Some(first.clone()),
+            due_at: now + MODERATION_REPUBLISH_SECS,
+            verdict: None,
+        };
+        assert!(channel_settings_read_due(Some(&published), db.channel_key_generation(&id_hex), now + 60));
+        let OwnedChannelSettingsRead::Read {
+            key_commitments: second,
+            publish: Some(publish),
+        } = read_now(&db, &ident, Some(first.as_slice()), false, now + 60)
+        else {
+            panic!("a different key under the same epoch is a change");
+        };
+        let (_, _, next_in) = *publish;
+        assert_ne!(first, second);
+        assert_eq!(second[0].0, 1);
+        assert_eq!(next_in, CHANNEL_SETTINGS_CONFIRM_SECS);
+
+        drop(db);
+        remove(&path);
+    }
+
+    /// While a rotation is in flight its key is stored but may yet be taken
+    /// back, so nothing is signed for the room; nor is anything read under a
+    /// key generation that has moved since it was sampled, which is what a
+    /// rotation taken back during the read leaves. Once the rotation ends the
+    /// room is read again at once: committed, its key is in the record; taken
+    /// back, it never appears in one.
+    #[test]
+    fn an_uncommitted_rotation_never_reaches_a_published_commitment_list() {
+        let (path, db) = temp_db("in-flight");
+        let ident = owned_room(&db, "private");
+        let id_hex = hex::encode(ident.channel_id);
+        let now = 1_800_000_000;
+        let commit = |epoch: i64, secret: &[u8; 32]| (epoch, key_commitment(&ident.channel_id, epoch, &content_key(secret)));
+        let commitments = |read: OwnedChannelSettingsRead| match read {
+            OwnedChannelSettingsRead::Read { key_commitments, .. } => key_commitments,
+            _ => panic!("read"),
+        };
+        db.insert_channel_key_epoch(&id_hex, 1, &[0x11; 32]).unwrap();
+
+        let aborted = RotatingRoom::begin(&id_hex);
+        db.insert_channel_key_epoch(&id_hex, 2, &[0x22; 32]).unwrap();
+        assert!(matches!(read_now(&db, &ident, None, true, now), OwnedChannelSettingsRead::HeldBack));
+        let sampled = db.channel_key_generation(&id_hex);
+        db.rollback_channel_key_epoch(&id_hex, 2).unwrap();
+        let before_end = db.channel_key_generation(&id_hex);
+        drop(aborted);
+        let ended = db.channel_key_generation(&id_hex);
+        assert_ne!(ended, before_end, "the end of a rotation has the room read again");
+        assert!(
+            matches!(
+                read_owned_channel_settings(&db, ident.channel_id, sampled, None, true, now),
+                OwnedChannelSettingsRead::HeldBack
+            ),
+            "a read under a generation that has moved since signs nothing"
+        );
+        let published = ChannelSettingsPublished {
+            generation: sampled,
+            key_commitments: Some(vec![commit(1, &[0x11; 32])]),
+            due_at: now + CHANNEL_SETTINGS_HELD_BACK_SECS,
+            verdict: None,
+        };
+        assert!(channel_settings_read_due(Some(&published), ended, now + 1));
+        assert_eq!(commitments(read_now(&db, &ident, None, true, now)), vec![commit(1, &[0x11; 32])]);
+
+        let committed = RotatingRoom::begin(&id_hex);
+        db.insert_channel_key_epoch(&id_hex, 2, &[0x23; 32]).unwrap();
+        let nested = RotatingRoom::begin(&id_hex);
+        drop(nested);
+        assert!(
+            matches!(read_now(&db, &ident, None, true, now), OwnedChannelSettingsRead::HeldBack),
+            "held back until every rotation of the room has ended"
+        );
+        drop(committed);
+        assert_eq!(
+            commitments(read_now(&db, &ident, None, true, now)),
+            vec![commit(2, &[0x23; 32]), commit(1, &[0x11; 32])]
+        );
+
+        drop(db);
+        remove(&path);
+    }
+}
+
+#[cfg(test)]
+mod pending_invite_key_tests {
+    use super::{
+        epochs_contradicting_commitments, ingest_channel_settings_records, run_channel_ingest,
+        settle_channel_keys_in, take_offered_key_in, ChannelIngestBatch, OfferedKey, OfferedKeyOutcome,
+        PendingInviteKeys, PENDING_INVITE_KEYS_MAX, PENDING_INVITE_KEY_SECS,
+    };
+    use crate::network::ember::channel::{content_key, key_commitment, ChannelIdentity};
+    use crate::network::ember::dht::publish::{ModerationTail, SignedRecord};
+    use crate::storage::database::Database;
+    use crate::storage::identity::NodeIdentity;
+    use std::sync::Mutex;
+
+    const NOW: i64 = 1_800_000_000;
+
+    fn temp_db(name: &str) -> (std::path::PathBuf, Database) {
+        let path = std::env::temp_dir().join(format!(
+            "ember-pending-invite-{name}-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        (path, db)
+    }
+
+    fn remove(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    fn secret(epoch: i64) -> [u8; 32] {
+        [0x40 + epoch as u8; 32]
+    }
+
+    /// A private room this device joined, holding `join` as its first secret.
+    fn member_room(db: &Database, join: &[u8; 32]) -> ChannelIdentity {
+        let ident = ChannelIdentity::generate();
+        db.insert_channel(&hex::encode(ident.channel_id), &hex::encode(ident.pubkey), "Den", "private", false, None, Some(join))
+            .expect("insert channel");
+        ident
+    }
+
+    fn announce(db: &Database, ident: &ChannelIdentity, epoch: i64, at: i64) {
+        assert!(db
+            .apply_channel_moderation(&hex::encode(ident.channel_id), "", "", at, &[], &[], None, None, None, Some(epoch as u64), None, None)
+            .unwrap());
+    }
+
+    /// The owner's settings record committing to the genuine key of each of
+    /// `epochs`.
+    fn settings_blob(ident: &ChannelIdentity, epochs: &[i64], at: i64) -> Vec<u8> {
+        let commitments: Vec<(i64, [u8; 32])> = epochs
+            .iter()
+            .map(|epoch| (*epoch, key_commitment(&ident.channel_id, *epoch, &content_key(&secret(*epoch)))))
+            .collect();
+        let record =
+            SignedRecord::channel_settings_at(&commitments, 1, ident.channel_id, ident.pubkey, true, &ident.signing_key, at)
+                .expect("fits");
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        blob
+    }
+
+    /// The owner's snapshot announcing `epoch`, as a lookup returns it.
+    fn moderation_blob(ident: &ChannelIdentity, epoch: i64) -> Vec<u8> {
+        let tail = ModerationTail {
+            owner_pubkey: Some([0x0C; 32]),
+            key_epoch: Some(epoch as u64),
+            ..Default::default()
+        };
+        let record = SignedRecord::channel_moderation(
+            "",
+            "",
+            &[],
+            &[],
+            &tail,
+            ident.channel_id,
+            ident.pubkey,
+            true,
+            &ident.signing_key,
+        )
+        .expect("fits");
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        blob
+    }
+
+    /// A first join stores the invite's key for its epoch before any snapshot
+    /// has said what the room's epoch is, and the room's settings lookup can
+    /// finish first, finding a record from before the rotation to that key.
+    /// The key is not judged past what the owner announced until a snapshot
+    /// has been taken; once one is, the keys are judged again at once, so a
+    /// crafted first join's key at an epoch past it still goes.
+    #[test]
+    fn a_first_joins_key_survives_a_settings_record_ingested_before_the_first_snapshot() {
+        let (path, db) = temp_db("first-join");
+        let seed = [0x0Bu8; 32];
+        let our_pk = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        let identity = NodeIdentity {
+            kad_id: [0; 16],
+            user_hash: [0; 16],
+            udp_key_seed: 0,
+            ember_hash: crate::network::ember::channel::channel_id_from_pubkey(&our_pk),
+            ed25519_secret_key: seed,
+            ed25519_public_key: our_pk,
+            noise_private_key: [0; 32],
+            noise_public_key: [0; 32],
+            intro_secret: [0; crate::network::ember::crypto::INTRO_SECRET_LEN],
+        };
+        let crafted = [0x66u8; 32];
+
+        let genuine = member_room(&db, &secret(3));
+        let genuine_hex = hex::encode(genuine.channel_id);
+        db.insert_channel_key_epoch(&genuine_hex, 3, &secret(3)).unwrap();
+        let far = member_room(&db, &crafted);
+        let far_hex = hex::encode(far.channel_id);
+        db.insert_channel_key_epoch(&far_hex, 1_000, &crafted).unwrap();
+
+        let results = run_channel_ingest(
+            &db,
+            &identity,
+            &our_pk,
+            ChannelIngestBatch {
+                settings: vec![
+                    (genuine.channel_id, vec![settings_blob(&genuine, &[2, 1], 1_000)]),
+                    (far.channel_id, vec![settings_blob(&far, &[2, 1], 1_000)]),
+                ],
+                ..Default::default()
+            },
+        );
+        assert!(results.rekeyed.is_empty(), "nothing announced yet to judge a key past");
+        assert_eq!(db.load_channel_key_epochs(&genuine_hex).unwrap(), vec![(3, secret(3))]);
+        assert_eq!(db.load_channel_key_epochs(&far_hex).unwrap(), vec![(1_000, crafted)]);
+
+        let results = run_channel_ingest(
+            &db,
+            &identity,
+            &our_pk,
+            ChannelIngestBatch {
+                moderation: vec![
+                    (genuine.channel_id, vec![moderation_blob(&genuine, 3)], 1),
+                    (far.channel_id, vec![moderation_blob(&far, 3)], 1),
+                ],
+                ..Default::default()
+            },
+        );
+        assert_eq!(results.moderated.len(), 2);
+        assert_eq!(results.rekeyed, vec![far.channel_id], "judged again as the first snapshot lands");
+        assert_eq!(db.load_channel_key_epochs(&genuine_hex).unwrap(), vec![(3, secret(3))]);
+        let genuine_row = db.get_channel(&genuine_hex).unwrap().unwrap();
+        assert_eq!((genuine_row.key_epoch, genuine_row.key_epoch_wanted), (3, 3), "the genuine key stays current");
+        assert!(db.load_channel_key_epochs(&far_hex).unwrap().is_empty());
+
+        drop(db);
+        remove(&path);
+    }
+
+    /// A settle judges on one read and drops on a later write, and the join's
+    /// own settle can run between them, dropping the same crafted key and
+    /// storing the genuine one in its slot. The later drop removes only the
+    /// key it judged, so the genuine one stays. A join whose settle dropped a
+    /// key reports the room's keys changed even when the key it offered waits.
+    #[test]
+    fn a_settle_judging_on_an_older_read_never_drops_the_key_that_replaced_it() {
+        let (path, db) = temp_db("interleaved");
+        let pending = Mutex::new(PendingInviteKeys::default());
+        let crafted = [0x66u8; 32];
+        let ident = member_room(&db, &crafted);
+        let id_hex = hex::encode(ident.channel_id);
+        db.insert_channel_key_epoch(&id_hex, 3, &crafted).unwrap();
+        announce(&db, &ident, 3, 10);
+        assert!(ingest_channel_settings_records(&db, ident.channel_id, &[settings_blob(&ident, &[3, 2], 1_000)]));
+        let row = db.get_channel(&id_hex).unwrap().unwrap();
+        let held = db.channel_settings(&id_hex).unwrap().unwrap();
+        let judged =
+            epochs_contradicting_commitments(&row, &ident.channel_id, &db.load_channel_key_epochs(&id_hex).unwrap(), &held);
+        assert_eq!(judged, vec![(3, crafted)]);
+
+        assert_eq!(
+            take_offered_key_in(&db, &pending, &row, ident.channel_id, 3, &secret(3), NOW).unwrap(),
+            OfferedKeyOutcome {
+                key: OfferedKey::Taken,
+                rekeyed: true,
+            }
+        );
+        assert!(db.drop_channel_key_epochs(&id_hex, &judged).unwrap().is_empty());
+        assert_eq!(db.load_channel_key_epochs(&id_hex).unwrap(), vec![(3, secret(3))]);
+
+        let other = member_room(&db, &crafted);
+        let other_hex = hex::encode(other.channel_id);
+        db.insert_channel_key_epoch(&other_hex, 3, &crafted).unwrap();
+        announce(&db, &other, 3, 10);
+        assert!(ingest_channel_settings_records(&db, other.channel_id, &[settings_blob(&other, &[3, 2], 1_000)]));
+        let row = db.get_channel(&other_hex).unwrap().unwrap();
+        assert_eq!(
+            take_offered_key_in(&db, &pending, &row, other.channel_id, 3, &[0x77; 32], NOW).unwrap(),
+            OfferedKeyOutcome {
+                key: OfferedKey::Held,
+                rekeyed: true,
+            },
+            "the crafted key went though the offered one waits"
+        );
+
+        drop(db);
+        remove(&path);
+    }
+
+    /// A member who left a room and missed two rotations pastes a fresh
+    /// invite. Nothing it holds can check the key yet, so the key waits in
+    /// memory, not on disk; the snapshot alone does not check it; the settings
+    /// record naming its epoch does, and it is taken. A crafted key pasted
+    /// beside it never is, and lapses.
+    #[test]
+    fn an_invite_this_device_could_not_check_is_taken_once_the_owners_records_catch_up() {
+        let (path, db) = temp_db("catch-up");
+        let pending = Mutex::new(PendingInviteKeys::default());
+        let ident = member_room(&db, &secret(0));
+        let id_hex = hex::encode(ident.channel_id);
+        db.insert_channel_key_epoch(&id_hex, 1, &secret(1)).unwrap();
+        let row = || db.get_channel(&id_hex).unwrap().unwrap();
+        let epochs = || db.load_channel_key_epochs(&id_hex).unwrap();
+
+        for offered in [secret(3), [0x99; 32]] {
+            assert_eq!(
+                take_offered_key_in(&db, &pending, &row(), ident.channel_id, 3, &offered, NOW).unwrap().key,
+                OfferedKey::Held
+            );
+        }
+        assert_eq!(epochs(), vec![(1, secret(1))], "nothing unchecked on disk");
+
+        announce(&db, &ident, 3, 10);
+        assert!(!settle_channel_keys_in(&db, &pending, ident.channel_id, false, NOW + 60));
+        assert_eq!(row().key_epoch, 1, "a snapshot carries no commitment");
+
+        assert!(ingest_channel_settings_records(&db, ident.channel_id, &[settings_blob(&ident, &[3, 2, 1], 1_000)]));
+        assert!(settle_channel_keys_in(&db, &pending, ident.channel_id, true, NOW + 120));
+        assert_eq!(row().key_epoch, 3);
+        assert_eq!(epochs()[0], (3, secret(3)));
+        assert!(epochs().iter().all(|(_, held)| *held != [0x99; 32]));
+
+        let left = pending.lock().unwrap().for_room(&ident.channel_id, NOW + 120);
+        assert_eq!(left.len(), 1, "the crafted key is still waiting, unchecked");
+        assert!(!settle_channel_keys_in(&db, &pending, ident.channel_id, false, NOW + 180));
+        assert!(pending
+            .lock()
+            .unwrap()
+            .for_room(&ident.channel_id, NOW + PENDING_INVITE_KEY_SECS + 1)
+            .is_empty());
+
+        drop(db);
+        remove(&path);
+    }
+
+    /// Waiting keys lapse, the same key offered twice is held once, and no
+    /// more than the cap are held, the oldest giving way.
+    #[test]
+    fn pending_invite_keys_lapse_and_are_bounded() {
+        let mut keys = PendingInviteKeys::default();
+        let room = [0x31u8; 16];
+        keys.hold(room, 2, &[2; 32], NOW);
+        keys.hold(room, 2, &[2; 32], NOW + 1);
+        assert_eq!(keys.for_room(&room, NOW + 1).len(), 1);
+        assert!(keys.holds_room(&room, NOW + PENDING_INVITE_KEY_SECS));
+        assert!(!keys.holds_room(&room, NOW + 1 + PENDING_INVITE_KEY_SECS));
+
+        for i in 0..=PENDING_INVITE_KEYS_MAX {
+            keys.hold([i as u8; 16], 1, &[i as u8; 32], NOW + i as i64);
+        }
+        assert!(!keys.holds_room(&[0u8; 16], NOW + 100), "the oldest gave way");
+        let held: usize = (0..=PENDING_INVITE_KEYS_MAX)
+            .map(|i| keys.for_room(&[i as u8; 16], NOW + 100).len())
+            .sum();
+        assert_eq!(held, PENDING_INVITE_KEYS_MAX);
+    }
+
+    /// A first join's crafted invite stored a wrong key at the room's epoch.
+    /// The owner's commitment shows it is wrong, so it is dropped and the
+    /// genuine key, from an invite that checks or the owner's sealed record,
+    /// takes its place; nothing unchecked does. A wrong key at an epoch the
+    /// owner never announced goes the same way, and a key the commitments
+    /// vouch for stays.
+    #[test]
+    fn a_held_key_the_owners_commitments_contradict_gives_way_to_the_genuine_one() {
+        let (path, db) = temp_db("contradicted");
+        let pending = Mutex::new(PendingInviteKeys::default());
+        let crafted = [0x66u8; 32];
+
+        let ident = member_room(&db, &crafted);
+        let id_hex = hex::encode(ident.channel_id);
+        db.insert_channel_key_epoch(&id_hex, 3, &crafted).unwrap();
+        announce(&db, &ident, 3, 10);
+        let epochs = || db.load_channel_key_epochs(&id_hex).unwrap();
+        let row = db.get_channel(&id_hex).unwrap().unwrap();
+        assert_eq!(
+            take_offered_key_in(&db, &pending, &row, ident.channel_id, 3, &secret(3), NOW).unwrap().key,
+            OfferedKey::Held,
+            "the slot is taken, so the genuine key waits"
+        );
+        assert_eq!(epochs(), vec![(3, crafted)]);
+        assert!(ingest_channel_settings_records(&db, ident.channel_id, &[settings_blob(&ident, &[3, 2], 1_000)]));
+        assert!(settle_channel_keys_in(&db, &pending, ident.channel_id, true, NOW + 60));
+        assert_eq!(epochs(), vec![(3, secret(3))], "the crafted key gave way to the genuine one");
+
+        let other = member_room(&db, &crafted);
+        let other_hex = hex::encode(other.channel_id);
+        db.insert_channel_key_epoch(&other_hex, 3, &crafted).unwrap();
+        announce(&db, &other, 3, 10);
+        assert!(ingest_channel_settings_records(&db, other.channel_id, &[settings_blob(&other, &[3, 2], 1_000)]));
+        assert!(settle_channel_keys_in(&db, &pending, other.channel_id, true, NOW));
+        let row = db.get_channel(&other_hex).unwrap().unwrap();
+        assert!(db.load_channel_key_epochs(&other_hex).unwrap().is_empty());
+        assert!(row.key_epoch_wanted > row.key_epoch, "behind again, so the key-epoch loop looks");
+        assert_eq!(
+            take_offered_key_in(&db, &pending, &row, other.channel_id, 3, &[0x77; 32], NOW).unwrap().key,
+            OfferedKey::Held,
+            "another unchecked key does not take the freed slot"
+        );
+        assert!(db.load_channel_key_epochs(&other_hex).unwrap().is_empty());
+        assert!(!settle_channel_keys_in(&db, &pending, other.channel_id, true, NOW + 60), "nor ever will");
+        db.insert_channel_key_epoch(&other_hex, 3, &secret(3))
+            .expect("the owner's sealed record can be stored");
+
+        let far = member_room(&db, &secret(0));
+        let far_hex = hex::encode(far.channel_id);
+        db.insert_channel_key_epoch(&far_hex, 2, &secret(2)).unwrap();
+        db.insert_channel_key_epoch(&far_hex, 1_000, &crafted).unwrap();
+        announce(&db, &far, 3, 10);
+        assert!(ingest_channel_settings_records(&db, far.channel_id, &[settings_blob(&far, &[3, 2], 1_000)]));
+        assert!(settle_channel_keys_in(&db, &pending, far.channel_id, true, NOW));
+        assert_eq!(db.load_channel_key_epochs(&far_hex).unwrap(), vec![(2, secret(2))]);
+        assert_eq!(db.get_channel(&far_hex).unwrap().unwrap().key_epoch, 2);
+        assert_eq!(
+            pending.lock().unwrap().for_room(&far.channel_id, NOW).len(),
+            1,
+            "kept in memory, in case a later record names it"
+        );
+
+        drop(db);
+        remove(&path);
+    }
+}
+
+#[cfg(test)]
 mod channel_roster_snapshot_tests {
     use super::{ChannelRosterSnapshot, CHANNEL_ROSTER_SNAPSHOT_TTL};
     use crate::storage::database::StoredChannelMember;
@@ -310,6 +1722,7 @@ mod channel_roster_snapshot_tests {
             last_seen,
             banned,
             moderator: false,
+            language: String::new(),
         }
     }
 
@@ -486,6 +1899,38 @@ mod channel_view_cache_tests {
     }
 }
 
+/// Start storing each form of one of our records, with a verdict for each
+/// publish that started. The caller drives the publishes.
+fn start_own_channel_publishes(
+    state: &mut NetworkState,
+    records: Vec<ember::dht::publish::SignedRecord>,
+) -> (Vec<u32>, Vec<oneshot::Receiver<EmberPublishResult>>) {
+    let mut publish_ids = Vec::with_capacity(records.len());
+    let mut verdicts = Vec::with_capacity(records.len());
+    for record in records {
+        if let Some(publish_id) = start_own_channel_publish(state, record) {
+            let (tx, rx) = oneshot::channel();
+            state.ember_dht_pending_publishes.insert(publish_id, tx);
+            publish_ids.push(publish_id);
+            verdicts.push(rx);
+        }
+    }
+    (publish_ids, verdicts)
+}
+
+/// Whether any form of a record stored somewhere. During the transition a v2
+/// form lands only on 1.7.5 storers and a v1 form on every storer, and a
+/// reader takes either, so one landing is enough. A dropped sender means the
+/// publish went away without a verdict, which is not evidence it landed.
+async fn any_publish_stored(verdicts: Vec<oneshot::Receiver<EmberPublishResult>>) -> bool {
+    for rx in verdicts {
+        if rx.await.is_ok_and(|result| result.stored_on > 0) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Re-announce our presence in joined channels so other members can find us.
 ///
 /// Members, not storers, republish presence (presence records are skipped by
@@ -516,6 +1961,7 @@ pub(super) async fn maybe_publish_channel_presence(
         }
         name.to_string()
     };
+    let language = settings.channel_language_code();
     let refresh_username = !due.is_empty()
         && now.saturating_sub(state.channel_username_refresh_at)
             >= ember::channel::USERNAME_REFRESH_SECS
@@ -558,17 +2004,20 @@ pub(super) async fn maybe_publish_channel_presence(
         let Some(join_secret) = current_channel_join_secret(db, &ch) else {
             continue;
         };
-        let record = ember::dht::publish::SignedRecord::channel_presence(
+        let records = ember::dht::publish::SignedRecord::channel_presence_forms(
             &nickname,
+            language,
             channel_id,
             channel_pubkey,
             &join_secret,
             private,
-            ember::channel::presence_epoch(now),
+            false,
             &identity.noise_public_key,
             &signing,
+            now,
         );
-        if let Some(publish_id) = start_own_channel_publish(state, record) {
+        let (publish_ids, verdicts) = start_own_channel_publishes(state, records);
+        if !publish_ids.is_empty() {
             // Stamped up front so the next scan does not start a second publish
             // for this room while the first is still in flight. Our own
             // last_seen has to move with the announce too: gossip neighbors
@@ -577,10 +2026,11 @@ pub(super) async fn maybe_publish_channel_presence(
             // minutes later we had dropped out of our own roster's "fresh" set
             // while still sitting in the room.
             let _ = db.touch_channel_presence(&channel_id_hex, now);
-            let _ = db.upsert_channel_member(
+            let _ = db.upsert_channel_member_with_language(
                 &channel_id_hex,
                 &hex::encode(identity.ed25519_public_key),
                 &nickname,
+                Some(language.unwrap_or("")),
                 now,
                 Some(&hex::encode(identity.ed25519_public_key)),
             );
@@ -591,21 +2041,19 @@ pub(super) async fn maybe_publish_channel_presence(
             // somebody sitting in the room disappear from every roster and
             // stop being picked as a gossip neighbor, with nothing on screen
             // to say why.
-            let (tx, rx) = oneshot::channel();
-            state.ember_dht_pending_publishes.insert(publish_id, tx);
             let retry_db = db.clone();
             let retry_id = channel_id_hex.clone();
             let retry_at = now - ember::channel::PRESENCE_REPUBLISH_SECS
                 + ember::channel::PRESENCE_RETRY_SECS;
             tokio::spawn(async move {
-                // A dropped sender means the publish went away without a
-                // verdict, which is not evidence it landed either.
-                if rx.await.is_ok_and(|result| result.stored_on > 0) {
+                if any_publish_stored(verdicts).await {
                     return;
                 }
                 let _ = retry_db.retry_channel_presence(&retry_id, now, retry_at);
             });
-            drive_ember_publish(socket, state, publish_id).await;
+            for publish_id in publish_ids {
+                drive_ember_publish(socket, state, publish_id).await;
+            }
         }
     }
     if refresh_username {
@@ -631,20 +2079,42 @@ pub(super) async fn maybe_publish_channel_presence(
 /// the previous handle, consume the newly-due slots, and stamp a ten-minute
 /// silence under the old name. Doing it here means the next publish — and this
 /// one — reads the username that was just applied.
+///
+/// A new Channel language is published the same way, and for the same reason.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn publish_presence_under_new_username(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
     settings: &AppSettings,
     identity: &crate::storage::identity::NodeIdentity,
     old_username: &str,
+    old_language: Option<&'static str>,
 ) {
     let new = settings.channel_username.trim();
-    if new.is_empty() || new == old_username.trim() {
+    let language = settings.channel_language_code();
+    let renamed = new != old_username.trim();
+    if new.is_empty() || (!renamed && language == old_language) {
         return;
     }
     let pk = hex::encode(identity.ed25519_public_key);
-    let _ = db.rename_self_channel_member(&pk, new);
+    if renamed {
+        let _ = db.rename_self_channel_member(&pk, new);
+    }
+    if language != old_language {
+        // The settings save relabelled these rows already, so this usually
+        // finds nothing. It catches a publish that ran on the old settings
+        // in between and wrote the old language back.
+        if let Ok(rooms) = db.set_self_channel_member_language(&pk, language.unwrap_or("")) {
+            for room in rooms {
+                let _ = app_handle.emit(
+                    "ember:channel-members",
+                    serde_json::json!({ "channel_id": room }),
+                );
+            }
+        }
+    }
     let _ = db.due_channel_presence_now();
     maybe_publish_channel_presence(socket, state, db, settings, identity).await;
 }
@@ -708,15 +2178,17 @@ pub(super) async fn publish_channel_departures(
             let _ = db.clear_channel_departure(&channel_id_hex);
             continue;
         };
-        let record = ember::dht::publish::SignedRecord::channel_presence_departure(
+        let records = ember::dht::publish::SignedRecord::channel_presence_forms(
             &nickname,
+            None,
             cid,
             cpk,
             &join_secret,
             ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE,
-            ember::channel::presence_epoch(now),
+            true,
             &identity.noise_public_key,
             &signing,
+            now,
         );
         // Re-checked against the room's state as it is *now*, not as the list
         // above found it. This loop yields between rooms, so a rejoin can land
@@ -731,21 +2203,22 @@ pub(super) async fn publish_channel_departures(
         {
             continue;
         }
-        let Some(publish_id) = start_own_channel_publish(state, record) else {
+        let (publish_ids, verdicts) = start_own_channel_publishes(state, records);
+        if publish_ids.is_empty() {
             continue;
-        };
+        }
         // Cleared only once a node says it stored the record. Clearing on the
         // attempt is the bug this whole function exists to fix, one layer up.
-        let (tx, rx) = oneshot::channel();
-        state.ember_dht_pending_publishes.insert(publish_id, tx);
         let retry_db = db.clone();
         let retry_id = channel_id_hex.clone();
         tokio::spawn(async move {
-            if rx.await.is_ok_and(|result| result.stored_on > 0) {
+            if any_publish_stored(verdicts).await {
                 let _ = retry_db.clear_channel_departure(&retry_id);
             }
         });
-        drive_ember_publish(socket, state, publish_id).await;
+        for publish_id in publish_ids {
+            drive_ember_publish(socket, state, publish_id).await;
+        }
     }
     publish_owed_channel_departures(socket, state, db, &nickname, identity, &signing, now).await;
 }
@@ -782,29 +2255,32 @@ async fn publish_owed_channel_departures(
         {
             continue;
         }
-        let record = ember::dht::publish::SignedRecord::channel_presence_departure(
+        let records = ember::dht::publish::SignedRecord::channel_presence_forms(
             nickname,
+            None,
             cid,
             departure.channel_pubkey,
             &departure.join_secret,
             departure.private,
-            ember::channel::presence_epoch(now),
+            true,
             &identity.noise_public_key,
             signing,
+            now,
         );
-        let Some(publish_id) = start_own_channel_publish(state, record) else {
+        let (publish_ids, verdicts) = start_own_channel_publishes(state, records);
+        if publish_ids.is_empty() {
             continue;
-        };
-        let (tx, rx) = oneshot::channel();
-        state.ember_dht_pending_publishes.insert(publish_id, tx);
+        }
         let retry_db = db.clone();
         let retry_id = departure.channel_id.clone();
         tokio::spawn(async move {
-            if rx.await.is_ok_and(|result| result.stored_on > 0) {
+            if any_publish_stored(verdicts).await {
                 let _ = retry_db.clear_owed_channel_departure(&retry_id);
             }
         });
-        drive_ember_publish(socket, state, publish_id).await;
+        for publish_id in publish_ids {
+            drive_ember_publish(socket, state, publish_id).await;
+        }
     }
 }
 
@@ -961,32 +2437,55 @@ pub(super) fn channel_roster_snapshot(
     db: &Database,
     channel_id: [u8; 16],
 ) -> Arc<ChannelRosterSnapshot> {
-    let now = std::time::Instant::now();
-    let channel_id_hex = hex::encode(channel_id);
-    let generation = db.channel_roster_generation(&channel_id_hex);
-    if let Some(snapshot) = state
+    if let Some(snapshot) = channel_roster_held(state, db, channel_id) {
+        return snapshot;
+    }
+    let snapshot = Arc::new(read_channel_roster(db, channel_id));
+    hold_channel_roster(state, channel_id, &snapshot);
+    snapshot
+}
+
+/// The room's held roster snapshot while it is still exact. Reads only the
+/// in-memory generation, never the table.
+pub(super) fn channel_roster_held(
+    state: &NetworkState,
+    db: &Database,
+    channel_id: [u8; 16],
+) -> Option<Arc<ChannelRosterSnapshot>> {
+    let generation = db.channel_roster_generation(&hex::encode(channel_id));
+    state
         .channel_view_cache
         .get(&channel_id)
         .and_then(|view| view.roster.as_ref())
-    {
-        if snapshot.valid_at(generation, now) {
-            return snapshot.clone();
-        }
-    }
-    // Not cached, so the next caller reads again. Cached as an empty roster, a
-    // transient error was a room where nobody was banned for the next 30 s.
-    let rows = match db.list_channel_members(&channel_id_hex) {
-        Ok(rows) => rows,
+        .filter(|snapshot| snapshot.valid_at(generation, std::time::Instant::now()))
+        .cloned()
+}
+
+/// Read the room's roster from the table. Blocking: off the loop where the
+/// caller can be.
+pub(super) fn read_channel_roster(db: &Database, channel_id: [u8; 16]) -> ChannelRosterSnapshot {
+    let now = std::time::Instant::now();
+    let channel_id_hex = hex::encode(channel_id);
+    let generation = db.channel_roster_generation(&channel_id_hex);
+    match db.list_channel_members(&channel_id_hex) {
+        Ok(rows) => ChannelRosterSnapshot::from_rows(rows, generation, now),
         Err(e) => {
             debug!("Channel roster read failed for {channel_id_hex}: {e}");
-            return Arc::new(ChannelRosterSnapshot::unreadable(now));
+            ChannelRosterSnapshot::unreadable(now)
         }
-    };
-    let snapshot = Arc::new(ChannelRosterSnapshot::from_rows(rows, generation, now));
+    }
+}
+
+/// Keep a roster read for the room's next callers. An unreadable one is not
+/// kept, so the next caller reads again: kept as an empty roster, a transient
+/// error was a room where nobody was banned for the next 30 s.
+pub(super) fn hold_channel_roster(state: &mut NetworkState, channel_id: [u8; 16], snapshot: &Arc<ChannelRosterSnapshot>) {
+    if snapshot.unreadable {
+        return;
+    }
     if let Some(view) = state.channel_view_cache.get_mut(&channel_id) {
         view.roster = Some(snapshot.clone());
     }
-    snapshot
 }
 
 /// [`channel_member_pubkeys`] from the room's roster snapshot.
@@ -1119,6 +2618,17 @@ pub(super) fn channel_content_keys(
     db: &Database,
     ch: &crate::storage::database::StoredChannel,
 ) -> Vec<[u8; 32]> {
+    channel_join_secrets(db, ch)
+        .iter()
+        .map(ember::channel::content_key)
+        .collect()
+}
+
+/// The join secrets behind [`channel_content_keys`], in the same order.
+pub(super) fn channel_join_secrets(
+    db: &Database,
+    ch: &crate::storage::database::StoredChannel,
+) -> Vec<[u8; 32]> {
     if ch.visibility != ember::channel::CHANNEL_KIND_PRIVATE {
         let Some(pk) = hex::decode(&ch.pubkey)
             .ok()
@@ -1126,25 +2636,22 @@ pub(super) fn channel_content_keys(
         else {
             return Vec::new();
         };
-        return vec![ember::channel::content_key(
-            &ember::channel::public_join_secret(&pk),
-        )];
+        return vec![ember::channel::public_join_secret(&pk)];
     }
-    let mut keys: Vec<[u8; 32]> = db
+    let mut secrets: Vec<[u8; 32]> = db
         .load_channel_key_epochs(&ch.channel_id)
         .unwrap_or_default()
         .into_iter()
-        .map(|(_, secret)| ember::channel::content_key(&secret))
+        .map(|(_, secret)| secret)
         .collect();
     // Epoch 0 is the secret the invite was minted with, still in `join_secret`
     // for any room that has never rotated.
     if let Ok(Some(secret)) = db.load_channel_join_secret(&ch.channel_id) {
-        let legacy = ember::channel::content_key(&secret);
-        if !keys.contains(&legacy) {
-            keys.push(legacy);
+        if !secrets.contains(&secret) {
+            secrets.push(secret);
         }
     }
-    keys
+    secrets
 }
 
 /// The join secret this room seals *new* traffic with: its newest epoch, or the
@@ -1729,7 +3236,7 @@ pub(super) async fn apply_channel_presence_beacons(
             continue;
         }
         if status.is_none()
-            && admission_key.is_some_and(|key| !beacon.proves_key(&channel_id, &key))
+            && !ember::channel::beacon_admits_newcomer(&beacon, &channel_id, admission_key.as_ref())
         {
             continue;
         }
@@ -2183,13 +3690,6 @@ pub(super) async fn maybe_refresh_channel_moderation(
         let Ok(channel_id) = <[u8; 16]>::try_from(id_bytes) else {
             continue;
         };
-        if state
-            .ember_channel_moderation_searches
-            .values()
-            .any(|id| *id == channel_id)
-        {
-            continue;
-        }
         let last = state
             .channel_moderation_fetch_at
             .get(&channel_id)
@@ -2198,22 +3698,721 @@ pub(super) async fn maybe_refresh_channel_moderation(
         if !ember::channel::schedule_due(last, now, ember::channel::MODERATION_FETCH_SECS) {
             continue;
         }
-        let key = ember::channel::moderation_key(&channel_id);
-        let Some(search_id) = state.ember_search.start_background_find_value(
-            ember::dht::EmberNodeId(key),
-            Vec::new(),
-            state.ember_dht.routing(),
-        ) else {
-            break;
-        };
-        seed_ember_local_records(state, search_id, &key, &[]);
-        state
-            .ember_channel_moderation_searches
-            .insert(search_id, channel_id);
-        drive_ember_search(socket, state, search_id).await;
-        state.channel_moderation_fetch_at.insert(channel_id, now);
-        started += 1;
+        match start_channel_moderation_fetch(socket, state, ch, channel_id, now).await {
+            None => break,
+            Some(false) => continue,
+            Some(true) => started += 1,
+        }
     }
+}
+
+/// FIND_VALUE one room's owner-signed snapshot, counted as one of its
+/// moderation passes. `Some(false)` when one is already in flight for the
+/// room, `None` when no search could start.
+async fn start_channel_moderation_fetch(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    ch: &crate::storage::database::StoredChannel,
+    channel_id: [u8; 16],
+    now: i64,
+) -> Option<bool> {
+    if state
+        .ember_channel_moderation_searches
+        .values()
+        .any(|id| *id == channel_id)
+    {
+        return Some(false);
+    }
+    let key = ember::channel::moderation_key(&channel_id);
+    let search_id = state.ember_search.start_background_find_value(
+        ember::dht::EmberNodeId(key),
+        Vec::new(),
+        state.ember_dht.routing(),
+    )?;
+    seed_ember_local_records(state, search_id, &key, &[]);
+    state
+        .ember_channel_moderation_searches
+        .insert(search_id, channel_id);
+    drive_ember_search(socket, state, search_id).await;
+    state.channel_moderation_fetch_at.insert(channel_id, now);
+    let pass = state.channel_moderation_passes.entry(channel_id).or_insert(0);
+    if settings_fetch_rides_pass(*pass, ch) {
+        state.channel_settings_fetch_owed.insert(channel_id);
+    }
+    *pass += 1;
+    Some(true)
+}
+
+/// Settings lookups ride the moderation pass: one on every this many, the
+/// first included, which with [`ember::channel::MODERATION_FETCH_SECS`] is
+/// every fifteen minutes. A pass can also ask for one at once
+/// ([`settings_owed_after_pass`]), which is the case a member behind the
+/// room's key needs: the commitments to the epoch it was just told of.
+const CHANNEL_SETTINGS_FETCH_EVERY_PASSES: u64 = 3;
+pub(super) const CHANNEL_SETTINGS_FETCH_PER_TICK: usize = 2;
+
+/// Whether moderation pass number `pass` (from 0) of `ch` this session also
+/// looks its settings record up.
+fn settings_fetch_rides_pass(pass: u64, ch: &crate::storage::database::StoredChannel) -> bool {
+    pass.is_multiple_of(CHANNEL_SETTINGS_FETCH_EVERY_PASSES) && channel_settings_fetched_for(ch)
+}
+
+/// Whether a room's settings record is looked up at once after one of its
+/// moderation passes came back, `row` as it stands after the pass and `held`
+/// the settings record held for it: the snapshot named a newer key epoch than
+/// any before (`wanted_before`), or this device is behind the room's key and
+/// holds no commitment to the epoch the owner announced. The second covers a
+/// lookup that ran before the owner's record moved, and a pass that found the
+/// snapshot already held.
+fn settings_owed_after_pass(
+    wanted_before: Option<i64>,
+    row: &crate::storage::database::StoredChannel,
+    held: Option<&crate::storage::database::HeldChannelSettings>,
+) -> bool {
+    if !channel_settings_fetched_for(row) {
+        return false;
+    }
+    wanted_before.is_some_and(|before| row.key_epoch_wanted > before)
+        || (row.key_epoch_wanted > row.key_epoch
+            && held.is_none_or(|held| {
+                !held
+                    .key_commitments
+                    .iter()
+                    .any(|(epoch, _)| *epoch == row.key_epoch_wanted)
+            }))
+}
+
+/// The longest a room stays without one of the lookups
+/// [`settings_owed_after_pass`] asks for while it is owed them.
+const SETTINGS_LOOKUP_BACKOFF_MAX_SECS: i64 = 6 * 60 * 60;
+
+/// How long each room behind its key waits before the next lookup
+/// [`settings_owed_after_pass`] asks for, and since which epochs.
+#[derive(Default)]
+struct SettingsLookupBackoff(HashMap<[u8; 16], SettingsLookupWait>);
+
+struct SettingsLookupWait {
+    /// `(key_epoch_wanted, key_epoch)` when the room first fell owed.
+    epochs: (i64, i64),
+    wait: i64,
+    next_at: i64,
+}
+
+impl SettingsLookupBackoff {
+    fn forget(&mut self, channel_id: &[u8; 16]) {
+        self.0.remove(channel_id);
+    }
+
+    /// Keep only the rooms `kept` holds to: one left or deleted is never
+    /// looked up again, and would otherwise stay here for the session.
+    fn retain_rooms(&mut self, mut kept: impl FnMut(&[u8; 16]) -> bool) {
+        self.0.retain(|channel_id, _| kept(channel_id));
+    }
+}
+
+fn settings_lookup_backoff() -> &'static std::sync::Mutex<SettingsLookupBackoff> {
+    static BACKOFF: std::sync::OnceLock<std::sync::Mutex<SettingsLookupBackoff>> = std::sync::OnceLock::new();
+    BACKOFF.get_or_init(Default::default)
+}
+
+/// Whether a lookup [`settings_owed_after_pass`] asks for goes out now, for
+/// a room whose `(key_epoch_wanted, key_epoch)` are `epochs`.
+///
+/// The first does, and the next one moderation pass later; after that each
+/// waits twice as long as the one before, up to
+/// [`SETTINGS_LOOKUP_BACKOFF_MAX_SECS`]. An owner on a build before 1.7.5
+/// never publishes kind 8, so a member behind its key may stay owed a lookup
+/// indefinitely, and lookups that never answer must not go out every pass. A
+/// move of either epoch starts over, and so does a settings record landing
+/// (the caller forgets the room). The lookup that rides every third pass is
+/// not held back by this.
+fn settings_lookup_backoff_allows(
+    backoff: &mut SettingsLookupBackoff,
+    channel_id: [u8; 16],
+    epochs: (i64, i64),
+    now: i64,
+) -> bool {
+    // Passes come about MODERATION_FETCH_SECS apart, give or take how long
+    // each lookup took to answer.
+    let slack = ember::channel::MODERATION_FETCH_SECS / 2;
+    match backoff.0.get_mut(&channel_id) {
+        Some(wait) if wait.epochs == epochs => {
+            if now + slack < wait.next_at {
+                return false;
+            }
+            wait.wait = (wait.wait * 2).min(SETTINGS_LOOKUP_BACKOFF_MAX_SECS);
+            wait.next_at = now + wait.wait;
+            true
+        }
+        _ => {
+            backoff.0.insert(
+                channel_id,
+                SettingsLookupWait {
+                    epochs,
+                    wait: ember::channel::MODERATION_FETCH_SECS,
+                    next_at: now + ember::channel::MODERATION_FETCH_SECS,
+                },
+            );
+            true
+        }
+    }
+}
+
+/// Drop the bookkeeping of a settings lookup given up on before it finished,
+/// leaving the room owed one: the walk answered nothing either way.
+pub(super) fn rearm_abandoned_settings_lookup(
+    searches: &mut HashMap<u32, [u8; 16]>,
+    owed: &mut HashSet<[u8; 16]>,
+    search_id: u32,
+) {
+    if let Some(channel_id) = searches.remove(&search_id) {
+        owed.insert(channel_id);
+    }
+}
+
+/// Look a held private room's snapshot and settings record up now rather
+/// than on their schedules: sent when an invite brought a key nothing held
+/// could check yet ([`OfferedKey::Held`]), so this device's view of the room
+/// is stale and the key waits on what these say.
+pub(super) async fn refresh_channel_owner_records_now(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+    channel_id: [u8; 16],
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    let read = {
+        let db = db.clone();
+        tokio::task::spawn_blocking(move || db.get_channel_lite(&hex::encode(channel_id))).await
+    };
+    let Ok(Ok(Some(ch))) = read else {
+        return;
+    };
+    if !channel_settings_fetched_for(&ch) {
+        return;
+    }
+    // The room has just been entered, which the cached roster may not show
+    // yet, and the settings loop drops a mark for a room it sees as left.
+    state.channel_roster_cache = None;
+    let now = chrono::Utc::now().timestamp();
+    let _ = start_channel_moderation_fetch(socket, state, &ch, channel_id, now).await;
+    state.channel_settings_fetch_owed.insert(channel_id);
+    let _ = start_channel_settings_fetch(socket, state, channel_id).await;
+}
+
+/// Whether this device looks up a room's settings record at all.
+///
+/// The fields this build reads, the key commitments and the admission rule,
+/// mean something only in a private room, and an owner applies its own, so for
+/// a public room or one we own the lookup would cost a walk and could change
+/// nothing here. A build that gives public rooms a setting widens this.
+fn channel_settings_fetched_for(ch: &crate::storage::database::StoredChannel) -> bool {
+    ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE && !ch.is_owner && !ch.deleted
+}
+
+/// FIND_VALUE the owner-signed settings record of each room owed a lookup.
+pub(super) async fn maybe_refresh_channel_settings(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+) {
+    if !settings.ember_native_enabled
+        || db.chat_locked()
+        || state.channel_settings_fetch_owed.is_empty()
+    {
+        return;
+    }
+    let Some(channels) = channels_lite_cached(state, db) else {
+        return;
+    };
+    let mut started = 0usize;
+    for ch in channels.iter() {
+        if started >= CHANNEL_SETTINGS_FETCH_PER_TICK {
+            break;
+        }
+        let Some(channel_id) = hex::decode(&ch.channel_id)
+            .ok()
+            .and_then(|b| <[u8; 16]>::try_from(b).ok())
+        else {
+            continue;
+        };
+        if !state.channel_settings_fetch_owed.contains(&channel_id) {
+            continue;
+        }
+        if !ch.in_room_now() || !channel_settings_fetched_for(ch) {
+            state.channel_settings_fetch_owed.remove(&channel_id);
+            continue;
+        }
+        match start_channel_settings_fetch(socket, state, channel_id).await {
+            None => break,
+            Some(false) => continue,
+            Some(true) => started += 1,
+        }
+    }
+    // Rooms that are no longer on the roster at all.
+    state.channel_settings_fetch_owed.retain(|id| {
+        let id_hex = hex::encode(id);
+        channels.iter().any(|ch| ch.channel_id == id_hex)
+    });
+}
+
+/// FIND_VALUE one room's settings record, settling the lookup it owed.
+/// `Some(false)` when one is already in flight, which leaves the owed mark
+/// for the next pass; `None` when no search could start.
+async fn start_channel_settings_fetch(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+) -> Option<bool> {
+    if state
+        .ember_channel_settings_searches
+        .values()
+        .any(|id| *id == channel_id)
+    {
+        return Some(false);
+    }
+    let key = ember::channel::settings_key(&channel_id);
+    let search_id = state.ember_search.start_background_find_value(
+        ember::dht::EmberNodeId(key),
+        Vec::new(),
+        state.ember_dht.routing(),
+    )?;
+    seed_ember_local_records(state, search_id, &key, &[]);
+    state
+        .ember_channel_settings_searches
+        .insert(search_id, channel_id);
+    state.channel_settings_fetch_owed.remove(&channel_id);
+    drive_ember_search(socket, state, search_id).await;
+    Some(true)
+}
+
+/// Hold the newest owner-signed settings record among `records` for a room on
+/// this device, if it supersedes the copy held. Returns whether it did.
+///
+/// Found records only ever replace one held: a lookup that finds none, or
+/// finds only older ones, leaves every setting as it was.
+pub(crate) fn ingest_channel_settings_records(
+    db: &Database,
+    channel_id: [u8; 16],
+    records: &[Vec<u8>],
+) -> bool {
+    if db.chat_locked() {
+        return false;
+    }
+    let channel_id_hex = hex::encode(channel_id);
+    let Ok(Some(ch)) = db.get_channel_lite(&channel_id_hex) else {
+        return false;
+    };
+    let Ok(stored_pk) = hex::decode(&ch.pubkey) else {
+        return false;
+    };
+    let mut best: Option<ember::dht::publish::ChannelSettings> = None;
+    for blob in records {
+        // Parsing holds the publisher to the key the record names as the room's,
+        // and the room's id to that key; this holds it to the key we joined.
+        let Some(parsed) =
+            ember::dht::publish::SignedRecord::parse_channel_settings(blob, &channel_id)
+        else {
+            continue;
+        };
+        if stored_pk.as_slice() != parsed.publisher_key.as_slice() {
+            continue;
+        }
+        if best.as_ref().is_none_or(|cur| {
+            ember::dht::publish::moderation_supersedes(
+                parsed.timestamp,
+                &parsed.signature,
+                cur.timestamp,
+                Some(&cur.signature),
+            )
+        }) {
+            best = Some(parsed);
+        }
+    }
+    let Some(settings) = best else {
+        return false;
+    };
+    db.ingest_channel_settings(
+        &channel_id_hex,
+        &crate::storage::database::HeldChannelSettings {
+            signed_at: settings.timestamp,
+            signature: settings.signature,
+            key_commitments: settings.key_commitments,
+            admission: settings.admission,
+        },
+    )
+    .unwrap_or(false)
+}
+
+/// The admission rule this device holds a private room's chat lines to.
+///
+/// The owner applies the one it states ([`ember::channel::RosterAdmission::OWNED_PRIVATE_ROOM`])
+/// from launch rather than from its first publish. A member applies the
+/// newest settings record it holds, and with none the rule before 1.7.5. A
+/// failed read is taken as the strict rule.
+pub(super) fn private_room_admission(
+    db: &Database,
+    channel_id_hex: &str,
+    own_room: bool,
+) -> ember::channel::RosterAdmission {
+    if own_room {
+        return ember::channel::RosterAdmission::OWNED_PRIVATE_ROOM;
+    }
+    match db.channel_settings(channel_id_hex) {
+        Ok(held) => held.map_or(ember::channel::RosterAdmission::Open, |held| {
+            ember::channel::RosterAdmission::from_setting(held.admission)
+        }),
+        Err(_) => ember::channel::RosterAdmission::KeyProven,
+    }
+}
+
+/// How long a key offered for a held room is kept for the owner's records to
+/// catch up with it, when nothing this device holds can check it yet.
+const PENDING_INVITE_KEY_SECS: i64 = 30 * 60;
+/// How many such keys are kept at once, across every room.
+const PENDING_INVITE_KEYS_MAX: usize = 16;
+
+struct PendingInviteKey {
+    channel_id: [u8; 16],
+    epoch: i64,
+    secret: zeroize::Zeroizing<[u8; 32]>,
+    until: i64,
+}
+
+/// Keys offered for private rooms this device holds that no commitment it
+/// holds checks yet: an invite pasted while its view of the room was behind,
+/// or a key the owner's commitments showed was not the room's. Each is taken
+/// only once a commitment checks it ([`committed_key_epoch`]), and lapses
+/// after [`PENDING_INVITE_KEY_SECS`].
+///
+/// In memory only. Nothing here has been checked, and the store keeps the
+/// first key an epoch is given.
+#[derive(Default)]
+pub(crate) struct PendingInviteKeys(Vec<PendingInviteKey>);
+
+impl PendingInviteKeys {
+    fn hold(&mut self, channel_id: [u8; 16], epoch: i64, secret: &[u8; 32], now: i64) {
+        self.prune(now);
+        self.0.retain(|held| {
+            !(held.channel_id == channel_id && held.epoch == epoch && *held.secret == *secret)
+        });
+        self.0.push(PendingInviteKey {
+            channel_id,
+            epoch,
+            secret: zeroize::Zeroizing::new(*secret),
+            until: now.saturating_add(PENDING_INVITE_KEY_SECS),
+        });
+        let excess = self.0.len().saturating_sub(PENDING_INVITE_KEYS_MAX);
+        self.0.drain(..excess);
+    }
+
+    fn prune(&mut self, now: i64) {
+        self.0.retain(|held| now < held.until);
+    }
+
+    fn holds_room(&mut self, channel_id: &[u8; 16], now: i64) -> bool {
+        self.prune(now);
+        self.0.iter().any(|held| held.channel_id == *channel_id)
+    }
+
+    /// The keys held for a room, newest epoch first.
+    fn for_room(&mut self, channel_id: &[u8; 16], now: i64) -> Vec<(i64, zeroize::Zeroizing<[u8; 32]>)> {
+        self.prune(now);
+        let mut keys: Vec<_> = self
+            .0
+            .iter()
+            .filter(|held| held.channel_id == *channel_id)
+            .map(|held| (held.epoch, held.secret.clone()))
+            .collect();
+        keys.sort_by_key(|(epoch, _)| std::cmp::Reverse(*epoch));
+        keys
+    }
+
+    fn forget(&mut self, channel_id: &[u8; 16], epoch: i64, secret: &[u8; 32]) {
+        self.0.retain(|held| {
+            !(held.channel_id == *channel_id && held.epoch == epoch && *held.secret == *secret)
+        });
+    }
+
+    fn forget_room(&mut self, channel_id: &[u8; 16]) {
+        self.0.retain(|held| held.channel_id != *channel_id);
+    }
+}
+
+fn pending_invite_keys() -> &'static std::sync::Mutex<PendingInviteKeys> {
+    static KEYS: std::sync::OnceLock<std::sync::Mutex<PendingInviteKeys>> = std::sync::OnceLock::new();
+    KEYS.get_or_init(Default::default)
+}
+
+fn lock_pending(
+    pending: &std::sync::Mutex<PendingInviteKeys>,
+) -> std::sync::MutexGuard<'_, PendingInviteKeys> {
+    pending.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The epoch a key offered for `row`, a room this device already holds, may
+/// be taken as; `None` when it may not.
+///
+/// An invite is unauthenticated and the store keeps the first key it is given
+/// for an epoch, so one taken unchecked would have this device seal under a
+/// key the invite's author reads, and refuse the genuine one when it came: why
+/// 1.7.3 stopped taking them. What makes it safe now is the owner's commitment
+/// to each kept epoch's key, carried in a record only the room key signs. So
+/// only a private room this device is behind in, by what the owner announced
+/// or by the epoch offered being past the newest it holds, only a key that
+/// says which epoch it is (epoch 0 does not), and only where the newest
+/// settings record held names that epoch with a matching commitment.
+pub(crate) fn committed_key_epoch(
+    row: &crate::storage::database::StoredChannel,
+    channel_id: &[u8; 16],
+    epoch: i64,
+    secret: &[u8; 32],
+    held: Option<&crate::storage::database::HeldChannelSettings>,
+) -> Option<i64> {
+    if row.visibility != ember::channel::CHANNEL_KIND_PRIVATE
+        || epoch < 1
+        || (row.key_epoch_wanted <= row.key_epoch && epoch <= row.key_epoch)
+    {
+        return None;
+    }
+    let (_, commitment) = held?
+        .key_commitments
+        .iter()
+        .find(|(committed, _)| *committed == epoch)?;
+    let offered = ember::channel::key_commitment(channel_id, epoch, &ember::channel::content_key(secret));
+    (offered == *commitment).then_some(epoch)
+}
+
+/// The keys among `epochs` (as `load_channel_key_epochs` reads them) the
+/// owner's commitments in `held` show are not the room's, for a private room
+/// this device holds and does not own:
+///
+/// - an epoch `held` names, under a different commitment;
+/// - once a snapshot has been taken for the room (`moderation_updated_at`),
+///   an epoch past both the newest `held` names and the newest the owner's
+///   snapshot announced (`key_epoch_wanted`). Only a first join's unchecked
+///   invite stores one: the key-epoch loop fetches no epoch past
+///   `key_epoch_wanted`, and an invite to a held room is taken only against a
+///   commitment. Before the first snapshot `key_epoch_wanted` is still 0, and
+///   a settings record looked up first can predate the rotation the invite's
+///   key came from, so a genuine key would read as past both.
+///
+/// With no commitments held there is nothing to judge by, so nothing.
+fn epochs_contradicting_commitments(
+    row: &crate::storage::database::StoredChannel,
+    channel_id: &[u8; 16],
+    epochs: &[(i64, [u8; 32])],
+    held: &crate::storage::database::HeldChannelSettings,
+) -> Vec<(i64, [u8; 32])> {
+    if row.visibility != ember::channel::CHANNEL_KIND_PRIVATE || row.is_owner {
+        return Vec::new();
+    }
+    let Some(newest_committed) = held.key_commitments.iter().map(|(epoch, _)| *epoch).max() else {
+        return Vec::new();
+    };
+    let announced = row.moderation_updated_at > 0;
+    epochs
+        .iter()
+        .filter(|(epoch, secret)| {
+            if *epoch < 1 {
+                return false;
+            }
+            match held.key_commitments.iter().find(|(committed, _)| committed == epoch) {
+                Some((_, commitment)) => {
+                    ember::channel::key_commitment(channel_id, *epoch, &ember::channel::content_key(secret))
+                        != *commitment
+                }
+                None => announced && *epoch > newest_committed && *epoch > row.key_epoch_wanted,
+            }
+        })
+        .copied()
+        .collect()
+}
+
+/// Whether a moderation pass for a held room calls for the held keys to be
+/// judged again ([`settle_channel_keys`] with `check_held`): it applied a
+/// snapshot that raised `key_epoch_wanted`, or the room's first, either of
+/// which can turn a key past everything announced into one the commitments
+/// contradict. `before` and `after` are the room's row around the pass.
+fn moderation_pass_rechecks_keys(
+    applied: bool,
+    before: Option<&crate::storage::database::StoredChannel>,
+    after: &crate::storage::database::StoredChannel,
+) -> bool {
+    applied
+        && before.is_some_and(|before| {
+            after.key_epoch_wanted > before.key_epoch_wanted || before.moderation_updated_at == 0
+        })
+}
+
+/// Bring a held private room's keys in line with what its owner has signed,
+/// after one of the owner's records was looked up: with `check_held` (a
+/// settings record has just been taken, or a snapshot that moves what the
+/// commitments are judged against, [`moderation_pass_rechecks_keys`]), drop
+/// each held key the commitments contradict
+/// ([`epochs_contradicting_commitments`]), keeping it in memory in case a
+/// later record vouches for it after all; then take any key waiting in memory
+/// that a commitment now checks. Returns whether the room's keys changed.
+/// Blocking.
+pub(crate) fn settle_channel_keys(db: &Database, channel_id: [u8; 16], check_held: bool) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    let pending = pending_invite_keys();
+    if !check_held && !lock_pending(pending).holds_room(&channel_id, now) {
+        return false;
+    }
+    settle_channel_keys_in(db, pending, channel_id, check_held, now)
+}
+
+fn settle_channel_keys_in(
+    db: &Database,
+    pending: &std::sync::Mutex<PendingInviteKeys>,
+    channel_id: [u8; 16],
+    check_held: bool,
+    now: i64,
+) -> bool {
+    let channel_id_hex = hex::encode(channel_id);
+    let Ok(Some(mut row)) = db.get_channel_lite(&channel_id_hex) else {
+        return false;
+    };
+    if row.visibility != ember::channel::CHANNEL_KIND_PRIVATE || row.is_owner || row.deleted {
+        lock_pending(pending).forget_room(&channel_id);
+        return false;
+    }
+    let held = db.channel_settings(&channel_id_hex).ok().flatten();
+    let mut changed = false;
+    if let Some(settings) = held.as_ref().filter(|_| check_held) {
+        let epochs = db.load_channel_key_epochs(&channel_id_hex).unwrap_or_default();
+        let contradicted = epochs_contradicting_commitments(&row, &channel_id, &epochs, settings);
+        match db.drop_channel_key_epochs(&channel_id_hex, &contradicted) {
+            Ok(dropped) if dropped.is_empty() => {}
+            Ok(dropped) => {
+                info!(
+                    "Ember channel {channel_id_hex}: dropped key epochs {dropped:?}, which the \
+                     owner's commitments show are not the room's"
+                );
+                changed = true;
+                let mut keys = lock_pending(pending);
+                for (epoch, secret) in contradicted.iter().filter(|(epoch, _)| dropped.contains(epoch)) {
+                    keys.hold(channel_id, *epoch, secret, now);
+                }
+            }
+            Err(e) => debug!("Ember channel {channel_id_hex}: could not drop contradicted key epochs: {e}"),
+        }
+        if changed {
+            match db.get_channel_lite(&channel_id_hex) {
+                Ok(Some(fresh)) => row = fresh,
+                _ => return changed,
+            }
+        }
+    }
+    let offered = lock_pending(pending).for_room(&channel_id, now);
+    for (epoch, secret) in offered {
+        if epoch < row.key_epoch {
+            lock_pending(pending).forget(&channel_id, epoch, &secret);
+            continue;
+        }
+        let Some(epoch) = committed_key_epoch(&row, &channel_id, epoch, &secret, held.as_ref()) else {
+            continue;
+        };
+        match db.insert_channel_key_epoch(&channel_id_hex, epoch, &secret) {
+            Ok(()) => {
+                info!("Ember channel {channel_id_hex}: took an invite's key for epoch {epoch} against the owner's commitment");
+                lock_pending(pending).forget(&channel_id, epoch, &secret);
+                changed = true;
+                match db.get_channel_lite(&channel_id_hex) {
+                    Ok(Some(fresh)) => row = fresh,
+                    _ => break,
+                }
+            }
+            Err(e) => debug!("Ember channel {channel_id_hex}: committed key for epoch {epoch} not stored: {e}"),
+        }
+    }
+    changed
+}
+
+/// What became of a key offered for a held room ([`take_offered_key`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OfferedKey {
+    /// A commitment checked it, and it is stored.
+    Taken,
+    /// Nothing held can check it yet, so it waits in memory for the owner's
+    /// records ([`PendingInviteKeys`]).
+    Held,
+    Refused,
+}
+
+/// What [`take_offered_key`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OfferedKeyOutcome {
+    pub(crate) key: OfferedKey,
+    /// The room's keys changed: the key was taken, or a held key the
+    /// commitments contradict was dropped first. The caller tells the network
+    /// loop, as an ingest that changes them does
+    /// ([`ChannelIngestResults::rekeyed`]).
+    pub(crate) rekeyed: bool,
+}
+
+/// Take a key an invite offers for `row`, a private room this device already
+/// holds, if a commitment checks it; otherwise keep it in memory when it
+/// names an epoch this device does not hold the same key for, at or past the
+/// newest it holds, which is what a device whose view of the room is stale
+/// sees. Held keys the commitments contradict are dropped first, so the
+/// genuine key can take their place. Blocking.
+pub(crate) fn take_offered_key(
+    db: &Database,
+    row: &crate::storage::database::StoredChannel,
+    channel_id: [u8; 16],
+    epoch: i64,
+    secret: &[u8; 32],
+) -> anyhow::Result<OfferedKeyOutcome> {
+    take_offered_key_in(db, pending_invite_keys(), row, channel_id, epoch, secret, chrono::Utc::now().timestamp())
+}
+
+fn take_offered_key_in(
+    db: &Database,
+    pending: &std::sync::Mutex<PendingInviteKeys>,
+    row: &crate::storage::database::StoredChannel,
+    channel_id: [u8; 16],
+    epoch: i64,
+    secret: &[u8; 32],
+    now: i64,
+) -> anyhow::Result<OfferedKeyOutcome> {
+    let refused = |rekeyed| OfferedKeyOutcome {
+        key: OfferedKey::Refused,
+        rekeyed,
+    };
+    if row.visibility != ember::channel::CHANNEL_KIND_PRIVATE || epoch < 1 {
+        return Ok(refused(false));
+    }
+    let settled = settle_channel_keys_in(db, pending, channel_id, true, now);
+    let Some(row) = db.get_channel_lite(&row.channel_id)? else {
+        return Ok(refused(settled));
+    };
+    let held = db.channel_settings(&row.channel_id)?;
+    if let Some(epoch) = committed_key_epoch(&row, &channel_id, epoch, secret, held.as_ref()) {
+        db.insert_channel_key_epoch(&row.channel_id, epoch, secret)?;
+        return Ok(OfferedKeyOutcome {
+            key: OfferedKey::Taken,
+            rekeyed: true,
+        });
+    }
+    let holds_it = epoch == row.key_epoch
+        && db
+            .load_channel_key_epochs(&row.channel_id)?
+            .iter()
+            .any(|(held_epoch, held_secret)| *held_epoch == epoch && held_secret == secret);
+    if row.is_owner || epoch < row.key_epoch || holds_it {
+        return Ok(refused(settled));
+    }
+    lock_pending(pending).hold(channel_id, epoch, secret, now);
+    Ok(OfferedKeyOutcome {
+        key: OfferedKey::Held,
+        rekeyed: settled,
+    })
 }
 
 pub(crate) fn ingest_channel_moderation_records(
@@ -2351,14 +4550,8 @@ pub(super) async fn maybe_publish_owned_channel_records(
         if !ember::channel::schedule_due(last, now, ember::channel::MODERATION_REPUBLISH_SECS) {
             continue;
         }
-        // Recovered, and still without the key the room seals with: a snapshot
-        // from here would announce an older one, and a rotation would mint a
-        // key under a number the room already uses. The key-epoch loop fetches
-        // our own sealed copy and lifts this. Behind the schedule, so only a
-        // room that is due costs the read.
-        if room_being_restored(&ch.channel_id)
-            || db.channel_owner_key_pending(&ch.channel_id).ok().flatten().is_some()
-        {
+        // Behind the schedule, so only a room that is due costs the reads.
+        if owner_republish_held_back(db, &ch.channel_id) {
             continue;
         }
         // A commitment this device did not offer: a record it found stored, or
@@ -2415,6 +4608,12 @@ pub(super) async fn maybe_publish_owned_channel_records(
         };
         if let Ok(Some(fresh)) = db.get_channel_lite(&ch.channel_id) {
             ch = std::borrow::Cow::Owned(fresh);
+        }
+        // Again now that the row is read: a rotation begun since the check
+        // above may have stored its epoch in what was just read.
+        if room_rotating(&ch.channel_id) {
+            undo_owned_rotation(db, &ch.channel_id, rotated);
+            continue;
         }
         let mut bans = db
             .list_banned_channel_pubkeys(&ch.channel_id)
@@ -2512,6 +4711,9 @@ pub(super) async fn maybe_publish_owned_channel_records(
             // The ban is now an eviction: the snapshot naming the new epoch is
             // on its way, and the re-seal at the end of this pass reaches
             // everyone still entitled to it.
+            // Its commitment goes out on the settings pass that follows this
+            // one in the same tick: storing the epoch moved the room's key
+            // generation.
             if rotated.is_some() {
                 let _ = db.clear_channel_rotate_pending(&ch.channel_id);
             }
@@ -2684,6 +4886,143 @@ pub(crate) fn note_owned_rooms_list_read() {
     OWNED_ROOMS_LIST_READ.store(true, std::sync::atomic::Ordering::Release);
 }
 
+/// When the latest look at the network's owned-rooms list that has ended
+/// began, as Unix seconds; 0 before one has ended this launch. A look that
+/// failed counts: a publish waits on one, not on its success.
+static OWNED_ROOMS_READ_BEGAN_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// When a publish of the owned-rooms list began waiting on a look, as Unix
+/// seconds; 0 when none is waiting. One older than
+/// [`OWNED_ROOMS_READ_WAIT_SECS`] plus [`OWNED_ROOMS_READ_FRESH_SECS`] counts
+/// as none ([`live_owned_rooms_ask`]).
+static OWNED_ROOMS_READ_ASKED_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// How recent a look has to be for the list to go out on it. The read loop
+/// looks ten minutes ahead of a scheduled publish, and a look walks every
+/// listed room, which takes minutes of its own.
+const OWNED_ROOMS_READ_FRESH_SECS: i64 = 15 * 60;
+
+/// The longest a publish waits on a look it asked for that never ends: the
+/// read loop may not be running.
+const OWNED_ROOMS_READ_WAIT_SECS: i64 = 10 * 60;
+
+/// Note that a look at the network's owned-rooms list that began at
+/// `began_at` has ended, however it ended.
+pub(crate) fn note_owned_rooms_read_ended(began_at: i64) {
+    OWNED_ROOMS_READ_BEGAN_AT.fetch_max(began_at, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Woken when a publish of the owned-rooms list waits on a look; the read
+/// loop looks at once (`channel_recovery`).
+pub(crate) fn owned_rooms_read_wanted() -> &'static tokio::sync::Notify {
+    static WANTED: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    WANTED.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Whether a publish of the owned-rooms list waits for a look at the
+/// network's copy, given when the latest look that ended began (`read_began`),
+/// when this publish asked for one (`asked`; 0 for not yet) and `now`.
+///
+/// Storers keep one list per identity, so a publish replaces whatever the
+/// identity's other device last published there. Going out only after a
+/// recent look — one that carried what that device added — is what keeps a
+/// room made there from being dropped. A look counts when it began within
+/// [`OWNED_ROOMS_READ_FRESH_SECS`], so one the publish asked for counts as
+/// soon as it ends, read or not; one that has not ended is waited on for
+/// [`OWNED_ROOMS_READ_WAIT_SECS`].
+pub(crate) fn owned_rooms_publish_waits(read_began: i64, asked: i64, now: i64) -> bool {
+    if owned_rooms_read_fresh(read_began, now) {
+        return false;
+    }
+    let asked = live_owned_rooms_ask(asked, now);
+    !(asked > 0 && now - asked >= OWNED_ROOMS_READ_WAIT_SECS)
+}
+
+/// Whether a look that began at `read_began` (0 for none) is recent enough
+/// at `now` for the owned-rooms list to go out on it.
+fn owned_rooms_read_fresh(read_began: i64, now: i64) -> bool {
+    read_began > 0 && now - read_began <= OWNED_ROOMS_READ_FRESH_SECS
+}
+
+/// `asked`, or 0 when it is too old to be the ask of a publish still
+/// waiting: a publish goes once [`OWNED_ROOMS_READ_WAIT_SECS`] have passed,
+/// so an ask that outlived that by [`OWNED_ROOMS_READ_FRESH_SECS`] was left
+/// by one that never went, and a publish now asks again.
+fn live_owned_rooms_ask(asked: i64, now: i64) -> i64 {
+    if asked > 0 && now - asked < OWNED_ROOMS_READ_WAIT_SECS + OWNED_ROOMS_READ_FRESH_SECS {
+        asked
+    } else {
+        0
+    }
+}
+
+/// Whether the read loop, woken by a publish of the owned-rooms list
+/// ([`owned_rooms_read_wanted`]), still has to look at `now`. It does not
+/// when a look recent enough for the publish has ended since the publish
+/// asked, as one already under way when it asked does.
+pub(crate) fn owned_rooms_read_still_wanted(now: i64) -> bool {
+    !owned_rooms_read_fresh(OWNED_ROOMS_READ_BEGAN_AT.load(std::sync::atomic::Ordering::Acquire), now)
+}
+
+/// Whether a publish of the owned-rooms list goes out at `now`, given whether
+/// one is due (`due`). One due waits while [`owned_rooms_publish_waits`]
+/// says so, asking the read loop for a look the first time; the ask is
+/// dropped once the list goes out or is no longer due.
+fn owned_rooms_publish_gate(due: bool, now: i64) -> bool {
+    use std::sync::atomic::Ordering;
+    if !due {
+        OWNED_ROOMS_READ_ASKED_AT.store(0, Ordering::Release);
+        return false;
+    }
+    let asked = live_owned_rooms_ask(OWNED_ROOMS_READ_ASKED_AT.load(Ordering::Acquire), now);
+    if owned_rooms_publish_waits(OWNED_ROOMS_READ_BEGAN_AT.load(Ordering::Acquire), asked, now) {
+        if asked == 0 {
+            OWNED_ROOMS_READ_ASKED_AT.store(now, Ordering::Release);
+            owned_rooms_read_wanted().notify_one();
+        }
+        return false;
+    }
+    OWNED_ROOMS_READ_ASKED_AT.store(0, Ordering::Release);
+    true
+}
+
+#[cfg(test)]
+pub(crate) fn owned_rooms_read_began_at() -> i64 {
+    OWNED_ROOMS_READ_BEGAN_AT.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Held by every test that reads or moves the process-wide look and ask
+/// times, which tests running in parallel would otherwise move under it.
+#[cfg(test)]
+pub(crate) fn owned_rooms_read_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// No look ended and no publish waiting, as at launch. Only under
+/// [`owned_rooms_read_test_lock`].
+#[cfg(test)]
+pub(crate) fn reset_owned_rooms_read_times() {
+    OWNED_ROOMS_READ_BEGAN_AT.store(0, std::sync::atomic::Ordering::Release);
+    OWNED_ROOMS_READ_ASKED_AT.store(0, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(test)]
+fn owned_rooms_read_asked_at() -> i64 {
+    OWNED_ROOMS_READ_ASKED_AT.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// When this device next publishes its owned-rooms list, as Unix seconds; 0
+/// before its first publish this launch.
+static NEXT_OWNED_ROOMS_PUBLISH_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// When this device next publishes its owned-rooms list, so a read of the
+/// network's can come just before it. `None` until it has published once.
+pub(crate) fn next_owned_rooms_list_publish_at() -> Option<i64> {
+    let at = NEXT_OWNED_ROOMS_PUBLISH_AT.load(std::sync::atomic::Ordering::Acquire);
+    (at > 0).then_some(at)
+}
+
 /// Rooms a recovery is putting back right now. Between the row going in and
 /// the room's snapshot landing on it, the owner loop would otherwise sign a
 /// snapshot of a room with no bans, no topic and an old key, and that
@@ -2723,41 +5062,126 @@ impl Drop for RestoringRoom {
     }
 }
 
+/// Rooms of ours with a rotated key stored whose snapshot has not committed
+/// yet, and so may still be taken back, by how many rotations. A settings
+/// record signed meanwhile would commit the room to a key it then undoes
+/// ([`read_owned_channel_settings`]).
+fn rooms_rotating() -> &'static std::sync::Mutex<HashMap<String, usize>> {
+    static ROOMS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, usize>>> = std::sync::OnceLock::new();
+    ROOMS.get_or_init(Default::default)
+}
+
+fn room_rotating(channel_id: &str) -> bool {
+    rooms_rotating()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(channel_id)
+}
+
+/// Whether the owner loop signs nothing for a room of ours this pass.
+///
+/// Recovered, and still without the key the room seals with: a snapshot from
+/// here would announce an older one, and a rotation would mint a key under a
+/// number the room already uses. The key-epoch loop fetches our own sealed
+/// copy and lifts this.
+///
+/// Rotating ([`RotatingRoom`]): the new epoch is stored before the snapshot
+/// that announces it commits, so a snapshot from here would announce it and
+/// the re-seal after it would hand its key to every member, and a rotation
+/// taken back then leaves the members on a key the owner no longer uses.
+fn owner_republish_held_back(db: &Database, channel_id: &str) -> bool {
+    room_being_restored(channel_id)
+        || room_rotating(channel_id)
+        || db.channel_owner_key_pending(channel_id).ok().flatten().is_some()
+}
+
+/// Held from before a rotation stores its key until its snapshot has
+/// committed or the rotation has been taken back. Dropping it moves the
+/// room's key generation, so a settings pass the rotation held back reads the
+/// room again at once.
+pub(crate) struct RotatingRoom(String);
+
+impl RotatingRoom {
+    pub(crate) fn begin(channel_id: &str) -> Self {
+        *rooms_rotating()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(channel_id.to_string())
+            .or_default() += 1;
+        Self(channel_id.to_string())
+    }
+}
+
+impl Drop for RotatingRoom {
+    fn drop(&mut self) {
+        {
+            let mut rooms = rooms_rotating().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(count) = rooms.get_mut(&self.0) {
+                *count -= 1;
+                if *count == 0 {
+                    rooms.remove(&self.0);
+                }
+            }
+        }
+        crate::storage::database::bump_channel_key_generation(&self.0);
+    }
+}
+
 /// Keep the identity's owned-rooms list on the network: on the owner records'
 /// cadence, and as soon as the set of rooms changes, so a room made or taken
-/// over is in it within a tick rather than within six hours.
+/// over is in it within minutes rather than within six hours.
 ///
 /// Only once the network's list has been read this launch (see
 /// [`owned_rooms_list_read`]): a database from an older time would otherwise
-/// replace a list naming the rooms made since with one that does not. An
-/// empty list is published too, so a deleted last room stops being listed.
+/// replace a list naming the rooms made since with one that does not. And
+/// each time only after a recent look at it ([`owned_rooms_publish_waits`]),
+/// which this asks for when there has been none. An empty list is published
+/// too, so a deleted last room stops being listed.
 pub(super) async fn maybe_publish_owned_rooms_list(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
     identity: &crate::storage::identity::NodeIdentity,
 ) {
-    if !owned_rooms_list_read() || db.chat_locked() {
+    if !owned_rooms_list_read() {
         return;
     }
+    let now = chrono::Utc::now().timestamp();
+    if db.chat_locked() {
+        owned_rooms_publish_gate(false, now);
+        return;
+    }
+    // `Some(unchanged)` when `salts` are due out.
+    let due = |state: &NetworkState, salts: &[ember::channel::OwnedRoomSalt]| {
+        let unchanged = state.owned_rooms_published.as_deref() == Some(salts);
+        (!unchanged
+            || ember::channel::schedule_due(
+                state.owned_rooms_published_at,
+                now,
+                ember::channel::MODERATION_REPUBLISH_SECS,
+            ))
+        .then_some(unchanged)
+    };
+    let due_now = db.owned_room_salts().is_ok_and(|salts| due(state, &salts).is_some());
+    if !owned_rooms_publish_gate(due_now, now) {
+        return;
+    }
+    // Read again: the look stored what it carried.
     let Ok(salts) = db.owned_room_salts() else {
         return;
     };
-    let now = chrono::Utc::now().timestamp();
-    let unchanged = state.owned_rooms_published.as_ref() == Some(&salts);
-    if unchanged
-        && !ember::channel::schedule_due(
-            state.owned_rooms_published_at,
-            now,
-            ember::channel::MODERATION_REPUBLISH_SECS,
-        )
-    {
+    let Some(unchanged) = due(state, &salts) else {
         return;
-    }
+    };
     let signing = crate::network::ember::crypto::signing_key_from_bytes(&identity.ed25519_secret_key);
-    // `owned_room_salts` stops at what one list carries, so this only fails
-    // if the identity key itself is unusable.
-    let Some(record) = ember::dht::publish::SignedRecord::owned_rooms(&salts, &signing) else {
+    let listed = if ember::channel::PAD_OWNED_ROOMS_LIST {
+        ember::channel::pad_owned_rooms_list(&salts, &identity.ed25519_secret_key)
+    } else {
+        salts.clone()
+    };
+    // `owned_room_salts` stops at what one list carries, and padding never
+    // goes past it, so this only fails if the identity key itself is unusable.
+    let Some(record) = ember::dht::publish::SignedRecord::owned_rooms(&listed, &signing) else {
         warn!("Ember: could not sign this identity's list of owned rooms");
         return;
     };
@@ -2770,6 +5194,10 @@ pub(super) async fn maybe_publish_owned_rooms_list(
         } else {
             now - ember::channel::MODERATION_REPUBLISH_SECS + OWNED_ROOMS_CONFIRM_SECS
         };
+        NEXT_OWNED_ROOMS_PUBLISH_AT.store(
+            state.owned_rooms_published_at + ember::channel::MODERATION_REPUBLISH_SECS,
+            std::sync::atomic::Ordering::Release,
+        );
         state.owned_rooms_published = Some(salts);
         drive_ember_publish(socket, state, publish_id).await;
     }
@@ -2777,6 +5205,355 @@ pub(super) async fn maybe_publish_owned_rooms_list(
 
 /// How soon a changed owned-rooms list is published again.
 const OWNED_ROOMS_CONFIRM_SECS: i64 = 30 * 60;
+
+/// How soon a changed settings record is published again, for the same reason
+/// as [`OWNED_ROOMS_CONFIRM_SECS`].
+const CHANNEL_SETTINGS_CONFIRM_SECS: i64 = OWNED_ROOMS_CONFIRM_SECS;
+/// How soon a settings record that stored on no node, or could not be
+/// started or read, is tried again.
+const CHANNEL_SETTINGS_RETRY_SECS: i64 = 60;
+/// How soon a room the owner-record gates held back is looked at again,
+/// unless its keys move first. Recovery lifts the commonest gate by storing
+/// the key it waited on, which moves them.
+const CHANNEL_SETTINGS_HELD_BACK_SECS: i64 = 5 * 60;
+
+/// What this device last did about one owned room's settings record.
+pub(super) struct ChannelSettingsPublished {
+    /// [`Database::channel_key_generation`] when the room's keys were last
+    /// read. A rotation, one taken back, or any other change to the epochs
+    /// moves it, so a pass reads the keys again only once it has moved or
+    /// `due_at` has come.
+    generation: u64,
+    /// What the last record this launch committed to, as read from the
+    /// epochs when it was signed; `None` until one has gone out.
+    key_commitments: Option<Vec<(i64, [u8; 32])>>,
+    /// When the room is read again whatever its keys do: the confirm or
+    /// republish, a retry, or a held-back room's next look.
+    due_at: i64,
+    /// The STORE verdict while it is outstanding.
+    verdict: Option<oneshot::Receiver<EmberPublishResult>>,
+}
+
+/// Whether a pass reads one owned room's keys: never read this launch, its
+/// keys moved since, or its schedule has come.
+fn channel_settings_read_due(published: Option<&ChannelSettingsPublished>, generation: u64, now: i64) -> bool {
+    published.is_none_or(|p| p.generation != generation || now >= p.due_at)
+}
+
+/// Whether a room whose commitments read as `current` publishes, given those
+/// it last published (`None`: nothing yet this launch) and whether its
+/// schedule has come; and if so, how many seconds until it goes out again.
+/// A change goes out at once and again within
+/// [`CHANNEL_SETTINGS_CONFIRM_SECS`]; otherwise on the snapshot's cadence.
+/// The first publish of a launch is a change when `current` differs from the
+/// commitments of the copy held (`held`, none read as none committed): a
+/// rotation committed before this pass has had no confirm.
+fn channel_settings_publish_plan(
+    last: Option<&[(i64, [u8; 32])]>,
+    held: Option<&[(i64, [u8; 32])]>,
+    current: &[(i64, [u8; 32])],
+    schedule_due: bool,
+) -> Option<i64> {
+    match last {
+        None if held.unwrap_or_default() != current => Some(CHANNEL_SETTINGS_CONFIRM_SECS),
+        None => Some(ember::channel::MODERATION_REPUBLISH_SECS),
+        Some(last) if last != current => Some(CHANNEL_SETTINGS_CONFIRM_SECS),
+        Some(_) if schedule_due => Some(ember::channel::MODERATION_REPUBLISH_SECS),
+        Some(_) => None,
+    }
+}
+
+/// One owned room's settings, as read off the network task.
+enum OwnedChannelSettingsRead {
+    /// An owner-record gate holds the room back, or its keys may yet change
+    /// under the read: a rotation not yet committed, or a write since the key
+    /// generation was sampled.
+    HeldBack,
+    /// The room's seed or keys could not be read, or made no record.
+    Unreadable,
+    Read {
+        key_commitments: Vec<(i64, [u8; 32])>,
+        /// The record to publish, what to hold of it once it has started, and
+        /// how soon it goes out again; `None` when nothing is due.
+        publish: Option<Box<OwnedChannelSettingsPublish>>,
+    },
+}
+
+type OwnedChannelSettingsPublish = (
+    ember::dht::publish::SignedRecord,
+    crate::storage::database::HeldChannelSettings,
+    i64,
+);
+
+/// Read and, when [`channel_settings_publish_plan`] says so, sign one owned
+/// private room's settings record. Blocking: it decrypts the room's keys.
+/// Writes nothing; the record is held once its publish has started.
+///
+/// `generation` is the room's key generation sampled before the read. The
+/// keys read commit the room only if nothing has written them since and no
+/// rotation is in flight ([`RotatingRoom`]): a rotation stores its key before
+/// its snapshot commits, and takes it back if the commit fails.
+fn read_owned_channel_settings(
+    db: &Database,
+    channel_id: [u8; 16],
+    generation: u64,
+    last: Option<&[(i64, [u8; 32])]>,
+    schedule_due: bool,
+    now: i64,
+) -> OwnedChannelSettingsRead {
+    let channel_id_hex = hex::encode(channel_id);
+    // The owner-record loop's gates, for its reasons: a recovered room still
+    // without its current key would commit to an older set, and a room
+    // leaving for a successor this device did not offer is not ours to keep
+    // speaking for.
+    if room_being_restored(&channel_id_hex)
+        || db.channel_owner_key_pending(&channel_id_hex).ok().flatten().is_some()
+        || db
+            .channel_handoff_commit(&channel_id_hex)
+            .ok()
+            .flatten()
+            .is_some_and(|commit| commit.claimed || commit.nominee.is_empty())
+    {
+        return OwnedChannelSettingsRead::HeldBack;
+    }
+    let Ok(Some(seed)) = db.load_channel_owner_seed(&channel_id_hex) else {
+        return OwnedChannelSettingsRead::Unreadable;
+    };
+    let ident = ember::channel::ChannelIdentity::from_seed(&seed);
+    if ident.channel_id != channel_id {
+        return OwnedChannelSettingsRead::Unreadable;
+    }
+    let Ok(epochs) = db.load_channel_key_epochs(&channel_id_hex) else {
+        return OwnedChannelSettingsRead::Unreadable;
+    };
+    if room_rotating(&channel_id_hex) || db.channel_key_generation(&channel_id_hex) != generation {
+        return OwnedChannelSettingsRead::HeldBack;
+    }
+    let (key_commitments, admission) = own_channel_settings(&channel_id, &epochs);
+    let held = last
+        .is_none()
+        .then(|| db.channel_settings(&channel_id_hex).ok().flatten())
+        .flatten();
+    let Some(next_in) = channel_settings_publish_plan(
+        last,
+        held.as_ref().map(|held| held.key_commitments.as_slice()),
+        &key_commitments,
+        schedule_due,
+    ) else {
+        return OwnedChannelSettingsRead::Read {
+            key_commitments,
+            publish: None,
+        };
+    };
+    let Ok(stamp) = db.stamp_channel_settings(&channel_id_hex, now) else {
+        return OwnedChannelSettingsRead::Unreadable;
+    };
+    let Some(record) = ember::dht::publish::SignedRecord::channel_settings_at(
+        &key_commitments,
+        admission.setting(),
+        channel_id,
+        ident.pubkey,
+        true,
+        &ident.signing_key,
+        stamp,
+    ) else {
+        warn!("Ember: channel {channel_id_hex} key commitments do not make a valid settings record");
+        return OwnedChannelSettingsRead::Unreadable;
+    };
+    let held = crate::storage::database::HeldChannelSettings {
+        signed_at: stamp,
+        signature: record.signature,
+        key_commitments: key_commitments.clone(),
+        admission: admission.setting(),
+    };
+    OwnedChannelSettingsRead::Read {
+        key_commitments,
+        publish: Some(Box::new((record, held, next_in))),
+    }
+}
+
+/// Whether this device publishes a settings record for `ch`: every private
+/// room it owns and still runs, rotated or not, since each states its
+/// admission rule. A public room has no setting yet, so it publishes nothing.
+fn owner_publishes_channel_settings(ch: &crate::storage::database::StoredChannel) -> bool {
+    !ch.deleted
+        && ch.is_owner
+        && ch.successor_id.is_empty()
+        && ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE
+}
+
+/// What an owner's settings record for one of its private rooms says: the
+/// commitments to each rotated epoch among `epochs` (newest first, as
+/// `load_channel_key_epochs` reads them), and its admission rule. Epoch 0 is
+/// the key the room's first invites were minted with and has no commitment.
+fn own_channel_settings(
+    channel_id: &[u8; 16],
+    epochs: &[(i64, [u8; 32])],
+) -> (Vec<(i64, [u8; 32])>, ember::channel::RosterAdmission) {
+    let key_commitments = epochs
+        .iter()
+        .filter(|(epoch, _)| *epoch >= 1)
+        .take(ember::dht::publish::SETTINGS_KEY_COMMITMENTS_MAX)
+        .map(|(epoch, secret)| {
+            (
+                *epoch,
+                ember::channel::key_commitment(channel_id, *epoch, &ember::channel::content_key(secret)),
+            )
+        })
+        .collect();
+    (key_commitments, ember::channel::RosterAdmission::OWNED_PRIVATE_ROOM)
+}
+
+/// Keep each owned private room's settings record on the network: the key
+/// commitments of every epoch the room keeps, and its admission rule.
+///
+/// Published as soon as the commitments differ from those last published,
+/// which is after every rotation and every rotation taken back (a rotation
+/// committed from a command asks for a pass at once), then once more within
+/// [`CHANNEL_SETTINGS_CONFIRM_SECS`], and otherwise on the snapshot's cadence,
+/// [`ember::channel::MODERATION_REPUBLISH_SECS`]; the first of a launch is
+/// confirmed the same way when it differs from the copy held. One that stored
+/// on no node is tried again within a minute. A room that has never rotated
+/// publishes one too, with no commitments, so commitments a room no longer
+/// stands behind are taken back the same way. Nothing is signed for a room
+/// while a rotation of it is in flight ([`RotatingRoom`]), so no record
+/// commits to a key that is then taken back.
+///
+/// A room's keys are read, on the blocking pool, only when its key generation
+/// has moved or its schedule has come ([`channel_settings_read_due`]), so a
+/// settled room costs a pass no database work at all, and a room the gates
+/// hold back is looked at again only after [`CHANNEL_SETTINGS_HELD_BACK_SECS`].
+pub(super) async fn maybe_publish_channel_settings(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let Some(channels) = channels_lite_cached(state, db) else {
+        return;
+    };
+    for published in state.channel_settings_published.values_mut() {
+        let Some(verdict) = published.verdict.as_mut() else {
+            continue;
+        };
+        // A dropped sender is a publish that went away without a verdict,
+        // which is not evidence it landed either.
+        let stored = match verdict.try_recv() {
+            Ok(result) => Some(result.stored_on > 0),
+            Err(oneshot::error::TryRecvError::Closed) => Some(false),
+            Err(oneshot::error::TryRecvError::Empty) => None,
+        };
+        if let Some(stored) = stored {
+            published.verdict = None;
+            if !stored {
+                published.due_at = published.due_at.min(now + CHANNEL_SETTINGS_RETRY_SECS);
+            }
+        }
+    }
+    let due: Vec<([u8; 16], u64, Option<Vec<(i64, [u8; 32])>>, bool)> = channels
+        .iter()
+        .filter(|ch| owner_publishes_channel_settings(ch))
+        .filter_map(|ch| {
+            let channel_id = <[u8; 16]>::try_from(hex::decode(&ch.channel_id).ok()?).ok()?;
+            // Sampled before the keys are read, so a change landing while
+            // they are has the next pass read them again.
+            let generation = db.channel_key_generation(&ch.channel_id);
+            let published = state.channel_settings_published.get(&channel_id);
+            channel_settings_read_due(published, generation, now).then(|| {
+                (
+                    channel_id,
+                    generation,
+                    published.and_then(|p| p.key_commitments.clone()),
+                    published.is_none_or(|p| now >= p.due_at),
+                )
+            })
+        })
+        .take(CHANNEL_MODERATION_PUBLISH_PER_TICK)
+        .collect();
+    if due.is_empty() {
+        return;
+    }
+    let reads = {
+        let db = db.clone();
+        tokio::task::spawn_blocking(move || {
+            due.into_iter()
+                .map(|(channel_id, generation, last, schedule_due)| {
+                    let read =
+                        read_owned_channel_settings(&db, channel_id, generation, last.as_deref(), schedule_due, now);
+                    (channel_id, generation, read)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default()
+    };
+    for (channel_id, generation, read) in reads {
+        let entry = state
+            .channel_settings_published
+            .entry(channel_id)
+            .or_insert_with(|| ChannelSettingsPublished {
+                generation,
+                key_commitments: None,
+                due_at: now,
+                verdict: None,
+            });
+        let (key_commitments, (record, held, next_in)) = match read {
+            OwnedChannelSettingsRead::HeldBack => {
+                entry.generation = generation;
+                entry.due_at = now + CHANNEL_SETTINGS_HELD_BACK_SECS;
+                continue;
+            }
+            OwnedChannelSettingsRead::Unreadable => {
+                entry.generation = generation;
+                entry.due_at = now + CHANNEL_SETTINGS_RETRY_SECS;
+                continue;
+            }
+            OwnedChannelSettingsRead::Read { publish: None, .. } => {
+                entry.generation = generation;
+                continue;
+            }
+            OwnedChannelSettingsRead::Read {
+                key_commitments,
+                publish: Some(publish),
+            } => (key_commitments, *publish),
+        };
+        let Some(publish_id) = start_own_channel_publish(state, record) else {
+            if let Some(entry) = state.channel_settings_published.get_mut(&channel_id) {
+                entry.generation = generation;
+                entry.due_at = now + CHANNEL_SETTINGS_RETRY_SECS;
+            }
+            continue;
+        };
+        // Held before it goes out, so the next stamp counts on from this one.
+        let hold = {
+            let db = db.clone();
+            let channel_id_hex = hex::encode(channel_id);
+            tokio::task::spawn_blocking(move || db.hold_own_channel_settings(&channel_id_hex, &held)).await
+        };
+        if !matches!(hold, Ok(Ok(_))) {
+            debug!(
+                "Ember: channel {} settings record going out without being held here",
+                hex::encode(channel_id)
+            );
+        }
+        let (tx, rx) = oneshot::channel();
+        state.ember_dht_pending_publishes.insert(publish_id, tx);
+        state.channel_settings_published.insert(
+            channel_id,
+            ChannelSettingsPublished {
+                generation,
+                key_commitments: Some(key_commitments),
+                due_at: now + next_in,
+                verdict: Some(rx),
+            },
+        );
+        drive_ember_publish(socket, state, publish_id).await;
+    }
+}
 
 /// Drop an epoch whose moderation snapshot never went out, so the room keeps
 /// talking under the key its members still hold.
@@ -2825,13 +5602,19 @@ pub(super) fn rotate_owned_channel_key(db: &Database, channel_id_hex: &str, from
 /// Every unbanned row is taken as entitled, which holds only because a new row
 /// needs evidence that its *author* held the current key — not merely that
 /// whoever sealed the frame did:
-/// - a DHT presence record, whose extra the member seals themselves and
-///   storers only hold;
+/// - a DHT presence record opened under the current key, whose extra the
+///   member seals themselves and storers only hold. A v2 seal carries the
+///   member's signature binding it to the record, so it cannot be moved into
+///   one somebody else signs. A v1 seal names the room but not the member, so
+///   a storer could copy one into a record it signs itself; v1 is still read
+///   for members on 1.7.4;
 /// - a beacon carrying the member's own key proof, checked against our current
 ///   key in [`apply_channel_presence_beacons`];
-/// - a live chat line opened under the current key, whose seal is the author's
+/// - unless the room's settings say [`ember::channel::RosterAdmission::KeyProven`],
+///   a live chat line opened under the current key, whose seal is the author's
 ///   because relays forward the original body. Catch-up re-serves are sealed
-///   by the responder and never admit ([`ember::channel::chat_author_joins_gossip_roster`]).
+///   by the responder and never admit ([`ember::channel::chat_author_joins_gossip_roster`]),
+///   but their TTL can be raised in transit, which is what that rule closes.
 ///
 /// The remaining writers are the owner's own snapshot, a moderator's signed
 /// action, and a handoff copying the old roster — each an authority over who
@@ -2847,21 +5630,50 @@ pub(super) async fn republish_channel_key_epoch(
     identity: &crate::storage::identity::NodeIdentity,
     our_pk: [u8; 32],
 ) {
-    let epoch = ch.key_epoch;
+    let records = {
+        let db = db.clone();
+        let channel_id_hex = ch.channel_id.clone();
+        let epoch = ch.key_epoch;
+        let ident = ident.clone();
+        let our_seed = zeroize::Zeroizing::new(identity.ed25519_secret_key);
+        tokio::task::spawn_blocking(move || {
+            seal_current_epoch_records(&db, &channel_id_hex, epoch, &ident, &our_seed, our_pk)
+        })
+        .await
+        .unwrap_or_default()
+    };
+    for record in records {
+        if let Some(publish_id) = start_own_channel_publish(state, record) {
+            drive_ember_publish(socket, state, publish_id).await;
+        }
+    }
+}
+
+/// The records [`republish_channel_key_epoch`] publishes: every form of the
+/// room's `epoch` key sealed to us and to each unbanned member. Empty when
+/// that key is not held. Blocking: it reads the key and the roster, and runs a
+/// DH and a seal per member.
+fn seal_current_epoch_records(
+    db: &Database,
+    channel_id_hex: &str,
+    epoch: i64,
+    ident: &ember::channel::ChannelIdentity,
+    our_seed: &[u8; 32],
+    our_pk: [u8; 32],
+) -> Vec<ember::dht::publish::SignedRecord> {
     let Some(secret) = db
-        .load_channel_key_epochs(&ch.channel_id)
+        .load_channel_key_epochs(channel_id_hex)
         .unwrap_or_default()
         .into_iter()
         .find(|(e, _)| *e == epoch)
-        .map(|(_, secret)| secret)
+        .map(|(_, secret)| zeroize::Zeroizing::new(secret))
     else {
-        return;
+        return Vec::new();
     };
-    let our_seed = identity.ed25519_secret_key;
     // Our own copy first, sealed to our own identity: it is what a device
     // restored from a backup taken before this epoch reads the key back from.
     // A member's slot, so the record is the one every member's is.
-    let members = db.list_channel_members(&ch.channel_id).unwrap_or_default();
+    let members = db.list_channel_members(channel_id_hex).unwrap_or_default();
     let recipients = std::iter::once(our_pk).chain(members.iter().filter_map(|member| {
         if member.banned {
             return None;
@@ -2871,29 +5683,28 @@ pub(super) async fn republish_channel_key_epoch(
             .and_then(|b| <[u8; 32]>::try_from(b).ok())?;
         (member_pk != our_pk).then_some(member_pk)
     }));
-    for member_pk in recipients.collect::<Vec<_>>() {
-        let Some(wrap) = ember::channel::derive_channel_epoch_secret(
-            &our_seed,
-            &member_pk,
-            &ident.channel_id,
-            epoch,
+    let mut records = Vec::new();
+    for member_pk in recipients {
+        let (Some(wrap), Some(blind)) = (
+            ember::channel::derive_channel_epoch_secret(our_seed, &member_pk, &ident.channel_id, epoch),
+            ember::channel::epoch_blind(our_seed, &member_pk, &ident.channel_id),
         ) else {
             continue;
         };
         let sealed =
             ember::channel::seal_channel_key_epoch(&wrap, &ident.channel_id, epoch, &secret);
-        let record = ember::dht::publish::SignedRecord::channel_key_epoch(
+        records.extend(ember::dht::publish::SignedRecord::channel_key_epoch_forms(
             ident.channel_id,
             ident.pubkey,
             &member_pk,
+            member_pk == our_pk,
             epoch,
+            &blind,
             &sealed,
             &ident.signing_key,
-        );
-        if let Some(publish_id) = start_own_channel_publish(state, record) {
-            drive_ember_publish(socket, state, publish_id).await;
-        }
+        ));
     }
+    records
 }
 
 pub(super) const CHANNEL_EPOCH_FETCH_PER_TICK: usize = 2;
@@ -2907,6 +5718,10 @@ pub(super) const CHANNEL_EPOCH_FETCH_SECS: i64 = 60;
 /// room's key is derivable by anyone so rotating one would evict nobody. Driven
 /// by `key_epoch_wanted` running ahead of `key_epoch`, both of which come from
 /// the owner's signed moderation record.
+///
+/// What to look up is read on the blocking pool, for every due room at once
+/// ([`channel_epoch_lookup`]). A room with nothing to look up is stamped, so it
+/// is read again an interval on rather than on every tick.
 pub(super) async fn maybe_refresh_channel_key_epoch(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -2921,79 +5736,157 @@ pub(super) async fn maybe_refresh_channel_key_epoch(
     let Some(channels) = channels_lite_cached(state, db) else {
         return;
     };
-    let our_pk = identity.ed25519_public_key;
+    let due: Vec<([u8; 16], crate::storage::database::StoredChannel)> = channels
+        .iter()
+        .filter(|ch| {
+            // An owner mints its keys and needs none fetched — unless it is a
+            // recovered owner, which fetches the current one back from the
+            // copy it sealed to itself ([`channel_epoch_lookup`] asks).
+            ch.in_room_now()
+                && ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE
+                && ch.key_epoch_wanted > 0
+                && ch.successor_id.is_empty()
+                && (!ch.is_owner || ch.key_epoch_wanted > ch.key_epoch)
+        })
+        .filter_map(|ch| {
+            let channel_id = <[u8; 16]>::try_from(hex::decode(&ch.channel_id).ok()?).ok()?;
+            let last = state.channel_epoch_fetch_at.get(&channel_id).copied().unwrap_or(0);
+            ember::channel::schedule_due(last, now, CHANNEL_EPOCH_FETCH_SECS)
+                .then(|| (channel_id, ch.clone()))
+        })
+        .collect();
+    if due.is_empty() {
+        return;
+    }
+    let lookups = {
+        let db = db.clone();
+        let our_seed = identity.ed25519_secret_key;
+        let our_pk = identity.ed25519_public_key;
+        tokio::task::spawn_blocking(move || {
+            due.into_iter()
+                .map(|(channel_id, ch)| {
+                    (channel_id, channel_epoch_lookup(&db, &our_seed, &our_pk, &ch, &channel_id))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default()
+    };
     let mut started = 0usize;
-    for ch in channels.iter() {
-        if !ch.in_room_now() {
-            continue;
-        }
-        if started >= CHANNEL_EPOCH_FETCH_PER_TICK {
-            break;
-        }
-        // An owner mints its keys and needs none fetched — unless it is a
-        // recovered owner, which fetches the current one back from the copy it
-        // sealed to itself.
-        let recovering = ch.is_owner
-            && ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE
-            && ch.key_epoch_wanted > ch.key_epoch
-            && db.channel_owner_key_pending(&ch.channel_id).ok().flatten().is_some();
-        if (ch.is_owner && !recovering)
-            || ch.visibility != ember::channel::CHANNEL_KIND_PRIVATE
-            || ch.key_epoch_wanted <= 0
-            || !ch.successor_id.is_empty()
-        {
-            continue;
-        }
-        let Ok(channel_id) = hex::decode(&ch.channel_id)
-            .map_err(|_| ())
-            .and_then(|b| <[u8; 16]>::try_from(b).map_err(|_| ()))
-        else {
-            continue;
-        };
-        let last = state
-            .channel_epoch_fetch_at
-            .get(&channel_id)
-            .copied()
-            .unwrap_or(0);
-        if !ember::channel::schedule_due(last, now, CHANNEL_EPOCH_FETCH_SECS) {
-            continue;
-        }
-        // The newest epoch we are *missing*, which is not the same as the one
-        // the owner advertises. Sleeping through two rotations used to leave the
-        // intermediate epoch unfetched for good: the member picked up the
-        // newest, `key_epoch` caught up to `key_epoch_wanted`, and the loop
-        // stopped looking — so the window of history sealed under the epoch in
-        // between stayed unreadable even though its record was still in the DHT
-        // and `channel_content_keys` would have used it. Behind the schedule
-        // gate so this costs one indexed read per room per interval.
-        let floor = (ch.key_epoch_wanted - Database::CHANNEL_KEY_EPOCHS_KEPT as i64 + 1).max(1);
-        let Ok(Some(target)) =
-            db.newest_missing_channel_key_epoch(&ch.channel_id, floor, ch.key_epoch_wanted)
-        else {
+    for (channel_id, lookup) in lookups {
+        let Some((target, keys)) = lookup else {
+            state.channel_epoch_fetch_at.insert(channel_id, now);
             continue;
         };
         if state
             .ember_channel_epoch_searches
             .values()
-            .any(|(id, epoch)| *id == channel_id && *epoch == target)
+            .any(|held| *held == (channel_id, target))
         {
+            state.channel_epoch_fetch_at.insert(channel_id, now);
             continue;
         }
-        let key = ember::channel::epoch_key(&channel_id, &our_pk, target);
-        let Some(search_id) = state.ember_search.start_background_find_value(
-            ember::dht::EmberNodeId(key),
-            Vec::new(),
-            state.ember_dht.routing(),
-        ) else {
+        if started >= CHANNEL_EPOCH_FETCH_PER_TICK {
+            continue;
+        }
+        let mut any = false;
+        for key in keys {
+            let Some(search_id) = state.ember_search.start_background_find_value(
+                ember::dht::EmberNodeId(key),
+                Vec::new(),
+                state.ember_dht.routing(),
+            ) else {
+                break;
+            };
+            seed_ember_local_records(state, search_id, &key, &[]);
+            state
+                .ember_channel_epoch_searches
+                .insert(search_id, (channel_id, target));
+            drive_ember_search(socket, state, search_id).await;
+            any = true;
+        }
+        if !any {
             break;
-        };
-        seed_ember_local_records(state, search_id, &key, &[]);
-        state
-            .ember_channel_epoch_searches
-            .insert(search_id, (channel_id, target));
-        drive_ember_search(socket, state, search_id).await;
+        }
         state.channel_epoch_fetch_at.insert(channel_id, now);
         started += 1;
+    }
+}
+
+/// The epoch to look our own copy of a private room's content key up for, and
+/// the keys to look under: v2 first, then v1. `None` when the room has nothing
+/// to look up: no epoch in the retention window missing, or a room we own that
+/// is not a recovered one waiting on its key.
+///
+/// The newest epoch we are *missing*, which is not the same as the one the
+/// owner advertises. Sleeping through two rotations used to leave the
+/// intermediate epoch unfetched for good: the member picked up the newest,
+/// `key_epoch` caught up to `key_epoch_wanted`, and the loop stopped looking —
+/// so the window of history sealed under the epoch in between stayed
+/// unreadable even though its record was still in the DHT and
+/// `channel_content_keys` would have used it. One indexed read of epoch
+/// numbers, no secrets; blocking, so the caller runs it off the network task.
+///
+/// v2 needs only the owner's key, which the moderation poll brings, so it is
+/// found for any epoch whatever this device missed. v1 is the only form a
+/// 1.7.4 owner publishes and a 1.7.4 storer keeps.
+pub(crate) fn channel_epoch_lookup(
+    db: &Database,
+    our_seed: &[u8; 32],
+    our_pk: &[u8; 32],
+    ch: &crate::storage::database::StoredChannel,
+    channel_id: &[u8; 16],
+) -> Option<(i64, Vec<[u8; 16]>)> {
+    if ch.is_owner && db.channel_owner_key_pending(&ch.channel_id).ok().flatten().is_none() {
+        return None;
+    }
+    let floor = (ch.key_epoch_wanted - Database::CHANNEL_KEY_EPOCHS_KEPT as i64 + 1).max(1);
+    let target = db
+        .newest_missing_channel_key_epoch(&ch.channel_id, floor, ch.key_epoch_wanted)
+        .ok()
+        .flatten()?;
+    let mut keys = Vec::with_capacity(2);
+    let blind = hex::decode(&ch.owner_pubkey)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .and_then(|owner| ember::channel::epoch_blind(our_seed, &owner, channel_id));
+    if let Some(blind) = blind {
+        let member_id = ember::channel::epoch_member_id(&blind, target);
+        keys.push(ember::channel::epoch_key_v2(channel_id, &member_id, target));
+    }
+    keys.push(ember::channel::epoch_key(channel_id, our_pk, target));
+    Some((target, keys))
+}
+
+/// Hold epoch blobs until every FIND_VALUE for this room and epoch has
+/// finished, v2 key and v1 key alike, then queue one ingest, so it reads the
+/// two forms together.
+pub(super) fn buffer_channel_epoch_records(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    epoch: i64,
+    records: Vec<Vec<u8>>,
+) {
+    state
+        .ember_channel_epoch_buffer
+        .entry((channel_id, epoch))
+        .or_default()
+        .extend(records);
+    flush_channel_epoch_if_idle(state, channel_id, epoch);
+}
+
+pub(super) fn flush_channel_epoch_if_idle(state: &mut NetworkState, channel_id: [u8; 16], epoch: i64) {
+    if state
+        .ember_channel_epoch_searches
+        .values()
+        .any(|held| *held == (channel_id, epoch))
+    {
+        return;
+    }
+    if let Some(records) = state.ember_channel_epoch_buffer.remove(&(channel_id, epoch)) {
+        state
+            .ember_pending_channel_epoch
+            .push((channel_id, epoch, records));
     }
 }
 
@@ -3053,25 +5946,32 @@ pub(crate) fn ingest_channel_epoch_records(
     };
     let mut newer_version = None;
     let mut opened_one = false;
+    let our_pk = identity.ed25519_public_key;
+    let our_member_id =
+        ember::channel::epoch_blind(&identity.ed25519_secret_key, &owner_pk, &channel_id)
+            .map(|blind| ember::channel::epoch_member_id(&blind, epoch));
+    let mut records: Vec<ember::dht::publish::ChannelKeyEpochRecord> = records
+        .iter()
+        .filter_map(|blob| {
+            ember::dht::publish::SignedRecord::parse_channel_key_epoch_record(blob, &channel_id)
+        })
+        .collect();
     // Newest first. A rotation rolled back and tried again under the same
     // epoch leaves two sealed keys in one slot, and a storer that missed the
     // second still serves the first; the one the owner signed last is the one
-    // the room uses.
-    let mut records: Vec<&Vec<u8>> = records.iter().collect();
-    records.sort_by_key(|blob| {
-        std::cmp::Reverse(
-            ember::dht::publish::SignedRecord::from_value_blob(blob).map_or(i64::MIN, |r| r.timestamp),
-        )
-    });
-    for blob in records {
-        let Some((member, record_epoch, envelope)) =
-            ember::dht::publish::SignedRecord::parse_channel_key_epoch(blob, &channel_id)
-        else {
-            continue;
+    // the room uses. Of copies signed the same second, v2 first.
+    records.sort_by_key(|record| (std::cmp::Reverse(record.timestamp), !record.blinded));
+    for record in records {
+        let envelope = record.envelope;
+        // Only our own slot, and only for the epoch we asked about. Either
+        // form is self-validating about both (the parse checks the key against
+        // them), so a mismatch is somebody else's.
+        let ours = if record.blinded {
+            our_member_id.is_some_and(|id| record.slot == id)
+        } else {
+            record.slot == our_pk
         };
-        // Only our own slot, and only for the epoch we asked about: the record
-        // is self-validating about both, so a mismatch is somebody else's.
-        if member != identity.ed25519_public_key || record_epoch != epoch {
+        if !ours || record.epoch != epoch {
             continue;
         }
         if let Some(&version) = envelope.first() {
@@ -3576,6 +6476,110 @@ impl ChannelPresenceIngest {
     }
 }
 
+/// The newest record per member among one room's presence blobs, and the
+/// members with at least one record sealed under the current secret, the head
+/// of `join_secrets`.
+///
+/// Only the latter may be added to the roster: a retired key is also what a
+/// rotation's evicted member holds, and a record under one from a key the
+/// roster has never seen is that member under a new name.
+///
+/// In a private room only a v2 record counts. A v1 seal binds the room but not
+/// the member, so a node storing any member's v1 copy can sign the same seal
+/// under a key of its own; counting it would put that key on the roster and
+/// have the owner seal it the next epoch. A v1 record still refreshes a member
+/// already held, and a newcomer on an older build is admitted by the key proof
+/// in their beacon.
+///
+/// Current and previous epoch are two FIND_VALUE walks. Newest-wins has to see
+/// both before any row is written, or a prev-epoch live announce re-inserts
+/// after the current tombstone and a prev-epoch tombstone deletes a rejoiner.
+/// Equal timestamps prefer the leave.
+///
+/// A private room's blob is read as v2 first, under each secret, and as v1 only
+/// if it is not v2. Both forms of one announcement carry one stamp and name one
+/// member, so they merge as one; v2 goes in last, so of two copies signed the
+/// same second the v2 one is what stands. A v2 record whose binding does not
+/// verify is dropped, never read as v1.
+pub(super) fn merge_channel_presence_blobs(
+    records: &[Vec<u8>],
+    channel_id: &[u8; 16],
+    join_secrets: &[[u8; 32]],
+    private: bool,
+    now: i64,
+) -> (
+    HashMap<[u8; 32], ember::dht::publish::ChannelPresenceMember>,
+    HashSet<[u8; 32]>,
+) {
+    use ember::dht::publish::SignedRecord;
+    let content_keys: Vec<[u8; 32]> =
+        join_secrets.iter().map(ember::channel::content_key).collect();
+    let blinds: Vec<([u8; 16], [u8; 32])> = if private {
+        join_secrets
+            .iter()
+            .map(|secret| ember::channel::presence_room_blind(channel_id, secret))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut v1 = Vec::new();
+    let mut v2 = Vec::new();
+    for blob in records {
+        let blinded = join_secrets
+            .iter()
+            .zip(&blinds)
+            .enumerate()
+            .find_map(|(index, (secret, blind))| {
+                // Same rule as `open_with_content_keys`: only the head is current.
+                let opened = if index == 0 {
+                    ember::channel::OpenedUnder::Current
+                } else {
+                    ember::channel::OpenedUnder::Retired
+                };
+                if blob.get(17..33) == Some(&blind.0[..]) {
+                    Some(
+                        SignedRecord::parse_channel_presence_member_v2(blob, channel_id, secret, blind)
+                            .map(|member| (member, opened)),
+                    )
+                } else {
+                    None
+                }
+            });
+        match blinded {
+            Some(Some(found)) => v2.push(found),
+            Some(None) => {}
+            None => {
+                if let Some(found) = ember::channel::open_with_content_keys(&content_keys, |candidate| {
+                    SignedRecord::parse_channel_presence_member_in_room(
+                        blob,
+                        channel_id,
+                        Some(candidate),
+                        private,
+                    )
+                }) {
+                    v1.push(found);
+                }
+            }
+        }
+    }
+    let mut latest = HashMap::new();
+    let mut current = HashSet::new();
+    let v1 = v1.into_iter().map(|(member, opened)| (member, opened, !private));
+    let v2 = v2.into_iter().map(|(member, opened)| (member, opened, true));
+    for (member, opened, may_admit) in v1.chain(v2) {
+        if may_admit && opened == ember::channel::OpenedUnder::Current {
+            current.insert(member.publisher_key);
+        }
+        let Some(ts) = ember::channel::clamp_presence_timestamp(member.timestamp, now) else {
+            continue;
+        };
+        let mut member = member;
+        member.timestamp = ts;
+        ember::dht::publish::keep_latest_presence_member(&mut latest, member);
+    }
+    (latest, current)
+}
+
 pub(super) fn ingest_channel_presence_records(
     db: &Database,
     our_pubkey: &[u8; 32],
@@ -3601,41 +6605,15 @@ pub(super) fn ingest_channel_presence_records(
     // A private room's presence extra is sealed under the content key, so a
     // member who has not yet picked up the newest epoch is still readable under
     // the one they published with.
-    let content_keys = channel_content_keys(db, &ch);
-    // Current and previous epoch are two FIND_VALUE walks. Newest-wins has
-    // to see both before any row is written, or a prev-epoch live announce
-    // re-inserts after the current tombstone and a prev-epoch tombstone
-    // deletes a rejoiner. Equal timestamps prefer the leave.
+    let join_secrets = channel_join_secrets(db, &ch);
     let now = chrono::Utc::now().timestamp();
-    let mut latest: HashMap<[u8; 32], ember::dht::publish::ChannelPresenceMember> =
-        HashMap::new();
-    // Publishers with at least one record sealed under the current key. Only
-    // they may be added to the roster: a retired key is also what a rotation's
-    // evicted member holds, and a record under one from a key the roster has
-    // never seen is that member under a new name.
-    let mut current: HashSet<[u8; 32]> = HashSet::new();
-    for blob in records {
-        let Some((member, opened)) =
-            ember::channel::open_with_content_keys(&content_keys, |candidate| {
-                ember::dht::publish::SignedRecord::parse_channel_presence_member(
-                    blob,
-                    &channel_id,
-                    Some(candidate),
-                )
-            })
-        else {
-            continue;
-        };
-        if opened == ember::channel::OpenedUnder::Current {
-            current.insert(member.publisher_key);
-        }
-        let Some(ts) = ember::channel::clamp_presence_timestamp(member.timestamp, now) else {
-            continue;
-        };
-        let mut member = member;
-        member.timestamp = ts;
-        ember::dht::publish::keep_latest_presence_member(&mut latest, member);
-    }
+    let (latest, current) = merge_channel_presence_blobs(
+        records,
+        &channel_id,
+        &join_secrets,
+        ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE,
+        now,
+    );
     let our_hex = hex::encode(our_pubkey);
     for member in latest.into_values() {
         let pk_hex = hex::encode(member.publisher_key);
@@ -3674,10 +6652,15 @@ pub(super) fn ingest_channel_presence_records(
             continue;
         }
         let nick = crate::security::sanitize_display_name(&member.nickname);
-        if let Ok(write) = db.upsert_channel_member(
+        // Our own row's language comes from our settings. A walk can still
+        // return the copy published before a change, and taking it would flip
+        // the flag back until the new one is found.
+        let language = (member.publisher_key != *our_pubkey).then(|| member.language.unwrap_or(""));
+        if let Ok(write) = db.upsert_channel_member_with_language(
             &channel_id_hex,
             &pk_hex,
             &nick,
+            language,
             member.timestamp,
             Some(&our_hex),
         ) {
@@ -3696,7 +6679,8 @@ pub(super) fn ingest_channel_presence_records(
                     }
                     outcome.roster_changed = true;
                 }
-                // The nickname moved, so the row has to be re-read to be drawn.
+                // The nickname or language moved, so the row has to be re-read
+                // to be drawn.
                 ChannelMemberWrite::Updated => {
                     outcome.roster_changed = true;
                 }
@@ -3722,6 +6706,7 @@ pub(super) fn ingest_channel_presence_records(
 pub(super) struct ChannelIngestBatch {
     pub(super) presence: Vec<([u8; 16], Vec<Vec<u8>>)>,
     pub(super) moderation: Vec<([u8; 16], Vec<Vec<u8>>, usize)>,
+    pub(super) settings: Vec<([u8; 16], Vec<Vec<u8>>)>,
     pub(super) claim: Vec<([u8; 16], Vec<Vec<u8>>)>,
     pub(super) epoch: Vec<([u8; 16], i64, Vec<Vec<u8>>)>,
     pub(super) handoff: Vec<([u8; 16], Vec<Vec<u8>>)>,
@@ -3733,12 +6718,14 @@ impl ChannelIngestBatch {
         let batch = Self {
             presence: std::mem::take(&mut state.ember_pending_channel_presence),
             moderation: std::mem::take(&mut state.ember_pending_channel_moderation),
+            settings: std::mem::take(&mut state.ember_pending_channel_settings),
             claim: std::mem::take(&mut state.ember_pending_channel_claim),
             epoch: std::mem::take(&mut state.ember_pending_channel_epoch),
             handoff: std::mem::take(&mut state.ember_pending_channel_handoff),
         };
         let empty = batch.presence.is_empty()
             && batch.moderation.is_empty()
+            && batch.settings.is_empty()
             && batch.claim.is_empty()
             && batch.epoch.is_empty()
             && batch.handoff.is_empty();
@@ -3752,9 +6739,13 @@ pub(super) struct ChannelIngestResults {
     pub(super) presence: Vec<([u8; 16], ChannelPresenceIngest)>,
     /// Rooms whose moderation snapshot landed.
     pub(super) moderated: Vec<[u8; 16]>,
+    /// Rooms whose settings record is looked up at once for its commitments
+    /// ([`settings_owed_after_pass`]).
+    pub(super) settings_owed: Vec<[u8; 16]>,
     /// `(room, successor)` for each ownership claim applied.
     pub(super) claimed: Vec<([u8; 16], [u8; 16])>,
-    /// Rooms that became readable under a new epoch.
+    /// Rooms whose keys changed: readable under a new epoch, or a held key
+    /// dropped because the owner's commitments contradict it.
     pub(super) rekeyed: Vec<[u8; 16]>,
     /// Rooms whose new epoch was sealed to us in a version that needs a
     /// newer Ember.
@@ -3781,16 +6772,62 @@ pub(super) fn run_channel_ingest(
         results.presence.push((channel_id, ingest));
     }
     let checked_at = chrono::Utc::now().timestamp();
+    if !batch.moderation.is_empty() {
+        let mut backoff = settings_lookup_backoff().lock().unwrap_or_else(|e| e.into_inner());
+        backoff.retain_rooms(|room| match db.get_channel_lite(&hex::encode(room)) {
+            Ok(Some(ch)) => !ch.deleted,
+            Ok(None) => false,
+            Err(_) => true,
+        });
+    }
     for (channel_id, records, answered) in batch.moderation {
         // Only a search some peer actually answered counts as having looked.
         // Finding no owner record because nobody replied is not evidence the
         // owner has gone, and succession is the one feature that acts on
         // absence.
+        let channel_id_hex = hex::encode(channel_id);
         if answered > 0 {
-            let _ = db.touch_channel_moderation_checked(&hex::encode(channel_id), checked_at);
+            let _ = db.touch_channel_moderation_checked(&channel_id_hex, checked_at);
         }
-        if ingest_channel_moderation_records(db, channel_id, &records) {
+        let before = db.get_channel_lite(&channel_id_hex).ok().flatten();
+        let applied = ingest_channel_moderation_records(db, channel_id, &records);
+        if applied {
             results.moderated.push(channel_id);
+        }
+        let mut check_held = false;
+        if let Ok(Some(row)) = db.get_channel_lite(&channel_id_hex) {
+            let held = (row.key_epoch_wanted > row.key_epoch)
+                .then(|| db.channel_settings(&channel_id_hex).ok().flatten())
+                .flatten();
+            let owed = settings_owed_after_pass(before.as_ref().map(|ch| ch.key_epoch_wanted), &row, held.as_ref());
+            let ask = {
+                let mut backoff = settings_lookup_backoff().lock().unwrap_or_else(|e| e.into_inner());
+                if owed {
+                    settings_lookup_backoff_allows(&mut backoff, channel_id, (row.key_epoch_wanted, row.key_epoch), checked_at)
+                } else {
+                    backoff.forget(&channel_id);
+                    false
+                }
+            };
+            if ask {
+                results.settings_owed.push(channel_id);
+            }
+            check_held = moderation_pass_rechecks_keys(applied, before.as_ref(), &row);
+        }
+        if settle_channel_keys(db, channel_id, check_held) {
+            results.rekeyed.push(channel_id);
+        }
+    }
+    for (channel_id, records) in batch.settings {
+        let landed = ingest_channel_settings_records(db, channel_id, &records);
+        if landed {
+            settings_lookup_backoff()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .forget(&channel_id);
+        }
+        if settle_channel_keys(db, channel_id, landed) {
+            results.rekeyed.push(channel_id);
         }
     }
     for (channel_id, records) in batch.claim {

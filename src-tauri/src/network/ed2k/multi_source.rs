@@ -33,6 +33,7 @@ use super::transfer::{
     PacketStreamDesynced,
 };
 
+mod feed_worker;
 mod web_worker;
 
 /// Shared registry of active download trackers so the shutdown path can
@@ -2149,7 +2150,9 @@ pub struct MultiSourceDownload {
     pub sources: Vec<DownloadSource>,
     pub download_folders: crate::storage::part_folders::SharedDownloadFolders,
     pub user_hash: [u8; 16],
-    pub nickname: String,
+    /// Read when each connection opens, so a rename mid-download is what
+    /// every later session announces.
+    pub nickname: Arc<tokio::sync::RwLock<String>>,
     pub tcp_port: u16,
     pub udp_port: u16,
     pub bandwidth_limiter: Arc<BandwidthLimiter>,
@@ -2553,10 +2556,12 @@ impl MultiSourceDownload {
                     transfer_id: self.transfer_id.clone(),
                 })
                 .await;
-            let zero_name = self
-                .control
-                .seal_pending_rename()
-                .unwrap_or_else(|| self.file_name.clone());
+            let zero_name = crate::sharing::name_tag::completed_download_name(
+                &self
+                    .control
+                    .seal_pending_rename()
+                    .unwrap_or_else(|| self.file_name.clone()),
+            );
             let download_dir = self.download_folders.read().current.clone();
             let zero_final = super::transfer::finalize_zero_ed2k_file(
                 &self.transfer_id,
@@ -2889,8 +2894,8 @@ impl MultiSourceDownload {
         };
         let part_hashes: Arc<RwLock<Vec<[u8; 16]>>> = Arc::new(RwLock::new(resumed_part_hashes));
         // Seed from EPX/cache when available. HashSet2 pins only when the
-        // catalog expected root matches, or two distinct sources agree
-        // (see `consider_hashset2_aich_pin`).
+        // catalog expected root matches, or eMule's quorum of source networks
+        // agrees (see `consider_hashset2_aich_pin`).
         let shared_aich_master =
             SharedAichPin::new(self.trusted_aich_master, self.expected_aich_master);
         if self.trusted_aich_master.is_some() {
@@ -3172,7 +3177,7 @@ impl MultiSourceDownload {
             let file_hash = self.file_hash;
             let file_size = self.file_size;
             let user_hash = self.user_hash;
-            let nickname = self.nickname.clone();
+            let nickname = self.nickname.read().await.clone();
             let tcp_port = self.tcp_port;
             let udp_port = self.udp_port;
             let bw = self.bandwidth_limiter.clone();
@@ -3195,7 +3200,7 @@ impl MultiSourceDownload {
             let src_ember_hash = self.ember_hash;
             let src_ember_pubkey = self.ed25519_public_key;
             let src_ember_secret = self.ed25519_secret_key;
-            let nick_for_src = self.nickname.clone();
+            let nick_for_src = self.nickname.read().await.clone();
             let sem_clone = conn_semaphore.clone();
             let qw = queue_wait_secs;
             let shared_out = shared_part_file.clone();
@@ -3424,6 +3429,36 @@ impl MultiSourceDownload {
                 banned_ips: self.banned_ips.clone(),
             };
             let handle = tokio::spawn(web_worker::dispatch(template, total_sources.clone()));
+            source_aborts.track(&handle);
+            web_handles.push(handle);
+        }
+        // A feed's publisher, streamed from as a mirror is fetched from, and
+        // waited on, stopped and counted with them.
+        {
+            let template = feed_worker::FeedWorker {
+                worker: FEED_WORKER_INDEX,
+                transfer_id: self.transfer_id.clone(),
+                file_size: self.file_size,
+                expected_blake3: self.ember_file_hash,
+                tracker: tracker.clone(),
+                output: shared_part_file.clone(),
+                bandwidth: self.bandwidth_limiter.clone(),
+                control: self.control.clone(),
+                progress_tx: web_progress_tx.clone(),
+                event_tx: event_tx.clone(),
+                drop_tx: drop_tx.clone(),
+                active_count: active_count.clone(),
+                disk_full: disk_full.clone(),
+                working: web_working.clone(),
+                our_hash: self.ember_hash,
+                our_public_key: self.ed25519_public_key,
+                our_secret_key: self.ed25519_secret_key,
+                ip_filter: self.ip_filter.clone(),
+                banned_ips: self.banned_ips.clone(),
+            };
+            let first = crate::network::feed_direct::stream_ready(&self.transfer_id)
+                .then(|| web_worker::Working::new(&web_working));
+            let handle = tokio::spawn(feed_worker::dispatch(template, first, total_sources.clone()));
             source_aborts.track(&handle);
             web_handles.push(handle);
         }
@@ -3703,7 +3738,7 @@ impl MultiSourceDownload {
                             let fh = self.file_hash;
                             let fs = self.file_size;
                             let uh = self.user_hash;
-                            let nn = self.nickname.clone();
+                            let nn = self.nickname.read().await.clone();
                             let tp = self.tcp_port;
                             let up = self.udp_port;
                             let bw = self.bandwidth_limiter.clone();
@@ -3734,7 +3769,7 @@ impl MultiSourceDownload {
                             let inj_ember_hash = self.ember_hash;
                             let inj_ember_pubkey = self.ed25519_public_key;
                             let inj_ember_secret = self.ed25519_secret_key;
-                            let inj_nick = self.nickname.clone();
+                            let inj_nick = self.nickname.read().await.clone();
                             let inj_qw = queue_wait_secs;
                             let inj_shared_out = shared_part_file.clone();
                             let inj_epx = self.ember_payload.clone();
@@ -3960,7 +3995,7 @@ impl MultiSourceDownload {
                             let fh = self.file_hash;
                             let fs = self.file_size;
                             let uh = self.user_hash;
-                            let nn = self.nickname.clone();
+                            let nn = self.nickname.read().await.clone();
                             let tp = self.tcp_port;
                             let up = self.udp_port;
                             let bw = self.bandwidth_limiter.clone();
@@ -3991,7 +4026,7 @@ impl MultiSourceDownload {
                             let inj_ember_hash = self.ember_hash;
                             let inj_ember_pubkey = self.ed25519_public_key;
                             let inj_ember_secret = self.ed25519_secret_key;
-                            let inj_nick = self.nickname.clone();
+                            let inj_nick = self.nickname.read().await.clone();
                             let inj_qw = queue_wait_secs;
                             let inj_shared_out = shared_part_file.clone();
                             let inj_epx = self.ember_payload.clone();
@@ -4366,7 +4401,7 @@ impl MultiSourceDownload {
                     let fh = self.file_hash;
                     let fs = self.file_size;
                     let uh = self.user_hash;
-                    let nn = self.nickname.clone();
+                    let nn = self.nickname.read().await.clone();
                     let tp = self.tcp_port;
                     let up = self.udp_port;
                     let bw = self.bandwidth_limiter.clone();
@@ -4394,7 +4429,7 @@ impl MultiSourceDownload {
                     let a_ember_hash = self.ember_hash;
                     let a_ember_pubkey = self.ed25519_public_key;
                     let a_ember_secret = self.ed25519_secret_key;
-                    let a_nick = self.nickname.clone();
+                    let a_nick = self.nickname.read().await.clone();
                     let a_qw = queue_wait_secs;
                     let a_shared_out = shared_part_file.clone();
                     let a_epx = self.ember_payload.clone();
@@ -4953,7 +4988,7 @@ impl MultiSourceDownload {
                 let file_hash = self.file_hash;
                 let file_size = self.file_size;
                 let user_hash = self.user_hash;
-                let nickname = self.nickname.clone();
+                let nickname = self.nickname.read().await.clone();
                 let tcp_port = self.tcp_port;
                 let udp_port = self.udp_port;
                 let bw = self.bandwidth_limiter.clone();
@@ -4981,7 +5016,7 @@ impl MultiSourceDownload {
                 let r_ember_hash = self.ember_hash;
                 let r_ember_pubkey = self.ed25519_public_key;
                 let r_ember_secret = self.ed25519_secret_key;
-                let r_nick = self.nickname.clone();
+                let r_nick = self.nickname.read().await.clone();
                 let rfail_etx = event_tx.clone();
                 let rfail_tid = self.transfer_id.clone();
                 let rfail_ip = source.peer_ip.clone();
@@ -5489,7 +5524,9 @@ impl MultiSourceDownload {
                     let mut t = tracker.write().await;
                     t.mark_file_hash_verified();
                     super::transfer::seal_control_rename(&self.control, &mut t);
-                    super::transfer::completed_download_name(t.file_name(), &self.file_name)
+                    crate::sharing::name_tag::completed_download_name(
+                        &super::transfer::completed_download_name(t.file_name(), &self.file_name),
+                    )
                 };
                 // A Pause, Stop or Cancel that arrived after verification: the
                 // verified `.part` stays where it is and the next run completes
@@ -5503,31 +5540,47 @@ impl MultiSourceDownload {
                 let pp = part_path.clone();
                 let pp_root = part_root.clone();
                 let download_root = self.download_folders.read().current.clone();
-                // The category it has now, not when it started, as with the
-                // download folder above.
-                let category_subdir =
-                    crate::storage::category_folders::completion_subdir(&self.transfer_id);
                 let met_roots = allowed_roots.clone();
                 let finish_tracker = tracker.clone();
                 let finish_part_hashes = part_hashes.clone();
                 let finish_tx = event_tx.clone();
                 let finish_id = self.transfer_id.clone();
+                let finish_id_for_move = self.transfer_id.clone();
                 let finish_generation = Some(self.control.generation());
+                // A fetch for the feeds code finishes where it asked, in the
+                // app data folder, never in `Downloads`.
+                let internal_dest = crate::sharing::feed_files::internal_fetch_dest(&self.transfer_id);
                 // Spawned, not awaited in place: Pause and Stop abort this
                 // worker, and `abort` cannot stop the blocking move. Dropped at
                 // its await, the move still finished but nothing after it ran:
                 // no `Completed`, so the row stayed Paused or Stopped with its
                 // `.part` gone, and Resume downloaded the whole file again.
                 let finish = tokio::spawn(async move {
-                    let actual_final = tokio::task::spawn_blocking(move || {
-                        super::transfer::move_part_to_completed(
+                    let actual_final = tokio::task::spawn_blocking(move || match internal_dest {
+                        Some(dest) => {
+                            let dest_root = dest
+                                .parent()
+                                .map(std::path::Path::to_path_buf)
+                                .ok_or_else(|| anyhow::anyhow!("internal fetch has no folder"))?;
+                            std::fs::create_dir_all(&dest_root)?;
+                            super::transfer::move_part_between_roots_approved(
+                                &pp,
+                                &pp_root,
+                                &dest,
+                                &dest_root,
+                                &verified_identity,
+                            )
+                        }
+                        // The category it has now, not when it started, as
+                        // with the download folder above.
+                        None => super::transfer::move_part_to_its_folder(
+                            &finish_id_for_move,
                             &pp,
                             &pp_root,
                             &download_root,
-                            &category_subdir,
                             &safe_name,
                             &verified_identity,
-                        )
+                        ),
                     })
                     .await
                     .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
@@ -5746,6 +5799,10 @@ async fn install_verified_part_hashes(
 /// download never has a million peers), so their claims and log lines can
 /// never be mistaken for a peer's.
 const WEB_WORKER_INDEX_BASE: usize = 1_000_000;
+
+/// The worker index of a feed's publisher stream, below every web worker's
+/// and above any peer's.
+const FEED_WORKER_INDEX: usize = WEB_WORKER_INDEX_BASE - 1;
 
 /// How often a transfer runs [`rehash_unverified_parts`].
 const UNVERIFIED_PART_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -7014,6 +7071,12 @@ async fn download_parts_from_source(
     // the Friends UI can distinguish binding-consistent peers from
     // peers that didn't advertise a pubkey at all.
     let mut ember_hash_binding_verified = false;
+    // The Ember hash this session's binding check passed for, and whether
+    // SecIdent verified this session: together they keep the binding for the
+    // Known Ember Peers tab without an address to tie them (see
+    // `CreditManager::note_session_proven_ember`).
+    let mut session_bound_ember: Option<[u8; 16]> = None;
+    let mut secident_verified_here = false;
     // Strict proof-of-possession flag. `true` iff
     // `perform_ember_auth_buffered` completed successfully on THIS
     // TCP session — the peer signed a fresh random nonce we issued
@@ -7146,7 +7209,16 @@ async fn download_parts_from_source(
                     true
                 };
                 if missing_peer_key {
-                    pending_peer_challenge = Some((challenge, state));
+                    pending_peer_challenge = Some(
+                        super::transfer::park_secident_challenge(
+                            &mut *writer,
+                            credit_mgr.as_ref(),
+                            state,
+                            challenge,
+                            addr,
+                        )
+                        .await?,
+                    );
                     debug!(
                         "Deferred SecIdent challenge from source {} — awaiting their public key",
                         _src_idx
@@ -7210,7 +7282,7 @@ async fn download_parts_from_source(
                 }
             }
             (OP_EMULEPROT, OP_SIGNATURE) if payload.len() >= 2 => {
-                super::transfer::handle_secident_signature(
+                if super::transfer::handle_secident_signature(
                     credit_mgr.as_ref(),
                     peer_user_hash,
                     &mut pending_secident_challenge,
@@ -7219,7 +7291,13 @@ async fn download_parts_from_source(
                     &payload,
                     our_client_id,
                 )
-                .await;
+                .await
+                {
+                    secident_verified_here = true;
+                    if let (Some(eh), Some(cm)) = (session_bound_ember, &credit_mgr) {
+                        cm.write().await.note_session_proven_ember(peer_user_hash, eh);
+                    }
+                }
             }
             (OP_EMULEPROT, OP_EMULEINFOANSWER) | (OP_EMULEPROT, OP_EMULEINFO) => {
                 merge_caps(&mut hello_caps, parse_emule_info(&payload));
@@ -7447,14 +7525,19 @@ async fn download_parts_from_source(
                                 peer_pk, peer_eh,
                             ) {
                                 ember_hash_binding_verified = true;
+                                session_bound_ember = Some(*peer_eh);
                                 info!("Ember binding: source {} at {} pubkey BLAKE3-binds to advertised hash", _src_idx, addr);
                                 if peer_user_hash != [0u8; 16] {
                                     if let Some(cm) = &credit_mgr {
-                                        cm.write().await.note_bound_ember_hash(
+                                        let mut cm = cm.write().await;
+                                        cm.note_bound_ember_hash(
                                             peer_user_hash,
                                             *peer_eh,
                                             CreditManager::ident_ip_of(addr),
                                         );
+                                        if secident_verified_here {
+                                            cm.note_session_proven_ember(peer_user_hash, *peer_eh);
+                                        }
                                     }
                                 }
                             } else {
@@ -7569,7 +7652,10 @@ async fn download_parts_from_source(
                                                 friend_seen_emitted = true;
                                             }
                                             if !friend_request_sent {
-                                                let nick_bytes = our_nickname.as_bytes();
+                                                let nick_bytes =
+                                                    super::friend_connect::friend_request_payload(
+                                                        &our_nickname,
+                                                    );
                                                 if write_packet_async_ms(
                                                     &mut *writer,
                                                     OP_EMULEPROT,
@@ -7722,17 +7808,21 @@ async fn download_parts_from_source(
     let wire_part_count = ed2k_wire_part_count(file_size);
     let single_part = part_count <= 1;
     let completed_bitmap = if peer_extended_requests_ver > 0 {
-        let t = tracker.read().await;
-        // Advertise only parts we will actually serve (complete AND
-        // MD4-verified). Using bare `completed_parts()` here advertised
-        // unverified parts that the serve gate then rejected, freezing the
-        // peer's download on a part it kept re-requesting.
-        let completed = t.serveable_parts();
         let bitmap_len = (wire_part_count + 7) / 8;
         let mut bitmap = vec![0u8; bitmap_len];
-        for (i, &done) in completed.iter().enumerate() {
-            if done {
-                bitmap[i / 8] |= 1 << (i % 8);
+        // A feed's download is private: it says it holds nothing, so the
+        // uploader does not pass us on as a source of it.
+        if !crate::sharing::feed_downloads::is_private(&transfer_id) {
+            let t = tracker.read().await;
+            // Advertise only parts we will actually serve (complete AND
+            // MD4-verified). Using bare `completed_parts()` here advertised
+            // unverified parts that the serve gate then rejected, freezing the
+            // peer's download on a part it kept re-requesting.
+            let completed = t.serveable_parts();
+            for (i, &done) in completed.iter().enumerate() {
+                if done {
+                    bitmap[i / 8] |= 1 << (i % 8);
+                }
             }
         }
         bitmap
@@ -8048,7 +8138,16 @@ async fn download_parts_from_source(
                 true
             };
             if missing_peer_key {
-                pending_peer_challenge = Some((challenge, state));
+                pending_peer_challenge = Some(
+                    super::transfer::park_secident_challenge(
+                        &mut *writer,
+                        credit_mgr.as_ref(),
+                        state,
+                        challenge,
+                        addr,
+                    )
+                    .await?,
+                );
             } else {
                 super::transfer::respond_to_secident_challenge(
                     &mut *writer,
@@ -8065,7 +8164,7 @@ async fn download_parts_from_source(
             continue;
         }
         if proto == OP_EMULEPROT && opcode == OP_SIGNATURE && _payload.len() >= 2 {
-            super::transfer::handle_secident_signature(
+            if super::transfer::handle_secident_signature(
                 credit_mgr.as_ref(),
                 peer_user_hash,
                 &mut pending_secident_challenge,
@@ -8074,7 +8173,13 @@ async fn download_parts_from_source(
                 &_payload,
                 our_client_id,
             )
-            .await;
+            .await
+            {
+                secident_verified_here = true;
+                if let (Some(eh), Some(cm)) = (session_bound_ember, &credit_mgr) {
+                    cm.write().await.note_session_proven_ember(peer_user_hash, eh);
+                }
+            }
             continue;
         }
         if proto == OP_EMULEPROT && opcode == OP_FILEDESC && _payload.len() >= 5 {
@@ -8245,14 +8350,19 @@ async fn download_parts_from_source(
                             peer_pk, peer_eh,
                         ) {
                             ember_hash_binding_verified = true;
+                            session_bound_ember = Some(*peer_eh);
                             info!("Ember binding: source {} at {} pubkey BLAKE3-binds (file-status-wait)", _src_idx, addr);
                             if peer_user_hash != [0u8; 16] {
                                 if let Some(cm) = &credit_mgr {
-                                    cm.write().await.note_bound_ember_hash(
+                                    let mut cm = cm.write().await;
+                                    cm.note_bound_ember_hash(
                                         peer_user_hash,
                                         *peer_eh,
                                         CreditManager::ident_ip_of(addr),
                                     );
+                                    if secident_verified_here {
+                                        cm.note_session_proven_ember(peer_user_hash, *peer_eh);
+                                    }
                                 }
                             }
                             if hello_caps.is_ember && !mesh_discovered_emitted {
@@ -8402,7 +8512,10 @@ async fn download_parts_from_source(
                                             friend_seen_emitted = true;
                                         }
                                         if !friend_request_sent {
-                                            let nick_bytes = our_nickname.as_bytes();
+                                            let nick_bytes =
+                                                super::friend_connect::friend_request_payload(
+                                                    &our_nickname,
+                                                );
                                             if write_packet_async_ms(
                                                 &mut *writer,
                                                 OP_EMULEPROT,

@@ -30,6 +30,8 @@
     sendChannelTyping,
     setChannelDraft,
     setChannelMessagePinned,
+    CHANNEL_EDIT_MAX_TEXT_BYTES,
+    CHANNEL_LINE_MAX_TEXT_BYTES,
     CHANNEL_PIN_MAX,
     REPLY_REFERENCE_BYTES,
     type ChannelInfo,
@@ -87,6 +89,7 @@
     visibleTypists,
     type Typists,
   } from '$lib/channelTyping';
+  import { EarlyRoomDeliveries, stepSlowModeAnnouncer, type SlowModeAnnouncer } from '$lib/conversationState';
   import { portal } from '$lib/actions/portal';
   import { rovingToolbar } from '$lib/actions/rovingToolbar';
   import { appSettings } from '$lib/stores/settings';
@@ -109,15 +112,17 @@
   } from '$lib/utils';
   import { formatMessage, type FormatBlock, type InlineNode } from '$lib/messageFormat';
   import { prefersReducedMotion } from 'svelte/motion';
+  import { fade, fly, slide } from 'svelte/transition';
   import { openExternalUrl } from '$lib/api/settings';
   import { toast, toastError, toastSuccess } from '$lib/stores/toast';
   import IconX from '$lib/components/IconX.svelte';
   import { passiveScroll } from '$lib/actions/passiveScroll';
 
-  // The backend rejects chat messages whose UTF-8 encoding exceeds this many
-  // bytes (`peers.rs`); the textarea `maxlength` only bounds characters, so we
-  // mirror the byte check here to give a clear error instead of a generic
-  // "send failed" on multi-byte/emoji-heavy text.
+  // The backend rejects friend chat messages whose UTF-8 encoding exceeds this
+  // many bytes (`peers.rs`); the textarea `maxlength` only bounds characters, so
+  // we mirror the byte check here to give a clear error instead of a generic
+  // "send failed" on multi-byte/emoji-heavy text. Room lines have the tighter
+  // limits in `$lib/api/channels`.
   const MAX_MESSAGE_BYTES = 4096;
   // Upper bound on messages held in memory at once. "Load older" stops past
   // this so a very long history can't grow the array (and the rendered DOM)
@@ -386,13 +391,10 @@
   const earlyDeliveredIds = new Map<number, number | null>();
   /** The room equivalent, keeping the state itself: a room line can also be
    *  reported failed before the send's response appends it. */
-  const earlyRoomDelivery = new Map<number, 'delivered' | 'queued' | 'failed'>();
+  const earlyRoomDelivery = new EarlyRoomDeliveries();
 
   function withEarlyRoomDelivery(row: ConvMessage): ConvMessage {
-    const early = earlyRoomDelivery.get(row.id);
-    if (early === undefined) return row;
-    earlyRoomDelivery.delete(row.id);
-    return { ...row, delivery: early };
+    return earlyRoomDelivery.apply(row);
   }
 
   const PAGE_SIZE = 100;
@@ -701,6 +703,21 @@
     editFromComposer = fromComposer;
   }
 
+  const utf8 = new TextEncoder();
+
+  /** A revised reply keeps its signed reference, which counts against the limit. */
+  function editMaxBytes(msg: ConvMessage): number {
+    return CHANNEL_EDIT_MAX_TEXT_BYTES - (msg.reply_to ? REPLY_REFERENCE_BYTES : 0);
+  }
+
+  /** What the save would send, in the unit the backend caps. */
+  let editBytes = $derived(editingId === null ? 0 : utf8.encode(editDraft.trim()).length);
+
+  /** Seconds left of the backend's edit window, by the same clock as `canEdit`. */
+  function editSecondsLeft(msg: ConvMessage): number {
+    return EDIT_WINDOW_SECS - (editClockNow / 1000 - msg.timestamp);
+  }
+
   function cancelEdit() {
     editingId = null;
     editDraft = '';
@@ -747,13 +764,16 @@
       closeEditor(msg.id);
       return;
     }
+    if (editSecondsLeft(msg) <= 0) {
+      editError = m.channels_edit_window_closed();
+      return;
+    }
     // Same UTF-8 byte guard `handleSend` applies, for the same reason: the
     // textarea's `maxlength` counts characters and the backend counts bytes, so
     // an emoji-heavy revision passed here and came back as a generic failure with
     // nothing to tell the user which limit they had hit.
-    // A revised reply keeps its signed reference, which counts against the cap.
-    const maxBytes = MAX_MESSAGE_BYTES - (msg.reply_to ? REPLY_REFERENCE_BYTES : 0);
-    if (new TextEncoder().encode(text).length > maxBytes) {
+    const maxBytes = editMaxBytes(msg);
+    if (utf8.encode(text).length > maxBytes) {
       editError = m.chat_message_too_long({ max: maxBytes });
       return;
     }
@@ -768,6 +788,7 @@
             : m,
         );
         closeEditor(msg.id);
+        flashEdited([msg.id]);
       }
     } catch (e: unknown) {
       if (channel === channelId) editError = translateError(e, m.channels_edit_failed());
@@ -1019,6 +1040,31 @@
       el.focus();
       el.select();
     });
+    // After the editor has grown to its text, so its buttons come into view too.
+    const raf = requestAnimationFrame(() =>
+      el.closest('.conv-bubble')?.scrollIntoView({ block: 'nearest' }),
+    );
+    return () => cancelAnimationFrame(raf);
+  });
+
+  // Grows the editor with its text up to the CSS max-height, past which it
+  // scrolls, the way the composer grows.
+  $effect(() => {
+    void editDraft;
+    const el = editInputEl;
+    if (!el) return;
+    el.style.height = 'auto';
+    // Border-box sizing: scrollHeight leaves out the border the height includes.
+    el.style.height = `${el.scrollHeight + el.offsetHeight - el.clientHeight}px`;
+  });
+
+  // The window's countdown is shown while editing, so it moves faster than the
+  // minute the Edit buttons are retired on.
+  $effect(() => {
+    if (editingId === null) return;
+    editClockNow = Date.now();
+    const timer = setInterval(() => (editClockNow = Date.now()), 10_000);
+    return () => clearInterval(timer);
   });
 
   // Retires the Edit affordance as the window closes. A minute's granularity on a
@@ -1127,8 +1173,10 @@
         }>('ember:channel-message-edited', (event) => {
           if (event.payload.channel_id !== room) return;
           const edited = event.payload.msg_id;
+          const revised: number[] = [];
           messages = messages.map((msg) => {
             if (msg.msg_id === edited || msg.id === event.payload.id) {
+              if (msg.message !== event.payload.message) revised.push(msg.id);
               return { ...msg, message: event.payload.message, edited_at: event.payload.edited_at };
             }
             // A reply whose parent is paged out quotes the backend's snapshot,
@@ -1138,6 +1186,7 @@
             }
             return msg;
           });
+          flashEdited(revised);
           // A line we were editing has been revised under us — most likely from
           // this account on another device. Drop the stale draft rather than let
           // it overwrite the newer text.
@@ -1480,9 +1529,7 @@
           const delivery = event.payload.delivery;
           if (delivery !== 'delivered' && delivery !== 'queued' && delivery !== 'failed') return;
           if (!messages.some((message) => message.id === event.payload.id)) {
-            // Only a send or resend still waiting on its response can be
-            // about to add this row; anything else would sit here unused.
-            if (sending || resendingId !== null) earlyRoomDelivery.set(event.payload.id, delivery);
+            earlyRoomDelivery.hold(event.payload.id, delivery, sending || resendingId !== null);
             return;
           }
           messages = messages.map((message) =>
@@ -2190,6 +2237,23 @@
     setTimeout(() => freshIds.delete(id), FRESH_MS);
   }
 
+  /** Lines revised in place a moment ago, so the change is seen rather than
+   *  found: an edit otherwise only swaps words under a reader who may be
+   *  looking straight at them. */
+  let editedFlashIds = $state<number[]>([]);
+  const EDIT_FLASH_MS = 1400;
+
+  function flashEdited(ids: number[]): void {
+    if (ids.length === 0) return;
+    editedFlashIds = [...new Set([...editedFlashIds, ...ids])];
+    setTimeout(() => {
+      editedFlashIds = editedFlashIds.filter((id) => !ids.includes(id));
+    }, EDIT_FLASH_MS);
+  }
+
+  /** How long the bars and pills around the transcript take to come and go. */
+  let barMs = $derived(prefersReducedMotion.current ? 0 : 180);
+
   function markFresh(next: readonly ConvMessage[]): void {
     const known = new Set(messages.map((message) => message.id));
     for (const message of next) {
@@ -2721,9 +2785,13 @@
     const reply = channel ? replyTarget : null;
     // Guard on UTF-8 byte length to match the backend's limit. `maxlength`
     // only caps characters, so a message of multi-byte glyphs (emoji, CJK)
-    // can be under 4096 chars yet over 4096 bytes and be rejected server-side
-    // with a generic error. A reply's signed reference rides in the same 4096.
-    const maxBytes = MAX_MESSAGE_BYTES - (reply ? REPLY_REFERENCE_BYTES : 0);
+    // can be under 4096 chars yet over the byte limit and be rejected
+    // server-side with a generic error. A room line has to fit one relayed
+    // datagram, which leaves it less than 4096, and a reply's signed reference
+    // rides in the same frame.
+    const maxBytes = channel
+      ? CHANNEL_LINE_MAX_TEXT_BYTES - (reply ? REPLY_REFERENCE_BYTES : 0)
+      : MAX_MESSAGE_BYTES;
     if (new TextEncoder().encode(text).length > maxBytes) {
       sendError = m.chat_message_too_long({ max: maxBytes });
       return;
@@ -3334,26 +3402,17 @@
 
   let slowModeWaiting = $derived(slowModeLeft > 0);
   let slowModeAnnouncement = $state('');
-  let slowModeWasWaiting = false;
-  let slowModeAnnouncedKey = '';
+  let slowModeAnnouncer: SlowModeAnnouncer = { key: '', waiting: false };
 
   $effect(() => {
     const waiting = slowModeWaiting;
     const key = conversationKey;
     untrack(() => {
-      // A switch drops the wait without it having run out, so it is not
-      // announced as over; whatever this run saw is the previous room's.
-      if (key !== slowModeAnnouncedKey) {
-        slowModeAnnouncedKey = key;
-        slowModeWasWaiting = false;
-        slowModeAnnouncement = '';
-        return;
-      }
-      if (waiting === slowModeWasWaiting) return;
-      slowModeWasWaiting = waiting;
-      slowModeAnnouncement = waiting
-        ? m.chat_slow_mode_started({ seconds: slowModeLeft })
-        : m.chat_slow_mode_ready();
+      const { next, say } = stepSlowModeAnnouncer(slowModeAnnouncer, key, waiting);
+      slowModeAnnouncer = next;
+      if (say === 'clear') slowModeAnnouncement = '';
+      else if (say === 'started') slowModeAnnouncement = m.chat_slow_mode_started({ seconds: slowModeLeft });
+      else if (say === 'ready') slowModeAnnouncement = m.chat_slow_mode_ready();
     });
   });
 
@@ -3535,10 +3594,14 @@
     <!-- Its own row above the transcript rather than floating over it, so the
          first lines are never hidden under it. One pin at a time: the bar is a
          pointer to the message, not a second transcript. -->
-    <div class="conv-pin-bar" role="region" aria-label={m.channels_pinned_label()}>
+    <div class="conv-pin-bar" role="region" aria-label={m.channels_pinned_label()} in:slide={{ duration: barMs }}>
       <svg class="conv-pin-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true">
         <path d="M6 2.5h4M7 2.5v4L4.5 9h7L9 6.5v-4M8 9v4.5"/>
       </svg>
+      <!-- The next pin slides up into place, so cycling reads as moving
+           through a stack rather than the text blinking. -->
+      {#key shownPinIndex}
+      <span class="conv-pin-slot" in:fly={{ y: 6, duration: barMs }}>
       {#if pin.kind === 'message' && isIgnoredSender(pin.senderPubkey)}
         <!-- Still counted, so "1 of 3" stays true, but neither named nor
              quoted, and nothing to jump to: the line itself is not drawn. -->
@@ -3559,6 +3622,8 @@
       {:else}
         <span class="conv-pin-target unavailable">{m.channels_pinned_unavailable()}</span>
       {/if}
+      </span>
+      {/key}
       {#if pinEntries.length > 1}
         <button
           type="button"
@@ -3678,6 +3743,7 @@
           class:received={row.msg.direction === 'received'}
           class:starts-run={startsRun}
           class:fresh={freshIds.has(row.msg.id)}
+          class:editing={editingId === row.msg.id}
         >
         {#if isChannel && row.msg.direction === 'sent'}
           <!-- Blue and on the right already says it is yours; the chip only
@@ -3697,6 +3763,8 @@
           class:ends-run={endsRun}
           class:focused={row.msg.id === focusedId}
           class:mentions-me={row.mentionsMe}
+          class:editing={editingId === row.msg.id}
+          class:just-edited={editedFlashIds.includes(row.msg.id)}
         >
           <!--
             `<bdi>` isolates the message body from the surrounding UI's
@@ -3745,22 +3813,51 @@
             <!-- Edited in place rather than in the composer at the bottom: that
                  one owns per-conversation drafts, the slow-mode countdown and
                  mention autocomplete, all of which would fight an edit. -->
+            {@const secondsLeft = editSecondsLeft(row.msg)}
+            {@const maxBytes = editMaxBytes(row.msg)}
+            {@const overLimit = editBytes > maxBytes}
             <div class="bubble-edit">
+              <div class="bubble-edit-head">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true">
+                  <path d="M11.5 2.5l2 2L6 12l-3 1 1-3z" />
+                </svg>
+                <span class="bubble-edit-title">{m.channels_editing_title()}</span>
+                <span class="bubble-edit-window" class:closing={secondsLeft <= 120} class:closed={secondsLeft <= 0}>
+                  {secondsLeft <= 0
+                    ? m.channels_edit_window_closed()
+                    : m.channels_edit_time_left({ minutes: Math.ceil(secondsLeft / 60) })}
+                </span>
+              </div>
               <textarea
                 class="bubble-edit-input"
                 bind:value={editDraft}
                 onkeydown={(e) => onEditKeydown(e, row.msg)}
                 maxlength="4096"
-                rows="2"
+                rows="3"
                 disabled={editBusy}
                 aria-label={m.channels_edit_message()}
+                aria-describedby="bubble-edit-hint-{row.msg.id}"
+                aria-invalid={overLimit || undefined}
                 bind:this={editInputEl}
               ></textarea>
               {#if editError}
                 <span class="bubble-edit-error" role="alert">{editError}</span>
               {/if}
               <div class="bubble-edit-actions">
-                <span class="bubble-edit-hint">{m.channels_edit_hint()}</span>
+                <span class="bubble-edit-hint" id="bubble-edit-hint-{row.msg.id}">{m.channels_edit_hint()}</span>
+                <!-- Only near the cap, where it starts to matter. Bytes, not
+                     characters, because that is what the backend counts. The
+                     count itself is not live, or every keystroke near the cap
+                     is read out; crossing it is, from a region that stays
+                     mounted. -->
+                <span class="sr-only" aria-live="polite">
+                  {overLimit ? m.chat_message_too_long({ max: maxBytes }) : ''}
+                </span>
+                {#if editBytes > maxBytes * 0.8}
+                  <span class="bubble-edit-count" class:over={overLimit}>
+                    {m.channels_edit_bytes({ used: editBytes, max: maxBytes })}
+                  </span>
+                {/if}
                 <button type="button" class="bubble-edit-cancel" onclick={() => closeEditor(row.msg.id)} disabled={editBusy}>
                   {m.common_cancel()}
                 </button>
@@ -3768,7 +3865,7 @@
                   type="button"
                   class="bubble-edit-save"
                   onclick={() => commitEdit(row.msg)}
-                  disabled={editBusy || !editDraft.trim()}
+                  disabled={editBusy || !editDraft.trim() || overLimit || secondsLeft <= 0}
                 >
                   {editBusy ? m.chat_loading_short() : m.common_save()}
                 </button>
@@ -4039,6 +4136,7 @@
     <button
       class="conv-jump conv-jump-unread has-unseen"
       type="button"
+      transition:fly={{ y: -6, duration: barMs }}
       onclick={jumpToFirstUnread}
       title={m.chat_jump_to_unread()}
       aria-label={m.chat_jump_to_unread()}
@@ -4058,6 +4156,7 @@
       class:has-unseen={missedWhileAway || unreadAhead}
       class:above-typing={typingPillShown}
       type="button"
+      transition:fly={{ y: 8, duration: barMs }}
       onclick={jumpToLatest}
       title={missedWhileAway || unreadAhead ? m.chat_new_messages_below() : m.chat_jump_to_latest()}
       aria-label={missedWhileAway || unreadAhead ? m.chat_new_messages_below() : m.chat_jump_to_latest()}
@@ -4078,7 +4177,7 @@
   <div class="conv-typing-anchor">
     <span class="sr-only" role="status" aria-live="polite">{isChannel ? roomTypingAnnouncement : friendTypingAnnouncement}</span>
     {#if typingPillShown}
-      <div class="conv-typing conv-typing-pill">
+      <div class="conv-typing conv-typing-pill" transition:fade={{ duration: barMs }}>
         <span class="conv-typing-text">
           {#if isChannel}
             {#each roomTypingSegments as segment, i (i)}
@@ -4112,7 +4211,7 @@
       {@const target = replyTarget}
       {@const current = messagesByMsgId.get(target.msgId)}
       {@const targetHidden = isIgnoredSender(current?.sender_pubkey ?? target.senderPubkey)}
-      <div class="conv-reply-bar">
+      <div class="conv-reply-bar" in:slide={{ duration: barMs }}>
         <svg class="conv-reply-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true">
           <path d="M6.5 4 2.5 8l4 4"/>
           <path d="M2.5 8h7a4 4 0 0 1 4 4v1"/>
@@ -4349,10 +4448,15 @@
           disabled={!inputText.trim() || sending || slowModeLeft > 0}
           title={slowModeLeft > 0 ? m.chat_slow_mode_wait({ seconds: slowModeLeft }) : m.chat_send_title_short()}
           aria-label={m.chat_send_aria()}
+          aria-busy={sending}
         >
-          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M3 10l14-7-7 14-2-5z"/><line x1="10" y1="17" x2="17" y2="3"/>
-          </svg>
+          {#if sending}
+            <span class="spinner sm current" aria-hidden="true"></span>
+          {:else}
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 10l14-7-7 14-2-5z"/><line x1="10" y1="17" x2="17" y2="3"/>
+            </svg>
+          {/if}
         </button>
       </div>
     </div>
@@ -4549,6 +4653,20 @@
     flex: 1;
     height: 1px;
     background: color-mix(in srgb, var(--accent) 45%, transparent);
+    /* Drawn outward from the label as the room opens. */
+    animation: divider-draw 520ms cubic-bezier(0.2, 0.8, 0.3, 1) 120ms backwards;
+  }
+
+  .conv-unread-divider::before { transform-origin: right; }
+  .conv-unread-divider::after { transform-origin: left; }
+
+  @keyframes divider-draw {
+    from { transform: scaleX(0); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .conv-unread-divider::before,
+    .conv-unread-divider::after { animation: none; }
   }
 
   /* One bubble shape for friends and rooms: the corner, the tighter corner
@@ -4738,11 +4856,45 @@
     border-bottom-left-radius: var(--bubble-tail-radius);
   }
 
-  /* Marks the message a search hit jumped to. A ring rather than a background
-     swap, so it reads the same on a sent bubble as on a received one. */
+  /* Marks the message a jump landed on. A ring rather than a background swap,
+     so it reads the same on a sent bubble as on a received one; it arrives with
+     two soft pulses, so the eye finds it wherever the scroll stopped. */
   .conv-bubble.focused {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
+    animation: bubble-found 900ms ease-out 2;
+  }
+
+  @keyframes bubble-found {
+    from { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent); }
+    to   { box-shadow: 0 0 0 12px color-mix(in srgb, var(--accent) 0%, transparent); }
+  }
+
+  /* Revised in place, by its author on any device: one ring, so the change is
+     seen rather than found. */
+  .conv-bubble.just-edited {
+    animation: bubble-edited 1.2s ease-out;
+  }
+
+  @keyframes bubble-edited {
+    0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent); }
+    20%  { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 40%, transparent); }
+    100% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 0%, transparent); }
+  }
+
+  /* A line naming you, arriving now: its marker glows up and settles into the
+     standing tint, so a mention in a busy room is not one more slide-in. */
+  .conv-msg.fresh .conv-bubble.mentions-me {
+    animation: bubble-mention 1.6s ease-out;
+  }
+
+  @keyframes bubble-mention {
+    from { background-color: color-mix(in srgb, var(--accent) 32%, var(--bg-secondary)); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .conv-bubble.focused,
+    .conv-bubble.just-edited { animation: none; }
   }
 
   .bubble-text {
@@ -5059,6 +5211,12 @@
     opacity: 1;
   }
 
+  /* The editor has its own Cancel and Save; a remove button floating over its
+     header is one wrong click from discarding the line being revised. */
+  .conv-bubble.editing > .bubble-tools {
+    display: none;
+  }
+
   .bubble-edit-btn {
     display: inline-flex;
     align-items: center;
@@ -5322,6 +5480,13 @@
     color: var(--accent);
   }
 
+  /* Holds the current pin so cycling can slide it; lays out as the target did. */
+  .conv-pin-slot {
+    display: flex;
+    flex: 1;
+    min-width: 0;
+  }
+
   .conv-pin-target {
     display: flex;
     align-items: baseline;
@@ -5423,22 +5588,91 @@
     opacity: 0.85;
   }
 
+  /* The line being edited takes the column's full width whatever its length,
+     so a one-word message is not revised in a box one word wide. */
+  .conversation.channel .conv-msg.editing {
+    width: min(720px, 90%);
+    max-width: min(720px, 90%);
+  }
+
+  /* A neutral card rather than the accent fill: a text field on the blue of a
+     sent bubble read as a box pasted onto it. The accent edge still says whose
+     line it is and that it is open. */
+  .conv-bubble.editing,
+  .conversation.channel .conv-msg.sent .conv-bubble.editing {
+    background: var(--bg-surface);
+    color: var(--text-primary);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-lg);
+    padding: 10px 12px 12px;
+  }
+
   .bubble-edit {
     display: flex;
     flex-direction: column;
-    gap: 5px;
-    min-width: 220px;
+    gap: 8px;
+    width: 100%;
   }
 
+  .bubble-edit-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--font-size-xs);
+    color: var(--accent);
+  }
+
+  .bubble-edit-title {
+    font-weight: 600;
+  }
+
+  .bubble-edit-window {
+    margin-inline-start: auto;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .bubble-edit-window.closing {
+    color: var(--warning);
+  }
+
+  .bubble-edit-window.closed {
+    color: var(--danger);
+    font-weight: 600;
+  }
+
+  /* Three lines to start, growing with the text (see the effect that sizes
+     it) up to half the window, then scrolling. */
   .bubble-edit-input {
+    box-sizing: border-box;
     width: 100%;
-    padding: 5px 7px;
+    min-height: calc(3 * 1.45em + 20px);
+    max-height: min(50vh, 420px);
+    padding: 9px 11px;
     border: 1px solid var(--input-border);
-    border-radius: var(--radius-sm);
-    background: var(--bg-primary);
+    border-radius: var(--radius-md);
+    background: var(--bg-input);
     color: var(--text-primary);
     font: inherit;
-    resize: vertical;
+    font-size: var(--font-size-md);
+    line-height: 1.45;
+    resize: none;
+    overflow-y: auto;
+    transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+  }
+
+  .bubble-edit-input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-halo);
+  }
+
+  .bubble-edit-input[aria-invalid='true'] {
+    border-color: var(--danger);
+  }
+
+  .bubble-edit-input:disabled {
+    opacity: 0.7;
   }
 
   .bubble-edit-error {
@@ -5449,35 +5683,58 @@
   .bubble-edit-actions {
     display: flex;
     align-items: center;
-    gap: 6px;
+    flex-wrap: wrap;
+    gap: 8px;
   }
 
   .bubble-edit-hint {
     flex: 1 1 auto;
-    font-size: var(--font-size-2xs);
-    opacity: 0.7;
+    min-width: 0;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+  }
+
+  .bubble-edit-count {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .bubble-edit-count.over {
+    color: var(--danger);
+    font-weight: 600;
   }
 
   .bubble-edit-cancel,
   .bubble-edit-save {
-    padding: 2px 8px;
+    padding: 5px 14px;
     border: 1px solid var(--border);
-    border-radius: 5px;
-    background: var(--bg-surface);
+    border-radius: var(--radius-md);
+    background: var(--bg-primary);
     color: var(--text-primary);
-    font-size: var(--font-size-xs);
+    font-size: var(--font-size-sm);
+    font-weight: 500;
     cursor: pointer;
+  }
+
+  .bubble-edit-cancel:hover:not(:disabled) {
+    background: var(--bg-hover);
   }
 
   .bubble-edit-save {
     border-color: var(--accent);
     background: var(--accent);
     color: var(--on-accent);
+    font-weight: 600;
+  }
+
+  .bubble-edit-save:hover:not(:disabled) {
+    filter: brightness(1.08);
   }
 
   .bubble-edit-cancel:disabled,
   .bubble-edit-save:disabled {
-    opacity: 0.6;
+    opacity: 0.55;
     cursor: default;
   }
 

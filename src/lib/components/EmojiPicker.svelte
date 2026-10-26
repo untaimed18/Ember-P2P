@@ -40,6 +40,14 @@
   let section = $state<Section>(sections[0].id);
   let shown = $derived(sections.find((entry) => entry.id === section)?.emoji ?? []);
   let gridEl: HTMLDivElement | undefined = $state();
+  /** The one cell in the tab order; the arrow keys move between the rest, so
+   *  Tab leaves a grid of hundreds in one press. */
+  let activeCell = $state(0);
+
+  function showSection(next: Section) {
+    section = next;
+    activeCell = 0;
+  }
 
   function cells(): HTMLButtonElement[] {
     return gridEl ? [...gridEl.querySelectorAll<HTMLButtonElement>('button')] : [];
@@ -99,6 +107,7 @@
   class="emoji-picker"
   {id}
   role="dialog"
+  aria-modal="false"
   aria-label={m.chat_emoji_button()}
   tabindex="-1"
   onkeydown={handleKeydown}
@@ -112,14 +121,20 @@
         aria-pressed={section === entry.id}
         title={LABELS[entry.id]()}
         aria-label={LABELS[entry.id]()}
-        onclick={() => (section = entry.id)}
+        onclick={() => showSection(entry.id)}
       ><span aria-hidden="true">{entry.icon}</span></button>
     {/each}
   </div>
   <div class="emoji-heading" aria-hidden="true">{LABELS[section]()}</div>
   <div class="emoji-grid" role="group" aria-label={LABELS[section]()} bind:this={gridEl}>
-    {#each shown as emoji (emoji)}
-      <button type="button" class="emoji-cell" onclick={() => pick(emoji)}>{emoji}</button>
+    {#each shown as emoji, i (emoji)}
+      <button
+        type="button"
+        class="emoji-cell"
+        tabindex={i === activeCell ? 0 : -1}
+        onfocus={() => (activeCell = i)}
+        onclick={() => pick(emoji)}
+      >{emoji}</button>
     {/each}
   </div>
 </div>

@@ -2,6 +2,7 @@
   import { onMount, tick, untrack } from 'svelte';
   import { fade, fly, scale, slide } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
+  import { backOut } from 'svelte/easing';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
@@ -21,6 +22,8 @@
     isChannelLanguage,
   } from '$lib/channelLanguages';
   import { appSettings, loadAppSettings } from '$lib/stores/settings';
+  import { closeDmTab, dmPreview, dmRequests, keepDmTab, openPrivateChat, refreshDmThreads } from '$lib/stores/roomDm';
+  import { answerRoomDmRequest, dropRoomDmRequest } from '$lib/api/roomDm';
   import {
     copyToClipboard,
     disambiguatedMemberName,
@@ -59,6 +62,10 @@
     createChannel,
     isValidChannelUsername,
     deleteOwnedChannel,
+    listRoomsDeletedElsewhere,
+    confirmRoomDeletedElsewhere,
+    ROOMS_DELETED_ELSEWHERE_EVENT,
+    type RoomDeletedElsewhere,
     dismissChannelNewerLines,
     enterChannel,
     forgetChannel,
@@ -119,6 +126,7 @@
     ignoreMemberEverywhere,
     ignoreScopeFor,
     forgetChannelIgnores,
+    pushIgnoredNow,
     notifyLevelOf,
     refreshChannels,
     unhideChannel,
@@ -230,6 +238,9 @@
   let banTarget = $state<ChannelMemberInfo | null>(null);
   let banRotates = $state(false);
   let banOpen = $state(false);
+  let demoteTarget = $state<ChannelMemberInfo | null>(null);
+  let demoteOpen = $state(false);
+  let claimOpen = $state(false);
   let composeMode = $state<'create' | 'join' | null>(null);
   let membersOpen = $state(true);
   /** The directory stays up alongside an open room; the header toggle hands the
@@ -310,6 +321,139 @@
   let creating = $state(false);
   let joiningForm = $state(false);
   let joiningIds = $state<string[]>([]);
+  /** The room just walked into, so its row settles into Your rooms rather
+   *  than appearing there in one frame. Cleared once the movement has played. */
+  let justJoinedId = $state<string | null>(null);
+  let justJoinedTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Members who turned up while their room was open, for their arrival in the
+   *  list. A room's first read is not arrivals: everyone would slide in. */
+  let arrivedMembers = $state<string[]>([]);
+  const arrivalTimers = new Set<ReturnType<typeof setTimeout>>();
+  /** The welcome card over a room just joined. `key` tells its timer apart
+   *  from one left running by an earlier join of the same room. The room's
+   *  name and language are its own: read from the open room instead, a card
+   *  leaving because another room was opened named that one on its way out. */
+  let joinWelcome = $state<{ id: string; key: number; name: string; language: string } | null>(null);
+  let joinWelcomeTimer: ReturnType<typeof setTimeout> | undefined;
+  $effect(() => () => {
+    clearTimeout(justJoinedTimer);
+    clearTimeout(joinWelcomeTimer);
+    clearTimeout(membersSettleTimer);
+    for (const timer of arrivalTimers) clearTimeout(timer);
+    for (const timer of freshListingTimers) clearTimeout(timer);
+  });
+
+  /** Longest arrival in the list, with room to spare. */
+  const ARRIVAL_MS = 1800;
+
+  /** Unread badges bump when their count climbs, but not as the page first
+   *  draws them: every room with a backlog bouncing at once is noise. */
+  let badgesLive = $state(false);
+  $effect(() => {
+    if (loading || badgesLive) return;
+    const timer = setTimeout(() => (badgesLive = true), 600);
+    return () => clearTimeout(timer);
+  });
+
+  /** Bumped when the open room's roster grows or shrinks, not when another
+   *  room's is shown, so the count only moves for a real change. */
+  let memberCountBump = $state(0);
+
+  /** False while a room's roster is first drawn, so its online dots appear
+   *  still; true after, so one that turns up later pops in. Reset in the same
+   *  write that shows another room's roster (`settleMembersFor`): an effect
+   *  would run after that first draw, still reading the last room's `true`. */
+  let membersSettled = $state(false);
+  let membersSettleTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function settleMembersFor(id: string) {
+    if (membersFor === id) return;
+    membersSettled = false;
+    // Or the count, drawn afresh for this room, plays the last room's bump.
+    memberCountBump = 0;
+    clearTimeout(membersSettleTimer);
+    membersSettleTimer = setTimeout(() => (membersSettled = true), 800);
+  }
+
+  /** Rooms a Discover walk has just turned up, beyond the ones already
+   *  listed, so they ease in as they are found rather than popping. */
+  let freshListings = $state<string[]>([]);
+  const freshListingTimers = new Set<ReturnType<typeof setTimeout>>();
+
+  function markFreshListings(ids: string[]) {
+    if (ids.length === 0) return;
+    freshListings = [...new Set([...freshListings, ...ids])];
+    const timer = setTimeout(() => {
+      freshListingTimers.delete(timer);
+      freshListings = freshListings.filter((id) => !ids.includes(id));
+    }, ARRIVAL_MS);
+    freshListingTimers.add(timer);
+  }
+
+  /** Long enough to read a room's name and a line under it, short enough that
+   *  it is gone before anyone wonders how to close it. */
+  const JOIN_WELCOME_MS = 3400;
+  /** Where the welcome badge's sparks fly, in degrees, and when each leaves. */
+  const JOIN_SPARKS = [
+    { angle: -90, delay: 0 },
+    { angle: -30, delay: 40 },
+    { angle: 30, delay: 80 },
+    { angle: 90, delay: 20 },
+    { angle: 150, delay: 60 },
+    { angle: 210, delay: 100 },
+  ];
+
+  /** Play a room's arrival and bring its new place in the list into view, which
+   *  a join from far down Discover would otherwise leave off-screen. */
+  async function markJustJoined(room: Pick<ChannelInfo, 'channel_id' | 'name' | 'language'>) {
+    const id = room.channel_id;
+    justJoinedId = id;
+    clearTimeout(justJoinedTimer);
+    justJoinedTimer = setTimeout(() => {
+      if (justJoinedId === id) justJoinedId = null;
+    }, ARRIVAL_MS);
+    const key = Date.now();
+    joinWelcome = { id, key, name: room.name, language: room.language };
+    clearTimeout(joinWelcomeTimer);
+    joinWelcomeTimer = setTimeout(() => {
+      if (joinWelcome?.key === key) joinWelcome = null;
+    }, JOIN_WELCOME_MS);
+    await tick();
+    document
+      .querySelector<HTMLElement>(`.chan-row[data-room-id="${id}"]`)
+      ?.scrollIntoView({ block: 'nearest', behavior: prefersReducedMotion.current ? 'auto' : 'smooth' });
+  }
+
+  function markArrivedMembers(keys: string[]) {
+    if (keys.length === 0) return;
+    arrivedMembers = [...new Set([...arrivedMembers, ...keys])];
+    const timer = setTimeout(() => {
+      arrivalTimers.delete(timer);
+      arrivedMembers = arrivedMembers.filter((key) => !keys.includes(key));
+    }, ARRIVAL_MS);
+    arrivalTimers.add(timer);
+  }
+
+  /**
+   * A newcomer's row opens to its height as it fades in, so the members below
+   * glide down to make room instead of jumping. Instant for everyone else —
+   * the list redraws on every roster change — and with reduced motion.
+   */
+  function memberArrive(node: HTMLElement, { arriving }: { arriving: boolean }) {
+    if (!arriving || prefersReducedMotion.current) return { duration: 0 };
+    const style = getComputedStyle(node);
+    const height = node.offsetHeight;
+    const paddingTop = parseFloat(style.paddingTop);
+    const paddingBottom = parseFloat(style.paddingBottom);
+    return {
+      duration: 360,
+      easing: (t: number) => 1 - Math.pow(1 - t, 3),
+      css: (t: number, u: number) =>
+        `overflow: hidden; height: ${t * height}px;` +
+        `padding-top: ${t * paddingTop}px; padding-bottom: ${t * paddingBottom}px;` +
+        `opacity: ${Math.min(1, t * 1.4)}; transform: translateX(${u * 10}px);`,
+    };
+  }
   /** Which member a handoff offer went to this session, per room. `ChannelInfo`
    *  carries no pending-handoff field, and the backend refuses only a switch to
    *  a different member — re-offering to the same one is the retry path for a
@@ -661,6 +805,38 @@
   /** Discover rows from the last pass, by room id. Plain rather than state:
    *  written from inside `directoryList`, and read only there. */
   let discoverRowCache = new Map<string, ChannelInfo>();
+  /** Stored rows redrawn with a listing's language, from the last pass, kept
+   *  the way `discoverRowCache` is. */
+  let listedLanguageCache = new Map<string, { source: ChannelInfo; row: ChannelInfo }>();
+
+  /**
+   * A stored room with the language its Discover listing carries where the
+   * row's own is missing or out of date.
+   *
+   * A room's stored language comes from the owner's snapshot, which is looked
+   * up only while we are in the room. Left before the first one landed, the
+   * row has none for good, and left after, it keeps whatever the owner had
+   * then; the listing is the owner's too and is heard on every walk. Inside the
+   * room the snapshot is current, so the listing only fills the gap before the
+   * first one lands: after that, an empty language is the owner's "none".
+   */
+  function withListedLanguage(
+    ch: ChannelInfo,
+    listed: string,
+    next: Map<string, { source: ChannelInfo; row: ChannelInfo }>,
+  ): ChannelInfo {
+    // A code from a later build's longer list draws nothing, so it must not
+    // displace one this build can.
+    if (!isChannelLanguage(listed)) listed = '';
+    const language = ch.in_room
+      ? ch.language || (ch.moderation_updated_at === 0 ? listed : '')
+      : listed || ch.language;
+    if (language === ch.language) return ch;
+    const prev = listedLanguageCache.get(ch.channel_id);
+    const row = prev && prev.source === ch && prev.row.language === language ? prev.row : { ...ch, language };
+    next.set(ch.channel_id, { source: ch, row });
+    return row;
+  }
   let directoryList = $derived.by(() => {
     const hidden = new Set(
       $channelsStore.filter((c) => c.deleted).map((c) => c.channel_id),
@@ -669,14 +845,17 @@
     // anything still listed a minute later.
     for (const id of $hiddenChannels) hidden.add(id);
     const byId = new Map<string, ChannelInfo>();
+    const listed = new Map<string, { source: ChannelInfo; row: ChannelInfo }>();
     for (const ch of channelList) {
       // Never hide a room we are standing in. Removal is only offered once
       // you are out, but the conversation pane reads membership straight from
       // the store, so a joined room missing from the list would be a room you
       // are in with no way back to it.
       if (hidden.has(ch.channel_id) && !ch.in_room) continue;
-      byId.set(ch.channel_id, ch);
+      const listing = ch.visibility === 'public' ? discoveredById.get(ch.channel_id) : undefined;
+      byId.set(ch.channel_id, withListedLanguage(ch, listing?.language ?? '', listed));
     }
+    listedLanguageCache = listed;
     const rows = new Map<string, ChannelInfo>();
     for (const item of discoveredById.values()) {
       if (hidden.has(item.channel_id) || byId.has(item.channel_id)) continue;
@@ -1118,7 +1297,7 @@
       return;
     }
     if (membersOpen && typeof window !== 'undefined' && window.matchMedia(MQ_MAX_LG).matches) {
-      membersOpen = false;
+      void setMembersOpen(false);
       e.preventDefault();
     }
   }
@@ -1232,6 +1411,94 @@
     error = null;
   }
 
+  /** Rooms this device runs that the registry lists as deleted, each waiting
+   *  on the owner's answer; see `confirm_room_deleted_elsewhere`. */
+  let deletedElsewhere = $state<RoomDeletedElsewhere[]>([]);
+  let answeringDeleted = $state<string | null>(null);
+  let deletedElsewhereSeq = 0;
+  let removeElsewhereTarget = $state<RoomDeletedElsewhere | null>(null);
+  let removeElsewhereOpen = $state(false);
+
+  async function loadDeletedElsewhere() {
+    const seq = ++deletedElsewhereSeq;
+    try {
+      const rooms = await listRoomsDeletedElsewhere();
+      if (seq === deletedElsewhereSeq) deletedElsewhere = rooms;
+    } catch (e) {
+      console.warn('channels: could not read rooms deleted elsewhere', e);
+    }
+  }
+
+  /** A private-message request being answered, by member key. */
+  let answeringDm = $state<string | null>(null);
+
+  async function answerDmRequest(member: string, accept: boolean, name = '') {
+    if (answeringDm) return;
+    answeringDm = member;
+    try {
+      await answerRoomDmRequest(member, accept);
+      if (accept) keepDmTab(member, name);
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      answeringDm = null;
+      void refreshDmThreads();
+    }
+  }
+
+  /** Ignore everywhere, and remove any request of theirs here without a word
+   *  to them: a decline would tell them they were refused, where silence
+   *  looks like being offline. The request goes only once the backend holds
+   *  the ignore, so nothing they send meanwhile opens a new one; if the
+   *  ignore could not be saved, the request stays. */
+  async function ignoreEverywhereSilently(member: string, name: string) {
+    const holdsBanner = answeringDm === null;
+    if (holdsBanner) answeringDm = member;
+    const hadRequest = $dmRequests.some((t) => t.member_pubkey === member.toLowerCase());
+    ignoreMemberEverywhere(member, name);
+    try {
+      await pushIgnoredNow();
+      await dropRoomDmRequest(member);
+      if (hadRequest) closeDmTab(member);
+    } catch (e) {
+      toastError(translateError(e, m.error_operation_failed()));
+    } finally {
+      if (holdsBanner) answeringDm = null;
+      void refreshDmThreads();
+    }
+  }
+
+  function askRemoveDeletedElsewhere(room: RoomDeletedElsewhere) {
+    removeElsewhereTarget = room;
+    removeElsewhereOpen = true;
+  }
+
+  async function answerDeletedElsewhere(channelId: string, del: boolean) {
+    if (answeringDeleted) return;
+    answeringDeleted = channelId;
+    try {
+      await confirmRoomDeletedElsewhere(channelId, del);
+      deletedElsewhere = deletedElsewhere.filter((room) => room.channel_id !== channelId);
+      if (del) {
+        // What deleting the room from its own menu clears.
+        forgetChannelNotifyLevel(channelId);
+        forgetChannelFavourite(channelId);
+        forgetChannelIgnores(channelId);
+        discovered = discovered.filter((item) => item.channel_id !== channelId);
+        if (selectedId === channelId) clearSelection();
+        await tick();
+        clearDraft(`ch:${channelId}`);
+        setPendingReply(channelId, null);
+        await refreshChannels().catch(() => {});
+      }
+    } catch (e) {
+      error = translateError(e, m.error_operation_failed());
+    } finally {
+      answeringDeleted = null;
+      void loadDeletedElsewhere();
+    }
+  }
+
   onMount(() => {
     restoreActiveChannelOnEnter();
     returningToChannels = takeStashedChannelSelection();
@@ -1299,6 +1566,14 @@
         if (!cancelled) presenceConfig = config;
       })
       .catch(() => {});
+    void loadDeletedElsewhere();
+    let unlistenDeletedElsewhere: UnlistenFn | undefined;
+    listen(ROOMS_DELETED_ELSEWHERE_EVENT, () => void loadDeletedElsewhere())
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlistenDeletedElsewhere = fn;
+      })
+      .catch((e) => console.error('Failed to register deleted-elsewhere listener:', e));
     let unlistenMembers: UnlistenFn | undefined;
     listen<{ channel_id: string }>('ember:channel-members', (event) => {
       const id = event.payload.channel_id;
@@ -1395,6 +1670,10 @@
       const batch = event.payload.channels ?? [];
       if (batch.length === 0) return;
       const byId = new Map(discovered.map((item) => [item.channel_id, item]));
+      // The first rooms of an empty list are the list, not arrivals.
+      if (byId.size > 0) {
+        markFreshListings(batch.filter((item) => !byId.has(item.channel_id)).map((item) => item.channel_id));
+      }
       for (const item of batch) {
         byId.set(item.channel_id, withKnownMemberCount(item, byId.get(item.channel_id)));
       }
@@ -1425,6 +1704,7 @@
       document.removeEventListener('visibilitychange', onGatherVisibilityChange);
       unlistenMembers?.();
       unlistenPresence?.();
+      unlistenDeletedElsewhere?.();
       unlistenChat?.();
       unlistenModeration?.();
       unlistenNewer?.();
@@ -1566,6 +1846,17 @@
     try {
       const mems = await listChannelMembers(id);
       if (gen === membersGen && id === selectedId) {
+        // Only against a roster already on screen for this room.
+        if (membersFor === id && members.length > 0) {
+          const known = new Set(members.map((mem) => mem.member_pubkey));
+          markArrivedMembers(
+            mems
+              .filter((mem) => !mem.is_self && !mem.banned && !known.has(mem.member_pubkey))
+              .map((mem) => mem.member_pubkey),
+          );
+          if (mems.length !== members.length) memberCountBump++;
+        }
+        settleMembersFor(id);
         members = mems;
         membersFor = id;
         membersLoading = false;
@@ -1608,8 +1899,16 @@
     next: GatheredChannelInfo,
     prev: GatheredChannelInfo | undefined,
   ): GatheredChannelInfo {
-    if (next.member_count !== null || !prev || prev.member_count === null) return next;
-    return { ...next, member_count: prev.member_count };
+    if (!prev) return next;
+    // The friends among them are read with the size, so they stand or go
+    // together; when the listing was first seen does not change.
+    const sized =
+      next.member_count !== null || prev.member_count === null
+        ? next
+        : { ...next, member_count: prev.member_count, friends_present: prev.friends_present ?? null };
+    return sized.listed_since == null && prev.listed_since != null
+      ? { ...sized, listed_since: prev.listed_since }
+      : sized;
   }
 
   async function selectChannel(id: string) {
@@ -1764,6 +2063,7 @@
         item.channel_id === joined.channel_id ? { ...item, joined: joined.in_room } : item,
       );
       upsertChannel(joined);
+      if (joined.in_room) void markJustJoined(joined);
       void refreshChannels().catch(() => {});
       await selectChannel(joined.channel_id);
     } catch (e) {
@@ -1914,6 +2214,7 @@
         item.channel_id === joined.channel_id ? { ...item, joined: joined.in_room } : item,
       );
       upsertChannel(joined);
+      if (joined.in_room) void markJustJoined(joined);
       void refreshChannels().catch(() => {});
       await selectChannel(joined.channel_id);
     } catch (e) {
@@ -1996,6 +2297,7 @@
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
       deletingOwned = false;
+      void loadDeletedElsewhere();
     }
   }
 
@@ -2111,6 +2413,15 @@
     } finally {
       moderatingMember = null;
     }
+  }
+
+  function requestRemoveModerator(member: ChannelMemberInfo) {
+    demoteTarget = member;
+    demoteOpen = true;
+  }
+
+  function confirmRemoveModerator() {
+    if (demoteTarget) void handleRemoveModerator(demoteTarget.member_pubkey);
   }
 
   async function handleRemoveModerator(memberPubkey: string) {
@@ -2409,7 +2720,7 @@
     addingFriend = [...addingFriend, pk];
     try {
       const code = await channelMemberFriendCode(pk);
-      await addFriend(code, mem.nickname || undefined);
+      await addFriend(code, mem.nickname || undefined, true);
       await refreshFriendsList();
       toastSuccess(m.channels_friend_added({ name }));
     } catch (e) {
@@ -2656,7 +2967,23 @@
    *  so the pane opens even where it covers the conversation. */
   function reviewRoomOffers() {
     xferCollapsed = false;
-    membersOpen = true;
+    void setMembersOpen(true);
+  }
+
+  let membersSlotEl: HTMLDivElement | undefined = $state(undefined);
+  let membersToggleEl: HTMLButtonElement | undefined = $state(undefined);
+  let membersCloseEl: HTMLButtonElement | undefined = $state(undefined);
+
+  /** Where the pane covers the conversation, focus goes into it on the way in
+   *  and back to the toggle on the way out; otherwise it would stay behind on
+   *  a page the pane is drawn over. */
+  async function setMembersOpen(open: boolean) {
+    const focusInside = !!membersSlotEl?.contains(document.activeElement);
+    membersOpen = open;
+    if (!window.matchMedia(MQ_MAX_LG).matches) return;
+    await tick();
+    if (open) membersCloseEl?.focus();
+    else if (focusInside) membersToggleEl?.focus();
   }
   let roomOffersLabel = $derived(
     plural(roomOffersWaiting, {
@@ -2770,6 +3097,14 @@
 </div>
 
 <div class="page-content channels-page">
+  <!-- The welcome card is drawn with the room it greets, and a live region
+       inserted along with its text is not announced, so the card speaks from
+       here. -->
+  <span class="sr-only" aria-live="polite">
+    {joinWelcome && joinWelcome.id === selected?.channel_id
+      ? `${m.channels_joined_title({ room: joinWelcome.name })} ${m.channels_joined_body()}`
+      : ''}
+  </span>
   {#if joinedCount === 0}
     <details class="how-panel">
       <summary class="how-title">{m.channels_how_title()}</summary>
@@ -2792,6 +3127,60 @@
       </div>
     </div>
   {/if}
+
+  {#each $dmRequests as request (request.member_pubkey)}
+    <!-- Someone in a room wrote privately first. Nothing of it counts as
+         unread until it is accepted. -->
+    {@const requestName = request.name || m.channels_dm_someone()}
+    <div class="banner dm-request-banner" role="region" aria-label={m.channels_dm_request_banner({ name: requestName })}>
+      <span>
+        {m.channels_dm_request_banner({ name: requestName })}
+        {#if request.last_text}
+          <span class="dm-request-preview"><bdi dir="auto">{dmPreview(request.last_text)}</bdi></span>
+        {/if}
+      </span>
+      <div class="banner-actions">
+        <button class="ghost" onclick={() => openPrivateChat(request.member_pubkey, request.name)}>
+          {m.channels_dm_open()}
+        </button>
+        <button class="ghost" disabled={answeringDm !== null} onclick={() => void answerDmRequest(request.member_pubkey, true, request.name)}>
+          {m.channels_dm_accept()}
+        </button>
+        <button class="ghost" disabled={answeringDm !== null} onclick={() => void answerDmRequest(request.member_pubkey, false)}>
+          {m.channels_dm_decline()}
+        </button>
+        <!-- Sends them nothing: the request goes, and whatever they send
+             next anywhere is dropped. -->
+        <button
+          class="ghost"
+          disabled={answeringDm !== null}
+          onclick={() => void ignoreEverywhereSilently(request.member_pubkey, request.name)}
+        >
+          {m.channels_ignore_everywhere()}
+        </button>
+      </div>
+    </div>
+  {/each}
+
+  {#each deletedElsewhere as room (room.channel_id)}
+    <!-- The registry says this room was deleted, but this device still runs
+         it: a restore from an older backup, or a delete on another device.
+         The registry's word alone never removes it; the owner does. -->
+    <div class="banner deleted-elsewhere-banner" role="status">
+      <span>
+        <strong><bdi dir="auto">{room.name}</bdi></strong>
+        {m.channels_deleted_elsewhere_body()}
+      </span>
+      <div class="banner-actions">
+        <button class="ghost" onclick={() => askRemoveDeletedElsewhere(room)} disabled={answeringDeleted !== null}>
+          {answeringDeleted === room.channel_id ? m.common_loading() : m.channels_deleted_elsewhere_delete()}
+        </button>
+        <button class="ghost" onclick={() => void answerDeletedElsewhere(room.channel_id, false)} disabled={answeringDeleted !== null}>
+          {m.channels_deleted_elsewhere_keep()}
+        </button>
+      </div>
+    </div>
+  {/each}
 
   {#if emberOff}
     <div class="banner" role="status">
@@ -2958,7 +3347,7 @@
         >
           {#if directoryList.length > 0}
             <div class="search-wrap">
-              <span class="search-icon">
+              <span class="search-icon" aria-hidden="true">
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
                   <circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="17" y2="17"/>
                 </svg>
@@ -2984,30 +3373,48 @@
             </div>
           {/if}
           <div class="list-scroll" bind:this={listScrollEl}>
-            <!-- The header stays while a search hides every joined room, so
-                 "Mark all rooms as read" — which covers them all regardless —
-                 does not come and go with the query. -->
-            {#if roomSections.yours.length > 0 || unreadJoinedIds.length > 0}
-              <div class="list-section">
-                <h3 class="list-section-label" id="rooms-section-yours">{m.channels_section_yours()}</h3>
-                {#if unreadJoinedIds.length > 0}
-                  <button
-                    type="button"
-                    class="list-section-action"
-                    title={m.channels_mark_all_read_title()}
-                    disabled={markingAllRead}
-                    aria-busy={markingAllRead ? 'true' : undefined}
-                    onclick={markAllRead}
-                  >{m.channels_mark_all_read()}</button>
-                {/if}
-              </div>
-              {#if roomSections.yours.length > 0}
-                <div role="list" aria-labelledby="rooms-section-yours">
-                  {#each roomSections.yours as ch (ch.channel_id)}
-                    {@render roomRow(ch)}
-                  {/each}
-                </div>
+            {#snippet markAllReadAction()}
+              {#if unreadJoinedIds.length > 0}
+                <button
+                  type="button"
+                  class="list-section-action"
+                  title={m.channels_mark_all_read_title()}
+                  disabled={markingAllRead}
+                  aria-busy={markingAllRead ? 'true' : undefined}
+                  onclick={markAllRead}
+                >{markingAllRead ? m.channels_marking_all_read() : m.channels_mark_all_read()}</button>
               {/if}
+            {/snippet}
+            <!-- "Mark all rooms as read" rides on the first of your sections.
+                 While a search hides every joined room, a plain "Your rooms"
+                 header keeps it, so it does not come and go with the query. -->
+            {#if roomSections.yoursPublic.length > 0}
+              <div class="list-section">
+                <h3 class="list-section-label" id="rooms-section-yours-public">{m.channels_section_yours_public()}</h3>
+                {@render markAllReadAction()}
+              </div>
+              <div role="list" aria-labelledby="rooms-section-yours-public">
+                {#each roomSections.yoursPublic as ch (ch.channel_id)}
+                  {@render roomRow(ch)}
+                {/each}
+              </div>
+            {/if}
+            {#if roomSections.yoursPrivate.length > 0}
+              <div class="list-section">
+                <h3 class="list-section-label" id="rooms-section-yours-private">{m.channels_section_yours_private()}</h3>
+                {#if roomSections.yoursPublic.length === 0}{@render markAllReadAction()}{/if}
+              </div>
+              <div role="list" aria-labelledby="rooms-section-yours-private">
+                {#each roomSections.yoursPrivate as ch (ch.channel_id)}
+                  {@render roomRow(ch)}
+                {/each}
+              </div>
+            {/if}
+            {#if roomSections.yours.length === 0 && unreadJoinedIds.length > 0}
+              <div class="list-section">
+                <h3 class="list-section-label">{m.channels_section_yours()}</h3>
+                {@render markAllReadAction()}
+              </div>
             {/if}
             {#if roomSections.discover.length > 0}
               <div class="list-section">
@@ -3051,6 +3458,8 @@
                   class:active={ch.in_room && ch.channel_id === selectedId}
                   class:highlighted={highlightedRow?.channel_id === ch.channel_id}
                   class:joining={joiningIds.includes(ch.channel_id)}
+                  class:just-joined={ch.in_room && ch.channel_id === justJoinedId}
+                  class:fresh-listing={!ch.in_room && freshListings.includes(ch.channel_id)}
                   class:moved={!!ch.successor_id}
                   class:likely-spam={likelySpamIds.has(ch.channel_id)}
                   class:has-unread={ch.in_room
@@ -3073,6 +3482,8 @@
                     aria-current={ch.in_room && ch.channel_id === selectedId ? 'true' : undefined}
                     aria-label={ch.in_room ? undefined : m.channels_join_room_aria({ name: ch.name })}
                     aria-busy={!ch.in_room && joiningIds.includes(ch.channel_id) ? 'true' : undefined}
+                    aria-disabled={!ch.in_room && needsUsername ? 'true' : undefined}
+                    title={!ch.in_room && needsUsername ? m.channels_username_required() : undefined}
                     disabled={!ch.in_room && joiningIds.includes(ch.channel_id)}
                     onclick={() => {
                       if (ch.in_room) void selectChannel(ch.channel_id);
@@ -3160,8 +3571,11 @@
                            own to a screen reader. Grey when the room's level
                            would not interrupt for what it holds; see
                            `unreadBadgeTone`. -->
+                      <!-- Redrawn per count, so a climb plays the bump; see `badgesLive`. -->
+                      {#key ch.unread}
                       <span
                         class="count-pill unread"
+                        class:bump={badgesLive}
                         class:silenced={unreadBadgeTone(notifyLevelOf($effectiveNotifyLevels, ch.channel_id), mentioned) === 'quiet'}
                         aria-label={mentioned
                           ? m.channels_unread_mention_aria({ count: ch.unread })
@@ -3171,6 +3585,7 @@
                               other: () => m.channels_unread_title_other({ count: ch.unread }),
                             })}
                       >{#if mentioned}<span class="unread-at" aria-hidden="true">@</span>{/if}{ch.unread > 99 ? '99+' : ch.unread}</span>
+                      {/key}
                     {/if}
                   </button>
                   <div class="chan-door-col">
@@ -3432,12 +3847,13 @@
                 <button
                   class="icon-btn members-toggle"
                   class:on={membersOpen}
-                  onclick={() => (membersOpen = !membersOpen)}
+                  bind:this={membersToggleEl}
+                  onclick={() => void setMembersOpen(!membersOpen)}
                   title={membersToggleLabel}
                   aria-pressed={membersOpen}
                   aria-label={membersToggleLabel}
                 >
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <circle cx="6" cy="6" r="2.2"/>
                     <path d="M2 13c0-2.2 1.8-4 4-4s4 1.8 4 4"/>
                     <circle cx="11.5" cy="6.5" r="1.7"/>
@@ -3540,7 +3956,12 @@
             {#if selected.successor_id}
               <div class="successor-banner" role="status">
                 <span>{m.channels_successor_banner()}</span>
-                <button class="ghost" onclick={openSuccessor} disabled={openingSuccessor}>{m.channels_open_successor()}</button>
+                <button
+                  class="ghost"
+                  onclick={openSuccessor}
+                  disabled={openingSuccessor}
+                  aria-busy={openingSuccessor ? 'true' : undefined}
+                >{openingSuccessor ? m.channels_opening_successor() : m.channels_open_successor()}</button>
               </div>
             {:else if transferPendingTo}
               <div class="successor-banner" role="status">
@@ -3607,7 +4028,7 @@
               <div class="successor-banner" role="status">
                 <span>{nomineeNotice}</span>
                 {#if selected.can_claim}
-                  <button class="ghost" disabled={claiming} onclick={handleClaim}>
+                  <button class="ghost" disabled={claiming} onclick={() => (claimOpen = true)}>
                     {claiming ? m.channels_taking_over() : m.channels_claim_ownership()}
                   </button>
                 {/if}
@@ -3650,7 +4071,7 @@
                   }}
                 />
                 <button type="submit" disabled={!searchQuery.trim() || searching}>
-                  {searching ? m.channels_discovering() : m.common_search()}
+                  {searching ? m.channels_searching() : m.common_search()}
                 </button>
               </form>
               {#if searchRan}
@@ -3679,6 +4100,42 @@
               {/if}
             {/if}
             <div class="transcript">
+              {#if joinWelcome && joinWelcome.id === selected.channel_id}
+                <!-- Floats over the top of the transcript and lets every click
+                     through, so it never stands between the reader and the room.
+                     Local, so leaving the room takes it at once rather than
+                     holding the pane open for its exit. -->
+                <div class="join-welcome-wrap" aria-hidden="true">
+                  <div
+                    class="join-welcome"
+                    out:fly={{ y: -10, duration: prefersReducedMotion.current ? 0 : 280 }}
+                  >
+                    <div class="join-welcome-badge">
+                      <span class="join-welcome-ring"></span>
+                      {#each JOIN_SPARKS as spark, i (i)}
+                        <span
+                          class="join-spark"
+                          class:alt={i % 2 === 1}
+                          style:--spark-angle="{spark.angle}deg"
+                          style:--spark-delay="{spark.delay}ms"
+                        ></span>
+                      {/each}
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M8.5 3.5L7 20.5M17 3.5l-1.5 17M3.5 9h17M3 15h17"/>
+                      </svg>
+                    </div>
+                    <div class="join-welcome-text">
+                      <strong>
+                        <bdi dir="auto">{m.channels_joined_title({ room: joinWelcome?.name ?? '' })}</bdi>
+                        {#if joinWelcome && isChannelLanguage(joinWelcome.language)}
+                          <img class="join-welcome-flag" src={channelLanguageFlagSrc(joinWelcome.language)} alt="" />
+                        {/if}
+                      </strong>
+                      <span>{m.channels_joined_body()}</span>
+                    </div>
+                  </div>
+                </div>
+              {/if}
               <ChatConversation
                 friendHash=""
                 friendName={selectedName}
@@ -3703,11 +4160,11 @@
         </section>
 
         {#if selected}
-          <div class="members-slot">
+          <div class="members-slot" bind:this={membersSlotEl}>
           <button
             class="members-backdrop"
             type="button"
-            onclick={() => (membersOpen = false)}
+            onclick={() => void setMembersOpen(false)}
             aria-label={m.channels_hide_members()}
             tabindex={membersOpen ? 0 : -1}
             inert={!membersOpen}
@@ -3718,11 +4175,14 @@
               <!-- Only once the roster is in hand. Falling back to the stored
                    count put a stale number beside a body that said Loading. -->
               {#if members.length > 0}
-                <span class="members-count">{members.length}</span>
+                {#key memberCountBump}
+                  <span class="members-count" class:bump={memberCountBump > 0}>{members.length}</span>
+                {/key}
               {/if}
               <button
                 class="icon-btn members-close"
-                onclick={() => (membersOpen = false)}
+                bind:this={membersCloseEl}
+                onclick={() => void setMembersOpen(false)}
                 aria-label={m.channels_hide_members()}
               >
                 <IconX size={14} />
@@ -3749,8 +4209,11 @@
                     presence === 'online' ? m.channels_member_online() : m.channels_member_away()}
                   {@const friendRelation = memberFriendRelation(mem)}
                   {@const ignoreScope = ignoreScopeFor($ignoredMembers, mem.member_pubkey, selectedId)}
+                  {@const arriving = arrivedMembers.includes(mem.member_pubkey)}
                   <li
                     class:banned={mem.banned}
+                    class:arrived={arriving}
+                    in:memberArrive={{ arriving }}
                     oncontextmenu={memberHasMenu(mem) ? openCardMenu : undefined}
                   >
                     <div
@@ -3762,13 +4225,33 @@
                         <circle cx="12" cy="8" r="4"/>
                         <path d="M4 21c0-4.418 3.582-8 8-8s8 3.582 8 8"/>
                       </svg>
+                      <!-- Pops in when someone comes online while the list is
+                           open; drawn still as the list itself first appears. -->
                       {#if presence !== 'offline'}
-                        <span class="present-dot" class:away={presence === 'away'} role="img" title={presenceLabel} aria-label={presenceLabel}></span>
+                        <span
+                          class="present-dot"
+                          class:away={presence === 'away'}
+                          role="img"
+                          title={presenceLabel}
+                          aria-label={presenceLabel}
+                          in:scale={{ start: 0, duration: membersSettled && !prefersReducedMotion.current ? 320 : 0, easing: backOut }}
+                        ></span>
                       {/if}
                     </div>
                     <div class="member-identity">
-                      <span class="member-name" title={roomMemberLabel(mem)}>
-                        <bdi dir="auto">{roomMemberLabel(mem)}</bdi>
+                      <span class="member-name-row">
+                        <span class="member-name" title={roomMemberLabel(mem)}>
+                          <bdi dir="auto">{roomMemberLabel(mem)}</bdi>
+                        </span>
+                        {#if isChannelLanguage(mem.language)}
+                          {@const languageName = channelLanguageName(mem.language)}
+                          <img
+                            class="member-flag"
+                            src={channelLanguageFlagSrc(mem.language)}
+                            alt={m.channels_member_language({ language: languageName })}
+                            title={m.channels_member_language({ language: languageName })}
+                          />
+                        {/if}
                       </span>
                       <span class="member-badges">
                         {#if isChannelOwner(mem)}
@@ -3821,6 +4304,24 @@
                             type="button"
                             role="menuitem"
                             tabindex="-1"
+                            disabled={mem.banned || selectedBanned || friendRelation === 'mutual' || ignoreScope !== 'none' || $appSettings?.room_dm_policy === 'off'}
+                            title={selectedBanned
+                              ? m.channels_you_are_banned()
+                              : mem.banned
+                                ? m.channels_dm_member_banned()
+                                : friendRelation === 'mutual'
+                                  ? m.channels_dm_is_friend()
+                                  : ignoreScope !== 'none'
+                                    ? m.channels_dm_ignored()
+                                    : $appSettings?.room_dm_policy === 'off'
+                                      ? m.channels_dm_policy_off()
+                                      : undefined}
+                            onclick={(e) => { closeCardMenu(e.currentTarget); openPrivateChat(mem.member_pubkey, mem.nickname || roomMemberLabel(mem)); }}
+                          >{m.channels_dm_message_privately()}</button>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            tabindex="-1"
                             disabled={addingFriend.includes(mem.member_pubkey) || friendRelation !== 'none'}
                             onclick={(e) => { closeCardMenu(e.currentTarget); handleAddFriend(mem); }}
                           >{friendRelation === 'mutual'
@@ -3854,7 +4355,7 @@
                             onclick={(e) => {
                               closeCardMenu(e.currentTarget);
                               if (ignoreScope === 'global') toggleMemberIgnore(mem.member_pubkey, mem.nickname);
-                              else ignoreMemberEverywhere(mem.member_pubkey, mem.nickname);
+                              else void ignoreEverywhereSilently(mem.member_pubkey, mem.nickname);
                             }}
                           >{ignoreScope === 'global'
                             ? m.channels_unignore()
@@ -3886,7 +4387,7 @@
                                 role="menuitem"
                                 tabindex="-1"
                                 disabled={moderationBusy}
-                                onclick={(e) => { closeCardMenu(e.currentTarget); handleRemoveModerator(mem.member_pubkey); }}
+                                onclick={(e) => { closeCardMenu(e.currentTarget); requestRemoveModerator(mem); }}
                               >{m.channels_remove_moderator()}</button>
                             {:else}
                               <button
@@ -4356,6 +4857,24 @@
 />
 
 <ConfirmDialog
+  bind:open={demoteOpen}
+  title={m.channels_remove_moderator_confirm({ name: demoteTarget ? roomMemberLabel(demoteTarget) : '' })}
+  message={m.channels_remove_moderator_confirm_body()}
+  confirmLabel={m.channels_remove_moderator()}
+  danger
+  onconfirm={confirmRemoveModerator}
+/>
+
+<ConfirmDialog
+  bind:open={claimOpen}
+  title={m.channels_claim_confirm()}
+  message={m.channels_claim_confirm_body()}
+  confirmLabel={m.channels_claim_ownership()}
+  danger
+  onconfirm={handleClaim}
+/>
+
+<ConfirmDialog
   bind:open={rotateOpen}
   title={m.channels_rotate_confirm()}
   message={m.channels_rotate_confirm_body()}
@@ -4382,6 +4901,17 @@
   confirmLabel={m.channels_delete()}
   danger
   onconfirm={handleDeleteOwned}
+/>
+
+<ConfirmDialog
+  bind:open={removeElsewhereOpen}
+  title={m.channels_deleted_elsewhere_confirm()}
+  message={m.channels_deleted_elsewhere_confirm_body({ name: removeElsewhereTarget?.name ?? '' })}
+  confirmLabel={m.channels_deleted_elsewhere_delete()}
+  danger
+  onconfirm={() => {
+    if (removeElsewhereTarget) void answerDeletedElsewhere(removeElsewhereTarget.channel_id, true);
+  }}
 />
 
 <style>
@@ -4541,6 +5071,13 @@
     display: flex;
     gap: 6px;
     flex-shrink: 0;
+  }
+
+  .dm-request-preview {
+    display: block;
+    margin-top: 2px;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
   }
 
   .banner {
@@ -4938,6 +5475,67 @@
     .chan-row.joining::after { animation: none; }
   }
 
+  /* Joined: the room settles into Your rooms with a small drop and a wash of
+     accent that fades into the selected row's own tint (the keyframes name only
+     a start, so they end on whatever the row's background is). The avatar
+     answers with a nudge and one ring, and the selection bar draws in. Under a
+     second and a half end to end, and once: the class is gone by the next join. */
+  .chan-row.just-joined {
+    animation:
+      chan-row-arrive 420ms cubic-bezier(0.2, 0.9, 0.3, 1.12) both,
+      chan-row-wash 1.5s ease-out;
+  }
+
+  .chan-row.just-joined .chan-avatar {
+    animation: chan-avatar-pop 560ms cubic-bezier(0.34, 1.5, 0.5, 1) 80ms both;
+  }
+
+  .chan-row.just-joined .chan-avatar::after {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    pointer-events: none;
+    animation: chan-avatar-ring 900ms ease-out 180ms both;
+  }
+
+  .chan-row.just-joined.active::before {
+    transform-origin: center;
+    animation: chan-bar-draw 380ms cubic-bezier(0.2, 0.9, 0.3, 1) 140ms both;
+  }
+
+  @keyframes chan-row-arrive {
+    from { opacity: 0; transform: translateY(-6px) scale(0.985); }
+    to   { opacity: 1; transform: none; }
+  }
+
+  @keyframes chan-row-wash {
+    from { background-color: color-mix(in srgb, var(--accent) 26%, transparent); }
+  }
+
+  @keyframes chan-avatar-pop {
+    0%   { transform: scale(0.82); }
+    100% { transform: scale(1); }
+  }
+
+  @keyframes chan-avatar-ring {
+    from { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
+    to   { box-shadow: 0 0 0 9px color-mix(in srgb, var(--accent) 0%, transparent); }
+  }
+
+  @keyframes chan-bar-draw {
+    from { transform: scaleY(0); }
+    to   { transform: scaleY(1); }
+  }
+
+  /* Nothing moves; the wash alone still says which row is new. */
+  @media (prefers-reduced-motion: reduce) {
+    .chan-row.just-joined { animation: chan-row-wash 1.5s ease-out; }
+    .chan-row.just-joined .chan-avatar,
+    .chan-row.just-joined .chan-avatar::after,
+    .chan-row.just-joined.active::before { animation: none; }
+  }
+
   /* One control, centred. The member count used to sit stacked above it, which
      made the column two pills tall and left the row taller than its content. */
   .chan-door-col {
@@ -5192,6 +5790,36 @@
   .chan-moved-badge {
     margin-inline-start: 6px;
     vertical-align: 1px;
+  }
+
+  /* Something new in the room: the badge pops on its first message and gives
+     a small bounce on each one after, so the list says where the conversation
+     moved without anything flashing. */
+  .unread.bump {
+    animation: unread-bump 460ms cubic-bezier(0.34, 1.6, 0.5, 1);
+  }
+
+  @keyframes unread-bump {
+    0%   { transform: scale(0.7); }
+    100% { transform: scale(1); }
+  }
+
+  /* Found by the walk still running: it eases into Discover. */
+  .chan-row.fresh-listing {
+    animation: chan-listing-in 360ms ease-out;
+  }
+
+  @keyframes chan-listing-in {
+    from { opacity: 0; transform: translateY(4px); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .unread.bump { animation: none; }
+    .chan-row.fresh-listing { animation: chan-listing-fade 360ms ease-out; }
+  }
+
+  @keyframes chan-listing-fade {
+    from { opacity: 0; }
   }
 
   /* A silenced room still counts its unread, it just stops shouting about it. */
@@ -5599,7 +6227,7 @@
     min-height: 0;
     border-top: 1px solid var(--border);
     background: var(--bg-surface);
-    box-shadow: 0 -8px 18px -14px rgba(0, 0, 0, 0.35);
+    box-shadow: var(--shadow-up-sm);
   }
 
   .xfer-drawer-head {
@@ -6074,6 +6702,152 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
+    /* Anchors the welcome card. */
+    position: relative;
+  }
+
+  /* The welcome on joining a room: a card that rises in a beat after the room
+     has drawn, its badge answering with a ring and a few sparks, then lifts
+     away on its own (`JOIN_WELCOME_MS`). Above the transcript, never in it, and
+     letting every click through. */
+  .join-welcome-wrap {
+    position: absolute;
+    inset-inline: 0;
+    top: 14px;
+    z-index: 5;
+    display: flex;
+    justify-content: center;
+    padding: 0 16px;
+    pointer-events: none;
+  }
+
+  .join-welcome {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    max-width: min(440px, 100%);
+    padding: 10px 18px 10px 10px;
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+    border-radius: var(--radius-pill);
+    background: color-mix(in srgb, var(--accent) 6%, var(--bg-surface));
+    box-shadow: var(--shadow-lg);
+    animation: join-welcome-in 520ms cubic-bezier(0.2, 0.9, 0.3, 1.15) 260ms backwards;
+  }
+
+  .join-welcome-badge {
+    position: relative;
+    flex-shrink: 0;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: var(--on-accent);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: join-badge-pop 600ms cubic-bezier(0.34, 1.5, 0.5, 1) 380ms backwards;
+  }
+
+  .join-welcome-badge svg {
+    width: 17px;
+    height: 17px;
+  }
+
+  .join-welcome-ring {
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    pointer-events: none;
+    animation: join-ring 1s ease-out 520ms both;
+  }
+
+  /* Six small sparks thrown out from the badge's centre. Each is turned to its
+     angle, then carried outward along it while it shrinks and fades. */
+  .join-spark {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 5px;
+    height: 5px;
+    margin: -2.5px 0 0 -2.5px;
+    border-radius: 50%;
+    background: var(--accent);
+    opacity: 0;
+    animation: join-spark 760ms cubic-bezier(0.2, 0.7, 0.3, 1) calc(520ms + var(--spark-delay)) both;
+  }
+
+  .join-spark.alt {
+    background: color-mix(in srgb, var(--accent) 45%, var(--warning));
+  }
+
+  .join-welcome-text {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+
+  .join-welcome-text strong {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .join-welcome-text strong bdi {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .join-welcome-text > span {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+  }
+
+  .join-welcome-flag {
+    flex-shrink: 0;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--text-primary) 14%, transparent);
+  }
+
+  @keyframes join-welcome-in {
+    from { opacity: 0; transform: translateY(-10px) scale(0.96); }
+    to   { opacity: 1; transform: none; }
+  }
+
+  @keyframes join-badge-pop {
+    from { transform: scale(0.6); }
+    to   { transform: scale(1); }
+  }
+
+  @keyframes join-ring {
+    from { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 50%, transparent); }
+    to   { box-shadow: 0 0 0 12px color-mix(in srgb, var(--accent) 0%, transparent); }
+  }
+
+  @keyframes join-spark {
+    0%   { opacity: 0; transform: rotate(var(--spark-angle)) translateX(6px) scale(1); }
+    20%  { opacity: 1; }
+    100% { opacity: 0; transform: rotate(var(--spark-angle)) translateX(30px) scale(0.3); }
+  }
+
+  /* The card still comes and goes, as a fade; the badge stays put and throws
+     nothing. */
+  @media (prefers-reduced-motion: reduce) {
+    .join-welcome { animation: join-welcome-fade 300ms ease 260ms backwards; }
+    .join-welcome-badge,
+    .join-welcome-ring { animation: none; }
+    .join-spark { display: none; }
+  }
+
+  @keyframes join-welcome-fade {
+    from { opacity: 0; }
   }
 
   .members-backdrop {
@@ -6099,8 +6873,21 @@
   }
 
   .members-count {
+    display: inline-block;
     font-size: var(--font-size-xs);
     color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Someone came or went: the number nudges and briefly takes the accent. */
+  .members-count.bump {
+    animation: count-bump 520ms cubic-bezier(0.34, 1.5, 0.5, 1);
+  }
+
+  @keyframes count-bump {
+    0%   { transform: scale(1); color: var(--text-muted); }
+    35%  { transform: scale(1.3); color: var(--accent); }
+    100% { transform: scale(1); color: var(--text-muted); }
   }
 
   .members-empty {
@@ -6142,6 +6929,31 @@
     background: var(--bg-hover);
   }
 
+  /* Someone just joined: their row opens into the list (`memberArrive`), then
+     holds a wash of accent that fades out, and their presence dot lands with a
+     small pop. The same wash the room row gets on a join, so the two read as
+     one gesture. */
+  .member-list li.arrived {
+    animation: member-wash 1.6s ease-out 200ms backwards;
+  }
+
+  .member-list li.arrived .present-dot {
+    animation: member-dot-pop 420ms cubic-bezier(0.34, 1.6, 0.5, 1) 260ms both;
+  }
+
+  @keyframes member-wash {
+    from { background-color: color-mix(in srgb, var(--accent) 18%, transparent); }
+  }
+
+  @keyframes member-dot-pop {
+    from { transform: scale(0); }
+    to   { transform: scale(1); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .member-list li.arrived .present-dot { animation: none; }
+  }
+
   .member-list li.banned { opacity: 0.65; }
 
   .member-avatar {
@@ -6155,6 +6967,10 @@
     align-items: center;
     justify-content: center;
     position: relative;
+    /* Online, away and offline shade into each other rather than switching. */
+    transition:
+      background-color var(--transition-normal) ease,
+      color var(--transition-normal) ease;
   }
 
   .member-avatar svg { width: 14px; height: 14px; }
@@ -6181,6 +6997,9 @@
     border-radius: 50%;
     background: var(--success);
     box-shadow: 0 0 0 2px var(--bg-secondary);
+    transition:
+      background-color var(--transition-normal) ease,
+      border-color var(--transition-normal) ease;
   }
 
   /* Hollow, so the two states stay apart for anyone who cannot separate them
@@ -6233,12 +7052,30 @@
     gap: 1px;
   }
 
+  .member-name-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+
   .member-name {
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     font-size: var(--font-size-md);
     font-weight: 500;
+  }
+
+  /* Matches the room list's flag, so a member's reads as the same kind of
+     mark as the room's. */
+  .member-flag {
+    flex-shrink: 0;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--text-primary) 14%, transparent);
   }
 
   .member-badges { display: flex; flex-wrap: wrap; gap: 4px; }

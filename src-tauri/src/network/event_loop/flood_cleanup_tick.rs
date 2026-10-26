@@ -26,6 +26,26 @@ pub(in crate::network) async fn on_flood_cleanup_tick(
         Err(e) => debug!("Disappearing-message sweep panicked: {e}"),
     }
 
+    // Chat attachments nobody answered, on the same half-minute: an offer
+    // lapses five minutes after it went, and an open conversation shows it
+    // from its last update, which would otherwise still read "waiting".
+    let db_attachments = db.clone();
+    match tokio::task::spawn_blocking(move || db_attachments.expire_chat_attachments(expire_now)).await {
+        Ok(Ok(expired)) => {
+            for xfer_hex in expired {
+                crate::network::chat_attach::emit_expired(app_handle, db, &xfer_hex);
+            }
+        }
+        Ok(Err(e)) => debug!("Chat attachment expiry sweep failed: {e}"),
+        Err(e) => debug!("Chat attachment expiry sweep panicked: {e}"),
+    }
+    crate::network::chat_attach::check_held_sources(state, db);
+    crate::network::chat_attach::retry_owed_holds(state).await;
+    // When a friend let go of what it held for us, should this process stop
+    // here: a restart counts their offers from it.
+    let db_alive = db.clone();
+    let _ = tokio::task::spawn_blocking(move || db_alive.note_alive(expire_now)).await;
+
     // Prevent unbounded growth of peer_nicknames
     const MAX_NICKNAME_ENTRIES: usize = 500;
     if state.peer_nicknames.len() > MAX_NICKNAME_ENTRIES {
@@ -63,6 +83,9 @@ pub(in crate::network) async fn on_flood_cleanup_tick(
         for eh in refresh {
             state.online_friends.insert(eh, now);
         }
+        // Their status is kept: it shows only while they are online, and the
+        // session this sweep gave up on can still recover without a new one
+        // that would send it again. A session that ends drops it.
         for eh in &expired {
             state.online_friends.remove(eh);
             let _ = app_handle.emit("ember:friend-offline", serde_json::json!({

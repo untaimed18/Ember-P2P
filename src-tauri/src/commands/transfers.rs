@@ -567,7 +567,9 @@ async fn revive_failed_download(
         transfer_id_short(transfer_id)
     );
     persist_transfer_status(state, transfer_id, &row.status).await;
-    let _ = app.emit("transfer-started", &row);
+    if !crate::sharing::feed_downloads::is_private(transfer_id) {
+        let _ = app.emit("transfer-started", &row);
+    }
     let Some(link) = link else {
         if active_now {
             start_promoted_downloads(state, std::slice::from_ref(&row)).await;
@@ -783,7 +785,7 @@ const PARTIAL_CLEANUP_FOLDER_BUDGET: std::time::Duration = std::time::Duration::
 /// them cannot be reached or does not answer in time, they are removed once
 /// it can be (`storage::deferred_removals`), and the folder stays a download
 /// folder until then.
-async fn cleanup_partial_files(db: &Arc<Database>, download_roots: &[String], transfer_id: &str) {
+pub(crate) async fn cleanup_partial_files(db: &Arc<Database>, download_roots: &[String], transfer_id: &str) {
     if uuid::Uuid::parse_str(transfer_id).is_err() {
         tracing::warn!("cleanup_partial_files: invalid transfer_id, skipping");
         return;
@@ -1520,6 +1522,81 @@ pub async fn start_download(
     // and capped by `web_sources::register`; anything unusable is dropped.
     web_sources: Option<Vec<String>>,
 ) -> Result<StartDownloadResponse, String> {
+    start_download_to(
+        app,
+        state,
+        file_hash,
+        file_name,
+        file_size,
+        peer_ip,
+        peer_port,
+        extra_sources,
+        ember_file_hash,
+        expected_aich,
+        friend_ember_hash,
+        web_sources,
+        None,
+    )
+    .await
+}
+
+/// Mark `transfer_id` as a download from a feed finishing in `folder`: in
+/// the database first, so the download is never saved without it.
+async fn mark_feed_download(state: &AppState, transfer_id: &str, folder: &str) -> Result<(), String> {
+    let (db, id, dir) = (state.db.clone(), transfer_id.to_string(), folder.to_string());
+    tokio::task::spawn_blocking(move || db.set_transfer_feed_folder(&id, &dir))
+        .await
+        .map_err(|e| coded_ctx("transfers_start_download_failed", "Failed to save download before starting it", e))?
+        .map_err(|e| coded_ctx("transfers_start_download_failed", "Failed to save download before starting it", e))?;
+    crate::sharing::feed_downloads::note(transfer_id, folder);
+    Ok(())
+}
+
+/// Undo [`mark_feed_download`] for a download that did not start after all.
+async fn unmark_feed_download(state: &AppState, transfer_id: &str) {
+    crate::sharing::feed_downloads::forget(transfer_id);
+    let (db, id) = (state.db.clone(), transfer_id.to_string());
+    let _ = tokio::task::spawn_blocking(move || db.clear_transfer_feed_folder(&id)).await;
+}
+
+/// A download from a feed: the folder in `Feeds` it finishes in, and the
+/// feed's publisher, who is asked for it before anyone else.
+pub(crate) struct FeedStart {
+    pub folder: String,
+    /// Who publishes the feed, and a friend publisher's last address.
+    pub publisher: crate::network::feed_direct::Publisher,
+}
+
+/// Hold a feed's download for its publisher before the network hears of it.
+fn hold_for_publisher(feed: Option<&FeedStart>, transfer_id: &str, file_hash: &str, file_size: u64) {
+    let mut hash = [0u8; 16];
+    if let Some(feed) = feed.filter(|_| hex::decode_to_slice(file_hash, &mut hash).is_ok()) {
+        crate::network::feed_direct::begin(transfer_id, hash, file_size, feed.publisher);
+    }
+}
+
+/// [`start_download`], for a download from a feed when `feed` says which.
+/// Such a download is private (see `sharing::feed_downloads`), marked before
+/// its row is saved or the network hears of it, kept off the Transfers page,
+/// and held for its publisher (see `network::feed_direct`). One already in
+/// the list is left as it is: the user's own.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn start_download_to(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    file_hash: String,
+    file_name: String,
+    file_size: u64,
+    peer_ip: String,
+    peer_port: u16,
+    extra_sources: Option<Vec<String>>,
+    ember_file_hash: Option<String>,
+    expected_aich: Option<String>,
+    friend_ember_hash: Option<String>,
+    web_sources: Option<Vec<String>>,
+    feed: Option<FeedStart>,
+) -> Result<StartDownloadResponse, String> {
+    let feed_folder = feed.as_ref().map(|feed| feed.folder.clone());
     let _download_admission = state.download_admission.lock().await;
     let file_name = crate::security::sanitize_filename(&file_name);
 
@@ -1694,6 +1771,7 @@ pub async fn start_download(
         completed_path: None,
         up_part_status: None,
         up_part_count: None,
+        up_part_fill: None,
         up_peer_part_status: None,
         ember_verified: false,
         friends_only: from_restricting_friend,
@@ -1734,15 +1812,27 @@ pub async fn start_download(
                     friend_ember_hash,
                     add_paused,
                 };
-                if revive_failed_download(&app, &state, &failed_id, Some(link))
-                    .await?
-                    .is_some()
-                {
+                let was_feed_download = crate::sharing::feed_downloads::is_private(&failed_id);
+                if let Some(folder) = &feed_folder {
+                    mark_feed_download(&state, &failed_id, folder).await?;
+                }
+                hold_for_publisher(feed.as_ref(), &failed_id, &file_hash, file_size);
+                let revived = revive_failed_download(&app, &state, &failed_id, Some(link)).await;
+                if !matches!(revived, Ok(Some(_))) {
+                    crate::network::feed_direct::forget(&failed_id);
+                }
+                if let Ok(Some(_)) = revived {
                     return Ok(StartDownloadResponse {
                         transfer_id: failed_id,
                         already_queued: false,
+                        in_feed: false,
                     });
                 }
+                // Not revived: the user's own download stays as it was.
+                if feed_folder.is_some() && !was_feed_download {
+                    unmark_feed_download(&state, &failed_id).await;
+                }
+                revived?;
             }
             Some(false) => state
                 .transfer_manager
@@ -1753,44 +1843,48 @@ pub async fn start_download(
         }
     }
 
-    let (active_now, existing_id) = {
+    if let Some(folder) = &feed_folder {
+        mark_feed_download(&state, &transfer_id, folder).await?;
+    }
+    let queued: Result<(bool, Option<String>), String> = {
         let mut manager = state.transfer_manager.write().await;
         if let Some(existing_id) = manager.pending_transfer_id_for_hash(&file_hash) {
-            if let Some(expected) = expected_aich.as_deref() {
-                let existing_pin = manager
-                    .get_transfer(&existing_id)
-                    .and_then(|transfer| transfer.expected_aich.as_deref());
-                if existing_pin != Some(expected) {
-                    return Err(coded(
-                        "transfers_existing_download_aich_mismatch",
-                        "This file is already queued without the same trusted AICH pin; cancel it and add the AICH link again",
-                    ));
-                }
+            let pinned = |pin: Option<&str>, of: fn(&Transfer) -> Option<&str>| {
+                pin.is_none_or(|expected| manager.get_transfer(&existing_id).and_then(of) == Some(expected))
+            };
+            if !pinned(expected_aich.as_deref(), |transfer| transfer.expected_aich.as_deref()) {
+                Err(coded(
+                    "transfers_existing_download_aich_mismatch",
+                    "This file is already queued without the same trusted AICH pin; cancel it and add the AICH link again",
+                ))
+            } else if !pinned(ember_file_hash.as_deref(), |transfer| transfer.ember_file_hash.as_deref()) {
+                Err(coded(
+                    "transfers_existing_download_ember_mismatch",
+                    "This file is already queued without the same Ember digest; cancel it and add the eh= link again",
+                ))
+            } else {
+                Ok((false, Some(existing_id)))
             }
-            if let Some(expected) = ember_file_hash.as_deref() {
-                let existing_pin = manager
-                    .get_transfer(&existing_id)
-                    .and_then(|transfer| transfer.ember_file_hash.as_deref());
-                if existing_pin != Some(expected) {
-                    return Err(coded(
-                        "transfers_existing_download_ember_mismatch",
-                        "This file is already queued without the same Ember digest; cancel it and add the eh= link again",
-                    ));
-                }
-            }
-            (false, Some(existing_id))
         } else {
-            ensure_pending_download_budget(&manager, &[file_size])?;
-            let active_now = manager.enqueue(transfer.clone());
-            manager.register_control(&transfer_id, control.clone());
-            (active_now, None)
+            ensure_pending_download_budget(&manager, &[file_size]).map(|()| {
+                let active_now = manager.enqueue(transfer.clone());
+                manager.register_control(&transfer_id, control.clone());
+                (active_now, None)
+            })
         }
     };
+    // Not this download after all: no mark is left behind.
+    if feed_folder.is_some() && !matches!(queued, Ok((_, None))) {
+        unmark_feed_download(&state, &transfer_id).await;
+    }
+    let (active_now, existing_id) = queued?;
     if let Some(existing_id) = existing_id {
         attach_link_web_sources(&state, &file_hash, web_sources).await;
+        let in_feed = crate::sharing::feed_downloads::is_private(&existing_id);
         return Ok(StartDownloadResponse {
             transfer_id: existing_id,
             already_queued: true,
+            in_feed,
         });
     }
 
@@ -1812,12 +1906,15 @@ pub async fn start_download(
     // Before the network task is told, so the download's first run has them.
     attach_link_web_sources(&state, &file_hash, web_sources).await;
 
-    let _ = app.emit("transfer-started", &persisted_transfer);
+    if feed.is_none() {
+        let _ = app.emit("transfer-started", &persisted_transfer);
+    }
 
     // Always hand the download to the network task: active starts run
     // MultiSource workers; queued / add-paused use discovery_only so
     // KAD + TCP + UDP source asking still runs (matching restore).
     let discovery_only = !active_now || add_paused;
+    hold_for_publisher(feed.as_ref(), &transfer_id, &file_hash, file_size);
 
     if let Err(e) = bounded_send(
         &state.network_tx,
@@ -1838,6 +1935,7 @@ pub async fn start_download(
     )
     .await
     {
+        crate::network::feed_direct::forget(&transfer_id);
         // The network channel is gone, so this transfer will never start.
         // It was already enqueued as active and occupies a download slot;
         // roll it back to Failed so it doesn't pin that slot forever and
@@ -1873,6 +1971,7 @@ pub async fn start_download(
     Ok(StartDownloadResponse {
         transfer_id,
         already_queued: false,
+        in_feed: false,
     })
 }
 
@@ -1953,6 +2052,7 @@ pub async fn pause_transfers_batch(
     hold: Option<bool>,
 ) -> Result<(), String> {
     check_batch_size(&transfer_ids)?;
+    let transfer_ids = without_completing(&state, transfer_ids).await;
     let (paused, promoted) = {
         let mut manager = state.transfer_manager.write().await;
         for transfer_id in &transfer_ids {
@@ -2173,6 +2273,7 @@ pub async fn stop_transfers_batch(
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
     check_batch_size(&transfer_ids)?;
+    let transfer_ids = without_completing(&state, transfer_ids).await;
     let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
     let mut send_error = None;
     for transfer_id in transfer_ids {
@@ -2213,12 +2314,41 @@ pub async fn stop_transfers_batch(
     }
 }
 
+/// Whether `transfer_id`'s finished file is being moved into place. That move
+/// runs on a task of its own that no pause, stop or cancel reaches: aborting
+/// the worker only stops waiting on it. A resume would then verify and move
+/// the file a second time beside it, and a cancel would delete the `.part`
+/// the move is still copying from while the copy is published regardless. So
+/// a row in that state is left to finish, which it does by itself.
+async fn is_completing(state: &AppState, transfer_id: &str) -> bool {
+    state
+        .transfer_manager
+        .read()
+        .await
+        .get_transfer(transfer_id)
+        .is_some_and(|t| t.status == TransferStatus::Completing)
+}
+
+/// `transfer_ids` without those [`is_completing`].
+async fn without_completing(state: &AppState, transfer_ids: Vec<String>) -> Vec<String> {
+    let manager = state.transfer_manager.read().await;
+    transfer_ids
+        .into_iter()
+        .filter(|id| {
+            !manager
+                .get_transfer(id)
+                .is_some_and(|t| t.status == TransferStatus::Completing)
+        })
+        .collect()
+}
+
 #[tauri::command]
 pub async fn cancel_transfers_batch(
     state: tauri::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
     check_batch_size(&transfer_ids)?;
+    let transfer_ids = without_completing(&state, transfer_ids).await;
     let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
     let mut pending_acks = Vec::with_capacity(transfer_ids.len());
     let mut cancelled_ids = Vec::with_capacity(transfer_ids.len());
@@ -2331,6 +2461,9 @@ pub async fn pause_transfer(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
+    if is_completing(&state, &transfer_id).await {
+        return Ok(());
+    }
     let (status, promoted) = {
         let mut manager = state.transfer_manager.write().await;
         if let Some(control) = manager.get_control(&transfer_id) {
@@ -2379,6 +2512,9 @@ pub async fn stop_transfer(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
+    if is_completing(&state, &transfer_id).await {
+        return Ok(());
+    }
     let (stopped, promoted) = {
         let mut manager = state.transfer_manager.write().await;
         if let Some(control) = manager.get_control(&transfer_id) {
@@ -2417,6 +2553,53 @@ pub async fn stop_transfer(
     Ok(())
 }
 
+/// Where a finished download is, for the recorded-file check: a feed's in its
+/// feed folder in `Feeds`, any other in `Downloads` or a category folder in
+/// it.
+struct FinishedPlace {
+    /// The folder of a download folder it is in, as
+    /// `verify_recorded_file_nested` takes it.
+    folder: &'static str,
+    /// How many folders below `folder` it may be.
+    depth: usize,
+    /// Where it is when completion did not record its path: in the current
+    /// download folder, under its own name.
+    default_path: PathBuf,
+}
+
+impl FinishedPlace {
+    fn of(transfer: &Transfer, current: &std::path::Path) -> Self {
+        let name = crate::security::sanitize_filename(&transfer.file_name);
+        match crate::sharing::feed_downloads::folder_of(&transfer.id) {
+            Some(folder) => Self {
+                folder: crate::sharing::feed_downloads::FEEDS_DIR,
+                depth: 1,
+                default_path: crate::sharing::feed_downloads::folder_dir(current, &folder).join(name),
+            },
+            None => Self {
+                folder: "Downloads",
+                depth: crate::storage::category_folders::MAX_DEPTH,
+                default_path: current.join("Downloads").join(name),
+            },
+        }
+    }
+}
+
+/// A finished download's file, found and checked as [`open_file`] does:
+/// where completion recorded it, or under its name where it would have
+/// finished. Blocking.
+pub(crate) fn verified_finished_file(
+    transfer: &Transfer,
+    folders: &crate::storage::part_folders::DownloadFolders,
+) -> std::io::Result<PathBuf> {
+    let place = FinishedPlace::of(transfer, &folders.current);
+    let path = match transfer.completed_path.as_deref() {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => place.default_path,
+    };
+    crate::security::filesystem::verify_recorded_file_nested(&path, &folders.roots(), place.folder, place.depth)
+}
+
 /// Completed file in `Downloads/`, or in-progress `.part` in `Temp/`.
 /// Always prefers the final file in Downloads/ over the .part in Temp/ so
 /// that a stale in-memory status never misdirects the user.
@@ -2427,13 +2610,13 @@ fn resolve_transfer_reveal_path(
     if transfer.direction != TransferDirection::Download {
         return Err(coded("transfers_not_a_download", "Not a download"));
     }
-    let completed_dir = folders.current.join("Downloads");
-    let safe_name = crate::security::sanitize_filename(&transfer.file_name);
+    let place = FinishedPlace::of(transfer, &folders.current);
+    let (finished_in, depth) = (place.folder, place.depth);
     // Prefer the exact destination recorded at completion (handles the
     // dedup-suffix case); otherwise reconstruct from the file name.
     let final_path = match transfer.completed_path.as_deref() {
         Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => completed_dir.join(&safe_name),
+        _ => place.default_path,
     };
     let part_path = folders.part_path_for(&transfer.id);
 
@@ -2441,8 +2624,8 @@ fn resolve_transfer_reveal_path(
         crate::security::filesystem::verify_recorded_file_nested(
             &final_path,
             &folders.roots(),
-            "Downloads",
-            crate::storage::category_folders::MAX_DEPTH,
+            finished_in,
+            depth,
         )
     } else if part_path.is_file() {
         crate::security::filesystem::verify_existing_path(&part_path, &folders.roots())
@@ -2543,9 +2726,11 @@ pub async fn open_downloads_folder(state: tauri::State<'_, AppState>) -> Result<
 
 #[tauri::command]
 pub async fn open_file(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     let (transfer, dl_folders) = {
         let (mgr, cfg) = tokio::join!(state.transfer_manager.read(), state.config.read(),);
         (
@@ -2555,15 +2740,14 @@ pub async fn open_file(
     };
     let transfer =
         transfer.ok_or_else(|| coded("transfers_transfer_not_found", "Transfer not found"))?;
-    let safe_name = crate::security::sanitize_filename(&transfer.file_name);
-    let download_dir = dl_folders.current.join("Downloads");
+    let place = FinishedPlace::of(&transfer, &dl_folders.current);
     // Prefer the exact path recorded at completion time. Falling back to
     // `Downloads/<name>` is only correct when no dedup suffix was applied;
     // the canonical-containment check below still confines either choice to
-    // a Downloads directory.
+    // a Downloads directory (a feed's `Feeds`).
     let file_path = match transfer.completed_path.as_deref() {
         Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
-        _ => download_dir.join(&safe_name),
+        _ => place.default_path.clone(),
     };
     tokio::task::spawn_blocking(move || {
         if !file_path.exists() {
@@ -2576,8 +2760,8 @@ pub async fn open_file(
         let canonical = crate::security::filesystem::verify_recorded_file_nested(
             &file_path,
             &dl_folders.roots(),
-            "Downloads",
-            crate::storage::category_folders::MAX_DEPTH,
+            place.folder,
+            place.depth,
         )
         .map_err(|e| {
             coded_ctx(
@@ -2705,9 +2889,11 @@ pub struct FinishedDeleteReport {
 #[tauri::command]
 pub async fn delete_finished_downloads(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<FinishedDeleteReport, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     check_batch_size(&transfer_ids)?;
     let (rows, dl_folders, permanently) = {
         let (mgr, cfg) = tokio::join!(state.transfer_manager.read(), state.config.read());
@@ -2732,12 +2918,10 @@ pub async fn delete_finished_downloads(
             ));
             continue;
         }
+        let place = FinishedPlace::of(&transfer, &dl_folders.current);
         let recorded = match transfer.completed_path.as_deref() {
             Some(p) if !p.is_empty() => PathBuf::from(p),
-            _ => dl_folders
-                .current
-                .join("Downloads")
-                .join(crate::security::sanitize_filename(&transfer.file_name)),
+            _ => place.default_path.clone(),
         };
         let resolved = tokio::task::spawn_blocking({
             let recorded = recorded.clone();
@@ -2750,8 +2934,8 @@ pub async fn delete_finished_downloads(
                 let canonical = crate::security::filesystem::verify_recorded_file_nested(
                     &recorded,
                     &roots,
-                    "Downloads",
-                    crate::storage::category_folders::MAX_DEPTH,
+                    place.folder,
+                    place.depth,
                 )
                 .map_err(|e| coded_ctx("transfers_invalid_path", "Invalid or changed download path", e))?;
                 let (_, opened) =
@@ -2830,10 +3014,20 @@ pub async fn remove_transfer(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
+    discard_transfer(&state, transfer_id, true).await
+}
+
+/// [`remove_transfer`], with `keep_failed` saying whether a failed
+/// download's bytes are moved into Downloads first or deleted with the rest:
+/// a feed's are private, and its Cancel says what arrived is deleted.
+pub(crate) async fn discard_transfer(state: &AppState, transfer_id: String, keep_failed: bool) -> Result<(), String> {
     let snapshot = {
         let manager = state.transfer_manager.read().await;
         manager.get_transfer(&transfer_id).cloned()
     };
+    if snapshot.as_ref().is_some_and(|t| t.status == TransferStatus::Completing) {
+        return Ok(());
+    }
     let dl_folders = state.config.read().await.settings.download_folders();
     // A failed download's bytes are kept: moved into Downloads before
     // anything else, since the cancel below deletes its `.part.met`. Until
@@ -2841,7 +3035,7 @@ pub async fn remove_transfer(
     // are, and the user is told why.
     let mut leave_files = false;
     if let Some(failed) = snapshot.filter(|t| {
-        t.status == TransferStatus::Failed && t.direction == TransferDirection::Download
+        keep_failed && t.status == TransferStatus::Failed && t.direction == TransferDirection::Download
     }) {
         leave_files = preserve_failed_partial(&dl_folders, &transfer_id, &failed.file_name).await?;
     }
@@ -2882,7 +3076,7 @@ pub async fn remove_transfer(
             }
         })
         .await;
-        start_promoted_downloads(&state, &promoted).await;
+        start_promoted_downloads(state, &promoted).await;
         return Ok(());
     }
 
@@ -2929,14 +3123,23 @@ pub async fn remove_transfer(
         .await;
     },);
     spawn_deferred_partial_cleanup(state.db.clone(), dl_roots, transfer_id.clone());
-    start_promoted_downloads(&state, &promoted).await;
+    start_promoted_downloads(state, &promoted).await;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn get_transfers(state: tauri::State<'_, AppState>) -> Result<Vec<Transfer>, String> {
     let manager = state.transfer_manager.read().await;
-    Ok(manager.get_all())
+    // A fetch for the feeds code is not one of the user's downloads, and a
+    // feed's files are shown on the Feeds page instead.
+    Ok(manager
+        .get_all()
+        .into_iter()
+        .filter(|t| {
+            !crate::sharing::feed_files::is_internal_fetch(&t.id)
+                && !crate::sharing::feed_downloads::is_private(&t.id)
+        })
+        .collect())
 }
 
 /// What changed since the caller's last answer, for the Transfers poll: only
@@ -3001,7 +3204,7 @@ pub async fn get_upload_queue(
 #[tauri::command]
 pub async fn get_known_clients(
     state: tauri::State<'_, AppState>,
-) -> Result<Vec<KnownClient>, String> {
+) -> Result<crate::types::KnownClientsSnapshot, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
@@ -3106,7 +3309,38 @@ pub async fn move_transfers_in_queue(
         .write()
         .await
         .move_queued(&transfer_ids, to_front);
+    if moved > 0 {
+        persist_download_order(&state).await;
+    }
     Ok(u32::try_from(moved).unwrap_or(u32::MAX))
+}
+
+/// Save the order downloads resume in: those running first, oldest first,
+/// then the queue as it stands. Without it a restart reloads by `started_at`,
+/// undoing every "move to front" or "to back". Saved on a move and again at
+/// shutdown, when the queue has had a session to change.
+pub(crate) async fn persist_download_order(state: &AppState) {
+    let order: Vec<String> = {
+        let manager = state.transfer_manager.read().await;
+        let mut running: Vec<&Transfer> = manager
+            .active
+            .values()
+            .filter(|t| t.direction == TransferDirection::Download)
+            .collect();
+        running.sort_by(|a, b| a.started_at.cmp(&b.started_at).then_with(|| a.id.cmp(&b.id)));
+        running
+            .into_iter()
+            .chain(manager.queue.iter().filter(|t| t.direction == TransferDirection::Download))
+            .map(|t| t.id.clone())
+            .collect()
+    };
+    let db = state.db.clone();
+    db_blocking(move || {
+        if let Err(e) = db.set_download_queue_order(&order) {
+            tracing::warn!("Could not save the download queue order: {e}");
+        }
+    })
+    .await;
 }
 
 /// What changing downloads' category did. A finished download's file moves to
@@ -3124,6 +3358,10 @@ pub struct CategoryChanges {
     /// One coded error per finished download whose file stayed where it was.
     /// Its category is changed regardless.
     move_failed: Vec<String>,
+    /// Coded errors about the moves as a whole rather than any one download:
+    /// the partly shared folders' lists could not follow the files that
+    /// moved, which then leave the Library at its next reload.
+    move_warnings: Vec<String>,
 }
 
 /// A finished download to file under its new category.
@@ -3181,7 +3419,9 @@ pub async fn set_transfers_category(
         let mut manager = state.transfer_manager.write().await;
         for id in &saved {
             manager.set_category(id, &category);
-            if !move_finished.unwrap_or(true) {
+            // A feed's file stays in its feed folder: a category folder is in
+            // `Downloads`, which may be shared.
+            if !move_finished.unwrap_or(true) || crate::sharing::feed_downloads::is_private(id) {
                 continue;
             }
             let Some(t) = manager.get_transfer(id).filter(|t| {
@@ -3269,7 +3509,9 @@ pub async fn set_transfers_category(
         }
     }
     changes.moved = u32::try_from(moves.len()).unwrap_or(u32::MAX);
-    crate::commands::sharing::relocate_library_files(&app, &state, &moves).await;
+    changes
+        .move_warnings
+        .extend(crate::commands::sharing::relocate_library_files(&app, &state, &moves).await);
     Ok(changes)
 }
 
@@ -3581,10 +3823,14 @@ pub async fn pause_all_transfers(
 ) -> Result<(), String> {
     let (paused, pause_ids) = {
         let mut manager = state.transfer_manager.write().await;
+        // A row moving its finished file into place is left to finish; see
+        // `is_completing`.
         let active_ids: Vec<String> = manager
             .active
             .iter()
-            .filter(|(_, t)| t.direction == TransferDirection::Download)
+            .filter(|(_, t)| {
+                t.direction == TransferDirection::Download && t.status != TransferStatus::Completing
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in &active_ids {

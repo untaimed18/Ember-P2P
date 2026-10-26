@@ -261,7 +261,12 @@ pub(in crate::network) async fn on_download_event(
             let mgr = transfer_manager.read().await;
             mgr.get_transfer(transfer_id).is_some_and(|t| t.friends_only)
         };
-        let restricted = from_restricting_friend || {
+        // A feed's list being fetched is never advertised as the user's
+        // (see `sharing::feed_files`).
+        let restricted = from_restricting_friend
+            || crate::sharing::feed_files::is_internal_fetch(transfer_id)
+            || crate::sharing::feed_downloads::is_private(transfer_id)
+            || {
             let index = local_index.read().await;
             !known_files.is_authoritative()
                 || hash16_is_friends_only(file_hash, &index, known_files)
@@ -363,7 +368,11 @@ pub(in crate::network) async fn on_download_event(
         // read lock across them previously stalled the whole
         // network `select!` loop and blocked download workers that
         // need `transfer_manager.write()`.
-        let completed_snapshot = {
+        // A fetch for the feeds code is not the user's file: it goes in no
+        // index, known.met, KAD or server list (see `sharing::feed_files`).
+        let completed_snapshot = if crate::sharing::feed_files::is_internal_fetch(transfer_id) {
+            None
+        } else {
             let mgr = transfer_manager.read().await;
             mgr.get_transfer(transfer_id).map(|t| (
                 t.peer_id.clone(),
@@ -433,7 +442,13 @@ pub(in crate::network) async fn on_download_event(
                 .unwrap_or(now)
             };
 
-            if let Ok(hash_bytes) = hex::decode(&file_hash) {
+            // A feed's download is private: it goes in no index, known.met,
+            // KAD or server list (see `sharing::feed_downloads`).
+            let private = crate::sharing::feed_downloads::is_private(transfer_id);
+            if private {
+                info!("Completed download {transfer_id} is from a feed: kept private, out of the library");
+            }
+            if let Some(hash_bytes) = hex::decode(&file_hash).ok().filter(|_| !private) {
                 if hash_bytes.len() == 16 {
                     let mut fh = [0u8; 16];
                     fh.copy_from_slice(&hash_bytes);
@@ -736,7 +751,10 @@ pub(in crate::network) async fn on_download_event(
                             .unwrap_or(shared_file)
                     };
                     {
-                        let mut snap = local_index.read().await.all_files().to_vec();
+                        let (mut snap, ticket) = {
+                            let index = local_index.read().await;
+                            (index.all_files().to_vec(), crate::commands::sharing::file_snapshot_ticket())
+                        };
                         let kad_connected =
                             state.stats.status == NetworkStatus::Connected;
                         let kad_published =
@@ -751,7 +769,7 @@ pub(in crate::network) async fn on_download_event(
                             &state.offered_ed2k_hashes,
                             &state.ember_published_sources,
                         );
-                        *shared_files.write().await = snap;
+                        let _ = crate::commands::sharing::store_file_snapshot(shared_files, snap, ticket).await;
                     }
 
                     if kad_may_advertise_complete(

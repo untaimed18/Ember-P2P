@@ -6,6 +6,7 @@ pub(crate) mod channel_membership;
 mod channel_relay;
 mod channel_xfer;
 mod chat;
+mod friend_status;
 pub(crate) mod chat_attach;
 mod chat_mailbox;
 mod command;
@@ -19,6 +20,7 @@ mod ember_publishing;
 mod ember_search;
 mod ember_udp;
 mod event_loop;
+pub(crate) mod feed_direct;
 pub(crate) mod friend_intro;
 mod friend_transfer;
 mod friends;
@@ -30,7 +32,9 @@ mod kad_search;
 mod nat_mapping;
 mod persistence;
 mod publishing;
+pub(crate) mod reachability;
 pub mod rendezvous;
+pub(crate) mod room_dm;
 mod search;
 mod server;
 mod settings;
@@ -43,6 +47,16 @@ mod udp;
 pub mod upnp;
 #[cfg(test)]
 mod tests;
+
+/// The upload listener could not open the TCP port this session: another
+/// program holds it. Read by the connection doctor through the stats.
+pub(crate) static TCP_LISTEN_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The connection doctor asked for UPnP to be tried again now. The loop takes
+/// it the next time no UPnP pass is running.
+pub(crate) static UPNP_RETRY_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Cursor;
@@ -147,6 +161,7 @@ use self::ember_search::*;
 use self::ember_udp::*;
 use self::event_loop::*;
 use self::friend_transfer::*;
+use self::friend_status::*;
 use self::friends::*;
 use self::kad_io::*;
 use self::kad_search::*;
@@ -646,7 +661,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let buddy_manager = BuddyManager::new(
         local_id,
         user_hash,
-        settings.nickname.clone(),
+        settings.ed2k_nickname(),
         tcp_port,
         udp_port,
         pending_buddy_hashes.clone(),
@@ -805,10 +820,16 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let (xfer_finish_tx, mut xfer_finish_rx) = mpsc::unbounded_channel::<XferFinishResult>();
     let (xfer_stream_tx, xfer_stream_rx) = mpsc::unbounded_channel::<StreamFetchOutcome>();
     let (xfer_accept_tx, xfer_accept_rx) = mpsc::unbounded_channel::<XferAcceptPrepared>();
+    let (attach_held_tx, attach_held_rx) = mpsc::unbounded_channel::<chat_attach::HeldLooked>();
 
     // Before anything below can finish a download or sweep where finished
     // files land; `apply_network_settings` keeps it current from here.
     crate::storage::category_folders::set_folders(&settings.download_category_folders);
+    crate::sharing::name_tag::set_tag_completed_downloads(settings.tag_completed_downloads);
+    room_dm::set_dm_policy(
+        crate::types::room_dm_policy_in_force(&settings.room_dm_policy),
+        settings.ignored_members.as_deref(),
+    );
 
     let mut state = NetworkState {
         local_id,
@@ -824,6 +845,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // Network page puts us there for the rest of the session — so
             // every gate that checks for it below still earns its place.
             status: NetworkStatus::Connecting,
+            bound_udp_port: udp_port,
+            session_tcp_port: tcp_port,
+            session_udp_port: settings.udp_port,
+            session_upnp_enabled: upnp_enabled,
             ..Default::default()
         },
         pending_keyword_searches: HashMap::new(),
@@ -869,6 +894,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         stun_sourced_udp_port: None,
         firewalled: !upnp_success,
         firewall_checks_sent: 0,
+        shared_nickname: Arc::new(tokio::sync::RwLock::new(settings.ed2k_nickname())),
         peer_nicknames: HashMap::new(),
         publish_pending: HashMap::new(),
         publish_confirmed: 0,
@@ -909,6 +935,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         self_lookup_done: false,
         last_self_lookup: 0,
         kad_started_at: monotonic_secs(),
+        session_started: std::time::Instant::now(),
         last_kad_contact: None,
         udp_firewalled: true,
         udp_fw_verified: false,
@@ -946,6 +973,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         active_established_senders: HashMap::new(),
         active_source_overflow: HashMap::new(),
         transfer_friend_hint: HashMap::new(),
+        chat_flush_due: HashMap::new(),
+        chat_session_flushed: HashMap::new(),
         friend_xfer_attempts: HashMap::new(),
         friend_xfer_waiting: HashMap::new(),
         friend_xfer_inbound_last: HashMap::new(),
@@ -1073,6 +1102,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         firewall_req_connect_bucket: TokenBucket::new(32, 1.0),
         firewall_req_cooldown: HashMap::new(),
         online_friends: HashMap::new(),
+        friend_statuses: HashMap::new(),
+        idle_away: false,
+        last_idle_check: None,
         pending_browse_requests: HashMap::new(),
         recent_ember_chat: HashMap::new(),
         held_chat_expires: HashMap::new(),
@@ -1202,6 +1234,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_pending_channel_moderation: Vec::new(),
         channel_moderation_fetch_at: HashMap::new(),
         channel_moderation_publish_at: HashMap::new(),
+        channel_moderation_passes: HashMap::new(),
+        channel_settings_fetch_owed: HashSet::new(),
+        ember_channel_settings_searches: HashMap::new(),
+        ember_pending_channel_settings: Vec::new(),
+        channel_settings_published: HashMap::new(),
         channel_username_refresh_at: 0,
         rendezvous_url: settings.rendezvous_url.clone(),
         ember_channel_noise_keys: HashMap::new(),
@@ -1235,9 +1272,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         xfer_stream_rx,
         xfer_block_times: VecDeque::new(),
         xfer_upload_credit: 0,
-        xfer_offer_policy: settings.channel_file_offers.clone(),
+        xfer_offer_policy: crate::types::channel_file_offers_in_force(&settings.channel_file_offers),
         xfer_friend_hashes: friend_hashes.clone(),
         attach_inbound: HashMap::new(),
+        attach_held_sources: HashMap::new(),
+        attach_waits_owed: HashMap::new(),
+        attach_held_looking: HashSet::new(),
+        attach_held_tx,
+        attach_held_rx,
         attach_fetches: HashMap::new(),
         attach_auto_log: HashMap::new(),
         attach_retry_asked: HashMap::new(),
@@ -1245,6 +1287,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         owned_rooms_published: None,
         owned_rooms_published_at: 0,
         ember_channel_epoch_searches: HashMap::new(),
+        ember_channel_epoch_buffer: HashMap::new(),
         ember_pending_channel_epoch: Vec::new(),
         channel_epoch_fetch_at: HashMap::new(),
         ember_channel_claim_searches: HashMap::new(),
@@ -1253,13 +1296,18 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
     kad::firewall::publish_local_firewall(state.firewalled, state.udp_firewalled);
 
-    // Chat attachments a restart stranded: offers whose details lived only in
-    // memory and receives cut off mid-file. Settled before anything can emit,
-    // so the transcript never shows a transfer that will not move again.
+    // Chat attachments a restart stranded: offers that can no longer be
+    // answered and receives cut off mid-file. Settled before anything can
+    // emit, so the transcript never shows a transfer that will not move again.
     {
         let db = db.clone();
         let folders = settings.download_roots();
-        let _ = tokio::task::spawn_blocking(move || chat_attach::sweep_interrupted(&db, &folders)).await;
+        let restored = tokio::task::spawn_blocking(move || chat_attach::sweep_interrupted(&db, &folders))
+            .await
+            .unwrap_or_default();
+        // Offers still waiting on the user, back from what was kept beside
+        // their rows: their senders hear of them when a session comes up.
+        state.attach_inbound.extend(restored);
     }
     // Web sources downloads were added with, before any of them can start.
     ed2k::web_sources::set_enabled(settings.web_sources_enabled);
@@ -1846,8 +1894,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
     // Shared so Settings nickname changes hot-reload into Hello / EmuleInfo
     // without restarting the upload listener.
-    let shared_nickname: Arc<tokio::sync::RwLock<String>> =
-        Arc::new(tokio::sync::RwLock::new(settings.nickname.clone()));
+    let shared_nickname = state.shared_nickname.clone();
 
     // Start the peer-to-peer upload listener (accepts incoming file requests from other KAD peers)
     {
@@ -1898,6 +1945,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let ul_inbound_stream_rx = inbound_stream_rx;
         let ul_adv_tcp = state.advertise_tcp_port.clone();
         let ul_adv_udp = state.advertise_udp_port.clone();
+        // A feed's files are streamed over QUIC as well as on this listener,
+        // and are checked on each request as an upload here is.
+        feed_direct::set_serve_checks(feed_direct::ServeChecks {
+            local_index: local_index.clone(),
+            friends_only: shared_friends_only_hashes.clone(),
+            shared_folders: upload_shared_folders.clone(),
+            download_folders: state.download_folders.clone(),
+        });
         let ul_file_streams = Some(ember::relay::FileStreamServe {
             chat: ember::relay::AttachServeContext {
                 db: db.clone(),
@@ -1968,6 +2023,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             .await
             {
                 error!("Upload listener error: {e}");
+                TCP_LISTEN_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
                 let _ = ul_app.emit("network-error", serde_json::json!({
                     "message": crate::commands::errors::coded_ctx(
                         "network_tcp_port_in_use",
@@ -2379,6 +2435,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let geoip_for_load = geoip.clone();
         let geoip_dir = geoip_resource_dir.clone();
         Some(tokio::task::spawn_blocking(move || {
+            // An empty file means no ranges, as an absent one does; read as a
+            // damaged list it would block every peer.
+            if std::fs::metadata(&ipfilter_path).is_ok_and(|meta| meta.is_file() && meta.len() == 0) {
+                crate::security::recover_interrupted_replace(&ipfilter_path);
+                if std::fs::metadata(&ipfilter_path).is_ok_and(|meta| meta.len() == 0) {
+                    match std::fs::remove_file(&ipfilter_path) {
+                        Ok(()) => info!("Removed an empty ipfilter.dat: no ranges to load"),
+                        Err(e) => warn!("Could not remove the empty ipfilter.dat: {e}"),
+                    }
+                }
+            }
             let mut filter = IpFilter::new(ipf_enabled, ipf_block_private);
             // Only clear the fail-closed gate when the load succeeded or the
             // file is absent (intentional empty). Mid-file I/O failure returns
@@ -2393,6 +2460,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             filter.blocks_private(),
                             n,
                         );
+                        true
+                    }
+                    // Readable rows that all permit: a list that blocks
+                    // nothing, not a damaged one.
+                    Some(0) if filter.has_permit_ranges() => {
+                        info!("IP filter at {} blocks no ranges", ipfilter_path.display());
                         true
                     }
                     Some(0) => {
@@ -2592,6 +2665,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         }
 
         // --- Deferred startup: disk loads, UPnP, transfer resume, offers ------
+        if upnp_enabled
+            && !upnp_maintain_in_flight
+            && UPNP_RETRY_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            pending_upnp_setup = true;
+        }
         if pending_upnp_setup {
             pending_upnp_setup = false;
             if upnp_enabled {
@@ -3032,7 +3111,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 while let Some(datagram) = next {
                     let (data, from) = (&datagram.data, datagram.from);
                     let len = data.len();
-                    if route_stun_binding_packet(
+                    if reachability::note_probe(data) {
+                        // The connection doctor's outside-in probe: consumed
+                        // here, and only recorded for the doctor to ask about.
+                    } else if route_stun_binding_packet(
                         &mut nat_probe_packet_tx,
                         &mut udp_map_ka_packet_tx,
                         data,
@@ -3729,6 +3811,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 // Here rather than an arm of its own: the loop is at
                 // `select!`'s branch limit. It keeps its own cadence.
                 on_chat_mailbox_tick(&mut state, &db, &app_handle, &settings, ed25519_secret_key, ed25519_pubkey);
+                chat::flush_due_chat(&mut state, &db, &app_handle, &settings, &ed25519_secret_key).await;
+                on_idle_check(&mut state, &settings, &app_handle, &ed25519_secret_key).await;
+                if settings.ember_native_enabled && !db.chat_locked() {
+                    room_dm::send_due_replies(&udp_socket, &mut state, &db).await;
+                } else {
+                    room_dm::forget_queued_frames();
+                }
             }
 
             // Buddy system: find a relay buddy if firewalled (always-on, like eMule)
@@ -4901,6 +4990,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         &mut stats_save_in_flight,
         upnp_enabled,
         &mut upnp_mappings,
+        &mut upnp_maintain_handle,
+        &mut upnp_maintain_result_rx,
         &mut xfer_finish_rx,
         &upload_queue_handle,
     )

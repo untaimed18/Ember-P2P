@@ -82,6 +82,33 @@ export function channelLanguageSearchText(code: ChannelLanguage, locale: string 
     .toLocaleLowerCase();
 }
 
+/** Primary subtags a locale can carry for a listed language under another code. */
+const LOCALE_ALIASES: Record<string, ChannelLanguage> = {
+  nb: 'no',
+  nn: 'no',
+  iw: 'he',
+  in: 'id',
+  tl: 'fil',
+};
+
+/** The listed language a BCP 47 locale (`pt-BR`, `zh-Hant-TW`) is written in,
+ *  or null when it is none of them. Regions and scripts are dropped: rooms
+ *  carry languages, not variants. */
+export function channelLanguageForLocale(locale: string): ChannelLanguage | null {
+  const primary = locale.trim().toLowerCase().split(/[-_]/)[0] ?? '';
+  const code = LOCALE_ALIASES[primary] ?? primary;
+  return isChannelLanguage(code) ? code : null;
+}
+
+/** The first of `locales`, most telling first, that names a listed language. */
+export function suggestedChannelLanguage(locales: readonly string[]): ChannelLanguage | null {
+  for (const locale of locales) {
+    const code = channelLanguageForLocale(locale);
+    if (code) return code;
+  }
+  return null;
+}
+
 /** Every language, sorted by its name in the app language. */
 export function sortedChannelLanguages(locale: string = getLocale()): ChannelLanguage[] {
   const collator = new Intl.Collator(locale);

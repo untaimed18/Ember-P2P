@@ -99,6 +99,12 @@ pub(crate) struct ServerFeatures {
     pub sealed_intro: bool,
     /// Holds sealed chat for a friend who is offline (`/v4/chat-mailbox/*`).
     pub chat_mailbox: bool,
+    /// Probes the caller's own ports from outside (`/v4/reachability`).
+    pub reachability: bool,
+    /// Its hourly probe budget's 429 says `"reason": "hourly"`, so any other
+    /// 429 from `/v4/reachability` is the general limit. Without this, every
+    /// 429 from it is the hourly budget.
+    pub reachability_hourly_reason: bool,
 }
 
 type ProtocolCache =
@@ -244,6 +250,8 @@ pub(crate) async fn negotiate_server_features(base_url: &str) -> Result<ServerFe
                 protocol: RendezvousProtocol::IpBoundV4,
                 sealed_intro: body["sealed_intro"].as_bool() == Some(true),
                 chat_mailbox: body["chat_mailbox"].as_bool() == Some(true),
+                reachability: body["reachability"].as_bool() == Some(true),
+                reachability_hourly_reason: body["reachability_hourly_reason"].as_bool() == Some(true),
             };
             remember_v4_server(base_url).await;
             remember_protocol(base_url, features).await;
@@ -269,6 +277,8 @@ pub(crate) async fn negotiate_server_features(base_url: &str) -> Result<ServerFe
             protocol: RendezvousProtocol::LegacyV3,
             sealed_intro: false,
             chat_mailbox: false,
+            reachability: false,
+            reachability_hourly_reason: false,
         };
         remember_protocol(base_url, features).await;
         Ok(features)
@@ -2065,6 +2075,8 @@ mod intro_presence_tests {
                 protocol: RendezvousProtocol::IpBoundV4,
                 sealed_intro: true,
                 chat_mailbox: false,
+                reachability: false,
+                reachability_hourly_reason: false,
             },
         )
         .await;
@@ -2697,6 +2709,164 @@ pub struct ChatMailboxPage {
     pub more: bool,
 }
 
+/// What the server found probing our own ports from outside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReachabilityAnswer {
+    /// The address it probed: ours, as it saw the request.
+    pub ip: String,
+    /// `open`, `closed` (refused) or `timeout`.
+    pub tcp: String,
+    /// It sent the UDP probe; whether it arrived is ours to tell.
+    pub udp_sent: bool,
+    /// The server's clock when it answered, Unix seconds; 0 when absent.
+    pub server_time: i64,
+}
+
+/// How a request for the outside-in probe ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reachability {
+    Probed(ReachabilityAnswer),
+    /// The server does not offer it.
+    Unsupported,
+    /// It does, but not for the address the request came from: IPv6, or
+    /// one behind a proxy in front of the server. `server_time` as in
+    /// [`ReachabilityAnswer`].
+    Declined { server_time: i64 },
+    /// This address has had its checks for the hour.
+    RateLimited,
+    /// The server's general per-address limit, which passes within a minute.
+    Busy,
+}
+
+/// Ask the server to connect back to `tcp_port` and send the UDP probe
+/// carrying `nonce` to `udp_port`, on the address the request comes from.
+pub async fn request_reachability(
+    base_url: &str,
+    tcp_port: u16,
+    udp_port: u16,
+    nonce: &[u8; 16],
+) -> Result<Reachability, String> {
+    require_https(base_url)?;
+    let features = negotiate_server_features(base_url).await?;
+    if !features.reachability {
+        return Ok(Reachability::Unsupported);
+    }
+    let url = format!("{}/v4/reachability", base_url.trim_end_matches('/'));
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let resp = ipv4_client(base_url)
+            .await?
+            .post(&url)
+            .json(&serde_json::json!({
+                "tcp_port": tcp_port,
+                "udp_port": udp_port,
+                "nonce": hex::encode(nonce),
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("reachability: {e}"))?;
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let refusal = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await.unwrap_or_default();
+            return Ok(refusal_from(features.reachability_hourly_reason, &refusal));
+        }
+        if !resp.status().is_success() {
+            return Err(format!("reachability: status {}", resp.status()));
+        }
+        serde_json::from_slice::<serde_json::Value>(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
+            .map(|body| reachability_from(&body))
+            .map_err(|e| format!("reachability bad body: {e}"))
+    })
+    .await
+    .map_err(|_| "reachability timed out".to_string())??;
+    Ok(answer)
+}
+
+/// A client for `base_url` that reaches it over IPv4 only. The server probes
+/// the address a request comes from and declines an IPv6 one, since Ember
+/// does not listen on IPv6; a dual-stack machine would otherwise often ask
+/// over IPv6 and never be probed. Not cached: it serves one doctor run.
+async fn ipv4_client(base_url: &str) -> Result<reqwest::Client, String> {
+    let (_, host, addrs) = crate::security::validate_fetch_url(base_url)
+        .await
+        .map_err(|e| format!("rendezvous URL rejected: {e}"))?;
+    let v4 = ipv4_only(&addrs);
+    if v4.is_empty() {
+        return Err("reachability: the server has no IPv4 address".to_string());
+    }
+    crate::security::build_pinned_client(&host, &v4)
+        .map_err(|e| format!("failed to build hardened rendezvous HTTP client: {e}"))
+}
+
+fn ipv4_only(addrs: &[std::net::SocketAddr]) -> Vec<std::net::SocketAddr> {
+    addrs.iter().copied().filter(std::net::SocketAddr::is_ipv4).collect()
+}
+
+/// What a 429 from `/v4/reachability` means. A server that advertises
+/// `reachability_hourly_reason` says `"reason": "hourly"` for its hourly probe
+/// budget, and any other 429 from it is the general per-minute limit. One that
+/// does not may refuse for the hour with no body at all, so every 429 from it
+/// is the hourly budget.
+fn refusal_from(hourly_reason_advertised: bool, body: &[u8]) -> Reachability {
+    if !hourly_reason_advertised
+        || serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|v| v["reason"] == "hourly")
+    {
+        Reachability::RateLimited
+    } else {
+        Reachability::Busy
+    }
+}
+
+fn reachability_from(body: &serde_json::Value) -> Reachability {
+    let server_time = body["server_time"].as_i64().unwrap_or(0);
+    // Servers from before the field probed every caller.
+    if body["available"].as_bool() == Some(false) {
+        return Reachability::Declined { server_time };
+    }
+    Reachability::Probed(ReachabilityAnswer {
+        ip: body["ip"].as_str().unwrap_or_default().to_string(),
+        tcp: body["tcp"].as_str().unwrap_or("timeout").to_string(),
+        udp_sent: body["udp_sent"].as_bool() == Some(true),
+        server_time,
+    })
+}
+
+#[cfg(test)]
+mod reachability_tests {
+    use super::{refusal_from, Reachability};
+
+    /// From a server that labels its hourly refusal, only that reads as
+    /// "used up for the hour"; the general per-minute limit, which answers
+    /// 429 with no body, is busy and passes.
+    #[test]
+    fn a_labelling_server_is_hourly_only_when_it_says_so() {
+        assert_eq!(refusal_from(true, br#"{"reason":"hourly","server_time":1}"#), Reachability::RateLimited);
+        assert_eq!(refusal_from(true, b""), Reachability::Busy);
+        assert_eq!(refusal_from(true, b"Too Many Requests"), Reachability::Busy);
+        assert_eq!(refusal_from(true, br#"{"reason":"general"}"#), Reachability::Busy);
+    }
+
+    /// A server that does not label its refusals may send the hourly one
+    /// with no body, so any 429 from it is the hourly budget.
+    #[test]
+    fn an_unlabelling_server_is_hourly_whatever_its_429_says() {
+        for body in [&b""[..], b"Too Many Requests", br#"{"reason":"general"}"#, br#"{"reason":"hourly"}"#] {
+            assert_eq!(refusal_from(false, body), Reachability::RateLimited);
+        }
+    }
+
+    /// The probe is asked for over IPv4 alone, whatever else the server's
+    /// name resolves to.
+    #[test]
+    fn the_probe_request_is_pinned_to_ipv4_addresses() {
+        let addrs: Vec<std::net::SocketAddr> = ["[2a09:8280:1::1]:443", "66.241.124.1:443", "[::1]:443", "1.2.3.4:443"]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect();
+        let v4 = super::ipv4_only(&addrs);
+        assert_eq!(v4, vec![addrs[1], addrs[3]]);
+        assert!(super::ipv4_only(&addrs[..1]).is_empty());
+    }
+}
+
 /// Whether the server holds sealed chat for offline friends.
 pub async fn chat_mailbox_supported(base_url: &str) -> bool {
     negotiate_server_features(base_url)
@@ -2861,13 +3031,19 @@ pub async fn poll_friend_relay_tickets(
     Err(last_error.unwrap_or_else(|| "relay ticket poll failed".to_string()))
 }
 
+/// A relay mailbox page: up to eight tickets whose envelopes the server takes
+/// at up to 2 KiB each, hex-encoded. Read under [`MAX_RESPONSE_BYTES`], two
+/// oversized offers anyone holding our intro capability can send made every
+/// poll fail, real friends' tickets with it.
+const MAX_RELAY_MAILBOX_RESPONSE_BYTES: usize = 48 * 1024;
+
 async fn parse_friend_relay_mailbox_response(
     resp: reqwest::Response,
     responder_ember_hash: &[u8; 16],
     secret_key: &[u8; 32],
 ) -> Result<FriendRelayTicketPollPage, String> {
     let body: serde_json::Value =
-        serde_json::from_slice(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
+        serde_json::from_slice(&read_bounded_bytes(resp, MAX_RELAY_MAILBOX_RESPONSE_BYTES).await?)
             .map_err(|e| format!("relay mailbox poll bad body: {e}"))?;
     let items = body["tickets"]
         .as_array()

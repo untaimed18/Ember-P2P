@@ -293,7 +293,14 @@ pub(crate) fn parse_friend_code(value: &str) -> Result<ParsedFriendCode, String>
 #[derive(serde::Serialize)]
 pub struct FriendInfo {
     pub user_hash: String,
+    /// The name to show: the user's label when they set one, else the
+    /// friend's own name.
     pub nickname: String,
+    /// The user's label for this friend, empty when they set none.
+    pub alias: String,
+    /// What the friend calls themselves, as their last verified session said;
+    /// the name shown until a session has said it.
+    pub self_name: String,
     pub added_at: i64,
     pub last_ip: String,
     pub last_port: u16,
@@ -324,11 +331,33 @@ pub struct FriendRequestInfo {
     pub verified: bool,
 }
 
+/// The name [`add_friend`] stores, empty for none. Bidi, zero-width and
+/// control formatters come off: the list neutralises them when drawing, but a
+/// stored one comes back whenever the name is copied or exported. A name the
+/// peer goes by (`name_is_theirs`) loses the site tag an Ember adds to it for
+/// eMule, as every name a peer gives does before it is stored.
+fn friend_name_to_store(nickname: &str, name_is_theirs: bool) -> String {
+    let nick = crate::security::sanitize_display_name(nickname);
+    // What `sanitize_display_name` gives for an empty name.
+    if nick == "Anonymous" {
+        return String::new();
+    }
+    if name_is_theirs {
+        crate::types::without_nickname_site_tag(&nick).to_string()
+    } else {
+        nick
+    }
+}
+
 #[tauri::command]
 pub async fn add_friend(
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
     nickname: Option<String>,
+    // The name is one the peer goes by (a room nickname, an eD2K Hello name)
+    // rather than one the user typed: it only stands in for theirs, and is
+    // not kept as the user's label once they say what they are called.
+    name_is_theirs: Option<bool>,
 ) -> Result<(), String> {
     let ParsedFriendCode {
         canonical,
@@ -336,23 +365,8 @@ pub async fn add_friend(
         pubkey: friend_pubkey,
         intro_secret,
     } = parse_friend_code(&user_hash_hex)?;
-    // L20: strip bidi/zero-width/control formatters from
-    // user-supplied nicknames before they're written to the DB.
-    // The friends list uses `<bdi>` to neutralise visual
-    // reordering at render time (M14), but storing the override
-    // character means it comes back the next time the user
-    // exports the friends list, copies a name, or syncs to a
-    // future sibling client.
-    let nick = crate::security::sanitize_display_name(&nickname.unwrap_or_default());
-    // `sanitize_display_name` substitutes "Anonymous" for empty
-    // input; treat that the same as a too-short nickname so
-    // adding a friend without specifying one keeps a sensible
-    // default rather than the literal string "Anonymous".
-    let nick = if nick == "Anonymous" {
-        String::new()
-    } else {
-        nick
-    };
+    let name_is_theirs = name_is_theirs.unwrap_or(false);
+    let nick = friend_name_to_store(&nickname.unwrap_or_default(), name_is_theirs);
     if friend_nickname_too_long(&nick) {
         return Err(coded_ctx(
             "peers_nickname_too_long",
@@ -408,8 +422,13 @@ pub async fn add_friend(
     let db = state.db.clone();
     let db_hash = canonical.clone();
     let db_nick = nick.clone();
+    let db_alias = if name_is_theirs {
+        String::new()
+    } else {
+        nick.clone()
+    };
     let db_result = tokio::task::spawn_blocking(move || {
-        db.add_friend(&db_hash, &db_nick, friend_pubkey.as_ref())
+        db.add_friend_named(&db_hash, &db_alias, &db_nick, friend_pubkey.as_ref())
     })
     .await;
     let became_mutual = match db_result {
@@ -676,6 +695,8 @@ pub async fn get_blocked_friends(
         .collect())
 }
 
+/// Set the user's own label for a friend. An empty name clears it, and the
+/// card goes back to the name the friend chose.
 #[tauri::command]
 pub async fn update_friend_nickname(
     state: tauri::State<'_, AppState>,
@@ -704,7 +725,7 @@ pub async fn update_friend_nickname(
     let db_hash = canonical;
     let db_nick = cleaned;
     let updated =
-        tokio::task::spawn_blocking(move || db.update_friend_nickname(&db_hash, &db_nick))
+        tokio::task::spawn_blocking(move || db.set_friend_alias(&db_hash, &db_nick))
             .await
             .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
             .map_err(|e| coded_ctx("peers_failed_update_friend", "Failed to update friend", e))?;
@@ -735,7 +756,7 @@ pub async fn get_friends(state: tauri::State<'_, AppState>) -> Result<Vec<Friend
     Ok(rows
         .into_iter()
         .map(
-            |(user_hash, nickname, added_at, last_ip, last_port, last_seen, mutual)| FriendInfo {
+            |(
                 user_hash,
                 nickname,
                 added_at,
@@ -743,6 +764,20 @@ pub async fn get_friends(state: tauri::State<'_, AppState>) -> Result<Vec<Friend
                 last_port,
                 last_seen,
                 mutual,
+                alias,
+                self_name,
+            )| {
+                FriendInfo {
+                    user_hash,
+                    nickname,
+                    alias,
+                    self_name,
+                    added_at,
+                    last_ip,
+                    last_port,
+                    last_seen,
+                    mutual,
+                }
             },
         )
         .collect())
@@ -1227,7 +1262,7 @@ pub async fn send_chat_typing(
 #[tauri::command]
 pub async fn get_unread_message_counts(
     state: tauri::State<'_, AppState>,
-) -> Result<Vec<(String, i64)>, String> {
+) -> Result<Vec<(String, i64, i64)>, String> {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.unread_message_counts())
         .await
@@ -1473,6 +1508,47 @@ pub async fn get_online_friends(state: tauri::State<'_, AppState>) -> Result<Vec
         .try_send(NetworkCommand::GetOnlineFriends { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     await_reply(rx, "peers_no_response", "No response").await
+}
+
+/// Online friends that set a status, by lowercase hex hash. A friend absent
+/// from the map is online or offline as `get_online_friends` says.
+#[tauri::command]
+pub async fn get_friend_statuses(
+    state: tauri::State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, crate::types::FriendStatus>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::GetFriendStatuses { tx })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    let statuses: Vec<(String, crate::types::FriendStatus)> =
+        await_reply(rx, "peers_no_response", "No response").await?;
+    Ok(statuses.into_iter().collect())
+}
+
+#[derive(serde::Serialize)]
+pub struct IdleAwayInfo {
+    /// Friends see us Away now because we have been idle.
+    pub active: bool,
+    /// This build can tell how long we have been idle at all.
+    pub supported: bool,
+}
+
+/// Never an error: whether this build can read idle time does not depend on
+/// the network loop, and the Settings page would otherwise call a busy loop
+/// an unsupported system. `active` falls back to false, which the next
+/// `ember:idle-away` event corrects.
+#[tauri::command]
+pub async fn get_idle_away(state: tauri::State<'_, AppState>) -> Result<IdleAwayInfo, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let active = match state.network_tx.try_send(NetworkCommand::GetIdleAway { tx }) {
+        Ok(()) => await_reply(rx, "peers_no_response", "No response").await.unwrap_or(false),
+        Err(_) => false,
+    };
+    Ok(IdleAwayInfo {
+        active,
+        supported: crate::idle::supported(),
+    })
 }
 
 #[tauri::command]
@@ -1873,12 +1949,33 @@ async fn fetch_bootstrap_contacts(
         // and the pid distinguishes concurrent instances.
         static NEXT_TMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = NEXT_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // A random part too: on Linux the temp dir is shared, and a name
+        // another local user could predict they could also create first.
         let tmp_path = std::env::temp_dir().join(format!(
-            "ember-nodes-{}-{unique}.dat",
-            std::process::id()
+            "ember-nodes-{}-{unique}-{:016x}.dat",
+            std::process::id(),
+            rand::random::<u64>()
         ));
-        std::fs::write(&tmp_path, &body)
-            .map_err(|e| format!("failed to write temp nodes.dat: {e}"))?;
+        // Created exclusively, so a symlink planted at the name is refused
+        // rather than followed.
+        {
+            use std::io::Write as _;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&tmp_path)
+                .map_err(|e| format!("failed to create temp nodes.dat: {e}"))?;
+            if let Err(e) = file.write_all(&body) {
+                drop(file);
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(format!("failed to write temp nodes.dat: {e}"));
+            }
+        }
         let parsed = crate::network::kad::bootstrap::load_nodes_dat(&tmp_path);
         let _ = std::fs::remove_file(&tmp_path);
         parsed.map_err(|e| format!("parsed {downloaded} bytes but the file is not a valid nodes.dat: {e}"))
@@ -2750,7 +2847,7 @@ pub async fn ember_dht_publish_keyword(
     )
     .await
     {
-        Ok(Ok(EmberPublishResult { stored_on, targets })) => Ok(EmberDhtPublishResult {
+        Ok(Ok(EmberPublishResult { stored_on, targets, .. })) => Ok(EmberDhtPublishResult {
             success: stored_on > 0,
             key,
             stored_on,
@@ -2932,7 +3029,7 @@ mod tests {
 
     use super::{
         chat_failure_is_permanent, code_permanent_chat_failure, format_friend_code,
-        friend_nickname_too_long, parse_friend_code, require_public_ember_peer_ip_for_mode,
+        friend_name_to_store, friend_nickname_too_long, parse_friend_code, require_public_ember_peer_ip_for_mode,
         INTRO_SECRET_LEN,
     };
 
@@ -2946,6 +3043,21 @@ mod tests {
         }
         assert!(!friend_nickname_too_long(&"名".repeat(64)));
         assert!(friend_nickname_too_long(&"名".repeat(65)));
+    }
+
+    /// A name the peer goes by is stored without the site tag their Ember
+    /// gave eMule, however long the name; one the user typed is kept as typed.
+    #[test]
+    fn a_peers_name_is_stored_without_the_site_tag() {
+        let tagged = crate::types::ed2k_nickname("Brady", true);
+        assert_eq!(friend_name_to_store(&tagged, true), "Brady");
+        assert_eq!(friend_name_to_store(&tagged, false), tagged);
+        let long = "B".repeat(60);
+        let stored = friend_name_to_store(&crate::types::ed2k_nickname(&long, true), true);
+        assert_eq!(stored, long);
+        assert!(!friend_nickname_too_long(&stored));
+        assert_eq!(friend_name_to_store("Bra\u{202E}dy", true), "Brady");
+        assert_eq!(friend_name_to_store("  ", true), "");
     }
 
     /// "Copy member ID" in a room yields a bare Ed25519 key. Add Friend has to

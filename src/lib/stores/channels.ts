@@ -1,5 +1,7 @@
 import { derived, get, writable } from 'svelte/store';
+import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import type { AppSettings } from '$lib/types';
 import {
   getChannelMessages,
   listChannels,
@@ -512,11 +514,19 @@ export function unhideChannel(channelId: string): void {
  * having to choose between reading them everywhere and nowhere is what made
  * the global-only list too blunt to use.
  *
- * Purely presentational — their messages still arrive, are still stored, and
- * still count toward unread. Nothing here is a security boundary.
+ * Presentational for room lines — they still arrive, are still stored, and
+ * still count toward unread. The backend keeps a copy in settings
+ * (`ignored_members`), by which their private messages are dropped before
+ * they are stored. Nothing here is a security boundary.
  */
 const IGNORED_KEY = 'ember.channels.ignored.v1';
 const IGNORED_NAME_MAX = 64;
+
+/** `name` cut to at most `max` code points, never through a surrogate pair:
+ *  a lone half would make the list one the backend cannot store. */
+function clipName(name: string, max = IGNORED_NAME_MAX): string {
+  return Array.from(name.trim()).slice(0, max).join('');
+}
 
 export interface IgnoredMember {
   pubkey: string;
@@ -541,7 +551,7 @@ function parseIgnoredEntry(raw: unknown): IgnoredMember | null {
   const pk = (raw as { pubkey: unknown }).pubkey;
   if (typeof pk !== 'string' || !MEMBER_PUBKEY_RE.test(pk)) return null;
   const nameRaw = (raw as { name?: unknown }).name;
-  const name = typeof nameRaw === 'string' ? nameRaw.trim().slice(0, IGNORED_NAME_MAX) : '';
+  const name = typeof nameRaw === 'string' ? clipName(nameRaw) : '';
   const roomsRaw = (raw as { rooms?: unknown }).rooms;
   if (!Array.isArray(roomsRaw)) return { pubkey: pk.toLowerCase(), name };
   const rooms = [
@@ -622,13 +632,113 @@ export function ignoreScopeFor(
   return !!id && entry.rooms.includes(id) ? 'room' : 'none';
 }
 
+/** Whether the list has been squared with the backend's this session: until
+ *  then a change here would overwrite a list the backend holds and this
+ *  window has not seen. */
+let ignoredSynced = false;
+/** Changed here before settings arrived: that change is the newest word,
+ *  and is pushed rather than replaced by the backend's list. */
+let ignoredEditedEarly = false;
+let ignoredSubscribed = false;
+let ignoredPushTimer: ReturnType<typeof setTimeout> | null = null;
+/** Saves go one after another, so an older list cannot land after a newer
+ *  one. The last one sent, until it settles. */
+let ignoredSaveChain: Promise<void> = Promise.resolve();
+let ignoredSaving: Promise<void> | null = null;
+
+function sameIgnored(a: IgnoredMember[], b: IgnoredMember[]): boolean {
+  const key = (list: IgnoredMember[]) =>
+    JSON.stringify(list.map((e) => [e.pubkey, e.name, e.rooms ? [...e.rooms].sort() : null]));
+  return key(a) === key(b);
+}
+
+function saveIgnored(entries: IgnoredMember[]): Promise<void> {
+  const run = ignoredSaveChain
+    .catch(() => {})
+    .then(() => invoke<void>('set_ignored_members', { members: entries }));
+  ignoredSaveChain = run;
+  ignoredSaving = run;
+  run
+    .finally(() => {
+      if (ignoredSaving === run) ignoredSaving = null;
+    })
+    .catch(() => {});
+  return run;
+}
+
+function pushIgnored(entries: IgnoredMember[]) {
+  if (ignoredPushTimer) clearTimeout(ignoredPushTimer);
+  ignoredPushTimer = setTimeout(() => {
+    ignoredPushTimer = null;
+    saveIgnored(entries).catch((e) => console.warn('channels: could not save the ignore list', e));
+  }, 300);
+}
+
+/** Resolves once the backend holds the list as it stands here, for a caller
+ *  whose next step depends on it; rejects if it could not be saved. Sends a
+ *  change still waiting out the push delay at once, waits for one already on
+ *  its way, and before settings have loaded sends the list here, which is
+ *  the newest word then (see `ignoredEditedEarly`). */
+export async function pushIgnoredNow(): Promise<void> {
+  if (ignoredPushTimer) {
+    clearTimeout(ignoredPushTimer);
+    ignoredPushTimer = null;
+    return saveIgnored(get(ignoredMembers));
+  }
+  if (!ignoredSynced) return saveIgnored(get(ignoredMembers));
+  if (ignoredSaving) return ignoredSaving;
+  if (!sameIgnored(get(ignoredMembers), ignoredFromSettings(get(appSettings)) ?? [])) {
+    return saveIgnored(get(ignoredMembers));
+  }
+}
+
 ignoredMembers.subscribe((entries) => {
+  if (ignoredSynced && !sameIgnored(entries, ignoredFromSettings(get(appSettings)) ?? [])) {
+    pushIgnored(entries);
+  } else if (!ignoredSynced && ignoredSubscribed) {
+    ignoredEditedEarly = true;
+  }
+  ignoredSubscribed = true;
   if (typeof localStorage === 'undefined') return;
   try {
     localStorage.setItem(IGNORED_KEY, JSON.stringify(entries));
   } catch {
     // Quota exceeded / private mode. Holds for this session.
   }
+});
+
+function ignoredFromSettings(settings: AppSettings | null): IgnoredMember[] | null {
+  const raw = settings?.ignored_members;
+  if (!Array.isArray(raw)) return null;
+  const seen = new Set<string>();
+  const out: IgnoredMember[] = [];
+  for (const item of raw) {
+    const entry = parseIgnoredEntry(item);
+    if (!entry || seen.has(entry.pubkey)) continue;
+    seen.add(entry.pubkey);
+    out.push(entry);
+  }
+  return out;
+}
+
+// The backend keeps the list, so a private message from someone ignored is
+// dropped before it is stored. The first settings this window sees either
+// carry it, and win over the copy here, or carry none yet: then the copy here
+// is moved over, once. Later settings (another window's change) are taken up.
+appSettings.subscribe((settings) => {
+  if (!settings) return;
+  const held = ignoredFromSettings(settings);
+  if (held === null || (!ignoredSynced && ignoredEditedEarly)) {
+    if (!ignoredSynced) {
+      ignoredSynced = true;
+      pushIgnored(get(ignoredMembers));
+    }
+    return;
+  }
+  ignoredSynced = true;
+  // A change of ours still on its way: the backend has not heard it yet.
+  if (ignoredPushTimer || ignoredSaving) return;
+  if (!sameIgnored(held, get(ignoredMembers))) ignoredMembers.set(held);
 });
 
 /**
@@ -640,7 +750,7 @@ ignoredMembers.subscribe((entries) => {
  */
 export function toggleMemberIgnore(memberPubkey: string, name?: string): void {
   const pk = memberPubkey.toLowerCase();
-  const label = typeof name === 'string' ? name.trim().slice(0, IGNORED_NAME_MAX) : '';
+  const label = typeof name === 'string' ? clipName(name) : '';
   ignoredMembers.update((list) =>
     list.some((entry) => entry.pubkey === pk)
       ? list.filter((entry) => entry.pubkey !== pk)
@@ -658,7 +768,7 @@ export function toggleMemberIgnore(memberPubkey: string, name?: string): void {
  */
 export function ignoreMemberEverywhere(memberPubkey: string, name?: string): void {
   const pk = memberPubkey.toLowerCase();
-  const label = typeof name === 'string' ? name.trim().slice(0, IGNORED_NAME_MAX) : '';
+  const label = typeof name === 'string' ? clipName(name) : '';
   ignoredMembers.update((list) => {
     const existing = list.find((entry) => entry.pubkey === pk);
     if (!existing) return [...list, { pubkey: pk, name: label }];
@@ -684,7 +794,7 @@ export function toggleMemberIgnoreInChannel(
   const pk = memberPubkey.toLowerCase();
   const id = channelId.toLowerCase();
   if (!CHANNEL_ID_RE.test(id)) return;
-  const label = typeof name === 'string' ? name.trim().slice(0, IGNORED_NAME_MAX) : '';
+  const label = typeof name === 'string' ? clipName(name) : '';
   ignoredMembers.update((list) => {
     const existing = list.find((entry) => entry.pubkey === pk);
     if (!existing) return [...list, { pubkey: pk, name: label, rooms: [id] }];

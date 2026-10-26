@@ -287,6 +287,16 @@ pub struct Transfer {
     /// [`up_part_status`]: Transfer::up_part_status
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub up_part_count: Option<u32>,
+    /// Upload-direction only: hex, one byte per part (shares
+    /// [`up_part_count`]), of how much of each part has been delivered this
+    /// session — 0 none, 1..=254 partly, 255 whole. Lets the parts bar draw
+    /// parts this peer is finishing from other sources too, which
+    /// [`up_part_status`] never lights.
+    ///
+    /// [`up_part_status`]: Transfer::up_part_status
+    /// [`up_part_count`]: Transfer::up_part_count
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up_part_fill: Option<String>,
     /// Upload-direction only: hex bitmap (same packing as [`up_part_status`],
     /// shares [`up_part_count`]) of the ED2K parts the downloader advertised it
     /// already had at request time — eMule's `m_abyUpPartStatus`. Drives the
@@ -643,6 +653,10 @@ pub struct StartDownloadResponse {
     pub transfer_id: String,
     /// True when this file was already in the active download queue (same ed2k hash).
     pub already_queued: bool,
+    /// The download already queued is a feed's, shown on the Feeds page
+    /// rather than in Transfers.
+    #[serde(default)]
+    pub in_feed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -716,6 +730,43 @@ pub struct NetworkStats {
     /// or `"broken"` (cryptkey.dat exists but could not be read).
     #[serde(default)]
     pub secident_status: String,
+    /// The router's own WAN address from UPnP, empty when it said none.
+    #[serde(default)]
+    pub upnp_wan_ip: String,
+    /// The TCP listen port could not be opened: another program holds it.
+    #[serde(default)]
+    pub tcp_listen_failed: bool,
+    /// The UDP port actually bound, which is the configured one unless it
+    /// was taken.
+    #[serde(default)]
+    pub bound_udp_port: u16,
+    /// The UDP port QUIC is bound to, 0 before it binds. The same as
+    /// `bound_udp_port` when QUIC shares that socket.
+    #[serde(default)]
+    pub quic_udp_port: u16,
+    /// What this session started with, which a saved change only replaces
+    /// at the next restart: the TCP port it listens on (or tried to), the UDP
+    /// port it was configured with, and whether UPnP runs.
+    #[serde(default)]
+    pub session_tcp_port: u16,
+    #[serde(default)]
+    pub session_udp_port: u16,
+    #[serde(default)]
+    pub session_upnp_enabled: bool,
+    /// The ports peers are told to dial (`advertised_tcp_port` and
+    /// `advertised_udp_port` in `network::nat_mapping`), which is where the
+    /// outside has to get through. Unlike `public_tcp_port` and
+    /// `public_udp_port`, a live UPnP forward outranks a STUN remap, and an
+    /// unconfirmed STUN observation does not count.
+    #[serde(default)]
+    pub advertised_tcp_port: u16,
+    #[serde(default)]
+    pub advertised_udp_port: u16,
+    /// How long the network loop has run, in seconds, by the monotonic clock:
+    /// a change to the system clock does not move it. As of the stats
+    /// snapshot it came in.
+    #[serde(default)]
+    pub session_age_secs: u64,
 }
 
 /// Diagnostic counters for the Ember mesh (EPX, LowID broker). Surfaced
@@ -1407,6 +1458,16 @@ impl Default for NetworkStats {
             ember_dht_contacts: 0,
             ember_dht_verified_contacts: 0,
             secident_status: String::from("unavailable"),
+            upnp_wan_ip: String::new(),
+            tcp_listen_failed: false,
+            bound_udp_port: 0,
+            quic_udp_port: 0,
+            session_tcp_port: 0,
+            session_udp_port: 0,
+            session_upnp_enabled: false,
+            advertised_tcp_port: 0,
+            advertised_udp_port: 0,
+            session_age_secs: 0,
         }
     }
 }
@@ -1421,16 +1482,30 @@ pub enum NetworkStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // Do not use `deny_unknown_fields`: a config.json written by a newer Ember
-// build (extra keys) must still load on downgrade. Unknown keys are ignored;
-// missing known fields use `#[serde(default)]` / field defaults where set.
-// Completely unreadable JSON still falls back to defaults after backup.
+// build (extra keys) must still load on downgrade. Unknown keys are kept in
+// `extra` and written back; missing known fields use `#[serde(default)]` /
+// field defaults where set. Completely unreadable JSON still falls back to
+// defaults after backup.
 pub struct AppSettings {
     pub nickname: String,
+    /// Add [`NICKNAME_SITE_TAG`] after [`Self::nickname`] where eD2K servers
+    /// and eMule clients see it, as eMule's own default name is its website.
+    /// Ember peers never see it: it is left out of the Ember hello and taken
+    /// off a received name. On by default; the Settings page shows the name as
+    /// eMule users see it, with the switch beside it.
+    #[serde(default = "default_true")]
+    pub nickname_site_tag: bool,
     /// Unique handle used in Channels, claimed on Rendezvous. Empty until
     /// the user chooses one. Distinct from [`Self::nickname`], which is the
     /// friend display name and is not unique.
     #[serde(default)]
     pub channel_username: String,
+    /// The language shown as a flag beside our username in room member
+    /// lists: a code from `CHANNEL_LANGUAGES`, or empty for none. Chosen by
+    /// the user rather than taken from the app language, which is often not
+    /// the language they speak and is not ours to publish unasked.
+    #[serde(default)]
+    pub channel_language: String,
     pub shared_folders: Vec<String>,
     pub download_folder: String,
     /// Earlier download folders whose `Temp` still holds unfinished downloads.
@@ -1571,6 +1646,16 @@ pub struct AppSettings {
     /// Automatically remove completed downloads from the list
     #[serde(default)]
     pub remove_finished_downloads: bool,
+    /// Save each download as `[Ember-P2P] <name>` when it completes.
+    #[serde(default)]
+    pub tag_completed_downloads: bool,
+    /// Rename files new to a shared folder to `[Ember-P2P] <name>` once they
+    /// are hashed. Files in the Library when this is turned on are left as
+    /// they are, and so is any file whose content the Library has seen
+    /// before, so a tag taken off by hand is not put back. Completed
+    /// downloads follow `tag_completed_downloads` instead.
+    #[serde(default)]
+    pub tag_shared_imports: bool,
     /// Globally prioritize the first and last part of every download so media
     /// files become previewable as early as possible (eMule's global "preview
     /// priority" preference). When on, every transfer behaves as if its
@@ -1707,8 +1792,29 @@ pub struct AppSettings {
     /// explicit choice, so the permissive default cannot cost more than a
     /// prompt you dismiss. `"friends"` compares the member's Ed25519 key
     /// against the friends list by its derived Ember hash.
+    ///
+    /// A value this build does not offer may be a later build's, so it is
+    /// kept as read rather than reset, and acts as `"nobody"` here (see
+    /// [`channel_file_offers_in_force`]). Settings refuses changing to one.
     #[serde(default = "default_channel_file_offers")]
     pub channel_file_offers: String,
+    /// Who may send you a private message through a room you share:
+    /// `"ask"` (the first message from someone waits for you to accept),
+    /// `"anyone"`, or `"off"`.
+    ///
+    /// A value this build does not offer may be a later build's, so it is
+    /// kept as read rather than reset, and acts as `"ask"` here (see
+    /// [`room_dm_policy_in_force`]). Settings refuses changing to one.
+    #[serde(default = "default_room_dm_policy")]
+    pub room_dm_policy: String,
+    /// Room members you ignore: their lines are hidden, and their private
+    /// messages dropped before they are stored. `None` until the list the
+    /// webview used to keep to itself has been moved here.
+    ///
+    /// Read leniently: an entry this build cannot read is dropped on its own,
+    /// rather than failing the whole config and resetting every setting.
+    #[serde(default, deserialize_with = "deserialize_ignored_members")]
+    pub ignored_members: Option<Vec<IgnoredMember>>,
     /// Files a friend sends in chat at or under this many megabytes are
     /// fetched without asking; larger ones wait for an explicit accept. Zero
     /// asks every time.
@@ -1731,6 +1837,21 @@ pub struct AppSettings {
     /// rather than failing the whole config and resetting every setting.
     #[serde(default, deserialize_with = "deserialize_friend_overrides")]
     pub friend_overrides: std::collections::BTreeMap<String, FriendOverrides>,
+    /// The status friends see while we are online. Offline needs no setting:
+    /// a friend without a session to us shows us offline whatever this says.
+    ///
+    /// Backend-owned: only `set_friend_status` writes it.
+    #[serde(default, deserialize_with = "deserialize_friend_status")]
+    pub friend_status: FriendStatus,
+    /// Show friends Away after this many minutes without keyboard or mouse
+    /// input, while the status is Online; 0 is off. A status set by hand to
+    /// Away or Busy is never changed. See [`AUTO_AWAY_CHOICES`].
+    ///
+    /// A time this build does not offer is kept as read: it may be a later
+    /// build's, and it is a number of minutes whichever build reads it.
+    /// Settings refuses changing to one.
+    #[serde(default = "default_auto_away_minutes")]
+    pub auto_away_minutes: u32,
     /// Rendezvous server URL for friend discovery
     #[serde(default = "default_rendezvous_url")]
     pub rendezvous_url: String,
@@ -1794,6 +1915,11 @@ pub struct AppSettings {
     /// users on older configs.
     #[serde(default = "default_close_to_tray_behavior")]
     pub close_to_tray_behavior: String,
+    /// Hide the main window to the system tray when it is minimized, instead
+    /// of leaving it on the taskbar. Without a visible tray icon the window
+    /// stays minimized. Off by default.
+    #[serde(default)]
+    pub minimize_to_tray: bool,
     /// Maximize the main window when Ember launches.
     ///
     /// The window is created at its configured size (see `tauri.conf.json`)
@@ -1954,6 +2080,17 @@ pub struct AppSettings {
     /// space while downloads are running. 0 turns the warning off.
     #[serde(default = "default_low_disk_warning_mb")]
     pub low_disk_warning_mb: u32,
+
+    /// Keys in `config.json` this build does not know, as read, so a save
+    /// here does not drop what a later build stored. A key any field reads,
+    /// alias included, never lands here.
+    ///
+    /// Not serialized: the webview neither sees nor sends it, and
+    /// `update_settings` carries it over from the config in memory. Only
+    /// `storage::config::settings_json` writes it, under the known fields,
+    /// which win over a key of the same name.
+    #[serde(flatten, skip_serializing)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn default_low_disk_warning_mb() -> u32 {
@@ -2003,7 +2140,36 @@ pub struct Ed2kDownloadLimits {
     pub max_download_bytes: u64,
 }
 
+/// Follows the user's name where eD2K servers and eMule clients see it
+/// ([`AppSettings::nickname_site_tag`]).
+pub const NICKNAME_SITE_TAG: &str = "[https://emberp2p.org]";
+
+/// The name eD2K servers and eMule clients are given: `nickname` and the site
+/// tag, unless the tag is off or the name already names the site. An empty
+/// name stays empty, so the callers that send no name for one still do.
+pub fn ed2k_nickname(nickname: &str, site_tag: bool) -> String {
+    let base = nickname.trim_end();
+    if !site_tag || base.trim().is_empty() || base.to_ascii_lowercase().contains("emberp2p.org") {
+        return nickname.to_string();
+    }
+    format!("{base} {NICKNAME_SITE_TAG}")
+}
+
+/// `name` without the site tag another Ember put after it for eMule. A name
+/// that is nothing but the tag is left as it is.
+pub fn without_nickname_site_tag(name: &str) -> &str {
+    match name.trim_end().strip_suffix(NICKNAME_SITE_TAG) {
+        Some(rest) if !rest.trim().is_empty() => rest.trim_end(),
+        _ => name,
+    }
+}
+
 impl AppSettings {
+    /// [`ed2k_nickname`] for these settings.
+    pub fn ed2k_nickname(&self) -> String {
+        ed2k_nickname(&self.nickname, self.nickname_site_tag)
+    }
+
     pub fn ed2k_download_limits(&self) -> Ed2kDownloadLimits {
         // Standard ED2K wire part counts are u16. The integer GiB setting is
         // capped at 593, then the exact byte ceiling closes the remaining
@@ -2017,6 +2183,12 @@ impl AppSettings {
             multisource_retry_rounds: self.multisource_retry_rounds.clamp(1, 20),
             max_download_bytes,
         }
+    }
+
+    /// [`Self::channel_language`] as a registry code, or `None` for none or
+    /// for a code this build does not list.
+    pub fn channel_language_code(&self) -> Option<&'static str> {
+        crate::network::ember::dht::publish::channel_language(self.channel_language.trim())
     }
 
     pub fn download_folders(&self) -> crate::storage::part_folders::DownloadFolders {
@@ -2210,8 +2382,22 @@ pub struct DownloadFileDetails {
 /// snapshot — see `NetworkCommand::GetKnownClientCounts`.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct KnownClientCounts {
+    /// Rows each tab lists, after the per-tab trim to the most recently seen.
     pub ed2k: u32,
     pub ember: u32,
+    /// Records the ledger holds for each tab before that trim. Above the
+    /// listed count only when the tab is capped.
+    pub ed2k_total: u32,
+    pub ember_total: u32,
+}
+
+/// What the known-peer tabs fetch: the trimmed rows plus the counts that
+/// describe them, so the labels can tell the ledger size apart from the
+/// rows listed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KnownClientsSnapshot {
+    pub clients: Vec<KnownClient>,
+    pub counts: KnownClientCounts,
 }
 
 /// One row in the upload-pane "Known Clients" tab — a SecIdent credit
@@ -2255,11 +2441,18 @@ pub struct KnownClient {
     /// Unknown after several connections).
     pub has_public_key: bool,
     /// Ember node id hex when known (from a verified hello binding).
-    /// Friends are keyed by this hash, not `user_hash`.
+    /// Decides the tab the row is on and the hash it shows.
     pub ember_hash: Option<String>,
-    /// True when `ember_hash` is present in the local friends set.
+    /// The Ember identity this row is known to be, which friends are
+    /// recognised by: the friend-proven link, or the identity a session in
+    /// the upload queue proved this run. `ember_hash` can also be a binding
+    /// SecIdent vouched for, which shows only that the peer presented a key,
+    /// and a friend's key is public.
+    #[serde(default)]
+    pub friend_hash: Option<String>,
+    /// True when `friend_hash` is present in the local friends set.
     pub is_friend: bool,
-    /// Friend nickname from the friends DB when this row's Ember hash
+    /// Friend nickname from the friends DB when this row's `friend_hash`
     /// matches a friends entry (empty otherwise). Surfaced so Known
     /// Clients can show a readable name even with no transfer history.
     #[serde(default)]
@@ -2312,6 +2505,114 @@ fn default_channel_file_offers() -> String {
     CHANNEL_FILE_OFFERS_EVERYONE.to_string()
 }
 
+pub fn channel_file_offers_valid(offers: &str) -> bool {
+    [CHANNEL_FILE_OFFERS_EVERYONE, CHANNEL_FILE_OFFERS_FRIENDS, CHANNEL_FILE_OFFERS_NOBODY]
+        .contains(&offers)
+}
+
+/// Whether a stored `channel_file_offers` can be kept as read: one this build
+/// offers, or a short lowercase word a later build may offer. Anything else
+/// is damage, and is repaired to the default.
+pub fn channel_file_offers_storable(offers: &str) -> bool {
+    later_choice_storable(offers)
+}
+
+/// Who may offer files here under `offers`: itself when this build offers
+/// it, and `"nobody"` for one it does not, so a later build's choice never
+/// lets anyone further than the user chose there.
+pub fn channel_file_offers_in_force(offers: &str) -> &'static str {
+    match offers {
+        CHANNEL_FILE_OFFERS_EVERYONE => CHANNEL_FILE_OFFERS_EVERYONE,
+        CHANNEL_FILE_OFFERS_FRIENDS => CHANNEL_FILE_OFFERS_FRIENDS,
+        _ => CHANNEL_FILE_OFFERS_NOBODY,
+    }
+}
+
+pub const ROOM_DM_POLICY_ASK: &str = "ask";
+pub const ROOM_DM_POLICY_ANYONE: &str = "anyone";
+pub const ROOM_DM_POLICY_OFF: &str = "off";
+
+fn default_room_dm_policy() -> String {
+    ROOM_DM_POLICY_ASK.to_string()
+}
+
+pub fn room_dm_policy_valid(policy: &str) -> bool {
+    [ROOM_DM_POLICY_ASK, ROOM_DM_POLICY_ANYONE, ROOM_DM_POLICY_OFF].contains(&policy)
+}
+
+/// Longest stored choice that may be a later build's.
+const LATER_CHOICE_MAX_LEN: usize = 32;
+
+/// Whether a stored choice this build may not offer still has the shape of
+/// one a later build could: a short lowercase word.
+fn later_choice_storable(choice: &str) -> bool {
+    !choice.is_empty()
+        && choice.len() <= LATER_CHOICE_MAX_LEN
+        && choice
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// Whether a stored `room_dm_policy` can be kept as read: one this build
+/// offers, or a short lowercase word a later build may offer. Anything else
+/// is damage, and is repaired to the default.
+pub fn room_dm_policy_storable(policy: &str) -> bool {
+    later_choice_storable(policy)
+}
+
+/// The policy `policy` acts as here: itself when this build offers it, and
+/// `"ask"` for one it does not, so a later build's choice neither opens
+/// private messages to anyone nor silently turns them off.
+pub fn room_dm_policy_in_force(policy: &str) -> &'static str {
+    match policy {
+        ROOM_DM_POLICY_ANYONE => ROOM_DM_POLICY_ANYONE,
+        ROOM_DM_POLICY_OFF => ROOM_DM_POLICY_OFF,
+        _ => ROOM_DM_POLICY_ASK,
+    }
+}
+
+/// A room member the user ignores.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IgnoredMember {
+    /// Their member key, lowercase hex.
+    pub pubkey: String,
+    /// What they were called when ignored, for the list in Settings.
+    #[serde(default)]
+    pub name: String,
+    /// The rooms they are ignored in; `None` for everywhere.
+    #[serde(default)]
+    pub rooms: Option<Vec<String>>,
+}
+
+impl IgnoredMember {
+    /// Whether this entry ignores them in `channel_id`.
+    pub fn covers(&self, channel_id: &str) -> bool {
+        self.rooms
+            .as_ref()
+            .is_none_or(|rooms| rooms.iter().any(|room| room.eq_ignore_ascii_case(channel_id)))
+    }
+}
+
+/// Absent or `null` stays `None`, the list not moved here yet. A list stays a
+/// list, keeping the entries this build can read; anything else reads as
+/// `None`, so the webview's own copy is moved here again.
+fn deserialize_ignored_members<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<IgnoredMember>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(serde_json::Value::Array(raw)) = Option::<serde_json::Value>::deserialize(deserializer)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        raw.into_iter()
+            .filter_map(|entry| serde_json::from_value(entry).ok())
+            .collect(),
+    ))
+}
+
 fn default_chat_attachment_auto_accept_mb() -> u64 {
     crate::network::ember::attach::ATTACH_AUTO_ACCEPT_DEFAULT_MB
 }
@@ -2350,6 +2651,27 @@ pub fn normalize_chat_disappear_secs(secs: u32) -> u32 {
         .iter()
         .copied()
         .min_by_key(|choice| choice.abs_diff(secs))
+        .unwrap_or(0)
+}
+
+/// The idle times, in minutes, after which friends see us Away. Off is 0.
+pub const AUTO_AWAY_CHOICES: [u32; 5] = [5, 10, 15, 30, 60];
+
+fn default_auto_away_minutes() -> u32 {
+    10
+}
+
+/// A stored idle time held to the offered choices, as
+/// [`normalize_chat_disappear_secs`] holds a timer: 0 stays off, anything
+/// else becomes the nearest choice.
+pub fn normalize_auto_away_minutes(minutes: u32) -> u32 {
+    if minutes == 0 {
+        return 0;
+    }
+    AUTO_AWAY_CHOICES
+        .iter()
+        .copied()
+        .min_by_key(|choice| choice.abs_diff(minutes))
         .unwrap_or(0)
 }
 
@@ -2408,6 +2730,48 @@ impl FriendOverrides {
         self.disappear_secs = self.disappear_secs.map(normalize_chat_disappear_secs);
         self
     }
+}
+
+/// What a friend shows while connected. Offline is not one of them: it is
+/// what having no session means, and nothing a friend sends can claim it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FriendStatus {
+    #[default]
+    Online,
+    Away,
+    Busy,
+}
+
+impl FriendStatus {
+    /// The byte `EMBER_EXT_STATUS` carries.
+    pub fn wire(self) -> u8 {
+        match self {
+            Self::Online => 0,
+            Self::Away => 1,
+            Self::Busy => 2,
+        }
+    }
+
+    /// A byte from a later build that this one has no name for is still a
+    /// friend who is connected, so it reads as online.
+    pub fn from_wire(byte: u8) -> Self {
+        match byte {
+            1 => Self::Away,
+            2 => Self::Busy,
+            _ => Self::Online,
+        }
+    }
+}
+
+/// Read leniently, so a status a later build wrote reads as online rather
+/// than failing the whole config.
+fn deserialize_friend_status<'de, D>(deserializer: D) -> Result<FriendStatus, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_default())
 }
 
 fn deserialize_friend_overrides<'de, D>(
@@ -2622,7 +2986,9 @@ impl Default for AppSettings {
 
         Self {
             nickname: format!("Ember-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+            nickname_site_tag: true,
             channel_username: String::new(),
+            channel_language: String::new(),
             shared_folders: vec![completed_dir],
             download_folder: download_dir,
             previous_download_folders: Vec::new(),
@@ -2668,6 +3034,8 @@ impl Default for AppSettings {
             max_connections_per_five_secs: 20,
             add_downloads_paused: false,
             remove_finished_downloads: false,
+            tag_completed_downloads: false,
+            tag_shared_imports: false,
             preview_priority_all: false,
             web_sources_enabled: true,
             preview_player: String::new(),
@@ -2695,8 +3063,12 @@ impl Default for AppSettings {
             friend_files_disabled: false,
             friend_session_encryption: true,
             channel_file_offers: default_channel_file_offers(),
+            room_dm_policy: default_room_dm_policy(),
+            ignored_members: None,
             chat_attachment_auto_accept_mb: default_chat_attachment_auto_accept_mb(),
             friend_overrides: std::collections::BTreeMap::new(),
+            friend_status: FriendStatus::Online,
+            auto_away_minutes: default_auto_away_minutes(),
             max_friends: default_max_friends(),
             rendezvous_url: default_rendezvous_url(),
             ember_native_enabled: true,
@@ -2707,6 +3079,7 @@ impl Default for AppSettings {
             max_relay_sessions: default_max_relay_sessions(),
             quic_shares_udp_port: true,
             close_to_tray_behavior: default_close_to_tray_behavior(),
+            minimize_to_tray: false,
             launch_maximized: false,
             silent_update_enabled: false,
             notifications_enabled: true,
@@ -2731,6 +3104,7 @@ impl Default for AppSettings {
             remember_window_position: true,
             watch_clipboard_links: false,
             low_disk_warning_mb: default_low_disk_warning_mb(),
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -2788,6 +3162,9 @@ pub struct TransferProgressPayload<'a> {
     pub up_part_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub up_part_count: Option<u32>,
+    /// Upload-direction only: see [`Transfer::up_part_fill`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub up_part_fill: Option<String>,
     /// Upload-direction only: see [`Transfer::up_peer_part_status`]. Carried on
     /// live progress events so the dark peer-has shading stays in sync between
     /// the 3 s polls.
@@ -2806,6 +3183,41 @@ pub struct TransferSourcesPayload<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// eMule users get the name and the site; a name that already names the
+    /// site, an empty one, or the switch off leaves it as typed. Another
+    /// Ember's tagged name reads back as the name alone.
+    #[test]
+    fn the_site_tag_follows_the_name_for_emule_and_comes_off_for_ember() {
+        assert_eq!(ed2k_nickname("Brady", true), "Brady [https://emberp2p.org]");
+        assert_eq!(ed2k_nickname("Brady  ", true), "Brady [https://emberp2p.org]");
+        assert_eq!(ed2k_nickname("Brady", false), "Brady");
+        assert_eq!(ed2k_nickname("", true), "", "no name is still sent as none");
+        assert_eq!(ed2k_nickname("Brady @ EmberP2P.org", true), "Brady @ EmberP2P.org");
+        assert_eq!(
+            ed2k_nickname("Brady [https://emberp2p.org]", true),
+            "Brady [https://emberp2p.org]",
+            "never twice"
+        );
+
+        assert_eq!(without_nickname_site_tag("Brady [https://emberp2p.org]"), "Brady");
+        assert_eq!(without_nickname_site_tag(&ed2k_nickname("Ana María", true)), "Ana María");
+        assert_eq!(without_nickname_site_tag("Brady"), "Brady");
+        assert_eq!(
+            without_nickname_site_tag("[https://emberp2p.org]"),
+            "[https://emberp2p.org]",
+            "a name that is only the tag keeps it"
+        );
+
+        let mut written_before = serde_json::to_value(AppSettings {
+            nickname_site_tag: false,
+            ..AppSettings::default()
+        })
+        .unwrap();
+        written_before.as_object_mut().unwrap().remove("nickname_site_tag");
+        let old: AppSettings = serde_json::from_value(written_before).unwrap();
+        assert!(old.nickname_site_tag, "on for a config written before the switch");
+    }
 
     #[test]
     fn a_friend_override_wins_over_the_global_setting_and_only_for_that_friend() {
@@ -3082,6 +3494,118 @@ mod tests {
         let parsed: AppSettings = serde_json::from_value(value)
             .expect("unknown keys must not fail AppSettings deserialize");
         assert!(!parsed.nickname.is_empty());
+        assert_eq!(
+            parsed.extra.get("future_setting_from_newer_build"),
+            Some(&serde_json::json!(true)),
+            "kept to be written back"
+        );
+    }
+
+    /// Only keys no field reads are kept aside, so a known one cannot be
+    /// written twice, and an alias is read as its field rather than kept
+    /// beside it. None of them reach the webview.
+    #[test]
+    fn only_keys_no_field_reads_are_kept_aside() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("launch_maximized");
+        object.insert("launch_fullscreen".into(), serde_json::json!(true));
+        object.insert("room_dm_policy".into(), serde_json::json!("off"));
+        object.insert("later_build_list".into(), serde_json::json!([1, 2]));
+
+        let parsed: AppSettings = serde_json::from_value(value).unwrap();
+        assert!(parsed.launch_maximized);
+        assert_eq!(parsed.room_dm_policy, "off");
+        assert_eq!(
+            parsed.extra.keys().collect::<Vec<_>>(),
+            ["later_build_list"],
+            "{:?}",
+            parsed.extra
+        );
+
+        let sent = serde_json::to_value(&parsed).unwrap();
+        assert!(sent.get("later_build_list").is_none());
+        assert!(sent.get("extra").is_none());
+    }
+
+    /// One unreadable entry costs that entry, not every setting. Whether the
+    /// list has been moved here yet survives reading.
+    #[test]
+    fn an_unreadable_ignored_member_is_dropped_without_failing_the_config() {
+        let good = "ab".repeat(32);
+        let mut value = serde_json::to_value(AppSettings {
+            room_dm_policy: ROOM_DM_POLICY_OFF.into(),
+            max_friends: 123,
+            ..AppSettings::default()
+        })
+        .unwrap();
+        value["ignored_members"] = serde_json::json!([
+            { "pubkey": good, "name": "Spam" },
+            { "name": "no key" },
+            { "pubkey": 7 },
+            "just a string",
+            { "pubkey": "cd".repeat(32), "rooms": "not a list" },
+            { "pubkey": "ef".repeat(32), "rooms": ["ab".repeat(16)], "later_field": 1 },
+        ]);
+        let parsed: AppSettings = serde_json::from_str(&value.to_string()).expect("config still loads");
+        assert_eq!(parsed.max_friends, 123, "every other setting still reads");
+        assert_eq!(parsed.room_dm_policy, ROOM_DM_POLICY_OFF);
+        let kept = parsed.ignored_members.expect("still a list");
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].pubkey, good);
+        assert_eq!(kept[0].name, "Spam");
+        assert_eq!(kept[1].rooms, Some(vec!["ab".repeat(16)]));
+
+        value["ignored_members"] = serde_json::json!([{ "name": "no key" }]);
+        let parsed: AppSettings = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.ignored_members, Some(Vec::new()), "a list that lost every entry");
+
+        for not_moved in [serde_json::Value::Null, serde_json::json!({ "a": 1 }), serde_json::json!(5)] {
+            value["ignored_members"] = not_moved;
+            let parsed: AppSettings = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(parsed.ignored_members, None);
+        }
+        value.as_object_mut().unwrap().remove("ignored_members");
+        let parsed: AppSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.ignored_members, None, "absent is not moved here yet");
+    }
+
+    /// A policy a later build offers acts as "ask": it neither opens private
+    /// messages to anyone nor turns them off.
+    #[test]
+    fn a_room_dm_policy_this_build_does_not_offer_acts_as_ask() {
+        assert_eq!(room_dm_policy_in_force(ROOM_DM_POLICY_OFF), ROOM_DM_POLICY_OFF);
+        assert_eq!(room_dm_policy_in_force(ROOM_DM_POLICY_ANYONE), ROOM_DM_POLICY_ANYONE);
+        assert_eq!(room_dm_policy_in_force(ROOM_DM_POLICY_ASK), ROOM_DM_POLICY_ASK);
+        assert_eq!(room_dm_policy_in_force("friends"), ROOM_DM_POLICY_ASK);
+        assert_eq!(room_dm_policy_in_force(""), ROOM_DM_POLICY_ASK);
+
+        assert!(room_dm_policy_storable("friends_only"));
+        assert!(room_dm_policy_storable(ROOM_DM_POLICY_OFF));
+        assert!(!room_dm_policy_storable(""));
+        assert!(!room_dm_policy_storable("Off"));
+        assert!(!room_dm_policy_storable("no way"));
+        assert!(!room_dm_policy_storable(&"a".repeat(33)));
+    }
+
+    /// A file-offer setting a later build offers lets nobody offer, rather
+    /// than anyone a narrower later choice would have kept out.
+    #[test]
+    fn a_channel_file_offers_value_this_build_does_not_offer_acts_as_nobody() {
+        for offered in [CHANNEL_FILE_OFFERS_EVERYONE, CHANNEL_FILE_OFFERS_FRIENDS, CHANNEL_FILE_OFFERS_NOBODY] {
+            assert!(channel_file_offers_valid(offered));
+            assert_eq!(channel_file_offers_in_force(offered), offered);
+        }
+        assert!(!channel_file_offers_valid("mutual_friends"));
+        assert_eq!(channel_file_offers_in_force("mutual_friends"), CHANNEL_FILE_OFFERS_NOBODY);
+        assert_eq!(channel_file_offers_in_force(""), CHANNEL_FILE_OFFERS_NOBODY);
+
+        assert!(channel_file_offers_storable("mutual_friends"));
+        assert!(channel_file_offers_storable(CHANNEL_FILE_OFFERS_EVERYONE));
+        assert!(!channel_file_offers_storable(""));
+        assert!(!channel_file_offers_storable("Friends"));
+        assert!(!channel_file_offers_storable("no one"));
+        assert!(!channel_file_offers_storable(&"a".repeat(33)));
     }
 
     /// A `config.json` written by the intermediate build stores the launch

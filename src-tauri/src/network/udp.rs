@@ -567,6 +567,11 @@ pub(super) async fn handle_udp_packet_inner(
                         idx.get_by_hash(&hash_hex)
                             .filter(|file| file.is_public_listable())
                             .map(|file| (file.size, Vec::new()))
+                            // A feed's list is served to anyone, unlisted.
+                            .or_else(|| {
+                                crate::sharing::feed_files::hidden_share(&file_hash)
+                                    .map(|share| (share.size, Vec::new()))
+                            })
                     }
                 };
                 let partial_candidate = if local_file.is_none()
@@ -578,6 +583,7 @@ pub(super) async fn handle_udp_packet_inner(
                         if t.direction != TransferDirection::Download
                             || t.file_hash != hash_hex
                             || t.friends_only
+                            || crate::sharing::feed_downloads::is_private(&t.id)
                             || matches!(
                                 t.status,
                                 TransferStatus::Completed | TransferStatus::Failed
@@ -2926,7 +2932,7 @@ pub(super) async fn handle_udp_packet_inner(
 
             if let Ok(permit) = state.firewall_connect_semaphore.clone().try_acquire_owned() {
                 let tcp_addr = SocketAddr::new(peer_ip.into(), peer_tcp_port);
-                let hello = fw_check_hello(state, &settings.nickname);
+                let hello = fw_check_hello(state, &settings.ed2k_nickname());
                 tokio::spawn(async move {
                     let _permit = permit;
                     let result = tokio::time::timeout(
@@ -3093,7 +3099,7 @@ pub(super) async fn handle_udp_packet_inner(
             if let Ok(permit) = state.firewall_connect_semaphore.clone().try_acquire_owned() {
                 let tcp_addr = SocketAddr::new(requester_ip.into(), peer_tcp_port);
                 let allow_obf = state.obfuscation_enabled && (connect_options & 0x01) != 0;
-                let hello = fw_check_hello(state, &settings.nickname);
+                let hello = fw_check_hello(state, &settings.ed2k_nickname());
                 tokio::spawn(async move {
                     let _permit = permit;
                     let connect_result = tokio::time::timeout(
@@ -3336,7 +3342,7 @@ pub(super) async fn handle_udp_packet_inner(
                 let mut mgr_clone = BuddyManager::new(
                     *state.buddy_manager.local_id(),
                     state.user_hash,
-                    settings.nickname.clone(),
+                    settings.ed2k_nickname(),
                     advertised_tcp_port(state),
                     advertised_udp_port(state),
                     state.pending_buddy_hashes.clone(),

@@ -485,6 +485,8 @@ pub(in crate::network) async fn on_source_retry_tick(
     // network gate below. A newly added link or one restored at launch starts
     // within a tick, and one whose mirror is resting after a failure starts
     // again once the rest is over. A download already running is left alone.
+    // A feed's download with its publisher's stream registered starts the
+    // same way.
     {
         let web_candidates: Vec<String> = state
             .pending_downloads
@@ -496,8 +498,9 @@ pub(in crate::network) async fn on_source_retry_tick(
                     .get(*tid)
                     .is_some_and(|h| !h.is_finished())
             })
-            .filter(|(_, pd)| {
+            .filter(|(tid, pd)| {
                 parse_ed2k_hash16(&pd.file_hash).is_some_and(|h| ed2k::web_sources::has_ready(&h))
+                    || crate::network::feed_direct::stream_ready(tid)
             })
             .map(|(tid, _)| tid.clone())
             .collect();
@@ -924,7 +927,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                 sources: download_sources,
                 download_folders: state.download_folders.clone(),
                 user_hash: state.user_hash,
-                nickname: settings.nickname.clone(),
+                nickname: state.shared_nickname.clone(),
                 tcp_port: advertised_tcp_port(state),
                 udp_port: advertised_udp_port(state),
                 bandwidth_limiter: bandwidth_limiter.clone(),
@@ -1160,7 +1163,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                 sources: download_sources,
                 download_folders: state.download_folders.clone(),
                 user_hash: state.user_hash,
-                nickname: settings.nickname.clone(),
+                nickname: state.shared_nickname.clone(),
                 tcp_port: advertised_tcp_port(state),
                 udp_port: advertised_udp_port(state),
                 bandwidth_limiter: bandwidth_limiter.clone(),

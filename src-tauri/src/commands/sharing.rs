@@ -9,6 +9,7 @@ use tauri_plugin_dialog::DialogExt;
 
 use tokio::sync::RwLock;
 
+use crate::sharing::name_tag::{tagged_name as ember_tagged_name, EMBER_NAME_TAG};
 use crate::storage::share_intent::UnshareOrigin;
 
 /// How long a claim keeps other passes off a path. Comfortably longer than
@@ -1021,12 +1022,6 @@ async fn forget_gone_paths(state: &AppState, paths: Vec<String>) {
     }
 }
 
-/// Files in the library were moved by Ember, each from `.0` to `.1`, as a
-/// finished download's is when its category changes: each row follows its
-/// file, keeping everything but where it is, so nothing is hashed again and
-/// uploads, which look the path up by hash, find it there. known.met forgets
-/// the old paths and learns the new ones at the reconcile, which sees a known
-/// hash at a path it has no record of. Best effort, after the moves happened.
 /// One file Ember moved: from where, to where, and the content hash it was
 /// moved as (empty when it had none), which is what the bookkeeping after it
 /// matches on as well as the path.
@@ -1036,25 +1031,62 @@ pub(crate) struct FileMove {
     pub hash: String,
 }
 
+/// Whether the Library's row at `mv.from` is the file `mv` moved. The hash as
+/// well as the path: the old name is free once the file has left it, and a
+/// download finishing under that name in between has its own row there, which
+/// is not this file's to take over.
+fn row_moved_with(row: &FileInfo, mv: &FileMove) -> bool {
+    mv.hash.is_empty() || row.hash.eq_ignore_ascii_case(&mv.hash)
+}
+
+/// Files in the library were moved by Ember, each from `.0` to `.1`, as a
+/// finished download's is when its category changes: each row follows its
+/// file, keeping everything but where it is, so nothing is hashed again and
+/// uploads, which look the path up by hash, find it there. known.met forgets
+/// the old paths and learns the new ones at the reconcile, which sees a known
+/// hash at a path it has no record of. Best effort, after the moves happened.
+///
+/// The partly shared folders' lists are brought along before the rows, since
+/// discovery walks those lists and nothing else: a reload in between would
+/// drop a row whose new path they do not name yet. When they cannot be saved
+/// the rows are moved all the same, and the coded error is returned for the
+/// caller to report: those files leave the Library at the next reload.
+#[must_use]
 pub(crate) async fn relocate_library_files(
     app: &tauri::AppHandle,
     state: &AppState,
     moves: &[FileMove],
-) {
+) -> Option<String> {
     if moves.is_empty() {
-        return;
+        return None;
+    }
+    let listed_moves: Vec<(String, String, bool)> = {
+        let index = state.local_index.read().await;
+        moves
+            .iter()
+            .filter_map(|mv| {
+                let row = index.get_by_path(&mv.from).filter(|row| row_moved_with(row, mv))?;
+                Some((mv.from.clone(), mv.to.to_string_lossy().into_owned(), row.shared))
+            })
+            .collect()
+    };
+    let mut lists_error = None;
+    if !listed_moves.is_empty() {
+        if let Err(e) = edit_folder_lists(state, |allowlists, withheld| {
+            relocate_folder_list_entries(allowlists, withheld, &listed_moves)
+        })
+        .await
+        {
+            warn!("Could not move renamed files' entries in partly shared folders: {e}");
+            lists_error = Some(e);
+        }
     }
     let mut renamed: HashMap<String, String> = HashMap::new();
     {
         let mut index = state.local_index.write().await;
         let mut rows = Vec::new();
         for mv in moves {
-            // The hash as well as the path: the old name is free once the file
-            // has left it, and a download finishing under that name in between
-            // has its own row there, which is not this file's to take over.
-            let ours = index
-                .get_by_path(&mv.from)
-                .is_some_and(|row| mv.hash.is_empty() || row.hash.eq_ignore_ascii_case(&mv.hash));
+            let ours = index.get_by_path(&mv.from).is_some_and(|row| row_moved_with(row, mv));
             if !ours {
                 continue;
             }
@@ -1105,6 +1137,110 @@ pub(crate) async fn relocate_library_files(
         "shared-files-changed",
         serde_json::json!({ "phase": "moved", "count": moves.len() }),
     );
+    lists_error
+}
+
+/// The innermost partly shared folder of `allowlists` that holds `path`, as
+/// [`crate::sharing::indexer::AllowlistOffers::offers`] picks it.
+fn innermost_listed_folder<'a>(
+    allowlists: &'a std::collections::HashMap<String, Vec<String>>,
+    path: &str,
+) -> Option<&'a str> {
+    allowlists
+        .keys()
+        .filter(|folder| crate::security::path_within_dir(path, folder))
+        .max_by_key(|folder| folder.len())
+        .map(String::as_str)
+}
+
+/// Point the partly shared folders' lists at files that moved, each `(from,
+/// to, shared)`: an entry naming the old path goes, and the new path is listed
+/// the way the old one was (offered, or withheld) when a partly shared folder
+/// holds it and does not cover it already. A file that leaves for a folder
+/// shared whole, or for none, is left to that folder's own rules; one that
+/// arrives from such a folder is listed as offered if it was shared. Returns
+/// whether anything changed.
+///
+/// The moves are taken in order, each against the lists as the ones before it
+/// left them, so a file moved twice in one call ends up listed once, the way
+/// it was at the start. The lists are walked once, not once per move: a call
+/// can carry thousands of moves over lists of thousands of entries.
+fn relocate_folder_list_entries(
+    allowlists: &mut std::collections::HashMap<String, Vec<String>>,
+    withheld: &mut std::collections::HashMap<String, Vec<String>>,
+    moves: &[(String, String, bool)],
+) -> bool {
+    use crate::search::index::normalize_path_key;
+    let as_sets = |lists: &std::collections::HashMap<String, Vec<String>>| -> HashMap<String, HashSet<String>> {
+        lists
+            .iter()
+            .map(|(folder, entries)| (folder.clone(), entries.iter().cloned().collect()))
+            .collect()
+    };
+    let mut offered_now = as_sets(allowlists);
+    let mut withheld_now = as_sets(withheld);
+    // By the folder a path is in, which is enough: a moved path is a file,
+    // never a listed folder itself, and the moves of one call come from and
+    // go to few folders.
+    let mut innermost_by_parent: HashMap<String, Option<String>> = HashMap::new();
+    let mut innermost = |path: &str| -> Option<String> {
+        let parent = std::path::Path::new(path)
+            .parent()
+            .map(|dir| normalize_path_key(&dir.to_string_lossy()))
+            .unwrap_or_default();
+        innermost_by_parent
+            .entry(parent)
+            .or_insert_with(|| innermost_listed_folder(allowlists, path).map(str::to_string))
+            .clone()
+    };
+    let mut gone: HashSet<String> = HashSet::new();
+    let mut added: Vec<(bool, String, String)> = Vec::new();
+    for (from, to, shared) in moves {
+        let from_key = normalize_path_key(from);
+        let to_key = normalize_path_key(to);
+        if from_key == to_key {
+            continue;
+        }
+        let offered = match innermost(from) {
+            Some(folder) => allowlist_permits(&offered_now[&folder], &from_key),
+            None => *shared,
+        };
+        for entries in offered_now.values_mut().chain(withheld_now.values_mut()) {
+            entries.remove(&from_key);
+        }
+        gone.insert(from_key);
+        let Some(folder) = innermost(to) else {
+            continue;
+        };
+        if allowlist_permits(&offered_now[&folder], &to_key) {
+            continue;
+        }
+        let now = if offered { &mut offered_now } else { &mut withheld_now };
+        if now.entry(folder.clone()).or_default().insert(to_key.clone()) {
+            added.push((offered, folder, to_key));
+        }
+    }
+    let mut changed = false;
+    for entries in allowlists.values_mut().chain(withheld.values_mut()) {
+        let before = entries.len();
+        entries.retain(|entry| !gone.contains(entry));
+        changed |= entries.len() != before;
+    }
+    for (offered, folder, key) in added {
+        let (now, lists) = if offered {
+            (&mut offered_now, &mut *allowlists)
+        } else {
+            (&mut withheld_now, &mut *withheld)
+        };
+        // Taken out of the set as it is written, so a path added, moved on
+        // and added again is written once; one a later move took away is not
+        // in the set at all.
+        if now.get_mut(&folder).is_some_and(|entries| entries.remove(&key)) {
+            lists.entry(folder).or_default().push(key);
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// The most files one [`move_files_to_category`] call moves: a selection in
@@ -1123,6 +1259,9 @@ pub struct CategoryMoveReport {
     recategorized: u32,
     /// One coded error per file that stayed where it was.
     failed: Vec<String>,
+    /// Coded errors about the move as a whole rather than any one file: the
+    /// partly shared folders' lists could not follow the files that moved.
+    warnings: Vec<String>,
 }
 
 /// Move Library files into the folder `category` names inside the `Downloads`
@@ -1223,10 +1362,11 @@ pub async fn move_files_to_category(
         }
     }
     let mut recategorized = 0usize;
+    let mut warnings = Vec::new();
     if !moves.is_empty() {
         recategorized +=
             crate::commands::transfers::follow_moved_finished_downloads(&state, &moves, &category).await;
-        relocate_library_files(&app, &state, &moves).await;
+        warnings.extend(relocate_library_files(&app, &state, &moves).await);
         info!("Moved {} library file(s) into the {category:?} category's folder", moves.len());
     }
     // Already in the category's folder: nothing to move, but a finished
@@ -1240,12 +1380,153 @@ pub async fn move_files_to_category(
         unchanged: u32::try_from(stayed.len()).unwrap_or(u32::MAX),
         recategorized: u32::try_from(recategorized).unwrap_or(u32::MAX),
         failed,
+        warnings,
     })
+}
+
+/// `name` if it is already a valid file name. One that would have to be
+/// altered to be safe (a separator, a reserved character) is refused rather
+/// than quietly turned into a different name.
+fn checked_file_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.len() > 255 {
+        return Err(coded_ctx("sharing_rename_invalid_name", "Enter a valid file name", trimmed));
+    }
+    let sanitized = crate::security::sanitize_filename(trimmed);
+    if sanitized != trimmed {
+        return Err(coded_ctx(
+            "sharing_rename_invalid_name",
+            "Enter a valid file name",
+            trimmed,
+        ));
+    }
+    Ok(sanitized)
+}
+
+/// Why [`rename_in_place`] left a file as it was: the coded error, and whether
+/// the same rename may well work on a later try.
+struct RenameFailure {
+    error: String,
+    transient: bool,
+}
+
+impl RenameFailure {
+    fn lasting(error: String) -> Self {
+        Self { error, transient: false }
+    }
+
+    fn io(code: &'static str, message: &'static str, e: std::io::Error) -> Self {
+        let transient = rename_error_is_transient(&e);
+        Self { error: coded_ctx(code, message, e), transient }
+    }
+}
+
+impl From<RenameFailure> for String {
+    fn from(failure: RenameFailure) -> Self {
+        failure.error
+    }
+}
+
+/// Whether a rename failed for a reason another program or a passing moment
+/// is behind: the file is open elsewhere (Windows' sharing and lock
+/// violations), access was refused, or it was not there when looked for.
+fn rename_error_is_transient(e: &std::io::Error) -> bool {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::ResourceBusy
+    ) || (cfg!(windows)
+        && matches!(e.raw_os_error(), Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)))
+}
+
+/// Rename the file at `indexed_path` to `new_name` inside its own folder, on
+/// the blocking pool. Never replaces another file. Returns the new path.
+fn rename_in_place(
+    indexed_path: &str,
+    new_name: &str,
+    allowed_dirs: &[String],
+) -> Result<std::path::PathBuf, RenameFailure> {
+    let (canonical, opened) = crate::security::filesystem::open_existing_approved(
+        std::path::Path::new(indexed_path),
+        allowed_dirs,
+        false,
+    )
+    .map_err(|e| RenameFailure::io("sharing_invalid_path", "Invalid or changed path", e))?;
+    let identity = crate::security::filesystem::opened_file_identity(&opened)
+        .map_err(|e| RenameFailure::io("sharing_invalid_path", "Invalid or changed path", e))?;
+    // Released before the rename: Windows will not rename a file this
+    // call still holds open.
+    drop(opened);
+    let parent = canonical
+        .parent()
+        .ok_or_else(|| RenameFailure::lasting(coded("sharing_invalid_path", "Invalid or changed path")))?;
+    let destination = parent.join(new_name);
+    let taken = std::fs::symlink_metadata(&destination);
+    if let Ok(taken) = taken {
+        // Only a change of capitals on a case-insensitive file system
+        // lands here legitimately: the name "taken" is this very file.
+        // Not a link to it (canonicalize would follow one, and the
+        // rename below would then replace the link), and resolved on
+        // both sides, since the index may spell the name in other
+        // capitals than the disk does.
+        let same_file = !taken.file_type().is_symlink()
+            && std::fs::canonicalize(&destination)
+                .ok()
+                .zip(std::fs::canonicalize(&canonical).ok())
+                .is_some_and(|(a, b)| a == b)
+            && destination
+                .file_name()
+                .zip(canonical.file_name())
+                .is_some_and(|(a, b)| {
+                    a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+                });
+        if !same_file {
+            return Err(RenameFailure::lasting(coded_ctx(
+                "sharing_rename_exists",
+                "A file with that name already exists",
+                new_name,
+            )));
+        }
+        std::fs::rename(&canonical, &destination)
+            .map_err(|e| RenameFailure::io("sharing_rename_failed", "The file could not be renamed", e))?;
+        return Ok(destination);
+    }
+    crate::security::filesystem::rename_approved_no_replace(
+        &canonical,
+        &destination,
+        allowed_dirs,
+        &identity,
+    )
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            RenameFailure::lasting(coded_ctx(
+                "sharing_rename_exists",
+                "A file with that name already exists",
+                new_name,
+            ))
+        } else {
+            RenameFailure::io("sharing_rename_failed", "The file could not be renamed", e)
+        }
+    })
+}
+
+/// What [`rename_library_file`] did.
+#[derive(serde::Serialize)]
+pub struct RenameReport {
+    /// The file's path now.
+    path: String,
+    /// A coded error when the file was renamed but the partly shared
+    /// folders' lists could not follow it: it leaves the Library at the next
+    /// reload.
+    warning: Option<String>,
 }
 
 /// Rename a Library file in place, keeping it in its folder. The row follows
 /// the file as it does for a category move, so nothing is hashed again and
-/// peers and uploads find it under the new name. Returns the file's new path.
+/// peers and uploads find it under the new name.
 ///
 /// The name must already be a valid file name: one that would have to be
 /// altered to be safe (a separator, a reserved character) is refused rather
@@ -1257,7 +1538,7 @@ pub async fn rename_library_file(
     state: tauri::State<'_, AppState>,
     file_path: String,
     new_name: String,
-) -> Result<String, String> {
+) -> Result<RenameReport, String> {
     if file_path.len() > MAX_PATH_LEN {
         return Err(coded_ctx(
             "sharing_file_path_too_long",
@@ -1265,18 +1546,7 @@ pub async fn rename_library_file(
             MAX_PATH_LEN,
         ));
     }
-    let trimmed = new_name.trim();
-    if trimmed.is_empty() || trimmed.len() > 255 {
-        return Err(coded("sharing_rename_invalid_name", "Enter a valid file name"));
-    }
-    let sanitized = crate::security::sanitize_filename(trimmed);
-    if sanitized != trimmed {
-        return Err(coded_ctx(
-            "sharing_rename_invalid_name",
-            "Enter a valid file name",
-            trimmed,
-        ));
-    }
+    let sanitized = checked_file_name(&new_name)?;
 
     let (indexed_path, old_name, hash) = {
         let index = state.local_index.read().await;
@@ -1296,7 +1566,7 @@ pub async fn rename_library_file(
         ));
     }
     if old_name == sanitized {
-        return Ok(indexed_path);
+        return Ok(RenameReport { path: indexed_path, warning: None });
     }
     let allowed_dirs = {
         let config = state.config.read().await;
@@ -1306,70 +1576,7 @@ pub async fn rename_library_file(
     let new_path = tokio::task::spawn_blocking({
         let indexed_path = indexed_path.clone();
         let sanitized = sanitized.clone();
-        move || -> Result<std::path::PathBuf, String> {
-            let (canonical, opened) = crate::security::filesystem::open_existing_approved(
-                std::path::Path::new(&indexed_path),
-                &allowed_dirs,
-                false,
-            )
-            .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid or changed path", e))?;
-            let identity = crate::security::filesystem::opened_file_identity(&opened)
-                .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid or changed path", e))?;
-            // Released before the rename: Windows will not rename a file this
-            // call still holds open.
-            drop(opened);
-            let parent = canonical
-                .parent()
-                .ok_or_else(|| coded("sharing_invalid_path", "Invalid or changed path"))?;
-            let destination = parent.join(&sanitized);
-            let taken = std::fs::symlink_metadata(&destination);
-            if let Ok(taken) = taken {
-                // Only a change of capitals on a case-insensitive file system
-                // lands here legitimately: the name "taken" is this very file.
-                // Not a link to it (canonicalize would follow one, and the
-                // rename below would then replace the link), and resolved on
-                // both sides, since the index may spell the name in other
-                // capitals than the disk does.
-                let same_file = !taken.file_type().is_symlink()
-                    && std::fs::canonicalize(&destination)
-                        .ok()
-                        .zip(std::fs::canonicalize(&canonical).ok())
-                        .is_some_and(|(a, b)| a == b)
-                    && destination
-                        .file_name()
-                        .zip(canonical.file_name())
-                        .is_some_and(|(a, b)| {
-                            a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
-                        });
-                if !same_file {
-                    return Err(coded_ctx(
-                        "sharing_rename_exists",
-                        "A file with that name already exists",
-                        &sanitized,
-                    ));
-                }
-                std::fs::rename(&canonical, &destination)
-                    .map_err(|e| coded_ctx("sharing_rename_failed", "The file could not be renamed", e))?;
-                return Ok(destination);
-            }
-            crate::security::filesystem::rename_approved_no_replace(
-                &canonical,
-                &destination,
-                &allowed_dirs,
-                &identity,
-            )
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    coded_ctx(
-                        "sharing_rename_exists",
-                        "A file with that name already exists",
-                        &sanitized,
-                    )
-                } else {
-                    coded_ctx("sharing_rename_failed", "The file could not be renamed", e)
-                }
-            })
-        }
+        move || rename_in_place(&indexed_path, &sanitized, &allowed_dirs)
     })
     .await
     .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))??;
@@ -1380,9 +1587,713 @@ pub async fn rename_library_file(
         hash,
     };
     crate::commands::transfers::follow_renamed_finished_download(&state, &mv).await;
-    relocate_library_files(&app, &state, std::slice::from_ref(&mv)).await;
+    let warning = relocate_library_files(&app, &state, std::slice::from_ref(&mv)).await;
     info!("Renamed library file {old_name:?} to {sanitized:?}");
-    Ok(new_path.to_string_lossy().into_owned())
+    Ok(RenameReport { path: new_path.to_string_lossy().into_owned(), warning })
+}
+
+/// The most files one [`tag_library_files`] call renames, as for a category
+/// move: a selection in the Library.
+const MAX_TAG_PATHS: usize = 5_000;
+
+/// One file [`tag_library_files`] renamed.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct TaggedFile {
+    from: String,
+    to: String,
+}
+
+/// What [`tag_library_files`] did.
+#[derive(serde::Serialize)]
+pub struct TagReport {
+    /// Files renamed, old path to new, so the caller can follow its selection.
+    renamed: Vec<TaggedFile>,
+    /// Files that already had the tag (adding) or never had it (removing).
+    unchanged: u32,
+    /// One coded error per file that kept its name.
+    failed: Vec<String>,
+    /// Coded errors about the renames as a whole rather than any one file:
+    /// the partly shared folders' lists could not follow the files renamed.
+    warnings: Vec<String>,
+    /// Paths among `failed` whose rename may work on a later try.
+    #[serde(skip)]
+    retry: Vec<String>,
+}
+
+/// Add `[Ember-P2P] ` to the start of each Library file's name, or with `add`
+/// false take it off, in place. Each file is renamed as [`rename_library_file`]
+/// renames one: nothing is hashed again, an existing file is never replaced,
+/// and a file that cannot be renamed keeps its name and is reported.
+#[tauri::command]
+pub async fn tag_library_files(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    paths: Vec<String>,
+    add: bool,
+) -> Result<TagReport, String> {
+    check_path_batch(&paths, MAX_TAG_PATHS)?;
+    tag_paths(&app, &state, paths, add).await
+}
+
+/// Put back the names a [`tag_library_files`] call changed, each file at `to`
+/// renamed to the name it had at `from`, exactly as it was. Only within its
+/// own folder, and checked and recorded as the tag's own renames are.
+#[tauri::command]
+pub async fn restore_library_file_names(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    renames: Vec<TaggedFile>,
+) -> Result<TagReport, String> {
+    let paths: Vec<String> = renames
+        .iter()
+        .flat_map(|rename| [rename.from.clone(), rename.to.clone()])
+        .collect();
+    check_path_batch(&paths, MAX_TAG_PATHS * 2)?;
+    let mut failed = Vec::new();
+    let mut unchanged = 0u32;
+    let mut retry = Vec::new();
+    let mut candidates = Vec::new();
+    {
+        let index = state.local_index.read().await;
+        let mut seen = HashSet::new();
+        for rename in renames {
+            if !seen.insert(crate::search::index::normalize_path_key(&rename.to)) {
+                continue;
+            }
+            let Some(row) = index.get_by_path(&rename.to) else {
+                failed.push(coded_ctx(
+                    "sharing_file_not_in_index",
+                    "File is not in the shared-file index",
+                    &rename.to,
+                ));
+                retry.push(rename.to);
+                continue;
+            };
+            if row.hash.is_empty() {
+                failed.push(coded_ctx(
+                    "sharing_rename_not_hashed",
+                    "The file is still being hashed",
+                    &row.name,
+                ));
+                continue;
+            }
+            match restored_file_name(&rename.from, &row.path) {
+                Ok(name) if name == row.name => unchanged += 1,
+                Ok(name) => candidates.push((row.path.clone(), name, row.hash.clone())),
+                Err(e) => failed.push(e),
+            }
+        }
+    }
+    let (moves, warning) = rename_library_paths(&app, &state, candidates, &mut failed, &mut retry).await?;
+    if !moves.is_empty() {
+        info!("Put back the names of {} library file(s)", moves.len());
+    }
+    Ok(tag_report(moves, unchanged, failed, warning, retry))
+}
+
+/// The name the file now at `current` had at `original`, when that is a name
+/// in the same folder that can be given back as it was: not trimmed or
+/// otherwise altered, as [`checked_file_name`] would alter a typed one.
+fn restored_file_name(original: &str, current: &str) -> Result<String, String> {
+    let original_path = std::path::Path::new(original);
+    let same_folder = original_path
+        .parent()
+        .zip(std::path::Path::new(current).parent())
+        .is_some_and(|(a, b)| {
+            crate::search::index::normalize_path_key(&a.to_string_lossy())
+                == crate::search::index::normalize_path_key(&b.to_string_lossy())
+        });
+    let name = original_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !same_folder
+        || name.trim().is_empty()
+        || name.len() > 255
+        || crate::security::sanitize_filename(&name) != name
+    {
+        return Err(coded_ctx("sharing_rename_invalid_name", "Enter a valid file name", name));
+    }
+    Ok(name)
+}
+
+fn tag_report(
+    moves: Vec<FileMove>,
+    unchanged: u32,
+    failed: Vec<String>,
+    warning: Option<String>,
+    retry: Vec<String>,
+) -> TagReport {
+    TagReport {
+        renamed: moves
+            .into_iter()
+            .map(|mv| TaggedFile { from: mv.from, to: mv.to.to_string_lossy().into_owned() })
+            .collect(),
+        unchanged,
+        failed,
+        warnings: warning.into_iter().collect(),
+        retry,
+    }
+}
+
+/// [`tag_library_files`] without the batch check, for callers inside the app.
+pub(crate) async fn tag_paths(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    paths: Vec<String>,
+    add: bool,
+) -> Result<TagReport, String> {
+    let mut failed = Vec::new();
+    let mut unchanged = 0u32;
+    let mut retry = Vec::new();
+    let mut candidates = Vec::new();
+    {
+        let index = state.local_index.read().await;
+        let mut seen = HashSet::new();
+        for path in paths {
+            if !seen.insert(crate::search::index::normalize_path_key(&path)) {
+                continue;
+            }
+            let Some(row) = index.get_by_path(&path) else {
+                failed.push(coded_ctx(
+                    "sharing_file_not_in_index",
+                    "File is not in the shared-file index",
+                    &path,
+                ));
+                retry.push(path);
+                continue;
+            };
+            if row.hash.is_empty() {
+                failed.push(coded_ctx(
+                    "sharing_rename_not_hashed",
+                    "The file is still being hashed",
+                    &row.name,
+                ));
+                continue;
+            }
+            let Some(new_name) = ember_tagged_name(&row.name, add) else {
+                unchanged += 1;
+                continue;
+            };
+            match checked_file_name(&new_name) {
+                Ok(new_name) => candidates.push((row.path.clone(), new_name, row.hash.clone())),
+                Err(e) => failed.push(e),
+            }
+        }
+    }
+    let (moves, warning) = rename_library_paths(app, state, candidates, &mut failed, &mut retry).await?;
+    if !moves.is_empty() {
+        info!(
+            "{} {EMBER_NAME_TAG} on {} library file(s)",
+            if add { "Added" } else { "Removed" },
+            moves.len()
+        );
+    }
+    Ok(tag_report(moves, unchanged, failed, warning, retry))
+}
+
+/// Rename each Library file of `candidates`, `(path, new name, hash)`, in its
+/// own folder, and bring the Library, the transfer list and the tag's record
+/// along. Failures go to `failed`, and the paths of those that may pass on a
+/// later try to `retry` as well. Returns the moves made, and the coded error
+/// when the partly shared folders' lists could not follow them.
+async fn rename_library_paths(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    candidates: Vec<(String, String, String)>,
+    failed: &mut Vec<String>,
+    retry: &mut Vec<String>,
+) -> Result<(Vec<FileMove>, Option<String>), String> {
+    if candidates.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    let allowed_dirs = {
+        let config = state.config.read().await;
+        shared_access_dirs(&config)
+    };
+    let outcome = tokio::task::spawn_blocking(move || {
+        candidates
+            .into_iter()
+            .map(|(path, new_name, hash)| {
+                let result = rename_in_place(&path, &new_name, &allowed_dirs);
+                (path, hash, result)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))?;
+
+    let mut moves = Vec::new();
+    for (path, hash, result) in outcome {
+        match result {
+            Ok(to) => moves.push(FileMove { from: path, to, hash }),
+            Err(failure) => {
+                if failure.transient {
+                    retry.push(path);
+                }
+                failed.push(failure.error);
+            }
+        }
+    }
+    for mv in &moves {
+        crate::commands::transfers::follow_renamed_finished_download(state, mv).await;
+    }
+    let warning = relocate_library_files(app, state, &moves).await;
+    if !moves.is_empty() {
+        // Decided about now, by hand or by the import pass, so the pass never
+        // puts back a tag the user took off: not before it reached the file,
+        // not after an Undo, not after the file is edited.
+        let decided: Vec<String> = moves
+            .iter()
+            .flat_map(|mv| {
+                [
+                    mv.hash.to_ascii_lowercase(),
+                    name_tag_seen_path(&mv.from),
+                    name_tag_seen_path(&mv.to.to_string_lossy()),
+                ]
+            })
+            .collect();
+        let db = state.db.clone();
+        match tokio::task::spawn_blocking(move || db.mark_name_tag_seen(&decided)).await {
+            Ok(Ok(())) => {
+                NAME_TAG_SEEN_GENERATION.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(Err(e)) => warn!("Could not record renamed files for the {EMBER_NAME_TAG} tag: {e}"),
+            Err(e) => warn!("Could not record renamed files for the {EMBER_NAME_TAG} tag: {e}"),
+        }
+    }
+    Ok((moves, warning))
+}
+
+/// How often the Library looks for files new to a shared folder to tag.
+pub(crate) const IMPORT_TAG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Files tagged in one pass at most. A large folder just shared is worked
+/// through over several passes rather than in one burst of renames.
+const MAX_IMPORT_TAGS_PER_PASS: usize = 500;
+
+/// Whether the normalized path `key` is inside the normalized folder `dir`.
+fn key_is_under(key: &str, dir: &str) -> bool {
+    let dir = dir.trim_end_matches(['/', '\\']);
+    key.strip_prefix(dir)
+        .is_some_and(|rest| rest.starts_with(['/', '\\']))
+}
+
+/// The `name_tag_seen` row that says the files already in the Library were
+/// recorded when `tag_shared_imports` was last turned on.
+const NAME_TAG_SEEDED: &str = "seeded";
+
+/// Bumped whenever `name_tag_seen` is reseeded or reset, so a copy of it
+/// read before is known to be stale.
+static NAME_TAG_SEEN_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The tagging loop's copy of `name_tag_seen`, with the generation it was
+/// read at.
+pub(crate) type NameTagSeenCache = Option<(u64, HashSet<String>)>;
+
+/// Prefix of the `name_tag_seen` entry holding when `tag_shared_imports` was
+/// last turned on, in Unix seconds. Each time adds one; the newest stands.
+const NAME_TAG_SEEDED_AT: &str = "seeded_at:";
+
+/// The `name_tag_seen` entry for a file's path: it was already there when the
+/// setting was turned on, or has been decided about since. An edit hashes the
+/// file again at the same path, and must not make it new.
+fn name_tag_seen_path(path: &str) -> String {
+    format!("path:{}", crate::search::index::normalize_path_key(path))
+}
+
+/// When `tag_shared_imports` was last turned on, from `seen`.
+fn name_tag_seeded_at(seen: &HashSet<String>) -> Option<i64> {
+    seen.iter()
+        .filter_map(|entry| entry.strip_prefix(NAME_TAG_SEEDED_AT)?.parse::<i64>().ok())
+        .max()
+}
+
+/// Whether the file at `path` may be tagged on its own as new: it came into
+/// being at or after `since`, and Windows does not mark it hidden (the name's
+/// leading dot, checked by `may_auto_tag`, is the only mark elsewhere).
+///
+/// "Came into being" is its creation time, or its modification time where the
+/// platform keeps no creation time. A copy or a download into a shared folder
+/// is created then; a file that was already there was not, however late the
+/// Library listed it. Unreadable counts as not new. Blocking.
+fn appeared_since(path: &str, since: i64) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        if meta.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0 {
+            return false;
+        }
+    }
+    meta.created()
+        .or_else(|_| meta.modified())
+        .ok()
+        .and_then(|when| when.duration_since(std::time::UNIX_EPOCH).ok())
+        .is_some_and(|age| i64::try_from(age.as_secs()).is_ok_and(|secs| secs >= since))
+}
+
+/// The innermost of `roots` that holds `path`.
+fn innermost_root<'a>(roots: &'a [String], path: &str) -> Option<&'a str> {
+    roots
+        .iter()
+        .filter(|root| crate::security::path_within_dir(path, root))
+        .max_by_key(|root| root.len())
+        .map(String::as_str)
+}
+
+/// Whether a folder between the shared folder `root` and the file at `path`
+/// keeps the file from being tagged on its own: one below `root` that is
+/// dot-named, or that Windows marks hidden, or one at or below `root` that
+/// holds a `.git`, whose files a repository tracks by name. A folder that
+/// cannot be read keeps it too. Blocking.
+fn in_hidden_or_repository_folder(path: &std::path::Path, root: &str) -> bool {
+    let mut folder = path.parent();
+    while let Some(dir) = folder {
+        let dir_str = dir.to_string_lossy();
+        if !crate::security::path_within_dir(&dir_str, root) {
+            return true;
+        }
+        if std::fs::symlink_metadata(dir.join(".git")).is_ok() {
+            return true;
+        }
+        if crate::security::path_within_dir(root, &dir_str) {
+            return false;
+        }
+        if dir.file_name().is_some_and(|name| name.to_string_lossy().starts_with('.')) {
+            return true;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(dir) else {
+            return true;
+        };
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+            if meta.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0 {
+                return true;
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = meta;
+        folder = dir.parent();
+    }
+    true
+}
+
+/// Whether the file at `path` sits in a disc's folder structure (see
+/// [`crate::sharing::name_tag::is_disc_structure_folder`]): one at or below
+/// the shared folder `root` that holds it.
+fn in_disc_structure_folder(path: &std::path::Path, root: &str) -> bool {
+    path.ancestors()
+        .skip(1)
+        .take_while(|dir| crate::security::path_within_dir(&dir.to_string_lossy(), root))
+        .any(|dir| {
+            dir.file_name()
+                .is_some_and(|name| crate::sharing::name_tag::is_disc_structure_folder(&name.to_string_lossy()))
+        })
+}
+
+/// Folder listings for [`has_companion_files`], each taken once and kept for
+/// the pass; `None` for a folder that could not be listed.
+type FolderListings = HashMap<std::path::PathBuf, Option<crate::sharing::name_tag::FolderNames>>;
+
+/// Whether another file in the folder of `path` finds it by name or is found
+/// by it (see [`crate::sharing::name_tag::FolderNames::has_companion`]).
+/// Subfolders are not among them. A folder that cannot be listed counts as
+/// holding companions. Blocking.
+fn has_companion_files(path: &std::path::Path, listings: &mut FolderListings) -> bool {
+    let (Some(folder), Some(name)) = (path.parent(), path.file_name()) else {
+        return true;
+    };
+    let listing = listings.entry(folder.to_path_buf()).or_insert_with(|| {
+        std::fs::read_dir(folder).ok().map(|entries| {
+            crate::sharing::name_tag::FolderNames::new(
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_type().map_or(true, |kind| !kind.is_dir()))
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned()),
+            )
+        })
+    });
+    listing
+        .as_ref()
+        .is_none_or(|names| names.has_companion(&name.to_string_lossy()))
+}
+
+/// Whether the file at `path`, in the shared folder `root`, is kept from
+/// being tagged on its own by where it sits or what sits beside it: see
+/// [`in_hidden_or_repository_folder`], [`in_disc_structure_folder`] and
+/// [`has_companion_files`]. Blocking.
+fn left_alone_where_it_sits(path: &std::path::Path, root: &str, listings: &mut FolderListings) -> bool {
+    in_hidden_or_repository_folder(path, root)
+        || in_disc_structure_folder(path, root)
+        || has_companion_files(path, listings)
+}
+
+/// Most passes of `tag_shared_imports` that try a file it could not rename
+/// for a passing reason, before it is recorded as seen like any other.
+const MAX_IMPORT_TAG_ATTEMPTS: u32 = 3;
+
+/// Failed passes so far, by content hash, for files `tag_shared_imports` will
+/// try again. For this run only: after a restart each gets its tries anew.
+static IMPORT_TAG_ATTEMPTS: std::sync::LazyLock<Mutex<HashMap<String, u32>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Count one pass that tried the files of `tried`, of which `failed` could not
+/// be renamed for a passing reason. Returns those of `failed` to try again on
+/// the next pass; the others have had their tries.
+fn note_import_tag_attempts(
+    attempts: &mut HashMap<String, u32>,
+    tried: &[String],
+    failed: &HashSet<String>,
+) -> HashSet<String> {
+    for hash in tried {
+        if !failed.contains(hash) {
+            attempts.remove(hash);
+        }
+    }
+    failed
+        .iter()
+        .filter(|hash| {
+            let count = attempts.entry((*hash).clone()).or_insert(0);
+            *count += 1;
+            if *count >= MAX_IMPORT_TAG_ATTEMPTS {
+                attempts.remove(*hash);
+                return false;
+            }
+            true
+        })
+        .cloned()
+        .collect()
+}
+
+/// Record that every file in the Library now has been decided about, and when,
+/// so turning on `tag_shared_imports` renames only files that arrive
+/// afterwards.
+///
+/// The Library is not the record that matters: at launch it is still being
+/// listed, and it never holds a drive that is unplugged or a folder past the
+/// scan's cap, so a file it lacks here may well be one already shared. The
+/// time is what decides — a file created before it is never taken for new
+/// (see [`appeared_since`]) — and the files listed are recorded as well, by
+/// content and by path, so one edited later is not taken for new either.
+pub(crate) async fn seed_name_tag_seen(state: &AppState) {
+    let mut entries: Vec<String> = {
+        let index = state.local_index.read().await;
+        index
+            .all_files()
+            .iter()
+            .flat_map(|row| {
+                let hash = (!row.hash.is_empty()).then(|| row.hash.to_ascii_lowercase());
+                hash.into_iter().chain(std::iter::once(name_tag_seen_path(&row.path)))
+            })
+            .collect()
+    };
+    entries.push(NAME_TAG_SEEDED.to_string());
+    entries.push(format!("{NAME_TAG_SEEDED_AT}{}", chrono::Utc::now().timestamp()));
+    let db = state.db.clone();
+    match tokio::task::spawn_blocking(move || db.mark_name_tag_seen(&entries)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("Could not record the Library's files for the {EMBER_NAME_TAG} tag: {e}"),
+        Err(e) => warn!("Could not record the Library's files for the {EMBER_NAME_TAG} tag: {e}"),
+    }
+    NAME_TAG_SEEN_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Turning `tag_shared_imports` off: the next time it is turned on, the files
+/// added meanwhile are recorded as already there, not renamed.
+pub(crate) async fn unseed_name_tag_seen(state: &AppState) {
+    let db = state.db.clone();
+    if let Ok(Err(e)) =
+        tokio::task::spawn_blocking(move || db.forget_name_tag_seen(&[NAME_TAG_SEEDED.to_string()])).await
+    {
+        warn!("Could not reset the {EMBER_NAME_TAG} tag's record: {e}");
+    }
+    NAME_TAG_SEEN_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// One pass of `tag_shared_imports`: tag hashed files whose content the
+/// Library has not seen before, outside the download folders' `Downloads`
+/// (completed downloads follow `tag_completed_downloads`). Every file looked
+/// at is recorded as seen, renamed or not, so a tag the user takes off stays
+/// off. One that could not be renamed for a passing reason, such as another
+/// program holding it open, is tried again on later passes, up to
+/// [`MAX_IMPORT_TAG_ATTEMPTS`] in all.
+///
+/// `cache` is the loop's copy of `name_tag_seen`, read again only when it
+/// was reseeded or reset since, so a pass over an unchanged Library does not
+/// read the whole table.
+pub(crate) async fn tag_new_shared_imports(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    cache: &mut NameTagSeenCache,
+) {
+    let (downloads, roots): (Vec<String>, Vec<String>) = {
+        let config = state.config.read().await;
+        if !config.settings.tag_shared_imports {
+            *cache = None;
+            return;
+        }
+        let download_roots = config.settings.download_folders().roots();
+        let downloads = download_roots
+            .iter()
+            .map(|root| {
+                crate::search::index::normalize_path_key(
+                    &std::path::Path::new(root).join("Downloads").to_string_lossy(),
+                )
+            })
+            .collect();
+        let mut roots = config.settings.shared_folders.clone();
+        roots.extend(download_roots);
+        (downloads, roots)
+    };
+    let generation = NAME_TAG_SEEN_GENERATION.load(Ordering::SeqCst);
+    if cache.as_ref().is_none_or(|(read_at, _)| *read_at != generation) {
+        let db = state.db.clone();
+        match tokio::task::spawn_blocking(move || db.name_tag_seen_hashes()).await {
+            Ok(Ok(read)) => *cache = Some((generation, read)),
+            Ok(Err(e)) => {
+                warn!("Could not read which files the {EMBER_NAME_TAG} tag has seen: {e}");
+                return;
+            }
+            Err(e) => {
+                warn!("Could not read which files the {EMBER_NAME_TAG} tag has seen: {e}");
+                return;
+            }
+        }
+    }
+    // Turned on some way that did not record the Library first (a restored
+    // backup, a hand-edited config, a seed that failed to save), or seeded by
+    // a build that recorded no time: record it now and rename nothing this
+    // pass. The time it records is what keeps every file already shared out.
+    let seeded_at = cache
+        .as_ref()
+        .filter(|(_, seen)| seen.contains(NAME_TAG_SEEDED))
+        .and_then(|(_, seen)| name_tag_seeded_at(seen));
+    let Some(seeded_at) = seeded_at else {
+        seed_name_tag_seen(state).await;
+        return;
+    };
+    let Some((_, seen)) = cache.as_mut() else {
+        return;
+    };
+    let mut decided: Vec<String> = Vec::new();
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    {
+        let index = state.local_index.read().await;
+        for row in index.all_files() {
+            if row.hash.is_empty() || seen.contains(&row.hash.to_ascii_lowercase()) {
+                continue;
+            }
+            let key = crate::search::index::normalize_path_key(&row.path);
+            if downloads.iter().any(|dir| key_is_under(&key, dir)) {
+                continue;
+            }
+            if decided.len() >= MAX_IMPORT_TAGS_PER_PASS * 2 {
+                break;
+            }
+            decided.push(row.hash.to_ascii_lowercase());
+            let path_entry = format!("path:{key}");
+            // Here when the setting was turned on, or decided about since and
+            // edited: the same file, not a new one.
+            if seen.contains(&path_entry) {
+                continue;
+            }
+            decided.push(path_entry);
+            if !crate::sharing::name_tag::has_tag(&row.name)
+                && crate::sharing::name_tag::may_auto_tag_new_shared_file(&row.name)
+            {
+                candidates.push((row.path.clone(), row.hash.to_ascii_lowercase()));
+            }
+        }
+    }
+    if decided.is_empty() {
+        return;
+    }
+    let hash_by_path: HashMap<String, String> = candidates
+        .iter()
+        .map(|(path, hash)| (crate::search::index::normalize_path_key(path), hash.clone()))
+        .collect();
+    // Off the network loop: a look at each file's creation time and at the
+    // folders above it, which on a share that is slow to answer is not free,
+    // and at the download history.
+    //
+    // A completed download is not a new import even outside today's
+    // `Downloads`: in a download folder since replaced, or under a mapped
+    // drive that its row names by UNC path. Those follow
+    // `tag_completed_downloads`, which is off for anyone who wants them left.
+    let db = state.db.clone();
+    let to_tag: Vec<String> = tokio::task::spawn_blocking(move || {
+        let hashes: Vec<String> = candidates.iter().map(|(_, hash)| hash.clone()).collect();
+        let history = db.get_download_history_batch(&hashes).unwrap_or_default();
+        let mut listings = HashMap::new();
+        candidates
+            .into_iter()
+            .filter(|(path, hash)| {
+                history.get(hash).map(String::as_str) != Some("completed")
+                    && appeared_since(path, seeded_at)
+                    && innermost_root(&roots, path).is_some_and(|root| {
+                        !left_alone_where_it_sits(std::path::Path::new(path), root, &mut listings)
+                    })
+            })
+            .map(|(path, _)| path)
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
+    // Turned off while this pass was deciding: rename nothing, and record
+    // nothing, so turning it on again starts from the Library as it is then.
+    // The next pass drops the cache when it finds the setting off.
+    if !state.config.read().await.settings.tag_shared_imports {
+        return;
+    }
+    if !to_tag.is_empty() {
+        let tried: Vec<String> = to_tag
+            .iter()
+            .filter_map(|path| hash_by_path.get(&crate::search::index::normalize_path_key(path)).cloned())
+            .collect();
+        let retry = match tag_paths(app, state, to_tag.clone(), true).await {
+            Ok(report) => {
+                if !report.renamed.is_empty() {
+                    info!(
+                        "Added {EMBER_NAME_TAG} to {} file(s) new to a shared folder",
+                        report.renamed.len()
+                    );
+                }
+                for failure in &report.failed {
+                    debug!("Could not add {EMBER_NAME_TAG} to a new shared file: {failure}");
+                }
+                report.retry
+            }
+            Err(e) => {
+                warn!("Could not add {EMBER_NAME_TAG} to new shared files: {e}");
+                to_tag
+            }
+        };
+        let failed: HashSet<String> = retry
+            .iter()
+            .filter_map(|path| hash_by_path.get(&crate::search::index::normalize_path_key(path)).cloned())
+            .collect();
+        let again = {
+            let mut attempts = IMPORT_TAG_ATTEMPTS.lock().unwrap_or_else(|e| e.into_inner());
+            note_import_tag_attempts(&mut attempts, &tried, &failed)
+        };
+        let again_paths: HashSet<String> = hash_by_path
+            .iter()
+            .filter(|(_, hash)| again.contains(*hash))
+            .map(|(key, _)| format!("path:{key}"))
+            .collect();
+        decided.retain(|entry| !again.contains(entry) && !again_paths.contains(entry));
+    }
+    seen.extend(decided.iter().cloned());
+    let db = state.db.clone();
+    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || db.mark_name_tag_seen(&decided)).await {
+        warn!("Could not record files the {EMBER_NAME_TAG} tag has seen: {e}");
+    }
 }
 
 /// Open a folder of the Library's tree — a shared folder or one inside it,
@@ -1948,12 +2859,66 @@ fn unshare_target_is_shared(shared_folders: &[String], requested: &str) -> bool 
         .any(|stored| crate::security::path_within_dir(requested, stored))
 }
 
+/// Set while the startup scan has not yet put last session's files back in
+/// the Library index: until then the index holds only part of what is shared,
+/// and a file missing from it is not gone.
+pub(crate) static STARTUP_LIBRARY_LOADING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn startup_library_loading() -> bool {
+    STARTUP_LIBRARY_LOADING.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static FILE_SNAPSHOT_TICKETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The ticket of the snapshot each Library cache holds, by the cache's
+/// address. An entry is only read and written under its cache's write lock.
+/// Tickets only grow, so an entry left by a dropped cache is below anything a
+/// new cache at that address is handed.
+fn file_cache_tickets() -> &'static parking_lot::Mutex<std::collections::HashMap<usize, u64>> {
+    static TICKETS: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<usize, u64>>> =
+        std::sync::OnceLock::new();
+    TICKETS.get_or_init(Default::default)
+}
+
+/// Number a snapshot of the Library index. Take it while holding the index
+/// lock the snapshot is read under, so tickets order snapshots as the index
+/// changed.
+pub(crate) fn file_snapshot_ticket() -> u64 {
+    FILE_SNAPSHOT_TICKETS.fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+}
+
+/// Put `snap`, numbered `ticket`, in the Library cache and return the list it
+/// replaced, unless the cache already holds a later snapshot: then `snap`
+/// comes back as the error. Writers take their snapshot, then do other work
+/// before this, and an older list landing last would stand until something
+/// else rebuilt it.
+pub(crate) async fn store_file_snapshot(
+    cache: &RwLock<Vec<FileInfo>>,
+    snap: Vec<FileInfo>,
+    ticket: u64,
+) -> Result<Vec<FileInfo>, Vec<FileInfo>> {
+    let mut cached = cache.write().await;
+    {
+        let mut tickets = file_cache_tickets().lock();
+        let held = tickets.entry(cache as *const RwLock<Vec<FileInfo>> as usize).or_insert(0);
+        if ticket <= *held {
+            return Err(snap);
+        }
+        *held = ticket;
+    }
+    Ok(std::mem::replace(&mut *cached, snap))
+}
+
 pub(crate) async fn refresh_file_cache(
     index: &Arc<RwLock<LocalIndex>>,
     cache: &Arc<RwLock<Vec<FileInfo>>>,
 ) {
-    let (snap_raw, previous_flags) =
-        tokio::join!(async { index.read().await.all_files().to_vec() }, async {
+    let ((snap_raw, ticket), previous_flags) =
+        tokio::join!(async {
+            let index = index.read().await;
+            (index.all_files().to_vec(), file_snapshot_ticket())
+        }, async {
             let cached = cache.read().await;
             cached
                 .iter()
@@ -1981,7 +2946,8 @@ pub(crate) async fn refresh_file_cache(
             file.shared_ember = listable && *shared_ember;
         }
     }
-    *cache.write().await = snap;
+    // Refused only for a later snapshot, which already shows this change.
+    let _ = store_file_snapshot(cache, snap, ticket).await;
 }
 
 /// Undo a priority or friends-only mutation that could not be persisted. Only
@@ -6162,25 +7128,193 @@ pub async fn get_unapproved_shared_folders(
     let Ok(registry) = crate::security::filesystem::approved_roots() else {
         return Ok(Vec::new());
     };
-    tokio::task::spawn_blocking(move || {
-        folders
-            .into_iter()
-            .filter(|folder| {
-                let path = std::path::Path::new(folder);
-                if crate::security::is_network_path(folder) && !registry.is_recorded(path) {
-                    return false;
-                }
-                std::fs::symlink_metadata(path).is_ok() && registry.verify_root(path).is_err()
-            })
-            .collect()
+    tokio::task::spawn_blocking(move || unapproved_among(folders, &registry))
+        .await
+        .map_err(|error| coded_ctx("sharing_task_failed", "Task failed", error))
+}
+
+/// The folders of `folders` that [`get_unapproved_shared_folders`] reports.
+/// Blocking.
+fn unapproved_among(
+    folders: Vec<String>,
+    registry: &crate::security::filesystem::ApprovedRootRegistry,
+) -> Vec<String> {
+    folders
+        .into_iter()
+        .filter(|folder| {
+            let path = std::path::Path::new(folder);
+            if crate::security::is_network_path(folder) && !registry.is_recorded(path) {
+                return false;
+            }
+            std::fs::symlink_metadata(path).is_ok() && registry.verify_root(path).is_err()
+        })
+        .collect()
+}
+
+/// Walk folders the user has just re-approved.
+///
+/// Every scan since the approval lapsed refused them, so their files stay out
+/// of the library until something walks them again; without this, re-approving
+/// read as having done nothing until the user found Reload. A pass already
+/// running was planned while they were refused, so wait that one out with a
+/// scan of just these, as adding a folder does. While hashing is stopped the
+/// walk waits for the resume, as the watcher's changes do: a full reload
+/// would undo the Stop. Returns whether it waits.
+async fn scan_reapproved_folders(app: &tauri::AppHandle, folders: &[String]) -> bool {
+    let state = app.state::<AppState>();
+    if defer_while_hashing_paused(&state.hashing_paused, &state.hashing_fs_dirty) {
+        info!("Hashing is stopped; re-approved shared folders will be scanned on resume");
+        return true;
+    }
+    match reload_shared_files(app.clone(), state).await {
+        Err(error) if error.contains("sharing_reload_in_flight") => {
+            tokio::spawn(settle_recheck_without_watcher(
+                app.clone(),
+                folders.iter().map(std::path::PathBuf::from).collect(),
+                std::time::Duration::ZERO,
+            ));
+        }
+        Err(error) => warn!("Could not scan the re-approved shared folders: {error}"),
+        Ok(()) => {}
+    }
+    false
+}
+
+/// What re-approving shared folders did.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReapproveReport {
+    /// The folders approved; empty when the user kept them blocked or none
+    /// needed it.
+    approved: Vec<String>,
+    /// Hashing is stopped, so they are scanned when it resumes rather than now.
+    scan_on_resume: bool,
+}
+
+impl ReapproveReport {
+    async fn after_scan(app: &tauri::AppHandle, approved: Vec<String>) -> Self {
+        let scan_on_resume = scan_reapproved_folders(app, &approved).await;
+        Self { approved, scan_on_resume }
+    }
+
+    fn none() -> Self {
+        Self { approved: Vec::new(), scan_on_resume: false }
+    }
+}
+
+/// Whether work that would walk the shared folders has to wait because the
+/// user stopped hashing. Marks the folders changed when it does, so resuming
+/// runs the full reload that picks it up.
+fn defer_while_hashing_paused(paused: &AtomicBool, fs_dirty: &AtomicBool) -> bool {
+    if !paused.load(Ordering::Relaxed) {
+        return false;
+    }
+    fs_dirty.store(true, Ordering::Relaxed);
+    true
+}
+
+/// Most folders the re-approve-all dialog names before summing up the rest,
+/// so a long list cannot push its buttons off screen.
+const REAPPROVE_ALL_LISTED: usize = 8;
+
+/// Re-approve every shared folder Ember stopped recognising, after one native
+/// confirmation that names them, and scan them.
+///
+/// What a restore onto a reinstalled or different computer leaves behind:
+/// every share's approval is tied to the volume and file IDs it was given on,
+/// so all of them lapse at once, and approving them one dialog at a time was a
+/// chore the Library did not even explain.
+#[tauri::command]
+pub async fn reapprove_shared_folders(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<ReapproveReport, String> {
+    let registry = crate::security::filesystem::approved_roots()
+        .map_err(|error| coded_ctx("sharing_reapprove_failed", "Could not re-approve the folders", error))?;
+    let folders = state.config.read().await.settings.shared_folders.clone();
+    let dialog_app = app.clone();
+    let dialog_registry = registry.clone();
+    let asked = tokio::task::spawn_blocking(move || {
+        let pending = unapproved_among(folders, &dialog_registry);
+        if pending.is_empty() {
+            return None;
+        }
+        let mut list: Vec<String> = pending
+            .iter()
+            .take(REAPPROVE_ALL_LISTED)
+            .map(|folder| format!("• {}", crate::commands::settings::elide_for_dialog(folder)))
+            .collect();
+        if pending.len() > REAPPROVE_ALL_LISTED {
+            list.push(format!("…and {} more", pending.len() - REAPPROVE_ALL_LISTED));
+        }
+        let prompt = format!(
+            "Ember no longer recognises these shared folders:\n\n{}\n\nThis happens after restoring a backup on a new or reinstalled computer, or after a drive is reconnected. Re-approve them only if they are still your folders. If something else was put at one of these paths, re-approving shares whatever is there now.",
+            list.join("\n")
+        );
+        let approved = dialog_app
+            .dialog()
+            .message(prompt)
+            .title("Re-approve shared folders?")
+            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                "Re-approve all".to_string(),
+                "Keep blocked".to_string(),
+            ))
+            .blocking_show();
+        Some((pending, approved))
     })
     .await
-    .map_err(|error| coded_ctx("sharing_task_failed", "Task failed", error))
+    .map_err(|error| coded_ctx("sharing_task_failed", "Task failed", error))?;
+    let Some((pending, true)) = asked else {
+        return Ok(ReapproveReport::none());
+    };
+
+    // As for one folder: re-read under the settings lock, since any of them may
+    // have been removed while the dialog was open.
+    let _settings_save_guard = state.settings_save_lock.lock().await;
+    let settings = state.config.read().await.settings.clone();
+    let still_shared: Vec<String> = pending
+        .into_iter()
+        .filter(|folder| settings.shared_folders.contains(folder))
+        .collect();
+    if still_shared.is_empty() {
+        return Ok(ReapproveReport::none());
+    }
+    let roots = settings.configured_roots();
+    let approved = tokio::task::spawn_blocking(move || {
+        if registry.reapprove_roots(&roots, &still_shared).is_ok() {
+            return Ok(still_shared);
+        }
+        // The batch is all or nothing, so one folder whose drive went away
+        // while the dialog was open kept every other one blocked. Approve what
+        // still can be, one at a time.
+        let mut approved = Vec::new();
+        let mut last_error = None;
+        for folder in still_shared {
+            match registry.reapprove_roots(&roots, std::slice::from_ref(&folder)) {
+                Ok(()) => approved.push(folder),
+                Err(error) => {
+                    warn!("Could not re-approve shared folder {folder}: {error}");
+                    last_error = Some(error);
+                }
+            }
+        }
+        match last_error {
+            Some(error) if approved.is_empty() => Err(error),
+            _ => Ok(approved),
+        }
+    })
+    .await
+    .map_err(|error| coded_ctx("sharing_task_failed", "Task failed", error))?
+    .map_err(|error| coded_ctx("sharing_reapprove_failed", "Could not re-approve the folders", error))?;
+    drop(_settings_save_guard);
+    info!("Re-approved {} shared folders on the user's confirmation", approved.len());
+    Ok(ReapproveReport::after_scan(&app, approved).await)
 }
 
 /// Re-approve a shared folder Ember stopped recognising, once the user has
-/// confirmed it in a native dialog. Returns whether the folder is approved
-/// afterwards.
+/// confirmed it in a native dialog, and scan it. The report names the folder
+/// when it is approved afterwards.
 ///
 /// Re-approval trusts whatever object now sits at the path, which is right
 /// after a drive was reconnected and exactly wrong after something else was
@@ -6191,7 +7325,7 @@ pub async fn reapprove_shared_folder(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
-) -> Result<bool, String> {
+) -> Result<ReapproveReport, String> {
     let is_shared = |settings: &crate::types::AppSettings| settings.shared_folders.contains(&path);
     if !is_shared(&state.config.read().await.settings) {
         return Err(coded("sharing_folder_not_shared", "Folder is not a shared folder"));
@@ -6231,8 +7365,10 @@ pub async fn reapprove_shared_folder(
     .await
     .map_err(|error| coded_ctx("sharing_task_failed", "Task failed", error))??;
     match answer {
-        None => return Ok(true),
-        Some(false) => return Ok(false),
+        // Approved since the Library last looked, perhaps by Re-approve all;
+        // still scanned, since the caller is told a scan has started.
+        None => return Ok(ReapproveReport::after_scan(&app, vec![path]).await),
+        Some(false) => return Ok(ReapproveReport::none()),
         Some(true) => {}
     }
 
@@ -6250,8 +7386,9 @@ pub async fn reapprove_shared_folder(
         .await
         .map_err(|error| coded_ctx("sharing_task_failed", "Task failed", error))?
         .map_err(|error| coded_ctx("sharing_reapprove_failed", "Could not re-approve the folder", error))?;
+    drop(_settings_save_guard);
     info!("Re-approved shared folder {path} on the user's confirmation");
-    Ok(true)
+    Ok(ReapproveReport::after_scan(&app, vec![path]).await)
 }
 
 /// Map a lofty `FileType` to a short eMule-style codec label.
@@ -9273,6 +10410,380 @@ pub async fn open_shared_folder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A snapshot taken earlier never replaces one taken later, whichever
+    /// writer reaches the cache last; each cache keeps its own order.
+    #[tokio::test]
+    async fn an_older_library_snapshot_does_not_replace_a_later_one() {
+        let cache = RwLock::new(Vec::new());
+        let older = file_snapshot_ticket();
+        let newer = file_snapshot_ticket();
+        assert!(store_file_snapshot(&cache, Vec::new(), newer).await.is_ok());
+        assert!(store_file_snapshot(&cache, Vec::new(), older).await.is_err());
+        assert!(store_file_snapshot(&cache, Vec::new(), file_snapshot_ticket()).await.is_ok());
+        let other = RwLock::new(Vec::new());
+        assert!(store_file_snapshot(&other, Vec::new(), older).await.is_ok());
+    }
+
+    /// Only a file that came into being once the setting was on counts as new:
+    /// one already shared is older than that however late the Library lists it,
+    /// and one that cannot be read is not new.
+    #[test]
+    fn only_a_file_created_since_the_setting_was_turned_on_is_new() {
+        let dir = std::env::temp_dir().join(format!("ember-name-tag-age-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Linux.zip");
+        std::fs::write(&file, b"x").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let now = chrono::Utc::now().timestamp();
+        assert!(appeared_since(&path, now - 60), "created after the cutoff");
+        assert!(!appeared_since(&path, now + 3600), "created before it");
+        assert!(!appeared_since(&dir.join("missing.zip").to_string_lossy(), 0), "unreadable");
+        #[cfg(windows)]
+        {
+            std::process::Command::new("attrib").arg("+h").arg(&file).status().unwrap();
+            assert!(!appeared_since(&path, now - 60), "hidden on Windows");
+            std::process::Command::new("attrib").arg("-h").arg(&file).status().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Turned off and on again, the newest time it was turned on stands.
+    #[test]
+    fn the_newest_seed_time_stands() {
+        let seen: HashSet<String> = [
+            NAME_TAG_SEEDED.to_string(),
+            format!("{NAME_TAG_SEEDED_AT}100"),
+            format!("{NAME_TAG_SEEDED_AT}300"),
+            "seeded_at:junk".to_string(),
+            "path:c:\\share\\a.zip".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(name_tag_seeded_at(&seen), Some(300));
+        assert_eq!(name_tag_seeded_at(&HashSet::from([NAME_TAG_SEEDED.to_string()])), None);
+    }
+
+    #[test]
+    fn only_files_inside_a_downloads_folder_count_as_inside_it() {
+        assert!(key_is_under(r"c:\dl\downloads\a.zip", r"c:\dl\downloads"));
+        assert!(key_is_under("/dl/Downloads/Video/a.mkv", "/dl/Downloads/"));
+        assert!(!key_is_under(r"c:\dl\downloads2\a.zip", r"c:\dl\downloads"));
+        assert!(!key_is_under(r"c:\dl\downloads", r"c:\dl\downloads"));
+    }
+
+    fn folder_lists(
+        entries: &[(&str, &[&str])],
+    ) -> std::collections::HashMap<String, Vec<String>> {
+        entries
+            .iter()
+            .map(|(folder, files)| {
+                (
+                    crate::search::index::normalize_path_key(folder),
+                    files.iter().map(|f| crate::search::index::normalize_path_key(f)).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn key(path: &str) -> String {
+        crate::search::index::normalize_path_key(path)
+    }
+
+    fn sep(path: &str) -> String {
+        path.replace('/', std::path::MAIN_SEPARATOR_STR)
+    }
+
+    /// A file of a partly shared folder renamed in place keeps its place in
+    /// the lists, offered or withheld, so the next reload still walks it.
+    #[test]
+    fn a_renamed_file_keeps_its_entry_in_a_partly_shared_folder() {
+        let share = sep("/share");
+        let (a, a2) = (sep("/share/a.zip"), sep("/share/[Ember-P2P] a.zip"));
+        let (b, b2) = (sep("/share/b.mkv"), sep("/share/[Ember-P2P] b.mkv"));
+        let mut allowlists = folder_lists(&[(&share, &[&a])]);
+        let mut withheld = folder_lists(&[(&share, &[&b])]);
+        let moves = vec![(a.clone(), a2.clone(), true), (b.clone(), b2.clone(), false)];
+        assert!(relocate_folder_list_entries(&mut allowlists, &mut withheld, &moves));
+        assert_eq!(allowlists[&key(&share)], vec![key(&a2)]);
+        assert_eq!(withheld[&key(&share)], vec![key(&b2)]);
+        assert!(crate::sharing::indexer::AllowlistOffers::new(&allowlists).offers(&a2));
+        assert!(!crate::sharing::indexer::AllowlistOffers::new(&allowlists).offers(&a));
+        assert!(!relocate_folder_list_entries(&mut allowlists, &mut withheld, &moves), "nothing left to move");
+    }
+
+    /// A file a listed folder covers needs no entry of its own, and a file
+    /// leaving for a folder shared whole leaves its entry behind without
+    /// taking one along.
+    #[test]
+    fn covered_and_departing_files_are_not_listed_again() {
+        let share = sep("/share");
+        let sub = sep("/share/sub");
+        let (c, c2) = (sep("/share/sub/c.zip"), sep("/share/sub/[Ember-P2P] c.zip"));
+        let (d, d2) = (sep("/share/d.zip"), sep("/other/Video/d.zip"));
+        let mut allowlists = folder_lists(&[(&share, &[&sub, &d])]);
+        let mut withheld = Default::default();
+        let moves = vec![(c, c2, true), (d, d2, true)];
+        assert!(relocate_folder_list_entries(&mut allowlists, &mut withheld, &moves));
+        assert_eq!(allowlists[&key(&share)], vec![key(&sub)]);
+        assert!(withheld.is_empty());
+    }
+
+    /// Moved into a category folder that is itself partly shared, a file is
+    /// listed there as it was where it came from: offered if it was offered.
+    #[test]
+    fn a_file_moved_into_another_partly_shared_folder_is_listed_there() {
+        let (from_share, to_share) = (sep("/dl"), sep("/dl/Downloads/Video"));
+        let (e, e2) = (sep("/dl/e.mkv"), sep("/dl/Downloads/Video/e.mkv"));
+        let (f, f2) = (sep("/elsewhere/f.mkv"), sep("/dl/Downloads/Video/f.mkv"));
+        let (g, g2) = (sep("/elsewhere/g.mkv"), sep("/dl/Downloads/Video/g.mkv"));
+        let other = sep("/dl/Downloads/Video/other.mkv");
+        let mut allowlists = folder_lists(&[(&from_share, &[&e]), (&to_share, &[&other])]);
+        let mut withheld = Default::default();
+        let moves = vec![(e.clone(), e2.clone(), true), (f, f2.clone(), true), (g, g2.clone(), false)];
+        assert!(relocate_folder_list_entries(&mut allowlists, &mut withheld, &moves));
+        assert!(allowlists[&key(&from_share)].is_empty());
+        assert_eq!(allowlists[&key(&to_share)], vec![key(&other), key(&e2), key(&f2)]);
+        assert_eq!(withheld[&key(&to_share)], vec![key(&g2)], "unshared where it came from, unshared here");
+    }
+
+    #[test]
+    fn a_case_only_rename_on_windows_changes_no_list() {
+        let share = sep("/share");
+        let a = sep("/share/a.zip");
+        let mut allowlists = folder_lists(&[(&share, &[&a])]);
+        let mut withheld = Default::default();
+        let moves = vec![(a.clone(), a.clone(), true)];
+        assert!(!relocate_folder_list_entries(&mut allowlists, &mut withheld, &moves));
+        assert_eq!(allowlists[&key(&share)], vec![key(&a)]);
+    }
+
+    /// Each move is taken against the lists the moves before it left: a file
+    /// moved on again in the same call is listed once, at its last path, the
+    /// way it was listed at the start.
+    #[test]
+    fn a_file_moved_twice_in_one_call_is_listed_once_at_the_end() {
+        let share = sep("/share");
+        let (x, y, z) = (sep("/share/x.zip"), sep("/share/y.zip"), sep("/share/z.zip"));
+        let (w, v) = (sep("/share/w.mkv"), sep("/share/v.mkv"));
+        let mut allowlists = folder_lists(&[(&share, &[&x])]);
+        let mut withheld = folder_lists(&[(&share, &[&w])]);
+        let moves = vec![
+            (x.clone(), y.clone(), true),
+            (w.clone(), v.clone(), false),
+            (y.clone(), z.clone(), true),
+        ];
+        assert!(relocate_folder_list_entries(&mut allowlists, &mut withheld, &moves));
+        assert_eq!(allowlists[&key(&share)], vec![key(&z)]);
+        assert_eq!(withheld[&key(&share)], vec![key(&v)]);
+    }
+
+    #[test]
+    fn thousands_of_moves_over_thousands_of_entries_land_where_they_should() {
+        const FILES: usize = 5_000;
+        let (share, sub) = (sep("/share"), sep("/share/sub"));
+        let name = |i: usize| sep(&format!("/share/file{i:05}.zip"));
+        let tagged = |i: usize| sep(&format!("/share/[Ember-P2P] file{i:05}.zip"));
+        let offered: Vec<String> = (0..FILES).filter(|i| i % 2 == 0).map(name).collect();
+        let held: Vec<String> = (0..FILES).filter(|i| i % 2 == 1).map(name).collect();
+        let kept = sep("/share/kept.zip");
+        let mut allowlist: Vec<&str> = offered.iter().map(String::as_str).collect();
+        allowlist.push(&kept);
+        allowlist.push(&sub);
+        let held_refs: Vec<&str> = held.iter().map(String::as_str).collect();
+        let mut allowlists = folder_lists(&[(&share, &allowlist)]);
+        let mut withheld = folder_lists(&[(&share, &held_refs)]);
+        let mut moves: Vec<(String, String, bool)> =
+            (0..FILES).map(|i| (name(i), tagged(i), i % 2 == 0)).collect();
+        moves.push((sep("/share/sub/c.zip"), sep("/share/sub/[Ember-P2P] c.zip"), true));
+
+        assert!(relocate_folder_list_entries(&mut allowlists, &mut withheld, &moves));
+
+        let mut expected_offered = vec![key(&kept), key(&sub)];
+        expected_offered.extend((0..FILES).filter(|i| i % 2 == 0).map(|i| key(&tagged(i))));
+        let expected_held: Vec<String> = (0..FILES).filter(|i| i % 2 == 1).map(|i| key(&tagged(i))).collect();
+        assert_eq!(allowlists[&key(&share)], expected_offered, "the folder entry covers c.zip");
+        assert_eq!(withheld[&key(&share)], expected_held);
+        assert!(!relocate_folder_list_entries(&mut allowlists, &mut withheld, &moves), "nothing left to move");
+    }
+
+    /// A disc copied whole, and files that others find by name or that find
+    /// others by name, are not renamed on their own; files on their own are.
+    #[test]
+    fn files_in_disc_folders_or_with_companions_are_left_alone() {
+        let root = std::env::temp_dir().join(format!("ember-name-tag-companions-{}", rand::random::<u64>()));
+        let dvd = root.join("Film").join("video_ts");
+        let bluray = root.join("Other Film").join("BDMV").join("STREAM");
+        let movies = root.join("Movies");
+        let music = root.join("Music");
+        let archives = root.join("Archives");
+        let shows = root.join("Shows");
+        let season = root.join("Show Name Season 1");
+        for dir in [&dvd, &bluray, &movies, &music, &archives, &shows, &season.join("Show.S01")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let files = [
+            dvd.join("VTS_01_1.VOB"),
+            dvd.join("VTS_01_0.IFO"),
+            bluray.join("00000.m2ts"),
+            movies.join("Movie.mkv"),
+            movies.join("Movie.en.srt"),
+            movies.join("Holiday.mkv"),
+            music.join("Album.flac"),
+            music.join("Album.cue"),
+            archives.join("x.rar"),
+            archives.join("x.r00"),
+            archives.join("y.zip"),
+            archives.join("Y.Z01"),
+            archives.join("Disc.img"),
+            archives.join("Disc.ccd"),
+            archives.join("Disc.sub"),
+            archives.join("Linux.iso"),
+            shows.join("Show.S01E01.mkv"),
+            shows.join("Show.S01E02.mkv"),
+            season.join("Show.Name.S01E01.mkv"),
+            season.join("Show.Name.S01E02.mkv"),
+            season.join("Show.S01E03.mkv"),
+            season.join("Show.Name.nfo"),
+            season.join("Show.Name.jpg"),
+        ];
+        for file in &files {
+            std::fs::write(file, b"").unwrap();
+        }
+        let root_str = root.to_string_lossy().into_owned();
+        let mut listings = HashMap::new();
+        for left in [
+            dvd.join("VTS_01_1.VOB"),
+            bluray.join("00000.m2ts"),
+            movies.join("Movie.mkv"),
+            music.join("Album.flac"),
+            archives.join("x.rar"),
+            archives.join("y.zip"),
+            archives.join("Disc.img"),
+        ] {
+            assert!(left_alone_where_it_sits(&left, &root_str, &mut listings), "{}", left.display());
+        }
+        for tagged in [
+            movies.join("Holiday.mkv"),
+            archives.join("Linux.iso"),
+            shows.join("Show.S01E01.mkv"),
+            shows.join("Show.S01E02.mkv"),
+            season.join("Show.Name.S01E01.mkv"),
+            season.join("Show.Name.S01E02.mkv"),
+            season.join("Show.S01E03.mkv"),
+        ] {
+            assert!(!left_alone_where_it_sits(&tagged, &root_str, &mut listings), "{}", tagged.display());
+        }
+        assert!(listings.len() <= 7, "each folder listed once");
+        let disc_root = dvd.to_string_lossy().into_owned();
+        assert!(
+            left_alone_where_it_sits(&dvd.join("VTS_01_1.VOB"), &disc_root, &mut listings),
+            "a disc folder shared itself"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Undo gives back the name exactly as it was, spaces and all, but only
+    /// within the file's own folder and only a name that needs no altering.
+    #[test]
+    fn undo_restores_the_exact_name_in_the_same_folder_only() {
+        let original = sep("/share/ Linux  .zip");
+        let current = sep("/share/[Ember-P2P]  Linux  .zip");
+        assert_eq!(restored_file_name(&original, &current).as_deref(), Ok(" Linux  .zip"));
+        assert!(restored_file_name(&sep("/other/Linux.zip"), &current).is_err(), "another folder");
+        assert!(restored_file_name(&sep("/share/a?.zip"), &current).is_err(), "an unsafe name");
+        assert!(restored_file_name(&sep("/share/Linux.zip "), &current).is_err(), "one Windows would trim");
+    }
+
+    #[test]
+    fn files_open_elsewhere_or_raced_away_are_worth_another_try() {
+        use std::io::{Error, ErrorKind};
+        assert!(rename_error_is_transient(&Error::from(ErrorKind::PermissionDenied)));
+        assert!(rename_error_is_transient(&Error::from(ErrorKind::NotFound)));
+        assert!(!rename_error_is_transient(&Error::from(ErrorKind::InvalidInput)));
+        #[cfg(windows)]
+        {
+            assert!(rename_error_is_transient(&Error::from_raw_os_error(32)), "sharing violation");
+            assert!(rename_error_is_transient(&Error::from_raw_os_error(33)), "lock violation");
+        }
+    }
+
+    /// A file that keeps failing for a passing reason is tried on three
+    /// passes, then given up on; one that succeeds starts its count over.
+    #[test]
+    fn a_file_is_given_up_on_after_three_failed_passes() {
+        let mut attempts = HashMap::new();
+        let tried = vec!["aa".to_string(), "bb".to_string()];
+        let failed: HashSet<String> = HashSet::from(["aa".to_string()]);
+        assert_eq!(note_import_tag_attempts(&mut attempts, &tried, &failed), failed);
+        assert_eq!(note_import_tag_attempts(&mut attempts, &tried, &failed), failed);
+        assert!(note_import_tag_attempts(&mut attempts, &tried, &failed).is_empty(), "third pass");
+        assert!(attempts.is_empty());
+
+        note_import_tag_attempts(&mut attempts, &tried, &failed);
+        note_import_tag_attempts(&mut attempts, &tried, &HashSet::new());
+        assert!(attempts.is_empty(), "renamed at last");
+    }
+
+    /// Re-approving a folder while hashing is stopped leaves the Stop alone
+    /// and the walk to the resume.
+    #[test]
+    fn a_stop_defers_the_walk_to_the_resume() {
+        let (paused, dirty) = (AtomicBool::new(false), AtomicBool::new(false));
+        assert!(!defer_while_hashing_paused(&paused, &dirty));
+        assert!(!dirty.load(Ordering::Relaxed));
+        paused.store(true, Ordering::Relaxed);
+        assert!(defer_while_hashing_paused(&paused, &dirty));
+        assert!(paused.load(Ordering::Relaxed), "still stopped");
+        assert!(dirty.load(Ordering::Relaxed), "the resume's reload picks it up");
+    }
+
+    /// New files under a hidden or dot-named folder, or anywhere in a git
+    /// repository, are not renamed on their own; a plain subfolder is fine.
+    #[test]
+    fn files_in_hidden_folders_and_repositories_are_left_alone() {
+        let root = std::env::temp_dir().join(format!("ember-name-tag-tree-{}", rand::random::<u64>()));
+        let plain = root.join("Movies").join("2026");
+        let dotted = root.join(".cache").join("thumbs");
+        let repo = root.join("project");
+        let objects = repo.join(".git").join("objects").join("e6");
+        let repo_media = repo.join("assets");
+        for dir in [&plain, &dotted, &objects, &repo_media] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let root_str = root.to_string_lossy().into_owned();
+        assert!(!in_hidden_or_repository_folder(&plain.join("a.mkv"), &root_str));
+        assert!(!in_hidden_or_repository_folder(&root.join("a.mkv"), &root_str), "directly in the share");
+        assert!(in_hidden_or_repository_folder(&dotted.join("a.jpg"), &root_str));
+        assert!(in_hidden_or_repository_folder(&objects.join("9de29bb2d1d6434b8b29ae775ad8c2e48c5391"), &root_str));
+        assert!(in_hidden_or_repository_folder(&repo_media.join("logo.png"), &root_str), "a working tree");
+        assert!(in_hidden_or_repository_folder(&repo.join("README.pdf"), &root_str));
+        #[cfg(windows)]
+        {
+            let hidden = root.join("Hidden");
+            std::fs::create_dir_all(&hidden).unwrap();
+            std::process::Command::new("attrib").arg("+h").arg(&hidden).status().unwrap();
+            assert!(in_hidden_or_repository_folder(&hidden.join("a.mkv"), &root_str), "hidden on Windows");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_innermost_shared_folder_is_the_one_a_file_belongs_to() {
+        let roots = vec![sep("/share"), sep("/share/.inner")];
+        assert_eq!(innermost_root(&roots, &sep("/share/.inner/a.mkv")), Some(roots[1].as_str()));
+        assert_eq!(innermost_root(&roots, &sep("/share/a.mkv")), Some(roots[0].as_str()));
+        assert_eq!(innermost_root(&roots, &sep("/elsewhere/a.mkv")), None);
+    }
+
+    #[test]
+    fn a_tagged_name_is_a_valid_name_and_too_long_is_refused() {
+        let tagged = ember_tagged_name("Linux.zip", true).unwrap();
+        assert_eq!(checked_file_name(&tagged).as_deref(), Ok(tagged.as_str()), "a valid name as is");
+        let long = format!("{}.zip", "a".repeat(250));
+        let too_long = ember_tagged_name(&long, true).unwrap();
+        assert!(checked_file_name(&too_long).is_err(), "past 255 bytes is refused, not cut");
+    }
 
     #[test]
     fn hashes_in_library_matches_case_insensitively_and_skips_unhashed_rows() {

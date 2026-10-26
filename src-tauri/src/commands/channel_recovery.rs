@@ -17,6 +17,8 @@
 //! gone costs one lookup and is dropped.
 
 use std::collections::HashSet;
+use std::future::Future;
+use std::sync::Arc;
 
 use tauri::{Emitter, Manager};
 
@@ -31,6 +33,7 @@ use crate::network::ember::dht::publish::{
 };
 use crate::network::NetworkCommand;
 use crate::storage::database::{Database, RecoveredChannel};
+use crate::storage::identity::NodeIdentity;
 
 /// How long one lookup may take before its answer counts as unknown.
 const PROBE_TIMEOUT_MS: u64 = 12_000;
@@ -38,7 +41,7 @@ const PROBE_TIMEOUT_MS: u64 = 12_000;
 /// taken to mean nothing is there. Counted from the walk itself, not from the
 /// routing table, which can be full of contacts that left while this device
 /// was off — a walk none of them answer finishes just as empty.
-const MIN_RESPONDERS_FOR_ABSENCE: usize = 4;
+pub(crate) const MIN_RESPONDERS_FOR_ABSENCE: usize = 4;
 /// Rooms looked up at once: a few lookups each, inside the background search
 /// pool without crowding out everything else that uses it.
 const PROBE_BATCH: usize = 3;
@@ -55,6 +58,64 @@ const OWN_EPOCH_LOOKAHEAD: i64 = 4;
 /// Ember runs. Before their snapshots lapse, and well before members start
 /// counting the owner as gone.
 const UNSETTLED_RETRY_SECS: u64 = 6 * 60 * 60;
+
+/// The longest the list goes unread once everything in it is settled. The
+/// identity may run on another device too, which publishes a list of its own
+/// on the same six-hour cadence; reading the network's shortly before this
+/// device publishes (see [`settled_reread_wait`]) and carrying what it adds
+/// keeps that publish from dropping the rooms made there.
+const SETTLED_REREAD_SECS: u64 = 3 * 60 * 60;
+
+/// How long before this device's next list publish the list is read.
+const REREAD_LEAD_SECS: i64 = 10 * 60;
+
+/// How long a settled loop waits before reading the list again: to just
+/// before this device next publishes its own, or [`SETTLED_REREAD_SECS`] if
+/// that is sooner or not known.
+fn settled_reread_wait(now: i64, next_publish: Option<i64>) -> u64 {
+    let Some(next) = next_publish else {
+        return SETTLED_REREAD_SECS;
+    };
+    let mut target = next - REREAD_LEAD_SECS;
+    if target <= now + 60 {
+        // Read for this one already, or too late to: the one after.
+        target += crate::network::ember::channel::MODERATION_REPUBLISH_SECS;
+    }
+    (target - now).clamp(60, SETTLED_REREAD_SECS as i64) as u64
+}
+
+/// What a look does with a room the network holds and this device does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pass {
+    /// Put it back: the first read of a launch, which is what follows a
+    /// restore, and the user's own look from Settings.
+    Restore,
+    /// Carry it, so this device's list keeps naming it, but leave it to the
+    /// device that runs it, so two devices do not both start running a room
+    /// made on one of them mid-session. A room an earlier look here was
+    /// already trying to put back is still put back.
+    Reread,
+}
+
+/// Rooms a [`Pass::Restore`] look could not put back yet, which later looks
+/// keep trying to.
+fn rooms_owed_back() -> &'static std::sync::Mutex<HashSet<String>> {
+    static ROOMS: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    ROOMS.get_or_init(Default::default)
+}
+
+fn owe_room_back(id_hex: &str, owed: bool) {
+    let mut rooms = rooms_owed_back().lock().unwrap_or_else(|e| e.into_inner());
+    if owed {
+        rooms.insert(id_hex.to_string());
+    } else {
+        rooms.remove(id_hex);
+    }
+}
+
+fn room_owed_back(id_hex: &str) -> bool {
+    rooms_owed_back().lock().unwrap_or_else(|e| e.into_inner()).contains(id_hex)
+}
 
 /// Emitted when a look put rooms back: `{ "count": n }`.
 pub const CHANNELS_RECOVERED_EVENT: &str = "ember:channels-recovered";
@@ -78,14 +139,86 @@ pub struct OwnedRoomScan {
     /// Rooms in the list that could not be settled this time. They stay
     /// listed and are looked at again.
     pub unsettled: u32,
+    /// Rooms this device runs that the registry lists as deleted, waiting on
+    /// the user's answer.
+    pub deleted_elsewhere: u32,
 }
 
-enum Probe {
+/// Emitted when a look found rooms this device runs that the registry lists
+/// as deleted: `{ "count": n }`. The Channels page asks what to do with them.
+pub const ROOMS_DELETED_ELSEWHERE_EVENT: &str = "ember:channels-deleted-elsewhere";
+
+pub(crate) enum Probe {
     /// What came back, and whether enough of the network answered for what
     /// is missing from it to count as missing.
     Found(Vec<Vec<u8>>, bool),
     Absent,
     Unknown,
+}
+
+/// What a look needs from the running app: the database and identity, DHT
+/// lookups, the registry's list of deleted rooms, and the steps that follow a
+/// restore. Everything else here is decided from what these return, so a test
+/// can drive a whole look from the records another device published.
+pub(crate) trait RecoveryEnv: Sync {
+    fn db(&self) -> Arc<Database>;
+    fn identity(&self) -> Arc<NodeIdentity>;
+    fn probe(&self, key: [u8; 16]) -> impl Future<Output = Probe> + Send;
+    fn ember_enabled(&self) -> impl Future<Output = bool> + Send;
+    /// The registry's deleted rooms, lowercase hex; `None` when it could not
+    /// say.
+    fn deleted_rooms(&self) -> impl Future<Output = Option<HashSet<String>>> + Send;
+    /// Back in a restored room under our username.
+    fn enter_room(&self, id_hex: &str) -> impl Future<Output = ()> + Send;
+    /// Give a restored room whose key never came back a fresh one.
+    fn rekey_room(&self, id_hex: &str, epoch: i64) -> impl Future<Output = Result<i64, String>> + Send;
+    fn refresh_members(&self, channel_id: [u8; 16]);
+}
+
+impl RecoveryEnv for AppState {
+    fn db(&self) -> Arc<Database> {
+        self.db.clone()
+    }
+
+    fn identity(&self) -> Arc<NodeIdentity> {
+        self.identity.clone()
+    }
+
+    fn probe(&self, key: [u8; 16]) -> impl Future<Output = Probe> + Send {
+        probe(self, key)
+    }
+
+    async fn ember_enabled(&self) -> bool {
+        self.config.read().await.settings.ember_native_enabled
+    }
+
+    async fn deleted_rooms(&self) -> Option<HashSet<String>> {
+        let url = crate::commands::channels::rendezvous_url(self).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::network::rendezvous::fetch_complete_deleted_channel_ids(&url),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .map(|ids| ids.into_iter().map(|id| id.to_ascii_lowercase()).collect())
+    }
+
+    async fn enter_room(&self, id_hex: &str) {
+        if let Ok(username) = crate::commands::channels::require_channel_username(self).await {
+            if let Err(e) = crate::commands::channels::enter_stored_channel(self, id_hex, &username).await {
+                tracing::debug!(channel_id = %id_hex, error = %e, "restored room not entered yet");
+            }
+        }
+    }
+
+    fn rekey_room(&self, id_hex: &str, epoch: i64) -> impl Future<Output = Result<i64, String>> + Send {
+        crate::commands::channels::rekey_recovered_room(self, id_hex, epoch)
+    }
+
+    fn refresh_members(&self, channel_id: [u8; 16]) {
+        let _ = self.network_tx.try_send(NetworkCommand::RefreshChannelMembers { channel_id });
+    }
 }
 
 impl Probe {
@@ -239,15 +372,15 @@ enum Slot {
     Unsettled,
 }
 
-async fn examine(
-    state: &AppState,
+async fn examine<E: RecoveryEnv>(
+    env: &E,
     ident: &ChannelIdentity,
     deleted: Option<&HashSet<String>>,
 ) -> Slot {
     let id_hex = hex::encode(ident.channel_id);
     let held = {
         let id = id_hex.clone();
-        let db = state.db.clone();
+        let db = env.db();
         tokio::task::spawn_blocking(move || {
             Ok::<_, anyhow::Error>((
                 db.get_channel(&id)?,
@@ -273,10 +406,10 @@ async fn examine(
     // missed the owner's later stores still serves an earlier one, and the
     // epoch in an older snapshot is one the room has already moved past.
     let (first, second, handoff, claim) = tokio::join!(
-        probe(state, channel::moderation_key(&ident.channel_id)),
-        probe(state, channel::moderation_key(&ident.channel_id)),
-        probe(state, channel::handoff_key(&ident.channel_id)),
-        probe(state, channel::claim_key(&ident.channel_id)),
+        env.probe(channel::moderation_key(&ident.channel_id)),
+        env.probe(channel::moderation_key(&ident.channel_id)),
+        env.probe(channel::handoff_key(&ident.channel_id)),
+        env.probe(channel::claim_key(&ident.channel_id)),
     );
     if handed_off(handoff.records(), ident) {
         return Slot::Gone;
@@ -309,8 +442,8 @@ async fn examine(
 
 /// Put one room back from its snapshot. Returns whether anything changed.
 #[allow(clippy::too_many_arguments)]
-async fn restore_room(
-    state: &AppState,
+async fn restore_room<E: RecoveryEnv>(
+    env: &E,
     app: Option<&tauri::AppHandle>,
     salt: OwnedRoomSalt,
     seed: [u8; 32],
@@ -327,7 +460,7 @@ async fn restore_room(
     // until the owner renames the room; members keep the name they have.
     let known_name = match snapshot.tail.room_name.clone() {
         Some(name) if !name.trim().is_empty() => Some(name),
-        _ if !private => match probe(state, channel::index_key_for_channel(&ident.channel_id)).await {
+        _ if !private => match env.probe(channel::index_key_for_channel(&ident.channel_id)).await {
             Probe::Found(records, _) => listed_name(&records, ident),
             Probe::Absent => None,
             // Asked and not answered is not "unnamed": a stand-in would stop
@@ -354,7 +487,7 @@ async fn restore_room(
     // and an old key, newer than the real one and so outranking it.
     let _restoring = RestoringRoom::begin(&id_hex);
     let outcome = {
-        let db = state.db.clone();
+        let db = env.db();
         let id = id_hex.clone();
         let pk = hex::encode(ident.pubkey);
         let records = records.to_vec();
@@ -424,13 +557,11 @@ async fn restore_room(
     }
     tracing::info!(channel_id = %id_hex, ?outcome, "restored a room this identity owns");
     if private {
-        catch_up_own_epochs(state, ident, epoch.max(1)).await;
+        catch_up_own_epochs(env, ident, epoch.max(1)).await;
     }
     drop(_restoring);
-    enter_if_ready(state, &id_hex).await;
-    let _ = state.network_tx.try_send(NetworkCommand::RefreshChannelMembers {
-        channel_id: ident.channel_id,
-    });
+    enter_if_ready(env, &id_hex).await;
+    env.refresh_members(ident.channel_id);
     if let Some(app) = app {
         let _ = app.emit(
             "ember:channel-moderation",
@@ -444,9 +575,9 @@ async fn restore_room(
 /// here. Before it, presence would be published under a key the room has
 /// left, which only the members it evicted can read; the room is already
 /// marked as ours and inside, and its presence follows the key.
-async fn enter_if_ready(state: &AppState, id_hex: &str) {
+async fn enter_if_ready<E: RecoveryEnv>(env: &E, id_hex: &str) {
     let waiting = {
-        let db = state.db.clone();
+        let db = env.db();
         let id = id_hex.to_string();
         tokio::task::spawn_blocking(move || db.channel_owner_key_pending(&id))
             .await
@@ -458,11 +589,7 @@ async fn enter_if_ready(state: &AppState, id_hex: &str) {
     if waiting {
         return;
     }
-    if let Ok(username) = crate::commands::channels::require_channel_username(state).await {
-        if let Err(e) = crate::commands::channels::enter_stored_channel(state, id_hex, &username).await {
-            tracing::debug!(channel_id = %id_hex, error = %e, "restored room not entered yet");
-        }
-    }
+    env.enter_room(id_hex).await;
 }
 
 /// What looking for our own sealed copy of a key found.
@@ -476,14 +603,14 @@ enum OwnCopy {
 /// than at the next pass of the key loop, which also keeps trying. Goes on
 /// past `from` while later copies turn up, for a snapshot served stale.
 /// Reports on `from` itself.
-async fn catch_up_own_epochs(state: &AppState, ident: &ChannelIdentity, from: i64) -> OwnCopy {
+async fn catch_up_own_epochs<E: RecoveryEnv>(env: &E, ident: &ChannelIdentity, from: i64) -> OwnCopy {
     let mut first = OwnCopy::Unknown;
     for epoch in from..from.saturating_add(OWN_EPOCH_LOOKAHEAD + 1) {
-        let key = channel::epoch_key(&ident.channel_id, &state.identity.ed25519_public_key, epoch);
-        let found = match probe(state, key).await {
+        let key = channel::epoch_key(&ident.channel_id, &env.identity().ed25519_public_key, epoch);
+        let found = match env.probe(key).await {
             Probe::Found(records, _) => {
-                let db = state.db.clone();
-                let identity = state.identity.clone();
+                let db = env.db();
+                let identity = env.identity();
                 let channel_id = ident.channel_id;
                 let ingested = tokio::task::spawn_blocking(move || {
                     crate::network::channel_membership::ingest_channel_epoch_records(
@@ -514,12 +641,12 @@ async fn catch_up_own_epochs(state: &AppState, ident: &ChannelIdentity, from: i6
 /// A room held here that is still waiting on its current key: fetch it, or
 /// once the network has said for long enough that it holds no copy for us,
 /// give the room a fresh key. Returns whether it is still waiting.
-async fn resume_waiting_room(state: &AppState, ident: &ChannelIdentity, epoch: i64, since: i64) -> bool {
+async fn resume_waiting_room<E: RecoveryEnv>(env: &E, ident: &ChannelIdentity, epoch: i64, since: i64) -> bool {
     let id_hex = hex::encode(ident.channel_id);
-    match catch_up_own_epochs(state, ident, epoch).await {
+    match catch_up_own_epochs(env, ident, epoch).await {
         OwnCopy::Fetched => {}
         OwnCopy::Absent if chrono::Utc::now().timestamp() - since >= OWNER_KEY_GIVE_UP_SECS => {
-            match crate::commands::channels::rekey_recovered_room(state, &id_hex, epoch).await {
+            match env.rekey_room(&id_hex, epoch).await {
                 Ok(next) => tracing::warn!(
                     channel_id = %id_hex,
                     "no copy of the room's key {epoch} came back; gave it a fresh one at {next}"
@@ -530,7 +657,7 @@ async fn resume_waiting_room(state: &AppState, ident: &ChannelIdentity, epoch: i
         _ => {}
     }
     let still = {
-        let db = state.db.clone();
+        let db = env.db();
         let id = id_hex.clone();
         tokio::task::spawn_blocking(move || db.channel_owner_key_pending(&id))
             .await
@@ -540,7 +667,7 @@ async fn resume_waiting_room(state: &AppState, ident: &ChannelIdentity, epoch: i
             .is_some()
     };
     if !still {
-        enter_if_ready(state, &id_hex).await;
+        enter_if_ready(env, &id_hex).await;
     }
     still
 }
@@ -552,13 +679,16 @@ fn placeholder_name(id_hex: &str) -> String {
 /// The identity's list, from two walks merged: one that reached only nodes
 /// holding an older copy would otherwise miss the rooms made since. `None`
 /// when the network could not say.
-async fn read_owned_rooms_list(state: &AppState) -> Option<Vec<OwnedRoomSalt>> {
-    let our_pk = state.identity.ed25519_public_key;
+async fn read_owned_rooms_list<E: RecoveryEnv>(env: &E) -> Option<Vec<OwnedRoomSalt>> {
+    let our_pk = env.identity().ed25519_public_key;
     let key = channel::owned_rooms_key(&our_pk);
-    let (first, second) = tokio::join!(probe(state, key), probe(state, key));
+    let (first, second) = tokio::join!(env.probe(key), env.probe(key));
     let mut records = first.records().to_vec();
     records.extend_from_slice(second.records());
-    if let Some(salts) = merged_lists(&records, &our_pk) {
+    if let Some(mut salts) = merged_lists(&records, &our_pk) {
+        // The padding names no room, and only this identity can tell it apart.
+        let seed = env.identity().ed25519_secret_key;
+        salts.retain(|salt| !channel::is_owned_rooms_pad(salt, &seed));
         return Some(salts);
     }
     // Nothing that is a list: no list yet, but only on enough of the
@@ -572,18 +702,40 @@ async fn read_owned_rooms_list(state: &AppState) -> Option<Vec<OwnedRoomSalt>> {
 pub(crate) async fn scan_owned_rooms(
     state: &AppState,
     app: Option<&tauri::AppHandle>,
+    pass: Pass,
+) -> Result<OwnedRoomScan, String> {
+    scan_owned_rooms_with(state, app, pass).await
+}
+
+/// Tells the owned-rooms publish, however a look ends, that one that began at
+/// this time has: a publish waiting on a look goes out after it, even after
+/// one that could not read the list.
+struct LookEnded(i64);
+
+impl Drop for LookEnded {
+    fn drop(&mut self) {
+        crate::network::channel_membership::note_owned_rooms_read_ended(self.0);
+    }
+}
+
+/// [`scan_owned_rooms`] over any [`RecoveryEnv`].
+async fn scan_owned_rooms_with<E: RecoveryEnv>(
+    env: &E,
+    app: Option<&tauri::AppHandle>,
+    pass: Pass,
 ) -> Result<OwnedRoomScan, String> {
     let _single = scan_lock().lock().await;
-    if state.db.chat_locked() {
+    let _ended = LookEnded(chrono::Utc::now().timestamp());
+    if env.db().chat_locked() {
         return Err(coded(
             "channels_chat_locked",
             "Chat history is locked; restore the key file to manage channels",
         ));
     }
-    if !state.config.read().await.settings.ember_native_enabled {
+    if !env.ember_enabled().await {
         return Err(coded("channels_ember_disabled", "Ember-native transport is disabled"));
     }
-    let Some(listed) = read_owned_rooms_list(state).await else {
+    let Some(listed) = read_owned_rooms_list(env).await else {
         return Err(coded(
             "channels_recover_unavailable",
             "Could not reach enough of the network to read the list",
@@ -593,31 +745,24 @@ pub(crate) async fn scan_owned_rooms(
     // look, and worth another.
     let mut salts: Vec<OwnedRoomSalt> = listed;
     {
-        let db = state.db.clone();
+        let db = env.db();
         let known = tokio::task::spawn_blocking(move || db.owned_room_salts())
             .await
             .ok()
             .and_then(|r| r.ok())
             .unwrap_or_default();
+        let seed = env.identity().ed25519_secret_key;
         for salt in known {
-            if !salts.contains(&salt) {
+            if !salts.contains(&salt) && !channel::is_owned_rooms_pad(&salt, &seed) {
                 salts.push(salt);
             }
         }
     }
     // A deleted room's records outlive it by weeks, so only the registry says
     // it is gone. Optional: without it, a room is carried rather than put back.
-    let url = crate::commands::channels::rendezvous_url(state).await;
-    let deleted: Option<HashSet<String>> = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        crate::network::rendezvous::fetch_complete_deleted_channel_ids(&url),
-    )
-    .await
-    .ok()
-    .and_then(|r| r.ok())
-    .map(|ids| ids.into_iter().map(|id| id.to_ascii_lowercase()).collect());
+    let deleted: Option<HashSet<String>> = env.deleted_rooms().await;
 
-    let identity_seed = state.identity.ed25519_secret_key;
+    let identity_seed = env.identity().ed25519_secret_key;
     let mut outcome = OwnedRoomScan::default();
     for batch in salts.chunks(PROBE_BATCH) {
         let examined = futures::future::join_all(batch.iter().map(|salt| {
@@ -625,48 +770,75 @@ pub(crate) async fn scan_owned_rooms(
             async move {
                 let seed = channel::derive_owned_room_seed(&identity_seed, salt);
                 let ident = ChannelIdentity::from_seed(&seed);
-                let slot = examine(state, &ident, deleted).await;
+                let slot = examine(env, &ident, deleted).await;
                 (*salt, seed, ident, slot)
             }
         }))
         .await;
         for (salt, seed, ident, slot) in examined {
             let id_hex = hex::encode(ident.channel_id);
-            let db = state.db.clone();
+            let db = env.db();
             match slot {
                 // Its salt is kept even if this database lost it, or the list
                 // this device publishes would leave the room out.
                 Slot::Held(pending) => {
-                    let _ =
-                        tokio::task::spawn_blocking(move || db.record_channel_owned_salt(&id_hex, &salt))
-                            .await;
+                    // Run here, yet listed as deleted: deleted on another
+                    // device, or after the backup this one came from. The list
+                    // is the server's word, so the user decides, once.
+                    let listed_deleted = deleted.as_ref().is_some_and(|ids| ids.contains(&id_hex));
+                    let id = id_hex.clone();
+                    let waiting = tokio::task::spawn_blocking(move || {
+                        let _ = db.record_channel_owned_salt(&id, &salt);
+                        listed_deleted && db.note_room_deleted_elsewhere(&id).unwrap_or(false)
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if waiting {
+                        outcome.deleted_elsewhere += 1;
+                    }
+                    owe_room_back(&id_hex, false);
                     if let Some((epoch, since)) = pending {
-                        if resume_waiting_room(state, &ident, epoch, since).await {
+                        if resume_waiting_room(env, &ident, epoch, since).await {
                             outcome.unsettled += 1;
                         }
                     }
                 }
                 Slot::Gone => {
+                    owe_room_back(&id_hex, false);
                     let _ = tokio::task::spawn_blocking(move || db.drop_owned_salt(&id_hex)).await;
                 }
                 Slot::Unsettled => {
+                    if pass == Pass::Restore {
+                        owe_room_back(&id_hex, true);
+                    }
                     outcome.unsettled += 1;
-                    let _ = tokio::task::spawn_blocking(move || db.carry_owned_salt(&id_hex, &salt))
+                    let _ = tokio::task::spawn_blocking(move || db.carry_owned_salt(&id_hex, &salt, false))
                         .await;
                 }
                 Slot::Withheld => {
-                    let _ = tokio::task::spawn_blocking(move || db.carry_owned_salt(&id_hex, &salt))
+                    if pass == Pass::Restore {
+                        owe_room_back(&id_hex, true);
+                    }
+                    let _ = tokio::task::spawn_blocking(move || db.carry_owned_salt(&id_hex, &salt, false))
+                        .await;
+                }
+                Slot::Live(..) if pass == Pass::Reread && !room_owed_back(&id_hex) => {
+                    let _ = tokio::task::spawn_blocking(move || db.carry_owned_salt(&id_hex, &salt, true))
                         .await;
                 }
                 Slot::Live(snapshot, records) => {
-                    match restore_room(state, app, salt, seed, &ident, &snapshot, &records).await {
-                        Ok(true) => outcome.recovered += 1,
-                        Ok(false) => {}
+                    match restore_room(env, app, salt, seed, &ident, &snapshot, &records).await {
+                        Ok(true) => {
+                            owe_room_back(&id_hex, false);
+                            outcome.recovered += 1;
+                        }
+                        Ok(false) => owe_room_back(&id_hex, false),
                         Err(e) => {
                             tracing::warn!(error = %e, "could not restore an owned room");
+                            owe_room_back(&id_hex, true);
                             outcome.unsettled += 1;
                             let _ = tokio::task::spawn_blocking(move || {
-                                db.carry_owned_salt(&id_hex, &salt)
+                                db.carry_owned_salt(&id_hex, &salt, true)
                             })
                             .await;
                         }
@@ -678,7 +850,7 @@ pub(crate) async fn scan_owned_rooms(
     // The list was read and everything in it is held, carried or gone: this
     // device's list now says at least what the network's did.
     {
-        let db = state.db.clone();
+        let db = env.db();
         tokio::task::spawn_blocking(move || db.set_owned_rooms_list_synced(true))
             .await
             .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
@@ -700,6 +872,14 @@ pub(crate) async fn scan_owned_rooms(
             );
         }
     }
+    if outcome.deleted_elsewhere > 0 {
+        if let Some(app) = app {
+            let _ = app.emit(
+                ROOMS_DELETED_ELSEWHERE_EVENT,
+                serde_json::json!({ "count": outcome.deleted_elsewhere }),
+            );
+        }
+    }
     Ok(outcome)
 }
 
@@ -710,7 +890,7 @@ pub async fn recover_owned_channels(
     state: tauri::State<'_, AppState>,
 ) -> Result<OwnedRoomScan, String> {
     crate::commands::channels::require_ember(&state).await?;
-    scan_owned_rooms(&state, Some(&app)).await
+    scan_owned_rooms(&state, Some(&app), Pass::Restore).await
 }
 
 /// At startup, once the network has had time to come up: read the identity's
@@ -744,6 +924,19 @@ pub fn ensure_list_read(app: tauri::AppHandle) {
     }
 }
 
+/// After this identity took on a room this session: keep the read loop going,
+/// so the list is read again on its cadence, and at once when the list that
+/// now names the room is about to go out ([`wait_or_wanted`]). Nothing when
+/// it already runs.
+pub fn keep_reading_list(app: tauri::AppHandle) {
+    let delay = if crate::network::channel_membership::owned_rooms_list_read() {
+        std::time::Duration::from_secs(SETTLED_REREAD_SECS)
+    } else {
+        std::time::Duration::ZERO
+    };
+    spawn_list_read(app, delay);
+}
+
 /// Lets the read loop start again however it ends.
 struct ReadLoopRunning;
 
@@ -757,7 +950,13 @@ impl Drop for ReadLoopRunning {
 
 /// Read the list until it has been read — every two minutes for a while if
 /// the network cannot be reached well enough yet — and then keep looking at
-/// rooms that could not be settled, every few hours. One such loop at a time.
+/// rooms that could not be settled, every few hours, and at the list itself
+/// (see [`settled_reread_wait`]), and whenever a publish of this device's list
+/// waits on a read. Only the first read of a launch puts rooms
+/// back; later ones carry what another device added (see [`Pass`]). It keeps
+/// going while this identity owns nothing, every [`SETTLED_REREAD_SECS`], so
+/// a room taken over or handed here later is read for without another start.
+/// One such loop at a time.
 fn spawn_list_read(app: tauri::AppHandle, delay: std::time::Duration) {
     if READ_LOOP_RUNNING.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return;
@@ -765,14 +964,30 @@ fn spawn_list_read(app: tauri::AppHandle, delay: std::time::Duration) {
     let running = ReadLoopRunning;
     tauri::async_runtime::spawn(async move {
         let _running = running;
-        tokio::time::sleep(delay).await;
+        wait_or_wanted(delay).await;
         let mut failures = 0u32;
         loop {
             let Some(state) = app.try_state::<AppState>() else {
                 return;
             };
-            let wait = match scan_owned_rooms(&state, Some(&app)).await {
-                Ok(scan) if scan.unsettled == 0 => return,
+            let pass = if crate::network::channel_membership::owned_rooms_list_read() {
+                Pass::Reread
+            } else {
+                Pass::Restore
+            };
+            let wait = match scan_owned_rooms(&state, Some(&app), pass).await {
+                Ok(scan) if scan.unsettled == 0 => {
+                    failures = 0;
+                    let owns = !state.db.owned_room_salts().unwrap_or_default().is_empty();
+                    if owns {
+                        settled_reread_wait(
+                            chrono::Utc::now().timestamp(),
+                            crate::network::channel_membership::next_owned_rooms_list_publish_at(),
+                        )
+                    } else {
+                        SETTLED_REREAD_SECS
+                    }
+                }
                 Ok(_) => UNSETTLED_RETRY_SECS,
                 Err(e) => {
                     failures += 1;
@@ -788,9 +1003,42 @@ fn spawn_list_read(app: tauri::AppHandle, delay: std::time::Duration) {
                     }
                 }
             };
-            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            wait_or_wanted(std::time::Duration::from_secs(wait)).await;
         }
     });
+}
+
+/// Sleep for `delay`, or until a publish of the owned-rooms list waits on a
+/// look ([`crate::network::channel_membership::owned_rooms_read_wanted`])
+/// that has not been had since it asked.
+async fn wait_or_wanted(delay: std::time::Duration) {
+    wait_or_wanted_with(
+        delay,
+        crate::network::channel_membership::owned_rooms_read_wanted(),
+        || crate::network::channel_membership::owned_rooms_read_still_wanted(chrono::Utc::now().timestamp()),
+    )
+    .await;
+}
+
+/// [`wait_or_wanted`] on `wanted`, waking early only when `still_wanted`
+/// holds. A publish that asks while a look is under way leaves a wake
+/// behind, which that look, once ended, has already served.
+async fn wait_or_wanted_with(
+    delay: std::time::Duration,
+    wanted: &tokio::sync::Notify,
+    still_wanted: impl Fn() -> bool,
+) {
+    let until = tokio::time::Instant::now() + delay;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(until) => return,
+            _ = wanted.notified() => {
+                if still_wanted() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// Mark that the identity's list has to be read again, for a database that
@@ -799,12 +1047,326 @@ pub fn owe_scan(db: &Database) {
     if let Err(e) = db.set_owned_rooms_list_synced(false) {
         tracing::warn!("could not mark the owned-rooms list for a re-read: {e}");
     }
+    if let Err(e) = db.reask_rooms_deleted_elsewhere() {
+        tracing::warn!("could not ask again about rooms deleted elsewhere: {e}");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::network::ember::crypto::signing_key_from_bytes;
+
+    /// The network a look reads, as another device left it: every record the
+    /// owner published, filed under the key it was stored at. A key nobody
+    /// stored at answers as settled absence, as a full walk would.
+    struct Published {
+        db: Arc<Database>,
+        identity: Arc<NodeIdentity>,
+        records: std::collections::HashMap<[u8; 16], Vec<Vec<u8>>>,
+        deleted: HashSet<String>,
+        asked: parking_lot::Mutex<Vec<[u8; 16]>>,
+        entered: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl Published {
+        fn publish(&mut self, record: SignedRecord) {
+            let blob = [record.data.clone(), record.signature.to_vec()].concat();
+            self.records.entry(record.keyword_hash).or_default().push(blob);
+        }
+    }
+
+    impl RecoveryEnv for Published {
+        fn db(&self) -> Arc<Database> {
+            self.db.clone()
+        }
+        fn identity(&self) -> Arc<NodeIdentity> {
+            self.identity.clone()
+        }
+        async fn probe(&self, key: [u8; 16]) -> Probe {
+            self.asked.lock().push(key);
+            match self.records.get(&key) {
+                Some(records) => Probe::Found(records.clone(), true),
+                None => Probe::Absent,
+            }
+        }
+        async fn ember_enabled(&self) -> bool {
+            true
+        }
+        async fn deleted_rooms(&self) -> Option<HashSet<String>> {
+            Some(self.deleted.clone())
+        }
+        async fn enter_room(&self, id_hex: &str) {
+            self.entered.lock().push(id_hex.to_string());
+        }
+        async fn rekey_room(&self, _id_hex: &str, _epoch: i64) -> Result<i64, String> {
+            Err("not in this test".into())
+        }
+        fn refresh_members(&self, _channel_id: [u8; 16]) {}
+    }
+
+    /// A device restored from nothing but the identity gets back every room
+    /// the identity owns, from what the network holds: a public room by its
+    /// snapshot, a private one with the key it rotated to, from the owner's
+    /// own sealed copy. The list's padding is never looked up, a room the
+    /// registry lists as deleted is not put back, and once the device runs a
+    /// room the registry later lists as deleted, it asks the owner.
+    #[tokio::test]
+    async fn a_device_with_only_the_identity_gets_every_owned_room_back() {
+        use crate::network::ember::dht::publish::ModerationTail;
+        let _serial = crate::network::channel_membership::owned_rooms_read_test_lock().lock().await;
+        let seed = [0x6Bu8; 32];
+        let signing = signing_key_from_bytes(&seed);
+        let pubkey = signing.verifying_key().to_bytes();
+        let identity = Arc::new(NodeIdentity {
+            kad_id: [1; 16],
+            user_hash: [2; 16],
+            udp_key_seed: 3,
+            ember_hash: crate::network::ember::crypto::node_id_from_ed25519_bytes(&pubkey).unwrap(),
+            ed25519_secret_key: seed,
+            ed25519_public_key: pubkey,
+            noise_private_key: [4; 32],
+            noise_public_key: [5; 32],
+            intro_secret: Default::default(),
+        });
+        let path = std::env::temp_dir().join(format!(
+            "ember-recovery-e2e-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Arc::new(Database::open_at(&path).expect("open db"));
+        let mut net = Published {
+            db: db.clone(),
+            identity: identity.clone(),
+            records: Default::default(),
+            deleted: HashSet::new(),
+            asked: Default::default(),
+            entered: Default::default(),
+        };
+
+        // What the identity's other device published: three rooms, a padded list.
+        let room = |salt: &OwnedRoomSalt| ChannelIdentity::from_seed(&channel::derive_owned_room_seed(&seed, salt));
+        let (lobby_salt, den_salt, gone_salt) = ([0x11u8; 16], [0x22u8; 16], [0x33u8; 16]);
+        let (lobby, den, gone) = (room(&lobby_salt), room(&den_salt), room(&gone_salt));
+        let listed = channel::pad_owned_rooms_list(&[lobby_salt, den_salt, gone_salt], &seed);
+        net.publish(SignedRecord::owned_rooms(&listed, &signing).unwrap());
+        let snapshot = |ident: &ChannelIdentity, name: &str, private: bool, epoch: u64| {
+            SignedRecord::channel_moderation_at(
+                "topic",
+                "welcome",
+                &[],
+                &[],
+                // As a new room's first snapshot writes it.
+                &ModerationTail {
+                    key_epoch: Some(epoch),
+                    ..crate::commands::channels::new_room_tail(pubkey, None, name)
+                },
+                ident.channel_id,
+                ident.pubkey,
+                private,
+                &ident.signing_key,
+                chrono::Utc::now().timestamp() - 60,
+            )
+            .unwrap()
+        };
+        net.publish(snapshot(&lobby, "Lobby", false, 0));
+        net.publish(snapshot(&den, "Den", true, 1));
+        net.publish(snapshot(&gone, "Gone", false, 0));
+        let den_key = [0x77u8; 32];
+        let wrap = channel::derive_channel_epoch_secret(&seed, &pubkey, &den.channel_id, 1).unwrap();
+        let blind = channel::epoch_blind(&seed, &pubkey, &den.channel_id).unwrap();
+        let sealed = channel::seal_channel_key_epoch(&wrap, &den.channel_id, 1, &den_key);
+        for form in
+            SignedRecord::channel_key_epoch_forms(den.channel_id, den.pubkey, &pubkey, true, 1, &blind, &sealed, &den.signing_key)
+        {
+            net.publish(form);
+        }
+        net.deleted.insert(hex::encode(gone.channel_id));
+
+        let scan = scan_owned_rooms_with(&net, None, Pass::Restore).await.expect("the list reads");
+        assert!(scan.confirmed);
+        assert_eq!(scan.recovered, 2, "{scan:?}");
+        assert_eq!(scan.deleted_elsewhere, 0);
+
+        let (lobby_hex, den_hex, gone_hex) =
+            (hex::encode(lobby.channel_id), hex::encode(den.channel_id), hex::encode(gone.channel_id));
+        let lobby_row = db.get_channel(&lobby_hex).unwrap().expect("the public room is back");
+        assert_eq!((lobby_row.is_owner, lobby_row.name.as_str()), (true, "Lobby"));
+        let den_row = db.get_channel(&den_hex).unwrap().expect("the private room is back");
+        assert_eq!((den_row.is_owner, den_row.name.as_str()), (true, "Den"));
+        assert!(
+            db.load_channel_key_epochs(&den_hex).unwrap().iter().any(|(e, k)| *e == 1 && *k == den_key),
+            "the private room runs on the key it rotated to"
+        );
+        assert!(db.channel_owner_key_pending(&den_hex).unwrap().is_none(), "nothing left waiting");
+        assert!(db.get_channel(&gone_hex).unwrap().is_none(), "the deleted room stays deleted");
+        let entered = net.entered.lock().clone();
+        assert!(entered.contains(&lobby_hex) && entered.contains(&den_hex));
+
+        let pads: Vec<[u8; 16]> = listed
+            .iter()
+            .filter(|salt| ![lobby_salt, den_salt, gone_salt].contains(salt))
+            .map(|salt| channel::moderation_key(&room(salt).channel_id))
+            .collect();
+        assert_eq!(pads.len(), 5, "three rooms read as eight");
+        assert!(net.asked.lock().iter().all(|key| !pads.contains(key)), "padding is never looked up");
+
+        // Later the registry lists the public room as deleted while this
+        // device runs it: the owner is asked, and the room keeps running.
+        net.deleted.insert(lobby_hex.clone());
+        let again = scan_owned_rooms_with(&net, None, Pass::Reread).await.expect("the list reads");
+        assert_eq!(again.deleted_elsewhere, 1);
+        assert_eq!(db.rooms_deleted_elsewhere().unwrap(), vec![(lobby_hex.clone(), "Lobby".to_string())]);
+        assert!(!db.get_channel(&lobby_hex).unwrap().unwrap().deleted);
+
+        // The other device makes a room mid-session: a re-read carries it, so
+        // this device's list keeps naming it, and leaves it to that device.
+        let annex_salt = [0x44u8; 16];
+        let annex = room(&annex_salt);
+        let annex_hex = hex::encode(annex.channel_id);
+        net.publish(SignedRecord::owned_rooms(&[lobby_salt, den_salt, gone_salt, annex_salt], &signing).unwrap());
+        net.publish(snapshot(&annex, "Annex", false, 0));
+        // This device's list changed meanwhile and waits on a look before it
+        // goes out; once the look has ended the list names the annex too.
+        crate::network::channel_membership::reset_owned_rooms_read_times();
+        let asked = chrono::Utc::now().timestamp();
+        assert!(crate::network::channel_membership::owned_rooms_publish_waits(
+            crate::network::channel_membership::owned_rooms_read_began_at(),
+            asked,
+            asked,
+        ));
+        let reread = scan_owned_rooms_with(&net, None, Pass::Reread).await.expect("the list reads");
+        assert_eq!((reread.recovered, reread.unsettled), (0, 0), "{reread:?}");
+        assert!(!crate::network::channel_membership::owned_rooms_publish_waits(
+            crate::network::channel_membership::owned_rooms_read_began_at(),
+            asked,
+            chrono::Utc::now().timestamp(),
+        ));
+        assert!(db.get_channel(&annex_hex).unwrap().is_none(), "not run here as well");
+        assert!(db.owned_room_salts().unwrap().contains(&annex_salt), "but still listed from here");
+        // Carried long enough to lapse, but the other device still runs it:
+        // each look that finds it live dates it again.
+        db.backdate_carried_salt(&annex_hex, chrono::Utc::now().timestamp() - 61 * 86_400)
+            .unwrap();
+        assert!(!db.owned_room_salts().unwrap().contains(&annex_salt));
+        scan_owned_rooms_with(&net, None, Pass::Reread).await.expect("the list reads");
+        assert!(db.owned_room_salts().unwrap().contains(&annex_salt), "live there, so listed here");
+        // The user's own look from Settings puts it back.
+        let asked = scan_owned_rooms_with(&net, None, Pass::Restore).await.expect("the list reads");
+        assert_eq!(asked.recovered, 1, "{asked:?}");
+        assert!(db.get_channel(&annex_hex).unwrap().is_some_and(|row| row.is_owner));
+
+        drop(net);
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// A look that cannot read the list ends the wait of a publish that asked
+    /// for it as one that read it does, so a list changed here goes out after
+    /// one attempt.
+    #[tokio::test]
+    async fn a_failed_look_lets_a_waiting_publish_go() {
+        let _serial = crate::network::channel_membership::owned_rooms_read_test_lock().lock().await;
+        crate::network::channel_membership::reset_owned_rooms_read_times();
+        struct Unreachable {
+            db: Arc<Database>,
+            identity: Arc<NodeIdentity>,
+        }
+        impl RecoveryEnv for Unreachable {
+            fn db(&self) -> Arc<Database> {
+                self.db.clone()
+            }
+            fn identity(&self) -> Arc<NodeIdentity> {
+                self.identity.clone()
+            }
+            async fn probe(&self, _key: [u8; 16]) -> Probe {
+                Probe::Unknown
+            }
+            async fn ember_enabled(&self) -> bool {
+                true
+            }
+            async fn deleted_rooms(&self) -> Option<HashSet<String>> {
+                None
+            }
+            async fn enter_room(&self, _id_hex: &str) {}
+            async fn rekey_room(&self, _id_hex: &str, _epoch: i64) -> Result<i64, String> {
+                Err("not in this test".into())
+            }
+            fn refresh_members(&self, _channel_id: [u8; 16]) {}
+        }
+        let seed = [0x6Cu8; 32];
+        let pubkey = signing_key_from_bytes(&seed).verifying_key().to_bytes();
+        let path = std::env::temp_dir().join(format!(
+            "ember-recovery-unreachable-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let env = Unreachable {
+            db: Arc::new(Database::open_at(&path).expect("open db")),
+            identity: Arc::new(NodeIdentity {
+                kad_id: [1; 16],
+                user_hash: [2; 16],
+                udp_key_seed: 3,
+                ember_hash: crate::network::ember::crypto::node_id_from_ed25519_bytes(&pubkey).unwrap(),
+                ed25519_secret_key: seed,
+                ed25519_public_key: pubkey,
+                noise_private_key: [4; 32],
+                noise_public_key: [5; 32],
+                intro_secret: Default::default(),
+            }),
+        };
+
+        let asked = chrono::Utc::now().timestamp();
+        assert!(scan_owned_rooms_with(&env, None, Pass::Reread).await.is_err());
+        let began = crate::network::channel_membership::owned_rooms_read_began_at();
+        assert!(began >= asked, "the failed look is noted");
+        assert!(!crate::network::channel_membership::owned_rooms_publish_waits(
+            began,
+            asked,
+            chrono::Utc::now().timestamp(),
+        ));
+
+        drop(env);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// A wake a publish left while a look was under way is slept through
+    /// once that look has served it; one it still wants ends the sleep.
+    #[tokio::test]
+    async fn a_wake_already_served_is_slept_through() {
+        let wanted = tokio::sync::Notify::new();
+        let delay = std::time::Duration::from_millis(300);
+        wanted.notify_one();
+        let started = std::time::Instant::now();
+        wait_or_wanted_with(delay, &wanted, || false).await;
+        assert!(started.elapsed() >= delay, "slept the whole delay");
+
+        wanted.notify_one();
+        let woke = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_or_wanted_with(std::time::Duration::from_secs(600), &wanted, || true),
+        )
+        .await;
+        assert!(woke.is_ok(), "woken at once");
+    }
+
+    /// A settled loop reads the list shortly before this device publishes its
+    /// own, and never goes longer than its cap without reading.
+    #[test]
+    fn the_list_is_read_just_before_this_device_publishes_its_own() {
+        let now = 1_900_000_000;
+        assert_eq!(settled_reread_wait(now, None), SETTLED_REREAD_SECS);
+        assert_eq!(settled_reread_wait(now, Some(now + 3_600)), 3_000, "ten minutes ahead of it");
+        assert_eq!(settled_reread_wait(now, Some(now + 5 * 3_600)), SETTLED_REREAD_SECS, "capped");
+        let after = settled_reread_wait(now, Some(now + 300));
+        assert_eq!(after, SETTLED_REREAD_SECS, "already read for this one: the next");
+    }
 
     #[test]
     fn every_list_found_is_merged_and_others_ignored() {

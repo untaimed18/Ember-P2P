@@ -60,6 +60,10 @@ export function readReceiptsWith(settings: Settings, friendHash: string): boolea
  *  one day, one week and four weeks. Mirrors `CHAT_DISAPPEAR_CHOICES`. */
 export const CHAT_DISAPPEAR_CHOICES = [300, 3_600, 86_400, 604_800, 2_419_200] as const;
 
+/** Idle minutes after which friends see us Away. Off is 0. Mirrors
+ *  `AUTO_AWAY_CHOICES`. */
+export const AUTO_AWAY_CHOICES = [5, 10, 15, 30, 60] as const;
+
 /** The disappearing-message timer with this friend, in seconds; 0 is off. */
 export function disappearSecsFor(settings: Settings, friendHash: string): number {
   const secs = friendOverrides(settings, friendHash).disappear_secs ?? settings?.chat_disappear_secs ?? 0;

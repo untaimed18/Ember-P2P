@@ -238,7 +238,7 @@ pub(in crate::network) async fn on_broker_tick(
                         .external_udp_port
                         .filter(|p| *p != 0)
                         .unwrap_or(state.udp_port);
-                    let greet_nickname = settings.nickname.clone();
+                    let greet_nickname = settings.ed2k_nickname();
                     let greet_peer_ip = conn.source_ip;
                     let greet_peer_port = conn.source_port;
                     let greet_file_hash = conn.file_hash;

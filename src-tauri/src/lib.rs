@@ -29,6 +29,7 @@ mod commands;
 mod emule_import;
 mod finish_action;
 mod geoip;
+mod idle;
 mod ipfilter_update;
 mod network;
 mod power;
@@ -341,6 +342,14 @@ pub(crate) async fn run_graceful_shutdown(
             scanning.load(std::sync::atomic::Ordering::Relaxed),
             SCAN_QUIESCE_GRACE.as_secs()
         );
+    }
+
+    // While the manager still holds the session's order: the network
+    // shutdown below stops the running downloads. Once, as a second pass
+    // runs after that and would save what it left.
+    static ORDER_SAVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !ORDER_SAVED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        commands::transfers::persist_download_order(&state).await;
     }
 
     let tx = state.network_tx.clone();
@@ -858,6 +867,13 @@ pub fn run() {
             let emule_import = emule_import::apply::apply_pending(&data_dir, &db, &mut config);
             storage::part_folders::forget_finished_previous_folders(&db, &mut config);
             let settings = config.settings.clone();
+            // Before the library is scanned or a download restored: both must
+            // know which downloads, and which folders, are feeds' and private.
+            sharing::feed_downloads::set_roots(&settings.download_roots());
+            match db.transfer_feed_folders() {
+                Ok(rows) => sharing::feed_downloads::load(rows),
+                Err(error) => tracing::error!("Could not read which downloads are from feeds: {error}"),
+            }
             // Best-effort, never fatal. A download folder on an unplugged USB
             // drive, an offline NAS or an unmapped share makes these fail, and
             // propagating that out of `setup` returns Err from `build()` — which
@@ -903,6 +919,10 @@ pub fn run() {
                 &import_roots,
             )
             .map_err(|error| anyhow::anyhow!("Failed to load approved filesystem roots: {error}"))?;
+            sharing::feed_files::allow_list_dirs(&data_dir);
+            // Not an approved root, unlike the lists' folders: nothing in it is
+            // ever served.
+            network::ember::attach_stream::set_feed_tree_dir(data_dir.join("feed-trees"));
             emule_import::apply::root_additions_approved(&data_dir);
             // Only share_intent.json is read here; the known.met migration runs
             // on its own thread, and every share-intent reader and known.met
@@ -1158,6 +1178,9 @@ pub fn run() {
                 close_behavior: Arc::new(parking_lot::RwLock::new(
                     settings.close_to_tray_behavior.clone(),
                 )),
+                minimize_to_tray: Arc::new(std::sync::atomic::AtomicBool::new(
+                    settings.minimize_to_tray,
+                )),
                 pending_deep_links: Arc::new(parking_lot::Mutex::new(pending_deep_links)),
                 runtime_status: Arc::new(parking_lot::RwLock::new(Default::default())),
             });
@@ -1177,6 +1200,8 @@ pub fn run() {
             auto_update::scheduler::spawn(app_handle.clone());
             ipfilter_update::spawn(app_handle.clone());
             commands::channel_recovery::spawn_startup_scan(app_handle.clone());
+            commands::room_dm::spawn_resends(app_handle.clone());
+            commands::feeds::spawn_feeds(app_handle.clone());
 
             // Non-silent recovery notice: if config.json was corrupt at load,
             // tell the user (their settings were reset to defaults; the original
@@ -1391,7 +1416,17 @@ pub fn run() {
             let net_tx = startup_network_tx;
             let startup_cancel_flags = hash_cancel_flags.clone();
             let startup_fresh_part_hashes = fresh_part_hashes.clone();
+            commands::sharing::STARTUP_LIBRARY_LOADING.store(true, std::sync::atomic::Ordering::Release);
             let startup_scan_handle = tauri::async_runtime::handle().inner().spawn(async move {
+                // However the scan ends, the index stops being a partial one.
+                struct LibraryLoaded;
+                impl Drop for LibraryLoaded {
+                    fn drop(&mut self) {
+                        commands::sharing::STARTUP_LIBRARY_LOADING
+                            .store(false, std::sync::atomic::Ordering::Release);
+                    }
+                }
+                let library_loaded = LibraryLoaded;
                 if shared_folders.is_empty() {
                     info!("Indexed 0 files from 0 shared folders");
                     let _ = net_tx.send(network::NetworkCommand::StartupLibraryIndexed).await;
@@ -1873,6 +1908,7 @@ pub fn run() {
                 commands::sharing::refresh_file_cache(&index_clone, &csf).await;
                 // Every file known from last session is in the index now, with
                 // its hash; only new ones wait for hashing.
+                drop(library_loaded);
                 let _ = net_tx.send(network::NetworkCommand::StartupLibraryIndexed).await;
 
                 let _ = startup_app.emit("shared-files-changed", serde_json::json!({
@@ -2332,6 +2368,24 @@ pub fn run() {
                 }
             });
 
+            // Files new to a shared folder, tagged `[Ember-P2P]` when the user
+            // asked for that. Polled rather than hooked into each hashing pass:
+            // startup, folder adds, rescans and the watcher all add files, and
+            // one sweep over the index covers every one of them.
+            let tag_handle = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut tick = tokio::time::interval(commands::sharing::IMPORT_TAG_INTERVAL);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut seen: commands::sharing::NameTagSeenCache = None;
+                loop {
+                    tick.tick().await;
+                    let Some(state) = tag_handle.try_state::<AppState>() else {
+                        continue;
+                    };
+                    commands::sharing::tag_new_shared_imports(&tag_handle, &state, &mut seen).await;
+                }
+            });
+
             info!("Ember P2P application started");
             Ok(())
         })
@@ -2410,6 +2464,7 @@ pub fn run() {
             commands::chat_attachments::cancel_chat_attachment,
             commands::chat_attachments::retry_chat_attachment,
             commands::settings::set_friend_overrides,
+            commands::settings::set_friend_status,
             commands::chat_attachments::list_chat_attachments,
             commands::chat_attachments::open_chat_attachment,
             commands::chat_attachments::open_chat_files_folder,
@@ -2427,6 +2482,7 @@ pub fn run() {
             commands::sharing::get_shared_folders,
             commands::sharing::get_unapproved_shared_folders,
             commands::sharing::reapprove_shared_folder,
+            commands::sharing::reapprove_shared_folders,
             commands::sharing::get_file_media_metadata,
             commands::sharing::get_folder_priorities,
             commands::sharing::set_folder_priority,
@@ -2451,6 +2507,8 @@ pub fn run() {
             commands::sharing::open_library_folder,
             commands::sharing::move_files_to_category,
             commands::sharing::rename_library_file,
+            commands::sharing::tag_library_files,
+            commands::sharing::restore_library_file_names,
             commands::transfers::delete_finished_downloads,
             commands::sharing::delete_shared_file,
             commands::sharing::republish_file,
@@ -2487,11 +2545,15 @@ pub fn run() {
             commands::peers::retry_friend_search,
             commands::peers::is_friend_discoverable,
             commands::peers::get_online_friends,
+            commands::peers::get_friend_statuses,
+            commands::peers::get_idle_away,
             commands::peers::kad_connect,
             commands::peers::kad_bootstrap_ip,
             commands::peers::kad_bootstrap_url,
             commands::peers::kad_bootstrap_clients,
             commands::peers::kad_recheck_firewall,
+            commands::connection_doctor::run_connection_check,
+            commands::connection_doctor::connection_doctor_action,
             commands::peers::get_kad_contacts,
             commands::peers::get_kad_searches,
             commands::peers::kad_cancel_search,
@@ -2519,6 +2581,42 @@ pub fn run() {
             commands::channels::set_channel_message_pinned,
             commands::channels::get_channel_pins,
             commands::channels::delete_owned_channel,
+            commands::channels::list_rooms_deleted_elsewhere,
+            commands::channels::confirm_room_deleted_elsewhere,
+            commands::room_dm::list_room_dm_threads,
+            commands::room_dm::get_room_dm_messages,
+            commands::room_dm::send_room_dm,
+            commands::room_dm::answer_room_dm_request,
+            commands::room_dm::mark_room_dm_read,
+            commands::room_dm::delete_room_dm_thread,
+            commands::room_dm::drop_room_dm_request,
+            commands::room_dm::retry_room_dm,
+            commands::room_dm::set_ignored_members,
+            commands::feeds::list_my_feeds,
+            commands::feeds::create_feed,
+            commands::feeds::set_feed_details,
+            commands::feeds::set_feed_listed,
+            commands::feeds::set_feed_items,
+            commands::feeds::publish_feed,
+            commands::feeds::delete_feed,
+            commands::feeds::list_followed_feeds,
+            commands::feeds::follow_feed,
+            commands::feeds::refresh_feed,
+            commands::feeds::get_feed_items,
+            commands::feeds::mark_feed_read,
+            commands::feeds::set_feed_auto_download,
+            commands::feeds::download_feed_items,
+            commands::feeds::cancel_feed_download,
+            commands::feeds::unfollow_feed,
+            commands::feeds::open_feed_folder,
+            commands::feeds::open_feed_files_folder,
+            commands::feeds::open_feed_item,
+            commands::feeds::show_feed_item,
+            commands::feed_discover::discover_feeds,
+            commands::feed_discover::cached_discovered_feeds,
+            commands::feed_discover::set_discovered_feed_hidden,
+            commands::feed_discover::hidden_discovered_feed_count,
+            commands::feed_discover::clear_hidden_discovered_feeds,
             commands::channels::get_channel_invite,
             commands::channels::list_channel_members,
             commands::channels::channel_presence_config,
@@ -2625,6 +2723,8 @@ pub fn run() {
             commands::system::get_runtime_status,
             commands::system::read_clipboard_text,
             commands::system::write_clipboard_text,
+            commands::system::ui_ping,
+            commands::system::log_ui_stall,
             commands::deeplink::list_pending_deep_links,
             commands::deeplink::ack_pending_deep_link,
             commands::deeplink::preview_deep_link,
@@ -2657,23 +2757,38 @@ pub fn run() {
             // callable IPC. `ember_ping_peer` and `ember_request_sources` were
             // registered unconditionally while the rest of this list was
             // already gated; that was an oversight rather than a decision.
-            #[cfg(debug_assertions)]
-            {
-                ember_invoke_handler![
-                    commands::peers::ember_ping_peer,
-                    commands::peers::ember_request_sources,
-                    commands::peers::add_ember_dht_contact,
-                    commands::peers::ember_dht_ping_peer,
-                    commands::peers::ember_dht_find_node,
-                    commands::peers::ember_dht_iterative_find_node,
-                    commands::peers::ember_dht_publish_keyword,
-                    commands::peers::ember_dht_find_value,
-                    commands::peers::ember_dht_run_maintenance,
-                ]
+            // Names the handler's type, which passing it straight to
+            // `invoke_handler` used to supply.
+            fn typed<F: Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static>(handler: F) -> F {
+                handler
             }
+            #[cfg(debug_assertions)]
+            let handler = typed(ember_invoke_handler![
+                commands::peers::ember_ping_peer,
+                commands::peers::ember_request_sources,
+                commands::peers::add_ember_dht_contact,
+                commands::peers::ember_dht_ping_peer,
+                commands::peers::ember_dht_find_node,
+                commands::peers::ember_dht_iterative_find_node,
+                commands::peers::ember_dht_publish_keyword,
+                commands::peers::ember_dht_find_value,
+                commands::peers::ember_dht_run_maintenance,
+            ]);
             #[cfg(not(debug_assertions))]
-            {
-                ember_invoke_handler![]
+            let handler = typed(ember_invoke_handler![]);
+            // App commands are not covered by the capability files, so the
+            // chat window could otherwise call every one of them.
+            move |invoke: tauri::ipc::Invoke| {
+                if invoke.message.webview_ref().label() == commands::chat_window::CHAT_WINDOW_LABEL
+                    && !commands::chat_window::chat_window_may_invoke(invoke.message.command())
+                {
+                    invoke.resolver.reject(commands::errors::coded(
+                        "chat_window_command_denied",
+                        "The chat window cannot do that; use the main window",
+                    ));
+                    return true;
+                }
+                handler(invoke)
             }
         })
         .on_window_event(|window, event| {
@@ -2738,6 +2853,21 @@ pub fn run() {
                     tauri::async_runtime::spawn(async move {
                         commands::sharing::share_dropped_paths(app_handle, paths).await;
                     });
+                }
+                return;
+            }
+
+            // Tauri has no minimize event; a minimize arrives as a resize.
+            if let tauri::WindowEvent::Resized(_) = event {
+                let wants_tray = window.app_handle().try_state::<AppState>().is_some_and(|state| {
+                    state.minimize_to_tray.load(std::sync::atomic::Ordering::Acquire)
+                });
+                // Without a visible tray icon the hidden window could not be
+                // reached again, so it stays minimized on the taskbar.
+                if wants_tray && tray::reachable() && window.is_minimized().unwrap_or(false) {
+                    if let Err(e) = window.hide() {
+                        tracing::warn!("Failed to hide window for minimize-to-tray: {e}");
+                    }
                 }
                 return;
             }

@@ -110,9 +110,11 @@ pub(in crate::network) async fn on_source_count_sync_tick(
     let ed2k_offered = state.offered_ed2k_hashes.clone();
     let ember_published = state.ember_published_sources.clone();
     tokio::spawn(async move {
-        let file_snap = {
+        let (file_snap, ticket) = {
             let index = li_ref.read().await;
             let mut snap = index.all_files().to_vec();
+            let ticket = crate::commands::sharing::file_snapshot_ticket();
+            drop(index);
             apply_publish_badges(
                 &mut snap,
                 kad_connected,
@@ -122,9 +124,10 @@ pub(in crate::network) async fn on_source_count_sync_tick(
                 &ed2k_offered,
                 &ember_published,
             );
-            snap
+            (snap, ticket)
         };
-        *s_files.write().await = file_snap;
+        // Refused only for a later snapshot, which already carries the counts.
+        let _ = crate::commands::sharing::store_file_snapshot(&s_files, file_snap, ticket).await;
         // Library only refreshes on this event (or scan done) —
         // without it the Peers column stayed stale for the
         // whole session after the initial load.

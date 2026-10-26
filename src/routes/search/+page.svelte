@@ -52,7 +52,7 @@
   import { get } from 'svelte/store';
   import { listen } from '@tauri-apps/api/event';
   import type { SearchResult, SpamExplanation } from '$lib/types';
-  import { formatNumber, formatSize, formatLiveSpeed, copyToClipboard, sizeUnitLabel } from '$lib/utils';
+  import { formatNumber, formatDecimal, formatSize, formatLiveSpeed, copyToClipboard, sizeUnitLabel, compareFileNames } from '$lib/utils';
   import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
   import { addToast } from '$lib/stores/toast';
   import { inertBackground, menuKeydown, swallowKeyboardContextMenu, trapTabKey } from '$lib/a11y';
@@ -72,6 +72,7 @@
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
   import * as m from '$lib/paraglide/messages';
+  import { alreadyQueuedText } from '$lib/alreadyQueued';
   import {
     translateError,
     degradedReasonText,
@@ -1919,7 +1920,7 @@
       let cmp = 0;
       switch (sortField) {
         case 'name':
-          cmp = sortCollator.compare(sortLabel(a, 'name'), sortLabel(b, 'name'));
+          cmp = compareFileNames(sortLabel(a, 'name'), sortLabel(b, 'name'));
           break;
         case 'size':
           cmp = a.file.size - b.file.size;
@@ -3509,7 +3510,7 @@
         result.file.ember_file_hash,
         result.file.aich_hash,
       );
-      addToast('success', res.already_queued ? m.search_already_in_queue() : m.search_download_queued());
+      addToast('success', res.already_queued ? alreadyQueuedText(res) : m.search_download_queued());
     } catch (e: unknown) {
       console.error('Download failed:', e);
       const msg = translateError(e, m.browse_download_failed());
@@ -3797,7 +3798,7 @@
     } else if (action.kind === 'close-tab') {
       void performCloseSearchTab(action.tab);
     } else if (action.kind === 'copy-all-links') {
-      void copyLinksFor(action.results);
+      void copyLinksFor(action.results, 'all');
     }
   }
 
@@ -4065,7 +4066,7 @@
   /** Above this many links, ask first: some apps take a long time to paste
    *  a list this size. Mirrors the library's threshold. */
   const COPY_ALL_LINKS_CONFIRM_AT = 5_000;
-  let copyingLinks = $state(false);
+  let copyingLinks = $state<'all' | 'checked' | null>(null);
 
   /** Results that can actually produce a link, deduplicated by hash. A hit
    *  still waiting on its hash has nothing to copy. */
@@ -4108,14 +4109,14 @@
     }
   }
 
-  async function copyLinksFor(results: SearchResult[]) {
+  async function copyLinksFor(results: SearchResult[], scope: 'all' | 'checked') {
     if (copyingLinks) return;
     const targets = linkableResults(results);
     if (targets.length === 0) {
       addToast('warning', m.search_copy_none());
       return;
     }
-    copyingLinks = true;
+    copyingLinks = scope;
     try {
       const text = await formatEd2kLinks(
         targets.map((r) => ({
@@ -4137,12 +4138,12 @@
     } catch (e: unknown) {
       addToast('error', translateError(e, m.search_copy_failed()));
     } finally {
-      copyingLinks = false;
+      copyingLinks = null;
     }
   }
 
   function copyCheckedLinks() {
-    void copyLinksFor(filteredResults.filter((r) => checkedKeys.has(resultKey(r))));
+    void copyLinksFor(filteredResults.filter((r) => checkedKeys.has(resultKey(r))), 'checked');
   }
 
   function requestCopyAllLinks() {
@@ -4152,7 +4153,7 @@
       return;
     }
     if (targets.length < COPY_ALL_LINKS_CONFIRM_AT) {
-      void copyLinksFor(targets);
+      void copyLinksFor(targets, 'all');
       return;
     }
     pendingConfirm = { kind: 'copy-all-links', results: targets };
@@ -5029,10 +5030,11 @@
         </details>
         <button
           class="ghost copy-links-btn"
-          disabled={copyingLinks || filteredResults.length === 0}
+          disabled={copyingLinks !== null || filteredResults.length === 0}
+          aria-busy={copyingLinks === 'all'}
           title={m.search_copy_all_links_title()}
           onclick={requestCopyAllLinks}
-        >{m.search_copy_all_links()}</button>
+        >{copyingLinks === 'all' ? m.library_copying() : m.search_copy_all_links()}</button>
         <button class="ghost clear-results-btn" onclick={requestClearResults}>{m.search_clear_results()}</button>
       </div>
     </div>
@@ -5042,8 +5044,8 @@
         <button class="bulk-download-btn" onclick={downloadChecked} disabled={bulkDownloadPending}>
           {bulkDownloadPending ? m.search_downloading_ellipsis() : plural(checkedCount, { one: m.search_bulk_download_one, other: () => m.search_bulk_download_other({ count: formatNumber(checkedCount) }) })}
         </button>
-        <button class="ghost bulk-copy-btn" onclick={copyCheckedLinks} disabled={copyingLinks} title={m.search_bulk_copy_links_title()}>
-          {plural(checkedCount, { one: m.search_bulk_copy_link_one, other: () => m.search_bulk_copy_links_other({ count: formatNumber(checkedCount) }) })}
+        <button class="ghost bulk-copy-btn" onclick={copyCheckedLinks} disabled={copyingLinks !== null} aria-busy={copyingLinks === 'checked'} title={m.search_bulk_copy_links_title()}>
+          {copyingLinks === 'checked' ? m.library_copying() : plural(checkedCount, { one: m.search_bulk_copy_link_one, other: () => m.search_bulk_copy_links_other({ count: formatNumber(checkedCount) }) })}
         </button>
         <button class="ghost bulk-clear-btn" onclick={clearChecked} title={m.search_clear_selection_title()}>{m.search_clear_selection()}</button>
         {#if bulkDownloadMessage}
@@ -5668,7 +5670,7 @@
                     on-disk figure. `transferred` counts re-fetched bytes and
                     would read as more than the file size at 100%.
                   -->
-                  <dd>{m.search_progress_value({ percent: selectedDlTransfer.progress.toFixed(1), transferred: formatSize(selectedDlTransfer.completed_size ?? selectedDlTransfer.transferred), total: formatSize(selectedDlTransfer.total_size) })}</dd>
+                  <dd>{m.search_progress_value({ percent: formatDecimal(selectedDlTransfer.progress, 1), transferred: formatSize(selectedDlTransfer.completed_size ?? selectedDlTransfer.transferred), total: formatSize(selectedDlTransfer.total_size) })}</dd>
                 {/if}
                 {#if selectedDlTransfer.status === 'active' || selectedDlTransfer.speed > 0}
                   <dt>{m.search_speed_label()}</dt>
@@ -6661,6 +6663,11 @@
 
   th.sortable:hover {
     color: var(--text-primary);
+  }
+
+  th.sortable:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
 
   table {

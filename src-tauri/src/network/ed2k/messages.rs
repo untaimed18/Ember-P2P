@@ -367,6 +367,53 @@ pub const EMBER_EXT_MAILBOX_AWARE: u8 = 0x10;
 /// collected it there shows it once.
 pub const EMBER_EXT_CHAT_ID: u8 = 0x11;
 
+/// [`OP_EMBER_EXT`] sub-type: chat attachment offers that wait for the user.
+/// Two forms, told apart by the body.
+///
+/// Empty: "an offer you make me can wait for my answer, and tell me again
+/// which of mine you keep". Sent whenever a secure session comes up, ahead of
+/// the queued files that go out then, and by a sender that let held offers go
+/// when one of the friend's sessions ended while another stayed up. The
+/// reader marks the session; a receiver names only to a marked session, since
+/// only such a sender answers. On receiving it a receiver puts every offer
+/// the sender had said it holds back on
+/// [`crate::network::ember::attach::ATTACH_OFFER_TTL_SECS`] from then, and
+/// names each again.
+///
+/// `ATTACH_VERSION || xfer_id`
+/// ([`crate::network::ember::attach::encode_attach_held`]), meaning by which
+/// end of the offer sends it. From the offer's receiver: "I am keeping your
+/// offer of this file for my user", sent when an offer is left waiting on the
+/// user and again after every session change. From the offer's sender, in
+/// answer: "I hold it", sent only when it does. The sender holds its grant
+/// past five minutes only on the receiver's note, and the receiver waits past
+/// five minutes only on the sender's echo, so neither waits on the other
+/// longer than the other will. A sender whose offer is over answers with
+/// [`EMBER_EXT_ATTACH_CANCEL`] instead; one that will not hold an offer that
+/// is still answerable says nothing.
+///
+/// Not [`EMBER_EXT_MAILBOX_AWARE`]: 1.7.4 sends that and still drops an
+/// offer at five minutes, so it says nothing about waiting. A peer that
+/// predates this ignores both forms and never sends either, so nothing waits
+/// with it.
+pub const EMBER_EXT_ATTACH_WAITS: u8 = 0x12;
+
+/// The status we show a friend while connected: online, away or busy.
+/// Encrypted to the friend like a typing signal
+/// ([`crate::network::ember::crypto::encrypt_chat_status`]). Sent when a
+/// secure session comes up and again whenever the user changes it. The
+/// receiver forgets it when the friend goes offline, so a status never
+/// outlives the session that carried it. A peer that predates this logs and
+/// ignores it, and shows us online.
+pub const EMBER_EXT_STATUS: u8 = 0x13;
+
+/// A feed head the friend just published: its signed record as a value blob
+/// (`data || signature`), sealed to us like a chat message. Pushed so friends
+/// following the feed see an update at once rather than at their next
+/// lookup; verified on arrival exactly as a looked-up head is, and taken only
+/// if signed by the friend who sent it. A peer that predates this ignores it.
+pub const EMBER_EXT_FEED_HEAD: u8 = 0x14;
+
 const DHT_MEET_FLAG_ANSWER: u8 = 0x01;
 
 /// [`EMBER_EXT_DHT_MEET`] body: `udp_port(2, LE) || flags(1)`.
@@ -1162,6 +1209,9 @@ pub fn build_emule_info(
 /// - mod_version_len(u16) + mod_version_utf8(...)
 /// - nickname_len(u16) + nickname_utf8(...)
 /// - if flags & 0x01: ed25519_pubkey(32)
+///
+/// `nickname` is the name the Hello carried, site tag and all; an Ember peer
+/// is given it without the tag, which is only for eMule users.
 pub fn build_ember_hello(
     ember_hash: &[u8; 16],
     nickname: &str,
@@ -1169,7 +1219,7 @@ pub fn build_ember_hello(
 ) -> Vec<u8> {
     let mod_version = format!("Ember {}", env!("CARGO_PKG_VERSION"));
     let mod_bytes = mod_version.as_bytes();
-    let nick_bytes = nickname.as_bytes();
+    let nick_bytes = crate::types::without_nickname_site_tag(nickname).as_bytes();
     let mut buf = Vec::with_capacity(2 + 16 + 2 + mod_bytes.len() + 2 + nick_bytes.len() + 32);
 
     buf.write_u8(0x01).unwrap(); // version
@@ -1809,8 +1859,10 @@ pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilit
                 if name_id == 0x01 {
                     const MAX_HELLO_STRING_LEN: usize = 8192;
                     let capped = slen.min(MAX_HELLO_STRING_LEN);
-                    caps.peer_name =
-                        String::from_utf8_lossy(&payload[pos..pos + capped]).to_string();
+                    let name = String::from_utf8_lossy(&payload[pos..pos + capped]);
+                    // Another Ember's name as eMule users see it: the tag is
+                    // for them, and an Ember user knows the client already.
+                    caps.peer_name = crate::types::without_nickname_site_tag(&name).to_string();
                 } else {
                     // CT_MODVERSION / ET_MOD_VERSION. Mods that skip
                     // OP_EMULEINFO still often put VeryCD / easyMule here;
@@ -3565,11 +3617,13 @@ mod tests {
             kad_version: 0x09,
         };
 
+        let tagged = crate::types::ed2k_nickname("ember", true);
         let payload =
-            build_hello_with_buddy_opts(&user_hash, 0x7F00_0001, 4662, "ember", None, &opts);
+            build_hello_with_buddy_opts(&user_hash, 0x7F00_0001, 4662, &tagged, None, &opts);
         let (parsed_hash, caps) = parse_hello_packet(&payload).unwrap();
 
         assert_eq!(parsed_hash, user_hash);
+        assert_eq!(caps.peer_name, "ember", "an Ember reads another's name without the site tag");
         assert_eq!(caps.udp_port, 4672);
         assert_eq!(caps.kad_port, 4672);
         assert!(caps.supports_large_files);
@@ -3701,6 +3755,11 @@ mod tests {
             parsed.mod_version
         );
         assert_eq!(parsed.ed25519_pubkey, Some(pk));
+
+        // Built from the name the Hello carried, but an Ember peer is not
+        // given the site tag that is only there for eMule users.
+        let tagged = crate::types::ed2k_nickname("alice", true);
+        assert_eq!(parse_ember_hello(&build_ember_hello(&hash, &tagged, None)).unwrap().nickname, "alice");
 
         let payload_nopk = build_ember_hello(&hash, "bob", None);
         let parsed_nopk = parse_ember_hello(&payload_nopk).expect("must parse");

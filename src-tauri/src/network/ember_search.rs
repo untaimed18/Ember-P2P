@@ -806,7 +806,12 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
                     &established,
                     &mut state.ember_content_hashes,
                 );
-                if !sources.is_empty() {
+                // A feed download waiting on its publisher takes only theirs,
+                // and starts on its stream alone: queued even empty, the
+                // injection sweep starts it.
+                let endpoint = super::chat_attach::quic_endpoint(state);
+                let sources = super::feed_direct::take_lookup(file_hash, sources, endpoint);
+                if !sources.is_empty() || super::feed_direct::stream_ready_for_file(&file_hash) {
                     state
                         .ember_pending_source_injections
                         .push((file_hash, sources));
@@ -871,9 +876,7 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
             } else if let Some((channel_id, epoch)) =
                 state.ember_channel_epoch_searches.remove(&search_id)
             {
-                state
-                    .ember_pending_channel_epoch
-                    .push((channel_id, epoch, into_blobs(held)));
+                buffer_channel_epoch_records(state, channel_id, epoch, into_blobs(held));
             } else if let Some(channel_id) =
                 state.ember_channel_moderation_searches.remove(&search_id)
             {
@@ -885,6 +888,14 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
                 state
                     .ember_pending_channel_moderation
                     .push((channel_id, into_blobs(held), answered));
+            } else if let Some(channel_id) =
+                state.ember_channel_settings_searches.remove(&search_id)
+            {
+                // Nothing found changes nothing, so only a find is worth the write.
+                let blobs = into_blobs(held);
+                if !blobs.is_empty() {
+                    state.ember_pending_channel_settings.push((channel_id, blobs));
+                }
             } else if let Some(channel_id) =
                 state.ember_channel_handoff_searches.remove(&search_id)
             {
@@ -946,7 +957,7 @@ pub(super) fn parse_ember_source_records(
     };
     let mut order: Vec<&ember::dht::search::SearchResultRecord> = held.iter().collect();
     order.sort_by_key(|record| !vouched(record));
-    let mut unconfirmed_from: HashMap<EmberResponder, usize> = HashMap::new();
+    let mut unconfirmed_from: HashMap<(EmberResponder, bool), usize> = HashMap::new();
     for held_record in order {
         let Some(rec) = ember::dht::publish::SignedRecord::from_value_blob(&held_record.data)
         else {
@@ -984,9 +995,15 @@ pub(super) fn parse_ember_source_records(
         if out.len() >= MAX_EMBER_SOURCES_PER_LOOKUP {
             continue;
         }
-        if !vouched(held_record) && sc.flags & ember::SOURCE_FLAG_FIREWALLED == 0 {
+        // Firewalled records are capped too: nobody dials them, but they take
+        // the lookup's slots, and the firewalled flag is free to set, so one
+        // responder answering early could fill every slot with them. Under a
+        // quota of their own, so a storer listing its firewalled sources first
+        // does not crowd out the HighID ones it holds.
+        if !vouched(held_record) {
             let responder = EmberResponder::of(held_record.from_node, held_record.from_subnet);
-            let taken = unconfirmed_from.entry(responder).or_insert(0);
+            let firewalled = sc.flags & ember::SOURCE_FLAG_FIREWALLED != 0;
+            let taken = unconfirmed_from.entry((responder, firewalled)).or_insert(0);
             if *taken >= MAX_UNCONFIRMED_SOURCES_PER_RESPONDER {
                 continue;
             }
@@ -1674,7 +1691,8 @@ fn ember_row_extension(name: &str) -> String {
 /// and a real swarm under one key can be larger than a KAD answer.
 const MAX_EMBER_SOURCES_PER_LOOKUP: usize = 50;
 /// HighID sources one responder may contribute that no other responder also
-/// returned. Enough for the honest storer that happens to hold a key alone.
+/// returned, and as many firewalled ones besides. Enough for the honest
+/// storer that happens to hold a key alone.
 pub(super) const MAX_UNCONFIRMED_SOURCES_PER_RESPONDER: usize = 10;
 
 /// One publisher's digest claim and the responders that carried it.
@@ -2269,6 +2287,63 @@ mod ember_source_self_filter_tests {
         assert_eq!(sources.len(), 3 + MAX_UNCONFIRMED_SOURCES_PER_RESPONDER);
         for confirmed in 41..=43u8 {
             assert!(sources.iter().any(|s| s.ip == Ipv4Addr::new(81, 7, 7, confirmed)));
+        }
+    }
+
+    /// Firewalled records cost no dial, but they fill the lookup's slots just
+    /// the same: one responder returning a page of them must not crowd out a
+    /// HighID source another responder returned.
+    #[test]
+    fn one_responder_cannot_fill_a_lookup_with_firewalled_records() {
+        let file_hash = [0x64u8; 16];
+        let record = |i: u8, flags: u8, from: u8| {
+            let sk = ed25519_dalek::SigningKey::from_bytes(&[i.wrapping_add(90); 32]);
+            let rec = ember::dht::publish::SignedRecord::source(
+                file_hash,
+                [0u8; 32],
+                1,
+                "big.iso",
+                ember::dht::publish::SourceContact {
+                    ip: Ipv4Addr::new(81, 7, 9, i),
+                    tcp_port: 4662,
+                    flags,
+                    ..Default::default()
+                },
+                &sk,
+            );
+            let mut data = rec.data.clone();
+            data.extend_from_slice(&rec.signature);
+            ember::dht::search::SearchResultRecord {
+                data,
+                from_node: ember::dht::EmberNodeId([from; 16]),
+                confirmed_by: None,
+                from_subnet: Some(u64::from(from)),
+                confirmed_subnet: None,
+                from_local_store: false,
+            }
+        };
+        let mut held: Vec<_> = (1..=75u8)
+            .map(|i| record(i, ember::SOURCE_FLAG_FIREWALLED, 1))
+            .collect();
+        // The same responder's HighID sources, listed after its firewalled
+        // ones, still get in.
+        held.extend((201..=205u8).map(|i| record(i, 0, 1)));
+        held.push(record(200, 0, 2));
+
+        let sources = parse_ember_source_records(
+            &held,
+            file_hash,
+            None,
+            &[0u8; 32],
+            &mut crate::types::EmberDiagnostics::default(),
+            &mut HashMap::new(),
+            &HashSet::new(),
+            &mut HashMap::new(),
+        );
+        assert_eq!(sources.len(), MAX_UNCONFIRMED_SOURCES_PER_RESPONDER + 5 + 1);
+        assert!(sources.iter().any(|s| s.ip == Ipv4Addr::new(81, 7, 9, 200)));
+        for highid in 201..=205u8 {
+            assert!(sources.iter().any(|s| s.ip == Ipv4Addr::new(81, 7, 9, highid)));
         }
     }
 

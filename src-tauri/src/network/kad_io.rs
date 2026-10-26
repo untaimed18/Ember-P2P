@@ -475,24 +475,13 @@ pub(super) async fn send_kad_search_results(
     let mut batch_est_size: usize = HEADER_OVERHEAD;
 
     for entry in results {
-        // Size each tag by what it actually serializes to. The old flat
-        // 24-bytes-per-tag figure ignored string payloads, and a stored
-        // keyword entry's filename may run to `MAX_STORED_FILENAME_BYTES`
-        // (4 KiB) — so a "1420-byte" batch of long-named hits was really
-        // several KB, `encode_packet` could not compress it under the
-        // fragment ceiling, and the error was discarded along with every
-        // result in the batch. A publisher could plant long filenames under
-        // a keyword we store for and blind our answers for it.
-        let entry_est: usize = 16
-            + 8
-            + entry
-                .tags
-                .iter()
-                .map(|tag| match &tag.value {
-                    kad::types::TagValue::String(s) => s.len() + 6,
-                    _ => 12,
-                })
-                .sum::<usize>();
+        // Sized exactly: a batch over the fragment ceiling that does not
+        // compress under it fails `encode_packet` and is lost whole, so an
+        // underpriced entry (a stored blob tag, a long tag name) would let one
+        // planted publish blind the honest results sent beside it.
+        let Some(entry_est) = entry.wire_len() else {
+            continue;
+        };
         if batch_est_size + entry_est > MAX_BATCH && !batch.is_empty() {
             let msg = KadMessage::SearchRes {
                 sender_id,
@@ -850,7 +839,7 @@ pub(super) fn dispatch_udp_firewall_probe_requests(
         spawn_udp_firewall_probe_request(
             contact,
             state.user_hash,
-            settings.nickname.clone(),
+            settings.ed2k_nickname(),
             advertised_tcp_port(state),
             advertised_udp_port(state),
             external_udp_port,

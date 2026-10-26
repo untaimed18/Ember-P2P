@@ -23,8 +23,8 @@ use tracing::trace;
 
 use super::messages::{self, DhtPayload, VersionRange};
 use super::publish::{
-    source_key, SignedRecord, SourceBuddy, SourceContact, RECORD_TYPE_CHANNEL, RECORD_TYPE_KEYWORD,
-    RECORD_TYPE_SOURCE,
+    source_key, SignedRecord, SourceBuddy, SourceContact, RECORD_TYPE_CHANNEL, RECORD_TYPE_FEED,
+    RECORD_TYPE_FEED_LISTING, RECORD_TYPE_KEYWORD, RECORD_TYPE_SOURCE,
 };
 use super::routing::{AddResult, RoutingTable};
 use super::store::{DhtStore, DhtStoreEntry, StoreRejectStats};
@@ -1206,6 +1206,21 @@ impl EmberDht {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
             return StoreOutcome::Rejected;
         }
+        if parsed.record_type == RECORD_TYPE_FEED && !parsed.feed_store_ok() {
+            self.store_reject_verify = self.store_reject_verify.saturating_add(1);
+            return StoreOutcome::Rejected;
+        }
+        if parsed.record_type == RECORD_TYPE_FEED_LISTING && !parsed.feed_listing_store_ok() {
+            self.store_reject_verify = self.store_reject_verify.saturating_add(1);
+            return StoreOutcome::Rejected;
+        }
+        // An index shard key holds listings only. A keyword record, whose key
+        // nothing can check, filed there took a shard's slot that the full
+        // shard's eviction, which drops listings alone, never gave back.
+        if parsed.record_type != RECORD_TYPE_FEED_LISTING && crate::network::ember::feed::is_feed_index_key(&key) {
+            self.store_reject_verify = self.store_reject_verify.saturating_add(1);
+            return StoreOutcome::Rejected;
+        }
 
         if key != parsed.keyword_hash {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
@@ -1363,7 +1378,11 @@ impl EmberDht {
         // `DhtStore::take_republish_batch`).
         let unknown_type = !matches!(
             parsed.record_type,
-            RECORD_TYPE_KEYWORD | RECORD_TYPE_SOURCE | RECORD_TYPE_CHANNEL
+            RECORD_TYPE_KEYWORD
+                | RECORD_TYPE_SOURCE
+                | RECORD_TYPE_CHANNEL
+                | RECORD_TYPE_FEED
+                | RECORD_TYPE_FEED_LISTING
         );
         if self
             .store
@@ -2128,8 +2147,22 @@ impl EmberDht {
     }
 
     /// Build a signed `CHANNEL_MSG` gossip frame. No ack is expected.
+    ///
+    /// Empty, the frame `prepare_outgoing` declines to send, for a body too
+    /// large for one datagram. A room line near the 4096-byte text cap seals to
+    /// one, and its v2 form is 24 bytes larger than the legacy one; such a body
+    /// is not a bug in the encoder's callers but a line nobody can be sent, so
+    /// it is refused here rather than tripping the encoder's assertion. The
+    /// send paths say so to the user (`chat_gossip_frames`).
     pub fn build_channel_msg(&mut self, body: Vec<u8>) -> (u32, Vec<u8>) {
         let request_id = self.next_request_id();
+        if body.len() > messages::MAX_DELIVERABLE_PAYLOAD {
+            tracing::debug!(
+                "Ember channel gossip: a {}-byte body does not fit a datagram; not sent",
+                body.len()
+            );
+            return (request_id, Vec::new());
+        }
         let msg = messages::build_channel_msg(self.local_id, request_id, body);
         let bytes = messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub);
         (request_id, bytes)
@@ -2138,6 +2171,13 @@ impl EmberDht {
     /// Build a signed `CHANNEL_RELAY` frame for a HighID overlay hop.
     pub fn build_channel_relay(&mut self, body: Vec<u8>) -> (u32, Vec<u8>) {
         let request_id = self.next_request_id();
+        if body.len() > messages::MAX_DELIVERABLE_PAYLOAD {
+            tracing::debug!(
+                "Ember channel relay: a {}-byte envelope does not fit a datagram; not sent",
+                body.len()
+            );
+            return (request_id, Vec::new());
+        }
         let msg = messages::build_channel_relay(self.local_id, request_id, body);
         let bytes = messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub);
         (request_id, bytes)
@@ -4521,6 +4561,29 @@ mod tests {
         let (_rid, frame) = a.build_store(record.keyword_hash, record.data.clone(), record.signature);
         assert!(b.handle_message(&frame, a_addr, a_noise, 1002).stored_record);
         assert_eq!(b.inbound_record_verifications, 1);
+    }
+
+    /// A feed index shard key holds listings only: a keyword record filed
+    /// there is refused, for the price of reading it, before its signature is
+    /// checked.
+    #[test]
+    fn only_a_feed_listing_is_stored_under_a_feed_index_key() {
+        let mut a = dht(28);
+        let mut b = dht(29);
+        let a_noise = a.local_noise_pub;
+        let a_addr = addr(28, 4672);
+
+        let key = crate::network::ember::feed::feed_index_key(0);
+        let mut data = a.build_keyword_record("ubuntu", [9u8; 16], [0u8; 32], 4096, "ubuntu.iso").data;
+        data[1..17].copy_from_slice(&key);
+        let signature = crypto::sign(&a.signing_key, &data);
+        let (_rid, frame) = a.build_store(key, data, signature);
+        let on_b = b.handle_message(&frame, a_addr, a_noise, 1000);
+        assert!(!on_b.stored_record);
+        assert!(on_b.responses.is_empty(), "no STORE_ACK for a refused record");
+        assert_eq!(b.store_reject_verify, 1);
+        assert_eq!(b.inbound_record_verifications, 0);
+        assert_eq!(b.store_stats(), (0, 0));
     }
 
     /// A byte-identical retransmit of a record we hold is answered from the
@@ -7333,6 +7396,48 @@ mod tests {
             1,
             "a replay is not a second attempt"
         );
+    }
+
+    /// A feed head is a type this build knows: stored under its own key, not
+    /// counted as unknown, and refused under any other.
+    #[test]
+    fn a_feed_head_is_stored_under_its_key_and_refused_elsewhere() {
+        let mut a = dht(57);
+        let mut b = dht(58);
+        let a_noise = a.local_noise_pub;
+        let a_addr = addr(57, 4672);
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[57u8; 32]);
+        let head = crate::network::ember::feed::FeedHead {
+            sequence: 1,
+            list_ed2k_hash: [1; 16],
+            list_size: 100,
+            list_blake3: [2; 32],
+            item_count: 1,
+            total_size: 0,
+            title: "Feed".into(),
+            description: String::new(),
+            deleted: false,
+        };
+        let record = SignedRecord::feed_head_record(&[5u8; 16], &head, &sk, chrono::Utc::now().timestamp()).unwrap();
+        let (_rid, frame) = a.build_store(record.keyword_hash, record.data.clone(), record.signature);
+        assert!(b.handle_message(&frame, a_addr, a_noise, 1000).stored_record);
+        assert_eq!(b.unknown_record_types_stored(), 0);
+
+        let mut wrong_key = record.keyword_hash;
+        wrong_key[0] ^= 1;
+        let (_rid, frame) = a.build_store(wrong_key, record.data, record.signature);
+        assert!(!b.handle_message(&frame, a_addr, a_noise, 1001).stored_record);
+
+        // Its listing is a known type too, kept under its index shard.
+        let listing =
+            SignedRecord::feed_listing_record(&[5u8; 16], &head, false, &sk, chrono::Utc::now().timestamp()).unwrap();
+        let (_rid, frame) = a.build_store(listing.keyword_hash, listing.data.clone(), listing.signature);
+        assert!(b.handle_message(&frame, a_addr, a_noise, 1002).stored_record);
+        assert_eq!(b.unknown_record_types_stored(), 0);
+        let mut wrong_shard = listing.keyword_hash;
+        wrong_shard[0] ^= 1;
+        let (_rid, frame) = a.build_store(wrong_shard, listing.data, listing.signature);
+        assert!(!b.handle_message(&frame, a_addr, a_noise, 1003).stored_record);
     }
 
     /// A type byte this build does not know is stored, not refused — refusing

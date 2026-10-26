@@ -192,10 +192,25 @@ export async function getUnapprovedSharedFolders(): Promise<string[]> {
   return invoke('get_unapproved_shared_folders');
 }
 
+/** What re-approving shared folders did. */
+export interface ReapproveReport {
+  /** The folders approved; empty if they were kept blocked. */
+  approved: string[];
+  /** Hashing is stopped, so they are scanned when it resumes rather than now. */
+  scanOnResume: boolean;
+}
+
 /** Ask the user, in a native dialog, to re-approve a shared folder Ember no
- *  longer recognises. Resolves to whether it is approved afterwards. */
-export async function reapproveSharedFolder(path: string): Promise<boolean> {
+ *  longer recognises. The report names it when it is approved afterwards. */
+export async function reapproveSharedFolder(path: string): Promise<ReapproveReport> {
   return invoke('reapprove_shared_folder', { path });
+}
+
+/** Ask the user, in one native dialog naming them all, to re-approve every
+ *  shared folder Ember no longer recognises. Either call starts a scan of
+ *  what it approved, unless hashing is stopped. */
+export async function reapproveSharedFolders(): Promise<ReapproveReport> {
+  return invoke('reapprove_shared_folders');
 }
 
 export async function getFolderPriorities(): Promise<Record<string, string>> {
@@ -351,6 +366,9 @@ export interface CategoryMoveReport {
   recategorized: number;
   /** A coded error for each file that stayed where it was. */
   failed: string[];
+  /** Coded errors about the move as a whole rather than any one file: the
+   *  partly shared folders' lists could not follow the files that moved. */
+  warnings: string[];
 }
 
 /** Move Library files into the folder `category` names inside Downloads, as a
@@ -360,11 +378,53 @@ export async function moveFilesToCategory(paths: string[], category: string): Pr
   return invoke('move_files_to_category', { paths, category });
 }
 
+export interface RenameReport {
+  /** The file's path now. */
+  path: string;
+  /** A coded error when the file was renamed but the partly shared folders'
+   *  lists could not follow it: it leaves the Library at the next reload. */
+  warning: string | null;
+}
+
 /** Rename a Library file inside its folder. The row follows the file, so
  *  nothing is hashed again. Rejects when the name is invalid or taken (an
- *  existing file is never replaced). Resolves with the file's new path. */
-export async function renameLibraryFile(filePath: string, newName: string): Promise<string> {
+ *  existing file is never replaced). */
+export async function renameLibraryFile(filePath: string, newName: string): Promise<RenameReport> {
   return invoke('rename_library_file', { filePath, newName });
+}
+
+/** The tag {@link tagLibraryFiles} puts at the start of a name. */
+export const EMBER_NAME_TAG = '[Ember-P2P]';
+
+/** Whether `name` already starts with {@link EMBER_NAME_TAG}, in any capitals. */
+export function hasEmberTag(name: string): boolean {
+  return name.slice(0, EMBER_NAME_TAG.length).toLowerCase() === EMBER_NAME_TAG.toLowerCase();
+}
+
+export interface TagReport {
+  /** Files renamed, old path to new. */
+  renamed: { from: string; to: string }[];
+  /** Files that already had the tag (adding) or never had it (removing). */
+  unchanged: number;
+  /** A coded error for each file that kept its name. */
+  failed: string[];
+  /** Coded errors about the renames as a whole rather than any one file: the
+   *  partly shared folders' lists could not follow the files renamed. */
+  warnings: string[];
+}
+
+/** Add `[Ember-P2P] ` to the start of each file's name, or take it off, in
+ *  place. Rows follow their files, so nothing is hashed again; an existing
+ *  file is never replaced. At most 5,000 paths a call. */
+export async function tagLibraryFiles(paths: string[], add: boolean): Promise<TagReport> {
+  return invoke('tag_library_files', { paths, add });
+}
+
+/** Give each file now at `to` back the exact name it had at `from`, in the
+ *  same folder: the Undo of {@link tagLibraryFiles}. At most 5,000 files a
+ *  call. */
+export async function restoreLibraryFileNames(renames: { from: string; to: string }[]): Promise<TagReport> {
+  return invoke('restore_library_file_names', { renames });
 }
 
 export async function openSharedFolder(filePath: string): Promise<void> {

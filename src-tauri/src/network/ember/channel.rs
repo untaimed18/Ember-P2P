@@ -29,7 +29,25 @@ const PRESENCE_KEY_PREFIX: &[u8] = b"ember:channel:presence:v1";
 const MODERATION_KEY_PREFIX: &[u8] = b"ember:channel:mod:v1";
 const HANDOFF_KEY_PREFIX: &[u8] = b"ember:channel:handoff:v1";
 const EPOCH_KEY_PREFIX: &[u8] = b"ember:channel:epoch:v1";
+const EPOCH_KEY_V2_PREFIX: &[u8] = b"ember:channel:epoch:v2";
+/// Pairwise purpose, before the channel id, of the owner–member secret a v2
+/// key-epoch record is blinded from. Not the envelope's `ch-epoch-v1`.
+const EPOCH_BLIND_PURPOSE: &[u8] = b"ch-epoch-blind-v2";
+/// BLAKE3 `derive_key` context for the blind one member's v2 key-epoch records
+/// in a room derive from. Changing it would hide every v2 epoch record.
+const EPOCH_BLIND_CONTEXT: &str = "ember channel epoch blind v2";
+/// BLAKE3 `derive_key` context for the blinded member id in a v2 epoch record.
+const EPOCH_MEMBER_CONTEXT: &str = "ember channel epoch member v2";
+/// BLAKE3 `derive_key` context for a member's per-room presence pseudonym.
+const PRESENCE_PSEUDONYM_CONTEXT: &str = "ember channel presence pseudonym v1";
+/// BLAKE3 `derive_key` context for the room-blind key a v2 presence record
+/// carries in place of the channel pubkey.
+const PRESENCE_ROOM_BLIND_CONTEXT: &str = "ember channel presence room v1";
 const CLAIM_KEY_PREFIX: &[u8] = b"ember:channel:claim:v1";
+const SETTINGS_KEY_PREFIX: &[u8] = b"ember:channel:settings:v1";
+/// BLAKE3 `derive_key` context for an owner's commitment to one epoch's
+/// content key. Changing it would make every published commitment unmatchable.
+const KEY_COMMITMENT_CONTEXT: &str = "ember channel key commitment v1";
 const EPOCH_AAD_DOMAIN: &[u8] = b"ember-channel-key-epoch-v1\0";
 pub const EPOCH_ENVELOPE_VERSION: u8 = 1;
 /// `version(1) + nonce + key(32) + tag`.
@@ -188,6 +206,10 @@ pub const CHANNEL_MSG_TTL_DEFAULT: u8 = 8;
 /// and its body key ([`admit_gossip`]) — so this is twice the frame window.
 pub const CHANNEL_GOSSIP_SEEN_CAP: usize = 8192;
 /// `CHANNEL_MSG` frames we will relay for the mesh per second.
+///
+/// Counted in frames, not lines: while [`SEND_LEGACY_CHAT_FRAMES`] holds, a
+/// chat line or revision is two frames, so this and the per-hop allowances
+/// derived from it carry half as many lines.
 pub const CHANNEL_GOSSIP_OUT_PER_SEC: usize = 16;
 /// `CHANNEL_MSG` frames this user may originate per second.
 ///
@@ -741,6 +763,62 @@ pub fn generate_owned_room_salt() -> OwnedRoomSalt {
     salt
 }
 
+/// Context of the salts that pad an owned-rooms list; see
+/// [`pad_owned_rooms_list`].
+const OWNED_ROOMS_PAD_CONTEXT: &str = "ember-identity-owned-rooms-pad-v1";
+
+/// Whether the owned-rooms list this identity publishes is padded. Off until
+/// 1.8.0: a 1.7.4 device on the same identity cannot tell a pad from a room,
+/// carries every pad as a room it cannot find and publishes them back. Lists
+/// read are stripped of pads either way.
+pub const PAD_OWNED_ROOMS_LIST: bool = false;
+
+/// Sizes an owned-rooms list is padded to, smallest first. The last is
+/// `OWNED_ROOMS_MAX`, the most one list carries.
+const OWNED_ROOMS_PAD_SIZES: [usize; 4] = [8, 16, 32, 48];
+
+/// The `index`th salt that pads this identity's owned-rooms list. Derived
+/// from the identity's secret, so they read like any other salt to everyone
+/// else and the identity can tell them apart without a lookup.
+fn owned_rooms_pad_salt(identity_seed: &[u8; 32], index: u8) -> OwnedRoomSalt {
+    let mut material = [0u8; 33];
+    material[..32].copy_from_slice(identity_seed);
+    material[32] = index;
+    let derived = blake3::derive_key(OWNED_ROOMS_PAD_CONTEXT, &material);
+    zeroize::Zeroize::zeroize(&mut material);
+    let mut salt = [0u8; 16];
+    salt.copy_from_slice(&derived[..16]);
+    salt
+}
+
+/// `salts` padded to the next of a few fixed sizes and put in byte order, so
+/// the published list says neither how many rooms the identity owns nor which
+/// of them were carried. Past the last size it is left as it is, for the
+/// signer to refuse.
+pub fn pad_owned_rooms_list(salts: &[OwnedRoomSalt], identity_seed: &[u8; 32]) -> Vec<OwnedRoomSalt> {
+    let mut padded = salts.to_vec();
+    if let Some(&size) = OWNED_ROOMS_PAD_SIZES.iter().find(|&&size| size >= salts.len()) {
+        let mut index = 0u8;
+        while padded.len() < size {
+            let pad = owned_rooms_pad_salt(identity_seed, index);
+            if !padded.contains(&pad) {
+                padded.push(pad);
+            }
+            index = index.wrapping_add(1);
+        }
+    }
+    padded.sort_unstable();
+    padded
+}
+
+/// Whether `salt` is one of this identity's pads, which name no room. A list
+/// never needs more pads than its largest size holds; a few more cover the
+/// odd pad skipped for matching a real salt.
+pub fn is_owned_rooms_pad(salt: &OwnedRoomSalt, identity_seed: &[u8; 32]) -> bool {
+    let tried = OWNED_ROOMS_PAD_SIZES[OWNED_ROOMS_PAD_SIZES.len() - 1] as u8 + 8;
+    (0..tried).any(|index| owned_rooms_pad_salt(identity_seed, index) == *salt)
+}
+
 /// DHT key of the list of rooms `identity_pubkey` owns.
 pub fn owned_rooms_key(identity_pubkey: &[u8; 32]) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
@@ -817,6 +895,76 @@ pub fn presence_key(channel_id: &[u8; 16], join_secret: &[u8; 32], epoch: i64) -
     key
 }
 
+/// Whether this build still publishes the v1 forms of a private room's
+/// membership records: the presence record that names the room and the member
+/// in its header, and the key-epoch record filed under [`epoch_key`].
+///
+/// On for the transition, so members on 1.7.4 and storers on 1.7.4, which keep
+/// neither v2 form, still find them. Planned off in 1.8.0, the release that
+/// stops sending the old chat frames, so a room has one cut-over to test.
+/// Readers keep reading v1 either way. See [`epoch_record_publishes_v1`] for
+/// the epoch records that stay v1 past it, and [`V1_CUT_OVER_ROTATES`] for
+/// what has to ship with turning it off.
+pub const PUBLISH_V1_MEMBERSHIP_RECORDS: bool = true;
+
+/// 1.8.0 also rotates: when an owner stops publishing v1 membership records it
+/// rotates every private room it owns once.
+///
+/// During the transition a member's v1 and v2 presence copies sit under one
+/// presence key with the same stamp and flags, so a storer keeping a table
+/// links the pseudonym and room-blind key to the member and the room. Both
+/// change only with the join secret, so without a rotation the v2 records
+/// after the cut-over would carry the ids the transition already linked.
+/// Not built yet, which is why turning v1 off does not compile.
+pub const V1_CUT_OVER_ROTATES: bool = !PUBLISH_V1_MEMBERSHIP_RECORDS;
+const _: () = assert!(
+    !V1_CUT_OVER_ROTATES,
+    "build the cut-over's one rotation per owned private room before turning v1 off"
+);
+
+/// The key a member signs its v2 presence records in one room with, while the
+/// room seals under `join_secret`.
+///
+/// Per room and per join secret, so the record alone does not link a member's
+/// presence across rooms or across a rotation, and derived from the member's
+/// seed, so nobody else can sign as it. The transport still names the member:
+/// the record goes to storers in a STORE signed under the member's long-term
+/// DHT identity. Stable across presence epochs: a tombstone has to replace the
+/// live record under the same store key, which is per publisher.
+pub fn presence_pseudonym(
+    member_seed: &[u8; 32],
+    channel_id: &[u8; 16],
+    join_secret: &[u8; 32],
+) -> SigningKey {
+    let mut material = [0u8; 32 + 16 + 32];
+    material[..32].copy_from_slice(member_seed);
+    material[32..48].copy_from_slice(channel_id);
+    material[48..].copy_from_slice(join_secret);
+    let mut seed = blake3::derive_key(PRESENCE_PSEUDONYM_CONTEXT, &material);
+    zeroize::Zeroize::zeroize(&mut material);
+    let key = SigningKey::from_bytes(&seed);
+    zeroize::Zeroize::zeroize(&mut seed);
+    key
+}
+
+/// `(file_hash, ember_file_hash)` for a v2 presence record: an Ed25519 key only
+/// the room's members can derive, and its node id.
+///
+/// Stands where the channel id and pubkey stand in every other channel record,
+/// so the storer rule every kind shares (`file_hash` is `BLAKE3` of a valid
+/// `ember_file_hash`) still holds, and the record names neither the room nor,
+/// with [`presence_pseudonym`], the member.
+pub fn presence_room_blind(channel_id: &[u8; 16], join_secret: &[u8; 32]) -> ([u8; 16], [u8; 32]) {
+    let mut material = [0u8; 16 + 32];
+    material[..16].copy_from_slice(channel_id);
+    material[16..].copy_from_slice(join_secret);
+    let mut seed = blake3::derive_key(PRESENCE_ROOM_BLIND_CONTEXT, &material);
+    zeroize::Zeroize::zeroize(&mut material);
+    let pubkey = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+    zeroize::Zeroize::zeroize(&mut seed);
+    (channel_id_from_pubkey(&pubkey), pubkey)
+}
+
 pub fn moderation_key(channel_id: &[u8; 16]) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(MODERATION_KEY_PREFIX);
@@ -825,6 +973,36 @@ pub fn moderation_key(channel_id: &[u8; 16]) -> [u8; 16] {
     let mut key = [0u8; 16];
     key.copy_from_slice(&hash.as_bytes()[..16]);
     key
+}
+
+/// DHT key for a room's owner-signed settings record.
+///
+/// Not [`moderation_key`]: the two share a publisher (the channel key) and a
+/// `file_hash` (the channel id), and a storer keeps one record per key,
+/// publisher and `file_hash`, so filed together one would replace the other.
+pub fn settings_key(channel_id: &[u8; 16]) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(SETTINGS_KEY_PREFIX);
+    hasher.update(channel_id);
+    let hash = hasher.finalize();
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&hash.as_bytes()[..16]);
+    key
+}
+
+/// The owner's commitment to `content_key` as the key of `epoch` in this room.
+///
+/// What lets a member behind the room's key take one from an invite: the
+/// invite is unauthenticated, the commitment rides a record only the room key
+/// can sign. It reveals nothing of the key, which derives from 32 random bytes.
+pub fn key_commitment(channel_id: &[u8; 16], epoch: i64, content_key: &[u8; 32]) -> [u8; 32] {
+    let mut material = [0u8; 16 + 8 + 32];
+    material[..16].copy_from_slice(channel_id);
+    material[16..24].copy_from_slice(&epoch.to_le_bytes());
+    material[24..].copy_from_slice(content_key);
+    let commitment = blake3::derive_key(KEY_COMMITMENT_CONTEXT, &material);
+    zeroize::Zeroize::zeroize(&mut material);
+    commitment
 }
 
 /// DHT key for an owner-signed successor record. `file_hash` on that record
@@ -856,6 +1034,80 @@ pub fn epoch_key(channel_id: &[u8; 16], member_pubkey: &[u8; 32], epoch: i64) ->
     let mut key = [0u8; 16];
     key.copy_from_slice(&hash.as_bytes()[..16]);
     key
+}
+
+/// The blind one member's v2 key-epoch records in one room derive from, which
+/// only the owner and that member can compute.
+///
+/// The static DH behind [`derive_channel_epoch_secret`], under a purpose of its
+/// own and with the epoch fixed at 0, so it does not change with the epoch: a
+/// member computes its record's key for any epoch directly, whatever it holds
+/// or missed. The owner passes its identity seed and the member's key, the
+/// member its own seed and the owner's. [`epoch_key`] is built from public
+/// values, so anyone who knew the room id could test whether a key was a
+/// member; this one needs the member's pairwise secret, which no other member,
+/// former ones included, holds. Only once v1 copies stop going out
+/// ([`PUBLISH_V1_MEMBERSHIP_RECORDS`]): until then each record is published
+/// beside a v1 copy of it, and that copy's key can still be tested.
+pub fn epoch_blind(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    channel_id: &[u8; 16],
+) -> Option<[u8; 32]> {
+    // Pairwise purpose is capped at 64 bytes; this is 33.
+    let mut purpose = Vec::with_capacity(EPOCH_BLIND_PURPOSE.len() + 16);
+    purpose.extend_from_slice(EPOCH_BLIND_PURPOSE);
+    purpose.extend_from_slice(channel_id);
+    let mut pairwise =
+        crypto::derive_pairwise_capability(our_ed25519_seed, peer_ed25519_pubkey, &purpose, 0)?;
+    let blind = blake3::derive_key(EPOCH_BLIND_CONTEXT, &pairwise);
+    zeroize::Zeroize::zeroize(&mut pairwise);
+    Some(blind)
+}
+
+/// The member id a v2 key-epoch record carries in place of the member's key.
+///
+/// A different one in every epoch, so the records one member is sealed across
+/// rotations cannot be told apart from different members' by a storer that
+/// keeps them all, once v1 copies stop going out: until then each v2 record
+/// goes out beside a v1 copy stamped the same second with the same envelope,
+/// which names the member, so a storer holding both can link them. The ids
+/// being per epoch, the next rotation after the cut-over starts unlinked
+/// without one of its own. The storer needs no more than the record gives it:
+/// the id and the epoch are both in the extra it recomputes the key from.
+pub fn epoch_member_id(blind: &[u8; 32], epoch: i64) -> [u8; 32] {
+    let mut input = [0u8; 32 + 8];
+    input[..32].copy_from_slice(blind);
+    input[32..].copy_from_slice(&epoch.to_le_bytes());
+    blake3::derive_key(EPOCH_MEMBER_CONTEXT, &input)
+}
+
+/// DHT key of one member's v2 copy of one content-key epoch.
+///
+/// Built only from what the record carries (its `file_hash` and the member id
+/// and epoch in its extra), so a storer recomputes it as it does [`epoch_key`]
+/// and refuses a record filed anywhere else. Nobody without the member's
+/// [`epoch_blind`] can compute the member id to look one up by.
+pub fn epoch_key_v2(channel_id: &[u8; 16], member_id: &[u8; 32], epoch: i64) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(EPOCH_KEY_V2_PREFIX);
+    hasher.update(channel_id);
+    hasher.update(member_id);
+    hasher.update(&epoch.to_le_bytes());
+    let hash = hasher.finalize();
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&hash.as_bytes()[..16]);
+    key
+}
+
+/// Whether a key-epoch record goes out in v1 as well as v2.
+///
+/// Past the transition ([`PUBLISH_V1_MEMBERSHIP_RECORDS`] off) the owner's own
+/// copy still does: the owner's key is already public in the room's moderation
+/// snapshot, so v1 hides nothing there, and it is the form a device restored
+/// from a backup reads its keys back from (`catch_up_own_epochs`).
+pub fn epoch_record_publishes_v1(own_copy: bool) -> bool {
+    PUBLISH_V1_MEMBERSHIP_RECORDS || own_copy
 }
 
 /// Whether a room's owner-silence is something we have observed rather than
@@ -1077,20 +1329,81 @@ pub fn derive_channel_presence_capability(
 ///
 /// The TTL is outside the seal, so a relay could raise it on a re-serve. The
 /// line must also be live by its signed time ([`gossip_fresh_for_relay`]),
-/// which re-serves of anything older are not. Members whose builds send
-/// key-proven beacons are admitted by those instead; this path remains for
-/// builds that do not.
+/// which re-serves of anything older are not. That still leaves a recent line
+/// re-served with its TTL raised, so a room whose owner states
+/// [`RosterAdmission::KeyProven`] closes this path altogether, and newcomers
+/// are admitted only on proof of the current key. Under
+/// [`RosterAdmission::Open`] it remains for builds that send no key-proven
+/// beacons.
 pub fn chat_author_joins_gossip_roster(
     private: bool,
+    admission: RosterAdmission,
     opened: OpenedUnder,
     ttl: u8,
     timestamp: i64,
     now: i64,
 ) -> bool {
     private
+        && admission == RosterAdmission::Open
         && opened == OpenedUnder::Current
         && !gossip_is_catch_up_shaped(ttl)
         && gossip_fresh_for_relay(timestamp, now)
+}
+
+/// How a private room admits a member its roster does not hold, as the owner's
+/// settings record states it (kind 8, tag 2).
+///
+/// Only the chat path reads it. A beacon from a newcomer is held to its
+/// author's proof of the current key whatever this says
+/// ([`beacon_admits_newcomer`]), and so is a DHT presence record, which admits
+/// only when it opens under the current key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RosterAdmission {
+    /// No settings record held, or one without tag 2 or with 0 in it: a live
+    /// chat line under the current key admits its author too, as before 1.7.5.
+    #[default]
+    Open,
+    /// Only proof of the current content key admits. Members already on the
+    /// roster stay, and a line from one still refreshes them.
+    KeyProven,
+}
+
+impl RosterAdmission {
+    /// The value an owner on this build writes as tag 2 for every private room.
+    pub const OWNED_PRIVATE_ROOM: Self = Self::KeyProven;
+
+    /// Read tag 2's value. Any value but 0 is [`Self::KeyProven`], so a value
+    /// above 1 can only ever name a rule at least as strict as 1: builds from
+    /// 1.7.5 on apply 1 to it.
+    pub fn from_setting(value: u8) -> Self {
+        if value == 0 {
+            Self::Open
+        } else {
+            Self::KeyProven
+        }
+    }
+
+    /// Tag 2's value for this rule; 0 is written by leaving the tag out.
+    pub fn setting(self) -> u8 {
+        match self {
+            Self::Open => 0,
+            Self::KeyProven => 1,
+        }
+    }
+}
+
+/// Whether a signature-valid beacon from a member the roster does not hold may
+/// add them.
+///
+/// `admission_key` is a private room's current content key; with one, only the
+/// author's own proof of it will do ([`PresenceBeacon::proves_key`]). A public
+/// room passes none, since its key proves nothing.
+pub fn beacon_admits_newcomer(
+    beacon: &PresenceBeacon,
+    channel_id: &[u8; 16],
+    admission_key: Option<&[u8; 32]>,
+) -> bool {
+    admission_key.is_none_or(|key| beacon.proves_key(channel_id, key))
 }
 
 /// Which of a room's content keys opened a frame.
@@ -1700,10 +2013,31 @@ impl ChannelExtFrame {
     }
 }
 
-/// Extension kinds this build reads. None yet: a kind is added here by the
-/// build that first gives it a meaning, and every build before that passes it
-/// on and, if it is displayable, says so.
-const UNDERSTOOD_EXT_KINDS: &[u8] = &[];
+/// A chat line, version 2: an extension frame whose body is a tagged field
+/// list ([`decode_chat_v2_body`]). Sent beside [`CHAT_PLAIN_VERSION`] until
+/// [`SEND_LEGACY_CHAT_FRAMES`] is turned off.
+pub const EXT_KIND_CHAT_LINE: u8 = 64;
+/// A revision of a line, version 2, beside [`CHAT_EDIT_PLAIN_VERSION`].
+pub const EXT_KIND_CHAT_EDIT: u8 = 65;
+/// A private message between two members, sealed to the recipient: see
+/// [`super::room_dm`]. Never displayable: an older build has nothing to show
+/// for one, and saying a line needs a newer Ember would tell every member
+/// that a private message passed.
+pub const EXT_KIND_PRIVATE_MESSAGE: u8 = 66;
+
+/// Extension kinds this build reads. A kind is added here by the build that
+/// first gives it a meaning, and every build before that passes it on and, if
+/// it is displayable, says so.
+const UNDERSTOOD_EXT_KINDS: &[u8] = &[EXT_KIND_CHAT_LINE, EXT_KIND_CHAT_EDIT, EXT_KIND_PRIVATE_MESSAGE];
+
+/// The most an extension frame's body can hold and still go out in one
+/// datagram, inside a gossip envelope, wrapped for an overlay relay hop too:
+/// a firewalled member is reached only that way.
+pub const EXT_BODY_MAX_BYTES: usize = super::dht::messages::MAX_DELIVERABLE_PAYLOAD
+    - CHANNEL_RELAY_ENVELOPE_HEADER
+    - GOSSIP_HEADER_LEN
+    - GOSSIP_ENVELOPE_OVERHEAD
+    - EXT_HEADER_LEN;
 
 pub fn ext_kind_understood(kind: u8) -> bool {
     UNDERSTOOD_EXT_KINDS.contains(&kind)
@@ -1734,9 +2068,8 @@ fn ext_sig_preimage(
 }
 
 /// Build an extension frame. `None` for a kind below [`EXT_KIND_MIN`], which
-/// belongs to a layout of its own. No kind is sent yet; this is the one way a
-/// later one will be.
-#[allow(dead_code)]
+/// belongs to a layout of its own.
+#[cfg(test)]
 pub fn encode_channel_ext_frame(
     signing_key: &SigningKey,
     channel_id: &[u8; 16],
@@ -1750,17 +2083,45 @@ pub fn encode_channel_ext_frame(
         return None;
     }
     let sender = signing_key.verifying_key().to_bytes();
-    let signature = crypto::sign(
+    let signature = ext_author_signature(signing_key, channel_id, msg_id, timestamp, kind, flags, body);
+    Some(encode_channel_ext_frame_presigned(kind, flags, &sender, &signature, body))
+}
+
+/// The author's signature over an extension frame, made apart from the frame
+/// so it can be kept with the stored copy and replayed on a catch-up, as
+/// [`chat_author_signature`] is.
+pub fn ext_author_signature(
+    signing_key: &SigningKey,
+    channel_id: &[u8; 16],
+    msg_id: &[u8; 16],
+    timestamp: i64,
+    kind: u8,
+    flags: u8,
+    body: &[u8],
+) -> [u8; 64] {
+    let sender = signing_key.verifying_key().to_bytes();
+    crypto::sign(
         signing_key,
         &ext_sig_preimage(channel_id, msg_id, timestamp, kind, flags, &sender, body),
-    );
+    )
+}
+
+/// Rebuild an extension frame around a signature its author already made.
+/// The caller keeps `kind` at [`EXT_KIND_MIN`] or above.
+pub fn encode_channel_ext_frame_presigned(
+    kind: u8,
+    flags: u8,
+    sender: &[u8; 32],
+    signature: &[u8; 64],
+    body: &[u8],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(EXT_HEADER_LEN + body.len());
     out.push(kind);
     out.push(flags);
-    out.extend_from_slice(&sender);
-    out.extend_from_slice(&signature);
+    out.extend_from_slice(sender);
+    out.extend_from_slice(signature);
     out.extend_from_slice(body);
-    Some(out)
+    out
 }
 
 /// Read an extension frame, or nothing if it is not one or its author cannot
@@ -1798,16 +2159,521 @@ pub fn decode_channel_ext_frame(
         body: body.to_vec(),
     })
 }
+
+/// Whether this build still sends every line as a chat line
+/// ([`CHAT_PLAIN_VERSION`], 15) and every revision as an edit
+/// ([`CHAT_EDIT_PLAIN_VERSION`], 19) beside its v2 frame. Off in 1.8.0, the
+/// release that stops sending 15 and 19, which also sets
+/// [`EXT_FLAG_DISPLAY`] on the v2 frames ([`CHAT_V2_FLAGS`]) and lets a line's
+/// frame take the line's own id ([`outgoing_chat_line`]).
+pub const SEND_LEGACY_CHAT_FRAMES: bool = true;
+
+/// Flags on every v2 chat frame this build sends. Unset while the legacy
+/// frames go out too: builds from 1.7.2 to 1.7.4 count a displayable frame of
+/// a kind they cannot read as a line needing a newer Ember, and with the flag
+/// set every line would raise that banner there even though its legacy twin
+/// shows it.
+pub const CHAT_V2_FLAGS: u8 = if SEND_LEGACY_CHAT_FRAMES { 0 } else { EXT_FLAG_DISPLAY };
+
+/// Version of a v2 chat body. A later version keeps the framing, so a reader
+/// that knows only this one reads its fields the same way.
+pub const CHAT_V2_BODY_VERSION: u8 = 1;
+/// The line's id: for a line, the `msg_id` its legacy twin travels under; for
+/// a revision, the line revised. 16 bytes.
+const CHAT_V2_TAG_LINE: u8 = 1;
+/// The text, UTF-8, without any reply trailer. Emoji joiners are kept.
+const CHAT_V2_TAG_TEXT: u8 = 2;
+/// The id of the line this one replies to, 16 bytes; absent for a line that
+/// is not a reply. Stands in for the tag-character trailer the legacy text
+/// carries ([`with_reply_trailer`]).
+const CHAT_V2_TAG_REPLY: u8 = 3;
+/// A revision's original send time, `i64`. The revision's own time is the
+/// envelope's, which the frame's signature binds.
+const CHAT_V2_TAG_ORIGINAL_TS: u8 = 4;
+
+/// Most bytes a line's text may take as stored, reply trailer included: what
+/// every receiver, older builds too, holds a chat line to.
+pub const CHAT_TEXT_MAX_BYTES: usize = 4096;
+
+/// The `(tag, value)` fields of `version(1) || (tag(1) || len(2) || value)*`,
+/// or `None` unless they fill `bytes` exactly, in ascending tag order without
+/// repeats, behind a version that is not 0.
+///
+/// The framing of the room settings record's `extra`, shared so the two cannot
+/// drift apart. Checking each known tag's value is left to the caller; an
+/// unknown tag comes back for the caller to skip.
+pub fn tagged_fields(bytes: &[u8]) -> Option<Vec<(u8, &[u8])>> {
+    let (&version, mut rest) = bytes.split_first()?;
+    if version == 0 {
+        return None;
+    }
+    let mut fields: Vec<(u8, &[u8])> = Vec::new();
+    while !rest.is_empty() {
+        let header = rest.get(..3)?;
+        let tag = header[0];
+        let len = u16::from_le_bytes([header[1], header[2]]) as usize;
+        let value = rest.get(3..3 + len)?;
+        if fields.last().is_some_and(|(prev, _)| tag <= *prev) {
+            return None;
+        }
+        fields.push((tag, value));
+        rest = &rest[3 + len..];
+    }
+    Some(fields)
+}
+
+fn push_tagged_field(out: &mut Vec<u8>, tag: u8, value: &[u8]) -> Option<()> {
+    out.push(tag);
+    out.extend_from_slice(&u16::try_from(value.len()).ok()?.to_le_bytes());
+    out.extend_from_slice(value);
+    Some(())
+}
+
+/// What a v2 chat body says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatV2Body {
+    pub line_id: [u8; 16],
+    pub text: String,
+    pub reply_to: Option<[u8; 16]>,
+    /// Revisions only.
+    pub original_timestamp: Option<i64>,
+}
+
+impl ChatV2Body {
+    /// The text as a line is stored and as its legacy twin is signed: the
+    /// body, then the reply trailer when there is a parent.
+    pub fn stored_text(&self) -> String {
+        with_reply_trailer(&self.text, self.reply_to.as_ref())
+    }
+}
+
+/// A v2 line or revision body, tags ascending. `None` for a text too long for
+/// its length field, which no caller sends.
+pub fn encode_chat_v2_body(body: &ChatV2Body) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(1 + 3 + 16 + 3 + body.text.len() + 3 + 16 + 3 + 8);
+    out.push(CHAT_V2_BODY_VERSION);
+    push_tagged_field(&mut out, CHAT_V2_TAG_LINE, &body.line_id)?;
+    push_tagged_field(&mut out, CHAT_V2_TAG_TEXT, body.text.as_bytes())?;
+    if let Some(parent) = body.reply_to {
+        push_tagged_field(&mut out, CHAT_V2_TAG_REPLY, &parent)?;
+    }
+    if let Some(original) = body.original_timestamp {
+        push_tagged_field(&mut out, CHAT_V2_TAG_ORIGINAL_TS, &original.to_le_bytes())?;
+    }
+    Some(out)
+}
+
+/// Read a v2 chat body of `kind`, or nothing if it is malformed: framing that
+/// does not fill it exactly, a known tag whose value is not its layout, a
+/// field the kind needs missing, a text that itself ends in a reply trailer,
+/// which would read as a reply once stored, or a text and parent that do not
+/// read alike in both forms ([`chat_v2_text_reads_alike`]). Unknown tags are
+/// skipped.
+///
+/// A known tag is held to its layout in every version and in both kinds, as
+/// the settings record's tags are; a later build that needs another layout
+/// takes another tag.
+pub fn decode_chat_v2_body(kind: u8, body: &[u8]) -> Option<ChatV2Body> {
+    let (mut line_id, mut text, mut reply_to, mut original_timestamp) = (None, None, None, None);
+    for (tag, value) in tagged_fields(body)? {
+        match tag {
+            CHAT_V2_TAG_LINE => line_id = Some(<[u8; 16]>::try_from(value).ok()?),
+            CHAT_V2_TAG_TEXT => text = Some(std::str::from_utf8(value).ok()?.to_string()),
+            CHAT_V2_TAG_REPLY => reply_to = Some(<[u8; 16]>::try_from(value).ok()?),
+            CHAT_V2_TAG_ORIGINAL_TS => {
+                original_timestamp = Some(i64::from_le_bytes(<[u8; 8]>::try_from(value).ok()?));
+            }
+            _ => {}
+        }
+    }
+    let text = text?;
+    if split_reply_trailer(&text).1.is_some() || !chat_v2_text_reads_alike(&text, reply_to.as_ref()) {
+        return None;
+    }
+    let original_timestamp = match kind {
+        EXT_KIND_CHAT_LINE => None,
+        EXT_KIND_CHAT_EDIT => Some(original_timestamp?),
+        _ => return None,
+    };
+    Some(ChatV2Body {
+        line_id: line_id?,
+        text,
+        reply_to,
+        original_timestamp,
+    })
+}
+
+/// A v2 chat frame as kept beside the line it carries, so a catch-up can put
+/// the author's bytes back on the wire: its own envelope id and signed time,
+/// which its signature binds, and everything the frame carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatV2Frame {
+    pub kind: u8,
+    pub flags: u8,
+    pub frame_id: [u8; 16],
+    pub signed_at: i64,
+    pub signature: [u8; 64],
+    pub body: Vec<u8>,
+}
+
+impl ChatV2Frame {
+    /// The plaintext to seal, for its author `sender`.
+    pub fn plain(&self, sender: &[u8; 32]) -> Vec<u8> {
+        encode_channel_ext_frame_presigned(self.kind, self.flags, sender, &self.signature, &self.body)
+    }
+}
+
+/// The text a legacy twin (15 or 19) carries for a line stored as `stored`
+/// from a v2 frame: the same body and trailer with the emoji joiners taken out,
+/// which is what senders on this build sign the legacy frame over.
+///
+/// Receivers hold the pair to it, whichever arrives first: a v2 frame replaces
+/// the stored text of its legacy twin only when this gives back the twin's
+/// text, and a legacy twin's signature is kept beside a v2 row only then too.
+/// So a row never holds two forms that say different things, and its legacy
+/// text is always this.
+pub fn chat_legacy_text(stored: &str) -> String {
+    let (body, parent) = split_reply_trailer(stored);
+    with_reply_trailer(
+        &crate::security::without_message_text_joiners(body),
+        parent.as_ref(),
+    )
+}
+
+/// Whether a v2 text and its parent (tag 3) read alike in both forms: stored
+/// ([`ChatV2Body::stored_text`]) and as the legacy twin carries it
+/// ([`chat_legacy_text`]), each names `reply_to` as its parent, or none, and
+/// leaves a body that is not empty.
+///
+/// An emoji joiner after a reply trailer hides it from the v2 reader alone,
+/// and a body of joiners alone leaves the legacy twin a bare trailer, which
+/// builds before this one read as no reply. Tag characters are not refused as
+/// such: subdivision flags are spelled with them.
+pub fn chat_v2_text_reads_alike(text: &str, reply_to: Option<&[u8; 16]>) -> bool {
+    let stored = with_reply_trailer(text, reply_to);
+    let legacy = chat_legacy_text(&stored);
+    let (body, parent) = split_reply_trailer(&stored);
+    let (legacy_body, legacy_parent) = split_reply_trailer(&legacy);
+    !body.is_empty()
+        && !legacy_body.is_empty()
+        && parent.as_ref() == reply_to
+        && legacy_parent.as_ref() == reply_to
+}
+
+/// The body a line or revision goes out as in its v2 frame: what was typed,
+/// sanitised as a receiver would ([`crate::security::sanitize_message_text`],
+/// which keeps emoji joiners) with any pasted trailer dropped. `legacy_body`
+/// is the body the legacy frame carries, from
+/// [`crate::security::sanitize_outgoing_message_text`].
+///
+/// `legacy_body` itself when the kept text would not pair with it
+/// ([`chat_legacy_text`]), would not read alike in both forms
+/// ([`chat_v2_text_reads_alike`]) or would not fit [`CHAT_TEXT_MAX_BYTES`], so
+/// the two frames always agree; that costs only the joiners. `legacy_body` is
+/// what the callers send as the legacy body: not empty, joiner-free and with
+/// its trailers stripped, so it reads alike itself.
+pub fn chat_v2_outgoing_text(typed: &str, legacy_body: &str, parent: Option<&[u8; 16]>) -> String {
+    let legacy = with_reply_trailer(legacy_body, parent);
+    crate::security::sanitize_message_text(typed)
+        .map(|kept| strip_reply_trailers(&kept).to_string())
+        .filter(|kept| {
+            let stored = with_reply_trailer(kept, parent);
+            chat_v2_text_reads_alike(kept, parent)
+                && stored.len() <= CHAT_TEXT_MAX_BYTES
+                && chat_legacy_text(&stored) == legacy
+        })
+        .unwrap_or_else(|| legacy_body.to_string())
+}
+
+/// One line or revision as this device sends and stores it.
+#[derive(Debug, Clone)]
+pub struct OutgoingChat {
+    /// The legacy frame's plaintext and the author's signature in it, while
+    /// [`SEND_LEGACY_CHAT_FRAMES`] holds.
+    pub legacy: Option<(Vec<u8>, [u8; 64])>,
+    pub v2: ChatV2Frame,
+    /// The text to store: the v2 body with its reply trailer.
+    pub stored_text: String,
+}
+
+/// Both frames of a line the local user sends.
+///
+/// The v2 frame travels under an envelope id of its own while the legacy
+/// frame goes out too. Every build drops a frame whose `msg_id` it has seen,
+/// so a build before this one that met a v2 frame under the line's id first
+/// would drop the legacy line as a duplicate and never show it; the line's id
+/// rides inside the signed body instead. With no legacy frame to shadow
+/// (1.8.0), the frame takes the line's id, so a line's delivery is still
+/// settled by the one frame that carries it.
+///
+/// `legacy_text` is the legacy frame's text, trailer included; `v2_text` the
+/// body from [`chat_v2_outgoing_text`]. `None` for a text too long for the
+/// body's length field, which the callers' own cap rules out.
+pub fn outgoing_chat_line(
+    signing_key: &SigningKey,
+    channel_id: &[u8; 16],
+    line_id: &[u8; 16],
+    timestamp: i64,
+    legacy_text: &str,
+    v2_text: &str,
+    parent: Option<&[u8; 16]>,
+) -> Option<OutgoingChat> {
+    let sender = signing_key.verifying_key().to_bytes();
+    let legacy = SEND_LEGACY_CHAT_FRAMES.then(|| {
+        let sig = chat_author_signature(signing_key, &sender, channel_id, line_id, timestamp, legacy_text);
+        (encode_channel_chat_plain_presigned(&sender, &sig, legacy_text), sig)
+    });
+    let frame_id = if SEND_LEGACY_CHAT_FRAMES {
+        let mut id = [0u8; 16];
+        OsRng.fill_bytes(&mut id);
+        id
+    } else {
+        *line_id
+    };
+    let body = ChatV2Body {
+        line_id: *line_id,
+        text: v2_text.to_string(),
+        reply_to: parent.copied(),
+        original_timestamp: None,
+    };
+    let stored_text = body.stored_text();
+    let body = encode_chat_v2_body(&body)?;
+    let signature = ext_author_signature(
+        signing_key,
+        channel_id,
+        &frame_id,
+        timestamp,
+        EXT_KIND_CHAT_LINE,
+        CHAT_V2_FLAGS,
+        &body,
+    );
+    Some(OutgoingChat {
+        legacy,
+        v2: ChatV2Frame {
+            kind: EXT_KIND_CHAT_LINE,
+            flags: CHAT_V2_FLAGS,
+            frame_id,
+            signed_at: timestamp,
+            signature,
+            body,
+        },
+        stored_text,
+    })
+}
+
+/// Both frames of a revision the local user makes of `target`, sent at
+/// `original_timestamp`. The v2 frame's envelope id is always its own: a
+/// revision has no id of its own to share.
+#[allow(clippy::too_many_arguments)]
+pub fn outgoing_chat_edit(
+    signing_key: &SigningKey,
+    channel_id: &[u8; 16],
+    target: &[u8; 16],
+    original_timestamp: i64,
+    edited_at: i64,
+    legacy_text: &str,
+    v2_text: &str,
+    parent: Option<&[u8; 16]>,
+) -> Option<OutgoingChat> {
+    let sender = signing_key.verifying_key().to_bytes();
+    let legacy = SEND_LEGACY_CHAT_FRAMES.then(|| {
+        let sig = edit_author_signature(
+            signing_key,
+            &sender,
+            channel_id,
+            target,
+            original_timestamp,
+            edited_at,
+            legacy_text,
+        );
+        (
+            encode_channel_chat_edit_presigned(
+                &sender,
+                target,
+                original_timestamp,
+                edited_at,
+                &sig,
+                legacy_text,
+            ),
+            sig,
+        )
+    });
+    let mut frame_id = [0u8; 16];
+    OsRng.fill_bytes(&mut frame_id);
+    let body = ChatV2Body {
+        line_id: *target,
+        text: v2_text.to_string(),
+        reply_to: parent.copied(),
+        original_timestamp: Some(original_timestamp),
+    };
+    let stored_text = body.stored_text();
+    let body = encode_chat_v2_body(&body)?;
+    let signature = ext_author_signature(
+        signing_key,
+        channel_id,
+        &frame_id,
+        edited_at,
+        EXT_KIND_CHAT_EDIT,
+        CHAT_V2_FLAGS,
+        &body,
+    );
+    Some(OutgoingChat {
+        legacy,
+        v2: ChatV2Frame {
+            kind: EXT_KIND_CHAT_EDIT,
+            flags: CHAT_V2_FLAGS,
+            frame_id,
+            signed_at: edited_at,
+            signature,
+            body,
+        },
+        stored_text,
+    })
+}
+
+/// Which of a line's two frames a receiver is charging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatForm {
+    /// Chat line 15 or edit 19.
+    Legacy,
+    /// Kind 64 or 65.
+    V2,
+}
+
+/// Most lines remembered as paid for by one form, waiting on the other.
+pub const CHAT_TWIN_CREDITS_CAP: usize = 4096;
+
+/// How long one form's credit waits for the other. A sender hands both
+/// frames to the network together and every hop passes them on in that
+/// order, so honest twins arrive back to back; a credit left longer could
+/// only be banked and spent in a burst.
+pub const CHAT_TWIN_CREDIT_TTL: Duration = Duration::from_secs(5);
+
+/// Lines whose author has paid for one form, so the other rides free.
+///
+/// One credit per line and revision, keyed by the time both forms sign, spent
+/// by the other form only and only within [`CHAT_TWIN_CREDIT_TTL`]: a third
+/// frame naming the same line is charged like any other, so an author cannot
+/// turn one line into a stream of v2 frames under fresh envelope ids.
+#[derive(Debug, Default)]
+pub struct ChatTwinCredits {
+    paid: HashMap<[u8; 16], (ChatForm, Instant)>,
+    order: VecDeque<([u8; 16], Instant)>,
+}
+
+impl ChatTwinCredits {
+    /// A line or revision by its author: `revision` is 0 for the line itself
+    /// and the revision's time for an edit, and `signed_at` the time both
+    /// forms sign, the line's send time (the legacy envelope's, the v2
+    /// frame's) or the revision's `edited_at`.
+    pub fn key(
+        channel_id: &[u8; 16],
+        author: &[u8; 32],
+        line_id: &[u8; 16],
+        revision: i64,
+        signed_at: i64,
+    ) -> [u8; 16] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"ember-channel-chat-twin\0");
+        hasher.update(channel_id);
+        hasher.update(author);
+        hasher.update(line_id);
+        hasher.update(&revision.to_le_bytes());
+        hasher.update(&signed_at.to_le_bytes());
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+        key
+    }
+
+    /// Spend the credit the other form left, if there is one and it is not
+    /// stale.
+    fn take(&mut self, key: &[u8; 16], form: ChatForm, now: Instant) -> bool {
+        match self.paid.get(key) {
+            Some(&(paid, at)) if paid != form => {
+                self.paid.remove(key);
+                now.saturating_duration_since(at) <= CHAT_TWIN_CREDIT_TTL
+            }
+            _ => false,
+        }
+    }
+
+    fn note_paid(&mut self, key: [u8; 16], form: ChatForm, now: Instant) {
+        self.paid.insert(key, (form, now));
+        self.order.push_back((key, now));
+        while let Some(&(oldest, at)) = self.order.front() {
+            if self.order.len() <= CHAT_TWIN_CREDITS_CAP
+                && now.saturating_duration_since(at) <= CHAT_TWIN_CREDIT_TTL
+            {
+                break;
+            }
+            self.order.pop_front();
+            if self.paid.get(&oldest).is_some_and(|&(_, paid_at)| paid_at == at) {
+                self.paid.remove(&oldest);
+            }
+        }
+    }
+}
+
+/// [`author_gossip_allow`] for one form of a line or revision: the two forms
+/// of it count once against the author, whichever arrives first, when they
+/// sign the same time `signed_at` (see [`ChatTwinCredits::key`]) and arrive
+/// within [`CHAT_TWIN_CREDIT_TTL`] of each other.
+///
+/// A line's legacy frame may travel under any `msg_id`, so a line leaves or
+/// spends a credit only when its id binds its author at `signed_at`
+/// ([`chat_msg_id_binds`]), as every id minted beside a v2 frame does. Any
+/// other line is charged on its own.
+#[allow(clippy::too_many_arguments)]
+pub fn chat_author_allow(
+    seen: &mut HashMap<([u8; 16], [u8; 32]), VecDeque<Instant>>,
+    credits: &mut ChatTwinCredits,
+    channel_id: [u8; 16],
+    author: &[u8; 32],
+    line_id: &[u8; 16],
+    revision: i64,
+    signed_at: i64,
+    form: ChatForm,
+    now: Instant,
+) -> bool {
+    let twinned = revision != 0 || chat_msg_id_binds(&channel_id, line_id, author, signed_at);
+    if !twinned {
+        return author_gossip_allow(seen, channel_id, author, now);
+    }
+    let key = ChatTwinCredits::key(&channel_id, author, line_id, revision, signed_at);
+    if credits.take(&key, form, now) {
+        return true;
+    }
+    if !author_gossip_allow(seen, channel_id, author, now) {
+        return false;
+    }
+    credits.note_paid(key, form, now);
+    true
+}
 const TYPING_SIG_DOMAIN: &[u8] = b"ember-channel-typing-author-v1\0";
 const PRESENCE_BEACON_SIG_DOMAIN: &[u8] = b"ember-channel-presence-beacon-v1\0";
 const MOD_ACTION_BAN: u8 = 1;
 const MOD_ACTION_UNBAN: u8 = 0;
 const PRESENCE_EXTRA_ENC_VERSION: u8 = 1;
 const PRESENCE_NICK_PAD: usize = 64;
+/// Where a sealed presence carries its member's language wire id: the last
+/// byte of the nickname pad. Builds before it zero-fill the pad and read only
+/// `nick_len` bytes of it, so they write "none" here and ignore what we write.
+/// Unused when a nickname fills the whole pad; a Channel username never does.
+const PRESENCE_LANGUAGE_AT: usize = 33 + PRESENCE_NICK_PAD - 1;
 const PRESENCE_EXTRA_AAD: &[u8] = b"ember-channel-presence-extra-v1\0";
 /// Encrypted private extra: version + nonce + tag + noise + nick_len + pad.
 pub const PRESENCE_EXTRA_ENC_LEN: usize =
     1 + GOSSIP_NONCE_LEN + GOSSIP_TAG_LEN + 32 + 1 + PRESENCE_NICK_PAD;
+/// A private presence extra signed by the member's per-room pseudonym
+/// ([`presence_pseudonym`]), carrying the member's own key and its binding.
+pub const PRESENCE_EXTRA_V2_VERSION: u8 = 2;
+const PRESENCE_EXTRA_V2_AAD: &[u8] = b"ember-channel-presence-extra-v2\0";
+const PRESENCE_BINDING_DOMAIN: &[u8] = b"ember-channel-presence-binding-v2\0";
+/// v1's plaintext, then `member_pubkey(32) || binding_signature(64)`.
+const PRESENCE_V2_PLAIN_LEN: usize = 32 + 1 + PRESENCE_NICK_PAD + 32 + 64;
+/// `version + nonce + tag + plaintext`: 234 bytes.
+pub const PRESENCE_EXTRA_V2_LEN: usize =
+    1 + GOSSIP_NONCE_LEN + GOSSIP_TAG_LEN + PRESENCE_V2_PLAIN_LEN;
 
 /// What the author's signature covers.
 ///
@@ -4377,6 +5243,13 @@ pub fn unread_envelope_room(bytes: &[u8], supported: fn(u8) -> bool) -> Option<(
 /// `version(1) + channel_id(16) + target_id(16)` before the inner gossip body.
 pub const CHANNEL_RELAY_ENVELOPE_HEADER: usize = 1 + 16 + 16;
 
+/// The most an encoded gossip frame can be and still go out in one datagram
+/// wrapped for an overlay relay hop, which is the only way a firewalled member
+/// is reached. A frame between this and `MAX_DELIVERABLE_PAYLOAD` reaches every
+/// member but those, and fails for them without a word.
+pub const RELAYABLE_GOSSIP_MAX_BYTES: usize =
+    super::dht::messages::MAX_DELIVERABLE_PAYLOAD - CHANNEL_RELAY_ENVELOPE_HEADER;
+
 /// Overlay-buddy relay envelope. The hop cannot decrypt `inner` (AEAD).
 pub fn encode_channel_relay_envelope(
     channel_id: &[u8; 16],
@@ -4518,48 +5391,236 @@ pub fn prune_rate_windows<K: Eq + std::hash::Hash>(
 }
 
 /// Storers cannot decrypt a private extra; they only check the length so a
-/// truncated or obviously-junk blob is dropped.
+/// truncated or obviously-junk blob is dropped. Builds before 1.7.5 know only
+/// the first two shapes, so they refuse a v2 record.
 pub fn presence_extra_store_ok(extra: &[u8]) -> bool {
     extra.len() == 32
         || (extra.first() == Some(&PRESENCE_EXTRA_ENC_VERSION)
             && extra.len() == PRESENCE_EXTRA_ENC_LEN)
+        || (extra.first() == Some(&PRESENCE_EXTRA_V2_VERSION)
+            && extra.len() == PRESENCE_EXTRA_V2_LEN)
+}
+
+/// What the member's long-term key signs inside a v2 presence seal: that the
+/// record signed by `pseudonym_pubkey` in this room, for this presence epoch,
+/// live or departed, at this time, is theirs.
+///
+/// The pseudonym signs the record, so a storer holding someone's record cannot
+/// re-sign it, and this ties the pseudonym to the member: a seal copied into a
+/// record another key signs fails its AAD, and one re-sealed for that key by
+/// someone holding the content key still carries this signature over the
+/// member's own pseudonym.
+fn presence_binding_preimage(
+    channel_id: &[u8; 16],
+    pseudonym_pubkey: &[u8; 32],
+    presence_epoch: i64,
+    departed: bool,
+    timestamp: i64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(PRESENCE_BINDING_DOMAIN.len() + 16 + 32 + 8 + 1 + 8);
+    out.extend_from_slice(PRESENCE_BINDING_DOMAIN);
+    out.extend_from_slice(channel_id);
+    out.extend_from_slice(pseudonym_pubkey);
+    out.extend_from_slice(&presence_epoch.to_le_bytes());
+    out.push(u8::from(departed));
+    out.extend_from_slice(&timestamp.to_le_bytes());
+    out
+}
+
+fn presence_extra_v2_aad(channel_id: &[u8; 16], pseudonym_pubkey: &[u8; 32]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(PRESENCE_EXTRA_V2_AAD.len() + 16 + 32);
+    aad.extend_from_slice(PRESENCE_EXTRA_V2_AAD);
+    aad.extend_from_slice(channel_id);
+    aad.extend_from_slice(pseudonym_pubkey);
+    aad
+}
+
+/// A private room's v2 presence extra: v1's noise key and padded nickname,
+/// then the member's long-term key and its signature over
+/// [`presence_binding_preimage`], all sealed under the content key with the
+/// room and the pseudonym as AAD. The record's name stays empty.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_presence_extra_v2(
+    content_key: &[u8; 32],
+    channel_id: &[u8; 16],
+    pseudonym_pubkey: &[u8; 32],
+    noise_pub: &[u8; 32],
+    nickname: &str,
+    language: u8,
+    member: &SigningKey,
+    presence_epoch: i64,
+    departed: bool,
+    timestamp: i64,
+) -> Vec<u8> {
+    let mut plain = vec![0u8; PRESENCE_V2_PLAIN_LEN];
+    write_presence_identity(&mut plain, noise_pub, nickname, language);
+    let at = 33 + PRESENCE_NICK_PAD;
+    plain[at..at + 32].copy_from_slice(&member.verifying_key().to_bytes());
+    let binding = crypto::sign(
+        member,
+        &presence_binding_preimage(channel_id, pseudonym_pubkey, presence_epoch, departed, timestamp),
+    );
+    plain[at + 32..].copy_from_slice(&binding);
+    let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(content_key));
+    let mut nonce = [0u8; GOSSIP_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    let encrypted = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &plain,
+                aad: &presence_extra_v2_aad(channel_id, pseudonym_pubkey),
+            },
+        )
+        .expect("XChaCha20-Poly1305 encryption cannot fail for presence extra");
+    let mut out = Vec::with_capacity(PRESENCE_EXTRA_V2_LEN);
+    out.push(PRESENCE_EXTRA_V2_VERSION);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&encrypted);
+    out
+}
+
+/// A member's v2 presence opened: their long-term key, Noise key, nickname,
+/// and language wire id (0 for none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresenceV2Member {
+    pub member_pubkey: [u8; 32],
+    pub noise_pub: [u8; 32],
+    pub nickname: String,
+    pub language: u8,
+}
+
+/// Open a v2 presence extra and check the member's binding to the record that
+/// carried it. `None` for anything that does not open, is malformed, or whose
+/// binding does not verify for exactly this pseudonym, epoch, flag and time.
+pub fn decode_presence_extra_v2(
+    content_key: &[u8; 32],
+    channel_id: &[u8; 16],
+    pseudonym_pubkey: &[u8; 32],
+    extra: &[u8],
+    presence_epoch: i64,
+    departed: bool,
+    timestamp: i64,
+) -> Option<PresenceV2Member> {
+    if extra.len() != PRESENCE_EXTRA_V2_LEN || extra[0] != PRESENCE_EXTRA_V2_VERSION {
+        return None;
+    }
+    let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(content_key));
+    let plain = cipher
+        .decrypt(
+            XNonce::from_slice(&extra[1..1 + GOSSIP_NONCE_LEN]),
+            Payload {
+                msg: &extra[1 + GOSSIP_NONCE_LEN..],
+                aad: &presence_extra_v2_aad(channel_id, pseudonym_pubkey),
+            },
+        )
+        .ok()?;
+    if plain.len() != PRESENCE_V2_PLAIN_LEN {
+        return None;
+    }
+    let (nickname, language) = read_presence_identity(&plain)?;
+    let at = 33 + PRESENCE_NICK_PAD;
+    let member_pubkey: [u8; 32] = plain[at..at + 32].try_into().ok()?;
+    let binding: [u8; 64] = plain[at + 32..].try_into().ok()?;
+    let member = crypto::verifying_key_from_bytes(&member_pubkey)?;
+    if !crypto::verify(
+        &member,
+        &presence_binding_preimage(channel_id, pseudonym_pubkey, presence_epoch, departed, timestamp),
+        &binding,
+    ) {
+        return None;
+    }
+    let mut noise_pub = [0u8; 32];
+    noise_pub.copy_from_slice(&plain[..32]);
+    Some(PresenceV2Member {
+        member_pubkey,
+        noise_pub,
+        nickname,
+        language,
+    })
+}
+
+/// What anyone holding the content key can do with a member's v2 seal: open
+/// it under the pseudonym it was made for and seal the same plaintext again
+/// for another, binding and all. `None` if it does not open under `from`.
+#[cfg(test)]
+pub fn reseal_presence_extra_v2(
+    content_key: &[u8; 32],
+    channel_id: &[u8; 16],
+    from_pseudonym: &[u8; 32],
+    to_pseudonym: &[u8; 32],
+    extra: &[u8],
+) -> Option<Vec<u8>> {
+    if extra.len() != PRESENCE_EXTRA_V2_LEN || extra[0] != PRESENCE_EXTRA_V2_VERSION {
+        return None;
+    }
+    let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(content_key));
+    let plain = cipher
+        .decrypt(
+            XNonce::from_slice(&extra[1..1 + GOSSIP_NONCE_LEN]),
+            Payload {
+                msg: &extra[1 + GOSSIP_NONCE_LEN..],
+                aad: &presence_extra_v2_aad(channel_id, from_pseudonym),
+            },
+        )
+        .ok()?;
+    let mut nonce = [0u8; GOSSIP_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    let encrypted = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &plain,
+                aad: &presence_extra_v2_aad(channel_id, to_pseudonym),
+            },
+        )
+        .ok()?;
+    let mut out = Vec::with_capacity(PRESENCE_EXTRA_V2_LEN);
+    out.push(PRESENCE_EXTRA_V2_VERSION);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&encrypted);
+    Some(out)
 }
 
 /// Public rooms keep nickname in `file_name` and Noise pub as 32 raw extra
 /// bytes (legacy). Private rooms leave `file_name` empty and seal both under
 /// the content key so a storer cannot read membership metadata.
+///
+/// `language` is a wire id, 0 for none, and is sealed only in a private room:
+/// a public room's record carries it in its header (see
+/// `dht::publish::channel_language_from_file_size`).
 pub fn encode_presence_extra(
     private: bool,
     content_key: &[u8; 32],
     channel_id: &[u8; 16],
     noise_pub: &[u8; 32],
     nickname: &str,
+    language: u8,
 ) -> (String, Vec<u8>) {
-    let nick = truncate_nickname(nickname);
     if !private {
-        return (nick, noise_pub.to_vec());
+        return (truncate_nickname(nickname), noise_pub.to_vec());
     }
     let mut plain = vec![0u8; 32 + 1 + PRESENCE_NICK_PAD];
-    plain[..32].copy_from_slice(noise_pub);
-    let nick_bytes = nick.as_bytes();
-    plain[32] = nick_bytes.len() as u8;
-    plain[33..33 + nick_bytes.len()].copy_from_slice(nick_bytes);
+    write_presence_identity(&mut plain, noise_pub, nickname, language);
     (
         String::new(),
         seal_presence_extra(content_key, channel_id, &plain),
     )
 }
 
+/// Noise key, nickname, and — for a sealed extra only — the language wire id
+/// it carries. `None` there means the legacy public shape, whose language
+/// lives in the record header.
 pub fn decode_presence_extra(
     content_key: Option<&[u8; 32]>,
     channel_id: &[u8; 16],
     extra: &[u8],
     file_name: &str,
-) -> Option<([u8; 32], String)> {
+) -> Option<([u8; 32], String, Option<u8>)> {
     if extra.len() == 32 {
         let mut noise = [0u8; 32];
         noise.copy_from_slice(extra);
-        return Some((noise, file_name.to_string()));
+        return Some((noise, file_name.to_string(), None));
     }
     let key = content_key?;
     let plain = open_presence_extra(key, channel_id, extra)?;
@@ -4568,6 +5629,24 @@ pub fn decode_presence_extra(
     }
     let mut noise = [0u8; 32];
     noise.copy_from_slice(&plain[..32]);
+    let (nick, language) = read_presence_identity(&plain)?;
+    Some((noise, nick, Some(language)))
+}
+
+/// The `noise_pub || nick_len || nick pad` head both sealed shapes share,
+/// with the language in the pad's last byte when the nickname leaves it free.
+fn write_presence_identity(plain: &mut [u8], noise_pub: &[u8; 32], nickname: &str, language: u8) {
+    let nick = truncate_nickname(nickname);
+    let nick_bytes = nick.as_bytes();
+    plain[..32].copy_from_slice(noise_pub);
+    plain[32] = nick_bytes.len() as u8;
+    plain[33..33 + nick_bytes.len()].copy_from_slice(nick_bytes);
+    if nick_bytes.len() < PRESENCE_NICK_PAD {
+        plain[PRESENCE_LANGUAGE_AT] = language;
+    }
+}
+
+fn read_presence_identity(plain: &[u8]) -> Option<(String, u8)> {
     let nick_len = plain[32] as usize;
     if nick_len > PRESENCE_NICK_PAD {
         return None;
@@ -4575,7 +5654,12 @@ pub fn decode_presence_extra(
     let nick = std::str::from_utf8(&plain[33..33 + nick_len])
         .ok()?
         .to_string();
-    Some((noise, nick))
+    let language = if nick_len < PRESENCE_NICK_PAD {
+        plain[PRESENCE_LANGUAGE_AT]
+    } else {
+        0
+    };
+    Some((nick, language))
 }
 
 fn truncate_nickname(s: &str) -> String {
@@ -5441,6 +6525,71 @@ mod tests {
         assert_eq!(presence_epoch(PRESENCE_EPOCH_SECS), 1);
     }
 
+    /// The room-blind key stands where the channel pubkey stands and meets the
+    /// rule every storer applies to that pair, names neither the room nor its
+    /// key, and changes with the join secret.
+    #[test]
+    fn the_room_blind_key_satisfies_the_storer_rule_and_hides_the_room() {
+        let ident = ChannelIdentity::generate();
+        let secret = [0x5Au8; 32];
+        let (blind_id, blind_pub) = presence_room_blind(&ident.channel_id, &secret);
+        assert!(crypto::verifying_key_from_bytes(&blind_pub).is_some());
+        assert_eq!(crypto::node_id_from_ed25519_bytes(&blind_pub), Some(blind_id));
+        assert_ne!(blind_id, ident.channel_id);
+        assert_ne!(blind_pub, ident.pubkey);
+        assert_eq!(presence_room_blind(&ident.channel_id, &secret), (blind_id, blind_pub));
+        assert_ne!(presence_room_blind(&ident.channel_id, &[0x5Bu8; 32]).0, blind_id);
+        assert_ne!(presence_room_blind(&[0x01; 16], &secret).0, blind_id);
+
+        let member = [0x11u8; 32];
+        let a = presence_pseudonym(&member, &ident.channel_id, &secret).verifying_key();
+        assert_eq!(a, presence_pseudonym(&member, &ident.channel_id, &secret).verifying_key());
+        assert_ne!(a, presence_pseudonym(&member, &ident.channel_id, &[0x5Bu8; 32]).verifying_key());
+        assert_ne!(a, presence_pseudonym(&member, &[0x01; 16], &secret).verifying_key());
+        assert_ne!(a, presence_pseudonym(&[0x12u8; 32], &ident.channel_id, &secret).verifying_key());
+        assert_ne!(a.to_bytes(), SigningKey::from_bytes(&member).verifying_key().to_bytes());
+    }
+
+    /// The owner and the member derive the same blind from their own seeds,
+    /// nobody else does, and it does not depend on the epoch; the v2 key is
+    /// built from the room, the member id and the epoch alone, so a storer can
+    /// recompute it, and it is never the v1 key.
+    #[test]
+    fn the_v2_epoch_blind_is_pairwise_and_the_key_is_recomputable_from_the_record() {
+        let channel_id = [0x31u8; 16];
+        let owner = [0x0Au8; 32];
+        let member = [0x0Bu8; 32];
+        let former = [0x0Cu8; 32];
+        let public = |seed: &[u8; 32]| SigningKey::from_bytes(seed).verifying_key().to_bytes();
+        let blind = epoch_blind(&owner, &public(&member), &channel_id).unwrap();
+        assert_eq!(epoch_blind(&member, &public(&owner), &channel_id), Some(blind));
+        // A former member holds its own pairwise secret with the owner, not
+        // this one, so it cannot test whether this key was resealed to.
+        assert_ne!(epoch_blind(&former, &public(&owner), &channel_id), Some(blind));
+        assert_ne!(epoch_blind(&owner, &public(&former), &channel_id), Some(blind));
+        assert_ne!(epoch_blind(&owner, &public(&member), &[0x32u8; 16]), Some(blind));
+        // Not the envelope's wrapping key at any epoch.
+        for epoch in 0..3 {
+            assert_ne!(
+                derive_channel_epoch_secret(&owner, &public(&member), &channel_id, epoch),
+                Some(blind)
+            );
+        }
+
+        let id = epoch_member_id(&blind, 4);
+        assert_ne!(id, public(&member));
+        assert_ne!(id, blind);
+        // One member's records in two epochs carry ids a storer cannot link.
+        assert_ne!(id, epoch_member_id(&blind, 5));
+        let v2 = epoch_key_v2(&channel_id, &id, 4);
+        assert_ne!(v2, epoch_key(&channel_id, &public(&member), 4));
+        assert_ne!(v2, epoch_key(&channel_id, &id, 4));
+        assert_ne!(v2, epoch_key_v2(&channel_id, &id, 5));
+        assert_ne!(v2, epoch_key_v2(&[0x32u8; 16], &id, 4));
+        let other = epoch_member_id(&epoch_blind(&owner, &public(&former), &channel_id).unwrap(), 4);
+        assert_ne!(v2, epoch_key_v2(&channel_id, &other, 4));
+    }
+
     #[test]
     fn public_invite_round_trip_binds_id_to_pubkey() {
         let ident = ChannelIdentity::generate();
@@ -5624,19 +6773,27 @@ mod tests {
             assert_eq!(plain, b"hi");
             assert_eq!(opened, OpenedUnder::Retired);
             assert!(
-                !chat_author_joins_gossip_roster(true, opened, CHANNEL_MSG_TTL_DEFAULT, 1_000, 1_000),
+                !chat_author_joins_gossip_roster(
+                    true,
+                    RosterAdmission::Open,
+                    opened,
+                    CHANNEL_MSG_TTL_DEFAULT,
+                    1_000,
+                    1_000
+                ),
                 "an evicted member holds every retired key; a line under one \
                  must not put a fresh identity on the roster"
             );
         }
         assert!(
-            !chat_author_joins_gossip_roster(true, OpenedUnder::Current, 1, 1_000, 1_000),
+            !chat_author_joins_gossip_roster(true, RosterAdmission::Open, OpenedUnder::Current, 1, 1_000, 1_000),
             "a catch-up re-serve is sealed by the responder, not the author, so \
              its current-key seal says nothing about who wrote the line"
         );
         assert!(
             !chat_author_joins_gossip_roster(
                 true,
+                RosterAdmission::Open,
                 OpenedUnder::Current,
                 CHANNEL_MSG_TTL_DEFAULT,
                 1_000,
@@ -5696,11 +6853,25 @@ mod tests {
     fn a_public_chat_line_does_not_insert_a_stranger_into_the_neighbor_set() {
         let now = 1_800_000_000;
         assert!(
-            !chat_author_joins_gossip_roster(false, OpenedUnder::Current, CHANNEL_MSG_TTL_DEFAULT, now, now),
+            !chat_author_joins_gossip_roster(
+                false,
+                RosterAdmission::Open,
+                OpenedUnder::Current,
+                CHANNEL_MSG_TTL_DEFAULT,
+                now,
+                now
+            ),
             "public rooms take neighbors from presence, not from chat authors"
         );
         assert!(
-            chat_author_joins_gossip_roster(true, OpenedUnder::Current, CHANNEL_MSG_TTL_DEFAULT, now, now),
+            chat_author_joins_gossip_roster(
+                true,
+                RosterAdmission::Open,
+                OpenedUnder::Current,
+                CHANNEL_MSG_TTL_DEFAULT,
+                now,
+                now
+            ),
             "a live private chat line is already evidence of membership"
         );
 
@@ -5715,6 +6886,64 @@ mod tests {
             "a stranger who only spoke must not become a mesh neighbor"
         );
         assert!(neighbors.is_empty());
+    }
+
+    /// Item 8: under a room's key-proven rule the line that used to admit its
+    /// author, live, under the current key and at a full TTL, admits nobody,
+    /// since a re-serve with its TTL raised looks exactly like it. The author's
+    /// own key-proven beacon still does.
+    #[test]
+    fn under_key_proven_admission_only_a_proven_beacon_admits_a_newcomer() {
+        let room = [0x5Au8; 16];
+        let now = 1_800_000_000;
+        let current = content_key(&[0x01u8; 32]);
+        let retired = content_key(&[0x02u8; 32]);
+        let live_line = |admission| {
+            chat_author_joins_gossip_roster(
+                true,
+                admission,
+                OpenedUnder::Current,
+                CHANNEL_MSG_TTL_DEFAULT,
+                now,
+                now,
+            )
+        };
+        assert!(live_line(RosterAdmission::Open), "no rule held: as before");
+        assert!(
+            !live_line(RosterAdmission::KeyProven),
+            "a fresh line under the current key at a full TTL is what a raised \
+             re-serve looks like, so it cannot admit under the strict rule"
+        );
+
+        let (_, beacon) = test_beacon(7, &room, 3, now);
+        let proven = beacon.with_key_proof(&room, &current);
+        assert!(beacon_admits_newcomer(&proven, &room, Some(&current)));
+        assert!(
+            !beacon_admits_newcomer(&beacon.with_key_proof(&room, &retired), &room, Some(&current)),
+            "a proof of a retired key is what an evicted member can still make"
+        );
+        assert!(!beacon_admits_newcomer(&beacon, &room, Some(&current)), "no proof, no entry");
+        assert!(
+            beacon_admits_newcomer(&beacon, &room, None),
+            "a public room has no key worth proving"
+        );
+    }
+
+    #[test]
+    fn tag_2_reads_every_value_but_0_as_key_proven() {
+        assert_eq!(RosterAdmission::default(), RosterAdmission::Open);
+        assert_eq!(RosterAdmission::from_setting(0), RosterAdmission::Open);
+        for value in 1..=u8::MAX {
+            assert_eq!(
+                RosterAdmission::from_setting(value),
+                RosterAdmission::KeyProven,
+                "value {value}: one this build does not know reads as the strict rule"
+            );
+        }
+        for rule in [RosterAdmission::Open, RosterAdmission::KeyProven] {
+            assert_eq!(RosterAdmission::from_setting(rule.setting()), rule);
+        }
+        assert_eq!(RosterAdmission::OWNED_PRIVATE_ROOM.setting(), 1);
     }
 
     #[test]
@@ -6174,27 +7403,60 @@ mod tests {
         let channel_id = [0x11u8; 16];
         let noise = [0x42u8; 32];
         let (public_name, public_extra) =
-            encode_presence_extra(false, &key, &channel_id, &noise, "Ada");
+            encode_presence_extra(false, &key, &channel_id, &noise, "Ada", 9);
         assert_eq!(public_name, "Ada");
-        assert_eq!(public_extra, noise);
+        assert_eq!(public_extra, noise, "a public extra has no room for a language");
         assert!(presence_extra_store_ok(&public_extra));
-        let (n, nick) = decode_presence_extra(None, &channel_id, &public_extra, "Ada").unwrap();
+        let (n, nick, language) =
+            decode_presence_extra(None, &channel_id, &public_extra, "Ada").unwrap();
         assert_eq!(n, noise);
         assert_eq!(nick, "Ada");
+        assert_eq!(language, None, "the header carries a public room's language");
 
         let (private_name, private_extra) =
-            encode_presence_extra(true, &key, &channel_id, &noise, "Ada");
+            encode_presence_extra(true, &key, &channel_id, &noise, "Ada", 9);
         assert!(private_name.is_empty());
         assert_ne!(private_extra, noise);
+        assert_eq!(private_extra.len(), PRESENCE_EXTRA_ENC_LEN);
         assert!(presence_extra_store_ok(&private_extra));
         assert!(decode_presence_extra(None, &channel_id, &private_extra, "").is_none());
-        let (n, nick) = decode_presence_extra(Some(&key), &channel_id, &private_extra, "").unwrap();
+        let (n, nick, language) =
+            decode_presence_extra(Some(&key), &channel_id, &private_extra, "").unwrap();
         assert_eq!(n, noise);
         assert_eq!(nick, "Ada");
+        assert_eq!(language, Some(9));
         assert!(
             decode_presence_extra(Some(&key), &[0x22u8; 16], &private_extra, "").is_none(),
             "presence extra must bind the channel id"
         );
+    }
+
+    /// What builds before the language byte sealed: the nickname, zeros after.
+    /// They have to read as "no language", and what we seal has to read the
+    /// same to them as it did before.
+    #[test]
+    fn a_sealed_presence_language_is_invisible_to_older_readers() {
+        let key = content_key(&[3u8; 32]);
+        let channel_id = [0x11u8; 16];
+        let noise = [0x42u8; 32];
+        let mut legacy = vec![0u8; 32 + 1 + PRESENCE_NICK_PAD];
+        legacy[..32].copy_from_slice(&noise);
+        legacy[32] = 3;
+        legacy[33..36].copy_from_slice(b"Ada");
+        let sealed = seal_presence_extra(&key, &channel_id, &legacy);
+        let (_, nick, language) = decode_presence_extra(Some(&key), &channel_id, &sealed, "").unwrap();
+        assert_eq!((nick.as_str(), language), ("Ada", Some(0)));
+
+        let (_, ours) = encode_presence_extra(true, &key, &channel_id, &noise, "Ada", 9);
+        let plain = open_presence_extra(&key, &channel_id, &ours).unwrap();
+        let nick_len = plain[32] as usize;
+        assert_eq!(&plain[33..33 + nick_len], b"Ada", "the old reader's view is unchanged");
+
+        // A nickname that fills the pad leaves no byte free, so none is read.
+        let long = "x".repeat(PRESENCE_NICK_PAD);
+        let (_, full) = encode_presence_extra(true, &key, &channel_id, &noise, &long, 9);
+        let (_, nick, language) = decode_presence_extra(Some(&key), &channel_id, &full, "").unwrap();
+        assert_eq!((nick, language), (long, Some(0)));
     }
 
     #[test]
@@ -8360,6 +9622,28 @@ mod tests {
     /// salt alone, so the derivation has to be stable, and distinct per salt
     /// and per identity.
     #[test]
+    fn an_owned_rooms_list_is_padded_to_a_few_sizes_only_its_identity_can_see_through() {
+        let me = [0x11u8; 32];
+        let other = [0x22u8; 32];
+        let real: Vec<OwnedRoomSalt> = (1..=3u8).map(|i| [i; 16]).collect();
+        let padded = pad_owned_rooms_list(&real, &me);
+        assert_eq!(padded.len(), 8, "three rooms read as eight");
+        assert!(padded.windows(2).all(|w| w[0] < w[1]), "in byte order, so carried ones do not show");
+        assert!(real.iter().all(|salt| padded.contains(salt)));
+        let pads: Vec<_> = padded.iter().filter(|salt| !real.contains(salt)).collect();
+        assert!(pads.iter().all(|salt| is_owned_rooms_pad(salt, &me)));
+        assert!(pads.iter().all(|salt| !is_owned_rooms_pad(salt, &other)), "nobody else can tell");
+        assert!(real.iter().all(|salt| !is_owned_rooms_pad(salt, &me)));
+        assert_eq!(pad_owned_rooms_list(&real, &me), padded, "the same list every time");
+
+        assert_eq!(pad_owned_rooms_list(&[], &me).len(), 8, "no rooms reads like a few");
+        let nine: Vec<OwnedRoomSalt> = (1..=9u8).map(|i| [i; 16]).collect();
+        assert_eq!(pad_owned_rooms_list(&nine, &me).len(), 16);
+        let full: Vec<OwnedRoomSalt> = (1..=48u8).map(|i| [i; 16]).collect();
+        assert_eq!(pad_owned_rooms_list(&full, &me).len(), 48, "a full list gains nothing");
+    }
+
+    #[test]
     fn an_owned_room_seed_comes_from_the_identity_and_its_salt() {
         let identity = [0x11u8; 32];
         let other = [0x12u8; 32];
@@ -8494,9 +9778,404 @@ mod tests {
         ] {
             assert!(version < EXT_KIND_MIN, "{version} would be read as an extension frame");
         }
-        assert!(!ext_kind_understood(EXT_KIND_MIN));
+        assert_eq!(EXT_KIND_CHAT_LINE, EXT_KIND_MIN, "the first extension kind is the v2 line");
+        assert!(ext_kind_understood(EXT_KIND_CHAT_LINE));
+        assert!(ext_kind_understood(EXT_KIND_CHAT_EDIT));
+        assert!(ext_kind_understood(EXT_KIND_PRIVATE_MESSAGE));
+        assert!(!ext_kind_understood(EXT_KIND_PRIVATE_MESSAGE + 1));
         assert!(!ext_kind_understood(u8::MAX));
     }
+
+    const V2_PARENT: [u8; 16] = [0x5Au8; 16];
+
+    fn v2_line_body(text: &str, parent: Option<[u8; 16]>) -> ChatV2Body {
+        ChatV2Body {
+            line_id: CHAT_MSG_ID,
+            text: text.to_string(),
+            reply_to: parent,
+            original_timestamp: None,
+        }
+    }
+
+    /// A body built by hand, field by field, so a test can put in what no
+    /// writer here would.
+    fn tagged(version: u8, fields: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut out = vec![version];
+        for (tag, value) in fields {
+            out.push(*tag);
+            out.extend_from_slice(&(value.len() as u16).to_le_bytes());
+            out.extend_from_slice(value);
+        }
+        out
+    }
+
+    #[test]
+    fn a_v2_chat_body_round_trips_and_skips_unknown_fields() {
+        let line = v2_line_body("hi \u{2764}\u{FE0F}", Some(V2_PARENT));
+        let bytes = encode_chat_v2_body(&line).unwrap();
+        assert_eq!(bytes[0], CHAT_V2_BODY_VERSION);
+        assert_eq!(decode_chat_v2_body(EXT_KIND_CHAT_LINE, &bytes), Some(line.clone()));
+        assert_eq!(line.stored_text(), with_reply_trailer("hi \u{2764}\u{FE0F}", Some(&V2_PARENT)));
+
+        let edit = ChatV2Body {
+            original_timestamp: Some(CHAT_TS - 30),
+            ..v2_line_body("revised", None)
+        };
+        let edit_bytes = encode_chat_v2_body(&edit).unwrap();
+        assert_eq!(decode_chat_v2_body(EXT_KIND_CHAT_EDIT, &edit_bytes), Some(edit));
+        assert_eq!(
+            decode_chat_v2_body(EXT_KIND_CHAT_EDIT, &bytes),
+            None,
+            "a revision needs its original time"
+        );
+        assert_eq!(decode_chat_v2_body(EXT_KIND_CHAT_EDIT + 1, &bytes), None);
+
+        // A later build's fields, before, between and after the known ones,
+        // and a later version framed the same way, read as the fields known.
+        let text = "hi".as_bytes();
+        for later in [
+            tagged(1, &[(1, &CHAT_MSG_ID), (2, text), (5, b"later"), (200, b"")]),
+            tagged(2, &[(1, &CHAT_MSG_ID), (2, text), (9, &[0u8; 300])]),
+        ] {
+            assert_eq!(
+                decode_chat_v2_body(EXT_KIND_CHAT_LINE, &later),
+                Some(v2_line_body("hi", None)),
+                "unknown tags are skipped"
+            );
+        }
+
+        // Framing that does not fill the body exactly, fields out of order or
+        // repeated, a known field off its layout, or a missing one: dropped.
+        let mut trailing = tagged(1, &[(1, &CHAT_MSG_ID), (2, text)]);
+        trailing.push(0);
+        let mut short = tagged(1, &[(1, &CHAT_MSG_ID), (2, text)]);
+        short.pop();
+        for malformed in [
+            Vec::new(),
+            tagged(0, &[(1, &CHAT_MSG_ID), (2, text)]),
+            trailing,
+            short,
+            tagged(1, &[(2, text), (1, &CHAT_MSG_ID)]),
+            tagged(1, &[(1, &CHAT_MSG_ID), (2, text), (2, text)]),
+            tagged(1, &[(1, &[0u8; 15]), (2, text)]),
+            tagged(1, &[(1, &CHAT_MSG_ID), (2, &[0xFF, 0xFE])]),
+            tagged(1, &[(1, &CHAT_MSG_ID), (2, text), (3, &[0u8; 17])]),
+            tagged(1, &[(1, &CHAT_MSG_ID), (2, text), (4, &[0u8; 7])]),
+            tagged(1, &[(1, &CHAT_MSG_ID)]),
+            tagged(1, &[(2, text)]),
+            tagged(1, &[(1, &CHAT_MSG_ID), (2, b"")]),
+            tagged(1, &[(1, &CHAT_MSG_ID), (2, with_reply_trailer("hi", Some(&V2_PARENT)).as_bytes())]),
+        ] {
+            assert_eq!(decode_chat_v2_body(EXT_KIND_CHAT_LINE, &malformed), None, "{malformed:?}");
+        }
+    }
+
+    /// The trap the separate id avoids: every build drops a frame whose
+    /// `msg_id` it has seen, so a v2 frame under the line's id would have a
+    /// build that met it first drop the legacy line as a duplicate. And while
+    /// the legacy frame goes out, the v2 frame must not read as a line needing
+    /// a newer Ember on the builds that cannot read it.
+    #[test]
+    fn a_v2_frame_never_shares_its_twins_id_or_asks_for_a_newer_ember() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let alice_pk = alice.verifying_key().to_bytes();
+        let line_id = new_chat_msg_id(&CHAT_CHANNEL, &alice_pk, CHAT_TS);
+        const { assert!(SEND_LEGACY_CHAT_FRAMES, "1.7.5 sends both forms") };
+        const { assert!(CHAT_V2_FLAGS & EXT_FLAG_DISPLAY == 0) };
+        let mut frame_ids = HashSet::new();
+        for _ in 0..8 {
+            let line = outgoing_chat_line(&alice, &CHAT_CHANNEL, &line_id, CHAT_TS, "hi", "hi", None).unwrap();
+            assert_ne!(line.v2.frame_id, line_id);
+            assert!(frame_ids.insert(line.v2.frame_id), "a fresh id every time");
+            assert_eq!(line.v2.flags & EXT_FLAG_DISPLAY, 0);
+            let (legacy, sig) = line.legacy.clone().expect("the legacy line goes out too");
+            assert_eq!(
+                decode_channel_chat_plain(&legacy, &CHAT_CHANNEL, &line_id, CHAT_TS),
+                Some((alice_pk, "hi".to_string(), sig))
+            );
+            let ext = decode_channel_ext_frame(&line.v2.plain(&alice_pk), &CHAT_CHANNEL, &line.v2.frame_id, CHAT_TS)
+                .expect("signed under its own id");
+            assert!(!ext.displayable());
+            assert_eq!(decode_chat_v2_body(ext.kind, &ext.body).unwrap().line_id, line_id);
+
+            let edit = outgoing_chat_edit(&alice, &CHAT_CHANNEL, &line_id, CHAT_TS, CHAT_TS + 9, "ho", "ho", None)
+                .unwrap();
+            assert_ne!(edit.v2.frame_id, line_id);
+            assert_eq!(edit.v2.flags & EXT_FLAG_DISPLAY, 0);
+            assert_eq!(edit.v2.signed_at, CHAT_TS + 9, "a revision's time is its envelope's");
+            let (legacy_edit, _) = edit.legacy.expect("the legacy edit goes out too");
+            assert!(decode_channel_chat_edit(&legacy_edit, &CHAT_CHANNEL).is_some());
+        }
+    }
+
+    /// A build that knows only chat line 15 still shows the conversation: the
+    /// v2 frame is passed on unread (1.7.2 to 1.7.4) or dropped (before that),
+    /// counted nowhere, and the legacy twin, arriving after it, is not taken
+    /// for a duplicate of it.
+    #[test]
+    fn a_reader_that_knows_only_the_legacy_line_still_shows_it() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let alice_pk = alice.verifying_key().to_bytes();
+        let line_id = new_chat_msg_id(&CHAT_CHANNEL, &alice_pk, CHAT_TS);
+        let line = outgoing_chat_line(&alice, &CHAT_CHANNEL, &line_id, CHAT_TS, "hello", "hello", None).unwrap();
+        let (legacy, _) = line.legacy.clone().unwrap();
+        let v2_plain = line.v2.plain(&alice_pk);
+        let key = [0x42u8; 32];
+        let v2_gossip = ChannelGossip::sealed(CHAT_CHANNEL, line.v2.frame_id, &key, 0, &v2_plain, 8, CHAT_TS);
+        let legacy_gossip = ChannelGossip::sealed(CHAT_CHANNEL, line_id, &key, 0, &legacy, 8, CHAT_TS);
+
+        let (mut seen, mut order) = (HashMap::new(), VecDeque::new());
+        let now = Instant::now();
+        for gossip in [&v2_gossip, &legacy_gossip] {
+            assert_eq!(
+                admit_gossip(&mut seen, &mut order, 64, gossip.msg_id, gossip_body_key(gossip), now),
+                GossipAdmission::Fresh,
+                "the v2 frame arriving first leaves the legacy line fresh"
+            );
+        }
+
+        assert_eq!(v1_6_7_branch(&v2_plain), V167Branch::DroppedWithDebugLog);
+        assert_eq!(v1_6_7_branch(&legacy), V167Branch::Chat);
+        // 1.7.2 to 1.7.4: proved, passed on, and with no display flag no
+        // "needs a newer Ember" row.
+        let ext = decode_channel_ext_frame(&v2_plain, &CHAT_CHANNEL, &v2_gossip.msg_id, CHAT_TS).unwrap();
+        assert!(!ext.displayable());
+        let (_, text, _) = decode_channel_chat_plain(&legacy, &CHAT_CHANNEL, &line_id, CHAT_TS).unwrap();
+        assert_eq!(chat_display_text(&text), "hello");
+    }
+
+    #[test]
+    fn every_field_of_a_v2_frame_is_under_its_authors_signature() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let alice_pk = alice.verifying_key().to_bytes();
+        let line_id = new_chat_msg_id(&CHAT_CHANNEL, &alice_pk, CHAT_TS);
+        for chat in [
+            outgoing_chat_line(&alice, &CHAT_CHANNEL, &line_id, CHAT_TS, "hi", "hi", Some(&V2_PARENT)).unwrap(),
+            outgoing_chat_edit(&alice, &CHAT_CHANNEL, &line_id, CHAT_TS, CHAT_TS + 5, "ho", "ho", Some(&V2_PARENT))
+                .unwrap(),
+        ] {
+            let frame = chat.v2.plain(&alice_pk);
+            let (id, at) = (chat.v2.frame_id, chat.v2.signed_at);
+            assert!(decode_channel_ext_frame(&frame, &CHAT_CHANNEL, &id, at).is_some());
+            // Kind, flags, sender, signature, and each byte of the body: line
+            // id, text, reply parent and original time alike.
+            for at_byte in 0..frame.len() {
+                let mut bent = frame.clone();
+                bent[at_byte] ^= if at_byte == 0 { 0x01 } else { 0x80 };
+                assert!(
+                    decode_channel_ext_frame(&bent, &CHAT_CHANNEL, &id, at).is_none(),
+                    "byte {at_byte} is covered"
+                );
+            }
+            // An unknown field added later breaks it too.
+            let mut extended = frame.clone();
+            extended.extend_from_slice(&[9, 0, 0]);
+            assert!(decode_channel_ext_frame(&extended, &CHAT_CHANNEL, &id, at).is_none());
+            assert!(decode_channel_ext_frame(&frame, &CHAT_CHANNEL, &[0x77; 16], at).is_none());
+            assert!(decode_channel_ext_frame(&frame, &CHAT_CHANNEL, &id, at + 1).is_none());
+            assert!(decode_channel_ext_frame(&frame, &[0x77; 16], &id, at).is_none());
+        }
+    }
+
+    #[test]
+    fn emoji_joiners_ride_the_v2_frame_and_the_two_texts_pair() {
+        let typed = "\u{2764}\u{FE0F} hi \u{1F468}\u{200D}\u{1F469}";
+        let legacy_body = crate::security::sanitize_outgoing_message_text(typed).unwrap();
+        assert_eq!(legacy_body, "\u{2764} hi \u{1F468}\u{1F469}");
+        for parent in [None, Some(V2_PARENT)] {
+            let v2 = chat_v2_outgoing_text(typed, &legacy_body, parent.as_ref());
+            assert_eq!(v2, typed, "the joiners are kept");
+            let stored = with_reply_trailer(&v2, parent.as_ref());
+            assert_eq!(chat_legacy_text(&stored), with_reply_trailer(&legacy_body, parent.as_ref()));
+            assert_eq!(split_reply_trailer(&stored).1, parent);
+        }
+        // Text the legacy body cannot be paired with goes out as the legacy body.
+        let pasted = format!("x{}\u{200D}", with_reply_trailer("", Some(&V2_PARENT)));
+        let legacy_body = strip_reply_trailers(&crate::security::sanitize_outgoing_message_text(&pasted).unwrap())
+            .to_string();
+        assert_eq!(chat_v2_outgoing_text(&pasted, &legacy_body, None), legacy_body);
+        let long = "\u{2764}\u{FE0F}".repeat(700);
+        let legacy_long = crate::security::sanitize_outgoing_message_text(&long).unwrap();
+        assert_eq!(
+            chat_v2_outgoing_text(&long, &legacy_long, None),
+            legacy_long,
+            "over the byte cap with its joiners, it goes without them"
+        );
+    }
+
+    /// Lines `author` sent at `sent`, under ids bound to them as 1.7.5 mints.
+    fn bound_lines(author: &[u8; 32], sent: i64, count: usize) -> Vec<[u8; 16]> {
+        (0..count).map(|_| new_chat_msg_id(&CHAT_CHANNEL, author, sent)).collect()
+    }
+
+    #[test]
+    fn the_two_forms_of_a_line_count_once_against_its_author() {
+        let mut seen = HashMap::new();
+        let mut credits = ChatTwinCredits::default();
+        let author = [0xA1u8; 32];
+        let now = Instant::now();
+        let lines = bound_lines(&author, CHAT_TS, CHANNEL_GOSSIP_PER_AUTHOR_PER_SEC);
+        let mut allow = |line: &[u8; 16], revision: i64, form: ChatForm| {
+            let signed_at = if revision == 0 { CHAT_TS } else { revision };
+            chat_author_allow(&mut seen, &mut credits, CHAT_CHANNEL, &author, line, revision, signed_at, form, now)
+        };
+        // Either order, every line twice, inside the one second.
+        for (n, line) in lines.iter().enumerate() {
+            let (first, second) = if n % 2 == 0 {
+                (ChatForm::Legacy, ChatForm::V2)
+            } else {
+                (ChatForm::V2, ChatForm::Legacy)
+            };
+            assert!(allow(line, 0, first), "line {n}");
+            assert!(allow(line, 0, second), "line {n}'s twin rides free");
+        }
+        let next = bound_lines(&author, CHAT_TS, 1)[0];
+        assert!(!allow(&next, 0, ChatForm::Legacy), "the next line is over the rate");
+        assert!(!allow(&lines[0], 0, ChatForm::V2), "a third frame for a line is charged");
+    }
+
+    /// With budget left and the line's own credit banked, a revision's form
+    /// is still charged, and leaves the line's credit where it was.
+    #[test]
+    fn a_revision_does_not_spend_the_credit_of_the_line_it_revises() {
+        let mut seen = HashMap::new();
+        let mut credits = ChatTwinCredits::default();
+        let author = [0xA2u8; 32];
+        let now = Instant::now();
+        let line = bound_lines(&author, CHAT_TS, 1)[0];
+        let mut allow = |line: &[u8; 16], revision: i64, form: ChatForm| {
+            let signed_at = if revision == 0 { CHAT_TS } else { revision };
+            chat_author_allow(&mut seen, &mut credits, CHAT_CHANNEL, &author, line, revision, signed_at, form, now)
+        };
+        assert!(allow(&line, 0, ChatForm::Legacy), "the line pays, and banks its twin's credit");
+        let edited_at = CHAT_TS + 7;
+        assert!(allow(&line, edited_at, ChatForm::V2), "budget is left, so the revision passes");
+        // It was charged: what is left of the second takes only this many more.
+        for n in 2..CHANNEL_GOSSIP_PER_AUTHOR_PER_SEC {
+            assert!(allow(&bound_lines(&author, CHAT_TS, 1)[0], 0, ChatForm::Legacy), "line {n}");
+        }
+        assert!(
+            !allow(&bound_lines(&author, CHAT_TS, 1)[0], 0, ChatForm::Legacy),
+            "the revision took a slot"
+        );
+        assert!(allow(&line, 0, ChatForm::V2), "and the line's own twin still rides free");
+        assert!(allow(&line, edited_at, ChatForm::Legacy), "as does the revision's");
+    }
+
+    /// A credit is only for the other form of the same line at the same
+    /// signed time, under an id bound to it, and only for a few seconds: one
+    /// form sent alone cannot bank a free frame for later, or for another
+    /// time under its id.
+    #[test]
+    fn a_twin_credit_is_bound_to_its_lines_time_and_expires() {
+        let author = [0xA3u8; 32];
+        let start = Instant::now();
+        let budget = CHANNEL_GOSSIP_PER_AUTHOR_PER_SEC;
+        let mut seen = HashMap::new();
+        let mut credits = ChatTwinCredits::default();
+        let mut allow = |line: &[u8; 16], signed_at: i64, form: ChatForm, now: Instant| {
+            chat_author_allow(&mut seen, &mut credits, CHAT_CHANNEL, &author, line, 0, signed_at, form, now)
+        };
+
+        // Banking: v2 lines alone, for a whole second's budget.
+        let banked = bound_lines(&author, CHAT_TS, budget);
+        for line in &banked {
+            assert!(allow(line, CHAT_TS, ChatForm::V2, start));
+        }
+        // Legacy lines under those ids at another time, a second on and
+        // inside the credits' life: charged, not free, so they fill the new
+        // second's budget themselves.
+        let later = start + Duration::from_millis(1100);
+        for (n, line) in banked.iter().enumerate() {
+            assert!(allow(line, CHAT_TS + 30, ChatForm::Legacy, later), "redated line {n} is charged");
+        }
+        assert!(
+            !allow(&bound_lines(&author, CHAT_TS, 1)[0], CHAT_TS, ChatForm::Legacy, later),
+            "the redated lines spent the budget"
+        );
+        assert!(
+            allow(&banked[0], CHAT_TS, ChatForm::Legacy, later),
+            "the true twin, at the line's own time, still rides free"
+        );
+
+        // Past the credit's life the twin is charged like any line.
+        let stale = start + CHAT_TWIN_CREDIT_TTL + Duration::from_secs(2);
+        for n in 0..budget {
+            assert!(allow(&bound_lines(&author, CHAT_TS, 1)[0], CHAT_TS, ChatForm::Legacy, stale), "line {n}");
+        }
+        assert!(
+            !allow(&banked[1], CHAT_TS, ChatForm::Legacy, stale),
+            "a credit left past its life is gone"
+        );
+
+        // A legacy line under an id not bound to its author and time leaves
+        // no credit, so a v2 frame naming that id is charged.
+        let fresh = stale + Duration::from_secs(2);
+        let unbound = [0x77u8; 16];
+        assert!(!chat_msg_id_binds(&CHAT_CHANNEL, &unbound, &author, CHAT_TS));
+        for n in 1..budget {
+            assert!(allow(&bound_lines(&author, CHAT_TS, 1)[0], CHAT_TS, ChatForm::Legacy, fresh), "line {n}");
+        }
+        assert!(allow(&unbound, CHAT_TS, ChatForm::Legacy, fresh), "the last slot");
+        assert!(!allow(&unbound, CHAT_TS, ChatForm::V2, fresh), "no credit was left under it");
+    }
+
+    /// The two forms of a line must agree about being a reply: a trailer
+    /// hidden behind a joiner, or a body of joiners alone, would read one way
+    /// in the v2 form and another in the legacy text. Tag characters as such
+    /// are fine.
+    #[test]
+    fn a_v2_body_is_refused_unless_both_forms_read_the_same_reply() {
+        const SCOTLAND: &str = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}";
+        let hidden = format!("x{}\u{200D}", with_reply_trailer("", Some(&[0x51; 16])));
+        let line = |text: &str, parent: Option<&[u8; 16]>| {
+            let mut fields: Vec<(u8, &[u8])> = vec![(1, &CHAT_MSG_ID), (2, text.as_bytes())];
+            if let Some(parent) = parent {
+                fields.push((3, parent));
+            }
+            decode_chat_v2_body(EXT_KIND_CHAT_LINE, &tagged(1, &fields))
+        };
+        for (text, parent) in [
+            (hidden.as_str(), None),
+            ("\u{200D}", Some(&V2_PARENT)),
+            ("\u{200D}", None),
+            ("\u{FE0F}\u{200C}", None),
+        ] {
+            assert_eq!(line(text, parent), None, "{text:?} with {parent:?}");
+            assert!(!chat_v2_text_reads_alike(text, parent));
+        }
+        for parent in [None, Some(&V2_PARENT)] {
+            for text in [SCOTLAND, "\u{1F468}\u{200D}\u{1F469}", "hi"] {
+                let body = line(text, parent).unwrap_or_else(|| panic!("{text:?} with {parent:?}"));
+                let stored = body.stored_text();
+                assert_eq!(split_reply_trailer(&stored).1.as_ref(), parent);
+                assert_eq!(split_reply_trailer(&chat_legacy_text(&stored)).1.as_ref(), parent);
+            }
+        }
+        // A trailer behind a joiner, with a parent of its own, still names
+        // that parent in both forms.
+        assert!(line(&hidden, Some(&V2_PARENT)).is_some());
+
+        // Whatever is typed, the sender's v2 body is one receivers read.
+        let alice = SigningKey::generate(&mut OsRng);
+        let alice_pk = alice.verifying_key().to_bytes();
+        let line_id = new_chat_msg_id(&CHAT_CHANNEL, &alice_pk, CHAT_TS);
+        for typed in [hidden.as_str(), "\u{200D}x", "x\u{200D}", SCOTLAND, JOINER_TYPED] {
+            let legacy_body =
+                strip_reply_trailers(&crate::security::sanitize_outgoing_message_text(typed).unwrap()).to_string();
+            for parent in [None, Some(&V2_PARENT)] {
+                let v2_text = chat_v2_outgoing_text(typed, &legacy_body, parent);
+                let legacy = with_reply_trailer(&legacy_body, parent);
+                let chat = outgoing_chat_line(&alice, &CHAT_CHANNEL, &line_id, CHAT_TS, &legacy, &v2_text, parent)
+                    .unwrap();
+                let body = decode_chat_v2_body(EXT_KIND_CHAT_LINE, &chat.v2.body)
+                    .unwrap_or_else(|| panic!("{typed:?} with {parent:?}"));
+                assert_eq!(chat_legacy_text(&body.stored_text()), legacy);
+            }
+        }
+    }
+
+    const JOINER_TYPED: &str = "\u{2764}\u{FE0F} hi \u{1F468}\u{200D}\u{1F469}";
 
     /// None of the decoders the dispatch tries ahead of extension frames may
     /// claim one, or a later kind would be misread as an older one.

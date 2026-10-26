@@ -168,6 +168,97 @@ pub async fn close_chat_window(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Commands the chat window may not call. The capability files scope plugin
+/// permissions only; every app command is callable from every window unless
+/// refused here. These change what is shared or filtered, delete, open or run
+/// files, restore backups, install updates or act on the whole machine, and
+/// none of them is reachable from the chat window's code
+/// (`scripts/chat-window-commands.test.mjs` holds that), so refusing them costs
+/// the chat nothing and keeps a compromised chat webview from them.
+pub const CHAT_WINDOW_DENIED_COMMANDS: &[&str] = &[
+    "acknowledge_security_policy_reset",
+    "add_ip_filter_range",
+    "add_server",
+    "ban_peer",
+    "batch_unshare",
+    "cancel_feed_download",
+    "clear_download_history",
+    "confirm_dropped_folders",
+    "create_feed",
+    "delete_feed",
+    "delete_shared_file",
+    "discard_emule_import",
+    "discard_pending_restore",
+    "download_and_load_ipfilter",
+    "download_feed_items",
+    "export_backup",
+    "follow_feed",
+    "import_backup",
+    "kad_bootstrap_url",
+    "move_files_to_category",
+    "open_feed_item",
+    "open_shared_file",
+    "pick_and_import_ipfilter_file",
+    "preview_file",
+    "publish_feed",
+    "reapprove_shared_folder",
+    "reapprove_shared_folders",
+    "remove_ip_filter_range",
+    "remove_missing_files",
+    "remove_server",
+    "remove_shared_folder",
+    "rename_library_file",
+    "reset_antileech_to_defaults",
+    "reset_spam_filter",
+    "restore_library_file_names",
+    "run_finish_action_now",
+    "secure_updater_install",
+    "secure_updater_run_saved_installer",
+    "set_antileech_enabled",
+    "set_antileech_patterns",
+    "set_block_private_ips",
+    "set_feed_auto_download",
+    "set_feed_details",
+    "set_feed_items",
+    "set_feed_listed",
+    "set_files_friends_only",
+    "set_finish_action",
+    "set_ip_filter_auto_update",
+    "set_ip_filter_enabled",
+    "share_browser_selection",
+    "share_library_files",
+    "show_feed_item",
+    "silent_update_now",
+    "stage_emule_import",
+    "tag_library_files",
+    "unban_peer",
+    "unfollow_feed",
+    "unshare_file",
+    "unshare_folder",
+    "update_ipfilter_from_url",
+];
+
+/// Whether the chat window may call `command`.
+pub fn chat_window_may_invoke(command: &str) -> bool {
+    !CHAT_WINDOW_DENIED_COMMANDS.contains(&command)
+}
+
+/// Refuse a command to every window but the main one. For commands the chat
+/// window's code imports the wrapper of but never calls (`update_settings`
+/// sits in the same module as `get_settings`), which
+/// [`CHAT_WINDOW_DENIED_COMMANDS`] cannot name without failing the check that
+/// the chat reaches none of them.
+pub fn require_main_window(window: &tauri::WebviewWindow) -> Result<(), String> {
+    if window.label() == "main" {
+        Ok(())
+    } else {
+        Err(coded(
+            "chat_window_command_denied",
+            "The chat window cannot do that; use the main window",
+        ))
+    }
+}
+
 /// Bring the main window to the front, for the chat window's links into it
 /// (the Friends page, docking back). The renderer cannot focus another window
 /// itself without a capability that would let it focus any of them.

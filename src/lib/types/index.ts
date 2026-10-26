@@ -164,6 +164,11 @@ export interface Transfer {
   /** Upload-direction only: total ED2K part count (ceil(total_size / PARTSIZE)),
    *  paired with {@link up_part_status} so the bar renders the right segments. */
   up_part_count?: number;
+  /** Upload-direction only: hex, one byte per part (shares
+   *  {@link up_part_count}), of how much of each part has been sent this
+   *  session — 0 none, 1–254 partly, 255 whole. Draws parts the peer is also
+   *  taking from other sources, which {@link up_part_status} never lights. */
+  up_part_fill?: string;
   /** Upload-direction only: hex bitmap (same packing as {@link up_part_status},
    *  shares {@link up_part_count}) of parts the downloader advertised it already
    *  had at request time — eMule's `m_abyUpPartStatus`. Shaded dark beneath the
@@ -245,6 +250,9 @@ export interface SearchResult {
 export interface StartDownloadResponse {
   transfer_id: string;
   already_queued: boolean;
+  /** The download already queued is a feed's, on the Feeds page rather than
+   *  in Transfers. */
+  in_feed?: boolean;
 }
 
 export interface SpamStats {
@@ -332,6 +340,19 @@ export interface NetworkStats {
   ember_dht_verified_contacts?: number;
   /** SecIdent: available | unavailable | broken */
   secident_status?: 'available' | 'unavailable' | 'broken';
+  /** The router's own WAN address from UPnP; empty when it said none. */
+  upnp_wan_ip?: string;
+  /** The TCP listen port is held by another program. */
+  tcp_listen_failed?: boolean;
+  /** The UDP port actually bound. */
+  bound_udp_port?: number;
+  /** The ports peers are told to dial: a live UPnP forward outranks a STUN
+   *  remap, and an unconfirmed STUN reading does not count, unlike
+   *  `public_tcp_port` / `public_udp_port`. */
+  advertised_tcp_port?: number;
+  advertised_udp_port?: number;
+  /** How long the network loop has run, in seconds, by the monotonic clock. */
+  session_age_secs?: number;
   stale?: boolean;
   degraded?: boolean;
   /** Stable reason code (localized at render time via
@@ -799,8 +820,12 @@ export interface KnownClient {
   last_known_ip: string | null;
   country_code: string | null;
   has_public_key: boolean;
-  /** Ember node id hex when known; friends are keyed by this, not user_hash. */
+  /** Ember node id hex when known: decides the tab and the hash shown. */
   ember_hash: string | null;
+  /** The Ember identity this row is known to be, which friends are matched
+   *  on. Unlike `ember_hash` it is never just a key the peer presented: a
+   *  friend's key is public. */
+  friend_hash?: string | null;
   is_friend: boolean;
   /** Friend nickname from the friends DB when this row is a friend. */
   nickname?: string;
@@ -811,8 +836,20 @@ export interface KnownClient {
  *  else is an eD2K peer. Mirrors `crate::types::KnownClientCounts`.
  *  Populated by `invoke('get_known_client_counts')`. */
 export interface KnownClientCounts {
+  /** Rows each tab lists, after the per-tab trim to the most recently seen. */
   ed2k: number;
   ember: number;
+  /** Records the ledger holds for each tab before that trim. Above the listed
+   *  count only when the tab is capped. */
+  ed2k_total: number;
+  ember_total: number;
+}
+
+/** Populated by `invoke('get_known_clients')`. Mirrors
+ *  `crate::types::KnownClientsSnapshot`. */
+export interface KnownClientsSnapshot {
+  clients: KnownClient[];
+  counts: KnownClientCounts;
 }
 
 /** Snapshot of the anti-leech client filter — the eMule-style
@@ -831,6 +868,11 @@ export interface AntiLeechReplaceResult {
   snapshot: AntiLeechSnapshot;
   compile_errors: Array<[string, string]>;
 }
+
+/** What a friend shows while connected. Offline is not one of them: it is
+ *  what having no session means. Mirrors `FriendStatus` in
+ *  `src-tauri/src/types.rs`. */
+export type FriendStatus = 'online' | 'away' | 'busy';
 
 /** One friend's exceptions to the friend settings. A field left out follows
  *  the global setting. Mirrors `FriendOverrides` in `src-tauri/src/types.rs`.
@@ -858,8 +900,14 @@ export interface FriendOverrides {
 
 export interface AppSettings {
   nickname: string;
+  /** Add Ember's website after `nickname` where eMule clients and eD2K
+   *  servers see it. Ember peers are always given the nickname alone. */
+  nickname_site_tag: boolean;
   /** Unique Channels handle claimed on Rendezvous. Empty until chosen. */
   channel_username: string;
+  /** Language shown as a flag beside our username in room member lists: a
+   *  code from `CHANNEL_LANGUAGES` (`$lib/channelLanguages`), empty for none. */
+  channel_language: string;
   /** Backend-owned: listed in `BACKEND_OWNED_SETTINGS_FIELDS`
    *  (`src-tauri/src/commands/settings.rs`), so `update_settings` restores it
    *  from the authoritative in-memory config and any value written here is
@@ -976,12 +1024,29 @@ export interface AppSettings {
   /** Who may offer you a file in a channel. Gates the prompt only — accepting
    *  is always a separate, explicit choice. */
   channel_file_offers: 'everyone' | 'friends' | 'nobody';
+  /** Who may send a private message through a room you share. */
+  room_dm_policy: 'ask' | 'anyone' | 'off';
+  /** Room members you ignore, kept by the backend so their private messages
+   *  are dropped before they are stored. Null until the webview's own list
+   *  has been moved here. Written only through `set_ignored_members`. */
+  ignored_members: { pubkey: string; name: string; rooms?: string[] | null }[] | null;
   /** Files a friend sends in chat at or under this many MB download without
    *  asking; larger ones wait for an accept. 0 always asks. At most 2048. */
   chat_attachment_auto_accept_mb: number;
   /** Per-friend exceptions to the friend settings above, keyed by the friend's
    *  lowercase hex hash. Written only through `setFriendOverrides`. */
   friend_overrides?: Record<string, FriendOverrides>;
+  /** What friends see while we are online. Written only through
+   *  `setFriendStatus`. */
+  friend_status?: FriendStatus;
+  /** Friends see Away after this many idle minutes while the status is
+   *  Online; 0 is off. One of `AUTO_AWAY_CHOICES`. */
+  auto_away_minutes: number;
+  /** Save each download as `[Ember-P2P] <name>` when it completes. */
+  tag_completed_downloads: boolean;
+  /** Rename files new to a shared folder to `[Ember-P2P] <name>` once
+   *  hashed; files already in the Library are left as they are. */
+  tag_shared_imports: boolean;
   /** Maximum number of friends allowed (1–500) */
   max_friends: number;
   /**
@@ -1019,6 +1084,9 @@ export interface AppSettings {
    *  - `'exit'`: fully quit the application.
    */
   close_to_tray_behavior: 'ask' | 'tray' | 'exit';
+  /** Hide the main window to the system tray when it is minimized. Without a
+   *  visible tray icon the window stays minimized. Off by default. */
+  minimize_to_tray: boolean;
   /** Maximize the main window on launch. Applied once at startup (the
    *  window is created at its configured size), so a change only affects
    *  the next launch. Off by default. */

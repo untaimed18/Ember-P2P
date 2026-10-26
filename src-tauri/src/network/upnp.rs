@@ -753,6 +753,13 @@ impl UpnpMappings {
         self.stood_down
     }
 
+    /// The router's own WAN address, when it told us. A private or
+    /// carrier-grade one means port forwarding on this router cannot reach
+    /// us from the internet.
+    pub fn wan_ip(&self) -> Option<Ipv4Addr> {
+        self.external_ip
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }

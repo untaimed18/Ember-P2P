@@ -56,8 +56,12 @@ pub struct EmberPublishPending {
 pub struct EmberPublishResult {
     /// Nodes that acknowledged storing the record.
     pub stored_on: usize,
-    /// Total nodes the record was sent to.
+    /// Nodes the publish meant to store the record on.
     pub targets: usize,
+    /// STOREs handed to the transport, sent or queued behind a handshake.
+    /// An ack lost on the way back leaves `stored_on` short of what was
+    /// stored, so only 0 here means no node can hold the record.
+    pub sent: usize,
 }
 
 /// Tally of work kicked off by one Ember DHT maintenance cycle (slice 6).
@@ -326,6 +330,11 @@ pub(super) struct NetworkState {
     pub(super) stun_sourced_udp_port: Option<u16>,
     pub(super) firewalled: bool,
     pub(super) firewall_checks_sent: u32,
+    /// Our nickname as Settings has it now, in the form eMule clients are
+    /// given ([`crate::types::AppSettings::ed2k_nickname`]). Downloads outlive a rename, so
+    /// they read this per connection: a friend hearing the old name from one
+    /// session and the new one from another would see their card flip.
+    pub(super) shared_nickname: Arc<tokio::sync::RwLock<String>>,
     pub(super) peer_nicknames: HashMap<KadId, String>,
     /// Outstanding publish requests awaiting `PublishRes` acks.
     ///
@@ -476,6 +485,9 @@ pub(super) struct NetworkState {
     pub(super) last_self_lookup: i64,
     /// When the KAD stack was started (eMule: first self FindNode after MIN2S(3))
     pub(super) kad_started_at: i64,
+    /// When the network loop started, for
+    /// [`crate::types::NetworkStats::session_age_secs`].
+    pub(super) session_started: std::time::Instant,
     /// eMule `CPrefs::m_tLastContact` — updated on each accepted incoming KAD UDP packet.
     pub(super) last_kad_contact: Option<i64>,
     /// Whether UDP is firewalled (separate from TCP, like eMule)
@@ -627,6 +639,15 @@ pub(super) struct NetworkState {
     /// eD2K/KAD callback paths that fallback needs neither a server login nor
     /// a HighID.
     pub(super) transfer_friend_hint: HashMap<String, [u8; 16]>,
+    /// Friends whose queued chat is to be flushed again while their session is
+    /// up, with when and how many tries it has had. See
+    /// `chat::schedule_chat_flush`.
+    pub(super) chat_flush_due: HashMap<[u8; 16], (std::time::Instant, u32)>,
+    /// The chat rows the flush at a friend's latest session start delivered,
+    /// and when. A friend re-sends their last read receipt as a session
+    /// starts, and it names a line by its text alone; see
+    /// `chat::receipt_excludes`.
+    pub(super) chat_session_flushed: HashMap<[u8; 16], (std::time::Instant, Vec<i64>)>,
     /// In-flight friend transfer requests, keyed by `(friend, file hash)`.
     /// Bounds retries and lets an `OP_EMBER_XFER_ACK` be matched to the
     /// request it answers.
@@ -1119,6 +1140,16 @@ pub(super) struct NetworkState {
     pub(super) firewall_req_cooldown: HashMap<Ipv4Addr, i64>,
     /// Ember friends currently connected (ember_hash -> last_seen_timestamp)
     pub(super) online_friends: HashMap<[u8; 16], i64>,
+    /// The status each friend last sent on their current session. Read only
+    /// for friends in `online_friends`, so an offline friend never shows one;
+    /// dropped when the session ends or the friend is removed. A friend with
+    /// no entry shows online.
+    pub(super) friend_statuses: HashMap<[u8; 16], crate::types::FriendStatus>,
+    /// The user has been idle past `auto_away_minutes`, so friends see Away
+    /// while the chosen status is Online. See `friend_status::on_idle_check`.
+    pub(super) idle_away: bool,
+    /// When idle time was last read; `None` asks for a read on the next tick.
+    pub(super) last_idle_check: Option<std::time::Instant>,
     /// Session-bound FIFO correlation for friend browse requests. See
     /// [`browse::PendingBrowseRequest`] for why a request ID alone is
     /// insufficient.
@@ -1596,6 +1627,19 @@ pub(super) struct NetworkState {
     pub(super) channel_moderation_fetch_at: HashMap<[u8; 16], i64>,
     /// Last owner moderation STORE per channel.
     pub(super) channel_moderation_publish_at: HashMap<[u8; 16], i64>,
+    /// Moderation lookups started per channel this session, which is what
+    /// settings lookups ride: one on every third.
+    pub(super) channel_moderation_passes: HashMap<[u8; 16], u64>,
+    /// Rooms whose settings record is to be looked up on the next pass.
+    pub(super) channel_settings_fetch_owed: HashSet<[u8; 16]>,
+    /// In-flight FIND_VALUE of channel settings keys (`search_id` → channel).
+    pub(super) ember_channel_settings_searches: HashMap<u32, [u8; 16]>,
+    /// Settings blobs waiting for the database.
+    pub(super) ember_pending_channel_settings: Vec<([u8; 16], Vec<Vec<u8>>)>,
+    /// What this device last published as each owned room's settings, and when
+    /// it is due again. See [`super::channel_membership::maybe_publish_channel_settings`].
+    pub(super) channel_settings_published:
+        HashMap<[u8; 16], super::channel_membership::ChannelSettingsPublished>,
     /// Last Channel-username refresh against Rendezvous.
     pub(super) channel_username_refresh_at: i64,
     /// Rendezvous base URL, refreshed from settings on the channel heartbeat.
@@ -1692,14 +1736,17 @@ pub(super) struct NetworkState {
     /// Upload allowance taken from the limiter but not yet spent on a block.
     /// See [`xfer_upload_allowance_ok`].
     pub(super) xfer_upload_credit: u64,
-    /// Mirror of `channel_file_offers`, so an inbound offer can be judged
-    /// without reaching back into the settings the command loop owns.
-    pub(super) xfer_offer_policy: String,
+    /// `channel_file_offers` as in force here
+    /// ([`crate::types::channel_file_offers_in_force`]), so an inbound offer
+    /// can be judged without reaching back into the settings the command loop
+    /// owns.
+    pub(super) xfer_offer_policy: &'static str,
     /// Read-only view of the friends list, for the `"friends"` offer policy.
     pub(super) xfer_friend_hashes: crate::app_state::SharedFriendHashes,
     /// Chat attachments a friend has offered us that nobody has answered yet,
-    /// with what accepting one needs. In memory only: see
-    /// [`chat_attach::sweep_interrupted`] for what a restart does to them.
+    /// with what accepting one needs. What its row does not hold is kept
+    /// beside it, sealed, so a restart can bring it back: see
+    /// [`chat_attach::sweep_interrupted`].
     pub(super) attach_inbound: HashMap<[u8; 16], chat_attach::InboundAttach>,
     /// Receives in flight with the friend each is from, so a cancel from
     /// either side, or removing the friend, can stop one.
@@ -1715,6 +1762,22 @@ pub(super) struct NetworkState {
     /// and when. The friend's next accept answers that offer rather than
     /// asking for another, which is what keeps the two from looping.
     pub(super) attach_reoffered: HashMap<[u8; 16], i64>,
+    /// Files we offered that the friend said they are keeping for their user,
+    /// with the friend and how the file looked when last checked. In memory
+    /// only, like the hold itself: a restart releases every held offer. See
+    /// [`chat_attach::check_held_sources`].
+    pub(super) attach_held_sources: chat_attach::HeldSources,
+    /// Friends owed an empty `EMBER_EXT_ATTACH_WAITS` their session had no
+    /// room for, with the half-minute ticks left to send it on. See
+    /// [`chat_attach::retry_owed_holds`].
+    pub(super) attach_waits_owed: HashMap<[u8; 16], u8>,
+    /// Held offers whose file is being looked at on the blocking pool, so a
+    /// look that is slow to return is not started again behind itself.
+    pub(super) attach_held_looking: HashSet<[u8; 16]>,
+    /// Where those looks report back; drained by the Kad process tick, which
+    /// is why both halves live here.
+    pub(super) attach_held_tx: mpsc::UnboundedSender<chat_attach::HeldLooked>,
+    pub(super) attach_held_rx: mpsc::UnboundedReceiver<chat_attach::HeldLooked>,
     /// The owned-rooms list last published, and when. See
     /// `channel_membership::maybe_publish_owned_rooms_list`.
     pub(super) owned_rooms_published: Option<Vec<[u8; 16]>>,
@@ -1722,6 +1785,9 @@ pub(super) struct NetworkState {
     /// In-flight FIND_VALUE of a content-key epoch record (`search_id` →
     /// channel + epoch).
     pub(super) ember_channel_epoch_searches: HashMap<u32, ([u8; 16], i64)>,
+    /// Epoch blobs accumulated for a room and epoch while a FIND_VALUE for it
+    /// is still in flight: one walk for the v2 key, one for the v1 key.
+    pub(super) ember_channel_epoch_buffer: HashMap<([u8; 16], i64), Vec<Vec<u8>>>,
     /// Epoch blobs waiting to be opened and stored (async drain).
     pub(super) ember_pending_channel_epoch: Vec<([u8; 16], i64, Vec<Vec<u8>>)>,
     /// Last epoch FIND_VALUE start per channel.

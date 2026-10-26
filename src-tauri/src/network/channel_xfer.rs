@@ -1245,15 +1245,15 @@ pub(super) fn member_reads_sealed_offers(
 /// explicit act. So the permissive default costs at most a dialog you dismiss,
 /// and the stricter settings exist for people who do not want even that.
 pub(super) async fn xfer_offer_allowed(state: &NetworkState, peer: &[u8; 32]) -> bool {
-    match state.xfer_offer_policy.as_str() {
-        crate::types::CHANNEL_FILE_OFFERS_NOBODY => false,
+    match state.xfer_offer_policy {
+        crate::types::CHANNEL_FILE_OFFERS_EVERYONE => true,
         crate::types::CHANNEL_FILE_OFFERS_FRIENDS => {
             // Channel members and friends are the same identity keyed two
             // ways: a friend's Ember hash is BLAKE3 of this same pubkey.
             let hash = ember::channel::channel_id_from_pubkey(peer);
             state.xfer_friend_hashes.read().await.contains(&hash)
         }
-        _ => true,
+        _ => false,
     }
 }
 
@@ -1416,6 +1416,7 @@ pub(super) async fn apply_xfer_offer(
     offer: ember::channel::XferOffer,
     key: [u8; 32],
     sealed: bool,
+    dedup_key: [u8; 16],
 ) {
     let sender_hex = hex::encode(offer.sender);
     let channel_id = gossip.channel_id;
@@ -1433,7 +1434,7 @@ pub(super) async fn apply_xfer_offer(
     match gate {
         XferOfferGate::Refused => return,
         XferOfferGate::Shed => {
-            forget_channel_gossip(state, &gossip.msg_id);
+            forget_channel_gossip(state, &dedup_key);
             return;
         }
         // At once, and ahead of the checks below: the sender only needs to
@@ -2166,7 +2167,14 @@ pub(super) fn finish_xfer_recv(state: &mut NetworkState, xfer_id: [u8; 16]) {
             if abandoned.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(std::io::Error::other("cancelled while it was being verified"));
             }
-            let target = unique_download_path(&recv.final_path);
+            // Tagged like an eD2K download when the user asked for that.
+            let wanted = match recv.final_path.file_name().and_then(|name| name.to_str()) {
+                Some(name) => recv
+                    .final_path
+                    .with_file_name(crate::sharing::name_tag::completed_download_name(name)),
+                None => recv.final_path.clone(),
+            };
+            let target = unique_download_path(&wanted);
             let landed = ed2k::transfer::move_part_to_final_approved(
                 &recv.part_path,
                 &target,

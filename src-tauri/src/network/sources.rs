@@ -627,6 +627,9 @@ pub(super) fn queue_server_source_ask(
     file_size: u64,
     now: std::time::Instant,
 ) -> bool {
+    if super::feed_direct::holds(transfer_id) {
+        return false;
+    }
     let Some(conn) = state.server_connection.as_ref().filter(|_| state.server_connected) else {
         return false;
     };
@@ -932,7 +935,7 @@ pub(super) fn build_all_getsources_packets(
     file_size: u64,
 ) -> Vec<(Vec<u8>, SocketAddr)> {
     let servers: Vec<_> = state.server_list.servers().to_vec();
-    if servers.is_empty() {
+    if servers.is_empty() || super::feed_direct::holds_file(file_hash) {
         return Vec::new();
     }
 
@@ -1022,6 +1025,9 @@ pub(super) fn build_all_getsources_packets_multi(
         let due: Vec<([u8; 16], u64)> = files
             .iter()
             .filter(|(fh, _)| {
+                if super::feed_direct::holds_file(fh) {
+                    return false;
+                }
                 let key = (server.ip.clone(), server.port, *fh);
                 state.server_udp_source_reask_at.get(&key).is_none_or(|last| {
                     now.saturating_duration_since(*last) >= secs(SERVER_UDP_SOURCE_REASK_SECS)
@@ -1272,6 +1278,11 @@ pub(super) async fn ask_networks_for_sources(
     // Ember: independent of KAD, so it is asked even on a KAD-less network.
     if settings.ember_native_enabled && ember_overlay_contact_count(state) > 0 {
         outcome.ember = start_ember_source_search(socket, state, transfer_id, file_hash).await;
+    }
+    // A feed download held for a publisher this cannot look for: the legs
+    // below are asked now rather than after the hold idles out.
+    if !outcome.ember {
+        super::feed_direct::lookup_unavailable(transfer_id);
     }
 
     // The connected eD2K server, over TCP: in line for its next source frame,

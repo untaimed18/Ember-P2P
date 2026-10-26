@@ -74,9 +74,10 @@
       })),
   );
 
-  // Settings sits past the Alt+1..0 range whenever all eleven entries are
-  // visible, so it carries its own conventional key. Listed only when the
-  // positional map doesn't already reach it, to keep one row per destination.
+  // Settings sits past the Alt+1..0 range whenever all twelve entries are
+  // visible (Ember on), so it carries its own conventional key. With Ember off
+  // ten are, and Alt+0 reaches it. Listed only when the positional map doesn't
+  // already reach it, to keep one row per destination.
   let settingsHasNavDigit = $derived(
     navShortcuts.length >= visibleNavItems($appSettings?.ember_native_enabled).length,
   );
@@ -121,6 +122,7 @@
         { keys: ['Shift', m.shortcuts_key_click()], label: () => m.shortcuts_table_multiselect() },
         { keys: [m.shortcuts_key_double_click()], label: () => m.shortcuts_table_open() },
         { keys: [m.shortcuts_key_right_click()], label: () => m.shortcuts_table_context() },
+        { keys: ['Shift', 'F10'], label: () => m.shortcuts_table_context() },
       ],
     },
     {
@@ -136,6 +138,7 @@
         { keys: ['Delete'], label: () => m.shortcuts_library_delete() },
         { keys: ['Space'], label: () => m.shortcuts_library_toggle_check() },
         { keys: ['↑ / ↓'], label: () => m.shortcuts_library_navigate() },
+        { keys: ['Shift', '↑ / ↓'], label: () => m.shortcuts_search_extend() },
         { keys: ['Home / End'], label: () => m.shortcuts_library_jump_ends() },
         { keys: ['PgUp / PgDn'], label: () => m.shortcuts_library_page() },
       ],
@@ -173,7 +176,7 @@
         { keys: ['Space'], label: () => m.shortcuts_transfers_pause_resume() },
         { keys: [modifierKey, 'V'], label: () => m.shortcuts_transfers_paste_links() },
         { keys: ['F2'], label: () => m.shortcuts_transfers_rename() },
-        { keys: ['Delete'], label: () => m.shortcuts_transfers_delete() },
+        { keys: ['Delete / Backspace'], label: () => m.shortcuts_transfers_delete() },
         { keys: ['Shift', 'Delete'], label: () => m.shortcuts_transfers_delete_files() },
       ],
     },

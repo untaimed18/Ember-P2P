@@ -18,6 +18,7 @@ use crate::network::ember::dht::publish::{
     ModerationTail, SignedRecord, CHANNEL_BAN_LIST_MAX, CHANNEL_MOD_LIST_MAX, CHANNEL_NAME_MAX,
     CHANNEL_PIN_MAX, CHANNEL_WELCOME_MAX,
 };
+use crate::network::channel_membership::{OfferedKey, OfferedKeyOutcome, RotatingRoom};
 use crate::network::ember::crypto;
 use crate::network::{EmberPublishPending, EmberPublishResult, NetworkCommand};
 use crate::storage::database::{
@@ -242,6 +243,9 @@ pub struct ChannelMemberInfo {
     /// `BLAKE3(pubkey)[..16]` hex — the Friend ID for this member. Empty when
     /// the stored key is not a valid Ed25519 point.
     pub ember_hash: String,
+    /// The language the member publishes in their presence, a code from
+    /// `CHANNEL_LANGUAGES`; empty when they publish none.
+    pub language: String,
 }
 
 fn ember_hash_for_member_pubkey(hex_pk: &str) -> String {
@@ -267,6 +271,7 @@ impl ChannelMemberInfo {
             is_self,
             moderator: row.moderator,
             ember_hash,
+            language: row.language,
         }
     }
 }
@@ -380,6 +385,12 @@ pub struct GatheredChannelInfo {
     pub member_count: Option<i64>,
     /// Default language code from the room's signed listing, empty for none.
     pub language: String,
+    /// How many of those present are on our friends list, when the room's
+    /// size was read. Discover never folds away a room a friend is in.
+    pub friends_present: Option<i64>,
+    /// When this device first saw the listing, if it has seen it before.
+    /// Floods of advertising rooms are new; a room listed for weeks is not.
+    pub listed_since: Option<i64>,
 }
 
 pub(crate) async fn require_ember(state: &AppState) -> Result<(), String> {
@@ -574,6 +585,37 @@ pub(crate) async fn apply_channel_username_locally(state: &AppState, username: &
     }
 }
 
+/// Relabel our own roster rows with a newly chosen language, so a member list
+/// opened before the next presence publish already shows it. The publish
+/// itself is the network loop's, when it applies `UpdateSettings`, for the
+/// reason [`apply_channel_username_locally`] gives.
+pub(crate) async fn apply_channel_language_locally(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    language: Option<&'static str>,
+) {
+    let pk = hex::encode(state.identity.ed25519_public_key);
+    let db = state.db.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        db.set_self_channel_member_language(&pk, language.unwrap_or(""))
+    })
+    .await;
+    match outcome {
+        Ok(Ok(rooms)) => {
+            for room in rooms {
+                let _ = app.emit("ember:channel-members", serde_json::json!({ "channel_id": room }));
+            }
+        }
+        Ok(Err(e)) => tracing::warn!(error = %e, "could not relabel our own room roster rows"),
+        Err(_) => {}
+    }
+}
+
+/// Our Channel language as the settings hold it now.
+async fn channel_language_setting(state: &AppState) -> Option<&'static str> {
+    state.config.read().await.settings.channel_language_code()
+}
+
 /// Claim `username` on Rendezvous and return the stored display form.
 pub(crate) async fn claim_username_on_registry(
     state: &AppState,
@@ -710,13 +752,21 @@ async fn record_self_member(
     nickname: &str,
     fail_code: &'static str,
 ) -> Result<(), String> {
+    let language = channel_language_setting(state).await;
     let db = state.db.clone();
     let id = channel_id.to_string();
     let pk = hex::encode(state.identity.ed25519_public_key);
     let nick = nickname.to_string();
     tokio::task::spawn_blocking(move || {
-        db.upsert_channel_member(&id, &pk, &nick, chrono::Utc::now().timestamp(), Some(&pk))
-            .map(|_| ())
+        db.upsert_channel_member_with_language(
+            &id,
+            &pk,
+            &nick,
+            Some(language.unwrap_or("")),
+            chrono::Utc::now().timestamp(),
+            Some(&pk),
+        )
+        .map(|_| ())
     })
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
@@ -796,8 +846,34 @@ pub async fn list_channels(state: tauri::State<'_, AppState>) -> Result<Vec<Chan
     Ok(rows)
 }
 
+/// The tail of a new room's first snapshot. It names us as owner from the
+/// very first record, so a member who joins before any moderation edit already
+/// knows who cannot be banned, and the language, or a member would read the
+/// room as having none. The room's defaults are written out as the owner
+/// loop's republish writes them: the tail stops at its first absent field, so
+/// left out they took the room's name with them, and a device restored before
+/// that republish got the room back unnamed.
+pub(crate) fn new_room_tail(
+    owner: [u8; 32],
+    language: Option<&'static str>,
+    name: &str,
+) -> ModerationTail {
+    ModerationTail {
+        owner_pubkey: Some(owner),
+        key_epoch: Some(0),
+        successor_nominee: Some([0u8; 32]),
+        claim_after_days: Some(0),
+        invites_owner_only: Some(false),
+        language,
+        // What a device restored from the identity names the room by.
+        room_name: Some(name.to_string()),
+        ..Default::default()
+    }
+}
+
 #[tauri::command]
 pub async fn create_channel(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     name: String,
     private: bool,
@@ -928,22 +1004,25 @@ pub async fn create_channel(
             );
         }
     }
-    let presence = SignedRecord::channel_presence(
+    for presence in SignedRecord::channel_presence_forms(
         &nickname,
+        channel_language_setting(&state).await,
         ident.channel_id,
         ident.pubkey,
         &join_secret,
         private,
-        channel::presence_epoch(chrono::Utc::now().timestamp()),
+        false,
         &state.identity.noise_public_key,
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
-    );
-    if let Err(e) = queue_signed_record(&state, presence).await {
-        tracing::warn!(
-            channel_id = %channel_id_hex,
-            error = %e,
-            "room created but its presence record did not publish"
-        );
+        chrono::Utc::now().timestamp(),
+    ) {
+        if let Err(e) = queue_signed_record(&state, presence).await {
+            tracing::warn!(
+                channel_id = %channel_id_hex,
+                error = %e,
+                "room created but its presence record did not publish"
+            );
+        }
     }
     // From the same stamp sequence as every later snapshot, so an edit made in
     // the room's first second still outranks this one.
@@ -963,17 +1042,7 @@ pub async fn create_channel(
         "",
         &[],
         &[],
-        // Names us as owner from the very first record, so a member who joins
-        // before any moderation edit already knows who cannot be banned. The
-        // language too, or a member would read the room as having none.
-        &ModerationTail {
-            owner_pubkey: Some(state.identity.ed25519_public_key),
-            key_epoch: Some(0),
-            language,
-            // What a device restored from the identity names the room by.
-            room_name: Some(name.clone()),
-            ..Default::default()
-        },
+        &new_room_tail(state.identity.ed25519_public_key, language, &name),
         ident.channel_id,
         ident.pubkey,
         private,
@@ -1059,6 +1128,10 @@ pub async fn create_channel(
         // A room that has just been created has never rotated.
         key_epoch: 0,
     };
+    // Now that this identity owns a room, its list is read again on a cadence
+    // (see `channel_recovery::SETTLED_REREAD_SECS`), even if the startup read
+    // had nothing to settle, and before the list naming this room goes out.
+    crate::commands::channel_recovery::keep_reading_list(app);
     Ok(ChannelInviteInfo {
         uri: invite.format(),
         channel_id: channel_id_hex,
@@ -1115,14 +1188,36 @@ pub async fn join_channel(
                 "This channel has been deleted",
             ));
         }
-        // The invite's key is not taken for a room already held. An invite is
-        // unauthenticated, nothing signed commits to an epoch's key, and the
-        // store keeps the first key it is given for an epoch: a crafted invite
-        // would have this device seal under a key its author reads, and block
-        // the genuine one when it arrived.
         // Local rows already know `deleted`. A directory round-trip here made
         // re-entry wait on Rendezvous even though membership is local.
-        return enter_stored_channel(&state, &channel_id_hex, &username).await;
+        let channel_id = invite.channel_id;
+        let taken = tokio::task::spawn_blocking({
+            let db = db.clone();
+            move || take_committed_invite_key(&db, &row, &invite)
+        })
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?;
+        let waiting = match taken {
+            Ok(outcome) => {
+                if outcome.rekeyed {
+                    let _ = state
+                        .network_tx
+                        .try_send(NetworkCommand::ChannelKeysChanged { channel_id });
+                }
+                outcome.key == OfferedKey::Held
+            }
+            Err(e) => {
+                tracing::warn!(channel_id = %channel_id_hex, error = %e, "could not take the invite's key");
+                false
+            }
+        };
+        let entered = enter_stored_channel(&state, &channel_id_hex, &username).await?;
+        if waiting {
+            let _ = state
+                .network_tx
+                .try_send(NetworkCommand::RefreshChannelOwnerRecords { channel_id });
+        }
+        return Ok(entered);
     }
 
     refuse_deleted_channel(&state, &channel_id_hex).await?;
@@ -1154,7 +1249,12 @@ pub async fn join_channel(
                 false,
                 None,
                 if private { Some(&join_secret) } else { None },
-            )
+            )?;
+            // Until the owner's snapshot lands, the language Discover showed.
+            if let Err(e) = db.seed_channel_language_from_listing(&id) {
+                tracing::debug!(channel_id = %id, error = %e, "could not seed the room's language");
+            }
+            Ok::<_, anyhow::Error>(())
         }
     })
     .await
@@ -1265,6 +1365,11 @@ pub(crate) async fn enter_stored_channel(
                     return Err(anyhow::anyhow!("deleted"));
                 }
                 db.set_channel_in_room(&id, true)?;
+                // A room left before the owner's snapshot first landed was
+                // never given its language, and is not looked up while out.
+                if let Err(e) = db.seed_channel_language_from_listing(&id) {
+                    tracing::debug!(channel_id = %id, error = %e, "could not seed the room's language");
+                }
             }
             Ok::<_, anyhow::Error>(row)
         }
@@ -1371,6 +1476,30 @@ pub(crate) async fn enter_stored_channel(
     Ok(refreshed)
 }
 
+/// Take `invite`'s key for `row`, a room this device already holds, when the
+/// owner's commitment checks it, or keep it in memory for the owner's records
+/// to catch up with
+/// ([`crate::network::channel_membership::take_offered_key`]). A public
+/// invite, or one at epoch 0, which does not say which epoch its key is, is
+/// refused.
+fn take_committed_invite_key(
+    db: &Database,
+    row: &StoredChannel,
+    invite: &ChannelInvite,
+) -> anyhow::Result<OfferedKeyOutcome> {
+    let refused = OfferedKeyOutcome {
+        key: OfferedKey::Refused,
+        rekeyed: false,
+    };
+    let Ok(epoch) = i64::try_from(invite.key_epoch) else {
+        return Ok(refused);
+    };
+    if !invite.private || epoch < 1 {
+        return Ok(refused);
+    }
+    crate::network::channel_membership::take_offered_key(db, row, invite.channel_id, epoch, &invite.join_secret)
+}
+
 /// A private room whose current key this device does not hold yet: the owner
 /// has announced a newer epoch, or this is a recovered room of ours still
 /// fetching its key back. A failed read counts as behind.
@@ -1391,22 +1520,25 @@ async fn private_room_key_behind(state: &AppState, row: &StoredChannel) -> bool 
 }
 
 async fn publish_join_presence(state: &AppState, invite: &ChannelInvite, username: &str) {
-    let presence = SignedRecord::channel_presence(
+    for presence in SignedRecord::channel_presence_forms(
         username,
+        channel_language_setting(state).await,
         invite.channel_id,
         invite.pubkey,
         &invite.join_secret,
         invite.private,
-        channel::presence_epoch(chrono::Utc::now().timestamp()),
+        false,
         &state.identity.noise_public_key,
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
-    );
-    if let Err(e) = queue_signed_record(state, presence).await {
-        tracing::warn!(
-            channel_id = %hex::encode(invite.channel_id),
-            error = %e,
-            "join presence did not publish"
-        );
+        chrono::Utc::now().timestamp(),
+    ) {
+        if let Err(e) = queue_signed_record(state, presence).await {
+            tracing::warn!(
+                channel_id = %hex::encode(invite.channel_id),
+                error = %e,
+                "join presence did not publish"
+            );
+        }
     }
     let _ = state
         .network_tx
@@ -1580,6 +1712,15 @@ pub async fn delete_owned_channel(
     ))
     .await
     .map_err(|e| registry_fail(e, "channels_name_taken"))?;
+    retire_deleted_room(&state, &owned).await
+}
+
+/// The local half of deleting a room we own: tell the room we left, purge it
+/// here and drop its transfers. Shared by [`delete_owned_channel`], after the
+/// registry has tombstoned the name, and by
+/// [`confirm_room_deleted_elsewhere`], where it already had.
+async fn retire_deleted_room(state: &AppState, owned: &OwnedChannel) -> Result<(), String> {
+    let channel_id = owned.row.channel_id.clone();
     // Every moderation command holds this from its load to its commit, so
     // taking it here lets one already past its check finish before the purge,
     // instead of signing a fresh record for the room straight after it. Taken
@@ -1615,6 +1756,67 @@ pub async fn delete_owned_channel(
         }
     }
     Ok(())
+}
+
+/// A room we own that the name registry lists as deleted while this device
+/// still runs it: deleted on another device, or after the backup this device
+/// was restored from. The registry's list is the server's word, not the
+/// room key's, so recovery never acts on it alone (see
+/// `channel_recovery::scan_owned_rooms`); the user is asked instead.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RoomDeletedElsewhere {
+    pub channel_id: String,
+    pub name: String,
+}
+
+/// Rooms waiting on the user's answer.
+#[tauri::command]
+pub async fn list_rooms_deleted_elsewhere(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<RoomDeletedElsewhere>, String> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.rooms_deleted_elsewhere())
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_list_failed", "Failed to list channels", e))
+        .map(|rows| {
+            rows.into_iter()
+                .map(|(channel_id, name)| RoomDeletedElsewhere { channel_id, name })
+                .collect()
+        })
+}
+
+/// The user's answer for one such room: `delete` purges it here as deleting
+/// it would have, `keep` keeps it here and stops asking. Only for a room the
+/// prompt lists: this is not a way to delete any room without its own
+/// confirmation.
+#[tauri::command]
+pub async fn confirm_room_deleted_elsewhere(
+    state: tauri::State<'_, AppState>,
+    channel_id: String,
+    delete: bool,
+) -> Result<(), String> {
+    let channel_id = parse_channel_id(&channel_id)?;
+    let db = state.db.clone();
+    let id = channel_id.clone();
+    let waiting = tokio::task::spawn_blocking(move || db.room_deleted_elsewhere_waiting(&id))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_list_failed", "Failed to list channels", e))?;
+    if !waiting {
+        return Err(coded("channels_not_found", "Channel not found"));
+    }
+    if delete {
+        require_ember(&state).await?;
+        let owned = load_owned_channel_as(&state, &channel_id, true).await?;
+        // Its row goes with the room (`tombstone_channel`).
+        return retire_deleted_room(&state, &owned).await;
+    }
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.settle_room_deleted_elsewhere(&channel_id, delete))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_delete_failed", "Failed to delete the room", e))
 }
 
 #[tauri::command]
@@ -1938,15 +2140,33 @@ pub async fn edit_channel_message(
             "Message must be between 1 and 4096 bytes",
         ));
     }
-    let edit_sig = channel::edit_author_signature(
+    let v2_text = channel::chat_v2_outgoing_text(&message, &cleaned, reply_parent.as_ref());
+    let revision = channel::outgoing_chat_edit(
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
-        &sender_pk,
         &channel_id_bytes,
         &msg_id_bytes,
         target.timestamp,
         edited_at,
         &wire_text,
-    );
+        &v2_text,
+        reply_parent.as_ref(),
+    )
+    .ok_or_else(|| {
+        coded(
+            "channels_message_size_invalid",
+            "Message must be between 1 and 4096 bytes",
+        )
+    })?;
+    let mut envelope_id = [0u8; 16];
+    OsRng.fill_bytes(&mut envelope_id);
+    let frames = chat_gossip_frames(
+        channel_id_bytes,
+        &channel::content_key(&join_secret),
+        &sender_pk,
+        envelope_id,
+        edited_at,
+        &revision,
+    )?;
 
     // The queue slot is claimed before the row is written, because the write
     // cannot be undone: `apply_channel_message_edit` overwrites the pre-edit
@@ -1962,11 +2182,12 @@ pub async fn edit_channel_message(
     let id_for_edit = channel_id.clone();
     let msg_id_for_edit = target.msg_id.clone();
     let sender_for_edit = sender.clone();
-    let text_for_edit = wire_text.clone();
-    let sig_hex = hex::encode(edit_sig);
+    let text_for_edit = revision.stored_text.clone();
+    let sig_hex = revision.legacy.as_ref().map(|(_, sig)| hex::encode(sig)).unwrap_or_default();
+    let v2_frame = revision.v2.clone();
     let original_ts = target.timestamp;
     let outcome = tokio::task::spawn_blocking(move || {
-        db.apply_channel_message_edit(
+        db.apply_channel_message_edit_with(
             &id_for_edit,
             &msg_id_for_edit,
             &sender_for_edit,
@@ -1975,6 +2196,7 @@ pub async fn edit_channel_message(
             &text_for_edit,
             &sig_hex,
             edited_at,
+            Some(&v2_frame),
         )
     })
     .await
@@ -2002,7 +2224,9 @@ pub async fn edit_channel_message(
                 "Only the author can edit a message",
             ));
         }
-        ChannelEditOutcome::NotNewer => {
+        // A revision of our own at this second is held already, from this or
+        // another of our devices; this one is not newer than it.
+        ChannelEditOutcome::NotNewer | ChannelEditOutcome::Paired { .. } => {
             return Err(coded(
                 "channels_edit_failed",
                 "A newer version of this message is already stored",
@@ -2018,38 +2242,17 @@ pub async fn edit_channel_message(
         }
     }
 
-    let plain = channel::encode_channel_chat_edit_presigned(
-        &sender_pk,
-        &msg_id_bytes,
-        target.timestamp,
-        edited_at,
-        &edit_sig,
-        &wire_text,
-    );
-    let mut envelope_id = [0u8; 16];
-    OsRng.fill_bytes(&mut envelope_id);
-    let gossip = channel::ChannelGossip::sealed(
-        channel_id_bytes,
-        envelope_id,
-        &channel::content_key(&join_secret),
-        edited_at.max(0) as u64,
-        &plain,
-        channel::CHANNEL_MSG_TTL_DEFAULT,
-        edited_at,
-    );
     // Spends the slot claimed before the write. Nothing between the two can
-    // refuse it, so the revision on disk and the frame on the mesh are one
+    // refuse it, so the revision on disk and the frames on the mesh are one
     // outcome rather than two.
-    permit.send(NetworkCommand::FanoutChannelGossip {
-        body: gossip.encode(),
-    });
+    permit.send(NetworkCommand::FanoutChannelChat { bodies: frames });
     let _ = app.emit(
         "ember:channel-message-edited",
         serde_json::json!({
             "channel_id": channel_id,
             "id": message_id,
             "msg_id": target.msg_id,
-            "message": cleaned,
+            "message": v2_text,
             "edited_at": edited_at,
         }),
     );
@@ -2060,7 +2263,7 @@ pub async fn edit_channel_message(
         reply_to_me: reply_parent_is_mine(reply.parent.as_ref(), &sender),
         sender_pubkey: sender,
         direction: target.direction,
-        message: cleaned,
+        message: v2_text,
         timestamp: target.timestamp,
         read: true,
         edited_at,
@@ -2520,25 +2723,31 @@ pub async fn send_channel_message(
     let sender_pk = state.identity.ed25519_public_key;
     let sent_at = chrono::Utc::now().timestamp();
     let msg_id = channel::new_chat_msg_id(&channel_id_bytes, &sender_pk, sent_at);
-    let author_sig = channel::chat_author_signature(
+    // The v2 frame keeps the emoji joiners the legacy text has to strip.
+    let v2_text = channel::chat_v2_outgoing_text(&message, &cleaned, reply_parent.as_ref());
+    let Some(line) = channel::outgoing_chat_line(
         &crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key),
-        &sender_pk,
         &channel_id_bytes,
         &msg_id,
         sent_at,
         &wire_text,
-    );
+        &v2_text,
+        reply_parent.as_ref(),
+    ) else {
+        refund_local_send(&channel_id);
+        return Err(coded(
+            "channels_message_size_invalid",
+            "Message must be between 1 and 4096 bytes",
+        ));
+    };
     let key = channel::content_key(&join_secret);
-    let plain = channel::encode_channel_chat_plain_presigned(&sender_pk, &author_sig, &wire_text);
-    let gossip = channel::ChannelGossip::sealed(
-        channel_id_bytes,
-        msg_id,
-        &key,
-        sent_at.max(0) as u64,
-        &plain,
-        channel::CHANNEL_MSG_TTL_DEFAULT,
-        sent_at,
-    );
+    let frames = match chat_gossip_frames(channel_id_bytes, &key, &sender_pk, msg_id, sent_at, &line) {
+        Ok(frames) => frames,
+        Err(e) => {
+            refund_local_send(&channel_id);
+            return Err(e);
+        }
+    };
     // Stored before it is flooded, which is the order the edit path already
     // uses. The other way round, a failed insert left the line on every peer's
     // disk and on none of ours: the user was told the send failed, and the retry
@@ -2548,12 +2757,14 @@ pub async fn send_channel_message(
     let db = state.db.clone();
     let id = channel_id.clone();
     let sender2 = sender.clone();
-    // Stored as signed, trailer and all, so a catch-up re-serves the same bytes.
-    let text = wire_text.clone();
+    // Stored as signed, trailer and all, so a catch-up re-serves the same
+    // bytes: the v2 text, and beside it both frames' signatures.
+    let text = line.stored_text.clone();
     let msg_id_hex = hex::encode(msg_id);
-    let author_sig_hex = hex::encode(author_sig);
+    let author_sig_hex = line.legacy.as_ref().map(|(_, sig)| hex::encode(sig)).unwrap_or_default();
+    let v2_frame = line.v2.clone();
     let row_id = tokio::task::spawn_blocking(move || {
-        let row_id = db.insert_channel_message(
+        let row_id = db.insert_channel_message_with(
             &id,
             &sender2,
             "sent",
@@ -2562,6 +2773,7 @@ pub async fn send_channel_message(
             sent_at,
             &author_sig_hex,
             true,
+            Some(&v2_frame),
         )?;
         // Queued until the flood finds somebody. The network task flips it to
         // delivered on the same tick in the ordinary case, and to failed when
@@ -2586,9 +2798,7 @@ pub async fn send_channel_message(
 
     if let Err(e) = state
         .network_tx
-        .try_send(NetworkCommand::FanoutChannelGossip {
-            body: gossip.encode(),
-        })
+        .try_send(NetworkCommand::FanoutChannelChat { bodies: frames })
     {
         // Take the row back out. A line nobody was sent is not history, and
         // leaving it would show the sender a transcript the room does not have —
@@ -2620,7 +2830,7 @@ pub async fn send_channel_message(
         reply_to_me: reply_parent_is_mine(reply.parent.as_ref(), &sender),
         sender_pubkey: sender,
         direction: "sent".into(),
-        message: cleaned,
+        message: v2_text,
         timestamp: sent_at,
         read: true,
         edited_at: 0,
@@ -2784,6 +2994,76 @@ async fn load_owned_channel_as(
 /// across the DHT publish too, which is bounded by that call's own timeout.
 static MODERATION_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
 
+/// The longest line, in UTF-8 bytes of its text, whose sealed legacy frame
+/// fits [`channel::RELAYABLE_GOSSIP_MAX_BYTES`]: past it, [`chat_gossip_frames`]
+/// refuses the line. A reply's trailer ([`channel::REPLY_TRAILER_BYTES`]) comes
+/// out of the same room.
+///
+/// The frame adds the same overhead whatever the text says, but the text it
+/// carries is what was typed with emoji joiners and the other characters the
+/// outgoing sanitiser drops taken out, so a line typed with those can run a
+/// little longer. Measured on what was typed, this is the most that always goes
+/// out. The send path measures the frame itself; this is the number the
+/// frontend holds (`CHANNEL_LINE_MAX_TEXT_BYTES` in `src/lib/api/channels.ts`).
+/// Once [`channel::SEND_LEGACY_CHAT_FRAMES`] is off the v2 frame sets the
+/// limit instead, and this changes.
+#[cfg(test)]
+const CHANNEL_LINE_MAX_TEXT_BYTES: usize = 3728;
+/// [`CHANNEL_LINE_MAX_TEXT_BYTES`] for a revision, whose legacy frame also
+/// carries the line's id and both its times. A revised reply keeps its
+/// trailer, so it too leaves [`channel::REPLY_TRAILER_BYTES`] less.
+#[cfg(test)]
+const CHANNEL_EDIT_MAX_TEXT_BYTES: usize = 3696;
+
+/// The sealed frames of one outgoing line or revision, the legacy one first so
+/// that a build reading only it meets it ahead of the frame it cannot read.
+/// `legacy_envelope` and `at` are the legacy frame's envelope id and time; the
+/// v2 frame carries its own.
+///
+/// A sealed frame has to fit one datagram inside the overlay relay envelope a
+/// firewalled member's copy goes in ([`channel::RELAYABLE_GOSSIP_MAX_BYTES`]),
+/// which a text near the 4096-byte cap does not. Unless the line is a reply,
+/// whose legacy trailer outweighs the v2 frame's reference, the v2 frame is the
+/// larger of the two, so a line whose legacy frame fits and v2 frame does not
+/// goes out in the legacy form alone, which every build reads; one whose first
+/// frame does not fit is refused, before the callers store anything, rather
+/// than kept here and delivered nowhere.
+fn chat_gossip_frames(
+    channel_id: [u8; 16],
+    key: &[u8; 32],
+    sender: &[u8; 32],
+    legacy_envelope: [u8; 16],
+    at: i64,
+    chat: &channel::OutgoingChat,
+) -> Result<Vec<Vec<u8>>, String> {
+    let seal = |envelope_id: [u8; 16], at: i64, plain: &[u8]| {
+        channel::ChannelGossip::sealed(
+            channel_id,
+            envelope_id,
+            key,
+            at.max(0) as u64,
+            plain,
+            channel::CHANNEL_MSG_TTL_DEFAULT,
+            at,
+        )
+        .encode()
+    };
+    let fits = |frame: &Vec<u8>| frame.len() <= channel::RELAYABLE_GOSSIP_MAX_BYTES;
+    let mut frames = Vec::with_capacity(2);
+    if let Some((plain, _)) = &chat.legacy {
+        frames.push(seal(legacy_envelope, at, plain));
+    }
+    frames.push(seal(chat.v2.frame_id, chat.v2.signed_at, &chat.v2.plain(sender)));
+    if !fits(&frames[0]) {
+        return Err(coded(
+            "channels_message_too_long_to_send",
+            "This message is too long to send to a room. Shorten it and try again.",
+        ));
+    }
+    frames.retain(fits);
+    Ok(frames)
+}
+
 /// Our own outbound chat times, per room, for [`LOCAL_SEND_PER_MINUTE`].
 ///
 /// Session-scoped on purpose. A restart is not a loophole that matters here:
@@ -2938,6 +3218,43 @@ async fn owner_moderation_tail(state: &AppState, owned: &OwnedChannel) -> Modera
     }
 }
 
+/// Refuse an owner snapshot of `owned` that does not make one whole record
+/// with `tail`, its pins already fitted.
+///
+/// The `fits` check catches the commoner case, where the record would publish
+/// but the encoder would quietly drop entries past the cap, so the room would
+/// go on believing it had banned someone it had not.
+fn owner_snapshot_fits(
+    owned: &OwnedChannel,
+    topic: &str,
+    welcome: &str,
+    bans: &[[u8; 32]],
+    mods: &[[u8; 32]],
+    tail: &ModerationTail,
+) -> Result<(), String> {
+    let fits = crate::network::ember::dht::publish::moderation_snapshot_fits(topic, welcome, bans, mods, tail)
+        && SignedRecord::channel_moderation(
+            topic,
+            welcome,
+            bans,
+            mods,
+            tail,
+            owned.channel_id,
+            owned.ident.pubkey,
+            owned.row.visibility == CHANNEL_KIND_PRIVATE,
+            &owned.ident.signing_key,
+        )
+        .is_some();
+    if !fits {
+        return Err(coded(
+            "channels_moderation_too_large",
+            "This change does not fit in one published record. Shorten the welcome \
+             message, or remove some bans or moderators.",
+        ));
+    }
+    Ok(())
+}
+
 /// Whether `tail`'s pins all fit a record for this snapshot.
 fn owner_pins_fit(
     topic: &str,
@@ -2974,43 +3291,13 @@ async fn commit_channel_moderation_with(
     let tail = crate::network::ember::dht::publish::fit_moderation_pins(
         topic, welcome, bans, mods, &tail,
     );
-    let record = SignedRecord::channel_moderation(
-        topic,
-        welcome,
-        bans,
-        mods,
-        &tail,
-        owned.channel_id,
-        owned.ident.pubkey,
-        private,
-        &owned.ident.signing_key,
-    );
     // Refuse before touching the database. A moderation record is a full
     // snapshot, so one the network will not accept does not leave the previous
     // state standing — the last good copy simply expires, taking the topic,
     // welcome, both lists, the owner key, the key epoch and any successor
     // nomination with it. Reporting the edit as applied while that happens is
     // the worst of both.
-    //
-    // The `fits` check catches the commoner case, where the record would
-    // publish but the encoder would quietly drop entries past the cap, so the
-    // room would go on believing it had banned someone it had not.
-    if !crate::network::ember::dht::publish::moderation_snapshot_fits(
-        topic, welcome, bans, mods, &tail,
-    ) {
-        return Err(coded(
-            "channels_moderation_too_large",
-            "This change does not fit in one published record. Shorten the welcome \
-             message, or remove some bans or moderators.",
-        ));
-    }
-    if record.is_none() {
-        return Err(coded(
-            "channels_moderation_too_large",
-            "This change does not fit in one published record. Shorten the welcome \
-             message, or remove some bans or moderators.",
-        ));
-    }
+    owner_snapshot_fits(owned, topic, welcome, bans, mods, &tail)?;
     let tail_nominee = tail.successor_nominee;
     let tail_days = tail.claim_after_days;
     let tail_epoch = tail.key_epoch;
@@ -3427,17 +3714,29 @@ async fn join_secret_for_channel(
 /// The `banned` flag is written by `commit_channel_moderation`, which runs
 /// *after* this — reading it from `channel_members` here would still show the
 /// member as present and seal the new key straight to the person being evicted.
+///
+/// The key is stored here; its sealed records are returned for the caller to
+/// queue once the snapshot naming the epoch has committed ([`rotate_and_commit`]).
 async fn rotate_channel_key(
     state: &AppState,
     owned: &OwnedChannel,
     excluded: &[[u8; 32]],
-) -> Result<Option<i64>, String> {
+) -> Result<Option<RotatedKey>, String> {
     if owned.row.visibility != CHANNEL_KIND_PRIVATE {
         return Ok(None);
     }
     let next_epoch = owned.row.key_epoch.saturating_add(1);
     let mut secret = [0u8; 32];
     OsRng.fill_bytes(&mut secret);
+
+    // Members before the key: a failure after the key is stored would leave an
+    // epoch no snapshot announces and no caller rolls back.
+    let db = state.db.clone();
+    let id = owned.row.channel_id.clone();
+    let members = tokio::task::spawn_blocking(move || db.list_channel_members(&id))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_moderation_failed", "Could not load members", e))?;
 
     let db = state.db.clone();
     let id = owned.row.channel_id.clone();
@@ -3449,40 +3748,32 @@ async fn rotate_channel_key(
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_moderation_failed", "Could not rotate the room key", e))?;
 
-    let db = state.db.clone();
-    let id = owned.row.channel_id.clone();
-    let members = tokio::task::spawn_blocking(move || db.list_channel_members(&id))
-        .await
-        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-        .map_err(|e| coded_ctx("channels_moderation_failed", "Could not load members", e))?;
-
     let our_seed = state.identity.ed25519_secret_key;
     let our_hex = hex::encode(state.identity.ed25519_public_key);
+    let mut records = Vec::new();
     // Sealed to ourselves as well, in a member's slot: the key is random, so
     // this copy is the only way a device restored from an older backup gets
     // the room's current key back.
-    if let Some(wrap) = channel::derive_channel_epoch_secret(
-        &our_seed,
-        &state.identity.ed25519_public_key,
-        &owned.channel_id,
-        next_epoch,
+    if let (Some(wrap), Some(blind)) = (
+        channel::derive_channel_epoch_secret(
+            &our_seed,
+            &state.identity.ed25519_public_key,
+            &owned.channel_id,
+            next_epoch,
+        ),
+        channel::epoch_blind(&our_seed, &state.identity.ed25519_public_key, &owned.channel_id),
     ) {
         let sealed = channel::seal_channel_key_epoch(&wrap, &owned.channel_id, next_epoch, &secret);
-        let record = SignedRecord::channel_key_epoch(
+        records.extend(SignedRecord::channel_key_epoch_forms(
             owned.channel_id,
             owned.ident.pubkey,
             &state.identity.ed25519_public_key,
+            true,
             next_epoch,
+            &blind,
             &sealed,
             &owned.ident.signing_key,
-        );
-        if let Err(e) = queue_signed_record(state, record).await {
-            tracing::warn!(
-                channel_id = %owned.row.channel_id,
-                error = %e,
-                "could not queue the owner's own copy of a rotated channel key"
-            );
-        }
+        ));
     }
     for member in members {
         // Banned members are the point of rotating, and we already hold the key
@@ -3499,41 +3790,36 @@ async fn rotate_channel_key(
         if excluded.contains(&member_pk) {
             continue;
         }
-        let Some(wrap) = channel::derive_channel_epoch_secret(
-            &our_seed,
-            &member_pk,
-            &owned.channel_id,
-            next_epoch,
+        let (Some(wrap), Some(blind)) = (
+            channel::derive_channel_epoch_secret(&our_seed, &member_pk, &owned.channel_id, next_epoch),
+            channel::epoch_blind(&our_seed, &member_pk, &owned.channel_id),
         ) else {
             continue;
         };
         let sealed =
             channel::seal_channel_key_epoch(&wrap, &owned.channel_id, next_epoch, &secret);
-        let record = SignedRecord::channel_key_epoch(
+        records.extend(SignedRecord::channel_key_epoch_forms(
             owned.channel_id,
             owned.ident.pubkey,
             &member_pk,
+            false,
             next_epoch,
+            &blind,
             &sealed,
             &owned.ident.signing_key,
-        );
-        // Queued rather than awaited. The STORE result was only ever logged, so
-        // waiting on it bought nothing and cost up to DEFAULT_FIND_TIMEOUT_MS
-        // per member — serially, while holding MODERATION_LOCK. On a sparse DHT
-        // where those lookups time out, one ban in a room of a dozen froze
-        // moderation everywhere for minutes. The walk still starts; a member who
-        // cannot find their record re-asks every minute, and the owner
-        // republishes moderation on a timer.
-        if let Err(e) = queue_signed_record(state, record).await {
-            tracing::warn!(
-                channel_id = %owned.row.channel_id,
-                member = %member.member_pubkey,
-                error = %e,
-                "could not queue a rotated channel key for a member"
-            );
-        }
+        ));
     }
-    Ok(Some(next_epoch))
+    Ok(Some(RotatedKey {
+        epoch: next_epoch,
+        records,
+    }))
+}
+
+/// A content key [`rotate_channel_key`] stored, and the records sealing it to
+/// us and to each member still entitled to it.
+struct RotatedKey {
+    epoch: i64,
+    records: Vec<SignedRecord>,
 }
 
 /// Mint a new content key and publish the snapshot that announces it.
@@ -3542,14 +3828,37 @@ async fn rotate_channel_key(
 /// tells members a new epoch exists, so a rotation whose commit fails has to
 /// come back off — otherwise everything sent afterwards is sealed under a key
 /// nobody will ever go looking for.
+///
+/// The sealed key goes out only once the snapshot has committed. A key taken
+/// back must not reach anyone: a member who fetched it would store it for its
+/// epoch, and the key minted next under the same number would be refused
+/// there until the owner's commitments showed the first one wrong. Nor its
+/// commitment: the settings pass signs nothing for the room until the commit
+/// or the undo is done ([`RotatingRoom`]).
 async fn rotate_and_commit(
     state: &AppState,
     owned: &OwnedChannel,
     bans: &[[u8; 32]],
     mods: &[[u8; 32]],
 ) -> Result<(), String> {
+    let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
+    if private {
+        // The snapshot the commit will sign, naming the epoch about to be
+        // minted, refused for size before the key is stored rather than after.
+        let mut tail = owner_moderation_tail(state, owned).await;
+        tail.key_epoch = Some(owned.row.key_epoch.saturating_add(1).max(0) as u64);
+        let tail = crate::network::ember::dht::publish::fit_moderation_pins(
+            &owned.row.topic,
+            &owned.row.welcome,
+            bans,
+            mods,
+            &tail,
+        );
+        owner_snapshot_fits(owned, &owned.row.topic, &owned.row.welcome, bans, mods, &tail)?;
+    }
+    let rotating = private.then(|| RotatingRoom::begin(&owned.row.channel_id));
     let rotated = rotate_channel_key(state, owned, bans).await?;
-    let Err(error) = commit_channel_moderation(
+    if let Err(error) = commit_channel_moderation(
         state,
         owned,
         &owned.row.topic,
@@ -3558,11 +3867,39 @@ async fn rotate_and_commit(
         mods,
     )
     .await
-    else {
-        return Ok(());
-    };
-    undo_rotation(state, owned, rotated).await;
-    Err(error)
+    {
+        undo_rotation(state, owned, rotated.as_ref().map(|rotated| rotated.epoch)).await;
+        drop(rotating);
+        return Err(error);
+    }
+    drop(rotating);
+    if let Some(rotated) = rotated {
+        hand_out_rotated_key(state, owned, rotated).await;
+    }
+    Ok(())
+}
+
+/// Send a committed rotation's sealed key out, and its commitment with it.
+async fn hand_out_rotated_key(state: &AppState, owned: &OwnedChannel, rotated: RotatedKey) {
+    // Queued rather than awaited. The STORE result was only ever logged, so
+    // waiting on it bought nothing and cost up to DEFAULT_FIND_TIMEOUT_MS per
+    // member — serially, while holding MODERATION_LOCK. On a sparse DHT where
+    // those lookups time out, one ban in a room of a dozen froze moderation
+    // everywhere for minutes. The walk still starts; a member who cannot find
+    // their record re-asks every minute, and the owner republishes moderation
+    // on a timer.
+    for record in rotated.records {
+        if let Err(e) = queue_signed_record(state, record).await {
+            tracing::warn!(
+                channel_id = %owned.row.channel_id,
+                error = %e,
+                "could not queue a rotated channel key"
+            );
+        }
+    }
+    let _ = state
+        .network_tx
+        .try_send(NetworkCommand::PublishOwnedChannelSettings);
 }
 
 /// Take a rotation back off after the snapshot that would have announced it
@@ -3627,32 +3964,34 @@ async fn reseal_current_epoch_to_member(
         );
         return Ok(());
     };
-    let Some(wrap) = channel::derive_channel_epoch_secret(
-        &state.identity.ed25519_secret_key,
-        &member_pk,
-        &owned.channel_id,
-        epoch,
+    let our_seed = state.identity.ed25519_secret_key;
+    let (Some(wrap), Some(blind)) = (
+        channel::derive_channel_epoch_secret(&our_seed, &member_pk, &owned.channel_id, epoch),
+        channel::epoch_blind(&our_seed, &member_pk, &owned.channel_id),
     ) else {
         return Ok(());
     };
     let sealed = channel::seal_channel_key_epoch(&wrap, &owned.channel_id, epoch, &secret);
-    let record = SignedRecord::channel_key_epoch(
+    // Queued rather than awaited, exactly as rotation does: the member re-asks
+    // every minute until they find it, so a slow walk costs nothing but time.
+    for record in SignedRecord::channel_key_epoch_forms(
         owned.channel_id,
         owned.ident.pubkey,
         &member_pk,
+        false,
         epoch,
+        &blind,
         &sealed,
         &owned.ident.signing_key,
-    );
-    // Queued rather than awaited, exactly as rotation does: the member re-asks
-    // every minute until they find it, so a slow walk costs nothing but time.
-    if let Err(e) = queue_signed_record(state, record).await {
-        tracing::warn!(
-            channel_id = %owned.row.channel_id,
-            member = %hex::encode(member_pk),
-            error = %e,
-            "could not queue the current room key for an unbanned member"
-        );
+    ) {
+        if let Err(e) = queue_signed_record(state, record).await {
+            tracing::warn!(
+                channel_id = %owned.row.channel_id,
+                member = %hex::encode(member_pk),
+                error = %e,
+                "could not queue the current room key for an unbanned member"
+            );
+        }
     }
     Ok(())
 }
@@ -5172,6 +5511,10 @@ pub async fn claim_channel_ownership(
             // key — so the snapshot goes out either way. What must not survive
             // is the reverse: a rotation the snapshot never announced leaves us
             // sealing traffic under an epoch nobody has been told to fetch.
+            // Held, as `rotate_and_commit` holds it, until the commit or the
+            // undo is done: a settings pass in between would sign a commitment
+            // to a key that may yet be taken back.
+            let rotating = private.then(|| RotatingRoom::begin(&successor_id_hex));
             let rotated = match rotate_channel_key(&state, &owned, &bans).await {
                 Ok(rotated) => rotated,
                 Err(e) => {
@@ -5189,7 +5532,12 @@ pub async fn claim_channel_ownership(
             )
             .await
             {
-                Ok(_) if rotated.is_some() || !private => {}
+                Ok(_) if rotated.is_some() || !private => {
+                    drop(rotating);
+                    if let Some(rotated) = rotated {
+                        hand_out_rotated_key(&state, &owned, rotated).await;
+                    }
+                }
                 // The one rotation this room is owed, and nothing else is going
                 // to mint it: the claim left no mark for the owned-room pass,
                 // whose rotation would have raced this one for the same epoch.
@@ -5197,8 +5545,9 @@ pub async fn claim_channel_ownership(
                 outcome => {
                     if let Err(e) = outcome {
                         tracing::warn!(channel_id = %successor_id_hex, error = %e, "could not publish the claimed room's first record");
-                        undo_rotation(&state, &owned, rotated).await;
+                        undo_rotation(&state, &owned, rotated.as_ref().map(|rotated| rotated.epoch)).await;
                     }
+                    drop(rotating);
                     let db = state.db.clone();
                     let id = successor_id_hex.clone();
                     let _ = tokio::task::spawn_blocking(move || db.mark_channel_rotate_pending(&id)).await;
@@ -5241,11 +5590,13 @@ const PRESENCE_FRESH_SECS: i64 = channel::PRESENCE_FRESH_SECS;
 /// Only the current epoch is asked for. A member who last announced under the
 /// previous key is missed for up to one republish interval. Rooms that time
 /// out or never answer stay `None`; a completed walk with no fresh live
-/// records is stamped 0.
+/// records is stamped 0. Each count comes with how many of those present are
+/// friends: a public room's presence names each member by the identity key
+/// the friends list holds.
 async fn probe_public_member_counts(
     state: &AppState,
     rooms: &[(String, String)],
-) -> Option<std::collections::HashMap<String, i64>> {
+) -> Option<std::collections::HashMap<String, (i64, i64)>> {
     use std::collections::{HashMap, HashSet};
 
     let now = chrono::Utc::now().timestamp();
@@ -5330,16 +5681,32 @@ async fn probe_public_member_counts(
     // A walked key that completed — including tombstone-only or empty —
     // reports 0 rather than leaving the previous count on screen forever.
     // Timeouts stay absent so the UI does not treat 0 as authoritative.
+    let friend_keys: HashSet<[u8; 32]> = {
+        let db = state.db.clone();
+        tokio::task::spawn_blocking(move || db.get_friend_public_keys())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, key)| key)
+            .collect()
+    };
     let mut out = HashMap::new();
     for id in answered {
-        let count = members.get(&id).map(|seen| {
-            seen.values()
-                .filter(|(ts, departed)| {
-                    !*departed && now.saturating_sub(*ts) <= PRESENCE_FRESH_SECS
-                })
-                .count() as i64
-        }).unwrap_or(0);
-        out.insert(id, count);
+        let present: Vec<&[u8; 32]> = members
+            .get(&id)
+            .map(|seen| {
+                seen.iter()
+                    .filter(|(_, (ts, departed))| {
+                        !*departed && now.saturating_sub(*ts) <= PRESENCE_FRESH_SECS
+                    })
+                    .map(|(key, _)| key)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let friends = present.iter().filter(|key| friend_keys.contains(**key)).count() as i64;
+        out.insert(id, (present.len() as i64, friends));
     }
     Some(out)
 }
@@ -5396,6 +5763,8 @@ fn listings_from_blobs(
                 )
                 .unwrap_or("")
                 .to_string(),
+                friends_present: None,
+                listed_since: None,
             },
             rec.timestamp,
         ));
@@ -5476,6 +5845,83 @@ fn inside_ids(rows: &[StoredChannel]) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// How long a shard walk the network task refused waits before asking again.
+/// A refusal means the background search pool was full; walks there finish
+/// or time out within seconds, so one more ask usually lands.
+const INDEX_SHARD_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// What one public-index shard walk turned up.
+pub(crate) struct ShardWalk {
+    pub(crate) shard: u8,
+    pub(crate) blobs: Vec<Vec<u8>>,
+    /// Enough of the network answered that a listing missing from `blobs`
+    /// can be taken as gone. A refused, timed-out or barely answered walk
+    /// says nothing about the listings it did not return, and nor does one
+    /// that came back full: a shard holding more than a lookup returns may
+    /// hold the missing ones too, and junk filling it would otherwise erase
+    /// every listing it crowded out.
+    pub(crate) settled: bool,
+}
+
+/// Whether a shard walk that `responded` nodes answered with `found` blobs
+/// settled (see [`ShardWalk::settled`]).
+pub(crate) fn shard_settled(responded: usize, found: usize) -> bool {
+    responded >= crate::commands::channel_recovery::MIN_RESPONDERS_FOR_ABSENCE
+        && found < crate::network::ember::dht::search::MAX_SEARCH_RESULTS
+}
+
+/// Walk one shard of a public index (rooms' or feeds'), asking once more if
+/// the network task refused it.
+///
+/// Discover asks for all sixteen shards at once on a pool other automatic
+/// work shares, so a refusal is routine; a timeout has already spent the
+/// whole budget and is not repeated.
+pub(crate) async fn walk_index_shard(state: &AppState, shard: u8, key: [u8; 16]) -> ShardWalk {
+    let mut walk = find_raw_keys_counted(state, vec![key], DEFAULT_FIND_TIMEOUT_MS).await;
+    if walk.is_err() {
+        tokio::time::sleep(INDEX_SHARD_RETRY_DELAY).await;
+        walk = find_raw_keys_counted(state, vec![key], DEFAULT_FIND_TIMEOUT_MS).await;
+    }
+    match walk {
+        Ok(Some((blobs, responded))) => ShardWalk { shard, settled: shard_settled(responded, blobs.len()), blobs },
+        Ok(None) => {
+            tracing::debug!(shard, "index shard walk timed out");
+            ShardWalk { shard, blobs: Vec::new(), settled: false }
+        }
+        Err(error) => {
+            tracing::debug!(shard, %error, "index shard walk refused twice");
+            ShardWalk { shard, blobs: Vec::new(), settled: false }
+        }
+    }
+}
+
+/// Cached rooms this walk cannot rule out: filed under a shard that did not
+/// settle, or any of them when the directory could not be read. `skip` names
+/// rooms already listed or not to be shown.
+///
+/// Without this a refused shard read as an empty one, and every room in it
+/// dropped off Discover until a later walk happened to get through.
+fn carry_forward_cached(
+    cached: Vec<CachedChannel>,
+    unsettled: &std::collections::HashSet<u8>,
+    directory_read: bool,
+    skip: impl Fn(&str) -> bool,
+) -> Vec<CachedChannel> {
+    cached
+        .into_iter()
+        .filter(|c| !skip(&c.channel_id))
+        .filter(|c| {
+            let Some(id) = hex::decode(&c.channel_id)
+                .ok()
+                .and_then(|b| <[u8; 16]>::try_from(b).ok())
+            else {
+                return false;
+            };
+            !directory_read || unsettled.contains(&channel::index_shard(&id))
+        })
+        .collect()
+}
+
 /// One shard's worth of listings, tagged with the walk that asked for them.
 #[derive(Clone, serde::Serialize)]
 struct GatheredChannelBatch<'a> {
@@ -5522,12 +5968,25 @@ pub async fn gather_channels(
 
     require_ember(&state).await?;
     let db = state.db.clone();
-    let local = tokio::task::spawn_blocking(move || db.list_channels())
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .unwrap_or_default();
+    let (local, cached) = tokio::task::spawn_blocking(move || {
+        (
+            db.list_channels().unwrap_or_default(),
+            db.list_cached_channels().unwrap_or_default(),
+        )
+    })
+    .await
+    .unwrap_or_default();
     let joined_ids = inside_ids(&local);
+    let hidden: std::collections::HashSet<String> = local
+        .iter()
+        .filter(|c| c.deleted)
+        .map(|c| c.channel_id.clone())
+        .collect();
+    let cached_languages: std::collections::HashMap<String, String> = cached
+        .iter()
+        .filter(|c| !c.language.is_empty())
+        .map(|c| (c.channel_id.clone(), c.language.clone()))
+        .collect();
 
     let url = rendezvous_url(&state).await;
     let (directory, deleted) = tokio::join!(
@@ -5541,6 +6000,7 @@ pub async fn gather_channels(
     // walks below turn up, which is the right behaviour — but it used to be
     // indistinguishable from "the network has no rooms". Log it so an empty
     // Discover can be told apart from an unreachable directory.
+    let directory_read = directory.is_ok();
     let directory = match directory {
         Ok(list) => list,
         Err(error) => {
@@ -5586,7 +6046,8 @@ pub async fn gather_channels(
 
     let mut walks: futures::stream::FuturesUnordered<_> = channel::all_index_keys()
         .into_iter()
-        .map(|key| find_raw_keys(&state, vec![key]))
+        .zip(0u8..)
+        .map(|(key, shard)| walk_index_shard(&state, shard, key))
         .collect();
 
     let mut signed_at: std::collections::HashMap<String, ListingOrigin> =
@@ -5618,6 +6079,12 @@ pub async fn gather_channels(
         }
         signed_at.insert(id.clone(), (out.len(), None, true));
         let name = discovered_room_name(&listing.name, &id);
+        // The directory carries no language, and a walk whose shard lookups are
+        // refused or time out hears no signed listing to bring one in. Start
+        // from the one the last signed listing gave, or every such walk cleared
+        // the language on screen and in the cache; a listing heard below still
+        // replaces it.
+        let language = cached_languages.get(&id).cloned().unwrap_or_default();
         out.push(GatheredChannelInfo {
             joined: joined_ids.contains(&id),
             channel_id: id,
@@ -5625,16 +6092,22 @@ pub async fn gather_channels(
             name,
             private: false,
             member_count: None,
-            language: String::new(),
+            language,
+            friends_present: None,
+            listed_since: None,
         });
     }
     if !out.is_empty() {
         emit(&out);
     }
 
+    let mut unsettled: std::collections::HashSet<u8> = std::collections::HashSet::new();
     while let Some(shard) = walks.next().await {
+        if !shard.settled {
+            unsettled.insert(shard.shard);
+        }
         let mut changed = Vec::new();
-        for (listing, timestamp) in listings_from_blobs(shard.unwrap_or_default(), &joined_ids) {
+        for (listing, timestamp) in listings_from_blobs(shard.blobs, &joined_ids) {
             if deleted.contains(&listing.channel_id) {
                 continue;
             }
@@ -5648,6 +6121,42 @@ pub async fn gather_channels(
         }
     }
 
+    let carried: Vec<GatheredChannelInfo> = carry_forward_cached(
+        cached,
+        &unsettled,
+        directory_read,
+        |id| signed_at.contains_key(id) || deleted.contains(id) || hidden.contains(id),
+    )
+    .into_iter()
+    .map(|c| GatheredChannelInfo {
+        joined: joined_ids.contains(&c.channel_id),
+        channel_id: c.channel_id,
+        pubkey: c.pubkey,
+        name: c.name,
+        private: false,
+        member_count: None,
+        language: c.language,
+        friends_present: None,
+        listed_since: (c.first_seen > 0).then_some(c.first_seen),
+    })
+    .collect();
+    if !unsettled.is_empty() || !directory_read {
+        tracing::debug!(
+            unsettled = unsettled.len(),
+            directory_read,
+            kept = carried.len(),
+            "Discover walk incomplete; keeping cached rooms it could not rule out"
+        );
+    }
+    // Not written back to the cache below: the cache's age limit is what
+    // retires a room no walk has heard from in a month.
+    let carried_ids: std::collections::HashSet<String> =
+        carried.iter().map(|c| c.channel_id.clone()).collect();
+    if !carried.is_empty() {
+        emit(&carried);
+        out.extend(carried);
+    }
+
     // A room the user has not joined shows no roster, so the directory is the
     // only place its size can come from. Rooms we are already in are skipped:
     // their own member table is both cheaper and more accurate.
@@ -5659,8 +6168,9 @@ pub async fn gather_channels(
     if !probe.is_empty() {
         if let Some(counts) = probe_public_member_counts(&state, &probe).await {
             for item in out.iter_mut() {
-                if let Some(count) = counts.get(&item.channel_id) {
+                if let Some((count, friends)) = counts.get(&item.channel_id) {
                     item.member_count = Some(*count);
+                    item.friends_present = Some(*friends);
                 }
             }
             emit(&out);
@@ -5669,16 +6179,27 @@ pub async fn gather_channels(
 
     let listings: Vec<CachedChannel> = out
         .iter()
+        .filter(|c| !carried_ids.contains(&c.channel_id))
         .map(|c| CachedChannel {
             channel_id: c.channel_id.clone(),
             pubkey: c.pubkey.clone(),
             name: c.name.clone(),
             language: c.language.clone(),
+            first_seen: 0,
         })
         .collect();
-    if !listings.is_empty() {
-        let db = state.db.clone();
-        let _ = tokio::task::spawn_blocking(move || db.cache_channel_listings(&listings)).await;
+    let ids: Vec<String> = out.iter().map(|c| c.channel_id.clone()).collect();
+    let db = state.db.clone();
+    let first_seen = tokio::task::spawn_blocking(move || {
+        if !listings.is_empty() {
+            let _ = db.cache_channel_listings(&listings);
+        }
+        db.channel_listings_first_seen(&ids).unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
+    for item in out.iter_mut() {
+        item.listed_since = first_seen.get(&item.channel_id).copied();
     }
 
     Ok(out)
@@ -5722,6 +6243,8 @@ pub async fn cached_channels(
             // walk this cache is standing in for comes back.
             member_count: None,
             language: c.language,
+            friends_present: None,
+            listed_since: (c.first_seen > 0).then_some(c.first_seen),
         })
         .collect())
 }
@@ -5731,7 +6254,7 @@ pub async fn cached_channels(
 /// hold the UI for that lookup (up to [`DEFAULT_FIND_TIMEOUT_MS`]). The
 /// oneshot is dropped: `PublishEmberRecord` still starts the walk, and
 /// `maybe_finish_ember_publish` ignores a gone waiter.
-async fn queue_signed_record(state: &AppState, record: SignedRecord) -> Result<(), String> {
+pub(crate) async fn queue_signed_record(state: &AppState, record: SignedRecord) -> Result<(), String> {
     let (tx, _rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
@@ -5758,7 +6281,7 @@ async fn start_signed_record(
     await_reply(rx, "channels_publish_failed", "No response from network").await?
 }
 
-async fn publish_signed_record(
+pub(crate) async fn publish_signed_record(
     state: &AppState,
     record: SignedRecord,
 ) -> Result<EmberPublishResult, String> {
@@ -5781,12 +6304,6 @@ async fn publish_signed_record(
     }
 }
 
-async fn find_raw_keys(state: &AppState, keys: Vec<[u8; 16]>) -> Result<Vec<Vec<u8>>, String> {
-    Ok(find_raw_keys_within(state, keys, DEFAULT_FIND_TIMEOUT_MS)
-        .await?
-        .unwrap_or_default())
-}
-
 /// `None` means the caller timed out (or the waiter was dropped) before the
 /// search completed. `Some(blobs)` — including empty — means the walk finished.
 async fn find_raw_keys_within(
@@ -5794,8 +6311,21 @@ async fn find_raw_keys_within(
     keys: Vec<[u8; 16]>,
     timeout_ms: u64,
 ) -> Result<Option<Vec<Vec<u8>>>, String> {
+    Ok(find_raw_keys_counted(state, keys, timeout_ms)
+        .await?
+        .map(|(records, _)| records))
+}
+
+/// [`find_raw_keys_within`], also saying how many nodes answered the walk.
+/// An empty result is only evidence of absence when enough of them did: a
+/// walk whose contacts have all left finishes just as empty.
+pub(crate) async fn find_raw_keys_counted(
+    state: &AppState,
+    keys: Vec<[u8; 16]>,
+    timeout_ms: u64,
+) -> Result<Option<(Vec<Vec<u8>>, usize)>, String> {
     if keys.is_empty() {
-        return Ok(Some(Vec::new()));
+        return Ok(Some((Vec::new(), 0)));
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -5803,13 +6333,17 @@ async fn find_raw_keys_within(
         .try_send(NetworkCommand::FindEmberKeys { keys, tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     let pending = await_reply(rx, "channels_gather_failed", "No response from network").await??;
+    let responded = pending.responded.clone();
     match tokio::time::timeout(
         std::time::Duration::from_millis(timeout_ms),
         pending.records_rx,
     )
     .await
     {
-        Ok(Ok(records)) => Ok(Some(records)),
+        Ok(Ok(records)) => Ok(Some((
+            records,
+            responded.load(std::sync::atomic::Ordering::Acquire),
+        ))),
         Ok(Err(_)) => Ok(None),
         Err(_) => {
             let _ = state
@@ -6445,6 +6979,298 @@ fn parse_xfer_id(hex_str: &str) -> Result<[u8; 16], String> {
 mod tests {
     use super::*;
 
+    /// A new room's first snapshot carries its name, so a device restored
+    /// before the first republish gets the room back by name.
+    #[test]
+    fn a_new_rooms_first_snapshot_names_it() {
+        let ident = ChannelIdentity::generate();
+        let record = SignedRecord::channel_moderation_at(
+            "",
+            "",
+            &[],
+            &[],
+            &new_room_tail([9; 32], Some("de"), "Stammtisch"),
+            ident.channel_id,
+            ident.pubkey,
+            true,
+            &ident.signing_key,
+            1_700_000_000,
+        )
+        .expect("fits");
+        let blob = [record.data.clone(), record.signature.to_vec()].concat();
+        let parsed = SignedRecord::parse_channel_moderation(&blob, &ident.channel_id).expect("parses");
+        assert_eq!(parsed.tail.room_name.as_deref(), Some("Stammtisch"));
+        assert_eq!(parsed.tail.owner_pubkey, Some([9; 32]));
+        assert_eq!(parsed.tail.key_epoch, Some(0));
+    }
+
+    /// Every frame handed to the gossip layer fits a datagram, wrapped for an
+    /// overlay relay hop too, which is how a firewalled member gets it. Near
+    /// the cap a line goes out in the legacy form alone; past what the legacy
+    /// frame can carry it is refused, so it is neither stored nor lost on the
+    /// way.
+    #[test]
+    fn a_line_too_long_for_a_datagram_is_refused_and_its_oversized_twin_dropped() {
+        let key = crypto::signing_key_from_bytes(&[0x31; 32]);
+        let sender = key.verifying_key().to_bytes();
+        let room = [0x5a; 16];
+        let content_key = [0x77; 32];
+        let frames_for = |len: usize| {
+            let text = "a".repeat(len);
+            let line_id = channel::new_chat_msg_id(&room, &sender, 1_700_000_000);
+            let line = channel::outgoing_chat_line(&key, &room, &line_id, 1_700_000_000, &text, &text, None)
+                .expect("under the text cap");
+            chat_gossip_frames(room, &content_key, &sender, line_id, 1_700_000_000, &line)
+        };
+        let max = crate::network::ember::dht::messages::MAX_DELIVERABLE_PAYLOAD;
+        let both = if channel::SEND_LEGACY_CHAT_FRAMES { 2 } else { 1 };
+
+        assert_eq!(frames_for(200).unwrap().len(), both);
+        assert!(frames_for(MAX_CHANNEL_MESSAGE).is_err());
+        let longest = (1..=MAX_CHANNEL_MESSAGE)
+            .rev()
+            .find(|len| frames_for(*len).is_ok())
+            .expect("some line fits");
+        assert!(longest > 3_500, "a long line still goes out: {longest}");
+        let relayed = |frame: &Vec<u8>| channel::encode_channel_relay_envelope(&room, &[0x42; 16], frame).len();
+        for len in longest.saturating_sub(64)..=longest {
+            let frames = frames_for(len).expect("every shorter line fits too");
+            assert!(
+                frames.iter().all(|frame| relayed(frame) <= max),
+                "a {len}-byte line's frame fits a relay hop's datagram"
+            );
+        }
+        let frames = frames_for(longest).unwrap();
+        if channel::SEND_LEGACY_CHAT_FRAMES {
+            assert_eq!(frames.len(), 1, "only the legacy frame fits at the edge");
+        }
+        // The first length refused is one whose frame would still fit a direct
+        // datagram, and only a relay hop's would not.
+        let line_id = channel::new_chat_msg_id(&room, &sender, 1_700_000_000);
+        let text = "a".repeat(longest + 1);
+        let line = channel::outgoing_chat_line(&key, &room, &line_id, 1_700_000_000, &text, &text, None).unwrap();
+        let first = channel::ChannelGossip::sealed(
+            room,
+            line_id,
+            &content_key,
+            1_700_000_000,
+            &line.legacy.as_ref().map_or_else(|| line.v2.plain(&sender), |(plain, _)| plain.clone()),
+            channel::CHANNEL_MSG_TTL_DEFAULT,
+            1_700_000_000,
+        )
+        .encode();
+        assert!(first.len() <= max && relayed(&first) > max, "{}", first.len());
+        assert!(frames_for(longest + 1).is_err());
+    }
+
+    /// The limits the frontend holds are exactly where the send path starts
+    /// refusing: for a line and a revision, each with and without a reply,
+    /// built as `send_channel_message` and `edit_channel_message` build them.
+    /// Multi-byte text meets the same edge, and text whose joiners the legacy
+    /// frame drops only ever gets further.
+    #[test]
+    fn the_frontends_line_limits_are_where_the_frames_stop_fitting() {
+        let key = crypto::signing_key_from_bytes(&[0x31; 32]);
+        let sender = key.verifying_key().to_bytes();
+        let room = [0x5a; 16];
+        let content_key = [0x77; 32];
+        let parent = [0xa7; 16];
+        let sent = 1_700_000_000;
+        let line_id = channel::new_chat_msg_id(&room, &sender, sent);
+        let frames_for = |typed: &str, parent: Option<&[u8; 16]>, edit: bool| {
+            let sanitized = crate::security::sanitize_outgoing_message_text(typed).expect("under the character cap");
+            let cleaned = channel::strip_reply_trailers(&sanitized).to_string();
+            let wire_text = channel::with_reply_trailer(&cleaned, parent);
+            let v2_text = channel::chat_v2_outgoing_text(typed, &cleaned, parent);
+            if edit {
+                let revision =
+                    channel::outgoing_chat_edit(&key, &room, &line_id, sent, sent + 60, &wire_text, &v2_text, parent)
+                        .expect("under the text cap");
+                chat_gossip_frames(room, &content_key, &sender, [0x42; 16], sent + 60, &revision)
+            } else {
+                let line = channel::outgoing_chat_line(&key, &room, &line_id, sent, &wire_text, &v2_text, parent)
+                    .expect("under the text cap");
+                chat_gossip_frames(room, &content_key, &sender, line_id, sent, &line)
+            }
+        };
+        let longest = |parent: Option<&[u8; 16]>, edit: bool| {
+            let fits = |len: usize| frames_for(&"a".repeat(len), parent, edit).is_ok();
+            let longest = (1..=MAX_CHANNEL_MESSAGE).rev().find(|len| fits(*len)).expect("some line fits");
+            assert!((1..=longest).step_by(97).all(fits), "every shorter line fits too");
+            longest
+        };
+        let reply = channel::REPLY_TRAILER_BYTES;
+        let cases = [
+            (None, false, CHANNEL_LINE_MAX_TEXT_BYTES),
+            (Some(&parent), false, CHANNEL_LINE_MAX_TEXT_BYTES - reply),
+            (None, true, CHANNEL_EDIT_MAX_TEXT_BYTES),
+            (Some(&parent), true, CHANNEL_EDIT_MAX_TEXT_BYTES - reply),
+        ];
+        for (parent, edit, limit) in cases {
+            let what = format!("edit {edit}, reply {}", parent.is_some());
+            assert_eq!(longest(parent, edit), limit, "{what}");
+
+            // Two-, three- and four-byte characters, padded to the edge.
+            let mixed = "é中😀".repeat(limit / 9);
+            let at_edge = format!("{mixed}{}", "a".repeat(limit - mixed.len()));
+            assert_eq!(at_edge.len(), limit);
+            assert!(frames_for(&at_edge, parent, edit).is_ok(), "{what}: multi-byte text at the edge");
+            assert!(frames_for(&format!("{at_edge}a"), parent, edit).is_err(), "{what}: one byte past it");
+
+            // Each family emoji is 18 bytes typed and 12 once its joiners are
+            // gone, and the edge is measured on the 12.
+            let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}".repeat(10);
+            let legacy_len = crate::security::without_message_text_joiners(&family).len();
+            let joined = format!("{family}{}", "a".repeat(limit - legacy_len));
+            assert_eq!(joined.len(), limit + 60);
+            assert!(frames_for(&joined, parent, edit).is_ok(), "{what}: joiners do not count");
+            assert!(frames_for(&format!("{joined}a"), parent, edit).is_err(), "{what}: past the edge without them");
+        }
+    }
+
+    /// A member behind a private room's key takes an invite's key only for an
+    /// epoch the owner's newest settings record commits to, and only when the
+    /// commitment matches. Everything else leaves the stored keys as they
+    /// were; a key naming an epoch past the newest held only waits in memory.
+    ///
+    /// Waiting keys go to the process-wide store, so the rooms are random
+    /// rather than ids another test could also use.
+    #[test]
+    fn an_invite_key_is_taken_for_a_held_room_only_against_the_owners_commitment() {
+        let fresh_id = || {
+            let mut id = [0u8; 16];
+            OsRng.fill_bytes(&mut id);
+            id
+        };
+        let path = std::env::temp_dir().join(format!(
+            "ember-invite-commitment-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let room = fresh_id();
+        let room_hex = hex::encode(room);
+        let uncommitted = fresh_id();
+        let uncommitted_hex = hex::encode(uncommitted);
+        let secret = |epoch: u8| [0x40 + epoch; 32];
+        for id in [&room_hex, &uncommitted_hex] {
+            db.insert_channel(id, &"01".repeat(32), "Den", "private", false, None, Some(&secret(0)))
+                .unwrap();
+            db.insert_channel_key_epoch(id, 1, &secret(1)).unwrap();
+            // The owner has since rotated twice while this device was away.
+            assert!(db
+                .apply_channel_moderation(id, "", "", 10, &[], &[], None, None, None, Some(3), None, None)
+                .unwrap());
+        }
+        let commit = |epoch: i64| {
+            (epoch, channel::key_commitment(&room, epoch, &channel::content_key(&secret(epoch as u8))))
+        };
+        assert!(db
+            .ingest_channel_settings(
+                &room_hex,
+                &crate::storage::database::HeldChannelSettings {
+                    signed_at: 20,
+                    signature: [1; 64],
+                    key_commitments: vec![commit(3), commit(2), commit(1)],
+                    admission: 1,
+                },
+            )
+            .unwrap());
+        let invite = |channel_id: [u8; 16], join_secret: [u8; 32], key_epoch: u64| ChannelInvite {
+            channel_id,
+            pubkey: [0x01; 32],
+            name: "Den".into(),
+            join_secret,
+            private: true,
+            key_epoch,
+        };
+        let row = |id: &str| db.get_channel(id).unwrap().unwrap();
+        let epochs = |id: &str| db.load_channel_key_epochs(id).unwrap();
+
+        for (what, offered, outcome) in [
+            ("a key the owner never committed to", invite(room, [0x99; 32], 3), OfferedKey::Held),
+            ("the right key under the wrong epoch", invite(room, secret(3), 2), OfferedKey::Held),
+            ("an invite that does not say its epoch", invite(room, secret(3), 0), OfferedKey::Refused),
+            ("an epoch the record does not name", invite(room, secret(4), 4), OfferedKey::Held),
+        ] {
+            assert_eq!(take_committed_invite_key(&db, &row(&room_hex), &offered).unwrap().key, outcome, "{what}");
+        }
+        assert_eq!(
+            take_committed_invite_key(&db, &row(&uncommitted_hex), &invite(uncommitted, secret(3), 3)).unwrap().key,
+            OfferedKey::Held,
+            "nothing to check it against without a settings record"
+        );
+        assert_eq!(epochs(&room_hex).len(), 1, "nothing unchecked reached the store");
+        assert_eq!(epochs(&uncommitted_hex).len(), 1);
+        assert_eq!(row(&room_hex).key_epoch, 1);
+
+        assert_eq!(
+            take_committed_invite_key(&db, &row(&room_hex), &invite(room, secret(3), 3)).unwrap(),
+            OfferedKeyOutcome {
+                key: OfferedKey::Taken,
+                rekeyed: true,
+            }
+        );
+        let held = row(&room_hex);
+        assert_eq!((held.key_epoch, held.key_epoch_wanted), (3, 3), "caught up");
+        assert_eq!(epochs(&room_hex)[0], (3, secret(3)));
+
+        // No longer behind, so even a committed key is not taken.
+        assert_eq!(
+            take_committed_invite_key(&db, &held, &invite(room, secret(2), 2)).unwrap().key,
+            OfferedKey::Refused
+        );
+        assert_eq!(epochs(&room_hex).len(), 2);
+
+        // A device whose snapshot is stale is still behind by the epoch the
+        // owner's commitment names, and takes it.
+        let stale = fresh_id();
+        let stale_hex = hex::encode(stale);
+        db.insert_channel(&stale_hex, &"01".repeat(32), "Den", "private", false, None, Some(&secret(0)))
+            .unwrap();
+        db.insert_channel_key_epoch(&stale_hex, 1, &secret(1)).unwrap();
+        let stale_commit = |epoch: i64| {
+            (epoch, channel::key_commitment(&stale, epoch, &channel::content_key(&secret(epoch as u8))))
+        };
+        assert!(db
+            .ingest_channel_settings(
+                &stale_hex,
+                &crate::storage::database::HeldChannelSettings {
+                    signed_at: 20,
+                    signature: [1; 64],
+                    key_commitments: vec![stale_commit(3), stale_commit(2), stale_commit(1)],
+                    admission: 1,
+                },
+            )
+            .unwrap());
+        assert!(row(&stale_hex).key_epoch_wanted <= row(&stale_hex).key_epoch, "no snapshot says it is behind");
+        assert_eq!(
+            take_committed_invite_key(&db, &row(&stale_hex), &invite(stale, secret(3), 3)).unwrap().key,
+            OfferedKey::Taken
+        );
+        assert_eq!(row(&stale_hex).key_epoch, 3);
+
+        // And a public room never takes one.
+        let public = fresh_id();
+        db.insert_channel(&hex::encode(public), &"02".repeat(32), "Hall", "public", false, None, None)
+            .unwrap();
+        let mut open = invite(public, secret(3), 3);
+        open.private = false;
+        assert_eq!(
+            take_committed_invite_key(&db, &row(&hex::encode(public)), &open).unwrap().key,
+            OfferedKey::Refused
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
     /// In an announcement-only room the owner and the snapshot's moderators
     /// send; everyone else is refused before anything goes on the wire. A room
     /// without the flag refuses nobody.
@@ -6594,6 +7420,8 @@ mod tests {
             joined: false,
             member_count: None,
             language: language.to_string(),
+            friends_present: None,
+            listed_since: None,
         }
     }
 
@@ -6660,6 +7488,52 @@ mod tests {
         assert_eq!(found.len(), 1, "only the room's own listing is read");
         assert_eq!(found[0].0.name, "Lobby");
         assert_eq!(found[0].0.language, "de");
+    }
+
+    /// A shard that did not settle says nothing about the rooms under it, so
+    /// those stay listed from the cache; a settled shard's absences stand, and
+    /// with the directory unread nothing can be ruled out.
+    #[test]
+    fn cached_rooms_stay_only_where_the_walk_could_not_rule_them_out() {
+        let cached = |first_byte: u8| CachedChannel {
+            channel_id: hex::encode([first_byte; 16]),
+            pubkey: "00".repeat(32),
+            name: format!("Room {first_byte}"),
+            language: "de".to_string(),
+            first_seen: 0,
+        };
+        let rows = || vec![cached(0x03), cached(0x13), cached(0x04), cached(0x05)];
+        let ids = |kept: Vec<CachedChannel>| {
+            kept.into_iter().map(|c| c.channel_id).collect::<Vec<_>>()
+        };
+        let unsettled = std::collections::HashSet::from([3u8]);
+
+        assert_eq!(
+            ids(carry_forward_cached(rows(), &unsettled, true, |_| false)),
+            vec![hex::encode([0x03u8; 16]), hex::encode([0x13u8; 16])],
+            "both rooms in shard 3 stay, the settled shards' absences stand"
+        );
+
+        let listed = hex::encode([0x13u8; 16]);
+        assert_eq!(
+            ids(carry_forward_cached(rows(), &unsettled, true, |id| id == listed)),
+            vec![hex::encode([0x03u8; 16])],
+            "a room already listed is not added twice"
+        );
+
+        assert_eq!(
+            carry_forward_cached(rows(), &std::collections::HashSet::new(), false, |_| false).len(),
+            4,
+            "with the directory unread, no absence is evidence"
+        );
+
+        let mut bad = rows();
+        bad.push(CachedChannel { channel_id: "zz".to_string(), ..cached(0x03) });
+        assert_eq!(
+            carry_forward_cached(bad, &unsettled, false, |_| false).len(),
+            4,
+            "a malformed id is dropped"
+        );
     }
 
     fn reaction_row(msg: &str, member: &str, reaction: u8) -> (String, String, u8) {

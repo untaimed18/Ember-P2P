@@ -102,6 +102,11 @@ const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
     // holds a copy from whenever it opened, and saving that back would undo a
     // change made since from the friend's card.
     "friend_overrides",
+    // Written by `set_friend_status` from the Friends page, for the same
+    // reason: a Settings page opened earlier would put the old one back.
+    "friend_status",
+    // Written by `set_ignored_members` from wherever a member is ignored.
+    "ignored_members",
     "shared_folders",
     "previous_download_folders",
     "default_shared_folder_seeded",
@@ -161,13 +166,17 @@ fn merge_renderer_settings(
             renderer_object.remove(*field);
         }
     }
-    serde_json::from_value(renderer).map_err(|error| {
+    let mut merged: AppSettings = serde_json::from_value(renderer).map_err(|error| {
         coded_ctx(
             "settings_invalid_update",
             "Settings update is invalid",
             error,
         )
-    })
+    })?;
+    // The webview is never sent the keys this build does not know, so any it
+    // names are its own invention, and the ones on disk come from memory.
+    merged.extra = authoritative.extra.clone();
+    Ok(merged)
 }
 
 /// Download roots the OS picker handed us this session.
@@ -809,15 +818,25 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
+    // A file-offer setting this build does not offer is kept: it may be a
+    // later build's, and it acts as "nobody" until that build runs again.
     let offers = settings.channel_file_offers.trim().to_ascii_lowercase();
-    if offers != crate::types::CHANNEL_FILE_OFFERS_EVERYONE
-        && offers != crate::types::CHANNEL_FILE_OFFERS_FRIENDS
-        && offers != crate::types::CHANNEL_FILE_OFFERS_NOBODY
-    {
+    if !crate::types::channel_file_offers_storable(&offers) {
         settings.channel_file_offers = crate::types::CHANNEL_FILE_OFFERS_EVERYONE.to_string();
         changed = true;
     } else if offers != settings.channel_file_offers {
         settings.channel_file_offers = offers;
+        changed = true;
+    }
+
+    // A policy this build does not offer is kept: it may be a later build's,
+    // and it acts as "ask" until that build runs again.
+    let dm_policy = settings.room_dm_policy.trim().to_ascii_lowercase();
+    if !crate::types::room_dm_policy_storable(&dm_policy) {
+        settings.room_dm_policy = crate::types::ROOM_DM_POLICY_ASK.to_string();
+        changed = true;
+    } else if dm_policy != settings.room_dm_policy {
+        settings.room_dm_policy = dm_policy;
         changed = true;
     }
 
@@ -841,6 +860,13 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
     if overrides != settings.friend_overrides {
         settings.friend_overrides = overrides;
         changed = true;
+    }
+    if let Some(members) = &settings.ignored_members {
+        let cleaned = crate::commands::room_dm::clean_ignored_members(members.clone());
+        if &cleaned != members {
+            settings.ignored_members = Some(cleaned);
+            changed = true;
+        }
     }
 
     // A username stored under the older, looser rule (spaces, punctuation, up
@@ -988,6 +1014,73 @@ pub(crate) fn resolved_download_folder_refused(path: &std::path::Path) -> bool {
     is_filesystem_root(path) || crate::sharing::path_has_sensitive_component(path)
 }
 
+/// Whether `folder` may be the download folder, as [`validate_settings`]
+/// decides it. Also for callers that are about to choose one on the user's
+/// behalf, such as an eMule import taking eMule's Incoming folder, so a folder
+/// refused here is refused when it is chosen rather than at the next launch.
+pub(crate) fn validate_download_folder(folder: &str) -> Result<(), String> {
+    // Rejected rather than skipped. An empty value used to bypass the whole
+    // path-safety block below, then compose the *relative* path `Downloads`
+    // against the process CWD, while `lib.rs` skipped both `create_dir_all` and
+    // the approved-root registration for it — leaving `open_or_create_approved`
+    // with no root to admit and every download failing with nothing to point at.
+    // The picker code is reused because an empty value means no folder has been
+    // chosen, which is the same remedy.
+    if folder.is_empty() {
+        return Err(coded(
+            "settings_download_folder_not_picked",
+            "Choose the download folder with Browse before saving",
+        ));
+    }
+    if folder.len() > MAX_PATH_LEN {
+        return Err(coded_ctx(
+            "settings_download_folder_too_long",
+            format!("Download folder path exceeds {MAX_PATH_LEN} bytes"),
+            MAX_PATH_LEN,
+        ));
+    }
+    let path = std::path::Path::new(folder);
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(coded(
+            "settings_download_folder_parent_dir",
+            "Download folder must not contain '..' path components",
+        ));
+    }
+    if is_filesystem_root(path)
+        || path
+            .canonicalize()
+            .ok()
+            .as_deref()
+            .is_some_and(is_filesystem_root)
+    {
+        return Err(coded_ctx(
+            "settings_download_folder_root",
+            "Download folder must not be a filesystem root",
+            folder,
+        ));
+    }
+    // Scan the literal path AND (best-effort) its canonical form. A
+    // junction/symlink can point a benign-looking folder at a blocked
+    // system directory; canonicalizing resolves the reparse point so the
+    // segment check can't be bypassed. A not-yet-created folder won't
+    // canonicalize — fall back to the literal check in that case.
+    let canonical = path.canonicalize().ok();
+    let scan_paths = std::iter::once(path.to_path_buf()).chain(canonical);
+    for scan_path in scan_paths {
+        if crate::sharing::path_has_sensitive_component(&scan_path) {
+            return Err(coded_ctx(
+                "settings_download_folder_system_dir",
+                "Cannot use system directory as download folder",
+                folder,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The download folder's checks that need only its text: set, within the
 /// length limit, no `..`, and not refused as written.
 fn download_folder_text_acceptable(folder: &str) -> bool {
@@ -1066,13 +1159,19 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             "Close behavior must be 'ask', 'tray', or 'exit'",
         ));
     }
-    if settings.channel_file_offers != crate::types::CHANNEL_FILE_OFFERS_EVERYONE
-        && settings.channel_file_offers != crate::types::CHANNEL_FILE_OFFERS_FRIENDS
-        && settings.channel_file_offers != crate::types::CHANNEL_FILE_OFFERS_NOBODY
-    {
+    // Shape only, as for `room_dm_policy` below.
+    if !crate::types::channel_file_offers_storable(&settings.channel_file_offers) {
         return Err(coded(
             "settings_channel_file_offers_invalid",
             "Channel file offers must be 'everyone', 'friends', or 'nobody'",
+        ));
+    }
+    // Shape only: a policy this build does not offer is refused when it is
+    // chosen (`refuse_unoffered_choices`), not when it is kept.
+    if !crate::types::room_dm_policy_storable(&settings.room_dm_policy) {
+        return Err(coded(
+            "settings_room_dm_policy_invalid",
+            "Private messages must be 'ask', 'anyone', or 'off'",
         ));
     }
     if settings.chat_attachment_auto_accept_mb > crate::types::CHAT_ATTACHMENT_AUTO_ACCEPT_MAX_MB {
@@ -1293,62 +1392,7 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
     if !settings.channel_username.is_empty() {
         crate::commands::channels::sanitize_channel_username(&settings.channel_username)?;
     }
-    // Rejected rather than skipped. An empty value used to bypass the whole
-    // path-safety block below, then compose the *relative* path `Downloads`
-    // against the process CWD, while `lib.rs` skipped both `create_dir_all` and
-    // the approved-root registration for it — leaving `open_or_create_approved`
-    // with no root to admit and every download failing with nothing to point at.
-    // The picker code is reused because an empty value means no folder has been
-    // chosen, which is the same remedy.
-    if settings.download_folder.is_empty() {
-        return Err(coded(
-            "settings_download_folder_not_picked",
-            "Choose the download folder with Browse before saving",
-        ));
-    }
-    // Braced to keep `path`/`canonical` out of the shared-folder loop below,
-    // which binds the same names.
-    {
-        let path = std::path::Path::new(&settings.download_folder);
-        if path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return Err(coded(
-                "settings_download_folder_parent_dir",
-                "Download folder must not contain '..' path components",
-            ));
-        }
-        if is_filesystem_root(path)
-            || path
-                .canonicalize()
-                .ok()
-                .as_deref()
-                .is_some_and(is_filesystem_root)
-        {
-            return Err(coded_ctx(
-                "settings_download_folder_root",
-                "Download folder must not be a filesystem root",
-                &settings.download_folder,
-            ));
-        }
-        // Scan the literal path AND (best-effort) its canonical form. A
-        // junction/symlink can point a benign-looking folder at a blocked
-        // system directory; canonicalizing resolves the reparse point so the
-        // segment check can't be bypassed. A not-yet-created folder won't
-        // canonicalize — fall back to the literal check in that case.
-        let canonical = path.canonicalize().ok();
-        let scan_paths = std::iter::once(path.to_path_buf()).chain(canonical);
-        for scan_path in scan_paths {
-            if crate::sharing::path_has_sensitive_component(&scan_path) {
-                return Err(coded_ctx(
-                    "settings_download_folder_system_dir",
-                    "Cannot use system directory as download folder",
-                    &settings.download_folder,
-                ));
-            }
-        }
-    }
+    validate_download_folder(&settings.download_folder)?;
     if !settings.rendezvous_url.is_empty() {
         let url_lower = settings.rendezvous_url.to_ascii_lowercase();
         if !url_lower.starts_with("https://") {
@@ -1447,6 +1491,38 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
     Ok(())
 }
 
+/// Choices this build does not offer, refused only when they change. One
+/// already stored may be a later build's, kept as read so a downgrade does
+/// not reset it, and re-saving the page around it must still work.
+fn refuse_unoffered_choices(settings: &AppSettings, old_settings: &AppSettings) -> Result<(), String> {
+    if settings.channel_file_offers != old_settings.channel_file_offers
+        && !crate::types::channel_file_offers_valid(&settings.channel_file_offers)
+    {
+        return Err(coded(
+            "settings_channel_file_offers_invalid",
+            "Channel file offers must be 'everyone', 'friends', or 'nobody'",
+        ));
+    }
+    if settings.room_dm_policy != old_settings.room_dm_policy
+        && !crate::types::room_dm_policy_valid(&settings.room_dm_policy)
+    {
+        return Err(coded(
+            "settings_room_dm_policy_invalid",
+            "Private messages must be 'ask', 'anyone', or 'off'",
+        ));
+    }
+    if settings.auto_away_minutes != old_settings.auto_away_minutes
+        && crate::types::normalize_auto_away_minutes(settings.auto_away_minutes)
+            != settings.auto_away_minutes
+    {
+        return Err(coded(
+            "settings_auto_away_invalid",
+            "Choose one of the offered idle times",
+        ));
+    }
+    Ok(())
+}
+
 /// Best-effort undo of a registry claim whose settings save then failed, so
 /// the registry and config.json go on naming the same handle. A claim is a
 /// rename, so re-claiming the previous name is the undo; with no previous name
@@ -1468,11 +1544,15 @@ async fn restore_previous_username_claim(state: &AppState, previous: &str) {
 #[tauri::command]
 pub async fn update_settings(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     settings: serde_json::Value,
     // Absent for every background/partial save; see the re-approval block below.
     reapprove_download_root: Option<bool>,
 ) -> Result<UpdateSettingsResult, String> {
+    // Turns the IP filter, private-address blocking and anti-leech on and off
+    // live, which the chat window is refused one by one.
+    crate::commands::chat_window::require_main_window(&window)?;
     let reapprove_download_root = reapprove_download_root.unwrap_or(false);
     // Serialize the read/merge/write transaction before deserializing the
     // renderer payload. Internal cursor/pending maps can advance without
@@ -1487,6 +1567,7 @@ pub async fn update_settings(
     settings.spam_filter_profile = settings.spam_filter_profile.trim().to_ascii_lowercase();
     settings.close_to_tray_behavior = settings.close_to_tray_behavior.trim().to_ascii_lowercase();
     settings.channel_file_offers = settings.channel_file_offers.trim().to_ascii_lowercase();
+    settings.room_dm_policy = settings.room_dm_policy.trim().to_ascii_lowercase();
     settings.chat_disappear_secs = crate::types::normalize_chat_disappear_secs(settings.chat_disappear_secs);
     // Web services are URL templates the user curates, so they are normalised
     // here rather than trusted: each is checked for a http/https scheme, a host
@@ -1561,6 +1642,7 @@ pub async fn update_settings(
             "Choose the download folder with Browse before saving",
         ));
     }
+    refuse_unoffered_choices(&settings, &old_settings)?;
     {
         let settings_for_validation = settings.clone();
         tokio::task::spawn_blocking(move || validate_settings(&settings_for_validation))
@@ -1610,6 +1692,21 @@ pub async fn update_settings(
     }
     let username_changed = settings.channel_username != old_settings.channel_username
         && !settings.channel_username.is_empty();
+
+    // Refused only when it changes. A code this build does not list may be a
+    // later build's, kept as it was so a downgrade does not wipe the choice;
+    // it publishes as no language until a build that knows it runs again.
+    settings.channel_language = settings.channel_language.trim().to_string();
+    let language_changed = settings.channel_language != old_settings.channel_language;
+    if language_changed
+        && !settings.channel_language.is_empty()
+        && settings.channel_language_code().is_none()
+    {
+        return Err(coded(
+            "channels_language_invalid",
+            "That is not one of the languages a room can be marked with",
+        ));
+    }
 
     if settings.settings_revision != old_settings.settings_revision {
         return Err(coded(
@@ -1857,6 +1954,13 @@ pub async fn update_settings(
             return Err(error);
         }
     }
+    // Before the setting takes effect: the next tagging pass reads it from the
+    // config, and must find the files already shared recorded as not new.
+    if settings.tag_shared_imports && !old_settings.tag_shared_imports {
+        crate::commands::sharing::seed_name_tag_seen(&state).await;
+    } else if !settings.tag_shared_imports && old_settings.tag_shared_imports {
+        crate::commands::sharing::unseed_name_tag_seen(&state).await;
+    }
     {
         let mut config = state.config.write().await;
         config.settings = settings.clone();
@@ -1869,11 +1973,22 @@ pub async fn update_settings(
         )
         .await;
     }
+    if language_changed {
+        crate::commands::channels::apply_channel_language_locally(
+            &app,
+            &state,
+            settings.channel_language_code(),
+        )
+        .await;
+    }
 
     // Keep the synchronous mirror used by the close-event handler in sync
     // with the canonical config so that a behavior change made here takes
     // effect on the very next title-bar X click without restarting.
     *state.close_behavior.write() = settings.close_to_tray_behavior.clone();
+    state
+        .minimize_to_tray
+        .store(settings.minimize_to_tray, std::sync::atomic::Ordering::Release);
 
     // Through the schedule, not straight from the form. While a timetable
     // window is open the caps in force are the rule's, and applying the manual
@@ -2533,6 +2648,7 @@ pub fn take_pending_known_met_notice() -> Result<Option<KnownMetNotice>, String>
 
 #[tauri::command]
 pub async fn set_close_behavior(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     behavior: String,
 ) -> Result<(), String> {
@@ -2569,9 +2685,14 @@ pub async fn set_close_behavior(
     .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?;
     {
         let mut config = state.config.write().await;
-        config.settings = new_settings;
+        config.settings = new_settings.clone();
     }
     *state.close_behavior.write() = normalized;
+    // An open Settings page holds its own copy, and would otherwise save the
+    // old choice back, or take picking it again for no change.
+    if let Err(error) = app.emit(SETTINGS_CHANGED_EVENT, &new_settings) {
+        tracing::debug!("Could not emit the settings change: {error}");
+    }
     Ok(())
 }
 
@@ -2692,6 +2813,22 @@ pub async fn set_friend_overrides(
         return Err(coded("peers_not_friend", "That is not one of your friends"));
     }
     Ok(saved)
+}
+
+/// Set the status friends see while we are online. Saved, so it is still
+/// ours after a restart, and sent at once to every friend connected now.
+#[tauri::command]
+pub async fn set_friend_status(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    status: crate::types::FriendStatus,
+) -> Result<AppSettings, String> {
+    save_settings_change(&app, &state, move |settings| {
+        let changed = settings.friend_status != status;
+        settings.friend_status = status;
+        Ok(changed)
+    })
+    .await
 }
 
 /// Forget a removed friend's overrides, so adding them again starts from the
@@ -2856,8 +2993,8 @@ pub async fn set_quick_limits(
     apply_quick_limits(&app, &state, patch).await
 }
 
-/// Official Ember project website (GitHub Pages).
-const EMBER_WEBSITE_URL: &str = "https://untaimed18.github.io/Ember-P2P/";
+/// Official Ember project website.
+const EMBER_WEBSITE_URL: &str = "https://www.emberp2p.org/";
 
 /// The source repository: code, releases and issues.
 const EMBER_GITHUB_URL: &str = "https://github.com/untaimed18/Ember-P2P";
@@ -4444,5 +4581,126 @@ mod tests {
             merged.shared_folder_scan_cursors,
             authoritative.shared_folder_scan_cursors
         );
+    }
+
+    /// A save from the Settings page keeps what a later build stored, and the
+    /// webview, which is never sent those keys, cannot add any.
+    #[test]
+    fn a_renderer_save_keeps_the_keys_this_build_does_not_know() {
+        let mut authoritative = AppSettings::default();
+        authoritative
+            .extra
+            .insert("future_setting".into(), serde_json::json!({"level": 3}));
+
+        let mut renderer = serde_json::to_value(&authoritative).unwrap();
+        let object = renderer.as_object_mut().unwrap();
+        assert!(!object.contains_key("future_setting"), "never sent to the webview");
+        assert!(!object.contains_key("extra"));
+        object.insert("nickname".into(), serde_json::json!("Changed"));
+        object.insert("renderer_invented".into(), serde_json::json!(true));
+
+        let merged = merge_renderer_settings(renderer, &authoritative).unwrap();
+        assert_eq!(merged.nickname, "Changed");
+        assert_eq!(merged.extra, authoritative.extra);
+
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&crate::storage::config::settings_json(&merged).unwrap()).unwrap();
+        assert_eq!(on_disk["future_setting"], serde_json::json!({"level": 3}));
+        assert!(on_disk.get("renderer_invented").is_none());
+        assert_eq!(on_disk["nickname"], "Changed");
+    }
+
+    /// A private-message policy or idle time a later build offers is kept on
+    /// load and survives re-saving the page around it, but cannot be chosen
+    /// here. Damage is still repaired.
+    #[test]
+    fn a_later_builds_choice_is_kept_but_cannot_be_chosen() {
+        let mut later = AppSettings {
+            room_dm_policy: " Friends ".into(),
+            auto_away_minutes: 120,
+            ..AppSettings::default()
+        };
+        assert!(soft_repair_settings(&mut later), "trimmed and lowercased");
+        assert_eq!(later.room_dm_policy, "friends");
+        assert_eq!(later.auto_away_minutes, 120);
+        assert!(!soft_repair_settings(&mut later.clone()), "nothing left to repair");
+        validate_settings(&later).expect("a later build's values load");
+        assert_eq!(crate::types::room_dm_policy_in_force(&later.room_dm_policy), "ask");
+
+        refuse_unoffered_choices(&later, &later).expect("re-saving around them works");
+        let chosen_here = AppSettings {
+            room_dm_policy: "off".into(),
+            auto_away_minutes: 30,
+            ..later.clone()
+        };
+        refuse_unoffered_choices(&chosen_here, &later).expect("moving to an offered choice");
+
+        let defaults = AppSettings::default();
+        let err = refuse_unoffered_choices(
+            &AppSettings { room_dm_policy: "friends".into(), ..defaults.clone() },
+            &defaults,
+        )
+        .unwrap_err();
+        assert!(err.contains("settings_room_dm_policy_invalid"), "{err}");
+        let err = refuse_unoffered_choices(
+            &AppSettings { auto_away_minutes: 120, ..defaults.clone() },
+            &defaults,
+        )
+        .unwrap_err();
+        assert!(err.contains("settings_auto_away_invalid"), "{err}");
+
+        let mut damaged = AppSettings {
+            room_dm_policy: "not a policy!".into(),
+            ..AppSettings::default()
+        };
+        assert!(soft_repair_settings(&mut damaged));
+        assert_eq!(damaged.room_dm_policy, "ask");
+        let mut long = AppSettings { room_dm_policy: "a".repeat(64), ..AppSettings::default() };
+        assert!(soft_repair_settings(&mut long));
+        assert_eq!(long.room_dm_policy, "ask");
+    }
+
+    /// A file-offer setting a later build offers is kept on load, lets nobody
+    /// offer here, and survives re-saving the page around it, but cannot be
+    /// chosen here. Damage is still repaired.
+    #[test]
+    fn a_later_builds_file_offer_setting_is_kept_and_lets_nobody_offer() {
+        let mut later = AppSettings {
+            channel_file_offers: " Mutual_Friends ".into(),
+            ..AppSettings::default()
+        };
+        assert!(soft_repair_settings(&mut later), "trimmed and lowercased");
+        assert_eq!(later.channel_file_offers, "mutual_friends");
+        assert!(!soft_repair_settings(&mut later.clone()), "nothing left to repair");
+        validate_settings(&later).expect("a later build's value loads");
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&crate::storage::config::settings_json(&later).unwrap()).unwrap();
+        assert_eq!(on_disk["channel_file_offers"], "mutual_friends");
+        assert_eq!(
+            crate::types::channel_file_offers_in_force(&later.channel_file_offers),
+            crate::types::CHANNEL_FILE_OFFERS_NOBODY
+        );
+
+        refuse_unoffered_choices(&later, &later).expect("re-saving around it works");
+        let chosen_here = AppSettings { channel_file_offers: "friends".into(), ..later.clone() };
+        refuse_unoffered_choices(&chosen_here, &later).expect("moving to an offered choice");
+
+        let defaults = AppSettings::default();
+        let err = refuse_unoffered_choices(
+            &AppSettings { channel_file_offers: "mutual_friends".into(), ..defaults.clone() },
+            &defaults,
+        )
+        .unwrap_err();
+        assert!(err.contains("settings_channel_file_offers_invalid"), "{err}");
+
+        let long = "a".repeat(64);
+        for damage in ["not a choice!", "", long.as_str()] {
+            let mut damaged = AppSettings { channel_file_offers: damage.into(), ..defaults.clone() };
+            assert!(soft_repair_settings(&mut damaged), "{damage:?}");
+            assert_eq!(damaged.channel_file_offers, crate::types::CHANNEL_FILE_OFFERS_EVERYONE);
+            assert!(validate_settings(&AppSettings { channel_file_offers: damage.into(), ..defaults.clone() })
+                .unwrap_err()
+                .contains("settings_channel_file_offers_invalid"));
+        }
     }
 }

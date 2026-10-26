@@ -138,60 +138,52 @@ describe('startup seed against live events', () => {
     expect([...get(legacyStrandedFriends)]).toEqual([C]);
   });
 
-  it('asks again for unread counts when a message lands during the fetch', async () => {
-    const first = deferred<[string, number][]>();
-    const second = deferred<[string, number][]>();
-    api.getUnreadMessageCounts
-      .mockReturnValueOnce(first.promise)
-      .mockReturnValueOnce(second.promise);
+  /** Seed with one counts fetch, firing `during` while it is in flight. */
+  async function seedUnreadWith(counts: [string, number, number][], during: () => void) {
+    const fetched = deferred<[string, number, number][]>();
+    api.getUnreadMessageCounts.mockReturnValueOnce(fetched.promise);
     const init = initFriendsStore();
     await vi.waitFor(() => expect(api.getUnreadMessageCounts).toHaveBeenCalledTimes(1));
-
-    fire('ember:chat-message', { user_hash: A, id: 9, direction: 'received', message: 'hi' });
-    first.resolve([[A, 2], [B, 1]]);
-    await vi.waitFor(() => expect(api.getUnreadMessageCounts).toHaveBeenCalledTimes(2));
-    second.resolve([[A, 3], [B, 1]]);
+    during();
+    fetched.resolve(counts);
     await init;
+    expect(api.getUnreadMessageCounts).toHaveBeenCalledTimes(1);
+  }
 
+  it('counts a message that landed during the fetch once, when the snapshot already holds it', async () => {
+    await seedUnreadWith([[A, 3, 9], [B, 1, 5]], () => {
+      fire('ember:chat-message', { user_hash: A, id: 9, direction: 'received', message: 'hi' });
+    });
     expect(get(unreadCounts)).toEqual(new Map([[A, 3], [B, 1]]));
   });
 
+  it('adds a message that landed during the fetch, when the snapshot predates it', async () => {
+    await seedUnreadWith([[A, 2, 8], [B, 1, 5]], () => {
+      fire('ember:chat-message', { user_hash: A, id: 9, direction: 'received', message: 'hi' });
+    });
+    expect(get(unreadCounts)).toEqual(new Map([[A, 3], [B, 1]]));
+  });
+
+  it('counts every bump for a friend the snapshot had nothing unread for', async () => {
+    await seedUnreadWith([[B, 1, 2]], () => {
+      fire('ember:chat-message', { user_hash: A, id: 3, direction: 'received' });
+      fire('ember:chat-message', { user_hash: A, id: 4, direction: 'received' });
+    });
+    expect(get(unreadCounts)).toEqual(new Map([[A, 2], [B, 1]]));
+  });
+
   it('lets a clear stand over a snapshot that still counts the messages', async () => {
-    const first = deferred<[string, number][]>();
-    const second = deferred<[string, number][]>();
-    api.getUnreadMessageCounts
-      .mockReturnValueOnce(first.promise)
-      .mockReturnValueOnce(second.promise);
-    const init = initFriendsStore();
-    await vi.waitFor(() => expect(api.getUnreadMessageCounts).toHaveBeenCalledTimes(1));
-
-    fire('ember-ui:unread-cleared', { user_hash: A });
-    first.resolve([[A, 4]]);
-    await vi.waitFor(() => expect(api.getUnreadMessageCounts).toHaveBeenCalledTimes(2));
-    fire('ember-ui:unread-cleared', { user_hash: A });
-    second.resolve([[A, 4]]);
-    await init;
-
+    await seedUnreadWith([[A, 4, 7]], () => {
+      fire('ember-ui:unread-cleared', { user_hash: A });
+    });
     expect(get(unreadCounts).has(A)).toBe(false);
   });
 
-  it('never counts fewer than the snapshot for a friend only bumped meanwhile', async () => {
-    const first = deferred<[string, number][]>();
-    const second = deferred<[string, number][]>();
-    api.getUnreadMessageCounts
-      .mockReturnValueOnce(first.promise)
-      .mockReturnValueOnce(second.promise);
-    const init = initFriendsStore();
-    await vi.waitFor(() => expect(api.getUnreadMessageCounts).toHaveBeenCalledTimes(1));
-
-    fire('ember:chat-message', { user_hash: A, id: 1, direction: 'received' });
-    first.resolve([[A, 4]]);
-    await vi.waitFor(() => expect(api.getUnreadMessageCounts).toHaveBeenCalledTimes(2));
-    fire('ember:chat-message', { user_hash: A, id: 2, direction: 'received' });
-    second.resolve([[A, 5]]);
-    await init;
-
-    expect(get(unreadCounts).get(A)).toBe(5);
+  it('never counts fewer than the snapshot for a bump that carried no id', async () => {
+    await seedUnreadWith([[A, 4, 9]], () => {
+      fire('ember:chat-message', { user_hash: A, direction: 'received', message: 'x' });
+    });
+    expect(get(unreadCounts).get(A)).toBe(4);
   });
 });
 

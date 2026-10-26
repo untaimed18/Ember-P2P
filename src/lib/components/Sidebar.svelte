@@ -8,6 +8,8 @@
   import { transfers } from '$lib/stores/transfers';
   import { friendRequests, fileOffers } from '$lib/stores/friends';
   import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
+  import { dmRequests, dmUnread } from '$lib/stores/roomDm';
+  import { totalFeedUnread } from '$lib/stores/feeds';
   import { awaitingChannelOffers, totalChannelUnread } from '$lib/stores/channels';
   import * as m from '$lib/paraglide/messages';
   import { plural } from '$lib/plural';
@@ -243,18 +245,22 @@
   // surfaces this so users can spot new messages from any page —
   // previously the only signal was per-friend badges on /friends,
   // which required navigating there to notice activity.
-  let totalUnreadChats = $derived($totalUnread);
+  // Private conversations with room members count too, once accepted. A
+  // request is not unread: it waits on the Channels page, and counts there.
+  let totalUnreadChats = $derived($totalUnread + [...$dmUnread.values()].reduce((sum, n) => sum + n, 0));
   let totalUnreadChannels = $derived($totalChannelUnread);
   let awaitingChannelOfferCount = $derived($awaitingChannelOffers);
-  let channelInboxCount = $derived(totalUnreadChannels + awaitingChannelOfferCount);
+  let dmRequestCount = $derived($dmRequests.length);
+  let channelInboxCount = $derived(totalUnreadChannels + awaitingChannelOfferCount + dmRequestCount);
 
   /** Every nav count caps the same way; the exact figure is in each title. */
   function navCount(n: number): string {
     return n > 99 ? '99+' : String(n);
   }
 
-  function channelInboxTitle(unread: number, offers: number): string {
+  function channelInboxTitle(unread: number, offers: number, requests = 0): string {
     const parts: string[] = [];
+    if (requests > 0) parts.push(m.channels_dm_requests_title({ count: requests }));
     if (unread > 0) {
       parts.push(
         plural(unread, {
@@ -368,10 +374,11 @@
       return;
     }
     // Ctrl/Cmd+, opens Settings — the desktop convention (VS Code, Slack,
-    // browsers). Settings is the eleventh nav entry, past the Alt+1..0 range,
-    // so without this the most-visited page was the only click-only one. Kept
-    // off the positional map on purpose: Settings keeps this key regardless of
-    // whether Channels is hidden and shifts everything up by one.
+    // browsers). Settings is the twelfth nav entry with Ember on, past the
+    // Alt+1..0 range, so without this the most-visited page would be
+    // click-only. Kept off the positional map on purpose: Settings keeps this
+    // key regardless of whether Channels and Feeds are hidden, which leaves ten
+    // entries and moves Settings up to Alt+0.
     if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key === ',') {
       if (isTypingTarget(e.target)) return;
       e.preventDefault();
@@ -486,6 +493,12 @@
                 <path d="M4 5h9a2 2 0 012 2v4a2 2 0 01-2 2H9l-3 2.5V13H4a2 2 0 01-2-2V7a2 2 0 012-2z"/>
                 <path d="M16 7.5h.5A1.5 1.5 0 0118 9v3.5a1.5 1.5 0 01-1.5 1.5H16v1.5L14.5 14"/>
               </svg>
+            {:else if item.id === 'feeds'}
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="5" cy="15" r="1.5" fill="currentColor" stroke="none"/>
+                <path d="M4 9a7 7 0 017 7"/>
+                <path d="M4 4a12 12 0 0112 12"/>
+              </svg>
             {:else if item.id === 'ember'}
               <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M10 2.5C11.5 5.5 14.5 6.5 14.5 11a4.5 4.5 0 0 1-9 0c0-1.6.7-2.8 1.6-3.7C8.3 6.2 8.8 5 8 3.5c1 .4 1.6 1 2 2z"/>
@@ -508,8 +521,11 @@
             {/if}
           </span>
           <span class="nav-label">{item.label()}</span>
-          {#if item.id === 'channels' || item.id === 'friends'}
+          {#if item.id === 'channels' || item.id === 'friends' || item.id === 'feeds'}
             <span class="beta-badge">{m.common_beta()}</span>
+          {/if}
+          {#if item.id === 'feeds' && $totalFeedUnread > 0}
+            <span class="nav-badge" title={m.feeds_unread_title({ count: $totalFeedUnread })}>{navCount($totalFeedUnread)}</span>
           {/if}
           {#if item.id === 'transfers' && activeTransferCount > 0}
             <span class="nav-transfer-counts">
@@ -538,8 +554,8 @@
           {#if item.id === 'channels' && channelInboxCount > 0}
             <span
               class="nav-badge"
-              class:nav-badge-attention={awaitingChannelOfferCount > 0}
-              title={channelInboxTitle(totalUnreadChannels, awaitingChannelOfferCount)}
+              class:nav-badge-attention={awaitingChannelOfferCount > 0 || dmRequestCount > 0}
+              title={channelInboxTitle(totalUnreadChannels, awaitingChannelOfferCount, dmRequestCount)}
             >{navCount(channelInboxCount)}</span>
           {/if}
         </a>

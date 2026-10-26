@@ -237,17 +237,23 @@ struct RollbackState {
 #[derive(Clone, Copy)]
 struct NetworkPolicy {
     allow_http_loopback: bool,
+    /// Go through the proxy the OS or environment names for the address
+    /// ([`system_proxy_for`]). Off for test fixtures, which must not depend
+    /// on the machine running them.
+    system_proxy: bool,
 }
 
 impl NetworkPolicy {
     const PRODUCTION: Self = Self {
         allow_http_loopback: false,
+        system_proxy: true,
     };
 
     #[cfg(test)]
     const fn local_fixture() -> Self {
         Self {
             allow_http_loopback: true,
+            system_proxy: false,
         }
     }
 
@@ -533,7 +539,42 @@ fn remaining(deadline: Instant) -> Result<Duration> {
     deadline
         .checked_duration_since(Instant::now())
         .filter(|duration| !duration.is_zero())
-        .ok_or_else(|| anyhow!("updater request deadline exceeded"))
+        .ok_or_else(|| UpdaterDeadlineExceeded.into())
+}
+
+/// The HTTP(S) proxy the OS or environment names for `url`, the way a browser
+/// on this computer would reach it: `HTTPS_PROXY` and friends, or the Windows
+/// and macOS proxy settings. Where GitHub is blocked, that proxy is often the
+/// only way to it. Nothing here rests on the connection being direct: the
+/// manifest is checked against the embedded key, and every installer against
+/// its signature, whoever carried the bytes.
+///
+/// `Ok(None)` when there is no proxy for `url`, or only one this client cannot
+/// speak (SOCKS).
+fn system_proxy_for(url: &Url) -> Result<Option<reqwest::Proxy>> {
+    let Ok(uri) = url.as_str().parse::<http::Uri>() else {
+        return Ok(None);
+    };
+    let Some(intercept) = hyper_util::client::proxy::matcher::Matcher::from_system().intercept(&uri)
+    else {
+        return Ok(None);
+    };
+    let scheme = intercept.uri().scheme_str().unwrap_or("");
+    if !matches!(scheme, "http" | "https") {
+        tracing::warn!(
+            "Ignoring the {scheme} system proxy for updates: only HTTP and HTTPS proxies are supported"
+        );
+        return Ok(None);
+    }
+    // The matcher takes an HTTP(S) proxy's `user:password@` out of its URI and
+    // keeps it only as a ready-made Basic header; `raw_auth` is SOCKS-only. So
+    // the header is what carries the credentials, or a proxy that needs them
+    // answers 407 to every update check.
+    let proxy = reqwest::Proxy::all(intercept.uri().to_string()).context("updater proxy is invalid")?;
+    Ok(Some(match intercept.basic_auth() {
+        Some(credentials) => proxy.custom_http_auth(credentials.clone()),
+        None => proxy,
+    }))
 }
 
 async fn client_for_url(
@@ -548,12 +589,24 @@ async fn client_for_url(
     let port = url
         .port_or_known_default()
         .ok_or_else(|| anyhow!("updater URL has no port"))?;
-    let mut builder = Client::builder()
+    let builder = Client::builder()
         .user_agent(concat!("ember-secure-updater/", env!("CARGO_PKG_VERSION")))
-        .no_proxy()
         .redirect(RedirectPolicy::none())
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT);
+
+    // Through a proxy the name is resolved there, so there is nothing to pin.
+    let system_proxy = if policy.system_proxy { system_proxy_for(url)? } else { None };
+    if let Some(proxy) = system_proxy {
+        return Ok((
+            builder
+                .proxy(proxy)
+                .build()
+                .context("failed to build updater HTTP client")?,
+            Vec::new(),
+        ));
+    }
+    let mut builder = builder.no_proxy();
 
     let addresses = if matches!(url.host(), Some(Host::Domain(_))) {
         let dns_deadline = remaining(deadline)?.min(DNS_TIMEOUT);
@@ -1471,6 +1524,11 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
     let final_addresses = manifest_response.final_addresses.clone();
     let offer_epoch = manifest.security_epoch;
     let offer_version = manifest_version.clone();
+    // The same route the vetted fetch took: the system proxy when there is
+    // one, or a direct connection pinned to the addresses it resolved. Set in
+    // `configure_client` rather than the plugin's own `proxy`, which logs the
+    // proxy URL and with it any credentials the proxy carries.
+    let final_proxy = system_proxy_for(&manifest_response.final_url)?;
     let updater = app
         .updater_builder()
         .endpoints(vec![manifest_response.final_url.clone()])
@@ -1487,12 +1545,15 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
                 )
         })
         .configure_client(move |builder| {
-            builder
+            let builder = builder
                 .no_proxy()
                 .redirect(RedirectPolicy::none())
                 .connect_timeout(CONNECT_TIMEOUT)
-                .read_timeout(READ_TIMEOUT)
-                .resolve_to_addrs(&final_host, &final_addresses)
+                .read_timeout(READ_TIMEOUT);
+            match &final_proxy {
+                Some(proxy) => builder.proxy(proxy.clone()),
+                None => builder.resolve_to_addrs(&final_host, &final_addresses),
+            }
         })
         .build()
         .context("failed to build Tauri updater")?;
@@ -1941,6 +2002,7 @@ async fn install_locked(
     crate::auto_update::watchdog::spawn_for_install();
     if let Err(error) = update.update.install(&artifact) {
         tracing::warn!("Secure updater install failed: {error}");
+        mark_session_running(app);
         // A manual install that failed leaves this Ember running and the user
         // in charge of it; the watchdog must not relaunch it after they quit.
         // A silent one restarts itself, which the watchdog then sees.
@@ -1960,6 +2022,15 @@ async fn install_locked(
     discard_staged(app);
     pending.take();
     Ok(())
+}
+
+/// After a graceful shutdown that did not end the process: it marked the
+/// database closed cleanly, but this process keeps running and writing to it
+/// until the user restarts, and a crash meanwhile must still be unclean.
+fn mark_session_running(app: &AppHandle) {
+    if let Some(state) = tauri::Manager::try_state::<crate::app_state::AppState>(app) {
+        state.db.mark_session_running();
+    }
 }
 
 /// Which updater operation a failure is being reported for.
@@ -1982,12 +2053,60 @@ enum UpdaterOperation {
     InstallerLaunch,
 }
 
+/// Whether `error` is the network failing to reach the update server, rather
+/// than anything about what it served. It is the one failure a user can act
+/// on, by checking the connection or a proxy, and in some countries the usual
+/// one: GitHub's download hosts are blocked there.
+fn is_unreachable(error: &anyhow::Error) -> bool {
+    let network = |e: &reqwest::Error| e.is_connect() || e.is_timeout();
+    error.chain().any(|cause| {
+        if let Some(e) = cause.downcast_ref::<reqwest::Error>() {
+            return network(e);
+        }
+        if let Some(tauri_plugin_updater::Error::Reqwest(e)) =
+            cause.downcast_ref::<tauri_plugin_updater::Error>()
+        {
+            return network(e);
+        }
+        cause.is::<tokio::time::error::Elapsed>()
+            || cause.is::<UpdaterDeadlineExceeded>()
+            || cause.to_string().starts_with("updater DNS lookup")
+    })
+}
+
+/// The overall deadline of an updater request ran out.
+#[derive(Debug)]
+struct UpdaterDeadlineExceeded;
+
+impl std::fmt::Display for UpdaterDeadlineExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("updater request deadline exceeded")
+    }
+}
+
+impl std::error::Error for UpdaterDeadlineExceeded {}
+
 /// Log the real cause and hand the UI a translatable, deliberately vague
 /// envelope. The underlying error is not carried as context: what fails here
 /// is signature/manifest/network internals the user cannot act on, and the
 /// original message kept them to the log for that reason.
 fn public_failure(operation: UpdaterOperation, error: anyhow::Error) -> String {
+    let unreachable = is_unreachable(&error);
     let (label, envelope) = match operation {
+        UpdaterOperation::Check if unreachable => (
+            "check",
+            coded(
+                "updater_check_unreachable",
+                "Couldn't reach the update server. Check your connection or proxy and try again.",
+            ),
+        ),
+        UpdaterOperation::Install if unreachable => (
+            "install",
+            coded(
+                "updater_install_unreachable",
+                "Couldn't download the update. Check your connection or proxy and try again.",
+            ),
+        ),
         UpdaterOperation::Check => (
             "check",
             coded(
@@ -2522,6 +2641,7 @@ pub async fn secure_updater_run_saved_installer(
     // either way: `msiexec` elevates through the Windows Installer service.
     let installer = verified_installer_path(&app, &claim).map_err(|error| {
         tracing::warn!("Refusing to run the staged installer: {error:#}");
+        mark_session_running(&app);
         coded(
             "updater_staged_installer_changed",
             "The staged installer changed while Ember was closing down. Check for updates again.",
@@ -2551,6 +2671,7 @@ pub async fn secure_updater_run_saved_installer(
         }
         Err(error) => {
             tracing::warn!("Could not launch the staged installer: {error}");
+            mark_session_running(&app);
             // The teardown above already stopped Ember's network services, so the
             // window is still up but nothing is transferring. Saying only where
             // the file is would send the user off to run it by hand from an app
@@ -3282,5 +3403,31 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
         .await
         .unwrap_err();
         assert!(error.to_string().contains("private or special-use"));
+    }
+
+    /// Only failing to reach the server reads as "couldn't reach", the one
+    /// failure the user can act on; anything about what was served stays the
+    /// general message.
+    #[tokio::test]
+    async fn only_failing_to_reach_the_server_reads_as_unreachable() {
+        let elapsed = timeout(Duration::from_millis(1), std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        assert!(is_unreachable(&anyhow::Error::new(elapsed).context("updater request timed out")));
+        assert!(is_unreachable(&anyhow::Error::from(UpdaterDeadlineExceeded)));
+        assert!(is_unreachable(&anyhow!("no such host").context("updater DNS lookup failed")));
+        let refused = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get("http://127.0.0.1:9/")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(is_unreachable(&anyhow::Error::new(refused).context("updater request failed")));
+
+        assert!(!is_unreachable(&anyhow!("updater manifest signature is invalid")));
+        assert!(!is_unreachable(&anyhow!("updater server returned HTTP 500 Internal Server Error")));
+        assert!(!is_unreachable(&UpdaterSignatureMissing.into()));
     }
 }

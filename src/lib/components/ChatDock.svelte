@@ -5,6 +5,9 @@
   import { prefersReducedMotion } from 'svelte/motion';
   import { goto } from '$app/navigation';
   import ChatConversation from '$lib/components/ChatConversation.svelte';
+  import RoomDmConversation from '$lib/components/RoomDmConversation.svelte';
+  import { dmMemberOf, dmTabKey, dmThreads, dmThreadsWithoutTab, dmUnread, refreshDmThreads } from '$lib/stores/roomDm';
+  import { deleteRoomDmThread } from '$lib/api/roomDm';
   import {
     chatTabs,
     activeChatTab,
@@ -19,6 +22,10 @@
   import {
     unreadCounts,
     onlineFriends,
+    friendStatuses,
+    friendPresence,
+    friendPresenceLabel,
+    type FriendPresence,
     friendsList,
     fileOffers,
     friendLabel,
@@ -37,6 +44,7 @@
   import { formatBytes } from '$lib/utils';
   import { translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
+  import { alreadyQueuedText } from '$lib/alreadyQueued';
   import { plural } from '$lib/plural';
   import IconX from '$lib/components/IconX.svelte';
   import { shortcutModAria } from '$lib/platform';
@@ -200,15 +208,17 @@
   const LISTBOX_ID = 'chat-dock-switcher-list';
 
   type SwitcherRow = {
-    /** `open` rows are conversations already in the dock; `friend` rows start
+    /** `open` rows are conversations already in the dock; `private` rows are
+     *  conversations with room members that have no tab; `friend` rows start
      *  a new one. The distinction drives the close button and the section. */
-    kind: 'open' | 'friend';
+    kind: 'open' | 'private' | 'friend';
     hash: string;
     name: string;
     /** `name` as drawn: with a short hash when it could pass for another
      *  friend's. `name` stays bare for search and for the tab it opens. */
     label: string;
     online: boolean;
+    presence: FriendPresence;
     unread: number;
   };
 
@@ -216,15 +226,50 @@
     return $onlineFriends.has(hash.toLowerCase());
   }
 
+  function presenceOf(hash: string) {
+    return friendPresence(hash, $onlineFriends, $friendStatuses);
+  }
+
+  /** A tab's name as drawn: a private conversation with a room member says
+   *  so, since they are not on the friends list it would otherwise suggest. */
+  function tabLabel(tab: { hash: string; name: string }): string {
+    if (dmMemberOf(tab.hash) !== null) {
+      return m.channels_dm_tab_label({ name: tab.name.trim() || `${tab.hash.slice(3, 11)}\u2026` });
+    }
+    return friendLabel(tab.hash, tab.name, $friendNames);
+  }
+
   let openRows = $derived<SwitcherRow[]>(
     $chatTabs.map((tab) => ({
       kind: 'open' as const,
       hash: tab.hash,
       name: tab.name,
-      label: friendLabel(tab.hash, tab.name, $friendNames),
+      label: tabLabel(tab),
       online: isOnline(tab.hash),
-      unread: $unreadCounts.get(tab.hash) ?? 0,
+      presence: presenceOf(tab.hash),
+      unread: $unreadCounts.get(tab.hash) ?? $dmUnread.get(tab.hash) ?? 0,
     })),
+  );
+
+  /** Accepted private conversations without a tab — closed, or never given
+   *  one past the tab cap — so their unread counts still lead somewhere.
+   *  Requests are answered from their banners on the Channels page. */
+  let privateRows = $derived<SwitcherRow[]>(
+    dmThreadsWithoutTab(
+      $dmThreads,
+      $chatTabs.map((tab) => tab.hash),
+    ).map((thread) => {
+      const hash = dmTabKey(thread.member_pubkey);
+      return {
+        kind: 'private' as const,
+        hash,
+        name: thread.name,
+        label: tabLabel({ hash, name: thread.name }),
+        online: false,
+        presence: 'offline' as const,
+        unread: $dmUnread.get(hash) ?? 0,
+      };
+    }),
   );
 
   /**
@@ -251,6 +296,7 @@
               name: f.nickname?.trim() || $friendNames.get(hash) || `${hash.slice(0, 8)}\u2026`,
               label: friendLabel(hash, f.nickname, $friendNames),
               online: isOnline(f.user_hash),
+              presence: presenceOf(f.user_hash),
               unread: 0,
             };
           })
@@ -262,10 +308,11 @@
 
   let needle = $derived(searchNeedle(query));
   let shownOpen = $derived(filterSwitcherRows(openRows, needle));
+  let shownPrivate = $derived(filterSwitcherRows(privateRows, needle));
   let shownFriends = $derived(filterSwitcherRows(friendRows, needle));
-  /** One index space over both sections, so the arrow keys cross the section
-   *  heading the way the eye does. */
-  let rows = $derived([...shownOpen, ...shownFriends]);
+  /** One index space over every section, so the arrow keys cross the section
+   *  headings the way the eye does. */
+  let rows = $derived([...shownOpen, ...shownPrivate, ...shownFriends]);
   /** Position of the highlight in `rows`, or -1 for none. */
   let activeIndex = $derived(
     activeHash === null ? -1 : rows.findIndex((r) => r.hash === activeHash),
@@ -278,11 +325,13 @@
   let activeTab = $derived(
     $activeChatTab ? $chatTabs.find((t) => t.hash === $activeChatTab) ?? null : null,
   );
-  let activeTabLabel = $derived(
-    activeTab ? friendLabel(activeTab.hash, activeTab.name, $friendNames) : '',
-  );
+  let activeTabLabel = $derived(activeTab ? tabLabel(activeTab) : '');
+  /** The member a private conversation on screen is with, or null. */
+  let activeDmMember = $derived(dmMemberOf(activeTab?.hash));
   /** The disappearing timer on the conversation on screen, 0 for none. */
-  let activeDisappearSecs = $derived(activeTab ? disappearSecsFor($appSettings, activeTab.hash) : 0);
+  let activeDisappearSecs = $derived(
+    activeTab && activeDmMember === null ? disappearSecsFor($appSettings, activeTab.hash) : 0,
+  );
 
   let confirmDeleteOpen = $state(false);
   let deletingChat = $state(false);
@@ -302,7 +351,14 @@
     if (!target || deletingChat) return;
     deletingChat = true;
     try {
-      await deleteChatHistory(target.hash);
+      const dmMember = dmMemberOf(target.hash);
+      if (dmMember !== null) {
+        await deleteRoomDmThread(dmMember);
+        closeTab(target.hash);
+        void refreshDmThreads();
+      } else {
+        await deleteChatHistory(target.hash);
+      }
       toastSuccess(m.chat_delete_chat_done({ name: target.name }));
     } catch (e) {
       toastError(translateError(e));
@@ -320,7 +376,7 @@
    * reporting the number, which is what makes it an answer instead of a nag.
    */
   let unreadElsewhere = $derived(
-    openRows.reduce((sum, r) => (r.hash === $activeChatTab ? sum : sum + r.unread), 0),
+    [...openRows, ...privateRows].reduce((sum, r) => (r.hash === $activeChatTab ? sum : sum + r.unread), 0),
   );
   let unreadElsewhereLabel = $derived(
     plural(unreadElsewhere, {
@@ -353,6 +409,8 @@
   function activateRow(row: SwitcherRow) {
     if (row.kind === 'open') {
       setActiveTab(row.hash);
+    } else if (row.kind === 'private') {
+      openChat(row.hash, row.name);
     } else {
       if (!chatAllowedWith($appSettings, row.hash)) return;
       openChat(row.hash, row.name);
@@ -575,7 +633,11 @@
   }
 
   function goToUnread() {
-    if (!focusNextUnread()) return;
+    if (!focusNextUnread($dmUnread)) {
+      const waiting = privateRows.find((row) => row.unread > 0);
+      if (!waiting) return;
+      openChat(waiting.hash, waiting.name);
+    }
     closeSwitcher(false);
   }
 
@@ -585,7 +647,7 @@
       if (!res) return;
       toastSuccess(
         res.already_queued
-          ? m.search_already_queued_name({ name: offer.file_name })
+          ? alreadyQueuedText(res, offer.file_name)
           : m.friends_offer_accepted({ name: offer.file_name }),
       );
     } catch (e) {
@@ -674,19 +736,21 @@
         onclick={toggleSwitcher}
       >
         {#if activeTab}
+          {@const presence = presenceOf(activeTab.hash)}
           <!-- Named, not decorative: the header says nothing else about whether
-               the friend is reachable, so hiding the dot hides the state. -->
-          <span
-            class="dock-presence"
-            class:online={isOnline(activeTab.hash)}
-            role="img"
-            aria-label={isOnline(activeTab.hash)
-              ? m.chat_online_label()
-              : m.chat_offline_label()}
-            title={isOnline(activeTab.hash)
-              ? m.chat_online_label()
-              : m.chat_offline_label()}
-          ></span>
+               the friend is reachable, so hiding the dot hides the state. A room
+               member's presence is not known here, so none is claimed. -->
+          {#if activeDmMember === null}
+            <span
+              class="dock-presence"
+              class:online={presence === 'online'}
+              class:away={presence === 'away'}
+              class:busy={presence === 'busy'}
+              role="img"
+              aria-label={friendPresenceLabel(presence)}
+              title={friendPresenceLabel(presence)}
+            ></span>
+          {/if}
           <span class="dock-current-name"><bdi dir="auto">{activeTabLabel}</bdi></span>
         {:else}
           <span class="dock-current-name dock-current-none">{m.chat_dock_none_selected()}</span>
@@ -855,12 +919,16 @@
                   closeRow(row);
                 }}
               >
-                <span
-                  class="dock-presence"
-                  class:online={row.online}
-                  role="img"
-                  aria-label={row.online ? m.chat_online_label() : m.chat_offline_label()}
-                ></span>
+                {#if dmMemberOf(row.hash) === null}
+                  <span
+                    class="dock-presence"
+                    class:online={row.presence === 'online'}
+                    class:away={row.presence === 'away'}
+                    class:busy={row.presence === 'busy'}
+                    role="img"
+                    aria-label={friendPresenceLabel(row.presence)}
+                  ></span>
+                {/if}
                 <span class="dock-row-name"><bdi dir="auto">{row.label}</bdi></span>
                 {#if row.unread > 0}
                   <span
@@ -891,11 +959,41 @@
               </div>
             {/each}
 
+            {#if shownPrivate.length > 0}
+              <p class="dock-list-section">{m.chat_dock_section_private()}</p>
+            {/if}
+            {#each shownPrivate as row, i (row.hash)}
+              {@const idx = shownOpen.length + i}
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <div
+                class="dock-row"
+                class:active={idx === activeIndex}
+                role="option"
+                id={`${LISTBOX_ID}-option-${idx}`}
+                aria-selected={idx === activeIndex}
+                tabindex="-1"
+                onclick={() => activateRow(row)}
+                onmouseenter={() => (activeHash = row.hash)}
+              >
+                <span class="dock-row-name"><bdi dir="auto">{row.label}</bdi></span>
+                {#if row.unread > 0}
+                  <span
+                    class="count-pill"
+                    aria-label={plural(row.unread, {
+                      one: m.chat_dock_unread_aria_one,
+                      few: () => m.chat_dock_unread_aria_few({ count: row.unread }),
+                      other: () => m.chat_dock_unread_aria_other({ count: row.unread }),
+                    })}
+                  >{row.unread > 99 ? '99+' : row.unread}</span>
+                {/if}
+              </div>
+            {/each}
+
             {#if shownFriends.length > 0}
               <p class="dock-list-section">{m.chat_dock_section_start()}</p>
             {/if}
             {#each shownFriends as row, i (row.hash)}
-              {@const idx = shownOpen.length + i}
+              {@const idx = shownOpen.length + shownPrivate.length + i}
               <!-- svelte-ignore a11y_click_events_have_key_events -->
               <div
                 class="dock-row"
@@ -909,9 +1007,11 @@
               >
                 <span
                   class="dock-presence"
-                  class:online={row.online}
+                  class:online={row.presence === 'online'}
+                  class:away={row.presence === 'away'}
+                  class:busy={row.presence === 'busy'}
                   role="img"
-                  aria-label={row.online ? m.chat_online_label() : m.chat_offline_label()}
+                  aria-label={friendPresenceLabel(row.presence)}
                 ></span>
                 <span class="dock-row-name"><bdi dir="auto">{row.label}</bdi></span>
               </div>
@@ -924,6 +1024,7 @@
         <div class="dock-offers" role="region" aria-label={m.chat_dock_offers_title()}>
           <div class="dock-offers-title">{m.chat_dock_offers_title()}</div>
           {#each pendingOffers as offer (`${offer.user_hash}:${offer.file_hash}`)}
+            {@const accepting = $acceptingOffer === offerKey(offer.user_hash, offer.file_hash)}
             <div class="dock-offer">
               <div class="dock-offer-info">
                 <span class="dock-offer-name"><bdi dir="auto">{offer.file_name}</bdi></span>
@@ -937,14 +1038,15 @@
                   type="button"
                   class="dock-offer-accept"
                   disabled={$acceptingOffer !== null}
+                  aria-busy={accepting}
                   onclick={() => void acceptDockOffer(offer)}
-                >{m.friends_offer_download()}</button>
+                >{accepting ? m.browse_downloading() : m.friends_offer_download()}</button>
                 <!-- Only the row being accepted is held: dismissing a
                      different offer starts nothing and can go through. -->
                 <button
                   type="button"
                   class="dock-offer-dismiss"
-                  disabled={$acceptingOffer === offerKey(offer.user_hash, offer.file_hash)}
+                  disabled={accepting}
                   onclick={() => clearFileOffer(offer.user_hash, offer.file_hash)}
                 >{m.common_dismiss()}</button>
               </div>
@@ -953,7 +1055,13 @@
         </div>
       {/if}
 
-      {#if activeTab}
+      {#if activeTab && activeDmMember !== null}
+        <!-- One instance per member: a draft or a reply in flight must never
+             carry over to the next private conversation. -->
+        {#key activeDmMember}
+          <RoomDmConversation member={activeDmMember} name={activeTab.name} />
+        {/key}
+      {:else if activeTab}
         <ChatConversation friendHash={activeTab.hash} friendName={activeTab.name} />
       {:else}
         <div class="empty-state dock-empty-state">
@@ -1121,6 +1229,16 @@
   .dock-presence.online {
     background: var(--status-connected);
     box-shadow: 0 0 0 2px color-mix(in srgb, var(--status-connected) 18%, transparent);
+  }
+
+  .dock-presence.away {
+    background: var(--warning);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--warning) 18%, transparent);
+  }
+
+  .dock-presence.busy {
+    background: var(--danger);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 18%, transparent);
   }
 
   .dock-encrypted {

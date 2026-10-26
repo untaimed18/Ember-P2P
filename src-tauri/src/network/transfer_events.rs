@@ -110,12 +110,13 @@ pub(super) fn reverify_complete_part_file(
     if control.is_cancelled() {
         anyhow::bail!("cancelled by user");
     }
-    let safe_name = crate::security::sanitize_filename(file_name);
-    let actual_final = ed2k::transfer::move_part_to_completed(
+    let safe_name =
+        crate::sharing::name_tag::completed_download_name(&crate::security::sanitize_filename(file_name));
+    let actual_final = ed2k::transfer::move_part_to_its_folder(
+        transfer_id,
         &part_path,
         part_dir,
         download_dir,
-        &crate::storage::category_folders::completion_subdir(transfer_id),
         &safe_name,
         &verified_identity,
     )?;
@@ -129,6 +130,19 @@ pub(super) fn reverify_complete_part_file(
         "Re-verified and completed restored download {transfer_id} ({file_name}, {file_size} bytes)"
     );
     Ok(actual_final)
+}
+
+/// The name a finished download's row takes when completion saved its file
+/// under the `[Ember-P2P]` tag and the row still has the name without it.
+fn tagged_completion_name(
+    mgr: &crate::sharing::manager::TransferManager,
+    transfer_id: &str,
+    final_path: &str,
+) -> Option<String> {
+    let name = std::path::Path::new(final_path).file_name()?.to_str()?;
+    let row = mgr.get_transfer(transfer_id)?;
+    (crate::sharing::name_tag::has_tag(name) && !crate::sharing::name_tag::has_tag(&row.file_name))
+        .then(|| name.to_string())
 }
 
 /// How long the leftover-partial cleanup waits for the finished download's
@@ -241,8 +255,9 @@ pub(super) async fn handle_download_event(
             } else {
                 downloaded
             };
-            let speed = {
+            let (speed, became_active) = {
                 let mut mgr = transfer_manager.write().await;
+                let before = mgr.active.get(&transfer_id).map(|t| t.completed_size);
                 // eMule's split: `transferred` is the wire counter behind its
                 // Transferred column, `capped_downloaded` the on-disk figure
                 // behind Completed, and progress comes from the latter
@@ -254,12 +269,29 @@ pub(super) async fn handle_download_event(
                     transferred.unwrap_or(capped_downloaded),
                     Some(capped_downloaded),
                 );
-                if let Some(t) = mgr.active.get(&transfer_id) {
-                    t.speed
-                } else {
-                    0
+                // Bytes landing are a download under way, whatever the row
+                // was left reading: a worker started with a peer in hand, or
+                // a source no peer count covers (a mirror, a feed's
+                // publisher), never passes through the paths that set it.
+                let became_active = before.is_some_and(|before| capped_downloaded > before)
+                    && mgr.active.get(&transfer_id).is_some_and(|t| {
+                        matches!(
+                            t.status,
+                            crate::types::TransferStatus::Queued | crate::types::TransferStatus::Searching
+                        )
+                    });
+                if became_active {
+                    mgr.update_status(&transfer_id, crate::types::TransferStatus::Active);
                 }
+                let speed = mgr.active.get(&transfer_id).map_or(0, |t| t.speed);
+                (speed, became_active)
             };
+            if became_active {
+                let _ = app_handle.emit(
+                    "transfer-status",
+                    serde_json::json!({ "id": transfer_id, "status": "active" }),
+                );
+            }
             let progress = if total > 0 {
                 ((capped_downloaded as f64 / total as f64) * 100.0).min(100.0)
             } else {
@@ -320,6 +352,7 @@ pub(super) async fn handle_download_event(
                     upload_time: None,
                     up_part_status: None,
                     up_part_count: None,
+                    up_part_fill: None,
                     up_peer_part_status: None,
                 },
             );
@@ -679,6 +712,50 @@ pub(super) async fn handle_download_event(
             final_path,
             ember_verified,
             ..
+        } if crate::sharing::feed_files::is_internal_fetch(&transfer_id) => {
+            // A fetch for the feeds code: no row, history or event of the
+            // user's, just the file handed over.
+            {
+                let mut mgr = transfer_manager.write().await;
+                if let Some(promoted) = mgr.complete(&transfer_id) {
+                    promoted_out.extend(promoted);
+                }
+                mgr.remove(&transfer_id);
+            }
+            db_progress_last_persist.remove(&transfer_id);
+            let outcome = match final_path {
+                Some(path) if ember_verified => crate::sharing::feed_files::FetchOutcome::Done(path.into()),
+                Some(path) => {
+                    let _ = std::fs::remove_file(path);
+                    crate::sharing::feed_files::FetchOutcome::Failed("not checked against its digest".into())
+                }
+                None => crate::sharing::feed_files::FetchOutcome::Failed("no file".into()),
+            };
+            crate::sharing::feed_files::report_fetch(&transfer_id, outcome);
+        }
+        DownloadEvent::Failed { transfer_id, error, .. }
+            if crate::sharing::feed_files::is_internal_fetch(&transfer_id) =>
+        {
+            {
+                let mut mgr = transfer_manager.write().await;
+                if let Some(promoted) =
+                    mgr.fail(&transfer_id, ed2k::transfer::TransferFailureCode::Cancelled, None, None)
+                {
+                    promoted_out.extend(promoted);
+                }
+                mgr.remove(&transfer_id);
+            }
+            db_progress_last_persist.remove(&transfer_id);
+            crate::sharing::feed_files::report_fetch(
+                &transfer_id,
+                crate::sharing::feed_files::FetchOutcome::failed(error),
+            );
+        }
+        DownloadEvent::Completed {
+            transfer_id,
+            final_path,
+            ember_verified,
+            ..
         } => {
             // A download reaches Completed only after every part is present
             // and hash-verified, so the terminal row represents the whole
@@ -699,6 +776,18 @@ pub(super) async fn handle_download_event(
                 // we wrote rather than reconstructing it from the file name.
                 if let Some(ref fp) = final_path {
                     mgr.set_completed_path(&transfer_id, fp.clone());
+                    // Saved under the `[Ember-P2P]` tag: the row shows the
+                    // name the file has, as it does after a Library rename.
+                    if let Some(tagged) = tagged_completion_name(&mgr, &transfer_id, fp) {
+                        mgr.follow_renamed_file(&transfer_id, &tagged, fp.clone());
+                        let db = db.clone();
+                        let id = transfer_id.clone();
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(e) = db.update_transfer_file_name(&id, &tagged) {
+                                warn!("Could not save the tagged name of finished download {id}: {e}");
+                            }
+                        });
+                    }
                 }
                 mgr.set_ember_verified(&transfer_id, ember_verified);
                 mgr.complete(&transfer_id)
@@ -732,6 +821,12 @@ pub(super) async fn handle_download_event(
                 mgr.get_transfer(&transfer_id)
                     .map(|t| (t.file_hash.clone(), t.file_name.clone(), t.total_size))
             };
+            // For the notification of a download the Transfers page does not
+            // list, a feed's, which the page has no row to name it from.
+            let (file_name, total_size) = history_row
+                .as_ref()
+                .map(|(_, name, size)| (name.clone(), *size))
+                .unwrap_or_default();
             let db_for_completion = db.clone();
             let completion_transfer_id = transfer_id.clone();
             let completed_seq = status_writes.next_seq();
@@ -753,6 +848,8 @@ pub(super) async fn handle_download_event(
                 serde_json::json!({
                     "id": transfer_id,
                     "ember_verified": ember_verified,
+                    "file_name": file_name,
+                    "total_size": total_size,
                 }),
             );
 
@@ -786,9 +883,11 @@ pub(super) async fn handle_download_event(
             {
                 return;
             }
-            let current_status = {
+            let (current_status, file_name) = {
                 let mgr = transfer_manager.read().await;
-                mgr.get_transfer(&transfer_id).map(|t| t.status.clone())
+                mgr.get_transfer(&transfer_id)
+                    .map(|t| (Some(t.status.clone()), t.file_name.clone()))
+                    .unwrap_or_default()
             };
             // `Completed` belongs here for the same reason the upload path
             // returns early when `fail()` finds nothing: once the row has moved
@@ -879,6 +978,7 @@ pub(super) async fn handle_download_event(
                     "failure_code": failure_code.as_code(),
                     "failure_kind": failure_kind_name,
                     "failure_stage": failure_stage,
+                    "file_name": file_name,
                 }),
             );
         }
@@ -972,6 +1072,7 @@ pub(super) async fn handle_upload_event(
                 completed_path: None,
                 up_part_status: None,
                 up_part_count: None,
+                up_part_fill: None,
                 up_peer_part_status: None,
                 ember_verified: false,
                 friends_only: false,
@@ -1013,6 +1114,7 @@ pub(super) async fn handle_upload_event(
             total,
             part_status,
             part_count,
+            part_fill,
             peer_part_status,
         } => {
             // Unique coverage, not session wire bytes. Re-requests inflate
@@ -1070,6 +1172,9 @@ pub(super) async fn handle_upload_event(
                         if part_count.is_some() {
                             t.up_part_count = part_count;
                         }
+                        if part_fill.is_some() {
+                            t.up_part_fill = part_fill.clone();
+                        }
                         // Always assign (Some or None): keyed by file hash on the
                         // session side, so if a row stops matching the advertised
                         // file the dark "peer has" shading clears instead of
@@ -1098,6 +1203,7 @@ pub(super) async fn handle_upload_event(
                     upload_time: Some(upload_time_ms),
                     up_part_status: part_status,
                     up_part_count: part_count,
+                    up_part_fill: part_fill,
                     up_peer_part_status: peer_part_status,
                 },
             );
@@ -1193,6 +1299,7 @@ pub(super) async fn handle_upload_event(
         | UploadEventKind::EmberChatMessage { .. }
         | UploadEventKind::EmberChatMailboxAware { .. }
         | UploadEventKind::EmberChatTyping { .. }
+        | UploadEventKind::EmberFriendStatus { .. }
         | UploadEventKind::EmberChatRead { .. }
         | UploadEventKind::EmberChatExpire { .. }
         | UploadEventKind::EmberBrowseRequest { .. }
@@ -1202,6 +1309,7 @@ pub(super) async fn handle_upload_event(
         | UploadEventKind::EmberBrowseSessionReady { .. }
         | UploadEventKind::EmberBrowseSessionFailed { .. }
         | UploadEventKind::EmberFriendDisconnected { .. }
+        | UploadEventKind::EmberFriendSessionEnded { .. }
         | UploadEventKind::EmberFriendConnected { .. }
         | UploadEventKind::FriendEndpointDiscovered { .. }
         | UploadEventKind::EmberFriendSearchFailed { .. }
@@ -1213,6 +1321,7 @@ pub(super) async fn handle_upload_event(
         | UploadEventKind::EmberAttachOffer { .. }
         | UploadEventKind::EmberAttachReply { .. }
         | UploadEventKind::EmberAttachCancel { .. }
+        | UploadEventKind::EmberAttachHeld { .. }
         | UploadEventKind::EmberRelayOffer { .. }
         | UploadEventKind::EmberDhtContactRequest { .. }
         | UploadEventKind::EmberDhtContacts { .. }

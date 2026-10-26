@@ -4,6 +4,7 @@
   import * as m from '$lib/paraglide/messages';
   import { openEmberLink, type EmberLink } from '$lib/api/settings';
   import { translateError } from '$lib/i18n';
+  import { SvelteSet } from 'svelte/reactivity';
 
   let failed = $state<{ target: EmberLink; message: string } | null>(null);
 
@@ -13,12 +14,18 @@
     { target: 'reddit', title: () => m.about_link_reddit_title(), desc: () => m.about_link_reddit_desc() },
   ];
 
+  const opening = new SvelteSet<EmberLink>();
+
   async function open(target: EmberLink) {
+    if (opening.has(target)) return;
+    opening.add(target);
     failed = null;
     try {
       await openEmberLink(target);
     } catch (e) {
       failed = { target, message: translateError(e) };
+    } finally {
+      opening.delete(target);
     }
   }
 </script>
@@ -26,7 +33,13 @@
 <ul class="ember-links">
   {#each links as link (link.target)}
     <li>
-      <button type="button" class="ember-link {link.target}" onclick={() => void open(link.target)}>
+      <button
+        type="button"
+        class="ember-link {link.target}"
+        aria-disabled={opening.has(link.target)}
+        aria-busy={opening.has(link.target)}
+        onclick={() => void open(link.target)}
+      >
         <span class="ember-link-icon" aria-hidden="true">
           {#if link.target === 'website'}
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -121,6 +134,10 @@
   .ember-link:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 1px;
+  }
+
+  .ember-link[aria-busy='true'] {
+    cursor: progress;
   }
 
   .ember-link-icon {

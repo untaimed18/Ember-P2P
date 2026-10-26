@@ -8,8 +8,8 @@ use crate::network::ember::crypto;
 use super::publish::{
     channel_flags_from_data, channel_kind_from_data, CHANNEL_FLAG_DEPARTED, CHANNEL_KIND_CLAIM,
     CHANNEL_KIND_EPOCH, CHANNEL_KIND_HANDOFF, CHANNEL_KIND_INDEX, CHANNEL_KIND_MODERATION,
-    CHANNEL_KIND_OWNED_ROOMS, CHANNEL_KIND_PRESENCE, RECORD_TYPE_CHANNEL,
-    RECORD_TYPE_KEYWORD, RECORD_TYPE_SOURCE,
+    CHANNEL_KIND_OWNED_ROOMS, CHANNEL_KIND_PRESENCE, CHANNEL_KIND_SETTINGS, RECORD_TYPE_CHANNEL,
+    RECORD_TYPE_FEED, RECORD_TYPE_FEED_LISTING, RECORD_TYPE_KEYWORD, RECORD_TYPE_SOURCE,
 };
 use super::{scale, EmberNodeId};
 
@@ -60,6 +60,20 @@ const MAX_RECORDS_PER_KEY: usize = 1000;
 /// record is still published to the nodes closest to the key, which is where
 /// searchers look — and it is the same allowance we grant everyone else.
 const MAX_RECORDS_PER_PUBLISHER_PER_KEY: usize = 150;
+/// [`MAX_RECORDS_PER_PUBLISHER_PER_KEY`] for feed listings, which share
+/// sixteen index keys among every publisher. One identity keeps at most
+/// `feed::FEEDS_PER_IDENTITY` feeds, so twice that leaves room for the
+/// withdrawals of feeds it deleted, and a shard takes sixty identities, not
+/// seven, to fill.
+const MAX_FEED_LISTINGS_PER_PUBLISHER_PER_KEY: usize = 2 * crate::network::ember::feed::FEEDS_PER_IDENTITY;
+/// Feed heads one publisher may hold across every key on this storer. Each
+/// feed's head has a key of its own, so the per-key caps never bind: an
+/// identity minting feeds without end would otherwise have each head kept
+/// and replicated for 30 days. One identity keeps at most
+/// `feed::FEEDS_PER_IDENTITY` feeds, and each it deletes leaves a tombstone
+/// head for a month, so this is far past what a client publishes. A head
+/// replacing one the publisher holds here is always taken.
+const MAX_FEED_HEADS_PER_PUBLISHER: usize = 64;
 /// Maximum total keys stored.
 const MAX_KEYS: usize = 50_000;
 /// Ceiling on resident record bytes.
@@ -215,8 +229,8 @@ const _: () = assert!(
     "a handoff must outlive a room listing and the generic keyword TTL"
 );
 
-/// A room's governance snapshot, and each member's sealed copy of its current
-/// content key, the owner's own among them.
+/// A room's governance snapshot and its settings record, and each member's
+/// sealed copy of its current content key, the owner's own among them.
 ///
 /// Only the owner can refresh either, and does every few hours while its
 /// device is up. The owner itself depends on them most when it is not: a
@@ -226,6 +240,11 @@ const _: () = assert!(
 /// could sign for but not run. Newest still wins under the one store key, so
 /// the length only decides how long the last snapshot outlives its owner.
 const CHANNEL_GOVERNANCE_TTL: Duration = CHANNEL_HANDOFF_TTL;
+
+const _: () = assert!(
+    CHANNEL_GOVERNANCE_TTL.as_secs() == crate::network::ember::feed::FEED_HEAD_TTL_SECS as u64,
+    "a feed head is kept as long as the publisher's tombstone schedule assumes"
+);
 
 const _: () = assert!(
     CHANNEL_GOVERNANCE_TTL.as_secs() > KEYWORD_RECORD_TTL.as_secs(),
@@ -248,14 +267,34 @@ fn record_ttl(data: &[u8]) -> Duration {
             }
             Some(CHANNEL_KIND_INDEX) => CHANNEL_INDEX_TTL,
             Some(CHANNEL_KIND_HANDOFF | CHANNEL_KIND_CLAIM) => CHANNEL_HANDOFF_TTL,
-            Some(CHANNEL_KIND_MODERATION | CHANNEL_KIND_EPOCH | CHANNEL_KIND_OWNED_ROOMS) => {
-                CHANNEL_GOVERNANCE_TTL
-            }
+            Some(
+                CHANNEL_KIND_MODERATION
+                | CHANNEL_KIND_EPOCH
+                | CHANNEL_KIND_OWNED_ROOMS
+                | CHANNEL_KIND_SETTINGS,
+            ) => CHANNEL_GOVERNANCE_TTL,
             _ => KEYWORD_RECORD_TTL,
         },
+        // As long as a room's governance: a feed's publisher may be away for
+        // days, and the head is the only way its followers find the list.
+        Some(&RECORD_TYPE_FEED) => CHANNEL_GOVERNANCE_TTL,
+        Some(&RECORD_TYPE_FEED_LISTING) => FEED_LISTING_TTL,
         _ => KEYWORD_RECORD_TTL,
     }
 }
+
+/// A feed's listing in the public index, and a withdrawal of one. A week: its
+/// publisher signs it anew every hour it runs, so a listing outlives a
+/// publisher's week away, while junk that fills a shard lapses within it
+/// unless its signers keep re-signing it. A withdrawal lives as long, and so
+/// outlives every listing it displaces.
+const FEED_LISTING_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+
+const _: () = assert!(
+    FEED_LISTING_TTL.as_secs() as i64 == crate::network::ember::feed::FEED_LISTING_TTL_SECS
+        && FEED_LISTING_TTL.as_secs() > KEYWORD_RECORD_TTL.as_secs(),
+    "publishers resend withdrawals for as long as storers keep listings"
+);
 
 fn is_presence_departure(data: &[u8]) -> bool {
     channel_kind_from_data(data) == Some(CHANNEL_KIND_PRESENCE)
@@ -329,7 +368,20 @@ pub struct DhtStoreEntry {
 /// `publish::moderation_supersedes`), so the copy a key serves does not depend
 /// on which one reached this node last. Re-storing the identical record still
 /// replaces it, which is how a republish refreshes it.
-fn resident_gives_way(resident: &DhtRecord, created_at: i64, signature: &[u8; 64]) -> bool {
+///
+/// A feed's heads go by their sequence first, as followers rank them: one
+/// device's republish of an older head, signed later, or a head published
+/// after the clock went back, would otherwise be ranked by its stamp alone.
+fn resident_gives_way(resident: &DhtRecord, data: &[u8], created_at: i64, signature: &[u8; 64]) -> bool {
+    let sequences = (
+        super::publish::SignedRecord::feed_head_sequence_of(&resident.data),
+        super::publish::SignedRecord::feed_head_sequence_of(data),
+    );
+    if let (Some(held), Some(incoming)) = sequences {
+        if held != incoming {
+            return incoming > held;
+        }
+    }
     match created_at.cmp(&resident.created_at) {
         std::cmp::Ordering::Greater => true,
         std::cmp::Ordering::Less => false,
@@ -450,6 +502,15 @@ struct PublisherLoad {
     keys: usize,
     /// Resident bytes, charged exactly as the store-wide total is.
     bytes: usize,
+    /// Feed heads it holds, across every key. See
+    /// [`MAX_FEED_HEADS_PER_PUBLISHER`].
+    feed_heads: usize,
+}
+
+/// Whether a record body is a feed head, which [`PublisherLoad::feed_heads`]
+/// counts.
+fn is_feed_head(data: &[u8]) -> bool {
+    data.first() == Some(&RECORD_TYPE_FEED)
 }
 
 /// Per-publisher occupancy of the store, kept so [`MAX_KEYS_PER_PUBLISHER`] and
@@ -512,9 +573,17 @@ impl PublisherIndex {
         self.over_share > 0
     }
 
+    /// Whether `publisher` holds as many feed heads as it may. Never for our
+    /// own key, for the reason [`Self::local`] gives.
+    fn feed_heads_full(&self, publisher: &[u8; 32]) -> bool {
+        self.local.as_ref() != Some(publisher)
+            && self.load.get(publisher).is_some_and(|l| l.feed_heads >= MAX_FEED_HEADS_PER_PUBLISHER)
+    }
+
     /// Note a record entering the store. `first_under_key` is whether this
-    /// publisher held nothing else under that key.
-    fn charge(&mut self, publisher: &[u8; 32], bytes: usize, first_under_key: bool) {
+    /// publisher held nothing else under that key; `feed_head` whether the
+    /// record is one ([`is_feed_head`]).
+    fn charge(&mut self, publisher: &[u8; 32], bytes: usize, first_under_key: bool, feed_head: bool) {
         self.no_crowding_victim = false;
         let counted = self.local.as_ref() != Some(publisher);
         let (key_share, byte_share) = (self.key_share, self.byte_share);
@@ -524,6 +593,9 @@ impl PublisherIndex {
         if first_under_key {
             load.keys = load.keys.saturating_add(1);
         }
+        if feed_head {
+            load.feed_heads = load.feed_heads.saturating_add(1);
+        }
         let now = counted && (load.keys >= key_share || load.bytes >= byte_share);
         if now && !was {
             self.over_share = self.over_share.saturating_add(1);
@@ -532,7 +604,7 @@ impl PublisherIndex {
 
     /// Note a record leaving it. `last_under_key` is whether that was this
     /// publisher's last record under that key.
-    fn discharge(&mut self, publisher: &[u8; 32], bytes: usize, last_under_key: bool) {
+    fn discharge(&mut self, publisher: &[u8; 32], bytes: usize, last_under_key: bool, feed_head: bool) {
         self.no_crowding_victim = false;
         let counted = self.local.as_ref() != Some(publisher);
         let (key_share, byte_share) = (self.key_share, self.byte_share);
@@ -543,6 +615,9 @@ impl PublisherIndex {
         load.bytes = load.bytes.saturating_sub(bytes);
         if last_under_key {
             load.keys = load.keys.saturating_sub(1);
+        }
+        if feed_head {
+            load.feed_heads = load.feed_heads.saturating_sub(1);
         }
         let now = counted && (load.keys >= key_share || load.bytes >= byte_share);
         if was && !now {
@@ -778,7 +853,7 @@ impl DhtStore {
                 self.bytes = self.bytes.saturating_sub(cost);
                 let last = released.insert(record.publisher_key);
                 self.publisher_index
-                    .discharge(&record.publisher_key, cost, last);
+                    .discharge(&record.publisher_key, cost, last, is_feed_head(&record.data));
             }
         }
     }
@@ -993,7 +1068,7 @@ impl DhtStore {
                     .iter()
                     .any(|r| r.publisher_key == victim.publisher_key);
                 self.publisher_index
-                    .discharge(&victim.publisher_key, cost, last);
+                    .discharge(&victim.publisher_key, cost, last, is_feed_head(&victim.data));
                 dropped += 1;
             }
             if records.is_empty() {
@@ -1142,6 +1217,29 @@ impl DhtStore {
             );
             return false;
         }
+        // Before a key is made room for, which could give one up for a head
+        // refused here. Heads under other keys that lapsed and are not swept
+        // yet still count, for the few minutes until `expire` runs.
+        if is_feed_head(&data) && self.publisher_index.feed_heads_full(&publisher_key) {
+            let incoming_file = file_hash_from_record_data(&data);
+            // A head: another record of that file hash, replaced by a head,
+            // would put one more head on the publisher's count.
+            let replaces = self.entries.get(&key).is_some_and(|records| {
+                records.iter().any(|r| {
+                    r.publisher_key == publisher_key
+                        && is_feed_head(&r.data)
+                        && file_hash_from_record_data(&r.data) == incoming_file
+                })
+            });
+            if !replaces {
+                self.publisher_cap_rejections = self.publisher_cap_rejections.saturating_add(1);
+                debug!(
+                    "DHT store: publisher {} already holds {MAX_FEED_HEADS_PER_PUBLISHER} feed heads, rejecting another",
+                    hex::encode(publisher_key),
+                );
+                return false;
+            }
+        }
 
         if !self.entries.contains_key(&key) {
             if !self.make_room_for_key(&key, &publisher_key) {
@@ -1218,7 +1316,7 @@ impl DhtStore {
             // that copy's (earlier) expiry, or roll back its metadata.
             // Not ACKed: the sender would otherwise count as placed a copy
             // this key does not hold.
-            if !resident_gives_way(&records[pos], created_at, &signature) {
+            if !resident_gives_way(&records[pos], &record.data, created_at, &signature) {
                 self.timestamp_rejections = self.timestamp_rejections.saturating_add(1);
                 debug!(
                     "Key {} already holds a newer record from this publisher, refusing the older copy",
@@ -1290,6 +1388,7 @@ impl DhtStore {
             }
             let old_len = record_cost(records[pos].data.len());
             let new_len = record_cost(record.data.len());
+            let (old_head, new_head) = (is_feed_head(&records[pos].data), is_feed_head(&record.data));
             records[pos] = record;
             debug_assert!(
                 self.bytes >= old_len,
@@ -1299,8 +1398,8 @@ impl DhtStore {
             // A replacement, so the publisher's key count is unchanged and only
             // the byte charge moves.
             self.publisher_index
-                .discharge(&publisher_key, old_len, false);
-            self.publisher_index.charge(&publisher_key, new_len, false);
+                .discharge(&publisher_key, old_len, false, old_head);
+            self.publisher_index.charge(&publisher_key, new_len, false, new_head);
             self.enforce_byte_budget(&key);
             return true;
         }
@@ -1329,12 +1428,12 @@ impl DhtStore {
         // this one could dedupe against cannot itself be lapsed, because
         // `store_attributed` has already refused anything whose age exceeds its TTL.
         let mut reclaimed = 0usize;
-        let mut lapsed: Vec<([u8; 32], usize)> = Vec::new();
+        let mut lapsed: Vec<([u8; 32], usize, bool)> = Vec::new();
         records.retain(|r| {
             if r.expires_at_unix <= now_unix {
                 let cost = record_cost(r.data.len());
                 reclaimed += cost;
-                lapsed.push((r.publisher_key, cost));
+                lapsed.push((r.publisher_key, cost, is_feed_head(&r.data)));
                 false
             } else {
                 true
@@ -1344,9 +1443,9 @@ impl DhtStore {
         // A publisher gives up its key slot once, however many of its records
         // under this key lapsed together.
         let mut released: HashSet<[u8; 32]> = HashSet::new();
-        for (author, cost) in lapsed {
+        for (author, cost, feed_head) in lapsed {
             let last = !records.iter().any(|r| r.publisher_key == author) && released.insert(author);
-            self.publisher_index.discharge(&author, cost, last);
+            self.publisher_index.discharge(&author, cost, last, feed_head);
         }
 
         // Per-IP cap on source records, mirroring KAD's MAX_SOURCES_PER_IP.
@@ -1395,7 +1494,12 @@ impl DhtStore {
             .iter()
             .filter(|r| r.publisher_key == publisher_key)
             .count();
-        if mine >= MAX_RECORDS_PER_PUBLISHER_PER_KEY {
+        let publisher_cap = if record.data.first() == Some(&RECORD_TYPE_FEED_LISTING) {
+            MAX_FEED_LISTINGS_PER_PUBLISHER_PER_KEY
+        } else {
+            MAX_RECORDS_PER_PUBLISHER_PER_KEY
+        };
+        if mine >= publisher_cap {
             self.publisher_cap_rejections = self.publisher_cap_rejections.saturating_add(1);
             debug!(
                 "Key {} already holds {mine} record(s) from publisher {}, rejecting",
@@ -1403,6 +1507,42 @@ impl DhtStore {
                 hex::encode(publisher_key),
             );
             return false;
+        }
+
+        // A full index shard makes room for a fresher listing by dropping its
+        // stalest one, as long as that was signed before this one. Refusing
+        // newcomers outright let throwaway identities shut every new feed
+        // out of Discover for a listing's life; this way junk must be kept
+        // fresher than the feeds whose publishers re-sign theirs hourly.
+        //
+        // Ranked by expiry rather than by the stamp: every listing has one
+        // TTL, aged from its stamp or from when it was stored, whichever is
+        // earlier. By the stamp alone, junk stamped up to the skew tolerance
+        // ahead of the clock outranked every honest listing.
+        if records.len() >= MAX_RECORDS_PER_KEY && record.data.first() == Some(&RECORD_TYPE_FEED_LISTING) {
+            let stalest = records
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| {
+                    r.data.first() == Some(&RECORD_TYPE_FEED_LISTING) && r.expires_at_unix < record.expires_at_unix
+                })
+                .min_by_key(|(_, r)| r.expires_at_unix)
+                .map(|(at, _)| at);
+            if let Some(at) = stalest {
+                let dropped = records.remove(at);
+                let cost = record_cost(dropped.data.len());
+                self.bytes = self.bytes.saturating_sub(cost);
+                // The incoming record keeps its publisher on this key, so a
+                // slot of theirs is not given up for it.
+                let last = dropped.publisher_key != publisher_key
+                    && !records.iter().any(|r| r.publisher_key == dropped.publisher_key);
+                self.publisher_index.discharge(&dropped.publisher_key, cost, last, is_feed_head(&dropped.data));
+                debug!(
+                    "Key {} is full; dropped its stalest listing, signed at {}, for one signed at {created_at}",
+                    hex::encode(key),
+                    dropped.created_at
+                );
+            }
         }
 
         if records.len() >= MAX_RECORDS_PER_KEY {
@@ -1415,11 +1555,12 @@ impl DhtStore {
         }
 
         let cost = record_cost(record.data.len());
+        let feed_head = is_feed_head(&record.data);
         self.bytes += cost;
         records.push(record);
         // `mine` was counted a few lines up, before the push, so zero there
         // means this record is what puts the publisher on this key.
-        self.publisher_index.charge(&publisher_key, cost, mine == 0);
+        self.publisher_index.charge(&publisher_key, cost, mine == 0, feed_head);
         self.enforce_byte_budget(&key);
         true
     }
@@ -1513,31 +1654,31 @@ impl DhtStore {
         let mut freed = 0usize;
         // Collected rather than applied in place: the closure cannot reach the
         // index while `entries` is being retained.
-        let mut released: Vec<([u8; 32], usize, bool)> = Vec::new();
+        let mut released: Vec<([u8; 32], usize, bool, bool)> = Vec::new();
         self.entries.retain(|_, records| {
             let before = records.len();
-            let mut lapsed: Vec<([u8; 32], usize)> = Vec::new();
+            let mut lapsed: Vec<([u8; 32], usize, bool)> = Vec::new();
             records.retain(|r| {
                 let live = r.expires_at_unix > now_unix;
                 if !live {
                     let cost = record_cost(r.data.len());
                     freed += cost;
-                    lapsed.push((r.publisher_key, cost));
+                    lapsed.push((r.publisher_key, cost, is_feed_head(&r.data)));
                 }
                 live
             });
             total_removed += before - records.len();
             let mut gave_up_key: HashSet<[u8; 32]> = HashSet::new();
-            for (author, cost) in lapsed {
+            for (author, cost, feed_head) in lapsed {
                 let last = !records.iter().any(|r| r.publisher_key == author)
                     && gave_up_key.insert(author);
-                released.push((author, cost, last));
+                released.push((author, cost, last, feed_head));
             }
             !records.is_empty()
         });
         self.bytes = self.bytes.saturating_sub(freed);
-        for (author, cost, last) in released {
-            self.publisher_index.discharge(&author, cost, last);
+        for (author, cost, last, feed_head) in released {
+            self.publisher_index.discharge(&author, cost, last, feed_head);
         }
         if total_removed > 0 {
             debug!("Expired {total_removed} DHT records");
@@ -1565,32 +1706,32 @@ impl DhtStore {
         }
         let mut total_removed = 0;
         let mut freed = 0usize;
-        let mut released: Vec<([u8; 32], usize, bool)> = Vec::new();
+        let mut released: Vec<([u8; 32], usize, bool, bool)> = Vec::new();
         self.entries.retain(|_, records| {
             let before = records.len();
-            let mut dropped: Vec<([u8; 32], usize)> = Vec::new();
+            let mut dropped: Vec<([u8; 32], usize, bool)> = Vec::new();
             records.retain(|r| {
                 let ours = &r.publisher_key == publisher_key
                     && file_hashes.contains(&file_hash_from_record_data(&r.data));
                 if ours {
                     let cost = record_cost(r.data.len());
                     freed += cost;
-                    dropped.push((r.publisher_key, cost));
+                    dropped.push((r.publisher_key, cost, is_feed_head(&r.data)));
                 }
                 !ours
             });
             total_removed += before - records.len();
             let mut gave_up_key: HashSet<[u8; 32]> = HashSet::new();
-            for (author, cost) in dropped {
+            for (author, cost, feed_head) in dropped {
                 let last = !records.iter().any(|r| r.publisher_key == author)
                     && gave_up_key.insert(author);
-                released.push((author, cost, last));
+                released.push((author, cost, last, feed_head));
             }
             !records.is_empty()
         });
         self.bytes = self.bytes.saturating_sub(freed);
-        for (author, cost, last) in released {
-            self.publisher_index.discharge(&author, cost, last);
+        for (author, cost, last, feed_head) in released {
+            self.publisher_index.discharge(&author, cost, last, feed_head);
         }
         total_removed
     }
@@ -1837,6 +1978,27 @@ impl DhtStore {
                     continue;
                 }
             }
+            // A feed head and a feed listing get their key check too, for the
+            // same reason.
+            if record.data.first() == Some(&RECORD_TYPE_FEED) {
+                let ok =
+                    super::publish::SignedRecord::parse_unverified(&record.data, record.signature)
+                        .is_some_and(|parsed| parsed.feed_store_ok());
+                if !ok {
+                    continue;
+                }
+            }
+            if record.data.first() == Some(&RECORD_TYPE_FEED_LISTING) {
+                let ok =
+                    super::publish::SignedRecord::parse_unverified(&record.data, record.signature)
+                        .is_some_and(|parsed| parsed.feed_listing_store_ok());
+                if !ok {
+                    continue;
+                }
+            } else if crate::network::ember::feed::is_feed_index_key(&key) {
+                // Only listings under an index shard key, as `accept_record`.
+                continue;
+            }
             if self.store_record(key, record.data, record.signature, None, true) {
                 accepted += 1;
             }
@@ -1942,6 +2104,7 @@ impl DhtStore {
             for r in records {
                 let load = expected.entry(r.publisher_key).or_default();
                 load.bytes += record_cost(r.data.len());
+                load.feed_heads += usize::from(is_feed_head(&r.data));
                 if counted.insert(r.publisher_key) {
                     load.keys += 1;
                 }
@@ -2017,7 +2180,7 @@ impl DhtStore {
 /// records that escape every rule tied to a known type.
 fn storer_replicates(data: &[u8]) -> bool {
     match data.first() {
-        Some(&RECORD_TYPE_KEYWORD) => true,
+        Some(&RECORD_TYPE_KEYWORD | &RECORD_TYPE_FEED | &RECORD_TYPE_FEED_LISTING) => true,
         Some(&RECORD_TYPE_CHANNEL) => channel_kind_from_data(data) != Some(CHANNEL_KIND_PRESENCE),
         _ => false,
     }
@@ -2426,7 +2589,7 @@ mod tests {
     fn the_publisher_shares_widen_while_nothing_filters_by_responsibility() {
         let mut store = DhtStore::new();
         let (_, big) = keypair();
-        store.publisher_index.charge(&big, 0, true);
+        store.publisher_index.charge(&big, 0, true, false);
         store.publisher_index.load.get_mut(&big).unwrap().keys = MAX_KEYS_PER_PUBLISHER;
         store.publisher_index.recount();
         assert!(store.publisher_index.anyone_over_share(), "an eighth is the filtered share");
@@ -2937,6 +3100,283 @@ mod tests {
     /// keyword bare and then locked it, because once every holder had one slot
     /// nobody outranked anybody and the key admitted no one. A full key must
     /// refuse, never displace.
+    /// One identity holds few listings in a feed index shard, but may still
+    /// replace those it holds, as a withdrawal does.
+    #[test]
+    fn a_publisher_holds_few_listings_in_a_feed_index_shard() {
+        use super::super::publish::SignedRecord;
+        use crate::network::ember::feed::{feed_index_shard, FeedHead};
+
+        let mut store = DhtStore::new();
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let publisher = sk.verifying_key().to_bytes();
+        let head = FeedHead {
+            sequence: 1,
+            list_ed2k_hash: [1; 16],
+            list_size: 10,
+            list_blake3: [2; 32],
+            item_count: 1,
+            total_size: 0,
+            title: "T".into(),
+            description: String::new(),
+            deleted: false,
+        };
+        let salts: Vec<[u8; 16]> = (0..=u16::MAX)
+            .map(|n| {
+                let mut salt = [0u8; 16];
+                salt[..2].copy_from_slice(&n.to_le_bytes());
+                salt
+            })
+            .filter(|salt| feed_index_shard(&publisher, salt) == 0)
+            .take(MAX_FEED_LISTINGS_PER_PUBLISHER_PER_KEY + 1)
+            .collect();
+        let now = chrono::Utc::now().timestamp();
+        let listing = |salt: &[u8; 16], withdrawn: bool, at: i64| {
+            SignedRecord::feed_listing_record(salt, &head, withdrawn, &sk, at).unwrap()
+        };
+        for salt in &salts[..MAX_FEED_LISTINGS_PER_PUBLISHER_PER_KEY] {
+            let rec = listing(salt, false, now);
+            assert!(store.store(rec.keyword_hash, rec.data, rec.signature));
+        }
+        let over = listing(&salts[MAX_FEED_LISTINGS_PER_PUBLISHER_PER_KEY], false, now);
+        assert!(!store.store(over.keyword_hash, over.data, over.signature), "past the cap");
+        let withdrawal = listing(&salts[0], true, now + 1);
+        assert!(store.store(withdrawal.keyword_hash, withdrawal.data, withdrawal.signature), "a replacement");
+        assert_eq!(store.get(&withdrawal.keyword_hash).map(|r| r.len()), Some(MAX_FEED_LISTINGS_PER_PUBLISHER_PER_KEY));
+    }
+
+    /// A feed's heads go by their sequence, as followers rank them, and only
+    /// then by their stamp: a stale device's later-signed head, or a newer
+    /// one signed after the clock went back, is ranked by what it says.
+    #[test]
+    fn a_feeds_heads_go_by_sequence_before_stamp() {
+        use super::super::publish::SignedRecord;
+        use crate::network::ember::feed::FeedHead;
+
+        let mut store = DhtStore::new();
+        let sk = SigningKey::from_bytes(&[8u8; 32]);
+        let salt = [4u8; 16];
+        let now = chrono::Utc::now().timestamp();
+        let head = |sequence: u64, at: i64| {
+            let head = FeedHead {
+                sequence,
+                list_ed2k_hash: [1; 16],
+                list_size: 10,
+                list_blake3: [2; 32],
+                item_count: 1,
+                total_size: 0,
+                title: "T".into(),
+                description: String::new(),
+                deleted: false,
+            };
+            SignedRecord::feed_head_record(&salt, &head, &sk, at).unwrap()
+        };
+        let stored = |store: &mut DhtStore, rec: SignedRecord| store.store(rec.keyword_hash, rec.data, rec.signature);
+        assert!(stored(&mut store, head(100, now - 60)));
+        assert!(!stored(&mut store, head(90, now)), "an older head signed later");
+        assert!(stored(&mut store, head(110, now - 120)), "a newer head signed after the clock went back");
+        assert!(stored(&mut store, head(110, now - 30)), "the same head signed again");
+        assert!(!stored(&mut store, head(110, now - 90)), "the same head's older copy");
+        let key = head(110, now).keyword_hash;
+        let held = store.get(&key).unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(SignedRecord::feed_head_sequence_of(&held[0].data), Some(110));
+    }
+
+    /// One identity holds at most so many feed heads across every key, each
+    /// feed's head having a key of its own; a head replacing one it holds is
+    /// always taken, a lapsed one frees its place, and our own are not
+    /// counted.
+    #[test]
+    fn a_publisher_holds_few_feed_heads_across_keys() {
+        use super::super::publish::SignedRecord;
+        use crate::network::ember::feed::FeedHead;
+
+        let mut store = DhtStore::new();
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let head = |sk: &SigningKey, feed: u16, sequence: u64| {
+            let mut salt = [0u8; 16];
+            salt[..2].copy_from_slice(&feed.to_le_bytes());
+            let head = FeedHead {
+                sequence,
+                list_ed2k_hash: [1; 16],
+                list_size: 10,
+                list_blake3: [2; 32],
+                item_count: 1,
+                total_size: 0,
+                title: "T".into(),
+                description: String::new(),
+                deleted: false,
+            };
+            SignedRecord::feed_head_record(&salt, &head, sk, now).unwrap()
+        };
+        let stored = |store: &mut DhtStore, rec: SignedRecord| store.store(rec.keyword_hash, rec.data, rec.signature);
+        let cap = MAX_FEED_HEADS_PER_PUBLISHER as u16;
+        for feed in 0..cap {
+            assert!(stored(&mut store, head(&sk, feed, 1)), "head {feed}");
+        }
+        assert!(!stored(&mut store, head(&sk, cap, 1)), "past the cap");
+        assert_eq!(store.reject_stats().publisher_cap, 1);
+        // A record of another type, filed first under a feed's key with its
+        // head's file hash, is no head for one to replace.
+        let blocked = head(&sk, cap + 2, 1);
+        let mut decoy = SignedRecord::keyword("ubuntu", [0u8; 16], [0u8; 32], 100, "u.iso", &sk).data;
+        decoy[1..17].copy_from_slice(&blocked.keyword_hash);
+        decoy[17..33].copy_from_slice(&blocked.data[17..33]);
+        let decoy_sig = sign(&sk, &decoy);
+        assert!(store.store(blocked.keyword_hash, decoy, decoy_sig));
+        assert!(!stored(&mut store, blocked), "still past the cap");
+        assert_eq!(store.reject_stats().publisher_cap, 2);
+        assert!(stored(&mut store, head(&sk, 0, 2)), "a newer head of a feed it holds");
+        assert!(stored(&mut store, head(&SigningKey::from_bytes(&[10u8; 32]), cap, 1)), "another publisher's");
+        store.assert_publisher_index_consistent();
+
+        let lapsing = head(&sk, 3, 1).keyword_hash;
+        store.lapse_for_test(&lapsing, 0);
+        store.expire();
+        assert!(stored(&mut store, head(&sk, cap, 1)), "room once one has lapsed");
+        store.assert_publisher_index_consistent();
+
+        store.set_local_publisher_key(sk.verifying_key().to_bytes());
+        assert!(stored(&mut store, head(&sk, cap + 1, 1)), "our own are not counted");
+        store.assert_publisher_index_consistent();
+    }
+
+    /// A full index shard drops its stalest listing for a fresher one, so
+    /// junk that fills it must be kept fresher than real feeds, re-signed
+    /// hourly, to keep them out; one staler than all it holds is refused.
+    #[test]
+    fn a_full_feed_index_shard_drops_its_stalest_listing() {
+        use super::super::publish::SignedRecord;
+        use crate::network::ember::feed::{feed_index_key, feed_index_shard, FeedHead};
+
+        let mut store = DhtStore::new();
+        let head = FeedHead {
+            sequence: 1,
+            list_ed2k_hash: [1; 16],
+            list_size: 10,
+            list_blake3: [2; 32],
+            item_count: 1,
+            total_size: 0,
+            title: "T".into(),
+            description: String::new(),
+            deleted: false,
+        };
+        let now = chrono::Utc::now().timestamp();
+        let shard_salts = |publisher: &[u8; 32], n: usize| -> Vec<[u8; 16]> {
+            (0..=u16::MAX)
+                .map(|i| {
+                    let mut salt = [0u8; 16];
+                    salt[..2].copy_from_slice(&i.to_le_bytes());
+                    salt
+                })
+                .filter(|salt| feed_index_shard(publisher, salt) == 0)
+                .take(n)
+                .collect()
+        };
+        let fill = |store: &mut DhtStore, at: &dyn Fn(usize) -> i64| {
+            let mut stored = 0usize;
+            let mut identity = 0u16;
+            while stored < MAX_RECORDS_PER_KEY {
+                identity += 1;
+                let mut seed = [0x30u8; 32];
+                seed[..2].copy_from_slice(&identity.to_le_bytes());
+                let sk = SigningKey::from_bytes(&seed);
+                let take = MAX_FEED_LISTINGS_PER_PUBLISHER_PER_KEY.min(MAX_RECORDS_PER_KEY - stored);
+                for salt in shard_salts(&sk.verifying_key().to_bytes(), take) {
+                    let rec = SignedRecord::feed_listing_record(&salt, &head, false, &sk, at(stored)).unwrap();
+                    assert!(store.store(rec.keyword_hash, rec.data, rec.signature), "filling the shard");
+                    stored += 1;
+                }
+            }
+        };
+        // The first stored is the stalest.
+        fill(&mut store, &|stored| now - 3600 + stored as i64);
+        let key = feed_index_key(0);
+        assert_eq!(store.get(&key).map(|r| r.len()), Some(MAX_RECORDS_PER_KEY));
+
+        let newcomer = SigningKey::from_bytes(&[0xEE; 32]);
+        let salt = shard_salts(&newcomer.verifying_key().to_bytes(), 1)[0];
+        let staler = SignedRecord::feed_listing_record(&salt, &head, false, &newcomer, now - 7200).unwrap();
+        assert!(!store.store(staler.keyword_hash, staler.data, staler.signature), "staler than every listing held");
+        let fresh = SignedRecord::feed_listing_record(&salt, &head, false, &newcomer, now).unwrap();
+        assert!(store.store(fresh.keyword_hash, fresh.data, fresh.signature), "a fresher listing makes room");
+        let held = store.get(&key).unwrap();
+        assert_eq!(held.len(), MAX_RECORDS_PER_KEY);
+        assert!(held.iter().any(|r| r.publisher_key == newcomer.verifying_key().to_bytes()));
+        assert!(!held.iter().any(|r| r.created_at == now - 3600), "the stalest listing went");
+
+        // Junk stamped ahead of the clock, as far as the skew tolerance
+        // allows, ranks from when it was stored: a listing signed since
+        // still makes room.
+        let mut ahead = DhtStore::new();
+        fill(&mut ahead, &|_| now + 1800);
+        for resident in ahead.entries.get_mut(&key).unwrap() {
+            // Stored a minute ago.
+            resident.expires_at_unix -= 60;
+        }
+        let since = SignedRecord::feed_listing_record(&salt, &head, false, &newcomer, now - 30).unwrap();
+        assert!(ahead.store(since.keyword_hash, since.data, since.signature), "signed after the junk was stored");
+        assert_eq!(ahead.get(&key).map(|r| r.len()), Some(MAX_RECORDS_PER_KEY));
+    }
+
+    /// A feed index shard key holds listings only, restored or not: anything
+    /// else there takes a slot the full shard's eviction never gives back.
+    #[test]
+    fn a_feed_index_key_restores_only_listings() {
+        use super::super::publish::SignedRecord;
+        use crate::network::ember::feed::{feed_index_key, feed_index_shard, FeedHead};
+
+        let sk = SigningKey::from_bytes(&[0x52u8; 32]);
+        let key = feed_index_key(0);
+        let word = SignedRecord::keyword("ubuntu", [0x33; 16], [0u8; 32], 100, "u.iso", &sk);
+        let mut misfiled = word.data.clone();
+        misfiled[1..17].copy_from_slice(&key);
+        let misfiled_sig = sign(&sk, &misfiled);
+        let salt = (0..=u16::MAX)
+            .map(|i| {
+                let mut salt = [0u8; 16];
+                salt[..2].copy_from_slice(&i.to_le_bytes());
+                salt
+            })
+            .find(|salt| feed_index_shard(&sk.verifying_key().to_bytes(), salt) == 0)
+            .unwrap();
+        let head = FeedHead {
+            sequence: 1,
+            list_ed2k_hash: [1; 16],
+            list_size: 10,
+            list_blake3: [2; 32],
+            item_count: 1,
+            total_size: 0,
+            title: "T".into(),
+            description: String::new(),
+            deleted: false,
+        };
+        let listing = SignedRecord::feed_listing_record(&salt, &head, false, &sk, now_ts()).unwrap();
+        let saved = [(misfiled, misfiled_sig), (listing.data, listing.signature)]
+            .into_iter()
+            .map(|(data, signature)| PersistedRecord {
+                key,
+                data,
+                signature,
+                publisher_key: sk.verifying_key().to_bytes(),
+                created_at: now_ts(),
+                attributed_ip: None,
+            })
+            .collect();
+        let mut restored = DhtStore::new();
+        assert_eq!(restored.restore(saved), 1, "the listing alone");
+        assert_eq!(restored.get(&key).unwrap()[0].data.first(), Some(&RECORD_TYPE_FEED_LISTING));
+    }
+
+    #[test]
+    fn a_listing_lives_a_week_and_a_head_a_month() {
+        assert_eq!(record_ttl(&[RECORD_TYPE_FEED_LISTING]), FEED_LISTING_TTL);
+        assert_eq!(FEED_LISTING_TTL.as_secs(), 7 * 24 * 3600);
+        assert_eq!(record_ttl(&[RECORD_TYPE_FEED]), CHANNEL_GOVERNANCE_TTL);
+    }
+
     #[test]
     fn a_full_keyword_never_evicts_an_incumbent() {
         use super::super::publish::SignedRecord;
@@ -3897,6 +4337,18 @@ mod tests {
         let owned = SignedRecord::owned_rooms(&[[3u8; 16]], &ed25519_dalek::SigningKey::from_bytes(&[0x43; 32]))
             .expect("one salt fits");
         assert_eq!(record_ttl(&owned.data), CHANNEL_GOVERNANCE_TTL);
+        // Lives as long as the snapshot it sits beside.
+        let settings = SignedRecord::channel_settings_at(
+            &[(2, [0x5C; 32]), (1, [0x5B; 32])],
+            1,
+            ident.channel_id,
+            ident.pubkey,
+            true,
+            &ident.signing_key,
+            chrono::Utc::now().timestamp(),
+        )
+        .expect("two commitments fit");
+        assert_eq!(record_ttl(&settings.data), CHANNEL_GOVERNANCE_TTL);
 
         let presence = SignedRecord::channel_presence(
             "Ana",
@@ -3915,6 +4367,47 @@ mod tests {
         let mut weeks_old = moderation.data.clone();
         weeks_old[105..113].copy_from_slice(&(now - 21 * 86_400).to_le_bytes());
         assert!(record_is_current(&weeks_old, now));
+    }
+
+    /// The startup load holds a settings record to the storer rule the wire
+    /// does: kept where the room key filed it, dropped from any other slot.
+    #[test]
+    fn a_settings_record_comes_back_from_disk_only_in_its_own_slot() {
+        use super::super::publish::SignedRecord;
+        use crate::network::ember::channel::{moderation_key, ChannelIdentity};
+
+        let ident = ChannelIdentity::generate();
+        let record = SignedRecord::channel_settings_at(
+            &[(1, [0x71; 32])],
+            1,
+            ident.channel_id,
+            ident.pubkey,
+            true,
+            &ident.signing_key,
+            now_ts(),
+        )
+        .expect("one commitment fits");
+        let persisted = |data: Vec<u8>, signature: [u8; 64]| PersistedRecord {
+            key: [0u8; 16],
+            data,
+            signature,
+            publisher_key: record.publisher_key,
+            created_at: record.timestamp,
+            attributed_ip: None,
+        };
+        let mut restored = DhtStore::new();
+        restored.set_local_id(EmberNodeId([0u8; 16]));
+        assert_eq!(restored.restore(vec![persisted(record.data.clone(), record.signature)]), 1);
+        assert_eq!(restored.get_live(&record.keyword_hash).len(), 1);
+
+        // Re-signed into the snapshot's slot, where it would replace the room's
+        // governance: refused, though the room key really did sign it.
+        let mut misfiled = record.data.clone();
+        misfiled[1..17].copy_from_slice(&moderation_key(&ident.channel_id));
+        let signature = sign(&ident.signing_key, &misfiled);
+        let mut moved = DhtStore::new();
+        moved.set_local_id(EmberNodeId([0u8; 16]));
+        assert_eq!(moved.restore(vec![persisted(misfiled, signature)]), 0);
     }
 
     /// A member who missed the move has only these two records to find the

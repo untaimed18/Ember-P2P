@@ -230,10 +230,11 @@
       style:bottom="{placement.bottom}px"
       style:right="{placement.right}px"
       role="dialog"
-      aria-label={m.statusbar_limits_title()}
+      aria-modal="false"
+      aria-labelledby="limits-title"
     >
       <div class="limits-header">
-        <span class="limits-title">{m.statusbar_limits_title()}</span>
+        <span id="limits-title" class="limits-title">{m.statusbar_limits_title()}</span>
       </div>
 
       <div class="limits-alt">

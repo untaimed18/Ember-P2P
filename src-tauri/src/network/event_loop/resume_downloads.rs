@@ -19,6 +19,18 @@ pub(in crate::network) struct RestoredPart {
 /// files the database never recorded.
 const UNRECORDED_FINISH_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Restore `transfer`, whose part files were removed, as Stopped with nothing
+/// downloaded: its progress went with them.
+fn mark_part_files_removed(transfer: &mut Transfer) {
+    let code = ed2k::transfer::TransferFailureCode::PartFilesRemoved;
+    transfer.status = TransferStatus::Stopped;
+    transfer.completed_size = 0;
+    transfer.transferred = 0;
+    transfer.progress = 0.0;
+    transfer.failure_code = Some(code.as_code().to_string());
+    transfer.failure_reason = Some(code.message().to_string());
+}
+
 /// What the blocking pool learned about the restored downloads.
 #[derive(Default)]
 pub(in crate::network) struct RestoredParts {
@@ -83,25 +95,34 @@ impl RootListing {
         LISTED_ROOTS.lock().push(root.to_path_buf());
         Self {
             parts: crate::storage::part_folders::part_names(root),
-            // Category folders too: a completion copy is made beside where the
-            // file is published.
+            // Category and feed folders too: a completion copy is made beside
+            // where the file is published. Feed folders always: they are
+            // small, and a drive without hard links (FAT, exFAT) makes a copy
+            // of every completion, on one volume too.
             copies: if copies {
                 crate::storage::category_folders::finished_download_dirs(root)
-                    .iter()
-                    .flat_map(|dir| ed2k::transfer::earlier_completion_copies(dir))
+                    .into_iter()
+                    .chain(crate::sharing::feed_downloads::finished_dirs(root))
+                    .flat_map(|dir| ed2k::transfer::earlier_completion_copies(&dir))
                     .collect()
             } else {
-                Vec::new()
+                crate::sharing::feed_downloads::finished_dirs(root)
+                    .into_iter()
+                    .flat_map(|dir| ed2k::transfer::earlier_completion_copies(&dir))
+                    .collect()
             },
         }
     }
 
-    /// [`Self::read`] for the current folder, whose part files are never
-    /// unknown: when its `Temp` cannot be listed, each download's are looked
-    /// up by name, as they were before there were earlier folders.
+    /// [`Self::read`] for the current folder: when its `Temp` cannot be listed,
+    /// each download's part files are looked up by name, as they were before
+    /// there were earlier folders. Not when the folder cannot be reached at
+    /// all — an unplugged drive — where every name is missing and that would
+    /// read as their having been removed; it stays unknown, like an earlier
+    /// folder that does not answer.
     fn read_current(root: &Path, jobs: &[RestoreJob], copies: bool) -> Self {
         let mut listing = Self::read(root, copies);
-        if listing.parts.is_none() {
+        if listing.parts.is_none() && crate::storage::part_folders::folder_reachable(root) {
             let temp = root.join("Temp");
             listing.parts = Some(
                 jobs.iter()
@@ -218,6 +239,13 @@ fn restore_from_listings(
                     if !answered {
                         restored.unanswered.insert(job.id.clone());
                     }
+                } else if listings
+                    .first()
+                    .is_some_and(|current| current.as_ref().is_none_or(|l| l.parts.is_none()))
+                {
+                    // No record of where it is, so it is taken to be in the
+                    // current folder, and that one did not answer.
+                    restored.unanswered.insert(job.id.clone());
                 }
             }
         }
@@ -453,6 +481,62 @@ fn recover_restored_copies(
     })
 }
 
+/// The publisher of each followed feed, by the folder in `Feeds` its files
+/// finish in: who a feed's restored download is held for again. Read only
+/// when one of `incomplete` is a feed's.
+async fn feed_publishers(
+    db: &Arc<Database>,
+    incomplete: &[Transfer],
+) -> HashMap<String, crate::network::feed_direct::Publisher> {
+    if !incomplete
+        .iter()
+        .any(|t| crate::sharing::feed_downloads::folder_of(&t.id).is_some())
+    {
+        return HashMap::new();
+    }
+    let db = db.clone();
+    let feeds = match tokio::task::spawn_blocking(move || db.feeds_followed()).await {
+        Ok(Ok(feeds)) => feeds,
+        Ok(Err(e)) => {
+            warn!("Could not read followed feeds for their restored downloads: {e}");
+            return HashMap::new();
+        }
+        Err(e) => {
+            warn!("Followed feeds read for their restored downloads failed: {e}");
+            return HashMap::new();
+        }
+    };
+    feeds
+        .into_iter()
+        .filter(|feed| !feed.folder.is_empty())
+        .filter_map(|feed| {
+            let (mut key, mut salt) = ([0u8; 32], [0u8; 16]);
+            hex::decode_to_slice(&feed.publisher, &mut key).ok()?;
+            hex::decode_to_slice(&feed.salt, &mut salt).ok()?;
+            Some((
+                feed.folder,
+                crate::network::feed_direct::Publisher { key, salt, friend_tcp: None },
+            ))
+        })
+        .collect()
+}
+
+/// Pin the Ember digest persisted on a restored download's row. The pin a
+/// start seeded lives only in memory, and the digest on the row is the one
+/// that start was given, so it gets the same standing again: below a digest
+/// hashed here, above a plurality. Without it a feed's download resumed with
+/// no BLAKE3 for its publisher's chunk list to come to.
+fn seed_restored_pin(pins: &mut HashMap<[u8; 16], EmberDigestPin>, transfer: &Transfer) {
+    if let Some(ed2k) = parse_ed2k_hash16(&transfer.file_hash) {
+        seed_ember_content_hash(
+            pins,
+            ed2k,
+            parse_ember_file_hash(transfer.ember_file_hash.as_deref().unwrap_or_default()),
+            EmberDigestProvenance::UserSelected,
+        );
+    }
+}
+
 /// Put a restored download into `active` for its re-verification, which runs
 /// whatever the concurrent-download cap: a check that finishes it is only
 /// local work. With `rejoin`, a check that does not finish it hands the row a
@@ -557,10 +641,12 @@ pub(in crate::network) async fn resume_incomplete_downloads(
             let index = local_index.read().await;
             collect_friends_only_hashes(&index, known_files)
         };
+        let feed_publishers = feed_publishers(db, &incomplete).await;
         for mut transfer in incomplete {
             // Before any branch below can finish it: several insert straight
             // into the transfer list rather than through `enqueue`.
             crate::storage::category_folders::note_category(&transfer.id, &transfer.category);
+            seed_restored_pin(&mut state.ember_content_hashes, &transfer);
             // Failed downloads are restored to keep their Temp `.part` owned
             // (orphan sweep) and resumable by hand. Do not auto-start them.
             if transfer.status == TransferStatus::Failed {
@@ -717,39 +803,57 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 let downloads = PathBuf::from(&dl_folder).join("Downloads");
                 // Its category's folder first, where completion put it, then
                 // Downloads itself, where it went before it had one or when
-                // that folder could not be made.
-                let subdir = crate::storage::category_folders::completion_subdir(&transfer.id);
-                let category_dir = (!subdir.is_empty())
-                    .then(|| subdir.iter().fold(downloads.clone(), |dir, s| dir.join(s)));
+                // that folder could not be made. A feed's download looks in
+                // its feed folder, then `Feeds`, and never in Downloads.
+                let feed_folder = crate::sharing::feed_downloads::folder_of(&transfer.id);
+                let (category_dir, downloads) = match &feed_folder {
+                    Some(folder) => {
+                        let feeds = crate::sharing::feed_downloads::feeds_dir(std::path::Path::new(&dl_folder));
+                        (Some(feeds.join(folder)), feeds)
+                    }
+                    None => {
+                        let subdir = crate::storage::category_folders::completion_subdir(&transfer.id);
+                        let category_dir = (!subdir.is_empty())
+                            .then(|| subdir.iter().fold(downloads.clone(), |dir, s| dir.join(s)));
+                        (category_dir, downloads)
+                    }
+                };
                 let name = safe_name.clone();
                 let part_check = part_path.clone();
                 // Past the budget nothing more is started: each look could
                 // hang on the same dead share and hold a blocking thread.
+                // `None` from the look: its `.part` is there after all.
                 let listing = (tokio::time::Instant::now() < probe_deadline).then(|| {
                     tokio::task::spawn_blocking(move || {
                         if part_check.exists() {
-                            return Vec::new();
+                            return None;
                         }
-                        category_dir
-                            .iter()
-                            .chain(std::iter::once(&downloads))
-                            .flat_map(|dir| ed2k::transfer::published_names(dir, &name))
-                            .filter(|path| path.exists())
-                            .collect::<Vec<_>>()
+                        Some(
+                            category_dir
+                                .iter()
+                                .chain(std::iter::once(&downloads))
+                                .flat_map(|dir| ed2k::transfer::published_names(dir, &name))
+                                .filter(|path| path.exists())
+                                .collect::<Vec<_>>(),
+                        )
                     })
                 });
                 let looked = match listing {
                     Some(listing) => tokio::time::timeout_at(probe_deadline, listing).await.ok(),
                     None => None,
                 };
-                let published: Vec<PathBuf> = match looked {
-                    Some(Ok(found)) => found,
+                // Whether Downloads was actually searched with no `.part`
+                // left: only then is "no finished file" an answer, rather than
+                // a look that ran out of time or found the `.part` after all.
+                let (published, searched_without_part): (Vec<PathBuf>, bool) = match looked {
+                    Some(Ok(Some(found))) => (found, true),
+                    Some(Ok(None)) => (Vec::new(), false),
                     _ => {
                         warn!(
                             "Could not look for {} in {dl_folder}/Downloads in time; resuming it as it was",
                             transfer.id
                         );
-                        Vec::new()
+                        (Vec::new(), false)
                     }
                 };
 
@@ -936,10 +1040,37 @@ pub(in crate::network) async fn resume_incomplete_downloads(
                 if interrupted_finish {
                     transfer.status = TransferStatus::Searching;
                 }
+                // Its part files are gone from a folder that answered, and no
+                // finished file of it is there: they were removed, most likely
+                // on purpose, as removing them is how eMule drops a download.
+                // Started over, it would download everything again unasked; it
+                // waits Stopped instead, and Resume starts it over. Not on a
+                // look that never finished: its progress is wiped here and saved,
+                // so a later start could no longer find the finish it missed.
+                if unrecorded_finish && searched_without_part {
+                    info!(
+                        "Restored download {} has no part files left; keeping it Stopped",
+                        transfer.id
+                    );
+                    mark_part_files_removed(&mut transfer);
+                    control.pause();
+                }
             }
 
             TransferManager::normalize_restored_incomplete_download(&mut transfer);
             restore_db_writes.push(transfer.clone());
+
+            // A feed's download is held for its publisher again, as when it
+            // was started, before anything asks the other networks for it.
+            let publisher = crate::sharing::feed_downloads::folder_of(&transfer.id)
+                .and_then(|folder| feed_publishers.get(&folder).copied());
+            let mut file_hash = [0u8; 16];
+            if let Some(publisher) = publisher.filter(|_| {
+                transfer.status != TransferStatus::Insufficient
+                    && hex::decode_to_slice(&transfer.file_hash, &mut file_hash).is_ok()
+            }) {
+                crate::network::feed_direct::begin(&transfer.id, file_hash, transfer.total_size, publisher);
+            }
 
             let active_now = {
                 let mut mgr = transfer_manager.write().await;
@@ -1169,6 +1300,30 @@ mod tests {
         std::fs::create_dir_all(external.join("Temp")).unwrap();
         std::fs::write(external.join("Temp").join(format!("{paused}.part")), b"progress").unwrap();
         assert_eq!(folders.folder_to_resume_in(&paused), Ok(external));
+    }
+
+    /// The current download folder on a drive that is not plugged in: its
+    /// downloads are held as unanswered, with or without a record of where
+    /// they were, and none reads as its part files having been removed — that
+    /// zeroes the row and asks the user to cancel it, deleting the real parts
+    /// once the drive is back.
+    #[test]
+    fn an_unplugged_current_folder_holds_its_downloads_rather_than_reading_them_as_removed() {
+        let scratch = Scratch::new("unplugged-current");
+        let volume = scratch.0.join("unplugged");
+        let current = volume.join("ember");
+        let folders = scratch.folders(&current, &[]);
+        let (unrecorded, recorded) = (uuid(), uuid());
+        simulate_unplugged(&volume, true);
+        let restored = read_restored_parts(
+            &folders,
+            vec![job(&unrecorded), job(&recorded)],
+            &HashMap::from([(recorded.clone(), current.to_string_lossy().into_owned())]),
+            BUDGET,
+        );
+        assert!(restored.unanswered.contains(&unrecorded), "no record: taken to be in the current folder");
+        assert!(restored.unanswered.contains(&recorded), "on record in the current folder");
+        assert!(restored.found.is_empty());
     }
 
     /// A drive that has not answered within the budget is unknown, exactly
@@ -1528,6 +1683,51 @@ mod tests {
             Err("Restored final file hash mismatch".to_string()),
             "an unrelated file of the same name is not this download"
         );
+
+        // Completion saved it under the `[Ember-P2P]` tag.
+        std::fs::write(downloads.join("[Ember-P2P] movie.bin"), &finished).unwrap();
+        let candidates = ed2k::transfer::published_names(&downloads, "movie.bin");
+        assert_eq!(
+            find_published_file(&candidates, &root, 100, &hash, None, None),
+            Ok(downloads.join("[Ember-P2P] movie.bin"))
+        );
+    }
+
+    /// A restored download is pinned to the digest on its row, as the start
+    /// that wrote it was, without displacing a digest hashed here.
+    #[test]
+    fn a_restored_download_is_pinned_to_the_digest_on_its_row() {
+        let restored = |ember: Option<&str>| -> Transfer {
+            serde_json::from_value(serde_json::json!({
+                "id": "restored",
+                "file_name": "movie.bin",
+                "file_hash": "11".repeat(16),
+                "peer_id": "",
+                "peer_name": "",
+                "direction": "download",
+                "status": "searching",
+                "progress": 0.0,
+                "speed": 0,
+                "total_size": 100,
+                "transferred": 0,
+                "started_at": 0,
+                "ember_file_hash": ember,
+            }))
+            .unwrap()
+        };
+        let file = [0x11u8; 16];
+        let mut pins = HashMap::new();
+        seed_restored_pin(&mut pins, &restored(None));
+        assert!(pins.is_empty(), "no digest on the row: nothing to pin");
+
+        seed_ember_content_hash(&mut pins, file, [0xBB; 32], EmberDigestProvenance::Corroborated(3));
+        seed_restored_pin(&mut pins, &restored(Some(&"aa".repeat(32))));
+        assert_eq!(pins[&file].digest, [0xAA; 32], "the row's digest outranks a plurality");
+        assert_eq!(pins[&file].provenance, EmberDigestProvenance::UserSelected);
+
+        seed_ember_content_hash(&mut pins, file, [0xDD; 32], EmberDigestProvenance::Local);
+        seed_restored_pin(&mut pins, &restored(Some(&"aa".repeat(32))));
+        assert_eq!(pins[&file].digest, [0xDD; 32], "but not a digest hashed here");
     }
 
     #[tokio::test]

@@ -10,7 +10,7 @@
   <meta property="og:type" content="website">
   <meta property="og:title" content="Ember — Free, open-source P2P file sharing">
   <meta property="og:description" content="Ember is a free, open-source P2P file sharing client for the eMule network, with its own encrypted, server-less Ember Network. No ads, no spyware.">
-  <meta property="og:image" content="https://untaimed18.github.io/Ember-P2P/icon.png">
+  <meta property="og:image" content="https://www.emberp2p.org/icon.png">
   <meta name="twitter:card" content="summary">
   <link rel="icon" type="image/png" href="favicon.png">
   <link rel="stylesheet" href="site.css">
@@ -125,7 +125,7 @@
   <section class="download-band" id="download">
     <div class="container">
       <img src="icon.png" alt="" width="72" height="72">
-      <h2>Download Ember 1.7.4</h2>
+      <h2>Download Ember 1.7.5</h2>
       <p>Free for Windows 10 and 11, and for x86-64 Linux as a <code>.deb</code> or an AppImage. Every release is signed, and Ember updates itself.</p>
       <div class="btn-group">
         <a href="https://github.com/untaimed18/Ember-P2P/releases/latest" class="btn btn-light" target="_blank" rel="noopener"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Download from GitHub</a>
@@ -142,6 +142,117 @@
           <h2>Release notes</h2>
           <p>Every Ember release, newest first. These are the same notes published on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
         </div>
+
+        <article class="release" id="release-1-7-5">
+              <div class="release-header">
+                <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.7.5" target="_blank" rel="noopener">Ember v1.7.5</a></h3>
+                <time class="release-date" datetime="2026-10-26">October 26, 2026</time>
+              </div>
+              <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.7.5" target="_blank" rel="noopener"><code>v1.7.5</code></a></p>
+              <div class="release-notes">
+                <p>Follow the people whose files you trust: a feed is a list of files someone keeps up to date under their Ember identity, and following one shows what they add and can download it for you, by its link or from the feeds their publishers list in Discover. Room members can now write to each other privately without becoming friends, a connection doctor under Settings &gt; Network says in plain words why other people cannot reach you and fixes what it can, and friends show whether they are Online, Away or Busy. The Library can tag files <code>[Ember-P2P]</code>, files sent in friend chat wait up to a day for an answer, and 1.7.5 freezes the Channels formats ahead of the end of the beta.</p>
+
+                <h4>Before you upgrade</h4>
+
+                <ul>
+                  <li><strong>The Ember DHT wire version is unchanged at version 4,</strong> so 1.7.5 sees every release back to 1.6 on the overlay. Feed heads and Discover listings are new record types (<code>0x04</code> and <code>0x05</code>), which older builds keep for 24 hours without passing on, so feeds are found more reliably as more people update</li>
+                  <li><strong>The Channels formats are frozen in 1.7.5.</strong> Rooms keep working with 1.7.4: chat goes out in both the new and the old form until 1.8.0, and a 1.7.4 member sees each of a 1.7.5 author&rsquo;s lines once. Private rooms also keep publishing the old membership records 1.7.4 reads until 1.8.0</li>
+                  <li><strong>If you go back to 1.7.4,</strong> it still shows every line, but lines with emoji that use joiners (families, flags, skin tones) and lines edited on 1.7.5 cannot be passed on from it to members catching up</li>
+                  <li><strong>Private messages need 1.7.5 at both ends.</strong> A 1.7.4 member passes them on through the room but shows nothing</li>
+                  <li><strong>Friend status needs 1.7.5 on both ends,</strong> and showing you as Away on its own when you are idle works on Windows only</li>
+                  <li><strong>eMule users and eD2K servers now see your nickname followed by <code>[https://emberp2p.org]</code>,</strong> as eMule&rsquo;s own default name carries its site. It is on by default, existing settings included; turn it off under Settings &gt; General. Friends and other Ember users always see your name alone</li>
+                  <li><strong>Files sent in friend chat between two 1.7.5 machines wait up to a day</strong> for an answer. With 1.7.4 at either end they still lapse after five minutes</li>
+                  <li><strong>Auto upload slots now survive a downgrade.</strong> Older versions read Auto as four slots, so there is no longer any need to set Max uploads to a number before going back to 1.7.1</li>
+                  <li><strong>With Ember on, <kbd>Alt</kbd>+<kbd>9</kbd> now opens Feeds and <kbd>Alt</kbd>+<kbd>0</kbd> Statistics,</strong> and Security no longer has an <kbd>Alt</kbd> shortcut. With Ember off the shortcuts are as before, and Settings always opens with <kbd>Ctrl</kbd>+<kbd>,</kbd></li>
+                  <li><strong>Settings this build does not know are now kept when it saves,</strong> so a later release&rsquo;s settings survive a trip back to 1.7.5. 1.7.4 does not do this: once it has saved, settings new in 1.7.5 go back to their defaults, so a private message policy of Off returns to Ask first and the website tag switch turns back on</li>
+                </ul>
+
+                <h4>What&rsquo;s New</h4>
+
+                <h5>Feeds</h5>
+                <ul>
+                  <li><strong>Follow a feed</strong> by pasting its <code>ember-feed:</code> link on the new Feeds page. Ember looks it up about every 30 minutes and marks the files the publisher added and the ones they removed, and Mark all as read clears the marks. A friend who publishes a feed sends you each new version at once</li>
+                  <li><strong>A followed feed says what it is doing:</strong> waiting for the feed or for its file list, from how many sources, or resting after a fetch gave up, with Retry. Check now says what it found, a feed not found for two days says when it last was, and one its publisher deleted says so and keeps what you downloaded</li>
+                  <li><strong>Discover</strong> lists the feeds their publishers chose to make public, online or not, found on the Ember network itself with no server keeping the list, each with its total size. Follow one with a click, sort by activity, last update, number of files or name, filter to publishers active in the last few hours, see everything from one publisher, and hide a feed or a publisher you do not want to see, with Undo</li>
+                  <li><strong>Files from feeds are kept private.</strong> They download into their feed&rsquo;s own folder under <code>Feeds</code> in your Ember download folder, beside <code>Downloads</code>, and are never shared: not while downloading, not once finished, and not in the Library. Open a feed&rsquo;s folder from its header, or the whole <code>Feeds</code> folder with <strong>Feed Files</strong> at the top of the Library, beside Chat Files and Channel Files. Files that can run code are marked, and Ember asks before downloading them by hand</li>
+                  <li><strong>Feed downloads stay on the Feeds page.</strong> Each file shows its download there instead of on the Transfers page: progress, speed, time left and sources, with pause, resume and cancel, why one failed, with Retry or Discard, and Open and Show in folder once a file is done. They share your speed limits and download slots, and still notify you when they finish or fail. A file another feed you follow already has is not downloaded twice, and unfollowing a feed cancels its unfinished downloads and keeps the finished files</li>
+                  <li><strong>Files come straight from the feed&rsquo;s publisher first,</strong> sent the way a file in friend chat is, friend or not: over QUIC to the publisher Ember found on the Ember network, checking it really is them, or their TCP port when QUIC does not answer, with each piece checked as it arrives. The publisher sends ahead of their eMule upload queue, a few followers at a time. If the publisher is offline, unreachable or busy, or sends nothing for 45 seconds, every network is asked for other sources. Files over 8&nbsp;GiB are downloaded the ordinary way</li>
+                  <li><strong>Automatic downloads, per feed,</strong> off until you turn them on, and then only for files the publisher adds from that moment. Each feed has a cap per file and per rolling 24 hours. New follows start at 1 GiB per file and 4 GiB per 24 hours; 0 means no limit. Programs, scripts and other risky file types are never downloaded automatically, and nothing is started that would leave less than 64 MiB free, counting downloads already queued on the same drive. A file held back says why, and starts by itself once there is room</li>
+                  <li><strong>Publish your own feeds</strong> from files you share with everyone, chosen in an Add files dialog, each with an optional note. The button says whether there is anything to publish (Publish, Publish changes or Up to date), a publish only succeeds once the feed is stored on the Ember network, and Ember republishes it every hour while it runs. The list is served without ever appearing in your Library, a friend&rsquo;s browse, KAD or the eD2K servers. Anyone with a feed&rsquo;s link can see its files and that you publish it. Choose <em>Link only</em> (the default) or <em>Listed in Discover</em> when you create it, and change it any time with the <em>List in Discover</em> switch. A link-only feed&rsquo;s title, description and files are encrypted on the Ember network with a key only its link holds, so the nodes that store it learn only that you publish a feed and when you last changed it</li>
+                  <li><strong>See who follows:</strong> a published feed shows how many followers it has, and each of its files how many followers downloaded it from you</li>
+                </ul>
+
+                <h5>Rooms</h5>
+                <ul>
+                  <li><strong>Private messages between room members,</strong> carried through a room you share and encrypted to the recipient. Choose Message privately from a member&rsquo;s menu. A first message arrives as a request with Accept, Decline and Ignore everywhere under Ask first, the default; Settings &gt; Channels also offers Allow from anyone and Off. Messages show Delivered once they arrive, and one unanswered for 20 minutes shows Not delivered with Try again. Conversations open in the chat dock, in the popped-out chat window too, and the dock&rsquo;s switcher lists the ones without a tab</li>
+                  <li><strong>Your rooms is split into Your public rooms and Your private rooms,</strong> each led by its favourites, in the order the arrow keys walk</li>
+                  <li><strong>Members can show their language as a flag</strong> beside their name, chosen under Settings &gt; Channels, and a room keeps its language flag in the list after you leave it</li>
+                  <li><strong>A way back into a private room:</strong> a member who fell too far behind its key gets back in from a fresh invite, checked against the owner&rsquo;s record, without leaving the room</li>
+                  <li><strong>Editing a message</strong> opens a full-width editor that shows the time left to edit and a byte counter near the limit</li>
+                  <li><strong>A room you own that was deleted on another device,</strong> or after the backup you restored, is offered for removal here too, with Keep it here and Remove it here</li>
+                  <li><strong>Discover folds spam on better signals:</strong> a room a friend is in is never folded, and a listing seen for two weeks counts in its favour</li>
+                  <li><strong>Channels moves:</strong> joins settle into Your rooms, a welcome card greets you, and unread badges, online dots, mentions and edited lines catch the eye, all respecting reduced motion</li>
+                </ul>
+
+                <h5>Friends</h5>
+                <ul>
+                  <li><strong>Friend status:</strong> Online, Away or Busy, set on the Friends page and shown on friend cards, in the chat dock and in a friend&rsquo;s settings. Ember can show you as Away after 5 to 60 minutes without keyboard or mouse input (Settings &gt; Friends, Windows only)</li>
+                  <li><strong>A friend&rsquo;s own name and your label for them are kept apart.</strong> Their renames reach their card, a label you give is shown with the name they chose beside it, and friend cards are bigger</li>
+                  <li><strong>Files sent in friend chat wait for an answer</strong> for up to a day instead of five minutes. A quick restart, a briefly unplugged drive or an unreachable share no longer loses one</li>
+                </ul>
+
+                <h5>Connection doctor</h5>
+                <ul>
+                  <li><strong>Settings &gt; Network checks your connection</strong> and gives a plain verdict (Fully reachable, Reachable through Ember&rsquo;s relays, Limited, Still checking or Offline), what Ember already does about it and at most three fixes. It reads your ports, Windows Firewall, UPnP, the router&rsquo;s address (to spot shared provider addresses), Kad, the eD2K server ID, NAT type, the Ember network and your clock, and asks the Rendezvous server to test your ports from outside. It judges the ports and UPnP setting Ember is running with, and says when a saved change needs a restart</li>
+                  <li><strong>Some fixes it does for you:</strong> try UPnP again, or add the Windows Firewall rules with one Windows prompt</li>
+                  <li><strong>The status bar links to it</strong> while you have a LowID or are firewalled on Kad, and offers it once after ten minutes in that state</li>
+                </ul>
+
+                <h5>Library and transfers</h5>
+                <ul>
+                  <li><strong>Tag files <code>[Ember-P2P]</code></strong> from the Library, on a selection or from a file&rsquo;s menu, with Undo. Settings &gt; Transfers can also tag completed downloads, and new media, archive, disc image and document files in shared folders. Only files that arrive after you turn that on are renamed, never programs, hidden files or anything in a hidden or git folder, and a file with companions of the same name (subtitles, a cue sheet, the other parts of a split archive, a DVD or Blu-ray folder) is left alone</li>
+                  <li><strong>The Library sorts by all-time totals</strong> for Requests, Accepted and Transferred, and one Re-approve folders approves every shared folder after a restore, with a Library that says why it is empty until then</li>
+                  <li><strong>Upload bars show what has been sent of each part,</strong> not only parts sent whole, and the tooltip says how much of the file has gone out</li>
+                  <li><strong>Download categories open where you need them:</strong> from <em>Edit categories</em> on Transfers, from the Library&rsquo;s Move to category menu, and from Settings &gt; Transfers. The window is larger, lists every category with the folder it saves to and its download count, searches once there are many, and puts a category back in Downloads with one click</li>
+                  <li><strong>Known eD2K Peers and Known Ember Peers count everyone you have traded with,</strong> not just the rows listed. Each tab lists its own 5,000 most recently seen peers and says so when there are more, so Ember peers are no longer pushed out by eD2K ones</li>
+                </ul>
+
+                <h5>Updates, backups and look</h5>
+                <ul>
+                  <li><strong>Minimize to the tray,</strong> a new switch under Settings &gt; General, hides Ember in the system tray when you minimize it instead of leaving it on the taskbar. It is off by default, and without a tray icon the window minimizes as usual</li>
+                  <li><strong>Update checks go through the system proxy,</strong> one that needs a password included, so they work where GitHub&rsquo;s download hosts are blocked, and say when the update server cannot be reached</li>
+                  <li><strong>Exported backups are no longer locked to the Windows account</strong> that made them, so a reinstalled Windows can open them</li>
+                  <li><strong>Ember asks first</strong> before taking over a room, removing a moderator, deleting a download category or closing a friend&rsquo;s file list mid-download. Keyboard focus is visible, and the shortcuts sheet matches the keys</li>
+                  <li><strong>The website is now <a href="https://www.emberp2p.org" target="_blank" rel="noopener">www.emberp2p.org</a></strong></li>
+                </ul>
+
+                <h4>What&rsquo;s Fixed</h4>
+
+                <ul>
+                  <li><strong>Library:</strong> renaming a file in a partly shared folder, or moving it to a category, no longer unshares it</li>
+                  <li><strong>Downloads:</strong> a download receiving data no longer shows Queued, a download whose part files were removed while Ember was closed is kept Stopped instead of starting again from zero, the order set with Move to front or back of queue survives a restart, pausing, stopping or cancelling a download while its finished file is being moved into place no longer damages it, a failed download whose progress cannot be kept offers Delete, and <kbd>Shift</kbd>+<kbd>F10</kbd> opens a download&rsquo;s menu</li>
+                  <li><strong>IP filter:</strong> removing the last range on the Security page no longer leaves an empty list that blocked every peer from the next start, and a range unblocked from a merged row stays unblocked when the list is updated</li>
+                  <li><strong>Friend chat:</strong> a message that could not go out at once is tried again while you stay connected instead of waiting for the next connection, and the messages typed after it no longer overtake it</li>
+                  <li><strong>Quitting</strong> removes the router port mappings Ember made through UPnP even when it was refreshing them at the time, and a close choice remembered from the close dialog shows on a Settings page already open</li>
+                  <li><strong>Hardening:</strong> AICH part recovery trusts a file&rsquo;s recovery hash only on eMule&rsquo;s quorum, sources on at least 10 networks with 92% of them agreeing, one Kad search answer can no longer crowd out the others it arrives with, and the TLS libraries take patched versions</li>
+                  <li><strong>Rooms:</strong> a line too long to reach members through a relay is refused when sent instead of being stored and lost to them, a device&rsquo;s list of owned rooms no longer drops rooms another device just made, a private room no longer takes an unsealed presence record as proof of its key, and the member count and Discover cache stay current</li>
+                  <li><strong>Unread counts at startup</strong> are exact</li>
+                  <li><strong>Credits between Ember users:</strong> two Ember clients meeting for the first time now complete Secure Identification, where before each usually waited for the other to go first, so Ember peers keep their credit across sessions and appear under Known Ember Peers, relayed and IPv6 connections included. Only a friend&rsquo;s own proven identity marks a row there as a friend</li>
+                  <li><strong>Speed test:</strong> a fast upload is measured at its real rate instead of at how quickly the send buffers fill</li>
+                </ul>
+
+                <p class="full-changelog">
+                  <strong>Full Changelog</strong>
+                  <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.7.4...v1.7.5" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.7.4...v1.7.5</a>
+                </p>
+              </div>
+            </article>
+
+        <details class="older-releases">
+          <summary>
+            <span class="when-closed">Show 42 older releases</span><span class="when-open">Hide older releases</span>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+          </summary>
 
         <article class="release" id="release-1-7-4">
               <div class="release-header">
@@ -232,12 +343,6 @@
                 </p>
               </div>
             </article>
-
-        <details class="older-releases">
-          <summary>
-            <span class="when-closed">Show 41 older releases</span><span class="when-open">Hide older releases</span>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
-          </summary>
 
         <article class="release" id="release-1-7-3">
               <div class="release-header">

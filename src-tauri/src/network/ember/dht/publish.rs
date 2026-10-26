@@ -50,6 +50,15 @@ pub const RECORD_TYPE_KEYWORD: u8 = 0x01;
 pub const RECORD_TYPE_SOURCE: u8 = 0x02;
 /// Channel index, presence, or moderation metadata. Never carries an IP.
 pub const RECORD_TYPE_CHANNEL: u8 = 0x03;
+/// A feed's head: the publisher's signed pointer at the current list (see
+/// [`crate::network::ember::feed`]). Builds before feeds store it as a type
+/// they do not know, for a day, and neither replicate nor read it.
+pub const RECORD_TYPE_FEED: u8 = 0x04;
+/// A public feed's listing in the feed index: the head's fields, signed by
+/// the publisher and filed under a shard of the index (see
+/// [`crate::network::ember::feed::feed_index_key`]) so Discover can find feeds
+/// nobody has a link to. Builds before it keep it as an unknown type for a day.
+pub const RECORD_TYPE_FEED_LISTING: u8 = 0x05;
 
 pub const CHANNEL_KIND_INDEX: u8 = 1;
 pub const CHANNEL_KIND_PRESENCE: u8 = 2;
@@ -67,6 +76,26 @@ const OWNED_ROOMS_VERSION: u8 = 1;
 /// Most salts one list carries. Well inside a record: an identity owns
 /// `MAX_OWNED_CHANNELS` rooms it made, and the rooms it took over.
 pub const OWNED_ROOMS_MAX: usize = 48;
+/// A room's settings beside the frozen moderation snapshot, signed by the
+/// channel key and filed under [`channel::settings_key`]. See
+/// [`encode_settings_extra`] for the layout.
+pub const CHANNEL_KIND_SETTINGS: u8 = 8;
+/// Version byte leading a settings record. A later version keeps the tagged
+/// framing, so a build that knows only this one still reads the tags it knows
+/// in a newer record, and storers keep it.
+const SETTINGS_VERSION: u8 = 1;
+/// Tag of the owner's commitments to the content keys of the epochs it keeps:
+/// `count(1) || (epoch(8) || commitment(32)) × count`, newest first. Private
+/// rooms only; a public room's key derives from a secret everyone holds.
+const SETTINGS_TAG_KEY_COMMITMENTS: u8 = 1;
+/// Tag of how the room admits a member its roster does not hold: one byte,
+/// read by [`channel::RosterAdmission::from_setting`]. Left out for 0.
+const SETTINGS_TAG_ADMISSION: u8 = 2;
+/// `epoch(8) || commitment(32)`.
+const KEY_COMMITMENT_ENTRY_LEN: usize = 8 + 32;
+/// Most commitments one record carries: one per epoch the owner keeps.
+pub const SETTINGS_KEY_COMMITMENTS_MAX: usize =
+    crate::storage::database::Database::CHANNEL_KEY_EPOCHS_KEPT;
 // Adding a kind here does *not* need an `EMBER_DHT_VERSION` bump, and must not
 // get one. That byte versions the frame *layout*, so that a peer handed a frame
 // it would misparse refuses it outright; bumping it partitions the transport for
@@ -88,6 +117,12 @@ pub const CHANNEL_FLAG_PRIVATE: u8 = 0x01;
 /// byte, and unknown bits were ignored. A newer timestamp replaces the live
 /// record under the same `(publisher, channel_id)` store key.
 pub const CHANNEL_FLAG_DEPARTED: u8 = 0x02;
+/// A key-epoch record (kind 5) in its v2 form: filed under
+/// [`channel::epoch_key_v2`], with [`channel::epoch_member_id`] where v1 has
+/// the member's key. Storers on this build recompute the v2 key from the
+/// record as they do the v1 one; builds before 1.7.5 recompute the v1 key from
+/// the extra and refuse it.
+pub const CHANNEL_FLAG_BLINDED: u8 = 0x04;
 const CHANNEL_TRAILER_VERSION: u8 = 1;
 /// `version(1) + extra_len(2)` before the variable extra blob.
 const CHANNEL_TRAILER_MIN_LEN: usize = 1 + 2;
@@ -393,6 +428,90 @@ fn decode_owned_rooms_extra(extra: &[u8]) -> Option<Vec<channel::OwnedRoomSalt>>
             .map(|chunk| <[u8; 16]>::try_from(chunk).expect("16-byte chunk"))
             .collect(),
     )
+}
+
+/// A settings record's `extra`: `version(1) || (tag(1) || len(2) || value)*`,
+/// tags ascending and each at most once, with no fields at all when every
+/// setting is off.
+///
+/// Tagged rather than appended like [`ModerationTail`], whose every new field
+/// cost older members the whole snapshot because they refuse bytes they cannot
+/// place. A writer leaves out what is off and a reader skips a tag it does not
+/// know by its length, so neither ever has to.
+///
+/// `None` for a commitment list [`decode_key_commitments`] would refuse, which
+/// every storer would refuse too.
+pub fn encode_settings_extra(key_commitments: &[(i64, [u8; 32])], admission: u8) -> Option<Vec<u8>> {
+    let mut extra = vec![SETTINGS_VERSION];
+    if !key_commitments.is_empty() {
+        let value = encode_key_commitments(key_commitments)?;
+        extra.push(SETTINGS_TAG_KEY_COMMITMENTS);
+        extra.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        extra.extend_from_slice(&value);
+    }
+    if admission != 0 {
+        extra.push(SETTINGS_TAG_ADMISSION);
+        extra.extend_from_slice(&1u16.to_le_bytes());
+        extra.push(admission);
+    }
+    Some(extra)
+}
+
+/// Tag 1's value; `None` for a list [`decode_key_commitments`] would refuse.
+pub fn encode_key_commitments(key_commitments: &[(i64, [u8; 32])]) -> Option<Vec<u8>> {
+    let mut value = Vec::with_capacity(1 + key_commitments.len() * KEY_COMMITMENT_ENTRY_LEN);
+    value.push(u8::try_from(key_commitments.len()).ok()?);
+    for (epoch, commitment) in key_commitments {
+        value.extend_from_slice(&epoch.to_le_bytes());
+        value.extend_from_slice(commitment);
+    }
+    decode_key_commitments(&value)?;
+    Some(value)
+}
+
+/// Tag 1's value, which must hold at most [`SETTINGS_KEY_COMMITMENTS_MAX`]
+/// entries, exactly, with epochs of at least 1 strictly decreasing.
+///
+/// The order is checked rather than assumed: a list naming one epoch twice
+/// would let a reader match an invite against whichever entry it met first.
+/// Epoch 0 is the secret the room was created with, which no rotation
+/// produced and an invite cannot be checked against (see
+/// [`channel::ChannelInvite::key_epoch`]).
+pub fn decode_key_commitments(value: &[u8]) -> Option<Vec<(i64, [u8; 32])>> {
+    let (&count, entries) = value.split_first()?;
+    let count = count as usize;
+    if count > SETTINGS_KEY_COMMITMENTS_MAX || entries.len() != count * KEY_COMMITMENT_ENTRY_LEN {
+        return None;
+    }
+    let mut out: Vec<(i64, [u8; 32])> = Vec::with_capacity(count);
+    for entry in entries.chunks_exact(KEY_COMMITMENT_ENTRY_LEN) {
+        let epoch = i64::from_le_bytes(entry[..8].try_into().ok()?);
+        if epoch < 1 || out.last().is_some_and(|(newer, _)| epoch >= *newer) {
+            return None;
+        }
+        out.push((epoch, entry[8..].try_into().ok()?));
+    }
+    Some(out)
+}
+
+/// The `(tag, value)` fields of a settings `extra`, or `None` unless they fill
+/// it exactly, in ascending order without repeats, behind a version that is
+/// not 0. Any later version is framed the same way, so it is read the same way.
+///
+/// A tag this build knows is held to its value's shape in every version: a tag
+/// keeps its meaning once assigned, and a later build that needs another shape
+/// takes another tag. One it does not know is returned for the caller to skip.
+fn settings_fields(extra: &[u8]) -> Option<Vec<(u8, &[u8])>> {
+    let fields = channel::tagged_fields(extra)?;
+    for (tag, value) in &fields {
+        if *tag == SETTINGS_TAG_KEY_COMMITMENTS {
+            decode_key_commitments(value)?;
+        }
+        if *tag == SETTINGS_TAG_ADMISSION && value.len() != 1 {
+            return None;
+        }
+    }
+    Some(fields)
 }
 
 /// Fixed-size prefix every record body carries before its file name:
@@ -885,6 +1004,9 @@ pub struct ChannelPresenceMember {
     pub noise_pub: [u8; 32],
     /// True when this is a leave tombstone (`CHANNEL_FLAG_DEPARTED`).
     pub departed: bool,
+    /// The language the member says they speak, from [`CHANNEL_LANGUAGES`].
+    /// `None` when they chose none, or published from a build without it.
+    pub language: Option<&'static str>,
 }
 
 /// Newest-wins across presence records for one publisher.
@@ -949,6 +1071,35 @@ pub fn moderation_supersedes(
     }
 }
 
+/// What an owner-signed settings record says, in the fields this build reads.
+///
+/// Ordered against the copy already held by [`moderation_supersedes`], like
+/// the snapshot, and on its own: neither record says anything about the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelSettings {
+    /// `(epoch, commitment)` for each epoch the owner keeps, newest first.
+    /// Empty when the record carries no tag 1.
+    pub key_commitments: Vec<(i64, [u8; 32])>,
+    /// Tag 2's byte as the owner wrote it, 0 when the record carries none.
+    /// Read through [`channel::RosterAdmission::from_setting`].
+    pub admission: u8,
+    pub timestamp: i64,
+    pub publisher_key: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+/// A key-epoch record as a reader sees it, in either form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelKeyEpochRecord {
+    /// The member's key (v1) or blinded member id (v2).
+    pub slot: [u8; 32],
+    pub epoch: i64,
+    pub envelope: Vec<u8>,
+    /// Flagged [`CHANNEL_FLAG_BLINDED`].
+    pub blinded: bool,
+    pub timestamp: i64,
+}
+
 /// Owner-signed successor mapping. `file_hash` is the **old** channel_id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelHandoff {
@@ -991,17 +1142,24 @@ fn channel_language_wire_id(code: &str) -> u8 {
         .map_or(0, |i| (i + 1) as u8)
 }
 
+fn channel_language_from_wire_id(id: u8) -> Option<&'static str> {
+    usize::from(id)
+        .checked_sub(1)
+        .and_then(|i| CHANNEL_LANGUAGES.get(i).copied())
+}
+
 /// The language a channel record's `file_size` carries in its third byte.
 ///
 /// That byte, like the five above it, was always written as zero and never
 /// read: every build masks `file_size` down to the kind and flag bytes, and
 /// the size filter that reads the whole value only runs for file searches. So
-/// an index or moderation record can carry the language without a byte of
-/// its trailer, and every storer that accepted the record before still does.
-/// The signature covers it like the rest of the header.
+/// an index or moderation record, or a public room's presence record, can
+/// carry a language without a byte of its trailer, and every storer that
+/// accepted the record before still does. The signature covers it like the
+/// rest of the header. A private room's presence keeps its member's language
+/// inside the seal instead, where a storer cannot read it.
 pub fn channel_language_from_file_size(file_size: u64) -> Option<&'static str> {
-    let id = ((file_size >> 16) & 0xff) as usize;
-    id.checked_sub(1).and_then(|i| CHANNEL_LANGUAGES.get(i).copied())
+    channel_language_from_wire_id(((file_size >> 16) & 0xff) as u8)
 }
 
 fn pack_channel_file_size_with_language(kind: u8, flags: u8, language: Option<&str>) -> u64 {
@@ -1190,6 +1348,10 @@ impl SignedRecord {
     /// address. Signed by the **member**, with the channel pubkey in
     /// `ember_file_hash`. `noise_pub` lets XOR-neighbors start Noise_IK
     /// after a rendezvous lookup without publishing an IP.
+    ///
+    /// The v1 form alone; what this build publishes is
+    /// [`Self::channel_presence_forms`].
+    #[cfg(test)]
     pub fn channel_presence(
         nickname: &str,
         channel_id: [u8; 16],
@@ -1200,25 +1362,166 @@ impl SignedRecord {
         noise_pub: &[u8; 32],
         signing_key: &SigningKey,
     ) -> Self {
-        let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
+        Self::channel_presence_v1_at(
+            nickname,
+            None,
+            channel_id,
+            channel_pubkey,
+            join_secret,
+            private,
+            epoch,
+            false,
+            noise_pub,
+            signing_key,
+            chrono::Utc::now().timestamp(),
+        )
+    }
+
+    /// The v1 presence record, live or departed, stamped `timestamp`.
+    ///
+    /// `language` rides where the nickname does: in the signed header of a
+    /// public room's record, inside the seal of a private room's.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn channel_presence_v1_at(
+        nickname: &str,
+        language: Option<&str>,
+        channel_id: [u8; 16],
+        channel_pubkey: [u8; 32],
+        join_secret: &[u8; 32],
+        private: bool,
+        epoch: i64,
+        departed: bool,
+        noise_pub: &[u8; 32],
+        signing_key: &SigningKey,
+        timestamp: i64,
+    ) -> Self {
+        let flags = (if private { CHANNEL_FLAG_PRIVATE } else { 0 })
+            | if departed { CHANNEL_FLAG_DEPARTED } else { 0 };
         let (nickname, extra) = channel::encode_presence_extra(
             private,
             &channel::content_key(join_secret),
             &channel_id,
             noise_pub,
             nickname,
+            language.map_or(0, channel_language_wire_id),
         );
-        Self::build(
+        let header_language = if private { None } else { language };
+        Self::build_with_media(
             RECORD_TYPE_CHANNEL,
             channel::presence_key(&channel_id, join_secret, epoch),
             channel_id,
             channel_pubkey,
-            pack_channel_file_size(CHANNEL_KIND_PRESENCE, flags),
+            pack_channel_file_size_with_language(CHANNEL_KIND_PRESENCE, flags, header_language),
             &nickname,
             None,
             Some(extra),
+            None,
             signing_key,
+            timestamp,
         )
+    }
+
+    /// A private room's presence in its v2 form, live or departed, stamped
+    /// `timestamp` and filed under the presence epoch of that stamp.
+    ///
+    /// Signed by the member's pseudonym for the room
+    /// ([`channel::presence_pseudonym`]), with the room-blind key
+    /// ([`channel::presence_room_blind`]) where v1 has the channel id and
+    /// pubkey, so the record names neither who nor which room. The member's
+    /// own key and its binding to this record ride inside the seal
+    /// ([`channel::encode_presence_extra_v2`]). A storer still learns the
+    /// member from the STORE, which goes out under the member's long-term DHT
+    /// identity; it learns no room.
+    #[allow(clippy::too_many_arguments)]
+    pub fn channel_presence_v2_at(
+        nickname: &str,
+        language: Option<&str>,
+        channel_id: [u8; 16],
+        join_secret: &[u8; 32],
+        departed: bool,
+        noise_pub: &[u8; 32],
+        member: &SigningKey,
+        timestamp: i64,
+    ) -> Self {
+        let epoch = channel::presence_epoch(timestamp);
+        let mut seed = member.to_bytes();
+        let pseudonym = channel::presence_pseudonym(&seed, &channel_id, join_secret);
+        zeroize::Zeroize::zeroize(&mut seed);
+        let pseudonym_pub = pseudonym.verifying_key().to_bytes();
+        let (blind_id, blind_pub) = channel::presence_room_blind(&channel_id, join_secret);
+        let extra = channel::encode_presence_extra_v2(
+            &channel::content_key(join_secret),
+            &channel_id,
+            &pseudonym_pub,
+            noise_pub,
+            nickname,
+            language.map_or(0, channel_language_wire_id),
+            member,
+            epoch,
+            departed,
+            timestamp,
+        );
+        let flags = CHANNEL_FLAG_PRIVATE | if departed { CHANNEL_FLAG_DEPARTED } else { 0 };
+        Self::build_with_media(
+            RECORD_TYPE_CHANNEL,
+            channel::presence_key(&channel_id, join_secret, epoch),
+            blind_id,
+            blind_pub,
+            pack_channel_file_size(CHANNEL_KIND_PRESENCE, flags),
+            "",
+            None,
+            Some(extra),
+            None,
+            &pseudonym,
+            timestamp,
+        )
+    }
+
+    /// Every form of our presence in a room this build publishes, live or
+    /// departed, all stamped `now`: v2 then v1 for a private room, v1 alone
+    /// once [`channel::PUBLISH_V1_MEMBERSHIP_RECORDS`] is off; v1 for a public
+    /// room, whose key anyone can derive, so blinding it would hide nothing.
+    ///
+    /// The two forms of a private record never share a store slot (publisher
+    /// and `file_hash` both differ), so neither replaces the other.
+    ///
+    /// A leave notice carries no `language`: it removes the row it would label.
+    #[allow(clippy::too_many_arguments)]
+    pub fn channel_presence_forms(
+        nickname: &str,
+        language: Option<&str>,
+        channel_id: [u8; 16],
+        channel_pubkey: [u8; 32],
+        join_secret: &[u8; 32],
+        private: bool,
+        departed: bool,
+        noise_pub: &[u8; 32],
+        member: &SigningKey,
+        now: i64,
+    ) -> Vec<Self> {
+        let language = if departed { None } else { language };
+        let mut forms = Vec::with_capacity(2);
+        if private {
+            forms.push(Self::channel_presence_v2_at(
+                nickname, language, channel_id, join_secret, departed, noise_pub, member, now,
+            ));
+        }
+        if !private || channel::PUBLISH_V1_MEMBERSHIP_RECORDS {
+            forms.push(Self::channel_presence_v1_at(
+                nickname,
+                language,
+                channel_id,
+                channel_pubkey,
+                join_secret,
+                private,
+                channel::presence_epoch(now),
+                departed,
+                noise_pub,
+                member,
+                now,
+            ));
+        }
+        forms
     }
 
     /// Leave tombstone under the same presence key as a live announcement.
@@ -1228,6 +1531,7 @@ impl SignedRecord {
     /// live record. Older builds ignore the unknown flag and treat this as a
     /// last announce until TTL elapses — the least-breaking option without a
     /// new record kind.
+    #[cfg(test)]
     pub fn channel_presence_departure(
         nickname: &str,
         channel_id: [u8; 16],
@@ -1238,24 +1542,18 @@ impl SignedRecord {
         noise_pub: &[u8; 32],
         signing_key: &SigningKey,
     ) -> Self {
-        let flags = (if private { CHANNEL_FLAG_PRIVATE } else { 0 }) | CHANNEL_FLAG_DEPARTED;
-        let (nickname, extra) = channel::encode_presence_extra(
-            private,
-            &channel::content_key(join_secret),
-            &channel_id,
-            noise_pub,
+        Self::channel_presence_v1_at(
             nickname,
-        );
-        Self::build(
-            RECORD_TYPE_CHANNEL,
-            channel::presence_key(&channel_id, join_secret, epoch),
+            None,
             channel_id,
             channel_pubkey,
-            pack_channel_file_size(CHANNEL_KIND_PRESENCE, flags),
-            &nickname,
-            None,
-            Some(extra),
+            join_secret,
+            private,
+            epoch,
+            true,
+            noise_pub,
             signing_key,
+            chrono::Utc::now().timestamp(),
         )
     }
 
@@ -1337,6 +1635,10 @@ impl SignedRecord {
     /// One member's copy of one rotated content key, signed by the channel key
     /// so only the owner can mint it, and sealed so only that member can read
     /// it. Published per member; the room key itself never appears in the clear.
+    ///
+    /// The v1 form alone; what this build publishes is
+    /// [`Self::channel_key_epoch_forms`].
+    #[cfg(test)]
     pub fn channel_key_epoch(
         channel_id: [u8; 16],
         channel_pubkey: [u8; 32],
@@ -1345,23 +1647,117 @@ impl SignedRecord {
         sealed: &[u8],
         signing_key: &SigningKey,
     ) -> Self {
+        Self::channel_key_epoch_at(
+            channel_id,
+            channel_pubkey,
+            member_pubkey,
+            None,
+            epoch,
+            sealed,
+            signing_key,
+            chrono::Utc::now().timestamp(),
+        )
+    }
+
+    /// One member's copy of one rotated content key, in v1 form, or in v2 when
+    /// `blind` is the member's [`channel::epoch_blind`] for the room: filed
+    /// under [`channel::epoch_key_v2`], with [`channel::epoch_member_id`] in
+    /// place of the member's key and [`CHANNEL_FLAG_BLINDED`] set. Stamped
+    /// `timestamp`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn channel_key_epoch_at(
+        channel_id: [u8; 16],
+        channel_pubkey: [u8; 32],
+        member_pubkey: &[u8; 32],
+        blind: Option<&[u8; 32]>,
+        epoch: i64,
+        sealed: &[u8],
+        signing_key: &SigningKey,
+        timestamp: i64,
+    ) -> Self {
+        let (key, slot, flags) = match blind {
+            Some(blind) => {
+                let member_id = channel::epoch_member_id(blind, epoch);
+                (
+                    channel::epoch_key_v2(&channel_id, &member_id, epoch),
+                    member_id,
+                    CHANNEL_FLAG_PRIVATE | CHANNEL_FLAG_BLINDED,
+                )
+            }
+            None => (
+                channel::epoch_key(&channel_id, member_pubkey, epoch),
+                *member_pubkey,
+                CHANNEL_FLAG_PRIVATE,
+            ),
+        };
         let mut extra = Vec::with_capacity(EPOCH_EXTRA_PREFIX_LEN + sealed.len());
-        extra.extend_from_slice(member_pubkey);
+        extra.extend_from_slice(&slot);
         extra.extend_from_slice(&epoch.to_le_bytes());
         extra.extend_from_slice(sealed);
-        Self::build(
+        Self::build_with_media(
             RECORD_TYPE_CHANNEL,
-            channel::epoch_key(&channel_id, member_pubkey, epoch),
+            key,
             channel_id,
             channel_pubkey,
             // Always private in effect: a public room's key is derivable by
             // anyone, so rotating one would evict nobody.
-            pack_channel_file_size(CHANNEL_KIND_EPOCH, CHANNEL_FLAG_PRIVATE),
+            pack_channel_file_size(CHANNEL_KIND_EPOCH, flags),
             "",
             None,
             Some(extra),
+            None,
             signing_key,
+            timestamp,
         )
+    }
+
+    /// Every form of one member's copy of one epoch this build publishes, all
+    /// stamped now: v2 under `blind`, the member's [`channel::epoch_blind`],
+    /// then v1 as [`channel::epoch_record_publishes_v1`] says. `own_copy` is
+    /// the owner's copy sealed to itself.
+    ///
+    /// The two forms share their stamp and envelope and the v1 one names the
+    /// member, so while both go out a storer holding both links the v2 one to
+    /// the member; v2's unlinkability starts with the cut-over.
+    #[allow(clippy::too_many_arguments)]
+    pub fn channel_key_epoch_forms(
+        channel_id: [u8; 16],
+        channel_pubkey: [u8; 32],
+        member_pubkey: &[u8; 32],
+        own_copy: bool,
+        epoch: i64,
+        blind: &[u8; 32],
+        sealed: &[u8],
+        signing_key: &SigningKey,
+    ) -> Vec<Self> {
+        let now = chrono::Utc::now().timestamp();
+        let mut forms = Vec::with_capacity(2);
+        // Storers refuse a flagged record below epoch 1, which no rotation makes.
+        if epoch >= 1 {
+            forms.push(Self::channel_key_epoch_at(
+                channel_id,
+                channel_pubkey,
+                member_pubkey,
+                Some(blind),
+                epoch,
+                sealed,
+                signing_key,
+                now,
+            ));
+        }
+        if channel::epoch_record_publishes_v1(own_copy) {
+            forms.push(Self::channel_key_epoch_at(
+                channel_id,
+                channel_pubkey,
+                member_pubkey,
+                None,
+                epoch,
+                sealed,
+                signing_key,
+                now,
+            ));
+        }
+        forms
     }
 
     /// The rooms `identity` owns, as the salts their seeds are derived from,
@@ -1413,12 +1809,257 @@ impl SignedRecord {
         Some((decode_owned_rooms_extra(&meta.extra)?, rec.timestamp))
     }
 
+    /// A feed's head, signed by the publisher's identity and filed under
+    /// [`crate::network::ember::feed::feed_key`], stamped `timestamp`: its
+    /// locator in `file_hash`, and all but its sequence sealed in the trailer
+    /// ([`crate::network::ember::feed::encode_sealed_head`]). The header's
+    /// digest and size are the trailer's, so the record names nothing of the
+    /// feed. `None` for a head with a field out of bounds.
+    pub fn feed_head_record(
+        salt: &crate::network::ember::feed::FeedSalt,
+        head: &crate::network::ember::feed::FeedHead,
+        identity: &SigningKey,
+        timestamp: i64,
+    ) -> Option<Self> {
+        use crate::network::ember::feed;
+        let pubkey = identity.verifying_key().to_bytes();
+        let extra = feed::encode_sealed_head(&pubkey, salt, head)?;
+        Some(Self::build_with_media(
+            RECORD_TYPE_FEED,
+            feed::feed_key(&pubkey, salt),
+            feed::feed_locator(salt),
+            *blake3::hash(&extra).as_bytes(),
+            extra.len() as u64,
+            feed::FEED_HEAD_RECORD_NAME,
+            None,
+            Some(extra),
+            None,
+            identity,
+            timestamp,
+        ))
+    }
+
+    /// The head of the feed `salt` this record carries, if it is one of it,
+    /// well formed and opens under the salt's key. Says nothing about the
+    /// signature: from a verified record only.
+    pub fn feed_head(&self, salt: &crate::network::ember::feed::FeedSalt) -> Option<crate::network::ember::feed::FeedHead> {
+        use crate::network::ember::feed;
+        if self.record_type != RECORD_TYPE_FEED || self.file_hash != feed::feed_locator(salt) {
+            return None;
+        }
+        let (_, extra) = self.name_and_trailer_extra()?;
+        feed::decode_sealed_head(&self.publisher_key, salt, extra)
+    }
+
+    /// The sequence a feed head's record body carries in the clear, of any
+    /// version this build or a later one writes: what a storer ranks a
+    /// feed's heads by. `None` for any other record.
+    pub fn feed_head_sequence_of(data: &[u8]) -> Option<u64> {
+        if data.first() != Some(&RECORD_TYPE_FEED) {
+            return None;
+        }
+        let name_len = usize::from(u16::from_le_bytes(data.get(113..115)?.try_into().ok()?));
+        let off = 115 + name_len;
+        let extra_len = usize::from(u16::from_le_bytes(data.get(off + 1..off + 3)?.try_into().ok()?));
+        crate::network::ember::feed::head_sequence(data.get(off + 3..off + 3 + extra_len)?)
+    }
+
+    /// The title (the record's name) and the trailer's extra bytes of a record
+    /// framed with the channel trailer.
+    fn name_and_trailer_extra(&self) -> Option<(String, &[u8])> {
+        let name_len = u16::from_le_bytes(self.data.get(113..115)?.try_into().ok()?) as usize;
+        let title = std::str::from_utf8(self.data.get(115..115 + name_len)?).ok()?.to_string();
+        let off = 115 + name_len;
+        let extra_len = u16::from_le_bytes(self.data.get(off + 1..off + 3)?.try_into().ok()?) as usize;
+        Some((title, self.data.get(off + 3..off + 3 + extra_len)?))
+    }
+
+    /// A head from a feed record's header and decoded trailer fields, if valid.
+    fn feed_head_from(
+        &self,
+        title: String,
+        listed: crate::network::ember::feed::ListedHead,
+    ) -> Option<crate::network::ember::feed::FeedHead> {
+        let head = crate::network::ember::feed::FeedHead {
+            sequence: listed.sequence,
+            list_ed2k_hash: listed.list_ed2k_hash,
+            list_size: self.file_size,
+            list_blake3: self.ember_file_hash,
+            item_count: listed.item_count,
+            total_size: listed.total_size,
+            title,
+            description: listed.description,
+            deleted: false,
+        };
+        head.valid().then_some(head)
+    }
+
+    /// Whether a storer should keep this feed head: one of this version or a
+    /// later one, whose sequence it can read, filed under the key its
+    /// publisher and locator give. Nothing more is checked, as nothing more
+    /// can be read without the salt, and a later build's head passes through
+    /// this one.
+    pub fn feed_store_ok(&self) -> bool {
+        self.record_type == RECORD_TYPE_FEED
+            && self
+                .name_and_trailer_extra()
+                .is_some_and(|(_, extra)| crate::network::ember::feed::head_sequence(extra).is_some())
+            && self.keyword_hash == crate::network::ember::feed::feed_key_at(&self.publisher_key, &self.file_hash)
+    }
+
+    /// A public feed's listing: the head `head` of the feed `salt`, signed by
+    /// the publisher's identity and filed under its shard of the feed index,
+    /// stamped `timestamp`. `withdrawn` takes the feed out of the index. `None`
+    /// for a head with a field out of bounds.
+    pub fn feed_listing_record(
+        salt: &crate::network::ember::feed::FeedSalt,
+        head: &crate::network::ember::feed::FeedHead,
+        withdrawn: bool,
+        identity: &SigningKey,
+        timestamp: i64,
+    ) -> Option<Self> {
+        let extra = crate::network::ember::feed::encode_feed_listing_extra(head, withdrawn)?;
+        let pubkey = identity.verifying_key().to_bytes();
+        let shard = crate::network::ember::feed::feed_index_shard(&pubkey, salt);
+        let record = Self::build_with_media(
+            RECORD_TYPE_FEED_LISTING,
+            crate::network::ember::feed::feed_index_key(shard),
+            *salt,
+            head.list_blake3,
+            head.list_size,
+            &head.title,
+            None,
+            Some(extra),
+            None,
+            identity,
+            timestamp,
+        );
+        (record.file_name == head.title).then_some(record)
+    }
+
+    /// The salt, head and whether it is withdrawn, of a feed listing that is
+    /// one and well formed. From a verified record only, as [`Self::feed_head`].
+    pub fn feed_listing(
+        &self,
+    ) -> Option<(crate::network::ember::feed::FeedSalt, crate::network::ember::feed::FeedHead, bool)> {
+        if self.record_type != RECORD_TYPE_FEED_LISTING {
+            return None;
+        }
+        let (title, extra) = self.name_and_trailer_extra()?;
+        let (flags, fields) = crate::network::ember::feed::decode_feed_listing_extra(extra)?;
+        let head = self.feed_head_from(title, fields)?;
+        let withdrawn = flags & crate::network::ember::feed::FEED_LISTING_WITHDRAWN != 0;
+        Some((self.file_hash, head, withdrawn))
+    }
+
+    /// Whether a storer should keep this listing: one of this version or a
+    /// later one ([`crate::network::ember::feed::listing_storable`]), filed
+    /// under the index shard its publisher and salt give, so a listing cannot
+    /// be aimed at whichever shard key is nearest a storer. One of this
+    /// version must also read as a follower reads it: a malformed listing
+    /// would only take a shard's slot from a real one. A later version is
+    /// read no further.
+    pub fn feed_listing_store_ok(&self) -> bool {
+        use crate::network::ember::feed::{listing_storable, FEED_LISTED_HEAD_VERSION};
+        self.record_type == RECORD_TYPE_FEED_LISTING
+            && self.name_and_trailer_extra().is_some_and(|(_, extra)| {
+                listing_storable(extra)
+                    && (extra[1] > FEED_LISTED_HEAD_VERSION || self.feed_listing().is_some())
+            })
+            && self.keyword_hash
+                == crate::network::ember::feed::feed_index_key(crate::network::ember::feed::feed_index_shard(
+                    &self.publisher_key,
+                    &self.file_hash,
+                ))
+    }
+
+    /// A room's settings, signed by the **channel** key and filed under
+    /// [`channel::settings_key`], stamped `timestamp`.
+    ///
+    /// Stamped by the caller for the same reason as
+    /// [`Self::channel_moderation_at`]: two records ranked by whole seconds
+    /// need a stamp that never repeats. `None` for a commitment list the
+    /// network would refuse.
+    pub fn channel_settings_at(
+        key_commitments: &[(i64, [u8; 32])],
+        admission: u8,
+        channel_id: [u8; 16],
+        channel_pubkey: [u8; 32],
+        private: bool,
+        signing_key: &SigningKey,
+        timestamp: i64,
+    ) -> Option<Self> {
+        let flags = if private { CHANNEL_FLAG_PRIVATE } else { 0 };
+        let extra = encode_settings_extra(key_commitments, admission)?;
+        Some(Self::build_with_media(
+            RECORD_TYPE_CHANNEL,
+            channel::settings_key(&channel_id),
+            channel_id,
+            channel_pubkey,
+            pack_channel_file_size(CHANNEL_KIND_SETTINGS, flags),
+            "",
+            None,
+            Some(extra),
+            None,
+            signing_key,
+            timestamp,
+        ))
+    }
+
+    /// Parse an owner-signed settings blob for `expected_channel_id`, reading
+    /// the tags this build knows and skipping the rest.
+    pub fn parse_channel_settings(
+        blob: &[u8],
+        expected_channel_id: &[u8; 16],
+    ) -> Option<ChannelSettings> {
+        let rec = Self::from_value_blob(blob)?;
+        if rec.record_type != RECORD_TYPE_CHANNEL || rec.file_hash != *expected_channel_id {
+            return None;
+        }
+        if !rec.channel_store_ok() {
+            return None;
+        }
+        let meta = rec.channel.as_ref()?;
+        if meta.kind != CHANNEL_KIND_SETTINGS {
+            return None;
+        }
+        let mut key_commitments = Vec::new();
+        let mut admission = 0;
+        for (tag, value) in settings_fields(&meta.extra)? {
+            if tag == SETTINGS_TAG_KEY_COMMITMENTS {
+                key_commitments = decode_key_commitments(value)?;
+            } else if tag == SETTINGS_TAG_ADMISSION {
+                admission = value[0];
+            }
+        }
+        Some(ChannelSettings {
+            key_commitments,
+            admission,
+            timestamp: rec.timestamp,
+            publisher_key: rec.publisher_key,
+            signature: rec.signature,
+        })
+    }
+
     /// Parse an epoch record for `expected_channel_id`, returning the recipient
-    /// it was sealed for, the epoch, and the sealed envelope.
+    /// it was sealed for, the epoch, and the sealed envelope. A v2 record's
+    /// recipient is its blinded member id.
+    #[cfg(test)]
     pub fn parse_channel_key_epoch(
         blob: &[u8],
         expected_channel_id: &[u8; 16],
     ) -> Option<([u8; 32], i64, Vec<u8>)> {
+        Self::parse_channel_key_epoch_record(blob, expected_channel_id)
+            .map(|record| (record.slot, record.epoch, record.envelope))
+    }
+
+    /// [`Self::parse_channel_key_epoch`] with what a reader needs to tell the
+    /// two forms apart and order copies. Either form's key is checked against
+    /// its slot and epoch here, as storers check it.
+    pub fn parse_channel_key_epoch_record(
+        blob: &[u8],
+        expected_channel_id: &[u8; 16],
+    ) -> Option<ChannelKeyEpochRecord> {
         let rec = Self::from_value_blob(blob)?;
         if rec.record_type != RECORD_TYPE_CHANNEL || rec.file_hash != *expected_channel_id {
             return None;
@@ -1430,8 +2071,14 @@ impl SignedRecord {
         if meta.kind != CHANNEL_KIND_EPOCH {
             return None;
         }
-        let (member, epoch, envelope) = decode_epoch_extra(&meta.extra)?;
-        Some((member, epoch, envelope.to_vec()))
+        let (slot, epoch, envelope) = decode_epoch_extra(&meta.extra)?;
+        Some(ChannelKeyEpochRecord {
+            slot,
+            epoch,
+            envelope: envelope.to_vec(),
+            blinded: meta.flags & CHANNEL_FLAG_BLINDED != 0,
+            timestamp: rec.timestamp,
+        })
     }
 
     /// A nominee claiming a room whose owner has gone silent, signed by the
@@ -1554,6 +2201,9 @@ impl SignedRecord {
                     && self.keyword_hash == channel::index_key_for_channel(&self.file_hash)
             }
             CHANNEL_KIND_PRESENCE => {
+                // A v2 record is signed by a pseudonym and carries a room-blind
+                // key in place of the channel's, both valid Ed25519 keys, so the
+                // rules above and here hold for it unchanged.
                 crypto::verifying_key_from_bytes(&self.publisher_key).is_some()
                     && channel::presence_extra_store_ok(&meta.extra)
             }
@@ -1567,16 +2217,25 @@ impl SignedRecord {
                     && channel::decode_handoff_extra(&meta.extra).is_some()
             }
             CHANNEL_KIND_EPOCH => {
-                // Fully self-validating: the recipient and epoch are in the
-                // extra, so a storer can recompute the key this record claims
-                // to live under and refuse one filed anywhere else. It cannot
-                // read the envelope, only check its shape.
+                // Both forms are self-validating: the recipient (v2: its
+                // blinded id) and the epoch are in the extra, so a storer can
+                // recompute the key this record claims to live under and
+                // refuse one filed anywhere else. It cannot read the envelope,
+                // only check its shape.
                 let Some((member, epoch, envelope)) = decode_epoch_extra(&meta.extra) else {
                     return false;
                 };
-                self.publisher_key == self.ember_file_hash
-                    && self.keyword_hash == channel::epoch_key(&self.file_hash, &member, epoch)
-                    && channel::epoch_envelope_store_ok(envelope)
+                if self.publisher_key != self.ember_file_hash
+                    || !channel::epoch_envelope_store_ok(envelope)
+                {
+                    return false;
+                }
+                if meta.flags & CHANNEL_FLAG_BLINDED != 0 {
+                    epoch >= 1
+                        && self.keyword_hash == channel::epoch_key_v2(&self.file_hash, &member, epoch)
+                } else {
+                    self.keyword_hash == channel::epoch_key(&self.file_hash, &member, epoch)
+                }
             }
             CHANNEL_KIND_OWNED_ROOMS => {
                 // Signed by the identity it lists rooms for, filed under the key
@@ -1584,6 +2243,15 @@ impl SignedRecord {
                 self.publisher_key == self.ember_file_hash
                     && self.keyword_hash == channel::owned_rooms_key(&self.publisher_key)
                     && decode_owned_rooms_extra(&meta.extra).is_some()
+            }
+            CHANNEL_KIND_SETTINGS => {
+                // Kept whatever version and tags it carries, so a later build's
+                // settings reach its members through storers on this one, but
+                // only framed as every version is.
+                self.publisher_key == self.ember_file_hash
+                    && self.keyword_hash == channel::settings_key(&self.file_hash)
+                    && self.data.len() <= messages::MAX_STORE_RECORD_BYTES
+                    && settings_fields(&meta.extra).is_some()
             }
             CHANNEL_KIND_CLAIM => {
                 // Signed by the *nominee's* user key, not the room key — the
@@ -1692,12 +2360,14 @@ impl SignedRecord {
         data.extend_from_slice(&media_trailer);
         let media = decode_media_trailer(&media_trailer);
 
+        // A feed head carries the same trailer; only a channel record reads it
+        // as channel metadata.
         let channel = if let Some(extra) = channel_extra {
             let extra_len = extra.len().min(u16::MAX as usize);
             data.push(CHANNEL_TRAILER_VERSION);
             data.write_u16::<LittleEndian>(extra_len as u16).unwrap();
             data.extend_from_slice(&extra[..extra_len]);
-            Some(ChannelRecordMeta {
+            (record_type == RECORD_TYPE_CHANNEL).then(|| ChannelRecordMeta {
                 kind: (file_size & 0xff) as u8,
                 flags: ((file_size >> 8) & 0xff) as u8,
                 extra: extra[..extra_len].to_vec(),
@@ -1782,6 +2452,23 @@ impl SignedRecord {
         expected_channel_id: &[u8; 16],
         content_key: Option<&[u8; 32]>,
     ) -> Option<ChannelPresenceMember> {
+        Self::parse_channel_presence_member_in_room(blob, expected_channel_id, content_key, false)
+    }
+
+    /// [`Self::parse_channel_presence_member`] for a room known to be public or
+    /// private. A private room's v1 presence is flagged private and sealed
+    /// under its content key; one that is neither opens under any key, since
+    /// [`channel::decode_presence_extra`] takes a bare 32-byte extra as the
+    /// public shape, and would pass for proof of the room's current key. Its
+    /// header names only the room's id and pubkey, which anyone can learn, so
+    /// any node answering the lookup could put a fresh identity on the roster
+    /// and be sealed the next key.
+    pub fn parse_channel_presence_member_in_room(
+        blob: &[u8],
+        expected_channel_id: &[u8; 16],
+        content_key: Option<&[u8; 32]>,
+        private_room: bool,
+    ) -> Option<ChannelPresenceMember> {
         let rec = Self::from_value_blob(blob)?;
         if rec.record_type != RECORD_TYPE_CHANNEL || rec.file_hash != *expected_channel_id {
             return None;
@@ -1793,18 +2480,79 @@ impl SignedRecord {
         if meta.kind != CHANNEL_KIND_PRESENCE {
             return None;
         }
-        let (noise_pub, nickname) = channel::decode_presence_extra(
+        if private_room && (!meta.is_private() || meta.extra.len() == 32) {
+            return None;
+        }
+        let (noise_pub, nickname, sealed_language) = channel::decode_presence_extra(
             content_key,
             expected_channel_id,
             &meta.extra,
             &rec.file_name,
         )?;
+        let language = match sealed_language {
+            Some(id) => channel_language_from_wire_id(id),
+            None => channel_language_from_file_size(rec.file_size),
+        };
         Some(ChannelPresenceMember {
             publisher_key: rec.publisher_key,
             nickname,
             timestamp: rec.timestamp,
             noise_pub,
             departed: meta.is_departed(),
+            language,
+        })
+    }
+
+    /// Parse a v2 presence blob for a private room sealed under `join_secret`,
+    /// whose room-blind key ([`channel::presence_room_blind`]) the caller passes
+    /// in, since it costs a scalar multiplication and is the same for every
+    /// blob of one walk. The member returned is the one the seal names, and
+    /// only once their binding to this record verifies; `publisher_key` is
+    /// their long-term key, not the pseudonym that signed the record.
+    pub fn parse_channel_presence_member_v2(
+        blob: &[u8],
+        channel_id: &[u8; 16],
+        join_secret: &[u8; 32],
+        room_blind: &([u8; 16], [u8; 32]),
+    ) -> Option<ChannelPresenceMember> {
+        let (blind_id, blind_pub) = room_blind;
+        // `file_hash`, before paying for the signature: every v1 record and
+        // every other room's v2 record differs here.
+        if blob.get(17..33) != Some(&blind_id[..]) {
+            return None;
+        }
+        let rec = Self::from_value_blob(blob)?;
+        if rec.record_type != RECORD_TYPE_CHANNEL
+            || rec.file_hash != *blind_id
+            || rec.ember_file_hash != *blind_pub
+            || !rec.channel_store_ok()
+        {
+            return None;
+        }
+        let meta = rec.channel.as_ref()?;
+        if meta.kind != CHANNEL_KIND_PRESENCE || !meta.is_private() {
+            return None;
+        }
+        let epoch = channel::presence_epoch(rec.timestamp);
+        if rec.keyword_hash != channel::presence_key(channel_id, join_secret, epoch) {
+            return None;
+        }
+        let opened = channel::decode_presence_extra_v2(
+            &channel::content_key(join_secret),
+            channel_id,
+            &rec.publisher_key,
+            &meta.extra,
+            epoch,
+            meta.is_departed(),
+            rec.timestamp,
+        )?;
+        Some(ChannelPresenceMember {
+            publisher_key: opened.member_pubkey,
+            nickname: opened.nickname,
+            timestamp: rec.timestamp,
+            noise_pub: opened.noise_pub,
+            departed: meta.is_departed(),
+            language: channel_language_from_wire_id(opened.language),
         })
     }
 
@@ -1902,7 +2650,7 @@ impl SignedRecord {
         if data[0] == RECORD_TYPE_SOURCE && data.len() < 115 + name_len + SOURCE_CONTACT_WIRE_LEN {
             return false;
         }
-        if data[0] == RECORD_TYPE_CHANNEL
+        if matches!(data[0], RECORD_TYPE_CHANNEL | RECORD_TYPE_FEED | RECORD_TYPE_FEED_LISTING)
             && !channel_trailer_len(data, name_len)
                 .is_some_and(|n| data.len() == 115 + name_len + n)
         {
@@ -1989,6 +2737,16 @@ impl SignedRecord {
         } else {
             None
         };
+        // A feed head and a feed listing carry the same trailer framing, read
+        // on demand by `feed_head` and `feed_listing`; its shape is checked
+        // here so a malformed one is not a record at all.
+        if record_type == RECORD_TYPE_FEED || record_type == RECORD_TYPE_FEED_LISTING {
+            let off = 115 + name_len;
+            let trailer_len = channel_trailer_len(data, name_len)?;
+            if data.len() != off + trailer_len || data[off] != CHANNEL_TRAILER_VERSION {
+                return None;
+            }
+        }
 
         // Keyword records only: on the other types these bytes are the contact
         // block or the channel trailer read above. Absent for every record
@@ -2088,15 +2846,17 @@ pub struct ModerationTail {
     /// them the whole record. This way the wire is byte-identical for every
     /// room that never turns it on.
     pub slow_mode_secs: Option<u16>,
-    /// The room's name, carried only once its owner has renamed it.
+    /// The room's name: carried once its owner has renamed it, and from 1.7.5
+    /// in every new room's first snapshot too, which is where recovering the
+    /// room from the identity alone reads it back.
     ///
     /// A member learns the name once, from the invite or listing they joined
     /// through, and nothing else ever corrects it; this is how a rename reaches
-    /// them. Absent for a room that was never renamed, for the same reason as
+    /// them. Absent for an older room never renamed, for the same reason as
     /// [`Self::slow_mode_secs`]: builds from before 1.6.0 refuse tail bytes
     /// they cannot place, and this field forces the one before it onto the
-    /// wire. Those builds lose a renamed room's snapshot until they update,
-    /// and nothing changes for any other room. Encoded as a length byte and
+    /// wire. Those builds lose a renamed or new room's snapshot until they
+    /// update, and nothing changes for any other room. Encoded as a length byte and
     /// at most [`CHANNEL_NAME_MAX`] bytes of UTF-8; a length of zero means no
     /// name is carried, which is how a later field is written without one.
     pub room_name: Option<String>,
@@ -2838,6 +3598,9 @@ pub struct PublishOperation {
     pub acked: Vec<EmberNodeId>,
     /// Nodes that failed.
     pub failed: Vec<EmberNodeId>,
+    /// STOREs handed to the transport. A target whose STORE could not be
+    /// sent is failed without counting here.
+    pub sent: usize,
     /// Outstanding request IDs mapped to node IDs.
     pub pending_requests: HashMap<u32, EmberNodeId>,
     pub started_at: Instant,
@@ -2859,6 +3622,7 @@ impl PublishOperation {
             targets,
             acked: Vec::new(),
             failed: Vec::new(),
+            sent: 0,
             pending_requests: HashMap::new(),
             started_at: Instant::now(),
             complete: false,
@@ -2985,18 +3749,16 @@ impl PublishManager {
         self.operations.remove(&publish_id)
     }
 
-    /// Clean up timed-out operations.
-    pub fn cleanup_expired(&mut self) -> Vec<u32> {
+    /// Remove and return the operations long past their timeout, with what
+    /// they got through, so their waiters hear it.
+    pub fn cleanup_expired(&mut self) -> Vec<PublishOperation> {
         let expired: Vec<u32> = self
             .operations
             .iter()
             .filter(|(_, op)| op.started_at.elapsed().as_secs() > PUBLISH_TIMEOUT_SECS * 2)
             .map(|(id, _)| *id)
             .collect();
-        for id in &expired {
-            self.operations.remove(id);
-        }
-        expired
+        expired.into_iter().filter_map(|id| self.operations.remove(&id)).collect()
     }
 
     pub fn active_count(&self) -> usize {
@@ -3703,6 +4465,7 @@ mod tests {
                 timestamp,
                 noise_pub: [0u8; 32],
                 departed,
+                language: None,
             }
         }
         let pk = [0xAAu8; 32];
@@ -3761,6 +4524,372 @@ mod tests {
                 .unwrap();
         assert_eq!(member_info.nickname, "Ada");
         assert_eq!(member_info.noise_pub, noise_pub);
+    }
+
+    /// A v2 presence record carries neither the room nor the member in the
+    /// clear, and a member of the room reads back exactly who announced, live
+    /// or leaving.
+    #[test]
+    fn a_v2_presence_record_round_trips_and_names_only_the_member_inside_the_seal() {
+        let channel = channel::ChannelIdentity::generate();
+        let member = SigningKey::generate(&mut OsRng);
+        let member_pub = member.verifying_key().to_bytes();
+        let join = [0x77u8; 32];
+        let noise_pub = [0x42u8; 32];
+        let now = 1_800_000_123;
+        let blind = channel::presence_room_blind(&channel.channel_id, &join);
+        for departed in [false, true] {
+            let record = SignedRecord::channel_presence_v2_at(
+                "Ada", None, channel.channel_id, &join, departed, &noise_pub, &member, now,
+            );
+            assert!(record.channel_store_ok());
+            assert_ne!(record.publisher_key, member_pub);
+            assert_ne!(record.file_hash, channel.channel_id);
+            assert_ne!(record.ember_file_hash, channel.pubkey);
+            assert_eq!((record.file_hash, record.ember_file_hash), blind);
+            assert!(record.file_name.is_empty());
+            assert_eq!(
+                record.keyword_hash,
+                channel::presence_key(&channel.channel_id, &join, channel::presence_epoch(now))
+            );
+            let extra = &record.channel.as_ref().unwrap().extra;
+            assert_eq!(extra.len(), channel::PRESENCE_EXTRA_V2_LEN);
+            assert!(!extra.windows(32).any(|w| w == member_pub));
+            assert!(!record.data.windows(16).any(|w| w == channel.channel_id));
+
+            let blob = blob_of(&record);
+            let read = SignedRecord::parse_channel_presence_member_v2(
+                &blob,
+                &channel.channel_id,
+                &join,
+                &blind,
+            )
+            .unwrap();
+            assert_eq!(read.publisher_key, member_pub);
+            assert_eq!(read.nickname, "Ada");
+            assert_eq!(read.noise_pub, noise_pub);
+            assert_eq!(read.timestamp, now);
+            assert_eq!(read.departed, departed);
+
+            let key = channel::content_key(&join);
+            assert!(
+                SignedRecord::parse_channel_presence_member(&blob, &channel.channel_id, Some(&key))
+                    .is_none(),
+                "a v2 record is never read as v1"
+            );
+            let other = [0x78u8; 32];
+            assert!(SignedRecord::parse_channel_presence_member_v2(
+                &blob,
+                &channel.channel_id,
+                &other,
+                &channel::presence_room_blind(&channel.channel_id, &other),
+            )
+            .is_none());
+        }
+    }
+
+    /// A v2 seal cannot be passed off under another pseudonym. Copied as it is
+    /// into a record another key signs, it does not open (the AAD names the
+    /// pseudonym). Re-sealed for that key by someone holding the content key,
+    /// it opens, and the member's binding, which covers the pseudonym, is what
+    /// refuses it; the binding covers the epoch, the flag and the time too.
+    #[test]
+    fn a_v2_seal_copied_into_a_record_another_pseudonym_signs_fails_the_binding() {
+        let channel = channel::ChannelIdentity::generate();
+        let member = SigningKey::generate(&mut OsRng);
+        let join = [0x77u8; 32];
+        let now = 1_800_000_123;
+        let epoch = channel::presence_epoch(now);
+        let blind = channel::presence_room_blind(&channel.channel_id, &join);
+        let genuine = SignedRecord::channel_presence_v2_at(
+            "Ada", None, channel.channel_id, &join, false, &[0x42; 32], &member, now,
+        );
+        let sealed = genuine.channel.as_ref().unwrap().extra.clone();
+        let read = |record: &SignedRecord| {
+            SignedRecord::parse_channel_presence_member_v2(
+                &blob_of(record),
+                &channel.channel_id,
+                &join,
+                &blind,
+            )
+        };
+        assert!(read(&genuine).is_some());
+        let signed_by = |signer: &SigningKey, extra: Vec<u8>| {
+            SignedRecord::build_with_media(
+                RECORD_TYPE_CHANNEL,
+                genuine.keyword_hash,
+                blind.0,
+                blind.1,
+                pack_channel_file_size(CHANNEL_KIND_PRESENCE, CHANNEL_FLAG_PRIVATE),
+                "",
+                None,
+                Some(extra),
+                None,
+                signer,
+                now,
+            )
+        };
+
+        let storer = SigningKey::generate(&mut OsRng);
+        let copied = signed_by(&storer, sealed.clone());
+        assert!(copied.channel_store_ok(), "a storer cannot tell, so it keeps it");
+        assert!(read(&copied).is_none());
+
+        // A member of the room, holding the content key, re-seals Ada's seal
+        // for its own pseudonym and signs the record with it.
+        let key = channel::content_key(&join);
+        let pseudonym = genuine.publisher_key;
+        let mut mallory_seed = SigningKey::generate(&mut OsRng).to_bytes();
+        let mallory = channel::presence_pseudonym(&mallory_seed, &channel.channel_id, &join);
+        zeroize::Zeroize::zeroize(&mut mallory_seed);
+        let mallory_pub = mallory.verifying_key().to_bytes();
+        let resealed = channel::reseal_presence_extra_v2(
+            &key, &channel.channel_id, &pseudonym, &mallory_pub, &sealed,
+        )
+        .expect("the content key opens any member's seal");
+        assert!(
+            channel::reseal_presence_extra_v2(&key, &channel.channel_id, &mallory_pub, &pseudonym, &resealed)
+                .is_some(),
+            "the re-seal opens under the forger's AAD"
+        );
+        let forged = signed_by(&mallory, resealed.clone());
+        assert!(forged.channel_store_ok());
+        assert!(read(&forged).is_none(), "Ada's binding names her pseudonym, not this one");
+        assert!(channel::decode_presence_extra_v2(
+            &key, &channel.channel_id, &mallory_pub, &resealed, epoch, false, now,
+        )
+        .is_none());
+
+        // Opened under the right pseudonym but checked against another time,
+        // epoch or flag, the binding is what refuses it.
+        let open = |epoch, departed, at| {
+            channel::decode_presence_extra_v2(
+                &key, &channel.channel_id, &pseudonym, &sealed, epoch, departed, at,
+            )
+        };
+        assert!(open(epoch, false, now).is_some());
+        assert!(open(epoch, false, now + 1).is_none());
+        assert!(open(epoch + 1, false, now).is_none());
+        assert!(open(epoch, true, now).is_none());
+        assert!(channel::decode_presence_extra_v2(
+            &key,
+            &channel.channel_id,
+            &storer.verifying_key().to_bytes(),
+            &sealed,
+            epoch,
+            false,
+            now,
+        )
+        .is_none());
+    }
+
+    /// Storers on this build keep v2 presence on its shape and flagged
+    /// key-epoch records only under the key they recompute from the record,
+    /// and refuse malformed or misfiled ones. A storer on 1.7.4, which knows
+    /// neither, refuses both.
+    #[test]
+    fn storers_keep_v2_presence_and_blinded_epoch_records_and_refuse_malformed_ones() {
+        let channel = channel::ChannelIdentity::generate();
+        let member = SigningKey::generate(&mut OsRng);
+        let join = [0x77u8; 32];
+        let presence = SignedRecord::channel_presence_v2_at(
+            "Ada", Some("ja"), channel.channel_id, &join, false, &[0x42; 32], &member, 1_800_000_000,
+        );
+        assert!(presence.channel_store_ok());
+        let extra = presence.channel.as_ref().unwrap().extra.clone();
+        for bad in [extra[..extra.len() - 1].to_vec(), [extra.clone(), vec![0]].concat(), {
+            let mut v = extra.clone();
+            v[0] = 3;
+            v
+        }] {
+            let mut malformed = presence.clone();
+            malformed.channel.as_mut().unwrap().extra = bad;
+            assert!(!malformed.channel_store_ok());
+        }
+        // The only shapes a 1.7.4 storer keeps.
+        assert!(![32, channel::PRESENCE_EXTRA_ENC_LEN].contains(&channel::PRESENCE_EXTRA_V2_LEN));
+
+        let member_pub = member.verifying_key().to_bytes();
+        let owner_seed = [0x0Au8; 32];
+        let blind = channel::epoch_blind(&owner_seed, &member_pub, &channel.channel_id).unwrap();
+        let member_id = channel::epoch_member_id(&blind, 2);
+        let envelope = [&[channel::EPOCH_ENVELOPE_VERSION][..], &[0u8; channel::EPOCH_ENVELOPE_LEN - 1]].concat();
+        let build = |blind: Option<&[u8; 32]>, epoch: i64, envelope: &[u8], signer: &SigningKey| {
+            SignedRecord::channel_key_epoch_at(
+                channel.channel_id,
+                channel.pubkey,
+                &member_pub,
+                blind,
+                epoch,
+                envelope,
+                signer,
+                1_800_000_000,
+            )
+        };
+        let epoch = build(Some(&blind), 2, &envelope, &channel.signing_key);
+        assert!(epoch.channel_store_ok());
+        assert_eq!(channel_flags_from_data(&epoch.data).map(|f| f & CHANNEL_FLAG_BLINDED), Some(CHANNEL_FLAG_BLINDED));
+        assert_eq!(&epoch.channel.as_ref().unwrap().extra[..32], &member_id);
+        assert_eq!(epoch.keyword_hash, channel::epoch_key_v2(&channel.channel_id, &member_id, 2));
+        assert!(!build(Some(&blind), 0, &envelope, &channel.signing_key).channel_store_ok());
+        assert!(!build(Some(&blind), 2, &envelope[..40], &channel.signing_key).channel_store_ok());
+        assert!(!build(Some(&blind), 2, &envelope, &member).channel_store_ok());
+
+        // Signed by the room key itself but filed under any other key, it is
+        // refused: another epoch's, another member id's, another room's, the
+        // v1 key, or any key at all.
+        let other_id = channel::epoch_member_id(&[0x5Eu8; 32], 2);
+        for key in [
+            channel::epoch_key_v2(&channel.channel_id, &member_id, 3),
+            channel::epoch_key_v2(&channel.channel_id, &channel::epoch_member_id(&blind, 3), 2),
+            channel::epoch_key_v2(&channel.channel_id, &other_id, 2),
+            channel::epoch_key_v2(&[0x01; 16], &member_id, 2),
+            channel::epoch_key(&channel.channel_id, &member_id, 2),
+            channel::presence_key(&channel.channel_id, &join, 7),
+            [0xEE; 16],
+        ] {
+            let misfiled = SignedRecord::build_with_media(
+                RECORD_TYPE_CHANNEL,
+                key,
+                channel.channel_id,
+                channel.pubkey,
+                pack_channel_file_size(CHANNEL_KIND_EPOCH, CHANNEL_FLAG_PRIVATE | CHANNEL_FLAG_BLINDED),
+                "",
+                None,
+                Some(epoch.channel.as_ref().unwrap().extra.clone()),
+                None,
+                &channel.signing_key,
+                1_800_000_000,
+            );
+            assert!(!misfiled.channel_store_ok());
+        }
+
+        // Without the flag, the v1 rule recomputes the key and refuses it.
+        let mut as_v1 = epoch.clone();
+        as_v1.channel.as_mut().unwrap().flags &= !CHANNEL_FLAG_BLINDED;
+        assert!(!as_v1.channel_store_ok());
+
+        let parsed = SignedRecord::parse_channel_key_epoch_record(&blob_of(&epoch), &channel.channel_id).unwrap();
+        assert!(parsed.blinded);
+        assert_eq!(parsed.slot, member_id);
+    }
+
+    /// A member's language reads back from every form of their presence: from
+    /// the signed header in a public room, from inside the seal in a private
+    /// one, where the header says nothing a storer could read. A leave notice
+    /// carries none.
+    #[test]
+    fn a_members_language_rides_every_presence_form() {
+        let channel = channel::ChannelIdentity::generate();
+        let member = SigningKey::generate(&mut OsRng);
+        let now = 1_800_000_000;
+
+        let public_join = channel::public_join_secret(&channel.pubkey);
+        let public = SignedRecord::channel_presence_forms(
+            "Ada", Some("ja"), channel.channel_id, channel.pubkey, &public_join, false, false, &[0x42; 32], &member, now,
+        );
+        assert_eq!(public.len(), 1);
+        assert!(public[0].channel_store_ok());
+        assert_eq!(channel_language_from_file_size(public[0].file_size), Some("ja"));
+        assert_eq!(channel_kind_from_data(&public[0].data), Some(CHANNEL_KIND_PRESENCE));
+        let read = SignedRecord::parse_channel_presence_member(&blob_of(&public[0]), &channel.channel_id, None).unwrap();
+        assert_eq!((read.nickname.as_str(), read.language), ("Ada", Some("ja")));
+
+        let join = [0x77u8; 32];
+        let key = channel::content_key(&join);
+        let blind = channel::presence_room_blind(&channel.channel_id, &join);
+        let private = SignedRecord::channel_presence_forms(
+            "Ada", Some("ja"), channel.channel_id, channel.pubkey, &join, true, false, &[0x42; 32], &member, now,
+        );
+        assert_eq!(private.len(), 2);
+        for record in &private {
+            assert!(record.channel_store_ok());
+            assert_eq!(channel_language_from_file_size(record.file_size), None, "kept out of the header");
+        }
+        let v2 = SignedRecord::parse_channel_presence_member_v2(&blob_of(&private[0]), &channel.channel_id, &join, &blind)
+            .unwrap();
+        assert_eq!(v2.language, Some("ja"));
+        let v1 = SignedRecord::parse_channel_presence_member(&blob_of(&private[1]), &channel.channel_id, Some(&key))
+            .unwrap();
+        assert_eq!(v1.language, Some("ja"));
+
+        let none = SignedRecord::channel_presence_forms(
+            "Ada", None, channel.channel_id, channel.pubkey, &public_join, false, false, &[0x42; 32], &member, now,
+        );
+        let read = SignedRecord::parse_channel_presence_member(&blob_of(&none[0]), &channel.channel_id, None).unwrap();
+        assert_eq!(read.language, None);
+
+        for private in [false, true] {
+            let secret = if private { join } else { public_join };
+            let left = SignedRecord::channel_presence_forms(
+                "Ada", Some("ja"), channel.channel_id, channel.pubkey, &secret, private, true, &[0x42; 32], &member, now,
+            );
+            let last = left.last().unwrap();
+            let read = SignedRecord::parse_channel_presence_member(&blob_of(last), &channel.channel_id, Some(&key)).unwrap();
+            assert!(read.departed);
+            assert_eq!(read.language, None);
+        }
+    }
+
+    /// This build publishes both forms of a private room's presence and key
+    /// records, stamped alike, and only v1 where v2 would hide nothing.
+    #[test]
+    fn both_forms_of_private_membership_records_are_published() {
+        const { assert!(channel::PUBLISH_V1_MEMBERSHIP_RECORDS, "the transition keeps v1 until 1.8.0") };
+        let channel = channel::ChannelIdentity::generate();
+        let member = SigningKey::generate(&mut OsRng);
+        let join = [0x77u8; 32];
+        let now = 1_800_000_000;
+        for departed in [false, true] {
+            let forms = SignedRecord::channel_presence_forms(
+                "Ada", None, channel.channel_id, channel.pubkey, &join, true, departed, &[0x42; 32], &member, now,
+            );
+            assert_eq!(forms.len(), 2);
+            assert_ne!(forms[0].file_hash, channel.channel_id, "v2 first");
+            assert_eq!(forms[1].file_hash, channel.channel_id);
+            assert_eq!(forms[0].keyword_hash, forms[1].keyword_hash);
+            assert!(forms.iter().all(|r| r.timestamp == now && r.channel_store_ok()));
+            assert!(forms.iter().all(|r| r.channel.as_ref().unwrap().is_departed() == departed));
+        }
+        let public = SignedRecord::channel_presence_forms(
+            "Ada",
+            None,
+            channel.channel_id,
+            channel.pubkey,
+            &channel::public_join_secret(&channel.pubkey),
+            false,
+            false,
+            &[0x42; 32],
+            &member,
+            now,
+        );
+        assert_eq!(public.len(), 1);
+        assert_eq!(public[0].file_hash, channel.channel_id);
+
+        let member_pub = member.verifying_key().to_bytes();
+        let blind = channel::epoch_blind(&[0x0Au8; 32], &member_pub, &channel.channel_id).unwrap();
+        let sealed = [&[channel::EPOCH_ENVELOPE_VERSION][..], &[0u8; channel::EPOCH_ENVELOPE_LEN - 1]].concat();
+        let epoch_forms = |own: bool, epoch: i64| {
+            SignedRecord::channel_key_epoch_forms(
+                channel.channel_id, channel.pubkey, &member_pub, own, epoch, &blind, &sealed, &channel.signing_key,
+            )
+        };
+        for epoch in [1, 2] {
+            let both = epoch_forms(false, epoch);
+            assert_eq!(both.len(), 2);
+            assert!(both[0].channel.as_ref().unwrap().flags & CHANNEL_FLAG_BLINDED != 0);
+            assert_eq!(
+                both[0].keyword_hash,
+                channel::epoch_key_v2(&channel.channel_id, &channel::epoch_member_id(&blind, epoch), epoch)
+            );
+            assert_eq!(both[1].keyword_hash, channel::epoch_key(&channel.channel_id, &member_pub, epoch));
+            assert!(both.iter().all(|r| r.timestamp == both[0].timestamp && r.channel_store_ok()));
+        }
+
+        // Past the transition the owner's own copy still goes out in v1; a
+        // member's copy does not.
+        assert!(channel::epoch_record_publishes_v1(true));
+        assert_eq!(channel::epoch_record_publishes_v1(false), channel::PUBLISH_V1_MEMBERSHIP_RECORDS);
     }
 
     /// A snapshot carries the stamp it was built at and the signature that
@@ -4578,6 +5707,316 @@ mod tests {
         assert_eq!(salts, vec![[1u8; 16], [2u8; 16]]);
     }
 
+    fn settings_record_with_extra(
+        signer: &SigningKey,
+        room_pub: [u8; 32],
+        keyword: [u8; 16],
+        extra: Vec<u8>,
+    ) -> SignedRecord {
+        SignedRecord::build(
+            RECORD_TYPE_CHANNEL,
+            keyword,
+            channel::channel_id_from_pubkey(&room_pub),
+            room_pub,
+            pack_channel_file_size(CHANNEL_KIND_SETTINGS, CHANNEL_FLAG_PRIVATE),
+            "",
+            None,
+            Some(extra),
+            signer,
+        )
+    }
+
+    fn blob_of(record: &SignedRecord) -> Vec<u8> {
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        blob
+    }
+
+    fn field(tag: u8, value: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        out.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        out.extend_from_slice(value);
+        out
+    }
+
+    fn commitments_value(entries: &[(i64, [u8; 32])]) -> Vec<u8> {
+        let mut out = vec![entries.len() as u8];
+        for (epoch, commitment) in entries {
+            out.extend_from_slice(&epoch.to_le_bytes());
+            out.extend_from_slice(commitment);
+        }
+        out
+    }
+
+    #[test]
+    fn a_settings_record_round_trips_and_only_the_room_key_can_file_it() {
+        let room = SigningKey::from_bytes(&[0x81; 32]);
+        let room_pub = room.verifying_key().to_bytes();
+        let channel_id = channel::channel_id_from_pubkey(&room_pub);
+        let commitments: Vec<(i64, [u8; 32])> =
+            (1..=SETTINGS_KEY_COMMITMENTS_MAX as i64).rev().map(|e| (e, [e as u8; 32])).collect();
+        let now = chrono::Utc::now().timestamp();
+        let record = SignedRecord::channel_settings_at(&commitments, 0, channel_id, room_pub, true, &room, now)
+            .expect("a full list fits");
+        assert_eq!(record.keyword_hash, channel::settings_key(&channel_id));
+        assert_ne!(record.keyword_hash, channel::moderation_key(&channel_id), "never the snapshot's slot");
+        assert_eq!(channel_kind_from_data(&record.data), Some(CHANNEL_KIND_SETTINGS));
+        assert_eq!(channel_flags_from_data(&record.data), Some(CHANNEL_FLAG_PRIVATE));
+        assert!(record.channel_store_ok());
+        assert_eq!(
+            record.channel.as_ref().unwrap().extra.len(),
+            1 + 3 + 1 + 40 * SETTINGS_KEY_COMMITMENTS_MAX,
+            "161 bytes of commitments behind the version and the field header"
+        );
+        let mut store = super::super::store::DhtStore::new();
+        assert!(store.store(record.keyword_hash, record.data.clone(), record.signature));
+
+        let parsed = SignedRecord::parse_channel_settings(&blob_of(&record), &channel_id).expect("parses");
+        assert_eq!(parsed.key_commitments, commitments);
+        assert_eq!(parsed.timestamp, now);
+        assert_eq!(parsed.publisher_key, room_pub);
+        assert_eq!(parsed.signature, record.signature);
+        assert!(SignedRecord::parse_channel_settings(&blob_of(&record), &[0u8; 16]).is_none());
+
+        // Nothing to say is one byte, and still a record storers keep.
+        let empty = SignedRecord::channel_settings_at(&[], 0, channel_id, room_pub, true, &room, 1).unwrap();
+        assert_eq!(empty.channel.as_ref().unwrap().extra, vec![SETTINGS_VERSION]);
+        assert!(empty.channel_store_ok());
+        assert!(SignedRecord::parse_channel_settings(&blob_of(&empty), &channel_id)
+            .unwrap()
+            .key_commitments
+            .is_empty());
+
+        // Signed by anyone but the room key, or filed anywhere but its own
+        // slot, it is refused, so nobody can stand in for the owner or crowd
+        // out the snapshot.
+        let extra = encode_settings_extra(&commitments, 1).unwrap();
+        let member = SigningKey::from_bytes(&[0x82; 32]);
+        let forged = settings_record_with_extra(&member, room_pub, channel::settings_key(&channel_id), extra.clone());
+        assert!(!forged.channel_store_ok());
+        assert!(SignedRecord::parse_channel_settings(&blob_of(&forged), &channel_id).is_none());
+        for misfiled in [channel::moderation_key(&channel_id), channel::settings_key(&[0x11; 16])] {
+            let record = settings_record_with_extra(&room, room_pub, misfiled, extra.clone());
+            assert!(!record.channel_store_ok());
+            assert!(SignedRecord::parse_channel_settings(&blob_of(&record), &channel_id).is_none());
+        }
+        assert!(settings_record_with_extra(&room, room_pub, channel::settings_key(&channel_id), extra)
+            .channel_store_ok());
+
+        assert!(
+            SignedRecord::channel_settings_at(&[(1, [0; 32]), (2, [0; 32])], 1, channel_id, room_pub, true, &room, 1)
+                .is_none(),
+            "the builder will not sign a list the network refuses"
+        );
+    }
+
+    #[test]
+    fn malformed_settings_are_refused_by_storers_and_readers() {
+        let room = SigningKey::from_bytes(&[0x83; 32]);
+        let room_pub = room.verifying_key().to_bytes();
+        let channel_id = channel::channel_id_from_pubkey(&room_pub);
+        let key = channel::settings_key(&channel_id);
+        let good = commitments_value(&[(3, [3; 32]), (2, [2; 32])]);
+        let with_fields = |fields: &[Vec<u8>]| {
+            let mut extra = vec![SETTINGS_VERSION];
+            for f in fields {
+                extra.extend_from_slice(f);
+            }
+            extra
+        };
+        let mut overrun = field(SETTINGS_TAG_KEY_COMMITMENTS, &good);
+        overrun[1] += 1;
+        let five: Vec<(i64, [u8; 32])> = (1..=5).rev().map(|e| (e, [0; 32])).collect();
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("no version", Vec::new()),
+            ("version 0", vec![0]),
+            ("a length running past the end", with_fields(&[overrun])),
+            ("bytes left over", {
+                let mut extra = with_fields(&[field(SETTINGS_TAG_KEY_COMMITMENTS, &good)]);
+                extra.push(0);
+                extra
+            }),
+            ("half a field header", with_fields(&[vec![9, 0]])),
+            ("tags out of order", with_fields(&[field(5, b"x"), field(4, b"y")])),
+            ("a tag repeated", with_fields(&[field(5, b"x"), field(5, b"y")])),
+            ("tag 1 repeated", with_fields(&[
+                field(SETTINGS_TAG_KEY_COMMITMENTS, &good),
+                field(SETTINGS_TAG_KEY_COMMITMENTS, &good),
+            ])),
+            ("epochs rising", with_fields(&[field(
+                SETTINGS_TAG_KEY_COMMITMENTS,
+                &commitments_value(&[(2, [2; 32]), (3, [3; 32])]),
+            )])),
+            ("an epoch twice", with_fields(&[field(
+                SETTINGS_TAG_KEY_COMMITMENTS,
+                &commitments_value(&[(3, [3; 32]), (3, [4; 32])]),
+            )])),
+            ("epoch 0", with_fields(&[field(
+                SETTINGS_TAG_KEY_COMMITMENTS,
+                &commitments_value(&[(1, [1; 32]), (0, [0; 32])]),
+            )])),
+            ("a negative epoch", with_fields(&[field(
+                SETTINGS_TAG_KEY_COMMITMENTS,
+                &commitments_value(&[(-1, [1; 32])]),
+            )])),
+            ("more epochs than are kept", with_fields(&[field(
+                SETTINGS_TAG_KEY_COMMITMENTS,
+                &commitments_value(&five),
+            )])),
+            ("miscounted", with_fields(&[field(SETTINGS_TAG_KEY_COMMITMENTS, &{
+                let mut value = good.clone();
+                value[0] = 3;
+                value
+            })])),
+            ("an empty commitment value", with_fields(&[field(SETTINGS_TAG_KEY_COMMITMENTS, &[])])),
+            ("an empty admission value", with_fields(&[field(SETTINGS_TAG_ADMISSION, &[])])),
+            ("a two-byte admission value", with_fields(&[field(SETTINGS_TAG_ADMISSION, &[1, 0])])),
+            ("tag 2 before tag 1", with_fields(&[
+                field(SETTINGS_TAG_ADMISSION, &[1]),
+                field(SETTINGS_TAG_KEY_COMMITMENTS, &good),
+            ])),
+        ];
+        for (what, extra) in cases {
+            let record = settings_record_with_extra(&room, room_pub, key, extra);
+            assert!(!record.channel_store_ok(), "a storer kept {what}");
+            assert!(
+                SignedRecord::parse_channel_settings(&blob_of(&record), &channel_id).is_none(),
+                "a reader took {what}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_later_settings_version_and_unknown_tags_are_kept_and_skipped() {
+        let room = SigningKey::from_bytes(&[0x84; 32]);
+        let room_pub = room.verifying_key().to_bytes();
+        let channel_id = channel::channel_id_from_pubkey(&room_pub);
+        let key = channel::settings_key(&channel_id);
+        let commitments = vec![(9, [9u8; 32]), (7, [7u8; 32])];
+        for version in [SETTINGS_VERSION, SETTINGS_VERSION + 1, u8::MAX] {
+            let mut extra = vec![version];
+            extra.extend(field(0, b"before"));
+            extra.extend(field(SETTINGS_TAG_KEY_COMMITMENTS, &commitments_value(&commitments)));
+            extra.extend(field(9, b"what a later build adds"));
+            extra.extend(field(200, &[]));
+            let record = settings_record_with_extra(&room, room_pub, key, extra);
+            assert!(record.channel_store_ok(), "version {version} is kept");
+            let parsed = SignedRecord::parse_channel_settings(&blob_of(&record), &channel_id)
+                .expect("the tags this build knows read");
+            assert_eq!(parsed.key_commitments, commitments, "version {version}");
+        }
+        let only_unknown = settings_record_with_extra(&room, room_pub, key, {
+            let mut extra = vec![SETTINGS_VERSION + 1];
+            extra.extend(field(3, &[0xAB; 300]));
+            extra
+        });
+        assert!(only_unknown.channel_store_ok());
+        assert!(SignedRecord::parse_channel_settings(&blob_of(&only_unknown), &channel_id)
+            .unwrap()
+            .key_commitments
+            .is_empty());
+
+        // Within the store limit only: past it, refused whatever it carries.
+        let mut oversized = only_unknown.clone();
+        oversized.data.resize(messages::MAX_STORE_RECORD_BYTES + 1, 0);
+        assert!(!oversized.channel_store_ok());
+    }
+
+    /// Tag 2 is one byte after tag 1, left out for 0, and kept and read back
+    /// as written whatever its value; a later version holds it to the same
+    /// one byte.
+    #[test]
+    fn the_admission_tag_is_one_byte_after_the_commitments() {
+        let room = SigningKey::from_bytes(&[0x85; 32]);
+        let room_pub = room.verifying_key().to_bytes();
+        let channel_id = channel::channel_id_from_pubkey(&room_pub);
+        let key = channel::settings_key(&channel_id);
+
+        assert_eq!(encode_settings_extra(&[], 1).unwrap(), vec![SETTINGS_VERSION, SETTINGS_TAG_ADMISSION, 1, 0, 1]);
+        assert_eq!(encode_settings_extra(&[], 0).unwrap(), vec![SETTINGS_VERSION], "0 is written by leaving it out");
+        let commitments = vec![(2, [2u8; 32]), (1, [1u8; 32])];
+        let both = encode_settings_extra(&commitments, 1).unwrap();
+        let mut expected = vec![SETTINGS_VERSION];
+        expected.extend(field(SETTINGS_TAG_KEY_COMMITMENTS, &commitments_value(&commitments)));
+        expected.extend(field(SETTINGS_TAG_ADMISSION, &[1]));
+        assert_eq!(both, expected);
+
+        let record = SignedRecord::channel_settings_at(&commitments, 1, channel_id, room_pub, true, &room, 7).unwrap();
+        assert!(record.channel_store_ok());
+        let parsed = SignedRecord::parse_channel_settings(&blob_of(&record), &channel_id).unwrap();
+        assert_eq!(parsed.admission, 1);
+        assert_eq!(parsed.key_commitments, commitments);
+        let without = SignedRecord::channel_settings_at(&commitments, 0, channel_id, room_pub, true, &room, 8).unwrap();
+        assert_eq!(SignedRecord::parse_channel_settings(&blob_of(&without), &channel_id).unwrap().admission, 0);
+
+        for value in [0u8, 1, 2, 0x7F, u8::MAX] {
+            for version in [SETTINGS_VERSION, SETTINGS_VERSION + 1] {
+                let mut extra = vec![version];
+                extra.extend(field(SETTINGS_TAG_ADMISSION, &[value]));
+                extra.extend(field(3, b"later"));
+                let record = settings_record_with_extra(&room, room_pub, key, extra);
+                assert!(record.channel_store_ok(), "value {value} at version {version} is kept");
+                let parsed = SignedRecord::parse_channel_settings(&blob_of(&record), &channel_id).unwrap();
+                assert_eq!(parsed.admission, value, "read back as written");
+            }
+        }
+        let mut later = vec![SETTINGS_VERSION + 1];
+        later.extend(field(SETTINGS_TAG_ADMISSION, &[1, 1]));
+        let later = settings_record_with_extra(&room, room_pub, key, later);
+        assert!(!later.channel_store_ok(), "the layout holds in every version");
+        assert!(SignedRecord::parse_channel_settings(&blob_of(&later), &channel_id).is_none());
+    }
+
+    #[test]
+    fn settings_fields_fuzz_never_panics() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5E77_1465);
+        let well_formed = encode_settings_extra(&[(4, [4; 32]), (2, [2; 32])], 1).unwrap();
+        let mut read = 0usize;
+        for i in 0..2_000 {
+            let buf = match i % 3 {
+                0 => well_formed.clone(),
+                1 => {
+                    let mut b = well_formed.clone();
+                    let at = rng.gen_range(0..b.len());
+                    b[at] ^= 1 << rng.gen_range(0..8);
+                    b.truncate(rng.gen_range(0..=b.len()));
+                    b
+                }
+                _ => (0..rng.gen_range(0..120)).map(|_| rng.gen()).collect(),
+            };
+            if settings_fields(&buf).is_some() {
+                read += 1;
+            }
+        }
+        assert!(read > 0, "the fuzz never produced fields the reader accepted");
+    }
+
+    #[test]
+    fn key_commitments_are_stable_and_bind_room_epoch_and_key() {
+        let room = [0x10u8; 16];
+        let key = [0x20u8; 32];
+        let commitment = channel::key_commitment(&room, 3, &key);
+        let mut material = Vec::new();
+        material.extend_from_slice(&room);
+        material.extend_from_slice(&3i64.to_le_bytes());
+        material.extend_from_slice(&key);
+        assert_eq!(commitment, blake3::derive_key("ember channel key commitment v1", &material));
+        assert_eq!(
+            hex::encode(commitment),
+            "b6b950c01d3a5b5f4dbc74d76005a5d8db0812c44e3605fe21e69c9db9236bc3",
+            "every published commitment depends on this never changing"
+        );
+        assert_ne!(commitment, channel::key_commitment(&[0x11; 16], 3, &key), "the room");
+        assert_ne!(commitment, channel::key_commitment(&room, 4, &key), "the epoch");
+        assert_ne!(commitment, channel::key_commitment(&room, 3, &[0x21; 32]), "the key");
+        assert_ne!(
+            channel::settings_key(&room),
+            channel::moderation_key(&room),
+            "and the record carrying it has a slot of its own"
+        );
+    }
+
     /// The channel sub-decoders sit behind `channel_store_ok`, which is only
     /// reached after an Ed25519 signature verifies — so random and bit-flipped
     /// buffers cannot get to them, and the record-level fuzz's two deterministic
@@ -4782,6 +6221,39 @@ mod tests {
                 .is_empty(),
             "the table is empty; the target must have come from start_publish_to"
         );
+    }
+
+    #[test]
+    fn an_expired_publish_is_handed_back_with_what_it_sent() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let target = |i: u8| EmberContact {
+            node_id: EmberNodeId([i; 16]),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, i, 1, 1)), 4662),
+            noise_pub: [i; 32],
+            ed25519_pub: [i; 32],
+            last_seen: chrono::Utc::now().timestamp(),
+            failed_queries: 0,
+        };
+        let sk = SigningKey::generate(&mut OsRng);
+        let record = SignedRecord::keyword("test", [0xAA; 16], [0xBB; 32], 1000, "file.txt", &sk);
+        let mut pm = PublishManager::new();
+        let pub_id = pm
+            .start_publish_to(record, vec![target(1), target(2)])
+            .expect("publish slot");
+        let op = pm.get_mut(pub_id).unwrap();
+        assert_eq!(op.next_to_store().len(), 2);
+        op.sent = 2;
+        assert!(pm.cleanup_expired().is_empty(), "not yet expired");
+
+        let op = pm.get_mut(pub_id).unwrap();
+        op.started_at = Instant::now() - std::time::Duration::from_secs(PUBLISH_TIMEOUT_SECS * 2 + 1);
+        let expired = pm.cleanup_expired();
+        assert_eq!(
+            expired.iter().map(|op| (op.id, op.sent, op.acked.len(), op.targets.len())).collect::<Vec<_>>(),
+            vec![(pub_id, 2, 0, 2)]
+        );
+        assert_eq!(pm.active_count(), 0);
     }
 
     /// A huge filename used to produce a body the STORE decoder accepted and

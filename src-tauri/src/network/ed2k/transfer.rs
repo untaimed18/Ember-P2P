@@ -1350,6 +1350,92 @@ pub(crate) fn move_part_to_completed(
     })
 }
 
+/// The folder a finished download from a feed lands in:
+/// `<download_root>/Feeds/<folder>`, each made inside the approved root as
+/// `Downloads` is. When the feed's own folder cannot be made, `Feeds` itself:
+/// never `Downloads`, which may be shared. Blocking.
+pub(crate) fn prepare_feed_completed_dir(
+    download_root: &std::path::Path,
+    folder: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let allowed = vec![download_root.to_string_lossy().into_owned()];
+    let feeds = crate::security::filesystem::prepare_approved_subdir(
+        download_root,
+        crate::sharing::feed_downloads::FEEDS_DIR,
+        &allowed,
+    )
+    .map_err(|e| download_folder_error("preparing Feeds", download_root, e))?;
+    crate::sharing::feed_downloads::mark_feeds_dir(&feeds);
+    match crate::security::filesystem::prepare_approved_subdir_like_parent(&feeds, folder, &allowed) {
+        Ok(dir) => Ok(dir),
+        Err(e) => {
+            tracing::warn!(
+                "Could not use the feed folder {folder} in {}: {e}. Finishing into Feeds.",
+                feeds.display()
+            );
+            Ok(feeds)
+        }
+    }
+}
+
+/// [`move_part_to_completed`] for a download from a feed, into its feed
+/// folder (see [`prepare_feed_completed_dir`]). Blocking.
+pub(crate) fn move_part_to_feed_folder(
+    part_path: &std::path::Path,
+    part_root: &std::path::Path,
+    download_root: &std::path::Path,
+    folder: &str,
+    file_name: &str,
+    expected_source_identity: &crate::security::filesystem::ObjectIdentity,
+) -> anyhow::Result<std::path::PathBuf> {
+    let completed_dir = prepare_feed_completed_dir(download_root, folder)?;
+    move_part_between_roots_approved(
+        part_path,
+        part_root,
+        &completed_dir.join(file_name),
+        download_root,
+        expected_source_identity,
+    )
+    .map_err(|e| {
+        let error = format!("{e:#}");
+        if is_disk_full_error(&error) || is_download_folder_error(&error) {
+            e
+        } else {
+            anyhow::anyhow!("{COMPLETION_MOVE_STAGE}: {error}")
+        }
+    })
+}
+
+/// Where a finished download lands, by what kind it is: a feed's in its feed
+/// folder, any other in its category's folder in `Downloads`.
+pub(crate) fn move_part_to_its_folder(
+    transfer_id: &str,
+    part_path: &std::path::Path,
+    part_root: &std::path::Path,
+    download_root: &std::path::Path,
+    file_name: &str,
+    expected_source_identity: &crate::security::filesystem::ObjectIdentity,
+) -> anyhow::Result<std::path::PathBuf> {
+    match crate::sharing::feed_downloads::folder_of(transfer_id) {
+        Some(folder) => move_part_to_feed_folder(
+            part_path,
+            part_root,
+            download_root,
+            &folder,
+            file_name,
+            expected_source_identity,
+        ),
+        None => move_part_to_completed(
+            part_path,
+            part_root,
+            download_root,
+            &crate::storage::category_folders::completion_subdir(transfer_id),
+            file_name,
+            expected_source_identity,
+        ),
+    }
+}
+
 /// Prefix on a failure to move a verified `.part` into `Downloads`. Every
 /// retry reads the whole file again to verify it, so the event loop retries
 /// such a failure once and then leaves the download Failed, `.part` kept, for
@@ -1428,6 +1514,8 @@ transfer_failure_codes! {
         "The download folder cannot be written; check it in Settings";
     PartFolderOffline => "part_folder_offline",
         "The drive holding this download's progress is not connected; Resume starts it over";
+    PartFilesRemoved => "part_files_removed",
+        "This download's part files were removed; Resume starts it over";
     EmberPinCorrupt => "ember_pin_corrupt",
         "Persisted Ember digest was corrupt; cancel and re-add the eh= link";
     AichPinCorrupt => "aich_pin_corrupt",
@@ -1767,14 +1855,17 @@ mod tests {
             );
         }
 
-        // The three variants the classifier cannot reach are assigned directly:
-        // two by the database loader for a corrupt persisted pin, one by the
-        // command layer when the network channel is gone. Named here so a
-        // variant added without a producer is visible rather than assumed.
+        // The variants the classifier cannot reach are assigned directly: two
+        // by the database loader for a corrupt persisted pin, one by the
+        // command layer when the network channel is gone, and one by the
+        // startup restore for a download whose part files were removed. Named
+        // here so a variant added without a producer is visible rather than
+        // assumed.
         let assigned_elsewhere = [
             C::EmberPinCorrupt,
             C::AichPinCorrupt,
             C::NetworkChannelUnavailable,
+            C::PartFilesRemoved,
         ];
         let produced: std::collections::HashSet<_> =
             cases.iter().map(|(_, _, code)| *code).collect();
@@ -1915,20 +2006,41 @@ mod tests {
     }
 
     #[test]
-    fn hashset2_aich_requires_two_sources_when_expected_is_unknown() {
+    fn hashset2_aich_requires_emules_quorum_when_expected_is_unknown() {
         let root = [0xBBu8; 20];
         let mut pinned = None;
         let mut votes: HashMap<[u8; 20], HashSet<String>> = HashMap::new();
-        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), "203.0.113.5", root);
-        assert!(pinned.is_none());
-        // A reconnect gets a new worker index but is still the same peer.
-        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), "203.0.113.5", root);
-        assert!(
-            pinned.is_none(),
-            "the same source repeating a root is still one vote"
-        );
-        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), "198.51.100.9", root);
-        assert_eq!(pinned, Some(root));
+        let vote = |pinned: &mut Option<[u8; 20]>, votes: &mut HashMap<_, _>, ip: &str, root| {
+            consider_hashset2_aich_pin(pinned, None, Some(votes), ip, root);
+        };
+        vote(&mut pinned, &mut votes, "203.0.113.5", root);
+        // A reconnect gets a new worker index but is still the same peer, and
+        // a neighbour in the same /20 is the same network.
+        vote(&mut pinned, &mut votes, "203.0.113.5", root);
+        vote(&mut pinned, &mut votes, "203.0.118.9", root);
+        for n in 1..=8u8 {
+            vote(&mut pinned, &mut votes, &format!("198.{n}.100.9"), root);
+        }
+        assert!(pinned.is_none(), "nine networks are not enough, two colluding peers far less");
+        vote(&mut pinned, &mut votes, "192.0.2.1", root);
+        assert_eq!(pinned, Some(root), "ten networks and every vote agreeing");
+    }
+
+    #[test]
+    fn hashset2_aich_needs_ninety_two_percent_agreement() {
+        let honest = [0xBBu8; 20];
+        let forged = [0xCCu8; 20];
+        let mut pinned = None;
+        let mut votes: HashMap<[u8; 20], HashSet<String>> = HashMap::new();
+        consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), "10.1.0.1", forged);
+        for n in 1..=10u8 {
+            consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), &format!("198.{n}.100.9"), honest);
+        }
+        assert!(pinned.is_none(), "10 of 11 is under 92%");
+        for n in 11..=12u8 {
+            consider_hashset2_aich_pin(&mut pinned, None, Some(&mut votes), &format!("198.{n}.100.9"), honest);
+        }
+        assert_eq!(pinned, Some(honest), "12 of 13 clears it");
     }
 
     #[test]
@@ -3762,7 +3874,8 @@ pub(crate) fn settle_stale_completion_copies(
     let dirs = finished_file_dirs()
         .into_iter()
         .map(|dir| std::path::Path::new(root).join(dir))
-        .chain(category_dirs);
+        .chain(category_dirs)
+        .chain(crate::sharing::feed_downloads::finished_dirs(std::path::Path::new(root)));
     for dir in dirs {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -3866,8 +3979,25 @@ pub(crate) enum CopyRecovery {
 }
 
 /// `name` in `dir` and every name completion gives it there when that one
-/// is taken (`name (1)`, `name (2)`, …), lowest first. Blocking.
+/// is taken (`name (1)`, `name (2)`, …), lowest first, then the same for the
+/// name with the `[Ember-P2P]` tag, which completion may have given it
+/// instead (see [`crate::sharing::name_tag::completed_download_name`]).
+/// Blocking.
 pub(crate) fn published_names(dir: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
+    let mut names = published_names_of(dir, name);
+    if let Some(tagged) = crate::sharing::name_tag::tagged_name(name, true) {
+        // Only those there: callers read a missing candidate as an unreadable
+        // file, and most downloads were never tagged.
+        names.extend(
+            published_names_of(dir, &tagged)
+                .into_iter()
+                .filter(|path| std::fs::symlink_metadata(path).is_ok()),
+        );
+    }
+    names
+}
+
+fn published_names_of(dir: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
     let base = dir.join(name);
     let mut variants: Vec<(u32, std::path::PathBuf)> = std::fs::read_dir(dir)
         .into_iter()
@@ -3968,12 +4098,18 @@ pub(crate) fn recover_completion_copy(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("completion copy has no folder"))?;
     let elsewhere = !crate::storage::part_folders::same_folder(root, download_root);
-    // Its category's folder, when the download it names still has one; a
-    // finished download's no longer does, and lands in Downloads.
-    let subdir = path
+    let stem = path
         .file_name()
         .and_then(|name| name.to_str())
-        .and_then(parse_completion_copy_name)
+        .and_then(parse_completion_copy_name);
+    // A feed's download is published in its feed folder, and looked for
+    // there and in `Feeds`, never in Downloads.
+    if let Some(folder) = stem.and_then(crate::sharing::feed_downloads::folder_of) {
+        return recover_feed_completion_copy(copy, &allowed, dir, root, download_root, elsewhere, &folder, &name, size, is_the_file);
+    }
+    // Its category's folder, when the download it names still has one; a
+    // finished download's no longer does, and lands in Downloads.
+    let subdir = stem
         .map(crate::storage::category_folders::completion_subdir)
         .unwrap_or_default();
     let downloads = std::path::Path::new(download_root).join("Downloads");
@@ -3995,6 +4131,8 @@ pub(crate) fn recover_completion_copy(
             }
         }
     }
+    // Not published yet: under the name a completion would give it now.
+    let name = crate::sharing::name_tag::completed_download_name(&name);
     if elsewhere {
         let published = move_part_to_completed(
             path,
@@ -4006,12 +4144,23 @@ pub(crate) fn recover_completion_copy(
         )?;
         return Ok(CopyRecovery::Published(published));
     }
-    let target = dir.join(&name);
+    publish_copy_beside(&copy, &allowed, dir, &name)
+}
+
+/// Publish `copy` in `dir`, where it is, under the first free name from
+/// `name`. Blocking.
+fn publish_copy_beside(
+    copy: &CompletionCopy,
+    allowed: &[String],
+    dir: &std::path::Path,
+    name: &str,
+) -> anyhow::Result<CopyRecovery> {
+    let target = dir.join(name);
     for suffix in 0..=10_000u32 {
         let final_path = dedup_candidate(&target, suffix);
-        match copy.publish(&final_path, &allowed) {
+        match copy.publish(&final_path, allowed) {
             Ok(published) => {
-                sync_published(&published, &allowed);
+                sync_published(&published, allowed);
                 return Ok(CopyRecovery::Published(published));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || final_path.exists() => {}
@@ -4019,6 +4168,54 @@ pub(crate) fn recover_completion_copy(
         }
     }
     anyhow::bail!("no free name for {}", target.display())
+}
+
+/// [`recover_completion_copy`] for a copy of a download from a feed, whose
+/// file is published in its feed `folder`. The copy is made beside where its
+/// file is published, so when it lies in this download folder it is
+/// published there; otherwise in the current one's feed folder.
+#[allow(clippy::too_many_arguments)]
+fn recover_feed_completion_copy(
+    copy: CompletionCopy,
+    allowed: &[String],
+    dir: &std::path::Path,
+    root: &str,
+    download_root: &str,
+    elsewhere: bool,
+    folder: &str,
+    name: &str,
+    size: u64,
+    is_the_file: &dyn Fn(&mut std::fs::File) -> anyhow::Result<bool>,
+) -> anyhow::Result<CopyRecovery> {
+    let current = std::path::Path::new(download_root);
+    let feeds = crate::sharing::feed_downloads::feeds_dir(current);
+    let places = std::iter::once((dir.to_path_buf(), root)).chain(
+        elsewhere
+            .then(|| [(feeds.join(folder), download_root), (feeds.clone(), download_root)])
+            .into_iter()
+            .flatten(),
+    );
+    for (dir, dir_root) in places {
+        for published in published_names(&dir, name) {
+            if is_published_copy(&published, dir_root, &copy.identity, size, is_the_file) {
+                copy.discard(allowed);
+                return Ok(CopyRecovery::AlreadyPublished(published));
+            }
+        }
+    }
+    let name = crate::sharing::name_tag::completed_download_name(name);
+    if elsewhere {
+        let published = move_part_to_feed_folder(
+            &copy.path,
+            std::path::Path::new(root),
+            current,
+            folder,
+            &name,
+            &copy.identity,
+        )?;
+        return Ok(CopyRecovery::Published(published));
+    }
+    publish_copy_beside(&copy, allowed, dir, &name)
 }
 
 /// Approved-root wrapper used by production completion/recovery paths. The
@@ -4307,16 +4504,37 @@ pub(crate) fn verify_hashset(
     computed == *file_hash
 }
 
+/// Source networks that must advertise one AICH root before it is trusted
+/// without a catalog value (eMule `MINUNIQUEIPS_TOTRUST`).
+const AICH_TRUST_MIN_NETWORKS: usize = 10;
+/// Share of all advertising networks that root must hold, in percent (eMule
+/// `MINPERCENTAGE_TOTRUST`).
+const AICH_TRUST_MIN_PERCENT: usize = 92;
+
+/// The network a vote counts for: an IPv4 address masked to its /20, as eMule
+/// masks `0x00F0FFFF`, so one operator's neighbouring addresses count once.
+fn aich_voter_network(voter: &str) -> String {
+    match voter.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) => {
+            let [a, b, c, _] = ip.octets();
+            format!("{a}.{b}.{}", c & 0xF0)
+        }
+        Err(_) => voter.to_string(),
+    }
+}
+
 /// Pin an AICH master from a HashSet2 whose MD4 hashset already verified.
 ///
 /// Whole-file ed2k still gates completion, but a first-wins pin poisons
-/// recovery: later AICH answers are ignored if they disagree with the pin.
-/// Catalog `expected` is enough on its own. Otherwise a single source is
-/// not: two distinct peer addresses must advertise the same root. Keyed on
-/// the address rather than the worker's index, which is new each time a peer
-/// is re-injected or calls back, so one client voted twice by reconnecting
-/// and pinned a root nothing could replace. When `expected` is already known,
-/// a conflicting HashSet2 root is ignored even if several sources repeat it.
+/// recovery: later AICH answers are ignored if they disagree with the pin, and
+/// a forged root steers which blocks recovery throws away. Catalog `expected`
+/// is enough on its own. Otherwise the root needs eMule's quorum: at least
+/// [`AICH_TRUST_MIN_NETWORKS`] source networks behind it and
+/// [`AICH_TRUST_MIN_PERCENT`] of every network that advertised any root.
+/// Keyed on the address rather than the worker's index, which is new each
+/// time a peer is re-injected or calls back, so reconnecting earns no second
+/// vote. When `expected` is already known, a conflicting HashSet2 root is
+/// ignored however many sources repeat it.
 pub(super) fn consider_hashset2_aich_pin(
     pinned: &mut Option<[u8; 20]>,
     expected: Option<[u8; 20]>,
@@ -4337,8 +4555,10 @@ pub(super) fn consider_hashset2_aich_pin(
     let Some(votes) = votes else {
         return;
     };
-    votes.entry(root).or_default().insert(voter.to_string());
-    if votes.get(&root).map(|s| s.len()).unwrap_or(0) >= 2 {
+    votes.entry(root).or_default().insert(aich_voter_network(voter));
+    let total: usize = votes.values().map(HashSet::len).sum();
+    let behind = votes.get(&root).map_or(0, HashSet::len);
+    if behind >= AICH_TRUST_MIN_NETWORKS && behind * 100 >= total * AICH_TRUST_MIN_PERCENT {
         *pinned = Some(root);
     }
 }
@@ -4445,10 +4665,7 @@ pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
         (pub_key, sig)
     };
     if state >= 2 && !pub_key.is_empty() {
-        let mut key_pkt = Vec::with_capacity(1 + pub_key.len());
-        key_pkt.push(pub_key.len() as u8);
-        key_pkt.extend_from_slice(&pub_key);
-        write_packet_async(writer, OP_EMULEPROT, OP_PUBLICKEY, &key_pkt).await?;
+        write_public_key_packet(writer, &pub_key).await?;
     }
     if !sig.is_empty() {
         let mut sig_pkt = Vec::with_capacity(2 + sig.len() + usize::from(add_trailer));
@@ -4472,6 +4689,49 @@ pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
         );
     }
     Ok(())
+}
+
+async fn write_public_key_packet<W: AsyncWriteExt + Unpin + ?Sized>(
+    writer: &mut W,
+    pub_key: &[u8],
+) -> std::io::Result<()> {
+    let mut key_pkt = Vec::with_capacity(1 + pub_key.len());
+    key_pkt.push(pub_key.len() as u8);
+    key_pkt.extend_from_slice(pub_key);
+    write_packet_async(writer, OP_EMULEPROT, OP_PUBLICKEY, &key_pkt).await
+}
+
+/// Take a peer's `OP_SECIDENTSTATE` that cannot be signed yet because we do
+/// not hold their key, and return the challenge to park for when it arrives.
+///
+/// A state-2 challenge asks for our key as well as a signature, and the key
+/// needs nothing of theirs, so it goes now; only the signature waits, and the
+/// parked state drops to 1 so the replay does not send the key again. This is
+/// eMule's `OP_SECIDENTSTATE` handler: `SendPublicKeyPacket` at once, moving
+/// to `IS_SIGNATURENEEDED`, and `SendSignaturePacket` returning until
+/// `ProcessPublicKeyPacket` brings the peer's key. Holding the key back as
+/// well leaves two peers that each wait for the other's key before sending
+/// their own with neither ever sent: every first meeting of two Ember clients.
+pub(crate) async fn park_secident_challenge<W: AsyncWriteExt + Unpin + ?Sized>(
+    writer: &mut W,
+    credit_manager: Option<&Arc<tokio::sync::RwLock<CreditManager>>>,
+    state: u8,
+    challenge: u32,
+    peer_addr: SocketAddr,
+) -> std::io::Result<(u32, u8)> {
+    if state < 2 {
+        return Ok((challenge, state));
+    }
+    let pub_key = match credit_manager {
+        Some(cm) => cm.read().await.our_public_key().to_vec(),
+        None => Vec::new(),
+    };
+    if pub_key.is_empty() {
+        return Ok((challenge, state));
+    }
+    write_public_key_packet(writer, &pub_key).await?;
+    debug!("SecIdent: sent our key to {peer_addr}; its signature waits for theirs");
+    Ok((challenge, 1))
 }
 
 /// Check a peer's `OP_SIGNATURE` against our outstanding challenge and record
@@ -4618,6 +4878,147 @@ async fn write_packet_async<W: AsyncWriteExt + Unpin + ?Sized>(
     writer.write_all(payload).await?;
     writer.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod secident_handshake_tests {
+    use super::*;
+
+    type Frame = (u8, u8, Vec<u8>);
+
+    /// The level an Ember client advertises with its keypair loaded.
+    const LEVEL: u8 = 3;
+
+    fn take_frames(buf: &mut Vec<u8>) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        let mut at = 0;
+        while at < buf.len() {
+            let len = u32::from_le_bytes(buf[at + 1..at + 5].try_into().unwrap()) as usize;
+            frames.push((buf[at], buf[at + 5], buf[at + 6..at + 5 + len].to_vec()));
+            at += 5 + len;
+        }
+        buf.clear();
+        frames
+    }
+
+    struct Side {
+        cm: Arc<tokio::sync::RwLock<CreditManager>>,
+        hash: [u8; 16],
+        addr: SocketAddr,
+        out: Vec<u8>,
+        ours: Option<u32>,
+        parked: Option<(u32, u8)>,
+        verified: bool,
+    }
+
+    impl Side {
+        fn new(hash: u8, addr: &str) -> Self {
+            Self {
+                cm: Arc::new(tokio::sync::RwLock::new(CreditManager::with_generated_keys())),
+                hash: [hash; 16],
+                addr: addr.parse().unwrap(),
+                out: Vec::new(),
+                ours: None,
+                parked: None,
+                verified: false,
+            }
+        }
+
+        /// What the download and upload loops do with each SecIdent packet.
+        async fn receive(&mut self, peer_hash: [u8; 16], peer_addr: SocketAddr, frame: Frame) {
+            let (proto, opcode, payload) = frame;
+            assert_eq!(proto, OP_EMULEPROT);
+            match opcode {
+                OP_SECIDENTSTATE => {
+                    let state = payload[0];
+                    let challenge = u32::from_le_bytes(payload[1..5].try_into().unwrap());
+                    if self.cm.read().await.has_public_key(&peer_hash) {
+                        respond_to_secident_challenge(
+                            &mut self.out, Some(&self.cm), state, challenge, peer_addr, peer_hash, LEVEL, 0,
+                        )
+                        .await
+                        .unwrap();
+                    } else {
+                        self.parked = Some(
+                            park_secident_challenge(&mut self.out, Some(&self.cm), state, challenge, peer_addr)
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                }
+                OP_PUBLICKEY => {
+                    let key = super::super::multi_source::public_key_from_packet(&payload).unwrap();
+                    assert!(self.cm.write().await.set_public_key(peer_hash, key.to_vec()));
+                    if let Some((challenge, state)) = self.parked.take() {
+                        respond_to_secident_challenge(
+                            &mut self.out, Some(&self.cm), state, challenge, peer_addr, peer_hash, LEVEL, 0,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+                OP_SIGNATURE => {
+                    self.verified = handle_secident_signature(
+                        Some(&self.cm), peer_hash, &mut self.ours, peer_addr, LEVEL, &payload, 0,
+                    )
+                    .await;
+                }
+                other => panic!("unexpected opcode {other:#04x}"),
+            }
+        }
+    }
+
+    /// Two Ember clients meeting for the first time each hold the other's
+    /// challenge until the other's key arrives. Unless the key a challenge
+    /// asks for is sent without waiting, neither ever arrives.
+    #[tokio::test]
+    async fn two_peers_that_have_never_met_prove_themselves_to_each_other() {
+        let mut a = Side::new(0xA1, "81.2.69.7:4662");
+        let mut b = Side::new(0xB2, "81.2.69.8:4662");
+        a.ours = maybe_send_secident_challenge(&mut a.out, Some(&a.cm), b.hash, b.addr, LEVEL).await.unwrap();
+        b.ours = maybe_send_secident_challenge(&mut b.out, Some(&b.cm), a.hash, a.addr, LEVEL).await.unwrap();
+        assert!(a.ours.is_some() && b.ours.is_some(), "each challenges the other");
+
+        let mut keys_sent = [0usize; 2];
+        for _ in 0..8 {
+            let from_a = take_frames(&mut a.out);
+            let from_b = take_frames(&mut b.out);
+            if from_a.is_empty() && from_b.is_empty() {
+                break;
+            }
+            keys_sent[0] += from_a.iter().filter(|f| f.1 == OP_PUBLICKEY).count();
+            keys_sent[1] += from_b.iter().filter(|f| f.1 == OP_PUBLICKEY).count();
+            for frame in from_b {
+                a.receive(b.hash, b.addr, frame).await;
+            }
+            for frame in from_a {
+                b.receive(a.hash, a.addr, frame).await;
+            }
+        }
+
+        assert!(a.verified && b.verified, "both signatures verified");
+        assert_eq!(keys_sent, [1, 1], "each key goes once");
+        for (side, peer) in [(&a, b.hash), (&b, a.hash)] {
+            let record = side.cm.read().await;
+            assert_eq!(record.get_record(&peer).unwrap().ident_state, IdentState::Verified);
+        }
+    }
+
+    /// Parking sends the key a challenge asked for, and nothing for one that
+    /// asked only for a signature.
+    #[tokio::test]
+    async fn parking_sends_only_the_key_a_challenge_asked_for() {
+        let mut side = Side::new(0xC3, "81.2.69.9:4662");
+        let parked = park_secident_challenge(&mut side.out, Some(&side.cm), 1, 42, side.addr).await.unwrap();
+        assert_eq!(parked, (42, 1));
+        assert!(side.out.is_empty());
+
+        let parked = park_secident_challenge(&mut side.out, Some(&side.cm), 2, 43, side.addr).await.unwrap();
+        assert_eq!(parked, (43, 1), "the key went, so only the signature is left");
+        let frames = take_frames(&mut side.out);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, OP_PUBLICKEY);
+    }
 }
 
 #[cfg(test)]

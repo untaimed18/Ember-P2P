@@ -6,6 +6,7 @@
     getSharedFolders,
     getUnapprovedSharedFolders,
     reapproveSharedFolder,
+    reapproveSharedFolders,
     reloadSharedFiles,
     getScanStatus,
     getHashingPaused,
@@ -31,11 +32,24 @@
     getFileMediaMetadata,
     moveFilesToCategory,
     renameLibraryFile,
+    tagLibraryFiles,
+    restoreLibraryFileNames,
+    hasEmberTag,
     openLibraryFolder,
+    type ReapproveReport,
     type SharedFolderPick,
+    type TagReport,
   } from '$lib/api/sharing';
-  import { goto } from '$app/navigation';
   import { BUILTIN_DOWNLOAD_CATEGORIES, downloadCategoryLabel } from '$lib/downloadCategories';
+  import {
+    addUserCategory,
+    countDownloadCategories,
+    isCategoryTaken,
+    removeUserCategory,
+    setCategoryFolder,
+  } from '$lib/categorySettings';
+  import { transfers } from '$lib/stores/transfers';
+  import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
   import {
     categoriesWithFolder,
     categoryDestinationLabel,
@@ -43,7 +57,6 @@
     downloadsSubdirOf,
     sameCategorySubdir,
   } from '$lib/categoryFolders';
-  import { categoriesDialogRequested } from '$lib/stores/categoriesDialog';
   import { getFileComments, setFileComment, type FileCommentInfo } from '$lib/api/comments';
   import { getStatistics, type TransferStats } from '$lib/api/statistics';
   import { formatEd2kLink, formatEd2kLinks, buildEd2kLink } from '$lib/api/search';
@@ -60,6 +73,7 @@
     formatNumber,
     formatDateTime,
     formatClockTime,
+    compareFileNames,
     copyToClipboard as writeClipboard,
   } from '$lib/utils';
   import type { FileInfo, MediaMetadata } from '$lib/types';
@@ -87,12 +101,14 @@
     buildLibraryFolderTree,
     flattenLibraryFolderTree,
   } from '$lib/libraryFolderTree';
+  import { compareAllTime } from '$lib/libraryStats';
   import * as m from '$lib/paraglide/messages';
   import { codedErrorOf, getLocale, translateError } from '$lib/i18n';
   import { highlightMatches } from '$lib/stores/highlight';
   import { plural } from '$lib/plural';
   import { openChatFilesFolder } from '$lib/api/friends';
   import { openChannelFilesFolder } from '$lib/api/channels';
+  import { openFeedFilesFolder } from '$lib/api/feeds';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { hoverSubmenus } from '$lib/hoverSubmenus';
@@ -293,7 +309,7 @@
     renameDialog.busy = true;
     renameDialog.error = null;
     try {
-      const newPath = await renameLibraryFile(path, value);
+      const { path: newPath, warning } = await renameLibraryFile(path, value);
       if (selectedPath === path) selectedPath = newPath;
       if (checkedPaths.has(path)) {
         const next = new Set(checkedPaths);
@@ -305,6 +321,7 @@
       closeRename();
       await refresh();
       toastSuccess(m.library_renamed_named({ oldName, name: value }));
+      if (warning) toastWarning(translateError(warning, m.transfers_operation_failed()));
     } catch (e: unknown) {
       renameDialog.busy = false;
       renameDialog.error = toErr(e);
@@ -1288,7 +1305,7 @@
     bulkBusy = true;
     const folder = categoryDestinationLabel(categorySubdir(category, categoryFolders));
     try {
-      const report = { moved: 0, unchanged: 0, recategorized: 0, failed: [] as string[] };
+      const report = { moved: 0, unchanged: 0, recategorized: 0, failed: [] as string[], warning: null as string | null };
       for (let i = 0; i < targets.length; i += MAX_CATEGORY_MOVE_BATCH) {
         const batch = targets.slice(i, i + MAX_CATEGORY_MOVE_BATCH);
         let part: Awaited<ReturnType<typeof moveFilesToCategory>>;
@@ -1303,6 +1320,8 @@
         report.unchanged += part.unchanged;
         report.recategorized += part.recategorized;
         report.failed.push(...part.failed);
+        // Each batch saves the same lists, so one shown says it for all.
+        report.warning ??= part.warnings[0] ?? null;
       }
       if (report.moved > 0) {
         toastSuccess(
@@ -1326,6 +1345,7 @@
           detail: translateError(report.failed[0], m.transfers_operation_failed()),
         }));
       }
+      if (report.warning) toastWarning(translateError(report.warning, m.transfers_operation_failed()));
     } catch (e: unknown) {
       error = toErr(e);
       toastError(error);
@@ -1335,11 +1355,13 @@
     }
   }
 
-  function editCategories() {
-    categoriesDialogRequested.set(true);
-    // Cleared if the page never comes up, or the dialog would open on some
-    // later, unrelated visit to Transfers.
-    goto('/transfers').catch(() => categoriesDialogRequested.set(false));
+  let categoriesOpen = $state(false);
+  let userCategories = $derived($appSettings?.download_categories ?? []);
+  let categoryCounts = $derived(countDownloadCategories($transfers));
+
+  async function addCategory(name: string, ownFolder: boolean) {
+    const { folderError } = await addUserCategory(name, ownFolder);
+    if (folderError) throw folderError;
   }
 
   const categoryListFormat = new Intl.ListFormat(getLocale(), { style: 'short', type: 'conjunction' });
@@ -1876,6 +1898,17 @@
     for (const f of files) if (checkedPaths.has(f.path) && f.hash && !f.shared) n++;
     return n;
   });
+  /** Checked, hashed files the tag could go on, and ones it could come off. */
+  let checkedTaggableCount = $derived.by(() => {
+    let n = 0;
+    for (const f of files) if (checkedPaths.has(f.path) && f.hash && !hasEmberTag(f.name)) n++;
+    return n;
+  });
+  let checkedUntaggableCount = $derived.by(() => {
+    let n = 0;
+    for (const f of files) if (checkedPaths.has(f.path) && f.hash && hasEmberTag(f.name)) n++;
+    return n;
+  });
   // Selections persist across filter changes and bulk actions operate on the
   // whole selection, not just the visible rows (see getCheckedFiles, which
   // filters `files`, not `sortedFiles`). Count how many checked files are
@@ -2182,6 +2215,165 @@
     }
   }
 
+  /** The backend's cap on one tag request. */
+  const MAX_TAG_BATCH = 5_000;
+
+  /** The files a tag action from `f`'s menu applies to: the checked selection
+   *  when `f` is in it, as for the other bulk actions, less those it would
+   *  not change. */
+  function emberTagTargets(f: FileInfo, add: boolean): FileInfo[] {
+    const rows = checkedCount > 1 && checkedPaths.has(f.path) ? getCheckedFiles() : [f];
+    return rows.filter((row) => !!row.hash && hasEmberTag(row.name) !== add);
+  }
+
+  async function bulkEmberTag(add: boolean) {
+    if (bulkBusy) return;
+    const checked = getCheckedFiles();
+    const targets = checked.filter((f) => !!f.hash && hasEmberTag(f.name) !== add);
+    if (targets.length === 0) {
+      if (checked.some((f) => !f.hash)) toastWarning(m.library_selection_still_hashing());
+      else toastInfo(add ? m.library_tag_none_to_add() : m.library_tag_none_to_remove());
+      return;
+    }
+    if (add && !(await confirmFirstEmberTag())) return;
+    await applyEmberTag(targets.map((f) => f.path), add);
+  }
+
+  // The first time files are tagged, say what that does: it renames them on
+  // disk, which nothing else on this page's toolbar does. Once is enough;
+  // the tooltips say it after that.
+  const TAG_EXPLAINED_KEY = 'library-tag-explained';
+  let tagExplainOpen = $state(false);
+  let tagExplainResolve: ((confirmed: boolean) => void) | null = null;
+
+  function confirmFirstEmberTag(): Promise<boolean> {
+    try {
+      if (localStorage.getItem(TAG_EXPLAINED_KEY) === '1') return Promise.resolve(true);
+    } catch {
+      // No storage: ask every time rather than never.
+    }
+    tagExplainResolve?.(false);
+    tagExplainOpen = true;
+    return new Promise((resolve) => {
+      tagExplainResolve = resolve;
+    });
+  }
+
+  function settleTagExplain(confirmed: boolean) {
+    const resolve = tagExplainResolve;
+    tagExplainResolve = null;
+    tagExplainOpen = false;
+    if (confirmed) {
+      try {
+        localStorage.setItem(TAG_EXPLAINED_KEY, '1');
+      } catch {
+        // Asked again next time; nothing else depends on it.
+      }
+    }
+    resolve?.(confirmed);
+  }
+
+  /** Add or remove the tag on `paths`, follow the selection to the new
+   *  names, and offer Undo, which puts back exactly the names it changed. */
+  async function applyEmberTag(paths: string[], add: boolean) {
+    await runEmberTagRenames(paths, (batch) => tagLibraryFiles(batch, add), add);
+  }
+
+  /** Undo of {@link applyEmberTag}: each file gets back the exact name it had
+   *  before, rather than the tag being worked out again. `add` is whether
+   *  this puts the tag back on. */
+  async function restoreEmberTagNames(renamed: { from: string; to: string }[], add: boolean) {
+    await runEmberTagRenames(renamed, restoreLibraryFileNames, add);
+  }
+
+  async function runEmberTagRenames<T>(
+    items: T[],
+    rename: (batch: T[]) => Promise<TagReport>,
+    add: boolean,
+  ) {
+    // Waits on the other bulk actions as they wait on each other: a delete
+    // or move over the same files would find paths already gone.
+    if (items.length === 0 || bulkBusy) return;
+    bulkBusy = true;
+    const renamed: { from: string; to: string }[] = [];
+    const failed: string[] = [];
+    let warning: string | null = null;
+    bulkProgress = { done: 0, total: items.length };
+    try {
+      for (let i = 0; i < items.length; i += MAX_TAG_BATCH) {
+        const batch = items.slice(i, i + MAX_TAG_BATCH);
+        try {
+          const part = await rename(batch);
+          renamed.push(...part.renamed);
+          failed.push(...part.failed);
+          // Each batch saves the same lists, so one shown says it for all.
+          warning ??= part.warnings[0] ?? null;
+        } catch (e: unknown) {
+          // Earlier batches did rename; keep them and go on with the rest.
+          failed.push(typeof e === 'string' ? e : toErr(e));
+        }
+        bulkProgress = { done: Math.min(i + batch.length, items.length), total: items.length };
+      }
+      followRenamedPaths(renamed);
+      if (renamed.length > 0) {
+        const count = formatNumber(renamed.length);
+        const message = add
+          ? plural(renamed.length, {
+              one: m.library_tag_added_one,
+              other: () => m.library_tag_added_other({ count }),
+            })
+          : plural(renamed.length, {
+              one: m.library_tag_removed_one,
+              other: () => m.library_tag_removed_other({ count }),
+            });
+        addActionToast(
+          'success',
+          message,
+          {
+            label: m.common_undo(),
+            undo: true,
+            // Waits its turn rather than being dropped: an Undo clicked while
+            // another bulk action runs would otherwise do nothing at all.
+            run: () => void whenBulkIdle().then(() => restoreEmberTagNames(renamed, !add)),
+          },
+          () => {},
+        );
+      } else if (failed.length === 0) {
+        toastInfo(add ? m.library_tag_none_to_add() : m.library_tag_none_to_remove());
+      }
+      if (failed.length === 1) {
+        toastError(translateError(failed[0], m.transfers_operation_failed()));
+      } else if (failed.length > 1) {
+        toastError(m.library_tag_failed_many({
+          count: formatNumber(failed.length),
+          detail: translateError(failed[0], m.transfers_operation_failed()),
+        }));
+      }
+      if (warning) toastWarning(translateError(warning, m.transfers_operation_failed()));
+    } catch (e: unknown) {
+      error = toErr(e);
+      toastError(error);
+    } finally {
+      bulkProgress = null;
+      await refresh();
+      bulkBusy = false;
+    }
+  }
+
+  async function whenBulkIdle(): Promise<void> {
+    while (bulkBusy) await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+
+  /** Keep the open file and the checked rows on files that were renamed. */
+  function followRenamedPaths(renamed: { from: string; to: string }[]) {
+    if (renamed.length === 0) return;
+    const to = new Map(renamed.map((r) => [r.from, r.to]));
+    if (selectedPath && to.has(selectedPath)) selectedPath = to.get(selectedPath) ?? selectedPath;
+    if (renamed.some((r) => checkedPaths.has(r.from))) {
+      checkedPaths = new Set([...checkedPaths].map((p) => to.get(p) ?? p));
+    }
+  }
+
   async function bulkCopyLinks() {
     const checked = getCheckedFiles();
     const targets = checked.filter(f => !!f.hash);
@@ -2232,13 +2424,6 @@
 
   const priorityOrder: Record<string, number> = { verylow: 0, low: 1, normal: 2, high: 3, release: 4, auto: 5 };
 
-  // One reused collator instead of an implicit `String.prototype.localeCompare`
-  // collator per comparison (which, on a 50k-row sort, is hundreds of
-  // thousands of allocations). `numeric: true` also gives natural ordering so
-  // "File2" sorts before "File10", and `sensitivity: 'base'` makes the sort
-  // case/accent-insensitive the way users expect from a file manager.
-  const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
-
   let sortedFiles = $derived.by(() => {
     const copy = [...filteredFiles];
     const dir = sortAsc ? 1 : -1;
@@ -2257,15 +2442,15 @@
     copy.sort((a, b) => {
       let cmp = 0;
       switch (sortField) {
-        case 'name': cmp = collator.compare(a.name, b.name); break;
+        case 'name': cmp = compareFileNames(a.name, b.name); break;
         case 'size': cmp = a.size - b.size; break;
-        case 'extension': cmp = collator.compare(typeSortKey(a), typeSortKey(b)) || collator.compare(a.extension, b.extension); break;
+        case 'extension': cmp = compareFileNames(typeSortKey(a), typeSortKey(b)) || compareFileNames(a.extension, b.extension); break;
         case 'priority': cmp = (priorityOrder[a.priority] ?? 2) - (priorityOrder[b.priority] ?? 2); break;
-        case 'hash': cmp = collator.compare(a.hash, b.hash); break;
-        case 'requests': cmp = a.requests - b.requests; break;
-        case 'accepted': cmp = a.accepted - b.accepted; break;
-        case 'bytes_transferred': cmp = a.bytes_transferred - b.bytes_transferred; break;
-        case 'folder': cmp = collator.compare(a.folder, b.folder); break;
+        case 'hash': cmp = compareFileNames(a.hash, b.hash); break;
+        case 'requests': cmp = compareAllTime(a.requests, a.alltime_requests, b.requests, b.alltime_requests); break;
+        case 'accepted': cmp = compareAllTime(a.accepted, a.alltime_accepted, b.accepted, b.alltime_accepted); break;
+        case 'bytes_transferred': cmp = compareAllTime(a.bytes_transferred, a.alltime_transferred, b.bytes_transferred, b.alltime_transferred); break;
+        case 'folder': cmp = compareFileNames(a.folder, b.folder); break;
         case 'complete_sources': cmp = a.complete_sources - b.complete_sources; break;
         case 'modified_at': cmp = (a.modified_at || 0) - (b.modified_at || 0); break;
       }
@@ -2275,10 +2460,10 @@
       // ascending regardless of the primary sort direction so names stay A→Z.
       if (cmp === 0) {
         if (sortField !== 'name') {
-          const byName = collator.compare(a.name, b.name);
+          const byName = compareFileNames(a.name, b.name);
           if (byName !== 0) return byName;
         }
-        return collator.compare(a.path, b.path);
+        return compareFileNames(a.path, b.path);
       }
       return dir * cmp;
     });
@@ -2850,7 +3035,7 @@
     // panel is an inline collapsible (the file table stays visible and
     // interactive below it), not a modal, and it has no keyboard handling of
     // its own that these shortcuts could conflict with.
-    if (createCollectionOpen || renameDialog.open || addFolderOpen || confirmOpen || confirmDiscardComment || stopConfirmVisible) {
+    if (createCollectionOpen || renameDialog.open || addFolderOpen || confirmOpen || tagExplainOpen || confirmDiscardComment || stopConfirmVisible || categoriesOpen) {
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
@@ -3045,10 +3230,18 @@
         case 'open_file': await openSharedFileExternally(f.path); break;
         case 'open_folder': await openSharedFolder(f.path); break;
         case 'rename': openRename(f); break;
+        case 'tag_add': {
+          const targets = emberTagTargets(f, true);
+          if (targets.length > 0 && (await confirmFirstEmberTag())) {
+            await applyEmberTag(targets.map((t) => t.path), true);
+          }
+          break;
+        }
+        case 'tag_remove': await applyEmberTag(emberTagTargets(f, false).map((t) => t.path), false); break;
         case 'move_category':
           if (extra !== undefined) await moveToCategory(categoryMoveTargets(f), extra);
           break;
-        case 'edit_categories': editCategories(); break;
+        case 'edit_categories': categoriesOpen = true; break;
         // The backend reads the template from settings by index and does the
         // substituting, and collects the native confirmation — so there is
         // deliberately no prompt here and no URL built in this renderer.
@@ -3312,11 +3505,50 @@
   // answer has to come from somewhere the page cannot answer for the user.
   async function handleReapproveFolder(path: string) {
     try {
-      if (!(await reapproveSharedFolder(path))) return;
-      const displayName = path.split(/[\\/]/).filter(Boolean).pop() || path;
-      toastSuccess(m.library_folder_reapproved({ name: displayName }));
+      const report = await reapproveSharedFolder(path);
+      if (report.approved.length === 0) return;
+      afterReapproved(report);
       await refresh();
     } catch (e: unknown) { error = toErr(e); }
+  }
+
+  let reapprovingAll = $state(false);
+  async function handleReapproveAll() {
+    if (reapprovingAll) return;
+    reapprovingAll = true;
+    try {
+      const report = await reapproveSharedFolders();
+      if (report.approved.length > 0) afterReapproved(report);
+      // Even when none was approved: an empty answer also means the backend
+      // found nothing left to approve (a drive gone since the page loaded),
+      // and the banner should stop offering what it cannot do.
+      await refresh();
+    } catch (e: unknown) {
+      error = toErr(e);
+    } finally {
+      reapprovingAll = false;
+    }
+  }
+
+  /** Re-approving starts a rescan in the backend; show it the way Reload is
+   *  shown rather than wait for the poll. While hashing is stopped the scan
+   *  waits for Resume instead, and the Stop stays as it is. */
+  function afterReapproved({ approved, scanOnResume }: ReapproveReport) {
+    const name = (path: string) => path.split(/[\\/]/).filter(Boolean).pop() || path;
+    if (scanOnResume) {
+      toastInfo(plural(approved.length, {
+        one: () => m.library_folder_reapproved_scan_on_resume({ name: name(approved[0]) }),
+        other: () => m.library_folders_reapproved_scan_on_resume_other({ count: formatNumber(approved.length) }),
+      }));
+      return;
+    }
+    toastSuccess(plural(approved.length, {
+      one: () => m.library_folder_reapproved({ name: name(approved[0]) }),
+      other: () => m.library_folders_reapproved_other({ count: formatNumber(approved.length) }),
+    }));
+    stoppedByUser = false;
+    hashingStateEpoch += 1;
+    scanning = true;
   }
 
   function formatSavedTime(ts: number | null): string {
@@ -3801,6 +4033,19 @@
 
 <svelte:document onclick={onDocClick} onkeydown={onPageKeyDown} />
 
+<CategoriesDialog
+  bind:open={categoriesOpen}
+  categories={userCategories}
+  builtins={BUILTIN_DOWNLOAD_CATEGORIES}
+  labelFor={downloadCategoryLabel}
+  folders={categoryFolders}
+  counts={categoryCounts}
+  isTaken={(name) => isCategoryTaken(name, userCategories)}
+  onadd={addCategory}
+  onremove={removeUserCategory}
+  onfolder={setCategoryFolder}
+/>
+
 <ConfirmDialog
   bind:open={confirmOpen}
   title={confirmTitle}
@@ -3808,6 +4053,15 @@
   danger={true}
   onconfirm={() => settleConfirm(true)}
   oncancel={() => settleConfirm(false)}
+/>
+
+<ConfirmDialog
+  bind:open={tagExplainOpen}
+  title={m.library_tag_explain_title()}
+  message={m.library_tag_explain_message()}
+  confirmLabel={m.library_bulk_tag()}
+  onconfirm={() => settleTagExplain(true)}
+  oncancel={() => settleTagExplain(false)}
 />
 
 <ConfirmDialog
@@ -3849,6 +4103,17 @@
         <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
       </svg>
       {m.library_channel_files()}
+    </button>
+    <button
+      type="button"
+      class="ghost folder-btn"
+      title={m.library_feed_files_title()}
+      onclick={() => void openFeedFilesFolder().catch((e) => toastError(translateError(e)))}
+    >
+      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
+      </svg>
+      {m.library_feed_files()}
     </button>
     <span class="header-divider" aria-hidden="true"></span>
     <button class="ghost" onclick={handleOpenCollection} disabled={collectionLoading}>
@@ -4741,6 +5006,21 @@
         <span class="scan-text">{m.library_scan_truncated({ limit: formatNumber(100000) })}</span>
       </div>
     {/if}
+    <!-- With nothing listed, the empty state below says the same and offers
+         the same button, so only one of the two is shown. -->
+    {#if unapprovedFolders.length > 0 && files.length > 0}
+      <div class="scan-banner scan-warning" role="status">
+        <span class="scan-text">
+          {plural(unapprovedFolders.length, {
+            one: m.library_unapproved_banner_one,
+            other: () => m.library_unapproved_banner_other({ count: formatNumber(unapprovedFolders.length) }),
+          })}
+        </span>
+        <button class="scan-btn resume-btn" onclick={handleReapproveAll} disabled={reapprovingAll}>
+          {m.library_reapprove_all()}
+        </button>
+      </div>
+    {/if}
     {#if sortedFiles.length === 0 && hasActiveLibraryFilters && files.length > 0}
       <div class="empty-state">
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="56" height="56" aria-hidden="true">
@@ -4765,6 +5045,20 @@
           <div class="spinner lg"></div>
           <p class="empty-title">{m.common_loading()}</p>
         {/if}
+      </div>
+    {:else if sortedFiles.length === 0 && !scanning && unapprovedFolders.length > 0}
+      <!-- Ahead of "No shared files": the folders are still listed, Ember
+           just will not walk them, and offering Add Folder sent people to
+           re-add a folder that was already there. -->
+      <div class="empty-state">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="56" height="56" aria-hidden="true">
+          <path d="M3 7v13a1 1 0 0 0 1 1h16a1 1 0 0 0 1-1V9a1 1 0 0 0-1-1h-9l-2-2H4a1 1 0 0 0-1 1z"></path>
+          <rect x="9" y="13" width="6" height="5" rx="1"></rect>
+          <path d="M10.5 13v-1.5a1.5 1.5 0 0 1 3 0V13"></path>
+        </svg>
+        <p class="empty-title">{m.library_empty_unapproved()}</p>
+        <p class="empty-sub">{m.library_empty_unapproved_sub()}</p>
+        <button type="button" class="empty-action" onclick={handleReapproveAll} disabled={reapprovingAll}>{m.library_reapprove_all()}</button>
       </div>
     {:else if sortedFiles.length === 0 && !scanning}
       <div class="empty-state">
@@ -4843,6 +5137,11 @@
         {:else}
           <button class="tb-btn" disabled={bulkBusy || checkedRestrictCount === 0} onclick={() => bulkFriendsOnly(true)} title={checkedRestrictCount === 0 ? m.library_bulk_need_shared() : m.library_bulk_friends_only_on_title()}>{m.library_bulk_friends_only_on()}</button>
         {/if}
+        {#if checkedUntaggableCount > 0 && checkedTaggableCount === 0}
+          <button class="tb-btn" disabled={bulkBusy} onclick={() => bulkEmberTag(false)} title={m.library_bulk_untag_title()}>{m.library_bulk_untag()}</button>
+        {:else}
+          <button class="tb-btn" disabled={bulkBusy || checkedTaggableCount === 0} onclick={() => bulkEmberTag(true)} title={checkedTaggableCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_tag_title()}>{m.library_bulk_tag()}</button>
+        {/if}
         <button class="tb-btn" disabled={checkedHashedCount === 0} onclick={bulkCopyLinks} title={checkedHashedCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_copy_links_title()}>{m.library_copy_links()}</button>
         <button class="tb-btn" onclick={openCreateDialogFromSelection} title={m.library_bulk_new_collection_title()}>{m.library_bulk_new_collection()}</button>
         <span class="bulk-spacer"></span>
@@ -4895,7 +5194,7 @@
         </div>
         <button
           type="button"
-          class="icon-close drawer-close"
+          class="icon-close drawer-close drawer-rename"
           disabled={!selectedFile.hash}
           onclick={() => { const f = selectedFile; if (f) openRename(f); }}
           title={selectedFile.hash ? m.library_rename_title() : m.library_rename_not_hashed()}
@@ -5315,6 +5614,8 @@
 {#if ctxMenu}
   {@const fileHashed = !!ctxMenu.file.hash}
   {@const moveTargets = categoryMoveTargets(ctxMenu.file)}
+  {@const tagAddTargets = emberTagTargets(ctxMenu.file, true)}
+  {@const tagRemoveTargets = emberTagTargets(ctxMenu.file, false)}
   <div class="ctx-menu" role="menu" bind:this={ctxMenuEl} use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}>
     <div class="ctx-header" role="presentation">
       <bdi dir="auto">{ctxMenu.file.name}</bdi>
@@ -5329,6 +5630,20 @@
       title={fileHashed ? undefined : m.library_rename_not_hashed()}
       onclick={() => ctxAction('rename')}
     >{m.library_rename()}</button>
+    {#if tagAddTargets.length > 0}
+      <button class="ctx-item" role="menuitem" title={m.library_bulk_tag_title()} onclick={() => ctxAction('tag_add')}>
+        {tagAddTargets.length > 1
+          ? m.library_ctx_tag_count({ count: formatNumber(tagAddTargets.length) })
+          : m.library_bulk_tag()}
+      </button>
+    {/if}
+    {#if tagRemoveTargets.length > 0}
+      <button class="ctx-item" role="menuitem" title={m.library_bulk_untag_title()} onclick={() => ctxAction('tag_remove')}>
+        {tagRemoveTargets.length > 1
+          ? m.library_ctx_untag_count({ count: formatNumber(tagRemoveTargets.length) })
+          : m.library_bulk_untag()}
+      </button>
+    {/if}
     {#if moveTargets.length > 0}
       <!-- Only for files a category can move: hashed, and in Downloads. A
            category's destination is shown beside it, so the choice says where
@@ -6325,6 +6640,16 @@
   }
   .drawer-close {
     margin-top: 1px;
+  }
+  /* The close button's shape, without its danger tint: renaming is not a
+     way out. */
+  button.icon-close.drawer-rename:hover:not(:disabled) {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+  button.icon-close.drawer-rename:active:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 20%, transparent);
   }
   .drawer-body {
     flex: 1;

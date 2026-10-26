@@ -339,6 +339,24 @@ pub async fn read_clipboard_text() -> Result<Option<String>, String> {
     Ok(Some(text))
 }
 
+/// Answers at once: the main window times the round trip to tell its own
+/// thread being busy from the backend being slow to reply (`src/lib/uiStall.ts`).
+#[tauri::command]
+pub async fn ui_ping() {}
+
+/// Note in the log that the main window stopped answering: `kind` is
+/// `blocked` (its own thread was busy), `long_task` (one task held it) or
+/// `ipc` (a reply from here was slow), for `ms` milliseconds, on `route`.
+/// Only reported past a couple of seconds, so it is a handful a session at
+/// most; what is logged is capped all the same.
+#[tauri::command]
+pub async fn log_ui_stall(kind: String, ms: u64, route: String, visible: bool, detail: String) {
+    let (kind, _) = cap_chars(&kind, 16);
+    let (route, _) = cap_chars(&route, 64);
+    let (detail, _) = cap_chars(&detail, 600);
+    tracing::warn!("UI stall: {kind} for {ms} ms on {route} (visible={visible}) {detail}");
+}
+
 /// Write text to the system clipboard.
 ///
 /// Copying works in the webview more often than pasting does, but not

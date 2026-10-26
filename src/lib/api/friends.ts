@@ -1,9 +1,16 @@
 import { invoke } from '@tauri-apps/api/core';
 import * as m from '$lib/paraglide/messages';
+import type { FriendStatus } from '$lib/types';
 
 export interface FriendInfo {
   user_hash: string;
+  /** The name to show: the user's label when they set one, else the name the
+   *  friend chose. */
   nickname: string;
+  /** The user's own label for this friend; empty when they set none. */
+  alias: string;
+  /** The name the friend chose, as their last verified session said. */
+  self_name: string;
   added_at: number;
   last_ip: string;
   last_port: number;
@@ -83,8 +90,15 @@ export async function getFriends(): Promise<FriendInfo[]> {
   return invoke('get_friends');
 }
 
-export async function addFriend(userHashHex: string, nickname?: string): Promise<void> {
-  return invoke('add_friend', { userHashHex, nickname: nickname || null });
+/** `nameIsTheirs`: the name is one the peer goes by (a room nickname, an eD2K
+ *  name) rather than one the user typed, so it only stands in for theirs and
+ *  never becomes the user's label. */
+export async function addFriend(
+  userHashHex: string,
+  nickname?: string,
+  nameIsTheirs = false,
+): Promise<void> {
+  return invoke('add_friend', { userHashHex, nickname: nickname || null, nameIsTheirs });
 }
 
 export async function removeFriend(userHashHex: string): Promise<void> {
@@ -115,6 +129,7 @@ export async function isChatLocked(): Promise<boolean> {
   return invoke('is_chat_locked');
 }
 
+/** Set the user's label for a friend; an empty one goes back to their own name. */
 export async function updateFriendNickname(userHashHex: string, nickname: string): Promise<void> {
   return invoke('update_friend_nickname', { userHashHex, nickname });
 }
@@ -171,7 +186,10 @@ export async function sendChatTyping(userHashHex: string, typing: boolean): Prom
   return invoke('send_chat_typing', { userHashHex, typing });
 }
 
-export async function getUnreadMessageCounts(): Promise<[string, number][]> {
+/** Per friend: `[hash, unread, newest unread row id]`. A message stored after
+ *  the count has a higher id, which is how a live bump is told apart from one
+ *  the count already holds. */
+export async function getUnreadMessageCounts(): Promise<[string, number, number][]> {
   return invoke('get_unread_message_counts');
 }
 
@@ -354,6 +372,23 @@ export async function isFriendDiscoverable(): Promise<boolean> {
  *  `ember:friend-online` transition. */
 export async function getOnlineFriends(): Promise<string[]> {
   return invoke('get_online_friends');
+}
+
+/** Statuses of online friends that set one, by lowercase hex hash. An online
+ *  friend missing from it is plain online. */
+export async function getFriendStatuses(): Promise<Record<string, FriendStatus>> {
+  return invoke('get_friend_statuses');
+}
+
+export interface IdleAwayInfo {
+  /** Friends see us Away now because we have been idle. */
+  active: boolean;
+  /** This build can tell how long we have been idle at all. */
+  supported: boolean;
+}
+
+export async function getIdleAway(): Promise<IdleAwayInfo> {
+  return invoke('get_idle_away');
 }
 
 export async function browseFriend(

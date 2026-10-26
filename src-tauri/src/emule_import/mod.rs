@@ -851,6 +851,14 @@ pub fn stage(
     result
 }
 
+/// eMule's Incoming folder, as the download folder an import would set.
+fn incoming_download_folder(scan: &Scan) -> Option<String> {
+    scan.prefs
+        .incoming_dir
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 fn stage_scan(
     data_dir: &Path,
     current_download_folder: &str,
@@ -858,6 +866,20 @@ fn stage_scan(
     scan: &Scan,
     progress: &mut dyn FnMut(StageProgress),
 ) -> anyhow::Result<StageSummary> {
+    // Checked before anything is staged or discarded. Applied at the next
+    // launch, a folder the settings refuse fails the whole settings step there,
+    // and the nickname, ports and shared folders go with it.
+    if selection.incoming_as_download_folder {
+        if let Some(folder) = incoming_download_folder(scan) {
+            if crate::commands::settings::validate_download_folder(&folder).is_err() {
+                anyhow::bail!(
+                    "eMule's Incoming folder ({folder}) cannot be Ember's download folder: \
+                     a drive root or a system folder is refused; leave that option off and \
+                     choose the download folder in Settings"
+                );
+            }
+        }
+    }
     set_aside_unreadable(data_dir);
     if read_manifest(data_dir).is_some() {
         discard(data_dir)?;
@@ -974,11 +996,7 @@ fn stage_scan(
         manifest.settings.obfuscation_enabled = prefs.obfuscation;
     }
     if selection.incoming_as_download_folder {
-        manifest.settings.download_folder = scan
-            .prefs
-            .incoming_dir
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned());
+        manifest.settings.download_folder = incoming_download_folder(scan);
     }
 
     let download_folder = manifest

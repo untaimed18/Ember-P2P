@@ -209,8 +209,15 @@ pub mod logging {
                 Regex::new(r"(?i)(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}").expect("static IPv6 regex")
             })
             .replace_all(&value, |caps: &Captures<'_>| {
-                let candidate = &caps[0];
-                if candidate.parse::<std::net::Ipv6Addr>().is_ok() {
+                let whole = caps.get(0).expect("group 0 always matches");
+                let candidate = whole.as_str();
+                // `b::` and `::` are valid addresses, and every Rust path
+                // (`ember_lib::network`) is full of them. An address never
+                // runs into an identifier, so one that does is not one.
+                let word = |c: char| c.is_alphanumeric() || c == '_';
+                let joined = value[..whole.start()].chars().next_back().is_some_and(word)
+                    || value[whole.end()..].chars().next().is_some_and(word);
+                if !joined && candidate.parse::<std::net::Ipv6Addr>().is_ok() {
                     format!("<ip:{}>", pseudonym(candidate))
                 } else {
                     candidate.to_string()
@@ -256,6 +263,32 @@ pub mod logging {
             assert!(redacted.contains("<ip:"));
             assert!(redacted.contains("<id:"));
             assert!(redacted.contains("<path:"));
+        }
+
+        #[test]
+        fn rust_paths_are_not_read_as_ipv6_addresses() {
+            for line in [
+                "INFO ember_lib::network::ed2k::multi_source: Ember binding ok",
+                "ember_lib::storage::known_files: Saved 2915 known files",
+                "ember_lib::network::ember::dht::engine: cycle done",
+                "std::io::Error",
+            ] {
+                assert_eq!(redact_normal_log(line), line);
+            }
+        }
+
+        #[test]
+        fn ipv6_addresses_are_still_redacted() {
+            for (line, addr) in [
+                ("peer [2001:db8::1]:4662 connected", "2001:db8::1"),
+                ("bound to ::1 port 4662", "::1"),
+                ("from fe80::1%eth0", "fe80::1"),
+                ("addr=2001:db8:85a3::8a2e:370:7334", "2001:db8:85a3::8a2e:370:7334"),
+            ] {
+                let redacted = redact_normal_log(line);
+                assert!(!redacted.contains(addr), "{line} -> {redacted}");
+                assert!(redacted.contains("<ip:"), "{line} -> {redacted}");
+            }
         }
 
         #[test]
@@ -1970,6 +2003,11 @@ pub fn sanitize_remote_text(text: &str, max_chars: usize) -> String {
 /// friend-request handling must impose its own narrow bound before creating a
 /// display string, emitting an event, or writing a log/DB row.
 pub const MAX_INBOUND_FRIEND_NICKNAME_BYTES: usize = 256;
+/// How many characters of a decoded friend-request name are kept before the
+/// site tag comes off and [`MAX_FRIEND_NICKNAME_CHARS`] applies. As many as
+/// the wire bound has bytes, so a name the wire bound leaves whole is never
+/// cut here.
+const MAX_INBOUND_FRIEND_NICKNAME_SCAN_CHARS: usize = MAX_INBOUND_FRIEND_NICKNAME_BYTES;
 /// The one limit on a stored friend name, in characters, for names a request
 /// brings in and names the user types alike: accepting a request must never
 /// store a name the rename box would then refuse. `src/lib/friendSettings.ts`
@@ -1980,8 +2018,18 @@ pub const MAX_FRIEND_NICKNAME_CHARS: usize = 64;
 ///
 /// This keeps the request UI compatible with peers that send decorative
 /// Unicode while guaranteeing a compact, single-line display value.
+///
+/// Earlier builds named themselves to Ember peers with the site tag meant for
+/// eMule, so the tag comes off before the length cap, which could otherwise
+/// leave half of it behind.
 pub fn sanitize_inbound_friend_nickname(name: &str) -> String {
-    let cleaned = sanitize_remote_text(name, MAX_FRIEND_NICKNAME_CHARS);
+    let cleaned = sanitize_remote_text(name, MAX_INBOUND_FRIEND_NICKNAME_SCAN_CHARS);
+    let cleaned = crate::types::without_nickname_site_tag(&cleaned)
+        .chars()
+        .take(MAX_FRIEND_NICKNAME_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string();
     if cleaned.is_empty() {
         "Anonymous".to_string()
     } else {
@@ -2068,6 +2116,13 @@ pub fn sanitize_message_text(text: &str) -> Option<String> {
 /// signature there — not re-served in catch-up, and an edit not even relayed.
 pub fn sanitize_outgoing_message_text(text: &str) -> Option<String> {
     filter_message_text(text, false)
+}
+
+/// `text` with the joiners [`sanitize_message_text`] keeps taken out, and
+/// nothing else changed: for text already sanitised on receipt, what
+/// [`sanitize_outgoing_message_text`] would have sent.
+pub fn without_message_text_joiners(text: &str) -> String {
+    text.chars().filter(|c| !is_message_text_joiner(*c)).collect()
 }
 
 fn filter_message_text(text: &str, keep_joiners: bool) -> Option<String> {
@@ -2282,6 +2337,25 @@ mod tests {
         let normalized = normalize_inbound_friend_nickname(&split_multibyte);
         assert_ne!(normalized, "Anonymous");
         assert_eq!(normalized.chars().count(), MAX_FRIEND_NICKNAME_CHARS);
+    }
+
+    /// A friend request from a build that sent its eMule name keeps only the
+    /// name, even one long enough that the cap would have cut into the tag.
+    #[test]
+    fn inbound_friend_nickname_drops_the_site_tag() {
+        let tagged = crate::types::ed2k_nickname("Brady", true);
+        assert_eq!(normalize_inbound_friend_nickname(tagged.as_bytes()), "Brady");
+        assert_eq!(sanitize_inbound_friend_nickname(&tagged), "Brady");
+
+        let long = "B".repeat(50);
+        let tagged_long = crate::types::ed2k_nickname(&long, true);
+        assert!(tagged_long.chars().count() > MAX_FRIEND_NICKNAME_CHARS);
+        assert_eq!(normalize_inbound_friend_nickname(tagged_long.as_bytes()), long);
+
+        assert_eq!(
+            sanitize_inbound_friend_nickname(crate::types::NICKNAME_SITE_TAG),
+            crate::types::NICKNAME_SITE_TAG
+        );
     }
 
     #[test]

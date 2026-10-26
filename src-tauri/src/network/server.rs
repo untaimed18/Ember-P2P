@@ -621,7 +621,7 @@ pub(super) async fn initiate_server_connect(
         login_tcp_port(state)
     };
     let user_hash = state.user_hash;
-    let nickname = settings.nickname.clone();
+    let nickname = settings.ed2k_nickname();
     let obf_port = state
         .server_list
         .servers()

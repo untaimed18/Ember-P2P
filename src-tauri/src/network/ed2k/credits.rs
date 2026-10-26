@@ -1665,6 +1665,25 @@ impl CreditManager {
         }
     }
 
+    /// [`Self::promote_proven_ember`] for one session that passed both checks
+    /// itself: its Ember binding, and SecIdent for `user_hash`. The session
+    /// ties the two as a shared address does there, and it is the only tie a
+    /// relayed or IPv6 session has, since both record address 0.
+    pub fn note_session_proven_ember(&mut self, user_hash: [u8; 16], ember_hash: [u8; 16]) {
+        if user_hash == [0u8; 16] || ember_hash == [0u8; 16] {
+            return;
+        }
+        let due = self.credits.get(&user_hash).is_some_and(|record| {
+            record.ident_state == IdentState::Verified && record.proven_ember_hash != Some(ember_hash)
+        });
+        if due {
+            self.mark_credit_unsaved(user_hash);
+            if let Some(record) = self.credits.get_mut(&user_hash) {
+                record.proven_ember_hash = Some(ember_hash);
+            }
+        }
+    }
+
     /// Reverse of [`Self::set_ember_hash`]: find the eD2K `user_hash` we last
     /// bound to this Ember identity. Used to relocate download sources when
     /// friend discovery learns a fresh IP:port.
@@ -4003,6 +4022,36 @@ mod tests {
         cm.get_or_create(unverified);
         cm.note_bound_ember_hash(unverified, ember, ip);
         assert_eq!(cm.get_record(&unverified).and_then(|r| r.proven_ember_hash), None);
+    }
+
+    /// A relayed or IPv6 session records address 0, so no address can tie its
+    /// two proofs; the session itself does, once it has passed both.
+    #[test]
+    fn a_session_that_passed_both_checks_keeps_its_binding_without_an_address() {
+        let ember = [0x73u8; 16];
+        let mut cm = CreditManager::new();
+
+        let relayed = [0x45u8; 16];
+        cm.note_bound_ember_hash(relayed, ember, 0);
+        cm.set_ident_state(relayed, IdentState::Verified);
+        cm.check_identity_ip(relayed, 0);
+        assert_eq!(
+            cm.get_record(&relayed).and_then(|r| r.proven_ember_hash),
+            None,
+            "address 0 vouches for nothing"
+        );
+        cm.note_session_proven_ember(relayed, ember);
+        assert_eq!(cm.get_record(&relayed).and_then(|r| r.proven_ember_hash), Some(ember));
+        assert!(cm.is_dirty(), "the link is saved");
+
+        let unverified = [0x46u8; 16];
+        cm.get_or_create(unverified);
+        cm.note_session_proven_ember(unverified, ember);
+        assert_eq!(
+            cm.get_record(&unverified).and_then(|r| r.proven_ember_hash),
+            None,
+            "a session SecIdent has not verified proves nothing"
+        );
     }
 
     // ---- Ember credit tests ----

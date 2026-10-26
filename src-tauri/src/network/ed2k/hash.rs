@@ -420,9 +420,8 @@ pub fn blake3_file_cancellable(
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// In-memory equivalent of [`ed2k_hash_file`], for transfer-verification
-/// unit tests.
-#[cfg(test)]
+/// In-memory equivalent of [`ed2k_hash_file`], for data already held whole
+/// (feed lists, tests).
 pub fn ed2k_hash_bytes(data: &[u8]) -> String {
     let file_size = data.len() as u64;
 

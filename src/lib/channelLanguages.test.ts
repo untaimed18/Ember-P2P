@@ -3,11 +3,13 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   CHANNEL_LANGUAGES,
+  channelLanguageForLocale,
   channelLanguageName,
   channelLanguageNativeName,
   channelLanguageSearchText,
   isChannelLanguage,
   sortedChannelLanguages,
+  suggestedChannelLanguage,
 } from './channelLanguages';
 
 describe('channel languages', () => {
@@ -57,5 +59,23 @@ describe('channel languages', () => {
     expect(sorted).toHaveLength(CHANNEL_LANGUAGES.length);
     expect(sorted.indexOf('ar')).toBeLessThan(sorted.indexOf('bg'));
     expect(sorted.indexOf('de')).toBeLessThan(sorted.indexOf('el'));
+  });
+
+  it('reads the language out of a locale, dropping region and script', () => {
+    expect(channelLanguageForLocale('pt-BR')).toBe('pt');
+    expect(channelLanguageForLocale('zh-Hant-TW')).toBe('zh');
+    expect(channelLanguageForLocale('zh_CN')).toBe('zh');
+    expect(channelLanguageForLocale('JA')).toBe('ja');
+    expect(channelLanguageForLocale('fil-PH')).toBe('fil');
+    expect(channelLanguageForLocale('nb-NO')).toBe('no');
+    expect(channelLanguageForLocale('iw')).toBe('he');
+    expect(channelLanguageForLocale('eo')).toBeNull();
+    expect(channelLanguageForLocale('')).toBeNull();
+  });
+
+  it('suggests the first locale that names a listed language', () => {
+    expect(suggestedChannelLanguage(['eo', 'ja-JP', 'en'])).toBe('ja');
+    expect(suggestedChannelLanguage(['eo', 'x-private'])).toBeNull();
+    expect(suggestedChannelLanguage([])).toBeNull();
   });
 });

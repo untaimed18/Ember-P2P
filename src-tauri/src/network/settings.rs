@@ -91,7 +91,11 @@ pub(super) fn apply_network_settings(
         // Do not clear on unrelated settings saves while already enabled.
         reset_stun_keepalive_session(state);
     }
-    state.xfer_offer_policy = new_settings.channel_file_offers.clone();
+    state.xfer_offer_policy = crate::types::channel_file_offers_in_force(&new_settings.channel_file_offers);
+    super::room_dm::set_dm_policy(
+        crate::types::room_dm_policy_in_force(&new_settings.room_dm_policy),
+        new_settings.ignored_members.as_deref(),
+    );
     state.obfuscation_enabled = new_settings.obfuscation_enabled;
     state.obfuscation_enabled_shared.store(
         new_settings.obfuscation_enabled,
@@ -102,7 +106,9 @@ pub(super) fn apply_network_settings(
         std::sync::atomic::Ordering::Relaxed,
     );
     *state.download_folders.write() = new_settings.download_folders();
+    crate::sharing::feed_downloads::set_roots(&new_settings.download_roots());
     crate::storage::category_folders::set_folders(&new_settings.download_category_folders);
+    crate::sharing::name_tag::set_tag_completed_downloads(new_settings.tag_completed_downloads);
     state.filter_incoming_shared.store(
         new_settings.filter_incoming_connections,
         std::sync::atomic::Ordering::Relaxed,
@@ -218,6 +224,11 @@ pub(super) async fn apply_settings_update(
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
 ) {
     let old_channel_username = settings.channel_username.clone();
+    let old_channel_language = settings.channel_language_code();
+    let old_nickname = settings.nickname.clone();
+    let old_shown_status = effective_friend_status(state, settings);
+    let old_friend_status = settings.friend_status;
+    let old_auto_away_minutes = settings.auto_away_minutes;
     let session_friends: Vec<[u8; 16]> = state.ember_sessions.read().await.keys().copied().collect();
     let collected_before: Vec<bool> = session_friends
         .iter()
@@ -237,9 +248,11 @@ pub(super) async fn apply_settings_update(
         udp_socket,
         state,
         db,
+        app_handle,
         settings,
         identity,
         &old_channel_username,
+        old_channel_language,
     )
     .await;
     state
@@ -248,8 +261,22 @@ pub(super) async fn apply_settings_update(
         .await
         .set_policy(settings.relay_for_peers, settings.max_relay_sessions);
     {
+        // The eD2K transfer tasks' copy, so the eMule-facing form.
         let mut nick = shared_nickname.write().await;
-        *nick = settings.nickname.clone();
+        *nick = settings.ed2k_nickname();
+    }
+    if settings.nickname != old_nickname {
+        announce_nickname_to_friends(state, &settings.nickname).await;
+    }
+    // Read idle time afresh first: choosing Online is itself input, and the
+    // last reading may still say Away, which would go out ahead of Online.
+    if settings.friend_status != old_friend_status
+        || settings.auto_away_minutes != old_auto_away_minutes
+    {
+        refresh_idle_away(state, settings, app_handle);
+    }
+    if effective_friend_status(state, settings) != old_shown_status {
+        announce_friend_status(state, settings, &identity.ed25519_secret_key).await;
     }
     source_manager
         .write()
@@ -257,5 +284,52 @@ pub(super) async fn apply_settings_update(
         .set_max_per_file(settings.max_sources_per_file);
     if settings.filter_servers_by_ip {
         apply_server_ip_filter(state, shared_server_addr, app_handle, true).await;
+    }
+}
+
+/// Tell every friend connected now what we are called, so their card changes
+/// without waiting for the next session. The friend request is the frame a
+/// session already opens with to say this, and each side reads it at any
+/// point in a session; a friend's own label for us is theirs to keep.
+fn nickname_frame(nickname: &str) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(6 + nickname.len());
+    frame.push(OP_EMULEPROT);
+    frame.extend_from_slice(&((1 + nickname.len()) as u32).to_le_bytes());
+    frame.push(ed2k::messages::OP_EMBER_FRIEND_REQ);
+    frame.extend_from_slice(nickname.as_bytes());
+    frame
+}
+
+/// Tell one friend whose session our dial just opened what we are called now.
+///
+/// A dial copies the nickname as it starts, and with its lookup and NAT
+/// fallback can take a minute or more to connect; a rename meanwhile reached
+/// every session but this one, which was not up yet, so the friend request it
+/// opened with carried the old name. Sent again here, the friend's side takes
+/// an unchanged name as no change.
+pub(in crate::network) async fn announce_nickname_to_friend(
+    state: &NetworkState,
+    friend: &[u8; 16],
+    nickname: &str,
+) {
+    if nickname.is_empty() {
+        return;
+    }
+    if let Some(session) = state.ember_sessions.read().await.get(friend) {
+        let _ = session.tx.try_send(nickname_frame(nickname));
+    }
+}
+
+async fn announce_nickname_to_friends(state: &NetworkState, nickname: &str) {
+    let frame = nickname_frame(nickname);
+    let sessions = state.ember_sessions.read().await;
+    let mut told = 0usize;
+    for session in sessions.values().filter(|h| h.is_fresh()) {
+        if session.tx.try_send(frame.clone()).is_ok() {
+            told += 1;
+        }
+    }
+    if told > 0 {
+        info!("Told {told} connected friend(s) our new nickname");
     }
 }

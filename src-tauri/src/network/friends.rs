@@ -23,6 +23,7 @@ pub(super) async fn forget_friend_network_state(
 ) {
     ed2k::upload::revoke_all_secure_sessions(friend);
     state.online_friends.remove(&friend);
+    state.friend_statuses.remove(&friend);
     let _ = retire_current_ember_session(&state.ember_sessions, friend).await;
     // A remove followed by a re-add must not wait out a stale search slot.
     state.outbound_session_tasks.remove(&friend);
@@ -807,9 +808,10 @@ pub(super) async fn process_inbound_friend_request(
         }
         FriendRequestDbOutcome::AlreadyMutual => {
             info!(
-                "Friend {} already mutual — ignoring redundant EmberFriendRequest",
+                "Friend {} already mutual — EmberFriendRequest only refreshes their name",
                 hash_hex
             );
+            refresh_friend_name(db, app_handle, req_hash, peer_pubkey, &nickname, verified).await;
         }
         FriendRequestDbOutcome::Promoted => {
             // Auto-confirm: the user already added this peer, so a reciprocal
@@ -844,6 +846,7 @@ pub(super) async fn process_inbound_friend_request(
                 );
                 return;
             }
+            refresh_friend_name(db, app_handle, req_hash, peer_pubkey, &nickname, verified).await;
             if let std::collections::hash_map::Entry::Vacant(e) = online_friends.entry(req_hash) {
                 e.insert(chrono::Utc::now().timestamp());
                 let _ = app_handle.emit(
@@ -909,6 +912,53 @@ pub(super) async fn process_inbound_friend_request(
         FriendRequestDbOutcome::Failed(e) => {
             warn!("Failed to persist inbound friend request from {hash_hex}: {e}");
         }
+    }
+}
+
+/// Record the name a friend announced on a session, and tell the UI when it
+/// changed.
+///
+/// Every session with a friend carries their friend request, so this is where
+/// a friend renaming themselves reaches their card. Only on proof of the key
+/// that `req_hash` is derived from: anyone else could otherwise rename a
+/// friend on our list. The user's own label for them is never touched.
+async fn refresh_friend_name(
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    req_hash: [u8; 16],
+    peer_pubkey: Option<[u8; 32]>,
+    nickname: &str,
+    verified: bool,
+) {
+    let speaks_for_friend = verified
+        && peer_pubkey
+            .as_ref()
+            .and_then(crate::network::ember::crypto::node_id_from_ed25519_bytes)
+            == Some(req_hash);
+    if !speaks_for_friend {
+        return;
+    }
+    let hash_hex = hex::encode(req_hash);
+    let db_q = db.clone();
+    let h_q = hash_hex.clone();
+    let n_q = nickname.to_string();
+    let renamed = tokio::task::spawn_blocking(move || db_q.refresh_friend_self_name(&h_q, &n_q))
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r.map_err(|e| e.to_string()));
+    match renamed {
+        Ok(true) => {
+            info!(
+                "Friend {hash_hex} changed their name (nickname_chars={})",
+                nickname.chars().count()
+            );
+            let _ = app_handle.emit(
+                "ember:friend-renamed",
+                serde_json::json!({ "user_hash": hash_hex }),
+            );
+        }
+        Ok(false) => {}
+        Err(e) => warn!("Failed to record friend {hash_hex}'s name: {e}"),
     }
 }
 

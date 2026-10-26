@@ -1,6 +1,7 @@
 /**
  * How much a public room listing looks like spam, from what Discover shows of
- * it: its name and the size the directory reports.
+ * it: its name, the size the directory reports, whether a friend is in it, and
+ * how long this device has seen it listed.
  *
  * Anyone can publish a listing, so Discover would otherwise give a flood of
  * advertising rooms the same footing as real ones. This only decides what is
@@ -18,11 +19,19 @@ export const LIKELY_SPAM_SCORE = 3;
  *  called "Music" is ordinary; a third is somebody publishing in bulk. */
 export const DUPLICATE_NAME_FLOOD = 3;
 
+/** A listing this device has known this long is not part of a fresh flood:
+ *  advertising rooms come in bursts, under names made for the occasion. */
+export const LONG_LISTED_SECS = 14 * 24 * 3600;
+
 interface Listing {
   channel_id: string;
   name: string;
   /** Members present right now; null when the directory could not tell. */
   member_count: number | null;
+  /** Friends among them; null when the size was not read. */
+  friends_present?: number | null;
+  /** Unix seconds this device first saw the listing. */
+  listed_since?: number | null;
 }
 
 /** A web address or an invite to somewhere else, which is what an advert in a
@@ -52,8 +61,14 @@ function mostlySymbols(name: string): boolean {
   return symbols * 2 > chars.length;
 }
 
-/** Each listing's score, by room id. */
-export function listingSpamScores(listings: readonly Listing[]): Map<string, number> {
+/** Each listing's score, by room id, as of `now` (Unix seconds).
+ *
+ *  A room a friend is in scores 0, whatever it is called: someone the user
+ *  knows chose to be there. Anyone can sign presence, so the size alone says
+ *  little, but a friend's own presence is signed by a key the user trusts.
+ *  A listing known for {@link LONG_LISTED_SECS} drops one point, enough to
+ *  outweigh one quirk of a long-standing room's name, never a link. */
+export function listingSpamScores(listings: readonly Listing[], now = Date.now() / 1000): Map<string, number> {
   const byName = new Map<string, Listing[]>();
   for (const listing of listings) {
     const key = listingNameKey(listing.name);
@@ -64,9 +79,14 @@ export function listingSpamScores(listings: readonly Listing[]): Map<string, num
   }
   const scores = new Map<string, number>();
   for (const listing of listings) {
+    if ((listing.friends_present ?? 0) > 0) {
+      scores.set(listing.channel_id, 0);
+      continue;
+    }
     const name = listing.name.trim();
+    const linked = LINK.test(name);
     let score = 0;
-    if (LINK.test(name)) score += 3;
+    if (linked) score += 3;
     if (REPEATED.test(name)) score += 1;
     if (shoutsInCapitals(name)) score += 1;
     if (mostlySymbols(name)) score += 1;
@@ -80,6 +100,8 @@ export function listingSpamScores(listings: readonly Listing[]): Map<string, num
     // Empty is weak evidence on its own — every new room starts empty — but
     // it tips a listing that already looks wrong.
     if (listing.member_count === 0) score += 1;
+    const listedFor = listing.listed_since == null ? 0 : now - listing.listed_since;
+    if (!linked && listedFor >= LONG_LISTED_SECS) score = Math.max(0, score - 1);
     scores.set(listing.channel_id, score);
   }
   return scores;

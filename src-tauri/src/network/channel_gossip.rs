@@ -12,6 +12,38 @@ pub(super) const CHANNEL_GOSSIP_RATE_WINDOW: std::time::Duration = std::time::Du
 /// Mark a frame we originated as seen, by envelope id and by body, so its echo
 /// from a neighbor is dropped at dedup. The id alone would let the echo in as
 /// a variant, to be applied and passed on a second time.
+/// The pairwise key a transfer frame from `sender` is checked under.
+///
+/// Deriving it is a static X25519 exchange, and every inbound frame of a
+/// transfer paid one — a block stream most of all. Each transfer this device
+/// holds kept the key it derived at setup from these same inputs, so it is
+/// reused whenever the room and peer match; only a frame for a transfer not
+/// held yet, such as the offer that starts it, derives one.
+fn xfer_frame_key(
+    state: &NetworkState,
+    channel_id: &[u8; 16],
+    sender: &[u8; 32],
+    xfer_id: &[u8; 16],
+) -> Option<[u8; 32]> {
+    let held = state
+        .xfer_recv
+        .get(xfer_id)
+        .map(|recv| (recv.channel_id, recv.peer, recv.key))
+        .or_else(|| state.xfer_send.get(xfer_id).map(|send| (send.channel_id, send.peer, send.key)))
+        .or_else(|| {
+            state
+                .xfer_pending
+                .get(xfer_id)
+                .map(|offer| (offer.channel_id, offer.peer, offer.key))
+        });
+    match held {
+        Some((held_channel, held_peer, key)) if &held_channel == channel_id && &held_peer == sender => {
+            Some(key)
+        }
+        _ => ember::channel::derive_xfer_key(&state.local_ed25519_seed, sender, channel_id, xfer_id),
+    }
+}
+
 pub(super) fn remember_originated_gossip(state: &mut NetworkState, gossip: &ember::channel::ChannelGossip) {
     let _ = remember_channel_gossip(state, gossip.msg_id);
     let _ = remember_channel_gossip(state, ember::channel::gossip_body_key(gossip));
@@ -38,6 +70,38 @@ pub(super) fn channel_author_gossip_ok(
         author,
         std::time::Instant::now(),
     )
+}
+
+/// [`channel_author_gossip_ok`] for one form of a chat line or revision, so
+/// the legacy frame and the v2 frame of it count once. `revision` is 0 for a
+/// line and the revision's time for an edit; `signed_at` is the time both
+/// forms sign, the line's send time or the revision's.
+pub(super) fn channel_chat_author_ok(
+    state: &mut NetworkState,
+    channel_id: [u8; 16],
+    author: &[u8; 32],
+    line_id: &[u8; 16],
+    revision: i64,
+    signed_at: i64,
+    form: ember::channel::ChatForm,
+) -> bool {
+    ember::channel::chat_author_allow(
+        &mut state.channel_gossip_author_times,
+        &mut chat_twin_credits().lock(),
+        channel_id,
+        author,
+        line_id,
+        revision,
+        signed_at,
+        form,
+        std::time::Instant::now(),
+    )
+}
+
+fn chat_twin_credits() -> &'static parking_lot::Mutex<ember::channel::ChatTwinCredits> {
+    static CREDITS: std::sync::OnceLock<parking_lot::Mutex<ember::channel::ChatTwinCredits>> =
+        std::sync::OnceLock::new();
+    CREDITS.get_or_init(Default::default)
 }
 
 pub(super) fn channel_history_sync_ok(
@@ -1015,12 +1079,7 @@ pub(super) async fn handle_inbound_channel_gossip(
         if target != state.local_ed25519_pubkey {
             return;
         }
-        let Some(key) = ember::channel::derive_xfer_key(
-            &state.local_ed25519_seed,
-            &sender,
-            &gossip.channel_id,
-            &xfer_id,
-        ) else {
+        let Some(key) = xfer_frame_key(state, &gossip.channel_id, &sender, &xfer_id) else {
             return;
         };
         let Some(body) = ember::channel::xfer_verify(&key, &plain) else {
@@ -1071,7 +1130,7 @@ pub(super) async fn handle_inbound_channel_gossip(
             if opened == ember::channel::OpenedUnder::Current
                 || channel_member_on_roster(state, db, gossip.channel_id, &sender)
             {
-                apply_xfer_offer(socket, state, db, app_handle, &ch, &gossip, offer, key, sealed)
+                apply_xfer_offer(socket, state, db, app_handle, &ch, &gossip, offer, key, sealed, dedup_key)
                     .await;
             } else {
                 debug!("Ember Transfer: ignored an offer in {channel_id_hex} under a retired key");
@@ -1151,7 +1210,7 @@ pub(super) async fn handle_inbound_channel_gossip(
     ) {
         note_gossip_proven(&gossip.msg_id, &plain);
         apply_room_friend_request(
-            socket, state, db, app_handle, &gossip, from_id, opened, sender_pk, tag,
+            socket, state, db, app_handle, &gossip, from_id, opened, sender_pk, tag, dedup_key,
         )
         .await;
         return;
@@ -1205,6 +1264,7 @@ pub(super) async fn handle_inbound_channel_gossip(
             successor_pk,
             version,
             proven,
+            dedup_key,
         )
         .await;
         return;
@@ -1245,7 +1305,7 @@ pub(super) async fn handle_inbound_channel_gossip(
         if !channel_history_sync_ok(state, gossip.channel_id, &sender_pk) {
             // Refused for rate, not validity, so the dedup slot goes back and a
             // genuine retry once the window rolls off is still admissible.
-            forget_channel_gossip(state, &gossip.msg_id);
+            forget_channel_gossip(state, &dedup_key);
             debug!("Ember channel gossip: rate-limited history sync in {channel_id_hex}");
             return;
         }
@@ -1255,7 +1315,7 @@ pub(super) async fn handle_inbound_channel_gossip(
         // allowance all of our rooms share. Any other member can answer the
         // same request, so one refused here is not left without history.
         if !channel_history_replies_ok(gossip.channel_id) {
-            forget_channel_gossip(state, &gossip.msg_id);
+            forget_channel_gossip(state, &dedup_key);
             debug!("Ember channel gossip: history sync replies for {channel_id_hex} at the room ceiling");
             return;
         }
@@ -1306,7 +1366,7 @@ pub(super) async fn handle_inbound_channel_gossip(
             chrono::Utc::now().timestamp(),
         );
         if fresh && !channel_author_gossip_ok(state, gossip.channel_id, &sender_pk) {
-            forget_channel_gossip(state, &gossip.msg_id);
+            forget_channel_gossip(state, &dedup_key);
             debug!("Ember channel gossip: rate-limited mod action in {channel_id_hex}");
             return;
         }
@@ -1396,8 +1456,10 @@ pub(super) async fn handle_inbound_channel_gossip(
             &gossip,
             &channel_id_hex,
             edit,
+            None,
             from_id,
             opened,
+            dedup_key,
         )
         .await;
         return;
@@ -1433,9 +1495,53 @@ pub(super) async fn handle_inbound_channel_gossip(
             &gossip.msg_id,
             gossip.timestamp,
         ) {
+            Some(ext) if ext.kind == ember::channel::EXT_KIND_CHAT_LINE => {
+                note_gossip_proven(&gossip.msg_id, &plain);
+                let Some(line) = chat_line_from_v2(&gossip, &channel_id_hex, ext) else {
+                    return;
+                };
+                handle_inbound_channel_chat(
+                    socket,
+                    state,
+                    db,
+                    app_handle,
+                    &ch,
+                    &gossip,
+                    &channel_id_hex,
+                    line,
+                    from_id,
+                    opened,
+                    variant,
+                    dedup_key,
+                )
+                .await;
+            }
+            Some(ext) if ext.kind == ember::channel::EXT_KIND_CHAT_EDIT => {
+                note_gossip_proven(&gossip.msg_id, &plain);
+                let Some((edit, frame)) = chat_edit_from_v2(&gossip, &channel_id_hex, ext) else {
+                    return;
+                };
+                handle_inbound_channel_edit(
+                    socket,
+                    state,
+                    db,
+                    app_handle,
+                    &gossip,
+                    &channel_id_hex,
+                    edit,
+                    Some(frame),
+                    from_id,
+                    opened,
+                    dedup_key,
+                )
+                .await;
+            }
             Some(ext) => {
                 note_gossip_proven(&gossip.msg_id, &plain);
-                handle_inbound_channel_ext(
+                // Relayed under the same rules as any extension frame first:
+                // whether it is to us must make no difference to that.
+                let private = (ext.kind == ember::channel::EXT_KIND_PRIVATE_MESSAGE).then(|| ext.clone());
+                let passed = handle_inbound_channel_ext(
                     socket,
                     state,
                     db,
@@ -1448,6 +1554,18 @@ pub(super) async fn handle_inbound_channel_gossip(
                     dedup_key,
                 )
                 .await;
+                if let Some(ext) = private.filter(|_| passed) {
+                    super::room_dm::on_private_message(
+                        state,
+                        db,
+                        app_handle,
+                        &gossip,
+                        &channel_id_hex,
+                        &ext,
+                        opened,
+                    )
+                    .await;
+                }
             }
             None => debug!(
                 "Ember channel gossip: dropped an extension frame in {channel_id_hex} that did \
@@ -1468,14 +1586,200 @@ pub(super) async fn handle_inbound_channel_gossip(
         );
         return;
     };
+    let line = InboundChatLine {
+        sender: sender_pk,
+        line_id: gossip.msg_id,
+        text,
+        form: InboundChatForm::Legacy(author_sig),
+    };
+    handle_inbound_channel_chat(
+        socket,
+        state,
+        db,
+        app_handle,
+        &ch,
+        &gossip,
+        &channel_id_hex,
+        line,
+        from_id,
+        opened,
+        variant,
+        dedup_key,
+    )
+    .await;
+}
+
+/// A chat line as it arrived, in either form.
+struct InboundChatLine {
+    sender: [u8; 32],
+    /// The legacy frame's `msg_id`, or the id a v2 frame names.
+    line_id: [u8; 16],
+    /// As signed: the legacy text, or the v2 body with its trailer.
+    text: String,
+    form: InboundChatForm,
+}
+
+enum InboundChatForm {
+    /// Chat line 15 and the author's signature over `text`.
+    Legacy([u8; 64]),
+    /// Kind 64, as it would be kept.
+    V2(ember::channel::ChatV2Frame),
+}
+
+/// A kind 64 frame as the line it carries, or nothing if its body is
+/// malformed or names a line its author did not write at its time.
+///
+/// The line id has to bind the author and the frame's signed time
+/// ([`ember::channel::chat_msg_id_binds`]); every build that sends this kind
+/// mints ids that do. So a v2 frame can name only its own author's line, and
+/// only the one sent at its own time, whether or not that line is held here.
+fn chat_line_from_v2(
+    gossip: &ember::channel::ChannelGossip,
+    channel_id_hex: &str,
+    ext: ember::channel::ChannelExtFrame,
+) -> Option<InboundChatLine> {
+    let Some(body) = ember::channel::decode_chat_v2_body(ext.kind, &ext.body) else {
+        debug!("Ember channel gossip: dropped a v2 chat line in {channel_id_hex} with a malformed body");
+        return None;
+    };
+    if !ember::channel::chat_msg_id_binds(&gossip.channel_id, &body.line_id, &ext.sender, gossip.timestamp) {
+        debug!(
+            "Ember channel gossip: dropped a v2 chat line in {channel_id_hex} naming a line its \
+             author did not write"
+        );
+        return None;
+    }
+    Some(InboundChatLine {
+        sender: ext.sender,
+        line_id: body.line_id,
+        text: body.stored_text(),
+        form: InboundChatForm::V2(ember::channel::ChatV2Frame {
+            kind: ext.kind,
+            flags: ext.flags,
+            frame_id: gossip.msg_id,
+            signed_at: gossip.timestamp,
+            signature: ext.signature,
+            body: ext.body,
+        }),
+    })
+}
+
+/// A kind 65 frame as the revision it carries and the frame to keep, or
+/// nothing if its body is malformed. Its revision time is the frame's signed
+/// time; who may revise the line is settled where the edit frame's is.
+fn chat_edit_from_v2(
+    gossip: &ember::channel::ChannelGossip,
+    channel_id_hex: &str,
+    ext: ember::channel::ChannelExtFrame,
+) -> Option<(ember::channel::ChannelChatEdit, ember::channel::ChatV2Frame)> {
+    let Some(body) = ember::channel::decode_chat_v2_body(ext.kind, &ext.body) else {
+        debug!("Ember channel edit: dropped a v2 revision in {channel_id_hex} with a malformed body");
+        return None;
+    };
+    let edit = ember::channel::ChannelChatEdit {
+        sender: ext.sender,
+        target_msg_id: body.line_id,
+        original_timestamp: body.original_timestamp?,
+        edited_at: gossip.timestamp,
+        text: body.stored_text(),
+        signature: ext.signature,
+    };
+    let frame = ember::channel::ChatV2Frame {
+        kind: ext.kind,
+        flags: ext.flags,
+        frame_id: gossip.msg_id,
+        signed_at: gossip.timestamp,
+        signature: ext.signature,
+        body: ext.body,
+    };
+    Some((edit, frame))
+}
+
+/// What about a room decides whether a chat line in it can add its author to
+/// the roster, taken from the room's row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChatRosterRoom {
+    private: bool,
+    own_room: bool,
+}
+
+impl ChatRosterRoom {
+    fn of(ch: &crate::storage::database::StoredChannel) -> Self {
+        Self {
+            private: ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE,
+            own_room: ch.is_owner,
+        }
+    }
+}
+
+/// Whether a chat line just stored adds its author to the roster: the one
+/// place in the gossip handlers a chat line can. A private room holds it to
+/// its admission rule ([`super::channel_membership::private_room_admission`]);
+/// a public room never admits by chat. Blocking: a member's private room
+/// reads the settings record it holds.
+fn chat_line_admits_author(
+    db: &Database,
+    channel_id_hex: &str,
+    room: ChatRosterRoom,
+    opened: ember::channel::OpenedUnder,
+    ttl: u8,
+    signed_at: i64,
+    received_at: i64,
+) -> bool {
+    let admission = if room.private {
+        super::channel_membership::private_room_admission(db, channel_id_hex, room.own_room)
+    } else {
+        ember::channel::RosterAdmission::Open
+    };
+    ember::channel::chat_author_joins_gossip_roster(room.private, admission, opened, ttl, signed_at, received_at)
+}
+
+/// Store a chat line, in either form, and pass it on.
+///
+/// Both forms of a line are one line here: stored under the line's id, and
+/// charged once against the author's rate whichever arrives first
+/// ([`channel_chat_author_ok`]). The second to arrive keeps what the first did
+/// not have, the v2 text or the legacy signature, and changes nothing else;
+/// one that does not pair with the first is neither kept nor passed on.
+#[allow(clippy::too_many_arguments)]
+async fn handle_inbound_channel_chat(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    ch: &crate::storage::database::StoredChannel,
+    gossip: &ember::channel::ChannelGossip,
+    channel_id_hex: &str,
+    line: InboundChatLine,
+    from_id: ember::dht::EmberNodeId,
+    opened: ember::channel::OpenedUnder,
+    variant: bool,
+    dedup_key: [u8; 16],
+) {
+    let channel_id_hex = channel_id_hex.to_string();
+    let InboundChatLine {
+        sender: sender_pk,
+        line_id,
+        text,
+        form,
+    } = line;
+    let chat_form = match form {
+        InboundChatForm::Legacy(_) => ember::channel::ChatForm::Legacy,
+        InboundChatForm::V2(_) => ember::channel::ChatForm::V2,
+    };
     let sender_hex = hex::encode(sender_pk);
-    let msg_id_hex = hex::encode(gossip.msg_id);
+    let msg_id_hex = hex::encode(line_id);
     let catch_up = catch_up_progress(state, gossip.channel_id, &from_id, gossip.ttl, gossip.timestamp);
     // Ahead of the rate charge: our own lines echo back as variants, and a line
     // we already hold says nothing new to us or to the mesh. A catch-up
     // re-serve of a line held from earlier this session lands here too — its
     // id is still in the seen-set — and still carries that neighbor forward.
+    // A legacy line only: a v2 frame's envelope id is its own, so holding the
+    // line says nothing about this frame, which may be the genuine one behind
+    // a frame squatting on its id. Its ingest settles it, and a variant it
+    // finds held is not passed on.
     if variant
+        && chat_form == ember::channel::ChatForm::Legacy
         && db
             .channel_message_known(&channel_id_hex, &msg_id_hex, &sender_hex, gossip.timestamp)
             .unwrap_or(true)
@@ -1493,7 +1797,17 @@ pub(super) async fn handle_inbound_channel_gossip(
     );
     // Ahead of any DB work, and ahead of the relay below: a member flooding a
     // room must not be forwarded on by us, or the mesh amplifies it.
-    if fresh && !channel_author_gossip_ok(state, gossip.channel_id, &sender_pk) {
+    if fresh
+        && !channel_chat_author_ok(
+            state,
+            gossip.channel_id,
+            &sender_pk,
+            &line_id,
+            0,
+            gossip.timestamp,
+            chat_form,
+        )
+    {
         // Release the dedup slot: this was refused for rate, not validity, so a
         // retransmit once the window rolls off has to still be admissible.
         forget_channel_gossip(state, &dedup_key);
@@ -1523,27 +1837,16 @@ pub(super) async fn handle_inbound_channel_gossip(
     let Some(cleaned) = crate::security::sanitize_message_text(&text) else {
         return;
     };
-    if cleaned.is_empty() || cleaned.len() > 4096 {
+    if cleaned.is_empty() || cleaned.len() > ember::channel::CHAT_TEXT_MAX_BYTES {
         return;
     }
     let now = gossip.timestamp;
-    // Keep the author's signature only when sanitising left the text alone.
-    // The signature covers what they wrote; if we had to change it, the two no
-    // longer agree, and storing the signature anyway would produce a re-serve
-    // that every recipient rejects. Such a line stays readable here and simply
-    // is not passed on.
-    let stored_sig = if cleaned == text {
-        hex::encode(author_sig)
-    } else {
-        String::new()
+    let Some(kept) = kept_chat_form(form, cleaned == text) else {
+        debug!("Ember channel gossip: v2 chat line in {channel_id_hex} did not survive sanitising");
+        return;
     };
-    let joins_roster = ember::channel::chat_author_joins_gossip_roster(
-        ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE,
-        opened,
-        gossip.ttl,
-        gossip.timestamp,
-        chrono::Utc::now().timestamp(),
-    );
+    let roster_room = ChatRosterRoom::of(ch);
+    let (ttl, received_at) = (gossip.ttl, chrono::Utc::now().timestamp());
     // The same derivation `insert_channel_message` stores, so the event and the
     // row agree on what this line answers.
     let reply_to = ember::channel::chat_reply_parent_hex(&cleaned, &msg_id_hex);
@@ -1567,45 +1870,99 @@ pub(super) async fn handle_inbound_channel_gossip(
             // claim about the room. Holding only the id is not holding the
             // line: a row that cannot prove the id is its own gives way to this
             // one inside `insert_channel_message`.
-            if db
-                .channel_message_known(&channel_id_hex, &msg_id_hex, &sender_hex, now)
-                .unwrap_or(false)
-            {
-                return ChatLineIngest::Known;
-            }
-            match db.insert_channel_message(
-                &channel_id_hex,
-                &sender_hex,
-                "received",
-                &cleaned,
-                &msg_id_hex,
-                now,
-                &stored_sig,
-                false,
-            ) {
-                Ok(row_id) => ChatLineIngest::Stored {
-                    row_id,
-                    // A parent that fails to read is a quote drawn as
-                    // unavailable, not a line lost.
-                    reply: reply_to
-                        .as_deref()
-                        .and_then(|parent| db.channel_reply_lookup(&channel_id_hex, parent).ok())
-                        .unwrap_or_default(),
-                    // First line from someone this device did not already
-                    // hold: the roster has to grow, and XOR-neighbors may have
-                    // changed, so do not wait for the next presence walk or the
-                    // friend heartbeat.
-                    member: joins_roster.then(|| {
-                        db.upsert_channel_member(
+            let stored = match &kept {
+                KeptChatForm::Legacy(stored_sig) => {
+                    if db
+                        .channel_message_known(&channel_id_hex, &msg_id_hex, &sender_hex, now)
+                        .unwrap_or(false)
+                    {
+                        // Held from its v2 twin: the signature is what lets
+                        // this device re-serve the line to older builds.
+                        use crate::storage::database::ChannelLegacyTwinOutcome;
+                        return match db.adopt_channel_line_signature(
                             &channel_id_hex,
+                            &msg_id_hex,
                             &sender_hex,
-                            "",
                             now,
-                            Some(&local_hex),
-                        )
-                        .ok()
-                    }),
-                },
+                            &cleaned,
+                            stored_sig,
+                        ) {
+                            Ok(ChannelLegacyTwinOutcome::Unpaired) => ChatLineIngest::Unpaired,
+                            _ => ChatLineIngest::Known,
+                        };
+                    }
+                    db.insert_channel_message(
+                        &channel_id_hex,
+                        &sender_hex,
+                        "received",
+                        &cleaned,
+                        &msg_id_hex,
+                        now,
+                        stored_sig,
+                        false,
+                    )
+                }
+                KeptChatForm::V2(frame) => {
+                    use crate::storage::database::ChannelV2LineOutcome;
+                    match db.ingest_channel_chat_v2_line(
+                        &channel_id_hex,
+                        &sender_hex,
+                        &msg_id_hex,
+                        now,
+                        &cleaned,
+                        frame,
+                    ) {
+                        Ok(ChannelV2LineOutcome::Created(row_id)) => Ok(row_id),
+                        Ok(ChannelV2LineOutcome::Paired { id, text_changed }) => {
+                            return ChatLineIngest::Paired {
+                                row_id: id,
+                                text_changed,
+                            };
+                        }
+                        Ok(ChannelV2LineOutcome::Known | ChannelV2LineOutcome::Forgotten) => {
+                            return ChatLineIngest::Known;
+                        }
+                        Ok(ChannelV2LineOutcome::Unpaired) => return ChatLineIngest::Unpaired,
+                        Ok(ChannelV2LineOutcome::NotAuthor) => return ChatLineIngest::NotAuthor,
+                        Err(e) => Err(e),
+                    }
+                }
+            };
+            match stored {
+                Ok(row_id) => {
+                    let joins_roster = chat_line_admits_author(
+                        &db,
+                        &channel_id_hex,
+                        roster_room,
+                        opened,
+                        ttl,
+                        now,
+                        received_at,
+                    );
+                    ChatLineIngest::Stored {
+                        row_id,
+                        // A parent that fails to read is a quote drawn as
+                        // unavailable, not a line lost.
+                        reply: reply_to
+                            .as_deref()
+                            .and_then(|parent| db.channel_reply_lookup(&channel_id_hex, parent).ok())
+                            .unwrap_or_default(),
+                        // First line from someone this device did not already
+                        // hold: the roster has to grow, and XOR-neighbors may
+                        // have changed, so do not wait for the next presence
+                        // walk or the friend heartbeat.
+                        member: joins_roster.then(|| {
+                            db.upsert_channel_member(
+                                &channel_id_hex,
+                                &sender_hex,
+                                "",
+                                now,
+                                Some(&local_hex),
+                            )
+                            .ok()
+                        }),
+                    }
+                }
                 Err(e) => ChatLineIngest::Failed(e.to_string()),
             }
         })
@@ -1614,15 +1971,44 @@ pub(super) async fn handle_inbound_channel_gossip(
     };
     // Catch-up has carried that neighbor through this line once it is held
     // here, by this frame or before it — never ahead of storing it.
-    if let Some(progress) = catch_up.filter(|_| !matches!(ingest, ChatLineIngest::Failed(_))) {
+    if let Some(progress) = catch_up
+        .filter(|_| !matches!(ingest, ChatLineIngest::Failed(_) | ChatLineIngest::NotAuthor))
+    {
         note_catch_up_progress(db, progress).await;
     }
+    let relay = ingest.relays(variant);
     match ingest {
-        ChatLineIngest::Known => {
-            if let Some(next) = gossip.decremented_ttl().filter(|_| fresh) {
-                fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+        ChatLineIngest::Known => {}
+        ChatLineIngest::Unpaired => {
+            debug!(
+                "Ember channel gossip: a chat line in {channel_id_hex} did not pair with the form \
+                 held; the first stands"
+            );
+        }
+        ChatLineIngest::NotAuthor => {
+            debug!(
+                "Ember channel gossip: dropped a v2 chat line in {channel_id_hex} naming another \
+                 member's line"
+            );
+        }
+        ChatLineIngest::Paired {
+            row_id,
+            text_changed,
+        } => {
+            // The line is on screen already; only its words moved, joiners
+            // back in, and the row is no more edited than it was.
+            if text_changed {
+                let _ = app_handle.emit(
+                    "ember:channel-message-edited",
+                    serde_json::json!({
+                        "channel_id": channel_id_hex,
+                        "id": row_id,
+                        "msg_id": msg_id_hex,
+                        "message": ember::channel::chat_display_text(&cleaned),
+                        "edited_at": 0,
+                    }),
+                );
             }
-            return;
         }
         ChatLineIngest::Stored {
             row_id,
@@ -1655,11 +2041,12 @@ pub(super) async fn handle_inbound_channel_gossip(
                 }
             } else {
                 // Public rooms do not INSERT strangers from chat (anti-eclipse),
-                // and no room does on a seal that is not the author's own under
-                // the current key. A line from someone already on the roster
-                // still refreshes last_seen so they do not age out while visibly
-                // talking. Never later than our own clock: the line's time is
-                // the author's, and may run minutes ahead.
+                // no room does on a seal that is not the author's own under the
+                // current key, and a private room whose owner states the
+                // key-proven rule does not at all. A line from someone already
+                // on the roster still refreshes last_seen so they do not age out
+                // while visibly talking. Never later than our own clock: the
+                // line's time is the author's, and may run minutes ahead.
                 note_channel_member_alive(
                     state,
                     gossip.channel_id,
@@ -1701,15 +2088,51 @@ pub(super) async fn handle_inbound_channel_gossip(
             debug!("Ember channel gossip: persist failed for {channel_id_hex}: {e}");
         }
     }
-    if let Some(next) = gossip.decremented_ttl().filter(|_| fresh) {
+    if let Some(next) = gossip.decremented_ttl().filter(|_| fresh && relay) {
         fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
+    }
+}
+
+/// What a chat line keeps of the form it arrived in.
+enum KeptChatForm {
+    /// The legacy signature, hex, or empty when sanitising changed the text.
+    Legacy(String),
+    /// The v2 frame.
+    V2(ember::channel::ChatV2Frame),
+}
+
+/// What to keep of a line's form, given whether sanitising left its text
+/// `unchanged`; nothing for a v2 frame it changed.
+///
+/// The signature covers what the author wrote; if sanitising changed it, the
+/// two no longer agree, and storing the signature anyway would produce a
+/// re-serve that every recipient rejects. A legacy line stays readable here
+/// with no signature and simply is not re-served. A v2 frame is dropped, as a
+/// revision is: a row made from it would hold neither form's signature and
+/// could never take its legacy twin's, which is left to make the row instead.
+fn kept_chat_form(form: InboundChatForm, unchanged: bool) -> Option<KeptChatForm> {
+    match form {
+        InboundChatForm::Legacy(author_sig) => Some(KeptChatForm::Legacy(if unchanged {
+            hex::encode(author_sig)
+        } else {
+            String::new()
+        })),
+        InboundChatForm::V2(frame) => unchanged.then_some(KeptChatForm::V2(frame)),
     }
 }
 
 /// What the blocking half of a chat line's ingest found.
 enum ChatLineIngest {
-    /// Already held, or held and forgotten: relay, do not store.
+    /// Already held, or held and forgotten: do not store; relay unless a
+    /// variant.
     Known,
+    /// The author's row under the line's id does not pair with this form:
+    /// another time, or other words. Not stored, not relayed.
+    Unpaired,
+    /// A v2 frame kept beside its author's legacy line; relay.
+    Paired { row_id: i64, text_changed: bool },
+    /// A v2 frame naming somebody else's line: dropped, not relayed.
+    NotAuthor,
     /// `member` is the roster write, when the line was one that may grow it;
     /// its inner `None` is a write that failed.
     Stored {
@@ -1718,6 +2141,19 @@ enum ChatLineIngest {
         member: Option<Option<ChannelMemberWrite>>,
     },
     Failed(String),
+}
+
+impl ChatLineIngest {
+    /// Whether the frame goes on, when it is fresh and has hops left. A
+    /// variant found held is the originator's own echo or a re-seal, and
+    /// passing it on would flood it again.
+    fn relays(&self, variant: bool) -> bool {
+        match self {
+            Self::Known => !variant,
+            Self::Unpaired | Self::NotAuthor => false,
+            Self::Paired { .. } | Self::Stored { .. } | Self::Failed(_) => true,
+        }
+    }
 }
 
 /// Whether a reply's parent was written by this device's identity.
@@ -1882,6 +2318,7 @@ async fn apply_room_friend_request(
     opened: ember::channel::OpenedUnder,
     sender_pk: [u8; 32],
     tag: [u8; 16],
+    dedup_key: [u8; 16],
 ) {
     let channel_id = gossip.channel_id;
     let now = chrono::Utc::now().timestamp();
@@ -1897,7 +2334,7 @@ async fn apply_room_friend_request(
         return;
     }
     if !channel_author_gossip_ok(state, channel_id, &sender_pk) {
-        forget_channel_gossip(state, &gossip.msg_id);
+        forget_channel_gossip(state, &dedup_key);
         return;
     }
     // Signed by its sender, and v1.6.x has no room friend request.
@@ -2105,6 +2542,7 @@ pub(super) async fn apply_channel_handoff_ready(
     successor_pk: [u8; 32],
     version: u64,
     proven: bool,
+    dedup_key: [u8; 16],
 ) {
     let mut offer_known = handoff_offers_seen()
         .lock()
@@ -2230,7 +2668,7 @@ pub(super) async fn apply_channel_handoff_ready(
         // answers may be a flood behind it, or have crossed this node before a
         // restart, and a copy arriving once we have seen it must still pass.
         if !offer_known || relay {
-            forget_channel_gossip(state, &gossip.msg_id);
+            forget_channel_gossip(state, &dedup_key);
         }
         debug!(
             "Ember channel handoff: not relaying a ready in {} (banned sender, unknown or \
@@ -2966,6 +3404,11 @@ pub(super) async fn send_channel_typing(
 /// our window closing is a fact about this device's clock, not about the frame,
 /// and a neighbour who was away may still legitimately accept it. Not forwarded
 /// when it is forged or a revision we already hold.
+///
+/// Both forms of a revision come through here: the edit frame (19) with `v2`
+/// `None`, and a v2 revision (65) with its frame in `v2` and its body and
+/// trailer as `edit.text`. They pair as a line's two forms do, and count once
+/// against the author.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_inbound_channel_edit(
     socket: &UdpSocket,
@@ -2975,14 +3418,31 @@ pub(super) async fn handle_inbound_channel_edit(
     gossip: &ember::channel::ChannelGossip,
     channel_id_hex: &str,
     edit: ember::channel::ChannelChatEdit,
+    v2: Option<ember::channel::ChatV2Frame>,
     from_id: ember::dht::EmberNodeId,
     opened: ember::channel::OpenedUnder,
+    dedup_key: [u8; 16],
 ) {
+    let form = if v2.is_some() {
+        ember::channel::ChatForm::V2
+    } else {
+        ember::channel::ChatForm::Legacy
+    };
     // A stale revision is a catch-up re-serve or a replay: neither charged to
     // its author nor passed on.
     let fresh = ember::channel::gossip_fresh_for_relay(edit.edited_at, chrono::Utc::now().timestamp());
-    if fresh && !channel_author_gossip_ok(state, gossip.channel_id, &edit.sender) {
-        forget_channel_gossip(state, &gossip.msg_id);
+    if fresh
+        && !channel_chat_author_ok(
+            state,
+            gossip.channel_id,
+            &edit.sender,
+            &edit.target_msg_id,
+            edit.edited_at,
+            edit.edited_at,
+            form,
+        )
+    {
+        forget_channel_gossip(state, &dedup_key);
         debug!("Ember channel edit: rate-limited author in {channel_id_hex}");
         return;
     }
@@ -2995,7 +3455,7 @@ pub(super) async fn handle_inbound_channel_edit(
     if opened == ember::channel::OpenedUnder::Retired
         && !channel_member_on_roster(state, db, gossip.channel_id, &edit.sender)
     {
-        forget_channel_gossip(state, &gossip.msg_id);
+        forget_channel_gossip(state, &dedup_key);
         return;
     }
     let Some(cleaned) = crate::security::sanitize_message_text(&edit.text) else {
@@ -3020,23 +3480,51 @@ pub(super) async fn handle_inbound_channel_edit(
     // forged. Our own clock or our own delete refusing it is still no reason
     // to keep it from a neighbour.
     let mut relay = true;
-    let outcome = db.apply_channel_message_edit(
-        channel_id_hex,
-        &target_hex,
-        &sender_hex,
-        edit.original_timestamp,
-        edit.edited_at,
-        &cleaned,
-        &hex::encode(edit.signature),
-        now,
-    );
+    let edit_sig = if v2.is_some() {
+        String::new()
+    } else {
+        hex::encode(edit.signature)
+    };
+    // Awaited on the blocking pool, as a chat line's ingest is: a revision
+    // decrypts, encrypts and seals inside its transaction, and the reply
+    // lookup for a line it creates is another query.
+    let (outcome, created_reply) = {
+        let db = db.clone();
+        let channel_id_hex = channel_id_hex.to_string();
+        let target_hex = target_hex.clone();
+        let sender_hex = sender_hex.clone();
+        let cleaned = cleaned.clone();
+        let (original_timestamp, edited_at) = (edit.original_timestamp, edit.edited_at);
+        tokio::task::spawn_blocking(move || {
+            let outcome = db.apply_channel_message_edit_with(
+                &channel_id_hex,
+                &target_hex,
+                &sender_hex,
+                original_timestamp,
+                edited_at,
+                &cleaned,
+                &edit_sig,
+                now,
+                v2.as_ref(),
+            );
+            let reply = matches!(outcome, Ok(crate::storage::database::ChannelEditOutcome::Created(_)))
+                .then(|| ember::channel::chat_reply_parent_hex(&cleaned, &target_hex))
+                .flatten()
+                .and_then(|parent| db.channel_reply_lookup(&channel_id_hex, &parent).ok())
+                .unwrap_or_default();
+            (outcome, reply)
+        })
+        .await
+        .unwrap_or_else(|e| (Err(anyhow::anyhow!(e.to_string())), Default::default()))
+    };
     // Catch-up serves a revised line as its revision, so the room's catch-up
     // mark moves past the line once it is held here, by this frame or before.
     let held = matches!(
         outcome,
         Ok(crate::storage::database::ChannelEditOutcome::Applied(_)
             | crate::storage::database::ChannelEditOutcome::Created(_)
-            | crate::storage::database::ChannelEditOutcome::NotNewer)
+            | crate::storage::database::ChannelEditOutcome::NotNewer
+            | crate::storage::database::ChannelEditOutcome::Paired { .. })
     );
     if let Some(progress) =
         catch_up_progress(state, gossip.channel_id, &from_id, gossip.ttl, edit.original_timestamp)
@@ -3067,10 +3555,7 @@ pub(super) async fn handle_inbound_channel_edit(
             // user was looking at. It is a new line here, so announce it as one
             // and let the live path append it and settle its unread state.
             let reply_to = ember::channel::chat_reply_parent_hex(&cleaned, &target_hex);
-            let reply = reply_to
-                .as_deref()
-                .and_then(|parent| db.channel_reply_lookup(channel_id_hex, parent).ok())
-                .unwrap_or_default();
+            let reply = created_reply;
             let _ = app_handle.emit(
                 "ember:channel-message",
                 serde_json::json!({
@@ -3091,6 +3576,23 @@ pub(super) async fn handle_inbound_channel_edit(
                     "reply_parent_deleted": reply.deleted,
                 }),
             );
+        }
+        // The other form of a revision held already. Passed on all the same:
+        // builds before 1.7.5 read only the edit frame, and builds after 1.8.0
+        // only the v2 one.
+        Ok(crate::storage::database::ChannelEditOutcome::Paired { id, text_changed }) => {
+            if text_changed {
+                let _ = app_handle.emit(
+                    "ember:channel-message-edited",
+                    serde_json::json!({
+                        "channel_id": channel_id_hex,
+                        "id": id,
+                        "msg_id": target_hex,
+                        "message": ember::channel::chat_display_text(&cleaned),
+                        "edited_at": edit.edited_at,
+                    }),
+                );
+            }
         }
         Ok(outcome) => {
             relay = !matches!(
@@ -3236,10 +3738,14 @@ pub(super) async fn handle_inbound_channel_reactions(
 /// rate. Then passed on whatever its kind, so a kind this build has never heard
 /// of still reaches the members who read it — the reason extension frames have
 /// one layout. A kind this build does read is handled ahead of this, by the
-/// code that gives it a meaning; none does yet.
+/// code that gives it a meaning: the v2 chat line and revision
+/// ([`handle_inbound_channel_chat`], [`handle_inbound_channel_edit`]).
 ///
 /// A displayable frame of a kind this build cannot read is noted against the
 /// room, so it can tell its user something there needs a newer Ember.
+///
+/// Returns whether the frame met those rules, which a kind this build reads
+/// alongside, a private message ([`super::room_dm`]), has to as well.
 #[allow(clippy::too_many_arguments)]
 async fn handle_inbound_channel_ext(
     socket: &UdpSocket,
@@ -3252,16 +3758,16 @@ async fn handle_inbound_channel_ext(
     from_id: ember::dht::EmberNodeId,
     opened: ember::channel::OpenedUnder,
     dedup_key: [u8; 16],
-) {
+) -> bool {
     if channel_member_banned(state, db, gossip.channel_id, &ext.sender) {
-        return;
+        return false;
     }
     if opened == ember::channel::OpenedUnder::Retired
         && !channel_member_on_roster(state, db, gossip.channel_id, &ext.sender)
     {
         // As for chat: the same frame may yet arrive under the current key.
         forget_channel_gossip(state, &dedup_key);
-        return;
+        return false;
     }
     // Ahead of the relay, so a member flooding a kind nobody here reads is not
     // carried on by us any more than a member flooding chat is. A stale frame
@@ -3273,7 +3779,7 @@ async fn handle_inbound_channel_ext(
     if fresh && !channel_author_gossip_ok(state, gossip.channel_id, &ext.sender) {
         forget_channel_gossip(state, &dedup_key);
         debug!("Ember channel gossip: rate-limited extension frame in {channel_id_hex}");
-        return;
+        return false;
     }
     note_channel_member_alive(
         state,
@@ -3311,6 +3817,7 @@ async fn handle_inbound_channel_ext(
     if let Some(next) = gossip.decremented_ttl().filter(|_| fresh) {
         fanout_channel_gossip_body(socket, state, db, next.encode(), Some(from_id)).await;
     }
+    true
 }
 
 pub(super) async fn reply_channel_history_sync(
@@ -3385,67 +3892,82 @@ pub(super) async fn reply_channel_history_sync(
         // revises, and every peer worth serving already has the original, so
         // reusing that id here put the revision behind their duplicate filter
         // and the edit never arrived.
-        let (plain, envelope_id) = if row.edited_at > 0 && !row.edit_sig.is_empty() {
-            let Ok(sig_bytes) = hex::decode(&row.edit_sig) else {
-                continue;
-            };
-            let Ok(edit_sig) = <[u8; 64]>::try_from(sig_bytes) else {
-                continue;
-            };
-            let mut envelope_id = [0u8; 16];
-            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut envelope_id);
-            (
-                ember::channel::encode_channel_chat_edit_presigned(
-                    &sender_pk,
-                    &msg_id,
+        //
+        // Both forms go out when both are held, the legacy one first, which
+        // is all builds before 1.7.5 read; either goes alone when it is all
+        // there is. The v2 frame keeps its own envelope id and signed time,
+        // both of which its signature binds.
+        let mut frames: Vec<([u8; 16], i64, Vec<u8>)> = Vec::with_capacity(2);
+        let signature = |hex_sig: &str| <[u8; 64]>::try_from(hex::decode(hex_sig).ok()?).ok();
+        if row.edited_at > 0 {
+            if let Some(edit_sig) = signature(&row.edit_sig) {
+                let mut envelope_id = [0u8; 16];
+                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut envelope_id);
+                frames.push((
+                    envelope_id,
                     row.timestamp,
-                    row.edited_at,
-                    &edit_sig,
-                    &row.message,
-                ),
-                envelope_id,
-            )
-        } else {
-            let Ok(sig_bytes) = hex::decode(&row.author_sig) else {
-                continue;
-            };
-            let Ok(author_sig) = <[u8; 64]>::try_from(sig_bytes) else {
-                continue;
-            };
-            (
+                    ember::channel::encode_channel_chat_edit_presigned(
+                        &sender_pk,
+                        &msg_id,
+                        row.timestamp,
+                        row.edited_at,
+                        &edit_sig,
+                        &row.legacy_message,
+                    ),
+                ));
+            }
+        } else if let Some(author_sig) = signature(&row.author_sig) {
+            frames.push((
+                msg_id,
+                row.timestamp,
                 ember::channel::encode_channel_chat_plain_presigned(
                     &sender_pk,
                     &author_sig,
-                    &row.message,
+                    &row.legacy_message,
                 ),
-                msg_id,
-            )
-        };
-        let gossip = ember::channel::ChannelGossip::sealed(
-            channel_id,
-            envelope_id,
-            &key,
-            row.timestamp.max(0) as u64,
-            &plain,
-            1,
-            row.timestamp,
-        );
+            ));
+        }
+        if let Some(v2) = &row.v2 {
+            frames.push((v2.frame_id, v2.signed_at, v2.plain(&sender_pk)));
+        }
+        if frames.is_empty() {
+            continue;
+        }
         // Every later frame would meet the same missing path or spent budget.
-        if send_channel_unicast_on(
-            socket,
-            state,
-            db,
-            channel_id,
-            to,
-            gossip.encode(),
-            UnicastAllowance::CatchUp,
-        )
-        .await
-            != ChannelUnicast::Sent
-        {
+        let mut stopped = false;
+        for (envelope_id, signed_at, plain) in frames {
+            if budget == 0 {
+                break;
+            }
+            let gossip = ember::channel::ChannelGossip::sealed(
+                channel_id,
+                envelope_id,
+                &key,
+                signed_at.max(0) as u64,
+                &plain,
+                1,
+                signed_at,
+            );
+            if send_channel_unicast_on(
+                socket,
+                state,
+                db,
+                channel_id,
+                to,
+                gossip.encode(),
+                UnicastAllowance::CatchUp,
+            )
+            .await
+                != ChannelUnicast::Sent
+            {
+                stopped = true;
+                break;
+            }
+            budget -= 1;
+        }
+        if stopped {
             break;
         }
-        budget -= 1;
         served.push(row.msg_id);
     }
     if budget > 0 && !served.is_empty() {
@@ -3927,5 +4449,146 @@ mod tests {
         note_gossip_proven(&id, ban);
         assert!(gossip_plain_proven(&id, ban), "its re-sealed replay does not");
         assert!(!gossip_plain_proven(&[0x5Fu8; 16], ban), "keyed to the id as well");
+    }
+
+    /// A v2 line whose text sanitising changed is dropped, so its legacy twin
+    /// makes the row and the row keeps that signature; a legacy line in the
+    /// same case is kept without one.
+    #[test]
+    fn a_v2_line_changed_by_sanitising_is_left_to_its_legacy_twin() {
+        let frame = || ember::channel::ChatV2Frame {
+            kind: ember::channel::EXT_KIND_CHAT_LINE,
+            flags: 0,
+            frame_id: [0x61; 16],
+            signed_at: 1_800_000_000,
+            signature: [0x62; 64],
+            body: vec![1],
+        };
+        assert!(kept_chat_form(InboundChatForm::V2(frame()), false).is_none());
+        assert!(matches!(
+            kept_chat_form(InboundChatForm::V2(frame()), true),
+            Some(KeptChatForm::V2(kept)) if kept == frame()
+        ));
+        assert!(matches!(
+            kept_chat_form(InboundChatForm::Legacy([0x63; 64]), false),
+            Some(KeptChatForm::Legacy(sig)) if sig.is_empty()
+        ));
+        assert!(matches!(
+            kept_chat_form(InboundChatForm::Legacy([0x63; 64]), true),
+            Some(KeptChatForm::Legacy(sig)) if sig == hex::encode([0x63; 64])
+        ));
+    }
+
+    /// Only a frame that says something new goes on: a second form that does
+    /// not pair with the first, or names another's line, never; a variant
+    /// found held never, since it is an echo or a re-seal. A variant that
+    /// pairs or makes the row does, which is the genuine v2 frame arriving
+    /// behind one squatting on its envelope id.
+    #[test]
+    fn a_chat_frame_is_relayed_only_when_it_says_something_new() {
+        let stored = || ChatLineIngest::Stored {
+            row_id: 1,
+            reply: Default::default(),
+            member: None,
+        };
+        let paired = || ChatLineIngest::Paired {
+            row_id: 1,
+            text_changed: true,
+        };
+        for variant in [false, true] {
+            assert!(!ChatLineIngest::Unpaired.relays(variant));
+            assert!(!ChatLineIngest::NotAuthor.relays(variant));
+            assert!(paired().relays(variant));
+            assert!(stored().relays(variant));
+        }
+        assert!(ChatLineIngest::Known.relays(false));
+        assert!(!ChatLineIngest::Known.relays(true));
+    }
+
+    /// The chat handler's admission reads the room's own flags from its row:
+    /// a room this device owns applies the owner's strict rule with nothing
+    /// held, a member's private room applies the settings record it holds, and
+    /// a public room never admits by chat.
+    #[test]
+    fn a_chat_line_admits_its_author_only_where_the_room_allows_it() {
+        use crate::network::ember::channel::{ChannelIdentity, OpenedUnder, CHANNEL_MSG_TTL_DEFAULT};
+        use crate::storage::database::{Database, HeldChannelSettings};
+        let path = std::env::temp_dir().join(format!(
+            "ember-chat-admission-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let room = |visibility: &str, owner: bool| {
+            let ident = ChannelIdentity::generate();
+            let id_hex = hex::encode(ident.channel_id);
+            db.insert_channel(
+                &id_hex,
+                &hex::encode(ident.pubkey),
+                "Den",
+                visibility,
+                owner,
+                owner.then_some(&[4u8; 32]),
+                (visibility == "private").then_some(&[5u8; 32]),
+            )
+            .expect("insert channel");
+            id_hex
+        };
+        let owned = room("private", true);
+        let open = room("private", false);
+        let strict = room("private", false);
+        let public = room("public", false);
+        assert!(db
+            .ingest_channel_settings(
+                &strict,
+                &HeldChannelSettings {
+                    signed_at: 10,
+                    signature: [1; 64],
+                    key_commitments: Vec::new(),
+                    admission: 1,
+                },
+            )
+            .unwrap());
+        let of = |id: &str| ChatRosterRoom::of(&db.get_channel(id).unwrap().unwrap());
+        assert_eq!(of(&owned), ChatRosterRoom { private: true, own_room: true });
+        assert_eq!(of(&open), ChatRosterRoom { private: true, own_room: false });
+        assert_eq!(of(&public), ChatRosterRoom { private: false, own_room: false });
+
+        let now = 1_800_000_000;
+        let admits = |id: &str, opened, ttl| chat_line_admits_author(&db, id, of(id), opened, ttl, now, now);
+        assert!(admits(&open, OpenedUnder::Current, CHANNEL_MSG_TTL_DEFAULT), "nothing held: as before 1.7.5");
+        assert!(!admits(&open, OpenedUnder::Current, 1), "a catch-up re-serve never admits");
+        assert!(!admits(&open, OpenedUnder::Retired, CHANNEL_MSG_TTL_DEFAULT));
+        assert!(!admits(&strict, OpenedUnder::Current, CHANNEL_MSG_TTL_DEFAULT), "the owner's tag 2 closes it");
+        assert!(!admits(&owned, OpenedUnder::Current, CHANNEL_MSG_TTL_DEFAULT), "the owner applies its own");
+        assert!(!admits(&public, OpenedUnder::Current, CHANNEL_MSG_TTL_DEFAULT));
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// The gossip handlers add a chat author to a roster in one place, behind
+    /// [`chat_line_admits_author`]'s verdict, which the test above holds to
+    /// the room's rule.
+    #[test]
+    fn chat_authors_reach_the_roster_through_one_admission_site() {
+        let source = include_str!("channel_gossip.rs");
+        let handlers = &source[..source.find(concat!("#[cfg(", "test)]")).expect("test module")];
+        assert_eq!(handlers.matches(concat!("upsert_channel_member", "(")).count(), 1);
+        assert_eq!(handlers.matches(concat!("chat_author_joins_gossip_roster", "(")).count(), 1);
+        assert_eq!(
+            handlers.matches(concat!("chat_line_admits_author", "(")).count(),
+            2,
+            "its definition and the chat handler"
+        );
+        let upsert = handlers.find(concat!("upsert_channel_member", "(")).unwrap();
+        let gate = handlers[..upsert].rfind("joins_roster.then(").expect("gated on the verdict");
+        assert!(upsert - gate < 160, "the upsert sits inside the verdict's gate");
     }
 }

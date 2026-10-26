@@ -1600,7 +1600,10 @@ async fn handle_command_inner(
                         if hb.len() >= 16 {
                             let mut raw = [0u8; 16];
                             raw.copy_from_slice(&hb[..16]);
-                            let restricted = transfer_friends_only || {
+                            let restricted = transfer_friends_only
+                                || crate::sharing::feed_files::is_internal_fetch(&transfer_id)
+                                || crate::sharing::feed_downloads::is_private(&transfer_id)
+                                || {
                                 let idx = local_index.read().await;
                                 !known_files.is_authoritative()
                                     || idx
@@ -1781,7 +1784,7 @@ async fn handle_command_inner(
                         sources: download_sources,
                         download_folders: state.download_folders.clone(),
                         user_hash: state.user_hash,
-                        nickname: settings.nickname.clone(),
+                        nickname: state.shared_nickname.clone(),
                         tcp_port: advertised_tcp_port(state),
                         udp_port: advertised_udp_port(state),
                         bandwidth_limiter: bandwidth_limiter.clone(),
@@ -1982,8 +1985,10 @@ async fn handle_command_inner(
 
                 // Persist download to database for resume across restarts.
                 // Check for an existing DB row first so we don't clobber
-                // progress/priority when a queued download is promoted.
-                {
+                // progress/priority when a queued download is promoted. Not a
+                // fetch for the feeds code: it is not the user's download, and
+                // the feeds code asks again after a restart.
+                if !crate::sharing::feed_files::is_internal_fetch(&transfer_id) {
                     let db_ref = db.clone();
                     let tid = transfer_id.clone();
                     let fname = file_name.clone();
@@ -2045,6 +2050,7 @@ async fn handle_command_inner(
                                 completed_path: None,
                                 up_part_status: None,
                                 up_part_count: None,
+                                up_part_fill: None,
                                 up_peer_part_status: None,
                                 ember_verified: false,
                                 friends_only: transfer_friends_only,
@@ -2111,7 +2117,10 @@ async fn handle_command_inner(
                 if hb.len() >= 16 {
                     let mut raw = [0u8; 16];
                     raw.copy_from_slice(&hb[..16]);
-                    let restricted = transfer_friends_only || {
+                    let restricted = transfer_friends_only
+                        || crate::sharing::feed_files::is_internal_fetch(&transfer_id)
+                        || crate::sharing::feed_downloads::is_private(&transfer_id)
+                        || {
                         let idx = local_index.read().await;
                         idx.get_by_hash(&file_hash.to_ascii_lowercase())
                             .is_some_and(|f| f.friends_only)
@@ -2570,6 +2579,12 @@ async fn handle_command_inner(
             state.stats.ember_dht_contacts = ember_contacts;
             state.stats.ember_dht_verified_contacts = ember_verified;
             state.stats.ed2k_low_id = state.server_connected.then_some(state.low_id);
+            state.stats.tcp_listen_failed =
+                super::TCP_LISTEN_FAILED.load(std::sync::atomic::Ordering::Relaxed);
+            state.stats.advertised_tcp_port = advertised_tcp_port(state);
+            state.stats.advertised_udp_port = advertised_udp_port(state);
+            state.stats.quic_udp_port = state.quic_port.unwrap_or(0);
+            state.stats.session_age_secs = state.session_started.elapsed().as_secs();
             let _ = tx.send(state.stats.clone());
         }
 
@@ -3382,6 +3397,40 @@ async fn handle_command_inner(
             fanout_channel_gossip_body(socket, state, db, body, None).await;
         }
 
+        NetworkCommand::FanoutChannelChat { bodies } => {
+            if !settings.ember_native_enabled {
+                return;
+            }
+            for body in bodies {
+                if let Some(gossip) = ember::channel::ChannelGossip::decode(&body) {
+                    remember_originated_gossip(state, &gossip);
+                }
+                fanout_channel_gossip_body(socket, state, db, body, None).await;
+            }
+        }
+
+        NetworkCommand::PushFeedHead { blob } => {
+            let friends: Vec<[u8; 16]> = state.ember_sessions.read().await.keys().copied().collect();
+            let seed = state.local_ed25519_seed;
+            for friend in friends {
+                let _ = send_encrypted_chat_ext(
+                    &state.ember_sessions,
+                    &seed,
+                    friend,
+                    ed2k::messages::EMBER_EXT_FEED_HEAD,
+                    &blob,
+                )
+                .await;
+            }
+        }
+
+        NetworkCommand::SendRoomDm { channel_id, member, payload } => {
+            if !settings.ember_native_enabled {
+                return;
+            }
+            super::room_dm::send_private_frame(socket, state, db, channel_id, member, &payload).await;
+        }
+
         NetworkCommand::SendChannelTyping { channel_id, typing } => {
             if !settings.ember_native_enabled {
                 return;
@@ -3399,6 +3448,22 @@ async fn handle_command_inner(
             };
             let now = chrono::Utc::now().timestamp();
             start_channel_presence_fetch(socket, state, db, &ch, channel_id, now).await;
+        }
+
+        NetworkCommand::RefreshChannelOwnerRecords { channel_id } => {
+            refresh_channel_owner_records_now(socket, state, db, settings, channel_id).await;
+        }
+
+        NetworkCommand::ChannelKeysChanged { channel_id } => {
+            state.channel_epoch_fetch_at.remove(&channel_id);
+            let _ = app_handle.emit(
+                "ember:channel-moderation",
+                serde_json::json!({ "channel_id": hex::encode(channel_id) }),
+            );
+        }
+
+        NetworkCommand::PublishOwnedChannelSettings => {
+            maybe_publish_channel_settings(socket, state, db, settings).await;
         }
 
         NetworkCommand::AnnounceChannelPresence {
@@ -3971,6 +4036,20 @@ async fn handle_command_inner(
             let _ = tx.send(online);
         }
 
+        NetworkCommand::GetFriendStatuses { tx } => {
+            let statuses = state
+                .friend_statuses
+                .iter()
+                .filter(|(eh, _)| state.online_friends.contains_key(*eh))
+                .map(|(eh, status)| (hex::encode(eh), *status))
+                .collect();
+            let _ = tx.send(statuses);
+        }
+
+        NetworkCommand::GetIdleAway { tx } => {
+            let _ = tx.send(state.idle_away);
+        }
+
         NetworkCommand::FindNotes {
             file_hash,
             file_size,
@@ -4412,6 +4491,8 @@ async fn handle_command_inner(
                                 );
                                 Some(fresh)
                             }
+                            // Rows that all permit: a list that blocks nothing.
+                            Some(0) if fresh.has_permit_ranges() => Some(fresh),
                             Some(0) => {
                                 fresh.mark_ranges_not_ready();
                                 warn!(
@@ -6216,6 +6297,23 @@ async fn handle_command_inner(
                                     return;
                                 }
                             };
+                            // An older message still queued goes first. Sent
+                            // live, this one would overtake it; the flush sends
+                            // both, oldest first.
+                            let (db_first, hex_first) = (db.clone(), hash_hex.clone());
+                            let older_queued = tokio::task::spawn_blocking(move || {
+                                db_first.pending_chat_messages(&hex_first, 1)
+                            })
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .and_then(|rows| rows.first().map(|(id, _, _)| *id))
+                            .is_some_and(|first| first != pending_id);
+                            if older_queued {
+                                schedule_chat_flush(state, friend_eh, std::time::Duration::ZERO);
+                                let _ = tx.send(Err(format!("ChatAlreadyQueued:{pending_id}")));
+                                return;
+                            }
                             let db_ids = db.clone();
                             let hex_ids = hash_hex.clone();
                             let mailbox_id = tokio::task::spawn_blocking(move || {
@@ -6258,6 +6356,7 @@ async fn handle_command_inner(
                                     Some(frame) => frames.push(frame),
                                     None => {
                                         debug!("Chat {pending_id} stays queued: its disappearing timer could not be sealed");
+                                        schedule_chat_flush(state, friend_eh, CHAT_RETRY_AFTER);
                                         let _ = tx.send(Err(format!("ChatAlreadyQueued:{pending_id}")));
                                         return;
                                     }
@@ -6282,6 +6381,8 @@ async fn handle_command_inner(
                                             let _ = tx.send(Ok(()));
                                         }
                                         Err(error) => {
+                                            // Sent, so not retried: a flush would
+                                            // send it a second time.
                                             warn!(
                                                 "Sent chat message remains queued because delivery persistence failed: {error}"
                                             );
@@ -6292,6 +6393,7 @@ async fn handle_command_inner(
                                     }
                                 }
                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    schedule_chat_flush(state, friend_eh, CHAT_RETRY_AFTER);
                                     let _ = tx.send(Err(format!("ChatAlreadyQueued:{pending_id}")));
                                 }
                                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {

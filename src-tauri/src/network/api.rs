@@ -250,7 +250,7 @@ pub enum NetworkCommand {
     /// "Known Clients" tab — this is the lifetime view from clients.met,
     /// independent of which peers are currently connected.
     GetKnownClientsSnapshot {
-        tx: oneshot::Sender<Vec<crate::types::KnownClient>>,
+        tx: oneshot::Sender<crate::types::KnownClientsSnapshot>,
     },
     /// Just the two row counts [`GetKnownClientsSnapshot`] would produce.
     ///
@@ -527,6 +527,15 @@ pub enum NetworkCommand {
     GetOnlineFriends {
         tx: oneshot::Sender<Vec<String>>,
     },
+    /// Online friends that sent a status, by lowercase hex hash. An online
+    /// friend missing from it shows online.
+    GetFriendStatuses {
+        tx: oneshot::Sender<Vec<(String, crate::types::FriendStatus)>>,
+    },
+    /// Whether friends see us Away now because we have been idle.
+    GetIdleAway {
+        tx: oneshot::Sender<bool>,
+    },
     /// Reputation for many peers at once, keyed by lowercase hex user hash.
     ///
     /// The Known Clients tab needs a Trust badge per visible row and refreshes
@@ -665,6 +674,24 @@ pub enum NetworkCommand {
     FanoutChannelGossip {
         body: Vec<u8>,
     },
+    /// [`Self::FanoutChannelGossip`] for every frame of one chat line or
+    /// revision, in order: the legacy frame first, then the v2 frame. One
+    /// command, so neither goes out without the other.
+    FanoutChannelChat {
+        bodies: Vec<Vec<u8>>,
+    },
+    /// Push a feed head we just published to every friend connected now
+    /// (`EMBER_EXT_FEED_HEAD`). `blob` is the signed record as a value blob.
+    PushFeedHead {
+        blob: Vec<u8>,
+    },
+    /// Seal a private message, receipt or answer to one member and send it
+    /// into a room both are in. See `network::room_dm`.
+    SendRoomDm {
+        channel_id: [u8; 16],
+        member: [u8; 32],
+        payload: crate::network::ember::room_dm::DmPayload,
+    },
     /// Live composing signal for a room, one hop to members we already hold a
     /// session with. Never queued, relayed, or stored; the next keystroke
     /// refreshes it.
@@ -686,6 +713,23 @@ pub enum NetworkCommand {
     RefreshChannelMembers {
         channel_id: [u8; 16],
     },
+    /// Look a held private room's owner snapshot and settings record up now:
+    /// an invite brought a key this device could not check against what it
+    /// holds, so its view of the room is stale and the key waits on these.
+    RefreshChannelOwnerRecords {
+        channel_id: [u8; 16],
+    },
+    /// A join changed a held room's keys, taking the invite's or dropping one
+    /// the owner's commitments contradict: what an ingest that changes them
+    /// does, the next missing epoch looked up on the next tick and the room
+    /// redrawn.
+    ChannelKeysChanged {
+        channel_id: [u8; 16],
+    },
+    /// Run the owner's settings pass now rather than at the next maintenance
+    /// tick: a rotation has just been committed, and members behind the
+    /// room's key check invites against the commitment it brings.
+    PublishOwnedChannelSettings,
     /// Announce our arrival or departure on the live mesh right now.
     ///
     /// The DHT record this pairs with takes a republish interval to be written
