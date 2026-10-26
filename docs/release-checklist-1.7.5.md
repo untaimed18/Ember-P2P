@@ -514,3 +514,16 @@ with C firewalled.
       setting, close it. The key is still in the file.
 - [ ] One malformed entry in `ignored_members` in `config.json` costs that
       entry only: every other setting loads as it was.
+- [ ] Categories: the categories window opens from Edit categories on
+      Transfers, from a Library file's Move to category menu, and from
+      Settings > Transfers > Manage categories, and stays on that page.
+      Adding a category from Settings, then saving another setting there,
+      keeps the category.
+- [ ] Known peers: with more than 5,000 eD2K peers in the ledger, the tab
+      label shows the full count and the toolbar says "5,000 most recently
+      seen of N peers". The Ember tab keeps its peers however many eD2K
+      ones there are.
+- [ ] SecIdent between two 1.7.5 machines that have never met (fresh
+      installs, or delete each other's rows from the `credits` table first):
+      after one download each way, both show the other as Verified, and the
+      other moves to Known Ember Peers. The same against a 1.7.4 machine.
