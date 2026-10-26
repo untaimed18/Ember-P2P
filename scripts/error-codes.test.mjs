@@ -103,7 +103,6 @@ const KNOWN_UNTRANSLATED = new Set([
   "transfers_priority_task_failed",
   "transfers_recovery_timed_out",
   "transfers_recovery_unavailable",
-  "transfers_reveal_unsafe_file_failed",
   "transfers_temp_path_invalid",
   "transfers_temp_path_reparse",
 ]);

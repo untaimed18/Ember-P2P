@@ -429,10 +429,51 @@ pub(super) async fn upload_queue_snapshot(
 /// (reseed / Hello binding) with zero transfer bytes and `ident_ip == 0`.
 /// Their usable address and last-seen live in the friends SQLite table,
 /// so we join that metadata in here before handing rows to the UI.
-/// Most rows [`known_clients_snapshot`] will let cross IPC. Shared with
-/// [`known_client_counts`] so the tab label cannot describe a different set
-/// than the table it opens.
+/// Most rows [`known_clients_snapshot`] will let cross IPC *per tab*. Shared
+/// with [`known_client_counts`] so the tab label cannot describe a different
+/// set than the table it opens.
+///
+/// Per tab rather than for the two together: a shared budget let a busy eD2K
+/// ledger push every older Ember peer off its tab, and made the eD2K label
+/// read `cap - ember` as if that were the ledger's size.
 pub(super) const MAX_KNOWN_CLIENT_ROWS: usize = 5_000;
+
+/// Split ranked rows into the two tabs, keep the [`MAX_KNOWN_CLIENT_ROWS`] most
+/// recently seen of each, and count both before and after the trim.
+///
+/// The one place the trim happens, so [`known_client_counts`] and
+/// [`known_clients_snapshot`] cannot drift apart on it. Survivors come back
+/// unordered, eD2K rows first.
+fn trim_known_rows<T>(
+    rows: impl Iterator<Item = (i64, bool, T)>,
+) -> (Vec<(i64, T)>, crate::types::KnownClientCounts) {
+    let mut ed2k: Vec<(i64, T)> = Vec::new();
+    let mut ember: Vec<(i64, T)> = Vec::new();
+    for (last_seen, is_ember, item) in rows {
+        if is_ember {
+            ember.push((last_seen, item));
+        } else {
+            ed2k.push((last_seen, item));
+        }
+    }
+    let as_u32 = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    let ed2k_total = as_u32(ed2k.len());
+    let ember_total = as_u32(ember.len());
+    for tab in [&mut ed2k, &mut ember] {
+        if tab.len() > MAX_KNOWN_CLIENT_ROWS {
+            tab.select_nth_unstable_by(MAX_KNOWN_CLIENT_ROWS, |a, b| b.0.cmp(&a.0));
+            tab.truncate(MAX_KNOWN_CLIENT_ROWS);
+        }
+    }
+    let counts = crate::types::KnownClientCounts {
+        ed2k: as_u32(ed2k.len()),
+        ember: as_u32(ember.len()),
+        ed2k_total,
+        ember_total,
+    };
+    ed2k.append(&mut ember);
+    (ed2k, counts)
+}
 
 /// Count what [`known_clients_snapshot`] would return, without building it.
 ///
@@ -457,41 +498,23 @@ pub(super) async fn known_client_counts(
     };
 
     let cm = credit_manager.read().await;
-    // The snapshot sorts most-recently-seen first and trims to
-    // `MAX_KNOWN_CLIENT_ROWS`, so counting the whole ledger would make the
-    // label jump every time the user entered or left the tab once the ledger
-    // passed the cap. Reproduce the trim on the same key.
+    // Reproduce the snapshot's per-tab trim on the same key, so the listed
+    // counts here match what the table would show.
     //
     // The snapshot's key is `max(record.last_seen, friend last_seen)`; this
     // uses the record's alone, because reading the friends table is exactly
     // the cost this command exists to avoid. The two can only disagree about
     // rows sitting on the cap boundary, and only for friends whose DB row is
-    // fresher than their credit row.
-    let mut rows: Vec<(i64, bool)> = cm
-        .all_records()
-        .iter()
-        .map(|record| {
-            (
-                record.last_seen,
-                record.ember_hash.is_some()
-                    || live_ember.contains(&record.user_hash)
-                    || record.proven_ember_hash.is_some(),
-            )
-        })
-        .collect();
-    if rows.len() > MAX_KNOWN_CLIENT_ROWS {
-        rows.select_nth_unstable_by(MAX_KNOWN_CLIENT_ROWS, |a, b| b.0.cmp(&a.0));
-        rows.truncate(MAX_KNOWN_CLIENT_ROWS);
-    }
-
-    let mut counts = crate::types::KnownClientCounts::default();
-    for (_, is_ember) in rows {
-        if is_ember {
-            counts.ember = counts.ember.saturating_add(1);
-        } else {
-            counts.ed2k = counts.ed2k.saturating_add(1);
-        }
-    }
+    // fresher than their credit row. The totals do not depend on the key.
+    let (_, counts) = trim_known_rows(cm.all_records().iter().map(|record| {
+        (
+            record.last_seen,
+            record.ember_hash.is_some()
+                || live_ember.contains(&record.user_hash)
+                || record.proven_ember_hash.is_some(),
+            (),
+        )
+    }));
     counts
 }
 
@@ -515,7 +538,7 @@ pub(super) async fn known_clients_snapshot(
     upload_queue: &ed2k::upload::UploadQueueRef,
     geoip: &crate::geoip::GeoIpReader,
     db: &Arc<Database>,
-) -> Vec<crate::types::KnownClient> {
+) -> crate::types::KnownClientsSnapshot {
     struct FriendMeta {
         nickname: String,
         last_ip: String,
@@ -598,37 +621,32 @@ pub(super) async fn known_clients_snapshot(
     // the survivors are built. This also cuts how long the credit read lock is
     // held roughly tenfold, which matters because tokio's fair `RwLock` parks
     // the upload path's credit writers behind this snapshot.
-    let mut ranked: Vec<(i64, usize)> = records
-        .iter()
-        .enumerate()
-        .map(|(idx, record)| {
-            let ember = record_ember_identity(record, &live_ember);
-            let meta_last_seen = ember
-                .and_then(|eh| friend_meta.get(&eh))
-                .map(|m| m.last_seen)
-                .unwrap_or(i64::MIN);
-            (record.last_seen.max(meta_last_seen), idx)
-        })
-        .collect();
+    //
     // Bound what crosses IPC. The credit ledger holds up to
     // `MAX_CREDIT_RECORDS` (50,000) rows and the Known Clients tab re-fetches
     // every 8 s, so an untrimmed snapshot serialised a multi-megabyte payload
-    // on a repeating timer for a table that renders a thousand rows. Trimming
-    // the *oldest* entries is the right end to lose: they are the peers a
-    // lifetime-view is least likely to be asked about.
-    if ranked.len() > MAX_KNOWN_CLIENT_ROWS {
+    // on a repeating timer. Trimming the *oldest* entries is the right end to
+    // lose: they are the peers a lifetime-view is least likely to be asked
+    // about. The counts carry the untrimmed totals so the UI can say so.
+    let (mut ranked, counts) = trim_known_rows(records.iter().enumerate().map(|(idx, record)| {
+        let ember = record_ember_identity(record, &live_ember);
+        let meta_last_seen = ember
+            .and_then(|eh| friend_meta.get(&eh))
+            .map(|m| m.last_seen)
+            .unwrap_or(i64::MIN);
+        (record.last_seen.max(meta_last_seen), ember.is_some(), idx)
+    }));
+    if counts.ed2k_total > counts.ed2k || counts.ember_total > counts.ember {
         debug!(
-            "Known clients snapshot: {} record(s) trimmed to the {MAX_KNOWN_CLIENT_ROWS} most recent",
-            ranked.len()
+            "Known clients snapshot: trimmed eD2K {}/{} and Ember {}/{} to the {MAX_KNOWN_CLIENT_ROWS} most recent per tab",
+            counts.ed2k, counts.ed2k_total, counts.ember, counts.ember_total,
         );
-        ranked.select_nth_unstable_by(MAX_KNOWN_CLIENT_ROWS, |a, b| b.0.cmp(&a.0));
-        ranked.truncate(MAX_KNOWN_CLIENT_ROWS);
     }
     // Stable, useful default order: most-recently-seen first. The UI can
     // re-sort by any column.
     ranked.sort_by_key(|(last_seen, _)| std::cmp::Reverse(*last_seen));
 
-    ranked
+    let clients = ranked
         .into_iter()
         .filter_map(|(_, idx)| records.get(idx).copied())
         .map(|record| {
@@ -684,7 +702,8 @@ pub(super) async fn known_clients_snapshot(
                 nickname: meta.map(|m| m.nickname.clone()).unwrap_or_default(),
             }
         })
-        .collect()
+        .collect();
+    crate::types::KnownClientsSnapshot { clients, counts }
 }
 
 // ----- AntiLeech filter command helpers ----------------------------
@@ -692,3 +711,34 @@ pub(super) async fn known_clients_snapshot(
 // All four helpers run on the network task (synchronous; the
 // `parking_lot` lock around the filter is non-blocking) so the upload
 // hot path can never observe a half-applied state.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_rows_under_the_cap_are_all_kept() {
+        let rows = [(10, false, 0), (20, true, 1), (30, false, 2)];
+        let (kept, counts) = trim_known_rows(rows.into_iter());
+        assert_eq!(kept.len(), 3);
+        assert_eq!((counts.ed2k, counts.ed2k_total), (2, 2));
+        assert_eq!((counts.ember, counts.ember_total), (1, 1));
+    }
+
+    #[test]
+    fn each_tab_keeps_its_own_most_recent_rows() {
+        let extra = 25;
+        let ed2k = (0..MAX_KNOWN_CLIENT_ROWS + extra).map(|i| (i as i64 + 1_000, false, i));
+        // Older than every eD2K row: under a shared cap they would all be cut.
+        let ember = (0..3).map(|i| (i as i64, true, usize::MAX - i));
+        let (kept, counts) = trim_known_rows(ed2k.chain(ember));
+
+        assert_eq!(counts.ed2k as usize, MAX_KNOWN_CLIENT_ROWS);
+        assert_eq!(counts.ed2k_total as usize, MAX_KNOWN_CLIENT_ROWS + extra);
+        assert_eq!((counts.ember, counts.ember_total), (3, 3), "Ember rows are not crowded out");
+        assert_eq!(kept.len(), MAX_KNOWN_CLIENT_ROWS + 3);
+
+        let oldest_kept_ed2k = kept[..MAX_KNOWN_CLIENT_ROWS].iter().map(|r| r.0).min().unwrap();
+        assert_eq!(oldest_kept_ed2k, 1_000 + extra as i64, "the oldest eD2K rows are the ones cut");
+    }
+}

@@ -31,6 +31,16 @@
   } from '$lib/channelLanguages';
   import ChannelLanguagePicker from '$lib/components/ChannelLanguagePicker.svelte';
   import { setAppSettings, appSettings } from '$lib/stores/settings';
+  import { transfers } from '$lib/stores/transfers';
+  import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
+  import { BUILTIN_DOWNLOAD_CATEGORIES, downloadCategoryLabel } from '$lib/downloadCategories';
+  import {
+    addUserCategory,
+    countDownloadCategories,
+    isCategoryTaken,
+    removeUserCategory,
+    setCategoryFolder,
+  } from '$lib/categorySettings';
   import {
     channels as channelsStore,
     hiddenChannels,
@@ -289,6 +299,53 @@
   }
 
   let settings: AppSettings | null = $state(null);
+
+  // --- Download categories ---
+  let categoriesOpen = $state(false);
+  let userCategories = $derived($appSettings?.download_categories ?? []);
+  let categoryCounts = $derived(countDownloadCategories($transfers));
+
+  /** The dialog saves the categories itself, so take what it saved into the
+   *  form and its baseline: they are not a change waiting to be applied. */
+  function foldCategorySettings() {
+    const saved = $appSettings;
+    if (!saved || !settings) return;
+    settings.download_categories = saved.download_categories;
+    settings.download_category_folders = saved.download_category_folders;
+    settings.settings_revision = saved.settings_revision;
+    if (!originalSettings) return;
+    try {
+      const base = JSON.parse(originalSettings) as AppSettings;
+      base.download_categories = saved.download_categories;
+      base.download_category_folders = saved.download_category_folders;
+      base.settings_revision = saved.settings_revision;
+      originalSettings = JSON.stringify(base);
+    } catch { /* malformed baseline; leave as-is */ }
+  }
+
+  async function addCategory(name: string, ownFolder: boolean) {
+    try {
+      const { folderError } = await addUserCategory(name, ownFolder);
+      if (folderError) throw folderError;
+    } finally {
+      foldCategorySettings();
+    }
+  }
+  async function removeCategory(name: string) {
+    try {
+      await removeUserCategory(name);
+    } finally {
+      foldCategorySettings();
+    }
+  }
+  async function saveCategoryFolder(category: string, folder: string | null) {
+    try {
+      await setCategoryFolder(category, folder);
+    } finally {
+      foldCategorySettings();
+    }
+  }
+
   /** "Warn when free space is below", besides off. The backend caps it at 100 GB. */
   const LOW_DISK_CHOICES_MB = [512, 1024, 2048, 5120, 10240];
   let pageContentEl: HTMLDivElement | null = $state(null);
@@ -3197,10 +3254,12 @@
             </div>
             <div class="field">
               <span class="field-label">{m.settings_category_folders_label()}</span>
-              <span class="hint">
-                {m.settings_category_folders_hint()}
-                <a href="/transfers" onclick={(e) => { e.preventDefault(); void goto('/transfers'); }}>{m.settings_open_page({ page: m.nav_transfers() })}</a>
-              </span>
+              <div class="category-manage">
+                <button type="button" class="secondary" onclick={() => (categoriesOpen = true)}>
+                  {m.settings_category_folders_manage()}
+                </button>
+              </div>
+              <span class="hint">{m.settings_category_folders_hint()}</span>
             </div>
             <div class="field">
               <label for="low-disk-warning">{m.settings_low_disk_label()}</label>
@@ -5268,6 +5327,19 @@
   {/if}
 </div>
 
+<CategoriesDialog
+  bind:open={categoriesOpen}
+  categories={userCategories}
+  builtins={BUILTIN_DOWNLOAD_CATEGORIES}
+  labelFor={downloadCategoryLabel}
+  folders={$appSettings?.download_category_folders ?? {}}
+  counts={categoryCounts}
+  isTaken={(name) => isCategoryTaken(name, userCategories)}
+  onadd={addCategory}
+  onremove={removeCategory}
+  onfolder={saveCategoryFolder}
+/>
+
 <!--
   Restart confirmation prompt — asked when the user leaves Settings while the
   saved ports or UPnP differ from what Ember started with. The network stack
@@ -5918,6 +5990,10 @@
     background: none;
     color: var(--accent);
     text-decoration: underline;
+  }
+
+  .category-manage {
+    display: flex;
   }
 
   /* ── Folder input ──────────────────────────────── */

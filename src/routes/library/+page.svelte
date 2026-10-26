@@ -40,8 +40,16 @@
     type SharedFolderPick,
     type TagReport,
   } from '$lib/api/sharing';
-  import { goto } from '$app/navigation';
   import { BUILTIN_DOWNLOAD_CATEGORIES, downloadCategoryLabel } from '$lib/downloadCategories';
+  import {
+    addUserCategory,
+    countDownloadCategories,
+    isCategoryTaken,
+    removeUserCategory,
+    setCategoryFolder,
+  } from '$lib/categorySettings';
+  import { transfers } from '$lib/stores/transfers';
+  import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
   import {
     categoriesWithFolder,
     categoryDestinationLabel,
@@ -49,7 +57,6 @@
     downloadsSubdirOf,
     sameCategorySubdir,
   } from '$lib/categoryFolders';
-  import { categoriesDialogRequested } from '$lib/stores/categoriesDialog';
   import { getFileComments, setFileComment, type FileCommentInfo } from '$lib/api/comments';
   import { getStatistics, type TransferStats } from '$lib/api/statistics';
   import { formatEd2kLink, formatEd2kLinks, buildEd2kLink } from '$lib/api/search';
@@ -1348,11 +1355,13 @@
     }
   }
 
-  function editCategories() {
-    categoriesDialogRequested.set(true);
-    // Cleared if the page never comes up, or the dialog would open on some
-    // later, unrelated visit to Transfers.
-    goto('/transfers').catch(() => categoriesDialogRequested.set(false));
+  let categoriesOpen = $state(false);
+  let userCategories = $derived($appSettings?.download_categories ?? []);
+  let categoryCounts = $derived(countDownloadCategories($transfers));
+
+  async function addCategory(name: string, ownFolder: boolean) {
+    const { folderError } = await addUserCategory(name, ownFolder);
+    if (folderError) throw folderError;
   }
 
   const categoryListFormat = new Intl.ListFormat(getLocale(), { style: 'short', type: 'conjunction' });
@@ -3026,7 +3035,7 @@
     // panel is an inline collapsible (the file table stays visible and
     // interactive below it), not a modal, and it has no keyboard handling of
     // its own that these shortcuts could conflict with.
-    if (createCollectionOpen || renameDialog.open || addFolderOpen || confirmOpen || tagExplainOpen || confirmDiscardComment || stopConfirmVisible) {
+    if (createCollectionOpen || renameDialog.open || addFolderOpen || confirmOpen || tagExplainOpen || confirmDiscardComment || stopConfirmVisible || categoriesOpen) {
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
@@ -3232,7 +3241,7 @@
         case 'move_category':
           if (extra !== undefined) await moveToCategory(categoryMoveTargets(f), extra);
           break;
-        case 'edit_categories': editCategories(); break;
+        case 'edit_categories': categoriesOpen = true; break;
         // The backend reads the template from settings by index and does the
         // substituting, and collects the native confirmation — so there is
         // deliberately no prompt here and no URL built in this renderer.
@@ -4023,6 +4032,19 @@
 {/snippet}
 
 <svelte:document onclick={onDocClick} onkeydown={onPageKeyDown} />
+
+<CategoriesDialog
+  bind:open={categoriesOpen}
+  categories={userCategories}
+  builtins={BUILTIN_DOWNLOAD_CATEGORIES}
+  labelFor={downloadCategoryLabel}
+  folders={categoryFolders}
+  counts={categoryCounts}
+  isTaken={(name) => isCategoryTaken(name, userCategories)}
+  onadd={addCategory}
+  onremove={removeUserCategory}
+  onfolder={setCategoryFolder}
+/>
 
 <ConfirmDialog
   bind:open={confirmOpen}

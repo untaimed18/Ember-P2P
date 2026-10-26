@@ -3204,7 +3204,7 @@ pub async fn get_upload_queue(
 #[tauri::command]
 pub async fn get_known_clients(
     state: tauri::State<'_, AppState>,
-) -> Result<Vec<KnownClient>, String> {
+) -> Result<crate::types::KnownClientsSnapshot, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx

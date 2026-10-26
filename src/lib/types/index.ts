@@ -832,8 +832,20 @@ export interface KnownClient {
  *  else is an eD2K peer. Mirrors `crate::types::KnownClientCounts`.
  *  Populated by `invoke('get_known_client_counts')`. */
 export interface KnownClientCounts {
+  /** Rows each tab lists, after the per-tab trim to the most recently seen. */
   ed2k: number;
   ember: number;
+  /** Records the ledger holds for each tab before that trim. Above the listed
+   *  count only when the tab is capped. */
+  ed2k_total: number;
+  ember_total: number;
+}
+
+/** Populated by `invoke('get_known_clients')`. Mirrors
+ *  `crate::types::KnownClientsSnapshot`. */
+export interface KnownClientsSnapshot {
+  clients: KnownClient[];
+  counts: KnownClientCounts;
 }
 
 /** Snapshot of the anti-leech client filter — the eMule-style

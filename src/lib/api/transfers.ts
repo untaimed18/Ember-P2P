@@ -7,8 +7,8 @@ import type {
   SourceInfo,
   StartDownloadResponse,
   UploadQueueClient,
-  KnownClient,
   KnownClientCounts,
+  KnownClientsSnapshot,
   DownloadFileDetails,
 } from '$lib/types';
 
@@ -174,14 +174,15 @@ export async function getDownloadFileDetails(
 
 /** Snapshot of every persistent SecIdent credit record (transfers bottom
  *  pane, Known ED2K Peers / Known Ember Peers tabs). Lifetime view
- *  independent of which peers are connected right now. */
-export async function getKnownClients(): Promise<KnownClient[]> {
+ *  independent of which peers are connected right now. Each tab is trimmed
+ *  to its most recently seen peers; `counts` says how many the ledger holds. */
+export async function getKnownClients(): Promise<KnownClientsSnapshot> {
   // Also polled (8 s). Reads the persistent credit store, so allow more room
   // than the queue snapshot above.
-  return withTimeout(invoke<KnownClient[]>('get_known_clients'), 'get_known_clients', 15_000);
+  return withTimeout(invoke<KnownClientsSnapshot>('get_known_clients'), 'get_known_clients', 15_000);
 }
 
-/** Just the two row counts the tab labels carry.
+/** Just the row counts the tab labels carry.
  *
  *  Polled on whichever bottom tab is showing, so that the counts keep moving
  *  without the user visiting the tab. `getKnownClients` cannot be used for

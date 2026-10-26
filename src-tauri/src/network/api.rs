@@ -250,7 +250,7 @@ pub enum NetworkCommand {
     /// "Known Clients" tab — this is the lifetime view from clients.met,
     /// independent of which peers are currently connected.
     GetKnownClientsSnapshot {
-        tx: oneshot::Sender<Vec<crate::types::KnownClient>>,
+        tx: oneshot::Sender<crate::types::KnownClientsSnapshot>,
     },
     /// Just the two row counts [`GetKnownClientsSnapshot`] would produce.
     ///

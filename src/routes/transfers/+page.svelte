@@ -7,7 +7,10 @@
   import AddLinksDialog from '$lib/components/AddLinksDialog.svelte';
   import { addLinksRequested, MAX_LINKS_TEXT_BYTES } from '$lib/clipboardWatch';
   import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
-  import { categoryDestinationLabel, categorySubdir, normalizeCategoryFolder } from '$lib/categoryFolders';
+  import { categoryDestinationLabel, categorySubdir } from '$lib/categoryFolders';
+  import {
+    addUserCategory, countDownloadCategories, isCategoryTaken, removeUserCategory, setCategoryFolder,
+  } from '$lib/categorySettings';
   import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, holdDownloadRemoved, setLocalCategory, IDLE_STATUSES, effectiveUploadSpeed, resumableFailedDownloads } from '$lib/stores/transfers';
   import { addActionToast, removeToast, setToastMessage, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
   import { holdPendingCancel, releasePendingCancel } from '$lib/stores/pendingCancels';
@@ -45,14 +48,13 @@
   import { prefersReducedMotion } from 'svelte/motion';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { hoverSubmenus } from '$lib/hoverSubmenus';
-  import { appSettings, setAppSettings } from '$lib/stores/settings';
-  import { getSettings, openWebService, updateSettings } from '$lib/api/settings';
+  import { appSettings } from '$lib/stores/settings';
+  import { openWebService } from '$lib/api/settings';
   import { serviceAvailableFor } from '$lib/webServices';
   import { mapSettledWithLimit } from '$lib/concurrency';
   import * as m from '$lib/paraglide/messages';
   import { plural } from '$lib/plural';
   import { BUILTIN_DOWNLOAD_CATEGORIES, downloadCategoryLabel } from '$lib/downloadCategories';
-  import { categoriesDialogRequested } from '$lib/stores/categoriesDialog';
   import {
     codedErrorOf,
     translateError,
@@ -1250,17 +1252,12 @@
     const countGen = ++knownCountsGen;
     knownClientsInFlight++;
     try {
-      const data = await getKnownClients();
+      const snap = await getKnownClients();
       if (!mounted || gen !== knownClientsGen) return;
-      knownClients = data;
-      // The ledger we just fetched is a stricter answer than the counts poll
-      // can give, so publish the labels from it. Split exactly as `knownSplit`
-      // does, or the label and the table it opens would disagree.
-      if (countGen === knownCountsGen) {
-        let ember = 0;
-        for (const kc of data) if (kc.ember_hash) ember++;
-        knownCounts = { ed2k: data.length - ember, ember };
-      }
+      knownClients = snap.clients;
+      // The snapshot's counts were taken with the rows they describe, so they
+      // are a stricter answer than the counts poll can give.
+      if (countGen === knownCountsGen) knownCounts = snap.counts;
       knownClientsLoaded = true;
       knownClientsFailCount = 0;
       knownClientsLoadFailed = false;
@@ -1369,6 +1366,12 @@
   });
   let showingEmberKnown = $derived(bottomView === 'known_ember');
   let knownLedger = $derived(showingEmberKnown ? knownSplit.ember : knownSplit.ed2k);
+  // Records the ledger holds for the showing tab. Larger than `knownLedger`
+  // once the backend trims the tab to its most recently seen peers.
+  let knownLedgerTotal = $derived(Math.max(
+    knownLedger.length,
+    (showingEmberKnown ? knownCounts?.ember_total : knownCounts?.ed2k_total) ?? 0,
+  ));
 
   // --- Known-peers sub-toolbar state ---
   // Filter string applied case-insensitively across user_hash, last_known_ip,
@@ -2183,13 +2186,7 @@
   // --- Categories ---
   const BUILTIN_CATEGORIES = BUILTIN_DOWNLOAD_CATEGORIES;
   let userCategories = $derived($appSettings?.download_categories ?? []);
-  let categoryCounts = $derived.by(() => {
-    const counts: Record<string, number> = {};
-    for (const t of allDownloads) {
-      if (t.category) counts[t.category] = (counts[t.category] ?? 0) + 1;
-    }
-    return counts;
-  });
+  let categoryCounts = $derived(countDownloadCategories(allDownloads));
   /** The filter chips: the built-in categories in use, then the user's own
    *  even while empty, then any other a download still carries (one the user
    *  has since deleted, say). */
@@ -2987,12 +2984,6 @@
   let categoryOptions = $derived(['None', ...BUILTIN_CATEGORIES, ...userCategories]);
 
   let categoriesDialog = $state<{ open: boolean; assignIds: string[] }>({ open: false, assignIds: [] });
-  // "Edit categories…" in the Library brings the user here for the dialog.
-  $effect(() => {
-    if (!$categoriesDialogRequested) return;
-    categoriesDialogRequested.set(false);
-    categoriesDialog = { open: true, assignIds: [] };
-  });
 
   /** A category set from the menu goes to the whole selection when the
    *  clicked row is part of it, as in eMule. */
@@ -3030,65 +3021,10 @@
     if (changes.error) throw changes.error;
   }
 
-  function isCategoryTaken(name: string): boolean {
-    const folded = name.toLocaleLowerCase();
-    return ['None', ...BUILTIN_CATEGORIES].some(
-      (cat) => cat.toLocaleLowerCase() === folded || categoryLabel(cat).toLocaleLowerCase() === folded,
-    ) || userCategories.some((cat) => cat.toLocaleLowerCase() === folded);
-  }
-
-  /** Edits the categories and their folders as the backend holds them now,
-   *  not as this page last saw them. */
-  async function saveCategorySettings(
-    edit: (categories: string[], folders: Record<string, string>) => {
-      categories: string[];
-      folders: Record<string, string>;
-    },
-  ): Promise<{ before: string[]; saved: string[] }> {
-    const current = await getSettings();
-    const before = current.download_categories ?? [];
-    const next = edit(before, current.download_category_folders ?? {});
-    const result = await updateSettings({
-      ...current,
-      download_categories: next.categories,
-      download_category_folders: next.folders,
-    });
-    setAppSettings(result.settings);
-    return { before, saved: result.settings.download_categories ?? [] };
-  }
-
-  function saveUserCategories(edit: (current: string[]) => string[]) {
-    return saveCategorySettings((categories, folders) => ({ categories: edit(categories), folders }));
-  }
-
-  /** Where a category's downloads finish; `null` is Downloads itself. */
-  async function setCategoryFolder(category: string, folder: string | null) {
-    await saveCategorySettings((categories, folders) => {
-      const next = { ...folders };
-      if (folder) next[category] = folder;
-      else delete next[category];
-      return { categories, folders: next };
-    });
-  }
-
-  async function addUserCategory(name: string, ownFolder: boolean) {
-    const { before, saved } = await saveUserCategories((current) => [...current, name]);
-    // The name as the backend kept it, which may be trimmed or cut; none when
-    // it cleaned the name into one that already exists.
-    const kept = saved.find((cat) => !before.includes(cat));
-    if (!kept) throw new Error(m.transfers_categories_exists());
-    // Named after the category as kept, so it matches what the backend holds.
+  async function addCategory(name: string, ownFolder: boolean) {
+    const { kept, folderError } = await addUserCategory(name, ownFolder);
     // A folder that could not be saved is reported once the downloads asked
     // for have their category anyway.
-    let folderError: unknown = null;
-    const folder = ownFolder ? normalizeCategoryFolder(kept) : null;
-    if (folder) {
-      try {
-        await setCategoryFolder(kept, folder);
-      } catch (e: unknown) {
-        folderError = e;
-      }
-    }
     const ids = new Set(categoriesDialog.assignIds);
     if (ids.size > 0) {
       await assignCategory(allDownloads.filter((t) => ids.has(t.id)), kept);
@@ -3096,10 +3032,8 @@
     if (folderError) throw folderError;
   }
 
-  async function removeUserCategory(name: string) {
-    const members = allDownloads.filter((t) => t.category === name);
-    if (members.length > 0) await assignCategory(members, '', false);
-    await saveUserCategories((current) => current.filter((cat) => cat !== name));
+  async function removeCategory(name: string) {
+    await removeUserCategory(name);
     if (categoryFilter === name) categoryFilter = '';
   }
 
@@ -5514,9 +5448,9 @@
   folders={$appSettings?.download_category_folders ?? {}}
   counts={categoryCounts}
   assignCount={categoriesDialog.assignIds.length}
-  isTaken={isCategoryTaken}
-  onadd={addUserCategory}
-  onremove={removeUserCategory}
+  isTaken={(name) => isCategoryTaken(name, userCategories)}
+  onadd={addCategory}
+  onremove={removeCategory}
   onfolder={setCategoryFolder}
 />
 
@@ -6184,7 +6118,7 @@
           tabindex={bottomView === 'known_clients' ? 0 : -1}
           onclick={() => bottomView = 'known_clients'}
           title={m.transfers_tab_known_title()}
-        >{knownCounts ? m.transfers_tab_known_count({ count: knownCounts.ed2k }) : m.transfers_tab_known()}</button>
+        >{knownCounts ? m.transfers_tab_known_count({ count: formatNumber(knownCounts.ed2k_total) }) : m.transfers_tab_known()}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'known_ember'}
@@ -6194,7 +6128,7 @@
           tabindex={bottomView === 'known_ember' ? 0 : -1}
           onclick={() => bottomView = 'known_ember'}
           title={m.transfers_tab_known_ember_title()}
-        >{knownCounts ? m.transfers_tab_known_ember_count({ count: knownCounts.ember }) : m.transfers_tab_known_ember()}</button>
+        >{knownCounts ? m.transfers_tab_known_ember_count({ count: formatNumber(knownCounts.ember_total) }) : m.transfers_tab_known_ember()}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'download_clients'}
@@ -6578,10 +6512,19 @@
           </label>
           {#if knownClientsLoaded}
             <div class="known-stats" aria-live="polite">
-              <span class="known-stat">
-                <strong>{knownStats.total}</strong>
-                {peersNoun(knownStats.total)}
-              </span>
+              {#if knownLedgerTotal > knownStats.total}
+                <span class="known-stat" title={m.transfers_known_trimmed_title()}>
+                  {m.transfers_known_trimmed({
+                    shown: formatNumber(knownStats.total),
+                    total: formatNumber(knownLedgerTotal),
+                  })}
+                </span>
+              {:else}
+                <span class="known-stat">
+                  <strong>{knownStats.total}</strong>
+                  {peersNoun(knownStats.total)}
+                </span>
+              {/if}
               {#if knownStats.friends > 0}
                 <span class="known-stat known-stat-friends" title={m.transfers_known_friends_title()}>
                   <strong>{knownStats.friends}</strong>

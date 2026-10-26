@@ -2382,8 +2382,22 @@ pub struct DownloadFileDetails {
 /// snapshot — see `NetworkCommand::GetKnownClientCounts`.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct KnownClientCounts {
+    /// Rows each tab lists, after the per-tab trim to the most recently seen.
     pub ed2k: u32,
     pub ember: u32,
+    /// Records the ledger holds for each tab before that trim. Above the
+    /// listed count only when the tab is capped.
+    pub ed2k_total: u32,
+    pub ember_total: u32,
+}
+
+/// What the known-peer tabs fetch: the trimmed rows plus the counts that
+/// describe them, so the labels can tell the ledger size apart from the
+/// rows listed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KnownClientsSnapshot {
+    pub clients: Vec<KnownClient>,
+    pub counts: KnownClientCounts,
 }
 
 /// One row in the upload-pane "Known Clients" tab — a SecIdent credit
