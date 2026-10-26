@@ -150,10 +150,11 @@ pub fn folder_name(title: &str) -> String {
 
 /// [`folder_name`] for the feed `salt`, made unlike every one of `taken`,
 /// compared without case as Windows does: the name, or the name with the
-/// start of the salt after it.
+/// start of the salt after it. [`MARKER`] counts as taken: `Feeds` holds a
+/// file of that name, so no folder of it can be made there.
 pub fn unique_folder_name(title: &str, salt: &str, taken: &[String]) -> String {
     let base = folder_name(title);
-    let free = |name: &str| !taken.iter().any(|other| other.eq_ignore_ascii_case(name));
+    let free = |name: &str| !name.eq_ignore_ascii_case(MARKER) && !taken.iter().any(|other| other.eq_ignore_ascii_case(name));
     if free(&base) {
         return base;
     }
@@ -200,6 +201,13 @@ mod tests {
         let long = unique_folder_name(&"y".repeat(64), salt, &["y".repeat(64)]);
         assert!(long.chars().count() <= crate::storage::category_folders::MAX_SEGMENT_CHARS);
         assert!(long.ends_with(" (01234567)"));
+    }
+
+    #[test]
+    fn a_feed_titled_as_the_marker_does_not_take_its_name() {
+        let salt = "0123456789abcdef";
+        assert_eq!(unique_folder_name(MARKER, salt, &[]), format!("{MARKER} (01234567)"));
+        assert_eq!(unique_folder_name(&MARKER.to_uppercase(), salt, &[]), format!("{} (01234567)", MARKER.to_uppercase()));
     }
 
     #[test]

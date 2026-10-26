@@ -78,6 +78,9 @@ const FETCH_RETRY_SECS: i64 = 30 * 60;
 const MAX_LIST_BYTES: u64 = 2 * 1024 * 1024;
 /// Free space auto-download leaves on the download folder's drive.
 const AUTO_DOWNLOAD_HEADROOM: u64 = 64 * 1024 * 1024;
+/// How long a Publish waits for the Library's index before saying it is
+/// still loading.
+const INDEX_WAIT: Duration = Duration::from_secs(5);
 
 fn publish_unreachable() -> String {
     coded("feeds_publish_unreachable", "Could not reach the Ember network to publish the feed. Try again in a minute.")
@@ -551,6 +554,9 @@ pub async fn set_feed_listed(
     listed: bool,
 ) -> Result<OwnFeedInfo, String> {
     let salt = hex::encode(hex_salt(&salt)?);
+    // So the listing carries the head last recorded, not one a Publish
+    // replaces between this read and its send.
+    let publishing = publish_lock().lock().await;
     let (db, key) = (state.db.clone(), salt.clone());
     let feed = blocking(
         move || {
@@ -565,6 +571,7 @@ pub async fn set_feed_listed(
     .await?
     .ok_or_else(|| coded("feeds_not_found", "That feed could not be found"))?;
     send_listing(&state, &feed, chrono::Utc::now().timestamp()).await;
+    drop(publishing);
     let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "salt": salt }));
     own_feed_info(&state, feed).await
 }
@@ -869,8 +876,13 @@ pub async fn publish_feed(
         let (feed, items) =
             blocking(move || Ok((db.feed_own(&key)?, db.feed_own_items(&key)?)), "feeds_failed", "Could not read feeds").await?;
         let feed = feed.ok_or_else(|| coded("feeds_not_found", "That feed could not be found"))?;
+        // A library scan holds the index through a whole re-index, and both
+        // locks are held here: waiting it out would hold up every Save,
+        // Delete and republish behind this Publish.
         let kept: Vec<FeedItem> = {
-            let index = state.local_index.read().await;
+            let Ok(index) = tokio::time::timeout(INDEX_WAIT, state.local_index.read()).await else {
+                return Err(library_loading());
+            };
             items.iter().filter(|item| still_public(&index, item)).cloned().collect()
         };
         if kept.len() != items.len() {
@@ -1265,12 +1277,11 @@ pub async fn delete_feed(app: tauri::AppHandle, state: tauri::State<'_, AppState
     let now = chrono::Utc::now().timestamp();
     let released = blocking(
         move || {
-            let mut released = Vec::new();
-            if let Some(feed) = db.feed_own(&key)? {
-                released = swap_own_lists(&own_owner(&key), &own_lists(&dir, &feed), &[]);
-            }
+            // Its lists go only once its row has: a delete that fails leaves
+            // the feed published, and its list still served.
+            let feed = db.feed_own(&key)?;
             db.feed_own_delete(&key, now, FEED_LISTING_TTL_SECS)?;
-            Ok(released)
+            Ok(feed.map(|feed| swap_own_lists(&own_owner(&key), &own_lists(&dir, &feed), &[])).unwrap_or_default())
         },
         "feeds_failed",
         "Could not delete the feed",
@@ -1398,6 +1409,9 @@ pub async fn refresh_feed(
     salt: String,
 ) -> Result<LookupOutcome, String> {
     let (publisher, salt) = (hex::encode(hex_publisher(&publisher)?), hex::encode(hex_salt(&salt)?));
+    if !still_followed(&state, &publisher, &salt).await {
+        return Err(coded("feeds_not_found", "That feed could not be found"));
+    }
     let outcome = look_up_head(&app, &state, &publisher, &salt).await;
     if outcome != LookupOutcome::Updated {
         gave_up().lock().remove(&(publisher.clone(), salt.clone()));
@@ -1450,16 +1464,22 @@ pub async fn get_feed_items(
     .await?;
     let feed = feed.ok_or_else(|| coded("feeds_not_found", "That feed could not be found"))?;
     mark("database", &mut at);
+    let wanted: std::collections::HashSet<String> = items.iter().map(|i| i.item.ed2k.to_ascii_lowercase()).collect();
     // What each file's download is doing: the transfer list's own word for
-    // it, newest first, then the file on disk.
+    // it, newest first, then the file on disk. Only this feed's files: the
+    // list may hold thousands of others.
     let transfers: HashMap<String, (ItemStatus, f64, Option<String>, ItemTransfer)> = {
         let manager = state.transfer_manager.read().await;
         mark("transfer list lock", &mut at);
         let mut by_hash = HashMap::new();
         for t in manager.completed.iter().chain(manager.queue.iter()).chain(manager.active.values()) {
-            if t.direction == crate::types::TransferDirection::Download {
+            if t.direction != crate::types::TransferDirection::Download {
+                continue;
+            }
+            let hash = t.file_hash.to_ascii_lowercase();
+            if wanted.contains(&hash) {
                 by_hash.insert(
-                    t.file_hash.to_ascii_lowercase(),
+                    hash,
                     (ItemStatus::of(&t.status), t.progress, t.completed_path.clone(), ItemTransfer::of(t, &feed.folder)),
                 );
             }
@@ -1484,7 +1504,6 @@ pub async fn get_feed_items(
         .filter_map(|(hash, (status, _, path, _))| (*status == ItemStatus::Done).then_some((hash.clone(), path.clone()?)))
         .collect();
     let finished_count = finished.len();
-    let wanted: std::collections::HashSet<String> = items.iter().map(|i| i.item.ed2k.to_ascii_lowercase()).collect();
     let ((on_disk, gone), held_elsewhere) = tokio::task::spawn_blocking(move || {
         let copies = copies.into_iter().filter(|copy| wanted.contains(&copy.ed2k.to_ascii_lowercase())).collect();
         (feed_folder_files(&folders, &folder, &finished), copies_elsewhere(&folders, copies))
@@ -2244,23 +2263,36 @@ async fn look_up_head(app: &tauri::AppHandle, state: &AppState, publisher: &str,
             }
         }
     }
-    // A lookup no node answered says nothing about the head: it is not a
-    // check, and is tried again sooner than the next one would be.
+    let too_large = best.as_ref().is_some_and(|head| head.list_size > MAX_LIST_BYTES);
+    {
+        // Unfollowed while the lookup was out: what it found is noted for
+        // nobody, and would be kept until the app closes. Under the lock, so
+        // an unfollow cannot clear the feed's state between this check and
+        // the notes.
+        let _followed = followed_lock().lock().await;
+        if !still_followed(state, publisher, salt).await {
+            listing_fallbacks().lock().remove(&looking_at);
+            return LookupOutcome::NotFound;
+        }
+        // A lookup no node answered says nothing about the head: it is not
+        // a check, and is tried again sooner than the next one would be.
+        if responded > 0 {
+            missed_lookups().lock().remove(&looking_at);
+        } else {
+            missed_lookups().lock().insert(looking_at.clone(), now);
+        }
+        if best.is_some() || responded > 0 {
+            set_too_large(&looking_at, too_large);
+        }
+    }
     if responded > 0 {
-        missed_lookups().lock().remove(&looking_at);
         let db = state.db.clone();
         let (key_pub, key_salt) = looking_at.clone();
         let _ = tokio::task::spawn_blocking(move || db.feed_checked(&key_pub, &key_salt, now)).await;
-    } else {
-        missed_lookups().lock().insert(looking_at.clone(), now);
     }
     drop(looked);
     if best.is_some() {
         note_seen(state, publisher, salt, now).await;
-    }
-    let too_large = best.as_ref().is_some_and(|head| head.list_size > MAX_LIST_BYTES);
-    if best.is_some() || responded > 0 {
-        set_too_large(&looking_at, too_large);
     }
     match best {
         Some(_) if too_large => {
@@ -2277,6 +2309,14 @@ async fn look_up_head(app: &tauri::AppHandle, state: &AppState, publisher: &str,
         None if responded == 0 => LookupOutcome::Unreachable,
         None => LookupOutcome::NotFound,
     }
+}
+
+/// Whether the feed is still followed. A read that fails counts as
+/// followed: it is no reason to refuse "Check now", or to drop what a lookup
+/// found.
+async fn still_followed(state: &AppState, publisher: &str, salt: &str) -> bool {
+    let (db, publisher, salt) = (state.db.clone(), publisher.to_string(), salt.to_string());
+    !matches!(tokio::task::spawn_blocking(move || db.feed_followed(&publisher, &salt)).await, Ok(Ok(None)))
 }
 
 /// A head of the feed was found, so it is still published (see
@@ -2450,7 +2490,7 @@ fn due_pushed_heads(gates: &mut PushGates, now: Instant) -> Vec<((String, String
 
 /// Held while a followed feed's row, list files, fetches and hidden share
 /// change together: by unfollowing, by taking up a head or a list, and by
-/// starting a fetch. Unfollowing between a list's being recorded and its
+/// starting a fetch; and while a lookup notes what it found. Unfollowing between a list's being recorded and its
 /// being served would otherwise leave it served from a deleted file.
 /// Never held across a lookup or auto-download.
 fn followed_lock() -> &'static tokio::sync::Mutex<()> {
@@ -2723,6 +2763,9 @@ async fn start_fetch(app: &tauri::AppHandle, state: &AppState, feed: &FollowedFe
     .await;
     if sent.is_err() {
         cancel_fetch(state, &transfer_id).await;
+        // Rests as a fetch that stalled does, rather than being started
+        // again by every tick while the network is backed up.
+        gave_up().lock().insert((feed.publisher.clone(), feed.salt.clone()), chrono::Utc::now().timestamp());
     }
     None
 }
@@ -2857,6 +2900,7 @@ async fn on_fetch_done(app: &tauri::AppHandle, state: &AppState, transfer_id: St
         FetchOutcome::Mismatch(error) | FetchOutcome::Failed(error) => {
             tracing::debug!("feed list fetch for {}/{} failed: {error}", fetch.publisher, fetch.salt);
             gave_up().lock().insert((fetch.publisher, fetch.salt), chrono::Utc::now().timestamp());
+            let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "publisher": feed.publisher, "salt": feed.salt }));
             None
         }
     };
@@ -3382,6 +3426,11 @@ fn reshare_lists(db: &crate::storage::database::Database, dir: &Path, publisher:
     for feed in db.feeds_followed().unwrap_or_default() {
         let path = followed_list_path(dir, &feed.publisher, &feed.salt, feed.list_sequence);
         kept.insert(path.clone());
+        // A newer head's list, fetched and not yet taken up: `start_fetch`
+        // reads it again rather than fetching it again. Kept, not served.
+        if feed.sequence > 0 && feed.sequence != feed.list_sequence {
+            kept.insert(followed_list_path(dir, &feed.publisher, &feed.salt, feed.sequence));
+        }
         if feed.list_sequence > 0 && !(list_file_whole(&path, feed.held_size) && list_is_sealed(&path)) {
             let _ = std::fs::remove_file(&path);
             let _ = db.feed_lost_held(&feed.publisher, &feed.salt);
@@ -3783,6 +3832,14 @@ impl Drop for ClearOnDrop {
     }
 }
 
+/// Run one of the service's handlers in a task of its own and wait for it:
+/// a panic in it is logged, and the worker that called it takes the next.
+async fn handle_caught(what: &str, handler: impl std::future::Future<Output = ()> + Send + 'static) {
+    if let Err(error) = tauri::async_runtime::spawn(handler).await {
+        tracing::error!("feeds: handling {what} failed: {error}");
+    }
+}
+
 /// Keep feeds current for the life of the app.
 pub fn spawn_feeds(app: tauri::AppHandle) {
     spawn_hold_watcher(app.clone());
@@ -3794,25 +3851,40 @@ pub fn spawn_feeds(app: tauri::AppHandle) {
         if let Some(state) = app.try_state::<AppState>() {
             reshare_held(&app, &state).await;
         }
-        let mut tick = tokio::time::interval(Duration::from_secs(60));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // A tick's lookups take up to a minute; run off the loop, one at a
-        // time, so lists and pushed heads are not kept waiting meanwhile.
-        let ticking = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        loop {
-            tokio::select! {
-                report = reports.recv() => {
-                    let Some((id, outcome)) = report else { return };
+        // Lists that arrived and heads friends pushed, each taken in order by
+        // a worker of its own: a list can start up to 2,000 downloads, and
+        // pushed heads are dropped while their worker is behind.
+        let worker = app.clone();
+        tauri::async_runtime::spawn(async move {
+            while let Some((id, outcome)) = reports.recv().await {
+                let app = worker.clone();
+                handle_caught("a list fetch's end", async move {
                     if let Some(state) = app.try_state::<AppState>() {
                         on_fetch_done(&app, &state, id, outcome).await;
                     }
-                }
-                head = pushed.recv() => {
-                    let Some((from, blob)) = head else { return };
+                })
+                .await;
+            }
+        });
+        let worker = app.clone();
+        tauri::async_runtime::spawn(async move {
+            while let Some((from, blob)) = pushed.recv().await {
+                let app = worker.clone();
+                handle_caught("a pushed head", async move {
                     if let Some(state) = app.try_state::<AppState>() {
                         on_pushed_head(&app, &state, from, blob).await;
                     }
-                }
+                })
+                .await;
+            }
+        });
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // A tick's lookups take up to a minute; run off the loop, one at a
+        // time, so followers' downloads are not kept waiting meanwhile.
+        let ticking = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        loop {
+            tokio::select! {
                 () = crate::network::feed_direct::downloads_noted().notified() => {
                     if let Some(state) = app.try_state::<AppState>() {
                         record_feed_downloads(&app, &state, chrono::Utc::now().timestamp()).await;

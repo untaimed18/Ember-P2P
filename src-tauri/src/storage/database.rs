@@ -925,6 +925,10 @@ pub struct Database {
     /// Set when `ember.db` was corrupt at open time and replaced after backup.
     /// Startup surfaces a non-silent notice (same pattern as config recovery).
     pub corrupt_backup: Option<std::path::PathBuf>,
+    /// Set once the feeds tables are made and up to date in `conn`'s file
+    /// (see `ensure_feeds_locked`). Per database, not per process: a test
+    /// opens many.
+    feeds_ready: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug)]
@@ -1186,6 +1190,7 @@ impl Database {
             path: db_path.to_path_buf(),
             chat_key,
             corrupt_backup: None,
+            feeds_ready: Default::default(),
         };
         db.run_migrations()?;
         // Every attachment read joins it, so it is made now rather than left
@@ -16518,6 +16523,7 @@ mod tests {
             path: std::path::PathBuf::from(":memory:"),
             chat_key: Some(Zeroizing::new([0xA5; 32])),
             corrupt_backup: None,
+            feeds_ready: Default::default(),
         }
     }
 
@@ -16545,6 +16551,7 @@ mod tests {
             path: std::path::PathBuf::from(":memory:"),
             chat_key: Some(Zeroizing::new([0xA5; 32])),
             corrupt_backup: None,
+            feeds_ready: Default::default(),
         }
     }
 
@@ -16634,6 +16641,7 @@ mod tests {
             path: std::path::PathBuf::from(":memory:"),
             chat_key: Some(Zeroizing::new([0xA5; 32])),
             corrupt_backup: None,
+            feeds_ready: Default::default(),
         }
     }
 
@@ -16769,6 +16777,7 @@ mod tests {
             path: std::path::PathBuf::from(":memory:"),
             chat_key: None,
             corrupt_backup: None,
+            feeds_ready: Default::default(),
         };
         assert!(locked.chat_locked());
 
@@ -18379,6 +18388,7 @@ mod tests {
             path: std::path::PathBuf::from(":memory:"),
             chat_key: Some(Zeroizing::new([0xA5; 32])),
             corrupt_backup: None,
+            feeds_ready: Default::default(),
         }
     }
 
@@ -19664,6 +19674,7 @@ mod tests {
             path: path.clone(),
             chat_key: Some(Zeroizing::new([0x5A; 32])),
             corrupt_backup: None,
+            feeds_ready: Default::default(),
         };
         let row = wrong_key.chat_attachment(&received).unwrap();
         assert_eq!(row.file_name, CHAT_ATTACH_UNAVAILABLE_NAME);
@@ -27611,6 +27622,7 @@ mod tests {
             path: path.clone(),
             chat_key: Some(Zeroizing::new([0x5A; 32])),
             corrupt_backup: None,
+            feeds_ready: Default::default(),
         };
         let unavailable = wrong_key_db.get_chat_messages(&friend, 10, None).unwrap();
         assert_eq!(unavailable.len(), 1);
@@ -27633,6 +27645,7 @@ mod tests {
             path: path.clone(),
             chat_key: Some(Zeroizing::new(correct_key)),
             corrupt_backup: None,
+            feeds_ready: Default::default(),
         };
         let recovered = recovered_db.get_chat_messages(&friend, 10, None).unwrap();
         assert_eq!(recovered.len(), 1);

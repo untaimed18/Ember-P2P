@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { AUTO_MIB_MAX, capMib, concernsFollowed, draftOf, sameDraft, withLiveProgress, type FeedDraft } from './feedsPage';
+import {
+  AUTO_MIB_MAX,
+  capMib,
+  concernsFollowed,
+  draftOf,
+  keepUnchanged,
+  sameDraft,
+  withLiveProgress,
+  type FeedDraft,
+} from './feedsPage';
 
 describe('withLiveProgress', () => {
   const row = (id: string | null, done = 0, speed = 0) => ({
@@ -30,6 +39,50 @@ describe('withLiveProgress', () => {
     expect(over).toMatchObject({ progress: 100, transfer: { done: 1000 } });
     const [under] = withLiveProgress([row('a', 10)], new Map([['a', { done: -1, speed: 0 }]]));
     expect(under).toMatchObject({ progress: 0, transfer: { done: 0 } });
+  });
+});
+
+describe('keepUnchanged', () => {
+  const row = (ed2k: string, done = 0, note = '') => ({
+    ed2k,
+    note,
+    status: done > 0 ? 'downloading' : 'none',
+    transfer: done > 0 ? { id: `t-${ed2k}`, done, speed: 5 } : null,
+  });
+
+  it('keeps the rows that read the same, and takes the ones that changed', () => {
+    const prev = [row('a', 100), row('b'), row('c', 0, 'live')];
+    const next = [row('a', 200), row('b'), row('c', 0, 'studio')];
+    const merged = keepUnchanged(prev, next);
+    expect(merged).toEqual(next);
+    expect(merged[0]).toBe(next[0]);
+    expect(merged[1]).toBe(prev[1]);
+    expect(merged[2]).toBe(next[2]);
+  });
+
+  it('sees a change inside the download', () => {
+    const prev = [row('a', 100)];
+    const next = [{ ...row('a', 100), transfer: { id: 't-a', done: 100, speed: 9 } }];
+    expect(keepUnchanged(prev, next)[0]).toBe(next[0]);
+  });
+
+  it('gives back the same list when nothing changed, so nothing redraws', () => {
+    const prev = [row('a', 100), row('b')];
+    expect(keepUnchanged(prev, [row('a', 100), row('b')])).toBe(prev);
+  });
+
+  it('follows the new order, and rows that came or went', () => {
+    const prev = [row('a'), row('b'), row('c')];
+    const moved = keepUnchanged(prev, [row('b'), row('a'), row('c')]);
+    expect(moved).not.toBe(prev);
+    expect(moved).toEqual([prev[1], prev[0], prev[2]]);
+    expect(moved[0]).toBe(prev[1]);
+    const added = keepUnchanged(prev, [row('a'), row('b'), row('c'), row('d')]);
+    expect(added.map((r) => r.ed2k)).toEqual(['a', 'b', 'c', 'd']);
+    expect(added[2]).toBe(prev[2]);
+    const removed = keepUnchanged(prev, [row('a'), row('c')]);
+    expect(removed).toEqual([prev[0], prev[2]]);
+    expect(removed[1]).toBe(prev[2]);
   });
 });
 

@@ -107,6 +107,9 @@ export interface FollowedItem extends FeedItem {
   removed: boolean;
   /** Downloaded or started from the feed at some point. */
   downloaded: boolean;
+  /** Its download was cancelled from the feed since. Still `downloaded`, so
+   *  auto-download does not start it again. */
+  cancelled: boolean;
   /** A type that can run code or change settings: asked about before it is
    *  downloaded, and never downloaded automatically. */
   risky: boolean;

@@ -1421,8 +1421,9 @@ records go out ahead of the library's, so a publisher with a large library
 behind a firewall is found as a source of a new list within one publishing
 pass. A follower connected to the publisher as a friend also asks the friend
 directly. A fetch is given up after 30 minutes with no byte and no source
-(queued at one counts as a source), or 6 hours in all, keeping what it has,
-and tried again 30 minutes later.
+(queued at one counts as a source), or 6 hours in all, and tried again 30
+minutes later from the start: what it had is deleted, as the retry is a new
+download and a list is at most 2 MiB.
 
 **Links.** `ember-feed:` followed by `publisher(32) || salt(16)` in lowercase
 unpadded RFC 4648 base32 (77 characters in all), or the same after

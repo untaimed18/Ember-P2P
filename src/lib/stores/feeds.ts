@@ -1,6 +1,13 @@
 import { derived, get, writable } from 'svelte/store';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { FEEDS_CHANGED_EVENT, listFollowedFeeds, type FeedsChangedEvent, type FollowedFeed } from '$lib/api/feeds';
+import {
+  FEEDS_CHANGED_EVENT,
+  discoverFeeds,
+  listFollowedFeeds,
+  type DiscoveredFeed,
+  type FeedsChangedEvent,
+  type FollowedFeed,
+} from '$lib/api/feeds';
 import { notify } from '$lib/notifications';
 import { formatNumber } from '$lib/utils';
 import * as m from '$lib/paraglide/messages';
@@ -74,9 +81,45 @@ export function cleanupFeedsStore(): void {
   followedFeeds.set([]);
   followedFeedsLoaded.set(false);
   followedFeedsFailed.set(false);
+  lastWalkAt = 0;
+  runningWalk = null;
 }
 
 /** The followed feed `publisher`/`salt`, if followed. */
 export function followedFeed(publisher: string, salt: string): FollowedFeed | undefined {
   return get(followedFeeds).find((f) => f.publisher === publisher && f.salt === salt);
+}
+
+/** A walk of the public feed index: the id its shards are tagged with, and
+ *  the whole set it answers. */
+export interface DiscoverWalk {
+  walk: string;
+  result: Promise<DiscoveredFeed[]>;
+}
+
+// Kept here, not on the Feeds page, which is made anew on each visit: a
+// visit soon after a walk reads its cache rather than walking again, and
+// one during a walk takes that walk's shards rather than starting another.
+let lastWalkAt = 0;
+let runningWalk: DiscoverWalk | null = null;
+
+/** When the last walk began, in milliseconds; 0 before the first. */
+export const lastDiscoverWalkAt = (): number => lastWalkAt;
+export const discoverWalkRunning = (): boolean => runningWalk !== null;
+
+function newWalk(): string {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  return `w-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+}
+
+/** Walk the index, or join the walk already running. */
+export function startDiscoverWalk(): DiscoverWalk {
+  if (runningWalk) return runningWalk;
+  const walk = newWalk();
+  lastWalkAt = Date.now();
+  const result = discoverFeeds(walk).finally(() => {
+    if (runningWalk?.walk === walk) runningWalk = null;
+  });
+  runningWalk = { walk, result };
+  return runningWalk;
 }

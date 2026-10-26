@@ -81,3 +81,31 @@ export function withLiveProgress<T extends ProgressRow>(items: T[], live: Readon
   });
   return changed ? next : items;
 }
+
+/** Whether two values read from the backend hold the same: compared field by
+ *  field, nested objects and arrays too. */
+function sameValue(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const x = a as Record<string, unknown>;
+  const y = b as Record<string, unknown>;
+  const keys = Object.keys(x);
+  return keys.length === Object.keys(y).length && keys.every((k) => k in y && sameValue(x[k], y[k]));
+}
+
+/** `next`, a list read again, with each row that has not changed since
+ *  `prev` kept as the row `prev` holds, by eD2K hash; `prev` itself when no
+ *  row changed, moved, came or went. A feed's list can hold 2,000 files, and
+ *  a row given anew is drawn anew. */
+export function keepUnchanged<T extends { ed2k: string }>(prev: readonly T[], next: T[]): T[] {
+  const held = new Map(prev.map((row) => [row.ed2k, row]));
+  let same = prev.length === next.length;
+  const merged = next.map((row, i) => {
+    const old = held.get(row.ed2k);
+    const kept = old !== undefined && sameValue(old, row) ? old : row;
+    if (kept !== prev[i]) same = false;
+    return kept;
+  });
+  return same ? (prev as T[]) : merged;
+}

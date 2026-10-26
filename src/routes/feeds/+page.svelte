@@ -15,7 +15,6 @@
     clearHiddenDiscoveredFeeds,
     createFeed,
     deleteFeed,
-    discoverFeeds,
     downloadFeedItems,
     FEEDS_CHANGED_EVENT,
     FEEDS_FOUND_EVENT,
@@ -47,6 +46,7 @@
     capMib,
     concernsFollowed,
     draftOf,
+    keepUnchanged,
     sameDraft,
     withLiveProgress,
     type FeedDraft,
@@ -56,7 +56,15 @@
   import FeedFilePicker from '$lib/components/FeedFilePicker.svelte';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import IconX from '$lib/components/IconX.svelte';
-  import { followedFeeds, followedFeedsFailed, followedFeedsLoaded, refreshFollowedFeeds } from '$lib/stores/feeds';
+  import {
+    discoverWalkRunning,
+    followedFeeds,
+    followedFeedsFailed,
+    followedFeedsLoaded,
+    lastDiscoverWalkAt,
+    refreshFollowedFeeds,
+    startDiscoverWalk,
+  } from '$lib/stores/feeds';
   import { noteUiActivity } from '$lib/uiStall';
   import { appSettings } from '$lib/stores/settings';
   import { addActionToast, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
@@ -286,8 +294,9 @@
     toastSuccess(m.feeds_own_opened());
   }
 
-  /** A link opened from outside while another follow was running. */
-  let queuedLink: string | null = null;
+  /** Links opened from outside while another follow was running, in the
+   *  order they came. */
+  let queuedLinks: string[] = [];
 
   async function follow(link = followLink) {
     const text = link.trim();
@@ -311,8 +320,7 @@
       }
     } finally {
       following = false;
-      const next = queuedLink;
-      queuedLink = null;
+      const next = queuedLinks.shift();
       if (next) void follow(next);
     }
   }
@@ -324,8 +332,8 @@
     if (!linked) return;
     untrack(() => {
       setTab('following');
-      if (following) queuedLink = linked;
-      else void follow(linked);
+      if (!following) void follow(linked);
+      else if (!queuedLinks.includes(linked)) queuedLinks.push(linked);
       const next = new URL(page.url);
       next.searchParams.delete('follow');
       void goto(`${next.pathname}${next.search}${next.hash}`, { replaceState: true, keepFocus: true, noScroll: true }).catch(
@@ -367,13 +375,14 @@
   });
 
   let itemsSeq = 0;
-  let itemsFor = '';
+  /** The feed whose files `items` holds; empty while none's are in. */
+  let itemsFor = $state('');
   /** The open feed's downloads, whose transfer events it shows. */
   let itemTransferIds = $derived(new Set(items.flatMap((i) => (i.transfer ? [i.transfer.id] : []))));
   /** How often the open feed's rows take in their downloads' progress. */
   const LIVE_PROGRESS_MS = 500;
-  /** How long after a download of the open feed ends its files are read
-   *  again, so several ending together are read once. */
+  /** How long after a download of the open feed ends, or the feed changes,
+   *  its files are read again, so several together are read once. */
   const SETTLED_RELOAD_MS = 300;
 
   /** `quiet` for the refresh that keeps a list's progress current: no
@@ -383,13 +392,11 @@
     if (!feed || itemsFor !== keyOf(feed)) {
       // Another feed's files must not show under this one while it loads.
       items = [];
+      itemsFor = '';
       itemFilter = 'all';
       itemQuery = '';
     }
-    if (!feed) {
-      itemsFor = '';
-      return;
-    }
+    if (!feed) return;
     if (!quiet) itemsLoading = true;
     try {
       const rows = await getFeedItems(feed.publisher, feed.salt);
@@ -398,7 +405,11 @@
       // What was new stays shown as new while the feed stays open, though
       // opening it marks it read.
       const wasNew = new Set(itemsFor === keyOf(feed) ? items.filter((i) => i.is_new).map((i) => i.ed2k) : []);
-      items = rows.map((r) => (wasNew.has(r.ed2k) ? { ...r, is_new: true } : r));
+      const next = keepUnchanged(
+        items,
+        rows.map((r) => (wasNew.has(r.ed2k) ? { ...r, is_new: true } : r)),
+      );
+      if (next !== items) items = next;
       itemsFor = keyOf(feed);
       itemsFailed = false;
       await markShownRead();
@@ -519,8 +530,8 @@
   }
 
   /** Downloads waiting on the user's word, because some can run code: all
-   *  of them, and those that cannot. */
-  let riskyAsk = $state<{ ed2ks: string[]; safe: string[]; names: string[] } | null>(null);
+   *  of them, and those that cannot; `from`, the row whose Download asked. */
+  let riskyAsk = $state<{ ed2ks: string[]; safe: string[]; names: string[]; from?: string } | null>(null);
 
   function riskyText(names: string[]): string {
     return plural(names.length, {
@@ -529,16 +540,39 @@
     });
   }
 
-  /** Download, after asking when any of them can run code. */
-  function askDownload(ed2ks: string[]) {
+  /** Download, after asking when any of them can run code. `from`: the row
+   *  whose own Download this is. */
+  function askDownload(ed2ks: string[], from?: string) {
     const wanted = new Set(ed2ks);
     const chosen = items.filter((i) => wanted.has(i.ed2k));
     const risky = chosen.filter((i) => i.risky);
     if (risky.length > 0) {
-      riskyAsk = { ed2ks, safe: chosen.filter((i) => !i.risky).map((i) => i.ed2k), names: risky.map((i) => i.name) };
+      riskyAsk = { ed2ks, safe: chosen.filter((i) => !i.risky).map((i) => i.ed2k), names: risky.map((i) => i.name), from };
     } else {
-      void download(ed2ks);
+      void download(ed2ks, from);
     }
+  }
+
+  /** The open feed's file list. */
+  let followList = $state<HTMLElement | null>(null);
+
+  /** Focus has fallen to the page: what had it is gone or was disabled. */
+  const focusLost = () => !document.activeElement || document.activeElement === document.body;
+
+  /** Once a row's Download has run, focus goes back to it; where the row
+   *  shows its download instead, to the nearest row's Download after it,
+   *  else before it, else the list. Not if the user has moved on. */
+  async function focusDownloadNear(ed2k: string) {
+    await tick();
+    if (!followList || !focusLost()) return;
+    const rows = [...followList.querySelectorAll<HTMLElement>('[data-row]')];
+    const at = rows.findIndex((r) => r.dataset.row === ed2k);
+    const button = (r: HTMLElement) => r.querySelector<HTMLElement>('[data-download]:not(:disabled)');
+    const near =
+      (at >= 0 ? button(rows[at]) : null) ??
+      rows.slice(at + 1).map(button).find(Boolean) ??
+      rows.slice(0, Math.max(0, at)).reverse().map(button).find(Boolean);
+    (near ?? followList).focus();
   }
 
   async function openFolder() {
@@ -556,7 +590,7 @@
     return selectedKey === keyOf(feed) ? text : m.feeds_toast_in_feed({ feed: feedLabel(feed), text });
   }
 
-  async function download(ed2ks: string[]) {
+  async function download(ed2ks: string[], from?: string) {
     const feed = selected;
     if (!feed || ed2ks.length === 0) return;
     const key = keyOf(feed);
@@ -579,6 +613,7 @@
       toastError(aboutFeed(feed, translateError(e, m.error_operation_failed())));
     } finally {
       downloadingFor = new Set([...downloadingFor].filter((other) => other !== key));
+      if (from && selectedKey === key) void focusDownloadNear(from);
     }
   }
 
@@ -834,7 +869,6 @@
   /** The walk whose shards are taken; any other's are stale. */
   let discoverWalk = '';
   let discoverOpened = false;
-  let lastWalkAt = 0;
 
   /** Show only this publisher's feeds. */
   let discoverPublisher = $state<string | null>(null);
@@ -853,6 +887,13 @@
     // the end: a card moving under the pointer is followed by mistake.
     return discovering ? matched : sortDiscovered(matched, discoverSort);
   });
+
+  /** A sort picked during a walk orders the cards found so far at once;
+   *  those still to come go at the end, as before. */
+  function pickSort(by: DiscoverSort) {
+    discoverSort = by;
+    if (discovering) discovered = sortDiscovered(discovered, by);
+  }
 
   let discoverShown = $derived(discoverMatches.slice(0, discoverLimit));
   let activeDiscovered = $derived(discovered.filter((f) => f.active).length);
@@ -899,11 +940,6 @@
     discovered = [...byKey.values()];
   }
 
-  function newWalk(): string {
-    if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
-    return `w-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
-  }
-
   async function refreshHiddenCount() {
     try {
       hiddenCount = await hiddenDiscoveredFeedCount();
@@ -925,17 +961,17 @@
       discoverLoaded = true;
       void refreshHiddenCount();
     }
-    if (Date.now() - lastWalkAt >= DISCOVER_STALE_MS) void walkDiscover();
+    if (discoverWalkRunning() || Date.now() - lastDiscoverWalkAt() >= DISCOVER_STALE_MS) void walkDiscover();
   }
 
+  /** Walk the index, or take in the walk running since an earlier visit. */
   async function walkDiscover() {
     if (discovering || emberOff) return;
-    const walk = newWalk();
+    const { walk, result } = startDiscoverWalk();
     discoverWalk = walk;
     discovering = true;
-    lastWalkAt = Date.now();
     try {
-      const feeds = await discoverFeeds(walk);
+      const feeds = await result;
       if (discoverWalk === walk) discovered = sortDiscovered(feeds.filter((f) => !hiddenNow(f)));
     } catch (e) {
       if (discoverWalk === walk) toastError(translateError(e, m.error_operation_failed()));
@@ -963,8 +999,17 @@
       const next = new Set(followingFromDiscover);
       next.delete(key);
       followingFromDiscover = next;
+      // Follow, disabled while it ran, has become Open, or is Follow again.
+      await tick();
+      if (focusLost()) cardAction(key)?.focus();
     }
   }
+
+  /** The Discover grid, for focus to fall back on once a card is gone. */
+  let discoverScroll = $state<HTMLElement | null>(null);
+
+  const cardAction = (key: string) =>
+    discoverScroll?.querySelector<HTMLElement>(`[data-card="${CSS.escape(key)}"] [data-card-action]`);
 
   function openFollowed(feed: DiscoveredFeed) {
     selectFollowed(keyOf(feed));
@@ -978,7 +1023,25 @@
     if (own && mineSelected !== own.salt) unlessDirty(() => selectMine(own));
   }
 
+  /** Once the cards of `hidden` are gone, focus the menu button of the
+   *  nearest card left of those that were `shown`: after it, else before
+   *  it, else the grid, or the empty Discover's own buttons. */
+  async function focusCardNear(shown: string[], hidden: string) {
+    await tick();
+    if (!focusLost()) return;
+    const left = new Set(discoverShown.map(keyOf));
+    const at = shown.indexOf(hidden);
+    const near =
+      shown.slice(at + 1).find((k) => left.has(k)) ?? shown.slice(0, Math.max(0, at)).reverse().find((k) => left.has(k));
+    const button = near
+      ? discoverScroll?.querySelector<HTMLElement>(`[data-card="${CSS.escape(near)}"] .card-menu-btn`)
+      : null;
+    (button ?? (discoverScroll?.isConnected ? discoverScroll : document.querySelector<HTMLElement>('.empty-card button')))?.focus();
+  }
+
   async function hideDiscovered(feed: DiscoveredFeed, wholePublisher: boolean) {
+    const trigger = menuTrigger;
+    const shown = discoverShown.map(keyOf);
     closeCardMenu(false);
     const salt = wholePublisher ? null : feed.salt;
     const matches = (f: DiscoveredFeed) => (wholePublisher ? f.publisher === feed.publisher : keyOf(f) === keyOf(feed));
@@ -989,6 +1052,7 @@
       if (wholePublisher && discoverPublisher === feed.publisher) discoverPublisher = null;
       const removed = discovered.filter(matches);
       discovered = discovered.filter((f) => !matches(f));
+      void focusCardNear(shown, keyOf(feed));
       hiddenCount += 1;
       addActionToast(
         'success',
@@ -1014,6 +1078,8 @@
       );
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
+      // The card stays, and so does the button its menu came from.
+      if (focusLost()) trigger?.focus();
     }
   }
 
@@ -1097,8 +1163,9 @@
   let mineSeq = 0;
   let mineShownSeq = 0;
   /** The user's feeds, shown unless a later load has answered first.
-   *  Returns what was read either way, or null if it could not be. */
-  async function loadMine(): Promise<OwnFeed[] | null> {
+   *  Returns what was read either way, or null if it could not be. `quiet`
+   *  for a reload the user did not ask for: no toast. */
+  async function loadMine(quiet = false): Promise<OwnFeed[] | null> {
     const seq = ++mineSeq;
     try {
       const feeds = await listMyFeeds();
@@ -1112,7 +1179,7 @@
     } catch (e) {
       if (seq === mineSeq) {
         mineFailed = true;
-        toastError(translateError(e, m.error_operation_failed()));
+        if (!quiet) toastError(translateError(e, m.error_operation_failed()));
       }
       return null;
     }
@@ -1177,16 +1244,33 @@
     ];
   }
 
-  function move(index: number, step: -1 | 1) {
+  /** The editor's file list. */
+  let editList = $state<HTMLElement | null>(null);
+
+  /** The editor's row `index`'s `tool` button, if it can be pressed. */
+  const editTool = (index: number, tool: 'up' | 'down' | 'remove') =>
+    editList?.querySelector<HTMLElement>(`[data-row="${index}"] [data-tool="${tool}"]:not(:disabled)`);
+
+  async function move(index: number, step: -1 | 1) {
     const to = index + step;
     if (to < 0 || to >= editItems.length) return;
     const next = editItems.slice();
     [next[index], next[to]] = [next[to], next[index]];
     editItems = next;
+    // Focus stays with the file moved; at the top or the bottom, the arrow
+    // pressed is disabled, and the other one takes it.
+    await tick();
+    const [same, other] = step < 0 ? (['up', 'down'] as const) : (['down', 'up'] as const);
+    (editTool(to, same) ?? editTool(to, other))?.focus();
   }
 
-  function removeItem(index: number) {
+  async function removeItem(index: number) {
     editItems = editItems.filter((_, i) => i !== index);
+    // The button pressed went with its row: the next row's takes focus,
+    // else the one before's, else the list's Add files.
+    await tick();
+    const near = editTool(index, 'remove') ?? editTool(index - 1, 'remove');
+    (near ?? editList?.querySelector<HTMLElement>('.file-list-empty button:not(:disabled)') ?? editList)?.focus();
   }
 
   interface Draft {
@@ -1243,7 +1327,7 @@
 
   async function save() {
     const d = draft();
-    if (!d || busy) return;
+    if (!d || busy || !d.title.trim()) return;
     saving = true;
     try {
       await saveDraft(d);
@@ -1254,7 +1338,7 @@
 
   async function publish() {
     const d = draft();
-    if (!d || busy) return;
+    if (!d || busy || !d.title.trim()) return;
     publishing = true;
     try {
       if (dirty && !(await saveDraft(d))) return;
@@ -1339,13 +1423,22 @@
     void loadMine();
     let unlisten: UnlistenFn | null = null;
     let alive = true;
+    let settledTimer: ReturnType<typeof setTimeout> | null = null;
+    const reloadItemsSoon = () => {
+      if (settledTimer) return;
+      settledTimer = setTimeout(() => {
+        settledTimer = null;
+        const feed = selected;
+        if (feed && itemsFor === keyOf(feed)) void loadItems(feed, true);
+      }, SETTLED_RELOAD_MS);
+    };
     void listen<FeedsChangedEvent>(FEEDS_CHANGED_EVENT, (event) => {
       // One of ours names only its salt; a followed one, its publisher too.
-      if (!event.payload?.publisher) void loadMine();
+      if (!event.payload?.publisher) void loadMine(true);
       // Files can change without a new list, as when one is downloaded
       // automatically.
       const feed = selected;
-      if (feed && itemsFor === keyOf(feed) && concernsFollowed(event.payload, feed)) void loadItems(feed, true);
+      if (feed && itemsFor === keyOf(feed) && concernsFollowed(event.payload, feed)) reloadItemsSoon();
     }).then((fn) => {
       if (alive) unlisten = fn;
       else fn();
@@ -1367,15 +1460,6 @@
       live.clear();
       if (next !== items) items = next;
     };
-    let settledTimer: ReturnType<typeof setTimeout> | null = null;
-    const reloadSettled = () => {
-      if (settledTimer) return;
-      settledTimer = setTimeout(() => {
-        settledTimer = null;
-        const feed = selected;
-        if (feed && itemsFor === keyOf(feed)) void loadItems(feed, true);
-      }, SETTLED_RELOAD_MS);
-    };
     const unlistenTransfers: UnlistenFn[] = [];
     const listenTransfers = <T,>(event: string, handler: (payload: T) => void) =>
       void listen<T>(event, (e) => handler(e.payload)).then((fn) => {
@@ -1392,7 +1476,7 @@
     );
     for (const event of ['transfer-complete', 'transfer-failed']) {
       listenTransfers<{ id: string }>(event, (p) => {
-        if (p && tab === 'following' && itemTransferIds.has(p.id)) reloadSettled();
+        if (p && tab === 'following' && itemTransferIds.has(p.id)) reloadItemsSoon();
       });
     }
     // Seen once the user comes back to Ember.
@@ -1710,7 +1794,8 @@
                 <p class="detail-meta">
                   <span title={m.feeds_discover_publisher({ id: selected.publisher })}>{m.feeds_discover_publisher({ id: shortKey(selected.publisher) })}</span>
                   <span aria-hidden="true">·</span>
-                  <span>{m.feeds_items_count({ count: formatNumber(listedItems.length) })}</span>
+                  <!-- The count its head gave, until its files are in. -->
+                  <span>{m.feeds_items_count({ count: formatNumber(itemsFor === keyOf(selected) ? listedItems.length : selected.item_count) })}</span>
                   {#if listedSize > 0}<span aria-hidden="true">·</span><span>{formatBytes(listedSize)}</span>{/if}
                   {#if selected.sequence > 0}
                     <span aria-hidden="true">·</span><span>{m.feeds_discover_updated({ when: ago(Math.floor(selected.sequence / 1000)) })}</span>
@@ -1868,7 +1953,7 @@
               {/if}
             </div>
 
-            <div class="file-list">
+            <div class="file-list" tabindex="-1" bind:this={followList}>
               {#if itemsLoading && items.length === 0}
                 <div class="file-list-empty"><span class="spinner xs" aria-hidden="true"></span><span class="sr-only">{m.common_loading()}</span></div>
               {:else if itemsFailed && items.length === 0}
@@ -1883,7 +1968,7 @@
               {/if}
               {#each shownItems as item (item.ed2k)}
                 {@const type = typeOf(item.name)}
-                <div class="file-row" class:removed={item.removed} class:is-new={item.is_new && !item.removed}>
+                <div class="file-row" class:removed={item.removed} class:is-new={item.is_new && !item.removed} data-row={item.ed2k}>
                   {@render fileIcon(type)}
                   <div class="file-main">
                     <span class="file-name" title={item.name}>
@@ -1992,7 +2077,8 @@
                         aria-label={item.status === 'failed'
                           ? m.feeds_item_retry_named({ name: item.name })
                           : m.feeds_download_named({ name: item.name })}
-                        onclick={() => askDownload([item.ed2k])}
+                        data-download
+                        onclick={() => askDownload([item.ed2k], item.ed2k)}
                       >
                         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                           <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
@@ -2072,7 +2158,11 @@
           {/if}
           <label class="sort-select">
             <span class="sr-only">{m.feeds_discover_sort()}</span>
-            <select bind:value={discoverSort} aria-label={m.feeds_discover_sort()}>
+            <select
+              value={discoverSort}
+              aria-label={m.feeds_discover_sort()}
+              onchange={(e) => pickSort(e.currentTarget.value as DiscoverSort)}
+            >
               <option value="active">{m.feeds_discover_sort_active()}</option>
               <option value="newest">{m.feeds_discover_sort_newest()}</option>
               <option value="files">{m.feeds_discover_sort_files()}</option>
@@ -2082,7 +2172,7 @@
         </div>
         <p class="discover-hint">{m.feeds_discover_hint()}</p>
 
-        <div class="discover-scroll" onscroll={() => menu && closeCardMenu(false)}>
+        <div class="discover-scroll" tabindex="-1" bind:this={discoverScroll} onscroll={() => menu && closeCardMenu(false)}>
           {#if discoverMatches.length === 0}
             <p class="list-empty">{m.feeds_no_matches()}</p>
           {/if}
@@ -2090,7 +2180,7 @@
             {#each discoverShown as feed (keyOf(feed))}
               {@const key = keyOf(feed)}
               {@const isFollowed = followedKeys.has(key)}
-              <article class="discover-card" class:menu-open={menuFor === key}>
+              <article class="discover-card" class:menu-open={menuFor === key} data-card={key}>
                 <header class="discover-card-head">
                   <span class="feed-avatar" style:--feed-hue={hueOf(feed.publisher + feed.salt)}>{@render feedGlyph()}</span>
                   <div class="discover-card-title">
@@ -2141,12 +2231,13 @@
                       <button type="button" class="secondary sm-btn" onclick={() => editOwn(feed)}>{m.feeds_discover_edit()}</button>
                     </span>
                   {:else if isFollowed}
-                    <button type="button" class="secondary sm-btn" onclick={() => openFollowed(feed)}>{m.feeds_discover_open()}</button>
+                    <button type="button" class="secondary sm-btn" data-card-action onclick={() => openFollowed(feed)}>{m.feeds_discover_open()}</button>
                   {:else}
                     <button
                       type="button"
                       class="primary sm-btn"
                       disabled={emberOff || followingFromDiscover.has(key)}
+                      data-card-action
                       onclick={() => void followDiscovered(feed)}
                     >
                       {m.feeds_follow()}
@@ -2401,7 +2492,7 @@
             </button>
           </div>
 
-          <div class="file-list">
+          <div class="file-list" tabindex="-1" bind:this={editList}>
             {#if editItems.length === 0}
               <div class="file-list-empty">
                 <p>{m.feeds_no_items()}</p>
@@ -2411,7 +2502,7 @@
             {#each editItems as item, i (item.ed2k)}
               {@const type = typeOf(item.name)}
               {@const downloads = downloadsOf(mineFeed, item.ed2k)}
-              <div class="file-row">
+              <div class="file-row" data-row={i}>
                 <span class="file-index" aria-hidden="true">{i + 1}</span>
                 {@render fileIcon(type)}
                 <div class="file-main">
@@ -2430,7 +2521,7 @@
                     bind:value={item.note}
                     disabled={busy}
                     placeholder={m.feeds_note_placeholder()}
-                    aria-label={m.feeds_note_placeholder()}
+                    aria-label={m.feeds_note_named({ name: item.name })}
                     oninput={(e) => {
                       if (!composing(e)) item.note = fitBytes(item.note, NOTE_MAX);
                     }}
@@ -2438,13 +2529,37 @@
                   />
                 </div>
                 <div class="row-tools">
-                  <button type="button" class="icon-btn sm" disabled={busy || i === 0} aria-label={m.feeds_move_up()} title={m.feeds_move_up()} onclick={() => move(i, -1)}>
+                  <button
+                    type="button"
+                    class="icon-btn sm"
+                    disabled={busy || i === 0}
+                    aria-label={m.feeds_move_up_named({ name: item.name })}
+                    title={m.feeds_move_up()}
+                    data-tool="up"
+                    onclick={() => void move(i, -1)}
+                  >
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 10 8 6 12 10"/></svg>
                   </button>
-                  <button type="button" class="icon-btn sm" disabled={busy || i === editItems.length - 1} aria-label={m.feeds_move_down()} title={m.feeds_move_down()} onclick={() => move(i, 1)}>
+                  <button
+                    type="button"
+                    class="icon-btn sm"
+                    disabled={busy || i === editItems.length - 1}
+                    aria-label={m.feeds_move_down_named({ name: item.name })}
+                    title={m.feeds_move_down()}
+                    data-tool="down"
+                    onclick={() => void move(i, 1)}
+                  >
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 6 8 10 12 6"/></svg>
                   </button>
-                  <button type="button" class="icon-btn sm danger-hover" disabled={busy} aria-label={m.feeds_remove_named({ name: item.name })} title={m.feeds_remove()} onclick={() => removeItem(i)}>
+                  <button
+                    type="button"
+                    class="icon-btn sm danger-hover"
+                    disabled={busy}
+                    aria-label={m.feeds_remove_named({ name: item.name })}
+                    title={m.feeds_remove()}
+                    data-tool="remove"
+                    onclick={() => void removeItem(i)}
+                  >
                     <IconX size={13} />
                   </button>
                 </div>
@@ -2457,13 +2572,13 @@
               {upToDate ? m.feeds_publish_up_to_date_title() : m.feeds_publish_public_hint()}
             </p>
             <div class="editor-foot-actions">
-              <button type="button" class="secondary" disabled={!dirty || busy} onclick={() => void save()}>{m.feeds_save()}</button>
+              <button type="button" class="secondary" disabled={!dirty || busy || !editTitle.trim()} onclick={() => void save()}>{m.feeds_save()}</button>
               <!-- Published and unchanged: publishing again would only bump the
                    sequence, and the hourly republish keeps the head alive. -->
               <button
                 type="button"
                 class="primary"
-                disabled={busy || emberOff || upToDate}
+                disabled={busy || emberOff || upToDate || !editTitle.trim()}
                 aria-describedby={upToDate ? 'feeds-publish-hint' : undefined}
                 onclick={() => void publish()}
               >
@@ -2521,13 +2636,13 @@
   onconfirm={() => {
     const ask = riskyAsk;
     riskyAsk = null;
-    if (ask) void download(ask.ed2ks);
+    if (ask) void download(ask.ed2ks, ask.from);
   }}
   altLabel={riskyAsk && riskyAsk.safe.length > 0 ? m.feeds_risky_skip({ count: formatNumber(riskyAsk.safe.length) }) : undefined}
   onalt={() => {
     const ask = riskyAsk;
     riskyAsk = null;
-    if (ask) void download(ask.safe);
+    if (ask) void download(ask.safe, ask.from);
   }}
   oncancel={() => (riskyAsk = null)}
   ondismiss={() => (riskyAsk = null)}

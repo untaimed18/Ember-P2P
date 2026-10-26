@@ -210,7 +210,21 @@ pub struct ListUpdate {
 }
 
 impl Database {
-    fn ensure_feeds_locked(conn: &Connection) -> anyhow::Result<()> {
+    /// Make the feeds tables, and bring one an earlier build made up to
+    /// date. Once per database: every feeds call comes through here, and the
+    /// tables stay made. Not marked done until it all succeeded, so a
+    /// failure is tried again by the next call.
+    fn ensure_feeds_locked(&self, conn: &Connection) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.feeds_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        Self::shape_feeds_locked(conn)?;
+        self.feeds_ready.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn shape_feeds_locked(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS feeds_own (
                 salt TEXT PRIMARY KEY,
@@ -358,16 +372,20 @@ impl Database {
                 |row| row.get(0),
             )?;
             if !present {
-                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind};"))?;
+                // The column and what fills it in go in together: a crash
+                // between them would leave the column, never filled in.
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind};"))?;
                 // Feeds followed before it was kept count as seen now: one
                 // already gone says so once it has been missed long enough,
                 // not on the first start after the update.
                 if column == "seen_at" {
-                    conn.execute(
+                    tx.execute(
                         "UPDATE feeds_followed SET seen_at = ?1 WHERE list_sequence != 0",
                         params![chrono::Utc::now().timestamp()],
                     )?;
                 }
+                tx.commit()?;
             }
         }
         Ok(())
@@ -377,7 +395,7 @@ impl Database {
 
     pub fn feeds_own(&self) -> anyhow::Result<Vec<OwnFeed>> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let mut stmt = conn.prepare(
             "SELECT salt, title, description, sequence, list_ed2k, list_blake3, list_size, item_count,
                     created_at, published_at, published_title, published_description, changed,
@@ -440,7 +458,7 @@ impl Database {
         max: usize,
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM feeds_own", [], |row| row.get(0))?;
         if count as usize >= max {
             return Ok(false);
@@ -454,7 +472,7 @@ impl Database {
 
     pub fn feed_own_set_details(&self, salt: &str, title: &str, description: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         Ok(conn.execute(
             "UPDATE feeds_own SET title = ?2, description = ?3,
                     changed = changed OR title != ?2 OR description != ?3
@@ -466,7 +484,7 @@ impl Database {
     /// A feed's items, in the publisher's order.
     pub fn feed_own_items(&self, salt: &str) -> anyhow::Result<Vec<FeedItem>> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         Self::feed_own_items_locked(&conn, salt)
     }
 
@@ -496,7 +514,7 @@ impl Database {
     /// list again leaves an up-to-date feed up to date.
     pub fn feed_own_set_items(&self, salt: &str, items: &[FeedItem]) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
         let found: bool =
             tx.query_row("SELECT COUNT(*) > 0 FROM feeds_own WHERE salt = ?1", params![salt], |row| row.get(0))?;
@@ -544,7 +562,7 @@ impl Database {
         now: i64,
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
         let items_changed = match items {
             Some(items) => Self::feed_own_items_locked(&tx, salt)? != items,
@@ -591,7 +609,7 @@ impl Database {
     /// `pending` is no newer than the head published.
     pub fn feed_own_set_pending(&self, salt: &str, pending: Option<&OwnPublish>) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let changed = match pending {
             Some(pending) => conn.execute(
                 "UPDATE feeds_own SET pending_sequence = ?2, pending_ed2k = ?3, pending_blake3 = ?4,
@@ -622,7 +640,7 @@ impl Database {
     /// the user last published stays as it was.
     pub fn feed_own_republished(&self, salt: &str, sequence: i64, now: i64) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         conn.execute(
             "UPDATE feeds_own SET refreshed_at = ?3 WHERE salt = ?1 AND sequence = ?2",
             params![salt, sequence, now],
@@ -634,7 +652,7 @@ impl Database {
     /// it: the feed needs publishing again.
     pub fn feed_own_mark_changed(&self, salt: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         conn.execute("UPDATE feeds_own SET changed = 1 WHERE salt = ?1", params![salt])?;
         Ok(())
     }
@@ -644,7 +662,7 @@ impl Database {
     /// withdrawal to send (see [`Self::feed_withdrawals_due`]).
     pub fn feed_own_delete(&self, salt: &str, now: i64, listing_ttl: i64) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "INSERT OR REPLACE INTO feeds_own_withdrawn (salt, listing_sent_at, listing_stamp, sent_at)
@@ -668,7 +686,7 @@ impl Database {
             return Ok(());
         }
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
         {
             let mut insert = tx.prepare(
@@ -688,7 +706,7 @@ impl Database {
     /// lowercase eD2K hash.
     pub fn feed_own_download_counts(&self, salt: &str) -> anyhow::Result<std::collections::HashMap<String, u32>> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let mut stmt = conn.prepare(
             "SELECT ed2k, COUNT(*) FROM feeds_own_downloads WHERE salt = ?1 GROUP BY ed2k",
         )?;
@@ -702,7 +720,7 @@ impl Database {
     /// there is no such feed.
     pub fn feed_own_set_listed(&self, salt: &str, listed: bool) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         Ok(conn.execute("UPDATE feeds_own SET listed = ?2 WHERE salt = ?1", params![salt, listed])? > 0)
     }
 
@@ -720,7 +738,7 @@ impl Database {
         listing_ttl: i64,
     ) -> anyhow::Result<Option<DueListing>> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let row: Option<(bool, i64, i64)> = conn
             .query_row(
                 "SELECT listed, listing_sent_at, listing_stamp FROM feeds_own WHERE salt = ?1",
@@ -751,7 +769,7 @@ impl Database {
     /// listing it displaces has lapsed, `listing_ttl` after it was sent.
     pub fn feed_withdrawals_due(&self, now: i64, interval: i64, listing_ttl: i64) -> anyhow::Result<Vec<DueListing>> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM feeds_own_withdrawn WHERE listing_sent_at < ?1", params![now - listing_ttl])?;
         let due: Vec<(String, i64)> = {
@@ -783,7 +801,7 @@ impl Database {
     /// table made by a development build has column defaults of 0.
     pub fn feed_follow(&self, publisher: &str, salt: &str, now: i64) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         Ok(conn.execute(
             "INSERT OR IGNORE INTO feeds_followed (publisher, salt, followed_at, auto_max_item_mib, auto_max_day_mib)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -801,7 +819,7 @@ impl Database {
 
     fn feeds_followed_where(&self, key: Option<(&str, &str)>) -> anyhow::Result<Vec<FollowedFeed>> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let select = "SELECT publisher, salt, title, description, sequence, list_ed2k, list_blake3, list_size,
                     item_count, state, list_sequence, unread, followed_at, checked_at, auto_download,
                     auto_max_item_mib, auto_max_day_mib, held_ed2k, held_blake3, held_size, folder,
@@ -866,7 +884,7 @@ impl Database {
         now: i64,
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         Ok(conn.execute(
             "UPDATE feeds_followed SET sequence = ?3, title = ?4, description = ?5, list_ed2k = ?6,
                     list_blake3 = ?7, list_size = ?8, item_count = ?9, checked_at = ?10,
@@ -879,7 +897,7 @@ impl Database {
     /// Note that a head of the feed was found, newer or not.
     pub fn feed_seen(&self, publisher: &str, salt: &str, now: i64) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         conn.execute(
             "UPDATE feeds_followed SET seen_at = MAX(seen_at, ?3) WHERE publisher = ?1 AND salt = ?2",
             params![publisher, salt, now],
@@ -890,7 +908,7 @@ impl Database {
     /// Note a look for the head that found nothing newer.
     pub fn feed_checked(&self, publisher: &str, salt: &str, now: i64) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         conn.execute(
             "UPDATE feeds_followed SET checked_at = ?3 WHERE publisher = ?1 AND salt = ?2",
             params![publisher, salt, now],
@@ -902,7 +920,7 @@ impl Database {
     /// items stay, so what the new one adds is still news.
     pub fn feed_lost_held(&self, publisher: &str, salt: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         conn.execute(
             "UPDATE feeds_followed SET list_sequence = -1, held_ed2k = '', held_blake3 = '', held_size = 0,
                     state = 'fetching'
@@ -916,7 +934,7 @@ impl Database {
     /// more. The sequence whose list was broken, or `None` if none was.
     pub fn feed_clear_broken(&self, publisher: &str, salt: &str) -> anyhow::Result<Option<i64>> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let sequence: Option<i64> = conn
             .query_row(
                 "SELECT sequence FROM feeds_followed WHERE publisher = ?1 AND salt = ?2 AND state = 'broken'",
@@ -937,7 +955,7 @@ impl Database {
     /// The list for `sequence` did not match its head, or did not parse.
     pub fn feed_mark_broken(&self, publisher: &str, salt: &str, sequence: i64) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         conn.execute(
             "UPDATE feeds_followed SET state = 'broken' WHERE publisher = ?1 AND salt = ?2 AND sequence = ?3",
             params![publisher, salt, sequence],
@@ -958,7 +976,7 @@ impl Database {
         now: i64,
     ) -> anyhow::Result<Option<ListUpdate>> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
         let current: Option<i64> = tx
             .query_row(
@@ -1064,7 +1082,7 @@ impl Database {
     /// A followed feed's items: newest first, removed ones last.
     pub fn feed_followed_items(&self, publisher: &str, salt: &str) -> anyhow::Result<Vec<FollowedItem>> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let mut stmt = conn.prepare(
             // Newest first, and each list's new files in the order the
             // publisher put them.
@@ -1096,7 +1114,7 @@ impl Database {
 
     pub fn feed_mark_read(&self, publisher: &str, salt: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE feeds_followed_items SET is_new = 0 WHERE publisher = ?1 AND salt = ?2",
@@ -1112,7 +1130,7 @@ impl Database {
 
     pub fn feed_mark_downloaded(&self, publisher: &str, salt: &str, ed2k: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         conn.execute(
             "UPDATE feeds_followed_items SET downloaded = 1
              WHERE publisher = ?1 AND salt = ?2 AND ed2k = ?3",
@@ -1126,7 +1144,7 @@ impl Database {
     /// that feed's title, and the file's name and size there.
     pub fn feed_downloaded_elsewhere(&self, publisher: &str, salt: &str) -> anyhow::Result<Vec<ElsewhereCopy>> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let mut stmt = conn.prepare(
             "SELECT i.ed2k, f.folder, f.title, i.name, i.size
              FROM feeds_followed_items i
@@ -1150,7 +1168,7 @@ impl Database {
     /// Record that the user cancelled an item's download from the feed.
     pub fn feed_mark_cancelled(&self, publisher: &str, salt: &str, ed2k: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         conn.execute(
             "UPDATE feeds_followed_items SET downloaded = ?4
              WHERE publisher = ?1 AND salt = ?2 AND ed2k = ?3",
@@ -1172,7 +1190,7 @@ impl Database {
         now: i64,
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         Ok(conn.execute(
             "UPDATE feeds_followed SET
                     auto_since = CASE WHEN ?3 AND auto_download = 0 THEN ?6 ELSE auto_since END,
@@ -1186,7 +1204,7 @@ impl Database {
     /// turned on before the window was kept takes only what comes from now.
     pub fn feed_start_auto_since(&self, publisher: &str, salt: &str, now: i64) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         conn.execute(
             "UPDATE feeds_followed SET auto_since = ?3 WHERE publisher = ?1 AND salt = ?2 AND auto_since = 0",
             params![publisher, salt, now],
@@ -1198,7 +1216,7 @@ impl Database {
     /// [`FEED_AUTO_WINDOW_SECS`] up to `now`.
     pub fn feed_auto_bytes(&self, publisher: &str, salt: &str, now: i64) -> anyhow::Result<i64> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         Ok(conn.query_row(
             "SELECT COALESCE(SUM(bytes), 0) FROM feeds_auto_started
              WHERE publisher = ?1 AND salt = ?2 AND at > ?3",
@@ -1212,7 +1230,7 @@ impl Database {
     /// entries a day ahead of `now`, left by a clock set back.
     pub fn feed_add_auto_bytes(&self, publisher: &str, salt: &str, now: i64, bytes: i64) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO feeds_auto_started (publisher, salt, at, bytes) VALUES (?1, ?2, ?3, ?4)",
@@ -1230,7 +1248,7 @@ impl Database {
     /// stay where they are.
     pub fn feed_unfollow(&self, publisher: &str, salt: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
         for table in ["feeds_followed_items", "feeds_auto_started", "feeds_followed"] {
             tx.execute(
@@ -1247,7 +1265,7 @@ impl Database {
     /// `title` and unlike every other feed's. `None` when it is not followed.
     pub fn feed_followed_folder(&self, publisher: &str, salt: &str, title: &str) -> anyhow::Result<Option<String>> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
         let held: Option<String> = tx
             .query_row(
@@ -1282,7 +1300,7 @@ impl Database {
     /// leaving out any found more than `max_age` seconds before `now`.
     pub fn feeds_discovered(&self, now: i64, max_age: i64) -> anyhow::Result<Vec<DiscoveredFeed>> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         conn.execute("DELETE FROM feeds_discovered WHERE listed_at < ?1", params![now - max_age])?;
         let mut stmt = conn.prepare(
             "SELECT publisher, salt, title, description, item_count, list_size, sequence, listed_at, first_seen
@@ -1319,7 +1337,7 @@ impl Database {
         now: i64,
     ) -> anyhow::Result<std::collections::HashMap<(String, String), i64>> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
         let mut first_seen = std::collections::HashMap::new();
         {
@@ -1364,7 +1382,7 @@ impl Database {
     /// hides the publisher.
     pub fn feeds_hidden(&self) -> anyhow::Result<Vec<(String, String)>> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         let mut stmt = conn.prepare("SELECT publisher, salt FROM feeds_hidden")?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -1376,7 +1394,7 @@ impl Database {
     /// publisher; with `hidden` false, show it again.
     pub fn feed_set_hidden(&self, publisher: &str, salt: &str, hidden: bool) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         if hidden {
             conn.execute(
                 "INSERT OR IGNORE INTO feeds_hidden (publisher, salt) VALUES (?1, ?2)",
@@ -1394,7 +1412,7 @@ impl Database {
     /// Show every hidden feed and publisher in Discover again.
     pub fn feeds_hidden_clear(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        Self::ensure_feeds_locked(&conn)?;
+        self.ensure_feeds_locked(&conn)?;
         conn.execute("DELETE FROM feeds_hidden", [])?;
         Ok(())
     }
@@ -1508,6 +1526,23 @@ mod tests {
         db.feed_seen(PUB, SALT, 500).unwrap();
         db.feed_seen(PUB, SALT, 400).unwrap();
         assert_eq!(db.feed_followed(PUB, SALT).unwrap().unwrap().seen_at, 500, "never moved back");
+        drop_db(db, path);
+    }
+
+    /// A table an earlier build made, without `seen_at`, gets it on the next
+    /// open, filled in for feeds with a list held.
+    #[test]
+    fn a_table_from_before_seen_at_gets_it_filled_in() {
+        let (db, path) = db("seen-column");
+        db.feed_follow(PUB, SALT, 1).unwrap();
+        assert!(take_head(&db, 20));
+        db.feed_take_list(PUB, SALT, 20, &[item("a", "A")], 100).unwrap().unwrap();
+        db.feed_follow(PUB, "unfetched", 1).unwrap();
+        db.conn.lock().execute_batch("ALTER TABLE feeds_followed DROP COLUMN seen_at;").unwrap();
+        drop(db);
+        let db = Database::open_at(&path).expect("open db again");
+        assert!(db.feed_followed(PUB, SALT).unwrap().unwrap().seen_at > 0, "a list held counts as seen");
+        assert_eq!(db.feed_followed(PUB, "unfetched").unwrap().unwrap().seen_at, 0, "nothing held, nothing seen");
         drop_db(db, path);
     }
 
