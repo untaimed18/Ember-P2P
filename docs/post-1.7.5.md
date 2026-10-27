@@ -851,6 +851,151 @@ probe needs the rendezvous server change above, and works without it.
 change. Until then the doctor reports from the Kad and eD2K results and
 says the outside test did not run.
 
+## 5. Followers that help seed a feed (opt-in per feed)
+
+From a user report after 1.7.5. 1.7.6 fixed the other points in that report:
+friend meets that stalled behind a restricted NAT, web mirrors idle behind a
+slow peer, and Russian plurals for 21, 31 and so on. This item and item 6 were
+left for later because they are features, not fixes.
+
+**Why:** a feed's files cost its publisher every byte, to every follower. A
+feed download finishes in `<download folder>/Feeds/<feed>` and stays private,
+as a received chat attachment does (`sharing/feed_downloads.rs`): its partial
+is neither advertised nor served, and the finished file goes in no index,
+known.met, KAD or server list. So a feed with many followers is served by
+the publisher alone, over the feed stream (at most 8 priority uploads at
+once) or, once the publisher-first hold ends, over the publisher's ordinary
+public share. Any third party that happens to share the same file helps
+too. A publisher who goes offline leaves new followers with nothing.
+
+**Keep:** private by default. Most followers never expect a feed to share
+from their machine, and a chat-attachment-like folder that starts sharing on
+its own would surprise them.
+
+**To do:** a per-feed switch, "Share files from this feed", off by default,
+beside the auto-download settings. When on:
+
+- A finished file from that feed is shared like any public file: indexed,
+  in known.met, published to KAD, the eD2K server and as an Ember source
+  record. Turning it off unshares them again, and Unfollow does the same.
+- The feed's folder is still skipped by a walk of the download folder
+  (`MARKER`, `is_private_receive_dir_name`); sharing is per file, by the
+  feed's switch, not by the folder.
+- Files are shared from where they are. Nothing is moved or copied.
+
+**Privacy cost.** For a public feed it is small: the publisher already shares
+every item publicly, so the hashes are public, and item 3 notes that anyone
+with a feed's link can already list its followers online. What it adds is
+that anyone looking up an item's hash finds this follower among its sources,
+and, for a feed whose items appear nowhere else, that ties the follower to the
+feed. The switch's help text says so.
+
+**Questions to settle first:**
+
+- **Partials.** Whether a download in progress from an opted-in feed also
+  advertises and serves its partial (as a normal download does), or only
+  finished files are shared. Partials help most while a new item spreads.
+- **The publisher-first hold.** With co-seeders, the 45 seconds a feed
+  download waits for the publisher (`network::feed_direct`) may be the wrong
+  default. One option is to let co-seeding followers' Ember source records
+  end the hold early when the publisher has none.
+- **Defaults per feed kind.** Whether the publisher can mark a feed as
+  "followers are asked to share" so the switch defaults on for that feed
+  (shown, never silently applied), which would need a field in the head.
+- **Upload priority.** Whether co-seeded files take ordinary queue places, or
+  a lower priority than the user's own shares.
+
+**Later, and much bigger:** a swarm among followers only, for link-only feeds,
+found under a key derived from the feed (so nobody without the link can find
+it) and served over Ember's own streams rather than eD2K. That needs Ember to
+download from several Ember peers at once, which it cannot yet do (a feed
+download has one Ember source, the publisher, beside whatever eD2K finds), so
+it waits for that.
+
+**Tests:** with the switch off nothing from the feed is indexed, published or
+served (as today); with it on a finished item is shared everywhere a public
+file is; off again and Unfollow unshare it; a walk of a shared download folder
+still skips `Feeds`; an item the user also shares on purpose stays shared when
+the switch goes off.
+
+## 6. Web mirrors: add one by hand, and keep the good ones
+
+From the same report as item 5.
+
+**Today:** an eD2K link's `s=` mirrors are attached to its download
+(`attach_link_web_sources` in `commands/transfers.rs`), validated and capped
+at 5 (`web_sources::register`, `MAX_WEB_SOURCES_PER_FILE`), and saved in
+`transfer_web_sources` so they survive restarts. Pasting the link again,
+with mirrors, while the download runs adds them, so adding a mirror to a
+running download already works, just not obviously. When the download
+finishes its mirrors are dropped (`web_sources::forget`,
+`delete_transfer_web_sources`), so Copy eD2K Link on the finished file, and a
+feed that lists it, carry none.
+
+**To do, in order of size:**
+
+1. **"Add web mirror…" on a transfer's menu.** A small dialog taking one URL
+   (or several, one per line), passed through `attach_link_web_sources`.
+   Refuse what `normalize_web_source_url` refuses, say when the file already
+   has 5, and say that every part a mirror fills is checked like a peer's.
+   Disabled while web sources are off in Settings > Downloads.
+2. **Keep verified mirrors on the Library entry.** A mirror that filled at
+   least one part that passed its hash check, and was never blamed for a
+   corrupt one (`note_written`, `note_corrupt_range`, `bad_parts`), is kept
+   with the finished file in a new table keyed by file hash, at most 5.
+   Copy eD2K Link then appends them as `|s=<url>|`, which eMule reads too.
+   Deleting the file from the Library drops them. A switch to leave them out
+   of copied links, since a mirror URL can name the user's own server.
+3. **Mirrors in feed lists.** A new per-item collection tag beside
+   `FT_EMBER_NOTE`, carrying the item's kept mirrors. Older followers skip a
+   tag they do not know (`collection.rs` reads only the tags it knows), so it
+   is not a format break; check it against the freeze rules in
+   `channels-format.md` and record it there under the feed list.
+
+**Safety:**
+
+- **A mirror chosen by someone else sees your address.** Fetching from a
+  mirror tells its web server the follower's IP address and when they
+  downloaded. With mirrors in feed lists, a publisher could name a server they
+  run and learn who downloads, which they cannot learn today without being a
+  source themselves. A feed's mirrors are used only when the follower turns
+  that on for the feed (off by default), and the help text says why.
+- **Local addresses.** `normalize_web_source_url` already refuses
+  credentials, `localhost` and private literal addresses, and a host that
+  resolves to a private address is refused at fetch time. A mirror in a feed
+  list or a pasted link goes through the same checks.
+- **Bad data costs nothing but time:** every part a mirror fills is checked
+  against the MD4 part hashes (and AICH when known), and two corrupt parts
+  retire it for the session (`MAX_BAD_PARTS`).
+
+**Tests:** the dialog refuses what the link path refuses and adds what it
+adds; a mirror is kept on the Library entry only after a verified part and
+never after a corrupt one; Copy eD2K Link carries kept mirrors, and none with
+the switch off; a feed list with the new tag parses in a build without it;
+feed mirrors are not fetched with the per-feed switch off.
+
+## Smaller follow-ups from the 1.7.6 fixes
+
+- **Check friend meets live.** 1.7.6 resends the first handshake message at 1
+  and 3 seconds and puts the sender's Noise key in the meet
+  (`docs/ember-dht.md`, section 3). Tests replay the failure, but no meet has
+  been tried between two real restricted NATs. Compare
+  `ember_dht_friend_meets` against `ember_dht_friend_meets_converted` in
+  Diagnostics on builds that have it; conversions should be close to meets for
+  friends that are not behind a symmetric NAT.
+- **Symmetric NAT stays out.** Meets are still skipped while our own NAT is
+  symmetric, since hole punching cannot work there. Reaching such a friend
+  needs a relay (item 1's relay path would serve).
+- **Three plurals still read wrongly in Russian for 21, 31 and so on.**
+  `channels_reactors_others_one`, `statusbar_epx_title_active_one_one` and
+  `transfers_confirm_batch_cancel_mixed_one_one` keep their fixed wording,
+  because each carries two counts or a count in another form, so the 1.7.6
+  change (`oneShowsCount` in `src/lib/plural.ts`) does not fit them. They
+  need rewording, ideally by a native speaker.
+- **French and Portuguese 0 stays on the plural form** ("0 fichiers"), by
+  decision: it reads naturally and avoids "0 fichier" wording in every
+  `_one` string.
+
 ## Already scheduled for 1.8.0
 
 Decided in 1.7.5 and written into the spec, so that a room has one cut-over to
