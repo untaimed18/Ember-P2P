@@ -203,7 +203,11 @@ fn extract_ipfilter_from_zip_with_limit(
         if !entry.is_file() {
             continue;
         }
-        let name = entry.name().to_ascii_lowercase();
+        // A name that does not decode cannot be judged by its extension.
+        let Ok(name) = entry.name() else {
+            continue;
+        };
+        let name = name.to_ascii_lowercase();
         let score = if name.ends_with("ipfilter.dat") {
             100
         } else if name.ends_with("ipfilter.p2p") {
