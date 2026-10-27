@@ -1,5 +1,6 @@
 //! One web source of a download: fetch the parts no peer is working on with
-//! HTTP `Range` requests, into the shared part file.
+//! HTTP `Range` requests, into the shared part file — and once every part left
+//! has a peer on it, the bytes in one of them that no peer has asked for.
 //!
 //! A child of `multi_source` so it uses the same claim → reserve → write →
 //! commit path, and the same MD4 sweep, as a peer worker — a mirror is one more
@@ -33,7 +34,8 @@ const THIN_PASS_PAUSE: std::time::Duration = std::time::Duration::from_secs(5);
 /// Redirects followed per request, each re-validated like the first URL.
 const MAX_REDIRECTS: usize = 5;
 
-/// How long to wait when every unfinished part is already being worked on.
+/// How long to wait when nothing is left to fetch but bytes another source is
+/// writing right now, and how often a resting source looks again.
 const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How often the dispatcher looks for web sources added since it started —
@@ -276,18 +278,41 @@ impl WebWorker {
             let picked = {
                 let mut t = self.tracker.write().await;
                 let claimed = t.in_progress_flags();
-                let part = (0..t.part_count).find(|&p| {
+                let free = (0..t.part_count).find(|&p| {
                     !t.is_part_complete(p) && !claimed.get(p).copied().unwrap_or(false)
                 });
-                part.map(|p| {
-                    guard.claim_locked(p, &mut t);
-                    let (ps, pe) = t.part_range(p);
-                    (p, t.fillable_subranges(ps, pe))
-                })
+                let picked = match free {
+                    Some(p) => {
+                        let (ps, pe) = t.part_range(p);
+                        Some((p, t.fillable_subranges(ps, pe)))
+                    }
+                    // Every unfinished part has a peer on it: join one, as a
+                    // peer's own fallback does, rather than sit idle behind a
+                    // slow peer holding the last part — or the only one, on a
+                    // file of a single part. Bytes nobody has asked for go
+                    // first, so the mirror takes what the peer is not yet
+                    // fetching; those the peer has in flight go last, which is
+                    // the endgame race eMule runs too.
+                    None => {
+                        let others = t.requested_by_others(self.worker);
+                        (0..t.part_count)
+                            .filter(|&p| !t.is_part_complete(p))
+                            .filter_map(|p| {
+                                let (ps, pe) = t.part_range(p);
+                                let (order, unrequested) = shared_part_order(&t.fillable_subranges(ps, pe), &others);
+                                (!order.is_empty()).then_some((p, order, unrequested))
+                            })
+                            .max_by_key(|&(p, _, unrequested)| (unrequested, std::cmp::Reverse(p)))
+                            .map(|(p, order, _)| (p, order))
+                    }
+                };
+                if let Some((p, _)) = &picked {
+                    guard.claim_locked(*p, &mut t);
+                }
+                picked
             };
             let Some((part, gaps)) = picked else {
-                // Every unfinished part has a peer on it. Wait, rather than
-                // racing them for the same bytes.
+                // Nothing left that is not mid-write by someone else.
                 self.pause(IDLE_RECHECK).await;
                 continue;
             };
@@ -322,8 +347,10 @@ impl WebWorker {
             }
             guard.publish_in_flight(&[], None).await;
             // Check what this source just filled now, while the claim still
-            // keeps the sweep and every peer off it, so the verdict is about
-            // this mirror and a bad one is found out after one part.
+            // keeps the sweep off it, so a bad mirror is found out after one
+            // part. On a part it joined a peer on, the verdict is about both,
+            // and only a source that wrote at least half of it is charged
+            // (`web_sources::note_corrupt_range`).
             let (to_check, part_done) = {
                 let t = self.tracker.read().await;
                 let (ps, pe) = t.part_range(part);
@@ -757,6 +784,44 @@ fn is_encoded(content_encoding: Option<&reqwest::header::HeaderValue>) -> bool {
     })
 }
 
+/// `ranges` with every part covered by one of `cut` taken out. `cut` may
+/// overlap itself (several workers' requests); `ranges` is sorted and disjoint.
+fn without_ranges(ranges: &[(u64, u64)], cut: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for &(start, end) in ranges {
+        let mut pieces = vec![(start, end)];
+        for &(cs, ce) in cut {
+            if cs >= ce {
+                continue;
+            }
+            pieces = pieces
+                .into_iter()
+                .flat_map(|(s, e)| {
+                    if ce <= s || cs >= e {
+                        vec![(s, e)]
+                    } else {
+                        [(s, cs.max(s)), (ce.min(e), e)].into_iter().filter(|&(a, b)| a < b).collect()
+                    }
+                })
+                .collect();
+        }
+        out.extend(pieces);
+    }
+    out
+}
+
+/// What a mirror joining a part a peer is already on fetches, in order: the
+/// gaps nobody has asked for, then those another worker has in flight. Also
+/// how many bytes the first kind holds, which decides which part to join.
+fn shared_part_order(gaps: &[(u64, u64)], others: &[(u64, u64)]) -> (Vec<(u64, u64)>, u64) {
+    let unrequested = without_ranges(gaps, others);
+    let requested = without_ranges(gaps, &unrequested);
+    let unrequested_bytes = unrequested.iter().map(|&(s, e)| e - s).sum();
+    let mut order = unrequested;
+    order.extend(requested);
+    (order, unrequested_bytes)
+}
+
 /// `bytes first-last/total` → `(first, last, total)`; `total` is `None` for
 /// `*`. Anything else, or a range that runs backwards, is `None`.
 fn parse_content_range(header: &str) -> Option<(u64, u64, Option<u64>)> {
@@ -777,8 +842,37 @@ fn parse_content_range(header: &str) -> Option<(u64, u64, Option<u64>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_encoded, parse_content_range};
+    use super::{is_encoded, parse_content_range, shared_part_order, without_ranges};
     use reqwest::header::HeaderValue;
+
+    #[test]
+    fn requested_ranges_are_cut_out_of_the_gaps() {
+        assert_eq!(without_ranges(&[(0, 100)], &[]), vec![(0, 100)]);
+        assert_eq!(without_ranges(&[(0, 100)], &[(20, 30)]), vec![(0, 20), (30, 100)]);
+        assert_eq!(without_ranges(&[(0, 100)], &[(0, 100)]), vec![]);
+        assert_eq!(
+            without_ranges(&[(0, 50), (60, 100)], &[(40, 70), (45, 65), (90, 200)]),
+            vec![(0, 40), (70, 90)],
+            "overlapping requests, and one past the end"
+        );
+        assert_eq!(without_ranges(&[(10, 20)], &[(30, 40), (5, 5)]), vec![(10, 20)], "disjoint and empty cuts");
+    }
+
+    /// The report this exists for: one part, one slow peer with a block in
+    /// flight, and a mirror that waited behind it for the whole part.
+    #[test]
+    fn a_mirror_joining_a_part_takes_what_nobody_asked_for_first() {
+        let block = 184_320;
+        let (order, unrequested) = shared_part_order(&[(0, 10 * block)], &[(0, block)]);
+        assert_eq!(order, vec![(block, 10 * block), (0, block)], "the peer's block goes last");
+        assert_eq!(unrequested, 9 * block);
+
+        let (order, unrequested) = shared_part_order(&[(0, block)], &[(0, block)]);
+        assert_eq!(order, vec![(0, block)], "only the peer's block is left, so the mirror races it");
+        assert_eq!(unrequested, 0);
+
+        assert_eq!(shared_part_order(&[], &[(0, block)]), (vec![], 0));
+    }
 
     #[test]
     fn only_a_real_content_encoding_counts() {
