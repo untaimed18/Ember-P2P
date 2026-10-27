@@ -323,8 +323,9 @@ pub const EMBER_EXT_BROWSE_SUMMARY: u8 = 0x0C;
 /// whichever lands first is answered with a signed `PONG` that admits its
 /// sender through the ordinary path.
 ///
-/// Body is [`encode_dht_meet`]: the sender's Ember UDP port and whether this
-/// is the answer to one. The port is claimed because it cannot be observed;
+/// Body is [`encode_dht_meet`]: the sender's Ember UDP port, whether this is
+/// the answer to one, and the sender's Noise static key. The port is claimed
+/// because it cannot be observed;
 /// the IP never travels and is always taken from the session itself, so a
 /// friend cannot aim our `PING` at a third party. The frame grants nothing —
 /// only a real `PONG` creates a contact. A peer that predates it ignores it.
@@ -416,22 +417,48 @@ pub const EMBER_EXT_FEED_HEAD: u8 = 0x14;
 
 const DHT_MEET_FLAG_ANSWER: u8 = 0x01;
 
-/// [`EMBER_EXT_DHT_MEET`] body: `udp_port(2, LE) || flags(1)`.
-pub fn encode_dht_meet(udp_port: u16, answer: bool) -> [u8; 3] {
+/// [`EMBER_EXT_DHT_MEET`] body: `udp_port(2, LE) || flags(1) || noise_pub(32)`.
+///
+/// The sender's Noise static key rides along so the friend can `PING` it with
+/// IK. Without it the friend falls back to XX for an address it holds no key
+/// for, and an XX dial in flight refuses every handshake the other side starts
+/// — which, in a meet, is exactly the one that would have got through. Taken
+/// on the friend's word, which the session behind this frame authenticates; a
+/// key that is not really theirs only makes the `PING` fail. Older builds read
+/// the first three bytes and ignore the rest.
+pub fn encode_dht_meet(udp_port: u16, answer: bool, noise_pub: &[u8; 32]) -> [u8; 35] {
     let [lo, hi] = udp_port.to_le_bytes();
-    [lo, hi, if answer { DHT_MEET_FLAG_ANSWER } else { 0 }]
+    let mut body = [0u8; 35];
+    body[0] = lo;
+    body[1] = hi;
+    body[2] = if answer { DHT_MEET_FLAG_ANSWER } else { 0 };
+    body[3..].copy_from_slice(noise_pub);
+    body
 }
 
-/// The claimed UDP port and the answer flag, or `None` for a body too short
-/// or naming port zero. Longer bodies are read for what they start with, so a
-/// later build can append fields.
-pub fn decode_dht_meet(body: &[u8]) -> Option<(u16, bool)> {
-    let port = u16::from_le_bytes([*body.first()?, *body.get(1)?]);
-    if port == 0 {
+/// A friend's [`EMBER_EXT_DHT_MEET`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DhtMeet {
+    pub udp_port: u16,
+    pub answer: bool,
+    /// Absent from a build that predates it.
+    pub noise_pub: Option<[u8; 32]>,
+}
+
+/// The claimed UDP port, the answer flag and the sender's Noise key, or `None`
+/// for a body too short or naming port zero. Longer bodies are read for what
+/// they start with, so a later build can append fields.
+pub fn decode_dht_meet(body: &[u8]) -> Option<DhtMeet> {
+    let udp_port = u16::from_le_bytes([*body.first()?, *body.get(1)?]);
+    if udp_port == 0 {
         return None;
     }
     let answer = body.get(2).is_some_and(|flags| flags & DHT_MEET_FLAG_ANSWER != 0);
-    Some((port, answer))
+    let noise_pub = body
+        .get(3..35)
+        .and_then(|key| <[u8; 32]>::try_from(key).ok())
+        .filter(|key| *key != [0u8; 32]);
+    Some(DhtMeet { udp_port, answer, noise_pub })
 }
 
 /// Wrap `body` in an [`OP_EMBER_EXT`] payload under `ext_type`.
@@ -3455,12 +3482,26 @@ mod tests {
 
     #[test]
     fn a_dht_meet_body_round_trips_and_refuses_port_zero() {
-        assert_eq!(decode_dht_meet(&encode_dht_meet(4672, false)), Some((4672, false)));
-        assert_eq!(decode_dht_meet(&encode_dht_meet(51_000, true)), Some((51_000, true)));
-        assert_eq!(decode_dht_meet(&[0x40, 0x12]), Some((0x1240, false)), "flags are optional");
-        assert_eq!(decode_dht_meet(&[0x40, 0x12, 0x01, 0xAA]), Some((0x1240, true)));
-        assert_eq!(decode_dht_meet(&encode_dht_meet(0, false)), None);
+        let key = [0x5Au8; 32];
+        let meet = |udp_port, answer, noise_pub| Some(DhtMeet { udp_port, answer, noise_pub });
+        assert_eq!(decode_dht_meet(&encode_dht_meet(4672, false, &key)), meet(4672, false, Some(key)));
+        assert_eq!(decode_dht_meet(&encode_dht_meet(51_000, true, &key)), meet(51_000, true, Some(key)));
+        assert_eq!(decode_dht_meet(&encode_dht_meet(0, false, &key)), None);
         assert_eq!(decode_dht_meet(&[0x40]), None);
+    }
+
+    /// What a build that predates the key sends, and anything cut short of a
+    /// whole key, still decodes, with no key: the friend then pings by XX.
+    #[test]
+    fn a_dht_meet_body_without_a_whole_key_still_decodes() {
+        let meet = |udp_port, answer| Some(DhtMeet { udp_port, answer, noise_pub: None });
+        assert_eq!(decode_dht_meet(&[0x40, 0x12]), meet(0x1240, false), "flags are optional");
+        assert_eq!(decode_dht_meet(&[0x40, 0x12, 0x01]), meet(0x1240, true));
+        assert_eq!(decode_dht_meet(&[0x40, 0x12, 0x01, 0xAA]), meet(0x1240, true), "a partial key is ignored");
+        let mut zero_key = encode_dht_meet(4672, false, &[0u8; 32]).to_vec();
+        assert_eq!(decode_dht_meet(&zero_key), meet(4672, false), "an all-zero key is no key");
+        zero_key.extend_from_slice(&[7; 8]);
+        assert_eq!(decode_dht_meet(&zero_key), meet(4672, false), "trailing fields are left for later builds");
     }
 
     /// Sub-types dispatch off one byte with no length or type tag around it, so

@@ -595,9 +595,9 @@ pub(in crate::network) async fn on_upload_event(
         }
     }
 
-    if let UploadEventKind::EmberDhtMeet { ember_hash, peer_ip, udp_port, answer, ref reply_tx } = event.kind {
+    if let UploadEventKind::EmberDhtMeet { ember_hash, peer_ip, udp_port, answer, noise_pub, ref reply_tx } = event.kind {
         if settings.ember_native_enabled && friend_hashes.read().await.contains(&ember_hash) {
-            answer_friend_meet(udp_socket, state, ember_hash, peer_ip, udp_port, answer, reply_tx).await;
+            answer_friend_meet(udp_socket, state, ember_hash, peer_ip, udp_port, answer, noise_pub, reply_tx).await;
         }
     }
 

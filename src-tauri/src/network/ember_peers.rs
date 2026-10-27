@@ -2055,7 +2055,7 @@ pub(super) async fn ask_friends_to_meet(state: &mut NetworkState) -> usize {
     let due = least_recently_asked_due(live, &state.ember_friend_meets_asked, now, EMBER_FRIEND_MEET_INTERVAL);
     let frame = ed2k::messages::build_ember_ext_frame(
         ed2k::messages::EMBER_EXT_DHT_MEET,
-        &ed2k::messages::encode_dht_meet(udp_port, false),
+        &ed2k::messages::encode_dht_meet(udp_port, false, state.ember_transport.local_noise_public_key()),
     );
     let mut asked = 0usize;
     for (eh, tx) in due {
@@ -2082,6 +2082,12 @@ pub(super) async fn ask_friends_to_meet(state: &mut NetworkState) -> usize {
 /// session is connected from and the port it claimed, and, unless this is the
 /// answer to our own ask, answer with ours so it `PING`s us back.
 ///
+/// The `PING` is IK to `noise_pub`, the key the friend sent, when it sent one.
+/// Both `PING`s of a meet then cross as IK dials, which the transport settles
+/// by key, and the one a NAT dropped first goes again once the other side has
+/// dialled (`MSG1_RESEND_AFTER`). An XX dial would refuse the friend's own
+/// handshake outright for as long as it waited.
+///
 /// An answer is only acted on inside [`EMBER_FRIEND_MEET_ANSWER_WINDOW`] of our
 /// ask, and a friend is `PING`ed for a meet at most once per window whichever
 /// frame asked for it, so no run of frames has us `PING` it on demand. When
@@ -2095,6 +2101,7 @@ pub(super) async fn answer_friend_meet(
     peer_ip: Ipv4Addr,
     udp_port: u16,
     answer: bool,
+    noise_pub: Option<[u8; 32]>,
     reply_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
     if crate::security::is_bogus_v4(peer_ip) {
@@ -2115,7 +2122,9 @@ pub(super) async fn answer_friend_meet(
         return;
     }
     state.ember_friend_meets_pinged.insert(friend, now);
-    let noise = lookup_ember_noise_key(&state.ember_noise_keys, peer_ip, udp_port);
+    // The friend's word for its own key, over the session that authenticates
+    // it, ahead of what we last saw at that address.
+    let noise = noise_pub.or_else(|| lookup_ember_noise_key(&state.ember_noise_keys, peer_ip, udp_port));
     let addr = SocketAddr::new(IpAddr::V4(peer_ip), udp_port);
     send_ember_dht_ping(socket, state, addr, noise.as_ref()).await;
     if answer {
@@ -2127,7 +2136,7 @@ pub(super) async fn answer_friend_meet(
     }
     let frame = ed2k::messages::build_ember_ext_frame(
         ed2k::messages::EMBER_EXT_DHT_MEET,
-        &ed2k::messages::encode_dht_meet(our_port, true),
+        &ed2k::messages::encode_dht_meet(our_port, true, state.ember_transport.local_noise_public_key()),
     );
     let _ = reply_tx.try_send(frame);
 }

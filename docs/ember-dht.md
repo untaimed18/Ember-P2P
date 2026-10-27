@@ -194,7 +194,14 @@ one", which the advertiser count is what measures.
 ### 3. Meeting a friend we cannot dial — built in 1.7.2, unvalidated live
 
 Built as designed below, as `EMBER_EXT_DHT_MEET` (`0x0D`; `0x07` was taken by
-then). Body is the sender's Ember UDP port and an answer flag. A node asks each
+then). Body is the sender's Ember UDP port, an answer flag and (since 1.7.6) the
+sender's Noise static key, so each side's `PING` opens with IK; a node that only
+knew the friend's ed2k hash used to fall back to XX, and an XX dial in flight
+refuses every inbound handshake, so the two crossed pings could both stall. The
+initiator also resends handshake message 1 at one and three seconds, because the
+first one is usually eaten by the far side's NAT before its own ping opens the
+pinhole, and the crossed-dial tie-break means only the resend gets through. A
+node asks each
 direct-session friend it holds no verified contact for, at most every ten
 minutes and two per tick, least recently asked first; the friend `PING`s the
 asker's session address at the claimed port and answers with its own port; the

@@ -483,6 +483,21 @@ fn retain_addressed_to(queued: Vec<QueuedPayload>, remote_noise_pub: &[u8; 32]) 
     kept
 }
 
+/// When an unanswered message 1 goes again, measured from when it first went:
+/// one round trip is long past by the first, and the second covers a loss on
+/// a link that dropped the first resend too.
+///
+/// What this is for is a first datagram that could never arrive: a NAT only
+/// lets the peer's datagrams in once we have sent toward it, so when both ends
+/// dial at once (a friend meet, a punch) the first message 1 to reach a NAT
+/// that has not yet sent anything is dropped. The peer's own message 1 then
+/// reaches us while ours is pending, and if our key is the lower we keep our
+/// dial and refuse theirs (see `handle_ik_init`) — waiting on an answer to a
+/// message the peer never saw. Sent again once the peer has dialled us, it
+/// gets through, and the higher key answers it. A lost message 2 is answered
+/// the same way: the responder replays its cached reply to the same bytes.
+const MSG1_RESEND_AFTER: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
+
 /// In-progress handshake awaiting a response.
 enum PendingHandshake {
     /// Noise_IK: we sent message 1, waiting for message 2.
@@ -492,6 +507,10 @@ enum PendingHandshake {
         /// the tie on is refused by the peer, message and all, so it has to go
         /// again over the session the peer's handshake produces.
         first_message: Vec<u8>,
+        /// Message 1 as sent, for [`EmberTransport::due_msg1_resends`].
+        msg1: Vec<u8>,
+        /// How many of [`MSG1_RESEND_AFTER`] have gone.
+        resends: u8,
         queued: Vec<QueuedPayload>,
         created: Instant,
         /// Static key this handshake was started for. `pending` is keyed by
@@ -504,6 +523,11 @@ enum PendingHandshake {
     /// Noise_XX: we sent message 1, waiting for message 2.
     XxInitiatorMsg1 {
         state: snow::HandshakeState,
+        /// Message 1 as sent — the cookie retry's once there is one — for
+        /// [`EmberTransport::due_msg1_resends`].
+        msg1: Vec<u8>,
+        /// How many of [`MSG1_RESEND_AFTER`] have gone.
+        resends: u8,
         queued: Vec<QueuedPayload>,
         created: Instant,
         /// Retry cookies this attempt has already acted on. Nothing is keyed yet
@@ -1648,6 +1672,30 @@ impl EmberTransport {
         }
     }
 
+    /// Message 1s of our own handshakes that have gone unanswered long enough
+    /// to send again (see [`MSG1_RESEND_AFTER`]), with where each goes. Only
+    /// initiator legs: a responder's message 2 is resent by the initiator's
+    /// repeat, from the replay cache. Each is counted as sent here, so the
+    /// caller sends every packet once.
+    pub fn due_msg1_resends(&mut self, now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
+        let mut due = Vec::new();
+        for (addr, pending) in self.pending.iter_mut() {
+            let (msg1, resends, created) = match pending {
+                PendingHandshake::IkInitiator { msg1, resends, created, .. }
+                | PendingHandshake::XxInitiatorMsg1 { msg1, resends, created, .. } => (msg1, resends, created),
+                PendingHandshake::XxResponderMsg2 { .. } => continue,
+            };
+            let Some(after) = MSG1_RESEND_AFTER.get(usize::from(*resends)) else {
+                continue;
+            };
+            if now.saturating_duration_since(*created) >= *after {
+                *resends += 1;
+                due.push((*addr, msg1.clone()));
+            }
+        }
+        due
+    }
+
     /// Remove expired sessions and pending handshakes.
     pub fn cleanup(&mut self) {
         let now = Instant::now();
@@ -1733,8 +1781,9 @@ impl EmberTransport {
     /// so the next frame for the peer starts a fresh one. Returns whether one
     /// was dropped.
     ///
-    /// An initiator never retransmits msg1, so a handshake whose msg1 or msg2
-    /// was lost holds the address's slot until the 30-second sweep in
+    /// An initiator resends msg1 only a few times early on
+    /// ([`MSG1_RESEND_AFTER`]), so a handshake that stays unanswered past those
+    /// holds the address's slot until the 30-second sweep in
     /// [`Self::cleanup`], and anything sent in the meantime queues behind it
     /// and is lost with it. `begun_by` lets a caller that gave up on one frame
     /// avoid discarding a newer handshake it did not wait on. Only an IK leg
@@ -1968,6 +2017,8 @@ impl EmberTransport {
                     PendingHandshake::IkInitiator {
                         state: initiator,
                         first_message: first_message.to_vec(),
+                        msg1: buf.clone(),
+                        resends: 0,
                         queued,
                         created: Instant::now(),
                         remote_noise_pub: *remote_pub,
@@ -2485,6 +2536,8 @@ impl EmberTransport {
             peer,
             PendingHandshake::XxInitiatorMsg1 {
                 state: initiator,
+                msg1: buf.clone(),
+                resends: 0,
                 queued,
                 created: Instant::now(),
                 cookie_retries,
@@ -2583,6 +2636,10 @@ impl EmberTransport {
             from,
             PendingHandshake::XxInitiatorMsg1 {
                 state: initiator,
+                // The retry replaces message 1, so it is the one resent, on a
+                // schedule of its own from now.
+                msg1: packet.clone(),
+                resends: 0,
                 queued,
                 // `created` is refreshed, which is deliberate but bounded: the
                 // retry is a new message 1 and deserves its own answer window, and
@@ -3461,6 +3518,94 @@ mod tests {
         let probe_answer = low.dispatch_incoming(&answer[3], high_addr);
         let released = high.dispatch_incoming(&probe_answer.responses[0], low_addr);
         assert_eq!(released.app_payloads, vec![b"from low".to_vec()]);
+    }
+
+    /// The friend meet through two NATs: the first message 1 is dropped by a NAT
+    /// that has sent nothing yet, and the peer's own dial then reaches a side
+    /// that keeps its dead one and refuses it. Resent once the peer has dialled,
+    /// the first gets through, and the higher key answers it.
+    #[test]
+    fn a_crossed_dial_whose_first_message_was_lost_completes_on_the_resend() {
+        let (a_priv, a_pub) = make_keypair();
+        let (b_priv, b_pub) = make_keypair();
+        let ((low_priv, low_pub), (high_priv, high_pub)) = if a_pub < b_pub {
+            ((a_priv, a_pub), (b_priv, b_pub))
+        } else {
+            ((b_priv, b_pub), (a_priv, a_pub))
+        };
+        let mut low = EmberTransport::new(low_priv, low_pub);
+        let mut high = EmberTransport::new(high_priv, high_pub);
+        let low_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let high_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let lost = match low.prepare_outgoing(high_addr, Some(&high_pub), b"from low") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        let high_init = match high.prepare_outgoing(low_addr, Some(&low_pub), b"from high") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        // After the dial, so a whole resend delay has passed since it began.
+        let started = Instant::now();
+        assert!(
+            matches!(low.process_incoming(&high_init, high_addr), IncomingResult::Rejected),
+            "the lower key keeps the dial whose first message never arrived"
+        );
+        assert!(low.due_msg1_resends(started).is_empty(), "nothing is resent at once");
+
+        let resent = low.due_msg1_resends(started + MSG1_RESEND_AFTER[0]);
+        assert_eq!(resent, vec![(high_addr, lost)], "the same message 1, to the same peer");
+        let answer = match high.process_incoming(&resent[0].1, low_addr) {
+            IncomingResult::HandshakeComplete { packets_to_send, .. } => packets_to_send,
+            _ => panic!("the higher key answers the resent message 1"),
+        };
+        assert!(!high.pending.contains_key(&low_addr), "and gives up its own dial");
+
+        let _ = low.process_incoming(&answer[0], high_addr);
+        assert!(!low.pending.contains_key(&high_addr), "the lower key's dial completed");
+        match low.process_incoming(&answer[1], high_addr) {
+            IncomingResult::Message { payload, .. } => assert_eq!(payload, b"from high"),
+            _ => panic!("the higher key's own first message arrives over the session"),
+        }
+        let probe_answer = low.dispatch_incoming(&answer[2], high_addr);
+        let released = high.dispatch_incoming(&probe_answer.responses[0], low_addr);
+        assert_eq!(released.app_payloads, vec![b"from low".to_vec()]);
+    }
+
+    #[test]
+    fn message_1_is_resent_on_schedule_and_then_left_alone() {
+        let (a_priv, a_pub) = make_keypair();
+        let (_, b_pub) = make_keypair();
+        let mut alice = EmberTransport::new(a_priv, a_pub);
+        let ik_peer: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+        let xx_peer: SocketAddr = "9.9.9.9:3000".parse().unwrap();
+        let ik = match alice.prepare_outgoing(ik_peer, Some(&b_pub), b"ik") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        let xx = match alice.prepare_outgoing(xx_peer, None, b"xx") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        // After both dials, so each delay is measured from no earlier than they began.
+        let started = Instant::now();
+        let sorted = |mut due: Vec<(SocketAddr, Vec<u8>)>| {
+            due.sort_by_key(|(addr, _)| *addr);
+            due
+        };
+        let both = sorted(vec![(ik_peer, ik.clone()), (xx_peer, xx.clone())]);
+
+        assert!(alice.due_msg1_resends(started).is_empty());
+        let first = started + MSG1_RESEND_AFTER[0];
+        assert_eq!(sorted(alice.due_msg1_resends(first)), both, "both patterns go again");
+        assert!(alice.due_msg1_resends(first).is_empty(), "each resend is handed out once");
+        let second = started + MSG1_RESEND_AFTER[1];
+        assert_eq!(sorted(alice.due_msg1_resends(second)), both);
+        assert!(
+            alice.due_msg1_resends(second + Duration::from_secs(20)).is_empty(),
+            "and no more after the schedule runs out"
+        );
     }
 
     #[test]

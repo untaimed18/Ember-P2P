@@ -3516,6 +3516,9 @@ pub enum UploadEventKind {
         udp_port: u16,
         /// This is the answer to a meet we asked for, so it is not answered.
         answer: bool,
+        /// The friend's Noise static key, from a build that sends it, so the
+        /// `PING` can be IK.
+        noise_pub: Option<[u8; 32]>,
         /// The friend session this arrived on, for our own answer.
         reply_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     },
@@ -15384,7 +15387,7 @@ impl UploadHandler {
                                 // friend's own to ping.
                                 if let (
                                     Some(std::net::IpAddr::V4(peer_ip)),
-                                    Some((udp_port, answer)),
+                                    Some(meet),
                                     Some(reply_tx),
                                 ) = (
                                     attach_addr.map(|a| a.ip()),
@@ -15398,8 +15401,9 @@ impl UploadHandler {
                                             kind: UploadEventKind::EmberDhtMeet {
                                                 ember_hash: eh,
                                                 peer_ip,
-                                                udp_port,
-                                                answer,
+                                                udp_port: meet.udp_port,
+                                                answer: meet.answer,
+                                                noise_pub: meet.noise_pub,
                                                 reply_tx,
                                             },
                                         })

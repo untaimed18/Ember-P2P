@@ -82,6 +82,15 @@ pub(in crate::network) async fn on_ember_search_tick(
         .await;
     }
 
+    // Message 1s our own handshakes still wait on, sent again (see
+    // `MSG1_RESEND_AFTER`). Ahead of the idle guard: a handshake in
+    // flight is not one of the maps it reads.
+    for (addr, packet) in state.ember_transport.due_msg1_resends(std::time::Instant::now()) {
+        if let Err(e) = send_ember_udp(udp_socket, &packet, addr, &state.ember_dht_overhead).await {
+            debug!("Ember: resending handshake message 1 to {addr} failed: {e}");
+        }
+    }
+
     // Cheap when idle: the maps are empty unless an iterative
     // lookup, a publish, or a maintenance liveness ping is in
     // flight.
