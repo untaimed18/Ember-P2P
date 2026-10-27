@@ -4010,9 +4010,11 @@ pub async fn clear_completed(
 
 #[tauri::command]
 pub async fn recover_archive(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<String, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     static RECOVERY_CONCURRENCY: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
         std::sync::OnceLock::new();
     let permit = RECOVERY_CONCURRENCY

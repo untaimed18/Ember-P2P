@@ -46,6 +46,7 @@
     takePendingKnownMetNotice,
     SETTINGS_CHANGED_EVENT,
     QUIT_REQUESTED_EVENT,
+    finishRequestedQuit,
     setPendingUndo,
   } from '$lib/api/settings';
   import {
@@ -607,7 +608,7 @@
     });
     listen(QUIT_REQUESTED_EVENT, () => {
       if (!mounted) return;
-      void quitApp().catch((e) => console.error('Failed to quit Ember:', e));
+      void finishRequestedQuit().catch((e) => console.error('Failed to quit Ember:', e));
     })
       .then((fn) => { if (mounted) unlistenQuitRequested = fn; else fn(); })
       .catch((e) => console.error('Failed to register quit-requested listener:', e));

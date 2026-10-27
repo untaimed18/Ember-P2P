@@ -41,6 +41,19 @@ const KEY_SRC_HKDF: u8 = 0;
 #[cfg(not(target_os = "windows"))]
 const KEY_SRC_KEYRING: u8 = 1;
 
+/// Set once this process has sealed a secret under the machine-id fallback key,
+/// or read one that stays there because the keyring still cannot be reached.
+/// Never cleared: nothing re-seals a secret until the next launch, so the file
+/// on disk is still under that key for the rest of this session. Never set on
+/// Windows, where DPAPI has no fallback.
+static FALLBACK_KEY_IN_USE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a long-term secret on disk is protected only by the machine-id
+/// fallback key, which anyone holding a copy of this disk can derive.
+pub fn fallback_key_in_use() -> bool {
+    FALLBACK_KEY_IN_USE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Extra entropy mixed into DPAPI so a protected blob can only be unwrapped by
 /// this application's code path (not by another DPAPI consumer on the system).
 #[cfg(target_os = "windows")]
@@ -571,6 +584,7 @@ mod unix {
                      from the machine id and uid, which are not secret. It is re-sealed under \
                      the keyring on a later launch once the keyring is reachable."
                 );
+                super::FALLBACK_KEY_IN_USE.store(true, std::sync::atomic::Ordering::Relaxed);
                 (KEY_SRC_HKDF, hkdf_key_uid(HKDF_SALT_V4, HKDF_INFO_V4)?)
             }
         };
@@ -618,6 +632,11 @@ mod unix {
                     "A stored secret is sealed only under the machine-id fallback key, \
                      not the OS keyring; it will be re-sealed once the keyring is reachable"
                 );
+                // With the keyring reachable the caller re-seals it now
+                // (`needs_rewrap`), and `protect` reports how that went.
+                if !keyring_reachable() {
+                    super::FALLBACK_KEY_IN_USE.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             return result;
         }

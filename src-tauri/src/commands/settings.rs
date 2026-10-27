@@ -2483,7 +2483,12 @@ pub fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn quit_app(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+pub fn quit_app(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     // Mark the close as user-confirmed so the `WindowEvent::CloseRequested`
     // hook in `lib::run` lets the destroy proceed even when the saved
     // behavior is "tray" or "ask". Exit is initiated via `app.exit(0)`,
@@ -2551,6 +2556,30 @@ pub fn exit_app(app: &tauri::AppHandle) {
         tracing::warn!("The window did not finish its pending Undo actions in time; exiting");
         confirm_and_exit(&app);
     });
+}
+
+/// The window's answer to [`QUIT_REQUESTED_EVENT`]: its pending Undo actions
+/// are sent, so finish the exit [`exit_app`] started.
+///
+/// Separate from `quit_app` because any window can emit that event, the
+/// popped-out chat included, and the main window cannot tell who did. Only an
+/// exit already under way is finished here; anything else is ignored.
+#[tauri::command]
+pub fn finish_requested_quit(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
+    if !QUIT_FLUSH_STARTED.load(std::sync::atomic::Ordering::Acquire) {
+        tracing::warn!("Ignoring a quit request that no exit in progress asked for");
+        return Ok(());
+    }
+    state
+        .quit_confirmed
+        .store(true, std::sync::atomic::Ordering::Release);
+    app.exit(0);
+    Ok(())
 }
 
 /// Consume a close request that arrived before the frontend listener was

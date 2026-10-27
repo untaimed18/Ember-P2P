@@ -106,3 +106,76 @@ test("nothing the chat window's code can reach is refused to it", () => {
     "the popped-out chat calls these, and CHAT_WINDOW_DENIED_COMMANDS would refuse them there",
   );
 });
+
+/**
+ * Commands whose wrapper module the chat window imports, so the deny list
+ * cannot name them, but which the chat never calls. Each refuses every window
+ * but the main one itself, with `require_main_window`.
+ *
+ * `callers` are the frontend functions that reach the command, each with the
+ * files allowed to name it: its definition, and a helper wrapping it.
+ */
+const MAIN_WINDOW_ONLY = [
+  { command: "quit_app", rust: "settings.rs", callers: [["quitApp", ["src/lib/api/settings.ts"]]] },
+  {
+    command: "finish_requested_quit",
+    rust: "settings.rs",
+    callers: [["finishRequestedQuit", ["src/lib/api/settings.ts"]]],
+  },
+  { command: "recover_archive", rust: "transfers.rs", callers: [["recoverArchive", ["src/lib/api/transfers.ts"]]] },
+  { command: "remove_friend", rust: "peers.rs", callers: [["removeFriend", ["src/lib/api/friends.ts"]]] },
+  { command: "get_my_ember_hash", rust: "peers.rs", callers: [["getMyEmberHash", ["src/lib/api/friends.ts"]]] },
+  { command: "reset_friend_code", rust: "peers.rs", callers: [["resetFriendCode", ["src/lib/api/friends.ts"]]] },
+  { command: "kad_bootstrap_ip", rust: "peers.rs", callers: [["kadBootstrapIp", ["src/lib/api/kad.ts"]]] },
+  {
+    command: "delete_owned_channel",
+    rust: "channels.rs",
+    callers: [["deleteOwnedChannel", ["src/lib/api/channels.ts"]]],
+  },
+  {
+    command: "transfer_channel_ownership",
+    rust: "channels.rs",
+    callers: [["transferChannelOwnership", ["src/lib/api/channels.ts"]]],
+  },
+  {
+    command: "read_clipboard_text",
+    rust: "system.rs",
+    callers: [
+      ["readClipboardText", ["src/lib/api/system.ts", "src/lib/utils.ts"]],
+      ["readFromClipboard", ["src/lib/utils.ts"]],
+    ],
+  },
+];
+
+/** The body of `fn name(` in a commands file, up to its closing brace. */
+function rustFunctionBody(file, name) {
+  const text = readFileSync(join(rustRoot, "commands", file), "utf8");
+  const start = text.search(new RegExp(`\\bfn ${name}\\s*\\(`));
+  assert.ok(start >= 0, `${name} was not found in commands/${file}`);
+  const end = text.indexOf("\n}\n", start);
+  return text.slice(start, end < 0 ? undefined : end);
+}
+
+test("main-window-only commands refuse every other window", () => {
+  const registered = registeredCommands();
+  const unguarded = MAIN_WINDOW_ONLY.filter(({ command, rust }) => {
+    assert.ok(registered.has(command), `${command} is not a registered command`);
+    return !/require_main_window\(&window\)\?/.test(rustFunctionBody(rust, command));
+  }).map(({ command }) => command);
+  assert.deepEqual(unguarded, [], "these must call require_main_window before doing anything");
+});
+
+test("the chat window's code never calls a main-window-only command", () => {
+  const called = [];
+  for (const file of chatWindowSources()) {
+    const relative = file.slice(root.length + 1).replaceAll("\\", "/");
+    const text = readFileSync(file, "utf8");
+    for (const { command, callers } of MAIN_WINDOW_ONLY) {
+      for (const [caller, allowed] of callers) {
+        if (allowed.includes(relative)) continue;
+        if (new RegExp(`\\b${caller}\\s*\\(`).test(text)) called.push(`${command} via ${caller} in ${relative}`);
+      }
+    }
+  }
+  assert.deepEqual(called, [], "the popped-out chat calls these, and require_main_window would refuse them there");
+});

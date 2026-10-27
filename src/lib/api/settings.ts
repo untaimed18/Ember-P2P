@@ -115,6 +115,14 @@ export async function quitApp(): Promise<void> {
  *  downloads finish") ask through this to have pending Undo actions sent. */
 export const QUIT_REQUESTED_EVENT = 'ember:quit-requested';
 
+/** Answer {@link QUIT_REQUESTED_EVENT}: send pending Undo actions, then let
+ *  the backend finish the exit it started. Any window can emit that event, so
+ *  the backend ignores this unless it really is waiting on one. */
+export async function finishRequestedQuit(): Promise<void> {
+  await flushToastActionsBeforeExit();
+  return invoke('finish_requested_quit');
+}
+
 /** Whether a cancel or removal is waiting behind an Undo toast. */
 export async function setPendingUndo(pending: boolean): Promise<void> {
   return invoke('set_pending_undo', { pending });

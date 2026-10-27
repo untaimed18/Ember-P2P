@@ -321,8 +321,12 @@ fn with_clipboard<T>(
 /// them apart would mean matching on an error string that is not ours, and an
 /// image-only clipboard is an ordinary state rather than a fault worth
 /// reporting as one.
+///
+/// Main window only: the popped-out chat never pastes through here, and a chat
+/// webview that could read the clipboard could also send it as a message.
 #[tauri::command]
-pub async fn read_clipboard_text() -> Result<Option<String>, String> {
+pub async fn read_clipboard_text(window: tauri::WebviewWindow) -> Result<Option<String>, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     // `spawn_blocking` because the read is a synchronous cross-process round
     // trip; see `with_clipboard`.
     let text = tokio::task::spawn_blocking(|| with_clipboard(|clipboard| clipboard.get_text()).ok())
@@ -337,6 +341,14 @@ pub async fn read_clipboard_text() -> Result<Option<String>, String> {
         tracing::debug!("Clipboard read truncated to {MAX_CLIPBOARD_CHARS} characters");
     }
     Ok(Some(text))
+}
+
+/// Whether a long-term secret (identity, SecIdent key, chat-history key) is
+/// sealed only under the machine-id fallback key because the system keyring
+/// could not be reached. Always false on Windows.
+#[tauri::command]
+pub fn identity_keyring_fallback() -> bool {
+    crate::storage::secret_store::fallback_key_in_use()
 }
 
 /// Answers at once: the main window times the round trip to tell its own

@@ -1696,9 +1696,11 @@ pub async fn claim_channel_username(
 /// this device out. Moderators cannot call this.
 #[tauri::command]
 pub async fn delete_owned_channel(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
     let owned = load_owned_channel_as(&state, &channel_id, true).await?;
@@ -6360,10 +6362,12 @@ pub(crate) async fn find_raw_keys_counted(
 /// old key then signs a DHT handoff. The seed is never copied.
 #[tauri::command]
 pub async fn transfer_channel_ownership(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(

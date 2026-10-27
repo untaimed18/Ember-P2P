@@ -94,7 +94,12 @@ const KDF_MAX_P_COST: u32 = 8;
 /// profile and is recoverable only by hand from `pre-restore-*`.
 const STAGED_RESTORE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
 
-const MIN_PASSPHRASE_LEN: usize = 10;
+/// Applies to new backups only. A restore takes whatever passphrase the backup
+/// was written with, so archives made under the old 10-character rule still open.
+const MIN_PASSPHRASE_LEN: usize = 12;
+/// What [`passphrase_strength_bits`] must reach. Twelve random lowercase letters
+/// score about 56 bits; `Password1234` and a 12-digit number fall short.
+const MIN_PASSPHRASE_BITS: f64 = 48.0;
 const MAX_PASSPHRASE_LEN: usize = 1024;
 const MAX_PATH_LEN: usize = 4 * 1024;
 
@@ -935,6 +940,48 @@ fn build_archive(
     Ok((zip_path, manifest, skipped))
 }
 
+/// A pessimistic guess at how many bits a passphrase is worth to someone
+/// guessing it offline against a stolen backup.
+///
+/// Each character is worth the alphabet its classes span, except one that
+/// repeats or steps from the one before (`aa`, `ab`, `ba`, `12`), or that ends
+/// a three-character run already seen earlier: those are worth nothing, so
+/// `aaaa…`, `1234…` and `passwordpassword` score as what they are. Words are
+/// not recognised, so a dictionary phrase scores higher than it deserves: this
+/// is a floor against patterns, not a strength meter.
+fn passphrase_strength_bits(passphrase: &str) -> f64 {
+    let chars: Vec<char> = passphrase.chars().collect();
+    let mut pool = 0u32;
+    if chars.iter().any(char::is_ascii_lowercase) {
+        pool += 26;
+    }
+    if chars.iter().any(char::is_ascii_uppercase) {
+        pool += 26;
+    }
+    if chars.iter().any(char::is_ascii_digit) {
+        pool += 10;
+    }
+    if chars.iter().any(|c| !c.is_ascii_alphanumeric()) {
+        pool += 33;
+    }
+    if pool == 0 {
+        return 0.0;
+    }
+    let per_char = f64::from(pool).log2();
+    let mut bits = 0.0;
+    for (i, &c) in chars.iter().enumerate() {
+        let steps_from_previous = i > 0 && (c as i64 - chars[i - 1] as i64).abs() <= 1;
+        let repeats_a_run = i >= 2 && {
+            let run = &chars[i - 2..=i];
+            chars[..i].windows(3).any(|earlier| earlier == run)
+        };
+        if !steps_from_previous && !repeats_a_run {
+            bits += per_char;
+        }
+    }
+    bits
+}
+
 fn validate_passphrase(passphrase: &str) -> Result<(), String> {
     if passphrase.chars().count() < MIN_PASSPHRASE_LEN {
         return Err(coded_ctx(
@@ -943,10 +990,18 @@ fn validate_passphrase(passphrase: &str) -> Result<(), String> {
             format!("minimum {MIN_PASSPHRASE_LEN} characters"),
         ));
     }
+    // Before the strength estimate, whose repeated-run scan is quadratic.
     if passphrase.len() > MAX_PASSPHRASE_LEN {
         return Err(coded(
             "backup_weak_passphrase",
             "That passphrase is unreasonably long",
+        ));
+    }
+    if passphrase_strength_bits(passphrase) < MIN_PASSPHRASE_BITS {
+        return Err(coded_ctx(
+            "backup_weak_passphrase",
+            "Choose a less predictable passphrase",
+            "repeated or sequential characters",
         ));
     }
     Ok(())
@@ -3231,7 +3286,30 @@ mod tests {
     #[test]
     fn short_passphrases_are_refused() {
         assert!(validate_passphrase("short").is_err());
+        assert!(validate_passphrase("tenletters").is_err(), "the old minimum is no longer enough");
         assert!(validate_passphrase("long enough passphrase").is_ok());
+    }
+
+    #[test]
+    fn predictable_passphrases_are_refused() {
+        for weak in [
+            "aaaaaaaaaaaaaaaa",
+            "123456789012",
+            "abcdefghijklmnop",
+            "Password1234",
+            "passwordpassword",
+            "abcxyzabcxyzabcxyz",
+        ] {
+            assert!(validate_passphrase(weak).is_err(), "{weak} should be refused");
+        }
+        for strong in [
+            "correct horse battery staple",
+            "MyEmberBackup2026",
+            "qhzvtmkwpxrb",
+            "我的备份口令是今晚的月亮很圆",
+        ] {
+            assert!(validate_passphrase(strong).is_ok(), "{strong} should be accepted");
+        }
     }
 
     #[test]

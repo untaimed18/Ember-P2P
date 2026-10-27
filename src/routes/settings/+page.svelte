@@ -97,7 +97,7 @@
     NICKNAME_MAX_BYTES,
     shortPubkey,
   } from '$lib/utils';
-  import { getRuntimeStatus } from '$lib/api/system';
+  import { getRuntimeStatus, identityKeyringFallback } from '$lib/api/system';
   import {
     MAX_RULE_LABEL_CHARS,
     MAX_SCHEDULE_RULES,
@@ -382,6 +382,8 @@
   /** Milliseconds; this install's own record, so a restored profile shows
    *  "no backup yet" until one is made here. */
   let lastBackupMs: number | null = $state(readLastBackup());
+  /** The identity keys are sealed without the system keyring this session. */
+  let keyringFallback = $state(false);
 
   function readLastBackup(): number | null {
     try {
@@ -1160,6 +1162,11 @@
         runtimeStatus = status;
       })
       .catch((e) => console.warn('Settings: runtime status unavailable', e));
+    identityKeyringFallback()
+      .then((fallback) => {
+        if (!unmounted) keyringFallback = fallback;
+      })
+      .catch((e) => console.warn('Settings: key protection status unavailable', e));
     listen<RuntimeStatus>('ember:runtime-status', (event) => {
       if (unmounted) return;
       runtimeStatus = event.payload;
@@ -4977,6 +4984,12 @@
 
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_backup()}</h4>
+            {#if keyringFallback}
+              <p class="backup-callout" role="note">
+                <span class="backup-callout-icon" aria-hidden="true">!</span>
+                <span>{m.settings_identity_keyring_fallback()}</span>
+              </p>
+            {/if}
             <div class="field">
               <span class="field-label">{m.settings_backup_contents_label()}</span>
               <span class="hint">{m.settings_backup_contents_hint()}</span>

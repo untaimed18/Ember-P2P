@@ -77,3 +77,10 @@ export async function setTrayLabels(labels: {
 export async function writeClipboardText(text: string): Promise<void> {
   return invoke('write_clipboard_text', { text });
 }
+
+/** Whether the identity keys are sealed without the system keyring, because it
+ *  could not be reached, so a copy of the disk is enough to read them. Always
+ *  false on Windows. */
+export async function identityKeyringFallback(): Promise<boolean> {
+  return invoke('identity_keyring_fallback');
+}

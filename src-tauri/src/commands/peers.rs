@@ -535,9 +535,11 @@ pub async fn add_friend(
 #[tauri::command]
 pub async fn remove_friend(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     let canonical = user_hash_hex.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
 
@@ -784,7 +786,11 @@ pub async fn get_friends(state: tauri::State<'_, AppState>) -> Result<Vec<Friend
 }
 
 #[tauri::command]
-pub fn get_my_ember_hash(state: tauri::State<'_, AppState>) -> Result<String, String> {
+pub fn get_my_ember_hash(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     let intro_secret = crate::network::friend_intro::own_intro_secret()
         .unwrap_or(state.identity.intro_secret);
     Ok(format_friend_code(
@@ -799,8 +805,10 @@ pub fn get_my_ember_hash(state: tauri::State<'_, AppState>) -> Result<String, St
 #[tauri::command]
 pub async fn reset_friend_code(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
     let secret = tokio::task::spawn_blocking(move || {
         crate::storage::identity::NodeIdentity::rotate_intro_secret(&data_dir)
@@ -1803,10 +1811,12 @@ pub fn kad_connect(state: tauri::State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn kad_bootstrap_ip(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     ip: String,
     port: u16,
 ) -> Result<String, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     if ip.is_empty() {
         return Err(coded("peers_ip_required", "IP address is required"));
     }
