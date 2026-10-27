@@ -357,7 +357,8 @@
       const count = loadedCollection.files.length;
       const name = loadedCollection.name;
       toastSuccess(plural(count, {
-        one: () => m.library_collection_loaded_one({ name }),
+        one: () => m.library_collection_loaded_one({ name, count: formatNumber(count) }),
+        oneShowsCount: true,
         few: () => m.library_collection_loaded_few({ name, count: formatNumber(count) }),
         other: () => m.library_collection_loaded({ name, count: formatNumber(count) }),
       }));
@@ -400,20 +401,23 @@
       }
       if (queued > 0) {
         toastSuccess(plural(queued, {
-          one: m.library_queued_files_download_one,
+          one: () => m.library_queued_files_download_one({ count: formatNumber(queued) }),
+          oneShowsCount: true,
           other: () => m.library_queued_files_download({ count: formatNumber(queued) }),
         }));
       }
       if (skipped > 0 || oversize > 0) {
         const totalSkipped = skipped + oversize;
         toastWarning(plural(totalSkipped, {
-          one: m.library_collection_entries_skipped_one,
+          one: () => m.library_collection_entries_skipped_one({ count: formatNumber(totalSkipped) }),
+          oneShowsCount: true,
           other: () => m.library_collection_entries_skipped({ count: formatNumber(totalSkipped) }),
         }));
       }
       if (failed > 0) {
         toastWarning(plural(failed, {
-          one: m.library_collection_start_failed_one,
+          one: () => m.library_collection_start_failed_one({ count: formatNumber(failed) }),
+          oneShowsCount: true,
           other: () => m.library_collection_start_failed({ count: formatNumber(failed) }),
         }));
       }
@@ -573,7 +577,8 @@
       const name = newCollName.trim();
       const count = formatNumber(collFiles.length);
       toastSuccess(plural(collFiles.length, {
-        one: () => m.library_collection_created_one({ name }),
+        one: () => m.library_collection_created_one({ name, count }),
+        oneShowsCount: true,
         few: () => m.library_collection_created_few({ name, count }),
         other: () => m.library_collection_created({ name, count }),
       }));
@@ -748,7 +753,8 @@
       const count = Math.max(missingTotalCount, missingPathSet.size);
       const confirmed = await askConfirm(
         plural(count, {
-          one: m.library_confirm_remove_missing_one,
+          one: () => m.library_confirm_remove_missing_one({ count: formatNumber(count) }),
+          oneShowsCount: true,
           few: () => m.library_confirm_remove_missing_few({ count: formatNumber(count) }),
           other: () => m.library_confirm_remove_missing_other({ count: formatNumber(count) }),
         }),
@@ -780,7 +786,7 @@
     if (!f || !missingPathSet.has(f.path)) return;
     try {
       const confirmed = await askConfirm(
-        m.library_confirm_remove_missing_one(),
+        m.library_confirm_remove_missing_one({ count: formatNumber(1) }),
         m.library_remove_missing_title(),
       );
       if (!confirmed) return;
@@ -1154,7 +1160,8 @@
 
   function copiedLinksText(count: number): string {
     return plural(count, {
-      one: m.library_copied_link_one,
+      one: () => m.library_copied_link_one({ count: formatNumber(count) }),
+      oneShowsCount: true,
       other: () => m.library_copied_links_other({ count: formatNumber(count) }),
     });
   }
@@ -1169,28 +1176,32 @@
       return;
     }
     toastWarning(plural(unshared, {
-      one: m.library_copied_unshared_one,
+      one: () => m.library_copied_unshared_one({ count: formatNumber(unshared) }),
+      oneShowsCount: true,
       other: () => m.library_copied_unshared_other({ count: formatNumber(unshared) }),
     }));
   }
 
   function removedMissingText(count: number): string {
     return plural(count, {
-      one: m.library_removed_missing_one,
+      one: () => m.library_removed_missing_one({ count: formatNumber(count) }),
+      oneShowsCount: true,
       other: () => m.library_removed_missing_other({ count: formatNumber(count) }),
     });
   }
 
   function unsharedText(count: number): string {
     return plural(count, {
-      one: m.library_unshared_one,
+      one: () => m.library_unshared_one({ count: formatNumber(count) }),
+      oneShowsCount: true,
       other: () => m.library_unshared_other({ count: formatNumber(count) }),
     });
   }
 
   function starsText(count: number): string {
     return plural(count, {
-      one: m.library_star_one,
+      one: () => m.library_star_one({ count }),
+      oneShowsCount: true,
       few: () => m.library_star_few({ count }),
       other: () => m.library_star_other({ count }),
     });
@@ -1200,7 +1211,8 @@
     const author = collection.author || m.common_unknown();
     const count = formatNumber(collection.files.length);
     return plural(collection.files.length, {
-      one: () => m.library_collection_meta_one({ author }),
+      one: () => m.library_collection_meta_one({ author, count }),
+      oneShowsCount: true,
       few: () => m.library_collection_meta_few({ author, count }),
       other: () => m.library_collection_meta_other({ author, count }),
     });
@@ -1328,7 +1340,8 @@
           targets.length === 1
             ? m.library_moved_one({ name: targets[0].name, folder })
             : plural(report.moved, {
-                one: () => m.library_moved_count_one({ folder }),
+                one: () => m.library_moved_count_one({ folder, count: formatNumber(report.moved) }),
+                oneShowsCount: true,
                 other: () => m.library_moved_count_other({ count: formatNumber(report.moved), folder }),
               }),
         );
@@ -1490,12 +1503,14 @@
         if (folderNames.size === 1) {
           const name = [...folderNames][0];
           toastSuccess(plural(sharedFiles.length, {
-            one: () => m.library_shared_from_one({ name }),
+            one: () => m.library_shared_from_one({ name, count: formatNumber(sharedFiles.length) }),
+            oneShowsCount: true,
             other: () => m.library_shared_from_other({ count: formatNumber(sharedFiles.length), name }),
           }));
         } else {
           toastSuccess(plural(sharedFiles.length, {
-            one: m.library_shared_one,
+            one: () => m.library_shared_one({ count: formatNumber(sharedFiles.length) }),
+            oneShowsCount: true,
             other: () => m.library_shared_other({ count: formatNumber(sharedFiles.length) }),
           }));
         }
@@ -1530,7 +1545,8 @@
       if (priority) {
         folderPriorities = { ...folderPriorities, [path]: priority };
         toastSuccess(plural(count, {
-          one: m.library_folder_priority_set_one,
+          one: () => m.library_folder_priority_set_one({ count: formatNumber(count) }),
+          oneShowsCount: true,
           other: () => m.library_folder_priority_set({ count: formatNumber(count) }),
         }));
       } else {
@@ -1558,7 +1574,8 @@
       const displayName = path.split(/[\\/]/).filter(Boolean).pop() || path;
       const body = stats > 0
         ? plural(stats, {
-            one: () => m.library_confirm_remove_folder_one({ name: displayName }),
+            one: () => m.library_confirm_remove_folder_one({ name: displayName, count: formatNumber(stats) }),
+            oneShowsCount: true,
             other: () => m.library_confirm_remove_folder_other({ name: displayName, count: formatNumber(stats) }),
           })
         : m.library_confirm_remove_folder_empty({ name: displayName });
@@ -1792,7 +1809,8 @@
 
   function filesCountLabel(count: number): string {
     return plural(count, {
-      one: m.library_stat_files_one,
+      one: () => m.library_stat_files_one({ count: formatNumber(count) }),
+      oneShowsCount: true,
       few: () => m.library_stat_files_few({ count: formatNumber(count) }),
       other: () => m.library_stat_files({ count: formatNumber(count) }),
     });
@@ -2020,7 +2038,8 @@
         (paths) => batchSetPriority(paths, priority),
       );
       toastSuccess(plural(count, {
-        one: () => m.library_set_priority_one({ priority: priorityLabel(priority) }),
+        one: () => m.library_set_priority_one({ priority: priorityLabel(priority), count: formatNumber(count) }),
+        oneShowsCount: true,
         other: () => m.library_set_priority_other({ priority: priorityLabel(priority), count: formatNumber(count) }),
       }));
     } catch (e: unknown) { error = toErr(e); }
@@ -2098,7 +2117,8 @@
     try {
       const count = await runBulkBatches(targets, shareLibraryFiles);
       toastSuccess(plural(count, {
-        one: m.library_shared_one,
+        one: () => m.library_shared_one({ count: formatNumber(count) }),
+        oneShowsCount: true,
         other: () => m.library_shared_other({ count: formatNumber(count) }),
       }));
     } catch (e: unknown) { error = toErr(e); }
@@ -2129,11 +2149,13 @@
       toastSuccess(
         friendsOnly
           ? plural(count, {
-              one: m.library_friends_only_on_count_one,
+              one: () => m.library_friends_only_on_count_one({ count: formatNumber(count) }),
+              oneShowsCount: true,
               other: () => m.library_friends_only_on_count({ count: formatNumber(count) }),
             })
           : plural(count, {
-              one: m.library_friends_only_off_count_one,
+              one: () => m.library_friends_only_off_count_one({ count: formatNumber(count) }),
+              oneShowsCount: true,
               other: () => m.library_friends_only_off_count({ count: formatNumber(count) }),
             }),
       );
@@ -2156,12 +2178,14 @@
       const confirmed = await askConfirm(
         $appSettings?.delete_permanently
           ? plural(targets.length, {
-              one: () => m.library_confirm_delete_one_permanent({ size }),
+              one: () => m.library_confirm_delete_one_permanent({ size, count }),
+              oneShowsCount: true,
               few: () => m.library_confirm_delete_few_permanent({ count, size }),
               other: () => m.library_confirm_delete_other_permanent({ count, size }),
             })
           : plural(targets.length, {
-              one: () => m.library_confirm_delete_one({ size }),
+              one: () => m.library_confirm_delete_one({ size, count }),
+              oneShowsCount: true,
               few: () => m.library_confirm_delete_few({ count, size }),
               other: () => m.library_confirm_delete_other({ count, size }),
             }),
@@ -2200,7 +2224,8 @@
       await refresh();
       if (deleted > 0) {
         const base = plural(deleted, {
-          one: m.library_deleted_one,
+          one: () => m.library_deleted_one({ count: formatNumber(deleted) }),
+          oneShowsCount: true,
           other: () => m.library_deleted_other({ count: formatNumber(deleted) }),
         });
         toastSuccess(failures.length ? m.library_deleted_with_failures({ base, failed: formatNumber(failures.length) }) : base);
@@ -2319,11 +2344,13 @@
         const count = formatNumber(renamed.length);
         const message = add
           ? plural(renamed.length, {
-              one: m.library_tag_added_one,
+              one: () => m.library_tag_added_one({ count }),
+              oneShowsCount: true,
               other: () => m.library_tag_added_other({ count }),
             })
           : plural(renamed.length, {
-              one: m.library_tag_removed_one,
+              one: () => m.library_tag_removed_one({ count }),
+              oneShowsCount: true,
               other: () => m.library_tag_removed_other({ count }),
             });
         addActionToast(
@@ -3017,7 +3044,7 @@
         toastError(m.library_copy_failed());
         return;
       }
-      reportCopied([selectedFile], m.library_copied_link_one());
+      reportCopied([selectedFile], m.library_copied_link_one({ count: formatNumber(1) }));
     } catch (e: unknown) { error = toErr(e); }
   }
 
@@ -3364,7 +3391,7 @@
   async function applyFilePriority(f: FileInfo, priority: FileInfo['priority']) {
     await setFilePriority(f.path, priority);
     await refresh();
-    toastSuccess(m.library_set_priority_one({ priority: priorityLabel(priority) }));
+    toastSuccess(m.library_set_priority_one({ priority: priorityLabel(priority), count: formatNumber(1) }));
   }
 
   async function applyFriendsOnly(f: FileInfo, restrict: boolean) {
@@ -3488,7 +3515,8 @@
       }
       const confirmed = await askConfirm(
         plural(sharedCount, {
-          one: () => m.library_confirm_unshare_folder_one({ name: displayName }),
+          one: () => m.library_confirm_unshare_folder_one({ name: displayName, count: formatNumber(sharedCount) }),
+          oneShowsCount: true,
           other: () => m.library_confirm_unshare_folder_other({ count: formatNumber(sharedCount), name: displayName }),
         }),
         m.library_unshare_folder_title(),
@@ -4175,7 +4203,8 @@
       title={duplicateHashes.size === 0
         ? m.library_no_duplicates()
         : plural(duplicateHashes.size, {
-            one: () => m.library_duplicates_tooltip_one({ files: formatNumber(duplicateFileCount) }),
+            one: () => m.library_duplicates_tooltip_one({ files: formatNumber(duplicateFileCount), hashes: formatNumber(duplicateHashes.size) }),
+            oneShowsCount: true,
             other: () => m.library_duplicates_tooltip({ files: formatNumber(duplicateFileCount), hashes: formatNumber(duplicateHashes.size) }),
           })}
     >
@@ -4237,7 +4266,8 @@
           ? m.library_copy_all_none()
           : hasActiveLibraryFilters
             ? plural(filteredHashedFiles.length, {
-                one: m.library_copy_all_filtered_title_one,
+                one: () => m.library_copy_all_filtered_title_one({ count: formatNumber(filteredHashedFiles.length) }),
+                oneShowsCount: true,
                 few: () => m.library_copy_all_filtered_title_few({ count: formatNumber(filteredHashedFiles.length) }),
                 other: () => m.library_copy_all_filtered_title({ count: formatNumber(filteredHashedFiles.length) }),
               })
@@ -4265,18 +4295,21 @@
     </button>
     <span class="inline-stats">
       <span class="inline-stat">{plural(files.length, {
-        one: m.library_stat_files_one,
+        one: () => m.library_stat_files_one({ count: formatNumber(files.length) }),
+        oneShowsCount: true,
         few: () => m.library_stat_files_few({ count: formatNumber(files.length) }),
         other: () => m.library_stat_files({ count: formatNumber(files.length) }),
       })}</span>
       <span class="inline-sep">&middot;</span>
       <span class="inline-stat">{plural(libraryHashedCount, {
-        one: m.library_stat_hashed_one,
+        one: () => m.library_stat_hashed_one({ count: formatNumber(libraryHashedCount) }),
+        oneShowsCount: true,
         other: () => m.library_stat_hashed({ count: formatNumber(libraryHashedCount) }),
       })}</span>
       <span class="inline-sep">&middot;</span>
       <span class="inline-stat">{plural(folders.length, {
-        one: m.library_stat_folders_one,
+        one: () => m.library_stat_folders_one({ count: formatNumber(folders.length) }),
+        oneShowsCount: true,
         few: () => m.library_stat_folders_few({ count: formatNumber(folders.length) }),
         other: () => m.library_stat_folders({ count: formatNumber(folders.length) }),
       })}</span>
@@ -4398,7 +4431,8 @@
                 {selectedFileHashes.size === 0
                   ? m.library_coll_summary_none()
                   : plural(selectedFileHashes.size, {
-                      one: () => m.library_coll_summary_one({ size: formatSize(selectedCollectionBytes) }),
+                      one: () => m.library_coll_summary_one({ size: formatSize(selectedCollectionBytes), count: formatNumber(selectedFileHashes.size) }),
+                      oneShowsCount: true,
                       few: () => m.library_coll_summary_few({ count: formatNumber(selectedFileHashes.size), size: formatSize(selectedCollectionBytes) }),
                       other: () => m.library_coll_summary_other({ count: formatNumber(selectedFileHashes.size), size: formatSize(selectedCollectionBytes) }),
                     })}
@@ -4910,7 +4944,8 @@
                     {topPanelMetric === 'bytes'
                       ? formatSize(val)
                       : plural(val, {
-                          one: m.library_uploads_one,
+                          one: () => m.library_uploads_one({ count: formatNumber(val) }),
+                          oneShowsCount: true,
                           few: () => m.library_uploads_few({ count: formatNumber(val) }),
                           other: () => m.library_uploads_other({ count: formatNumber(val) }),
                         })}
@@ -5104,7 +5139,7 @@
 
     {#if checkedCount > 0}
       <div class="bulk-action-bar">
-        <span class="bulk-count">{plural(checkedCount, { one: m.library_bulk_count_one, other: () => m.library_bulk_count_other({ count: formatNumber(checkedCount) }) })}<span class="bulk-size"> · {formatSize(checkedTotalSize)}</span></span>
+        <span class="bulk-count">{plural(checkedCount, { one: () => m.library_bulk_count_one({ count: formatNumber(checkedCount) }), oneShowsCount: true, other: () => m.library_bulk_count_other({ count: formatNumber(checkedCount) }) })}<span class="bulk-size"> · {formatSize(checkedTotalSize)}</span></span>
         {#if checkedHiddenCount > 0}
           <button
             type="button"
@@ -5114,7 +5149,7 @@
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="11" height="11" aria-hidden="true">
               <path d="M2 3h12l-4.5 5.5V13l-3 1.5V8.5z"/>
             </svg>
-            {plural(checkedHiddenCount, { one: m.library_bulk_hidden_one, other: () => m.library_bulk_hidden_other({ count: formatNumber(checkedHiddenCount) }) })}
+            {plural(checkedHiddenCount, { one: () => m.library_bulk_hidden_one({ count: formatNumber(checkedHiddenCount) }), oneShowsCount: true, other: () => m.library_bulk_hidden_other({ count: formatNumber(checkedHiddenCount) }) })}
           </button>
         {/if}
         <div class="bulk-prio-group">

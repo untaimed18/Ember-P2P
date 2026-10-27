@@ -494,7 +494,8 @@
     if (sharing) return m.library_explorer_sharing();
     if (ownFilesOnly) {
       return plural(currentOwnFiles.length, {
-        one: m.library_explorer_share_file_one,
+        one: () => m.library_explorer_share_file_one({ count: formatNumber(currentOwnFiles.length) }),
+        oneShowsCount: true,
         other: () => m.library_explorer_share_file_other({ count: formatNumber(currentOwnFiles.length) }),
       });
     }
@@ -506,7 +507,8 @@
     }
     if (selectedFileCount > 0 && selectedFolderCount === 0) {
       return plural(selectedFileCount, {
-        one: m.library_explorer_share_file_one,
+        one: () => m.library_explorer_share_file_one({ count: formatNumber(selectedFileCount) }),
+        oneShowsCount: true,
         other: () => m.library_explorer_share_file_other({ count: formatNumber(selectedFileCount) }),
       });
     }
@@ -653,7 +655,8 @@
       return m.library_explorer_summary_files_at_least({ count: formatNumber(count) });
     }
     return plural(count, {
-      one: m.library_explorer_summary_files_one,
+      one: () => m.library_explorer_summary_files_one({ count: formatNumber(count) }),
+      oneShowsCount: true,
       other: () => m.library_explorer_summary_files_other({ count: formatNumber(count) }),
     });
   });
@@ -667,12 +670,14 @@
     const { folders: count, subfolders } = shareSummary;
     if (subfolders) {
       return plural(count, {
-        one: m.library_explorer_summary_subfolders_one,
+        one: () => m.library_explorer_summary_subfolders_one({ count: formatNumber(count) }),
+        oneShowsCount: true,
         other: () => m.library_explorer_summary_subfolders_other({ count: formatNumber(count) }),
       });
     }
     return plural(count, {
-      one: m.library_explorer_summary_folders_one,
+      one: () => m.library_explorer_summary_folders_one({ count: formatNumber(count) }),
+      oneShowsCount: true,
       other: () => m.library_explorer_summary_folders_other({ count: formatNumber(count) }),
     });
   });
@@ -873,7 +878,8 @@
         const count = entry.shared_count ?? 0;
         if (count === 0) return m.library_explorer_partial_none();
         return plural(count, {
-          one: m.library_explorer_partial_one,
+          one: () => m.library_explorer_partial_one({ count }),
+          oneShowsCount: true,
           other: () => m.library_explorer_partial_other({ count }),
         });
       }

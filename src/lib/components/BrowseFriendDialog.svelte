@@ -1050,7 +1050,8 @@
                   {m.browse_count_filtered({ filtered: filteredFiles.length, total: files.length })}
                 {:else}
                   {plural(files.length, {
-                    one: m.browse_count_one,
+                    one: () => m.browse_count_one({ count: files.length }),
+                    oneShowsCount: true,
                     few: () => m.browse_count_few({ count: files.length }),
                     other: () => m.browse_count_other({ count: files.length }),
                   })}
@@ -1170,7 +1171,8 @@
           {#if queuedCount > 0}
             <div class="browse-banner browse-banner-success" role="status">
               <span>{plural(queuedCount, {
-                one: m.browse_added_one,
+                one: () => m.browse_added_one({ count: formatNumber(queuedCount) }),
+                oneShowsCount: true,
                 other: () => m.browse_added_other({ count: formatNumber(queuedCount) }),
               })}</span>
               <button type="button" class="browse-link-btn" onclick={viewTransfers}>{m.browse_view_transfers()}</button>

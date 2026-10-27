@@ -50,6 +50,20 @@ describe('plural', () => {
     expect(plural(21, all, 'ru')).toBe('other');
   });
 
+  it('lets a one that shows its count serve Russian 21, 31, …', () => {
+    const counted: PluralForms = { ...all, oneShowsCount: true };
+    for (const n of [21, 31, 101, 1001]) expect(plural(n, counted, 'ru')).toBe('one');
+    // Russian 11 and 111 are `many`, not `one`, whatever their last digit.
+    for (const n of [11, 111]) expect(plural(n, counted, 'ru')).toBe('many');
+    for (const n of [22, 34]) expect(plural(n, counted, 'ru')).toBe('few');
+    // French and Portuguese 0 stays plural, and other languages are unchanged.
+    expect(plural(0, counted, 'fr')).toBe('other');
+    expect(plural(0, counted, 'pt-BR')).toBe('other');
+    expect(plural(0, counted, 'ru')).toBe('many');
+    expect(plural(21, counted, 'en')).toBe('other');
+    expect(plural(21, counted, 'de')).toBe('other');
+  });
+
   it('keeps English and German to one and other', () => {
     for (const n of [0, 2, 3, 5, 21, 1000]) {
       expect(plural(n, all, 'en')).toBe('other');

@@ -1341,7 +1341,8 @@
       {/if}
       <span class="inline-stat">
         {plural(friends.length, {
-          one: () => m.friends_online_count_one({ online: onlineFriendCount }),
+          one: () => m.friends_online_count_one({ online: onlineFriendCount, total: friends.length }),
+          oneShowsCount: true,
           few: () => m.friends_online_count_few({ online: onlineFriendCount, total: friends.length }),
           other: () => m.friends_online_count_other({ online: onlineFriendCount, total: friends.length }),
         })}
@@ -1386,7 +1387,8 @@
     <div class="result-count-row">
       <span class="result-count">
         {plural(filtered.length, {
-          one: m.friends_match_count_one,
+          one: () => m.friends_match_count_one({ count: filtered.length }),
+          oneShowsCount: true,
           few: () => m.friends_match_count_few({ count: filtered.length }),
           other: () => m.friends_match_count_other({ count: filtered.length }),
         })}
@@ -1523,7 +1525,8 @@
             {:else if unread > 0}
               <span class="status-unread">
                 {plural(unread, {
-                  one: m.friends_unread_one,
+                  one: () => m.friends_unread_one({ count: unread }),
+                  oneShowsCount: true,
                   few: () => m.friends_unread_few({ count: unread }),
                   other: () => m.friends_unread_other({ count: unread }),
                 })}
@@ -1562,7 +1565,8 @@
               <span class="count-pill" aria-hidden="true">{unread > 99 ? '99+' : unread}</span>
               <span class="sr-only">
                 {plural(unread, {
-                  one: m.friends_unread_one,
+                  one: () => m.friends_unread_one({ count: unread }),
+                  oneShowsCount: true,
                   few: () => m.friends_unread_few({ count: unread }),
                   other: () => m.friends_unread_other({ count: unread }),
                 })}

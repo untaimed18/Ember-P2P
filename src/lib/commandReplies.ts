@@ -39,7 +39,8 @@ export function kadNodesLoadedText(reply: string): string {
   if (!counts) return m.kad_bootstrap_url_loaded();
   const [count] = counts;
   return plural(count, {
-    one: m.kad_bootstrap_url_loaded_one,
+    one: () => m.kad_bootstrap_url_loaded_one({ count: formatNumber(count) }),
+    oneShowsCount: true,
     other: () => m.kad_bootstrap_url_loaded_other({ count: formatNumber(count) }),
   });
 }

@@ -277,7 +277,8 @@
               {customCount === 0
                 ? m.friend_settings_custom_none()
                 : plural(customCount, {
-                    one: m.friend_settings_custom_one,
+                    one: () => m.friend_settings_custom_one({ count: customCount }),
+                    oneShowsCount: true,
                     few: () => m.friend_settings_custom_few({ count: customCount }),
                     other: () => m.friend_settings_custom_other({ count: customCount }),
                   })}

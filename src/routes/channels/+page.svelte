@@ -161,7 +161,7 @@
     sectionRooms,
   } from '$lib/channelSections';
   import { LIKELY_SPAM_SCORE, listingSpamScores } from '$lib/channelListingSpam';
-  import { isApplePlatform, shortcutModAria } from '$lib/platform';
+  import { isApplePlatform, shortcutModAria, shortcutModSymbol } from '$lib/platform';
   import { isShortcutLetter } from '$lib/shortcutKey';
 
   let channelList = $derived($channelsStore.filter((c) => !c.deleted));
@@ -621,7 +621,8 @@
     // Only worth mentioning once the owner has actually started to go quiet.
     if (left <= 0 || elapsedDays < selected.claim_after_days / 2) return '';
     return plural(left, {
-      one: () => m.channels_owner_inactive_one({ name: who }),
+      one: () => m.channels_owner_inactive_one({ name: who, days: left }),
+      oneShowsCount: true,
       other: () => m.channels_owner_inactive({ name: who, days: left }),
     });
   });
@@ -1036,6 +1037,40 @@
     }),
   );
 
+  /** From this many members the pane offers a filter: below it, the whole
+   *  list is already in view. */
+  const MEMBER_FILTER_FROM = 10;
+  let memberQuery = $state('');
+  /** The members pane's list: everyone, or those whose name, or key, the
+   *  filter matches. */
+  let shownMembers = $derived.by(() => {
+    const q = memberQuery.trim().toLowerCase();
+    if (!q) return sortedMembers;
+    return sortedMembers.filter(
+      (mem) => roomMemberLabel(mem).toLowerCase().includes(q) || mem.member_pubkey.toLowerCase().startsWith(q),
+    );
+  });
+
+  /** The conversation pane, which fades in when another room opens. */
+  let conversationEl = $state<HTMLElement | null>(null);
+  /** The room last shown; undefined until the page has drawn one, so the
+   *  room open on arrival comes in with the page rather than after it. */
+  let roomShown: string | null | undefined;
+  $effect(() => {
+    const id = selectedId;
+    untrack(() => {
+      const switched = roomShown !== undefined && roomShown !== id;
+      roomShown = id;
+      if (!switched) return;
+      // Whoever was looked for in the last room is not in this one.
+      memberQuery = '';
+      // Opacity only: a transform would move the pane's fixed menus with it.
+      if (id && conversationEl && !prefersReducedMotion.current) {
+        conversationEl.animate([{ opacity: 0.35 }, { opacity: 1 }], { duration: 180, easing: 'ease-out' });
+      }
+    });
+  });
+
   function autoFocus(node: HTMLElement) {
     node.focus();
   }
@@ -1101,8 +1136,9 @@
     const menuKey =
       !e.altKey && !e.ctrlKey && !e.metaKey
       && ['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key);
+    // With Shift, to the next room with something unread instead.
     const roomStep =
-      e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey
+      e.altKey && !e.ctrlKey && !e.metaKey
       && (e.key === 'ArrowUp' || e.key === 'ArrowDown');
     const searchKey =
       (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && isShortcutLetter(e, 'k');
@@ -1136,7 +1172,8 @@
       if (rooms.length === 0) return;
       e.preventDefault();
       const at = rooms.findIndex((c) => c.channel_id === selectedId);
-      const next = rooms[cycleIndex(at, rooms.length, e.key === 'ArrowDown' ? 1 : -1)];
+      const step = e.key === 'ArrowDown' ? 1 : -1;
+      const next = e.shiftKey ? nextUnreadRoom(rooms, at, step) : rooms[cycleIndex(at, rooms.length, step)];
       if (next && next.channel_id !== selectedId) void selectChannel(next.channel_id);
       return;
     }
@@ -1150,6 +1187,33 @@
     e.preventDefault();
     void focusListSearch();
   }
+
+  /** The next joined room after `at`, going `step`, with something unread:
+   *  one whose badge would interrupt first, since a muted room's unread is
+   *  what the user chose not to be pulled to, then any. Null when none is. */
+  function nextUnreadRoom(rooms: ChannelInfo[], at: number, step: 1 | -1): ChannelInfo | null {
+    const n = rooms.length;
+    const start = at < 0 ? (step > 0 ? -1 : n) : at;
+    const loud = (c: ChannelInfo) =>
+      unreadBadgeTone(
+        notifyLevelOf($effectiveNotifyLevels, c.channel_id),
+        $channelUnreadMentions.includes(c.channel_id),
+      ) === 'loud';
+    for (const wanted of [loud, () => true]) {
+      for (let i = 1; i <= n; i++) {
+        const room = rooms[(((start + step * i) % n) + n) % n];
+        if (room.channel_id !== selectedId && room.unread > 0 && wanted(room)) return room;
+      }
+    }
+    return null;
+  }
+
+  /** The room shortcuts, shown where a room would be while none is open. */
+  const roomShortcutHints = [
+    { keys: [shortcutModSymbol(), 'K'], label: () => m.shortcuts_channels_search() },
+    { keys: ['Alt', '↑ / ↓'], label: () => m.shortcuts_channels_prev_next() },
+    { keys: ['Alt', 'Shift', '↑ / ↓'], label: () => m.shortcuts_channels_unread_prev_next() },
+  ];
 
   /** Ctrl/⌘+F: opens the room's message search, or returns to it if open. */
   async function openRoomSearch() {
@@ -2915,7 +2979,8 @@
   let newerLinesLabel = $derived.by(() => {
     const count = selected?.newer_lines ?? 0;
     return plural(count, {
-      one: m.channels_newer_lines_one,
+      one: () => m.channels_newer_lines_one({ count }),
+      oneShowsCount: true,
       other: () => m.channels_newer_lines_other({ count }),
     });
   });
@@ -2939,7 +3004,8 @@
     if (membersOpen) return m.channels_hide_members();
     if (roomOffersWaiting === 0) return m.channels_show_members();
     return plural(roomOffersWaiting, {
-      one: m.channels_show_members_offers_one,
+      one: () => m.channels_show_members_offers_one({ count: roomOffersWaiting }),
+      oneShowsCount: true,
       other: () => m.channels_show_members_offers_other({ count: roomOffersWaiting }),
     });
   });
@@ -3032,6 +3098,22 @@
   {/if}
 {/snippet}
 
+<!-- Members in outline while the roster loads. -->
+{#snippet memberSkeleton()}
+  <div class="member-skeleton" role="status">
+    <span class="sr-only">{m.common_loading()}</span>
+    {#each [0, 1, 2, 3, 4] as row (row)}
+      <div class="member-skel-row" aria-hidden="true">
+        <span class="skel skel-avatar"></span>
+        <span class="skel-lines">
+          <span class="skel skel-line" style:width={`${68 - row * 8}%`}></span>
+          <span class="skel skel-line short"></span>
+        </span>
+      </div>
+    {/each}
+  </div>
+{/snippet}
+
 {#snippet howBody()}
   <p class="how-lede">{m.channels_page_subtitle()}</p>
   <p class="how-limits">{m.channels_public_readable()}</p>
@@ -3050,7 +3132,8 @@
     {#if joinedCount > 0}
       <span class="header-count">
         {plural(joinedCount, {
-          one: m.channels_count_one,
+          one: () => m.channels_count_one({ count: joinedCount }),
+          oneShowsCount: true,
           other: () => m.channels_count_other({ count: joinedCount }),
         })}
       </span>
@@ -3430,7 +3513,8 @@
                   <span class="muted">{showLikelySpam
                     ? m.channels_likely_spam_shown()
                     : plural(likelySpam.length, {
-                        one: m.channels_likely_spam_hidden_one,
+                        one: () => m.channels_likely_spam_hidden_one({ count: likelySpam.length }),
+                        oneShowsCount: true,
                         other: () => m.channels_likely_spam_hidden_other({ count: likelySpam.length }),
                       })}</span>
                   <button
@@ -3551,7 +3635,8 @@
                       {@const countLabel = ch.in_room
                         ? m.channels_members_here_of_total({ present: count, total: Math.max(ch.roster_count, count) })
                         : plural(count, {
-                            one: m.channels_members_one,
+                            one: () => m.channels_members_one({ count }),
+                            oneShowsCount: true,
                             few: () => m.channels_members_few({ count }),
                             other: () => m.channels_members_n({ count }),
                           })}
@@ -3580,7 +3665,8 @@
                         aria-label={mentioned
                           ? m.channels_unread_mention_aria({ count: ch.unread })
                           : plural(ch.unread, {
-                              one: m.channels_unread_title_one,
+                              one: () => m.channels_unread_title_one({ count: ch.unread }),
+                              oneShowsCount: true,
                               few: () => m.channels_unread_title_few({ count: ch.unread }),
                               other: () => m.channels_unread_title_other({ count: ch.unread }),
                             })}
@@ -3734,7 +3820,7 @@
           {/if}
         {/snippet}
 
-        <section class="conversation-pane" class:hidden-when-list={!selected}>
+        <section class="conversation-pane" class:hidden-when-list={!selected} bind:this={conversationEl}>
           {#if !selected}
             <div class="empty-state compact">
               <div class="empty-icon">
@@ -3745,6 +3831,21 @@
               </div>
               <p class="empty-title">{m.channels_select_title()}</p>
               <p class="empty-sub">{m.channels_no_selection()}</p>
+              <!-- The keys that move between rooms, said where nobody has
+                   opened one yet: otherwise they are only in the ? sheet. -->
+              {#if joinedInOrder.length > 0}
+                <dl class="room-shortcuts" aria-label={m.shortcuts_section_channels()}>
+                  {#each roomShortcutHints as hint (hint.keys.join('+'))}
+                    <div class="room-shortcut">
+                      <dt>
+                        {#each hint.keys as key, i (i)}{#if i > 0}<span class="kbd-plus" aria-hidden="true">+</span>{/if}<kbd>{key}</kbd>{/each}
+                      </dt>
+                      <dd>{hint.label()}</dd>
+                    </div>
+                  {/each}
+                </dl>
+                <p class="room-shortcuts-more"><kbd>?</kbd> {m.shortcuts_show_shortcuts()}</p>
+              {/if}
             </div>
           {:else}
             <header class="conv-header">
@@ -4189,7 +4290,7 @@
               </button>
             </div>
             {#if membersLoading && members.length === 0}
-              <p class="muted list-empty">{m.common_loading()}</p>
+              {@render memberSkeleton()}
             {:else if membersError && members.length === 0}
               <div class="members-empty">
                 <p class="muted list-empty">{m.channels_members_failed()}</p>
@@ -4198,12 +4299,42 @@
                 </button>
               </div>
             {:else if members.length === 0 && membersFor !== selectedId}
-              <p class="muted list-empty">{m.common_loading()}</p>
+              {@render memberSkeleton()}
             {:else if members.length === 0}
               <p class="muted list-empty">{m.channels_members_empty()}</p>
             {:else}
+              {#if members.length >= MEMBER_FILTER_FROM || memberQuery}
+                <div class="search-wrap member-filter">
+                  <span class="search-icon" aria-hidden="true">
+                    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
+                      <circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="17" y2="17"/>
+                    </svg>
+                  </span>
+                  <input
+                    type="text"
+                    class="search-input"
+                    bind:value={memberQuery}
+                    placeholder={m.channels_members_filter()}
+                    aria-label={m.channels_members_filter()}
+                    spellcheck="false"
+                    autocomplete="off"
+                    onkeydown={(e) => {
+                      if (e.key !== 'Escape' || !memberQuery) return;
+                      e.preventDefault();
+                      e.stopPropagation();
+                      memberQuery = '';
+                    }}
+                  />
+                  {#if memberQuery}
+                    <button type="button" class="search-clear" onclick={() => (memberQuery = '')} title={m.search_bar_clear()} aria-label={m.search_bar_clear()}><IconX size={12} /></button>
+                  {/if}
+                </div>
+              {/if}
+              {#if shownMembers.length === 0}
+                <p class="muted list-empty">{m.channels_members_no_match()}</p>
+              {/if}
               <ul class="member-list">
-                {#each sortedMembers as mem (mem.member_pubkey)}
+                {#each shownMembers as mem (mem.member_pubkey)}
                   {@const presence = presenceOf(mem, presenceNow)}
                   {@const presenceLabel =
                     presence === 'online' ? m.channels_member_online() : m.channels_member_away()}
@@ -6900,6 +7031,78 @@
 
   .members-close { margin-left: auto; }
 
+  .member-filter {
+    flex-shrink: 0;
+    margin: 8px 8px 2px;
+  }
+
+  /* ── Members in outline while the roster loads ── */
+  .member-skeleton {
+    padding: 6px;
+    animation: skel-fade-in 0.2s ease 0.15s both;
+  }
+
+  .member-skel-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+  }
+
+  .skel {
+    position: relative;
+    display: block;
+    overflow: hidden;
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--text-muted) 14%, transparent);
+  }
+
+  .skel::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background: linear-gradient(
+      90deg,
+      transparent,
+      color-mix(in srgb, var(--text-primary) 7%, transparent),
+      transparent
+    );
+    animation: skel-shimmer 1.4s ease-in-out infinite;
+  }
+
+  .skel-avatar {
+    flex-shrink: 0;
+    width: var(--avatar-size-compact);
+    height: var(--avatar-size-compact);
+    border-radius: 50%;
+  }
+
+  .skel-lines {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .skel-line { height: 8px; }
+  .skel-line.short { width: 34%; }
+
+  @keyframes skel-fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  @keyframes skel-shimmer {
+    to { transform: translateX(100%); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .member-skeleton { animation: none; }
+    .skel::after { animation: none; display: none; }
+  }
+
   .member-list {
     list-style: none;
     margin: 0;
@@ -7229,6 +7432,68 @@
   }
 
   .empty-state.compact { padding: 40px 24px; }
+
+  /* The room keys, under "Pick a room". */
+  .room-shortcuts {
+    display: grid;
+    grid-template-columns: auto auto;
+    justify-content: center;
+    gap: 8px 14px;
+    margin: 18px 0 0;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+  }
+
+  .room-shortcut {
+    display: contents;
+  }
+
+  .room-shortcut dt {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 3px;
+  }
+
+  .room-shortcut dd {
+    margin: 0;
+    text-align: start;
+    align-self: center;
+  }
+
+  .room-shortcuts kbd,
+  .room-shortcuts-more kbd {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 20px;
+    height: 20px;
+    padding: 0 6px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-bottom-width: 2px;
+    border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+    font-size: var(--font-size-2xs, 11px);
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  :global([data-theme="dark"]) .room-shortcuts kbd,
+  :global([data-theme="dark"]) .room-shortcuts-more kbd {
+    background: var(--bg-tertiary);
+  }
+
+  .kbd-plus {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+  }
+
+  .room-shortcuts-more {
+    margin: 14px 0 0;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+  }
 
   .empty-icon {
     width: 64px;

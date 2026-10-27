@@ -434,7 +434,8 @@
       if (count <= 0) return;
       toastSuccess(
         plural(count, {
-          one: m.layout_channels_recovered_one,
+          one: () => m.layout_channels_recovered_one({ count }),
+          oneShowsCount: true,
           other: () => m.layout_channels_recovered_other({ count }),
         }),
       );
@@ -531,7 +532,8 @@
       if (count <= 0) return;
       toastSuccess(
         plural(count, {
-          one: m.library_folders_shared_one,
+          one: () => m.library_folders_shared_one({ count }),
+          oneShowsCount: true,
           other: () => m.library_folders_shared_other({ count }),
         }),
       );
@@ -547,7 +549,8 @@
       if (count <= 0) return;
       toastWarning(
         plural(count, {
-          one: m.library_folders_share_failed_one,
+          one: () => m.library_folders_share_failed_one({ count }),
+          oneShowsCount: true,
           other: () => m.library_folders_share_failed_other({ count }),
         }),
       );
@@ -721,7 +724,8 @@
               if (migrated > 0) {
                 toastWarning(
                   plural(migrated, {
-                    one: m.layout_download_overflow_notice_one,
+                    one: () => m.layout_download_overflow_notice_one({ count: migrated }),
+                    oneShowsCount: true,
                     few: () => m.layout_download_overflow_notice_few({ count: migrated }),
                     other: () => m.layout_download_overflow_notice_other({ count: migrated }),
                   }),

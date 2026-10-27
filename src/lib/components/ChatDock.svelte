@@ -380,7 +380,8 @@
   );
   let unreadElsewhereLabel = $derived(
     plural(unreadElsewhere, {
-      one: m.chat_dock_unread_elsewhere_one,
+      one: () => m.chat_dock_unread_elsewhere_one({ count: unreadElsewhere }),
+      oneShowsCount: true,
       few: () => m.chat_dock_unread_elsewhere_few({ count: unreadElsewhere }),
       other: () => m.chat_dock_unread_elsewhere_other({ count: unreadElsewhere }),
     }),
@@ -934,7 +935,8 @@
                   <span
                     class="count-pill"
                     aria-label={plural(row.unread, {
-                      one: m.chat_dock_unread_aria_one,
+                      one: () => m.chat_dock_unread_aria_one({ count: row.unread }),
+                      oneShowsCount: true,
                       few: () => m.chat_dock_unread_aria_few({ count: row.unread }),
                       other: () => m.chat_dock_unread_aria_other({ count: row.unread }),
                     })}
@@ -980,7 +982,8 @@
                   <span
                     class="count-pill"
                     aria-label={plural(row.unread, {
-                      one: m.chat_dock_unread_aria_one,
+                      one: () => m.chat_dock_unread_aria_one({ count: row.unread }),
+                      oneShowsCount: true,
                       few: () => m.chat_dock_unread_aria_few({ count: row.unread }),
                       other: () => m.chat_dock_unread_aria_other({ count: row.unread }),
                     })}

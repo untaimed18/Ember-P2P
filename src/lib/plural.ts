@@ -3,10 +3,17 @@ import { getLocale } from '$lib/paraglide/runtime';
 /**
  * The variants of one plural message group, keyed by CLDR category.
  *
- * `one` is only ever used for exactly 1. The catalog's `_one` strings spell the
- * number out ("1 file", "this server"), so they cannot stand in for the other
- * counts some locales also file under `one` — French and Portuguese 0, Russian
- * 21, 31, … — and those get `other` instead.
+ * `one` is used for exactly 1, and for the other counts a locale files under
+ * `one` — Russian 21, 31, 101, … — only when the group sets `oneShowsCount`.
+ * Most `_one` strings write the number into the message as `{count}` (or
+ * whatever the group calls it), which is what lets them stand in for 21: the
+ * noun after it takes the same form in Russian. A `_one` string that names a
+ * single thing instead ("this server", "{name} is typing") must not, so those
+ * groups leave the flag off and such counts get `other`.
+ *
+ * French and Portuguese file 0 under `one` too. It never takes `one` here:
+ * "0 fichiers" is the form people expect from a count, and those strings say
+ * the plural.
  *
  * `few` and `many` are optional and fall back to `other`. A group only carries
  * `_few` where a locale needs a distinct form for it: Russian 2–4, 22–24, …
@@ -15,6 +22,10 @@ import { getLocale } from '$lib/paraglide/runtime';
  */
 export interface PluralForms {
   one: () => string;
+  /** `one` shows the count it is given — or is the noun after a count shown
+   *  beside it — so it also serves the counts besides 1 that the locale files
+   *  under `one`. */
+  oneShowsCount?: boolean;
   few?: () => string;
   many?: () => string;
   other: () => string;
@@ -37,15 +48,18 @@ export function pluralCategory(count: number, locale: string = getLocale()): Int
  *
  * ```ts
  * plural(n, {
- *   one: m.library_deleted_one,
- *   few: () => m.library_deleted_few({ count: n }),
- *   other: () => m.library_deleted_other({ count: n }),
+ *   one: () => m.library_deleted_one({ count: formatNumber(n) }),
+ *   oneShowsCount: true,
+ *   few: () => m.library_deleted_few({ count: formatNumber(n) }),
+ *   other: () => m.library_deleted_other({ count: formatNumber(n) }),
  * });
  * ```
  */
 export function plural(count: number, forms: PluralForms, locale: string = getLocale()): string {
   if (count === 1) return forms.one();
   switch (pluralCategory(count, locale)) {
+    case 'one':
+      return count !== 0 && forms.oneShowsCount ? forms.one() : forms.other();
     case 'few':
       return (forms.few ?? forms.other)();
     case 'many':

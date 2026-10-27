@@ -231,7 +231,8 @@
           tab?.error
             ? m.search_failed_with({ error: tab.error })
             : plural(found, {
-                one: m.search_announce_complete_one,
+                one: () => m.search_announce_complete_one({ count: formatNumber(found) }),
+                oneShowsCount: true,
                 other: () => m.search_announce_complete_other({ count: formatNumber(found) }),
               }),
         );
@@ -241,7 +242,8 @@
         announcedAt = now;
         announcedCount = count;
         announceSearch(plural(count, {
-          one: m.search_results_so_far_one,
+          one: () => m.search_results_so_far_one({ count: formatNumber(count) }),
+          oneShowsCount: true,
           other: () => m.search_results_so_far({ count: formatNumber(count) }),
         }));
       }
@@ -2606,7 +2608,8 @@
     confirmMessage = tab.isSearching
       ? m.search_confirm_stop_message({ preview })
       : plural(tab.results.length, {
-          one: () => m.search_confirm_close_message_one({ preview }),
+          one: () => m.search_confirm_close_message_one({ preview, count: formatNumber(tab.results.length) }),
+          oneShowsCount: true,
           other: () => m.search_confirm_close_message_other({ preview, count: formatNumber(tab.results.length) }),
         });
     confirmOpen = true;
@@ -3032,7 +3035,8 @@
         'info',
         outcome.servers > 0
           ? plural(outcome.servers, {
-              one: m.search_more_asking_one,
+              one: () => m.search_more_asking_one({ count: formatNumber(outcome.servers) }),
+              oneShowsCount: true,
               other: () => m.search_more_asking_other({ count: formatNumber(outcome.servers) }),
             })
           : m.search_more_asking_server(),
@@ -3708,7 +3712,8 @@
     pendingConfirm = { kind: 'clear-results' };
     confirmTitle = m.search_confirm_clear_title();
     confirmMessage = plural(tab.results.length, {
-      one: m.search_confirm_clear_message_one,
+      one: () => m.search_confirm_clear_message_one({ count: formatNumber(tab.results.length) }),
+      oneShowsCount: true,
       few: () => m.search_confirm_clear_message_few({ count: formatNumber(tab.results.length) }),
       other: () => m.search_confirm_clear_message_other({ count: formatNumber(tab.results.length) }),
     });
@@ -4103,7 +4108,7 @@
         addToast('error', m.search_copy_failed());
         return;
       }
-      addToast('success', m.search_copied_link_one());
+      addToast('success', m.search_copied_link_one({ count: formatNumber(1) }));
     } catch (e: unknown) {
       addToast('error', translateError(e, m.search_copy_failed()));
     }
@@ -4132,7 +4137,8 @@
         return;
       }
       addToast('success', plural(targets.length, {
-        one: m.search_copied_link_one,
+        one: () => m.search_copied_link_one({ count: formatNumber(targets.length) }),
+        oneShowsCount: true,
         other: () => m.search_copied_links_other({ count: formatNumber(targets.length) }),
       }));
     } catch (e: unknown) {
@@ -4250,7 +4256,8 @@
     if (skippedLocal > 0) parts.push(m.search_bulk_already_in_library({ count: formatNumber(skippedLocal) }));
     if (failed > 0) {
       parts.push(plural(failed, {
-        one: m.search_bulk_failed_one,
+        one: () => m.search_bulk_failed_one({ count: formatNumber(failed) }),
+        oneShowsCount: true,
         other: () => m.search_bulk_failed_other({ count: formatNumber(failed) }),
       }));
     }
@@ -4268,11 +4275,13 @@
       const local = formatNumber(skippedLocal);
       addToast('success', skippedLocal > 0
         ? plural(queued, {
-            one: () => m.search_bulk_queued_with_local_one({ local }),
+            one: () => m.search_bulk_queued_with_local_one({ local, count }),
+            oneShowsCount: true,
             other: () => m.search_bulk_queued_with_local_other({ count, local }),
           })
         : plural(queued, {
-            one: m.search_bulk_queued_one,
+            one: () => m.search_bulk_queued_one({ count }),
+            oneShowsCount: true,
             other: () => m.search_bulk_queued_other({ count }),
           }));
     } else if (queued === 0 && alreadyQueued > 0 && failed === 0) {
@@ -4287,11 +4296,13 @@
       const failedText = formatNumber(failed);
       addToast('error', queued > 0
         ? plural(failed, {
-            one: () => m.search_bulk_failed_summary_queued_one({ queued: queuedText, details }),
+            one: () => m.search_bulk_failed_summary_queued_one({ queued: queuedText, details, failed: failedText }),
+            oneShowsCount: true,
             other: () => m.search_bulk_failed_summary_queued_other({ failed: failedText, queued: queuedText, details }),
           })
         : plural(failed, {
-            one: () => m.search_bulk_failed_summary_one({ details }),
+            one: () => m.search_bulk_failed_summary_one({ details, failed: failedText }),
+            oneShowsCount: true,
             other: () => m.search_bulk_failed_summary_other({ failed: failedText, details }),
           }));
     } else if (skippedLocal > 0) {
@@ -4578,7 +4589,7 @@
           tabindex={tab.id === $activeSearchTabId ? 0 : -1}
         >
           <span class="search-tab-label">{searchTabLabel(tab)}</span>
-          <span class="search-tab-meta" aria-label={tab.isSearching ? m.search_in_progress_aria() : plural(tab.results.length, { one: m.search_results_aria_one, other: () => m.search_results_aria({ count: formatNumber(tab.results.length) }) })}>
+          <span class="search-tab-meta" aria-label={tab.isSearching ? m.search_in_progress_aria() : plural(tab.results.length, { one: () => m.search_results_aria_one({ count: formatNumber(tab.results.length) }), oneShowsCount: true, other: () => m.search_results_aria({ count: formatNumber(tab.results.length) }) })}>
             {#if tab.isSearching}
               {m.search_searching_label()}
             {:else}
@@ -4715,7 +4726,8 @@
               <div class="filter-help-popover" role="tooltip">
                 {#if hidingSpam && spamHiddenCount > 0}
                   {plural(spamHiddenCount, {
-                    one: m.search_spam_hidden_count_one,
+                    one: () => m.search_spam_hidden_count_one({ count: formatNumber(spamHiddenCount) }),
+                    oneShowsCount: true,
                     other: () => m.search_spam_hidden_count({ count: formatNumber(spamHiddenCount) }),
                   })}
                 {:else}
@@ -4901,12 +4913,14 @@
         {@const found = activeTab.progress.results_so_far}
         <p class="search-detail">
           {plural(nodes, {
-            one: m.search_contacted_nodes_one,
+            one: () => m.search_contacted_nodes_one({ count: formatNumber(nodes) }),
+            oneShowsCount: true,
             other: () => m.search_contacted_nodes({ count: formatNumber(nodes) }),
           })}
           {#if found > 0}
             &middot; {plural(found, {
-              one: m.search_results_so_far_one,
+              one: () => m.search_results_so_far_one({ count: formatNumber(found) }),
+              oneShowsCount: true,
               other: () => m.search_results_so_far({ count: formatNumber(found) }),
             })}
           {/if}
@@ -4951,14 +4965,15 @@
           {/if}
           {#if filteredResults.length > 0 && resultsHidden > 0}
             {plural(filteredResults.length, {
-              one: () => m.search_showing_filtered_one({ total: formatNumber(visibleResults.length) }),
+              one: () => m.search_showing_filtered_one({ total: formatNumber(visibleResults.length), count: formatNumber(filteredResults.length) }),
+              oneShowsCount: true,
               other: () => m.search_showing_filtered_other({
                 count: formatNumber(filteredResults.length),
                 total: formatNumber(visibleResults.length),
               }),
             })}
           {:else if filteredResults.length > 0}
-            {plural(filteredResults.length, { one: m.search_showing_one, other: () => m.search_showing_other({ count: formatNumber(filteredResults.length) }) })}
+            {plural(filteredResults.length, { one: () => m.search_showing_one({ count: formatNumber(filteredResults.length) }), oneShowsCount: true, other: () => m.search_showing_other({ count: formatNumber(filteredResults.length) }) })}
           {:else if visibleResults.length > 0 && !hasActiveFilters}
             {@const spamHides = hidingSpam && spamHiddenCount + bothHiddenCount > 0}
             {@const ownedHides = hideOwned && ownedHiddenCount + bothHiddenCount > 0}
@@ -4977,7 +4992,8 @@
         {#if hidingSpam && spamHiddenCount > 0 && (filteredResults.length > 0 || hasActiveFilters)}
           <span class="results-spam-hidden">
             {plural(spamHiddenCount, {
-              one: m.search_spam_hidden_inline_one,
+              one: () => m.search_spam_hidden_inline_one({ count: formatNumber(spamHiddenCount) }),
+              oneShowsCount: true,
               other: () => m.search_spam_hidden_inline_other({ count: formatNumber(spamHiddenCount) }),
             })}
             <button type="button" class="ghost results-spam-show" onclick={revealSpamInTab}>{m.search_show_spam()}</button>
@@ -5042,7 +5058,7 @@
       <div class="bulk-actions" role="toolbar" aria-label={m.search_bulk_actions_aria()}>
         <span class="bulk-count">{m.search_bulk_selected({ count: formatNumber(checkedCount) })}<span class="bulk-size"> · {formatSize(checkedTotalSize)}</span></span>
         <button class="bulk-download-btn" onclick={downloadChecked} disabled={bulkDownloadPending}>
-          {bulkDownloadPending ? m.search_downloading_ellipsis() : plural(checkedCount, { one: m.search_bulk_download_one, other: () => m.search_bulk_download_other({ count: formatNumber(checkedCount) }) })}
+          {bulkDownloadPending ? m.search_downloading_ellipsis() : plural(checkedCount, { one: () => m.search_bulk_download_one({ count: formatNumber(checkedCount) }), oneShowsCount: true, other: () => m.search_bulk_download_other({ count: formatNumber(checkedCount) }) })}
         </button>
         <button class="ghost bulk-copy-btn" onclick={copyCheckedLinks} disabled={copyingLinks !== null} aria-busy={copyingLinks === 'checked'} title={m.search_bulk_copy_links_title()}>
           {copyingLinks === 'checked' ? m.library_copying() : plural(checkedCount, { one: m.search_bulk_copy_link_one, other: () => m.search_bulk_copy_links_other({ count: formatNumber(checkedCount) }) })}

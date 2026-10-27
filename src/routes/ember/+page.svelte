@@ -320,7 +320,8 @@
             ? m.ember_relay_using()
             : relayingFor > 0
               ? plural(relayingFor, {
-                  one: m.ember_relay_relaying_for_one,
+                  one: () => m.ember_relay_relaying_for_one({ count: formatNumber(relayingFor) }),
+                  oneShowsCount: true,
                   few: () => m.ember_relay_relaying_for_few({ count: formatNumber(relayingFor) }),
                   other: () => m.ember_relay_relaying_for_other({ count: formatNumber(relayingFor) }),
                 })

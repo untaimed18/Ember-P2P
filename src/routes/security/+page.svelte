@@ -332,7 +332,8 @@
 
   function rangeCountText(count: number): string {
     return plural(count, {
-      one: m.security_range_count_one,
+      one: () => m.security_range_count_one({ count: formatNumber(count) }),
+      oneShowsCount: true,
       few: () => m.security_range_count_few({ count: formatNumber(count) }),
       other: () => m.security_ranges_count({ count: formatNumber(count) }),
     });
@@ -340,7 +341,8 @@
 
   function hitsCountText(count: number): string {
     return plural(count, {
-      one: m.security_hits_count_one,
+      one: () => m.security_hits_count_one({ count: formatNumber(count) }),
+      oneShowsCount: true,
       few: () => m.security_hits_count_few({ count: formatNumber(count) }),
       other: () => m.security_hits_count({ count: formatNumber(count) }),
     });
@@ -763,7 +765,8 @@
       </div>
       <span class="result-count">
         {plural(matchedCount, {
-          one: m.security_range_count_one,
+          one: () => m.security_range_count_one({ count: formatNumber(matchedCount) }),
+          oneShowsCount: true,
           few: () => m.security_range_count_few({ count: formatNumber(matchedCount) }),
           other: () => m.security_range_count_other({ count: formatNumber(matchedCount) }),
         })}

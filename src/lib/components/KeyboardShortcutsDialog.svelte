@@ -194,6 +194,7 @@
       title: () => m.shortcuts_section_channels(),
       shortcuts: [
         { keys: ['Alt', '↑ / ↓'], label: () => m.shortcuts_channels_prev_next() },
+        { keys: ['Alt', 'Shift', '↑ / ↓'], label: () => m.shortcuts_channels_unread_prev_next() },
         { keys: [modifierKey, 'K'], label: () => m.shortcuts_channels_search() },
         { keys: ['↑ / ↓'], label: () => m.shortcuts_channels_search_navigate() },
         { keys: ['Enter'], label: () => m.shortcuts_channels_search_open() },

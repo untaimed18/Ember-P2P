@@ -366,7 +366,8 @@
 
   function countLabel(count: number): string {
     return plural(count, {
-      one: m.transfers_categories_count_one,
+      one: () => m.transfers_categories_count_one({ count: formatNumber(count) }),
+      oneShowsCount: true,
       other: () => m.transfers_categories_count_other({ count: formatNumber(count) }),
     });
   }

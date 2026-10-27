@@ -518,7 +518,7 @@
     error = null;
     try {
       await removeServer(server.ip, server.port);
-      const msg = m.servers_removed_one();
+      const msg = m.servers_removed_one({ count: 1 });
       log(msg);
       flash(msg);
       const key = serverKey(server);
@@ -630,7 +630,8 @@
     selectedServers = new Set();
     lastClickedKey = null;
     const msg = plural(removed, {
-      one: m.servers_removed_one,
+      one: () => m.servers_removed_one({ count: removed }),
+      oneShowsCount: true,
       other: () => m.servers_removed_other({ count: removed }),
     });
     log(msg);
@@ -830,7 +831,8 @@
     selectedServer = null;
     lastClickedKey = null;
     const removedMsg = plural(count, {
-      one: m.servers_removed_one,
+      one: () => m.servers_removed_one({ count }),
+      oneShowsCount: true,
       other: () => m.servers_removed_other({ count }),
     });
     log(removedMsg);

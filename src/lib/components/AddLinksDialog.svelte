@@ -182,7 +182,8 @@
           <span class="warn">{m.transfers_add_links_too_long({ size: formatBytes(byteLength(text.trim())), max: formatBytes(maxLength) })}</span>
         {:else if batch}
           {plural(count, {
-            one: m.transfers_add_links_found_one,
+            one: () => m.transfers_add_links_found_one({ count: formatNumber(count) }),
+            oneShowsCount: true,
             other: () => m.transfers_add_links_found_other({ count: formatNumber(count) }),
           })}{#if batch.invalid > 0}
             {' '}{m.transfers_add_links_ignored({ count: formatNumber(batch.invalid) })}{/if}{#if batch.skipped > 0}

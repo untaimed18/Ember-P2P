@@ -249,7 +249,8 @@
         if (!destroyed) {
           const count = formatNumber(coll.files.length);
           toastSuccess(plural(coll.files.length, {
-            one: () => m.library_collection_loaded_one({ name: coll.name }),
+            one: () => m.library_collection_loaded_one({ name: coll.name, count }),
+            oneShowsCount: true,
             few: () => m.library_collection_loaded_few({ name: coll.name, count }),
             other: () => m.library_collection_loaded({ name: coll.name, count }),
           }));
@@ -443,7 +444,8 @@
   <div class="deferred-link-notice" role="status" aria-live="polite">
     <span>
       {plural(deferredCount, {
-        one: m.deeplink_pending_one,
+        one: () => m.deeplink_pending_one({ count: deferredCount }),
+        oneShowsCount: true,
         few: () => m.deeplink_pending_few({ count: deferredCount }),
         other: () => m.deeplink_pending_other({ count: deferredCount }),
       })}

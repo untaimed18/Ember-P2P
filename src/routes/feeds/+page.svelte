@@ -5,6 +5,9 @@
    */
   import { onMount, tick, untrack } from 'svelte';
   import { on } from 'svelte/events';
+  import { fade, fly } from 'svelte/transition';
+  import { cubicOut } from 'svelte/easing';
+  import { prefersReducedMotion } from 'svelte/motion';
   import { page } from '$app/state';
   import { beforeNavigate, goto } from '$app/navigation';
   import { navigatingForDeepLink } from '$lib/deepLinkNavigation';
@@ -104,8 +107,16 @@
   /** Seconds, refreshed each minute so "2 minutes ago" keeps up. */
   let now = $state(Math.floor(Date.now() / 1000));
 
+  /** The tabs in the order they are shown. */
+  const TABS: readonly Tab[] = ['following', 'discover', 'mine'];
+  /** Which way the last tab change went: its content comes in from that side. */
+  let tabStep = $state(0);
+
   function setTab(next: Tab) {
     if (tab === next) return;
+    // Its grid is made anew on the way back, scrolled to where it was left.
+    if (tab === 'discover' && discoverScroll) discoverScrollTop = discoverScroll.scrollTop;
+    tabStep = Math.sign(TABS.indexOf(next) - TABS.indexOf(tab));
     tab = next;
     feedsPageMemory.tab = next;
     compose = null;
@@ -113,6 +124,75 @@
     menu = null;
     if (next === 'discover') void openDiscover();
   }
+
+  /** Arrows, Home and End move between the tabs, as in any tab list. */
+  function tabKeydown(e: KeyboardEvent) {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+    e.preventDefault();
+    const at = TABS.indexOf(tab);
+    const next =
+      e.key === 'Home'
+        ? 0
+        : e.key === 'End'
+          ? TABS.length - 1
+          : (at + (e.key === 'ArrowRight' ? 1 : -1) + TABS.length) % TABS.length;
+    setTab(TABS[next]);
+    document.getElementById(`feeds-tab-${TABS[next]}`)?.focus();
+  }
+
+  /** A tab's content slides a little way in from the side the user moved
+   *  toward; a feed opened in the list fades in. */
+  const tabIn = () => ({ x: 16 * tabStep, duration: prefersReducedMotion.current ? 0 : 220, easing: cubicOut });
+  const detailIn = () => ({ duration: prefersReducedMotion.current ? 0 : 160 });
+
+  /** Glide a switch's highlight under its pressed button, `active` being that
+   *  button's `data-seg`. Without a highlight placed the buttons keep their
+   *  own background, so the switch reads the same either way. */
+  function segmentThumb(active: string) {
+    return (group: HTMLElement) => {
+      const thumb = group.querySelector<HTMLElement>(':scope > .seg-thumb');
+      if (!thumb) return;
+      const place = () => {
+        const on = group.querySelector<HTMLElement>(`:scope > [data-seg="${active}"]`);
+        if (!on || on.offsetWidth === 0) {
+          group.classList.remove('has-thumb');
+          return;
+        }
+        thumb.style.width = `${on.offsetWidth}px`;
+        thumb.style.transform = `translateX(${on.offsetLeft}px)`;
+        group.classList.add('has-thumb');
+      };
+      place();
+      // Slides only once it is somewhere, rather than in from the edge.
+      requestAnimationFrame(() => thumb.classList.add('ready'));
+      // A count appearing, or the language changing, resizes the buttons.
+      const resized = new ResizeObserver(place);
+      for (const button of group.querySelectorAll(':scope > button')) resized.observe(button);
+      return () => resized.disconnect();
+    };
+  }
+
+  /** Arrow keys, Home and End move focus along a list of feeds; Enter or
+   *  Space opens the one focused, as clicking it does. */
+  function listKeydown(e: KeyboardEvent) {
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) return;
+    const rows = [...(e.currentTarget as HTMLElement).querySelectorAll<HTMLElement>('.feed-row:not(:disabled)')];
+    const at = rows.indexOf(document.activeElement as HTMLElement);
+    if (at < 0) return;
+    e.preventDefault();
+    const next =
+      e.key === 'Home'
+        ? 0
+        : e.key === 'End'
+          ? rows.length - 1
+          : Math.min(rows.length - 1, Math.max(0, at + (e.key === 'ArrowDown' ? 1 : -1)));
+    rows[next].focus();
+    rows[next].scrollIntoView({ block: 'nearest' });
+  }
+
+  /** Placeholder rows and cards while the real ones load. */
+  const SKELETON_ROWS = [0, 1, 2, 3];
+  const SKELETON_CARDS = [0, 1, 2, 3, 4, 5];
 
   function toggleCompose(kind: 'follow' | 'create') {
     compose = compose === kind ? null : kind;
@@ -196,6 +276,8 @@
   let markingAll = $state(false);
   let markAllButton = $state<HTMLButtonElement | null>(null);
   let anyUnread = $derived($followedFeeds.some((f) => f.unread > 0));
+  /** New files across every followed feed, for the Following tab's dot. */
+  let unreadTotal = $derived($followedFeeds.reduce((sum, f) => sum + f.unread, 0));
   /** Feeds a Check now or a Download is running for, by key: another feed
    *  opened meanwhile has its own buttons. */
   let refreshingFor = $state<ReadonlySet<string>>(new Set());
@@ -712,7 +794,8 @@
         const active = formatNumber(t.active_sources);
         parts.push(
           plural(t.sources, {
-            one: () => m.feeds_item_sources_one({ active }),
+            one: () => m.feeds_item_sources_one({ active, total: formatNumber(t.sources) }),
+            oneShowsCount: true,
             other: () => m.feeds_item_sources({ active, total: formatNumber(t.sources) }),
           }),
         );
@@ -1114,6 +1197,10 @@
 
   /** The Discover grid, for focus to fall back on once a card is gone. */
   let discoverScroll = $state<HTMLElement | null>(null);
+  /** Where the Discover grid was scrolled when another tab was opened. */
+  let discoverScrollTop = 0;
+  /** New feeds a walk is still finding, shown along the pane's top edge. */
+  let walkShowing = $derived(discovering && discovered.length > 0);
 
   const cardAction = (key: string) =>
     discoverScroll?.querySelector<HTMLElement>(`[data-card="${CSS.escape(key)}"] [data-card-action]`);
@@ -1254,7 +1341,8 @@
   function followersText({ count, at_least }: { count: number; at_least: boolean }): string {
     if (at_least) return m.feeds_followers({ count: `${formatNumber(count)}+` });
     return plural(count, {
-      one: () => m.feeds_followers_one(),
+      one: () => m.feeds_followers_one({ count: formatNumber(count) }),
+      oneShowsCount: true,
       other: () => m.feeds_followers({ count: formatNumber(count) }),
     });
   }
@@ -1266,7 +1354,8 @@
 
   function downloadsText(count: number): string {
     return plural(count, {
-      one: () => m.feeds_item_downloads_one(),
+      one: () => m.feeds_item_downloads_one({ count: formatNumber(count) }),
+      oneShowsCount: true,
       other: () => m.feeds_item_downloads({ count: formatNumber(count) }),
     });
   }
@@ -1663,6 +1752,48 @@
   </svg>
 {/snippet}
 
+<!-- The list beside an open feed, in outline, while the real ones load. -->
+{#snippet skeletonWorkspace()}
+  <div class="workspace skeleton" role="status">
+    <span class="sr-only">{m.common_loading()}</span>
+    <div class="list-pane" aria-hidden="true">
+      {#each SKELETON_ROWS as row (row)}
+        <div class="skel-row">
+          <span class="skel skel-avatar"></span>
+          <span class="skel-lines">
+            <span class="skel skel-line" style:width={`${70 - row * 9}%`}></span>
+            <span class="skel skel-line short"></span>
+          </span>
+        </div>
+      {/each}
+    </div>
+    <div class="detail-pane" aria-hidden="true">
+      <div class="skel-head">
+        <span class="skel skel-avatar lg"></span>
+        <span class="skel-lines">
+          <span class="skel skel-line title"></span>
+          <span class="skel skel-line short"></span>
+        </span>
+      </div>
+      {@render skeletonFiles()}
+    </div>
+  </div>
+{/snippet}
+
+{#snippet skeletonFiles()}
+  <div class="skel-files" aria-hidden="true">
+    {#each SKELETON_ROWS as row (row)}
+      <div class="skel-row">
+        <span class="skel skel-icon"></span>
+        <span class="skel-lines">
+          <span class="skel skel-line" style:width={`${62 - row * 7}%`}></span>
+          <span class="skel skel-line short"></span>
+        </span>
+      </div>
+    {/each}
+  </div>
+{/snippet}
+
 {#snippet fileIcon(type: FileTypeKey | '')}
   <span class="file-icon" data-type={type || 'Other'} aria-hidden="true">
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round">
@@ -1708,18 +1839,37 @@
     </h2>
   </div>
   <div class="header-actions">
-    <div class="segmented" role="group" aria-label={m.nav_feeds()}>
-      <button type="button" aria-pressed={tab === 'following'} class:active={tab === 'following'} onclick={() => setTab('following')}>
-        {m.feeds_tab_following()}
-        {#if $followedFeeds.length > 0}<span class="seg-count">{formatNumber($followedFeeds.length)}</span>{/if}
-      </button>
-      <button type="button" aria-pressed={tab === 'discover'} class:active={tab === 'discover'} onclick={() => setTab('discover')}>
-        {m.feeds_tab_discover()}
-      </button>
-      <button type="button" aria-pressed={tab === 'mine'} class:active={tab === 'mine'} onclick={() => setTab('mine')}>
-        {m.feeds_tab_mine()}
-        {#if mine.length > 0}<span class="seg-count">{formatNumber(mine.length)}</span>{/if}
-      </button>
+    <div class="segmented" role="tablist" aria-label={m.nav_feeds()} {@attach segmentThumb(tab)}>
+      <span class="seg-thumb" aria-hidden="true"></span>
+      {#each TABS as t (t)}
+        <button
+          type="button"
+          role="tab"
+          id={`feeds-tab-${t}`}
+          aria-selected={tab === t}
+          aria-controls="feeds-tabpanel"
+          tabindex={tab === t ? 0 : -1}
+          data-seg={t}
+          class:active={tab === t}
+          onclick={() => setTab(t)}
+          onkeydown={tabKeydown}
+        >
+          {#if t === 'following'}
+            {m.feeds_tab_following()}
+            {#if $followedFeeds.length > 0}<span class="seg-count">{formatNumber($followedFeeds.length)}</span>{/if}
+            <!-- What is new is on this tab while another is open. -->
+            {#if unreadTotal > 0 && tab !== 'following'}
+              <span class="tab-dot" aria-hidden="true"></span>
+              <span class="sr-only">{m.feeds_unread_title({ count: formatNumber(unreadTotal) })}</span>
+            {/if}
+          {:else if t === 'discover'}
+            {m.feeds_tab_discover()}
+          {:else}
+            {m.feeds_tab_mine()}
+            {#if mine.length > 0}<span class="seg-count">{formatNumber(mine.length)}</span>{/if}
+          {/if}
+        </button>
+      {/each}
     </div>
     {#if tab === 'following'}
       {#if anyUnread || markingAll}
@@ -1783,1032 +1933,1073 @@
 {/if}
 
 <div class="page-content feeds-page">
-  {#if compose === 'follow' && tab === 'following'}
-    <!-- svelte-ignore a11y_no_noninteractive_element_interactions (Escape from any of its fields) -->
-    <form class="compose-card" onsubmit={(e) => { e.preventDefault(); void follow(); }} onkeydown={composeKeydown}>
-      <div class="compose-row">
-        <div class="compose-input-wrap">
-          <span class="compose-input-icon" aria-hidden="true">
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M6.5 9.5a3 3 0 0 0 4.2 0l2.1-2.1a3 3 0 0 0-4.2-4.2l-.7.7"/><path d="M9.5 6.5a3 3 0 0 0-4.2 0L3.2 8.6a3 3 0 0 0 4.2 4.2l.7-.7"/>
-            </svg>
-          </span>
-          <input
-            type="text"
-            class="compose-input"
-            bind:value={followLink}
-            placeholder={m.feeds_follow_placeholder()}
-            aria-label={m.feeds_follow_placeholder()}
-            spellcheck="false"
-            autocomplete="off"
-            {@attach (el: HTMLInputElement) => el.focus()}
-          />
-        </div>
-        <button type="submit" class="primary" disabled={following || !followLink.trim()}>{m.feeds_follow()}</button>
-      </div>
-      <p class="compose-hint">{m.feeds_follow_privacy()}</p>
-    </form>
-  {:else if compose === 'create' && tab === 'mine'}
-    <!-- svelte-ignore a11y_no_noninteractive_element_interactions (Escape from any of its fields) -->
-    <form class="compose-card" onsubmit={(e) => { e.preventDefault(); unlessDirty(() => void create()); }} onkeydown={composeKeydown}>
-      <div class="compose-row">
-        <input
-          type="text"
-          class="compose-input plain"
-          bind:value={newTitle}
-          oninput={(e) => {
-            if (!composing(e)) newTitle = fitBytes(newTitle, TITLE_MAX);
-          }}
-          oncompositionend={() => (newTitle = fitBytes(newTitle, TITLE_MAX))}
-          placeholder={m.feeds_title_placeholder()}
-          aria-label={m.feeds_title_placeholder()}
-          {@attach (el: HTMLInputElement) => el.focus()}
-        />
-        <input
-          type="text"
-          class="compose-input plain grow"
-          bind:value={newDescription}
-          oninput={(e) => {
-            if (!composing(e)) newDescription = fitBytes(newDescription, DESCRIPTION_MAX);
-          }}
-          oncompositionend={() => (newDescription = fitBytes(newDescription, DESCRIPTION_MAX))}
-          placeholder={m.feeds_description_placeholder()}
-          aria-label={m.feeds_description_placeholder()}
-        />
-        <button type="submit" class="primary" disabled={creating || !newTitle.trim()}>{m.feeds_create()}</button>
-      </div>
-      <fieldset class="visibility">
-        <legend class="visibility-legend">{m.feeds_visibility_label()}</legend>
-        <label class="visibility-option" class:chosen={!newListed}>
-          <input type="radio" name="feed-visibility" checked={!newListed} onchange={() => (newListed = false)} />
-          <span class="visibility-text">
-            <span class="visibility-name">{m.feeds_visibility_link()}</span>
-            <span class="visibility-hint">{m.feeds_visibility_link_hint()}</span>
-          </span>
-        </label>
-        <label class="visibility-option" class:chosen={newListed}>
-          <input type="radio" name="feed-visibility" checked={newListed} onchange={() => (newListed = true)} />
-          <span class="visibility-text">
-            <span class="visibility-name">{m.feeds_visibility_public()}</span>
-            <span class="visibility-hint">{m.feeds_visibility_public_hint()}</span>
-          </span>
-        </label>
-      </fieldset>
-      <p class="compose-hint">{m.feeds_publish_public_hint()}</p>
-    </form>
-  {/if}
-
-  {#if tab === 'following'}
-    {#if $followedFeeds.length === 0 && $followedFeedsFailed}
-      <div class="empty-card">
-        <div class="empty-state">
-          <p class="empty-title">{m.feeds_load_failed()}</p>
-          <div class="empty-actions">
-            <button type="button" class="primary empty-action" onclick={() => void refreshFollowedFeeds()}>{m.common_retry()}</button>
-          </div>
-        </div>
-      </div>
-    {:else if $followedFeeds.length === 0 && !$followedFeedsLoaded}
-      <div class="empty-card"><span class="spinner xs" aria-hidden="true"></span><span class="sr-only">{m.common_loading()}</span></div>
-    {:else if $followedFeeds.length === 0}
-      <div class="empty-card">
-        <div class="empty-state">
-          <span class="empty-glyph">{@render feedGlyph()}</span>
-          <p class="empty-title">{m.feeds_none_followed()}</p>
-          <p class="empty-sub">{m.feeds_empty_following_body()}</p>
-          {#if compose !== 'follow'}
-            <div class="empty-actions">
-              <button type="button" class="primary empty-action" onclick={() => (compose = 'follow')}>{m.feeds_follow_a_feed()}</button>
-              <button type="button" class="secondary empty-action" onclick={() => setTab('discover')}>{m.feeds_browse_discover()}</button>
+  {#key tab}
+    <div class="tab-view" role="tabpanel" id="feeds-tabpanel" aria-labelledby={`feeds-tab-${tab}`} in:fly={tabIn()}>
+      {#if compose === 'follow' && tab === 'following'}
+        <!-- svelte-ignore a11y_no_noninteractive_element_interactions (Escape from any of its fields) -->
+        <form class="compose-card" onsubmit={(e) => { e.preventDefault(); void follow(); }} onkeydown={composeKeydown}>
+          <div class="compose-row">
+            <div class="compose-input-wrap">
+              <span class="compose-input-icon" aria-hidden="true">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M6.5 9.5a3 3 0 0 0 4.2 0l2.1-2.1a3 3 0 0 0-4.2-4.2l-.7.7"/><path d="M9.5 6.5a3 3 0 0 0-4.2 0L3.2 8.6a3 3 0 0 0 4.2 4.2l.7-.7"/>
+                </svg>
+              </span>
+              <input
+                type="text"
+                class="compose-input"
+                bind:value={followLink}
+                placeholder={m.feeds_follow_placeholder()}
+                aria-label={m.feeds_follow_placeholder()}
+                spellcheck="false"
+                autocomplete="off"
+                {@attach (el: HTMLInputElement) => el.focus()}
+              />
             </div>
-          {/if}
-        </div>
-      </div>
-    {:else}
-      <div class="workspace">
-        <aside class="list-pane" aria-label={m.feeds_tab_following()}>
-          {#if $followedFeeds.length >= LIST_SEARCH_FROM}
-            {@render searchBox(listQuery, (v) => (listQuery = v), m.feeds_search_feeds())}
-          {/if}
-          <div class="list-scroll">
-            {#each followedShown as feed (keyOf(feed))}
-              {@const active = keyOf(feed) === selectedKey}
-              <button
-                type="button"
-                class="feed-row"
-                class:active
-                class:has-unread={feed.unread > 0}
-                class:deleted={feed.deleted}
-                aria-current={active ? 'true' : undefined}
-                title={feed.deleted ? m.feeds_toast_in_feed({ feed: feedLabel(feed), text: m.feeds_deleted_notice() }) : feedLabel(feed)}
-                onclick={() => selectFollowed(keyOf(feed))}
-              >
-                <span class="feed-avatar" style:--feed-hue={hueOf(feed.publisher + feed.salt)}>{@render feedGlyph()}</span>
-                <span class="feed-row-text">
-                  <span class="feed-row-title">
-                    <bdi dir="auto">{feedLabel(feed)}</bdi>
-                    {#if !feed.title.trim()}<span class="row-key">{shortKey(feed.publisher)}</span>{/if}
-                  </span>
-                  <span
-                    class="feed-row-sub"
-                    class:warn={!feed.deleted && (feed.state === 'broken' || feed.activity.too_large || notSeen(feed))}
-                  >{followedSub(feed)}</span>
-                </span>
-                {#if feed.unread > 0}
-                  <span class="count-pill" aria-hidden="true">{feed.unread > 99 ? '99+' : feed.unread}</span>
-                  <span class="sr-only">{m.feeds_unread_title({ count: formatNumber(feed.unread) })}</span>
-                {/if}
-              </button>
-            {:else}
-              <p class="list-empty">{m.feeds_no_matches()}</p>
-            {/each}
+            <button type="submit" class="primary" disabled={following || !followLink.trim()}>{m.feeds_follow()}</button>
           </div>
-        </aside>
+          <p class="compose-hint">{m.feeds_follow_privacy()}</p>
+        </form>
+      {:else if compose === 'create' && tab === 'mine'}
+        <!-- svelte-ignore a11y_no_noninteractive_element_interactions (Escape from any of its fields) -->
+        <form class="compose-card" onsubmit={(e) => { e.preventDefault(); unlessDirty(() => void create()); }} onkeydown={composeKeydown}>
+          <div class="compose-row">
+            <input
+              type="text"
+              class="compose-input plain"
+              bind:value={newTitle}
+              oninput={(e) => {
+                if (!composing(e)) newTitle = fitBytes(newTitle, TITLE_MAX);
+              }}
+              oncompositionend={() => (newTitle = fitBytes(newTitle, TITLE_MAX))}
+              placeholder={m.feeds_title_placeholder()}
+              aria-label={m.feeds_title_placeholder()}
+              {@attach (el: HTMLInputElement) => el.focus()}
+            />
+            <input
+              type="text"
+              class="compose-input plain grow"
+              bind:value={newDescription}
+              oninput={(e) => {
+                if (!composing(e)) newDescription = fitBytes(newDescription, DESCRIPTION_MAX);
+              }}
+              oncompositionend={() => (newDescription = fitBytes(newDescription, DESCRIPTION_MAX))}
+              placeholder={m.feeds_description_placeholder()}
+              aria-label={m.feeds_description_placeholder()}
+            />
+            <button type="submit" class="primary" disabled={creating || !newTitle.trim()}>{m.feeds_create()}</button>
+          </div>
+          <fieldset class="visibility">
+            <legend class="visibility-legend">{m.feeds_visibility_label()}</legend>
+            <label class="visibility-option" class:chosen={!newListed}>
+              <input type="radio" name="feed-visibility" checked={!newListed} onchange={() => (newListed = false)} />
+              <span class="visibility-text">
+                <span class="visibility-name">{m.feeds_visibility_link()}</span>
+                <span class="visibility-hint">{m.feeds_visibility_link_hint()}</span>
+              </span>
+            </label>
+            <label class="visibility-option" class:chosen={newListed}>
+              <input type="radio" name="feed-visibility" checked={newListed} onchange={() => (newListed = true)} />
+              <span class="visibility-text">
+                <span class="visibility-name">{m.feeds_visibility_public()}</span>
+                <span class="visibility-hint">{m.feeds_visibility_public_hint()}</span>
+              </span>
+            </label>
+          </fieldset>
+          <p class="compose-hint">{m.feeds_publish_public_hint()}</p>
+        </form>
+      {/if}
 
-        <!-- svelte-ignore a11y_no_static_element_interactions (noticing the user act in the open feed; the controls are its own) -->
-        <section
-          class="detail-pane"
-          onpointerdown={claimOpen}
-          onkeydown={claimOpen}
-          {@attach (el: HTMLElement) => on(el, 'wheel', claimOpen, { passive: true })}
-        >
-          {#if selected}
-            <header class="detail-head">
-              <span class="feed-avatar lg" style:--feed-hue={hueOf(selected.publisher + selected.salt)}>{@render feedGlyph()}</span>
-              <div class="detail-title">
-                <h3 title={feedLabel(selected)}><bdi dir="auto">{feedLabel(selected)}</bdi></h3>
-                <p class="detail-meta">
-                  <span title={m.feeds_discover_publisher({ id: selected.publisher })}>{m.feeds_discover_publisher({ id: shortKey(selected.publisher) })}</span>
-                  <span aria-hidden="true">·</span>
-                  <!-- The count its head gave, until its files are in. -->
-                  <span>{m.feeds_items_count({ count: formatNumber(itemsFor === keyOf(selected) ? listedItems.length : selected.item_count) })}</span>
-                  {#if selectedSize > 0}<span aria-hidden="true">·</span><span>{formatBytes(selectedSize)}</span>{/if}
-                  {#if selected.sequence > 0}
-                    <span aria-hidden="true">·</span><span>{m.feeds_discover_updated({ when: ago(Math.floor(selected.sequence / 1000)) })}</span>
-                  {/if}
-                  {#if selected.checked_at > 0}
-                    <span aria-hidden="true">·</span><span>{m.feeds_checked_at({ when: ago(selected.checked_at) })}</span>
-                  {/if}
-                </p>
+      {#if tab === 'following'}
+        {#if $followedFeeds.length === 0 && $followedFeedsFailed}
+          <div class="empty-card">
+            <div class="empty-state">
+              <p class="empty-title">{m.feeds_load_failed()}</p>
+              <div class="empty-actions">
+                <button type="button" class="primary empty-action" onclick={() => void refreshFollowedFeeds()}>{m.common_retry()}</button>
               </div>
-              <div class="detail-actions">
-                {#if !selected.deleted}
+            </div>
+          </div>
+        {:else if $followedFeeds.length === 0 && !$followedFeedsLoaded}
+          {@render skeletonWorkspace()}
+        {:else if $followedFeeds.length === 0}
+          <div class="empty-card">
+            <div class="empty-state">
+              <span class="empty-glyph">{@render feedGlyph()}</span>
+              <p class="empty-title">{m.feeds_none_followed()}</p>
+              <p class="empty-sub">{m.feeds_empty_following_body()}</p>
+              {#if compose !== 'follow'}
+                <div class="empty-actions">
+                  <button type="button" class="primary empty-action" onclick={() => (compose = 'follow')}>{m.feeds_follow_a_feed()}</button>
+                  <button type="button" class="secondary empty-action" onclick={() => setTab('discover')}>{m.feeds_browse_discover()}</button>
+                </div>
+              {/if}
+            </div>
+          </div>
+        {:else}
+          <div class="workspace">
+            <aside class="list-pane" aria-label={m.feeds_tab_following()}>
+              {#if $followedFeeds.length >= LIST_SEARCH_FROM}
+                {@render searchBox(listQuery, (v) => (listQuery = v), m.feeds_search_feeds())}
+              {/if}
+              <!-- svelte-ignore a11y_no_static_element_interactions (arrows between the feeds it holds, each a button) -->
+              <div class="list-scroll" onkeydown={listKeydown}>
+                {#each followedShown as feed (keyOf(feed))}
+                  {@const active = keyOf(feed) === selectedKey}
                   <button
                     type="button"
-                    class="icon-btn"
-                    class:spinning={refreshing}
-                    disabled={refreshing || emberOff}
-                    title={m.feeds_refresh()}
-                    aria-label={m.feeds_refresh()}
-                    onclick={() => void refreshSelected()}
+                    class="feed-row"
+                    class:active
+                    class:has-unread={feed.unread > 0}
+                    class:deleted={feed.deleted}
+                    aria-current={active ? 'true' : undefined}
+                    title={feed.deleted ? m.feeds_toast_in_feed({ feed: feedLabel(feed), text: m.feeds_deleted_notice() }) : feedLabel(feed)}
+                    onclick={() => selectFollowed(keyOf(feed))}
                   >
-                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                      <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><polyline points="13.5 2.5 13.5 5.5 10.5 5.5"/>
-                    </svg>
-                  </button>
-                {/if}
-                <button type="button" class="icon-btn" title={m.feeds_open_folder()} aria-label={m.feeds_open_folder()} onclick={() => void openFolder()}>
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M2 4.5V12.5h12V6H7.5L6 4.5z"/>
-                  </svg>
-                </button>
-                <button type="button" class="icon-btn" title={m.feeds_copy_link()} aria-label={m.feeds_copy_link()} onclick={() => void copy(selected!.link)}>
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M6.5 9.5a3 3 0 0 0 4.2 0l2.1-2.1a3 3 0 0 0-4.2-4.2l-.7.7"/><path d="M9.5 6.5a3 3 0 0 0-4.2 0L3.2 8.6a3 3 0 0 0 4.2 4.2l.7-.7"/>
-                  </svg>
-                </button>
-                <button type="button" class="pill-btn danger-hover" onclick={askUnfollow}>{m.feeds_unfollow()}</button>
-              </div>
-            </header>
-            {#if selected.description}
-              <p class="detail-description"><bdi dir="auto">{selected.description}</bdi></p>
-            {/if}
-            <p class="private-note">
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="3.5" y="7" width="9" height="6.5" rx="1"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/>
-              </svg>
-              <span>{m.feeds_private_note()}</span>
-            </p>
-
-            {#if selected.deleted}
-              <div class="state-strip tone-warning" role="status">
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <path d="M8 2.5 14 13H2z"/><line x1="8" y1="6.5" x2="8" y2="9.5"/><line x1="8" y1="11.5" x2="8" y2="11.6"/>
-                </svg>
-                <span class="state-text">{m.feeds_deleted_notice()}</span>
-                <button type="button" class="pill-btn strip-btn" onclick={askUnfollow}>{m.feeds_unfollow()}</button>
-              </div>
-            {/if}
-
-            {@const strip = stateText(selected)}
-            {#if strip}
-              <div class="state-strip" class:tone-warning={strip.warn} role="status">
-                {#if strip.busy}
-                  <span class="spinner xs" aria-hidden="true"></span>
-                {:else}
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M8 2.5 14 13H2z"/><line x1="8" y1="6.5" x2="8" y2="9.5"/><line x1="8" y1="11.5" x2="8" y2="11.6"/>
-                  </svg>
-                {/if}
-                {#if strip.spoken}
-                  <span class="state-text" aria-hidden="true">{strip.text}</span>
-                  <span class="sr-only">{strip.spoken}</span>
-                {:else}
-                  <span class="state-text">{strip.text}</span>
-                {/if}
-                {#if strip.retry}
-                  <button type="button" class="pill-btn strip-btn" disabled={refreshing || emberOff} onclick={() => void refreshSelected()}>
-                    {m.common_retry()}
-                  </button>
-                {/if}
-              </div>
-            {/if}
-
-            <!-- Nothing new comes of a deleted feed, so nothing downloads by itself. -->
-            {#if !selected.deleted}
-              <div class="auto-card" class:on={selected.auto_download}>
-                <div class="auto-head">
-                  <span class="auto-icon" aria-hidden="true">
-                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                      <path d="M8 2v8M4.5 6.5 8 10l3.5-3.5"/><path d="M2.5 11.5v1.75h11V11.5"/>
-                    </svg>
-                  </span>
-                  <button type="button" class="auto-title" aria-expanded={autoOpen} onclick={() => (autoOpen = !autoOpen)}>
-                    <span class="auto-text">
-                      <span class="auto-line">
-                        <span class="auto-name">{m.feeds_auto_title()}</span>
-                        <span class="auto-state">{selected.auto_download ? m.feeds_auto_on() : m.feeds_auto_off()}</span>
+                    <span class="feed-avatar" style:--feed-hue={hueOf(feed.publisher + feed.salt)}>{@render feedGlyph()}</span>
+                    <span class="feed-row-text">
+                      <span class="feed-row-title">
+                        <bdi dir="auto">{feedLabel(feed)}</bdi>
+                        {#if !feed.title.trim()}<span class="row-key">{shortKey(feed.publisher)}</span>{/if}
                       </span>
-                      <span class="auto-desc">{m.feeds_auto_desc()}</span>
-                      {#if selected.auto_download}
-                        <span class="auto-summary">{autoSummary(selected.auto_max_item_mib, selected.auto_max_day_mib)}</span>
-                      {/if}
+                      <span
+                        class="feed-row-sub"
+                        class:warn={!feed.deleted && (feed.state === 'broken' || feed.activity.too_large || notSeen(feed))}
+                      >{followedSub(feed)}</span>
                     </span>
-                    <svg class="chevron" class:open={autoOpen} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                      <polyline points="4 6 8 10 12 6"/>
-                    </svg>
+                    {#if feed.unread > 0}
+                      <span class="count-pill" aria-hidden="true">{feed.unread > 99 ? '99+' : feed.unread}</span>
+                      <span class="sr-only">{m.feeds_unread_title({ count: formatNumber(feed.unread) })}</span>
+                    {/if}
                   </button>
-                  <ToggleSwitch
-                    checked={autoEnabled}
-                    disabled={autoSaving}
-                    ariaLabel={m.feeds_auto_enable()}
-                    onchange={(on) => void toggleAuto(on)}
-                  />
-                </div>
-                {#if autoOpen}
-                  <div class="auto-body">
-                    <div class="auto-grid">
-                      <label class="field">
-                        <span class="field-label">{m.feeds_auto_max_item()}</span>
-                        <input type="number" min="0" max={AUTO_MIB_MAX} bind:value={autoItemMib} onchange={() => (autoItemMib = capMib(autoItemMib))} />
-                        <span class="field-hint">{mibText(autoItemMib)}</span>
-                      </label>
-                      <label class="field">
-                        <span class="field-label">{m.feeds_auto_max_day()}</span>
-                        <input type="number" min="0" max={AUTO_MIB_MAX} bind:value={autoDayMib} onchange={() => (autoDayMib = capMib(autoDayMib))} />
-                        <span class="field-hint">{mibText(autoDayMib)}</span>
-                      </label>
-                    </div>
-                    <div class="auto-foot">
-                      <p class="hint">{m.feeds_auto_hint()}</p>
-                      <button type="button" class="secondary" disabled={!autoChanged || autoSaving} onclick={() => void saveAutoLimits()}>
-                        {m.feeds_save()}
-                      </button>
-                    </div>
-                  </div>
-                {/if}
+                {:else}
+                  <p class="list-empty">{m.feeds_no_matches()}</p>
+                {/each}
               </div>
-            {/if}
+            </aside>
 
-            <div class="files-toolbar">
-              <h4 class="section-label">{m.feeds_files_heading()}</h4>
-              <div class="segmented small" role="group" aria-label={m.feeds_files_heading()}>
-                <button type="button" aria-pressed={itemFilter === 'all'} class:active={itemFilter === 'all'} onclick={() => (itemFilter = 'all')}>
-                  {m.feeds_filter_all()}
-                </button>
-                <button type="button" aria-pressed={itemFilter === 'new'} class:active={itemFilter === 'new'} onclick={() => (itemFilter = 'new')}>
-                  {m.feeds_filter_new_only()}
-                  {#if newShownCount > 0}<span class="seg-count">{formatNumber(newShownCount)}</span>{/if}
-                </button>
-              </div>
-              {#if items.length > LIST_SEARCH_FROM}
-                <div class="files-search">
-                  {@render searchBox(itemQuery, (v) => (itemQuery = v), m.browse_filter_placeholder())}
-                </div>
-              {/if}
-              <span class="toolbar-spacer"></span>
-              {#if newItems.length > 0}
-                <button type="button" class="primary sm-btn" disabled={downloading} onclick={() => askDownload(newItems.map((i) => i.ed2k))}>
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
-                  </svg>
-                  {m.feeds_download_all_new_size({ count: formatNumber(newItems.length), size: formatBytes(newSize) })}
-                </button>
-              {:else if downloadableItems.length > 1}
-                <button type="button" class="secondary sm-btn" disabled={downloading} onclick={() => askDownload(downloadableItems.map((i) => i.ed2k))}>
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
-                  </svg>
-                  {m.feeds_download_all_size({ count: formatNumber(downloadableItems.length), size: formatBytes(downloadableSize) })}
-                </button>
-              {/if}
-            </div>
-
-            <div class="file-list" tabindex="-1" bind:this={followList}>
-              {#if itemsLoading && items.length === 0}
-                <div class="file-list-empty"><span class="spinner xs" aria-hidden="true"></span><span class="sr-only">{m.common_loading()}</span></div>
-              {:else if itemsFailed && items.length === 0}
-                <div class="file-list-empty">
-                  <p>{m.feeds_items_load_failed()}</p>
-                  <button type="button" class="secondary sm-btn" onclick={() => void loadItems(selected)}>{m.common_retry()}</button>
-                </div>
-              {:else if items.length === 0}
-                <div class="file-list-empty">{m.feeds_no_items()}</div>
-              {:else if shownItems.length === 0}
-                <div class="file-list-empty">{itemFilter === 'new' && !itemQuery.trim() ? m.feeds_no_new() : m.browse_no_match()}</div>
-              {/if}
-              {#each shownItems as item (item.ed2k)}
-                {@const type = typeOf(item.name)}
-                <div class="file-row" class:removed={item.removed} class:is-new={item.is_new && !item.removed} data-row={item.ed2k}>
-                  {@render fileIcon(type)}
-                  <div class="file-main">
-                    <span class="file-name" title={item.name}>
-                      <bdi dir="auto">{item.name}</bdi>
-                      {#if item.is_new && !item.removed}<span class="badge sm tone-accent">{m.feeds_badge_new()}</span>{/if}
-                      {#if item.removed}<span class="badge sm tone-muted">{m.feeds_badge_removed()}</span>{/if}
-                      {#if item.risky}<span class="badge sm tone-warning" title={m.common_risky_file()}>{m.feeds_badge_risky()}</span>{/if}
-                    </span>
-                    <span class="file-meta">
-                      <span>{formatBytes(item.size)}</span>
-                      {#if type}<span aria-hidden="true">·</span><span>{fileTypeFilterLabel(type)}</span>{/if}
-                      {#if item.first_seen > 0}<span aria-hidden="true">·</span><span>{m.feeds_item_added_at({ when: ago(item.first_seen) })}</span>{/if}
-                      {#if item.held}<span aria-hidden="true">·</span><span class="held">{heldText(item.held)}</span>{/if}
-                      {#if item.status === 'missing'}<span aria-hidden="true">·</span><span>{m.feeds_item_missing()}</span>{/if}
-                      {#if item.status === 'cancelled'}<span aria-hidden="true">·</span><span>{m.feeds_item_cancelled()}</span>{/if}
-                      {#if item.status === 'elsewhere'}
+            {#key selectedKey}
+              <!-- svelte-ignore a11y_no_static_element_interactions (noticing the user act in the open feed; the controls are its own) -->
+              <section
+                class="detail-pane"
+                in:fade={detailIn()}
+                onpointerdown={claimOpen}
+                onkeydown={claimOpen}
+                {@attach (el: HTMLElement) => on(el, 'wheel', claimOpen, { passive: true })}
+              >
+                {#if selected}
+                  <header class="detail-head">
+                    <span class="feed-avatar lg" style:--feed-hue={hueOf(selected.publisher + selected.salt)}>{@render feedGlyph()}</span>
+                    <div class="detail-title">
+                      <h3 title={feedLabel(selected)}><bdi dir="auto">{feedLabel(selected)}</bdi></h3>
+                      <p class="detail-meta">
+                        <span title={m.feeds_discover_publisher({ id: selected.publisher })}>{m.feeds_discover_publisher({ id: shortKey(selected.publisher) })}</span>
                         <span aria-hidden="true">·</span>
-                        <span>{m.feeds_item_elsewhere({ feed: item.elsewhere?.trim() || m.feeds_untitled() })}</span>
+                        <!-- The count its head gave, until its files are in. -->
+                        <span>{m.feeds_items_count({ count: formatNumber(itemsFor === keyOf(selected) ? listedItems.length : selected.item_count) })}</span>
+                        {#if selectedSize > 0}<span aria-hidden="true">·</span><span>{formatBytes(selectedSize)}</span>{/if}
+                        {#if selected.sequence > 0}
+                          <span aria-hidden="true">·</span><span>{m.feeds_discover_updated({ when: ago(Math.floor(selected.sequence / 1000)) })}</span>
+                        {/if}
+                        {#if selected.checked_at > 0}
+                          <span aria-hidden="true">·</span><span>{m.feeds_checked_at({ when: ago(selected.checked_at) })}</span>
+                        {/if}
+                      </p>
+                    </div>
+                    <div class="detail-actions">
+                      {#if !selected.deleted}
+                        <button
+                          type="button"
+                          class="icon-btn"
+                          class:spinning={refreshing}
+                          disabled={refreshing || emberOff}
+                          title={m.feeds_refresh()}
+                          aria-label={m.feeds_refresh()}
+                          onclick={() => void refreshSelected()}
+                        >
+                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><polyline points="13.5 2.5 13.5 5.5 10.5 5.5"/>
+                          </svg>
+                        </button>
                       {/if}
-                      {#if item.status === 'failed' && item.transfer && (item.transfer.failure_reason || item.transfer.failure_code)}
-                        <span aria-hidden="true">·</span>
-                        <span class="failed">{transferFailureReasonText(item.transfer.failure_reason, item.transfer.failure_code)}</span>
-                      {/if}
-                    </span>
-                    {#if item.note}
-                      <span class="file-note"><bdi dir="auto">{item.note}</bdi></span>
-                    {/if}
-                    {#if item.status === 'downloading' || item.status === 'queued' || item.status === 'paused'}
-                      <span class="row-progress" aria-hidden="true"><span style:width={`${Math.min(100, Math.max(0, item.progress))}%`}></span></span>
-                      {#if item.transfer}
-                        <span class="file-meta transfer-meta">{transferText(item)}</span>
-                      {/if}
-                    {/if}
-                  </div>
-                  {#if onDisk(item.status)}
-                    <div class="row-controls">
-                      <span class="row-done" title={item.status === 'done' ? m.feeds_badge_downloaded() : m.feeds_item_in_library()}>
-                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                          <polyline points="3 8 7 12 13 4"/>
-                        </svg>
-                        <span>{item.status === 'done' ? m.feeds_badge_downloaded() : m.feeds_item_in_library()}</span>
-                      </span>
-                      <button
-                        type="button"
-                        class="icon-btn"
-                        title={m.feeds_item_open()}
-                        aria-label={m.feeds_item_open_named({ name: item.name })}
-                        onclick={() => void openItem(item, openFeedItem)}
-                      >
-                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                          <path d="M9.5 2.5h4v4"/><path d="M13.5 2.5 7.5 8.5"/><path d="M12 9.5v4H2.5V4h4"/>
-                        </svg>
-                      </button>
-                      <button
-                        type="button"
-                        class="icon-btn"
-                        title={m.feeds_item_show()}
-                        aria-label={m.feeds_item_show_named({ name: item.name })}
-                        onclick={() => void openItem(item, showFeedItem)}
-                      >
+                      <button type="button" class="icon-btn" title={m.feeds_open_folder()} aria-label={m.feeds_open_folder()} onclick={() => void openFolder()}>
                         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
                           <path d="M2 4.5V12.5h12V6H7.5L6 4.5z"/>
                         </svg>
                       </button>
-                    </div>
-                  {:else if item.status === 'downloading' || item.status === 'queued' || item.status === 'paused'}
-                    {@const stateText =
-                      item.status === 'downloading'
-                        ? m.feeds_item_downloading({ percent: formatNumber(Math.floor(item.progress)) })
-                        : item.status === 'queued'
-                          ? m.feeds_item_queued()
-                          : m.feeds_item_paused()}
-                    {#if item.transfer?.other_feed}
-                      <span class="row-state muted" title={m.feeds_item_other_feed()}>{stateText}</span>
-                    {:else if !item.transfer || item.transfer.in_transfers}
-                      <a
-                        class="row-state"
-                        href="/transfers"
-                        title={m.feeds_show_in_transfers()}
-                        aria-label={m.feeds_item_in_transfers_named({ name: item.name, state: stateText })}
-                      >{stateText}</a>
-                    {:else}
-                      {@const busy = controlling.has(item.transfer.id)}
-                      <div class="row-controls">
-                        <span class="row-state">{stateText}</span>
-                        {#if item.status === 'paused'}
-                          <button
-                            type="button"
-                            class="icon-btn"
-                            disabled={busy}
-                            title={m.feeds_item_resume()}
-                            aria-label={m.feeds_item_resume_named({ name: item.name })}
-                            onclick={() => void controlItem(item, resumeTransfer)}
-                          >
-                            <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M5 3.5v9l7-4.5z"/></svg>
-                          </button>
-                        {:else}
-                          <button
-                            type="button"
-                            class="icon-btn"
-                            disabled={busy}
-                            title={m.feeds_item_pause()}
-                            aria-label={m.feeds_item_pause_named({ name: item.name })}
-                            onclick={() => void controlItem(item, pauseTransfer)}
-                          >
-                            <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><rect x="4" y="3.5" width="2.6" height="9" rx="0.6"/><rect x="9.4" y="3.5" width="2.6" height="9" rx="0.6"/></svg>
-                          </button>
-                        {/if}
-                        <button
-                          type="button"
-                          class="icon-btn danger"
-                          disabled={busy}
-                          title={m.feeds_item_cancel()}
-                          aria-label={m.feeds_item_cancel_named({ name: item.name })}
-                          onclick={() => (cancelAsk = item)}
-                        >
-                          <IconX />
-                        </button>
-                      </div>
-                    {/if}
-                  {:else if canDownload(item)}
-                    {@const discardable =
-                      item.status === 'failed' && !!item.transfer && !item.transfer.in_transfers && !item.transfer.other_feed}
-                    <div class="row-controls">
-                      <button
-                        type="button"
-                        class="row-btn"
-                        class:retry={item.status === 'failed'}
-                        disabled={downloading}
-                        aria-label={item.status === 'failed'
-                          ? m.feeds_item_retry_named({ name: item.name })
-                          : m.feeds_download_named({ name: item.name })}
-                        data-download
-                        onclick={() => askDownload([item.ed2k], item.ed2k)}
-                      >
-                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                          <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
+                      <button type="button" class="icon-btn" title={m.feeds_copy_link()} aria-label={m.feeds_copy_link()} onclick={() => void copy(selected!.link)}>
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <path d="M6.5 9.5a3 3 0 0 0 4.2 0l2.1-2.1a3 3 0 0 0-4.2-4.2l-.7.7"/><path d="M9.5 6.5a3 3 0 0 0-4.2 0L3.2 8.6a3 3 0 0 0 4.2 4.2l.7-.7"/>
                         </svg>
-                        <span>{item.status === 'failed' ? m.feeds_item_failed_retry() : m.feeds_download()}</span>
                       </button>
-                      {#if discardable && item.transfer}
-                        <button
-                          type="button"
-                          class="icon-btn danger"
-                          disabled={controlling.has(item.transfer.id)}
-                          title={m.feeds_item_discard()}
-                          aria-label={m.feeds_item_discard_named({ name: item.name })}
-                          onclick={() => (cancelAsk = item)}
-                        >
-                          <IconX />
+                      <button type="button" class="pill-btn danger-hover" onclick={askUnfollow}>{m.feeds_unfollow()}</button>
+                    </div>
+                  </header>
+                  {#if selected.description}
+                    <p class="detail-description"><bdi dir="auto">{selected.description}</bdi></p>
+                  {/if}
+                  <p class="private-note">
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <rect x="3.5" y="7" width="9" height="6.5" rx="1"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/>
+                    </svg>
+                    <span>{m.feeds_private_note()}</span>
+                  </p>
+
+                  {#if selected.deleted}
+                    <div class="state-strip tone-warning" role="status">
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M8 2.5 14 13H2z"/><line x1="8" y1="6.5" x2="8" y2="9.5"/><line x1="8" y1="11.5" x2="8" y2="11.6"/>
+                      </svg>
+                      <span class="state-text">{m.feeds_deleted_notice()}</span>
+                      <button type="button" class="pill-btn strip-btn" onclick={askUnfollow}>{m.feeds_unfollow()}</button>
+                    </div>
+                  {/if}
+
+                  {@const strip = stateText(selected)}
+                  {#if strip}
+                    <div class="state-strip" class:tone-warning={strip.warn} role="status">
+                      {#if strip.busy}
+                        <span class="spinner xs" aria-hidden="true"></span>
+                      {:else}
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <path d="M8 2.5 14 13H2z"/><line x1="8" y1="6.5" x2="8" y2="9.5"/><line x1="8" y1="11.5" x2="8" y2="11.6"/>
+                        </svg>
+                      {/if}
+                      {#if strip.spoken}
+                        <span class="state-text" aria-hidden="true">{strip.text}</span>
+                        <span class="sr-only">{strip.spoken}</span>
+                      {:else}
+                        <span class="state-text">{strip.text}</span>
+                      {/if}
+                      {#if strip.retry}
+                        <button type="button" class="pill-btn strip-btn" disabled={refreshing || emberOff} onclick={() => void refreshSelected()}>
+                          {m.common_retry()}
                         </button>
                       {/if}
                     </div>
                   {/if}
-                </div>
-              {/each}
-            </div>
-          {:else}
-            <div class="empty-state compact"><p class="empty-sub">{m.feeds_pick_one()}</p></div>
-          {/if}
-        </section>
-      </div>
-    {/if}
-  {:else if tab === 'discover'}
-    {#if !discoverLoaded}
-      <div class="empty-card"><span class="spinner xs" aria-hidden="true"></span><span class="sr-only">{m.common_loading()}</span></div>
-    {:else if discovered.length === 0}
-      <div class="empty-card">
-        <div class="empty-state">
-          <span class="empty-glyph">{@render feedGlyph()}</span>
-          <p class="empty-title">{discovering ? m.feeds_discover_searching() : m.feeds_discover_empty_title()}</p>
-          <p class="empty-sub">{m.feeds_discover_empty_body()}</p>
-          {#if hiddenCount > 0 && !discovering}
-            <div class="empty-actions">
-              <button type="button" class="secondary empty-action" onclick={() => (showHiddenAsk = true)}>
-                {m.feeds_discover_show_hidden({ count: formatNumber(hiddenCount) })}
-              </button>
-            </div>
-          {/if}
-        </div>
-      </div>
-    {:else}
-      <div class="discover-pane">
-        <div class="discover-toolbar">
-          <div class="discover-search">
-            {@render searchBox(discoverQuery, (v) => (discoverQuery = v), m.feeds_discover_search())}
-          </div>
-          <div class="segmented small" role="group" aria-label={m.feeds_tab_discover()}>
-            <button type="button" aria-pressed={discoverFilter === 'all'} class:active={discoverFilter === 'all'} onclick={() => (discoverFilter = 'all')}>
-              {m.feeds_filter_all()}
-              <span class="seg-count">{formatNumber(discovered.length)}</span>
-            </button>
-            <button type="button" aria-pressed={discoverFilter === 'active'} class:active={discoverFilter === 'active'} onclick={() => (discoverFilter = 'active')}>
-              {m.feeds_discover_filter_active()}
-              <span class="seg-count">{formatNumber(activeDiscovered)}</span>
-            </button>
-          </div>
-          {#if discoverPublisher}
-            <span class="filter-chip">
-              <span title={discoverPublisher}>{m.feeds_discover_publisher_filter({ id: shortKey(discoverPublisher) })}</span>
-              <button type="button" title={m.common_clear()} aria-label={m.common_clear()} onclick={() => (discoverPublisher = null)}>
-                <IconX size={11} />
-              </button>
-            </span>
-          {/if}
-          <span class="toolbar-spacer"></span>
-          {#if hiddenCount > 0}
-            <button type="button" class="link-btn" disabled={discovering} onclick={() => (showHiddenAsk = true)}>
-              {m.feeds_discover_show_hidden({ count: formatNumber(hiddenCount) })}
-            </button>
-          {/if}
-          <label class="sort-select">
-            <span class="sr-only">{m.feeds_discover_sort()}</span>
-            <select
-              value={discoverSort}
-              aria-label={m.feeds_discover_sort()}
-              onchange={(e) => pickSort(e.currentTarget.value as DiscoverSort)}
-            >
-              <option value="active">{m.feeds_discover_sort_active()}</option>
-              <option value="newest">{m.feeds_discover_sort_newest()}</option>
-              <option value="files">{m.feeds_discover_sort_files()}</option>
-              <option value="name">{m.feeds_discover_sort_name()}</option>
-            </select>
-          </label>
-        </div>
-        <p class="discover-hint">{m.feeds_discover_hint()}</p>
 
-        <div class="discover-scroll" tabindex="-1" bind:this={discoverScroll} onscroll={() => menu && closeCardMenu(false)}>
-          {#if discoverMatches.length === 0}
-            <p class="list-empty">{m.feeds_no_matches()}</p>
-          {/if}
-          <div class="discover-grid">
-            {#each discoverShown as feed (keyOf(feed))}
-              {@const key = keyOf(feed)}
-              {@const isFollowed = followedKeys.has(key)}
-              <article class="discover-card" class:menu-open={menuFor === key} data-card={key}>
-                <header class="discover-card-head">
-                  <span class="feed-avatar" style:--feed-hue={hueOf(feed.publisher + feed.salt)}>{@render feedGlyph()}</span>
-                  <div class="discover-card-title">
-                    <h3 title={feed.title}><bdi dir="auto">{feed.title.trim() || m.feeds_untitled()}</bdi></h3>
-                    <p class="discover-seen">
-                      <span class="seen-state" class:active={feed.active} title={feed.active ? m.feeds_discover_active_title() : undefined}>
-                        <span class="status-dot" class:published={feed.active} aria-hidden="true"></span>
-                        {seenText(feed)}
+                  <!-- Nothing new comes of a deleted feed, so nothing downloads by itself. -->
+                  {#if !selected.deleted}
+                    <div class="auto-card" class:on={selected.auto_download}>
+                      <div class="auto-head">
+                        <span class="auto-icon" aria-hidden="true">
+                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M8 2v8M4.5 6.5 8 10l3.5-3.5"/><path d="M2.5 11.5v1.75h11V11.5"/>
+                          </svg>
+                        </span>
+                        <button type="button" class="auto-title" aria-expanded={autoOpen} onclick={() => (autoOpen = !autoOpen)}>
+                          <span class="auto-text">
+                            <span class="auto-line">
+                              <span class="auto-name">{m.feeds_auto_title()}</span>
+                              <span class="auto-state">{selected.auto_download ? m.feeds_auto_on() : m.feeds_auto_off()}</span>
+                            </span>
+                            <span class="auto-desc">{m.feeds_auto_desc()}</span>
+                            {#if selected.auto_download}
+                              <span class="auto-summary">{autoSummary(selected.auto_max_item_mib, selected.auto_max_day_mib)}</span>
+                            {/if}
+                          </span>
+                          <svg class="chevron" class:open={autoOpen} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <polyline points="4 6 8 10 12 6"/>
+                          </svg>
+                        </button>
+                        <ToggleSwitch
+                          checked={autoEnabled}
+                          disabled={autoSaving}
+                          ariaLabel={m.feeds_auto_enable()}
+                          onchange={(on) => void toggleAuto(on)}
+                        />
+                      </div>
+                      {#if autoOpen}
+                        <div class="auto-body">
+                          <div class="auto-grid">
+                            <label class="field">
+                              <span class="field-label">{m.feeds_auto_max_item()}</span>
+                              <input type="number" min="0" max={AUTO_MIB_MAX} bind:value={autoItemMib} onchange={() => (autoItemMib = capMib(autoItemMib))} />
+                              <span class="field-hint">{mibText(autoItemMib)}</span>
+                            </label>
+                            <label class="field">
+                              <span class="field-label">{m.feeds_auto_max_day()}</span>
+                              <input type="number" min="0" max={AUTO_MIB_MAX} bind:value={autoDayMib} onchange={() => (autoDayMib = capMib(autoDayMib))} />
+                              <span class="field-hint">{mibText(autoDayMib)}</span>
+                            </label>
+                          </div>
+                          <div class="auto-foot">
+                            <p class="hint">{m.feeds_auto_hint()}</p>
+                            <button type="button" class="secondary" disabled={!autoChanged || autoSaving} onclick={() => void saveAutoLimits()}>
+                              {m.feeds_save()}
+                            </button>
+                          </div>
+                        </div>
+                      {/if}
+                    </div>
+                  {/if}
+
+                  <div class="files-toolbar">
+                    <h4 class="section-label">{m.feeds_files_heading()}</h4>
+                    <div class="segmented small" role="group" aria-label={m.feeds_files_heading()} {@attach segmentThumb(itemFilter)}>
+                      <span class="seg-thumb" aria-hidden="true"></span>
+                      <button type="button" aria-pressed={itemFilter === 'all'} class:active={itemFilter === 'all'} data-seg="all" onclick={() => (itemFilter = 'all')}>
+                        {m.feeds_filter_all()}
+                      </button>
+                      <button type="button" aria-pressed={itemFilter === 'new'} class:active={itemFilter === 'new'} data-seg="new" onclick={() => (itemFilter = 'new')}>
+                        {m.feeds_filter_new_only()}
+                        {#if newShownCount > 0}<span class="seg-count">{formatNumber(newShownCount)}</span>{/if}
+                      </button>
+                    </div>
+                    {#if items.length > LIST_SEARCH_FROM}
+                      <div class="files-search">
+                        {@render searchBox(itemQuery, (v) => (itemQuery = v), m.browse_filter_placeholder())}
+                      </div>
+                    {/if}
+                    <span class="toolbar-spacer"></span>
+                    {#if newItems.length > 0}
+                      <button type="button" class="primary sm-btn" disabled={downloading} onclick={() => askDownload(newItems.map((i) => i.ed2k))}>
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
+                        </svg>
+                        {m.feeds_download_all_new_size({ count: formatNumber(newItems.length), size: formatBytes(newSize) })}
+                      </button>
+                    {:else if downloadableItems.length > 1}
+                      <button type="button" class="secondary sm-btn" disabled={downloading} onclick={() => askDownload(downloadableItems.map((i) => i.ed2k))}>
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
+                        </svg>
+                        {m.feeds_download_all_size({ count: formatNumber(downloadableItems.length), size: formatBytes(downloadableSize) })}
+                      </button>
+                    {/if}
+                  </div>
+
+                  <div class="file-list" tabindex="-1" bind:this={followList}>
+                    {#if itemsLoading && items.length === 0}
+                      <div role="status"><span class="sr-only">{m.common_loading()}</span>{@render skeletonFiles()}</div>
+                    {:else if itemsFailed && items.length === 0}
+                      <div class="file-list-empty">
+                        <p>{m.feeds_items_load_failed()}</p>
+                        <button type="button" class="secondary sm-btn" onclick={() => void loadItems(selected)}>{m.common_retry()}</button>
+                      </div>
+                    {:else if items.length === 0}
+                      <div class="file-list-empty">{m.feeds_no_items()}</div>
+                    {:else if shownItems.length === 0}
+                      <div class="file-list-empty">{itemFilter === 'new' && !itemQuery.trim() ? m.feeds_no_new() : m.browse_no_match()}</div>
+                    {/if}
+                    {#each shownItems as item (item.ed2k)}
+                      {@const type = typeOf(item.name)}
+                      <div class="file-row" class:removed={item.removed} class:is-new={item.is_new && !item.removed} data-row={item.ed2k}>
+                        {@render fileIcon(type)}
+                        <div class="file-main">
+                          <span class="file-name" title={item.name}>
+                            <bdi dir="auto">{item.name}</bdi>
+                            {#if item.is_new && !item.removed}<span class="badge sm tone-accent">{m.feeds_badge_new()}</span>{/if}
+                            {#if item.removed}<span class="badge sm tone-muted">{m.feeds_badge_removed()}</span>{/if}
+                            {#if item.risky}<span class="badge sm tone-warning" title={m.common_risky_file()}>{m.feeds_badge_risky()}</span>{/if}
+                          </span>
+                          <span class="file-meta">
+                            <span>{formatBytes(item.size)}</span>
+                            {#if type}<span aria-hidden="true">·</span><span>{fileTypeFilterLabel(type)}</span>{/if}
+                            {#if item.first_seen > 0}<span aria-hidden="true">·</span><span>{m.feeds_item_added_at({ when: ago(item.first_seen) })}</span>{/if}
+                            {#if item.held}<span aria-hidden="true">·</span><span class="held">{heldText(item.held)}</span>{/if}
+                            {#if item.status === 'missing'}<span aria-hidden="true">·</span><span>{m.feeds_item_missing()}</span>{/if}
+                            {#if item.status === 'cancelled'}<span aria-hidden="true">·</span><span>{m.feeds_item_cancelled()}</span>{/if}
+                            {#if item.status === 'elsewhere'}
+                              <span aria-hidden="true">·</span>
+                              <span>{m.feeds_item_elsewhere({ feed: item.elsewhere?.trim() || m.feeds_untitled() })}</span>
+                            {/if}
+                            {#if item.status === 'failed' && item.transfer && (item.transfer.failure_reason || item.transfer.failure_code)}
+                              <span aria-hidden="true">·</span>
+                              <span class="failed">{transferFailureReasonText(item.transfer.failure_reason, item.transfer.failure_code)}</span>
+                            {/if}
+                          </span>
+                          {#if item.note}
+                            <span class="file-note"><bdi dir="auto">{item.note}</bdi></span>
+                          {/if}
+                          {#if item.status === 'downloading' || item.status === 'queued' || item.status === 'paused'}
+                            <span class="row-progress" aria-hidden="true"><span style:width={`${Math.min(100, Math.max(0, item.progress))}%`}></span></span>
+                            {#if item.transfer}
+                              <span class="file-meta transfer-meta">{transferText(item)}</span>
+                            {/if}
+                          {/if}
+                        </div>
+                        {#if onDisk(item.status)}
+                          <div class="row-controls">
+                            <span class="row-done" title={item.status === 'done' ? m.feeds_badge_downloaded() : m.feeds_item_in_library()}>
+                              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <polyline points="3 8 7 12 13 4"/>
+                              </svg>
+                              <span>{item.status === 'done' ? m.feeds_badge_downloaded() : m.feeds_item_in_library()}</span>
+                            </span>
+                            <button
+                              type="button"
+                              class="icon-btn"
+                              title={m.feeds_item_open()}
+                              aria-label={m.feeds_item_open_named({ name: item.name })}
+                              onclick={() => void openItem(item, openFeedItem)}
+                            >
+                              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <path d="M9.5 2.5h4v4"/><path d="M13.5 2.5 7.5 8.5"/><path d="M12 9.5v4H2.5V4h4"/>
+                              </svg>
+                            </button>
+                            <button
+                              type="button"
+                              class="icon-btn"
+                              title={m.feeds_item_show()}
+                              aria-label={m.feeds_item_show_named({ name: item.name })}
+                              onclick={() => void openItem(item, showFeedItem)}
+                            >
+                              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
+                                <path d="M2 4.5V12.5h12V6H7.5L6 4.5z"/>
+                              </svg>
+                            </button>
+                          </div>
+                        {:else if item.status === 'downloading' || item.status === 'queued' || item.status === 'paused'}
+                          {@const stateText =
+                            item.status === 'downloading'
+                              ? m.feeds_item_downloading({ percent: formatNumber(Math.floor(item.progress)) })
+                              : item.status === 'queued'
+                                ? m.feeds_item_queued()
+                                : m.feeds_item_paused()}
+                          {#if item.transfer?.other_feed}
+                            <span class="row-state muted" title={m.feeds_item_other_feed()}>{stateText}</span>
+                          {:else if !item.transfer || item.transfer.in_transfers}
+                            <a
+                              class="row-state"
+                              href="/transfers"
+                              title={m.feeds_show_in_transfers()}
+                              aria-label={m.feeds_item_in_transfers_named({ name: item.name, state: stateText })}
+                            >{stateText}</a>
+                          {:else}
+                            {@const busy = controlling.has(item.transfer.id)}
+                            <div class="row-controls">
+                              <span class="row-state">{stateText}</span>
+                              {#if item.status === 'paused'}
+                                <button
+                                  type="button"
+                                  class="icon-btn"
+                                  disabled={busy}
+                                  title={m.feeds_item_resume()}
+                                  aria-label={m.feeds_item_resume_named({ name: item.name })}
+                                  onclick={() => void controlItem(item, resumeTransfer)}
+                                >
+                                  <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M5 3.5v9l7-4.5z"/></svg>
+                                </button>
+                              {:else}
+                                <button
+                                  type="button"
+                                  class="icon-btn"
+                                  disabled={busy}
+                                  title={m.feeds_item_pause()}
+                                  aria-label={m.feeds_item_pause_named({ name: item.name })}
+                                  onclick={() => void controlItem(item, pauseTransfer)}
+                                >
+                                  <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><rect x="4" y="3.5" width="2.6" height="9" rx="0.6"/><rect x="9.4" y="3.5" width="2.6" height="9" rx="0.6"/></svg>
+                                </button>
+                              {/if}
+                              <button
+                                type="button"
+                                class="icon-btn danger"
+                                disabled={busy}
+                                title={m.feeds_item_cancel()}
+                                aria-label={m.feeds_item_cancel_named({ name: item.name })}
+                                onclick={() => (cancelAsk = item)}
+                              >
+                                <IconX />
+                              </button>
+                            </div>
+                          {/if}
+                        {:else if canDownload(item)}
+                          {@const discardable =
+                            item.status === 'failed' && !!item.transfer && !item.transfer.in_transfers && !item.transfer.other_feed}
+                          <div class="row-controls">
+                            <button
+                              type="button"
+                              class="row-btn"
+                              class:retry={item.status === 'failed'}
+                              disabled={downloading}
+                              aria-label={item.status === 'failed'
+                                ? m.feeds_item_retry_named({ name: item.name })
+                                : m.feeds_download_named({ name: item.name })}
+                              data-download
+                              onclick={() => askDownload([item.ed2k], item.ed2k)}
+                            >
+                              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
+                              </svg>
+                              <span>{item.status === 'failed' ? m.feeds_item_failed_retry() : m.feeds_download()}</span>
+                            </button>
+                            {#if discardable && item.transfer}
+                              <button
+                                type="button"
+                                class="icon-btn danger"
+                                disabled={controlling.has(item.transfer.id)}
+                                title={m.feeds_item_discard()}
+                                aria-label={m.feeds_item_discard_named({ name: item.name })}
+                                onclick={() => (cancelAsk = item)}
+                              >
+                                <IconX />
+                              </button>
+                            {/if}
+                          </div>
+                        {/if}
+                      </div>
+                    {/each}
+                  </div>
+                {:else}
+                  <div class="empty-state compact"><p class="empty-sub">{m.feeds_pick_one()}</p></div>
+                {/if}
+              </section>
+            {/key}
+          </div>
+        {/if}
+      {:else if tab === 'discover'}
+        {#if !discoverLoaded}
+          <div class="discover-pane skeleton" role="status">
+            <span class="sr-only">{m.common_loading()}</span>
+            <div class="discover-scroll" aria-hidden="true">
+              <div class="discover-grid">
+                {#each SKELETON_CARDS as card (card)}
+                  <div class="discover-card skel-card">
+                    <div class="skel-head">
+                      <span class="skel skel-avatar"></span>
+                      <span class="skel-lines">
+                        <span class="skel skel-line" style:width={`${72 - (card % 3) * 12}%`}></span>
+                        <span class="skel skel-line short"></span>
                       </span>
-                      <span class="seen-sep" aria-hidden="true">·</span>
+                    </div>
+                    <span class="skel skel-line"></span>
+                    <span class="skel skel-line" style:width="55%"></span>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          </div>
+        {:else if discovered.length === 0}
+          <div class="empty-card">
+            <div class="empty-state">
+              <span class="empty-glyph">{@render feedGlyph()}</span>
+              <p class="empty-title">{discovering ? m.feeds_discover_searching() : m.feeds_discover_empty_title()}</p>
+              <p class="empty-sub">{m.feeds_discover_empty_body()}</p>
+              {#if hiddenCount > 0 && !discovering}
+                <div class="empty-actions">
+                  <button type="button" class="secondary empty-action" onclick={() => (showHiddenAsk = true)}>
+                    {m.feeds_discover_show_hidden({ count: formatNumber(hiddenCount) })}
+                  </button>
+                </div>
+              {/if}
+            </div>
+          </div>
+        {:else}
+          <div class="discover-pane">
+            {#if walkShowing}
+              <span class="walk-bar" aria-hidden="true" transition:fade={detailIn()}></span>
+            {/if}
+            <div class="discover-toolbar">
+              <div class="discover-search">
+                {@render searchBox(discoverQuery, (v) => (discoverQuery = v), m.feeds_discover_search())}
+              </div>
+              <div class="segmented small" role="group" aria-label={m.feeds_tab_discover()} {@attach segmentThumb(discoverFilter)}>
+                <span class="seg-thumb" aria-hidden="true"></span>
+                <button type="button" aria-pressed={discoverFilter === 'all'} class:active={discoverFilter === 'all'} data-seg="all" onclick={() => (discoverFilter = 'all')}>
+                  {m.feeds_filter_all()}
+                  <span class="seg-count">{formatNumber(discovered.length)}</span>
+                </button>
+                <button type="button" aria-pressed={discoverFilter === 'active'} class:active={discoverFilter === 'active'} data-seg="active" onclick={() => (discoverFilter = 'active')}>
+                  {m.feeds_discover_filter_active()}
+                  <span class="seg-count">{formatNumber(activeDiscovered)}</span>
+                </button>
+              </div>
+              {#if discoverPublisher}
+                <span class="filter-chip">
+                  <span title={discoverPublisher}>{m.feeds_discover_publisher_filter({ id: shortKey(discoverPublisher) })}</span>
+                  <button type="button" title={m.common_clear()} aria-label={m.common_clear()} onclick={() => (discoverPublisher = null)}>
+                    <IconX size={11} />
+                  </button>
+                </span>
+              {/if}
+              <span class="toolbar-spacer"></span>
+              {#if hiddenCount > 0}
+                <button type="button" class="link-btn" disabled={discovering} onclick={() => (showHiddenAsk = true)}>
+                  {m.feeds_discover_show_hidden({ count: formatNumber(hiddenCount) })}
+                </button>
+              {/if}
+              <label class="sort-select">
+                <span class="sr-only">{m.feeds_discover_sort()}</span>
+                <select
+                  value={discoverSort}
+                  aria-label={m.feeds_discover_sort()}
+                  onchange={(e) => pickSort(e.currentTarget.value as DiscoverSort)}
+                >
+                  <option value="active">{m.feeds_discover_sort_active()}</option>
+                  <option value="newest">{m.feeds_discover_sort_newest()}</option>
+                  <option value="files">{m.feeds_discover_sort_files()}</option>
+                  <option value="name">{m.feeds_discover_sort_name()}</option>
+                </select>
+              </label>
+            </div>
+            <p class="discover-hint">{m.feeds_discover_hint()}</p>
+
+            <div
+              class="discover-scroll"
+              tabindex="-1"
+              bind:this={discoverScroll}
+              onscroll={() => menu && closeCardMenu(false)}
+              {@attach (el: HTMLElement) => {
+                el.scrollTop = discoverScrollTop;
+              }}
+            >
+              {#if discoverMatches.length === 0}
+                <p class="list-empty">{m.feeds_no_matches()}</p>
+              {/if}
+              <div class="discover-grid">
+                {#each discoverShown as feed (keyOf(feed))}
+                  {@const key = keyOf(feed)}
+                  {@const isFollowed = followedKeys.has(key)}
+                  <!-- Cards a walk finds while the tab is open fade in, rather than appear. -->
+                  <article class="discover-card" class:menu-open={menuFor === key} data-card={key} in:fade={detailIn()}>
+                    <header class="discover-card-head">
+                      <span class="feed-avatar" style:--feed-hue={hueOf(feed.publisher + feed.salt)}>{@render feedGlyph()}</span>
+                      <div class="discover-card-title">
+                        <h3 title={feed.title}><bdi dir="auto">{feed.title.trim() || m.feeds_untitled()}</bdi></h3>
+                        <p class="discover-seen">
+                          <span class="seen-state" class:active={feed.active} title={feed.active ? m.feeds_discover_active_title() : undefined}>
+                            <span class="status-dot" class:published={feed.active} aria-hidden="true"></span>
+                            {seenText(feed)}
+                          </span>
+                          <span class="seen-sep" aria-hidden="true">·</span>
+                          <button
+                            type="button"
+                            class="publisher-key"
+                            title={m.feeds_discover_publisher({ id: feed.publisher })}
+                            aria-label={`${m.feeds_discover_publisher({ id: shortKey(feed.publisher) })}: ${m.feeds_discover_by_publisher()}`}
+                            onclick={() => (discoverPublisher = feed.publisher)}
+                          >{shortKey(feed.publisher)}</button>
+                        </p>
+                      </div>
                       <button
                         type="button"
-                        class="publisher-key"
-                        title={m.feeds_discover_publisher({ id: feed.publisher })}
-                        aria-label={`${m.feeds_discover_publisher({ id: shortKey(feed.publisher) })}: ${m.feeds_discover_by_publisher()}`}
-                        onclick={() => (discoverPublisher = feed.publisher)}
-                      >{shortKey(feed.publisher)}</button>
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    class="icon-btn sm card-menu-btn"
-                    aria-haspopup="menu"
-                    aria-expanded={menuFor === key}
-                    title={m.feeds_discover_more()}
-                    aria-label={m.feeds_discover_more()}
-                    onclick={(e) => toggleMenu(feed, e.currentTarget)}
-                  >
-                    <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                      <circle cx="3.5" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="12.5" cy="8" r="1.3"/>
-                    </svg>
-                  </button>
-                </header>
-                {#if feed.description}
-                  <p class="discover-description" title={feed.description}><bdi dir="auto">{feed.description}</bdi></p>
-                {/if}
-                <footer class="discover-card-foot">
-                  <span class="discover-meta">
-                    <span>{m.feeds_items_count({ count: formatNumber(feed.item_count) })}</span>
-                    {#if feed.total_size > 0}<span aria-hidden="true">·</span><span>{formatBytes(feed.total_size)}</span>{/if}
-                    {#if feed.sequence > 0}
-                      <span aria-hidden="true">·</span>
-                      <span>{m.feeds_discover_updated({ when: ago(Math.floor(feed.sequence / 1000)) })}</span>
+                        class="icon-btn sm card-menu-btn"
+                        aria-haspopup="menu"
+                        aria-expanded={menuFor === key}
+                        title={m.feeds_discover_more()}
+                        aria-label={m.feeds_discover_more()}
+                        onclick={(e) => toggleMenu(feed, e.currentTarget)}
+                      >
+                        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                          <circle cx="3.5" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="12.5" cy="8" r="1.3"/>
+                        </svg>
+                      </button>
+                    </header>
+                    {#if feed.description}
+                      <p class="discover-description" title={feed.description}><bdi dir="auto">{feed.description}</bdi></p>
                     {/if}
-                  </span>
-                  {#if feed.own}
-                    <span class="own-actions">
-                      <span class="badge sm tone-muted">{m.feeds_badge_yours()}</span>
-                      <button type="button" class="secondary sm-btn" onclick={() => editOwn(feed)}>{m.feeds_discover_edit()}</button>
-                    </span>
-                  {:else if isFollowed}
-                    <button type="button" class="secondary sm-btn" data-card-action onclick={() => openFollowed(feed)}>{m.feeds_discover_open()}</button>
-                  {:else}
-                    <button
-                      type="button"
-                      class="primary sm-btn"
-                      disabled={emberOff || followingFromDiscover.has(key)}
-                      data-card-action
-                      onclick={() => void followDiscovered(feed)}
-                    >
-                      {m.feeds_follow()}
+                    <footer class="discover-card-foot">
+                      <span class="discover-meta">
+                        <span>{m.feeds_items_count({ count: formatNumber(feed.item_count) })}</span>
+                        {#if feed.total_size > 0}<span aria-hidden="true">·</span><span>{formatBytes(feed.total_size)}</span>{/if}
+                        {#if feed.sequence > 0}
+                          <span aria-hidden="true">·</span>
+                          <span>{m.feeds_discover_updated({ when: ago(Math.floor(feed.sequence / 1000)) })}</span>
+                        {/if}
+                      </span>
+                      {#if feed.own}
+                        <span class="own-actions">
+                          <span class="badge sm tone-muted">{m.feeds_badge_yours()}</span>
+                          <button type="button" class="secondary sm-btn" onclick={() => editOwn(feed)}>{m.feeds_discover_edit()}</button>
+                        </span>
+                      {:else if isFollowed}
+                        <button type="button" class="secondary sm-btn" data-card-action onclick={() => openFollowed(feed)}>{m.feeds_discover_open()}</button>
+                      {:else}
+                        <button
+                          type="button"
+                          class="primary sm-btn"
+                          disabled={emberOff || followingFromDiscover.has(key)}
+                          data-card-action
+                          onclick={() => void followDiscovered(feed)}
+                        >
+                          {m.feeds_follow()}
+                        </button>
+                      {/if}
+                    </footer>
+                  </article>
+                {/each}
+              </div>
+              <!-- Keyed so another card's menu is a new one, given focus too. -->
+              {#key menuFor}
+              {#if menu}
+                {@const feed = menu.feed}
+                <div
+                  class="ctx-menu feed-card-menu"
+                  role="menu"
+                  tabindex="-1"
+                  aria-label={m.feeds_discover_more()}
+                  use:ctxMenuPosition={{ x: menu.x, y: menu.y }}
+                  onkeydown={cardMenuKeydown}
+                  {@attach (el: HTMLElement) => el.querySelector<HTMLElement>('[role="menuitem"]')?.focus()}
+                >
+                  <button type="button" class="ctx-item" role="menuitem" onclick={() => { closeCardMenu(true); void copy(feed.link); }}>
+                    {m.feeds_copy_link()}
+                  </button>
+                  {#if discoverPublisher !== feed.publisher}
+                    <button type="button" class="ctx-item" role="menuitem" onclick={() => { closeCardMenu(true); discoverPublisher = feed.publisher; }}>
+                      {m.feeds_discover_by_publisher()}
                     </button>
                   {/if}
-                </footer>
-              </article>
-            {/each}
-          </div>
-          <!-- Keyed so another card's menu is a new one, given focus too. -->
-          {#key menuFor}
-          {#if menu}
-            {@const feed = menu.feed}
-            <div
-              class="ctx-menu feed-card-menu"
-              role="menu"
-              tabindex="-1"
-              aria-label={m.feeds_discover_more()}
-              use:ctxMenuPosition={{ x: menu.x, y: menu.y }}
-              onkeydown={cardMenuKeydown}
-              {@attach (el: HTMLElement) => el.querySelector<HTMLElement>('[role="menuitem"]')?.focus()}
-            >
-              <button type="button" class="ctx-item" role="menuitem" onclick={() => { closeCardMenu(true); void copy(feed.link); }}>
-                {m.feeds_copy_link()}
-              </button>
-              {#if discoverPublisher !== feed.publisher}
-                <button type="button" class="ctx-item" role="menuitem" onclick={() => { closeCardMenu(true); discoverPublisher = feed.publisher; }}>
-                  {m.feeds_discover_by_publisher()}
-                </button>
-              {/if}
-              {#if !feed.own}
-                <div class="ctx-sep" role="separator"></div>
-                <button type="button" class="ctx-item" role="menuitem" onclick={() => void hideDiscovered(feed, false)}>
-                  {m.feeds_discover_hide()}
-                </button>
-                <button type="button" class="ctx-item ctx-danger" role="menuitem" onclick={() => void hideDiscovered(feed, true)}>
-                  {m.feeds_discover_hide_publisher()}
-                </button>
-              {/if}
-            </div>
-          {/if}
-          {/key}
-          {#if discoverMatches.length > discoverShown.length}
-            <div class="discover-more">
-              <button type="button" class="secondary" onclick={() => (discoverLimit += DISCOVER_PAGE)}>
-                {m.feeds_discover_show_more({ count: formatNumber(discoverMatches.length - discoverShown.length) })}
-              </button>
-            </div>
-          {/if}
-        </div>
-      </div>
-    {/if}
-  {:else if !mineLoaded}
-    <div class="empty-card">
-      {#if mineFailed}
-        <div class="empty-state">
-          <p class="empty-title">{m.feeds_load_failed()}</p>
-          <div class="empty-actions">
-            <button type="button" class="primary empty-action" onclick={() => void loadMine()}>{m.common_retry()}</button>
-          </div>
-        </div>
-      {:else}
-        <span class="spinner xs" aria-hidden="true"></span>
-        <span class="sr-only">{m.common_loading()}</span>
-      {/if}
-    </div>
-  {:else if mine.length === 0}
-    <div class="empty-card">
-      <div class="empty-state">
-        <span class="empty-glyph">{@render feedGlyph()}</span>
-        <p class="empty-title">{m.feeds_none_mine()}</p>
-        <p class="empty-sub">{m.feeds_empty_mine_body()}</p>
-        {#if compose !== 'create'}
-          <div class="empty-actions">
-            <button type="button" class="primary empty-action" onclick={() => (compose = 'create')}>{m.feeds_new_feed()}</button>
-          </div>
-        {/if}
-      </div>
-    </div>
-  {:else if mine.length > 0}
-    <div class="workspace">
-      <aside class="list-pane" aria-label={m.feeds_tab_mine()}>
-        {#if mine.length >= LIST_SEARCH_FROM}
-          {@render searchBox(listQuery, (v) => (listQuery = v), m.feeds_search_feeds())}
-        {/if}
-        <div class="list-scroll">
-          {#each mineShown as feed (feed.salt)}
-            {@const active = feed.salt === mineSelected}
-            <button
-              type="button"
-              class="feed-row"
-              class:active
-              aria-current={active ? 'true' : undefined}
-              disabled={busy}
-              onclick={() => !active && unlessDirty(() => selectMine(feed))}
-            >
-              <span class="feed-avatar" style:--feed-hue={hueOf(feed.publisher + feed.salt)}>{@render feedGlyph()}</span>
-              <span class="feed-row-text">
-                <span class="feed-row-title"><bdi dir="auto">{feed.title}</bdi></span>
-                <span class="feed-row-sub">
-                  {feed.published_at > 0
-                    ? m.feeds_published_short({ when: ago(feed.published_at) })
-                    : m.feeds_items_count({ count: formatNumber(feed.items.length) })}
-                  {#if feed.published_at > 0 && (feed.followers || !emberOff)}
-                    <span aria-hidden="true"> · </span>{feed.followers ? followersText(feed.followers) : m.feeds_followers_counting()}
+                  {#if !feed.own}
+                    <div class="ctx-sep" role="separator"></div>
+                    <button type="button" class="ctx-item" role="menuitem" onclick={() => void hideDiscovered(feed, false)}>
+                      {m.feeds_discover_hide()}
+                    </button>
+                    <button type="button" class="ctx-item ctx-danger" role="menuitem" onclick={() => void hideDiscovered(feed, true)}>
+                      {m.feeds_discover_hide_publisher()}
+                    </button>
                   {/if}
-                  {#if feed.listed && feed.published_at > 0}<span aria-hidden="true"> · </span>{m.feeds_badge_listed()}{/if}
-                </span>
-              </span>
-              {#if feed.published_at === 0}
-                <span class="badge sm tone-muted">{m.feeds_badge_draft()}</span>
-              {:else if feed.changed || (active && dirty)}
-                <span class="badge sm tone-warning">{m.feeds_badge_unpublished()}</span>
+                </div>
               {/if}
-            </button>
-          {:else}
-            <p class="list-empty">{m.feeds_no_matches()}</p>
-          {/each}
+              {/key}
+              {#if discoverMatches.length > discoverShown.length}
+                <div class="discover-more">
+                  <button type="button" class="secondary" onclick={() => (discoverLimit += DISCOVER_PAGE)}>
+                    {m.feeds_discover_show_more({ count: formatNumber(discoverMatches.length - discoverShown.length) })}
+                  </button>
+                </div>
+              {/if}
+            </div>
+          </div>
+        {/if}
+      {:else if !mineLoaded && mineFailed}
+        <div class="empty-card">
+          <div class="empty-state">
+            <p class="empty-title">{m.feeds_load_failed()}</p>
+            <div class="empty-actions">
+              <button type="button" class="primary empty-action" onclick={() => void loadMine()}>{m.common_retry()}</button>
+            </div>
+          </div>
         </div>
-      </aside>
-
-      <section class="detail-pane">
-        {#if mineFeed}
-          <header class="detail-head">
-            <span class="feed-avatar lg" style:--feed-hue={hueOf(mineFeed.publisher + mineFeed.salt)}>{@render feedGlyph()}</span>
-            <div class="detail-title">
-              <input
-                type="text"
-                class="title-input"
-                bind:value={editTitle}
-                disabled={busy}
-                oninput={(e) => {
-                  if (!composing(e)) editTitle = fitBytes(editTitle, TITLE_MAX);
-                }}
-                oncompositionend={() => (editTitle = fitBytes(editTitle, TITLE_MAX))}
-                placeholder={m.feeds_title_placeholder()}
-                aria-label={m.feeds_title_placeholder()}
-                aria-invalid={titleMissing || undefined}
-                aria-describedby={titleMissing ? 'feeds-title-required' : undefined}
-              />
-              {#if titleMissing}<p class="hint title-required" id="feeds-title-required">{m.error_feeds_title_required()}</p>{/if}
-              <p class="detail-meta">
-                {#if mineFeed.published_at > 0}
-                  <span class="status-dot published" aria-hidden="true"></span>
-                  <span>{m.feeds_published_short({ when: ago(mineFeed.published_at) })}</span>
-                {:else}
-                  <span class="status-dot" aria-hidden="true"></span>
-                  <span>{m.feeds_badge_draft()}</span>
-                {/if}
-                <span aria-hidden="true">·</span>
-                <span>{m.feeds_items_count({ count: formatNumber(editItems.length) })}</span>
-                {#if editSize > 0}<span aria-hidden="true">·</span><span>{formatBytes(editSize)}</span>{/if}
-                {#if mineFeed.published_at > 0 && mineFeed.followers}
-                  <span aria-hidden="true">·</span>
-                  <span class="has-hint" title={m.feeds_followers_hint({ when: ago(mineFeed.followers.checked_at) })}>
-                    {followersText(mineFeed.followers)}
-                  </span>
-                {:else if mineFeed.published_at > 0 && !emberOff}
-                  <!-- Not counted yet: nothing is counted while the network is off. -->
-                  <span aria-hidden="true">·</span>
-                  <span>{m.feeds_followers_counting()}</span>
-                {/if}
-                {#if dirty}<span aria-hidden="true">·</span><span class="unsaved">{m.feeds_unsaved()}</span>{/if}
-              </p>
-            </div>
-            <div class="detail-actions">
-              {#if mineFeed.published_at > 0}
-                <button type="button" class="icon-btn" title={m.feeds_copy_link()} aria-label={m.feeds_copy_link()} onclick={() => void copy(mineFeed!.link)}>
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M6.5 9.5a3 3 0 0 0 4.2 0l2.1-2.1a3 3 0 0 0-4.2-4.2l-.7.7"/><path d="M9.5 6.5a3 3 0 0 0-4.2 0L3.2 8.6a3 3 0 0 0 4.2 4.2l.7-.7"/>
-                  </svg>
-                </button>
-              {/if}
-              <button type="button" class="icon-btn danger-hover" disabled={busy} title={m.feeds_delete()} aria-label={m.feeds_delete()} onclick={askDelete}>
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <path d="M2.5 4.5h11"/><path d="M6 4.5V3h4v1.5"/><path d="M4 4.5l.7 9h6.6l.7-9"/>
-                </svg>
-              </button>
-            </div>
-          </header>
-          <textarea
-            class="desc-input"
-            rows="2"
-            bind:value={editDescription}
-            disabled={busy}
-            oninput={(e) => {
-              if (!composing(e)) editDescription = fitBytes(editDescription, DESCRIPTION_MAX);
-            }}
-            oncompositionend={() => (editDescription = fitBytes(editDescription, DESCRIPTION_MAX))}
-            placeholder={m.feeds_description_placeholder()}
-            aria-label={m.feeds_description_placeholder()}
-          ></textarea>
-
-          <div class="share-row">
-            <span class="share-label">{m.feeds_share_label()}</span>
-            {#if mineFeed.published_at > 0}
-              <input
-                type="text"
-                class="share-link"
-                readonly
-                value={mineFeed.link}
-                aria-label={m.feeds_share_label()}
-                onfocus={(e) => e.currentTarget.select()}
-              />
-              <button type="button" class="secondary sm-btn" onclick={() => void copy(mineFeed!.link)}>{m.feeds_copy_link()}</button>
-            {:else}
-              <span class="share-pending">{m.feeds_share_after_publish()}</span>
-            {/if}
-          </div>
-
-          <div class="listed-row" class:on={mineFeed.listed}>
-            <span class="auto-icon" aria-hidden="true">
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="8" cy="8" r="6"/><path d="M2 8h12"/><path d="M8 2a9 9 0 0 1 0 12a9 9 0 0 1 0-12"/>
-              </svg>
-            </span>
-            <span class="listed-text">
-              <span class="auto-name">{m.feeds_listed_toggle()}</span>
-              <span class="hint">
-                {#if !mineFeed.listed}
-                  {m.feeds_visibility_link_hint()}
-                {:else if mineFeed.published_at === 0}
-                  {m.feeds_listed_hint_unpublished()}
-                {:else}
-                  {m.feeds_visibility_public_hint()}
-                {/if}
-              </span>
-            </span>
-            <ToggleSwitch
-              checked={listedSwitch}
-              disabled={listing || busy || (emberOff && mineFeed.published_at > 0)}
-              ariaLabel={m.feeds_listed_toggle()}
-              onchange={(on) => void toggleListed(on)}
-            />
-          </div>
-
-          {#if mineFeed.published_at === 0}
-            <div class="state-strip" role="status">
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
-                <circle cx="8" cy="8" r="6"/><line x1="8" y1="7" x2="8" y2="11"/><line x1="8" y1="5" x2="8" y2="5.1"/>
-              </svg>
-              <span>{m.feeds_not_published()}</span>
-            </div>
-          {:else if mineFeed.changed || dirty}
-            <div class="state-strip tone-warning" role="status">
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
-                <circle cx="8" cy="8" r="6"/><line x1="8" y1="7" x2="8" y2="11"/><line x1="8" y1="5" x2="8" y2="5.1"/>
-              </svg>
-              <span>{m.feeds_unpublished_changes()}</span>
-            </div>
-          {/if}
-
-          <div class="files-toolbar">
-            <h4 class="section-label">{m.feeds_files_heading()}</h4>
-            <span class="toolbar-spacer"></span>
-            <button type="button" class="secondary sm-btn" disabled={busy} onclick={() => (pickerOpen = true)}>
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">
-                <line x1="8" y1="3" x2="8" y2="13"/><line x1="3" y1="8" x2="13" y2="8"/>
-              </svg>
-              {m.feeds_add_files()}
-            </button>
-          </div>
-
-          <div class="file-list" tabindex="-1" bind:this={editList}>
-            {#if editItems.length === 0}
-              <div class="file-list-empty">
-                <p>{m.feeds_no_items()}</p>
-                <button type="button" class="primary sm-btn" disabled={busy} onclick={() => (pickerOpen = true)}>{m.feeds_add_files()}</button>
+      {:else if !mineLoaded}
+        {@render skeletonWorkspace()}
+      {:else if mine.length === 0}
+        <div class="empty-card">
+          <div class="empty-state">
+            <span class="empty-glyph">{@render feedGlyph()}</span>
+            <p class="empty-title">{m.feeds_none_mine()}</p>
+            <p class="empty-sub">{m.feeds_empty_mine_body()}</p>
+            {#if compose !== 'create'}
+              <div class="empty-actions">
+                <button type="button" class="primary empty-action" onclick={() => (compose = 'create')}>{m.feeds_new_feed()}</button>
               </div>
             {/if}
-            {#each editItems as item, i (item.ed2k)}
-              {@const type = typeOf(item.name)}
-              {@const downloads = downloadsOf(mineFeed, item.ed2k)}
-              <div class="file-row" data-row={i}>
-                <span class="file-index" aria-hidden="true">{i + 1}</span>
-                {@render fileIcon(type)}
-                <div class="file-main">
-                  <span class="file-name"><bdi dir="auto">{item.name}</bdi></span>
-                  <span class="file-meta">
-                    <span>{formatBytes(item.size)}</span>
-                    {#if type}<span aria-hidden="true">·</span><span>{fileTypeFilterLabel(type)}</span>{/if}
-                    {#if downloads > 0}
-                      <span aria-hidden="true">·</span>
-                      <span class="has-hint" title={m.feeds_item_downloads_hint()}>{downloadsText(downloads)}</span>
-                    {/if}
+          </div>
+        </div>
+      {:else if mine.length > 0}
+        <div class="workspace">
+          <aside class="list-pane" aria-label={m.feeds_tab_mine()}>
+            {#if mine.length >= LIST_SEARCH_FROM}
+              {@render searchBox(listQuery, (v) => (listQuery = v), m.feeds_search_feeds())}
+            {/if}
+            <!-- svelte-ignore a11y_no_static_element_interactions (arrows between the feeds it holds, each a button) -->
+            <div class="list-scroll" onkeydown={listKeydown}>
+              {#each mineShown as feed (feed.salt)}
+                {@const active = feed.salt === mineSelected}
+                <button
+                  type="button"
+                  class="feed-row"
+                  class:active
+                  aria-current={active ? 'true' : undefined}
+                  disabled={busy}
+                  onclick={() => !active && unlessDirty(() => selectMine(feed))}
+                >
+                  <span class="feed-avatar" style:--feed-hue={hueOf(feed.publisher + feed.salt)}>{@render feedGlyph()}</span>
+                  <span class="feed-row-text">
+                    <span class="feed-row-title"><bdi dir="auto">{feed.title}</bdi></span>
+                    <span class="feed-row-sub">
+                      {feed.published_at > 0
+                        ? m.feeds_published_short({ when: ago(feed.published_at) })
+                        : m.feeds_items_count({ count: formatNumber(feed.items.length) })}
+                      {#if feed.published_at > 0 && (feed.followers || !emberOff)}
+                        <span aria-hidden="true"> · </span>{feed.followers ? followersText(feed.followers) : m.feeds_followers_counting()}
+                      {/if}
+                      {#if feed.listed && feed.published_at > 0}<span aria-hidden="true"> · </span>{m.feeds_badge_listed()}{/if}
+                    </span>
                   </span>
-                  <input
-                    type="text"
-                    class="note-input"
-                    bind:value={item.note}
-                    disabled={busy}
-                    placeholder={m.feeds_note_placeholder()}
-                    aria-label={m.feeds_note_named({ name: item.name })}
-                    oninput={(e) => {
-                      if (!composing(e)) item.note = fitBytes(item.note, NOTE_MAX);
-                    }}
-                    oncompositionend={() => (item.note = fitBytes(item.note, NOTE_MAX))}
+                  {#if feed.published_at === 0}
+                    <span class="badge sm tone-muted">{m.feeds_badge_draft()}</span>
+                  {:else if feed.changed || (active && dirty)}
+                    <span class="badge sm tone-warning">{m.feeds_badge_unpublished()}</span>
+                  {/if}
+                </button>
+              {:else}
+                <p class="list-empty">{m.feeds_no_matches()}</p>
+              {/each}
+            </div>
+          </aside>
+
+          {#key mineSelected}
+            <section class="detail-pane" in:fade={detailIn()}>
+              {#if mineFeed}
+                <header class="detail-head">
+                  <span class="feed-avatar lg" style:--feed-hue={hueOf(mineFeed.publisher + mineFeed.salt)}>{@render feedGlyph()}</span>
+                  <div class="detail-title">
+                    <input
+                      type="text"
+                      class="title-input"
+                      bind:value={editTitle}
+                      disabled={busy}
+                      oninput={(e) => {
+                        if (!composing(e)) editTitle = fitBytes(editTitle, TITLE_MAX);
+                      }}
+                      oncompositionend={() => (editTitle = fitBytes(editTitle, TITLE_MAX))}
+                      placeholder={m.feeds_title_placeholder()}
+                      aria-label={m.feeds_title_placeholder()}
+                      aria-invalid={titleMissing || undefined}
+                      aria-describedby={titleMissing ? 'feeds-title-required' : undefined}
+                    />
+                    {#if titleMissing}<p class="hint title-required" id="feeds-title-required">{m.error_feeds_title_required()}</p>{/if}
+                    <p class="detail-meta">
+                      {#if mineFeed.published_at > 0}
+                        <span class="status-dot published" aria-hidden="true"></span>
+                        <span>{m.feeds_published_short({ when: ago(mineFeed.published_at) })}</span>
+                      {:else}
+                        <span class="status-dot" aria-hidden="true"></span>
+                        <span>{m.feeds_badge_draft()}</span>
+                      {/if}
+                      <span aria-hidden="true">·</span>
+                      <span>{m.feeds_items_count({ count: formatNumber(editItems.length) })}</span>
+                      {#if editSize > 0}<span aria-hidden="true">·</span><span>{formatBytes(editSize)}</span>{/if}
+                      {#if mineFeed.published_at > 0 && mineFeed.followers}
+                        <span aria-hidden="true">·</span>
+                        <span class="has-hint" title={m.feeds_followers_hint({ when: ago(mineFeed.followers.checked_at) })}>
+                          {followersText(mineFeed.followers)}
+                        </span>
+                      {:else if mineFeed.published_at > 0 && !emberOff}
+                        <!-- Not counted yet: nothing is counted while the network is off. -->
+                        <span aria-hidden="true">·</span>
+                        <span>{m.feeds_followers_counting()}</span>
+                      {/if}
+                      {#if dirty}<span aria-hidden="true">·</span><span class="unsaved">{m.feeds_unsaved()}</span>{/if}
+                    </p>
+                  </div>
+                  <div class="detail-actions">
+                    {#if mineFeed.published_at > 0}
+                      <button type="button" class="icon-btn" title={m.feeds_copy_link()} aria-label={m.feeds_copy_link()} onclick={() => void copy(mineFeed!.link)}>
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <path d="M6.5 9.5a3 3 0 0 0 4.2 0l2.1-2.1a3 3 0 0 0-4.2-4.2l-.7.7"/><path d="M9.5 6.5a3 3 0 0 0-4.2 0L3.2 8.6a3 3 0 0 0 4.2 4.2l.7-.7"/>
+                        </svg>
+                      </button>
+                    {/if}
+                    <button type="button" class="icon-btn danger-hover" disabled={busy} title={m.feeds_delete()} aria-label={m.feeds_delete()} onclick={askDelete}>
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M2.5 4.5h11"/><path d="M6 4.5V3h4v1.5"/><path d="M4 4.5l.7 9h6.6l.7-9"/>
+                      </svg>
+                    </button>
+                  </div>
+                </header>
+                <textarea
+                  class="desc-input"
+                  rows="2"
+                  bind:value={editDescription}
+                  disabled={busy}
+                  oninput={(e) => {
+                    if (!composing(e)) editDescription = fitBytes(editDescription, DESCRIPTION_MAX);
+                  }}
+                  oncompositionend={() => (editDescription = fitBytes(editDescription, DESCRIPTION_MAX))}
+                  placeholder={m.feeds_description_placeholder()}
+                  aria-label={m.feeds_description_placeholder()}
+                ></textarea>
+
+                <div class="share-row">
+                  <span class="share-label">{m.feeds_share_label()}</span>
+                  {#if mineFeed.published_at > 0}
+                    <input
+                      type="text"
+                      class="share-link"
+                      readonly
+                      value={mineFeed.link}
+                      aria-label={m.feeds_share_label()}
+                      onfocus={(e) => e.currentTarget.select()}
+                    />
+                    <button type="button" class="secondary sm-btn" onclick={() => void copy(mineFeed!.link)}>{m.feeds_copy_link()}</button>
+                  {:else}
+                    <span class="share-pending">{m.feeds_share_after_publish()}</span>
+                  {/if}
+                </div>
+
+                <div class="listed-row" class:on={mineFeed.listed}>
+                  <span class="auto-icon" aria-hidden="true">
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                      <circle cx="8" cy="8" r="6"/><path d="M2 8h12"/><path d="M8 2a9 9 0 0 1 0 12a9 9 0 0 1 0-12"/>
+                    </svg>
+                  </span>
+                  <span class="listed-text">
+                    <span class="auto-name">{m.feeds_listed_toggle()}</span>
+                    <span class="hint">
+                      {#if !mineFeed.listed}
+                        {m.feeds_visibility_link_hint()}
+                      {:else if mineFeed.published_at === 0}
+                        {m.feeds_listed_hint_unpublished()}
+                      {:else}
+                        {m.feeds_visibility_public_hint()}
+                      {/if}
+                    </span>
+                  </span>
+                  <ToggleSwitch
+                    checked={listedSwitch}
+                    disabled={listing || busy || (emberOff && mineFeed.published_at > 0)}
+                    ariaLabel={m.feeds_listed_toggle()}
+                    onchange={(on) => void toggleListed(on)}
                   />
                 </div>
-                <div class="row-tools">
-                  <button
-                    type="button"
-                    class="icon-btn sm"
-                    disabled={busy || i === 0}
-                    aria-label={m.feeds_move_up_named({ name: item.name })}
-                    title={m.feeds_move_up()}
-                    data-tool="up"
-                    onclick={() => void move(i, -1)}
-                  >
-                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 10 8 6 12 10"/></svg>
-                  </button>
-                  <button
-                    type="button"
-                    class="icon-btn sm"
-                    disabled={busy || i === editItems.length - 1}
-                    aria-label={m.feeds_move_down_named({ name: item.name })}
-                    title={m.feeds_move_down()}
-                    data-tool="down"
-                    onclick={() => void move(i, 1)}
-                  >
-                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 6 8 10 12 6"/></svg>
-                  </button>
-                  <button
-                    type="button"
-                    class="icon-btn sm danger-hover"
-                    disabled={busy}
-                    aria-label={m.feeds_remove_named({ name: item.name })}
-                    title={m.feeds_remove()}
-                    data-tool="remove"
-                    onclick={() => void removeItem(i)}
-                  >
-                    <IconX size={13} />
+
+                {#if mineFeed.published_at === 0}
+                  <div class="state-strip" role="status">
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+                      <circle cx="8" cy="8" r="6"/><line x1="8" y1="7" x2="8" y2="11"/><line x1="8" y1="5" x2="8" y2="5.1"/>
+                    </svg>
+                    <span>{m.feeds_not_published()}</span>
+                  </div>
+                {:else if mineFeed.changed || dirty}
+                  <div class="state-strip tone-warning" role="status">
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+                      <circle cx="8" cy="8" r="6"/><line x1="8" y1="7" x2="8" y2="11"/><line x1="8" y1="5" x2="8" y2="5.1"/>
+                    </svg>
+                    <span>{m.feeds_unpublished_changes()}</span>
+                  </div>
+                {/if}
+
+                <div class="files-toolbar">
+                  <h4 class="section-label">{m.feeds_files_heading()}</h4>
+                  <span class="toolbar-spacer"></span>
+                  <button type="button" class="secondary sm-btn" disabled={busy} onclick={() => (pickerOpen = true)}>
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">
+                      <line x1="8" y1="3" x2="8" y2="13"/><line x1="3" y1="8" x2="13" y2="8"/>
+                    </svg>
+                    {m.feeds_add_files()}
                   </button>
                 </div>
-              </div>
-            {/each}
-          </div>
 
-          <footer class="editor-foot">
-            <p class="hint" class:up-to-date={upToDate} id="feeds-publish-hint">
-              {upToDate ? m.feeds_publish_up_to_date_title() : m.feeds_publish_public_hint()}
-            </p>
-            <div class="editor-foot-actions">
-              <button
-                type="button"
-                class="secondary"
-                disabled={!dirty || busy || titleMissing}
-                aria-describedby={titleMissing ? 'feeds-title-required' : undefined}
-                onclick={() => void save()}
-              >{m.feeds_save()}</button>
-              <!-- Published and unchanged: publishing again would only bump the
-                   sequence, and the hourly republish keeps the head alive. -->
-              <button
-                type="button"
-                class="primary"
-                disabled={busy || emberOff || upToDate || titleMissing}
-                aria-describedby={titleMissing ? 'feeds-title-required' : upToDate ? 'feeds-publish-hint' : undefined}
-                onclick={() => void publish()}
-              >
-                {#if publishing}
-                  <span class="spinner xs" aria-hidden="true"></span>
-                {:else if upToDate}
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <polyline points="3 8 7 12 13 4"/>
-                  </svg>
-                {/if}
-                {upToDate ? m.feeds_publish_up_to_date() : mineFeed.published_at > 0 ? m.feeds_publish_changes() : m.feeds_publish()}
-              </button>
-            </div>
-          </footer>
+                <div class="file-list" tabindex="-1" bind:this={editList}>
+                  {#if editItems.length === 0}
+                    <div class="file-list-empty">
+                      <p>{m.feeds_no_items()}</p>
+                      <button type="button" class="primary sm-btn" disabled={busy} onclick={() => (pickerOpen = true)}>{m.feeds_add_files()}</button>
+                    </div>
+                  {/if}
+                  {#each editItems as item, i (item.ed2k)}
+                    {@const type = typeOf(item.name)}
+                    {@const downloads = downloadsOf(mineFeed, item.ed2k)}
+                    <div class="file-row" data-row={i}>
+                      <span class="file-index" aria-hidden="true">{i + 1}</span>
+                      {@render fileIcon(type)}
+                      <div class="file-main">
+                        <span class="file-name"><bdi dir="auto">{item.name}</bdi></span>
+                        <span class="file-meta">
+                          <span>{formatBytes(item.size)}</span>
+                          {#if type}<span aria-hidden="true">·</span><span>{fileTypeFilterLabel(type)}</span>{/if}
+                          {#if downloads > 0}
+                            <span aria-hidden="true">·</span>
+                            <span class="has-hint" title={m.feeds_item_downloads_hint()}>{downloadsText(downloads)}</span>
+                          {/if}
+                        </span>
+                        <input
+                          type="text"
+                          class="note-input"
+                          bind:value={item.note}
+                          disabled={busy}
+                          placeholder={m.feeds_note_placeholder()}
+                          aria-label={m.feeds_note_named({ name: item.name })}
+                          oninput={(e) => {
+                            if (!composing(e)) item.note = fitBytes(item.note, NOTE_MAX);
+                          }}
+                          oncompositionend={() => (item.note = fitBytes(item.note, NOTE_MAX))}
+                        />
+                      </div>
+                      <div class="row-tools">
+                        <button
+                          type="button"
+                          class="icon-btn sm"
+                          disabled={busy || i === 0}
+                          aria-label={m.feeds_move_up_named({ name: item.name })}
+                          title={m.feeds_move_up()}
+                          data-tool="up"
+                          onclick={() => void move(i, -1)}
+                        >
+                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 10 8 6 12 10"/></svg>
+                        </button>
+                        <button
+                          type="button"
+                          class="icon-btn sm"
+                          disabled={busy || i === editItems.length - 1}
+                          aria-label={m.feeds_move_down_named({ name: item.name })}
+                          title={m.feeds_move_down()}
+                          data-tool="down"
+                          onclick={() => void move(i, 1)}
+                        >
+                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 6 8 10 12 6"/></svg>
+                        </button>
+                        <button
+                          type="button"
+                          class="icon-btn sm danger-hover"
+                          disabled={busy}
+                          aria-label={m.feeds_remove_named({ name: item.name })}
+                          title={m.feeds_remove()}
+                          data-tool="remove"
+                          onclick={() => void removeItem(i)}
+                        >
+                          <IconX size={13} />
+                        </button>
+                      </div>
+                    </div>
+                  {/each}
+                </div>
 
-          <FeedFilePicker
-            bind:open={pickerOpen}
-            feedTitle={editTitle || mineFeed.title}
-            {inFeed}
-            room={FEED_ITEMS_MAX - editItems.length}
-            onadd={addFiles}
-            onclose={() => {}}
-          />
-        {:else}
-          <div class="empty-state compact"><p class="empty-sub">{m.feeds_pick_one_mine()}</p></div>
-        {/if}
-      </section>
+                <footer class="editor-foot">
+                  <p class="hint" class:up-to-date={upToDate} id="feeds-publish-hint">
+                    {upToDate ? m.feeds_publish_up_to_date_title() : m.feeds_publish_public_hint()}
+                  </p>
+                  <div class="editor-foot-actions">
+                    <button
+                      type="button"
+                      class="secondary"
+                      disabled={!dirty || busy || titleMissing}
+                      aria-describedby={titleMissing ? 'feeds-title-required' : undefined}
+                      onclick={() => void save()}
+                    >{m.feeds_save()}</button>
+                    <!-- Published and unchanged: publishing again would only bump the
+                         sequence, and the hourly republish keeps the head alive. -->
+                    <button
+                      type="button"
+                      class="primary"
+                      disabled={busy || emberOff || upToDate || titleMissing}
+                      aria-describedby={titleMissing ? 'feeds-title-required' : upToDate ? 'feeds-publish-hint' : undefined}
+                      onclick={() => void publish()}
+                    >
+                      {#if publishing}
+                        <span class="spinner xs" aria-hidden="true"></span>
+                      {:else if upToDate}
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <polyline points="3 8 7 12 13 4"/>
+                        </svg>
+                      {/if}
+                      {upToDate ? m.feeds_publish_up_to_date() : mineFeed.published_at > 0 ? m.feeds_publish_changes() : m.feeds_publish()}
+                    </button>
+                  </div>
+                </footer>
+
+                <FeedFilePicker
+                  bind:open={pickerOpen}
+                  feedTitle={editTitle || mineFeed.title}
+                  {inFeed}
+                  room={FEED_ITEMS_MAX - editItems.length}
+                  onadd={addFiles}
+                  onclose={() => {}}
+                />
+              {:else}
+                <div class="empty-state compact"><p class="empty-sub">{m.feeds_pick_one_mine()}</p></div>
+              {/if}
+            </section>
+          {/key}
+        </div>
+      {/if}
     </div>
-  {/if}
+  {/key}
 </div>
 
 <ConfirmDialog
@@ -2922,6 +3113,7 @@
 
   /* ── Segmented switch (tabs, file filter) ─────────────────────────── */
   .segmented {
+    position: relative;
     display: inline-flex;
     padding: 2px;
     gap: 2px;
@@ -2930,7 +3122,38 @@
     background: var(--bg-tertiary);
   }
 
+  /* The pressed button's background, as one piece that glides between them
+     (`segmentThumb`). Until it is placed, each button draws its own. */
+  .seg-thumb {
+    position: absolute;
+    top: 2px;
+    bottom: 2px;
+    left: 0;
+    width: 0;
+    border-radius: calc(var(--radius-md) - 2px);
+    background: var(--bg-secondary);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18), inset 0 1px 0 var(--surface-highlight);
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .seg-thumb:global(.ready) {
+    transition:
+      transform 0.24s cubic-bezier(0.22, 1, 0.36, 1),
+      width 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .segmented:global(.has-thumb) .seg-thumb {
+    opacity: 1;
+  }
+
+  .segmented:global(.has-thumb) button.active {
+    background: transparent;
+    box-shadow: none;
+  }
+
   .segmented button {
+    position: relative;
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -2970,6 +3193,16 @@
     color: var(--text-accent);
   }
 
+  /* New files on Following, seen from another tab. */
+  .tab-dot {
+    width: 6px;
+    height: 6px;
+    margin-inline-start: -2px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+
   /* ── Page body ────────────────────────────────────────────────────── */
   .feeds-page {
     flex: 1;
@@ -2983,6 +3216,16 @@
     /* The window's minimum width is 900px, so the layout answers to the
        room the sidebar leaves, not to the window. */
     container-type: inline-size;
+  }
+
+  /* One tab's content, made anew on each change of tab so it can slide in;
+     laid out as the page body it replaces. */
+  .tab-view {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
   }
 
   .compose-card {
@@ -4177,6 +4420,7 @@
   }
 
   .discover-pane {
+    position: relative;
     flex: 1;
     min-height: 0;
     display: flex;
@@ -4185,6 +4429,32 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     box-shadow: inset 0 1px 0 var(--surface-highlight);
+  }
+
+  /* A walk still finding feeds: a thin sweep along the pane's top edge, so
+     cards still arriving do not look like the whole list. */
+  .walk-bar {
+    position: absolute;
+    top: 0;
+    inset-inline: var(--radius-lg);
+    height: 2px;
+    overflow: hidden;
+    border-radius: var(--radius-pill);
+  }
+
+  .walk-bar::after {
+    content: '';
+    position: absolute;
+    inset-block: 0;
+    width: 30%;
+    border-radius: inherit;
+    background: var(--accent);
+    animation: feeds-sweep 1.3s ease-in-out infinite;
+  }
+
+  @keyframes feeds-sweep {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(340%); }
   }
 
   .discover-toolbar {
@@ -4433,9 +4703,131 @@
     height: 13px;
   }
 
+  /* ── Loading placeholders ─────────────────────────────────────────── */
+  /* Held back a moment, so a load that answers at once never flashes them. */
+  .skeleton {
+    animation: feeds-fade-in 0.2s ease 0.15s both;
+  }
+
+  @keyframes feeds-fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  .skel {
+    position: relative;
+    display: block;
+    overflow: hidden;
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--text-muted) 14%, transparent);
+  }
+
+  .skel::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background: linear-gradient(
+      90deg,
+      transparent,
+      color-mix(in srgb, var(--text-primary) 7%, transparent),
+      transparent
+    );
+    animation: feeds-shimmer 1.4s ease-in-out infinite;
+  }
+
+  @keyframes feeds-shimmer {
+    to { transform: translateX(100%); }
+  }
+
+  .skel-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 8px;
+  }
+
+  .skel-head {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .skeleton .detail-pane .skel-head {
+    padding: 16px 18px 14px;
+  }
+
+  .skel-lines {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+  }
+
+  .skel-line {
+    height: 9px;
+  }
+
+  .skel-line.title {
+    width: 45%;
+    height: 13px;
+  }
+
+  .skel-line.short {
+    width: 32%;
+  }
+
+  .skel-avatar {
+    flex-shrink: 0;
+    width: var(--avatar-size, 32px);
+    height: var(--avatar-size, 32px);
+    border-radius: 9px;
+  }
+
+  .skel-avatar.lg {
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
+  }
+
+  .skel-icon {
+    flex-shrink: 0;
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+  }
+
+  /* In an open feed's file list, which pads its rows itself. */
+  .skel-files {
+    padding: 0;
+  }
+
+  .skeleton .detail-pane .skel-files {
+    padding: 6px 10px 10px;
+    border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+  }
+
+  .skel-card {
+    min-height: 120px;
+    justify-content: flex-start;
+  }
+
+  .skel-card > .skel-line {
+    margin-top: 2px;
+  }
+
+  .skel-card > .skel-line:first-of-type {
+    margin-top: 6px;
+  }
+
   @media (prefers-reduced-motion: reduce) {
     .compose-card { animation: none; }
     .icon-btn.spinning svg { animation: none; }
+    .skeleton { animation: none; }
+    .skel::after,
+    .walk-bar::after { animation: none; display: none; }
+    .walk-bar { background: color-mix(in srgb, var(--accent) 55%, transparent); }
   }
 
   @container (max-width: 860px) {

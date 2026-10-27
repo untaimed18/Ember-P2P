@@ -480,7 +480,8 @@
                           {folder.subfolder_count_capped
                             ? m.emule_import_folder_subfolders_capped({ count: folder.newly_shared_subfolders })
                             : plural(folder.newly_shared_subfolders, {
-                                one: m.emule_import_folder_subfolders_one,
+                                one: () => m.emule_import_folder_subfolders_one({ count: folder.newly_shared_subfolders }),
+                                oneShowsCount: true,
                                 other: () => m.emule_import_folder_subfolders_other({ count: folder.newly_shared_subfolders }),
                               })}
                         </span>
@@ -513,7 +514,8 @@
             <span class="toggle-title">{m.emule_import_credits_title()}</span>
             <span class="hint">
               {plural(preview.credits, {
-                one: m.emule_import_credits_desc_one,
+                one: () => m.emule_import_credits_desc_one({ count: preview.credits }),
+                oneShowsCount: true,
                 few: () => m.emule_import_credits_desc_few({ count: preview.credits }),
                 other: () => m.emule_import_credits_desc_other({ count: preview.credits }),
               })}
@@ -572,7 +574,8 @@
             <div class="toggle-info">
               <span class="toggle-title">
                 {plural(preview.servers, {
-                  one: m.emule_import_servers_one,
+                  one: () => m.emule_import_servers_one({ count: preview.servers }),
+                  oneShowsCount: true,
                   other: () => m.emule_import_servers_other({ count: preview.servers }),
                 })}
               </span>

@@ -2067,7 +2067,8 @@
         };
       } else {
         const addedText = plural(added, {
-          one: m.webservices_imported_one,
+          one: () => m.webservices_imported_one({ count: added }),
+          oneShowsCount: true,
           other: () => m.webservices_imported_other({ count: added }),
         });
         webServiceMessage = { kind: 'ok', text: full ? `${addedText} ${full}` : addedText };
@@ -2187,7 +2188,8 @@
         antileechMessage = {
           kind: 'warn',
           text: plural(savedCount, {
-            one: () => m.settings_antileech_saved_rejected_one({ rejected }),
+            one: () => m.settings_antileech_saved_rejected_one({ rejected, count: savedCount }),
+            oneShowsCount: true,
             other: () => m.settings_antileech_saved_rejected_other({ count: savedCount, rejected }),
           }),
         };
@@ -2196,7 +2198,8 @@
         antileechMessage = {
           kind: 'ok',
           text: plural(savedCount, {
-            one: m.settings_antileech_saved_one,
+            one: () => m.settings_antileech_saved_one({ count: savedCount }),
+            oneShowsCount: true,
             other: () => m.settings_antileech_saved_other({ count: savedCount }),
           }),
         };
@@ -2310,7 +2313,8 @@
       antileechMessage = {
         kind: 'ok',
         text: plural(snap.pattern_count, {
-          one: m.settings_antileech_restored_one,
+          one: () => m.settings_antileech_restored_one({ count: snap.pattern_count }),
+          oneShowsCount: true,
           other: () => m.settings_antileech_restored_other({ count: snap.pattern_count }),
         }),
       };
@@ -2689,7 +2693,8 @@
         {:else}
           <p class="settings-filter-status" role="status">
             {plural(filterMatchCount, {
-              one: m.settings_filter_one_result,
+              one: () => m.settings_filter_one_result({ count: filterMatchCount }),
+              oneShowsCount: true,
               other: () => m.settings_filter_results({ count: filterMatchCount }),
             })}
           </p>

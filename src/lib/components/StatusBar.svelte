@@ -48,7 +48,8 @@
     const size = formatBytes(bytes);
     const n = formatNumber(count);
     return plural(count, {
-      one: () => m.statusbar_shared_title_one({ size }),
+      one: () => m.statusbar_shared_title_one({ size, count: n }),
+      oneShowsCount: true,
       few: () => m.statusbar_shared_title_few({ count: n, size }),
       other: () => m.statusbar_shared_title_other({ count: n, size }),
     });
@@ -183,7 +184,8 @@
       const peers = stats.ember_dht_verified_contacts ?? 0;
       const label = statusLabel(status);
       base = plural(peers, {
-        one: () => m.statusbar_ember_dht_title_peers_one({ status: label }),
+        one: () => m.statusbar_ember_dht_title_peers_one({ status: label, count: peers }),
+        oneShowsCount: true,
         few: () => m.statusbar_ember_dht_title_peers_few({ status: label, count: peers }),
         other: () => m.statusbar_ember_dht_title_peers_other({ status: label, count: peers }),
       });
@@ -228,7 +230,8 @@
         other: () => m.statusbar_epx_title_active_one_other({ sources: s }),
       }),
       other: () => plural(s, {
-        one: () => m.statusbar_epx_title_active_other_one({ peers: p }),
+        one: () => m.statusbar_epx_title_active_other_one({ peers: p, sources: s }),
+        oneShowsCount: true,
         other: () => m.statusbar_epx_title_active_other_other({ peers: p, sources: s }),
       }),
     });

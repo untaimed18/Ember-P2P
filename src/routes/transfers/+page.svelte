@@ -470,13 +470,13 @@
       let msg: string;
       switch (d.kind) {
         case 'server_query': msg = m.transfers_src_server_query(); break;
-        case 'server_found': msg = plural(count, { one: m.transfers_src_server_found_one, other: () => m.transfers_src_server_found_other({ count }) }); break;
+        case 'server_found': msg = plural(count, { one: () => m.transfers_src_server_found_one({ count }), oneShowsCount: true, other: () => m.transfers_src_server_found_other({ count }) }); break;
         case 'server_empty': msg = m.transfers_src_server_empty(); break;
-        case 'udp_found': msg = plural(count, { one: m.transfers_src_udp_found_one, other: () => m.transfers_src_udp_found_other({ count }) }); break;
+        case 'udp_found': msg = plural(count, { one: () => m.transfers_src_udp_found_one({ count }), oneShowsCount: true, other: () => m.transfers_src_udp_found_other({ count }) }); break;
         case 'udp_empty': msg = m.transfers_src_udp_empty(); break;
         case 'kad_search': msg = m.transfers_src_kad_search(); break;
-        case 'kad_found': msg = plural(count, { one: m.transfers_src_kad_found_one, other: () => m.transfers_src_kad_found_other({ count }) }); break;
-        case 'kad_indirect': msg = plural(count, { one: m.transfers_src_kad_indirect_one, other: () => m.transfers_src_kad_indirect_other({ count }) }); break;
+        case 'kad_found': msg = plural(count, { one: () => m.transfers_src_kad_found_one({ count }), oneShowsCount: true, other: () => m.transfers_src_kad_found_other({ count }) }); break;
+        case 'kad_indirect': msg = plural(count, { one: () => m.transfers_src_kad_indirect_one({ count }), oneShowsCount: true, other: () => m.transfers_src_kad_indirect_other({ count }) }); break;
         case 'kad_empty': msg = m.transfers_src_kad_empty(); break;
         default: msg = m.transfers_src_unknown(); break;
       }
@@ -2646,7 +2646,8 @@
         if (t.health === 'degraded' && t.health_reason) return m.transfers_dl_status_searching_delayed();
         if (t.sources > 0) {
           return plural(t.sources, {
-            one: m.transfers_dl_status_searching_with_sources_one,
+            one: () => m.transfers_dl_status_searching_with_sources_one({ count: t.sources }),
+            oneShowsCount: true,
             other: () => m.transfers_dl_status_searching_with_sources_other({ count: t.sources }),
           });
         }
@@ -3450,8 +3451,8 @@
           const front = action === 'queue_front';
           const moved = await moveTransfersInQueue(queueTargetsOf(targets, queued).map((x) => x.id), front);
           if (moved === 0) showInfo(m.transfers_queue_none_waiting());
-          else if (front) showInfo(plural(moved, { one: m.transfers_queue_moved_front_one, other: () => m.transfers_queue_moved_front_other({ count: moved }) }));
-          else showInfo(plural(moved, { one: m.transfers_queue_moved_back_one, other: () => m.transfers_queue_moved_back_other({ count: moved }) }));
+          else if (front) showInfo(plural(moved, { one: () => m.transfers_queue_moved_front_one({ count: moved }), oneShowsCount: true, other: () => m.transfers_queue_moved_front_other({ count: moved }) }));
+          else showInfo(plural(moved, { one: () => m.transfers_queue_moved_back_one({ count: moved }), oneShowsCount: true, other: () => m.transfers_queue_moved_back_other({ count: moved }) }));
           break;
         }
         case 'find_sources': {
@@ -3555,7 +3556,8 @@
     const filter = narrowLabel;
     if (filter && ok) {
       showInfo(plural(ids.length, {
-        one: () => m.transfers_paused_matching_one({ filter }),
+        one: () => m.transfers_paused_matching_one({ filter, count: ids.length }),
+        oneShowsCount: true,
         other: () => m.transfers_paused_matching_other({ count: ids.length, filter }),
       }));
     }
@@ -3567,7 +3569,8 @@
     const filter = narrowLabel;
     if (filter && ok) {
       showInfo(plural(ids.length, {
-        one: () => m.transfers_resumed_matching_one({ filter }),
+        one: () => m.transfers_resumed_matching_one({ filter, count: ids.length }),
+        oneShowsCount: true,
         other: () => m.transfers_resumed_matching_other({ count: ids.length, filter }),
       }));
     }
@@ -3620,7 +3623,8 @@
       }
       showInfo(
         plural(targets.length, {
-          one: m.transfers_copied_links_one,
+          one: () => m.transfers_copied_links_one({ count: targets.length }),
+          oneShowsCount: true,
           other: () => m.transfers_copied_links_other({ count: targets.length }),
         }),
       );
@@ -3829,7 +3833,8 @@
   function summarizeBatchResult(label: string, total: number, failed: { id: string; name: string; error: string }[]) {
     if (failed.length === 0) {
       showInfo(plural(total, {
-        one: () => m.transfers_batch_done_one({ label }),
+        one: () => m.transfers_batch_done_one({ label, count: total }),
+        oneShowsCount: true,
         other: () => m.transfers_batch_done_other({ label, count: total }),
       }));
       return;
@@ -4221,11 +4226,13 @@
     }
     return permanently
       ? plural(count, {
-          one: m.transfers_confirm_delete_finished_permanent_one,
+          one: () => m.transfers_confirm_delete_finished_permanent_one({ count: formatNumber(count) }),
+          oneShowsCount: true,
           other: () => m.transfers_confirm_delete_finished_permanent_other({ count: formatNumber(count) }),
         })
       : plural(count, {
-          one: m.transfers_confirm_delete_finished_bin_one,
+          one: () => m.transfers_confirm_delete_finished_bin_one({ count: formatNumber(count) }),
+          oneShowsCount: true,
           other: () => m.transfers_confirm_delete_finished_bin_other({ count: formatNumber(count) }),
         });
   }
@@ -4252,11 +4259,13 @@
         const permanently = $appSettings?.delete_permanently === true;
         showInfo(permanently
           ? plural(removed.size, {
-              one: m.transfers_deleted_finished_permanent_one,
+              one: () => m.transfers_deleted_finished_permanent_one({ count: formatNumber(removed.size) }),
+              oneShowsCount: true,
               other: () => m.transfers_deleted_finished_permanent_other({ count: formatNumber(removed.size) }),
             })
           : plural(removed.size, {
-              one: m.transfers_deleted_finished_bin_one,
+              one: () => m.transfers_deleted_finished_bin_one({ count: formatNumber(removed.size) }),
+              oneShowsCount: true,
               other: () => m.transfers_deleted_finished_bin_other({ count: formatNumber(removed.size) }),
             }));
       }
@@ -4312,7 +4321,8 @@
     const filter = narrowLabel;
     if (filter && ok) {
       showInfo(plural(ids.length, {
-        one: () => m.transfers_stopped_matching_one({ filter }),
+        one: () => m.transfers_stopped_matching_one({ filter, count: ids.length }),
+        oneShowsCount: true,
         other: () => m.transfers_stopped_matching_other({ count: ids.length, filter }),
       }));
     }
@@ -4340,7 +4350,8 @@
         other: () => m.transfers_confirm_batch_cancel_mixed_one_other({ removed }),
       }),
       other: () => plural(removed, {
-        one: () => m.transfers_confirm_batch_cancel_mixed_other_one({ count }),
+        one: () => m.transfers_confirm_batch_cancel_mixed_other_one({ count, removed }),
+        oneShowsCount: true,
         other: () => m.transfers_confirm_batch_cancel_mixed_other_other({ count, removed }),
       }),
     });
@@ -4350,13 +4361,15 @@
   function batchCancelMessage(count: number, filter: string): string {
     if (filter) {
       return plural(count, {
-        one: () => m.transfers_confirm_batch_cancel_filtered_one({ filter }),
+        one: () => m.transfers_confirm_batch_cancel_filtered_one({ filter, count }),
+        oneShowsCount: true,
         few: () => m.transfers_confirm_batch_cancel_filtered_few({ count, filter }),
         other: () => m.transfers_confirm_batch_cancel_filtered_other({ count, filter }),
       });
     }
     return plural(count, {
-      one: m.transfers_confirm_batch_cancel_one,
+      one: () => m.transfers_confirm_batch_cancel_one({ count }),
+      oneShowsCount: true,
       few: () => m.transfers_confirm_batch_cancel_few({ count }),
       other: () => m.transfers_confirm_batch_cancel_other({ count }),
     });
@@ -4366,6 +4379,7 @@
   function peersNoun(count: number): string {
     return plural(count, {
       one: m.transfers_known_peers_one,
+      oneShowsCount: true,
       few: m.transfers_known_peers_few,
       other: m.transfers_known_peers_other,
     });
@@ -5752,7 +5766,8 @@
                     <span class="source-indent">
                       {t.sources > 0
                         ? plural(t.sources, {
-                          one: m.transfers_connecting_sources_one,
+                          one: () => m.transfers_connecting_sources_one({ count: t.sources }),
+                          oneShowsCount: true,
                           other: () => m.transfers_connecting_sources_other({ count: t.sources }),
                         })
                         : m.transfers_no_source_details()}
@@ -5834,7 +5849,7 @@
                 {#if failedCount > 0}
                   <tr class="source-child-row src-failed-summary">
                     <td class="source-child-cell" colspan={dlColCount}>
-                      <span class="source-indent source-failed-note">{plural(failedCount, { one: m.transfers_failed_sources_hidden_one, other: () => m.transfers_failed_sources_hidden_other({ count: failedCount }) })}</span>
+                      <span class="source-indent source-failed-note">{plural(failedCount, { one: () => m.transfers_failed_sources_hidden_one({ count: failedCount }), oneShowsCount: true, other: () => m.transfers_failed_sources_hidden_other({ count: failedCount }) })}</span>
                     </td>
                   </tr>
                 {/if}
@@ -6009,7 +6024,7 @@
           -->
           <span>{formatSize(selectedTransfer.completed_size ?? selectedTransfer.transferred)} / {formatSize(selectedTransfer.total_size)}</span>
           <span>{dlStatusLabel(selectedTransfer)}</span>
-          <span>{selectedSourcesLabel}{#if selectedSourcesLabel !== '\u2014'} {plural(selectedSourcesTotal, { one: m.transfers_src_suffix_one, other: m.transfers_src_suffix_other })}{/if}{#if selectedTransfer.ember_sources > 0} {m.transfers_epx_count({ count: selectedTransfer.ember_sources })}{/if}</span>
+          <span>{selectedSourcesLabel}{#if selectedSourcesLabel !== '\u2014'} {plural(selectedSourcesTotal, { one: m.transfers_src_suffix_one, oneShowsCount: true, other: m.transfers_src_suffix_other })}{/if}{#if selectedTransfer.ember_sources > 0} {m.transfers_epx_count({ count: selectedTransfer.ember_sources })}{/if}</span>
         </div>
         <div class="selection-actions">
           <span class="tb-btn-wrap" title={!canPause(selectedTransfer) ? m.transfers_action_cannot_pause() : undefined}>
@@ -6536,6 +6551,7 @@
                   <strong>{knownStats.friends}</strong>
                   {plural(knownStats.friends, {
                     one: m.transfers_known_friends_one,
+                    oneShowsCount: true,
                     few: m.transfers_known_friends_few,
                     other: m.transfers_known_friends_other,
                   })}
@@ -6874,7 +6890,8 @@
                   <p class="empty-title">
                     {parent.sources > 0
                       ? plural(parent.sources, {
-                        one: m.transfers_connecting_sources_one,
+                        one: () => m.transfers_connecting_sources_one({ count: parent.sources }),
+                        oneShowsCount: true,
                         other: () => m.transfers_connecting_sources_other({ count: parent.sources }),
                       })
                       : m.transfers_no_source_details()}

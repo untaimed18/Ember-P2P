@@ -48,7 +48,7 @@ describe('serverMetDownloadedText', () => {
 describe('kadNodesLoadedText', () => {
   it('uses the singular and plural messages', () => {
     expect(kadNodesLoadedText('Loaded 1 contacts from nodes.dat')).toBe(
-      m.kad_bootstrap_url_loaded_one(),
+      m.kad_bootstrap_url_loaded_one({ count: formatNumber(1) }),
     );
     expect(kadNodesLoadedText('Loaded 250 contacts from nodes.dat')).toBe(
       m.kad_bootstrap_url_loaded_other({ count: formatNumber(250) }),
