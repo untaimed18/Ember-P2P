@@ -710,6 +710,7 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
             // pinning an empty target set for the whole TTL.
             if let Some(key) = state.ember_publish_target_lookups.remove(&search_id) {
                 note_ember_target_lookup_ended(state, key);
+                note_key_record_lookup_ended(state, key, !contacts.is_empty());
                 if contacts.is_empty() {
                     debug!(
                         "Ember DHT: target lookup for {} found nobody; keeping the table's answer",
@@ -870,6 +871,13 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
             } else if let Some(channel_id) =
                 state.ember_channel_claim_searches.remove(&search_id)
             {
+                // A look an owner back from a claimable silence can sign after
+                // (`owner_return_waits_for_claims`), once someone answered it.
+                if search.as_ref().is_some_and(|s| s.responded_count() > 0) {
+                    state
+                        .channel_claim_answered_at
+                        .insert(channel_id, chrono::Utc::now().timestamp());
+                }
                 state
                     .ember_pending_channel_claim
                     .push((channel_id, into_blobs(held)));

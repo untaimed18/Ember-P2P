@@ -4566,6 +4566,21 @@ pub(super) async fn maybe_publish_owned_channel_records(
         {
             continue;
         }
+        // Back from a silence our nominee could have claimed the room in: look
+        // for the claim before signing, so the copy found predates our return.
+        if let Ok(Some(silence)) = db.channel_owner_pending_silence(&ch.channel_id, now) {
+            let held_since = *state.channel_return_held_since.entry(channel_id).or_insert(now);
+            if ember::channel::owner_return_waits_for_claims(
+                silence
+                    .silent_from
+                    .saturating_add(silence.claim_after_days.saturating_mul(86_400)),
+                state.channel_claim_answered_at.get(&channel_id).copied(),
+                held_since,
+                now,
+            ) {
+                continue;
+            }
+        }
         let Ok(Some(seed)) = db.load_channel_owner_seed(&ch.channel_id) else {
             continue;
         };
@@ -4606,6 +4621,7 @@ pub(super) async fn maybe_publish_owned_channel_records(
             undo_owned_rotation(db, &ch.channel_id, rotated);
             continue;
         };
+        state.channel_return_held_since.remove(&channel_id);
         if let Ok(Some(fresh)) = db.get_channel_lite(&ch.channel_id) {
             ch = std::borrow::Cow::Owned(fresh);
         }
@@ -5643,7 +5659,7 @@ pub(super) async fn republish_channel_key_epoch(
         .unwrap_or_default()
     };
     for record in records {
-        if let Some(publish_id) = start_own_channel_publish(state, record) {
+        if let Some(publish_id) = start_own_channel_renewal(state, record) {
             drive_ember_publish(socket, state, publish_id).await;
         }
     }
@@ -6111,13 +6127,18 @@ pub(super) async fn maybe_refresh_channel_handoff(
         // A succession claim lives under its own key, because it is signed by
         // the nominee rather than the room. Only worth asking for once the
         // owner has actually been silent long enough to honour one — and by
-        // the owner, just back from such a silence, while a claim it finds can
-        // still be one that silence allowed.
+        // the owner, back from such a silence, before it signs anything and
+        // while a claim it finds can still be one that silence allowed.
         let claim_due = if ch.is_owner {
             db.live_channel_owner_silence(&ch.channel_id, now)
                 .ok()
                 .flatten()
                 .is_some()
+                || db
+                    .channel_owner_pending_silence(&ch.channel_id, now)
+                    .ok()
+                    .flatten()
+                    .is_some()
         } else {
             !ch.successor_nominee.is_empty()
                 && ch.claim_after_days > 0
@@ -6391,6 +6412,12 @@ pub(super) fn ingest_channel_claim_records(
 /// of that return, in a copy signed before it: nothing the claimant signs can
 /// show when a claim was first made, so its turning up at once, dated inside
 /// the silence, is the evidence there is that it was made then.
+///
+/// Before that first stamp the silence runs until now, and every copy found
+/// was signed before we said we were back. That is why a device coming back
+/// looks before it signs (`owner_return_waits_for_claims`): the claimant
+/// re-signs every few hours, and a copy re-signed between our stamp and our
+/// first look would otherwise read as a claim raced against our return.
 fn follow_claim_on_owned_channel(
     db: &Database,
     ch: &crate::storage::database::StoredChannel,
@@ -6401,7 +6428,10 @@ fn follow_claim_on_owned_channel(
         return None;
     }
     let now = chrono::Utc::now().timestamp();
-    let silence = db.live_channel_owner_silence(&ch.channel_id, now).ok().flatten()?;
+    let silence = match db.live_channel_owner_silence(&ch.channel_id, now).ok().flatten() {
+        Some(silence) => silence,
+        None => db.channel_owner_pending_silence(&ch.channel_id, now).ok().flatten()?,
+    };
     let mut candidates: Vec<([u8; 32], [u8; 32], [u8; 16], i64, bool)> = records
         .iter()
         .filter_map(|blob| {

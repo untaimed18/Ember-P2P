@@ -583,6 +583,31 @@ pub const HANDOFF_CLAIMED_REPUBLISH_SECS: i64 = 5 * 60;
 /// neither its date nor the stamp it cites can show it was made before we came
 /// back; a claim first published since then is a race against our return.
 pub const OWNER_RETURN_CLAIM_WINDOW_SECS: i64 = 12 * HANDOFF_FETCH_SECS;
+/// Longest an owner back from a claimable silence holds its first snapshot
+/// while no claim lookup has answered: two handoff fetches, the second the
+/// retry of a first that reached nobody. Past it, the owner signs and judges
+/// what it finds after against the silence it then records, as before.
+pub const OWNER_RETURN_LOOK_MAX_SECS: i64 = 2 * HANDOFF_FETCH_SECS;
+
+/// Whether an owner back from a silence its nominee could have claimed the
+/// room in still holds its first snapshot: no claim lookup has answered since
+/// the silence became claimable (`claimable_at`), and it has held for less than
+/// [`OWNER_RETURN_LOOK_MAX_SECS`] (since `held_since`).
+///
+/// The claimant re-signs its claim every few hours with the time of signing,
+/// and the owner takes only a copy signed before it came back, its first stamp.
+/// Looking first means the copy it finds predates that stamp, so a re-sign
+/// landing between the stamp and the owner's first look cannot hide a claim
+/// the members followed.
+pub fn owner_return_waits_for_claims(
+    claimable_at: i64,
+    answered_at: Option<i64>,
+    held_since: i64,
+    now: i64,
+) -> bool {
+    answered_at.is_none_or(|at| at < claimable_at)
+        && now.saturating_sub(held_since) < OWNER_RETURN_LOOK_MAX_SECS
+}
 
 /// Whether a succession claim citing `witnessed_ts` is one the members could
 /// rightly have honoured while we, the owner, were silent from `silent_from`
@@ -8274,6 +8299,25 @@ mod tests {
             "its window had not run out when we came back"
         );
         assert!(!claim_fits_owner_silence(from, from, until, 0), "no window, no succession");
+    }
+
+    /// An owner back from a claimable silence signs nothing until a claim
+    /// lookup has answered since the silence became claimable, and no longer
+    /// than its cap whatever the network does.
+    #[test]
+    fn an_owner_back_looks_for_claims_before_signing_but_not_forever() {
+        let claimable_at = 1_000_000;
+        let back = claimable_at + 86_400;
+        assert!(owner_return_waits_for_claims(claimable_at, None, back, back), "nothing looked yet");
+        assert!(
+            owner_return_waits_for_claims(claimable_at, Some(claimable_at - 1), back, back + 60),
+            "a look from before the silence could be claimed says nothing about it"
+        );
+        assert!(!owner_return_waits_for_claims(claimable_at, Some(back + 30), back, back + 60), "looked");
+        assert!(
+            !owner_return_waits_for_claims(claimable_at, None, back, back + OWNER_RETURN_LOOK_MAX_SECS),
+            "a network nobody answers holds it only so long"
+        );
     }
 
     #[test]

@@ -1962,6 +1962,7 @@ pub(super) async fn run_ember_maintenance(
                 }
             }
         }
+        start_key_record_lookups(socket, state).await;
     }
 
     // 2) Liveness pings — probe contacts we haven't heard from recently.

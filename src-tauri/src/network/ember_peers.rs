@@ -1323,13 +1323,44 @@ pub(super) fn ember_overlay_publish_targets_within(
 /// presence key changes every [`ember::channel::PRESENCE_EPOCH_SECS`], so its
 /// lookup would land after the only publish that could use it. Key epochs are
 /// one key per member, so a large room's republish would fill the queue, which
-/// drains a few keys a minute, and hold back every other key behind it.
+/// drains a few keys a minute, and hold back every other key behind it; they
+/// have a lookup schedule of their own instead ([`hold_key_record_in`]).
 pub(super) fn start_own_channel_publish(
     state: &mut NetworkState,
     record: ember::dht::publish::SignedRecord,
 ) -> Option<u32> {
+    start_own_channel_publish_queued(state, record, true)
+}
+
+/// [`start_own_channel_publish`] for the owner's renewal of key-epoch records,
+/// whose lookups wait behind those of records a member is waiting on.
+pub(super) fn start_own_channel_renewal(
+    state: &mut NetworkState,
+    record: ember::dht::publish::SignedRecord,
+) -> Option<u32> {
+    start_own_channel_publish_queued(state, record, false)
+}
+
+fn start_own_channel_publish_queued(
+    state: &mut NetworkState,
+    record: ember::dht::publish::SignedRecord,
+    urgent: bool,
+) -> Option<u32> {
+    let key = record.keyword_hash;
     let queue_limit = own_record_target_queue_limit(&record.data);
-    let targets = ember_overlay_publish_targets_within(state, record.keyword_hash, queue_limit);
+    let targets = ember_overlay_publish_targets_within(state, key, queue_limit);
+    let now = chrono::Utc::now().timestamp();
+    if ember::dht::publish::channel_kind_from_data(&record.data) == Some(ember::dht::publish::CHANNEL_KIND_EPOCH)
+        && key_record_needs_lookup_in(state.ember_dht.routing().verified_len(), &state.ember_publish_targets, key, now)
+    {
+        hold_key_record_in(
+            &mut state.ember_key_record_holds,
+            &mut state.ember_key_record_queue,
+            record.clone(),
+            urgent,
+            now,
+        );
+    }
     state.ember_publish.start_publish_to(record, targets)
 }
 

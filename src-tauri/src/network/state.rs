@@ -1003,6 +1003,14 @@ pub(super) struct NetworkState {
     pub(super) ember_publish_target_waits: HashMap<[u8; 16], (i64, bool)>,
     /// In-flight target lookups, search id to the key each is resolving.
     pub(super) ember_publish_target_lookups: HashMap<u32, [u8; 16]>,
+    /// Our key-epoch records waiting for a target lookup, by key. See
+    /// [`hold_key_record_in`].
+    pub(super) ember_key_record_holds: HashMap<[u8; 16], KeyRecordHold>,
+    /// Held keys waiting for their lookup to start, a rotation's first.
+    pub(super) ember_key_record_queue: std::collections::VecDeque<[u8; 16]>,
+    /// Held keys whose lookup has landed, waiting for the search tick to
+    /// publish them.
+    pub(super) ember_key_records_ready: std::collections::VecDeque<[u8; 16]>,
     /// Whether this session managed to read `store_ember.dat` (or found there was
     /// none to read). Only the shutdown save consults it, to tell an empty store
     /// from a file it never got to open — see `bootstrap::save_store`.
@@ -1808,6 +1816,11 @@ pub(super) struct NetworkState {
     pub(super) ember_channel_claim_searches: HashMap<u32, [u8; 16]>,
     /// Claim blobs waiting to be verified against the owner's nomination.
     pub(super) ember_pending_channel_claim: Vec<([u8; 16], Vec<Vec<u8>>)>,
+    /// When a claim lookup for a room last had an answer, by room.
+    pub(super) channel_claim_answered_at: HashMap<[u8; 16], i64>,
+    /// When the owner pass first held a room's snapshot for a claim lookup,
+    /// by room; see [`ember::channel::owner_return_waits_for_claims`].
+    pub(super) channel_return_held_since: HashMap<[u8; 16], i64>,
 }
 
 /// One in-flight iterative-lookup `FIND_NODE`, tracked by the network

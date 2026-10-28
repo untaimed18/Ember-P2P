@@ -8,8 +8,8 @@ room members, feeds and the connection doctor) were built in time and ship
 in 1.7.5; each keeps its plan and records what was built and what is left
 under "Not yet" or "Left as they are". Item 1, and the sections after
 item 4, are for later releases and are not tied to a particular one: they
-can come in whichever release has room. If 1.7.6 needs no format change, it
-removes the BETA badge.
+can come in whichever release has room. 1.7.6 needed no format change, and
+removed the Channels BETA badge.
 
 ## 1. Private-room membership traffic under a throwaway DHT identity
 
@@ -1036,7 +1036,10 @@ Origin: `docs/post-1.7.4.md`, "Known limits" of owned-room recovery.
 ## Carried from the 1.7.5 plan
 
 What `docs/post-1.7.4.md` leaves open, apart from the item above, which this
-plan now owns: under "Later", the Away status, component tests, Discover spam
-folding and the smaller Friends items; under "Channels: smaller follow-ups",
-the relayed catch-up frontier, the moderation lock race and pre-1.7.3 bans;
-and its "Known limits".
+plan now owns: under "Later", tuning Discover's spam thresholds from real use
+and the pop-out chat's own copy of the friends store; under "Channels:
+smaller follow-ups", the relayed catch-up frontier (1.8.0), the moderation
+lock race and pre-1.7.3 bans; and the rest of its "Known limits". The Away
+status, the component tests and Discover's friend and age signals were done
+in 1.7.5; key-epoch records sent to the nodes a lookup finds (item 9) and the
+owner's claim on its way back (the 1.7.2 audit) in 1.7.6.

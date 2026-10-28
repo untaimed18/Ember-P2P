@@ -91,6 +91,12 @@ pub(in crate::network) async fn on_ember_search_tick(
         }
     }
 
+    // Key-epoch records whose target lookup has landed (see
+    // `hold_key_record_in`); nothing to do while none has.
+    if !state.ember_key_records_ready.is_empty() {
+        publish_ready_key_records(udp_socket, state).await;
+    }
+
     // Cheap when idle: the maps are empty unless an iterative
     // lookup, a publish, or a maintenance liveness ping is in
     // flight.

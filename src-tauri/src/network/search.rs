@@ -2200,6 +2200,7 @@ pub(super) fn release_ember_search_state(
     // waiting on it stops waiting.
     if let Some(key) = state.ember_publish_target_lookups.remove(&search_id) {
         note_ember_target_lookup_ended(state, key);
+        note_key_record_lookup_ended(state, key, false);
     }
     drop_running_ember_companion(state, search_id);
     state.ember_search.remove(search_id);

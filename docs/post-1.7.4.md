@@ -297,6 +297,10 @@ needs no format change, remove the BETA badge in 1.7.6.
 tagging is item 5's cross-machine run, the translation review the checklist
 lists, and the release itself.
 
+**Done in 1.7.6:** it needed no format change, so Channels no longer carries
+the badge: not in the sidebar, the page header, the README or the guide.
+Friends and Feeds keep theirs.
+
 ### 7. A way back in for a member behind a private room's key
 
 **Why:** A member who falls behind past the retained epochs, or whose sealed
@@ -538,20 +542,30 @@ Known limits:
 - A leave counts as landed when either form stored, so a v2-only landing
   leaves a 1.7.4 reader showing the member until the live record ages out.
 
-**With it: not done.** Key-epoch records still go to our own table's closest
-nodes, reusing a lookup already cached but never queuing one
-(`own_record_target_queue_limit`). It does not fit the publish-target
-machinery as it stands. Each member's key is its own hash, in v2 as in v1 (a
-storer keeps one record per key, publisher and `file_hash`, and a room's key
-records share both), so there is no room neighbourhood to resolve once. A
-looked-up set lives `EMBER_PUBLISH_TARGETS_TTL_SECS` (4 hours) and the owner
-renews key records every `MODERATION_REPUBLISH_SECS` (6 hours), so a lookup
-queued by one renewal has lapsed by the next. Holding a publish until its
-lookup lands (`ember_publish_awaits_lookup`) suits library records, which stay
-due tick to tick, not records published in one pass on a rotation or a
-renewal. Doing it needs a key-record schedule of its own that queues a
-bounded share of lookups and publishes each member's records once its set
-lands.
+**With it: done in 1.7.6.** Key-epoch records went only to our own table's
+closest nodes, reusing a lookup already cached but never queuing one
+(`own_record_target_queue_limit`), and once k contacts have answered, a
+storer refuses a key it is not among the closest to. They did not fit the
+publish-target machinery: each member's key is its own hash, in v2 as in v1,
+so there is no room neighbourhood to resolve once; a looked-up set lives
+`EMBER_PUBLISH_TARGETS_TTL_SECS` (4 hours) against the owner's 6-hour
+renewal; and holding a publish until its lookup lands
+(`ember_publish_awaits_lookup`) suits library records, which stay due tick to
+tick, not records published in one pass. So they have a schedule of their
+own (`hold_key_record_in` in `ember_publishing.rs`). Each still goes at once
+to our table's closest, which is the network's answer on a small overlay.
+Where it is not (k answered contacts and no fresh set for the key), the record
+is also held, at most 2,048 keys for up to 3 hours, and its key queued for a
+lookup: at the front for a rotation or an unban's re-seal, which a member is
+waiting on, at the back for the owner's renewal
+(`start_own_channel_renewal`). The maintenance tick starts 2 to 8 of these
+lookups a cycle, enough to reach every held key within half its hold, on a
+budget apart from the library's (`key_record_lookups_this_cycle`); the search
+tick publishes a key's records once its lookup lands, to the set it found. A
+lookup that found nobody is asked once more, then the key is let go. Tests:
+`held_key_records_queue_a_rotation_first_and_keep_the_latest_copy`,
+`a_key_record_lookup_that_found_nobody_is_retried_then_dropped` and the
+others beside them in `network/tests.rs`.
 
 ## Channels: smaller follow-ups
 
@@ -767,7 +781,8 @@ stays at 62. Tests:
   the new signal; for anyone else, offers lapse as they do today.
 - **The file moving first.** An accept after the file changed already ends as
   `source_gone` on the stream. The card should say so when the accept is
-  pressed rather than after a dial.
+  pressed rather than after a dial. **Done in 1.7.5**
+  (`an_accept_after_the_file_changed_says_source_gone_without_dialing`).
 
 **Tests:** an offer answered after an hour still transfers; one answered after
 the grant lapses fails cleanly on both ends; a 1.7.4 receiver's offer still
@@ -786,7 +801,10 @@ they matter.
   `docs/post-1.7.5.md` item 1, which plans it.
 - **An Away status.** An "Away" or "Not at PC" state, set by hand and by idle
   time, sent as a new friend-session extension frame (older builds ignore
-  unknown ones), shown in the friends list and the chat header.
+  unknown ones), shown in the friends list and the chat header. **Done in
+  1.7.5:** Online, Away and Busy, set by hand or Away after an idle time
+  chosen in Settings, sent as `EMBER_EXT_STATUS` (`0x13`) and encrypted to
+  the friend like a typing signal.
 - **No component tests** for the 1.7.3 changes to `ChatConversation.svelte`
   and the Channels page (early delivery, pin cleanup, slow-mode announcements,
   coalesced refreshes); only the store logic is unit tested. A component
@@ -917,7 +935,16 @@ the release notes.
 - **A claim the owner meets on its way back.** An owner back from a claimable
   silence follows its nominee's claim only in a copy signed before it
   returned, so a re-sign landing just before the owner's first successful
-  fetch leaves it running a room its members have left.
+  fetch leaves it running a room its members have left. **Fixed in 1.7.6:**
+  the owner looks before it signs. While a room it owns is in a silence its
+  nominee could have claimed it in and nothing has been signed since
+  (`channel_owner_pending_silence`), the owner loop holds the first snapshot
+  until a claim lookup someone answered has run, for at most two handoff
+  fetches (`owner_return_waits_for_claims`, `OWNER_RETURN_LOOK_MAX_SECS`),
+  and a claim found meanwhile is judged against the silence so far, up to
+  now. Every copy found then was signed before anything told the claimant
+  the owner was back, however recently it was re-signed. Past the cap, or
+  for a claim found after the first stamp, the rule is as before.
 - **Downgrading to 1.7.1 leaves one upload slot. Done in 1.7.5:** Auto is
   still `max_concurrent_uploads = 0` in memory, but `config.json` stores it as
   `upload_slots_auto: true` beside a count of 4, eMule's floor, which every

@@ -853,6 +853,27 @@ pub struct ChannelOwnerSilence {
     /// Our first stamp after.
     pub silent_until: i64,
 }
+
+/// The silence from our last stamp `last` until `until`, when it was long
+/// enough for `nominee` to claim the room.
+fn claimable_owner_silence(
+    last: i64,
+    nominee: &str,
+    claim_after_days: i64,
+    until: i64,
+) -> Option<ChannelOwnerSilence> {
+    (last > 0
+        && !nominee.is_empty()
+        && claim_after_days > 0
+        && until.saturating_sub(last) >= claim_after_days.saturating_mul(86_400))
+    .then(|| ChannelOwnerSilence {
+        nominee: nominee.to_ascii_lowercase(),
+        claim_after_days,
+        silent_from: last,
+        silent_until: until,
+    })
+}
+
 const CHAT_KEY_FILE: &str = "chat-history.key";
 const CHAT_CIPHERTEXT_PREFIX: &str = "EMBRCHAT1:";
 const CHAT_UNAVAILABLE_TEXT: &str = "[Message unavailable]";
@@ -12435,6 +12456,40 @@ impl Database {
             .optional()?)
     }
 
+    /// The silence a room we own is in now, if its nominee could have claimed
+    /// it and we have signed nothing for it since: the silence the next stamp
+    /// will record, running until `now`. A device back after that long reads
+    /// it before it signs, so a claim it finds then was made while it was away
+    /// (see `owner_return_waits_for_claims`).
+    pub fn channel_owner_pending_silence(
+        &self,
+        channel_id: &str,
+        now: i64,
+    ) -> anyhow::Result<Option<ChannelOwnerSilence>> {
+        let conn = self.conn.lock();
+        let row: Option<(i64, i64, String, i64, bool)> = conn
+            .query_row(
+                "SELECT owner_snapshot_at, moderation_updated_at, successor_nominee,
+                        claim_after_days, is_owner
+                 FROM channels WHERE channel_id = ?1 AND deleted = 0",
+                params![channel_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get::<_, i64>(4)? != 0,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.and_then(|(snapshot_at, moderated_at, nominee, claim_after_days, is_owner)| {
+            claimable_owner_silence(snapshot_at.max(moderated_at), &nominee, claim_after_days, now)
+                .filter(|_| is_owner)
+        }))
+    }
+
     /// [`Self::channel_owner_silence`] while a claim found now could still be
     /// one the silence allowed, forgetting it once that is over; see
     /// [`Self::settle_channel_owner_silence_locked`].
@@ -13970,11 +14025,8 @@ impl Database {
         if let (Some((snapshot_at, moderated_at, nominee, claim_after_days, true)), Some(stamp)) =
             (prior, stamp)
         {
-            let last = snapshot_at.max(moderated_at);
-            if last > 0
-                && !nominee.is_empty()
-                && claim_after_days > 0
-                && stamp.saturating_sub(last) >= claim_after_days.saturating_mul(86_400)
+            if let Some(silence) =
+                claimable_owner_silence(snapshot_at.max(moderated_at), &nominee, claim_after_days, stamp)
             {
                 Self::ensure_channel_owner_silences_locked(conn)?;
                 conn.execute(
@@ -13986,7 +14038,13 @@ impl Database {
                         claim_after_days = excluded.claim_after_days,
                         silent_from = excluded.silent_from,
                         silent_until = excluded.silent_until",
-                    params![channel_id, nominee.to_ascii_lowercase(), claim_after_days, last, stamp],
+                    params![
+                        channel_id,
+                        silence.nominee,
+                        silence.claim_after_days,
+                        silence.silent_from,
+                        silence.silent_until
+                    ],
                 )?;
             }
         }
@@ -25939,7 +25997,21 @@ mod tests {
             )
             .unwrap();
 
+        // Before signing anything, the silence the stamp will record runs
+        // until now, and a stamp ends it.
+        assert_eq!(
+            db.channel_owner_pending_silence(&room, now - 60).unwrap(),
+            Some(ChannelOwnerSilence {
+                nominee: nominee.to_ascii_lowercase(),
+                claim_after_days: 14,
+                silent_from: last,
+                silent_until: now - 60,
+            })
+        );
+        assert!(db.channel_owner_pending_silence(&room, last + 13 * day).unwrap().is_none(), "not yet claimable");
+
         assert_eq!(db.stamp_owner_snapshot(&room, now).unwrap(), Some(now));
+        assert!(db.channel_owner_pending_silence(&room, now + 60).unwrap().is_none(), "signed since");
         assert_eq!(
             db.channel_owner_silence(&room).unwrap(),
             Some(ChannelOwnerSilence {
@@ -25970,6 +26042,7 @@ mod tests {
                 params![room, nominee, now - 13 * day],
             )
             .unwrap();
+        assert!(quiet_db.channel_owner_pending_silence(&room, now).unwrap().is_none());
         quiet_db.stamp_owner_snapshot(&room, now).unwrap();
         assert!(
             quiet_db.channel_owner_silence(&room).unwrap().is_none(),

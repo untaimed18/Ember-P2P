@@ -1919,6 +1919,241 @@ pub(super) fn prune_ember_publish_target_waits(state: &mut NetworkState) {
         .retain(|_, (since, _)| now.saturating_sub(*since) < EMBER_PUBLISH_TARGETS_TTL_SECS);
 }
 
+/// Keys whose key-epoch records may be held for a target lookup at once:
+/// both forms for every member of several full rooms. Past it a record only
+/// goes to our own table's closest, as every key-epoch record did before.
+pub(super) const KEY_RECORD_HOLDS_MAX: usize = 2048;
+
+/// Records held under one key. A storer keeps one per key, publisher and
+/// `file_hash`, so a later copy replaces an earlier one; this only bounds a
+/// key that several owners publish under.
+pub(super) const KEY_RECORDS_PER_KEY: usize = 4;
+
+/// How long a held record waits for its lookup. Half the owner's renewal
+/// interval, so a record the queue never reached is dropped before the next
+/// renewal holds it again.
+pub(super) const KEY_RECORD_HOLD_SECS: i64 = 3 * 3600;
+
+/// Lookups a held key gets before it is let go: one that found nobody is
+/// asked again once, as the walk may only have met a churning frontier.
+pub(super) const KEY_RECORD_LOOKUP_TRIES: u8 = 2;
+
+/// Fewest and most key-record lookups started per maintenance cycle. Their own
+/// budget, beside the library's, so a large room's renewal neither waits
+/// behind the library's keys nor holds them back.
+pub(super) const KEY_RECORD_MIN_LOOKUPS: usize = 2;
+pub(super) const KEY_RECORD_MAX_LOOKUPS: usize = 8;
+
+/// Held keys whose lookup has landed that one search tick publishes.
+pub(super) const KEY_RECORD_FLUSH_PER_TICK: usize = 8;
+
+/// Key-epoch records sent to our own table's closest, held until a lookup has
+/// found the nodes really closest to their key. See [`hold_key_record_in`].
+#[derive(Debug, Clone)]
+pub(super) struct KeyRecordHold {
+    pub records: Vec<ember::dht::publish::SignedRecord>,
+    /// When it was last held.
+    pub held_at: i64,
+    /// Lookups started for it.
+    pub lookups: u8,
+}
+
+/// Whether a key-epoch record under `key` should also be held for a target
+/// lookup: the table no longer is the network's answer (see
+/// [`ember_publish_awaits_lookup`]) and no lookup has answered for the key
+/// lately.
+pub(super) fn key_record_needs_lookup_in(
+    verified: usize,
+    cache: &HashMap<[u8; 16], (Vec<ember::dht::EmberContact>, i64)>,
+    key: [u8; 16],
+    now: i64,
+) -> bool {
+    verified >= ember::dht::K_BUCKET_SIZE
+        && !cache.get(&key).is_some_and(|(found, at)| {
+            !found.is_empty() && now.saturating_sub(*at) < EMBER_PUBLISH_TARGETS_TTL_SECS
+        })
+}
+
+/// Hold `record` until a lookup for its key lands, queueing that lookup: at
+/// the front for a record a member is waiting on (a rotation, an unban's
+/// re-seal), at the back for the owner's renewal of a key members already
+/// hold. Returns whether it was held.
+///
+/// Key-epoch records are one key per member, so they cannot go through the
+/// library's lookup queue (see [`start_own_channel_publish`]); and a lookup
+/// for each lands long after the publish that needed it, so they cannot wait
+/// on it either. They go out at once to our own table's closest, which is the
+/// network's answer on a small overlay, and again from here to the nodes the
+/// lookup found, which a storer past k contacts requires (`store_proximity_ok`).
+pub(super) fn hold_key_record_in(
+    holds: &mut HashMap<[u8; 16], KeyRecordHold>,
+    queue: &mut VecDeque<[u8; 16]>,
+    record: ember::dht::publish::SignedRecord,
+    urgent: bool,
+    now: i64,
+) -> bool {
+    let key = record.keyword_hash;
+    if !holds.contains_key(&key) && holds.len() >= KEY_RECORD_HOLDS_MAX {
+        return false;
+    }
+    let hold = holds.entry(key).or_insert_with(|| KeyRecordHold {
+        records: Vec::new(),
+        held_at: now,
+        lookups: 0,
+    });
+    hold.held_at = now;
+    hold.lookups = 0;
+    hold.records
+        .retain(|held| held.publisher_key != record.publisher_key || held.file_hash != record.file_hash);
+    hold.records.push(record);
+    if hold.records.len() > KEY_RECORDS_PER_KEY {
+        hold.records.remove(0);
+    }
+    let queued = queue.iter().position(|k| *k == key);
+    if urgent {
+        if let Some(at) = queued {
+            queue.remove(at);
+        }
+        queue.push_front(key);
+    } else if queued.is_none() {
+        queue.push_back(key);
+    }
+    true
+}
+
+/// A target lookup for `key` has ended: publish what is held under it if the
+/// lookup found anyone, or queue it again while it has tries left.
+pub(super) fn note_key_record_lookup_ended_in(
+    holds: &mut HashMap<[u8; 16], KeyRecordHold>,
+    queue: &mut VecDeque<[u8; 16]>,
+    ready: &mut VecDeque<[u8; 16]>,
+    key: [u8; 16],
+    found: bool,
+) {
+    let Some(hold) = holds.get(&key) else {
+        return;
+    };
+    if found {
+        if !ready.contains(&key) {
+            ready.push_back(key);
+        }
+    } else if hold.lookups < KEY_RECORD_LOOKUP_TRIES {
+        if !queue.contains(&key) {
+            queue.push_back(key);
+        }
+    } else {
+        holds.remove(&key);
+    }
+}
+
+pub(super) fn note_key_record_lookup_ended(state: &mut NetworkState, key: [u8; 16], found: bool) {
+    note_key_record_lookup_ended_in(
+        &mut state.ember_key_record_holds,
+        &mut state.ember_key_record_queue,
+        &mut state.ember_key_records_ready,
+        key,
+        found,
+    );
+}
+
+/// Drop holds past [`KEY_RECORD_HOLD_SECS`], and the queued and ready keys
+/// they leave behind, so both stay within the holds.
+pub(super) fn prune_key_record_holds_in(
+    holds: &mut HashMap<[u8; 16], KeyRecordHold>,
+    queue: &mut VecDeque<[u8; 16]>,
+    ready: &mut VecDeque<[u8; 16]>,
+    now: i64,
+) {
+    holds.retain(|_, hold| now.saturating_sub(hold.held_at) < KEY_RECORD_HOLD_SECS);
+    queue.retain(|key| holds.contains_key(key));
+    ready.retain(|key| holds.contains_key(key));
+}
+
+/// Key-record lookups to start this cycle with `queued` keys waiting: enough
+/// to reach every one within half its hold.
+pub(super) fn key_record_lookups_this_cycle(queued: usize) -> usize {
+    let cycles = (KEY_RECORD_HOLD_SECS as u64 / 2 / EMBER_MAINT_INTERVAL.as_secs()).max(1) as usize;
+    queued.div_ceil(cycles).clamp(KEY_RECORD_MIN_LOOKUPS, KEY_RECORD_MAX_LOOKUPS)
+}
+
+/// Start this cycle's key-record lookups, from the maintenance tick. A key
+/// whose set another lookup has meanwhile found is published without one.
+pub(super) async fn start_key_record_lookups(socket: &UdpSocket, state: &mut NetworkState) {
+    let now = chrono::Utc::now().timestamp();
+    prune_key_record_holds_in(
+        &mut state.ember_key_record_holds,
+        &mut state.ember_key_record_queue,
+        &mut state.ember_key_records_ready,
+        now,
+    );
+    let verified = state.ember_dht.routing().verified_len();
+    let mut budget = key_record_lookups_this_cycle(state.ember_key_record_queue.len());
+    // Each key is looked at once a cycle, so keys skipped below do not spin.
+    let mut left = state.ember_key_record_queue.len();
+    while budget > 0 && left > 0 {
+        left -= 1;
+        let Some(key) = state.ember_key_record_queue.pop_front() else {
+            break;
+        };
+        if !state.ember_key_record_holds.contains_key(&key) {
+            continue;
+        }
+        if !key_record_needs_lookup_in(verified, &state.ember_publish_targets, key, now) {
+            if !state.ember_key_records_ready.contains(&key) {
+                state.ember_key_records_ready.push_back(key);
+            }
+            continue;
+        }
+        // Its end, whoever started it, reports here.
+        if state.ember_publish_target_lookups.values().any(|k| *k == key) {
+            continue;
+        }
+        match start_ember_background_find_node(state, ember::dht::EmberNodeId(key)) {
+            Some(search_id) => {
+                budget -= 1;
+                if let Some(hold) = state.ember_key_record_holds.get_mut(&key) {
+                    hold.lookups = hold.lookups.saturating_add(1);
+                }
+                state.ember_publish_target_lookups.insert(search_id, key);
+                drive_ember_search(socket, state, search_id).await;
+            }
+            None => {
+                // Search cap reached: keep its place and stop for this cycle.
+                state.ember_key_record_queue.push_front(key);
+                break;
+            }
+        }
+    }
+}
+
+/// Publish what is held under keys whose lookup has landed, from the search
+/// tick, against the set the lookup found.
+pub(super) async fn publish_ready_key_records(socket: &UdpSocket, state: &mut NetworkState) {
+    for _ in 0..KEY_RECORD_FLUSH_PER_TICK {
+        let Some(key) = state.ember_key_records_ready.pop_front() else {
+            return;
+        };
+        let Some(hold) = state.ember_key_record_holds.remove(&key) else {
+            continue;
+        };
+        let mut records = hold.records.into_iter();
+        while let Some(record) = records.next() {
+            let targets = ember_overlay_publish_targets_within(state, key, 0);
+            let Some(publish_id) = state.ember_publish.start_publish_to(record.clone(), targets) else {
+                // Too many publishes in flight: put the rest back for a later tick.
+                let rest: Vec<_> = std::iter::once(record).chain(records).collect();
+                state.ember_key_record_holds.insert(
+                    key,
+                    KeyRecordHold { records: rest, held_at: hold.held_at, lookups: hold.lookups },
+                );
+                state.ember_key_records_ready.push_front(key);
+                return;
+            };
+            drive_ember_publish(socket, state, publish_id).await;
+        }
+    }
+}
+
 /// How long a stranger's PING keeps proving our UDP port is open.
 ///
 /// Long enough that the evidence does not lapse between arrivals — once we are
