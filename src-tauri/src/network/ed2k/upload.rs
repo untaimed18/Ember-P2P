@@ -6262,9 +6262,15 @@ impl UploadHandler {
             ) {
                 return Ok(());
             }
-            let served =
-                relay::serve_feed_stream(&mut reader, &mut writer, &header, Some(peer.ember_hash), &self.bandwidth_limiter)
-                    .await;
+            let served = relay::serve_feed_stream(
+                &mut reader,
+                &mut writer,
+                &header,
+                Some(peer.ember_hash),
+                &self.bandwidth_limiter,
+                Some(&self.credit_manager),
+            )
+            .await;
             if let Ok(Some(xfer_id)) = served {
                 if attach_tcp::tcp_stream_delivered(&mut reader, &mut writer).await {
                     crate::network::feed_direct::note_downloaded(&xfer_id, peer.ember_hash);
@@ -6300,6 +6306,7 @@ impl UploadHandler {
                 &mut writer,
                 &header,
                 &self.bandwidth_limiter,
+                Some(&self.credit_manager),
             )
             .await
             else {
@@ -6316,6 +6323,7 @@ impl UploadHandler {
                 &mut writer,
                 &header,
                 &self.bandwidth_limiter,
+                Some(&self.credit_manager),
             )
             .await;
             // Completion reaches the event loop as the recipient's done frame;

@@ -5423,7 +5423,7 @@ async fn handle_command_inner(
             tx,
         } => {
             let result =
-                super::chat_attach::respond(state, db, app_handle, settings, xfer_id, accept).await;
+                super::chat_attach::respond(state, db, app_handle, settings, credit_manager, xfer_id, accept).await;
             let _ = tx.send(result);
         }
 

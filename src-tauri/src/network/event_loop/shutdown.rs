@@ -55,7 +55,7 @@ pub(in crate::network) async fn save_on_shutdown(
     while state.xfer_finish_in_flight > 0 {
         match tokio::time::timeout_at(xfer_drain_deadline, xfer_finish_rx.recv()).await {
             Ok(Some(finished)) => {
-                apply_xfer_finish(udp_socket, state, db, app_handle, finished).await;
+                apply_xfer_finish(udp_socket, state, db, app_handle, credit_manager, finished).await;
             }
             // Only `state` holds a sender, so this cannot happen while the
             // loop owns it — treat it as "nothing more is coming" regardless.

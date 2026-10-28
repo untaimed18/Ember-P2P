@@ -229,6 +229,7 @@ pub(super) async fn handle_download_event(
     stats_manager: &mut StatsManager,
     remove_finished: bool,
     a4af: &Arc<RwLock<ed2k::a4af::A4AFManager>>,
+    credit_manager: &Arc<RwLock<CreditManager>>,
     download_roots: &[String],
     db_progress_last_persist: &mut HashMap<String, std::time::Instant>,
     db_progress_persist_interval: std::time::Duration,
@@ -672,13 +673,17 @@ pub(super) async fn handle_download_event(
                     assigned,
                     format!("{ip}:{port}").parse::<std::net::SocketAddr>(),
                 ) {
+                    let standing = match live_hash {
+                        Some(user_hash) => credit_manager.read().await.standing_with(&user_hash),
+                        None => 1.0,
+                    };
                     let mut a4af_lock = a4af.write().await;
                     a4af_lock.update_source_state(
                         addr,
                         assigned,
                         queue_rank.unwrap_or(0).min(u16::MAX as u32) as u16,
                         true,
-                        1.0,
+                        standing,
                     );
                 }
             }

@@ -1714,6 +1714,9 @@ pub(super) struct NetworkState {
     /// socket down, so a transfer that finished hashing as the user quit still
     /// gets its completion frame instead of being timed out by the sender.
     pub(super) xfer_finish_in_flight: usize,
+    /// Bytes room transfers sent as blocks, by the recipient's Ember identity,
+    /// for the KAD process tick to count against it in the credit ledger.
+    pub(super) xfer_block_uploads: Vec<([u8; 16], u64)>,
     /// Receives being verified and moved into place, by transfer id. Out of
     /// `xfer_recv` by then, so this is what a cancel, a leave or a ban finds
     /// them by.

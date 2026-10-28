@@ -493,6 +493,7 @@ pub(in crate::network) async fn on_upload_event(
                 db,
                 app_handle,
                 settings,
+                credit_manager,
                 attach_eh,
                 offer.clone(),
                 peer_addr,

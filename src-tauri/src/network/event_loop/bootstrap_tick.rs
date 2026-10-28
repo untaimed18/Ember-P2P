@@ -19,6 +19,7 @@ pub(in crate::network) async fn on_bootstrap_tick(
     firewall_probe_ips: &upload_server::FirewallProbeSet,
     shared_banned_ips: &upload_server::SharedBannedIps,
     friend_hashes: &crate::app_state::SharedFriendHashes,
+    credit_manager: &Arc<RwLock<CreditManager>>,
     ember_hash: [u8; 16],
     ul_event_tx: &mpsc::Sender<UploadEvent>,
     ed25519_pubkey: [u8; 32],
@@ -685,6 +686,7 @@ pub(in crate::network) async fn on_bootstrap_tick(
                                 Some(ember::relay::RoomXferServeContext {
                                     grants: state.xfer_grants.clone(),
                                 }),
+                                Some(credit_manager.clone()),
                             ));
                             tracing::info!("QUIC accept loop spawned");
 

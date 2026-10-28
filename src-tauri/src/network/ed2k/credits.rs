@@ -4,6 +4,33 @@ use zeroize::ZeroizeOnDrop;
 const MAX_CREDIT_RATIO: f64 = 10.0;
 const MIN_CREDIT_RATIO: f64 = 1.0;
 
+/// eMule's `CClientCredits::GetScoreRatio` over one peer's ledger, `downloaded`
+/// being what it sent us and `uploaded` what we sent it, before the SecIdent
+/// gates [`CreditManager::get_score_ratio`] puts in front of it.
+fn emule_score_ratio(downloaded: u64, uploaded: u64) -> f64 {
+    // eMule: if downloaded < 1MB, return 1.0 (no credits for trivial transfers)
+    if downloaded < 1_048_576 {
+        return MIN_CREDIT_RATIO;
+    }
+
+    let uploaded = uploaded.max(1) as f64;
+    let downloaded = downloaded as f64;
+
+    let ratio1 = (downloaded * 2.0) / uploaded;
+    let ratio2 = (downloaded / 1_048_576.0 + 2.0).sqrt();
+    // eMule result3: linear ramp from 1.0 at 1 MB to 3.34 at ~9.2 MB, then 10.0
+    let ratio3 = if downloaded < 9_646_899.0 {
+        (downloaded - 1_048_576.0) / 8_598_323.0 * 2.34 + 1.0
+    } else {
+        MAX_CREDIT_RATIO
+    };
+
+    ratio1
+        .min(ratio2)
+        .min(ratio3)
+        .clamp(MIN_CREDIT_RATIO, MAX_CREDIT_RATIO)
+}
+
 /// Age, in days since last contact, past which `cleanup_stale` drops a
 /// credit record. eMule's `CClientCreditsList::LoadList` expires records
 /// after 150 days (`12960000` seconds); a shorter window would forget peers
@@ -1325,27 +1352,18 @@ impl CreditManager {
             }
         }
 
-        // eMule: if downloaded < 1MB, return 1.0 (no credits for trivial transfers)
-        if record.downloaded < 1_048_576 {
-            return MIN_CREDIT_RATIO;
-        }
+        emule_score_ratio(record.downloaded, record.uploaded)
+    }
 
-        let uploaded = record.uploaded.max(1) as f64;
-        let downloaded = record.downloaded as f64;
-
-        let ratio1 = (downloaded * 2.0) / uploaded;
-        let ratio2 = (downloaded / 1_048_576.0 + 2.0).sqrt();
-        // eMule result3: linear ramp from 1.0 at 1 MB to 3.34 at ~9.2 MB, then 10.0
-        let ratio3 = if downloaded < 9_646_899.0 {
-            (downloaded - 1_048_576.0) / 8_598_323.0 * 2.34 + 1.0
-        } else {
-            MAX_CREDIT_RATIO
-        };
-
-        ratio1
-            .min(ratio2)
-            .min(ratio3)
-            .clamp(MIN_CREDIT_RATIO, MAX_CREDIT_RATIO)
+    /// The credit ratio this peer most likely gives us in its own queue: eMule's
+    /// formula from its side, where what we uploaded to it is what it
+    /// downloaded. An estimate only, since its record of us may differ (a
+    /// SecIdent it could not complete, records it expired); 1.0 when we have
+    /// no record of it.
+    pub fn standing_with(&self, user_hash: &[u8; 16]) -> f64 {
+        self.credits
+            .get(user_hash)
+            .map_or(MIN_CREDIT_RATIO, |record| emule_score_ratio(record.uploaded, record.downloaded))
     }
 
     /// Queue score for upload slot selection.
@@ -1707,6 +1725,41 @@ impl CreditManager {
                         (bound == ember_hash && persisted.is_none()).then_some(*user_hash)
                     })
             })
+    }
+
+    /// The one eD2K user hash the Ember identity `ember_hash` is proven to own
+    /// ([`Self::ember_identity_proven_for`]), or `None` when none is, or when
+    /// more than one is and the bytes could belong to either.
+    fn proven_user_hash_of(&self, ember_hash: &[u8; 16]) -> Option<[u8; 16]> {
+        let mut proven = self
+            .credits
+            .keys()
+            .filter(|user_hash| self.ember_identity_proven_for(user_hash, ember_hash));
+        let first = *proven.next()?;
+        proven.next().is_none().then_some(first)
+    }
+
+    /// Bytes the Ember identity `ember_hash` sent us over one of Ember's own
+    /// streams (a feed, a chat file, a room transfer), each checked against
+    /// what was offered before it was kept. Credited to the eD2K user hash
+    /// that identity is proven to own, so its uploads earn it the same place
+    /// in our queue as bytes sent over eD2K would; nothing for an identity
+    /// with no proven user hash. Judged by the record's stored state: the
+    /// stream itself proved the identity, and SecIdent the link.
+    pub fn add_downloaded_over_ember(&mut self, ember_hash: &[u8; 16], bytes: u64) -> bool {
+        match self.proven_user_hash_of(ember_hash) {
+            Some(user_hash) if bytes > 0 => self.add_downloaded(user_hash, 0, bytes),
+            _ => false,
+        }
+    }
+
+    /// [`Self::add_downloaded_over_ember`] for bytes we sent that identity,
+    /// which count against it as any upload does.
+    pub fn add_uploaded_over_ember(&mut self, ember_hash: &[u8; 16], bytes: u64) -> bool {
+        match self.proven_user_hash_of(ember_hash) {
+            Some(user_hash) if bytes > 0 => self.add_uploaded(user_hash, 0, bytes),
+            _ => false,
+        }
     }
 
     /// The Ember identity bound to `user_hash`, if we have ever seen one.
@@ -4052,6 +4105,59 @@ mod tests {
             None,
             "a session SecIdent has not verified proves nothing"
         );
+    }
+
+    /// Bytes over Ember's own streams count on the eD2K record of the user hash
+    /// the sender's identity is proven to own, and on no record otherwise: not
+    /// one it only claims, and not when two records are proven for it.
+    #[test]
+    fn ember_stream_bytes_count_only_for_a_proven_user_hash() {
+        let ember = [0x73u8; 16];
+        let mut cm = CreditManager::new();
+        let owner = [0x45u8; 16];
+
+        assert!(!cm.add_downloaded_over_ember(&ember, 4 << 20), "no user hash at all");
+        cm.note_bound_ember_hash(owner, ember, 0);
+        assert!(!cm.add_downloaded_over_ember(&ember, 4 << 20), "a binding alone is a claim");
+        assert_eq!(cm.get_record(&owner).map_or(0, |r| r.downloaded), 0);
+
+        cm.set_ident_state(owner, IdentState::Verified);
+        cm.note_session_proven_ember(owner, ember);
+        assert!(cm.add_downloaded_over_ember(&ember, 4 << 20));
+        assert!(cm.add_uploaded_over_ember(&ember, 1 << 20));
+        assert!(!cm.add_downloaded_over_ember(&ember, 0), "nothing to count");
+        let record = cm.get_record(&owner).unwrap();
+        assert_eq!((record.downloaded, record.uploaded), (4 << 20, 1 << 20));
+        assert!(cm.get_score_ratio(&owner, 0) > MIN_CREDIT_RATIO, "and it ranks them as eD2K bytes would");
+
+        assert!(!cm.add_downloaded_over_ember(&[0x74; 16], 4 << 20), "another identity");
+
+        let second = [0x46u8; 16];
+        cm.note_bound_ember_hash(second, ember, 0);
+        cm.set_ident_state(second, IdentState::Verified);
+        cm.note_session_proven_ember(second, ember);
+        assert!(!cm.add_downloaded_over_ember(&ember, 4 << 20), "two proven records: neither is credited");
+        assert_eq!(cm.get_record(&owner).unwrap().downloaded, 4 << 20);
+    }
+
+    /// Our standing with a peer is eMule's formula from its side: a peer we
+    /// have sent 20 MB and taken nothing from ranks us as we would rank one
+    /// that sent us 20 MB.
+    #[test]
+    fn our_standing_with_a_peer_mirrors_its_score_with_us() {
+        let mut cm = CreditManager::new();
+        let peer = [0x51u8; 16];
+        assert_eq!(cm.standing_with(&peer), MIN_CREDIT_RATIO, "no record, no standing");
+
+        assert!(cm.add_uploaded(peer, 0, 20 << 20));
+        let expected = (20.0f64 + 2.0).sqrt();
+        assert!((cm.standing_with(&peer) - expected).abs() < 1e-9);
+        assert_eq!(cm.get_score_ratio(&peer, 0), MIN_CREDIT_RATIO, "while it has earned nothing with us");
+
+        let giver = [0x52u8; 16];
+        assert!(cm.add_downloaded(giver, 0, 20 << 20));
+        assert!((cm.get_score_ratio(&giver, 0) - cm.standing_with(&peer)).abs() < 1e-9);
+        assert_eq!(cm.standing_with(&giver), MIN_CREDIT_RATIO);
     }
 
     // ---- Ember credit tests ----

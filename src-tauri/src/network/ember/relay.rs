@@ -2207,7 +2207,8 @@ pub struct FileStreamServe {
 ///
 /// `None` when the peer is not a friend. Otherwise the serve result, and the
 /// progress the carrier settles once it knows whether every byte arrived —
-/// which each carrier learns its own way.
+/// which each carrier learns its own way. What was sent counts against the
+/// friend in `credits` (see [`note_sent_over_ember`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_chat_attachment_stream<R, W>(
     ctx: &AttachServeContext,
@@ -2218,6 +2219,7 @@ pub async fn serve_chat_attachment_stream<R, W>(
     send: &mut W,
     header: &[u8; 7],
     limiter: &crate::bandwidth::limiter::BandwidthLimiter,
+    credits: Option<&SharedCredits>,
 ) -> Option<(anyhow::Result<u64>, crate::network::chat_attach::ServeProgress)>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -2273,7 +2275,20 @@ where
             "Chat attachment: stream to {peer_hex} stopped at {reached} of {size} bytes: {e}"
         ),
     }
+    note_sent_over_ember(credits, Some(peer_id), served.as_ref().ok().copied()).await;
     Some((served, progress))
+}
+
+/// The credit ledger a file stream's serve records what it sent in.
+pub type SharedCredits = std::sync::Arc<tokio::sync::RwLock<crate::network::ed2k::credits::CreditManager>>;
+
+/// Count `sent` bytes, sent to the Ember identity `peer` over one of Ember's
+/// own streams, against the eD2K user hash it is proven to own, as an upload
+/// to it over eD2K would count. Nothing when either is unknown.
+async fn note_sent_over_ember(credits: Option<&SharedCredits>, peer: Option<[u8; 16]>, sent: Option<u64>) {
+    if let (Some(credits), Some(peer), Some(sent)) = (credits, peer, sent) {
+        credits.write().await.add_uploaded_over_ember(&peer, sent);
+    }
 }
 
 /// Serve a room member's transfer request on a stream whose carrier has proved
@@ -2287,6 +2302,7 @@ pub async fn serve_room_transfer_stream<R, W>(
     send: &mut W,
     header: &[u8; 7],
     limiter: &crate::bandwidth::limiter::BandwidthLimiter,
+    credits: Option<&SharedCredits>,
 ) -> anyhow::Result<u64>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -2311,6 +2327,8 @@ where
         Ok(bytes) => debug!("Ember Transfer: streamed {bytes} byte(s)"),
         Err(e) => debug!("Room transfer stream failed: {e}"),
     }
+    let peer = super::crypto::node_id_from_ed25519_bytes(&peer_pubkey);
+    note_sent_over_ember(credits, peer, served.as_ref().ok().copied()).await;
     served
 }
 
@@ -2329,6 +2347,7 @@ pub async fn serve_feed_stream<R, W>(
     header: &[u8; 7],
     follower: Option<[u8; 16]>,
     limiter: &crate::bandwidth::limiter::BandwidthLimiter,
+    credits: Option<&SharedCredits>,
 ) -> anyhow::Result<Option<[u8; 16]>>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -2367,6 +2386,7 @@ where
         Ok(bytes) => debug!("Feed stream: served {bytes} byte(s)"),
         Err(e) => debug!("Feed stream failed: {e}"),
     }
+    note_sent_over_ember(credits, follower, served.as_ref().ok().copied()).await;
     let whole = streamed.and_then(|(xfer_id, _)| {
         let follower = follower?;
         crate::network::feed_direct::note_served(&xfer_id, follower, sent).then_some(xfer_id)
@@ -2441,6 +2461,7 @@ pub async fn run_quic_accept_loop(
     bandwidth_limiter: std::sync::Arc<crate::bandwidth::limiter::BandwidthLimiter>,
     attach_serve: Option<AttachServeContext>,
     room_serve: Option<RoomXferServeContext>,
+    credits: Option<SharedCredits>,
 ) {
     info!("QUIC accept loop started on {:?}", endpoint.local_addr());
     let ordinary_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(QUIC_ACCEPT_ORDINARY_CAP));
@@ -2533,6 +2554,7 @@ pub async fn run_quic_accept_loop(
         let limiter = bandwidth_limiter.clone();
         let attach_serve = attach_serve.clone();
         let room_serve = room_serve.clone();
+        let credits = credits.clone();
         let accepted_at = tokio::time::Instant::now();
         tokio::spawn(async move {
             let pending_ip_guard = pending_ip_guard;
@@ -2665,6 +2687,7 @@ pub async fn run_quic_accept_loop(
                     &mut init_send,
                     &header,
                     limiter.as_ref(),
+                    credits.as_ref(),
                 )
                 .await
                 else {
@@ -2702,6 +2725,7 @@ pub async fn run_quic_accept_loop(
                     &mut init_send,
                     &header,
                     limiter.as_ref(),
+                    credits.as_ref(),
                 )
                 .await;
                 // As for an attachment: returning drops the connection, and
@@ -2715,8 +2739,15 @@ pub async fn run_quic_accept_loop(
                 // A follower fetching a file of a feed we publish. No identity
                 // check: a feed is public, and the request's id is the grant.
                 // The certificate names who it was, for the download count.
-                let finished =
-                    serve_feed_stream(&mut init_recv, &mut init_send, &header, peer_node_id, limiter.as_ref()).await;
+                let finished = serve_feed_stream(
+                    &mut init_recv,
+                    &mut init_send,
+                    &header,
+                    peer_node_id,
+                    limiter.as_ref(),
+                    credits.as_ref(),
+                )
+                .await;
                 let _ = init_send.finish();
                 let delivered = attachment_delivered(&init_send).await;
                 if let (Ok(Some(xfer_id)), true, Some(follower)) = (finished, delivered, peer_node_id) {

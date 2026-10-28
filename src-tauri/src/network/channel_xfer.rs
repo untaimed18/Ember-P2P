@@ -2257,6 +2257,7 @@ pub(super) async fn apply_xfer_finish(
     state: &mut NetworkState,
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
+    credit_manager: &Arc<RwLock<CreditManager>>,
     result: XferFinishResult,
 ) {
     state.xfer_finish_in_flight = state.xfer_finish_in_flight.saturating_sub(1);
@@ -2273,6 +2274,13 @@ pub(super) async fn apply_xfer_finish(
         return;
     }
     let complete = result.status == "complete";
+    if complete {
+        // Every block came sealed from the member under this transfer's key,
+        // and the file matched the offered root.
+        if let Some(sender) = ember::crypto::node_id_from_ed25519_bytes(&result.peer) {
+            credit_manager.write().await.add_downloaded_over_ember(&sender, result.size);
+        }
+    }
     // Tell the sender how it ended either way. It has no other way to find
     // out: it answers requests and then hears nothing, so without this its
     // own stall timer would eventually report a finished transfer as failed.
@@ -2377,6 +2385,15 @@ pub(super) fn apply_xfer_done(
         return;
     }
     let send = state.xfer_send.remove(&xfer_id).expect("just checked");
+    // What went as blocks counts against the member like an upload; what went
+    // over a stream was counted where it was served.
+    let blocks = send
+        .sent_blocks
+        .saturating_mul(ember::channel::XFER_BLOCK_SIZE as u64)
+        .min(send.size);
+    if let (Some(member), true) = (ember::crypto::node_id_from_ed25519_bytes(&send.peer), blocks > 0) {
+        state.xfer_block_uploads.push((member, blocks));
+    }
     emit_xfer_update(
         app_handle,
         &xfer_id,

@@ -1264,6 +1264,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         xfer_recv: HashMap::new(),
         xfer_finish_tx,
         xfer_finish_in_flight: 0,
+        xfer_block_uploads: Vec::new(),
         xfer_finishing: HashMap::new(),
         xfer_accepting: HashMap::new(),
         xfer_accept_tx,
@@ -3421,6 +3422,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &firewall_probe_ips,
                     &shared_banned_ips,
                     &friend_hashes,
+                    &credit_manager,
                     ember_hash,
                     &ul_event_tx,
                     ed25519_pubkey,
@@ -3736,6 +3738,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &bandwidth_limiter,
                     &db,
                     &app_handle,
+                    &credit_manager,
                     &mut xfer_finish_rx,
                 ))
                 .catch_unwind()

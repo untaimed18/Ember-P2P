@@ -3455,6 +3455,7 @@ impl MultiSourceDownload {
                 our_secret_key: self.ed25519_secret_key,
                 ip_filter: self.ip_filter.clone(),
                 banned_ips: self.banned_ips.clone(),
+                credit_manager: self.credit_manager.clone(),
             };
             let first = crate::network::feed_direct::stream_ready(&self.transfer_id)
                 .then(|| web_worker::Working::new(&web_working));

@@ -115,6 +115,8 @@ pub(super) struct FeedWorker {
     pub our_secret_key: [u8; 32],
     pub ip_filter: Option<crate::network::kad::ip_filter::SharedIpFilter>,
     pub banned_ips: Option<super::super::upload::SharedBannedIps>,
+    /// Where the publisher is credited for what its stream filled.
+    pub credit_manager: Option<Arc<RwLock<CreditManager>>>,
 }
 
 /// How a run of the stream ended.
@@ -209,6 +211,11 @@ impl FeedWorker {
             if written > 0 {
                 failures = 0;
                 busy = 0;
+                // Every chunk was checked against the list the feed's signed
+                // BLAKE3 names before it was written.
+                if let Some(credits) = &self.credit_manager {
+                    credits.write().await.add_downloaded_over_ember(&source.publisher, written);
+                }
             }
             match pulled {
                 // To the end, or stopped to skip what is held: the top of the
@@ -505,6 +512,7 @@ mod tests {
             our_secret_key: [0; 32],
             ip_filter: None,
             banned_ips: None,
+            credit_manager: None,
         };
         let source = StreamSource {
             publisher: [1; 16],
