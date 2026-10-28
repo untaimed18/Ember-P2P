@@ -2410,6 +2410,8 @@
   "transfers_failed_sources_hidden_one": "{count} source échouée masquée",
   "transfers_failed_sources_hidden_other": "{count} sources échouées masquées",
   "transfers_completed_failed_section": "Terminés / Échoués ({count})",
+  "transfers_completed_first": "Terminés en premier",
+  "transfers_downloading_section": "En téléchargement ({count})",
   "transfers_empty_no_downloads": "Aucun téléchargement pour l'instant",
   "transfers_empty_start_search_prefix": "Lancez une recherche",
   "transfers_empty_start_search_suffix": " pour trouver des fichiers sur le réseau.",

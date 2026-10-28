@@ -605,6 +605,19 @@
   $effect(() => {
     try { localStorage.setItem(COMPLETED_COLLAPSED_KEY, completedCollapsed ? '1' : '0'); } catch { /* ignore */ }
   });
+  // The Completed / Failed section above the downloads still running, for
+  // whoever reads the list for what has just finished. Each section keeps its
+  // own sort either way. Off unless chosen, and kept like the collapsed state.
+  const COMPLETED_FIRST_KEY = 'transfers-completed-first';
+  function loadCompletedFirst(): boolean {
+    try {
+      return localStorage.getItem(COMPLETED_FIRST_KEY) === '1';
+    } catch { return false; }
+  }
+  let completedFirst = $state(loadCompletedFirst());
+  $effect(() => {
+    try { localStorage.setItem(COMPLETED_FIRST_KEY, completedFirst ? '1' : '0'); } catch { /* ignore */ }
+  });
 
   // --- Source detail panel (eMule-style) ---
   let expandedTransferId: string | null = $state(null);
@@ -2284,15 +2297,21 @@
   let visibleActiveDownloadIds = $derived.by(() => new Set(filteredActiveDownloads.map((t) => t.id)));
 
   // Every row the user can currently click or tick, in render order: the
-  // active rows followed by the completed/failed ones (which only exist on
-  // screen while that section is expanded). Selection, shift-ranges and
-  // arrow-key navigation all walk this list so finished rows can be picked
-  // in bulk and removed, instead of one right-click at a time.
-  let filteredSelectableDownloads = $derived.by(() =>
-    completedCollapsed
-      ? filteredActiveDownloads
-      : [...filteredActiveDownloads, ...filteredCompletedDownloads]
-  );
+  // active rows and the completed/failed ones (which only exist on screen
+  // while that section is expanded), in whichever order `completedFirst`
+  // draws them. Selection, shift-ranges and arrow-key navigation all walk
+  // this list so finished rows can be picked in bulk and removed, instead of
+  // one right-click at a time.
+  let filteredSelectableDownloads = $derived.by(() => {
+    if (completedCollapsed) return filteredActiveDownloads;
+    return completedFirst
+      ? [...filteredCompletedDownloads, ...filteredActiveDownloads]
+      : [...filteredActiveDownloads, ...filteredCompletedDownloads];
+  });
+  // Rows drawn above each section's first, so the stripes run on unbroken
+  // from one section into the next.
+  let dlActiveStripeOffset = $derived(completedFirst && !completedCollapsed ? filteredCompletedDownloads.length : 0);
+  let dlCompletedStripeOffset = $derived(completedFirst ? 0 : filteredActiveDownloads.length);
   let visibleSelectableDownloadIds = $derived.by(() => new Set(filteredSelectableDownloads.map((t) => t.id)));
 
   // --- Downloads table windowing ---
@@ -2400,6 +2419,7 @@
     void filteredActiveDownloads.length;
     void filteredCompletedDownloads.length;
     void completedCollapsed;
+    void completedFirst;
     void expandedTransferId;
     void expandedSources;
     void loadingSources;
@@ -5597,6 +5617,8 @@
             {#if clearCompletedTargets().length > 0}
               <button type="button" role="menuitem" onclick={(e) => { clearCompletedWithUndo(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_clear_completed()}</button>
             {/if}
+            <div class="toolbar-more-sep" role="separator"></div>
+            <button type="button" role="menuitemcheckbox" aria-checked={completedFirst} onclick={(e) => { completedFirst = !completedFirst; (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_completed_first()}</button>
           </div>
         </details>
       </div>
@@ -5662,11 +5684,12 @@
           </tr>
         </thead>
         <tbody>
+          {#snippet activeDownloadRows()}
           <tr class="vpad-row" aria-hidden="true" bind:this={dlActiveTopPadEl} style="height: {dlActiveWindow.topPad}px;"><td colspan={dlColCount}></td></tr>
           {#each dlActiveSlice as t, i (t.id)}
             <tr
               class="dl-row {t.status}"
-              class:row-alt={((dlActiveWindow.start + i) & 1) === 1}
+              class:row-alt={((dlActiveStripeOffset + dlActiveWindow.start + i) & 1) === 1}
               class:expanded={expandedTransferId === t.id}
               class:selected={focusedDlId === t.id || checkedDlIdSet.has(t.id)}
               class:ctx-target={ctxMenu?.transfer.id === t.id && focusedDlId !== t.id && !checkedDlIdSet.has(t.id)}
@@ -5859,6 +5882,8 @@
           {#if dlActiveWindow.bottomPad > 0}
             <tr class="vpad-row" aria-hidden="true" style="height: {dlActiveWindow.bottomPad}px;"><td colspan={dlColCount}></td></tr>
           {/if}
+          {/snippet}
+          {#snippet completedDownloadRows()}
           {#if filteredCompletedDownloads.length > 0}
             <tr class="section-divider-row">
               <td colspan={dlColCount}>
@@ -5873,7 +5898,7 @@
             {#each dlCompletedSlice as t, i (t.id)}
               <tr
                 class="dl-row completed-row {t.status}"
-                class:row-alt={((filteredActiveDownloads.length + dlCompletedWindow.start + i) & 1) === 1}
+                class:row-alt={((dlCompletedStripeOffset + dlCompletedWindow.start + i) & 1) === 1}
                 class:selected={focusedDlId === t.id || checkedDlIdSet.has(t.id)}
                 class:ctx-target={ctxMenu?.transfer.id === t.id && focusedDlId !== t.id && !checkedDlIdSet.has(t.id)}
                 data-transfer-id={t.id}
@@ -5944,6 +5969,22 @@
               <tr class="vpad-row" aria-hidden="true" style="height: {dlCompletedWindow.bottomPad}px;"><td colspan={dlColCount}></td></tr>
             {/if}
             {/if}
+          {/if}
+          {/snippet}
+          <!-- The running downloads are rendered by the same block in either
+               order, so switching it moves their rows rather than rebuilding
+               them. -->
+          {#if completedFirst}
+            {@render completedDownloadRows()}
+            {#if filteredCompletedDownloads.length > 0 && filteredActiveDownloads.length > 0}
+              <tr class="section-divider-row">
+                <td colspan={dlColCount}>{m.transfers_downloading_section({ count: filteredActiveDownloads.length })}</td>
+              </tr>
+            {/if}
+          {/if}
+          {@render activeDownloadRows()}
+          {#if !completedFirst}
+            {@render completedDownloadRows()}
           {/if}
           {#if allDownloads.length === 0}
             <tr class="empty-row"><td colspan={dlColCount} class="empty-cell">
@@ -8221,6 +8262,25 @@
   }
   .toolbar-more-menu button.menu-danger:hover {
     background: color-mix(in srgb, var(--danger) 14%, transparent);
+  }
+  .toolbar-more-sep {
+    height: 1px;
+    margin: 2px 4px;
+    background: var(--ctx-border);
+  }
+  /* A setting rather than a command: its tick, drawn as the context menus
+     draw theirs, from `aria-checked` so it cannot disagree with it. */
+  .toolbar-more-menu button[role="menuitemcheckbox"] {
+    position: relative;
+    padding-left: 26px;
+  }
+  .toolbar-more-menu button[aria-checked="true"]::before {
+    content: "\2713";
+    position: absolute;
+    left: 9px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: var(--font-size-xs);
   }
   /* Both panes window their tables behind spacer rows. Scroll anchoring would
      answer each spacer resize by nudging scrollTop, which moves the window

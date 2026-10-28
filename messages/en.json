@@ -2410,6 +2410,8 @@
   "transfers_failed_sources_hidden_one": "{count} failed source hidden",
   "transfers_failed_sources_hidden_other": "{count} failed sources hidden",
   "transfers_completed_failed_section": "Completed / Failed ({count})",
+  "transfers_completed_first": "Completed First",
+  "transfers_downloading_section": "Downloading ({count})",
   "transfers_empty_no_downloads": "No downloads yet",
   "transfers_empty_start_search_prefix": "Start a search",
   "transfers_empty_start_search_suffix": " to find files on the network.",

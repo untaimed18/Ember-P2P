@@ -2410,6 +2410,8 @@
   "transfers_failed_sources_hidden_one": "{count} fonte com falha oculta",
   "transfers_failed_sources_hidden_other": "{count} fontes com falha ocultas",
   "transfers_completed_failed_section": "Concluídos / Com falha ({count})",
+  "transfers_completed_first": "Concluídos Primeiro",
+  "transfers_downloading_section": "Baixando ({count})",
   "transfers_empty_no_downloads": "Nenhum download ainda",
   "transfers_empty_start_search_prefix": "Inicie uma busca",
   "transfers_empty_start_search_suffix": " para encontrar arquivos na rede.",

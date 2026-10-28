@@ -2410,6 +2410,8 @@
   "transfers_failed_sources_hidden_one": "{count} fehlgeschlagene Quelle ausgeblendet",
   "transfers_failed_sources_hidden_other": "{count} fehlgeschlagene Quellen ausgeblendet",
   "transfers_completed_failed_section": "Abgeschlossen / Fehlgeschlagen ({count})",
+  "transfers_completed_first": "Abgeschlossene zuerst",
+  "transfers_downloading_section": "Wird heruntergeladen ({count})",
   "transfers_empty_no_downloads": "Noch keine Downloads",
   "transfers_empty_start_search_prefix": "Starten Sie eine Suche",
   "transfers_empty_start_search_suffix": ", um Dateien im Netzwerk zu finden.",

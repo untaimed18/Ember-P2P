@@ -2410,6 +2410,8 @@
   "transfers_failed_sources_hidden_one": "Скрыт {count} неудачный источник",
   "transfers_failed_sources_hidden_other": "Скрыто неудачных источников: {count}",
   "transfers_completed_failed_section": "Завершено / Ошибка ({count})",
+  "transfers_completed_first": "Завершённые сверху",
+  "transfers_downloading_section": "Загружается ({count})",
   "transfers_empty_no_downloads": "Загрузок пока нет",
   "transfers_empty_start_search_prefix": "Начните поиск",
   "transfers_empty_start_search_suffix": ", чтобы найти файлы в сети.",

@@ -2410,6 +2410,8 @@
   "transfers_failed_sources_hidden_one": "已隱藏 {count} 個失敗來源",
   "transfers_failed_sources_hidden_other": "已隱藏 {count} 個失敗來源",
   "transfers_completed_failed_section": "已完成 / 失敗（{count}）",
+  "transfers_completed_first": "已完成置頂",
+  "transfers_downloading_section": "正在下載（{count}）",
   "transfers_empty_no_downloads": "暫無下載",
   "transfers_empty_start_search_prefix": "開始搜尋",
   "transfers_empty_start_search_suffix": "以在網路中查詢檔案。",
