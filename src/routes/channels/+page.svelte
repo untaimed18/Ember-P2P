@@ -3124,7 +3124,6 @@
   <div class="header-title">
     <h2>
       {m.nav_channels()}
-      <span class="beta-badge">{m.common_beta()}</span>
     </h2>
     <!-- Rooms you are in, not rows in the list. The list also carries every
          public room Discover turned up, so counting it read "14 rooms" to

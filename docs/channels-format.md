@@ -1734,6 +1734,8 @@ signed by anyone else, or forwarded, is ignored. Older builds log the sub-type a
 
 ## What freezes at the end of the beta
 
+Frozen in 1.7.5; the beta ended in 1.7.6, which changed none of it.
+
 **Fixed from then on:**
 
 - The plaintext frame numbers above, in use and retired. Nothing is reused;

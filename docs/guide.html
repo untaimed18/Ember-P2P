@@ -236,7 +236,7 @@
       <li><strong>Ember Friends</strong> &mdash; Ember-exclusive friend system powered by a rendezvous server. Share a <strong>Friend Code</strong>, exchange mutual requests, then enjoy live status (Online, Away, Busy or Offline), remote file browsing, friends-only shares, file offers, priority upload slots, durable offline chat, and <strong>end-to-end encrypted</strong> messaging. See the <a href="#friends">Friends section</a> for details.</li>
       <li><strong>E2E Friend Chat</strong> &mdash; Mutual-friend messages use static X25519 ECDH + AEAD end-to-end encryption after session setup. A lock icon in the chat window and on online mutual friends&rsquo; cards marks it; plaintext fallbacks are rejected. Conversation history is encrypted in the local database, and outbound messages queue until the friend is reachable again. Being a static exchange, it provides no forward secrecy and covers message bodies only &mdash; see <a href="#friends-encryption">E2E Encryption</a>.</li>
       <li><strong>Noise-Secured Friend Sessions</strong> &mdash; Friend connections use <strong>Noise IK</strong> secure streams with Ed25519 proof-of-possession before chat, browse, offers, and verified friend privileges unlock. Friend file transfers can also run over the same secure path when ordinary HighID/callback routes are unavailable.</li>
-      <li><strong>Channels</strong> <span class="beta-badge">Beta</span> &mdash; Group rooms carried over the Ember Network itself. Create a public room anyone can find or a private one that needs an invite, moderate it with bans, moderators, owner-only invites and slow mode, edit and react to messages, write privately to another member, and send a file to one member at a time &mdash; encrypted to that member, not to the room. Nobody publishes their IP address to the room. See the <a href="#channels">Channels section</a> for details.</li>
+      <li><strong>Channels</strong> &mdash; Group rooms carried over the Ember Network itself. Create a public room anyone can find or a private one that needs an invite, moderate it with bans, moderators, owner-only invites and slow mode, edit and react to messages, write privately to another member, and send a file to one member at a time &mdash; encrypted to that member, not to the room. Nobody publishes their IP address to the room. See the <a href="#channels">Channels section</a> for details.</li>
       <li><strong>Feeds</strong> &mdash; Follow a list of files someone keeps up to date under their Ember identity, see what they add, and have it downloaded for you if you choose; or publish your own. See the <a href="#feeds">Feeds section</a>.</li>
       <li><strong>Credits &amp; SecIdent</strong> &mdash; RSA-based Secure Identification prevents credit theft. Upload priority follows the standard credit ratio formula.</li>
     </ul>
@@ -508,15 +508,13 @@ peer_count    (u16 LE)
   <hr>
 
   <section id="channels">
-    <h2>Channels <span class="beta-badge">Beta</span></h2>
+    <h2>Channels</h2>
 
     <p>Channels are group chat rooms carried over the <a href="#ember">Ember Network</a> itself. No server hosts a room and no company runs one: messages travel encrypted between the members over the same overlay that carries search and source lookup. Room and user names are registered with the rendezvous server; messages never pass through it. Members never publish their IP address to the room.</p>
 
     <p>Friends are for people you know one-to-one. Channels are for a group &mdash; a room you can hand an invite to, hand off to someone else, or leave running after you have gone.</p>
 
-    <div class="callout-warn callout">
-      <p><strong>Channels are in beta.</strong> The app marks them so too. The format is still settling, so expect rough edges, and read <a href="#channels-limits">What to expect</a> before you rely on a room for anything that matters.</p>
-    </div>
+    <p>Channels left beta in 1.7.6. The room formats have been fixed since 1.7.5, so rooms keep working across updates. Read <a href="#channels-limits">What to expect</a> before you rely on a room for anything that matters.</p>
 
     <h3 id="channels-start">Getting started</h3>
     <ol class="steps-list">

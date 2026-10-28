@@ -228,13 +228,13 @@ This is a **static** DH, not a ratchet. It gives confidentiality and integrity a
 - **Friend Block List** — Block a Friend ID to reject future requests, chat, browse and offers from that identity. Blocking removes any existing mutual friendship, and unblocking does not restore it.
 - **Optional Peer Relaying** — **Relay for other peers** (Settings) lets your client carry traffic for peers that cannot reach each other directly. It is what makes transfers work behind strict NATs, and it spends your upload bandwidth on people you are not trading with, so it can be turned off.
 
-## Channels — group rooms (beta)
+## Channels — group rooms
 
 Channels are group chat rooms carried over the [Ember Network](#ember-network) itself. No server hosts a room: messages travel encrypted between the members over the same overlay that carries search and source lookup, and members never publish their IP address to the room.
 
 Friends are one-to-one with people you know. Channels are for a group — a room you can hand an invite to, hand off to someone else, or leave running after you have gone.
 
-Channels are in beta and the app marks them so. The format is still settling; read [What to expect](#what-to-expect) before relying on a room.
+Channels left beta in 1.7.6. Their formats have been frozen since 1.7.5 ([docs/channels-format.md](docs/channels-format.md#what-freezes-at-the-end-of-the-beta)), so rooms keep working across updates; read [What to expect](#what-to-expect) before relying on a room.
 
 ### Getting in
 
@@ -367,7 +367,7 @@ eMule users and eD2K servers see your nickname followed by `[https://emberp2p.or
 ### Social
 
 - **Friends (beta)** — Ember-exclusive friend system with v3 Friend Codes, Noise-secured sessions, Online/Away/Busy status, end-to-end encrypted chat with file sending, remote browsing, friends-only shares, file offers, priority uploads, a block list, and transfers that can work without HighID (see [above](#friends--ember-exclusive-social-features-beta)).
-- **Channels (beta)** — Group rooms carried over the Ember Network itself: public rooms anyone can find, private rooms that need an invite, moderation with bans, moderators, owner-only invites and slow mode, private messages between members, and member-to-member file sending. Nobody publishes their IP address to the room (see [above](#channels--group-rooms-beta)).
+- **Channels** — Group rooms carried over the Ember Network itself: public rooms anyone can find, private rooms that need an invite, moderation with bans, moderators, owner-only invites and slow mode, private messages between members, and member-to-member file sending. Nobody publishes their IP address to the room (see [above](#channels--group-rooms)).
 - **Feeds** — Follow the files someone publishes under their Ember identity, by link or from Discover, with private downloads fetched from the publisher first and optional automatic downloads; or publish your own (see [above](#feeds)).
 - **Credits & SecIdent** — RSA-based Secure Identification prevents credit theft; upload priority follows the standard credit ratio formula.
 
@@ -404,7 +404,7 @@ Ember ships for **Windows 10 and Windows 11**, and for **x86-64 Linux** as a `.d
 5. The [Ember Network](#ember-network) needs no connect step either — it is on by default and joins on its own, finding its first peers *through* KAD.
 6. Add folders to your library, search with the Global / KAD / Server / Ember methods, open `ed2k://` links, and start downloading. Ember handles multi-source transfers, queueing and source discovery on its own.
 7. Optionally open the Friends page, share your Friend Code and add theirs. Once mutual and online you get end-to-end encrypted chat, remote browsing and priority upload slots — see [Friends](#friends--ember-exclusive-social-features-beta).
-8. Optionally open the Channels page, pick a Channel username, then create a room or paste an invite. Discover lists public rooms other people have published — see [Channels](#channels--group-rooms-beta).
+8. Optionally open the Channels page, pick a Channel username, then create a room or paste an invite. Discover lists public rooms other people have published — see [Channels](#channels--group-rooms).
 9. Optionally open the Feeds page and paste an `ember-feed:` link, or follow a feed from Discover, to get the files someone publishes as they add them — see [Feeds](#feeds).
 
 ### Port forwarding

@@ -529,7 +529,7 @@
             {/if}
           </span>
           <span class="nav-label">{item.label()}</span>
-          {#if item.id === 'channels' || item.id === 'friends' || item.id === 'feeds'}
+          {#if item.id === 'friends' || item.id === 'feeds'}
             <span class="beta-badge">{m.common_beta()}</span>
           {/if}
           {#if item.id === 'feeds' && $totalFeedUnread > 0}
