@@ -299,22 +299,23 @@ fn add_firewall_rule(rule_name: &str, protocol: &str, port: u16) -> AddRuleOutco
 /// startup. Now we collapse both into a single actionable message so
 /// the user knows what to do without thinking they have a bug.
 pub fn ensure_firewall_rules(tcp_port: u16, udp_port: u16) {
+    // Each rule is its own few netsh/PowerShell launches, so they run at once.
+    let (tcp_outcome, udp_outcome, quic_outcome) = std::thread::scope(|scope| {
+        let udp = scope.spawn(|| ensure_one_rule(RULE_NAME_UDP, "UDP", udp_port));
+        let quic = dedicated_quic_udp_port(tcp_port, udp_port)
+            .map(|_| scope.spawn(|| ensure_one_rule(RULE_NAME_QUIC_UDP, "UDP", tcp_port)));
+        let tcp = ensure_one_rule(RULE_NAME_TCP, "TCP", tcp_port);
+        (
+            tcp,
+            udp.join().ok().flatten(),
+            quic.and_then(|quic| quic.join().ok().flatten()),
+        )
+    });
+
     let mut elevation_failures: Vec<&'static str> = Vec::new();
-
-    let tcp_outcome = ensure_one_rule(RULE_NAME_TCP, "TCP", tcp_port);
-    if matches!(tcp_outcome, Some(AddRuleOutcome::NeedsElevation)) {
-        elevation_failures.push("TCP");
-    }
-
-    let udp_outcome = ensure_one_rule(RULE_NAME_UDP, "UDP", udp_port);
-    if matches!(udp_outcome, Some(AddRuleOutcome::NeedsElevation)) {
-        elevation_failures.push("UDP");
-    }
-
-    if dedicated_quic_udp_port(tcp_port, udp_port).is_some() {
-        let quic_outcome = ensure_one_rule(RULE_NAME_QUIC_UDP, "UDP", tcp_port);
-        if matches!(quic_outcome, Some(AddRuleOutcome::NeedsElevation)) {
-            elevation_failures.push("QUIC");
+    for (outcome, proto) in [(tcp_outcome, "TCP"), (udp_outcome, "UDP"), (quic_outcome, "QUIC")] {
+        if matches!(outcome, Some(AddRuleOutcome::NeedsElevation)) {
+            elevation_failures.push(proto);
         }
     }
 
@@ -366,15 +367,18 @@ fn dedicated_quic_udp_port(quic_udp_port: u16, kad_udp_port: u16) -> Option<u16>
 /// outside-in probe only reaches the Kad UDP port, so a missing QUIC rule
 /// shows up here or nowhere.
 pub fn rules_in_place(tcp_port: u16, udp_port: u16, quic_port: u16) -> Option<bool> {
-    let tcp = firewall_rule_has_port(RULE_NAME_TCP, tcp_port);
-    if tcp == Some(false) {
-        return Some(false);
-    }
-    let kad = both_rules(tcp, firewall_rule_has_port(RULE_NAME_UDP, udp_port));
-    match dedicated_quic_udp_port(quic_port, udp_port) {
-        Some(port) if kad != Some(false) => both_rules(kad, firewall_rule_has_port(RULE_NAME_QUIC_UDP, port)),
-        _ => kad,
-    }
+    // Each query is a PowerShell launch of a second or more, so they run at once.
+    std::thread::scope(|scope| {
+        let udp = scope.spawn(|| firewall_rule_has_port(RULE_NAME_UDP, udp_port));
+        let quic = dedicated_quic_udp_port(quic_port, udp_port)
+            .map(|port| scope.spawn(move || firewall_rule_has_port(RULE_NAME_QUIC_UDP, port)));
+        let tcp = firewall_rule_has_port(RULE_NAME_TCP, tcp_port);
+        let kad = both_rules(tcp, udp.join().ok().flatten());
+        match quic {
+            Some(quic) => both_rules(kad, quic.join().ok().flatten()),
+            None => kad,
+        }
+    })
 }
 
 /// Either rule known missing settles it; otherwise both must be known.
@@ -463,6 +467,16 @@ fn elevated_rules_script(exe: &str, netsh: &str, tcp_port: u16, udp_port: u16, q
 /// caller distinguish "tried and failed" from "didn't need to try" for the
 /// single-line consolidated warning above.
 fn ensure_one_rule(rule_name: &str, protocol: &str, port: u16) -> Option<AddRuleOutcome> {
+    // Startup and the QUIC bind can both reach the QUIC rule; two check-then-
+    // add passes on one name at once would leave a duplicate rule.
+    static RULE_LOCKS: [std::sync::Mutex<()>; 3] =
+        [std::sync::Mutex::new(()), std::sync::Mutex::new(()), std::sync::Mutex::new(())];
+    let lock = match rule_name {
+        RULE_NAME_TCP => &RULE_LOCKS[0],
+        RULE_NAME_UDP => &RULE_LOCKS[1],
+        _ => &RULE_LOCKS[2],
+    };
+    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if firewall_rule_exists(rule_name) {
         match firewall_rule_state(rule_name, port) {
             Some(RuleState::Opens) => {

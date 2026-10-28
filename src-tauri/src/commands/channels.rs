@@ -1220,11 +1220,15 @@ pub async fn join_channel(
         return Ok(entered);
     }
 
-    refuse_deleted_channel(&state, &channel_id_hex).await?;
-
-    // Only a first join reaches here — re-entry returned above — so this costs
-    // a bounded round-trip once per room rather than on every walk back in.
-    let username = reassert_channel_username(&state, &username).await?;
+    // Only a first join reaches here — re-entry returned above — so the
+    // username costs a bounded round-trip once per room rather than on every
+    // walk back in. A deleted room is refused at once, whatever the registry
+    // says about the username.
+    let ((), username) = tokio::try_join!(
+        refuse_deleted_channel(&state, &channel_id_hex),
+        async { Ok::<_, String>(reassert_channel_username(&state, &username).await) },
+    )?;
+    let username = username?;
 
     let pubkey_hex = hex::encode(invite.pubkey);
     let visibility = if invite.private {
@@ -5626,19 +5630,17 @@ async fn probe_public_member_counts(
     // One FIND_VALUE per presence key, the same pattern as the public-index
     // shard walks. Batching independent rooms into extras AND-filters by
     // file_hash, and MAX_FIND_VALUE_KEYS would truncate the rest to a
-    // confirmed 0 the UI treated as authoritative. Run in small batches so
-    // the 64-slot search table is not filled by one Discover pass.
+    // confirmed 0 the UI treated as authoritative. A few at a time so the
+    // 64-slot search table is not filled by one Discover pass.
     let keys: Vec<[u8; 16]> = wanted.keys().copied().collect();
-    let mut walks = Vec::with_capacity(keys.len());
-    for chunk in keys.chunks(PRESENCE_PROBE_CONCURRENCY) {
-        let batch = futures::future::join_all(
-            chunk
-                .iter()
-                .map(|key| find_raw_keys_within(state, vec![*key], PRESENCE_PROBE_TIMEOUT_MS)),
-        )
-        .await;
-        walks.extend(batch);
-    }
+    let walks: Vec<_> = {
+        use futures::StreamExt;
+        futures::stream::iter(keys.clone())
+            .map(|key| find_raw_keys_within(state, vec![key], PRESENCE_PROBE_TIMEOUT_MS))
+            .buffered(PRESENCE_PROBE_CONCURRENCY)
+            .collect()
+            .await
+    };
     let mut members: HashMap<String, HashMap<[u8; 32], (i64, bool)>> = HashMap::new();
     let mut answered: HashSet<String> = HashSet::new();
     let mut any_answer = false;

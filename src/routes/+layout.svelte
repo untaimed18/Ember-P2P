@@ -715,25 +715,27 @@
           if (degraded.length > 0) {
             toastError(translateError(degraded[0], m.layout_init_failed()));
           }
-          try {
-            // Only consume once we know the shell is still alive. The backend
-            // command acknowledges+returns the count atomically — there is no
-            // peek — so always surface the toast after a successful take.
-            if (mounted) {
-              const migrated = await takePendingDownloadOverflowNotice();
-              if (migrated > 0) {
-                toastWarning(
-                  plural(migrated, {
-                    one: () => m.layout_download_overflow_notice_one({ count: migrated }),
-                    oneShowsCount: true,
-                    few: () => m.layout_download_overflow_notice_few({ count: migrated }),
-                    other: () => m.layout_download_overflow_notice_other({ count: migrated }),
-                  }),
-                );
-              }
-            }
-          } catch (e) {
-            console.error('Failed to read pending-download migration notice:', e);
+          // Only consume once we know the shell is still alive. The backend
+          // command acknowledges+returns the count atomically — there is no
+          // peek — so always surface the toast after a successful take. Not
+          // awaited: the splash waits on the settings below, not on this.
+          if (mounted) {
+            void takePendingDownloadOverflowNotice()
+              .then((migrated) => {
+                if (migrated > 0) {
+                  toastWarning(
+                    plural(migrated, {
+                      one: () => m.layout_download_overflow_notice_one({ count: migrated }),
+                      oneShowsCount: true,
+                      few: () => m.layout_download_overflow_notice_few({ count: migrated }),
+                      other: () => m.layout_download_overflow_notice_other({ count: migrated }),
+                    }),
+                  );
+                }
+              })
+              .catch((e) => {
+                console.error('Failed to read pending-download migration notice:', e);
+              });
           }
 
           // Fetch settings with bounded exponential-backoff retries.

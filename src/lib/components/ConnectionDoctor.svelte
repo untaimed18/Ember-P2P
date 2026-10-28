@@ -215,6 +215,12 @@
   }
 
   const statusIcon: Record<string, string> = { pass: '✓', warn: '!', fail: '✕', skip: '–' };
+
+  let tally = $derived(
+    (['pass', 'warn', 'fail', 'skip'] as const)
+      .map((status) => [status, report?.checks.filter((c) => c.status === status).length ?? 0] as const)
+      .filter(([, count]) => count > 0),
+  );
 </script>
 
 <div class="doctor">
@@ -283,26 +289,42 @@
       </div>
     {/if}
 
-    <details class="doctor-block">
-      <summary>{m.doctor_checks_title()}</summary>
-      <ul class="doctor-checks">
-        {#each report.checks as check (check.id)}
-          <li class={check.status}>
-            <span class="doctor-icon" role="img" aria-label={STATUS[check.status]?.() ?? check.status}>{statusIcon[check.status]}</span>
-            <span class="doctor-check-label">{CHECK[check.id]?.() ?? check.id}</span>
-            <span class="doctor-check-detail">{DETAIL[check.detail]?.() ?? check.detail}</span>
-          </li>
-        {/each}
-      </ul>
-      {#if !report.probed}
-        <p class="doctor-hint">{m.doctor_not_probed()}</p>
-      {/if}
-      <div class="doctor-row">
-        <button type="button" class="secondary small" onclick={() => void copyReport()}>{m.doctor_copy_report()}</button>
-        <label class="doctor-include">
-          <input type="checkbox" bind:checked={includeAddresses} />
-          {m.doctor_copy_include_addresses()}
-        </label>
+    <details class="doctor-block doctor-details">
+      <summary>
+        <svg class="doctor-chevron" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+          <path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <span>{m.doctor_checks_title()}</span>
+        <span class="doctor-tally">
+          {#each tally as [status, count] (status)}
+            <span class="doctor-tally-item {status}" role="img" aria-label="{STATUS[status]?.() ?? status}: {count}">
+              <span class="doctor-icon" aria-hidden="true">{statusIcon[status]}</span>{count}
+            </span>
+          {/each}
+        </span>
+      </summary>
+      <div class="doctor-card">
+        <ul class="doctor-checks">
+          {#each report.checks as check (check.id)}
+            <li class={check.status}>
+              <span class="doctor-icon" role="img" aria-label={STATUS[check.status]?.() ?? check.status}>{statusIcon[check.status]}</span>
+              <span class="doctor-check-label">{CHECK[check.id]?.() ?? check.id}</span>
+              <span class="doctor-check-detail">{DETAIL[check.detail]?.() ?? check.detail}</span>
+            </li>
+          {/each}
+        </ul>
+        <div class="doctor-card-footer">
+          {#if !report.probed}
+            <p class="doctor-hint">{m.doctor_not_probed()}</p>
+          {/if}
+          <div class="doctor-row">
+            <button type="button" class="secondary small" onclick={() => void copyReport()}>{m.doctor_copy_report()}</button>
+            <label class="doctor-include">
+              <input type="checkbox" bind:checked={includeAddresses} />
+              {m.doctor_copy_include_addresses()}
+            </label>
+          </div>
+        </div>
       </div>
     </details>
   {/if}
@@ -387,8 +409,70 @@
     cursor: default;
   }
 
-  .doctor-block summary {
+  .doctor-details summary {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0;
+    padding: 4px 0;
+    list-style: none;
     cursor: pointer;
+    user-select: none;
+  }
+
+  .doctor-details summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .doctor-chevron {
+    flex-shrink: 0;
+    color: var(--text-muted);
+    transition: transform 0.15s ease;
+  }
+
+  .doctor-details[open] .doctor-chevron {
+    transform: rotate(90deg);
+  }
+
+  .doctor-details summary:hover .doctor-chevron {
+    color: var(--text-primary);
+  }
+
+  .doctor-tally {
+    display: inline-flex;
+    gap: 10px;
+    margin-left: 6px;
+    font-weight: 500;
+    color: var(--text-secondary);
+  }
+
+  .doctor-tally-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .doctor-tally-item .doctor-icon {
+    width: 16px;
+    height: 16px;
+    font-size: 10px;
+  }
+
+  .doctor-card {
+    margin-top: 6px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+  }
+
+  .doctor-card-footer {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px;
+    border-top: 1px solid var(--border);
+    background: var(--bg-surface);
   }
 
   .doctor-list,
@@ -417,36 +501,58 @@
   .doctor-checks {
     list-style: none;
     padding-left: 0;
-    gap: 3px;
+    gap: 0;
   }
 
   .doctor-checks li {
     display: grid;
-    grid-template-columns: 18px minmax(120px, 30%) 1fr;
-    gap: 8px;
-    align-items: baseline;
+    grid-template-columns: 20px minmax(140px, 40%) 1fr;
+    gap: 10px;
+    align-items: center;
+    padding: 7px 12px;
+  }
+
+  .doctor-checks li + li {
+    border-top: 1px solid var(--border);
   }
 
   .doctor-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    font-size: 11px;
     font-weight: 700;
-    text-align: center;
-  }
-
-  .doctor-checks li.pass .doctor-icon {
-    color: var(--success);
-  }
-
-  .doctor-checks li.warn .doctor-icon,
-  .doctor-checks li.fail .doctor-icon {
-    color: var(--warning);
-  }
-
-  .doctor-checks li.skip {
+    line-height: 1;
     color: var(--text-muted);
+    background: color-mix(in srgb, var(--text-muted) 14%, transparent);
+  }
+
+  .pass .doctor-icon {
+    color: var(--success);
+    background: color-mix(in srgb, var(--success) 15%, transparent);
+  }
+
+  .warn .doctor-icon,
+  .fail .doctor-icon {
+    color: var(--warning);
+    background: color-mix(in srgb, var(--warning) 16%, transparent);
   }
 
   .doctor-check-label {
     color: var(--text-primary);
+  }
+
+  .doctor-checks li.warn .doctor-check-detail,
+  .doctor-checks li.fail .doctor-check-detail {
+    color: color-mix(in srgb, var(--warning) 75%, var(--text-primary));
+  }
+
+  .doctor-checks li.skip .doctor-check-label,
+  .doctor-checks li.skip .doctor-check-detail {
+    color: var(--text-muted);
   }
 
   .doctor-include {

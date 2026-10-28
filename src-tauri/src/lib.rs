@@ -1480,6 +1480,17 @@ pub fn run() {
                         )
                     })
                     .collect();
+                // Read while the folders are walked; nothing below needs it sooner.
+                let known_path =
+                    storage::paths::resolve_data_dir_with_app(&startup_app).join("known.met");
+                let known_load = tokio::task::spawn_blocking(move || {
+                    let known_list = storage::known_files::KnownFileList::load(&known_path);
+                    // The per-file `effective_shared` calls below would
+                    // otherwise wait out the share-intent migration on this
+                    // runtime worker.
+                    storage::share_intent::wait_until_initialized();
+                    known_list
+                });
                 let mut all_discovered: Vec<crate::types::FileInfo> = Vec::new();
                 let mut startup_cursor_updates = std::collections::HashMap::new();
                 // Not walked until re-approved, so not filled in from known.met
@@ -1533,18 +1544,7 @@ pub fn run() {
                     return;
                 }
 
-                let known_path =
-                    storage::paths::resolve_data_dir_with_app(&startup_app).join("known.met");
-                let known_list = match tokio::task::spawn_blocking(move || {
-                    let known_list = storage::known_files::KnownFileList::load(&known_path);
-                    // The per-file `effective_shared` calls below would
-                    // otherwise wait out the share-intent migration on this
-                    // runtime worker.
-                    storage::share_intent::wait_until_initialized();
-                    known_list
-                })
-                .await
-                {
+                let known_list = match known_load.await {
                     Ok(known_list) => known_list,
                     Err(e) => {
                         tracing::error!("Startup known.met load panicked: {e}");

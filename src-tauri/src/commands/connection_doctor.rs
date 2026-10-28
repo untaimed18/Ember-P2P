@@ -433,17 +433,12 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
     let (probe_tcp, probe_udp) = probe_ports(&stats, tcp_port, bound_udp);
     let wan = router_wan(&stats.upnp_wan_ip);
 
+    // Read after the probe, which spends its time waiting on the server.
     #[cfg(target_os = "windows")]
-    let firewall_rules = {
+    let firewall_check = {
         let (tcp, udp, quic) = (tcp_port, bound_udp, stats.quic_udp_port);
         tokio::task::spawn_blocking(move || crate::security::firewall::rules_in_place(tcp, udp, quic))
-            .await
-            .ok()
-            .flatten()
     };
-    #[cfg(not(target_os = "windows"))]
-    let firewall_rules = None;
-    let firewall_check_failed = cfg!(target_os = "windows") && firewall_rules.is_none();
 
     let mut signals = Signals {
         kad_connected: stats.status == crate::types::NetworkStatus::Connected,
@@ -451,8 +446,6 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
         dht_contacts: stats.ember_dht_verified_contacts,
         tcp_listen_failed: stats.tcp_listen_failed,
         udp_port_moved: bound_udp != session_udp,
-        firewall_rules,
-        firewall_check_failed,
         upnp_enabled,
         upnp_mapped: stats.upnp_mapped,
         upnp_stood_down: stats.upnp_stood_down,
@@ -509,6 +502,11 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
             }
             _ => {}
         }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        signals.firewall_rules = firewall_check.await.ok().flatten();
+        signals.firewall_check_failed = signals.firewall_rules.is_none();
     }
     Ok(Gathered { signals, stats, tcp_port, udp_port: bound_udp, probed })
 }

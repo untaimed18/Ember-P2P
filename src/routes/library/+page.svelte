@@ -805,8 +805,7 @@
       missingTotalCount = Math.max(0, missingTotalCount - 1);
       if (selectedPath === f.path) selectedPath = null;
       if (showMissingOnly && missingPathSet.size === 0) showMissingOnly = false;
-      await refreshMissingSet(true);
-      await refresh();
+      await Promise.all([refreshMissingSet(true), refresh()]);
     } catch (e: unknown) {
       toastError(toErr(e));
     }
@@ -3804,6 +3803,7 @@
     filtersRestored = true;
 
     refresh();
+    void refreshMissingSet();
 
     // Poll every 3s: detect scan completion. The poll never INITIATES the
     // scanning UI state -- only progress events do that. This prevents the

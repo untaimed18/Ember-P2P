@@ -385,11 +385,13 @@ async fn count_followers(state: &AppState, dir: &Path, feed: &OwnFeed) -> Option
     let own = state.identity.ed25519_public_key;
     let mut followers = std::collections::HashSet::new();
     let (mut answered, mut at_least) = (false, false);
-    for list in &lists {
+    let lookups = futures::future::join_all(lists.iter().map(|list| {
         let key = crate::network::ember::dht::publish::source_key(list);
-        let Some((blobs, responded)) =
-            crate::commands::channels::find_raw_keys_counted(state, vec![key], LOOKUP_TIMEOUT_MS).await.ok().flatten()
-        else {
+        crate::commands::channels::find_raw_keys_counted(state, vec![key], LOOKUP_TIMEOUT_MS)
+    }))
+    .await;
+    for (list, lookup) in lists.iter().zip(lookups) {
+        let Some((blobs, responded)) = lookup.ok().flatten() else {
             continue;
         };
         if responded == 0 {

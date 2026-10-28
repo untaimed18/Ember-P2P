@@ -2441,9 +2441,13 @@ pub async fn cancel_transfers_batch(
         })
         .await;
     }
-    for transfer_id in cancelled_ids {
-        cleanup_partial_files(&state.db, &dl_roots, &transfer_id).await;
-        spawn_deferred_partial_cleanup(state.db.clone(), dl_roots.clone(), transfer_id.clone());
+    cleanup_partial_files_many(&state.db, &dl_roots, &cancelled_ids).await;
+    {
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            cleanup_partial_files_many(&db, &dl_roots, &cancelled_ids).await;
+        });
     }
     let promoted: Vec<Transfer> = promoted_by_id.into_values().collect();
     start_promoted_downloads(&state, &promoted).await;

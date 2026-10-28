@@ -999,46 +999,54 @@ pub async fn register(
         // Public presence is never indexed by the stable Friend ID. Register
         // one opaque rotating capability for each friend whose public key is
         // available; hash-only relationships are covered by the legacy intro
-        // until the backfill above supplies their key.
-        let mut pairwise_attempted = 0usize;
-        let mut pairwise_failed = 0usize;
-        let mut last_pairwise_error: Option<String> = None;
-        for (_, friend_pubkey) in &friend_identities {
-            let Some(capability) =
+        // until the backfill above supplies their key. Each capability is
+        // its own entry on the server, so they go a few at a time.
+        use futures::StreamExt;
+        let pairwise_targets: Vec<_> = friend_identities
+            .iter()
+            .filter_map(|(_, friend_pubkey)| {
                 crate::network::ember::crypto::derive_pairwise_presence_capability(
                     secret_key,
                     friend_pubkey,
                     pubkey,
                     epoch,
                 )
-            else {
-                continue;
-            };
-            pairwise_attempted += 1;
-            if let Err(error) = register_capability_presence(
-                base_url,
-                &capability,
-                epoch,
-                port,
-                external_ip,
-                pubkey,
-                friend_pubkey,
-                secret_key,
-                protocol,
-                IntroProof::None,
-            )
-            .await
-            {
-                pairwise_failed += 1;
-                last_pairwise_error = Some(error.to_string());
-            }
+                .map(|capability| (capability, *friend_pubkey))
+            })
+            .collect();
+        let pairwise: Vec<Result<(), PresenceRegisterError>> = futures::stream::iter(pairwise_targets)
+            .map(|(capability, friend_pubkey)| async move {
+                register_capability_presence(
+                    base_url,
+                    &capability,
+                    epoch,
+                    port,
+                    external_ip,
+                    pubkey,
+                    &friend_pubkey,
+                    secret_key,
+                    protocol,
+                    IntroProof::None,
+                )
+                .await
+            })
+            .buffer_unordered(PRESENCE_REGISTER_CONCURRENCY)
+            .collect()
+            .await;
+        let pairwise_attempted = pairwise.len();
+        let mut pairwise_failed = 0usize;
+        let mut last_pairwise_error: Option<String> = None;
+        for error in pairwise.into_iter().filter_map(Result::err) {
+            pairwise_failed += 1;
+            last_pairwise_error = Some(error.to_string());
         }
         // Channel gossip neighbors resolve over Ember UDP, not the friend
         // TCP listener. Capability `port` is per-entry, so these sit
         // alongside friend slots without changing `/register`.
         if udp_port > 0 {
-            for (channel_id, neighbor_pubkey) in channel_neighbors {
-                let Some(capability) =
+            let neighbor_targets: Vec<_> = channel_neighbors
+                .iter()
+                .filter_map(|(channel_id, neighbor_pubkey)| {
                     crate::network::ember::channel::derive_channel_presence_capability(
                         secret_key,
                         neighbor_pubkey,
@@ -1046,26 +1054,29 @@ pub async fn register(
                         channel_id,
                         epoch,
                     )
-                else {
-                    continue;
-                };
-                if let Err(error) = register_capability_presence(
-                    base_url,
-                    &capability,
-                    epoch,
-                    udp_port,
-                    external_ip,
-                    pubkey,
-                    neighbor_pubkey,
-                    secret_key,
-                    protocol,
-                    IntroProof::None,
-                )
-                .await
-                {
-                    debug!("Channel presence registration failed: {error}");
-                }
-            }
+                    .map(|capability| (capability, *neighbor_pubkey))
+                })
+                .collect();
+            futures::stream::iter(neighbor_targets)
+                .for_each_concurrent(PRESENCE_REGISTER_CONCURRENCY, |(capability, neighbor_pubkey)| async move {
+                    if let Err(error) = register_capability_presence(
+                        base_url,
+                        &capability,
+                        epoch,
+                        udp_port,
+                        external_ip,
+                        pubkey,
+                        &neighbor_pubkey,
+                        secret_key,
+                        protocol,
+                        IntroProof::None,
+                    )
+                    .await
+                    {
+                        debug!("Channel presence registration failed: {error}");
+                    }
+                })
+                .await;
         }
         if let Some(error) = last_pairwise_error {
             if pairwise_failed == pairwise_attempted {
@@ -1304,6 +1315,10 @@ const CAPABILITY_TS_MAX_LEAD_SECS: i64 = 5;
 /// or after the current second are kept, so this is a burst bound, not a
 /// history.
 const CAPABILITY_TS_MAX_TRACKED: usize = 4_096;
+
+/// Capability registrations in flight at once in [`register`]: well inside
+/// the server's per-network connection limit.
+const PRESENCE_REGISTER_CONCURRENCY: usize = 4;
 
 /// Last second each capability was signed at, for [`next_capability_ts`].
 static CAPABILITY_LAST_SIGNED_TS: std::sync::Mutex<std::collections::BTreeMap<[u8; 32], i64>> =

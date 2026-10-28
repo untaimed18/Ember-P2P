@@ -735,12 +735,20 @@ async fn scan_owned_rooms_with<E: RecoveryEnv>(
     if !env.ember_enabled().await {
         return Err(coded("channels_ember_disabled", "Ember-native transport is disabled"));
     }
-    let Some(listed) = read_owned_rooms_list(env).await else {
-        return Err(coded(
-            "channels_recover_unavailable",
-            "Could not reach enough of the network to read the list",
-        ));
-    };
+    // A deleted room's records outlive it by weeks, so only the registry says
+    // it is gone. Optional: without it, a room is carried rather than put back.
+    // Asked alongside the list, and given up on if the list cannot be read.
+    let (listed, deleted): (_, Option<HashSet<String>>) = tokio::try_join!(
+        async {
+            read_owned_rooms_list(env).await.ok_or_else(|| {
+                coded(
+                    "channels_recover_unavailable",
+                    "Could not reach enough of the network to read the list",
+                )
+            })
+        },
+        async { Ok::<_, String>(env.deleted_rooms().await) },
+    )?;
     // Plus the ones already known here: held, or carried from an earlier
     // look, and worth another.
     let mut salts: Vec<OwnedRoomSalt> = listed;
@@ -758,9 +766,6 @@ async fn scan_owned_rooms_with<E: RecoveryEnv>(
             }
         }
     }
-    // A deleted room's records outlive it by weeks, so only the registry says
-    // it is gone. Optional: without it, a room is carried rather than put back.
-    let deleted: Option<HashSet<String>> = env.deleted_rooms().await;
 
     let identity_seed = env.identity().ed25519_secret_key;
     let mut outcome = OwnedRoomScan::default();

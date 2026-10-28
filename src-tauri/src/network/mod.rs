@@ -2080,6 +2080,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     punch_poll_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_punch_poll: Option<tokio::time::Instant> = None;
     publish_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // See the early re-run of the publish tick in the loop below.
+    let mut publish_recheck_armed = true;
     // eMule's Kad publish driver wakes every KADEMLIAPUBLISHTIME (2s)
     // and starts at most one due source/keyword/note store per tick while
     // respecting per-type active-search caps.
@@ -3020,6 +3022,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 reason,
             ));
         }
+        // The publish tick settles the Ember reachability verdict, and the first
+        // one usually runs before any external IPv4 is known. Bring the next one
+        // forward once an address is, instead of leaving the verdict at
+        // "Checking" for up to a minute. At most once per regular tick.
+        if publish_recheck_armed
+            && state.ember_diagnostics.ember_dht_udp_unreachable
+            && ember_known_ipv4(&state).is_some()
+        {
+            publish_recheck_armed = false;
+            publish_timer.reset_immediately();
+        }
         // Not gated on activity: an idle node is exactly the one nothing else
         // re-probes for, and the votes only ask on a change of confirmation.
         if state.ember_observed_ip_moved
@@ -3518,6 +3531,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
             // Periodic publishing
             _ = publish_timer.tick() => {
+                publish_recheck_armed = true;
                 let __panic_result = std::panic::AssertUnwindSafe(on_publish_tick(
                     &udp_socket,
                     &mut state,

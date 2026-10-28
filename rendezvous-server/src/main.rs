@@ -3803,30 +3803,38 @@ async fn reachability_v4(
         let refusal = serde_json::json!({ "reason": "hourly", "server_time": server_time });
         return Err((StatusCode::TOO_MANY_REQUESTS, Json(refusal)).into_response());
     }
-    let tcp = match tokio::time::timeout(
-        REACHABILITY_CONNECT_TIMEOUT,
-        tokio::net::TcpStream::connect(SocketAddr::new(client_ip, body.tcp_port)),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => {
-            drop(stream);
-            "open"
+    let tcp_check = async {
+        match tokio::time::timeout(
+            REACHABILITY_CONNECT_TIMEOUT,
+            tokio::net::TcpStream::connect(SocketAddr::new(client_ip, body.tcp_port)),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
+                drop(stream);
+                "open"
+            }
+            Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionRefused => "closed",
+            _ => "timeout",
         }
-        Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionRefused => "closed",
-        _ => "timeout",
     };
-    let mut probe = Vec::with_capacity(REACHABILITY_PROBE_TAG.len() + nonce.len());
-    probe.extend_from_slice(REACHABILITY_PROBE_TAG);
-    probe.extend_from_slice(&nonce);
-    let mut udp_sent = false;
-    if let Ok(socket) = tokio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await {
-        let target = SocketAddr::new(client_ip, body.udp_port);
-        for _ in 0..3 {
-            udp_sent |= socket.send_to(&probe, target).await.is_ok();
-            tokio::time::sleep(Duration::from_millis(150)).await;
+    let udp_check = async {
+        let mut probe = Vec::with_capacity(REACHABILITY_PROBE_TAG.len() + nonce.len());
+        probe.extend_from_slice(REACHABILITY_PROBE_TAG);
+        probe.extend_from_slice(&nonce);
+        let mut udp_sent = false;
+        if let Ok(socket) = tokio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await {
+            let target = SocketAddr::new(client_ip, body.udp_port);
+            for attempt in 0..3 {
+                if attempt > 0 {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                udp_sent |= socket.send_to(&probe, target).await.is_ok();
+            }
         }
-    }
+        udp_sent
+    };
+    let (tcp, udp_sent) = tokio::join!(tcp_check, udp_check);
     debug!("reachability check for {client_ip}: tcp {tcp}, udp sent {udp_sent}");
     Ok(Json(serde_json::json!({
         "available": true,

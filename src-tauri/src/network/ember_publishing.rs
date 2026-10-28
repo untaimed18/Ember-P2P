@@ -2498,6 +2498,17 @@ pub(super) fn enqueue_ember_source_overlay(
     )
 }
 
+/// The IPv4 address our source records name. Prefers the confirmed external
+/// IP (eD2K HighID / KAD firewall vote), falling back to the STUN-mapped
+/// address so a KAD-less Ember seeder (HighID or LowID) can still advertise
+/// sources after a NAT probe.
+pub(super) fn ember_known_ipv4(state: &NetworkState) -> Option<std::net::Ipv4Addr> {
+    state.external_ip.or(match state.nat_info.external_addr.map(|a| a.ip()) {
+        Some(std::net::IpAddr::V4(ip)) => Some(ip),
+        _ => None,
+    })
+}
+
 /// Auto-publish Ember DHT source records for our shared files (slice 9 + 15).
 ///
 /// Runs on the 60-second publish tick, gated on `ember_native_enabled`
@@ -2563,13 +2574,7 @@ pub(super) async fn maybe_publish_ember_sources(
     prune_expired_ember_published_sources(state);
     state.ember_proxy_buddies.prune(std::time::Instant::now());
 
-    // Prefer the confirmed external IP (eD2K HighID / KAD firewall vote).
-    // Fall back to the STUN-mapped address so a KAD-less Ember seeder
-    // (HighID or LowID) can still advertise sources after a NAT probe.
-    let known_ipv4 = state.external_ip.or(match state.nat_info.external_addr.map(|a| a.ip()) {
-        Some(std::net::IpAddr::V4(ip)) => Some(ip),
-        _ => None,
-    });
+    let known_ipv4 = ember_known_ipv4(state);
     // The HighID named in the trailer — and the only contact we PROXY_STORE.
     let (buddy_candidates, named_buddy) = if firewalled_like {
         ember_source_buddy_choice(state)
