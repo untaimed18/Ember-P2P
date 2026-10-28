@@ -2509,6 +2509,73 @@ pub(super) fn ember_known_ipv4(state: &NetworkState) -> Option<std::net::Ipv4Add
     })
 }
 
+/// Whether the reachability verdict the last publish tick settled is out of
+/// date in a way the next tick would correct, so that tick is worth bringing
+/// forward: it had no IPv4 and one is known now, or it called for a relay and
+/// nothing does any more. Not while UDP is only assumed firewalled, the
+/// startup default before anything has measured it: a verdict settled then
+/// reads "relayed" and flips back once the check runs.
+pub(super) fn ember_reachability_recheck_due_from(
+    shown_no_ipv4: bool,
+    shown_relayed: bool,
+    ipv4_known: bool,
+    tcp_firewalled: bool,
+    udp_firewalled: bool,
+    udp_measured: bool,
+    udp_proven: bool,
+) -> bool {
+    let udp_needs_help = udp_firewalled && !udp_proven;
+    let udp_assumed = udp_needs_help && !udp_measured;
+    (shown_no_ipv4 && ipv4_known && !udp_assumed) || (shown_relayed && !tcp_firewalled && !udp_needs_help)
+}
+
+/// [`ember_reachability_recheck_due_from`] for the running state. Mirrors the
+/// verdict [`maybe_publish_ember_sources`] settles, so a tick it brings
+/// forward clears what brought it.
+pub(super) fn ember_reachability_recheck_due(state: &NetworkState) -> bool {
+    let diag = &state.ember_diagnostics;
+    let shown_relayed = diag.ember_dht_firewalled_publishing || diag.ember_dht_waiting_buddy;
+    if !diag.ember_dht_udp_unreachable && !shown_relayed {
+        return false;
+    }
+    ember_reachability_recheck_due_from(
+        diag.ember_dht_udp_unreachable,
+        shown_relayed,
+        ember_known_ipv4(state).is_some(),
+        ember_tcp_firewalled(state),
+        state.udp_firewalled,
+        state.firewall_checker.udp_status() != crate::network::kad::firewall::FirewallStatus::Unknown,
+        ember_udp_reachable(state),
+    )
+}
+
+#[cfg(test)]
+mod ember_reachability_recheck_tests {
+    use super::ember_reachability_recheck_due_from as due;
+
+    #[test]
+    fn an_assumed_udp_firewall_never_brings_the_verdict_forward() {
+        // An address, but UDP firewalled only by the startup default.
+        assert!(!due(true, false, true, false, true, false, false));
+        // Kad's check has answered, either way.
+        assert!(due(true, false, true, false, true, true, false));
+        assert!(due(true, false, true, false, false, true, false));
+        // Ember's own evidence settles it as well.
+        assert!(due(true, false, true, false, true, false, true));
+        // Still no address: nothing to settle yet.
+        assert!(!due(true, false, false, false, false, true, false));
+    }
+
+    #[test]
+    fn a_relayed_verdict_is_corrected_once_nothing_calls_for_a_relay() {
+        assert!(due(false, true, true, false, false, true, false));
+        assert!(due(false, true, true, false, true, true, true), "Ember proved UDP");
+        assert!(!due(false, true, true, false, true, true, false), "UDP measured firewalled");
+        assert!(!due(false, true, true, true, false, true, false), "TCP firewalled");
+        assert!(!due(false, true, true, false, true, false, false), "UDP only assumed");
+    }
+}
+
 /// Auto-publish Ember DHT source records for our shared files (slice 9 + 15).
 ///
 /// Runs on the 60-second publish tick, gated on `ember_native_enabled`

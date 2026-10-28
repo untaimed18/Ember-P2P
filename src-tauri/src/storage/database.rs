@@ -643,6 +643,8 @@ pub struct StoredChannelMember {
     pub moderator: bool,
     /// From the member's own presence record; empty for none.
     pub language: String,
+    /// The second language beside it, from the same record; empty for none.
+    pub language2: String,
 }
 
 /// What [`Database::upsert_channel_member`] did to the roster row.
@@ -3603,6 +3605,13 @@ impl Database {
             &conn,
             "channel_members",
             "language",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        // And the second language beside it, for the same reason.
+        Self::add_column_if_missing(
+            &conn,
+            "channel_members",
+            "language2",
             "TEXT NOT NULL DEFAULT ''",
         )?;
         // Finish a v23 encryption pass that was deferred because chat was
@@ -11910,9 +11919,9 @@ impl Database {
             tx.execute(
                 "INSERT OR IGNORE INTO channel_members
                     (channel_id, member_pubkey, nickname, last_seen, banned, moderator,
-                     ban_revised_at, language)
+                     ban_revised_at, language, language2)
                  SELECT ?2, member_pubkey, nickname, last_seen, banned, moderator,
-                     ban_revised_at, language
+                     ban_revised_at, language, language2
                  FROM channel_members WHERE channel_id = ?1",
                 params![old_channel_id, successor_channel_id],
             )?;
@@ -13225,19 +13234,21 @@ impl Database {
         )
     }
 
-    /// `language` is `Some` only from the member's own presence record, the
-    /// one thing allowed to say what they speak, and `Some("")` there clears
-    /// it. `None` — a beacon, a chat line, a moderation snapshot — keeps the
-    /// row's, as an empty `nickname` keeps its name.
+    /// `languages` (first, second) are `Some` only from the member's own
+    /// presence record, the one thing allowed to say what they speak, and an
+    /// empty code there clears that one. `None` — a beacon, a chat line, a
+    /// moderation snapshot — keeps the row's, as an empty `nickname` keeps
+    /// its name.
     pub fn upsert_channel_member_with_language(
         &self,
         channel_id: &str,
         member_pubkey: &str,
         nickname: &str,
-        language: Option<&str>,
+        languages: Option<(&str, &str)>,
         last_seen: i64,
         local_pubkey: Option<&str>,
     ) -> anyhow::Result<ChannelMemberWrite> {
+        let (language, language2) = (languages.map(|l| l.0), languages.map(|l| l.1));
         let now = chrono::Utc::now().timestamp();
         // Signed records can claim a last_seen up to an hour ahead of us
         // (DHT store CLOCK_SKEW). Eviction sorts by last_seen, so an
@@ -13249,24 +13260,25 @@ impl Database {
         if !Self::channel_live_locked(&tx, channel_id)? {
             return Ok(ChannelMemberWrite::Refused);
         }
-        let prior: Option<(String, i64, String)> = tx
+        let prior: Option<(String, i64, (String, String))> = tx
             .query_row(
-                "SELECT nickname, last_seen, language FROM channel_members
+                "SELECT nickname, last_seen, language, language2 FROM channel_members
                  WHERE channel_id = ?1 AND member_pubkey = ?2",
                 params![channel_id, member_pubkey],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, (row.get(2)?, row.get(3)?))),
             )
             .optional()?;
         let existed = prior.is_some();
         tx.execute(
             "INSERT INTO channel_members
-                (channel_id, member_pubkey, nickname, last_seen, banned, moderator, language)
-             VALUES (?1, ?2, ?3, ?4, 0, 0, COALESCE(?5, ''))
+                (channel_id, member_pubkey, nickname, last_seen, banned, moderator, language, language2)
+             VALUES (?1, ?2, ?3, ?4, 0, 0, COALESCE(?5, ''), COALESCE(?6, ''))
              ON CONFLICT(channel_id, member_pubkey) DO UPDATE SET
                 nickname = CASE WHEN excluded.nickname = '' THEN channel_members.nickname ELSE excluded.nickname END,
                 last_seen = MAX(channel_members.last_seen, excluded.last_seen),
-                language = COALESCE(?5, channel_members.language)",
-            params![channel_id, member_pubkey, nickname, last_seen, language],
+                language = COALESCE(?5, channel_members.language),
+                language2 = COALESCE(?6, channel_members.language2)",
+            params![channel_id, member_pubkey, nickname, last_seen, language, language2],
         )?;
         // Presence ingest and private-room chat can still grow the table.
         // Banned rows stay: a ban has to survive eviction or it can be
@@ -13335,9 +13347,10 @@ impl Database {
         }
         Ok(match prior {
             None => ChannelMemberWrite::Inserted,
-            Some((old_nick, old_seen, old_language)) => {
+            Some((old_nick, old_seen, (old_language, old_language2))) => {
                 let nick_changed = !nickname.is_empty() && nickname != old_nick;
-                let language_changed = language.is_some_and(|code| code != old_language);
+                let language_changed = languages
+                    .is_some_and(|(first, second)| first != old_language || second != old_language2);
                 if nick_changed || language_changed {
                     ChannelMemberWrite::Updated
                 } else if last_seen > old_seen {
@@ -13489,7 +13502,7 @@ impl Database {
     ) -> anyhow::Result<Vec<StoredChannelMember>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT member_pubkey, nickname, last_seen, banned, moderator, language
+            "SELECT member_pubkey, nickname, last_seen, banned, moderator, language, language2
              FROM channel_members WHERE channel_id = ?1
              ORDER BY nickname COLLATE NOCASE, member_pubkey",
         )?;
@@ -13502,6 +13515,7 @@ impl Database {
                     banned: row.get::<_, i64>(3)? != 0,
                     moderator: row.get::<_, i64>(4)? != 0,
                     language: row.get(5)?,
+                    language2: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -14656,21 +14670,22 @@ impl Database {
         Ok(n)
     }
 
-    /// Set our own language on our roster rows across every room, empty for
-    /// none. Returns the rooms whose row it changed.
+    /// Set our own first and second languages on our roster rows across every
+    /// room, empty for none. Returns the rooms whose row it changed.
     pub fn set_self_channel_member_language(
         &self,
         member_pubkey: &str,
         language: &str,
+        language2: &str,
     ) -> anyhow::Result<Vec<String>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "UPDATE channel_members SET language = ?2
-             WHERE member_pubkey = ?1 AND language != ?2
+            "UPDATE channel_members SET language = ?2, language2 = ?3
+             WHERE member_pubkey = ?1 AND (language != ?2 OR language2 != ?3)
              RETURNING channel_id",
         )?;
         let rooms = stmt
-            .query_map(params![member_pubkey, language], |row| row.get(0))?
+            .query_map(params![member_pubkey, language, language2], |row| row.get(0))?
             .collect::<Result<Vec<String>, _>>()?;
         Ok(rooms)
     }
@@ -23772,31 +23787,39 @@ mod tests {
             ChannelMemberWrite::Inserted
         );
         assert_eq!(language(&db), "", "a beacon-made row starts with none");
+        let second = |db: &Database| db.list_channel_members(&channel_id).unwrap()[0].language2.clone();
         assert_eq!(
-            db.upsert_channel_member_with_language(&channel_id, &pk, "Ada", Some("ja"), 100, None)
+            db.upsert_channel_member_with_language(&channel_id, &pk, "Ada", Some(("ja", "en")), 100, None)
                 .unwrap(),
             ChannelMemberWrite::Updated
         );
-        assert_eq!(language(&db), "ja");
+        assert_eq!((language(&db), second(&db)), ("ja".to_string(), "en".to_string()));
         assert_eq!(
             db.upsert_channel_member(&channel_id, &pk, "", 200, None).unwrap(),
             ChannelMemberWrite::Touched,
             "a write without a language keeps it and is no relabel"
         );
-        assert_eq!(language(&db), "ja");
+        assert_eq!((language(&db), second(&db)), ("ja".to_string(), "en".to_string()));
         assert_eq!(
-            db.upsert_channel_member_with_language(&channel_id, &pk, "Ada", Some("ja"), 200, None)
+            db.upsert_channel_member_with_language(&channel_id, &pk, "Ada", Some(("ja", "en")), 200, None)
                 .unwrap(),
             ChannelMemberWrite::Unchanged
         );
         assert_eq!(
-            db.upsert_channel_member_with_language(&channel_id, &pk, "Ada", Some("ko"), 200, None)
+            db.upsert_channel_member_with_language(&channel_id, &pk, "Ada", Some(("ko", "en")), 200, None)
                 .unwrap(),
             ChannelMemberWrite::Updated,
             "a language moving alone is drawn again"
         );
         assert_eq!(
-            db.upsert_channel_member_with_language(&channel_id, &pk, "Ada", Some(""), 300, None)
+            db.upsert_channel_member_with_language(&channel_id, &pk, "Ada", Some(("ko", "")), 200, None)
+                .unwrap(),
+            ChannelMemberWrite::Updated,
+            "and so is the second one"
+        );
+        assert_eq!(second(&db), "");
+        assert_eq!(
+            db.upsert_channel_member_with_language(&channel_id, &pk, "Ada", Some(("", "")), 300, None)
                 .unwrap(),
             ChannelMemberWrite::Updated
         );
@@ -23806,16 +23829,18 @@ mod tests {
         db.insert_channel(&other_room, &"ce".repeat(32), "Other", "public", false, None, None)
             .unwrap();
         db.upsert_channel_member(&other_room, &pk, "Ada", 300, None).unwrap();
-        let mut rooms = db.set_self_channel_member_language(&pk, "de").unwrap();
+        let mut rooms = db.set_self_channel_member_language(&pk, "de", "").unwrap();
         rooms.sort();
         let mut both = vec![channel_id.clone(), other_room.clone()];
         both.sort();
         assert_eq!(rooms, both);
         assert_eq!(language(&db), "de");
         assert!(
-            db.set_self_channel_member_language(&pk, "de").unwrap().is_empty(),
+            db.set_self_channel_member_language(&pk, "de", "").unwrap().is_empty(),
             "rows already carrying it are not reported"
         );
+        assert_eq!(db.set_self_channel_member_language(&pk, "de", "fr").unwrap().len(), 2);
+        assert_eq!(second(&db), "fr");
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
@@ -24984,7 +25009,7 @@ mod tests {
         let successor_pk = "9c".repeat(32);
         db.insert_channel(&old_id, &"a1".repeat(32), "Room", "private", true, None, None)
             .expect("insert channel");
-        db.upsert_channel_member_with_language(&old_id, &"b2".repeat(32), "Them", Some("ko"), 100, None)
+        db.upsert_channel_member_with_language(&old_id, &"b2".repeat(32), "Them", Some(("ko", "ja")), 100, None)
             .unwrap();
         db.insert_channel_message(&old_id, &"b2".repeat(32), "received", "hello", "m1", 100, "", true)
             .unwrap();
@@ -25021,6 +25046,7 @@ mod tests {
         let copied_members = db.list_channel_members(&successor_id).unwrap();
         assert_eq!(copied_members.len(), 1);
         assert_eq!(copied_members[0].language, "ko", "a member keeps their language");
+        assert_eq!(copied_members[0].language2, "ja", "and their second one");
         assert_eq!(
             db.get_channel_messages(&successor_id, 10, None).unwrap().len(),
             1

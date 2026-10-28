@@ -1506,6 +1506,11 @@ pub struct AppSettings {
     /// the language they speak and is not ours to publish unasked.
     #[serde(default)]
     pub channel_language: String,
+    /// A second language shown beside the first, for someone who writes in
+    /// two: a code from `CHANNEL_LANGUAGES`, or empty for none. Published only
+    /// beside a first and when it differs from it.
+    #[serde(default)]
+    pub channel_language_secondary: String,
     pub shared_folders: Vec<String>,
     pub download_folder: String,
     /// Earlier download folders whose `Temp` still holds unfinished downloads.
@@ -2189,6 +2194,20 @@ impl AppSettings {
     /// for a code this build does not list.
     pub fn channel_language_code(&self) -> Option<&'static str> {
         crate::network::ember::dht::publish::channel_language(self.channel_language.trim())
+    }
+
+    /// [`Self::channel_language_secondary`] as a registry code, alone; see
+    /// [`Self::channel_languages`] for what is published.
+    pub fn channel_language_secondary_code(&self) -> Option<&'static str> {
+        crate::network::ember::dht::publish::channel_language(self.channel_language_secondary.trim())
+    }
+
+    /// The languages our presence publishes beside our username.
+    pub fn channel_languages(&self) -> crate::network::ember::dht::publish::ChannelLanguages {
+        crate::network::ember::dht::publish::ChannelLanguages::new(
+            self.channel_language_code(),
+            self.channel_language_secondary_code(),
+        )
     }
 
     pub fn download_folders(&self) -> crate::storage::part_folders::DownloadFolders {
@@ -2989,6 +3008,7 @@ impl Default for AppSettings {
             nickname_site_tag: true,
             channel_username: String::new(),
             channel_language: String::new(),
+            channel_language_secondary: String::new(),
             shared_folders: vec![completed_dir],
             download_folder: download_dir,
             previous_download_folders: Vec::new(),

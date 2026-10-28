@@ -4374,13 +4374,15 @@
                           <bdi dir="auto">{roomMemberLabel(mem)}</bdi>
                         </span>
                         {#if isChannelLanguage(mem.language)}
-                          {@const languageName = channelLanguageName(mem.language)}
-                          <img
-                            class="member-flag"
-                            src={channelLanguageFlagSrc(mem.language)}
-                            alt={m.channels_member_language({ language: languageName })}
-                            title={m.channels_member_language({ language: languageName })}
-                          />
+                          {#each [mem.language, ...(isChannelLanguage(mem.language2) && mem.language2 !== mem.language ? [mem.language2] : [])] as code (code)}
+                            {@const languageName = channelLanguageName(code)}
+                            <img
+                              class="member-flag"
+                              src={channelLanguageFlagSrc(code)}
+                              alt={m.channels_member_language({ language: languageName })}
+                              title={m.channels_member_language({ language: languageName })}
+                            />
+                          {/each}
                         {/if}
                       </span>
                       <span class="member-badges">
@@ -7278,6 +7280,10 @@
     height: 14px;
     border-radius: 50%;
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--text-primary) 14%, transparent);
+  }
+
+  .member-flag + .member-flag {
+    margin-left: -3px;
   }
 
   .member-badges { display: flex; flex-wrap: wrap; gap: 4px; }

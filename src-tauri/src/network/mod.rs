@@ -3024,12 +3024,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         }
         // The publish tick settles the Ember reachability verdict, and the first
         // one usually runs before any external IPv4 is known. Bring the next one
-        // forward once an address is, instead of leaving the verdict at
-        // "Checking" for up to a minute. At most once per regular tick.
-        if publish_recheck_armed
-            && state.ember_diagnostics.ember_dht_udp_unreachable
-            && ember_known_ipv4(&state).is_some()
-        {
+        // forward once the verdict is out of date and the evidence is in,
+        // instead of leaving it for up to a minute. At most once per regular tick.
+        if publish_recheck_armed && ember_reachability_recheck_due(&state) {
             publish_recheck_armed = false;
             publish_timer.reset_immediately();
         }

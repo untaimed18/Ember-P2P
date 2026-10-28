@@ -610,7 +610,7 @@ fields that matter here sit in the fixed record header (`RECORD_HEADER_LEN`,
 | 1..17 | 16 | `keyword_hash` | the DHT key the record is filed under |
 | 17..33 | 16 | `file_hash` | the channel id (kind 7: the identity's node id; kind 2 v2: the room-blind id) |
 | 33..65 | 32 | `ember_file_hash` | the channel pubkey (kind 7: the identity pubkey; kind 2 v2: the room-blind key) |
-| 65..73 | 8 | `file_size` | byte 65 kind, 66 flags, 67 language (index, moderation, and from 1.7.5 a public room's presence) |
+| 65..73 | 8 | `file_size` | byte 65 kind, 66 flags, 67 language (index, moderation, and from 1.7.5 a public room's presence), 68 second language (a public room's presence, from 1.7.6) |
 | 73..105 | 32 | `publisher_key` | the signer (kind 2 v2: the member's pseudonym for the room) |
 | 105..113 | 8 | `timestamp` | |
 | 113..115 | 2 | `name_len` | then the name |
@@ -621,9 +621,9 @@ signature travels beside the body; see the
 [DHT specification](ember-dht-specification.pdf) for the record as a whole.
 
 **Language wire ids** (`CHANNEL_LANGUAGES` in `network/ember/dht/publish.rs`,
-mirrored by `src/lib/channelLanguages.ts`). Byte 67 of `file_size`, and the
-language byte in a private room's presence seal (kind 2 below), carry a
-language as its position in this list plus one; 0 is no language:
+mirrored by `src/lib/channelLanguages.ts`). Bytes 67 and 68 of `file_size`,
+and the language bytes in a private room's presence seal (kind 2 below),
+carry a language as its position in this list plus one; 0 is no language:
 
 | Id | Code | Id | Code | Id | Code | Id | Code |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -694,6 +694,14 @@ but `channel_store_ok` refuses those first. The `extra` each kind carries:
   bytes, so their records read as none and ours read to them as before. A
   leave carries none. A reader takes it only from the member's own record:
   beacons, chat lines and snapshots never set or clear it.
+
+  **A second language** (from 1.7.6), for a member who writes in two, rides
+  beside the first: byte 68 of a public room's record, and the pad byte
+  before the last inside a private room's seal, counted only while
+  `nick_len` is under 63 (a Channel username is at most 12). Builds before it
+  write zero in both places and read neither, so they show the first alone. A
+  second is kept only beside a first and only when it differs from it
+  (`ChannelLanguages::new`), whatever the record holds.
 - **3, moderation.** The owner's whole governance snapshot (welcome, bans,
   moderators, `ModerationTail`). The storer does not check its shape; readers
   do. Worst case 1164 of 1165 bytes (see
@@ -1170,7 +1178,7 @@ replaces the live record under the one store key, as in v1.
 
 The plaintext is v1's, then the member: `noise_pub(32) || nick_len(1) ||
 nickname padded to 64 || member_pubkey(32) || binding(64)`, the pad's last
-byte carrying the member's language as in v1 (see kind 2 above). The AAD is
+two bytes carrying the member's languages as in v1 (see kind 2 above). The AAD is
 `"ember-channel-presence-extra-v2\0" || channel_id || pseudonym_pubkey`
 (`presence_extra_v2_aad`). The binding is the member's long-term key's
 signature over `"ember-channel-presence-binding-v2\0" || channel_id ||

@@ -2438,10 +2438,22 @@
     getLocale(),
   ]);
 
-  /** Saves at once, like every other picker on this page. */
+  let channelLanguageSecondaryValue = $derived.by((): ChannelLanguage | null => {
+    const code = settings?.channel_language_secondary;
+    return isChannelLanguage(code) ? code : null;
+  });
+
+  /** Saves at once, like every other picker on this page. A second language
+   *  stands only beside a different first, so it goes with the first. */
   function setChannelLanguage(code: ChannelLanguage | null) {
     if (!settings) return;
     settings.channel_language = code ?? '';
+    if (!code || code === settings.channel_language_secondary) settings.channel_language_secondary = '';
+  }
+
+  function setChannelLanguageSecondary(code: ChannelLanguage | null) {
+    if (!settings) return;
+    settings.channel_language_secondary = code ?? '';
   }
 
   /** The suggestion button goes away once a language is set, so focus moves
@@ -4766,6 +4778,22 @@
               </div>
               <span class="hint" id="channel-language-hint">{m.settings_channel_language_hint()}</span>
             </div>
+            {#if channelLanguageValue}
+              <div class="field">
+                <label for="channel-language-secondary">{m.settings_channel_language_secondary_label()}</label>
+                <ChannelLanguagePicker
+                  id="channel-language-secondary"
+                  bind:value={() => channelLanguageSecondaryValue, setChannelLanguageSecondary}
+                  exclude={channelLanguageValue}
+                  noneLabel={m.settings_channel_language_secondary_none()}
+                  noneAriaLabel={m.settings_channel_language_secondary_value({
+                    language: m.settings_channel_language_secondary_none(),
+                  })}
+                  valueLabel={(language) => m.settings_channel_language_secondary_value({ language })}
+                  listLabel={m.settings_channel_language_secondary_label()}
+                />
+              </div>
+            {/if}
           </div>
 
           <div class="settings-group">

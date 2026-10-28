@@ -908,6 +908,9 @@ export interface AppSettings {
   /** Language shown as a flag beside our username in room member lists: a
    *  code from `CHANNEL_LANGUAGES` (`$lib/channelLanguages`), empty for none. */
   channel_language: string;
+  /** A second language shown beside the first, for someone who writes in two;
+   *  empty for none. Published only beside a first and when it differs. */
+  channel_language_secondary: string;
   /** Backend-owned: listed in `BACKEND_OWNED_SETTINGS_FIELDS`
    *  (`src-tauri/src/commands/settings.rs`), so `update_settings` restores it
    *  from the authoritative in-memory config and any value written here is

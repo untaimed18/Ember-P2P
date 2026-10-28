@@ -2686,6 +2686,12 @@ impl MultiSourceDownload {
                     !resuming,
                 )?;
                 if fs > 0 && f.metadata()?.len() != fs {
+                    // Sparse, so the length costs no disk space until data
+                    // arrives: a download that never progresses takes none,
+                    // and a block far into the file is not preceded by NTFS
+                    // writing zeros up to it. A filesystem without sparse
+                    // files just takes the length as before.
+                    let _ = super::preview::mark_sparse(&f);
                     f.set_len(fs)?;
                 }
                 Ok(())

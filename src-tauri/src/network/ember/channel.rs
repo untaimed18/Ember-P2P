@@ -2685,6 +2685,9 @@ const PRESENCE_NICK_PAD: usize = 64;
 /// `nick_len` bytes of it, so they write "none" here and ignore what we write.
 /// Unused when a nickname fills the whole pad; a Channel username never does.
 const PRESENCE_LANGUAGE_AT: usize = 33 + PRESENCE_NICK_PAD - 1;
+/// The member's second language, in the pad byte before the first, which
+/// builds before it zero-fill and never read, as they do the first's.
+const PRESENCE_LANGUAGE2_AT: usize = PRESENCE_LANGUAGE_AT - 1;
 const PRESENCE_EXTRA_AAD: &[u8] = b"ember-channel-presence-extra-v1\0";
 /// Encrypted private extra: version + nonce + tag + noise + nick_len + pad.
 pub const PRESENCE_EXTRA_ENC_LEN: usize =
@@ -5472,13 +5475,14 @@ pub fn encode_presence_extra_v2(
     noise_pub: &[u8; 32],
     nickname: &str,
     language: u8,
+    language2: u8,
     member: &SigningKey,
     presence_epoch: i64,
     departed: bool,
     timestamp: i64,
 ) -> Vec<u8> {
     let mut plain = vec![0u8; PRESENCE_V2_PLAIN_LEN];
-    write_presence_identity(&mut plain, noise_pub, nickname, language);
+    write_presence_identity(&mut plain, noise_pub, nickname, language, language2);
     let at = 33 + PRESENCE_NICK_PAD;
     plain[at..at + 32].copy_from_slice(&member.verifying_key().to_bytes());
     let binding = crypto::sign(
@@ -5506,13 +5510,14 @@ pub fn encode_presence_extra_v2(
 }
 
 /// A member's v2 presence opened: their long-term key, Noise key, nickname,
-/// and language wire id (0 for none).
+/// and the wire ids of their first and second languages (0 for none).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresenceV2Member {
     pub member_pubkey: [u8; 32],
     pub noise_pub: [u8; 32],
     pub nickname: String,
     pub language: u8,
+    pub language2: u8,
 }
 
 /// Open a v2 presence extra and check the member's binding to the record that
@@ -5543,7 +5548,7 @@ pub fn decode_presence_extra_v2(
     if plain.len() != PRESENCE_V2_PLAIN_LEN {
         return None;
     }
-    let (nickname, language) = read_presence_identity(&plain)?;
+    let (nickname, language, language2) = read_presence_identity(&plain)?;
     let at = 33 + PRESENCE_NICK_PAD;
     let member_pubkey: [u8; 32] = plain[at..at + 32].try_into().ok()?;
     let binding: [u8; 64] = plain[at + 32..].try_into().ok()?;
@@ -5562,6 +5567,7 @@ pub fn decode_presence_extra_v2(
         noise_pub,
         nickname,
         language,
+        language2,
     })
 }
 
@@ -5611,8 +5617,8 @@ pub fn reseal_presence_extra_v2(
 /// bytes (legacy). Private rooms leave `file_name` empty and seal both under
 /// the content key so a storer cannot read membership metadata.
 ///
-/// `language` is a wire id, 0 for none, and is sealed only in a private room:
-/// a public room's record carries it in its header (see
+/// `language` and `language2` are wire ids, 0 for none, and are sealed only
+/// in a private room: a public room's record carries them in its header (see
 /// `dht::publish::channel_language_from_file_size`).
 pub fn encode_presence_extra(
     private: bool,
@@ -5621,27 +5627,28 @@ pub fn encode_presence_extra(
     noise_pub: &[u8; 32],
     nickname: &str,
     language: u8,
+    language2: u8,
 ) -> (String, Vec<u8>) {
     if !private {
         return (truncate_nickname(nickname), noise_pub.to_vec());
     }
     let mut plain = vec![0u8; 32 + 1 + PRESENCE_NICK_PAD];
-    write_presence_identity(&mut plain, noise_pub, nickname, language);
+    write_presence_identity(&mut plain, noise_pub, nickname, language, language2);
     (
         String::new(),
         seal_presence_extra(content_key, channel_id, &plain),
     )
 }
 
-/// Noise key, nickname, and — for a sealed extra only — the language wire id
-/// it carries. `None` there means the legacy public shape, whose language
-/// lives in the record header.
+/// Noise key, nickname, and — for a sealed extra only — the wire ids of the
+/// first and second languages it carries. `None` there means the legacy
+/// public shape, whose languages live in the record header.
 pub fn decode_presence_extra(
     content_key: Option<&[u8; 32]>,
     channel_id: &[u8; 16],
     extra: &[u8],
     file_name: &str,
-) -> Option<([u8; 32], String, Option<u8>)> {
+) -> Option<([u8; 32], String, Option<(u8, u8)>)> {
     if extra.len() == 32 {
         let mut noise = [0u8; 32];
         noise.copy_from_slice(extra);
@@ -5654,24 +5661,34 @@ pub fn decode_presence_extra(
     }
     let mut noise = [0u8; 32];
     noise.copy_from_slice(&plain[..32]);
-    let (nick, language) = read_presence_identity(&plain)?;
-    Some((noise, nick, Some(language)))
+    let (nick, language, language2) = read_presence_identity(&plain)?;
+    Some((noise, nick, Some((language, language2))))
 }
 
 /// The `noise_pub || nick_len || nick pad` head both sealed shapes share,
-/// with the language in the pad's last byte when the nickname leaves it free.
-fn write_presence_identity(plain: &mut [u8], noise_pub: &[u8; 32], nickname: &str, language: u8) {
+/// with the languages in the pad's last two bytes when the nickname leaves
+/// them free.
+fn write_presence_identity(
+    plain: &mut [u8],
+    noise_pub: &[u8; 32],
+    nickname: &str,
+    language: u8,
+    language2: u8,
+) {
     let nick = truncate_nickname(nickname);
     let nick_bytes = nick.as_bytes();
     plain[..32].copy_from_slice(noise_pub);
     plain[32] = nick_bytes.len() as u8;
     plain[33..33 + nick_bytes.len()].copy_from_slice(nick_bytes);
-    if nick_bytes.len() < PRESENCE_NICK_PAD {
+    if 33 + nick_bytes.len() <= PRESENCE_LANGUAGE_AT {
         plain[PRESENCE_LANGUAGE_AT] = language;
+    }
+    if 33 + nick_bytes.len() <= PRESENCE_LANGUAGE2_AT {
+        plain[PRESENCE_LANGUAGE2_AT] = language2;
     }
 }
 
-fn read_presence_identity(plain: &[u8]) -> Option<(String, u8)> {
+fn read_presence_identity(plain: &[u8]) -> Option<(String, u8, u8)> {
     let nick_len = plain[32] as usize;
     if nick_len > PRESENCE_NICK_PAD {
         return None;
@@ -5679,12 +5696,17 @@ fn read_presence_identity(plain: &[u8]) -> Option<(String, u8)> {
     let nick = std::str::from_utf8(&plain[33..33 + nick_len])
         .ok()?
         .to_string();
-    let language = if nick_len < PRESENCE_NICK_PAD {
+    let language = if 33 + nick_len <= PRESENCE_LANGUAGE_AT {
         plain[PRESENCE_LANGUAGE_AT]
     } else {
         0
     };
-    Some((nick, language))
+    let language2 = if 33 + nick_len <= PRESENCE_LANGUAGE2_AT {
+        plain[PRESENCE_LANGUAGE2_AT]
+    } else {
+        0
+    };
+    Some((nick, language, language2))
 }
 
 fn truncate_nickname(s: &str) -> String {
@@ -7428,7 +7450,7 @@ mod tests {
         let channel_id = [0x11u8; 16];
         let noise = [0x42u8; 32];
         let (public_name, public_extra) =
-            encode_presence_extra(false, &key, &channel_id, &noise, "Ada", 9);
+            encode_presence_extra(false, &key, &channel_id, &noise, "Ada", 9, 4);
         assert_eq!(public_name, "Ada");
         assert_eq!(public_extra, noise, "a public extra has no room for a language");
         assert!(presence_extra_store_ok(&public_extra));
@@ -7439,7 +7461,7 @@ mod tests {
         assert_eq!(language, None, "the header carries a public room's language");
 
         let (private_name, private_extra) =
-            encode_presence_extra(true, &key, &channel_id, &noise, "Ada", 9);
+            encode_presence_extra(true, &key, &channel_id, &noise, "Ada", 9, 4);
         assert!(private_name.is_empty());
         assert_ne!(private_extra, noise);
         assert_eq!(private_extra.len(), PRESENCE_EXTRA_ENC_LEN);
@@ -7449,7 +7471,7 @@ mod tests {
             decode_presence_extra(Some(&key), &channel_id, &private_extra, "").unwrap();
         assert_eq!(n, noise);
         assert_eq!(nick, "Ada");
-        assert_eq!(language, Some(9));
+        assert_eq!(language, Some((9, 4)));
         assert!(
             decode_presence_extra(Some(&key), &[0x22u8; 16], &private_extra, "").is_none(),
             "presence extra must bind the channel id"
@@ -7470,18 +7492,25 @@ mod tests {
         legacy[33..36].copy_from_slice(b"Ada");
         let sealed = seal_presence_extra(&key, &channel_id, &legacy);
         let (_, nick, language) = decode_presence_extra(Some(&key), &channel_id, &sealed, "").unwrap();
-        assert_eq!((nick.as_str(), language), ("Ada", Some(0)));
+        assert_eq!((nick.as_str(), language), ("Ada", Some((0, 0))));
 
-        let (_, ours) = encode_presence_extra(true, &key, &channel_id, &noise, "Ada", 9);
+        let (_, ours) = encode_presence_extra(true, &key, &channel_id, &noise, "Ada", 9, 4);
         let plain = open_presence_extra(&key, &channel_id, &ours).unwrap();
         let nick_len = plain[32] as usize;
         assert_eq!(&plain[33..33 + nick_len], b"Ada", "the old reader's view is unchanged");
+        // A build before the second language reads the last byte alone.
+        assert_eq!(plain[PRESENCE_LANGUAGE_AT], 9, "and still finds the first language there");
 
-        // A nickname that fills the pad leaves no byte free, so none is read.
+        // A nickname that fills the pad leaves no byte free, so none is read;
+        // one a byte shorter leaves room for the first language only.
         let long = "x".repeat(PRESENCE_NICK_PAD);
-        let (_, full) = encode_presence_extra(true, &key, &channel_id, &noise, &long, 9);
+        let (_, full) = encode_presence_extra(true, &key, &channel_id, &noise, &long, 9, 4);
         let (_, nick, language) = decode_presence_extra(Some(&key), &channel_id, &full, "").unwrap();
-        assert_eq!((nick, language), (long, Some(0)));
+        assert_eq!((nick, language), (long, Some((0, 0))));
+        let nearly = "x".repeat(PRESENCE_NICK_PAD - 1);
+        let (_, one) = encode_presence_extra(true, &key, &channel_id, &noise, &nearly, 9, 4);
+        let (_, nick, language) = decode_presence_extra(Some(&key), &channel_id, &one, "").unwrap();
+        assert_eq!((nick, language), (nearly, Some((9, 0))));
     }
 
     #[test]

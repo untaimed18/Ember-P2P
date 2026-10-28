@@ -15,8 +15,8 @@ use crate::network::ember::channel::{
     self, ChannelIdentity, ChannelInvite, CHANNEL_KIND_PRIVATE, CHANNEL_KIND_PUBLIC,
 };
 use crate::network::ember::dht::publish::{
-    ModerationTail, SignedRecord, CHANNEL_BAN_LIST_MAX, CHANNEL_MOD_LIST_MAX, CHANNEL_NAME_MAX,
-    CHANNEL_PIN_MAX, CHANNEL_WELCOME_MAX,
+    ChannelLanguages, ModerationTail, SignedRecord, CHANNEL_BAN_LIST_MAX, CHANNEL_MOD_LIST_MAX,
+    CHANNEL_NAME_MAX, CHANNEL_PIN_MAX, CHANNEL_WELCOME_MAX,
 };
 use crate::network::channel_membership::{OfferedKey, OfferedKeyOutcome, RotatingRoom};
 use crate::network::ember::crypto;
@@ -246,6 +246,8 @@ pub struct ChannelMemberInfo {
     /// The language the member publishes in their presence, a code from
     /// `CHANNEL_LANGUAGES`; empty when they publish none.
     pub language: String,
+    /// A second language they publish beside it; empty for none.
+    pub language2: String,
 }
 
 fn ember_hash_for_member_pubkey(hex_pk: &str) -> String {
@@ -272,6 +274,7 @@ impl ChannelMemberInfo {
             moderator: row.moderator,
             ember_hash,
             language: row.language,
+            language2: row.language2,
         }
     }
 }
@@ -585,19 +588,23 @@ pub(crate) async fn apply_channel_username_locally(state: &AppState, username: &
     }
 }
 
-/// Relabel our own roster rows with a newly chosen language, so a member list
-/// opened before the next presence publish already shows it. The publish
+/// Relabel our own roster rows with newly chosen languages, so a member list
+/// opened before the next presence publish already shows them. The publish
 /// itself is the network loop's, when it applies `UpdateSettings`, for the
 /// reason [`apply_channel_username_locally`] gives.
 pub(crate) async fn apply_channel_language_locally(
     app: &tauri::AppHandle,
     state: &AppState,
-    language: Option<&'static str>,
+    languages: ChannelLanguages,
 ) {
     let pk = hex::encode(state.identity.ed25519_public_key);
     let db = state.db.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        db.set_self_channel_member_language(&pk, language.unwrap_or(""))
+        db.set_self_channel_member_language(
+            &pk,
+            languages.primary.unwrap_or(""),
+            languages.secondary.unwrap_or(""),
+        )
     })
     .await;
     match outcome {
@@ -611,9 +618,9 @@ pub(crate) async fn apply_channel_language_locally(
     }
 }
 
-/// Our Channel language as the settings hold it now.
-async fn channel_language_setting(state: &AppState) -> Option<&'static str> {
-    state.config.read().await.settings.channel_language_code()
+/// Our Channel languages as the settings hold them now.
+async fn channel_language_setting(state: &AppState) -> ChannelLanguages {
+    state.config.read().await.settings.channel_languages()
 }
 
 /// Claim `username` on Rendezvous and return the stored display form.
@@ -752,7 +759,7 @@ async fn record_self_member(
     nickname: &str,
     fail_code: &'static str,
 ) -> Result<(), String> {
-    let language = channel_language_setting(state).await;
+    let languages = channel_language_setting(state).await;
     let db = state.db.clone();
     let id = channel_id.to_string();
     let pk = hex::encode(state.identity.ed25519_public_key);
@@ -762,7 +769,7 @@ async fn record_self_member(
             &id,
             &pk,
             &nick,
-            Some(language.unwrap_or("")),
+            Some((languages.primary.unwrap_or(""), languages.secondary.unwrap_or(""))),
             chrono::Utc::now().timestamp(),
             Some(&pk),
         )

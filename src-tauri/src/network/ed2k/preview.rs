@@ -193,7 +193,7 @@ pub fn preview_ranges(
 /// byte below a write with real zeros unless the file is sparse — which would
 /// put back the multi-gigabyte copy [`PREVIEW_MAX_BYTES`] exists to prevent.
 #[cfg(windows)]
-fn mark_sparse(file: &std::fs::File) -> std::io::Result<()> {
+pub(super) fn mark_sparse(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
     use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -221,7 +221,7 @@ fn mark_sparse(file: &std::fs::File) -> std::io::Result<()> {
 
 /// Elsewhere the filesystem leaves a region past `set_len` unallocated on its own.
 #[cfg(not(windows))]
-fn mark_sparse(_file: &std::fs::File) -> std::io::Result<()> {
+pub(super) fn mark_sparse(_file: &std::fs::File) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -565,6 +565,43 @@ mod tests {
         assert_eq!(std::fs::read(&preview).unwrap(), b"GOOD");
         let _ = std::fs::remove_file(preview);
         let _ = std::fs::remove_file(part);
+    }
+
+    /// A download's length is set long before its data arrives, so its part
+    /// file must hold no disk space for bytes it has not received.
+    #[cfg(windows)]
+    #[test]
+    fn a_sparse_file_takes_no_space_for_its_unwritten_length() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::fs::MetadataExt;
+
+        const LEN: u64 = 256 * 1024 * 1024;
+        let path = std::env::temp_dir().join(format!(
+            "ember-sparse-part-test-{}-{}.part",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut file =
+            std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap();
+        mark_sparse(&file).unwrap();
+        file.set_len(LEN).unwrap();
+        file.seek(SeekFrom::Start(LEN - 4096)).unwrap();
+        file.write_all(&[0xAB; 4096]).unwrap();
+        file.sync_all().unwrap();
+
+        const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+        assert_ne!(file.metadata().unwrap().file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE, 0);
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut high = 0u32;
+        // SAFETY: `wide` is a NUL-terminated path that outlives the call.
+        let low = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW(wide.as_ptr(), &mut high)
+        };
+        let on_disk = (u64::from(high) << 32) | u64::from(low);
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        assert!(on_disk < 16 * 1024 * 1024, "{on_disk} bytes on disk for a {LEN}-byte part");
     }
 
     fn spans(ranges: &[FilledRange]) -> Vec<(u64, u64)> {

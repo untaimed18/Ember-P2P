@@ -1697,16 +1697,21 @@ pub async fn update_settings(
     // later build's, kept as it was so a downgrade does not wipe the choice;
     // it publishes as no language until a build that knows it runs again.
     settings.channel_language = settings.channel_language.trim().to_string();
-    let language_changed = settings.channel_language != old_settings.channel_language;
-    if language_changed
-        && !settings.channel_language.is_empty()
-        && settings.channel_language_code().is_none()
+    settings.channel_language_secondary = settings.channel_language_secondary.trim().to_string();
+    let primary_changed = settings.channel_language != old_settings.channel_language;
+    let secondary_changed =
+        settings.channel_language_secondary != old_settings.channel_language_secondary;
+    if (primary_changed && !settings.channel_language.is_empty() && settings.channel_language_code().is_none())
+        || (secondary_changed
+            && !settings.channel_language_secondary.is_empty()
+            && settings.channel_language_secondary_code().is_none())
     {
         return Err(coded(
             "channels_language_invalid",
             "That is not one of the languages a room can be marked with",
         ));
     }
+    let language_changed = primary_changed || secondary_changed;
 
     if settings.settings_revision != old_settings.settings_revision {
         return Err(coded(
@@ -1977,7 +1982,7 @@ pub async fn update_settings(
         crate::commands::channels::apply_channel_language_locally(
             &app,
             &state,
-            settings.channel_language_code(),
+            settings.channel_languages(),
         )
         .await;
     }
