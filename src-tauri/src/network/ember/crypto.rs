@@ -117,13 +117,6 @@ impl Blake3FileHasher {
     }
 }
 
-/// Streaming BLAKE3 of a file on disk (slice 18). Returns hex for storage
-/// on `FileInfo` / `known.met`.
-pub fn blake3_hash_file_path(path: &std::path::Path) -> anyhow::Result<[u8; 32]> {
-    let mut file = std::fs::File::open(path)?;
-    blake3_hash_open_file(&mut file)
-}
-
 /// Streaming BLAKE3 of a file that is already open, from the start.
 ///
 /// The completion paths verify against a handle whose identity has already been

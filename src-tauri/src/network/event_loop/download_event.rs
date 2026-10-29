@@ -246,7 +246,7 @@ pub(in crate::network) async fn on_download_event(
     a4af_shared: &Arc<RwLock<A4AFManager>>,
     aich_set_tx: &mpsc::Sender<ed2k::aich::AICHRecoveryHashSet>,
     db_progress_last_persist: &mut HashMap<String, std::time::Instant>,
-    ember_digest_result_tx: &mpsc::UnboundedSender<([u8; 16], [u8; 32])>,
+    completed_digest_result_tx: &mpsc::UnboundedSender<CompletedDigests>,
     part_hashset_result_tx: &mpsc::UnboundedSender<([u8; 16], Vec<[u8; 16]>)>,
     pending_kad_callbacks: &upload_server::PendingKadCallbacks,
     shared_files: &Arc<RwLock<Vec<FileInfo>>>,
@@ -454,6 +454,9 @@ pub(in crate::network) async fn on_download_event(
                     fh.copy_from_slice(&hash_bytes);
                     use crate::storage::known_files::KnownFileRecord;
                     let existing = known_files.find_by_hash(&fh).cloned();
+                    // What the completion arrived without, recomputed
+                    // below in one read of the finished file.
+                    let mut recompute_parts = false;
                     // Prefer the hashset already verified during
                     // the transfer, then a valid cached set, before
                     // re-reading the completed file.
@@ -468,33 +471,9 @@ pub(in crate::network) async fn on_download_event(
                             .map(|record| record.part_hashes.clone())
                             .unwrap_or_default()
                     } else {
-                        // Recompute off the loop and fold it in
-                        // when it lands, exactly as the BLAKE3
-                        // digest below does. Awaiting a sequential
-                        // end-to-end read of a multi-GB file here
-                        // suspended the whole `select!` — no UDP
-                        // receive, no timers, no command handling —
-                        // on every completion that arrives without
-                        // a hashset (callback and single-source
-                        // downloads, and restore re-verification).
-                        let hash_path = completed_path.clone();
-                        let hashset_tx = part_hashset_result_tx.clone();
-                        tokio::task::spawn_blocking(move || {
-                            // Another whole-file read the library
-                            // scheduler would otherwise not see. It
-                            // rations reads per physical drive, and
-                            // this one lands on the same spindle a
-                            // scan may be working through.
-                            let _drive_busy =
-                                crate::sharing::disk::note_external_read(&hash_path);
-                            if let Ok(hashes) =
-                                ed2k::hash::ed2k_part_hashes_file(&hash_path)
-                            {
-                                if !hashes.is_empty() {
-                                    let _ = hashset_tx.send((fh, hashes));
-                                }
-                            }
-                        });
+                        // Callback and single-source downloads, and
+                        // restore re-verification, arrive without one.
+                        recompute_parts = file_size >= ed2k::hash::PARTSIZE;
                         Vec::new()
                     };
                     let record = KnownFileRecord {
@@ -529,30 +508,9 @@ pub(in crate::network) async fn on_download_event(
                                     })
                                 })
                                 .unwrap_or_default();
-                            if ember_hex.is_empty() {
-                                // Compute it off the loop and fold
-                                // it in when it lands. Awaiting the
-                                // hash here suspended the whole
-                                // `select!` for as long as it took
-                                // to read the file end to end — no
-                                // UDP receive, no timers, no
-                                // command handling, on every plain
-                                // eD2K completion (the fallback is
-                                // the common case: only an Ember
-                                // DHT hit or a prior known.met
-                                // record fills the field above).
-                                let hash_path = completed_path.clone();
-                                let digest_tx = ember_digest_result_tx.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    if let Ok(digest) =
-                                        crate::network::ember::crypto::blake3_hash_file_path(
-                                            &hash_path,
-                                        )
-                                    {
-                                        let _ = digest_tx.send((fh, digest));
-                                    }
-                                });
-                            }
+                            // Empty on every plain eD2K completion: only
+                            // an Ember DHT hit or a prior known.met
+                            // record fills it, and the read below does.
                             ember_hex
                         },
                         modified_at: completed_mtime,
@@ -629,6 +587,60 @@ pub(in crate::network) async fn on_download_event(
                             .as_ref()
                             .is_some_and(|r| r.media_scanned),
                     };
+                    // The AICH root is missing on nearly every download:
+                    // only a prior known.met record supplies one. One read
+                    // computes it with whatever else is missing, off the
+                    // loop, and the results are folded in when they land.
+                    // Awaiting a sequential end-to-end read of a multi-GB
+                    // file here suspended the whole `select!` — no UDP
+                    // receive, no timers, no command handling.
+                    let want = ed2k::hash::WantedDigests {
+                        aich: record.aich_hash.is_empty(),
+                        ember: record.ember_file_hash.is_empty(),
+                    };
+                    if recompute_parts || want.aich || want.ember {
+                        let hash_path = completed_path.clone();
+                        let hashset_tx = part_hashset_result_tx.clone();
+                        let digest_tx = completed_digest_result_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            // Another whole-file read the library scheduler
+                            // would otherwise not see. It rations reads per
+                            // physical drive, and this one lands on the same
+                            // spindle a scan may be working through.
+                            let _drive_busy = crate::sharing::disk::note_external_read(&hash_path);
+                            static NEVER_CANCELLED: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+                            let digests = std::fs::File::open(&hash_path)
+                                .map_err(anyhow::Error::from)
+                                .and_then(|mut file| {
+                                    ed2k::hash::hash_open_file_digests_cancellable(&mut file, want, &NEVER_CANCELLED)
+                                });
+                            let digests = match digests {
+                                Ok(digests) => digests,
+                                Err(e) => {
+                                    debug!("Could not hash completed {}: {e}", hash_path.display());
+                                    return;
+                                }
+                            };
+                            // Bytes that are no longer the download's (edited
+                            // or replaced since it finished) say nothing about
+                            // the file this record describes.
+                            if !digests.ed2k.eq_ignore_ascii_case(&hex::encode(fh)) {
+                                debug!("Completed {} no longer matches its ed2k hash", hash_path.display());
+                                return;
+                            }
+                            if recompute_parts && !digests.part_hashes.is_empty() {
+                                let _ = hashset_tx.send((fh, digests.part_hashes));
+                            }
+                            if digests.aich.is_some() || digests.ember.is_some() {
+                                let _ = digest_tx.send(CompletedDigests {
+                                    file_hash: fh,
+                                    aich: digests.aich,
+                                    ember: digests.ember,
+                                });
+                            }
+                        });
+                    }
                     let completed_friends_only = record.friends_only;
                     known_files.add_or_update(record.clone());
                     if completed_friends_only {

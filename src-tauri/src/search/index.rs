@@ -989,35 +989,17 @@ impl LocalIndex {
         changed
     }
 
-    /// Record a freshly computed Ember BLAKE3 digest against every copy of
-    /// this content. Returns whether anything changed.
-    ///
-    /// Keyed by content hash rather than path because the digest describes
-    /// the bytes, so all duplicates of the same file share it.
-    pub fn set_ember_file_hash_by_hash(&mut self, hash: &str, ember_file_hash: &str) -> bool {
-        if hash.is_empty() || ember_file_hash.is_empty() {
-            return false;
-        }
-        let mut changed = false;
-        for file in &mut self.files {
-            if file.hash == hash && file.ember_file_hash != ember_file_hash {
-                file.ember_file_hash = ember_file_hash.to_string();
-                changed = true;
-            }
-        }
-        changed
-    }
-
-    /// Both top-up results in one pass over the index.
+    /// Both freshly computed digests in one pass over the index: the
+    /// background top-up's, and a completed download's.
     ///
     /// This replaced a pair of setters that each walked every row, called back
     /// to back under a single `write()` — so each repaired file held the index's
     /// write lock for two full scans, once per file across a pass that runs for
     /// hours, against the lock search and the Library UI contend on.
     ///
-    /// Keyed by content hash for the same reason its sibling above is: both
-    /// digests are derived from the bytes, so every copy of this content has the
-    /// same answer and the pass only ever reads a single copy.
+    /// Keyed by content hash rather than path: both digests are derived from
+    /// the bytes, so every copy of this content has the same answer and only a
+    /// single copy is ever read.
     ///
     /// Never clears: an empty argument means the pass did not ask for that
     /// digest on this file, not that the file has none. Overwriting a stored

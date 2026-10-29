@@ -65,6 +65,14 @@ pub(crate) struct FriendRelayTicketPollResult {
     pub(crate) result: Result<rendezvous::FriendRelayTicketPollPage, String>,
 }
 
+/// The digests a completed download arrived without, read from the finished
+/// file off the event loop. `None` for one the completion already had.
+pub(crate) struct CompletedDigests {
+    pub(crate) file_hash: [u8; 16],
+    pub(crate) aich: Option<[u8; 20]>,
+    pub(crate) ember: Option<[u8; 32]>,
+}
+
 pub(crate) struct NatProbeResult {
     pub(crate) generation: u64,
     pub(crate) reason: &'static str,

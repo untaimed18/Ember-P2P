@@ -211,28 +211,24 @@ type HashPassResult = anyhow::Result<(String, String, Vec<[u8; 16]>, String, u64
 /// file has an ed2k id and its part hashes, so it is shared, searchable and
 /// downloadable whether or not either of these is ever filled in.
 ///
-/// A single-part file legitimately has no AICH root, so an empty one there is
-/// the stored answer rather than a gap to fill. "Single part" has to be the
-/// hasher's own boundary — `file_size < PARTSIZE` — because a file of exactly
-/// `PARTSIZE` is two parts to it (one of data, one empty) and it does compute a
-/// root. Asking with `>` instead left that one size unable to recover a missing
-/// root through any route, since this is what decides whether it is computed.
+/// Every file has an AICH root, a single-part one included: eMule computes one
+/// for any file it shares, and so does the hasher here, from the part's
+/// 180 KiB blocks. An empty one is therefore always a gap. Skipping files
+/// under `PARTSIZE` on the belief that they have none left every small file
+/// that arrived without a root — a completed download, most often — without
+/// one for good, while the same file hashed by a scan had it.
 /// Taken apart from `FileInfo` so the narrow [`TopUpRow`] answers it with the
 /// same code rather than a copy of the rule — the drift `wants_hash_top_up`
 /// warns about, one layer down.
-fn wanted_digests(
-    aich_hash: &str,
-    ember_file_hash: &str,
-    size: u64,
-) -> crate::network::ed2k::hash::WantedDigests {
+fn wanted_digests(aich_hash: &str, ember_file_hash: &str) -> crate::network::ed2k::hash::WantedDigests {
     crate::network::ed2k::hash::WantedDigests {
-        aich: aich_hash.is_empty() && size >= crate::network::ed2k::hash::PARTSIZE,
+        aich: aich_hash.is_empty(),
         ember: ember_file_hash.is_empty(),
     }
 }
 
 fn wanted_top_up(file: &FileInfo) -> crate::network::ed2k::hash::WantedDigests {
-    wanted_digests(&file.aich_hash, &file.ember_file_hash, file.size)
+    wanted_digests(&file.aich_hash, &file.ember_file_hash)
 }
 
 /// Whether a row has nothing left to top up.
@@ -414,7 +410,7 @@ impl TopUpRow {
     }
 
     fn wanted(&self) -> crate::network::ed2k::hash::WantedDigests {
-        wanted_digests(&self.aich_hash, &self.ember_file_hash, self.size)
+        wanted_digests(&self.aich_hash, &self.ember_file_hash)
     }
 }
 
@@ -4051,6 +4047,7 @@ async fn run_hash_top_up(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
                 last_checkpoint = std::time::Instant::now();
                 refresh_file_cache(&local_index, &file_cache).await;
                 reconcile_shared_files_best_effort(&network_tx).await;
+                emit_top_up_progress(&app);
             }
 
             // Give the drives back their share, proportionally, so a big file
@@ -4126,9 +4123,17 @@ async fn run_hash_top_up(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
     if updated_since_reconcile > 0 {
         refresh_file_cache(&local_index, &file_cache).await;
         reconcile_shared_files_best_effort(&network_tx).await;
+        emit_top_up_progress(&app);
     }
     let (done, total) = finished;
     info!("Hash top-up finished: {done}/{total}");
+}
+
+/// Have the Library show the roots and digests the pass has added. It reloads
+/// on `shared-files-changed` alone, so a refreshed cache without the event left
+/// a new AICH badge unseen until the page was opened again.
+fn emit_top_up_progress(app: &tauri::AppHandle) {
+    let _ = app.emit("shared-files-changed", serde_json::json!({ "phase": "digests" }));
 }
 
 /// After hashing, set a completed row's share and friends-only flags to what
@@ -10853,7 +10858,7 @@ mod tests {
         let multi_part = crate::network::ed2k::hash::PARTSIZE;
         for (aich, ember, size) in [
             ("", "", multi_part),          // both wanted
-            ("", "", 1),                   // single part: ember only
+            ("", "", 1),                   // single part: both wanted too
             ("aich", "", multi_part),      // ember only
             ("", "ember", multi_part),     // aich only
             ("aich", "ember", multi_part), // nothing wanted
@@ -12356,11 +12361,11 @@ mod tests {
             .starts_with(crate::search::index::REHASH_ID_PREFIX));
     }
 
-    /// A single-part file has no AICH root by design, so an empty one there is
-    /// the stored answer and not a gap. Getting this wrong queues every small
-    /// file in the library for a whole-file read that can never satisfy it.
+    /// A single-part file has an AICH root like any other, so a small file
+    /// that arrived without one (a completed download, most often) is topped
+    /// up rather than left without it for good.
     #[test]
-    fn a_single_part_file_is_not_asked_for_an_aich_root() {
+    fn a_single_part_file_without_an_aich_root_is_topped_up() {
         let mut known = KnownFileList::new();
         let mut record = known_record("C:/L/small.bin", [0x44; 16], &"ab".repeat(32));
         record.aich_hash = String::new();
@@ -12372,10 +12377,11 @@ mod tests {
         discovered[0].modified_at = 0;
         let work = resolve_from_known(&mut discovered, &known);
 
-        assert!(work.needs_hashing.is_empty());
-        assert!(
-            work.needs_top_up.is_empty(),
-            "a single-part file is complete without a root"
+        assert!(work.needs_hashing.is_empty(), "the stored ed2k hash still serves it meanwhile");
+        assert_eq!(work.needs_top_up.len(), 1, "a single-part file without a root is a gap");
+        assert_eq!(
+            top_up_inputs(&work.needs_top_up[0]).map(|(_, _, _, want)| want.aich),
+            Some(true),
         );
     }
 
@@ -12747,14 +12753,19 @@ mod tests {
             "how the row was queued must not decide how much of it is hashed"
         );
 
-        // Single-part files never had an AICH root, so an empty one is the
-        // answer rather than a gap — still only the digest to compute.
+        // A single-part file has a root like any other, so an empty one is a
+        // gap to fill alongside the digest.
         let mut single_part = migration.clone();
         single_part.aich_hash = String::new();
         single_part.size = 1;
         assert_eq!(
             top_up_inputs(&single_part),
-            Some((hash.clone(), String::new(), String::new(), digest_only)),
+            Some((
+                hash.clone(),
+                String::new(),
+                String::new(),
+                crate::network::ed2k::hash::WantedDigests { aich: true, ember: true },
+            )),
         );
 
         // Old enough to predate AICH as well. This used to fall through to the
@@ -12804,6 +12815,7 @@ mod tests {
         // A row with both repairs already present must not be handed a
         // whole-file read that would compute nothing.
         let mut complete = indexed_file("C:/A/file.bin", &hash);
+        complete.aich_hash = "cd".repeat(20);
         complete.ember_file_hash = "ef".repeat(32);
         assert_eq!(top_up_inputs(&complete), None);
         assert!(!wants_hash_top_up(&complete));

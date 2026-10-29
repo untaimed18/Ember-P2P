@@ -15,11 +15,6 @@ pub const PARTSIZE: u64 = 9_728_000;
 
 const HASH_BUF_SIZE: usize = 1024 * 1024;
 
-pub fn ed2k_part_hashes_file(path: &Path) -> anyhow::Result<Vec<[u8; 16]>> {
-    static NEVER: AtomicBool = AtomicBool::new(false);
-    ed2k_part_hashes_file_cancellable(path, &NEVER)
-}
-
 pub fn ed2k_known_met_part_hash_count(file_size: u64) -> usize {
     if file_size < PARTSIZE {
         0
@@ -123,6 +118,9 @@ pub fn ed2k_hash_open_file_cancellable(
     Ok(hex::encode(final_hash))
 }
 
+/// The part hashes alone, read on their own: the reference the one-pass
+/// hasher's hashset is checked against.
+#[cfg(test)]
 pub fn ed2k_part_hashes_file_cancellable(
     path: &Path,
     cancelled: &AtomicBool,

@@ -1616,14 +1616,13 @@ pub fn run() {
                         // the same background pass. Kept in step with
                         // `resolve_from_known`, which documents the reasoning:
                         //
-                        // - empty AICH on multi-part (v2 migration / missing
-                        //   root) is eD2k recovery data. Valuable, but it costs
-                        //   a downloader one re-fetched part rather than one
+                        // - an empty AICH root (v2 migration, or a file such as
+                        //   a completed download that arrived without one) is
+                        //   eD2k recovery data. Valuable, but it costs a
+                        //   downloader one re-fetched part rather than one
                         //   re-fetched block, and only once something is
                         //   actually corrupt — not worth blocking a scan that
-                        //   would otherwise re-read the whole share. Single-part
-                        //   empty AICH is left as-is (roots never straddled a
-                        //   part boundary).
+                        //   would otherwise re-read the whole share.
                         // - empty ember_file_hash is an Ember-only extra that
                         //   lets a downloader double-check the whole file.
                         //

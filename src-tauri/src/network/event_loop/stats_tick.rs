@@ -27,39 +27,52 @@ pub(in crate::network) async fn on_stats_tick(
     channel_neighbor_lookup_tx: &mpsc::UnboundedSender<ChannelNeighborLookupResult>,
     channel_relay_event_rx: &mut mpsc::UnboundedReceiver<ChannelRelayEvent>,
     channel_relay_event_tx: &mpsc::UnboundedSender<ChannelRelayEvent>,
-    ember_digest_result_rx: &mut mpsc::UnboundedReceiver<([u8; 16], [u8; 32])>,
+    completed_digest_result_rx: &mut mpsc::UnboundedReceiver<CompletedDigests>,
     part_hashset_result_rx: &mut mpsc::UnboundedReceiver<([u8; 16], Vec<[u8; 16]>)>,
     shared_ip_filter: &kad::ip_filter::SharedIpFilter,
     shared_transfer_stats: &Arc<RwLock<TransferStats>>,
 ) {
-    // Fold in any completed-download BLAKE3 digests finished on the
-    // blocking pool since the last tick, so the file can be
-    // published to the Ember DHT and verified on later transfers.
-    // Drained here rather than in its own `select!` arm because
-    // this loop is already at tokio's 64-branch ceiling.
-    while let Ok((digest_hash, digest)) = ember_digest_result_rx.try_recv() {
-        // Hashed from the completed bytes on this disk, so it
-        // outranks any DHT claim about the same file.
-        seed_ember_content_hash(
-            &mut state.ember_content_hashes,
-            digest_hash,
-            digest,
-            EmberDigestProvenance::Local,
-        );
-        let digest_hex = hex::encode(digest);
-        if let Some(record) = known_files.find_by_hash_mut(&digest_hash) {
-            if record.ember_file_hash != digest_hex {
-                record.ember_file_hash = digest_hex.clone();
+    // Fold in any completed-download AICH roots and BLAKE3 digests
+    // finished on the blocking pool since the last tick: the digest so
+    // the file can be published to the Ember DHT and verified on later
+    // transfers, the root so it is offered as recovery data (and shows
+    // as AICH in the Library). Drained here rather than in its own
+    // `select!` arm because this loop is already at tokio's 64-branch
+    // ceiling.
+    while let Ok(CompletedDigests { file_hash, aich, ember }) = completed_digest_result_rx.try_recv() {
+        if let Some(digest) = ember {
+            // Hashed from the completed bytes on this disk, so it
+            // outranks any DHT claim about the same file.
+            seed_ember_content_hash(
+                &mut state.ember_content_hashes,
+                file_hash,
+                digest,
+                EmberDigestProvenance::Local,
+            );
+        }
+        let ember_hex = ember.map(hex::encode).unwrap_or_default();
+        let aich_hex = aich.map(hex::encode).unwrap_or_default();
+        if let Some(record) = known_files.find_by_hash_mut(&file_hash) {
+            let mut dirty = false;
+            if !ember_hex.is_empty() && record.ember_file_hash != ember_hex {
+                record.ember_file_hash = ember_hex.clone();
+                dirty = true;
+            }
+            if !aich_hex.is_empty() && record.aich_hash != aich_hex {
+                record.aich_hash = aich_hex.clone();
+                dirty = true;
+            }
+            if dirty {
                 known_files.mark_dirty();
             }
         }
-        let hash_hex = hex::encode(digest_hash);
+        let hash_hex = hex::encode(file_hash);
         let changed = {
             let mut index = local_index.write().await;
-            index.set_ember_file_hash_by_hash(&hash_hex, &digest_hex)
+            index.set_top_up_digests_by_hash(&hash_hex, &ember_hex, &aich_hex)
         };
         if changed {
-            debug!("Ember digest for {hash_hex} computed after completion");
+            debug!("Digests for {hash_hex} computed after completion");
         }
     }
     // Apply any enforced-ban rebuild whose DB reads finished on the

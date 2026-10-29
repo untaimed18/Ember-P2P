@@ -138,7 +138,7 @@ use self::ember_publish::{
     EMBER_STORE_RECORDS_PER_PEER_PER_MIN, K_EMBER_REPLICAS,
 };
 use self::health::{
-    ActiveSourceInjectionStats, FriendRelayTicketPollResult, KnownMetSaveResult, NatProbeResult,
+    ActiveSourceInjectionStats, CompletedDigests, FriendRelayTicketPollResult, KnownMetSaveResult, NatProbeResult,
     PeriodicSaveJob, PeriodicSaveResult, PublishHealthSnapshot, RendezvousRegisterResult,
     ServerConnectResult, SourceInjectionResult, SpamSaveResult, TcpMappingKeepaliveResult,
     TcpPortConfirmation, UdpDiscoveryHealthSnapshot, UdpMappingKeepaliveResult, UpnpMaintainResult,
@@ -2289,12 +2289,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         mpsc::unbounded_channel::<String>();
     let (nat_probe_result_tx, mut nat_probe_result_rx) =
         mpsc::unbounded_channel::<NatProbeResult>();
-    // Completed-download BLAKE3 digests, computed off the event loop.
-    // `(ed2k hash, digest)`.
-    let (ember_digest_result_tx, mut ember_digest_result_rx) =
-        mpsc::unbounded_channel::<([u8; 16], [u8; 32])>();
-    // Completed-download ed2k part hashsets, recomputed off the event loop for
-    // the same reason as the digests above. `(ed2k hash, part hashes)`.
+    // Completed-download AICH roots and BLAKE3 digests, computed off the event
+    // loop.
+    let (completed_digest_result_tx, mut completed_digest_result_rx) =
+        mpsc::unbounded_channel::<CompletedDigests>();
+    // Completed-download ed2k part hashsets, recomputed off the event loop in
+    // the same read as the digests above. `(ed2k hash, part hashes)`.
     let (part_hashset_result_tx, mut part_hashset_result_rx) =
         mpsc::unbounded_channel::<([u8; 16], Vec<[u8; 16]>)>();
     // Durable inputs for the enforced-ban rebuild, read off the event loop.
@@ -3322,7 +3322,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &a4af_shared,
                     &aich_set_tx,
                     &mut db_progress_last_persist,
-                    &ember_digest_result_tx,
+                    &completed_digest_result_tx,
                     &part_hashset_result_tx,
                     &pending_kad_callbacks,
                     &shared_files,
@@ -4488,7 +4488,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &channel_neighbor_lookup_tx,
                     &mut channel_relay_event_rx,
                     &channel_relay_event_tx,
-                    &mut ember_digest_result_rx,
+                    &mut completed_digest_result_rx,
                     &mut part_hashset_result_rx,
                     &shared_ip_filter,
                     &shared_transfer_stats,
