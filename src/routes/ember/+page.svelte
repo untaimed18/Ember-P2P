@@ -1,12 +1,10 @@
 <script lang="ts">
   /*
-   * User-facing "Ember Network" page. The default view answers only the
-   * questions a user actually has — is it on, am I connected, can people
-   * reach me, are my shared files findable — in plain language. Every
-   * protocol-level counter and table lives behind the "Technical
-   * details" disclosure, which is also the only thing that polls the
-   * contact / search / store snapshots, so the common case costs one
-   * command per tick instead of four.
+   * "Ember Network" page, laid out like the KAD page: routing contacts on
+   * the left, the network status panel on the right — status, reachability
+   * and sharing in plain language, then the counters — and the protocol
+   * tables in tabs underneath. Only what is on screen is polled: the
+   * contacts, and the table of the open tab.
    *
    * The overlay is always on.
    */
@@ -45,12 +43,13 @@
   let storeEntries = $state<EmberDhtStoreEntry[]>([]);
   let contactFilter = $state('');
   let metricFilter = $state('');
-  let detailsOpen = $state(false);
 
   // Device-local view state, like collapsed sections elsewhere: not carried
   // by a profile backup.
-  const DETAILS_OPEN_KEY = 'ember.page.details-open.v1';
+  const LOWER_TAB_KEY = 'ember.page.lower-tab.v1';
   const GROWING_DISMISSED_KEY = 'ember.page.growing-dismissed.v1';
+  type LowerTab = 'searches' | 'store' | 'stats' | 'identity';
+  const LOWER_TABS: LowerTab[] = ['searches', 'store', 'stats', 'identity'];
   function readFlag(key: string): boolean {
     try {
       return typeof localStorage !== 'undefined' && localStorage.getItem(key) === '1';
@@ -66,7 +65,36 @@
       // Storage disabled: the choice holds for this visit.
     }
   }
-  const detailsInitiallyOpen = readFlag(DETAILS_OPEN_KEY);
+  function readLowerTab(): LowerTab {
+    try {
+      const saved = typeof localStorage !== 'undefined' ? localStorage.getItem(LOWER_TAB_KEY) : null;
+      return LOWER_TABS.includes(saved as LowerTab) ? (saved as LowerTab) : 'searches';
+    } catch {
+      return 'searches';
+    }
+  }
+  let lowerTab = $state<LowerTab>(readLowerTab());
+  function selectLowerTab(tab: LowerTab) {
+    if (tab === lowerTab) return;
+    lowerTab = tab;
+    try {
+      localStorage.setItem(LOWER_TAB_KEY, tab);
+    } catch {
+      // Storage disabled: the choice holds for this visit.
+    }
+    void refreshLists();
+  }
+  /** Arrow keys move between tabs, the tablist pattern. */
+  function onTabKeydown(e: KeyboardEvent) {
+    const step = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+    const edge = e.key === 'Home' ? 0 : e.key === 'End' ? LOWER_TABS.length - 1 : -1;
+    if (!step && edge < 0) return;
+    e.preventDefault();
+    const at = LOWER_TABS.indexOf(lowerTab);
+    const next = edge >= 0 ? edge : (at + step + LOWER_TABS.length) % LOWER_TABS.length;
+    selectLowerTab(LOWER_TABS[next]);
+    document.getElementById(`ember-tab-${LOWER_TABS[next]}`)?.focus();
+  }
   let growingDismissed = $state(readFlag(GROWING_DISMISSED_KEY));
   function dismissGrowing() {
     growingDismissed = true;
@@ -109,29 +137,28 @@
     await refreshLists();
   }
 
-  // The contact / search / store snapshots are three extra commands per
-  // tick and only render inside "Technical details", so they are fetched
-  // only while that section is open. Guarded separately from the
-  // diagnostics poll so opening the section can fill the tables at once
-  // instead of being swallowed by an in-flight poll and waiting out a tick.
+  // The contacts are always on screen; the search and store snapshots only
+  // under their own tab, so each tick asks for those alone. Guarded
+  // separately from the diagnostics poll, so switching tabs fills the table
+  // at once unless a list fetch is already in flight, which the next tick
+  // then completes.
   async function refreshLists() {
     if (unmounted || inFlightLists) return;
-    if (!detailsOpen || !diag?.ember_native_enabled) {
+    if (!diag?.ember_native_enabled) {
       contacts = [];
       searches = [];
       storeEntries = [];
       return;
     }
     inFlightLists = true;
+    const tab = lowerTab;
     try {
       const [c, s, st] = await Promise.all([
         getEmberDhtContacts().catch(() => contacts),
-        getEmberDhtSearches().catch(() => searches),
-        getEmberDhtStore().catch(() => storeEntries),
+        tab === 'searches' ? getEmberDhtSearches().catch(() => searches) : Promise.resolve(searches),
+        tab === 'store' ? getEmberDhtStore().catch(() => storeEntries) : Promise.resolve(storeEntries),
       ]);
-      // Re-check: the user can close the section while these are in flight,
-      // and the close path has already cleared the lists.
-      if (!unmounted && detailsOpen) {
+      if (!unmounted) {
         contacts = c;
         searches = s;
         storeEntries = st;
@@ -141,26 +168,64 @@
     }
   }
 
-  function onDetailsToggle(e: Event & { currentTarget: HTMLDetailsElement }) {
-    detailsOpen = e.currentTarget.open;
-    writeFlag(DETAILS_OPEN_KEY, detailsOpen);
-    void refreshLists();
+  // Sorted like the KAD page's contacts: a header click picks the column, a
+  // second reverses it. By default, contacts that have answered come first,
+  // most recently heard first; the rest keep the routing table's order.
+  type ContactSortCol = 'node' | 'answered' | 'seen' | 'distance';
+  let contactSortCol = $state<ContactSortCol>('answered');
+  let contactSortAsc = $state(true);
+  let contactScrollEl = $state<HTMLDivElement>();
+
+  function sortContactsBy(col: ContactSortCol) {
+    if (contactSortCol === col) contactSortAsc = !contactSortAsc;
+    else {
+      contactSortCol = col;
+      contactSortAsc = true;
+    }
+    if (contactScrollEl) contactScrollEl.scrollTop = 0;
   }
+
+  /** Most recently heard first; never heard from last. */
+  function bySeen(a: EmberDhtContact, b: EmberDhtContact): number {
+    const seenA = a.last_seen ?? 0;
+    const seenB = b.last_seen ?? 0;
+    if ((seenA > 0) !== (seenB > 0)) return seenA > 0 ? -1 : 1;
+    return seenB - seenA;
+  }
+
+  function compareContacts(a: EmberDhtContact, b: EmberDhtContact): number {
+    switch (contactSortCol) {
+      case 'node':
+        return a.node_id.localeCompare(b.node_id);
+      case 'distance':
+        // Hex of one length, so text order is numeric order; unknown last.
+        if (!a.distance || !b.distance) return a.distance ? -1 : b.distance ? 1 : 0;
+        return a.distance.localeCompare(b.distance);
+      case 'seen':
+        return bySeen(a, b);
+      case 'answered': {
+        const answeredA = contactAnswered(a);
+        const answeredB = contactAnswered(b);
+        if (answeredA !== answeredB) return answeredA ? -1 : 1;
+        return answeredA ? bySeen(a, b) : 0;
+      }
+    }
+  }
+
+  let sortedContacts = $derived.by(() => {
+    const dir = contactSortAsc ? 1 : -1;
+    return [...contacts].sort((a, b) => dir * compareContacts(a, b));
+  });
 
   let filteredContacts = $derived.by(() => {
     const q = contactFilter.trim().toLowerCase();
-    if (!q) return contacts;
-    return contacts.filter(
+    if (!q) return sortedContacts;
+    return sortedContacts.filter(
       (c) =>
         c.node_id.toLowerCase().includes(q) ||
         (c.distance ?? '').toLowerCase().includes(q),
     );
   });
-
-  function shortHex(hex: string, head = 8, tail = 4): string {
-    if (hex.length <= head + tail + 1) return hex || '—';
-    return `${hex.slice(0, head)}…${hex.slice(-tail)}`;
-  }
 
   function emberSearchTypeLabel(type: string): string {
     switch (type) {
@@ -232,6 +297,9 @@
   // (TTL) or the publish manager can still be empty while hydrated stamps
   // already light badges.
   let publishedTotal = $derived(Math.max(publishableCount, publishedCount));
+  // From diagnostics, so the tab counts hold while their tables are not polled.
+  let activeSearches = $derived(diag?.ember_dht_active_searches ?? 0);
+  let storedKeys = $derived(diag?.ember_dht_stored_keys ?? 0);
   let publishedInProgress = $derived(publishedTotal > 0 && publishedCount < publishedTotal);
   let joining = $derived(isActive && verifiedCount === 0 && !$emberJoinTimedOut);
   let isConnected = $derived(isActive && verifiedCount > 0);
@@ -597,8 +665,7 @@
   </div>
 </header>
 
-<div class="page-content">
-  <div class="ember-inner">
+<div class="ember-layout">
   {#if restartError}
     <div class="banner banner-error" role="alert">{restartError}</div>
   {/if}
@@ -616,30 +683,9 @@
       </button>
     </div>
   {/if}
-
-  <section class="hero" class:state-off={heroState === 'loading'} class:state-connecting={heroState === 'connecting'} class:state-connected={heroState === 'connected'} class:state-no-peers={heroState === 'no_peers'} aria-live="polite">
-    <div class="hero-glow" aria-hidden="true"></div>
-    <div class="hero-main">
-      <span
-        class="status-dot"
-        class:on={heroState === 'connected'}
-        class:pending={heroState === 'connecting'}
-        class:warn={heroState === 'no_peers'}
-      ></span>
-      <div class="hero-text">
-        <div class="status-label">
-          {statusLabel}
-          {#if joining}<span class="spinner sm" aria-hidden="true"></span>{/if}
-        </div>
-        {#if statusHint}<p class="hint">{statusHint}</p>{/if}
-      </div>
-    </div>
-  </section>
-
   {#if diagStale}
     <div class="banner banner-error" role="alert">{m.ember_stats_unavailable()}</div>
   {/if}
-
   {#if showNewerVersionBanner}
     <div class="banner banner-warn banner-with-action" role="status">
       <div class="banner-text">
@@ -666,288 +712,367 @@
       {/if}
     </div>
   {/if}
-
   {#if showOlderVersionBanner}
     <div class="banner banner-warn" role="status">{m.ember_version_mismatch_banner()}</div>
   {/if}
 
-  {#if isActive}
-    <section class="stat-grid" aria-label={m.ember_overview_aria()}>
-      <!-- Confirmed contacts only. The routing table's total swings as
-           unverified entries come and go, so it lives in the stats below. -->
-      <div class="stat-card stat">
-        <div class="value">{formatNumber(verifiedCount)}</div>
-        <div class="label">{m.ember_overview_contacts()}</div>
+  <div class="ember-upper">
+    <!-- Routing contacts, where the KAD page keeps its contact list. -->
+    <section class="ember-upper-left" aria-labelledby="ember-contacts-label">
+      <div class="panel-toolbar">
+        <span class="toolbar-label" id="ember-contacts-label">
+          {m.ember_dht_contacts_title()}
+          <span class="toolbar-count">
+            {contactFilter.trim() ? `${formatNumber(filteredContacts.length)} / ` : ''}{formatNumber(contacts.length)}
+          </span>
+        </span>
+        <input
+          class="filter-input"
+          type="search"
+          bind:value={contactFilter}
+          placeholder={m.ember_dht_contacts_filter()}
+          aria-label={m.ember_dht_contacts_filter()}
+          disabled={contacts.length === 0}
+        />
       </div>
-      <div class="stat-card stat" title={publishedTotal > 0 ? m.ember_overview_published_of_hint({ published: publishedCount, total: publishedTotal }) : undefined}>
-        <div class="value">
-          {#if publishedTotal > 0}
-            {m.ember_overview_published_of({ published: publishedCount, total: publishedTotal })}
-          {:else}
-            {publishedCount}
-          {/if}
-        </div>
-        <div class="label">{m.ember_overview_published()}</div>
-      </div>
-    </section>
-
-    <section class="card checklist">
-      <h2>{m.ember_health_title()}</h2>
-
-      <div class="check-row">
-        <div class="check-indicator" class:ok={reachabilityTone === 'ok'} class:warn={reachabilityTone === 'warn'} class:muted={reachabilityTone === 'muted'} aria-hidden="true">
-          {#if reachabilityTone === 'ok'}
-            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3.5,8.5 6.5,11.5 12.5,4.5" /></svg>
-          {:else if reachabilityTone === 'warn'}
-            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3l6 10H2L8 3z" /><path d="M8 7v3M8 11.5h.01" /></svg>
-          {:else}
-            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="8" cy="8" r="5.5" /><path d="M5.5 8h5" /></svg>
-          {/if}
-        </div>
-        <div class="check-body">
-          <div class="check-head">
-            <span class="check-label">{m.ember_health_reachability()}</span>
-            <span class="badge" class:tone-success={reachabilityTone === 'ok'} class:tone-warning={reachabilityTone === 'warn'} class:tone-muted={reachabilityTone === 'muted'}>{reachabilityLabel}</span>
+      <div class="panel-content scrollable scroll-shadows" bind:this={contactScrollEl}>
+        {#if diag === null}
+          <div class="empty-state compact">
+            <div class="spinner lg"></div>
+            <p>{m.common_loading()}</p>
           </div>
-          <p class="hint">{reachabilityHint}</p>
-          {#if relayedFix}
-            <p class="hint">{relayedFix}</p>
-          {/if}
-          <PortTest />
-        </div>
-      </div>
-
-      <div class="check-row">
-        <div class="check-indicator" class:ok={sharingTone === 'ok'} class:warn={sharingTone === 'warn'} class:muted={sharingTone === 'muted'} aria-hidden="true">
-          {#if sharingTone === 'ok'}
-            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3.5,8.5 6.5,11.5 12.5,4.5" /></svg>
-          {:else if sharingTone === 'warn'}
-            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3l6 10H2L8 3z" /><path d="M8 7v3M8 11.5h.01" /></svg>
-          {:else}
-            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="8" cy="8" r="5.5" /><path d="M5.5 8h5" /></svg>
-          {/if}
-        </div>
-        <div class="check-body">
-          <div class="check-head">
-            <span class="check-label">{m.ember_health_sharing()}</span>
-            <span class="badge" class:tone-success={sharingTone === 'ok'} class:tone-warning={sharingTone === 'warn'} class:tone-muted={sharingTone === 'muted'}>{sharingPillLabel}</span>
-          </div>
-          <p class="hint">{sharingHint}</p>
-        </div>
-      </div>
-    </section>
-  {/if}
-
-  <!--
-    The reachability check above gives the verdict; these are the readings
-    behind it. Shown regardless of the overlay's state, because external IP,
-    firewall and port mapping describe this machine's connection rather than
-    Ember, and they're most worth reading when something is off. Same
-    component as the KAD page's Network Status panel, so the two can't drift.
-  -->
-  <section class="card">
-    <h2>{m.kad_network_status()}</h2>
-    <NetworkStatusTiles
-      relayTile={{
-        label: m.ember_relay_label(),
-        help: m.ember_relay_help(),
-        value: emberRelayValue,
-        title: emberRelayTitle,
-      }}
-    />
-  </section>
-
-  <!--
-    Everything below is protocol-level diagnostics. Collapsed by default,
-    and `onDetailsToggle` is what starts/stops polling the three snapshot
-    commands that feed the tables.
-  -->
-  <details class="card advanced" open={detailsInitiallyOpen} ontoggle={onDetailsToggle}>
-    <summary>
-      <span class="chevron" aria-hidden="true">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="12" height="12">
-          <polyline points="6,3 11,8 6,13" />
-        </svg>
-      </span>
-      <span class="summary-text">
-        <span class="summary-title">{m.ember_details_summary()}</span>
-        <span class="summary-hint">{m.ember_details_hint()}</span>
-      </span>
-    </summary>
-
-    <div class="advanced-body">
-      <section class="sub-card">
-        <h3>{m.ember_identity_title()}</h3>
-        <p class="hint">{m.ember_identity_hint()}</p>
-        {#each [
-          { key: 'node', label: m.ember_node_id_label(), value: diag?.ember_dht_node_id ?? '' },
-          { key: 'noise', label: m.ember_noise_key_label(), value: diag?.local_noise_public_key ?? '' },
-          { key: 'ed', label: m.ember_ed25519_key_label(), value: diag?.local_ed25519_public_key ?? '' },
-        ] as row (row.key)}
-          <div class="kv">
-            <div class="k">{row.label}</div>
-            <div class="v pubkey-row">
-              <code class="pubkey">{row.value || '—'}</code>
-              {#if row.value}
-                <!-- The label is only set while idle: during feedback the
-                     visible "Copied" / "Copy failed" must be the accessible name. -->
-                <button
-                  type="button"
-                  class="copy-btn"
-                  onclick={() => copyText(row.value, row.key)}
-                  title={m.ember_copy_aria({ label: row.label })}
-                  aria-label={copiedKey === row.key || copiedKey === `${row.key}:error` ? undefined : m.ember_copy_aria({ label: row.label })}
-                >
-                  {#if copiedKey === row.key}{m.ember_copied()}
-                  {:else if copiedKey === `${row.key}:error`}{m.ember_copy_failed()}
-                  {:else}{m.ember_copy()}{/if}
-                </button>
-              {/if}
-            </div>
-          </div>
-        {/each}
-      </section>
-
-      {#if isActive}
-        <section class="sub-card">
-          <div class="panel-head">
-            <h3>{m.ember_dht_status_title()}</h3>
-            <div class="panel-tools">
-              <input
-                class="filter-input"
-                type="search"
-                bind:value={metricFilter}
-                placeholder={m.ember_metrics_filter()}
-                aria-label={m.ember_metrics_filter()}
-              />
-              <button
-                type="button"
-                class="copy-btn"
-                onclick={() => copyText(diagnosticsText(), 'diagnostics')}
-                title={m.ember_copy_diagnostics()}
-              >
-                {#if copiedKey === 'diagnostics'}{m.ember_copied()}
-                {:else if copiedKey === 'diagnostics:error'}{m.ember_copy_failed()}
-                {:else}{m.ember_copy_diagnostics()}{/if}
-              </button>
-            </div>
-          </div>
-          <div class="metric-grid">
-            {#each filteredMetrics as metric (metric.id)}
-              <div class="metric">
-                <span class="metric-k">{metric.k}</span>
-                <span class="metric-v">{metric.v}</span>
-              </div>
+        {:else if contacts.length === 0}
+          <div class="empty-state compact">
+            {#if joining}
+              <div class="spinner lg"></div>
+              <p class="empty-title">{m.ember_status_connecting()}</p>
+              <p class="empty-sub">{m.ember_joining_hint()}</p>
             {:else}
-              <p class="hint metric-empty">{m.ember_metrics_filter_empty()}</p>
-            {/each}
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48" aria-hidden="true"><circle cx="12" cy="5" r="2.5" /><circle cx="5" cy="18" r="2.5" /><circle cx="19" cy="18" r="2.5" /><path d="M10.8 7.2 6.4 15.6M13.2 7.2l4.4 8.4M7.5 18h9" stroke-dasharray="2 2.5" /></svg>
+              <p class="empty-title">{m.ember_status_no_peers()}</p>
+              <p class="empty-sub">{m.ember_no_contacts_hint()}</p>
+            {/if}
           </div>
-        </section>
-
-        <section class="sub-card">
-          <div class="panel-head">
-            <h3>
-              {m.ember_dht_contacts_title()}
-              <span class="count-pill">{contactFilter.trim() ? `${formatNumber(filteredContacts.length)} / ` : ''}{formatNumber(contacts.length)}</span>
-            </h3>
-            <input
-              class="filter-input"
-              type="search"
-              bind:value={contactFilter}
-              placeholder={m.ember_dht_contacts_filter()}
-              aria-label={m.ember_dht_contacts_filter()}
-            />
+        {:else if filteredContacts.length === 0}
+          <div class="empty-state compact">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48" aria-hidden="true"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line><line x1="11" y1="8" x2="11" y2="14"></line><line x1="8" y1="11" x2="14" y2="11"></line></svg>
+            <p class="empty-title">{m.kad_empty_no_matches()}</p>
+            <p class="empty-sub">{m.kad_empty_no_matches_sub()}</p>
+            <button class="empty-action ghost" onclick={() => (contactFilter = '')}>{m.common_clear_filters()}</button>
           </div>
-          <div class="table-wrap">
-            <table class="dht-table">
-              <thead>
-                <tr>
-                  <th>{m.ember_dht_col_node_id()}</th>
-                  <th>{m.ember_dht_col_answered()}</th>
-                  <th>{m.ember_dht_col_last_seen()}</th>
-                  <th>{m.ember_dht_col_distance()}</th>
+        {:else}
+          {#snippet sortHeader(col: ContactSortCol, label: string, cls: string)}
+            <th
+              class="sortable {cls}"
+              tabindex="0"
+              aria-sort={contactSortCol === col ? (contactSortAsc ? 'ascending' : 'descending') : 'none'}
+              onclick={() => sortContactsBy(col)}
+              onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortContactsBy(col))}
+            >
+              {label}<span class="sort-arrow" aria-hidden="true">{contactSortCol === col ? (contactSortAsc ? '▲' : '▼') : ''}</span>
+            </th>
+          {/snippet}
+          <table class="compact-table">
+            <thead>
+              <tr>
+                {@render sortHeader('node', m.ember_dht_col_node_id(), '')}
+                {@render sortHeader('answered', m.ember_dht_col_answered(), 'col-answered')}
+                {@render sortHeader('seen', m.ember_dht_col_last_seen(), 'col-seen')}
+                {@render sortHeader('distance', m.ember_dht_col_distance(), '')}
+              </tr>
+            </thead>
+            <tbody>
+              {#each filteredContacts as c (c.node_id)}
+                {@const answered = contactAnswered(c)}
+                <tr class:unanswered={!answered}>
+                  <td class="mono-cell">
+                    <div class="cell-inner">
+                      <span class="cell-content" title={c.node_id}>{c.node_id}</span>
+                      <button
+                        type="button"
+                        class="icon-copy"
+                        onclick={() => copyText(c.node_id, `node:${c.node_id}`)}
+                        title={m.ember_copy_aria({ label: m.ember_dht_col_node_id() })}
+                        aria-label={m.ember_copy_aria({ label: m.ember_dht_col_node_id() })}
+                      >
+                        {#if copiedKey === `node:${c.node_id}`}
+                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3.5,8.5 6.5,11.5 12.5,4.5" /></svg>
+                        {:else}
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                        {/if}
+                      </button>
+                    </div>
+                  </td>
+                  <td>
+                    <span class="answered" class:yes={answered}>
+                      <span class="answered-dot" aria-hidden="true"></span>
+                      {answered ? m.common_yes() : m.common_no()}
+                    </span>
+                  </td>
+                  <td class="muted-cell">{contactLastSeen(c)}</td>
+                  <td class="mono-cell distance">{c.distance || '—'}</td>
                 </tr>
-              </thead>
-              <tbody>
-                {#each filteredContacts as c (c.node_id)}
-                  <tr>
-                    <td title={c.node_id}><code>{shortHex(c.node_id)}</code></td>
-                    <td>{contactAnswered(c) ? m.common_yes() : m.common_no()}</td>
-                    <td>{contactLastSeen(c)}</td>
-                    <td title={c.distance ?? ''}><code>{shortHex(c.distance ?? '', 6, 4)}</code></td>
-                  </tr>
-                {:else}
-                  <tr><td colspan="4" class="empty">{m.ember_dht_contacts_empty()}</td></tr>
-                {/each}
-              </tbody>
-            </table>
-          </div>
-        </section>
+              {/each}
+            </tbody>
+          </table>
+        {/if}
+      </div>
+    </section>
 
-        <section class="sub-card">
-          <h3>{m.ember_dht_searches_title()} <span class="count-pill">{formatNumber(searches.length)}</span></h3>
-          <div class="table-wrap">
-            <table class="dht-table">
-              <thead>
-                <tr>
-                  <th>{m.ember_dht_search_col_id()}</th>
-                  <th>{m.ember_dht_search_col_type()}</th>
-                  <th>{m.ember_dht_search_col_target()}</th>
-                  <th>{m.ember_dht_search_col_results()}</th>
-                  <th>{m.ember_dht_search_col_progress()}</th>
-                  <th>{m.ember_dht_search_col_age()}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {#each searches as s (s.id)}
-                  <tr>
-                    <td>{s.id}</td>
-                    <td>{emberSearchTypeLabel(s.type)}{#if s.keyword_count > 1} ({s.keyword_count}){/if}</td>
-                    <td title={s.target}><code>{shortHex(s.target)}</code></td>
-                    <td>{s.results}</td>
-                    <td title={m.ember_dht_search_progress_title({ responded: s.responded, queried: s.queried, in_flight: s.in_flight, pending: s.pending })}>{s.responded}/{s.queried} · {s.in_flight}↑ · {s.pending}…</td>
-                    <td>{formatDurationSecs(s.age_secs)}</td>
-                  </tr>
-                {:else}
-                  <tr><td colspan="6" class="empty">{m.ember_dht_searches_empty()}</td></tr>
-                {/each}
-              </tbody>
-            </table>
-          </div>
-        </section>
+    <!-- The KAD page's Network Status panel, with Ember's own verdicts on top. -->
+    <div class="ember-upper-right scroll-shadows">
+      <section class="stats-panel" aria-label={m.kad_network_status()}>
+        <div class="panel-title">{m.kad_network_status()}</div>
 
-        <section class="sub-card">
-          <h3>{m.ember_dht_store_title()} <span class="count-pill">{formatNumber(storeEntries.length)}</span></h3>
-          <p class="hint">{m.ember_dht_store_hint()}</p>
-          <div class="table-wrap">
-            <table class="dht-table">
-              <thead>
-                <tr>
-                  <th>{m.ember_dht_store_col_key()}</th>
-                  <th>{m.ember_dht_store_col_records()}</th>
-                  <th>{m.ember_dht_store_col_keyword()}</th>
-                  <th>{m.ember_dht_store_col_source()}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {#each storeEntries as e (e.key)}
-                  <tr>
-                    <td title={e.key}><code>{shortHex(e.key)}</code></td>
-                    <td>{e.record_count}</td>
-                    <td>{e.keyword_records}</td>
-                    <td>{e.source_records}</td>
-                  </tr>
-                {:else}
-                  <tr><td colspan="4" class="empty">{m.ember_dht_store_empty()}</td></tr>
-                {/each}
-              </tbody>
-            </table>
+        <div class="health-list" aria-live="polite">
+          <div class="health-item">
+            <div class="health-head">
+              <span class="stat-label-text">{m.kad_stat_status()}</span>
+              <span class="badge" class:tone-success={heroState === 'connected'} class:tone-warning={heroState === 'connecting' || heroState === 'no_peers'} class:tone-muted={heroState === 'loading'}>
+                {#if joining}<span class="spinner xs current" aria-hidden="true"></span>{/if}
+                {statusLabel}
+              </span>
+            </div>
+            {#if statusHint}<p class="health-hint">{statusHint}</p>{/if}
           </div>
-        </section>
+
+          {#if isActive}
+            <div class="health-item">
+              <div class="health-head">
+                <span class="stat-label-text">{m.ember_health_reachability()}</span>
+                <span class="badge" class:tone-success={reachabilityTone === 'ok'} class:tone-warning={reachabilityTone === 'warn'} class:tone-muted={reachabilityTone === 'muted'}>{reachabilityLabel}</span>
+              </div>
+              <p class="health-hint">{reachabilityHint}</p>
+              {#if relayedFix}<p class="health-hint">{relayedFix}</p>{/if}
+              <div class="health-tool"><PortTest /></div>
+            </div>
+
+            <div class="health-item">
+              <div class="health-head">
+                <span class="stat-label-text">{m.ember_health_sharing()}</span>
+                <span class="badge" class:tone-success={sharingTone === 'ok'} class:tone-warning={sharingTone === 'warn'} class:tone-muted={sharingTone === 'muted'}>{sharingPillLabel}</span>
+              </div>
+              <p class="health-hint">{sharingHint}</p>
+            </div>
+          {/if}
+        </div>
+
+        {#if isActive}
+          <div class="stat-group stat-group-grid">
+            <div class="stat-tile">
+              <span class="stat-label" title={m.ember_overview_contacts()}>{m.ember_overview_contacts()}</span>
+              <span class="stat-value stat-numeric">{formatNumber(verifiedCount)}</span>
+            </div>
+            <div class="stat-tile">
+              <span class="stat-label" title={m.ember_stat_network_size()}>{m.ember_stat_network_size()}</span>
+              <span class="stat-value stat-numeric">{estimatedNodes}</span>
+            </div>
+            <div class="stat-tile" title={publishedTotal > 0 ? m.ember_overview_published_of_hint({ published: publishedCount, total: publishedTotal }) : undefined}>
+              <span class="stat-label" title={m.ember_overview_published()}>{m.ember_overview_published()}</span>
+              <span class="stat-value stat-numeric">
+                {publishedTotal > 0 ? m.ember_overview_published_of({ published: publishedCount, total: publishedTotal }) : formatNumber(publishedCount)}
+              </span>
+            </div>
+            <div class="stat-tile">
+              <span class="stat-label" title={m.ember_stat_active_searches()}>{m.ember_stat_active_searches()}</span>
+              <span class="stat-value stat-numeric">{formatNumber(activeSearches)}</span>
+            </div>
+          </div>
+        {/if}
+
+        <!--
+          The readings behind the reachability verdict. Shown whatever the
+          overlay's state, because external IP, firewall and port mapping
+          describe this machine's connection rather than Ember. Same component
+          as the KAD page's panel, so the two cannot drift.
+        -->
+        <NetworkStatusTiles
+          relayTile={{
+            label: m.ember_relay_label(),
+            help: m.ember_relay_help(),
+            value: emberRelayValue,
+            title: emberRelayTitle,
+          }}
+        />
+
+        {#if isActive}
+          <div class="stats-actions">
+            <button type="button" class="ghost" onclick={() => copyText(diagnosticsText(), 'diagnostics')}>
+              {#if copiedKey === 'diagnostics'}{m.ember_copied()}
+              {:else if copiedKey === 'diagnostics:error'}{m.ember_copy_failed()}
+              {:else}{m.ember_copy_diagnostics()}{/if}
+            </button>
+          </div>
+        {/if}
+      </section>
+    </div>
+  </div>
+
+  <!-- Protocol tables, where the KAD page keeps its searches. -->
+  <section class="ember-lower" aria-label={m.ember_details_summary()}>
+    <div class="lower-header">
+      <div class="lower-tabs" role="tablist" aria-label={m.ember_details_summary()}>
+        {#each [
+          { id: 'searches' as const, label: m.ember_dht_searches_title(), count: isActive ? activeSearches : null },
+          { id: 'store' as const, label: m.ember_dht_store_title(), count: isActive ? storedKeys : null },
+          { id: 'stats' as const, label: m.ember_dht_status_title(), count: null },
+          { id: 'identity' as const, label: m.ember_identity_title(), count: null },
+        ] as tab (tab.id)}
+          <button
+            type="button"
+            role="tab"
+            id={`ember-tab-${tab.id}`}
+            class="lower-tab"
+            class:active={lowerTab === tab.id}
+            aria-selected={lowerTab === tab.id}
+            aria-controls="ember-lower-panel"
+            tabindex={lowerTab === tab.id ? 0 : -1}
+            onclick={() => selectLowerTab(tab.id)}
+            onkeydown={onTabKeydown}
+          >
+            {tab.label}
+            {#if tab.count !== null}<span class="tab-count">{formatNumber(tab.count)}</span>{/if}
+          </button>
+        {/each}
+      </div>
+      {#if lowerTab === 'stats' && isActive}
+        <input
+          class="filter-input lower-filter"
+          type="search"
+          bind:value={metricFilter}
+          placeholder={m.ember_metrics_filter()}
+          aria-label={m.ember_metrics_filter()}
+        />
       {/if}
     </div>
-  </details>
-  </div>
+
+    <div
+      class="panel-content scrollable scroll-shadows"
+      id="ember-lower-panel"
+      role="tabpanel"
+      aria-labelledby={`ember-tab-${lowerTab}`}
+      tabindex="-1"
+    >
+      {#if lowerTab === 'identity'}
+        <div class="lower-pad">
+          <p class="panel-note">{m.ember_identity_hint()}</p>
+          {#each [
+            { key: 'node', label: m.ember_node_id_label(), value: diag?.ember_dht_node_id ?? '' },
+            { key: 'noise', label: m.ember_noise_key_label(), value: diag?.local_noise_public_key ?? '' },
+            { key: 'ed', label: m.ember_ed25519_key_label(), value: diag?.local_ed25519_public_key ?? '' },
+          ] as row (row.key)}
+            <div class="kv">
+              <div class="k">{row.label}</div>
+              <div class="v pubkey-row">
+                <code class="pubkey">{row.value || '—'}</code>
+                {#if row.value}
+                  <!-- The label is only set while idle: during feedback the
+                       visible "Copied" / "Copy failed" must be the accessible name. -->
+                  <button
+                    type="button"
+                    class="copy-btn"
+                    onclick={() => copyText(row.value, row.key)}
+                    title={m.ember_copy_aria({ label: row.label })}
+                    aria-label={copiedKey === row.key || copiedKey === `${row.key}:error` ? undefined : m.ember_copy_aria({ label: row.label })}
+                  >
+                    {#if copiedKey === row.key}{m.ember_copied()}
+                    {:else if copiedKey === `${row.key}:error`}{m.ember_copy_failed()}
+                    {:else}{m.ember_copy()}{/if}
+                  </button>
+                {/if}
+              </div>
+            </div>
+          {/each}
+        </div>
+      {:else if !isActive}
+        <div class="empty-state compact">
+          <div class="spinner lg"></div>
+          <p>{m.common_loading()}</p>
+        </div>
+      {:else if lowerTab === 'stats'}
+        <div class="metric-grid lower-pad">
+          {#each filteredMetrics as metric (metric.id)}
+            <div class="metric">
+              <span class="metric-k">{metric.k}</span>
+              <span class="metric-v">{metric.v}</span>
+            </div>
+          {:else}
+            <p class="panel-note metric-empty">{m.ember_metrics_filter_empty()}</p>
+          {/each}
+        </div>
+      {:else if lowerTab === 'searches'}
+        {#if searches.length === 0}
+          <div class="empty-state compact">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48" aria-hidden="true"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+            <p class="empty-sub">{m.ember_dht_searches_empty()}</p>
+          </div>
+        {:else}
+          <table class="compact-table">
+            <thead>
+              <tr>
+                <th class="col-id">{m.ember_dht_search_col_id()}</th>
+                <th class="col-type">{m.ember_dht_search_col_type()}</th>
+                <th>{m.ember_dht_search_col_target()}</th>
+                <th class="num col-num">{m.ember_dht_search_col_results()}</th>
+                <th class="col-progress">{m.ember_dht_search_col_progress()}</th>
+                <th class="num col-age">{m.ember_dht_search_col_age()}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each searches as s (s.id)}
+                <tr>
+                  <td class="muted-cell">{s.id}</td>
+                  <td>
+                    <span class="badge sm tone-accent">{emberSearchTypeLabel(s.type)}{#if s.keyword_count > 1} ({s.keyword_count}){/if}</span>
+                  </td>
+                  <td class="mono-cell">{s.target || '—'}</td>
+                  <td class="num">{formatNumber(s.results)}</td>
+                  <td title={m.ember_dht_search_progress_title({ responded: s.responded, queried: s.queried, in_flight: s.in_flight, pending: s.pending })}>
+                    <span class="progress-cell">
+                      <span class="progress-bar" aria-hidden="true">
+                        <span class="progress-fill" style={`width: ${s.queried > 0 ? Math.min(100, Math.round((s.responded / s.queried) * 100)) : 0}%`}></span>
+                      </span>
+                      <span class="progress-text">{s.responded}/{s.queried} · {s.in_flight}↑ · {s.pending}…</span>
+                    </span>
+                  </td>
+                  <td class="num muted-cell">{formatDurationSecs(s.age_secs)}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        {/if}
+      {:else if lowerTab === 'store'}
+        {#if storeEntries.length === 0}
+          <div class="empty-state compact">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48" aria-hidden="true"><ellipse cx="12" cy="5" rx="8" ry="3" /><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6" /></svg>
+            <p class="empty-sub">{m.ember_dht_store_empty()}</p>
+          </div>
+        {:else}
+          <p class="panel-note table-note">{m.ember_dht_store_hint()}</p>
+          <table class="compact-table">
+            <thead>
+              <tr>
+                <th>{m.ember_dht_store_col_key()}</th>
+                <th class="num col-num">{m.ember_dht_store_col_records()}</th>
+                <th class="num col-num">{m.ember_dht_store_col_keyword()}</th>
+                <th class="num col-num">{m.ember_dht_store_col_source()}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each storeEntries as e (e.key)}
+                <tr>
+                  <td class="mono-cell">{e.key || '—'}</td>
+                  <td class="num">{formatNumber(e.record_count)}</td>
+                  <td class="num">{formatNumber(e.keyword_records)}</td>
+                  <td class="num">{formatNumber(e.source_records)}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        {/if}
+      {/if}
+    </div>
+  </section>
 </div>
 
 <!--
@@ -975,19 +1100,10 @@
 
 <style>
   /*
-   * Fixed `.page-header` + scrollable `.page-content` (the app-wide
-   * pattern); `.ember-inner` is the centered column inside the scroll
-   * area so content is never clipped by the layout's `overflow: hidden`.
+   * The KAD page's frame: a fixed header, then panels that fill the window
+   * and scroll inside themselves. Contacts on the left, the network status
+   * panel on the right, the protocol tables underneath.
    */
-  .ember-inner {
-    padding: var(--page-padding);
-    max-width: 900px;
-    margin: 0 auto;
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-  }
-
   .page-header {
     gap: 16px;
   }
@@ -1002,337 +1118,509 @@
     flex-shrink: 0;
   }
 
-  /* Size/weight come from the global `.page-header h2` rule; only the layout
-     bits this page adds (icon alignment, and room for the subtitle) live here. */
   .page-header h2 {
     margin: 0;
-    display: flex;
-    align-items: center;
-    gap: 10px;
   }
 
-
-  .card {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    padding: 18px 20px;
-  }
-
-  .card h2 {
-    font-size: var(--font-size-base);
-    font-weight: 600;
-    color: var(--text-primary);
-    margin: 0 0 12px;
-  }
-
-  /* --- Status hero --- */
-
-  .hero {
-    position: relative;
-    overflow: hidden;
-    display: flex;
-    align-items: center;
-    gap: 20px;
-    padding: 22px 24px;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    transition:
-      background var(--transition-slow) ease,
-      border-color var(--transition-slow) ease,
-      box-shadow var(--transition-slow) ease;
-  }
-
-  .hero-glow {
-    position: absolute;
-    inset: -40% -20% auto auto;
-    width: 55%;
-    height: 140%;
-    pointer-events: none;
-    background: radial-gradient(
-      ellipse at center,
-      color-mix(in srgb, var(--ember-color, #c2185b) 18%, transparent) 0%,
-      transparent 70%
-    );
-    opacity: 0;
-    transition: opacity 0.4s ease;
-  }
-
-  .hero.state-connected {
-    border-color: color-mix(in srgb, var(--ember-color, #c2185b) 28%, var(--border));
-    background:
-      linear-gradient(
-        135deg,
-        color-mix(in srgb, var(--ember-color, #c2185b) 7%, var(--bg-secondary)) 0%,
-        var(--bg-secondary) 55%
-      );
-    box-shadow: 0 1px 0 color-mix(in srgb, var(--ember-color, #c2185b) 12%, transparent);
-  }
-
-  .hero.state-connected .hero-glow {
-    opacity: 1;
-  }
-
-  .hero.state-connecting {
-    border-color: color-mix(in srgb, var(--warning) 32%, var(--border));
-    background:
-      linear-gradient(
-        135deg,
-        color-mix(in srgb, var(--warning) 8%, var(--bg-secondary)) 0%,
-        var(--bg-secondary) 60%
-      );
-  }
-
-  .hero.state-no-peers {
-    border-color: color-mix(in srgb, var(--warning) 28%, var(--border));
-  }
-
-  .hero-main {
-    position: relative;
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    min-width: 0;
+  .ember-layout {
     flex: 1;
-  }
-
-  .status-dot {
-    width: 14px;
-    height: 14px;
-    border-radius: 50%;
-    flex-shrink: 0;
-    background: var(--text-muted);
-    transition: background var(--transition-slow) ease, box-shadow var(--transition-slow) ease;
-  }
-
-  .status-dot.pending {
-    background: var(--warning);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--warning) 18%, transparent);
-  }
-
-  .status-dot.warn {
-    background: var(--warning);
-  }
-
-  .status-dot.on {
-    background: var(--success);
-    box-shadow:
-      0 0 0 3px color-mix(in srgb, var(--success) 20%, transparent),
-      0 0 14px color-mix(in srgb, var(--ember-color, #c2185b) 35%, transparent);
-  }
-
-  .status-label {
-    font-size: 22px;
-    font-weight: 700;
-    letter-spacing: -0.02em;
-    color: var(--text-primary);
     display: flex;
-    align-items: center;
-    gap: 10px;
-    line-height: 1.2;
+    flex-direction: column;
+    overflow: hidden;
+    padding: var(--workspace-padding);
+    gap: 12px;
+    background: var(--bg-primary);
   }
 
-  .hero-text .hint {
-    margin: 6px 0 0;
-    max-width: 56ch;
-  }
-
-  .hint {
-    color: var(--text-muted);
-    font-size: var(--font-size-md);
-    line-height: 1.5;
-  }
-
-  /* --- Glance metrics --- */
-
-  .stat-grid {
-    display: grid;
-    grid-template-columns: repeat(2, 1fr);
+  .ember-upper {
+    display: flex;
+    flex: 1;
+    min-height: 0;
     gap: 12px;
   }
 
-  /* The shared `.stat-card`, centred with the number above its label and in
-     the Ember colour. */
-  .stat {
-    text-align: center;
-    transition: border-color var(--transition-normal) ease;
-  }
-
-  .stat:hover {
-    border-color: color-mix(in srgb, var(--ember-color) 22%, var(--border));
-  }
-
-  .stat .value {
-    margin-top: 0;
-    color: var(--ember-color);
-  }
-
-  .stat .label {
-    margin-top: 6px;
-  }
-
-  /* --- Health checklist --- */
-
-  .checklist {
-    padding-top: 16px;
-    padding-bottom: 8px;
-  }
-
-  .check-row {
+  .ember-upper-left {
+    flex: 1;
     display: flex;
-    gap: 14px;
-    padding: 14px 0;
-    border-top: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+    flex-direction: column;
+    min-width: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    background: var(--bg-secondary);
+    box-shadow: var(--shadow-sm);
   }
 
-  .check-row:first-of-type {
-    border-top: none;
-    padding-top: 2px;
-  }
-
-  .check-indicator {
-    width: 28px;
-    height: 28px;
-    border-radius: 50%;
+  .ember-upper-right {
+    width: 340px;
     flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    overflow-y: auto;
+  }
+
+  /* --- Panel chrome, as on the KAD page --- */
+
+  .panel-toolbar {
+    display: flex;
+    align-items: center;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-surface);
+    flex-shrink: 0;
+  }
+
+  .toolbar-label {
     display: inline-flex;
     align-items: center;
-    justify-content: center;
-    margin-top: 1px;
-    color: var(--text-muted);
-    background: color-mix(in srgb, var(--text-muted) 12%, transparent);
-    border: 1px solid color-mix(in srgb, var(--text-muted) 22%, transparent);
-  }
-
-  .check-indicator.ok {
-    color: var(--badge-success-text);
-    background: color-mix(in srgb, var(--success) 14%, transparent);
-    border-color: color-mix(in srgb, var(--success) 28%, transparent);
-  }
-
-  .check-indicator.warn {
-    color: var(--badge-warning-text);
-    background: color-mix(in srgb, var(--warning) 14%, transparent);
-    border-color: color-mix(in srgb, var(--warning) 28%, transparent);
-  }
-
-  .check-indicator.muted {
-    color: var(--text-secondary);
-    background: color-mix(in srgb, var(--text-muted) 12%, transparent);
-    border-color: color-mix(in srgb, var(--text-muted) 22%, transparent);
-  }
-
-  .check-body {
-    min-width: 0;
-    flex: 1;
-  }
-
-  .check-head {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex-wrap: wrap;
-  }
-
-  .check-label {
-    font-size: var(--font-size-md);
+    gap: 8px;
+    padding: 10px 14px;
+    font-size: var(--font-size-base);
     font-weight: 600;
+    color: var(--text-secondary);
+    white-space: nowrap;
+  }
+
+  .toolbar-count,
+  .tab-count {
+    padding: 0 7px;
+    border-radius: var(--radius-pill);
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    line-height: 1.6;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .filter-input {
+    flex: 1 1 120px;
+    min-width: 80px;
+    max-width: 280px;
+    margin: 5px 8px 5px auto;
+    padding: 6px 12px;
+    font-size: var(--font-size-md);
+    background: var(--bg-secondary);
     color: var(--text-primary);
+    border: 1px solid var(--input-border);
+    border-radius: var(--radius-pill);
   }
 
-  .check-row .hint {
-    margin: 5px 0 0;
-    max-width: 70ch;
+  .filter-input:focus {
+    outline: none;
+    border-color: var(--accent);
   }
 
-  /* --- Technical details disclosure --- */
-
-  .advanced {
-    padding: 0;
+  .filter-input:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
-  .advanced summary {
+  .panel-content {
+    flex: 1;
+    min-height: 0;
+  }
+
+  .panel-content.scrollable {
+    overflow: auto;
+  }
+
+  .panel-content:focus {
+    outline: none;
+  }
+
+  .panel-title {
+    font-size: var(--font-size-sm);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+
+  .stats-panel {
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--bg-secondary);
+    box-shadow: var(--shadow-sm);
+    container-type: inline-size;
+  }
+
+  /* Numeric readouts read at a glance, as on the KAD panel. */
+  .stat-tile .stat-numeric {
+    font-size: var(--font-size-xl);
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.3px;
+  }
+
+  .stats-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 14px;
+  }
+
+  .stats-actions button {
+    flex: 1;
+    font-size: var(--font-size-sm);
+    padding: 7px 10px;
+    white-space: nowrap;
+  }
+
+  /* --- Health: Ember's plain-language verdicts at the head of the panel --- */
+
+  .health-list {
+    display: flex;
+    flex-direction: column;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+  }
+
+  .health-item {
+    padding: 9px 0;
+  }
+
+  .health-item + .health-item {
+    border-top: 1px dashed color-mix(in srgb, var(--border) 70%, transparent);
+  }
+
+  .health-head {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 10px;
-    padding: 14px 20px;
-    cursor: pointer;
-    list-style: none;
-    border-radius: var(--radius-lg);
   }
 
-  .advanced summary::-webkit-details-marker {
-    display: none;
+  .stat-label-text {
+    color: var(--text-muted);
+    font-weight: 500;
+    font-size: var(--font-size-2xs);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
   }
 
-  .advanced summary:hover .summary-title {
+  .health-head .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .health-hint {
+    margin: 5px 0 0;
+    font-size: var(--font-size-sm);
+    line-height: 1.45;
+    color: var(--text-muted);
+  }
+
+  .health-tool {
+    margin-top: 8px;
+  }
+
+  /* --- Tables --- */
+
+  .compact-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--font-size-sm);
+  }
+
+  .compact-table th {
+    padding: 7px 10px;
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    text-align: left;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    color: var(--text-muted);
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+
+  .compact-table td {
+    padding: 4px 10px;
+    line-height: 1.25;
+    white-space: nowrap;
+  }
+
+  .compact-table tbody tr {
+    height: 30px;
+    transition: background-color var(--transition-fast) ease;
+  }
+
+  .compact-table tbody tr:nth-child(even) td {
+    background: var(--table-row-alt);
+  }
+
+  .compact-table tbody tr:hover td {
+    background: var(--bg-hover);
+  }
+
+  .compact-table .num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* A fixed slot, so the header text does not shift as the arrow comes and goes. */
+  .sort-arrow {
+    display: inline-block;
+    width: 1.2em;
+    margin-inline-start: 2px;
+    font-size: 0.85em;
     color: var(--accent);
   }
 
-  .advanced summary:focus-visible {
+  /* The short columns keep their size and the key column takes the slack, so
+     a row's readings sit together instead of across the whole panel. */
+  .col-answered { width: 110px; }
+  .col-seen { width: 110px; }
+  .col-id { width: 70px; }
+  .col-type { width: 110px; }
+  .col-num { width: 110px; }
+  .col-progress { width: 260px; }
+  .col-age { width: 90px; }
+
+  .mono-cell {
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+  }
+
+  .mono-cell.distance {
+    color: var(--text-muted);
+  }
+
+  /* Never heard from: still in the table, but the live rows read first. */
+  tr.unanswered .mono-cell {
+    color: var(--text-muted);
+  }
+
+  tr.unanswered .mono-cell.distance {
+    color: color-mix(in srgb, var(--text-muted) 75%, transparent);
+  }
+
+  .muted-cell {
+    color: var(--text-muted);
+  }
+
+  .cell-inner {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  .cell-content {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* Revealed on the row, like the KAD contact list's copy buttons. */
+  .icon-copy {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity var(--transition-fast), color var(--transition-fast), background var(--transition-fast);
+  }
+
+  .icon-copy svg {
+    width: 12px;
+    height: 12px;
+  }
+
+  tr:hover .icon-copy,
+  .icon-copy:focus-visible {
+    opacity: 1;
+  }
+
+  .icon-copy:hover {
+    color: var(--text-primary);
+    background: var(--bg-tertiary);
+  }
+
+  @media (hover: none) {
+    .icon-copy { opacity: 1; }
+  }
+
+  .answered {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-muted);
+  }
+
+  .answered-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--text-muted) 55%, transparent);
+  }
+
+  .answered.yes {
+    color: var(--text-secondary);
+  }
+
+  .answered.yes .answered-dot {
+    background: var(--success);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--success) 20%, transparent);
+  }
+
+  .progress-cell {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .progress-bar {
+    width: 56px;
+    height: 5px;
+    border-radius: var(--radius-pill);
+    background: var(--bg-tertiary);
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+
+  .progress-fill {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--accent);
+    transition: width var(--transition-normal) ease;
+  }
+
+  .progress-text {
+    font-variant-numeric: tabular-nums;
+    color: var(--text-secondary);
+  }
+
+  /* --- Lower: the protocol tables in tabs --- */
+
+  .ember-lower {
+    flex: 1 1 32%;
+    max-height: 42%;
+    display: flex;
+    flex-direction: column;
+    min-height: 140px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    background: var(--bg-secondary);
+    box-shadow: var(--shadow-sm);
+  }
+
+  .lower-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-surface);
+    flex-shrink: 0;
+    min-width: 0;
+  }
+
+  .lower-tabs {
+    display: flex;
+    min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .lower-tab {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 9px 14px;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: var(--font-size-base);
+    font-weight: 600;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: color var(--transition-fast) ease, background-color var(--transition-fast) ease;
+  }
+
+  .lower-tab:hover {
+    color: var(--text-primary);
+    background: color-mix(in srgb, var(--text-primary) 4%, transparent);
+  }
+
+  .lower-tab.active {
+    color: var(--text-primary);
+  }
+
+  .lower-tab::after {
+    content: '';
+    position: absolute;
+    left: 10px;
+    right: 10px;
+    bottom: -1px;
+    height: 2px;
+    border-radius: 2px 2px 0 0;
+    background: var(--accent);
+    transform: scaleX(0);
+    transition: transform var(--transition-normal) ease;
+  }
+
+  .lower-tab.active::after {
+    transform: scaleX(1);
+  }
+
+  .lower-tab.active .tab-count {
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    color: var(--text-accent);
+  }
+
+  .lower-tab:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: -2px;
   }
 
-  .chevron {
-    display: inline-flex;
-    color: var(--text-muted);
-    transition: transform var(--transition-normal) ease;
-    flex-shrink: 0;
+  .lower-filter {
+    max-width: 240px;
   }
 
-  .advanced[open] .chevron {
-    transform: rotate(90deg);
+  .lower-pad {
+    padding: 10px 14px 14px;
   }
 
-  .summary-text {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    min-width: 0;
-  }
-
-  .summary-title {
-    font-size: var(--font-size-base);
-    font-weight: 600;
-    color: var(--text-primary);
-  }
-
-  .summary-hint {
-    font-size: var(--font-size-sm);
-    color: var(--text-muted);
-  }
-
-  .advanced-body {
-    display: flex;
-    flex-direction: column;
-    gap: 18px;
-    padding: 4px 20px 20px;
-    border-top: 1px solid var(--border);
-    margin-top: -1px;
-  }
-
-  .advanced-body .sub-card:first-child {
-    padding-top: 14px;
-  }
-
-  .sub-card h3 {
-    font-size: var(--font-size-md);
-    font-weight: 600;
-    color: var(--text-primary);
-    margin: 0 0 4px;
-  }
-
-  .sub-card .hint {
+  .panel-note {
     margin: 0 0 8px;
+    font-size: var(--font-size-md);
+    line-height: 1.45;
+    color: var(--text-muted);
+  }
+
+  .table-note {
+    margin: 0;
+    padding: 8px 10px 6px;
   }
 
   .metric-grid {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 0 24px;
-    margin-top: 6px;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 0 28px;
   }
 
   .metric {
@@ -1346,7 +1634,7 @@
   }
 
   .metric-k {
-    font-size: var(--font-size-sm);
+    font-size: var(--font-size-md);
     color: var(--text-muted);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1354,106 +1642,16 @@
   }
 
   .metric-v {
-    font-size: var(--font-size-sm);
+    font-size: var(--font-size-md);
     font-weight: 600;
     color: var(--text-secondary);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
 
-  .panel-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    flex-wrap: wrap;
-    margin-bottom: 8px;
-  }
-
-  .panel-head h3 {
-    margin: 0;
-  }
-
-  .panel-tools {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex: 1;
-    justify-content: flex-end;
-    min-width: 0;
-  }
-
-  .count-pill {
-    display: inline-block;
-    margin-left: 6px;
-    padding: 0 7px;
-    border-radius: var(--radius-pill);
-    background: var(--bg-tertiary);
-    color: var(--text-muted);
-    font-size: var(--font-size-xs);
-    font-weight: 600;
-    line-height: 1.6;
-    vertical-align: 1px;
-    font-variant-numeric: tabular-nums;
-  }
-
   .metric-empty {
     grid-column: 1 / -1;
-    margin: 6px 0 0;
-  }
-
-  .filter-input {
-    flex: 1;
-    min-width: 140px;
-    max-width: 260px;
-    padding: 6px 12px;
-    border: 1px solid var(--input-border);
-    border-radius: var(--radius-pill);
-    background: var(--bg-primary);
-    color: var(--text-primary);
-    font-size: var(--font-size-md);
-  }
-
-  .table-wrap {
-    overflow: auto;
-    max-height: 280px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-  }
-
-  .dht-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: var(--font-size-sm);
-  }
-
-  .dht-table th,
-  .dht-table td {
-    padding: 6px 10px;
-    text-align: left;
-    border-bottom: 1px solid var(--border);
-    white-space: nowrap;
-  }
-
-  .dht-table th {
-    position: sticky;
-    top: 0;
-    background: var(--bg-secondary);
-    color: var(--text-muted);
-    font-weight: 600;
-    font-size: var(--font-size-xs);
-    text-transform: uppercase;
-    letter-spacing: 0.4px;
-  }
-
-  .dht-table code {
-    font-size: var(--font-size-xs);
-  }
-
-  .dht-table .empty {
-    color: var(--text-muted);
-    text-align: center;
-    padding: 16px;
+    margin-top: 6px;
   }
 
   .kv {
@@ -1462,7 +1660,7 @@
     gap: 10px;
     align-items: center;
     padding: 8px 0;
-    border-top: 1px solid var(--border);
+    border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
   }
 
   .kv:first-of-type {
@@ -1495,7 +1693,7 @@
     border: 1px solid var(--border);
     color: var(--text-secondary);
     border-radius: var(--radius-md);
-    padding: 4px 10px;
+    padding: 3px 10px;
     font-size: var(--font-size-sm);
     cursor: pointer;
     transition: background var(--transition-normal) ease, color var(--transition-normal) ease, border-color var(--transition-normal) ease;
@@ -1507,9 +1705,12 @@
     border-color: var(--accent);
   }
 
+  /* --- Banners --- */
+
   .banner {
+    flex-shrink: 0;
     border-radius: var(--radius-md);
-    padding: 10px 14px;
+    padding: 9px 14px;
     font-size: var(--font-size-md);
     line-height: 1.5;
     display: flex;
@@ -1600,11 +1801,9 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .chevron,
-    .hero,
-    .hero-glow,
-    .status-dot,
-    .stat { transition: none; }
+    .lower-tab::after,
+    .progress-fill,
+    .compact-table tbody tr { transition: none; }
   }
 
   /* Same overlay as a port-change restart in Settings. */
@@ -1638,24 +1837,55 @@
     margin: 0;
   }
 
+  /* --- Smaller windows, the KAD page's breakpoints --- */
+
+  @media (max-height: 900px) {
+    .ember-lower {
+      flex: 0 1 30%;
+      max-height: 36%;
+      min-height: 120px;
+    }
+  }
+
+  @media (max-width: 1200px) {
+    .ember-layout {
+      padding: 10px;
+      gap: 10px;
+      overflow-y: auto;
+    }
+
+    .ember-upper {
+      flex-direction: column;
+      gap: 10px;
+      flex: none;
+    }
+
+    .ember-upper-left {
+      min-height: 260px;
+      max-height: 420px;
+    }
+
+    .ember-upper-right {
+      width: 100%;
+      overflow: visible;
+    }
+
+    .ember-lower {
+      flex: none;
+      max-height: none;
+      height: 360px;
+    }
+  }
+
   @media (max-width: 760px) {
     .page-header {
       align-items: flex-start;
       flex-direction: column;
     }
 
-    .stat-grid {
-      grid-template-columns: 1fr 1fr;
-    }
-    .metric-grid {
-      grid-template-columns: 1fr;
-    }
     .kv {
       grid-template-columns: 1fr;
       gap: 4px;
-    }
-    .status-label {
-      font-size: var(--font-size-2xl);
     }
   }
 </style>

@@ -3446,6 +3446,9 @@
                 onblur={() => (listHighlightId = null)}
                 onkeydown={onListSearchKeydown}
               />
+              {#if !listQuery}
+                <span class="search-kbd" aria-hidden="true"><kbd>{shortcutModSymbol()}</kbd><kbd>K</kbd></span>
+              {/if}
               {#if listQuery}
                 <button type="button" class="search-clear" onclick={() => (listQuery = '')} title={m.search_bar_clear()} aria-label={m.search_bar_clear()}><IconX size={12} /></button>
               {/if}
@@ -3472,7 +3475,9 @@
                  header keeps it, so it does not come and go with the query. -->
             {#if roomSections.yoursPublic.length > 0}
               <div class="list-section">
-                <h3 class="list-section-label" id="rooms-section-yours-public">{m.channels_section_yours_public()}</h3>
+                <h3 class="list-section-label" id="rooms-section-yours-public">
+                  {m.channels_section_yours_public()}<span class="list-section-count" aria-hidden="true">{roomSections.yoursPublic.length}</span>
+                </h3>
                 {@render markAllReadAction()}
               </div>
               <div role="list" aria-labelledby="rooms-section-yours-public">
@@ -3483,7 +3488,9 @@
             {/if}
             {#if roomSections.yoursPrivate.length > 0}
               <div class="list-section">
-                <h3 class="list-section-label" id="rooms-section-yours-private">{m.channels_section_yours_private()}</h3>
+                <h3 class="list-section-label" id="rooms-section-yours-private">
+                  {m.channels_section_yours_private()}<span class="list-section-count" aria-hidden="true">{roomSections.yoursPrivate.length}</span>
+                </h3>
                 {#if roomSections.yoursPublic.length === 0}{@render markAllReadAction()}{/if}
               </div>
               <div role="list" aria-labelledby="rooms-section-yours-private">
@@ -3499,8 +3506,10 @@
               </div>
             {/if}
             {#if roomSections.discover.length > 0}
-              <div class="list-section">
-                <h3 class="list-section-label" id="rooms-section-discover">{m.channels_section_discover()}</h3>
+              <div class="list-section discover-section" class:after-yours={roomSections.yours.length > 0}>
+                <h3 class="list-section-label" id="rooms-section-discover">
+                  {m.channels_section_discover()}<span class="list-section-count" aria-hidden="true">{discoverShown.length}</span>
+                </h3>
               </div>
               <div role="list" aria-labelledby="rooms-section-discover">
                 {#each discoverShown as ch (ch.channel_id)}
@@ -3539,6 +3548,7 @@
                   class="chan-row"
                   role="listitem"
                   class:active={ch.in_room && ch.channel_id === selectedId}
+                  class:discover={!ch.in_room}
                   class:highlighted={highlightedRow?.channel_id === ch.channel_id}
                   class:joining={joiningIds.includes(ch.channel_id)}
                   class:just-joined={ch.in_room && ch.channel_id === justJoinedId}
@@ -5444,13 +5454,51 @@
 
   .search-input {
     width: 100%;
-    padding: 5px 26px 5px 30px;
+    padding: 6px 26px 6px 30px;
     border: 1px solid var(--input-border);
     border-radius: var(--radius-pill);
     background: var(--bg-input);
     color: var(--text-primary);
     font-size: var(--font-size-sm);
+    transition:
+      border-color var(--transition-fast) ease,
+      box-shadow var(--transition-fast) ease;
   }
+
+  .search-input:placeholder-shown { padding-right: 58px; }
+
+  /* The shortcut, said where it is used. Gone once the box has focus, which
+     is all the shortcut does. */
+  .search-kbd {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    display: inline-flex;
+    gap: 3px;
+    pointer-events: none;
+    transition: opacity var(--transition-fast) ease;
+  }
+
+  .search-kbd kbd {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 4px;
+    border: 1px solid var(--border);
+    border-bottom-width: 2px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+    color: var(--text-muted);
+    font-family: inherit;
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 1;
+  }
+
+  .search-input:focus ~ .search-kbd { opacity: 0; }
 
   .search-clear {
     position: absolute;
@@ -5487,6 +5535,8 @@
   /* Sized like the dock switcher's section labels, so the two lists read as
      one family. A fixed height keeps the header from growing when its action
      appears and disappears. */
+  /* Sticky, so a long list still says which part of it is on screen. The
+     pane's own colour hides the rows passing under it. */
   .list-section {
     display: flex;
     align-items: center;
@@ -5494,18 +5544,47 @@
     gap: 8px;
     min-height: 22px;
     margin: 10px 0 2px;
-    padding: 0 6px 0 8px;
+    padding: 2px 6px 2px 8px;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--bg-secondary);
   }
 
   .list-section:first-child { margin-top: 0; }
 
   .list-section-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
     margin: 0;
     font-size: var(--font-size-xs);
     font-weight: 700;
     letter-spacing: 0.04em;
     text-transform: uppercase;
     color: var(--text-muted);
+  }
+
+  .list-section-count {
+    min-width: 16px;
+    padding: 1px 5px;
+    border-radius: var(--radius-pill);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0;
+    line-height: 1.4;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Rooms you are in, then rooms you could join: a rule between the two kinds
+     of list rather than one more header in the same run. */
+  .discover-section.after-yours {
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
   }
 
   .list-section-action {
@@ -5733,16 +5812,37 @@
     transition: transform var(--transition-fast) ease;
   }
 
+  /* Tinted at rest so a column of them does not outshout the rooms you are
+     in, and filled once the row is reached, where the click is about to go. */
   .chan-join {
-    background: var(--accent);
-    color: var(--on-accent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--text-accent);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
     font-weight: 600;
     transition:
       background-color var(--transition-fast) ease,
+      border-color var(--transition-fast) ease,
+      color var(--transition-fast) ease,
       transform var(--transition-fast) ease;
   }
 
-  .chan-join:hover:not(:disabled) { background: var(--accent-hover); }
+  .chan-row:hover .chan-join:not(:disabled),
+  .chan-row.highlighted .chan-join:not(:disabled),
+  .chan-join:focus-visible:not(:disabled) {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--on-accent);
+  }
+
+  .chan-join:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+
+  @media (hover: none) {
+    .chan-join:not(:disabled) {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--on-accent);
+    }
+  }
 
   .chan-door:active:not(:disabled) { transform: scale(0.94); }
 
@@ -5787,6 +5887,21 @@
   /* The search box keeps focus while its arrows steer, so the row carries the
      ring focus would otherwise have drawn. */
   .chan-row.highlighted { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent); }
+
+  /* Tabbing to a room rings the whole row, the shape that is picked, rather
+     than the button inside it, whose outline the list's edge clipped. */
+  .chan-row-main:focus-visible { outline: none; }
+
+  .chan-row:has(> .chan-row-main:focus-visible) {
+    background: var(--bg-hover);
+    box-shadow: inset 0 0 0 2px var(--accent);
+  }
+
+  .row-more > summary:focus-visible {
+    opacity: 1;
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
 
   .chan-fav {
     display: inline-flex;
@@ -5861,6 +5976,27 @@
   }
 
   .chan-avatar svg { width: 14px; height: 15px; }
+
+  /* Not joined yet: the same mark, outlined, so your rooms and the ones on
+     offer read apart before any heading is read. It fills as the row is
+     reached, the way joining would make it. */
+  .chan-row.discover .chan-avatar {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--text-accent);
+    border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+    transition:
+      background-color var(--transition-fast) ease,
+      border-color var(--transition-fast) ease,
+      color var(--transition-fast) ease;
+  }
+
+  .chan-row.discover:hover .chan-avatar,
+  .chan-row.discover.highlighted .chan-avatar {
+    background: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 72%, var(--border));
+    color: var(--on-accent);
+  }
+
   .chan-avatar.sm { width: var(--avatar-size-compact); height: var(--avatar-size-compact); }
   .chan-avatar.sm svg { width: 13px; height: 14px; }
 
